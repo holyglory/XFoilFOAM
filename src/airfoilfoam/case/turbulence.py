@@ -93,20 +93,53 @@ def build_turbulence(
     eps_dims = dimensions(0, 2, -3, 0, 0, 0, 0)
     nutilda_dims = dimensions(0, 2, -1, 0, 0, 0, 0)
 
-    if model in (TurbulenceModel.k_omega, TurbulenceModel.k_omega_sst):
+    if model in (
+        TurbulenceModel.k_omega,
+        TurbulenceModel.k_omega_sst,
+        TurbulenceModel.k_omega_sst_lm,
+    ):
         k_field = scalar_field("k", k_dims, k, {"type": "kqRWallFunction", "value": _u(k)})
         omega_field = scalar_field(
             "omega", omega_dims, omega, {"type": "omegaWallFunction", "value": _u(omega)}
         )
+        fields = [k_field, omega_field, nut_field]
+        div = {"div(phi,k)": "bounded Gauss upwind", "div(phi,omega)": "bounded Gauss upwind"}
+        solver_vars = ["k", "omega"]
+        relaxation = {"k": 0.5, "omega": 0.5}
+
+        if model == TurbulenceModel.k_omega_sst_lm:
+            # Langtry-Menter transition: intermittency gammaInt and transition
+            # momentum-thickness Reynolds number ReThetat (both dimensionless).
+            re_theta = physics.transition_re_theta_t(intensity)
+            dimless = dimensions(0, 0, 0, 0, 0, 0, 0)
+
+            def transition_field(name, value):
+                return FieldSpec(
+                    object_name=name,
+                    class_name="volScalarField",
+                    dims=dimless,
+                    internal=f"uniform {value}",
+                    boundary={
+                        inlet: {"type": "fixedValue", "value": _u(value)},
+                        outlet: {"type": "inletOutlet", "inletValue": _u(value), "value": _u(value)},
+                        wall: {"type": "zeroGradient"},
+                        empty: {"type": "empty"},
+                    },
+                )
+
+            fields += [transition_field("gammaInt", 1), transition_field("ReThetat", re_theta)]
+            div["div(phi,gammaInt)"] = "bounded Gauss upwind"
+            div["div(phi,ReThetat)"] = "bounded Gauss upwind"
+            solver_vars += ["gammaInt", "ReThetat"]
+            relaxation["gammaInt"] = 0.5
+            relaxation["ReThetat"] = 0.5
+
         return TurbulenceConfig(
             ras_model=model.value,
-            fields=[k_field, omega_field, nut_field],
-            div_schemes={
-                "div(phi,k)": "bounded Gauss upwind",
-                "div(phi,omega)": "bounded Gauss upwind",
-            },
-            solver_vars=["k", "omega"],
-            relaxation={"k": 0.5, "omega": 0.5},
+            fields=fields,
+            div_schemes=div,
+            solver_vars=solver_vars,
+            relaxation=relaxation,
             residual_controls=["k", "omega"],
         )
 

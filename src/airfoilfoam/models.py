@@ -85,6 +85,7 @@ class RoughnessParams(BaseModel):
 class TurbulenceModel(str, Enum):
     k_omega = "kOmega"
     k_omega_sst = "kOmegaSST"
+    k_omega_sst_lm = "kOmegaSSTLM"  # Langtry-Menter transition model (laminar-turbulent)
     k_epsilon = "kEpsilon"
     spalart_allmaras = "SpalartAllmaras"
 
@@ -147,6 +148,25 @@ class SolverParams(BaseModel):
         default="linearUpwind",
         description="Convection scheme for div(phi,U): 'linearUpwind' (2nd order, default) or "
         "'upwind' (1st order, most robust).",
+    )
+    transient_fallback: bool = Field(
+        default=True,
+        description="If the steady solve does not converge (e.g. post-stall, unsteady separation), "
+        "automatically re-run the case transient (pimpleFoam/URANS) and report time-averaged "
+        "force coefficients with their fluctuation.",
+    )
+    transient_cycles: float = Field(
+        default=10.0, gt=1, description="Vortex-shedding cycles to simulate in the transient fallback."
+    )
+    transient_discard_fraction: float = Field(
+        default=0.4, ge=0, lt=1, description="Initial fraction of the transient run discarded as startup."
+    )
+    transient_max_courant: float = Field(
+        default=15.0,
+        gt=0,
+        description="Max Courant number for the adaptive transient time step. The implicit "
+        "pimpleFoam solver tolerates Co>1; a larger value avoids the tiny wall cells (y+~1) "
+        "throttling the step to an impractically small size.",
     )
     write_images: list[ImageField] = Field(
         default_factory=lambda: [ImageField.velocity_magnitude, ImageField.pressure]
@@ -245,6 +265,14 @@ class PolarPoint(BaseModel):
     cd: Optional[float] = None
     cm: Optional[float] = None
     cl_cd: Optional[float] = None
+    cl_std: Optional[float] = Field(default=None, description="Std-dev of Cl over the averaging window (transient only).")
+    cd_std: Optional[float] = Field(default=None, description="Std-dev of Cd over the averaging window (transient only).")
+    cm_std: Optional[float] = None
+    unsteady: bool = Field(
+        default=False,
+        description="True if values are time-averaged from a transient (URANS) run because the "
+        "steady solve did not converge (e.g. post-stall). The *_std fields give the fluctuation.",
+    )
     converged: bool = False
     final_residual: Optional[float] = None
     iterations: Optional[int] = None

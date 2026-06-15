@@ -58,6 +58,7 @@ def test_health_and_capabilities(client):
     caps = client.get("/capabilities").json()
     assert "blockmesh-cgrid" in caps["meshers"]
     assert "kOmegaSST" in caps["turbulence_models"]
+    assert "kOmegaSSTLM" in caps["turbulence_models"]  # transition model exposed
 
 
 def test_parse_airfoil_endpoint(client, naca0012_selig_text):

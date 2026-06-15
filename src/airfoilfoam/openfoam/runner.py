@@ -48,12 +48,19 @@ class Runner:
     def application(self, case_dir: Path, app: str, args: str = "", timeout: int = 7200) -> RunResult:
         return self.run(case_dir, f"{app} {args}".strip(), timeout=timeout)
 
-    def solver(self, case_dir: Path, app: str, n_proc: int, timeout: int = 7200) -> RunResult:
-        """Run a solver serially or in parallel (decomposePar + mpirun + reconstructPar)."""
+    def solver(
+        self, case_dir: Path, app: str, n_proc: int, timeout: int = 7200, restart: bool = False
+    ) -> RunResult:
+        """Run a solver serially or in parallel (decomposePar + mpirun + reconstructPar).
+
+        ``restart=True`` decomposes the latest time (to continue a run, e.g. a transient
+        solve started from a converged steady field) instead of the initial 0/ fields.
+        """
         if n_proc <= 1:
             return self.run(case_dir, app, timeout=timeout)
+        decompose = "decomposePar -latestTime -force" if restart else "decomposePar -force"
         steps = (
-            f"decomposePar -force && "
+            f"{decompose} && "
             f"mpirun --allow-run-as-root -np {n_proc} {app} -parallel && "
             f"reconstructPar -latestTime"
         )

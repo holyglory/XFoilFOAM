@@ -35,6 +35,22 @@ def test_freestream_turbulence_consistency():
     assert eps == pytest.approx(physics.CMU * k * omega)
 
 
+def test_transition_re_theta_t_low_tu():
+    # low turbulence -> late transition -> large ReThetat
+    re_low = physics.transition_re_theta_t(0.001)   # Tu = 0.1%
+    re_high = physics.transition_re_theta_t(0.05)    # Tu = 5%
+    assert re_low > re_high
+    assert re_high >= 20.0
+    # floored against the 1/Tu^2 blow-up
+    assert physics.transition_re_theta_t(0.0) == physics.transition_re_theta_t(0.0003)
+
+
+def test_shedding_period():
+    # T = c/(St U); halving the speed doubles the period
+    assert physics.shedding_period(10.0, 1.0, strouhal=0.2) == pytest.approx(0.5)
+    assert physics.shedding_period(5.0, 1.0, strouhal=0.2) == pytest.approx(1.0)
+
+
 def test_first_cell_height_scales_with_yplus():
     h1 = physics.first_cell_height_for_yplus(1.0, 50.0, 1.0, 1.5e-5)
     h30 = physics.first_cell_height_for_yplus(30.0, 50.0, 1.0, 1.5e-5)

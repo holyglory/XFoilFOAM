@@ -41,6 +41,27 @@ def freestream_nutilda(nu: float, viscosity_ratio: float) -> float:
     return max(viscosity_ratio, 3.0) * nu
 
 
+def transition_re_theta_t(intensity: float) -> float:
+    """Freestream transition momentum-thickness Reynolds number (Menter-Langtry).
+
+    Used to initialise the ``ReThetat`` field of the k-omega SST-LM transition model
+    from the turbulence intensity Tu (fraction). Correlation (Tu in %):
+        Tu <= 1.3 : 1173.51 - 589.428 Tu + 0.2196/Tu^2
+        Tu  > 1.3 : 331.50 (Tu - 0.5658)^-0.671
+    """
+    tu = max(intensity * 100.0, 0.03)  # percent, floored to avoid the 1/Tu^2 blow-up
+    if tu <= 1.3:
+        re = 1173.51 - 589.428 * tu + 0.2196 / (tu * tu)
+    else:
+        re = 331.50 * (tu - 0.5658) ** (-0.671)
+    return max(re, 20.0)
+
+
+def shedding_period(speed: float, chord: float, strouhal: float = 0.2) -> float:
+    """Estimated vortex-shedding period T = c / (St U) for sizing transient runs."""
+    return chord / (strouhal * max(speed, 1e-9))
+
+
 def first_cell_height_for_yplus(target_yplus: float, speed: float, chord: float, nu: float) -> float:
     """Wall-normal first-cell *height* [m] to achieve a target y+ (flat-plate estimate).
 

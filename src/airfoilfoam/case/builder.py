@@ -109,12 +109,12 @@ class CaseBuilder:
         if self.n_proc > 1:
             self._write_decompose()
 
-    def _write_control_dict(self) -> None:
+    def _force_coeffs_dict(self) -> dict:
         fv = self.freestream_vector
         chord = self.spec.chord
         span = self.mesh_params.span_chords * chord
         area = chord * span
-        force_coeffs = {
+        return {
             "type": "forceCoeffs",
             "libs": ["forces"],
             "writeControl": "timeStep",
@@ -131,6 +131,9 @@ class CaseBuilder:
             "CofR": vector(0.25 * chord, 0.0, 0.0),
             "pitchAxis": vector(0, 0, 1),
         }
+
+    def _write_control_dict(self) -> None:
+        force_coeffs = self._force_coeffs_dict()
         write_foam_dict(
             self._p("system", "controlDict"),
             "dictionary",
@@ -228,6 +231,101 @@ class CaseBuilder:
                     "residualControl": residual,
                 },
                 "relaxationFactors": {"fields": {"p": 0.3}, "equations": relax_eq},
+            },
+        )
+
+    # -- transient (URANS) overrides --------------------------------------- #
+    def write_transient(self, case_dir: Path, start_time: float, end_time: float, delta_t: float) -> None:
+        """Rewrite system/ for a transient pimpleFoam run that continues from the
+        latest (steady) field. Keeps 0/ and constant/ untouched."""
+        self._case_dir = case_dir
+        turb = self._turbulence()
+        self._write_transient_control_dict(start_time, end_time, delta_t)
+        self._write_transient_schemes(turb)
+        self._write_transient_solution(turb)
+
+    def _write_transient_control_dict(self, start_time, end_time, delta_t) -> None:
+        write_foam_dict(
+            self._p("system", "controlDict"),
+            "dictionary",
+            "controlDict",
+            {
+                "application": "pimpleFoam",
+                "startFrom": "latestTime",
+                "startTime": start_time,
+                "stopAt": "endTime",
+                "endTime": end_time,
+                "deltaT": delta_t,
+                "writeControl": "adjustableRunTime",
+                "writeInterval": (end_time - start_time) / 5.0,
+                "purgeWrite": 2,
+                "writeFormat": "ascii",
+                "writePrecision": 8,
+                "writeCompression": "off",
+                "timeFormat": "general",
+                "runTimeModifiable": "false",
+                "adjustTimeStep": "yes",
+                "maxCo": self.solver.transient_max_courant,
+                "maxDeltaT": (end_time - start_time) / 50.0,
+                "functions": {"forceCoeffs1": self._force_coeffs_dict()},
+            },
+        )
+
+    def _write_transient_schemes(self, turb) -> None:
+        div = {
+            "default": "none",
+            "div(phi,U)": "Gauss linearUpwind grad(U)",
+            "div((nuEff*dev2(T(grad(U)))))": "Gauss linear",
+        }
+        div.update(turb.div_schemes)
+        write_foam_dict(
+            self._p("system", "fvSchemes"),
+            "dictionary",
+            "fvSchemes",
+            {
+                "ddtSchemes": {"default": "Euler"},  # 1st-order time, robust for URANS
+                "gradSchemes": {"default": "Gauss linear", "grad(U)": "cellLimited Gauss linear 1"},
+                "divSchemes": div,
+                "laplacianSchemes": {"default": "Gauss linear corrected"},
+                "interpolationSchemes": {"default": "linear"},
+                "snGradSchemes": {"default": "corrected"},
+                "wallDist": {"method": "meshWave"},
+            },
+        )
+
+    def _write_transient_solution(self, turb) -> None:
+        turb_vars = "|".join(turb.solver_vars)
+        write_foam_dict(
+            self._p("system", "fvSolution"),
+            "dictionary",
+            "fvSolution",
+            {
+                "solvers": {
+                    "p": {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.05},
+                    "pFinal": {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.0},
+                    f'"({turb_vars}|U).*"': {
+                        "solver": "smoothSolver",
+                        "smoother": "symGaussSeidel",
+                        "tolerance": 1e-8,
+                        "relTol": 0.1,
+                    },
+                },
+                # Several outer correctors with under-relaxation tighten the
+                # pressure-velocity coupling each step, which is essential to keep
+                # the violently-separated post-stall flow from diverging.
+                "PIMPLE": {
+                    "momentumPredictor": "yes",
+                    "nOuterCorrectors": 3,
+                    "nCorrectors": 2,
+                    "nNonOrthogonalCorrectors": 1,
+                },
+                "relaxationFactors": {
+                    "fields": {"p": 0.3},
+                    "equations": {
+                        "U": 0.7,
+                        '"(k|omega|epsilon|nuTilda|gammaInt|ReThetat)"': 0.5,
+                    },
+                },
             },
         )
 

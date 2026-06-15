@@ -70,6 +70,45 @@ def test_real_naca0012_case(require_docker, tmp_path, naca0012_selig_text):
     assert (tmp_path / "case" / out.images["velocity_magnitude"]).is_file()
 
 
+def test_transition_model_runs(require_docker, tmp_path, naca0012_selig_text):
+    """The k-omega SST-LM transition model builds its extra fields and converges."""
+    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    spec = CaseSpec(chord=1.0, speed=7.5, aoa_deg=4.0)  # Re=5e5
+    fluid = FluidProperties(density=1.225, kinematic_viscosity=1.5e-5)
+    mesh = MeshParams(n_surface=130, n_radial=80, n_wake=60,
+                      farfield_radius_chords=15.0, wake_length_chords=12.0)
+    solver = SolverParams(
+        turbulence=TurbulenceParams(model=TurbulenceModel.k_omega_sst_lm),
+        n_iterations=2500, write_images=[],
+    )
+    out = run_case(tmp_path / "lm", af, spec, fluid, RoughnessParams(), mesh, solver,
+                   BlockMeshCGrid(), DockerRunner(), n_proc=4)
+    assert out.error is None, out.error
+    assert 0.1 < out.cl < 0.8, out.cl
+    assert 0.0 < out.cd < 0.05, out.cd
+
+
+def test_transient_fallback_on_deep_stall(require_docker, tmp_path, naca0012_selig_text):
+    """A deep-stall case that won't converge steady triggers the transient (URANS)
+    fallback and returns time-averaged coefficients with a fluctuation."""
+    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    spec = CaseSpec(chord=1.0, speed=7.5, aoa_deg=20.0)  # deep stall
+    fluid = FluidProperties(density=1.225, kinematic_viscosity=1.5e-5)
+    mesh = MeshParams(n_surface=120, n_radial=70, n_wake=60,
+                      farfield_radius_chords=15.0, wake_length_chords=12.0)
+    # few cycles so the test runs in a few minutes
+    solver = SolverParams(n_iterations=1200, write_images=[], transient_cycles=4.0)
+    out = run_case(tmp_path / "stall", af, spec, fluid, RoughnessParams(), mesh, solver,
+                   BlockMeshCGrid(), DockerRunner(), n_proc=8)
+    assert out.error is None, out.error
+    if out.unsteady:  # steady may occasionally settle to a separated state instead
+        assert out.cl is not None and out.cd is not None and out.cd > 0
+        assert out.cl_std is not None and out.cl_std >= 0.0
+        assert (tmp_path / "stall" / "transient").is_dir()
+    else:
+        assert out.converged
+
+
 def test_rough_wall_increases_drag(require_docker, tmp_path, naca0012_selig_text):
     af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
     spec = CaseSpec(chord=1.0, speed=50.0, aoa_deg=3.0)

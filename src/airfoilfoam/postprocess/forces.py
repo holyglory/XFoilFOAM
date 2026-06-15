@@ -65,6 +65,63 @@ def parse_force_coefficients(path: Path, average_last: int = 50) -> ForceCoeffic
     return ForceCoefficients(cl=cl, cd=cd, cm=cm)
 
 
+@dataclass
+class AveragedCoefficients:
+    cl: float
+    cd: float
+    cm: float
+    cl_std: float
+    cd_std: float
+    cm_std: float
+    samples: int
+
+    @property
+    def cl_cd(self) -> Optional[float]:
+        return self.cl / self.cd if self.cd not in (0.0, None) else None
+
+
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    n = len(values)
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / n
+    return mean, var**0.5
+
+
+def time_averaged_coefficients(path: Path, discard_fraction: float = 0.4) -> AveragedCoefficients:
+    """Time-average Cl/Cd/Cm over the statistically-stationary tail of a transient run.
+
+    Drops the first ``discard_fraction`` of rows (startup transient) and returns the
+    mean and standard deviation of the remainder.
+    """
+    header, rows = _data_rows(path)
+    if not rows:
+        raise ValueError(f"No coefficient data found in {path}")
+    if not header:
+        header = [
+            "Time", "Cd", "Cd(f)", "Cd(r)", "Cl", "Cl(f)", "Cl(r)",
+            "CmPitch", "CmRoll", "CmYaw", "Cs", "Cs(f)", "Cs(r)",
+        ]
+    idx = {name: i for i, name in enumerate(header)}
+    cm_key = "CmPitch" if "CmPitch" in idx else ("Cm" if "Cm" in idx else None)
+
+    start = int(len(rows) * discard_fraction)
+    sample = rows[start:] or rows[-1:]
+
+    def col(name: str) -> list[float]:
+        i = idx[name]
+        return [r[i] for r in sample if len(r) > i]
+
+    cl_m, cl_s = _mean_std(col("Cl"))
+    cd_m, cd_s = _mean_std(col("Cd"))
+    if cm_key:
+        cm_m, cm_s = _mean_std(col(cm_key))
+    else:
+        cm_m, cm_s = 0.0, 0.0
+    return AveragedCoefficients(
+        cl=cl_m, cd=cd_m, cm=cm_m, cl_std=cl_s, cd_std=cd_s, cm_std=cm_s, samples=len(sample)
+    )
+
+
 def force_is_steady(path: Path, window: int = 200, tol: float = 2.5e-3) -> bool:
     """True if Cl and Cd have stopped changing over the last ``window`` iterations.
 

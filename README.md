@@ -18,7 +18,15 @@ images (velocity, pressure, turbulence).
   parametric **blockMesh C-grid**; the first wall-cell height is sized per case for
   a target **y+**.
 - **Steady incompressible RANS** with `simpleFoam`. Turbulence models:
-  `kOmegaSST` (default), `kOmega`, `kEpsilon`, `SpalartAllmaras`.
+  `kOmegaSST` (default), `kOmega`, `kEpsilon`, `SpalartAllmaras`, and the
+  **`kOmegaSSTLM` laminar-turbulent transition model** (Langtry-Menter) for
+  low-Re / transitional flows.
+- **Transient (URANS) fallback for unsteady flows.** When a steady case will not
+  converge (typically post-stall, with massive separation and vortex shedding),
+  the pipeline automatically re-runs it transient with `pimpleFoam` on a
+  wall-function mesh and reports **time-averaged** Cl/Cd/Cm with their fluctuation
+  (`cl_std`, …) — turning the otherwise-meaningless steady snapshot into a
+  physically meaningful mean. Flagged with `unsteady: true`.
 - **Angle of attack by rotating the freestream** (the mesh never moves), so a whole
   AoA polar reuses one topology. Lift/drag directions are rotated to match.
 - **Sand-grain wall roughness** (`nutkRoughWallFunction`).
@@ -160,6 +168,22 @@ solution across a wide AoA range) rather than absolute accuracy:
   resolution (`mesh.n_surface/n_radial/n_wake`) for more accuracy at higher cost.
   Very fine wall spacing (y+≪1) on a large domain can produce extreme aspect ratios
   near the wake — keep `n_*` and the domain in proportion.
+
+### Post-stall and low-Re flows
+
+- **Post-stall is unsteady**, so a steady solver cannot give a meaningful answer —
+  it never converges and returns whatever iterate it stopped on. The transient
+  fallback (above) handles this: it runs a `pimpleFoam` URANS on a coarser
+  wall-function mesh (post-stall flow is pressure-dominated; a y+~1 wall would
+  throttle the time step) and time-averages the forces. The `cl_std`/`cd_std`
+  fields report the fluctuation amplitude — large in deep stall, which is correct.
+  Tune `solver.transient_cycles`, `transient_discard_fraction` and
+  `transient_max_courant`; 2D URANS captures the shedding and mean trends but for
+  quantitative deep-stall loads a 3D DES/DDES run is the gold standard.
+- **Low Reynolds (≈10⁵)** is transitional (laminar separation bubbles). Fully
+  turbulent models are inappropriate there; use `solver.turbulence.model =
+  kOmegaSSTLM`. Transition is very sensitive to the freestream turbulence — set
+  `solver.turbulence.intensity` to the real Tu (e.g. 0.001 for clean external flow).
 
 ## Development & tests
 
