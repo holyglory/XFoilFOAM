@@ -67,7 +67,11 @@ class RoughnessParams(BaseModel):
     """Sand-grain wall-roughness model (Cebeci-Bradshaw) for the airfoil surface."""
 
     sand_grain_height: float = Field(
-        default=0.0, ge=0, description="Equivalent sand-grain roughness height Ks [m]. 0 = smooth."
+        default=0.0,
+        ge=0,
+        description="Equivalent sand-grain roughness height Ks [m]. 0 = smooth. NOTE: the sand-grain "
+        "wall-function model requires the first wall cell to be larger than Ks, so for rough walls "
+        "set a coarser wall spacing via mesh.first_cell_height_chords (>= Ks/chord) instead of y+~1.",
     )
     roughness_constant: float = Field(
         default=0.5, gt=0, le=1.0, description="Roughness constant Cs (typically 0.5)."
@@ -98,13 +102,13 @@ class TurbulenceParams(BaseModel):
 class MeshParams(BaseModel):
     mesher: str = Field(default="blockmesh-cgrid", description="Registered mesher name.")
     farfield_radius_chords: float = Field(
-        default=12.0, gt=1, description="Outer C-boundary radius in chord lengths."
+        default=15.0, gt=1, le=80, description="Outer C-boundary radius in chord lengths."
     )
     wake_length_chords: float = Field(
-        default=16.0, gt=1, description="Downstream wake length (from TE to outlet) in chords."
+        default=12.0, gt=1, le=80, description="Downstream wake length (from TE to outlet) in chords."
     )
     n_surface: int = Field(
-        default=120, ge=20, le=600, description="Cells along each airfoil surface (upper/lower)."
+        default=130, ge=20, le=600, description="Cells along each airfoil surface (upper/lower)."
     )
     n_radial: int = Field(default=80, ge=20, le=400, description="Cells in the radial (normal) direction.")
     n_wake: int = Field(default=60, ge=10, le=400, description="Cells along the wake (streamwise).")
@@ -135,9 +139,14 @@ class ImageField(str, Enum):
 
 class SolverParams(BaseModel):
     turbulence: TurbulenceParams = Field(default_factory=TurbulenceParams)
-    n_iterations: int = Field(default=2000, ge=50, le=20000, description="Max SIMPLE iterations.")
+    n_iterations: int = Field(default=3000, ge=50, le=20000, description="Max SIMPLE iterations.")
     convergence_tolerance: float = Field(
         default=1.0e-5, gt=0, description="Residual control for early convergence."
+    )
+    momentum_scheme: str = Field(
+        default="linearUpwind",
+        description="Convection scheme for div(phi,U): 'linearUpwind' (2nd order, default) or "
+        "'upwind' (1st order, most robust).",
     )
     write_images: list[ImageField] = Field(
         default_factory=lambda: [ImageField.velocity_magnitude, ImageField.pressure]
@@ -241,6 +250,11 @@ class PolarPoint(BaseModel):
     iterations: Optional[int] = None
     y_plus_avg: Optional[float] = None
     y_plus_max: Optional[float] = None
+    first_order_fallback: bool = Field(
+        default=False,
+        description="True if the case diverged with 2nd-order convection and was re-run with the "
+        "more dissipative 1st-order upwind scheme (less accurate but stable).",
+    )
     images: dict[str, str] = Field(default_factory=dict, description="image field -> result URL path")
     error: Optional[str] = None
 

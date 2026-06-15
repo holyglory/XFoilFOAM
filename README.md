@@ -72,6 +72,21 @@ curl -s localhost:8000/jobs/$JOB/polar.csv  # CSV
 
 Interactive docs: <http://localhost:8000/docs>.
 
+## Example output
+
+A NACA 0012 polar at Re = 3.3×10⁶ (k-ω SST), AoA 0–12°, computed by the full
+stack against real OpenFOAM (all points converged):
+
+![NACA0012 polar](docs/examples/naca0012_polar.png)
+
+Contour images returned per AoA (velocity magnitude and pressure at 10°):
+
+![velocity](docs/examples/velocity_magnitude.png)
+![pressure](docs/examples/pressure.png)
+
+Regenerate the polar plot from a job result with
+`python examples/plot_polar.py result.json out.png`.
+
 ## API
 
 | Method & path | Purpose |
@@ -116,16 +131,35 @@ under `$AIRFOILFOAM_DATA_DIR/jobs/<id>/`.
 
 ## Accuracy & meshing notes
 
+The defaults are tuned for **robustness** (a converged, steady, physically sensible
+solution across a wide AoA range) rather than absolute accuracy:
+
+- The solver uses **plain SIMPLE** with under-relaxation (p 0.3, U 0.7, turbulence
+  0.5), 2 non-orthogonal correctors and a `potentialFoam` initialisation. The
+  far-field is a proper **inlet / pressure-referenced outlet** (fixed p=0 at the
+  outlet) rather than a single freestream patch — this gives the pressure equation a
+  solid reference and is what makes the delicate symmetric (AoA=0) case converge
+  deterministically. The pipeline reports a case as converged when the residual
+  control is met *or* Cl/Cd are steady over the last 200 iterations
+  (`force_is_steady`).
+- **Automatic robustness fallback.** If a case still diverges with 2nd-order
+  convection, the pipeline re-runs it once with 1st-order upwind (more dissipative
+  but stable) and flags the point with `first_order_fallback`.
 - Defaults target **y+ ≈ 1** (the first-cell height is computed per case from a
-  flat-plate estimate). For wall-function accuracy at high Re you can instead set
-  `mesh.first_cell_height_chords` explicitly.
-- Lift is sensitive to **domain size** (finite-domain circulation clamping). Larger
-  `mesh.farfield_radius_chords` increases accuracy at the cost of cells.
-- The solver uses plain SIMPLE with conservative relaxation, 2 non-orthogonal
-  correctors and limited Laplacian/snGrad schemes for robustness on the C-grid's
-  trailing-edge region, with a `potentialFoam` initialisation.
-- Tune `mesh.{n_surface,n_radial,n_wake,farfield_radius_chords}` and
-  `solver.n_iterations` for your accuracy/cost trade-off.
+  flat-plate estimate). You can instead set `mesh.first_cell_height_chords` directly.
+- **Known limitation — lift is conservative.** The parametric blockMesh C-grid has
+  moderate trailing-edge skewness / non-orthogonality, which systematically
+  *under-predicts* the lift slope (typically ~20–40% low vs. wind-tunnel data) and
+  shifts the centre of pressure forward. Drag is the right order of magnitude;
+  trends (Cl increasing with AoA, roughness increasing drag, polar shape) are
+  correct. Treat absolute numbers as engineering estimates and **validate against
+  reference data** for quantitative work. The meshing layer is pluggable
+  (`Mesher` registry) precisely so a higher-fidelity mesher (hyperbolic/elliptic,
+  Gmsh, snappyHexMesh) can be dropped in for better accuracy.
+- Lift also rises with **domain size**; increase `mesh.farfield_radius_chords` and
+  resolution (`mesh.n_surface/n_radial/n_wake`) for more accuracy at higher cost.
+  Very fine wall spacing (y+≪1) on a large domain can produce extreme aspect ratios
+  near the wake — keep `n_*` and the domain in proportion.
 
 ## Development & tests
 

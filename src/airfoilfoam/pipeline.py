@@ -10,8 +10,8 @@ from .airfoil import Airfoil
 from .case.builder import CaseBuilder
 from .meshing.base import Mesher
 from .models import CaseSpec, FluidProperties, MeshParams, RoughnessParams, SolverParams
-from .openfoam.runner import OpenFOAMError, Runner
-from .postprocess.forces import parse_force_coefficients, parse_y_plus
+from .openfoam.runner import OpenFOAMError, RunResult, Runner
+from .postprocess.forces import force_is_steady, parse_force_coefficients, parse_y_plus
 from .postprocess.images import render_contours
 from .postprocess.residuals import parse_convergence
 
@@ -30,6 +30,7 @@ class CaseOutcome:
     y_plus_avg: Optional[float] = None
     y_plus_max: Optional[float] = None
     n_cells: int = 0
+    first_order_fallback: bool = False
     images: dict[str, str] = field(default_factory=dict)  # field -> path relative to case dir
     error: Optional[str] = None
 
@@ -71,21 +72,32 @@ def run_case(
         # 1. mesh inputs + 2. case files (controlDict needed before blockMesh)
         mesher.write_inputs(case_dir, airfoil, resolved, spec.chord)
         patches = mesher.patches(resolved)
-        builder = CaseBuilder(
-            airfoil, patches, resolved, spec, fluid, roughness, solver_params, n_proc=n_proc
-        )
-        builder.write(case_dir)
+
+        def write_case(sp):
+            CaseBuilder(
+                airfoil, patches, resolved, spec, fluid, roughness, sp, n_proc=n_proc
+            ).write(case_dir)
+
+        write_case(solver_params)
 
         # 3. generate mesh
         mesh_result = mesher.run_mesh(case_dir, resolved, runner)
         outcome.n_cells = mesh_result.n_cells
 
-        # 4. initialise the velocity/pressure field with a potential-flow solve
-        # (greatly improves robustness of the cold RANS start). Non-fatal if it fails.
-        runner.application(case_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+        def solve_once(sp) -> "RunResult":
+            write_case(sp)
+            # Potential-flow initialisation greatly stabilises the cold RANS start.
+            runner.application(case_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+            return runner.solver(case_dir, "simpleFoam", n_proc, timeout=solver_timeout)
 
-        # 5. solve
-        log = runner.solver(case_dir, "simpleFoam", n_proc, timeout=solver_timeout).check().stdout
+        # 4/5. solve, with an automatic first-order fallback for fragile cases
+        # (e.g. the delicate symmetric AoA=0 state) that diverge with 2nd-order
+        # convection. The fallback is more dissipative but reliably stable.
+        res = solve_once(solver_params)
+        if not res.ok and solver_params.momentum_scheme != "upwind":
+            outcome.first_order_fallback = True
+            res = solve_once(solver_params.model_copy(update={"momentum_scheme": "upwind"}))
+        log = res.check().stdout
         (case_dir / "log.simpleFoam").write_text(log)
         conv = parse_convergence(log)
         outcome.converged = conv.converged
@@ -99,6 +111,9 @@ def run_case(
         coeffs = parse_force_coefficients(coeff_files[-1])
         outcome.cl, outcome.cd, outcome.cm = coeffs.cl, coeffs.cd, coeffs.cm
         outcome.cl_cd = coeffs.cl_cd
+        # Treat steady integrated forces as converged even if the residual plateaus.
+        if not outcome.converged and force_is_steady(coeff_files[-1]):
+            outcome.converged = True
 
         # 6. y+
         runner.application(case_dir, "simpleFoam -postProcess -func yPlus -latestTime")

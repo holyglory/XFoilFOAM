@@ -51,7 +51,8 @@ def build_turbulence(
     viscosity_ratio: float,
     roughness: RoughnessParams,
     wall: str,
-    freestream: str,
+    inlet: str,
+    outlet: str,
     empty: str,
 ) -> TurbulenceConfig:
     k = physics.freestream_k(speed, intensity)
@@ -67,7 +68,8 @@ def build_turbulence(
             dims=dims,
             internal=f"uniform {value}",
             boundary={
-                freestream: {"type": "inletOutlet", "inletValue": _u(value), "value": _u(value)},
+                inlet: {"type": "fixedValue", "value": _u(value)},
+                outlet: {"type": "inletOutlet", "inletValue": _u(value), "value": _u(value)},
                 wall: wall_bc,
                 empty: {"type": "empty"},
             },
@@ -79,7 +81,8 @@ def build_turbulence(
         dims=dimensions(0, 2, -1, 0, 0, 0, 0),
         internal=f"uniform {nut}",
         boundary={
-            freestream: {"type": "calculated", "value": _u(nut)},
+            inlet: {"type": "calculated", "value": _u(nut)},
+            outlet: {"type": "calculated", "value": _u(nut)},
             wall: _wall_nut(roughness),
             empty: {"type": "empty"},
         },
@@ -131,7 +134,8 @@ def build_turbulence(
         dims=nutilda_dims,
         internal=f"uniform {nutilda}",
         boundary={
-            freestream: {"type": "inletOutlet", "inletValue": _u(nutilda), "value": _u(nutilda)},
+            inlet: {"type": "fixedValue", "value": _u(nutilda)},
+            outlet: {"type": "inletOutlet", "inletValue": _u(nutilda), "value": _u(nutilda)},
             wall: {"type": "fixedValue", "value": _u(0)},
             empty: {"type": "empty"},
         },

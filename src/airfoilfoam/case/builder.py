@@ -36,7 +36,8 @@ class CaseBuilder:
 
         by_role = lambda r: [p.name for p in patches if p.role == r]  # noqa: E731
         self.wall = by_role("wall")[0]
-        self.freestream = by_role("freestream")[0]
+        self.inlet = by_role("inlet")[0]
+        self.outlet = by_role("outlet")[0]
         self.empty = by_role("empty")[0]
 
     # -- derived quantities ------------------------------------------------- #
@@ -70,7 +71,8 @@ class CaseBuilder:
             viscosity_ratio=self.solver.turbulence.viscosity_ratio,
             roughness=self.roughness,
             wall=self.wall,
-            freestream=self.freestream,
+            inlet=self.inlet,
+            outlet=self.outlet,
             empty=self.empty,
         )
 
@@ -153,9 +155,14 @@ class CaseBuilder:
         )
 
     def _write_fv_schemes(self, turb) -> None:
+        u_scheme = (
+            "bounded Gauss upwind"
+            if self.solver.momentum_scheme == "upwind"
+            else "bounded Gauss linearUpwind grad(U)"
+        )
         div = {
             "default": "none",
-            "div(phi,U)": "bounded Gauss linearUpwind grad(U)",
+            "div(phi,U)": u_scheme,
             "div((nuEff*dev2(T(grad(U)))))": "Gauss linear",
         }
         div.update(turb.div_schemes)
@@ -171,21 +178,21 @@ class CaseBuilder:
                     "limitedGrad": "cellLimited Gauss linear 1",
                 },
                 "divSchemes": div,
-                # 'limited 0.5' keeps the laplacian/snGrad stable on the non-orthogonal
-                # cells near the trailing-edge wake cut of the C-grid.
-                "laplacianSchemes": {"default": "Gauss linear limited corrected 0.5"},
+                "laplacianSchemes": {"default": "Gauss linear corrected"},
                 "interpolationSchemes": {"default": "linear"},
-                "snGradSchemes": {"default": "limited corrected 0.5"},
+                "snGradSchemes": {"default": "corrected"},
                 "wallDist": {"method": "meshWave"},
             },
         )
 
     def _write_fv_solution(self, turb) -> None:
         turb_vars = "|".join(turb.solver_vars)
-        # Conservative relaxation -> robust on the non-orthogonal C-grid; SIMPLEC
-        # (consistent) is faster but diverges late on poor cells, so use plain SIMPLE.
+        # Plain SIMPLE with conservative under-relaxation. SIMPLEC is faster but
+        # sets up a 2-iteration limit-cycle oscillation in the forces on this
+        # non-orthogonal C-grid; under-relaxed plain SIMPLE converges to a steady
+        # state and stays stable for the delicate symmetric (AoA=0) case.
         relax_eq = {"U": 0.7}
-        relax_eq.update(turb.relaxation)
+        relax_eq.update({k: 0.5 for k in turb.relaxation})
         residual = {"p": self.solver.convergence_tolerance, "U": self.solver.convergence_tolerance}
         for v in turb.residual_controls:
             residual[v] = self.solver.convergence_tolerance
@@ -220,10 +227,7 @@ class CaseBuilder:
                     "consistent": "no",
                     "residualControl": residual,
                 },
-                "relaxationFactors": {
-                    "fields": {"p": 0.3},
-                    "equations": relax_eq,
-                },
+                "relaxationFactors": {"fields": {"p": 0.3}, "equations": relax_eq},
             },
         )
 
@@ -241,11 +245,15 @@ class CaseBuilder:
     # -- 0/ ----------------------------------------------------------------- #
     def _write_zero(self, turb) -> None:
         fv = self.freestream_vector
-        # U
+        u_free = Raw(f"uniform {vector(fv.ux, fv.uy, fv.uz)}")
+        # U: fixed freestream at the inlet; inletOutlet at the outlet (zeroGradient
+        # on outflow, clipped to zero on any backflow).
         u_boundary = {
-            self.freestream: {
-                "type": "freestreamVelocity",
-                "freestreamValue": Raw(f"uniform {vector(fv.ux, fv.uy, fv.uz)}"),
+            self.inlet: {"type": "fixedValue", "value": u_free},
+            self.outlet: {
+                "type": "inletOutlet",
+                "inletValue": Raw(f"uniform {vector(0, 0, 0)}"),
+                "value": u_free,
             },
             self.wall: {"type": "noSlip"},
             self.empty: {"type": "empty"},
@@ -254,9 +262,10 @@ class CaseBuilder:
             "U", "volVectorField", dimensions(0, 1, -1, 0, 0, 0, 0),
             f"uniform {vector(fv.ux, fv.uy, fv.uz)}", u_boundary,
         )
-        # p (kinematic)
+        # p (kinematic): zeroGradient inlet, fixed reference at the outlet.
         p_boundary = {
-            self.freestream: {"type": "freestreamPressure", "freestreamValue": Raw("uniform 0")},
+            self.inlet: {"type": "zeroGradient"},
+            self.outlet: {"type": "fixedValue", "value": Raw("uniform 0")},
             self.wall: {"type": "zeroGradient"},
             self.empty: {"type": "empty"},
         }

@@ -32,7 +32,7 @@ def test_build_dict_structure(naca0012_selig_text):
     # four blocks
     assert text.count("hex (") == 4
     # boundary patches and the wake-cut merge
-    for patch in ("airfoil", "freestream", "frontAndBack", "wakeUpper", "wakeLower"):
+    for patch in ("airfoil", "inlet", "outlet", "frontAndBack", "wakeUpper", "wakeLower"):
         assert patch in text
     assert "mergePatchPairs" in text
     assert "(wakeUpper wakeLower)" in text
@@ -50,4 +50,4 @@ def test_patches_roles():
     mp = MeshParams()
     patches = BlockMeshCGrid().patches(mp)
     roles = {p.role for p in patches}
-    assert roles == {"wall", "freestream", "empty"}
+    assert roles == {"wall", "inlet", "outlet", "empty"}

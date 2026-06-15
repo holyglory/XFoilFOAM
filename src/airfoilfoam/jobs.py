@@ -40,6 +40,7 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
         iterations=outcome.iterations,
         y_plus_avg=outcome.y_plus_avg,
         y_plus_max=outcome.y_plus_max,
+        first_order_fallback=outcome.first_order_fallback,
         images=images,
         error=outcome.error,
     )

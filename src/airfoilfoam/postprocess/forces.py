@@ -65,6 +65,33 @@ def parse_force_coefficients(path: Path, average_last: int = 50) -> ForceCoeffic
     return ForceCoefficients(cl=cl, cd=cd, cm=cm)
 
 
+def force_is_steady(path: Path, window: int = 200, tol: float = 2.5e-3) -> bool:
+    """True if Cl and Cd have stopped changing over the last ``window`` iterations.
+
+    A pragmatic convergence test for steady airfoil RANS, where the residual norm
+    often plateaus above the target while the integrated forces are already steady.
+    Uses the peak-to-peak spread of the last window, normalised by |mean| (plus a
+    small floor), for both Cl and Cd.
+    """
+    header, rows = _data_rows(path)
+    if len(rows) < window + 5:
+        return False
+    if not header:
+        header = ["Time", "Cd", "Cd(f)", "Cd(r)", "Cl"]
+    idx = {name: i for i, name in enumerate(header)}
+    sample = rows[-window:]
+
+    def spread(name: str) -> float:
+        i = idx[name]
+        vals = [r[i] for r in sample if len(r) > i]
+        if not vals:
+            return 1.0
+        mean = sum(vals) / len(vals)
+        return (max(vals) - min(vals)) / (abs(mean) + 1e-3)
+
+    return spread("Cl") < tol and spread("Cd") < tol
+
+
 def parse_y_plus(path: Path) -> tuple[Optional[float], Optional[float]]:
     """Return (average, max) y+ for the airfoil patch from a yPlus.dat file."""
     avg: Optional[float] = None

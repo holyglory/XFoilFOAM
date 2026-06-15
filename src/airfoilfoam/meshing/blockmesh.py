@@ -7,9 +7,10 @@ Topology (unit-chord, scaled to metres via ``convertToMeters``):
 
 Four blocks: upper-around, lower-around, upper-wake, lower-wake.  The trailing
 edge is closed (sharp) and the wake cut between the two wake blocks is stitched
-into internal faces with ``mergePatchPairs``.  The whole outer boundary is a
-single ``freestream`` patch, which lets the same mesh serve every angle of
-attack (AoA is applied by rotating the freestream velocity, not the mesh).
+into internal faces with ``mergePatchPairs``.  The outer boundary is split into an
+``inlet`` (front arcs + top + bottom) and a downstream ``outlet`` (a fixed-pressure
+reference); the same mesh serves every angle of attack because AoA is applied by
+rotating the freestream velocity, not the mesh.
 """
 from __future__ import annotations
 
@@ -78,7 +79,8 @@ class BlockMeshCGrid(Mesher):
     def patches(self, params: MeshParams) -> list[BoundaryPatch]:
         return [
             BoundaryPatch("airfoil", "wall"),
-            BoundaryPatch("freestream", "freestream"),
+            BoundaryPatch("inlet", "inlet"),
+            BoundaryPatch("outlet", "outlet"),
             BoundaryPatch("frontAndBack", "empty"),
         ]
 
@@ -163,6 +165,7 @@ class BlockMeshCGrid(Mesher):
         # Each block: corners keyed by (radial r in {0=wall/inner,1=far},
         # streamwise s in {0,1}); we pick the local axis order that yields a
         # positive cell volume.
+        rg = f"{rad_grading:.8g}"  # radial grading (fine at wall / wake-cut TE end)
         blocks = [
             # name, n_stream, stream_grading, corners {(r,s): vertex}
             ("UA", n_surf, surf_grading, {(0, 0): 0, (1, 0): 3, (0, 1): 1, (1, 1): 4}),
@@ -176,21 +179,21 @@ class BlockMeshCGrid(Mesher):
             # Mapping A: i = radial (wall->far), j = streamwise (s0->s1)
             a_order = [(0, 0), (1, 0), (1, 1), (0, 1)]
             area = _signed_area([coord[k] for k in a_order])
-            if area > 0:
+            radial_is_i = area > 0
+            if radial_is_i:
                 quad = [c[k] for k in a_order]
                 div = (n_rad, n_stream, 1)
-                grading = (f"{rad_grading:.8g}", stream_grading, "1")
             else:
                 # Mapping B: i = streamwise, j = radial (transpose -> flips sign)
                 b_order = [(0, 0), (0, 1), (1, 1), (1, 0)]
                 quad = [c[k] for k in b_order]
                 div = (n_stream, n_rad, 1)
-                grading = (stream_grading, f"{rad_grading:.8g}", "1")
             top = [v + 10 for v in quad]
             verts = " ".join(str(v) for v in quad + top)
+            g = (rg, stream_grading, "1") if radial_is_i else (stream_grading, rg, "1")
             block_lines.append(
                 f"    hex ({verts}) ({div[0]} {div[1]} {div[2]}) "
-                f"simpleGrading ({grading[0]} {grading[1]} {grading[2]})  // {name}"
+                f"simpleGrading ({g[0]} {g[1]} {g[2]})  // {name}"
             )
 
         # --- boundary ------------------------------------------------------ #
@@ -198,14 +201,11 @@ class BlockMeshCGrid(Mesher):
             return f"            ({v0} {v1} {v1 + 10} {v0 + 10})"
 
         airfoil_faces = [face(0, 1), face(1, 2)]
-        freestream_faces = [
-            face(3, 4),
-            face(4, 5),
-            face(3, 6),
-            face(5, 9),
-            face(7, 6),
-            face(8, 9),
-        ]
+        # Inlet = the C outer (front arcs + top + bottom); outlet = the two
+        # downstream vertical faces. A fixed-pressure outlet gives the pressure a
+        # solid reference, which keeps the delicate symmetric (AoA=0) case stable.
+        inlet_faces = [face(3, 4), face(4, 5), face(3, 6), face(5, 9)]
+        outlet_faces = [face(7, 6), face(8, 9)]
         front_back = [
             "            (0 3 4 1)",
             "            (1 4 5 2)",
@@ -220,13 +220,13 @@ class BlockMeshCGrid(Mesher):
         wake_lower = [face(2, 8)]
 
         boundary = self._boundary_block(
-            airfoil_faces, freestream_faces, front_back, wake_upper, wake_lower
+            airfoil_faces, inlet_faces, outlet_faces, front_back, wake_upper, wake_lower
         )
 
         return self._assemble(chord, vert_lines, edge_lines, block_lines, boundary)
 
     @staticmethod
-    def _boundary_block(airfoil, freestream, front_back, wake_upper, wake_lower) -> str:
+    def _boundary_block(airfoil, inlet, outlet, front_back, wake_upper, wake_lower) -> str:
         def patch(name: str, ptype: str, faces: list[str]) -> str:
             joined = "\n".join(faces)
             return (
@@ -236,7 +236,8 @@ class BlockMeshCGrid(Mesher):
 
         return (
             patch("airfoil", "wall", airfoil)
-            + patch("freestream", "patch", freestream)
+            + patch("inlet", "patch", inlet)
+            + patch("outlet", "patch", outlet)
             + patch("frontAndBack", "empty", front_back)
             + patch("wakeUpper", "patch", wake_upper)
             + patch("wakeLower", "patch", wake_lower)

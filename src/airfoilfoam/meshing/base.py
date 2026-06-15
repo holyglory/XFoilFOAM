@@ -19,7 +19,7 @@ from ..openfoam.runner import Runner
 @dataclass
 class BoundaryPatch:
     name: str
-    role: str  # one of: "wall", "freestream", "empty"
+    role: str  # one of: "wall", "inlet", "outlet", "empty"
 
 
 @dataclass

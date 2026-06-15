@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from airfoilfoam.postprocess.forces import parse_force_coefficients, parse_y_plus
+from airfoilfoam.postprocess.forces import (
+    force_is_steady,
+    parse_force_coefficients,
+    parse_y_plus,
+)
 from airfoilfoam.postprocess.residuals import parse_convergence
 
 COEFF = """# Force and moment coefficients
@@ -31,6 +35,32 @@ def test_parse_force_coefficients_last_only(tmp_path: Path):
     fc = parse_force_coefficients(p, average_last=1)
     assert fc.cl == pytest.approx(0.52)
     assert fc.cd == pytest.approx(0.014)
+
+
+def _coeff_file(tmp_path, cl_series, cd=0.01):
+    p = tmp_path / "coefficient.dat"
+    head = "# Time\tCd\tCd(f)\tCd(r)\tCl\tCl(f)\tCl(r)\tCmPitch\tCmRoll\tCmYaw\n"
+    rows = "".join(
+        f"{i}\t{cd}\t0\t0\t{cl}\t0\t0\t0\t0\t0\n" for i, cl in enumerate(cl_series, 1)
+    )
+    p.write_text("# Force coefficients\n" + head + rows)
+    return p
+
+
+def test_force_is_steady_true(tmp_path: Path):
+    p = _coeff_file(tmp_path, [0.5] * 300)
+    assert force_is_steady(p, window=200) is True
+
+
+def test_force_is_steady_false_when_drifting(tmp_path: Path):
+    series = [0.001 * i for i in range(300)]  # steadily climbing
+    p = _coeff_file(tmp_path, series)
+    assert force_is_steady(p, window=200) is False
+
+
+def test_force_is_steady_false_when_too_few_rows(tmp_path: Path):
+    p = _coeff_file(tmp_path, [0.5] * 50)
+    assert force_is_steady(p, window=200) is False
 
 
 def test_parse_y_plus(tmp_path: Path):
