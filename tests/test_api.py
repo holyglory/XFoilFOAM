@@ -22,13 +22,20 @@ def eager_celery():
 
 @pytest.fixture
 def fake_run_case(monkeypatch):
-    """Replace the OpenFOAM pipeline with a cheap analytic stand-in that writes images."""
+    """Replace meshing + the marched-polar solve with cheap analytic stand-ins."""
+    import math
+    from types import SimpleNamespace
 
-    def _fake(case_dir: Path, airfoil, spec, fluid, roughness, mesh_params, solver_params,
-              mesher, runner, n_proc=1, render_images=True, solver_timeout=7200):
-        import math
-        from airfoilfoam import physics
+    from airfoilfoam import physics
+    from airfoilfoam.models import CaseSpec
 
+    def fake_prepare_mesh(mesh_dir, airfoil, resolved, chord, mesher, runner):
+        mesh_dir.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(n_cells=1000, patches=[], span_chords=0.1)
+
+    def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
+                      mesher, runner, n_proc=1, render_images=True, solver_timeout=7200,
+                      mesh_dir=None):
         cl = 2 * math.pi * math.radians(spec.aoa_deg)
         cd = 0.01 + 0.02 * cl**2
         images = {}
@@ -44,8 +51,9 @@ def fake_run_case(monkeypatch):
             final_residual=1e-6, y_plus_avg=0.8, y_plus_max=3.0, n_cells=1000, images=images,
         )
 
-    monkeypatch.setattr(jobs, "run_case", _fake)
-    return _fake
+    monkeypatch.setattr(jobs, "prepare_mesh", fake_prepare_mesh)
+    monkeypatch.setattr(jobs, "run_case", fake_run_case)
+    return fake_run_case
 
 
 @pytest.fixture

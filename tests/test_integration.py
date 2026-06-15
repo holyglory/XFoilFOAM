@@ -70,6 +70,41 @@ def test_real_naca0012_case(require_docker, tmp_path, naca0012_selig_text):
     assert (tmp_path / "case" / out.images["velocity_magnitude"]).is_file()
 
 
+def test_mesh_once_marched_polar(require_docker, tmp_path, naca0012_selig_text):
+    """A marched polar meshes once (reused for every AoA) and warm-starts each
+    angle; results match independent cold solves."""
+    from airfoilfoam.pipeline import prepare_mesh, resolve_mesh_params, run_case, solve_polar_marched
+
+    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    fluid = FluidProperties(density=1.225, kinematic_viscosity=1.5e-5)
+    mesh = MeshParams(n_surface=100, n_radial=70, n_wake=50,
+                      farfield_radius_chords=12.0, wake_length_chords=10.0)
+    solver = SolverParams(n_iterations=3000, write_images=[], transient_fallback=False)
+    mesher = BlockMeshCGrid()
+    runner = DockerRunner()
+    resolved = resolve_mesh_params(mesh, CaseSpec(chord=1.0, speed=50.0, aoa_deg=0.0), fluid)
+
+    mesh_dir = tmp_path / "mesh"
+    mr = prepare_mesh(mesh_dir, af, resolved, 1.0, mesher, runner)
+    assert mr.n_cells > 0
+    assert (mesh_dir / "constant" / "polyMesh" / "points").exists()
+
+    aoas = [2.0, 2.86, 3.72]
+    outs = solve_polar_marched(tmp_path / "polar", mesh_dir, af, 1.0, 50.0, fluid,
+                               RoughnessParams(), resolved, solver, mesher, runner, aoas,
+                               n_cells=mr.n_cells, render_images=False)
+    assert len(outs) == 3
+    cls = [o.cl for o in outs]
+    assert all(c is not None for c in cls), [o.error for o in outs]
+    assert cls[0] < cls[1] < cls[2]  # lift increases with AoA
+
+    # cold reference at the top angle must agree with the marched value
+    cold = run_case(tmp_path / "cold", af, CaseSpec(chord=1.0, speed=50.0, aoa_deg=3.72),
+                    fluid, RoughnessParams(), mesh, solver, mesher, runner, n_proc=1,
+                    render_images=False)
+    assert abs(cold.cl - cls[2]) < 0.02, (cold.cl, cls[2])
+
+
 def test_transition_model_runs(require_docker, tmp_path, naca0012_selig_text):
     """The k-omega SST-LM transition model builds its extra fields and converges."""
     af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)

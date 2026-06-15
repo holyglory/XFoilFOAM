@@ -155,6 +155,14 @@ class SolverParams(BaseModel):
         "automatically re-run the case transient (pimpleFoam/URANS) and report time-averaged "
         "force coefficients with their fluctuation.",
     )
+    warm_start: bool = Field(
+        default=False,
+        description="Solve each polar by marching the angle of attack, warm-starting each AoA from "
+        "the previous converged field (serial within a polar). Helps with fine AoA spacing in the "
+        "attached regime; the default (off) instead cold-starts every AoA with a potentialFoam "
+        "initialisation and runs them concurrently, which is more robust and parallel. Either way "
+        "the mesh is built once per airfoil/chord and reused.",
+    )
     transient_cycles: float = Field(
         default=10.0, gt=1, description="Vortex-shedding cycles to simulate in the transient fallback."
     )

@@ -38,6 +38,33 @@ images (velocity, pressure, turbulence).
 - **Async**: FastAPI enqueues jobs to Celery/Redis; the OpenFOAM worker runs cases
   concurrently and streams progress.
 
+## Throughput: mesh once, solve many
+
+A polar job is organised for batch efficiency:
+
+- **Mesh once per airfoil/chord.** `blockMesh` runs once per `(airfoil, mesh, chord)`
+  and the resulting mesh is reused by every speed and angle (the steady solution
+  depends only on Re, set per case). The mesh is sized for the highest Re in the
+  batch. Reuse is by absolute symlink under the local runner (no copy), or copied
+  into each case under the docker runner (which mounts only the case dir).
+- **Solve every (speed, AoA) concurrently** (default). Each case is independent,
+  cold-started with a `potentialFoam` init on the shared mesh, and run in parallel —
+  the most robust and parallel option.
+- **Optional warm-start marching** (`solver.warm_start=true`). Within a polar, angles
+  are marched in order, each continuing from the previous converged field (only the
+  velocity BC + lift/drag dirs change), skipping the per-angle `potentialFoam`. This
+  helps for finely-spaced sweeps in the attached regime, but the per-angle
+  `potentialFoam` init is often competitive (or better near α≈0), so it's off by
+  default — benchmark it for your spacing.
+- **Serial per case, parallel across cases.** 2D meshes (20–70k cells) scale poorly
+  past ~2 MPI ranks, so keep `AIRFOILFOAM_SOLVER_PROCESSES=1` and get throughput from
+  `AIRFOILFOAM_CASE_CONCURRENCY` (≈ cores); scale out by adding workers. Reserve a
+  small `solver_processes>1` pool only for the expensive URANS (wave-2) fallback.
+
+For database-scale runs (wave 1 steady, wave 2 unsteady), set
+`solver.transient_fallback=false` for wave 1 (so post-stall points don't trigger the
+costly URANS), then re-run only the flagged points with it enabled for wave 2.
+
 ## Architecture
 
 ```

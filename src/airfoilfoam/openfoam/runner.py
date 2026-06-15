@@ -38,6 +38,11 @@ class OpenFOAMError(RuntimeError):
 class Runner:
     """Base class. Subclasses run a shell command with the OpenFOAM environment loaded."""
 
+    #: True if the solver sees the host filesystem (so a mesh can be shared by an
+    #: absolute symlink); False when each command runs in a container that mounts
+    #: only the case directory (then a shared mesh must be copied in).
+    external_paths_visible: bool = True
+
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
 
@@ -82,6 +87,10 @@ class LocalRunner(Runner):
 
 
 class DockerRunner(Runner):
+    # Each command runs in a fresh container that mounts only the case dir, so an
+    # external symlink to a shared mesh would be a dangling link inside it.
+    external_paths_visible = False
+
     def run(self, case_dir: Path, command: str, timeout: int = 7200) -> RunResult:
         bashrc = self.settings.openfoam_bashrc
         inner = f"source {shlex.quote(bashrc)} >/dev/null 2>&1; cd /case && {command}"
