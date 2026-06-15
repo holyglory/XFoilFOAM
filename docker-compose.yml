@@ -1,0 +1,46 @@
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
+      AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+    ports:
+      - "8000:8000"
+    volumes:
+      - results:/data/airfoilfoam
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
+      AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_CASE_CONCURRENCY: "4"
+    volumes:
+      - results:/data/airfoilfoam
+    depends_on:
+      redis:
+        condition: service_healthy
+    # CFD is CPU heavy; raise/lower to taste.
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+
+volumes:
+  results:

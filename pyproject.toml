@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airfoilfoam"
+version = "0.1.0"
+description = "Web API that computes airfoil AoA polars via 2D RANS CFD in OpenFOAM (Docker)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "XFoilFOAM" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.1",
+    "python-multipart>=0.0.9",
+    "celery>=5.3",
+    "redis>=5.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "meshio>=5.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+airfoilfoam = "airfoilfoam.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require Docker + the OpenFOAM image (deselect with '-m \"not integration\"')",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -1,0 +1,27 @@
+# Worker image: OpenFOAM + Python. The container *is* the OpenFOAM environment,
+# so the solver runs locally inside it (AIRFOILFOAM_OPENFOAM_RUNNER=local).
+FROM opencfd/openfoam-default:2406
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV AIRFOILFOAM_OPENFOAM_RUNNER=local \
+    AIRFOILFOAM_OPENFOAM_BASHRC=/usr/lib/openfoam/openfoam2406/etc/bashrc \
+    AIRFOILFOAM_DATA_DIR=/data/airfoilfoam \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip3 install --no-cache-dir .
+
+RUN mkdir -p /data/airfoilfoam && chown -R openfoam /data/airfoilfoam /app
+USER openfoam
+
+# -A airfoilfoam.celery_app imports tasks; concurrency is the number of cases run
+# in parallel inside this worker (each case is a serial OpenFOAM run).
+CMD ["celery", "-A", "airfoilfoam.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
