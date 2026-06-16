@@ -122,6 +122,32 @@ Contour images returned per AoA (velocity magnitude and pressure at 10°):
 Regenerate the polar plot from a job result with
 `python examples/plot_polar.py result.json out.png`.
 
+### Deep stall: the transient (URANS) fallback
+
+At AoA = 20° the flow is **massively separated and unsteady**, so a steady solver
+cannot converge. The pipeline detects this and automatically re-runs the case as a
+`pimpleFoam` URANS, time-averaging the forces. Below is an *instantaneous* snapshot
+from such a run (NACA 0012, Re ≈ 5×10⁵), computed end-to-end against real OpenFOAM —
+the von-Kármán-style vortex street shed off the stalled airfoil is exactly what the
+steady solver could not represent:
+
+![URANS velocity magnitude](docs/examples/urans_velocity_magnitude.png)
+
+Streamwise velocity makes the separation explicit — the dark region is **reversed
+flow** (negative `Uₓ`, i.e. recirculation) covering the entire suction side and wake:
+
+![URANS streamwise velocity](docs/examples/urans_velocity_x.png)
+
+The instantaneous pressure field shows the low-pressure cores of the shed vortices
+convecting downstream:
+
+![URANS pressure](docs/examples/urans_pressure.png)
+
+For this case the fallback reports **time-averaged Cl ≈ 0.75, Cd ≈ 0.33** with
+fluctuation amplitudes `cl_std ≈ 0.05`, `cd_std ≈ 0.01` (returned as `cl_std`/`cd_std`
+and flagged `unsteady: true`) — a physically meaningful mean and unsteadiness measure,
+instead of the meaningless single iterate a non-converged steady run would return.
+
 ## API
 
 | Method & path | Purpose |
