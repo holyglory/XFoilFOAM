@@ -44,6 +44,16 @@ function snapshotParts(snapshot: SimulationSetupSnapshot | undefined) {
       kinematicViscosity?: number;
       mach?: number | null;
     };
+    mesh?: {
+      mesher: string;
+      farfieldRadiusChords: number;
+      wakeLengthChords: number;
+      nSurface: number;
+      nRadial: number;
+      nWake: number;
+      targetYPlus: number;
+      spanChords: number;
+    };
   };
   return {
     mediumName: snapshot.flowState?.mediumName ?? legacy.operating?.mediumName,
@@ -54,6 +64,7 @@ function snapshotParts(snapshot: SimulationSetupSnapshot | undefined) {
     density: snapshot.flowState?.density ?? legacy.operating?.density,
     dynamicViscosity: snapshot.flowState?.dynamicViscosity ?? legacy.operating?.dynamicViscosity,
     kinematicViscosity: snapshot.flowState?.kinematicViscosity ?? legacy.operating?.kinematicViscosity,
+    mesh: snapshot.mesh ?? legacy.mesh,
   };
 }
 
@@ -160,6 +171,23 @@ async function solvedDetail(name: string, re: number, r: Result): Promise<Simula
           turbulenceModel: snapshot.solver.turbulenceModel,
           turbulenceIntensity: snapshot.boundary.turbulenceIntensity,
           viscosityRatio: snapshot.boundary.viscosityRatio,
+          mesh: setup.mesh
+            ? {
+                mesher: setup.mesh.mesher,
+                farfieldRadiusChords: setup.mesh.farfieldRadiusChords,
+                wakeLengthChords: setup.mesh.wakeLengthChords,
+                nSurface: setup.mesh.nSurface,
+                nRadial: setup.mesh.nRadial,
+                nWake: setup.mesh.nWake,
+                targetYPlus: setup.mesh.targetYPlus,
+                spanChords: setup.mesh.spanChords,
+                nCells: r.nCells,
+                yPlusAvg: r.yPlusAvg,
+                yPlusMax: r.yPlusMax,
+                iterations: r.iterations,
+                finalResidual: r.finalResidual,
+              }
+            : null,
         }
       : legacyCondition
       ? {
@@ -175,6 +203,21 @@ async function solvedDetail(name: string, re: number, r: Result): Promise<Simula
           turbulenceModel: legacyCondition.bc.turbulenceModel,
           turbulenceIntensity: legacyCondition.bc.turbulenceIntensity,
           viscosityRatio: legacyCondition.bc.viscosityRatio,
+          mesh: {
+            mesher: legacyCondition.bc.mesher,
+            farfieldRadiusChords: legacyCondition.bc.farfieldRadiusChords,
+            wakeLengthChords: legacyCondition.bc.wakeLengthChords,
+            nSurface: legacyCondition.bc.nSurface,
+            nRadial: legacyCondition.bc.nRadial,
+            nWake: legacyCondition.bc.nWake,
+            targetYPlus: legacyCondition.bc.targetYPlus,
+            spanChords: legacyCondition.bc.spanChords,
+            nCells: r.nCells,
+            yPlusAvg: r.yPlusAvg,
+            yPlusMax: r.yPlusMax,
+            iterations: r.iterations,
+            finalResidual: r.finalResidual,
+          },
         }
       : null,
   };

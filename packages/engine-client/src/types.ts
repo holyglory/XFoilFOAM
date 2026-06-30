@@ -263,6 +263,7 @@ export interface PolarPoint {
   iterations?: number | null;
   y_plus_avg?: number | null;
   y_plus_max?: number | null;
+  n_cells?: number | null;
   first_order_fallback: boolean;
   images: Record<string, string>;
   strouhal?: number | null;

@@ -462,6 +462,23 @@ export function SimModal(props: {
                 ["Chord", `${fmt(sim.condition.referenceChordM, 3)} m`],
               ]}
             />
+            {sim.condition.mesh && (
+              <ConditionGroup
+                title="Mesh"
+                rows={[
+                  ["Cells", sim.condition.mesh.nCells == null ? "—" : sim.condition.mesh.nCells.toLocaleString()],
+                  ["Mesher", mesherLabel(sim.condition.mesh.mesher)],
+                  ["Surface", `${sim.condition.mesh.nSurface.toLocaleString()} cells`],
+                  ["Radial", `${sim.condition.mesh.nRadial.toLocaleString()} cells`],
+                  ["Wake", `${sim.condition.mesh.nWake.toLocaleString()} cells`],
+                  ["Domain", `${fmt(sim.condition.mesh.farfieldRadiusChords, 1)}c far · ${fmt(sim.condition.mesh.wakeLengthChords, 1)}c wake`],
+                  ["y+ target", fmt(sim.condition.mesh.targetYPlus, 2)],
+                  ["y+ avg/max", sim.condition.mesh.yPlusAvg == null && sim.condition.mesh.yPlusMax == null ? "—" : `${fmtOptional(sim.condition.mesh.yPlusAvg, 2)} / ${fmtOptional(sim.condition.mesh.yPlusMax, 2)}`],
+                  ["Iterations", sim.condition.mesh.iterations == null ? "—" : sim.condition.mesh.iterations.toLocaleString()],
+                  ["Residual", sim.condition.mesh.finalResidual == null ? "—" : fmtCompact(sim.condition.mesh.finalResidual)],
+                ]}
+              />
+            )}
             <ConditionGroup
               title="Boundary Model"
               rows={[
@@ -740,7 +757,7 @@ function ConditionGroup({ title, rows }: { title: string; rows: [string, string]
     <div style={{ display: "grid", gap: 5, background: C.panel2, border: `1px solid ${C.stroke2}`, borderRadius: 8, padding: "8px 10px", minWidth: 0 }}>
       <div style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.04em", textTransform: "uppercase" }}>{title}</div>
       {rows.map(([label, value]) => (
-        <div key={label} style={{ display: "grid", gridTemplateColumns: "56px minmax(0, 1fr)", gap: 8, alignItems: "baseline", fontFamily: MONO, fontSize: 10, minWidth: 0 }}>
+        <div key={label} style={{ display: "grid", gridTemplateColumns: "74px minmax(0, 1fr)", gap: 8, alignItems: "baseline", fontFamily: MONO, fontSize: 10, minWidth: 0 }}>
           <span style={{ color: C.dimmest }}>{label}</span>
           <span style={{ color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</span>
         </div>
@@ -775,6 +792,14 @@ function fmt(n: number, digits: number) {
 
 function fmtSci(n: number) {
   return Number.isFinite(n) ? n.toExponential(3).replace("e", "e") + " m²/s" : "—";
+}
+
+function fmtOptional(n: number | null | undefined, digits: number) {
+  return n == null ? "—" : fmt(n, digits);
+}
+
+function mesherLabel(value: string) {
+  return value === "blockmesh-cgrid" ? "C-grid blockMesh" : value;
 }
 
 function fmtCompact(n: number) {

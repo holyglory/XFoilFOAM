@@ -169,6 +169,13 @@
       "when": 1782864000000,
       "tag": "0023_up_tier_sync_remote_solvers",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1782921600000,
+      "tag": "0024_result_mesh_cell_counts",
+      "breakpoints": true
     }
   ]
 }

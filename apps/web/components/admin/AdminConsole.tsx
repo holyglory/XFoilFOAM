@@ -684,6 +684,7 @@ const IMAGE_FIELD_LABELS: Record<string, string> = {
 
 const REFERENCE_GEOMETRY_TYPE_OPTIONS = [{ value: "airfoil_2d", label: "2D airfoil" }];
 const REFERENCE_LENGTH_KIND_OPTIONS = [{ value: "chord", label: "Chord" }];
+const MESH_MESHER_OPTIONS = [{ value: "blockmesh-cgrid", label: "C-grid blockMesh" }];
 
 const defaultFlowForm = (medium?: MediumDTO): FlowConditionInput => ({
   name: "",
@@ -1182,7 +1183,15 @@ function SimulationSetupPanel() {
           <EditorHeader text={meshId ? "EDIT MESH PROFILE" : "ADD MESH PROFILE"} onNew={() => { setMeshId(""); setMeshForm(defaultMeshForm()); }} />
           <TextField label="Name" value={meshForm.name} onChange={(name) => setMeshForm((f) => ({ ...f, name }))} />
           {!meshId && <TextField label="Slug optional" value={meshForm.slug ?? ""} onChange={(slug) => setMeshForm((f) => ({ ...f, slug }))} />}
-          <TextField label="Mesher" value={meshForm.mesher} onChange={(mesher) => setMeshForm((f) => ({ ...f, mesher }))} />
+          {shouldShowSetupOption(MESH_MESHER_OPTIONS, meshForm.mesher) && (
+            <SelectField
+              label="Mesher"
+              value={meshForm.mesher}
+              options={setupOptionValues(MESH_MESHER_OPTIONS, meshForm.mesher)}
+              optionLabels={setupOptionLabels(MESH_MESHER_OPTIONS, meshForm.mesher)}
+              onChange={(mesher) => setMeshForm((f) => ({ ...f, mesher }))}
+            />
+          )}
           <div className="admin-form-grid">
             <NumberField label="Farfield chords" value={meshForm.farfieldRadiusChords} onChange={(farfieldRadiusChords) => setMeshForm((f) => ({ ...f, farfieldRadiusChords }))} />
             <NumberField label="Wake chords" value={meshForm.wakeLengthChords} onChange={(wakeLengthChords) => setMeshForm((f) => ({ ...f, wakeLengthChords }))} />

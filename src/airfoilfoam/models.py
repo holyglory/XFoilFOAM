@@ -377,6 +377,7 @@ class PolarPoint(BaseModel):
     iterations: Optional[int] = None
     y_plus_avg: Optional[float] = None
     y_plus_max: Optional[float] = None
+    n_cells: Optional[int] = Field(default=None, description="OpenFOAM mesh cell count for this case.")
     first_order_fallback: bool = Field(
         default=False,
         description="True if the case diverged with 2nd-order convection and was re-run with the "

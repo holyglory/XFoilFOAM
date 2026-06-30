@@ -415,6 +415,21 @@ export interface SimulationDetail {
     turbulenceModel: string;
     turbulenceIntensity: number;
     viscosityRatio: number;
+    mesh?: {
+      mesher: string;
+      farfieldRadiusChords: number;
+      wakeLengthChords: number;
+      nSurface: number;
+      nRadial: number;
+      nWake: number;
+      targetYPlus: number;
+      spanChords: number;
+      nCells?: number | null;
+      yPlusAvg?: number | null;
+      yPlusMax?: number | null;
+      iterations?: number | null;
+      finalResidual?: number | null;
+    } | null;
   } | null;
   jobId?: string | null;
   progress?: { done: number; total: number } | null;

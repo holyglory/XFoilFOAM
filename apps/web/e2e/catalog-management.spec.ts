@@ -440,6 +440,7 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
 
     await page.getByRole("button", { name: /^Mesh$/i }).click();
     await fillWrappedField(page, "Name", `${bcName} mesh`);
+    await expect(page.getByLabel("Mesher")).toHaveCount(0);
     await page.getByRole("button", { name: /add mesh profile/i }).click();
 
     await page.getByRole("button", { name: /^Solver$/i }).click();

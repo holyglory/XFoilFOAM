@@ -67,6 +67,7 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
         final_residual=outcome.final_residual,
         iterations=outcome.iterations,
         y_plus_avg=outcome.y_plus_avg, y_plus_max=outcome.y_plus_max,
+        n_cells=outcome.n_cells or None,
         first_order_fallback=outcome.first_order_fallback,
         images={field: url(rel) for field, rel in outcome.images.items()},
         strouhal=outcome.strouhal,

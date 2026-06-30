@@ -1,5 +1,23 @@
 # Decision History
 
+## 2026-07-01 — Setup Editors Hide Single-Option Engine Choices
+
+- Decision: CFD setup editors expose enumerated engine choices as typed selects,
+  and hide them entirely when only one supported option exists. Raw engine tokens
+  such as `blockmesh-cgrid` are not editable free text in the primary form.
+- Decision: Mesh information shown on solved AoA evidence is evidence-derived:
+  actual cell count comes from solver output, while profile controls such as
+  farfield/wake chords and surface/radial/wake cell targets come from the
+  immutable setup revision. Missing mesh counters stay blank rather than being
+  estimated from profile knobs.
+- Why: The Mesh form exposed the single supported mesher as a text input and
+  showed several numerical mesh knobs without making clear which values had
+  actually been used by local OpenFOAM runs or where solved-case mesh metrics
+  would appear.
+- Expected effect: Admin setup stays compact and purpose-built, while result
+  dialogs can show real per-AoA mesh evidence such as cell count, y+, iteration
+  count, and residual when the solver has produced it.
+
 ## 2026-06-29 — Keep Solver Queue UI Polling Bounded
 
 - Decision: Admin queue refreshes must not overlap, and slow engine
