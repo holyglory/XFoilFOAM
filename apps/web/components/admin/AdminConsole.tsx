@@ -685,6 +685,11 @@ const IMAGE_FIELD_LABELS: Record<string, string> = {
 const REFERENCE_GEOMETRY_TYPE_OPTIONS = [{ value: "airfoil_2d", label: "2D airfoil" }];
 const REFERENCE_LENGTH_KIND_OPTIONS = [{ value: "chord", label: "Chord" }];
 const MESH_MESHER_OPTIONS = [{ value: "blockmesh-cgrid", label: "C-grid blockMesh" }];
+const TURBULENT_VISCOSITY_RATIO_PRESETS = [
+  { value: "3", label: "Low · νt/ν 3" },
+  { value: "10", label: "Standard airfoil · νt/ν 10" },
+  { value: "30", label: "High freestream turbulence · νt/ν 30" },
+];
 
 const defaultFlowForm = (medium?: MediumDTO): FlowConditionInput => ({
   name: "",
@@ -1171,7 +1176,7 @@ function SimulationSetupPanel() {
           {!boundaryId && <TextField label="Slug optional" value={boundaryForm.slug ?? ""} onChange={(slug) => setBoundaryForm((f) => ({ ...f, slug }))} />}
           <div className="admin-form-grid">
             <NumberField label="Turbulence intensity" value={boundaryForm.turbulenceIntensity} onChange={(turbulenceIntensity) => setBoundaryForm((f) => ({ ...f, turbulenceIntensity }))} />
-            <NumberField label="Viscosity ratio" value={boundaryForm.viscosityRatio} onChange={(viscosityRatio) => setBoundaryForm((f) => ({ ...f, viscosityRatio }))} />
+            <TurbulentViscosityRatioField value={boundaryForm.viscosityRatio} onChange={(viscosityRatio) => setBoundaryForm((f) => ({ ...f, viscosityRatio }))} />
             <NumberField label="Roughness Ks" value={boundaryForm.sandGrainHeight} onChange={(sandGrainHeight) => setBoundaryForm((f) => ({ ...f, sandGrainHeight }))} />
             <NumberField label="Roughness constant" value={boundaryForm.roughnessConstant} onChange={(roughnessConstant) => setBoundaryForm((f) => ({ ...f, roughnessConstant }))} />
           </div>
@@ -2308,6 +2313,35 @@ function OptionalNumberField({ label: l, value, onChange }: { label: string; val
         style={inputStyle}
       />
     </label>
+  );
+}
+
+function TurbulentViscosityRatioField({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const rounded = Number.isFinite(value) ? String(value) : "10";
+  const presetValue = TURBULENT_VISCOSITY_RATIO_PRESETS.some((preset) => preset.value === rounded) ? rounded : "custom";
+  const options = presetValue === "custom" ? ["custom", ...TURBULENT_VISCOSITY_RATIO_PRESETS.map((preset) => preset.value)] : TURBULENT_VISCOSITY_RATIO_PRESETS.map((preset) => preset.value);
+  const optionLabels = {
+    ...Object.fromEntries(TURBULENT_VISCOSITY_RATIO_PRESETS.map((preset) => [preset.value, preset.label])),
+    custom: `Custom · νt/ν ${f(value, 2)}`,
+  };
+  return (
+    <div style={{ display: "grid", gap: 6 }}>
+      <SelectField
+        label="Turbulent viscosity ratio νt/ν"
+        value={presetValue}
+        options={options}
+        optionLabels={optionLabels}
+        onChange={(next) => {
+          if (next !== "custom") onChange(Number(next));
+        }}
+      />
+      <details {...(presetValue === "custom" ? { open: true } : {})} style={{ border: `1px solid ${C.stroke2}`, borderRadius: 8, padding: "7px 9px" }}>
+        <summary style={{ cursor: "pointer", color: C.dim, fontFamily: MONO, fontSize: 10 }}>advanced raw value</summary>
+        <div style={{ marginTop: 8 }}>
+          <NumberField label="νt/ν raw" value={value} onChange={onChange} />
+        </div>
+      </details>
+    </div>
   );
 }
 

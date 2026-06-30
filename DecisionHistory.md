@@ -1,5 +1,16 @@
 # Decision History
 
+## 2026-07-01 — Boundary Forms Prefer Domain Presets Over Raw Solver Numbers
+
+- Decision: Turbulent viscosity ratio is presented as `Turbulent viscosity
+  ratio νt/ν` with practical presets, while the exact raw numeric value remains
+  available in an advanced disclosure.
+- Why: The previous `Viscosity ratio` label exposed a solver parameter without
+  its physical meaning or a reasonable default choice for 2D airfoil work.
+- Expected effect: New boundary profiles steer users toward intentional,
+  documented freestream turbulence choices while retaining precise control for
+  expert cases and imported legacy values.
+
 ## 2026-07-01 — Setup Editors Hide Single-Option Engine Choices
 
 - Decision: CFD setup editors expose enumerated engine choices as typed selects,

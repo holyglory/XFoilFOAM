@@ -436,6 +436,8 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
 
     await page.getByRole("button", { name: /^Boundary$/i }).click();
     await fillWrappedField(page, "Name", `${bcName} boundary`);
+    await expect(page.getByLabel("Turbulent viscosity ratio νt/ν")).toBeVisible();
+    await expect(page.getByText("advanced raw value")).toBeVisible();
     await page.getByRole("button", { name: /add boundary profile/i }).click();
 
     await page.getByRole("button", { name: /^Mesh$/i }).click();
