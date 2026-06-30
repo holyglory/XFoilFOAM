@@ -58,6 +58,26 @@ jobs:
           chmod 600 ~/.ssh/airfoils_pro_vps
           ssh-keyscan -p "$VPS_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts
 
+      - name: Ensure VPS deploy tools are available
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" '
+            set -euo pipefail
+            if command -v rsync >/dev/null 2>&1; then
+              exit 0
+            fi
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y rsync
+            elif command -v apk >/dev/null 2>&1; then
+              sudo apk add --no-cache rsync
+            else
+              echo "rsync is required on the VPS, and no supported package manager was found." >&2
+              exit 12
+            fi
+          '
+
       - name: Upload source to VPS
         shell: bash
         run: |

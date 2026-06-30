@@ -428,8 +428,8 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     await page.getByRole("button", { name: /^Reference geometry$/i }).click();
     await fillWrappedField(page, "Name", `${bcName} reference geometry`);
     await fillWrappedField(page, "Slug optional", `${slugify(bcName)}-reference-geometry`);
-    await fillWrappedField(page, "Geometry type", "airfoil_2d");
-    await fillWrappedField(page, "Reference length kind", "chord");
+    await expect(page.getByLabel("Geometry type")).toHaveCount(0);
+    await expect(page.getByLabel("Reference length kind")).toHaveCount(0);
     await selectUnit(page, "Reference length", "ft");
     await fillWrappedField(page, "Reference length", "2.46063");
     await page.getByRole("button", { name: /add reference geometry/i }).click();

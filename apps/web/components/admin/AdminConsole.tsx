@@ -682,6 +682,9 @@ const IMAGE_FIELD_LABELS: Record<string, string> = {
   turbulent_viscosity: "Turbulent viscosity νt",
 };
 
+const REFERENCE_GEOMETRY_TYPE_OPTIONS = [{ value: "airfoil_2d", label: "2D airfoil" }];
+const REFERENCE_LENGTH_KIND_OPTIONS = [{ value: "chord", label: "Chord" }];
+
 const defaultFlowForm = (medium?: MediumDTO): FlowConditionInput => ({
   name: "",
   mediumId: medium?.id ?? "",
@@ -732,6 +735,19 @@ function optionLabels<T extends { id: string; name: string }>(rows: T[], empty =
 
 function optionValues<T extends { id: string }>(rows: T[]) {
   return ["", ...rows.map((row) => row.id)];
+}
+
+function setupOptionValues(options: { value: string }[], current: string) {
+  const values = options.map((option) => option.value);
+  return values.includes(current) ? values : [current, ...values];
+}
+
+function setupOptionLabels(options: { value: string; label: string }[], current: string) {
+  return Object.fromEntries(setupOptionValues(options, current).map((value) => [value, options.find((option) => option.value === value)?.label ?? value]));
+}
+
+function shouldShowSetupOption(options: { value: string }[], current: string) {
+  return options.length > 1 || !options.some((option) => option.value === current);
 }
 
 function SetupRecordList<T extends { id: string; name: string }>({
@@ -1118,8 +1134,24 @@ function SimulationSetupPanel() {
             <EditorHeader text={referenceGeometryId ? "EDIT REFERENCE GEOMETRY" : "ADD REFERENCE GEOMETRY"} onNew={() => { setReferenceGeometryId(""); setReferenceGeometryForm(defaultReferenceGeometryForm()); }} />
             <TextField label="Name" value={referenceGeometryForm.name} onChange={(name) => setReferenceGeometryForm((g) => ({ ...g, name }))} />
             {!referenceGeometryId && <TextField label="Slug optional" value={referenceGeometryForm.slug ?? ""} onChange={(slug) => setReferenceGeometryForm((g) => ({ ...g, slug }))} />}
-            <TextField label="Geometry type" value={referenceGeometryForm.geometryType} onChange={(geometryType) => setReferenceGeometryForm((g) => ({ ...g, geometryType }))} />
-            <TextField label="Reference length kind" value={referenceGeometryForm.referenceLengthKind} onChange={(referenceLengthKind) => setReferenceGeometryForm((g) => ({ ...g, referenceLengthKind }))} />
+            {shouldShowSetupOption(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType) && (
+              <SelectField
+                label="Geometry type"
+                value={referenceGeometryForm.geometryType}
+                options={setupOptionValues(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType)}
+                optionLabels={setupOptionLabels(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType)}
+                onChange={(geometryType) => setReferenceGeometryForm((g) => ({ ...g, geometryType }))}
+              />
+            )}
+            {shouldShowSetupOption(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind) && (
+              <SelectField
+                label="Reference length kind"
+                value={referenceGeometryForm.referenceLengthKind}
+                options={setupOptionValues(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind)}
+                optionLabels={setupOptionLabels(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind)}
+                onChange={(referenceLengthKind) => setReferenceGeometryForm((g) => ({ ...g, referenceLengthKind }))}
+              />
+            )}
             <div className="admin-form-grid">
               <UnitNumberField label="Reference length" dimension="length" valueSi={referenceGeometryForm.referenceLengthM} min={0} onChangeSi={(referenceLengthM) => setReferenceGeometryForm((g) => ({ ...g, referenceLengthM }))} />
               <UnitNumberField label="Span" dimension="length" valueSi={referenceGeometryForm.spanM ?? 0} min={0} onChangeSi={(spanM) => setReferenceGeometryForm((g) => ({ ...g, spanM: spanM > 0 ? spanM : null }))} />
