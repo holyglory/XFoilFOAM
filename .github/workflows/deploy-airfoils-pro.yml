@@ -1,0 +1,95 @@
+name: Deploy Airfoils.Pro VPS
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: airfoils-pro-vps-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy control plane
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VPS_HOST: ${{ secrets.AIRFOILS_VPS_HOST }}
+      VPS_USER: ${{ secrets.AIRFOILS_VPS_USER }}
+      VPS_PORT: ${{ secrets.AIRFOILS_VPS_PORT }}
+      VPS_SSH_KEY: ${{ secrets.AIRFOILS_VPS_SSH_KEY }}
+      VPS_APP_DIR: ${{ vars.AIRFOILS_VPS_APP_DIR }}
+      PUBLIC_ORIGIN: ${{ vars.AIRFOILS_PUBLIC_ORIGIN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Ensure deploy tools are available
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rsync
+
+      - name: Validate deploy configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/deploy/vps-redeploy.sh
+          test -f docker-compose.deploy.yml
+
+      - name: Install SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${VPS_HOST:?Set AIRFOILS_VPS_HOST secret}"
+          : "${VPS_USER:?Set AIRFOILS_VPS_USER secret}"
+          : "${VPS_SSH_KEY:?Set AIRFOILS_VPS_SSH_KEY secret}"
+          if [[ -z "${VPS_PORT:-}" ]]; then
+            VPS_PORT=22
+          fi
+          echo "VPS_PORT=$VPS_PORT" >> "$GITHUB_ENV"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/airfoils_pro_vps
+          chmod 600 ~/.ssh/airfoils_pro_vps
+          ssh-keyscan -p "$VPS_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload source to VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="${VPS_APP_DIR:-/opt/airfoils-pro/app}"
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/airfoils_pro_vps -p ${VPS_PORT}" \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.ssh/' \
+            --exclude '.env' \
+            --exclude '.env.deploy' \
+            --exclude '.env.local' \
+            --exclude 'node_modules/' \
+            --exclude '.next/' \
+            --exclude '.next-build/' \
+            --exclude '.pnpm-store/' \
+            --exclude 'coverage/' \
+            --exclude 'data/' \
+            --exclude 'VTK/' \
+            --exclude 'processor*/' \
+            --exclude 'postProcessing/' \
+            --exclude '.codex-artifacts/' \
+            --exclude '.codex-db-backups/' \
+            --exclude 'test-results/' \
+            ./ "${VPS_USER}@${VPS_HOST}:${APP_DIR}/"
+
+      - name: Redeploy VPS control plane
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="${VPS_APP_DIR:-/opt/airfoils-pro/app}"
+          ORIGIN="${PUBLIC_ORIGIN:-https://airfoils.pro}"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "cd '${APP_DIR}' && chmod +x scripts/deploy/vps-redeploy.sh && APP_DIR='${APP_DIR}' PUBLIC_ORIGIN='${ORIGIN}' scripts/deploy/vps-redeploy.sh"

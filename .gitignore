@@ -12,6 +12,8 @@ venv/
 .ruff_cache/
 data/
 *.log
+.DS_Store
+._*
 VTK/
 processor*/
 postProcessing/
@@ -42,3 +44,6 @@ Airfoil Database and Simulation Portal-handoff.zip
 test-results/
 **/test-results/
 product-design-audits/
+
+# --- local SSH credentials ---
+.ssh/

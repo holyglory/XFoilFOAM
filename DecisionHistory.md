@@ -276,3 +276,41 @@
 - Expected effect: Up-tier admins can see registered solvers and their work;
   local admins can configure outbound sync and remote solving; partial local
   installs can display remote-backed fields through local proxy endpoints.
+
+## 2026-06-30 — Admin Access Uses Google OAuth Domain Gating
+
+- Decision: Production admin access can be granted through Google OAuth using
+  `ADMIN_GOOGLE_CLIENT_ID`, `ADMIN_GOOGLE_CLIENT_SECRET`, and an allowed domain
+  defaulting to `vr.ae`. The API exchanges the OAuth code server-side, fetches
+  Google userinfo, requires a verified email, and enforces the domain before
+  signing the existing admin session cookie.
+- Decision: The password login route remains as an explicit fallback only when
+  `ADMIN_PASSWORD` is configured. The browser is told only which providers are
+  available and receives no OAuth client secret.
+- Why: The deployment should allow everyone from the `vr.ae` Google Workspace
+  domain into `/admin` without sharing a single password, while preserving the
+  API pre-handler as the actual authorization boundary.
+- Expected effect: `/admin` presents a Google sign-in button when OAuth is
+  configured, rejects non-`vr.ae` Google accounts even if they reach the
+  callback, and continues protecting all admin API routes with the same signed
+  session cookie.
+
+## 2026-07-01 — GitHub Actions VPS Deploy Preserves OpenFOAM Workers
+
+- Decision: GitHub Actions deploys Airfoils.Pro to the VPS through SSH and
+  rsync, then runs the checked-in `scripts/deploy/vps-redeploy.sh` script on
+  the server.
+- Decision: The default deploy path builds and restarts only the Node
+  control-plane services: `node-api`, `web`, and `sweeper`. It intentionally
+  skips the Python engine `api` service and the OpenFOAM `worker` service.
+- Decision: The deploy script detects active OpenFOAM child processes inside
+  the `worker` container. Solver-service redeploys require the explicit
+  `DEPLOY_OPENFOAM_SERVICES=1` opt-in and are refused while OpenFOAM processes
+  are active.
+- Why: The VPS host does not install OpenFOAM directly; OpenFOAM exists inside
+  the `worker` Docker image. Recreating that container during a normal web/API
+  deploy would terminate live CFD solves.
+- Expected effect: New commits pushed to GitHub automatically refresh the web
+  and control-plane API while preserving any running OpenFOAM jobs. Engine or
+  worker changes can still be rolled out deliberately during an idle solver
+  window.

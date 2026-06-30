@@ -66,10 +66,40 @@ pnpm --filter @aerodb/core test     # golden tests vs the design's airfoil-db.js
 `/admin` shows and manages the OpenFOAM queue: the CFD sweeper (pause/resume,
 concurrency), the backlog of pending cases, in-flight/solved/failed counts, the
 recent `sim_jobs` (with cancel), and a requeue-failed action. Auth is enforced by
-the API: **open in dev** (`NODE_ENV` ≠ `production`), **email/password in prod** (a
-signed HttpOnly session cookie). Configure with `ADMIN_EMAIL` / `ADMIN_PASSWORD` /
-`ADMIN_SESSION_SECRET`; force either mode with `ADMIN_AUTH_REQUIRED=true` /
-`ADMIN_AUTH_DISABLED=true`.
+the API: **open in dev** (`NODE_ENV` ≠ `production`), **Google OAuth or configured
+password in prod** (a signed HttpOnly session cookie). Google admin access is
+configured with `ADMIN_GOOGLE_CLIENT_ID`, `ADMIN_GOOGLE_CLIENT_SECRET`,
+`ADMIN_GOOGLE_ALLOWED_DOMAIN=vr.ae`, and
+`ADMIN_GOOGLE_REDIRECT_URI=https://airfoils.pro/api/admin/oauth/google/callback`.
+Password fallback is available only when `ADMIN_PASSWORD` is set. Configure the
+cookie signer with `ADMIN_SESSION_SECRET`; force auth/open modes with
+`ADMIN_AUTH_REQUIRED=true` / `ADMIN_AUTH_DISABLED=true`.
+
+### Production deployment
+
+Pushes to `master` or `main` run `.github/workflows/deploy-airfoils-pro.yml`.
+The workflow uploads the checked-out source to the VPS over SSH and runs
+`scripts/deploy/vps-redeploy.sh` in `/opt/airfoils-pro/app`.
+
+Required GitHub secrets:
+
+- `AIRFOILS_VPS_HOST`
+- `AIRFOILS_VPS_USER`
+- `AIRFOILS_VPS_SSH_KEY`
+- optional `AIRFOILS_VPS_PORT`
+
+Repository variables:
+
+- `AIRFOILS_VPS_APP_DIR` defaults operationally to `/opt/airfoils-pro/app`
+- `AIRFOILS_PUBLIC_ORIGIN` defaults operationally to `https://airfoils.pro`
+
+The default deploy is solver-safe: it rebuilds/restarts only `node-api`, `web`,
+and `sweeper`. It does **not** restart the Python engine `api` service or the
+OpenFOAM `worker` service, so active OpenFOAM child processes keep running. The
+VPS host itself does not install OpenFOAM; OpenFOAM is provided by the Docker
+`worker` image. To update `api`/`worker`, run the same script with
+`DEPLOY_OPENFOAM_SERVICES=1`; it refuses that mode while `simpleFoam`,
+`pimpleFoam`, meshing, or related OpenFOAM processes are active.
 
 **Status.** Both phases are implemented and tested. *Phase 1*: the Postgres database
 (categories, airfoils, mediums, boundary conditions, results), the control-plane API,

@@ -33,6 +33,7 @@ import {
   type SimulationPresetInput,
   type SolverProfileInput,
   type SweepDefinitionInput,
+  adminGoogleLoginUrl,
   adminLogin,
   adminLogout,
   adminMe,
@@ -217,26 +218,51 @@ export function AdminConsole() {
     return <div style={{ fontFamily: MONO, fontSize: 13, color: C.muted, padding: 40 }}>checking access…</div>;
   }
   if (!me.authed) {
+    const googleProvider = me.providers?.google || me.google?.enabled;
+    const passwordProvider = me.providers?.password ?? true;
+    const googleDomain = me.google?.allowedDomain || "vr.ae";
     return (
       <div style={{ maxWidth: 380, margin: "60px auto", ...card }}>
         <div style={label}>ADMIN SIGN IN</div>
         <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim, marginBottom: 14 }}>
-          This deployment requires admin credentials.
+          {googleProvider ? `Use a verified ${googleDomain} Google account.` : "This deployment requires admin credentials."}
         </div>
-        <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" autoComplete="username" style={inputStyle} />
-        <input
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && doLogin()}
-          placeholder="password"
-          type="password"
-          autoComplete="current-password"
-          style={{ ...inputStyle, marginTop: 10 }}
-        />
-        {loginErr && <div style={{ fontFamily: MONO, fontSize: 11, color: C.red, marginTop: 10 }}>{loginErr}</div>}
-        <button type="button" disabled={busy} onClick={doLogin} style={{ ...primaryBtn(busy), width: "100%", marginTop: 14 }}>
-          {busy ? "Signing in…" : "Sign in"}
-        </button>
+        {googleProvider && (
+          <button
+            type="button"
+            onClick={() => {
+              window.location.href = adminGoogleLoginUrl("/admin");
+            }}
+            style={{ ...primaryBtn(false), width: "100%", display: "flex", justifyContent: "center", alignItems: "center", gap: 8 }}
+          >
+            Continue with Google
+            <ExternalLink size={14} />
+          </button>
+        )}
+        {passwordProvider && (
+          <div style={{ marginTop: googleProvider ? 14 : 0 }}>
+            {googleProvider && <div style={{ ...label, marginTop: 2, marginBottom: 10 }}>PASSWORD FALLBACK</div>}
+            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" autoComplete="username" style={inputStyle} />
+            <input
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && doLogin()}
+              placeholder="password"
+              type="password"
+              autoComplete="current-password"
+              style={{ ...inputStyle, marginTop: 10 }}
+            />
+            {loginErr && <div style={{ fontFamily: MONO, fontSize: 11, color: C.red, marginTop: 10 }}>{loginErr}</div>}
+            <button type="button" disabled={busy} onClick={doLogin} style={{ ...primaryBtn(busy), width: "100%", marginTop: 14 }}>
+              {busy ? "Signing in…" : "Sign in"}
+            </button>
+          </div>
+        )}
+        {!googleProvider && !passwordProvider && (
+          <div style={{ fontFamily: MONO, fontSize: 12, color: C.red, lineHeight: 1.5 }}>
+            Admin authentication is not configured. Set Google OAuth credentials or a password on the API server.
+          </div>
+        )}
       </div>
     );
   }
@@ -361,7 +387,7 @@ export function AdminConsole() {
             padding: "3px 8px",
           }}
         >
-          {me.mode === "prod" ? `PROD · ${me.email}` : "DEV · auth off"}
+          {me.mode === "prod" ? `PROD · ${me.provider === "google" ? "Google · " : ""}${me.email}` : "DEV · auth off"}
         </span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
           {me.mode === "prod" && (

@@ -65,6 +65,39 @@
   evidence, and render requests must be proxied by the local API so secrets stay
   server-side and artifact access remains auditable.
 
+## Admin Authentication
+
+- Admin access must be enforced by the API pre-handler that protects admin
+  routes. UI sign-in screens are convenience only and must not be treated as
+  security boundaries.
+- Google OAuth admin access is valid only after the API verifies a real Google
+  OAuth callback, confirms the email is verified, and enforces the configured
+  allowed domain. A Google `hd` hint in the authorization URL is not sufficient
+  authorization by itself.
+- OAuth client secrets, upstream sync secrets, and admin session secrets remain
+  server-side. Browser clients may receive only provider availability, allowed
+  domain display text, and a login URL.
+- Password admin login is a fallback/development path only when explicitly
+  configured. If OAuth credentials are missing in production, the UI must show a
+  misconfigured/unavailable auth state rather than pretending OAuth works.
+
+## Production Deployment And OpenFOAM Safety
+
+- Production VPS deployment is done manually over SSH or through GitHub Actions,
+  not through the local development coordinator.
+- The VPS host does not need host-level OpenFOAM. OpenFOAM is provided by the
+  Docker `worker` image/container and its live child processes run inside that
+  container.
+- Normal production redeploys must update only the Node control-plane services:
+  `node-api`, `web`, and `sweeper`. Do not restart or recreate the OpenFOAM
+  engine services `api` or `worker` during an ordinary deploy, because that can
+  terminate active CFD solves.
+- Redeploying `api` or `worker` in production requires an explicit solver
+  maintenance action and an idle-worker guard that checks for active
+  `simpleFoam`, `pimpleFoam`, meshing, decomposition, reconstruction, or
+  related OpenFOAM processes first. If such processes are active, preserve them
+  and defer the solver-service redeploy.
+
 ## Solver Evidence Versus Valid Polars
 
 - Treat stored solver evidence and valid polar points as separate concepts.

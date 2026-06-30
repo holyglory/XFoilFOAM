@@ -1,0 +1,149 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+      args:
+        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+    restart: unless-stopped
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
+      AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - results:/data/airfoilfoam
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      args:
+        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+    restart: unless-stopped
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
+      AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_WORKER_CPU_BUDGET: ${AIRFOILFOAM_WORKER_CPU_BUDGET:-8}
+      AIRFOILFOAM_CASE_CONCURRENCY: ${AIRFOILFOAM_CASE_CONCURRENCY:-8}
+      AIRFOILFOAM_CELERY_CONCURRENCY: ${AIRFOILFOAM_CELERY_CONCURRENCY:-8}
+      AIRFOILFOAM_RANS_SOLVER_TIMEOUT: ${AIRFOILFOAM_RANS_SOLVER_TIMEOUT:-1200}
+      AIRFOILFOAM_RANS_MAX_ITERATIONS: ${AIRFOILFOAM_RANS_MAX_ITERATIONS:-600}
+    volumes:
+      - results:/data/airfoilfoam
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aerodb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: aerodb
+    ports:
+      - "127.0.0.1:5544:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aerodb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  node-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    restart: unless-stopped
+    command: sh -c "pnpm --filter @aerodb/db migrate && pnpm --filter @aerodb/db seed && pnpm --filter @aerodb/api start"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      ENGINE_URL: ${ENGINE_URL}
+      ENGINE_EXPECTED_BUILD_ID: ${ENGINE_EXPECTED_BUILD_ID}
+      MEDIA_DIR: ${MEDIA_DIR}
+      API_PORT: "4000"
+      API_HOST: 0.0.0.0
+      NODE_ENV: production
+      ADMIN_AUTH_REQUIRED: ${ADMIN_AUTH_REQUIRED}
+      ADMIN_AUTH_DISABLED: ${ADMIN_AUTH_DISABLED}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET}
+      ADMIN_GOOGLE_CLIENT_ID: ${ADMIN_GOOGLE_CLIENT_ID}
+      ADMIN_GOOGLE_CLIENT_SECRET: ${ADMIN_GOOGLE_CLIENT_SECRET}
+      ADMIN_GOOGLE_ALLOWED_DOMAIN: ${ADMIN_GOOGLE_ALLOWED_DOMAIN}
+      ADMIN_GOOGLE_REDIRECT_URI: ${ADMIN_GOOGLE_REDIRECT_URI}
+      ADMIN_PUBLIC_ORIGIN: ${ADMIN_PUBLIC_ORIGIN}
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - results:/data/airfoilfoam:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'fetch(\"http://127.0.0.1:4000/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    restart: unless-stopped
+    command: sh -c "pnpm --filter @aerodb/web build && pnpm --filter @aerodb/web start"
+    environment:
+      API_URL: ${API_URL}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_TELEMETRY_DISABLED: "1"
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:3100:3100"
+    depends_on:
+      node-api:
+        condition: service_healthy
+
+  sweeper:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    restart: unless-stopped
+    command: sh -c "pnpm --filter @aerodb/sweeper start"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      ENGINE_URL: ${ENGINE_URL}
+      MEDIA_DIR: ${MEDIA_DIR}
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+    volumes:
+      - results:/data/airfoilfoam
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-api:
+        condition: service_healthy
+
+volumes:
+  results:
+  pgdata:

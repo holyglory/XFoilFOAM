@@ -35,7 +35,22 @@ import { and, asc, count, desc, eq, inArray, isNotNull, isNull, like, or, sql } 
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
-import { authMode, checkCredentials, COOKIE_NAME, requireAdmin, signSession, verifySession } from "./admin-auth";
+import {
+  authMode,
+  adminAuthProviders,
+  checkCredentials,
+  COOKIE_NAME,
+  GOOGLE_STATE_COOKIE_NAME,
+  googleAllowedDomain,
+  googleAuthorizationUrl,
+  googleOAuthConfigured,
+  googleSessionFromCode,
+  requireAdmin,
+  signOAuthState,
+  signSession,
+  verifyOAuthState,
+  verifySession,
+} from "./admin-auth";
 import { db } from "./db";
 import { env } from "./env";
 import { categoriesTree } from "./services/catalog";
@@ -1145,15 +1160,17 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // ---- auth ----
   app.get("/api/admin/me", async (req) => {
     const mode = authMode();
-    if (mode === "dev") return { authed: true, mode, email: null };
+    const providers = adminAuthProviders();
+    const google = { enabled: providers.google, allowedDomain: googleAllowedDomain(), loginUrl: "/api/admin/oauth/google?returnTo=/admin" };
+    if (mode === "dev") return { authed: true, mode, email: null, provider: null, providers, google };
     const s = verifySession((req as { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME]);
-    return { authed: !!s, mode, email: s?.email ?? null };
+    return { authed: !!s, mode, email: s?.email ?? null, provider: s?.provider ?? null, providers, google };
   });
 
   app.post("/api/admin/login", async (req, reply) => {
     const { email, password } = z.object({ email: z.string(), password: z.string() }).parse(req.body);
     if (!checkCredentials(email, password)) return reply.code(401).send({ error: "invalid email or password" });
-    reply.setCookie(COOKIE_NAME, signSession(email), {
+    reply.setCookie(COOKIE_NAME, signSession(email, 86_400_000, "password"), {
       httpOnly: true,
       sameSite: "lax",
       secure: process.env.NODE_ENV === "production",
@@ -1161,6 +1178,50 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       maxAge: 86_400,
     });
     return { ok: true };
+  });
+
+  app.get("/api/admin/oauth/google", async (req, reply) => {
+    if (authMode() === "dev") return reply.redirect("/admin", 303);
+    if (!googleOAuthConfigured()) return reply.code(503).send({ error: "Google OAuth is not configured" });
+    const query = z.object({ returnTo: z.string().optional() }).parse(req.query);
+    const state = signOAuthState(query.returnTo ?? "/admin");
+    reply.setCookie(GOOGLE_STATE_COOKIE_NAME, state, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      path: "/api/admin/oauth/google/callback",
+      maxAge: 600,
+    });
+    return reply.redirect(googleAuthorizationUrl(req, state), 303);
+  });
+
+  app.get("/api/admin/oauth/google/callback", async (req, reply) => {
+    if (authMode() === "dev") return reply.redirect("/admin", 303);
+    const query = z
+      .object({
+        code: z.string().optional(),
+        state: z.string().optional(),
+        error: z.string().optional(),
+      })
+      .parse(req.query);
+    const verifiedState = verifyOAuthState(query.state, (req as { cookies?: Record<string, string> }).cookies?.[GOOGLE_STATE_COOKIE_NAME]);
+    reply.clearCookie(GOOGLE_STATE_COOKIE_NAME, { path: "/api/admin/oauth/google/callback" });
+    if (query.error) return reply.redirect(`/admin?auth=google-denied`, 303);
+    if (!query.code || !verifiedState) return reply.code(400).send({ error: "invalid Google OAuth state" });
+    try {
+      const session = await googleSessionFromCode(req, query.code);
+      reply.setCookie(COOKIE_NAME, signSession(session.email, 86_400_000, "google", session.domain), {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: process.env.NODE_ENV === "production",
+        path: "/",
+        maxAge: 86_400,
+      });
+      return reply.redirect(verifiedState.returnTo, 303);
+    } catch (error) {
+      app.log.warn({ err: error }, "Google admin OAuth failed");
+      return reply.code(401).send({ error: error instanceof Error ? error.message : "Google OAuth failed" });
+    }
   });
 
   app.post("/api/admin/logout", async (_req, reply) => {

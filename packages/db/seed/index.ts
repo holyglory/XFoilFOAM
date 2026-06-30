@@ -213,7 +213,7 @@ function tagsFor(category: CategorySeed, geo: AirfoilGeometry): string[] {
 
 function seligFiles(): string[] {
   return readdirSync(seligDir)
-    .filter((file) => extname(file).toLowerCase() === ".dat")
+    .filter((file) => !file.startsWith(".") && extname(file).toLowerCase() === ".dat")
     .sort((a, b) => a.localeCompare(b));
 }
 

@@ -30,6 +30,16 @@ export interface AdminMe {
   authed: boolean;
   mode: "dev" | "prod";
   email: string | null;
+  provider?: "password" | "google" | null;
+  providers?: {
+    google: boolean;
+    password: boolean;
+  };
+  google?: {
+    enabled: boolean;
+    allowedDomain: string;
+    loginUrl: string;
+  };
 }
 export interface SweeperState {
   enabled: boolean;
@@ -287,6 +297,8 @@ export interface AdminSyncState {
 export const adminMe = () => aj<AdminMe>("/api/admin/me");
 export const adminLogin = (email: string, password: string) =>
   aj<{ ok: boolean }>("/api/admin/login", { method: "POST", body: JSON.stringify({ email, password }) });
+export const adminGoogleLoginUrl = (returnTo = "/admin") =>
+  `${BASE}/api/admin/oauth/google?returnTo=${encodeURIComponent(returnTo)}`;
 export const adminLogout = () => aj<{ ok: boolean }>("/api/admin/logout", { method: "POST" });
 export const getAdminQueue = () => aj<AdminQueue>("/api/admin/queue");
 export const getAdminSync = () => aj<AdminSyncState>("/api/admin/sync");

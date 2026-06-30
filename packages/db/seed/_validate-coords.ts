@@ -8,7 +8,9 @@ import { deriveGeometry, parseCoordinates } from "@aerodb/core";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dir = resolve(here, "selig-database");
-for (const file of readdirSync(dir).filter((f) => f.endsWith(".dat")).sort()) {
+for (const file of readdirSync(dir)
+  .filter((f) => !f.startsWith(".") && f.endsWith(".dat"))
+  .sort()) {
   const text = readFileSync(join(dir, file), "utf8");
   try {
     const parsed = parseCoordinates(text);
