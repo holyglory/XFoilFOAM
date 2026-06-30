@@ -1,0 +1,82 @@
+{
+  "name": "aerodb",
+  "servers": [
+    {
+      "name": "api",
+      "role": "api",
+      "port": 4000,
+      "cmd": "API_HOST=127.0.0.1 API_PORT={port} ENGINE_URL=http://127.0.0.1:8000 MEDIA_DIR=data/airfoilfoam ENGINE_EXPECTED_BUILD_ID=dev-20260630-evidence-media pnpm --filter @aerodb/api dev",
+      "health_url": "http://127.0.0.1:{port}/health",
+      "env": [
+        "CI=true"
+      ]
+    },
+    {
+      "name": "web",
+      "role": "web",
+      "port": 3004,
+      "cmd": "rm -rf apps/web/.next && API_URL=http://127.0.0.1:4000 NEXT_PUBLIC_API_URL=http://127.0.0.1:4000 NEXT_TELEMETRY_DISABLED=1 pnpm --filter @aerodb/web exec next dev -H 127.0.0.1 -p {port}",
+      "health_url": "http://127.0.0.1:{port}/health",
+      "env": [
+        "CI=true"
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "docker",
+      "name": "database",
+      "container": "aerodb-pg",
+      "ports": [
+        {
+          "host": "127.0.0.1",
+          "port": 5544
+        }
+      ]
+    },
+    {
+      "type": "docker",
+      "name": "openfoam-api",
+      "container": "xfoilfoam-api-1",
+      "ports": [
+        {
+          "host": "127.0.0.1",
+          "port": 8000
+        }
+      ]
+    },
+    {
+      "type": "docker",
+      "name": "openfoam-worker",
+      "container": "xfoilfoam-worker-1"
+    },
+    {
+      "type": "docker",
+      "name": "openfoam-redis",
+      "container": "xfoilfoam-redis-1"
+    }
+  ],
+  "health_checks": [
+    {
+      "name": "api-ready",
+      "url": "http://127.0.0.1:4000/health",
+      "expect_status": 200
+    },
+    {
+      "name": "web-ready",
+      "url": "http://127.0.0.1:3004/health",
+      "expect_status": 200
+    },
+    {
+      "name": "web-detail-ready",
+      "url": "http://127.0.0.1:3004/airfoils/ag24",
+      "expect_status": 200
+    },
+    {
+      "name": "openfoam-ready",
+      "url": "http://127.0.0.1:8000/health",
+      "expect_status": 200,
+      "expect_text": "ok"
+    }
+  ]
+}

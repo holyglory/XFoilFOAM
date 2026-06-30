@@ -152,7 +152,7 @@ class CaseBuilder:
                 "writePrecision": 8,
                 "writeCompression": "off",
                 "timeFormat": "general",
-                "runTimeModifiable": "false",
+                "runTimeModifiable": "true",
                 "functions": {"forceCoeffs1": force_coeffs},
             },
         )
@@ -235,16 +235,25 @@ class CaseBuilder:
         )
 
     # -- transient (URANS) overrides --------------------------------------- #
-    def write_transient(self, case_dir: Path, start_time: float, end_time: float, delta_t: float) -> None:
+    def write_transient(
+        self,
+        case_dir: Path,
+        start_time: float,
+        end_time: float,
+        delta_t: float,
+        write_interval: float | None = None,
+        max_delta_t: float | None = None,
+    ) -> None:
         """Rewrite system/ for a transient pimpleFoam run that continues from the
         latest (steady) field. Keeps 0/ and constant/ untouched."""
         self._case_dir = case_dir
         turb = self._turbulence()
-        self._write_transient_control_dict(start_time, end_time, delta_t)
+        self._write_transient_control_dict(start_time, end_time, delta_t, write_interval, max_delta_t)
         self._write_transient_schemes(turb)
         self._write_transient_solution(turb)
 
-    def _write_transient_control_dict(self, start_time, end_time, delta_t) -> None:
+    def _write_transient_control_dict(self, start_time, end_time, delta_t, write_interval=None, max_delta_t=None) -> None:
+        run_time = end_time - start_time
         write_foam_dict(
             self._p("system", "controlDict"),
             "dictionary",
@@ -257,16 +266,19 @@ class CaseBuilder:
                 "endTime": end_time,
                 "deltaT": delta_t,
                 "writeControl": "adjustableRunTime",
-                "writeInterval": (end_time - start_time) / 5.0,
-                "purgeWrite": 2,
+                # ~48 field snapshots, all retained (purgeWrite 0), so the URANS
+                # animation has frames; the time-averaged forces use coefficient.dat
+                # (accumulated separately, unaffected by these field writes).
+                "writeInterval": write_interval if write_interval is not None else run_time / 48.0,
+                "purgeWrite": 0,
                 "writeFormat": "ascii",
                 "writePrecision": 8,
                 "writeCompression": "off",
                 "timeFormat": "general",
-                "runTimeModifiable": "false",
+                "runTimeModifiable": "true",
                 "adjustTimeStep": "yes",
                 "maxCo": self.solver.transient_max_courant,
-                "maxDeltaT": (end_time - start_time) / 50.0,
+                "maxDeltaT": max_delta_t if max_delta_t is not None else run_time / 50.0,
                 "functions": {"forceCoeffs1": self._force_coeffs_dict()},
             },
         )

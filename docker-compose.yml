@@ -1,4 +1,5 @@
 services:
+  # ===================== CFD solver service (Python / OpenFOAM) =====================
   redis:
     image: redis:7-alpine
     healthcheck:
@@ -11,9 +12,12 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.api
+      args:
+        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
     environment:
       AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
     ports:
       - "8000:8000"
     volumes:
@@ -26,11 +30,18 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
+      args:
+        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
     environment:
       AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
       AIRFOILFOAM_OPENFOAM_RUNNER: local
-      AIRFOILFOAM_CASE_CONCURRENCY: "4"
+      AIRFOILFOAM_WORKER_CPU_BUDGET: "18"
+      AIRFOILFOAM_CASE_CONCURRENCY: "18"
+      AIRFOILFOAM_CELERY_CONCURRENCY: "18"
+      AIRFOILFOAM_RANS_SOLVER_TIMEOUT: "1200"
+      AIRFOILFOAM_RANS_MAX_ITERATIONS: "600"
     volumes:
       - results:/data/airfoilfoam
     depends_on:
@@ -40,7 +51,89 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "8"
+          cpus: "18"
+
+  # ===================== Airfoils.Pro control-plane (Node) + database =====================
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aerodb
+      POSTGRES_PASSWORD: aerodb
+      POSTGRES_DB: aerodb
+    ports:
+      - "5544:5432" # host:container — 5544 avoids clashing with a local Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aerodb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  node-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    # migrate + seed (idempotent) then serve the control-plane API
+    command: sh -c "pnpm --filter @aerodb/db migrate && pnpm --filter @aerodb/db seed && pnpm --filter @aerodb/api start"
+    environment:
+      DATABASE_URL: postgres://aerodb:aerodb@postgres:5432/aerodb
+      ENGINE_URL: http://api:8000
+      ENGINE_EXPECTED_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
+      MEDIA_DIR: /data/airfoilfoam
+      API_PORT: "4000"
+      API_HOST: 0.0.0.0
+    ports:
+      - "4000:4000"
+    volumes:
+      - results:/data/airfoilfoam:ro # serve CFD images/videos the Python engine writes
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    command: sh -c "pnpm --filter @aerodb/web exec next dev -H 0.0.0.0 -p 3100"
+    environment:
+      API_URL: http://node-api:4000 # server-side fetches (SSR)
+      NEXT_PUBLIC_API_URL: http://localhost:4000 # browser fetches (sim modal, media)
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "3100:3100"
+    depends_on:
+      - node-api
+
+  # Continuous CFD sweeper — gated by the sweeper_state row (DISABLED by default).
+  # It idles (reconcile-only) until enabled via PATCH /api/sweeper; once on it
+  # enqueues PolarRequests to the Python `api` and ingests solved results +
+  # media into Postgres. Enabling it requires the CFD engine (api + worker) up.
+  sweeper:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    command: sh -c "pnpm --filter @aerodb/sweeper start"
+    environment:
+      DATABASE_URL: postgres://aerodb:aerodb@postgres:5432/aerodb
+      ENGINE_URL: http://api:8000
+    volumes:
+      - results:/data/airfoilfoam # ingest reads engine artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-api:
+        condition: service_healthy
 
 volumes:
   results:
+  pgdata:

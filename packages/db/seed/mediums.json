@@ -1,0 +1,4177 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "library": "CoolProp",
+    "libraryVersion": "8.0.0",
+    "coolPropVersion": "8.0.0",
+    "referenceTemperatureK": 288.15,
+    "referencePressurePa": 101325.0,
+    "propertyCall": "CoolProp.CoolProp.PropsSI(output, 'T', T, 'P', P, fluid)",
+    "phaseCall": "CoolProp.CoolProp.PhaseSI('T', T, 'P', P, fluid)",
+    "urls": [
+      "https://coolprop.org/coolprop/HighLevelAPI.html",
+      "https://coolprop.org/fluid_properties/PurePseudoPure.html"
+    ],
+    "validation": "Rows are included only when density, dynamic viscosity, and speed of sound are finite positive values at the reference state. Viscosity table points keep the same gas/liquid phase class as the reference state."
+  },
+  "mediums": [
+    {
+      "slug": "air",
+      "name": "Air",
+      "phase": "gas",
+      "density": 1.225539021373505,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.7961537371721837e-05,
+      "kinematicViscosity": 1.4656030577950679e-05,
+      "speedOfSound": 340.40998328942305,
+      "coolPropFluid": "Air",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "AIR.PPF",
+      "formula": null,
+      "aliases": [
+        "air",
+        "AIR",
+        "R729"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Air; reference phase=supercritical_gas. CAS=AIR.PPF.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.4442760935424875e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.551498745771976e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.655312898077678e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.7218405867226838e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.7961537371721837e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.8537340509026122e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.972151391935931e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 2.086714953999417e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 2.1977494313364075e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 2.305542271163637e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "ammonia",
+      "name": "Ammonia",
+      "phase": "gas",
+      "density": 0.7290961874580126,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 9.728910183655247e-06,
+      "kinematicViscosity": 1.3343795168611436e-05,
+      "speedOfSound": 425.8451317386073,
+      "coolPropFluid": "Ammonia",
+      "coolPropPhase": "gas",
+      "cas": "7664-41-7",
+      "formula": "H_{3}N_{1}",
+      "aliases": [
+        "NH3",
+        "ammonia",
+        "R717",
+        "AMMONIA"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Ammonia; reference phase=gas. CAS=7664-41-7. Formula=H_{3}N_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 8.059345217270289e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 8.73421178225839e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 9.193040946596457e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 9.728910183655247e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.0160366730597508e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.1089697395618976e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.2038668138011745e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.3000889667318912e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.3971198198765989e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "argon",
+      "name": "Argon",
+      "phase": "gas",
+      "density": 1.6907542964798599,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 2.1987101055588978e-05,
+      "kinematicViscosity": 1.3004314761385489e-05,
+      "speedOfSound": 316.2206701052405,
+      "coolPropFluid": "Argon",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "7440-37-1",
+      "formula": "Ar_{1}",
+      "aliases": [
+        "argon",
+        "ARGON",
+        "R740",
+        "Ar"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Argon; reference phase=supercritical_gas. CAS=7440-37-1. Formula=Ar_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.7420552742512245e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.8803939018016162e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 2.0150434605559462e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 2.10166598218473e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 2.1987101055588978e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 2.2740960263116123e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 2.4296164797116026e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 2.5806341014020773e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 2.7274583592697544e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 2.8703720050672593e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "carbon-dioxide",
+      "name": "Carbon dioxide",
+      "phase": "gas",
+      "density": 1.8718497603166653,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.4434308883347894e-05,
+      "kinematicViscosity": 7.711253963515751e-06,
+      "speedOfSound": 264.46805324030083,
+      "coolPropFluid": "CarbonDioxide",
+      "coolPropPhase": "gas",
+      "cas": "124-38-9",
+      "formula": "C_{1}O_{2}",
+      "aliases": [
+        "R744",
+        "co2",
+        "CO2",
+        "carbondioxide",
+        "CARBONDIOXIDE"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=CarbonDioxide; reference phase=gas. CAS=124-38-9. Formula=C_{1}O_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.110645976452782e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.2090913818214034e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.3069707484747547e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.3709304673683335e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.4434308883347894e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.5003195772361618e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.6190827259493183e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.735966345261932e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.850812232238857e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.963518663482666e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "dimethyl-ether",
+      "name": "Dimethyl ether",
+      "phase": "gas",
+      "density": 1.9897402100191424,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 8.944912237776239e-06,
+      "kinematicViscosity": 4.495517652372409e-06,
+      "speedOfSound": 240.6422776322223,
+      "coolPropFluid": "DimethylEther",
+      "coolPropPhase": "gas",
+      "cas": "115-10-6",
+      "formula": "C_{2}H_{6}O_{1}",
+      "aliases": [
+        "DIMETHYLETHER",
+        "DME",
+        "RE170"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=DimethylEther; reference phase=gas. CAS=115-10-6. Formula=C_{2}H_{6}O_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 8.304559873370367e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 8.595147464242968e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 8.944912237776239e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 9.234864895897548e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 9.885534360382444e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.0588437159628402e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.1343214831636841e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.2149930281828967e-05,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "ethane",
+      "name": "Ethane",
+      "phase": "gas",
+      "density": 1.2825255804100084,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 9.059435275303615e-06,
+      "kinematicViscosity": 7.063746262594949e-06,
+      "speedOfSound": 306.5729345885169,
+      "coolPropFluid": "Ethane",
+      "coolPropPhase": "gas",
+      "cas": "74-84-0",
+      "formula": "C_{2}H_{6}",
+      "aliases": [
+        "ethane",
+        "ETHANE",
+        "R170",
+        "n-C2H6"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Ethane; reference phase=gas. CAS=74-84-0. Formula=C_{2}H_{6}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 6.9913222170609795e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 7.608060091500213e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 8.21713994826672e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 8.61289654168134e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 9.059435275303615e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 9.408370570946364e-06,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.0133099201155256e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.0842087983445252e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.1535336135381633e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.2213076907136953e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "helium",
+      "name": "Helium",
+      "phase": "gas",
+      "density": 0.16919523568794606,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.9388480426758158e-05,
+      "kinematicViscosity": 0.00011459235449464519,
+      "speedOfSound": 999.2676929129183,
+      "coolPropFluid": "Helium",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "7440-59-7",
+      "formula": "He_{1}",
+      "aliases": [
+        "helium",
+        "HELIUM",
+        "He",
+        "R704"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Helium; reference phase=supercritical_gas. CAS=7440-59-7. Formula=He_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.614481602923473e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.7122278659722053e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.8077493951195257e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.8694518761805835e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.9388480426758158e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.9929719619187127e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 2.1053445543639675e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 2.2153753439673274e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 2.323276248848899e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 2.429226620077048e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "hydrogen",
+      "name": "Hydrogen",
+      "phase": "gas",
+      "density": 0.08520493577522305,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 8.692689402602014e-06,
+      "kinematicViscosity": 0.00010202096068159684,
+      "speedOfSound": 1293.8785922632198,
+      "coolPropFluid": "Hydrogen",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "1333-74-0",
+      "formula": "H_{2}",
+      "aliases": [
+        "hydrogen",
+        "HYDROGEN",
+        "H2",
+        "R702"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Hydrogen; reference phase=supercritical_gas. CAS=1333-74-0. Formula=H_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 7.210397277970284e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 7.65906907895607e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 8.095742451887352e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 8.377008463658217e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 8.692689402602014e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 8.938468144405006e-06,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 9.447429302817726e-06,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 9.944643480427444e-06,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.0431357142228511e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.0908601461001895e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "hydrogen-sulfide",
+      "name": "Hydrogen sulfide",
+      "phase": "gas",
+      "density": 1.4537545165052321,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.1649479048041473e-05,
+      "kinematicViscosity": 8.01337427727919e-06,
+      "speedOfSound": 303.5345029696855,
+      "coolPropFluid": "HydrogenSulfide",
+      "coolPropPhase": "gas",
+      "cas": "7783-06-4",
+      "formula": "H_{2}S_{1}",
+      "aliases": [
+        "H2S",
+        "HYDROGENSULFIDE"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=HydrogenSulfide; reference phase=gas. CAS=7783-06-4. Formula=H_{2}S_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 8.711971170825911e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 9.582134273953732e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.0441716010583e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1006095885258186e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.1649479048041473e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2157020658925116e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.3223402433757815e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.4280337104448748e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.5324443206119772e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.6353416302398127e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "isobutane",
+      "name": "Isobutane",
+      "phase": "gas",
+      "density": 2.533274612007598,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 7.250499528471407e-06,
+      "kinematicViscosity": 2.8621056296480425e-06,
+      "speedOfSound": 207.4598233185795,
+      "coolPropFluid": "IsoButane",
+      "coolPropPhase": "gas",
+      "cas": "75-28-5",
+      "formula": "C_{4}H_{10}",
+      "aliases": [
+        "isobutane",
+        "Isobutane",
+        "ISOBUTANE",
+        "R600A",
+        "R600a",
+        "ISOBUTAN"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=IsoButane; reference phase=gas. CAS=75-28-5. Formula=C_{4}H_{10}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 6.875864766270433e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 7.250499528471407e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 7.543407471193008e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 8.153443349267874e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 8.753843566790335e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 9.345596669097329e-06,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 9.929435157572862e-06,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "methane",
+      "name": "Methane",
+      "phase": "gas",
+      "density": 0.6798343282369096,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.0876766177969868e-05,
+      "kinematicViscosity": 1.5999142329540498e-05,
+      "speedOfSound": 441.50230350121484,
+      "coolPropFluid": "Methane",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "74-82-8",
+      "formula": "C_{1}H_{4}",
+      "aliases": [
+        "CH4",
+        "methane",
+        "METHANE",
+        "R50",
+        "n-C1H4"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Methane; reference phase=supercritical_gas. CAS=74-82-8. Formula=C_{1}H_{4}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 8.579011995160887e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 9.277175222162452e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 9.954574482211063e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.0389672001976599e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.0876766177969868e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.1255039218871348e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.2035525581076825e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.2794081714744093e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.3532680012539273e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.4252996428477953e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "n-butane",
+      "name": "n-Butane",
+      "phase": "gas",
+      "density": 2.544249688789635,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 7.1524138896798526e-06,
+      "kinematicViscosity": 2.8112075324975045e-06,
+      "speedOfSound": 206.5438660448988,
+      "coolPropFluid": "n-Butane",
+      "coolPropPhase": "gas",
+      "cas": "106-97-8",
+      "formula": "C_{4}H_{10}",
+      "aliases": [
+        "nButane",
+        "butane",
+        "Butane",
+        "BUTANE",
+        "N-BUTANE",
+        "R600",
+        "NC4H10",
+        "n-C4H10"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Butane; reference phase=gas. CAS=106-97-8. Formula=C_{4}H_{10}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 6.769005874047592e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 7.1524138896798526e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 7.451945307105121e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 8.075856557190432e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 8.690748572409978e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 9.298116115049465e-06,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 9.898943567557827e-06,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "n-propane",
+      "name": "n-Propane",
+      "phase": "gas",
+      "density": 1.8992307819225982,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 7.876219166267974e-06,
+      "kinematicViscosity": 4.147057451488254e-06,
+      "speedOfSound": 244.51596481169298,
+      "coolPropFluid": "n-Propane",
+      "coolPropPhase": "gas",
+      "cas": "74-98-6",
+      "formula": "C_{3}H_{8}",
+      "aliases": [
+        "Propane",
+        "propane",
+        "R290",
+        "C3H8",
+        "PROPANE",
+        "N-PROPANE",
+        "NC3H8",
+        "n-C3H8"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Propane; reference phase=gas. CAS=74-98-6. Formula=C_{3}H_{8}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 6.557975725387338e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 7.109564661177852e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 7.469012493304036e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 7.876219166267974e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 8.195872564438366e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 8.864372468139554e-06,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 9.524690172134159e-06,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.0176401748719711e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.0819018266444498e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "nitrogen",
+      "name": "Nitrogen",
+      "phase": "gas",
+      "density": 1.185099038334946,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.7339457045726296e-05,
+      "kinematicViscosity": 1.4631230373866545e-05,
+      "speedOfSound": 346.1119795421818,
+      "coolPropFluid": "Nitrogen",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "7727-37-9",
+      "formula": "N_{2}",
+      "aliases": [
+        "nitrogen",
+        "NITROGEN",
+        "N2",
+        "R728"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Nitrogen; reference phase=supercritical_gas. CAS=7727-37-9. Formula=N_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.397280576092215e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.4998980389222244e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.5992284997219098e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.6628694428711407e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.7339457045726296e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.789009282215899e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.9022283424482873e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 2.0117366646758494e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 2.11785050445621e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 2.2208498698581106e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "oxygen",
+      "name": "Oxygen",
+      "phase": "gas",
+      "density": 1.3543636899148912,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.999324287331322e-05,
+      "kinematicViscosity": 1.476209309374619e-05,
+      "speedOfSound": 323.243206617029,
+      "coolPropFluid": "Oxygen",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "7782-44-7",
+      "formula": "O_{2}",
+      "aliases": [
+        "oxygen",
+        "OXYGEN",
+        "O2",
+        "R732"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Oxygen; reference phase=supercritical_gas. CAS=7782-44-7. Formula=O_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.597793807779454e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.7198836159266125e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.8383222695419363e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.9143300420473667e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.999324287331322e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 2.0652424277518874e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 2.20096087256958e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 2.332437431963804e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 2.460004764717739e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 2.583960338934907e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "para-hydrogen",
+      "name": "Para hydrogen",
+      "phase": "gas",
+      "density": 0.08520498245155393,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 8.692689402944522e-06,
+      "kinematicViscosity": 0.00010202090479728735,
+      "speedOfSound": 1282.362393877357,
+      "coolPropFluid": "ParaHydrogen",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "1333-74-0p",
+      "formula": null,
+      "aliases": [
+        "Parahydrogen",
+        "parahydrogen",
+        "PARAHYDROGEN",
+        "PARAHYD"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=ParaHydrogen; reference phase=supercritical_gas. CAS=1333-74-0p.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 7.210397282646418e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 7.659069081439082e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 8.095742453123239e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 8.377008464385778e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 8.692689402944522e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 8.938468144546537e-06,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 9.447429302727939e-06,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 9.944643480262362e-06,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.043135714206924e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.0908601460888972e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "propylene",
+      "name": "Propylene",
+      "phase": "gas",
+      "density": 1.8086810785116223,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 8.260634228214992e-06,
+      "kinematicViscosity": 4.5672143786746155e-06,
+      "speedOfSound": 253.07413651123366,
+      "coolPropFluid": "Propylene",
+      "coolPropPhase": "gas",
+      "cas": "115-07-1",
+      "formula": "C_{3}H_{6}",
+      "aliases": [
+        "propylene",
+        "PROPYLENE",
+        "PROPYLEN",
+        "R1270"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Propylene; reference phase=gas. CAS=115-07-1. Formula=C_{3}H_{6}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 6.798219986228767e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 7.409976003094453e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 7.809191838055914e-06,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 8.260634228214992e-06,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 8.613996921261431e-06,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 9.349630166824513e-06,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.0071604615810935e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.0779549467608142e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.1473138197155471e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r116",
+      "name": "R116",
+      "phase": "gas",
+      "density": 5.906568049117117,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.3648488748312186e-05,
+      "kinematicViscosity": 2.3107308059122913e-06,
+      "speedOfSound": 136.0175617226663,
+      "coolPropFluid": "R116",
+      "coolPropPhase": "gas",
+      "cas": "76-16-4",
+      "formula": "C_{2}F_{6}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R116; reference phase=gas. CAS=76-16-4. Formula=C_{2}F_{6}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.035708140814713e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.1335213913931608e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.2303795058213691e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.29352757630226e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.3648488748312186e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.4204347559330833e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.535022173843166e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.6458869967194238e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.7532582402430764e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.8574310916968057e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "r12",
+      "name": "R12",
+      "phase": "gas",
+      "density": 5.225215377841839,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.1392573816014937e-05,
+      "kinematicViscosity": 2.1803070289363634e-06,
+      "speedOfSound": 147.24585040411685,
+      "coolPropFluid": "R12",
+      "coolPropPhase": "gas",
+      "cas": "75-71-8",
+      "formula": "C_{1}Cl_{2}F_{2}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R12; reference phase=gas. CAS=75-71-8. Formula=C_{1}Cl_{2}F_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.0223585778349958e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.1392573816014937e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.188021933198451e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.2899273087685716e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.3902301685911965e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.4886453882684908e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.5850294027754735e-05,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "r1234yf",
+      "name": "R1234yf",
+      "phase": "gas",
+      "density": 4.946086486102653,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.1964907618252664e-05,
+      "kinematicViscosity": 2.4190655888996802e-06,
+      "speedOfSound": 148.3447266461873,
+      "coolPropFluid": "R1234yf",
+      "coolPropPhase": "gas",
+      "cas": "754-12-1",
+      "formula": "C_{3}F_{4}H_{2}",
+      "aliases": [
+        "R1234YF"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R1234yf; reference phase=gas. CAS=754-12-1. Formula=C_{3}F_{4}H_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.07725849316627e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1330644706711199e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.1964907618252664e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2463528607237261e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.350618767589491e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.4533482785988872e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.554300965831618e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.65332852171483e-05,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "r1234ze-e",
+      "name": "R1234ze(E)",
+      "phase": "gas",
+      "density": 4.955396949176565,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.192936784428398e-05,
+      "kinematicViscosity": 2.4073485871331205e-06,
+      "speedOfSound": 148.2358893590437,
+      "coolPropFluid": "R1234ze(E)",
+      "coolPropPhase": "gas",
+      "cas": "29118-24-9",
+      "formula": "C_{3}F_{4}H_{2}",
+      "aliases": [
+        "R1234ZE",
+        "R1234ZEE",
+        "R1234zeE",
+        "R1234ZE(E)"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R1234ze(E); reference phase=gas. CAS=29118-24-9. Formula=C_{3}F_{4}H_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.073649126552487e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1294449426220935e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.192936784428398e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2429096564956761e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.3475753858606005e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.4509129316101831e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.552653685801947e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.652617679405575e-05,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "r124",
+      "name": "R124",
+      "phase": "gas",
+      "density": 5.948183621432682,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.2451709076446124e-05,
+      "kinematicViscosity": 2.0933632632959973e-06,
+      "speedOfSound": 135.237381569513,
+      "coolPropFluid": "R124",
+      "coolPropPhase": "gas",
+      "cas": "2837-89-0",
+      "formula": "C_{2}Cl_{1}F_{4}H_{1}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R124; reference phase=gas. CAS=2837-89-0. Formula=C_{2}Cl_{1}F_{4}H_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1787855443303707e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.2451709076446124e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2974933074317975e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.4072553904894376e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.5158326930332073e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.6229125877044546e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.7282774356092873e-05,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "r125",
+      "name": "R125",
+      "phase": "gas",
+      "density": 5.164908769902439,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.253244300888277e-05,
+      "kinematicViscosity": 2.426459704750893e-06,
+      "speedOfSound": 146.06913140468637,
+      "coolPropFluid": "R125",
+      "coolPropPhase": "gas",
+      "cas": "354-33-6",
+      "formula": "C_{2}F_{5}H_{1}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R125; reference phase=gas. CAS=354-33-6. Formula=C_{2}F_{5}H_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.0397123558304647e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.1297859708739694e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.187935726131313e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.253244300888277e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.3040727872745785e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.4091078602054554e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.511209429805153e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.610471196235871e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.707020901990216e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r13",
+      "name": "R13",
+      "phase": "gas",
+      "density": 4.4637596398892425,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.3899544335670466e-05,
+      "kinematicViscosity": 3.113864871096722e-06,
+      "speedOfSound": 160.8441712540901,
+      "coolPropFluid": "R13",
+      "coolPropPhase": "gas",
+      "cas": "75-72-9",
+      "formula": "C_{1}Cl_{1}F_{3}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R13; reference phase=gas. CAS=75-72-9. Formula=C_{1}Cl_{1}F_{3}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.0650455614425322e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.1633415799205168e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.2591567493958284e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.3208411329168717e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.3899544335670466e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.4436289873391013e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.5542633504931684e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.6615120547254012e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.7655727834631106e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.866648464320456e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "r134a",
+      "name": "R134a",
+      "phase": "gas",
+      "density": 4.418259993372001,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.1425688354590093e-05,
+      "kinematicViscosity": 2.5860153933290936e-06,
+      "speedOfSound": 158.63803424371793,
+      "coolPropFluid": "R134a",
+      "coolPropPhase": "gas",
+      "cas": "811-97-2",
+      "formula": "C_{2}F_{4}H_{2}",
+      "aliases": [
+        "R134A"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R134a; reference phase=gas. CAS=811-97-2. Formula=C_{2}F_{4}H_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.0303843465730275e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.0831043206422157e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.1425688354590093e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.1891208389302142e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.2863096313574382e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.3823378233177539e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.4773904153899673e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.5715911698974932e-05,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "r14",
+      "name": "R14",
+      "phase": "gas",
+      "density": 3.737752829598423,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.6739685380135092e-05,
+      "kinematicViscosity": 4.47854262796012e-06,
+      "speedOfSound": 177.33400262194834,
+      "coolPropFluid": "R14",
+      "coolPropPhase": "supercritical_gas",
+      "cas": "75-73-0",
+      "formula": "C_{1}F_{4}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R14; reference phase=supercritical_gas. CAS=75-73-0. Formula=C_{1}F_{4}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.3097460648001994e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.4203861528557895e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.527893892587783e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.596879716351689e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.6739685380135092e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.7337023307966092e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.856525513376669e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.975316960771236e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 2.0904383989744812e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 2.20221822799672e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "r143a",
+      "name": "R143a",
+      "phase": "gas",
+      "density": 3.6240066111295786,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.0748566574663834e-05,
+      "kinematicViscosity": 2.9659345934011907e-06,
+      "speedOfSound": 176.26019673114516,
+      "coolPropFluid": "R143a",
+      "coolPropPhase": "gas",
+      "cas": "420-46-2",
+      "formula": "C_{2}F_{3}H_{3}",
+      "aliases": [
+        "R143A"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R143a; reference phase=gas. CAS=420-46-2. Formula=C_{2}F_{3}H_{3}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 8.97530662968408e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 9.70139124547867e-06,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.0188509007811321e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.0748566574663834e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.11907706804436e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.211463983500012e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.3020404435644263e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.3905821852282728e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.4770604757445984e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r152a",
+      "name": "R152A",
+      "phase": "gas",
+      "density": 2.8633227550734675,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.0749247873642994e-05,
+      "kinematicViscosity": 3.754116735389542e-06,
+      "speedOfSound": 200.17497384492896,
+      "coolPropFluid": "R152A",
+      "coolPropPhase": "gas",
+      "cas": "75-37-6",
+      "formula": "C_{2}F_{2}H_{4}",
+      "aliases": [
+        "R152a"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R152A; reference phase=gas. CAS=75-37-6. Formula=C_{2}F_{2}H_{4}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 9.673623002268628e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.0176612379053278e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.0749247873642994e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.1200126724141126e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.2144899131321335e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.307819299542201e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.3997508150123552e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.4901149430806726e-05,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "r218",
+      "name": "R218",
+      "phase": "gas",
+      "density": 8.148834310290502,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.190368761149607e-05,
+      "kinematicViscosity": 1.4607841021462258e-06,
+      "speedOfSound": 113.82229838154288,
+      "coolPropFluid": "R218",
+      "coolPropPhase": "gas",
+      "cas": "76-19-7",
+      "formula": "C_{3}F_{8}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R218; reference phase=gas. CAS=76-19-7. Formula=C_{3}F_{8}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.190368761149607e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2455713147136749e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.3546874949262812e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.4592025137673483e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.5604681098302156e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.6588825982057708e-05,
+          "sortOrder": 5
+        }
+      ]
+    },
+    {
+      "slug": "r22",
+      "name": "R22",
+      "phase": "gas",
+      "density": 3.7182107332158436,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.3313814156690417e-05,
+      "kinematicViscosity": 3.5807045678595606e-06,
+      "speedOfSound": 178.58035475820594,
+      "coolPropFluid": "R22",
+      "coolPropPhase": "gas",
+      "cas": "75-45-6",
+      "formula": "C_{1}Cl_{1}F_{2}H_{1}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R22; reference phase=gas. CAS=75-45-6. Formula=C_{1}Cl_{1}F_{2}H_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.1037541791385501e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.1985270546702262e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.2607121848226358e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.3313814156690417e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.3869351927408328e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.503103844758419e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.6175687989188443e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.7300655746001912e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.8404291513198182e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r227ea",
+      "name": "R227EA",
+      "phase": "gas",
+      "density": 7.422902001193815,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.1160643618537259e-05,
+      "kinematicViscosity": 1.5035418245778143e-06,
+      "speedOfSound": 119.3295735738316,
+      "coolPropFluid": "R227EA",
+      "coolPropPhase": "gas",
+      "cas": "431-89-0",
+      "formula": "C_{3}F_{7}H_{1}",
+      "aliases": [
+        "R227ea"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R227EA; reference phase=gas. CAS=431-89-0. Formula=C_{3}F_{7}H_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 9.941650576259289e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.0524895489640717e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.1160643618537259e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.1649793755451229e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.2654367125455e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.3630419906927685e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.4582688033783647e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.5512965803178544e-05,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "r23",
+      "name": "R23",
+      "phase": "gas",
+      "density": 2.987044177857422,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.443053908190833e-05,
+      "kinematicViscosity": 4.831043072238461e-06,
+      "speedOfSound": 201.4349451640735,
+      "coolPropFluid": "R23",
+      "coolPropPhase": "gas",
+      "cas": "75-46-7",
+      "formula": "C_{1}F_{3}H_{1}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R23; reference phase=gas. CAS=75-46-7. Formula=C_{1}F_{3}H_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 1.1005901884705461e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.2039555053290762e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.3048989900599141e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.3699937607162351e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.443053908190833e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.5002564923533544e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.6174171336833743e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.7318264763070195e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.8433258488998968e-05,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.9521003641201457e-05,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "r236ea",
+      "name": "R236EA",
+      "phase": "gas",
+      "density": 6.691325663355048,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.0509442348520591e-05,
+      "kinematicViscosity": 1.5706069136756272e-06,
+      "speedOfSound": 125.58892926664512,
+      "coolPropFluid": "R236EA",
+      "coolPropPhase": "gas",
+      "cas": "431-63-0",
+      "formula": "C_{3}F_{6}H_{2}",
+      "aliases": [
+        "R236ea"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R236EA; reference phase=gas. CAS=431-63-0. Formula=C_{3}F_{6}H_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.0509442348520591e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.0963160748330767e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.1919293708352754e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.28743795033151e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.4747000687512523e-05,
+          "sortOrder": 4
+        }
+      ]
+    },
+    {
+      "slug": "r236fa",
+      "name": "R236FA",
+      "phase": "gas",
+      "density": 6.677609225387069,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.0561441714589074e-05,
+      "kinematicViscosity": 1.5816202113828961e-06,
+      "speedOfSound": 125.98705751854054,
+      "coolPropFluid": "R236FA",
+      "coolPropPhase": "gas",
+      "cas": "690-39-1",
+      "formula": "C_{3}F_{6}H_{2}",
+      "aliases": [
+        "R236fa"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R236FA; reference phase=gas. CAS=690-39-1. Formula=C_{3}F_{6}H_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 9.985346470794326e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.0561441714589074e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.1016137628277565e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.1974102979391657e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.292986608291637e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.3872369559063463e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.4791258819284565e-05,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "r32",
+      "name": "R32",
+      "phase": "gas",
+      "density": 2.2316743613914776,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.2913033426902896e-05,
+      "kinematicViscosity": 5.786253429398837e-06,
+      "speedOfSound": 237.42125522080144,
+      "coolPropFluid": "R32",
+      "coolPropPhase": "gas",
+      "cas": "75-10-5",
+      "formula": "C_{1}F_{2}H_{2}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R32; reference phase=gas. CAS=75-10-5. Formula=C_{1}F_{2}H_{2}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.0714537763933818e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.1631406148150128e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.2231838694591538e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.2913033426902896e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.3447672031294686e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.4563314404179047e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.5659708947079123e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.6734765035350224e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.7787364975172607e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r404a",
+      "name": "R404A",
+      "phase": "gas",
+      "density": 4.207848639690377,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.1825578367432029e-05,
+      "kinematicViscosity": 2.8103621066327567e-06,
+      "speedOfSound": 162.81573517492646,
+      "coolPropFluid": "R404A",
+      "coolPropPhase": "gas",
+      "cas": "R404A.PPF",
+      "formula": null,
+      "aliases": [
+        "R404a"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R404A; reference phase=gas. CAS=R404A.PPF.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 9.98455994410506e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.0747357201217563e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1250387839848295e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.1825578367432029e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.228100478557257e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.3244731757764636e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.4212344350152556e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.518378828343255e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.6159026818180037e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r407c",
+      "name": "R407C",
+      "phase": "gas",
+      "density": 3.713704468390638,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.1815168856566199e-05,
+      "kinematicViscosity": 3.181504871249594e-06,
+      "speedOfSound": 175.3743535814201,
+      "coolPropFluid": "R407C",
+      "coolPropPhase": "gas",
+      "cas": "R407C.PPF",
+      "formula": null,
+      "aliases": [
+        "R407c"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R407C; reference phase=gas. CAS=R407C.PPF.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 9.694778652312716e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.0580744772377861e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1159226668551365e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.1815168856566199e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2330403767158848e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.3408821047500808e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.4475595155733703e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.553072226286503e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.6574201088994144e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r410a",
+      "name": "R410A",
+      "phase": "gas",
+      "density": 3.1163133626968387,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.2422816238578476e-05,
+      "kinematicViscosity": 3.986382238475481e-06,
+      "speedOfSound": 194.47357081317543,
+      "coolPropFluid": "R410A",
+      "coolPropPhase": "gas",
+      "cas": "R410A.PPF",
+      "formula": null,
+      "aliases": [
+        "R410a"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R410A; reference phase=gas. CAS=R410A.PPF.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.0153951816239065e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.1107981517288155e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1726286788816966e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.2422816238578476e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2966441676999884e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.4094044285200687e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.519538486036343e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.6270383357063035e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.731898363948748e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "r507a",
+      "name": "R507A",
+      "phase": "gas",
+      "density": 4.260972821515935,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.175878834126521e-05,
+      "kinematicViscosity": 2.759648754831006e-06,
+      "speedOfSound": 161.73297751174292,
+      "coolPropFluid": "R507A",
+      "coolPropPhase": "gas",
+      "cas": "R507A.PPF",
+      "formula": null,
+      "aliases": [
+        "R507a"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R507A; reference phase=gas. CAS=R507A.PPF.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 9.643104219357817e-06,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.0534781085666802e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.1111093361445413e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.175878834126521e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.2263143828906363e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.3305933842258908e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.4319838565884393e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.5304816411570527e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.626083975045985e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "sulfur-hexafluoride",
+      "name": "Sulfur hexafluoride",
+      "phase": "gas",
+      "density": 6.2563461004539915,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 1.476245206245043e-05,
+      "kinematicViscosity": 2.3595964522134083e-06,
+      "speedOfSound": 132.71558597802263,
+      "coolPropFluid": "SulfurHexafluoride",
+      "coolPropPhase": "gas",
+      "cas": "2551-62-4",
+      "formula": "F_{6}S_{1}",
+      "aliases": [
+        "SULFURHEXAFLUORIDE",
+        "SF6"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=SulfurHexafluoride; reference phase=gas. CAS=2551-62-4. Formula=F_{6}S_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 1.2527200149335372e-05,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 1.3461315579105239e-05,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 1.4071621214303266e-05,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 1.476245206245043e-05,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 1.5303915126435912e-05,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 1.64333224778656e-05,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 1.754457079572945e-05,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 1.8636988874191753e-05,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 1.9710077503526013e-05,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "benzene",
+      "name": "Benzene",
+      "phase": "liquid",
+      "density": 884.1430943268176,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0006974450531108829,
+      "kinematicViscosity": 7.888373020002088e-07,
+      "speedOfSound": 1351.1330009419921,
+      "coolPropFluid": "Benzene",
+      "coolPropPhase": "liquid",
+      "cas": "71-43-2",
+      "formula": "C_{6}H_{6}",
+      "aliases": [
+        "benzene",
+        "BENZENE"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Benzene; reference phase=liquid. CAS=71-43-2. Formula=C_{6}H_{6}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0021207426206952856,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.00118124709123054,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.000899421663106355,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0006974450531108829,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0005868439885220578,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.00042989546311621857,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.0003298824184813523,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "cyclohexane",
+      "name": "Cyclohexane",
+      "phase": "liquid",
+      "density": 783.3660278305795,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.001065648376828546,
+      "kinematicViscosity": 1.3603454055567194e-06,
+      "speedOfSound": 1305.282810070716,
+      "coolPropFluid": "CycloHexane",
+      "coolPropPhase": "liquid",
+      "cas": "110-82-7",
+      "formula": "C_{6}H_{12}",
+      "aliases": [
+        "Cyclohexane",
+        "CYCLOHEXANE",
+        "CYCLOHEX"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=CycloHexane; reference phase=liquid. CAS=110-82-7. Formula=C_{6}H_{12}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.001065648376828546,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0008637088746416307,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0005915771565505618,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00043049528477670057,
+          "sortOrder": 3
+        }
+      ]
+    },
+    {
+      "slug": "cyclopentane",
+      "name": "Cyclopentane",
+      "phase": "liquid",
+      "density": 750.2764551460018,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.00033933556177510215,
+      "kinematicViscosity": 4.52280701930155e-07,
+      "speedOfSound": 1256.8290204107077,
+      "coolPropFluid": "Cyclopentane",
+      "coolPropPhase": "liquid",
+      "cas": "287-92-3",
+      "formula": "C_{5}H_{10}",
+      "aliases": [
+        "CycloPentane",
+        "cyclopentane",
+        "CYCLOPENTANE",
+        "CYCLOPEN"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Cyclopentane; reference phase=liquid. CAS=287-92-3. Formula=C_{5}H_{10}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0007008840502401104,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0005539934638426258,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.00044688944352109237,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0003915824202703554,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.00033933556177510215,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0003045279729503737,
+          "sortOrder": 5
+        }
+      ]
+    },
+    {
+      "slug": "ethanol",
+      "name": "Ethanol",
+      "phase": "liquid",
+      "density": 793.6890631092817,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.001320386069170918,
+      "kinematicViscosity": 1.6636062288653663e-06,
+      "speedOfSound": 1175.6255184138793,
+      "coolPropFluid": "Ethanol",
+      "coolPropPhase": "liquid",
+      "cas": "64-17-5",
+      "formula": "C_{2}H_{6}O_{1}",
+      "aliases": [
+        "C2H6O",
+        "ethanol",
+        "ETHANOL"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Ethanol; reference phase=liquid. CAS=64-17-5. Formula=C_{2}H_{6}O_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.007373622602714024,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0041146391896911775,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.002466067640741351,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0018186633924595465,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.001320386069170918,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0010445265384609092,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0006679223099070574,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00045053693497441725,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "ethylbenzene",
+      "name": "Ethylbenzene",
+      "phase": "liquid",
+      "density": 871.251945156842,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0006869000151099115,
+      "kinematicViscosity": 7.884057176896821e-07,
+      "speedOfSound": 1361.1369885835766,
+      "coolPropFluid": "EthylBenzene",
+      "coolPropPhase": "liquid",
+      "cas": "100-41-4",
+      "formula": "C_{8}H_{10}",
+      "aliases": [
+        "ethylbenzene",
+        "ETHYLBENZENE",
+        "EBENZENE"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=EthylBenzene; reference phase=liquid. CAS=100-41-4. Formula=C_{8}H_{10}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0021595000616962726,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0014085714595644713,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0010034835809019358,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0008310733217680203,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0006869000151099115,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0005994418177719503,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.00046360655212588807,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.0003691787417173131,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.00029993403270917057,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 0.00024722967604982703,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "heavy-water",
+      "name": "Heavy water",
+      "phase": "liquid",
+      "density": 1105.832073116098,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0014359368198888342,
+      "kinematicViscosity": 1.2985125452570226e-06,
+      "speedOfSound": 1366.9499496122453,
+      "coolPropFluid": "HeavyWater",
+      "coolPropPhase": "liquid",
+      "cas": "7789-20-0",
+      "formula": "D_{2}O_{1}",
+      "aliases": [
+        "D2O",
+        "HEAVYWATER"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=HeavyWater; reference phase=liquid. CAS=7789-20-0. Formula=D_{2}O_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0014359368198888342,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0010460542430199573,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0006304472392133468,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00043319010182306063,
+          "sortOrder": 3
+        }
+      ]
+    },
+    {
+      "slug": "isopentane",
+      "name": "Isopentane",
+      "phase": "liquid",
+      "density": 625.0809916408289,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0002119040192457596,
+      "kinematicViscosity": 3.3900250060318505e-07,
+      "speedOfSound": 1008.6430787297767,
+      "coolPropFluid": "Isopentane",
+      "coolPropPhase": "liquid",
+      "cas": "78-78-4",
+      "formula": "C_{5}H_{12}",
+      "aliases": [
+        "ipentane",
+        "R601a",
+        "ISOPENTANE",
+        "IPENTANE"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Isopentane; reference phase=liquid. CAS=78-78-4. Formula=C_{5}H_{12}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0004324915006925788,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0003424396871578188,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0002773614736205593,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.00024377682966280674,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0002119040192457596,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0001904883627455349,
+          "sortOrder": 5
+        }
+      ]
+    },
+    {
+      "slug": "m-xylene",
+      "name": "m-Xylene",
+      "phase": "liquid",
+      "density": 868.4828443073118,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0006570341996429053,
+      "kinematicViscosity": 7.565310057067914e-07,
+      "speedOfSound": 1369.0194266473807,
+      "coolPropFluid": "m-Xylene",
+      "coolPropPhase": "liquid",
+      "cas": "108-38-3",
+      "formula": "C_{8}H_{10}",
+      "aliases": [
+        "mXylene",
+        "m-xylene",
+        "M-XYLENE",
+        "MC8H10"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=m-Xylene; reference phase=liquid. CAS=108-38-3. Formula=C_{8}H_{10}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0021393799451199526,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0014027586951819554,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0009835541422581401,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0008044437455735615,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0006570341996429053,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0005696785505150942,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0004384211406240615,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00035050085628804596,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.0002871161522198105,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 0.0002387834886245368,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "methanol",
+      "name": "Methanol",
+      "phase": "liquid",
+      "density": 795.69080356407,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0006315561961459465,
+      "kinematicViscosity": 7.937206177538695e-07,
+      "speedOfSound": 1132.6920079795598,
+      "coolPropFluid": "Methanol",
+      "coolPropPhase": "liquid",
+      "cas": "67-56-1",
+      "formula": "C_{1}H_{4}O_{1}",
+      "aliases": [
+        "methanol",
+        "METHANOL"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Methanol; reference phase=liquid. CAS=67-56-1. Formula=C_{1}H_{4}O_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0024551078536144215,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0015243191994309209,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0010193128260197364,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0008059159742649496,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0006315561961459465,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0005293702343796431,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0003794429866675906,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "n-decane",
+      "name": "n-Decane",
+      "phase": "liquid",
+      "density": 734.2955375901307,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0009871726202194235,
+      "kinematicViscosity": 1.3443805248486254e-06,
+      "speedOfSound": 1273.7918908915663,
+      "coolPropFluid": "n-Decane",
+      "coolPropPhase": "liquid",
+      "cas": "124-18-5",
+      "formula": "C_{10}H_{22}",
+      "aliases": [
+        "Decane",
+        "decane",
+        "DECANE",
+        "N-DECANE",
+        "NC10H22",
+        "n-C10H22"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Decane; reference phase=liquid. CAS=124-18-5. Formula=C_{10}H_{22}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.005232686042416927,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0026788827815620885,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0016514939127295907,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0012746634021000118,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0009871726202194235,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0008257763692534834,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0005963890503993129,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00045344215126638226,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.0003575025874532427,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 0.0002892293194637842,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "n-dodecane",
+      "name": "n-Dodecane",
+      "phase": "liquid",
+      "density": 753.1490387519855,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0016388876750316585,
+      "kinematicViscosity": 2.176046958444502e-06,
+      "speedOfSound": 1321.7337525719302,
+      "coolPropFluid": "n-Dodecane",
+      "coolPropPhase": "liquid",
+      "cas": "112-40-3",
+      "formula": "C_{12}H_{26}",
+      "aliases": [
+        "nDodecane",
+        "Dodecane",
+        "DODECANE",
+        "N-DODECANE",
+        "C12",
+        "NC12H26",
+        "n-C12H26"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Dodecane; reference phase=liquid. CAS=112-40-3. Formula=C_{12}H_{26}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.025735839613797176,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.006537066770422495,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0032065815164508595,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.002269357524935478,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0016388876750316585,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0013153658973143972,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0008926459108946899,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.0006513816119412864,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.0004990222180180924,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 0.00039513965928117926,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "n-heptane",
+      "name": "n-Heptane",
+      "phase": "liquid",
+      "density": 688.0151632712078,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.00043612539454059897,
+      "kinematicViscosity": 6.338892190500796e-07,
+      "speedOfSound": 1170.4059602957184,
+      "coolPropFluid": "n-Heptane",
+      "coolPropPhase": "liquid",
+      "cas": "142-82-5",
+      "formula": "C_{7}H_{16}",
+      "aliases": [
+        "nHeptane",
+        "Heptane",
+        "HEPTANE",
+        "N-HEPTANE",
+        "NC7H16",
+        "n-C7H16"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Heptane; reference phase=liquid. CAS=142-82-5. Formula=C_{7}H_{16}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0012450646620680624,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.000849247529660439,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0006234482531111155,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0005228242025783548,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.00043612539454059897,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0003823631922112898,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0002972403486188701,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00023701103288210524,
+          "sortOrder": 7
+        }
+      ]
+    },
+    {
+      "slug": "n-hexane",
+      "name": "n-Hexane",
+      "phase": "liquid",
+      "density": 663.8809912877288,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0003295349647800276,
+      "kinematicViscosity": 4.963765631259139e-07,
+      "speedOfSound": 1123.645588294748,
+      "coolPropFluid": "n-Hexane",
+      "coolPropPhase": "liquid",
+      "cas": "110-54-3",
+      "formula": "C_{6}H_{14}",
+      "aliases": [
+        "nHexane",
+        "Hexane",
+        "HEXANE",
+        "N-HEXANE",
+        "NC6H14",
+        "n-C6H14"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Hexane; reference phase=liquid. CAS=110-54-3. Formula=C_{6}H_{14}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0007939014758696811,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0005841312449341253,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.00045066032744537574,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0003869506280236889,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0003295349647800276,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0002926025218102073,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0002317529305786999,
+          "sortOrder": 6
+        }
+      ]
+    },
+    {
+      "slug": "n-nonane",
+      "name": "n-Nonane",
+      "phase": "liquid",
+      "density": 721.9654109935123,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0007480405073832362,
+      "kinematicViscosity": 1.0361168222087557e-06,
+      "speedOfSound": 1245.5518612172107,
+      "coolPropFluid": "n-Nonane",
+      "coolPropPhase": "liquid",
+      "cas": "111-84-2",
+      "formula": "C_{9}H_{20}",
+      "aliases": [
+        "nonane",
+        "Nonane",
+        "NONANE",
+        "N-NONANE",
+        "NC9H20",
+        "n-C9H20"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Nonane; reference phase=liquid. CAS=111-84-2. Formula=C_{9}H_{20}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.003987316973353129,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.001917018582745175,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0011958323880623771,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0009412480774294623,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0007480405073832362,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0006388319988406544,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.00048028774336510247,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00037718655674355686,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.00030443651804176264,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 0.0002499187231949007,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "n-octane",
+      "name": "n-Octane",
+      "phase": "liquid",
+      "density": 706.6325222484887,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0005801308774636945,
+      "kinematicViscosity": 8.209795886803103e-07,
+      "speedOfSound": 1214.0495184886777,
+      "coolPropFluid": "n-Octane",
+      "coolPropPhase": "liquid",
+      "cas": "111-65-9",
+      "formula": "C_{8}H_{18}",
+      "aliases": [
+        "nOctane",
+        "Octane",
+        "OCTANE",
+        "N-OCTANE",
+        "NC8H18",
+        "n-C8H18"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Octane; reference phase=liquid. CAS=111-65-9. Formula=C_{8}H_{18}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.002041811056559076,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.001277260455073787,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0008798203464895971,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0007149322922234377,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0005801308774636945,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0005002712738495577,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.00038007400921450686,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00029970288510348974,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.0002422128978016758,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "n-pentane",
+      "name": "n-Pentane",
+      "phase": "liquid",
+      "density": 631.1221239820566,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0001989226616514552,
+      "kinematicViscosity": 3.1518885821393066e-07,
+      "speedOfSound": 1053.9692035630896,
+      "coolPropFluid": "n-Pentane",
+      "coolPropPhase": "liquid",
+      "cas": "109-66-0",
+      "formula": "C_{5}H_{12}",
+      "aliases": [
+        "nPentane",
+        "Pentane",
+        "PENTANE",
+        "N-PENTANE",
+        "R601",
+        "NC5H12",
+        "n-C5H12"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=n-Pentane; reference phase=liquid. CAS=109-66-0. Formula=C_{5}H_{12}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0003886612529578844,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0003226901564439516,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0002644963938229866,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.00023155166537899008,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0001989226616514552,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0001765105459925925,
+          "sortOrder": 5
+        }
+      ]
+    },
+    {
+      "slug": "o-xylene",
+      "name": "o-Xylene",
+      "phase": "liquid",
+      "density": 884.4336283623213,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0008723217497726897,
+      "kinematicViscosity": 9.863054974378814e-07,
+      "speedOfSound": 1385.3218924809855,
+      "coolPropFluid": "o-Xylene",
+      "coolPropPhase": "liquid",
+      "cas": "95-47-6",
+      "formula": "C_{8}H_{10}",
+      "aliases": [
+        "oXylene",
+        "o-xylene",
+        "O-XYLENE",
+        "OC8H10"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=o-Xylene; reference phase=liquid. CAS=95-47-6. Formula=C_{8}H_{10}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0037387647731107784,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0021880042681743034,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0014123543792927936,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0011086925694865227,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0008723217497726897,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0007382552748720682,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0005457168041542985,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.0004236385994668627,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.0003401851328232456,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 0.0002799531879636592,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "p-xylene",
+      "name": "p-Xylene",
+      "phase": "liquid",
+      "density": 865.3968847867643,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0006866280101678989,
+      "kinematicViscosity": 7.934255625811335e-07,
+      "speedOfSound": 1349.0379142954678,
+      "coolPropFluid": "p-Xylene",
+      "coolPropPhase": "liquid",
+      "cas": "106-42-3",
+      "formula": "C_{8}H_{10}",
+      "aliases": [
+        "pXylene",
+        "p-xylene",
+        "P-XYLENE",
+        "PC8H10"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=p-Xylene; reference phase=liquid. CAS=106-42-3. Formula=C_{8}H_{10}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0019430361483965901,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0013836185051798527,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.001013114138786263,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0008385964897167807,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0006866280101678989,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0005932616185473166,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.00045026614533519576,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.0003552718116133385,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.0002887402003982727,
+          "sortOrder": 8
+        },
+        {
+          "temperatureK": 400.0,
+          "dynamicViscosity": 0.0002392076586628488,
+          "sortOrder": 9
+        }
+      ]
+    },
+    {
+      "slug": "r11",
+      "name": "R11",
+      "phase": "liquid",
+      "density": 1499.8285039662956,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0004796873692689968,
+      "kinematicViscosity": 3.1982814568496587e-07,
+      "speedOfSound": 765.5919439633124,
+      "coolPropFluid": "R11",
+      "coolPropPhase": "liquid",
+      "cas": "75-69-4",
+      "formula": "C_{1}Cl_{3}F_{1}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R11; reference phase=liquid. CAS=75-69-4. Formula=C_{1}Cl_{3}F_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0011921595938998457,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0008626036553981829,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.000659629100596087,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0005645748950179218,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0004796873692689968,
+          "sortOrder": 4
+        }
+      ]
+    },
+    {
+      "slug": "r123",
+      "name": "R123",
+      "phase": "liquid",
+      "density": 1489.284173683308,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0004698241752537013,
+      "kinematicViscosity": 3.1546979653435037e-07,
+      "speedOfSound": 742.0570898207033,
+      "coolPropFluid": "R123",
+      "coolPropPhase": "liquid",
+      "cas": "306-83-2",
+      "formula": "C_{2}Cl_{2}F_{3}H_{1}",
+      "aliases": [],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R123; reference phase=liquid. CAS=306-83-2. Formula=C_{2}Cl_{2}F_{3}H_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0012253659457031098,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0008892804616110102,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0006704804943997132,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0005650264665105967,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0004698241752537013,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0004087430042635123,
+          "sortOrder": 5
+        }
+      ]
+    },
+    {
+      "slug": "r141b",
+      "name": "R141b",
+      "phase": "liquid",
+      "density": 1253.0627715735175,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.00045803768486825933,
+      "kinematicViscosity": 3.6553450893212986e-07,
+      "speedOfSound": 858.2494033884852,
+      "coolPropFluid": "R141b",
+      "coolPropPhase": "liquid",
+      "cas": "1717-00-6",
+      "formula": "C_{2}Cl_{2}F_{1}H_{3}",
+      "aliases": [
+        "R141B"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R141b; reference phase=liquid. CAS=1717-00-6. Formula=C_{2}Cl_{2}F_{1}H_{3}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.001281893404721712,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0008919723376943207,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0006585736923286788,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0005517291349961157,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.00045803768486825933,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.00039908400220425595,
+          "sortOrder": 5
+        }
+      ]
+    },
+    {
+      "slug": "r245fa",
+      "name": "R245fa",
+      "phase": "liquid",
+      "density": 1365.179663803679,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0004448586706362852,
+      "kinematicViscosity": 3.258608976028949e-07,
+      "speedOfSound": 710.2594835431986,
+      "coolPropFluid": "R245fa",
+      "coolPropPhase": "liquid",
+      "cas": "460-73-1",
+      "formula": "C_{3}F_{5}H_{3}",
+      "aliases": [
+        "R245FA"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=R245fa; reference phase=liquid. CAS=460-73-1. Formula=C_{3}F_{5}H_{3}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0011948549543303363,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0008515604307653683,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0006374976884002245,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0005361416600792702,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0004448586706362852,
+          "sortOrder": 4
+        }
+      ]
+    },
+    {
+      "slug": "toluene",
+      "name": "Toluene",
+      "phase": "liquid",
+      "density": 871.5349032373421,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0006257955274238835,
+      "kinematicViscosity": 7.180383999531718e-07,
+      "speedOfSound": 1345.9356754417518,
+      "coolPropFluid": "Toluene",
+      "coolPropPhase": "liquid",
+      "cas": "108-88-3",
+      "formula": "C_{7}H_{8}",
+      "aliases": [
+        "toluene",
+        "TOLUENE"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Toluene; reference phase=liquid. CAS=108-88-3. Formula=C_{7}H_{8}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 220.0,
+          "dynamicViscosity": 0.0022389748114215124,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 240.0,
+          "dynamicViscosity": 0.0013761170574953152,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 260.0,
+          "dynamicViscosity": 0.0009468914255705707,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 273.15,
+          "dynamicViscosity": 0.0007702537499206951,
+          "sortOrder": 3
+        },
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0006257955274238835,
+          "sortOrder": 4
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0005401108062934756,
+          "sortOrder": 5
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0004112537256867088,
+          "sortOrder": 6
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.0003257956334042482,
+          "sortOrder": 7
+        },
+        {
+          "temperatureK": 375.0,
+          "dynamicViscosity": 0.0002656741697596429,
+          "sortOrder": 8
+        }
+      ]
+    },
+    {
+      "slug": "water",
+      "name": "Water",
+      "phase": "liquid",
+      "density": 999.1026214670632,
+      "refTemperatureK": 288.15,
+      "refPressurePa": 101325.0,
+      "viscosityModel": "table",
+      "dynamicViscosity": 0.0011375675592526638,
+      "kinematicViscosity": 1.1385893048526701e-06,
+      "speedOfSound": 1465.9294691143364,
+      "coolPropFluid": "Water",
+      "coolPropPhase": "liquid",
+      "cas": "7732-18-5",
+      "formula": "H_{2}O_{1}",
+      "aliases": [
+        "water",
+        "WATER",
+        "H2O",
+        "h2o",
+        "R718"
+      ],
+      "notes": "CoolProp 8.0.0 HEOS PropsSI at T=288.15 K, p=101325 Pa. CoolProp fluid=Water; reference phase=liquid. CAS=7732-18-5. Formula=H_{2}O_{1}.",
+      "viscosityTable": [
+        {
+          "temperatureK": 288.15,
+          "dynamicViscosity": 0.0011375675592526638,
+          "sortOrder": 0
+        },
+        {
+          "temperatureK": 300.0,
+          "dynamicViscosity": 0.0008537424862859429,
+          "sortOrder": 1
+        },
+        {
+          "temperatureK": 325.0,
+          "dynamicViscosity": 0.0005299666699874978,
+          "sortOrder": 2
+        },
+        {
+          "temperatureK": 350.0,
+          "dynamicViscosity": 0.00036846976971508264,
+          "sortOrder": 3
+        }
+      ]
+    }
+  ]
+}

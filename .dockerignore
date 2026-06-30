@@ -9,3 +9,13 @@ examples/*.dat
 .code-review-graph/
 tests/
 *.log
+
+# --- Node / JS monorepo (kept out of the Python build context) ---
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+dist/
+**/dist/
+.turbo/
+.pnpm-store/

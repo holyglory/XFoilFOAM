@@ -16,3 +16,29 @@ VTK/
 processor*/
 postProcessing/
 .code-review-graph/
+
+# --- Node / JS monorepo ---
+node_modules/
+.pnpm-store/
+.next/
+.next-build/
+out/
+*.tsbuildinfo
+.turbo/
+coverage/
+next-env.d.ts
+.env.local
+.env*.local
+
+# --- design handoff (kept locally, not committed) ---
+Airfoil Database and Simulation Portal-handoff.zip
+
+# --- local Codex/test artifacts ---
+.claude/
+.codex/*
+!.codex/dev-runtime.json
+.codex-artifacts/
+.codex-db-backups/
+test-results/
+**/test-results/
+product-design-audits/

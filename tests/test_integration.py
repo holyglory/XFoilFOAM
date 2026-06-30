@@ -90,9 +90,10 @@ def test_mesh_once_marched_polar(require_docker, tmp_path, naca0012_selig_text):
     assert (mesh_dir / "constant" / "polyMesh" / "points").exists()
 
     aoas = [2.0, 2.86, 3.72]
-    outs = solve_polar_marched(tmp_path / "polar", mesh_dir, af, 1.0, 50.0, fluid,
-                               RoughnessParams(), resolved, solver, mesher, runner, aoas,
-                               n_cells=mr.n_cells, render_images=False)
+    march = solve_polar_marched(tmp_path / "polar", mesh_dir, af, 1.0, 50.0, fluid,
+                                RoughnessParams(), resolved, solver, mesher, runner, aoas,
+                                n_cells=mr.n_cells, render_images=False)
+    outs = [item.outcome for item in march.points]
     assert len(outs) == 3
     cls = [o.cl for o in outs]
     assert all(c is not None for c in cls), [o.error for o in outs]
@@ -142,6 +143,44 @@ def test_transient_fallback_on_deep_stall(require_docker, tmp_path, naca0012_sel
         assert (tmp_path / "stall" / "transient").is_dir()
     else:
         assert out.converged
+
+
+def test_urans_outputs_history_strouhal_animation(require_docker, tmp_path, naca0012_selig_text):
+    """The URANS fallback emits a Cl/Cd time-history (+ measured Strouhal), a
+    time-averaged field image, and an animation mp4 (rendered on the host)."""
+    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    spec = CaseSpec(chord=1.0, speed=7.5, aoa_deg=20.0)  # deep stall
+    fluid = FluidProperties(density=1.225, kinematic_viscosity=1.5e-5)
+    mesh = MeshParams(n_surface=120, n_radial=70, n_wake=60,
+                      farfield_radius_chords=15.0, wake_length_chords=12.0)
+    solver = SolverParams(
+        n_iterations=1200, transient_cycles=4.0,
+        write_images=[ImageField.velocity_magnitude, ImageField.vorticity],
+    )
+    out = run_case(tmp_path / "urans", af, spec, fluid, RoughnessParams(), mesh, solver,
+                   BlockMeshCGrid(), DockerRunner(), n_proc=8)
+    assert out.error is None, out.error
+    if not out.unsteady:
+        pytest.skip("steady settled to a separated state; URANS path not exercised")
+
+    # measured force history + Strouhal
+    assert out.force_history is not None
+    assert len(out.force_history.cl) > 10
+    assert out.strouhal is not None and out.strouhal > 0.0
+    assert out.quality_warnings == []
+
+    # instantaneous + time-averaged contour images
+    assert "velocity_magnitude" in out.images
+    assert (tmp_path / "urans" / out.images["velocity_magnitude"]).is_file()
+    assert "velocity_magnitude" in out.mean_images
+    assert (tmp_path / "urans" / out.mean_images["velocity_magnitude"]).is_file()
+
+    # vorticity field (newly supported) rendered too
+    assert "vorticity" in out.images
+
+    # animation mp4 (rendered on the host via ffmpeg)
+    assert out.video, "no animation produced"
+    assert (tmp_path / "urans" / out.video["velocity_magnitude"]).is_file()
 
 
 def test_rough_wall_increases_drag(require_docker, tmp_path, naca0012_selig_text):

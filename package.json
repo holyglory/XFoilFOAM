@@ -1,0 +1,33 @@
+{
+  "name": "aerodb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Airfoils.Pro — airfoil database & simulation portal (Node/Next.js control-plane over the XFoilFOAM CFD engine)",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "test": "pnpm -r --workspace-concurrency=1 test",
+    "test:e2e": "playwright test",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "format": "prettier --write \"{apps,packages}/**/*.{ts,tsx,js,json,css}\"",
+    "db:generate": "pnpm --filter @aerodb/db generate",
+    "db:migrate": "pnpm --filter @aerodb/db migrate",
+    "db:push": "pnpm --filter @aerodb/db push",
+    "db:seed": "pnpm --filter @aerodb/db seed",
+    "db:backfill-polar-cache": "pnpm --filter @aerodb/db backfill:polar-cache",
+    "db:reset": "pnpm --filter @aerodb/db reset"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "@types/node": "^22.10.2",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from airfoilfoam import jobs
 from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
+from airfoilfoam.storage import JobStore
 from airfoilfoam.pipeline import CaseOutcome
 
 
@@ -29,13 +30,13 @@ def fake_run_case(monkeypatch):
     from airfoilfoam import physics
     from airfoilfoam.models import CaseSpec
 
-    def fake_prepare_mesh(mesh_dir, airfoil, resolved, chord, mesher, runner):
+    def fake_prepare_mesh(mesh_dir, airfoil, resolved, chord, mesher, runner, **_kwargs):
         mesh_dir.mkdir(parents=True, exist_ok=True)
         return SimpleNamespace(n_cells=1000, patches=[], span_chords=0.1)
 
     def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
                       mesher, runner, n_proc=1, render_images=True, solver_timeout=7200,
-                      mesh_dir=None):
+                      mesh_dir=None, **_kwargs):
         cl = 2 * math.pi * math.radians(spec.aoa_deg)
         cd = 0.01 + 0.02 * cl**2
         images = {}
@@ -140,6 +141,24 @@ def test_multi_speed_chord_produces_multiple_polars(client, fake_run_case, naca0
 
 def test_job_not_found(client):
     assert client.get("/jobs/doesnotexist").status_code == 404
+
+
+def test_runtime_endpoint_reports_unreadable_status(client):
+    store = JobStore()
+    job_id = "runtime-broken-status"
+    job_dir = store.job_dir(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text("")
+
+    body = client.post("/jobs/runtime", json={"job_ids": [job_id]}).json()
+    row = body["jobs"][0]
+    assert row["job_id"] == job_id
+    assert row["exists"] is True
+    assert row["status_readable"] is False
+    assert "empty JSON" in row["status_error"]
+    assert row["has_result"] is False
+    assert row["process_count"] == 0
+    assert client.get(f"/jobs/{job_id}").status_code == 409
 
 
 def test_file_traversal_blocked(client, fake_run_case, naca0012_selig_text):

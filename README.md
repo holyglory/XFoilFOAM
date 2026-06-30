@@ -9,6 +9,80 @@ images (velocity, pressure, turbulence).
 > Not affiliated with XFOIL. The name nods to the goal — XFOIL-style polars — but
 > the engine is a real finite-volume RANS solver (OpenFOAM `simpleFoam`).
 
+## Airfoils.Pro — airfoil database & simulation portal
+
+On top of the CFD engine sits **Airfoils.Pro**, an explorable web database of airfoil
+profiles with a modern UI and a Node control-plane that drives the solver. It is a
+**pnpm monorepo** (Node + Next.js + Postgres) wrapped around the *unchanged* Python
+engine, which stays the CFD solver service.
+
+```
+apps/web   — Next.js (App Router) UI: Browse / Search / Compare / Airfoil Detail
+             (RANS/URANS sim modal), light+dark themes, and an /admin queue console
+apps/api   — Fastify control-plane: catalog, detail payloads, coordinate export,
+             airfoil create (single + bulk), mediums, boundary conditions, media
+             serving, simulate-enqueue, and the admin/queue endpoints
+packages/db            — Drizzle schema + migrations + idempotent seed (Postgres)
+packages/core          — pure TS: NACA/source geometry, evidence metrics, chart
+                         projection, viscosity (ported from the design's airfoil-db.js)
+packages/engine-client — typed client for the Python /polars API
+```
+
+**Evidence-first data model.** Airfoil geometry is stored from trusted coordinates
+or an explicit deterministic airfoil definition. Aerodynamic values stay queued
+until accepted OpenFOAM evidence exists: real Cl/Cd/Cm plus contour images for
+RANS and video + force-history for URANS (post-stall). Missing solver evidence is
+shown as missing/queued, never filled with invented polar values.
+
+The Postgres database stores: a **category tree** (materialized path), **airfoils as
+point data** + derived geometry, a **mediums registry**, a
+**boundary-condition registry** (medium + operating state + the full CFD knobs), and
+a **results** table (per airfoil × boundary-condition × AoA, with media and URANS
+force history). A fresh reset seeds real Selig/UIUC coordinate geometry and
+CoolProp-verified mediums; boundary conditions, jobs, results, and media start
+empty.
+
+### Run the portal
+
+```bash
+docker compose up --build    # postgres + node-api(:4000) + web(:3100), plus the
+                             # Python engine (redis/api/worker). node-api migrates + seeds.
+# open http://localhost:3100  →  Browse  →  any airfoil  →  Detail
+```
+
+Local dev (no Docker), against a Postgres you have running:
+
+```bash
+pnpm install
+cp .env.example .env                # set DATABASE_URL
+pnpm db:migrate && pnpm db:seed     # schema + seed: Selig/UIUC geometry + mediums
+pnpm --filter @aerodb/api dev       # control-plane API on :4000
+pnpm --filter @aerodb/web dev       # UI on :3100
+pnpm --filter @aerodb/core test     # golden tests vs the design's airfoil-db.js
+```
+
+### Admin console
+
+`/admin` shows and manages the OpenFOAM queue: the CFD sweeper (pause/resume,
+concurrency), the backlog of pending cases, in-flight/solved/failed counts, the
+recent `sim_jobs` (with cancel), and a requeue-failed action. Auth is enforced by
+the API: **open in dev** (`NODE_ENV` ≠ `production`), **email/password in prod** (a
+signed HttpOnly session cookie). Configure with `ADMIN_EMAIL` / `ADMIN_PASSWORD` /
+`ADMIN_SESSION_SECRET`; force either mode with `ADMIN_AUTH_REQUIRED=true` /
+`ADMIN_AUTH_DISABLED=true`.
+
+**Status.** Both phases are implemented and tested. *Phase 1*: the Postgres database
+(categories, airfoils, mediums, boundary conditions, results), the control-plane API,
+and the pixel-faithful Airfoil Detail page. Aerodynamic rankings and charts appear
+only after accepted solver evidence is stored. *Phase 2*: the continuous CFD
+**sweeper** (gap-fill → `solved` upgrades the page in place; integration-tested),
+the **Browse / Search / Compare** pages, and the Python URANS extensions — the
+transient fallback now also emits a
+**Cl/Cd time-history**, a **measured Strouhal** number, **time-averaged** + **vorticity
+/ Cp** fields, and an **mp4 animation** (verified end-to-end against real OpenFOAM).
+Turn the worker on with `curl -X PATCH localhost:4000/api/sweeper -d '{"enabled":true}'
+-H 'content-type: application/json'` (needs the CFD engine — `api` + `worker` — running).
+
 ## Features
 
 - **Airfoil input**: Selig and Lednicer coordinate formats (auto-detected), or an
@@ -188,7 +262,9 @@ under `$AIRFOILFOAM_DATA_DIR/jobs/<id>/`.
 | `REDIS_URL` | `redis://localhost:6379/0` | Celery broker & backend |
 | `CASE_CONCURRENCY` | `4` | cases run in parallel per job |
 | `SOLVER_PROCESSES` | `1` | MPI ranks per case (`>1` → decomposePar/mpirun/reconstructPar) |
-| `SOLVER_TIMEOUT` | `7200` | per-case timeout (s) |
+| `SOLVER_TIMEOUT` | `7200` | URANS/global per-case guard timeout (s) |
+| `RANS_SOLVER_TIMEOUT` | `1200` | steady RANS per-case wall-clock timeout (s); slow 2D RANS points are stored as failed/non-converged evidence and the sweep moves on |
+| `RANS_MAX_ITERATIONS` | `600` | worker-side SIMPLE iteration cap for steady RANS during large sweeps |
 
 ## Accuracy & meshing notes
 

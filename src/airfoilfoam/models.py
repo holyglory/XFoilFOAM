@@ -1,6 +1,7 @@
 """Pydantic request/response models — the public contract of the API."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Optional
 
@@ -134,8 +135,13 @@ class ImageField(str, Enum):
     velocity_x = "velocity_x"
     velocity_y = "velocity_y"
     pressure = "pressure"
+    pressure_coefficient = "pressure_coefficient"
+    vorticity = "vorticity"
     turbulent_kinetic_energy = "turbulent_kinetic_energy"
     turbulent_viscosity = "turbulent_viscosity"
+
+
+ALL_IMAGE_FIELDS: tuple[ImageField, ...] = tuple(ImageField)
 
 
 class SolverParams(BaseModel):
@@ -154,6 +160,12 @@ class SolverParams(BaseModel):
         description="If the steady solve does not converge (e.g. post-stall, unsteady separation), "
         "automatically re-run the case transient (pimpleFoam/URANS) and report time-averaged "
         "force coefficients with their fluctuation.",
+    )
+    force_transient: bool = Field(
+        default=False,
+        description="Always run the transient URANS path for requested AoAs. A short steady solve may "
+        "still be used as initialisation, but the steady RANS coefficients are not accepted as the "
+        "reported polar result.",
     )
     warm_start: bool = Field(
         default=False,
@@ -176,11 +188,54 @@ class SolverParams(BaseModel):
         "pimpleFoam solver tolerates Co>1; a larger value avoids the tiny wall cells (y+~1) "
         "throttling the step to an impractically small size.",
     )
+    transient_auto_refine: bool = Field(
+        default=True,
+        description="After a URANS run, rerun once with measured shedding timing if the retained "
+        "window or field-write cadence is too sparse for reliable media. Background whole-polar "
+        "URANS promotions may disable this so coefficients can ingest before expensive per-AoA "
+        "media refinement.",
+    )
     write_images: list[ImageField] = Field(
-        default_factory=lambda: [ImageField.velocity_magnitude, ImageField.pressure]
+        default_factory=lambda: list(ALL_IMAGE_FIELDS)
     )
     image_zoom_chords: float = Field(
         default=2.0, gt=0, description="Half-window (in chords) around the airfoil for contour images."
+    )
+
+
+class ResourcePolicy(str, Enum):
+    auto = "auto"
+    airfoil_parallel = "airfoil_parallel"
+    case_parallel = "case_parallel"
+    exclusive = "exclusive"
+
+
+class ResourceParams(BaseModel):
+    """Requested CPU scheduling policy for one airfoil job."""
+
+    cpu_budget: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum worker-local CPU tokens this airfoil job may consume. None lets the engine decide.",
+    )
+    case_concurrency: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum AoA cases allowed to run concurrently inside this job. None lets the engine decide.",
+    )
+    solver_processes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="MPI/OpenFOAM processes per AoA case. 1 means a serial OpenFOAM solve.",
+    )
+    queue_pressure: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Optional control-plane backlog pressure hint used by the auto scheduler.",
+    )
+    policy: ResourcePolicy = Field(
+        default=ResourcePolicy.auto,
+        description="Scheduling policy: auto, airfoil_parallel, case_parallel, or exclusive.",
     )
 
 
@@ -233,6 +288,7 @@ class PolarRequest(BaseModel):
     roughness: RoughnessParams = Field(default_factory=RoughnessParams)
     mesh: MeshParams = Field(default_factory=MeshParams)
     solver: SolverParams = Field(default_factory=SolverParams)
+    resources: ResourceParams = Field(default_factory=ResourceParams)
 
     @model_validator(mode="after")
     def _validate(self) -> "PolarRequest":
@@ -267,7 +323,42 @@ class CaseSpec(BaseModel):
 # --------------------------------------------------------------------------- #
 # Outputs
 # --------------------------------------------------------------------------- #
+class ForceHistory(BaseModel):
+    """Cl/Cd/Cm time series over the transient sampling window (URANS only)."""
+
+    t: list[float] = Field(default_factory=list)
+    cl: list[float] = Field(default_factory=list)
+    cd: list[float] = Field(default_factory=list)
+    cm: list[float] = Field(default_factory=list)
+    shedding_freq_hz: Optional[float] = None
+    samples: Optional[int] = None
+    period_s: Optional[float] = Field(default=None, description="Measured vortex-shedding period used for this window.")
+    retained_cycles: Optional[int] = Field(default=None, description="Integer number of shedding periods retained.")
+    window_start: Optional[float] = Field(default=None, description="Start time of the retained integer-period window.")
+    window_end: Optional[float] = Field(default=None, description="End time of the retained integer-period window.")
+
+
+class EvidenceArtifact(BaseModel):
+    """Immutable raw/derived evidence file emitted by the engine.
+
+    ``path`` is relative to the case directory. ``url`` is filled when the
+    result is serialized for the API so downstream ingestion can preserve the
+    exact job-file location.
+    """
+
+    kind: str
+    path: str
+    mime_type: str
+    sha256: str
+    byte_size: int
+    role: Optional[str] = None
+    field: Optional[str] = None
+    url: Optional[str] = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
 class PolarPoint(BaseModel):
+    case_slug: Optional[str] = Field(default=None, description="Engine case directory slug for this AoA evidence.")
     aoa_deg: float
     cl: Optional[float] = None
     cd: Optional[float] = None
@@ -292,6 +383,26 @@ class PolarPoint(BaseModel):
         "more dissipative 1st-order upwind scheme (less accurate but stable).",
     )
     images: dict[str, str] = Field(default_factory=dict, description="image field -> result URL path")
+    strouhal: Optional[float] = Field(
+        default=None, description="Measured vortex-shedding Strouhal number St = f c / U (transient only)."
+    )
+    video: dict[str, str] = Field(
+        default_factory=dict, description="image field -> animation (mp4) URL path (transient only)."
+    )
+    mean_images: dict[str, str] = Field(
+        default_factory=dict, description="image field -> time-averaged contour URL path (transient only)."
+    )
+    force_history: Optional[ForceHistory] = Field(
+        default=None, description="Cl/Cd/Cm time series for the force monitors (transient only)."
+    )
+    quality_warnings: list[str] = Field(
+        default_factory=list,
+        description="Non-fatal solver/media quality warnings, e.g. unmeasurable or under-resolved URANS output.",
+    )
+    evidence_artifacts: list[EvidenceArtifact] = Field(
+        default_factory=list,
+        description="Raw immutable OpenFOAM evidence artifacts for this solver point.",
+    )
     error: Optional[str] = None
 
 
@@ -301,6 +412,10 @@ class Polar(BaseModel):
     reynolds: float
     mach: Optional[float] = None
     points: list[PolarPoint] = Field(default_factory=list)
+    attempts: list[PolarPoint] = Field(
+        default_factory=list,
+        description="Rejected or superseded solver attempts retained as evidence; not valid polar points.",
+    )
 
 
 class JobState(str, Enum):
@@ -308,14 +423,55 @@ class JobState(str, Enum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
+
+
+class JobPhase(str, Enum):
+    pending = "pending"
+    waiting_cpu = "waiting_cpu"
+    meshing = "meshing"
+    solving_rans = "solving_rans"
+    solving_urans = "solving_urans"
+    postprocessing = "postprocessing"
+    ingesting = "ingesting"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class SchedulingMetadata(BaseModel):
+    requested_policy: ResourcePolicy = ResourcePolicy.auto
+    resolved_policy: ResourcePolicy = ResourcePolicy.auto
+    worker_cpu_budget: int = 1
+    resolved_cpu_budget: int = 1
+    resolved_case_concurrency: int = 1
+    solver_processes: int = 1
+    mesh_build_count: int = 0
+    aoa_case_count: int = 0
+    mesh_reuse_mode: Literal["symlink", "copy"] = "symlink"
+    queue_depth: Optional[int] = None
 
 
 class JobStatus(BaseModel):
     job_id: str
     state: JobState
+    phase: JobPhase = JobPhase.pending
     total_cases: int = 0
     completed_cases: int = 0
     message: Optional[str] = None
+    task_id: Optional[str] = None
+    queued_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    phase_started_at: Optional[datetime] = None
+    last_progress_at: Optional[datetime] = None
+    active_solver: Optional[str] = None
+    active_case_slug: Optional[str] = None
+    active_aoa_deg: Optional[float] = None
+    active_pids: list[int] = Field(default_factory=list)
+    cpu_tokens_waiting: int = 0
+    cpu_tokens_held: int = 0
+    scheduling: Optional[SchedulingMetadata] = None
 
 
 class JobResult(BaseModel):
@@ -323,3 +479,4 @@ class JobResult(BaseModel):
     state: JobState
     polars: list[Polar] = Field(default_factory=list)
     message: Optional[str] = None
+    scheduling: Optional[SchedulingMetadata] = None

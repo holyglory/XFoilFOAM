@@ -1,0 +1,152 @@
+/* ============================ theme tokens ============================ */
+/* Dark is the default (:root); the header toggle sets data-theme="light". */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --aero-bg: #070a0e;
+  --aero-panel: #0c1219;
+  --aero-panel2: #0a0f15;
+  --aero-panel3: #11171f;
+  --aero-border: #1a232d;
+  --aero-border-soft: #161f29;
+  --aero-border-row: #131b24;
+  --aero-border-rule: #1c2731;
+  --aero-stroke: #243140;
+  --aero-stroke2: #1f2a35;
+  --aero-text: #e6edf3;
+  --aero-text2: #cbd5e0;
+  --aero-muted: #8a97a4;
+  --aero-dim: #586572;
+  --aero-dimmer: #3a4754;
+  --aero-dimmest: #4a5663;
+  --aero-teal: #2dd4bf;
+  --aero-teal-border: #1f5d55;
+  --aero-teal-dim: #1f8a7f;
+  --aero-teal-text: #6b7785;
+  --aero-teal-fill: rgba(45, 212, 191, 0.08);
+  --aero-teal-ink: #07110f;
+  --aero-amber: #f5a524;
+  --aero-red: #ef4444;
+  --aero-red-text: #c0392b;
+  --aero-topbar-bg: rgba(11, 16, 22, 0.85);
+  --aero-nav-active: #16202b;
+  --aero-row-active: #0f1620;
+  --aero-tab-active: #1c2a36;
+  --aero-popover: #0e151d;
+  --aero-modal-bg: #0b1119;
+  --aero-overlay: rgba(4, 7, 10, 0.72);
+  --aero-shadow: rgba(0, 0, 0, 0.5);
+  --aero-grid: #16202b;
+  --aero-grid-x: #131b24;
+  --aero-axis: #2a3540;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --aero-bg: #eef2f7;
+  --aero-panel: #ffffff;
+  --aero-panel2: #f3f6fa;
+  --aero-panel3: #eef3f8;
+  --aero-border: #d8e0ea;
+  --aero-border-soft: #e6ecf3;
+  --aero-border-row: #edf1f6;
+  --aero-border-rule: #dde4ec;
+  --aero-stroke: #cdd7e3;
+  --aero-stroke2: #d6dee8;
+  --aero-text: #14202c;
+  --aero-text2: #2f3e4c;
+  --aero-muted: #5b6b7a;
+  --aero-dim: #8492a0;
+  --aero-dimmer: #aab5c0;
+  --aero-dimmest: #99a5b1;
+  --aero-teal: #0d9488;
+  --aero-teal-border: #5fc8ba;
+  --aero-teal-dim: #0f766e;
+  --aero-teal-text: #5b6b7a;
+  --aero-teal-fill: rgba(13, 148, 136, 0.1);
+  --aero-teal-ink: #ffffff;
+  --aero-amber: #bb7a0c;
+  --aero-red: #dc2626;
+  --aero-red-text: #b91c1c;
+  --aero-topbar-bg: rgba(255, 255, 255, 0.85);
+  --aero-nav-active: #e3ebf3;
+  --aero-row-active: #eef4f9;
+  --aero-tab-active: rgba(13, 148, 136, 0.12);
+  --aero-popover: #ffffff;
+  --aero-modal-bg: #ffffff;
+  --aero-overlay: rgba(30, 41, 59, 0.45);
+  --aero-shadow: rgba(15, 23, 42, 0.16);
+  --aero-grid: #e3e9f0;
+  --aero-grid-x: #edf1f6;
+  --aero-axis: #c0cbd8;
+}
+
+/* ============================ base ============================ */
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--aero-bg);
+  color: var(--aero-text);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+}
+body {
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+::-webkit-scrollbar {
+  height: 9px;
+  width: 9px;
+}
+::-webkit-scrollbar-track {
+  background: var(--aero-panel2);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--aero-stroke);
+  border-radius: 6px;
+}
+@keyframes recpulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 3px;
+  background: var(--aero-stroke);
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--aero-teal);
+  cursor: pointer;
+  border: 2px solid var(--aero-teal-ink);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--aero-teal);
+  cursor: pointer;
+  border: 2px solid var(--aero-teal-ink);
+}
+a {
+  text-decoration: none;
+  color: inherit;
+}
+.mono {
+  font-family: "IBM Plex Mono", monospace;
+}

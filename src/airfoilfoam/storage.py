@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypeVar
 
 from .config import Settings, get_settings
-from .models import JobResult, JobState, JobStatus, PolarRequest
+from .models import JobPhase, JobResult, JobState, JobStatus, PolarRequest
+
+T = TypeVar("T", JobResult, JobStatus, PolarRequest)
 
 
 class JobStore:
@@ -34,36 +39,236 @@ class JobStore:
     # -- lifecycle ---------------------------------------------------------- #
     def create(self, job_id: str, request: PolarRequest) -> None:
         self.job_dir(job_id).mkdir(parents=True, exist_ok=True)
-        (self.job_dir(job_id) / "request.json").write_text(request.model_dump_json(indent=2))
+        cancel_path = self.job_dir(job_id) / "cancelled"
+        if cancel_path.exists():
+            cancel_path.unlink()
+        self._write_json_atomic(self.job_dir(job_id) / "request.json", request.model_dump_json(indent=2))
         total = len(request.cases())
-        self.write_status(JobStatus(job_id=job_id, state=JobState.pending, total_cases=total))
+        self.write_status(JobStatus(job_id=job_id, state=JobState.pending, total_cases=total, queued_at=datetime.now(timezone.utc)))
+
+    def mark_cancelled(self, job_id: str, reason: str = "cancelled") -> None:
+        path = self.job_dir(job_id) / "cancelled"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(reason)
+
+    def is_cancelled(self, job_id: str) -> bool:
+        return (self.job_dir(job_id) / "cancelled").exists()
 
     def write_status(self, status: JobStatus) -> None:
         path = self.job_dir(status.job_id) / "status.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(status.model_dump_json(indent=2))
+        now = datetime.now(timezone.utc)
+        previous = self.read_status(status.job_id)
+        if previous:
+            status.task_id = status.task_id or previous.task_id
+            status.queued_at = status.queued_at or previous.queued_at
+            status.started_at = status.started_at or previous.started_at
+            if status.phase == previous.phase and status.phase_started_at is None:
+                status.phase_started_at = previous.phase_started_at
+            if status.last_progress_at is None:
+                status.last_progress_at = previous.last_progress_at
+            if status.completed_cases > previous.completed_cases:
+                status.last_progress_at = now
+        if status.state == JobState.running and status.started_at is None:
+            status.started_at = now
+        if status.phase_started_at is None:
+            status.phase_started_at = now
+        if status.state in {JobState.completed, JobState.failed, JobState.cancelled}:
+            status.last_progress_at = status.last_progress_at or now
+            if status.phase in {JobPhase.pending, JobPhase.waiting_cpu}:
+                status.phase = {
+                    JobState.completed: JobPhase.completed,
+                    JobState.failed: JobPhase.failed,
+                    JobState.cancelled: JobPhase.cancelled,
+                }.get(status.state, status.phase)
+        status.updated_at = now
+        self._write_json_atomic(path, status.model_dump_json(indent=2))
 
     def read_status(self, job_id: str) -> Optional[JobStatus]:
+        status, _ = self.read_status_info(job_id)
+        return status
+
+    def read_status_info(self, job_id: str) -> tuple[Optional[JobStatus], Optional[str]]:
         path = self.job_dir(job_id) / "status.json"
-        if not path.exists():
-            return None
-        return JobStatus.model_validate_json(path.read_text())
+        return self._read_model_info(path, JobStatus)
 
     def write_result(self, result: JobResult) -> None:
         path = self.job_dir(result.job_id) / "result.json"
-        path.write_text(result.model_dump_json(indent=2))
+        self._write_json_atomic(path, result.model_dump_json(indent=2))
 
     def read_result(self, job_id: str) -> Optional[JobResult]:
+        result, _ = self.read_result_info(job_id)
+        return result
+
+    def read_result_info(self, job_id: str) -> tuple[Optional[JobResult], Optional[str]]:
         path = self.job_dir(job_id) / "result.json"
-        if not path.exists():
-            return None
-        return JobResult.model_validate_json(path.read_text())
+        return self._read_model_info(path, JobResult)
 
     def read_request(self, job_id: str) -> Optional[PolarRequest]:
         path = self.job_dir(job_id) / "request.json"
+        request, _ = self._read_model_info(path, PolarRequest)
+        return request
+
+    def write_runtime_heartbeat(
+        self,
+        job_id: str,
+        worker_pid: int,
+        process_count: int,
+        *,
+        process_details: Optional[list[dict]] = None,
+        phase: Optional[str] = None,
+        active_solver: Optional[str] = None,
+        active_case_slug: Optional[str] = None,
+        active_aoa_deg: Optional[float] = None,
+        cpu_tokens_waiting: Optional[int] = None,
+        cpu_tokens_held: Optional[int] = None,
+        current_case: Optional[str] = None,
+        last_progress_at: Optional[str] = None,
+    ) -> None:
+        payload = {
+            "job_id": job_id,
+            "worker_pid": worker_pid,
+            "process_count": process_count,
+            "processes": process_details or [],
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if phase is not None:
+            payload["phase"] = phase
+        if active_solver is not None:
+            payload["active_solver"] = active_solver
+        if active_case_slug is not None:
+            payload["active_case_slug"] = active_case_slug
+        if active_aoa_deg is not None:
+            payload["active_aoa_deg"] = active_aoa_deg
+        if cpu_tokens_waiting is not None:
+            payload["cpu_tokens_waiting"] = cpu_tokens_waiting
+        if cpu_tokens_held is not None:
+            payload["cpu_tokens_held"] = cpu_tokens_held
+        if current_case is not None:
+            payload["current_case"] = current_case
+        if last_progress_at is not None:
+            payload["last_progress_at"] = last_progress_at
+        self._write_json_atomic(self.job_dir(job_id) / "runtime.json", json.dumps(payload, indent=2))
+
+    def read_runtime_info(self, job_id: str) -> tuple[Optional[dict], Optional[str]]:
+        path = self.job_dir(job_id) / "runtime.json"
         if not path.exists():
-            return None
-        return PolarRequest.model_validate_json(path.read_text())
+            return None, None
+        try:
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+                return None, "empty JSON file"
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None, None
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{type(exc).__name__}: {exc}"
 
     def exists(self, job_id: str) -> bool:
         return self.job_dir(job_id).exists()
+
+    def job_processes(self, job_id: str) -> list[int]:
+        return [proc["pid"] for proc in self.job_process_details(job_id)]
+
+    def job_process_details(self, job_id: str) -> list[dict]:
+        proc_root = Path("/proc")
+        if not proc_root.exists():
+            return []
+        root = self.job_dir(job_id).resolve()
+        processes: list[dict] = []
+        for proc in proc_root.iterdir():
+            if not proc.name.isdigit():
+                continue
+            pid = int(proc.name)
+            if pid == os.getpid():
+                continue
+            try:
+                cwd = (proc / "cwd").resolve()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            try:
+                cwd.relative_to(root)
+            except ValueError:
+                continue
+            command = self._read_proc_command(proc)
+            case_slug = self._case_slug_for_cwd(root, cwd)
+            processes.append(
+                {
+                    "pid": pid,
+                    "command": command,
+                    "cwd": str(cwd),
+                    "case_slug": case_slug,
+                    "solver_mode": self._solver_mode(command, cwd),
+                    "elapsed_sec": self._proc_elapsed_seconds(proc),
+                }
+            )
+        return sorted(processes, key=lambda item: item["pid"])
+
+    def _read_proc_command(self, proc: Path) -> str:
+        try:
+            raw = (proc / "cmdline").read_bytes()
+            command = raw.replace(b"\x00", b" ").decode(errors="replace").strip()
+            if command:
+                return command
+        except Exception:
+            pass
+        try:
+            return (proc / "comm").read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            return proc.name
+
+    def _case_slug_for_cwd(self, root: Path, cwd: Path) -> Optional[str]:
+        try:
+            rel = cwd.relative_to(root / "cases")
+        except ValueError:
+            return None
+        parts = rel.parts
+        return parts[0] if parts else None
+
+    def _solver_mode(self, command: str, cwd: Path) -> Optional[str]:
+        name = command.lower()
+        cwd_text = str(cwd).lower()
+        if "pimplefoam" in name or "/urans_" in cwd_text:
+            return "urans"
+        if "simplefoam" in name:
+            return "rans"
+        if "blockmesh" in name or "snappyhexmesh" in name or "extrudemesh" in name:
+            return "meshing"
+        return None
+
+    def _proc_elapsed_seconds(self, proc: Path) -> Optional[float]:
+        try:
+            ticks_per_sec = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+            uptime = float(Path("/proc/uptime").read_text().split()[0])
+            start_ticks = int((proc / "stat").read_text().split()[21])
+            return max(0.0, uptime - (start_ticks / ticks_per_sec))
+        except Exception:
+            return None
+
+    def _write_json_atomic(self, path: Path, payload: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_name = ""
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as tmp:
+            tmp_name = tmp.name
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+
+    def _read_model_info(self, path: Path, model: type[T]) -> tuple[Optional[T], Optional[str]]:
+        if not path.exists():
+            return None, None
+        try:
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+                return None, "empty JSON file"
+            return model.model_validate_json(text), None
+        except Exception as exc:  # noqa: BLE001 - runtime endpoint needs the exact read failure
+            return None, f"{type(exc).__name__}: {exc}"
