@@ -332,6 +332,11 @@ export function AdminConsole() {
           grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
           gap: 10px;
         }
+        .admin-mesh-guide-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+          gap: 8px;
+        }
         .queue-header-grid {
           display: grid;
           grid-template-columns: minmax(0, 1fr) auto;
@@ -1197,6 +1202,7 @@ function SimulationSetupPanel() {
               onChange={(mesher) => setMeshForm((f) => ({ ...f, mesher }))}
             />
           )}
+          <MeshSettingsGuide form={meshForm} />
           <div className="admin-form-grid">
             <NumberField label="Farfield chords" value={meshForm.farfieldRadiusChords} onChange={(farfieldRadiusChords) => setMeshForm((f) => ({ ...f, farfieldRadiusChords }))} />
             <NumberField label="Wake chords" value={meshForm.wakeLengthChords} onChange={(wakeLengthChords) => setMeshForm((f) => ({ ...f, wakeLengthChords }))} />
@@ -2342,6 +2348,66 @@ function TurbulentViscosityRatioField({ value, onChange }: { value: number; onCh
         </div>
       </details>
     </div>
+  );
+}
+
+function MeshSettingsGuide({ form }: { form: MeshProfileInput }) {
+  const safeSurface = Math.max(0, Math.round(form.nSurface || 0));
+  const safeRadial = Math.max(0, Math.round(form.nRadial || 0));
+  const safeWake = Math.max(0, Math.round(form.nWake || 0));
+  const cellCount = 2 * safeSurface * safeRadial + 2 * safeWake * safeRadial;
+  const items = [
+    { k: "surface", v: `${safeSurface.toLocaleString()} per side`, d: "Chordwise cells on upper and lower airfoil walls." },
+    { k: "radial", v: `${safeRadial.toLocaleString()} outward`, d: "Wall-normal cells from airfoil to farfield." },
+    { k: "wake", v: `${safeWake.toLocaleString()} downstream`, d: "Cells from trailing edge to the fixed outlet." },
+    { k: "target y+", v: f(form.targetYPlus, 2), d: "Sets first wall-normal height per case." },
+    { k: "span", v: `${f(form.spanChords, 2)}c`, d: "Thin empty-patch slab thickness, not wing span." },
+  ];
+
+  return (
+    <section aria-label="Mesh parameter guide" style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, background: C.panel2, padding: 12, display: "grid", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+        <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.08em", color: C.dim, textTransform: "uppercase" }}>C-grid mesh guide</div>
+        <div style={{ fontFamily: MONO, fontSize: 11, color: C.teal }}>~{cellCount.toLocaleString()} cells</div>
+      </div>
+      <svg viewBox="0 0 520 250" role="img" aria-label="C-grid airfoil mesh infographic" style={{ width: "100%", height: "auto", display: "block", borderRadius: 8, background: "#071016" }}>
+        <defs>
+          <marker id="meshArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill={C.teal} />
+          </marker>
+          <marker id="meshAmberArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill={C.amber} />
+          </marker>
+        </defs>
+        <path d="M 240 40 Q 92 40 70 125 Q 92 210 240 210 L 430 210 M 240 40 L 430 40" fill="none" stroke={C.stroke} strokeWidth="2" />
+        <path d="M 245 82 Q 130 82 105 125 Q 130 168 245 168 L 430 168 M 245 82 L 430 82" fill="none" stroke="#1f3140" strokeWidth="1.5" strokeDasharray="4 7" />
+        <path d="M 250 124 C 292 105 350 107 392 124 C 349 132 294 135 250 124 Z" fill="#102838" stroke={C.teal} strokeWidth="2" />
+        <path d="M 252 125 C 298 122 346 122 392 124" fill="none" stroke={C.amber} strokeDasharray="4 5" />
+        <path d="M 255 106 C 300 91 350 93 390 117" fill="none" stroke={C.teal} strokeWidth="2.5" markerEnd="url(#meshArrow)" />
+        <text x="280" y="92" fill={C.teal} fontFamily={MONO} fontSize="12">surface</text>
+        <path d="M 250 124 C 207 123 168 122 120 124" fill="none" stroke={C.teal} strokeWidth="2.5" markerEnd="url(#meshArrow)" />
+        <text x="126" y="114" fill={C.teal} fontFamily={MONO} fontSize="12">radial</text>
+        <path d="M 392 124 L 474 124" fill="none" stroke={C.amber} strokeWidth="3" markerEnd="url(#meshAmberArrow)" />
+        <text x="414" y="114" fill={C.amber} fontFamily={MONO} fontSize="12">wake</text>
+        <path d="M 262 129 L 262 147" fill="none" stroke="#f97316" strokeWidth="2" markerEnd="url(#meshAmberArrow)" />
+        <text x="271" y="151" fill="#fb923c" fontFamily={MONO} fontSize="11">target y+</text>
+        <path d="M 230 195 L 260 225 L 410 225 L 380 195 Z" fill="#0e2431" stroke={C.stroke} strokeWidth="1.5" />
+        <path d="M 260 225 L 260 207 M 410 225 L 410 207" stroke={C.stroke} strokeWidth="1.2" />
+        <text x="312" y="219" fill={C.muted} fontFamily={MONO} fontSize="11">span</text>
+        <text x="28" y="235" fill={C.dim} fontFamily={MONO} fontSize="10">AoA sweep rotates freestream velocity; this wake block stays chord-aligned.</text>
+      </svg>
+      <div className="admin-mesh-guide-grid">
+        {items.map((item) => (
+          <div key={item.k} style={{ border: `1px solid ${C.stroke}`, borderRadius: 8, background: C.panel, padding: "8px 9px", minWidth: 0 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+              <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, textTransform: "uppercase" }}>{item.k}</span>
+              <span style={{ fontFamily: MONO, fontSize: 11, color: C.text }}>{item.v}</span>
+            </div>
+            <p style={{ margin: "6px 0 0", color: C.muted, fontSize: 11, lineHeight: 1.35 }}>{item.d}</p>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

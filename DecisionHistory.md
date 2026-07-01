@@ -1,5 +1,16 @@
 # Decision History
 
+## 2026-07-01 — Mesh Settings Need In-Context Visual Explanations
+
+- Decision: Mesh profiles include an in-form C-grid infographic, current
+  estimated cell count, and compact explanations for surface, radial, wake,
+  target y+, and span.
+- Why: The raw fields are meaningful only in the context of the app's fixed
+  chord-aligned C-grid. Users need to see that AoA sweeps rotate freestream
+  velocity while the wake block remains fixed to the chord line.
+- Expected effect: Mesh setup choices become understandable without requiring
+  users to inspect OpenFOAM topology or source code.
+
 ## 2026-07-01 — Boundary Forms Prefer Domain Presets Over Raw Solver Numbers
 
 - Decision: Turbulent viscosity ratio is presented as `Turbulent viscosity
