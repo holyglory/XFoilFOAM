@@ -880,3 +880,30 @@
   assertions own their seeded job; cleanup in afterAll). E2e asserts the badge
   honestly matches the live API count (absent at 0 — never an invented
   number).
+
+## 2026-07-05 — Campaign counter model: one canonical definition (found on first prod campaign)
+
+- Incident: two progress recompute implementations disagreed. The API path
+  (campaigns.ts) counted terminal-failed points as SOLVED and looked for failed
+  points at state='requested' (always 0, since ingest terminalizes failures);
+  failedResultsWhere shared the wrong assumption, so GET /campaigns/:id/failures
+  returned {total:0} with 3 real failures and requeue-failed could find nothing.
+  Whichever recompute ran last won -> visible counter drift on
+  validation-campaign-20260705.
+- Decision: ONE canonical counter model, single-sourced in
+  campaign-execution.ts and delegated to by campaigns.ts:
+  requested = total obligation (state <> 'released'), stable as points
+  terminalize (UI denominators depend on this); solved = terminal AND NOT
+  derived AND result done; failed = terminal AND result failed; running = open
+  point with live queued/running cell result; derived = terminal symmetry cells.
+  remaining = requested - solved - derived - failed.
+- requeueCampaignFailed flips terminal-failed points BACK to state='requested'
+  (plus result -> pending) — without the state flip the sweeper would never
+  reschedule them.
+- Semantics note (user-confirmed): non-converged RANS escalated to URANS is
+  normal operation, never displayed or counted as failure. 'failed' is strictly
+  the crash class (solver error / no coefficients). needs_urans displays amber.
+- Recall proof: reverting the fix while keeping the new tests reproduces the
+  exact production breakage (solved absorbs the failure, failed=0, failures
+  endpoint empty, requeue drift error). apps/api/test/campaigns.test.ts
+  "counter/failures/requeue coherence".
