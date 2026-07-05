@@ -204,6 +204,13 @@
       "when": 1783382400000,
       "tag": "0028_campaign_closed_rejected_count",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1783468800000,
+      "tag": "0029_field_color_scale_render_attempts",
+      "breakpoints": true
     }
   ]
 }

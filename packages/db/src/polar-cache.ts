@@ -197,6 +197,11 @@ async function upsertClassification(
     reasons: c.reasons,
     supersededByResultId: null,
   };
+  // The conflict UPDATE must rewrite EVERY verdict-scoped column, regime and
+  // classifierVersion included: a results row re-solved under a different
+  // regime keeps its classification row, and an in-place update that skips
+  // regime leaves 'rans' stamped on an accepted URANS verdict (prod row
+  // 3db79ff8, 2026-07-05).
   if (values.resultAttemptId) {
     await db
       .insert(resultClassifications)
@@ -204,6 +209,7 @@ async function upsertClassification(
       .onConflictDoUpdate({
         target: resultClassifications.resultAttemptId,
         set: {
+          regime: values.regime,
           classifierVersion: values.classifierVersion,
           state: values.state,
           region: values.region,
@@ -221,6 +227,7 @@ async function upsertClassification(
     .onConflictDoUpdate({
       target: resultClassifications.resultId,
       set: {
+        regime: values.regime,
         classifierVersion: values.classifierVersion,
         state: values.state,
         region: values.region,

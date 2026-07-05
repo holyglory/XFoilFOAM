@@ -9,6 +9,7 @@ import {
   boundaryProfiles,
   campaignFailures,
   campaignProgressTotals,
+  campaignRejected,
   categories,
   closeCampaignWithFailures,
   deriveCampaignCompletion,
@@ -889,6 +890,204 @@ describe("rejected-classification honesty + premature-completion guard (D6)", ()
     await probeCampaignCompletion(db, campaignId);
     const [camp] = (await db.execute(sql`SELECT status FROM sim_campaigns WHERE id = ${campaignId}`)) as unknown as Array<{ status: string }>;
     expect(camp.status).toBe("completed");
+  });
+});
+
+// Must-catch mirror of the counter/failures/requeue coherence suite for the
+// REJECTED bucket (live campaign 592d40c6, 2026-07-05: 4 done-but-physics-
+// rejected points had NO repair affordance — re-solving them needed manual
+// SQL). A rejected campaign point is TERMINAL with its results row DONE and
+// its classification 'rejected'; the dialog count (campaignRejected), the
+// counters, and requeueCampaignFailed(includeRejected) must all match on that
+// model, and a failed-only requeue must NEVER touch rejected evidence.
+describe("rejected requeue coherence (engine-fix re-solve path)", () => {
+  let campaignId = "";
+  let conditionId = "";
+  let revisionId = "";
+  let bcId = "";
+  let rqAirfoilId = "";
+  let rejectedResultId = "";
+  let ransResultId = "";
+  const RQ_SPEED = 15.5; // unique physics hash → isolated pinned revision
+
+  beforeAll(async () => {
+    const [af] = await db
+      .insert(airfoils)
+      .values({ slug: `${PREFIX}-rq-af`, name: `${PREFIX} rq af`, categoryId: cleanupCategoryIds[0], points: camberedPoints, isSymmetric: false })
+      .returning();
+    rqAirfoilId = af.id;
+    cleanupAirfoilIds.push(af.id);
+  });
+
+  it("drives a campaign to 4 accepted + 1 rejected and the dialog data sees exactly that", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} rq`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-rq-key`,
+        airfoilIds: [rqAirfoilId],
+        plan: planBody({ chordsM: [0.2], speedsMps: [RQ_SPEED], objectives: { ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 }, clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 } } }),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    campaignId = res.json().campaign.id;
+    cleanupCampaignIds.push(campaignId);
+
+    const [cond] = (await db.execute(sql`
+      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id, p.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc JOIN simulation_presets p ON p.id = cc.preset_id
+      WHERE cc.campaign_id = ${campaignId}
+    `)) as unknown as Array<{ id: string; revision_id: string; bc_id: string }>;
+    conditionId = cond.id;
+    revisionId = cond.revision_id;
+    bcId = cond.bc_id;
+
+    // α=-2,-1,1,2 → clean accepted RANS evidence (α=1 kept for the regime test).
+    for (const aoa of [-2, -1, 1, 2]) {
+      const [row] = await db
+        .insert(results)
+        .values({ airfoilId: rqAirfoilId, bcId, simulationPresetRevisionId: revisionId, aoaDeg: aoa, status: "done", source: "solved", regime: "rans", converged: true, stalled: false, cl: 0.3 + 0.1 * aoa, cd: 0.011, cm: -0.02 })
+        .returning({ id: results.id });
+      cleanupResultIds.push(row.id);
+      if (aoa === 1) ransResultId = row.id;
+      await onResultIngested(db, { airfoilId: rqAirfoilId, revisionId, aoaDeg: aoa, resultId: row.id, status: "done" });
+    }
+    // α=0 → ingest-shaped URANS done WITHOUT force history / video → rejected.
+    const [urans] = await db
+      .insert(results)
+      .values({ airfoilId: rqAirfoilId, bcId, simulationPresetRevisionId: revisionId, aoaDeg: 0, status: "done", source: "solved", regime: "urans", unsteady: true, stalled: true, converged: true, cl: 0.35, cd: 0.02, cm: -0.02 })
+      .returning({ id: results.id });
+    rejectedResultId = urans.id;
+    cleanupResultIds.push(urans.id);
+    await onResultIngested(db, { airfoilId: rqAirfoilId, revisionId, aoaDeg: 0, resultId: urans.id, status: "done" });
+
+    await refreshPolarCacheForRevision(db, rqAirfoilId, revisionId);
+    await db.transaction(async (tx) => {
+      await recomputeCampaignProgress(tx, campaignId);
+    });
+    await probeCampaignCompletion(db, campaignId);
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.solved).toBe(4);
+    expect(totals.rejected).toBe(1);
+    expect(totals.failed).toBe(0);
+    expect(totals.remaining).toBe(0);
+
+    // The dialog data source must find the rejected point on the SAME
+    // terminal+result_id model as the counters (the failures analogue of the
+    // production drift: campaignFailures saw total:0 while failed counted 1).
+    const rejected = await campaignRejected(db, campaignId);
+    expect(rejected.total).toBe(1);
+    expect(rejected.samples[0].resultId).toBe(rejectedResultId);
+    expect(rejected.samples[0].aoaDeg).toBe(0);
+    expect(rejected.samples[0].reasons).toContain("missing-force-history");
+
+    // API shape for the dialog: failures response carries the rejected bucket.
+    const viaApi = await app.inject({ method: "GET", url: `/api/admin/campaigns/${campaignId}/failures` });
+    expect(viaApi.statusCode).toBe(200);
+    expect(viaApi.json().total).toBe(0);
+    expect(viaApi.json().rejected.total).toBe(1);
+    expect(viaApi.json().rejected.samples[0].airfoilSlug).toBe(`${PREFIX}-rq-af`);
+  });
+
+  it("failed-only requeue is a no-op on rejected evidence (false-positive guard)", async () => {
+    const out = await requeueCampaignFailed(db, campaignId, { expectedCount: 0 });
+    expect(out.requeued).toBe(0);
+    const [point] = (await db.execute(sql`
+      SELECT p.state, r.status
+      FROM sim_campaign_points p JOIN results r ON r.id = p.result_id
+      WHERE p.campaign_id = ${campaignId} AND p.aoa_deg = 0
+    `)) as unknown as Array<{ state: string; status: string }>;
+    expect(point.state).toBe("terminal");
+    expect(point.status).toBe("done"); // rejected evidence untouched
+  });
+
+  it("rejected requeue drift-guards on its own expected count", async () => {
+    // Wrong rejected count → drift, nothing moves (includeRejected without a
+    // confirmed count behaves the same: expected 0 vs actual 1).
+    await expect(
+      requeueCampaignFailed(db, campaignId, { expectedCount: 0, includeRejected: true, expectedRejectedCount: 3 }),
+    ).rejects.toMatchObject({ code: "drift" });
+    await expect(requeueCampaignFailed(db, campaignId, { expectedCount: 0, includeRejected: true })).rejects.toMatchObject({
+      code: "drift",
+    });
+    const drift = await app.inject({
+      method: "POST",
+      url: `/api/admin/campaigns/${campaignId}/requeue-failed`,
+      payload: { expectedCount: 0, includeRejected: true, expectedRejectedCount: 2 },
+    });
+    expect(drift.statusCode).toBe(409);
+  });
+
+  it("requeues the rejected point back to requested + pending and reopens the campaign", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/admin/campaigns/${campaignId}/requeue-failed`,
+      payload: { expectedCount: 0, includeRejected: true, expectedRejectedCount: 1 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().requeued).toBe(1);
+    expect(res.json().requeuedFailed).toBe(0);
+    expect(res.json().requeuedRejected).toBe(1);
+
+    // Re-claimable exactly like the failed path: point requested, result pending.
+    const [point] = (await db.execute(sql`
+      SELECT p.state, r.status
+      FROM sim_campaign_points p JOIN results r ON r.id = p.result_id
+      WHERE p.campaign_id = ${campaignId} AND p.aoa_deg = 0
+    `)) as unknown as Array<{ state: string; status: string }>;
+    expect(point.state).toBe("requested");
+    expect(point.status).toBe("pending");
+
+    const rejected = await campaignRejected(db, campaignId);
+    expect(rejected.total).toBe(0);
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.rejected).toBe(0);
+    expect(totals.remaining).toBe(1);
+    const [camp] = (await db.execute(sql`SELECT status FROM sim_campaigns WHERE id = ${campaignId}`)) as unknown as Array<{ status: string }>;
+    expect(camp.status).toBe("active");
+  });
+
+  it("the re-solve lands accepted and the classification row refreshes regime in place (3db79ff8 staleness)", async () => {
+    // Simulate the fixed-engine re-solve landing on the SAME results row with
+    // full URANS evidence this time.
+    await db
+      .update(results)
+      .set({ status: "done", source: "solved", regime: "urans", unsteady: true, stalled: true, converged: true, cl: 0.36, cd: 0.019 })
+      .where(eq(results.id, rejectedResultId));
+    await db.insert(forceHistory).values({ resultId: rejectedResultId, t: [0, 0.1, 0.2, 0.3], cl: [0.33, 0.37, 0.35, 0.36], cd: [0.019, 0.021, 0.02, 0.02], cm: [-0.02, -0.02, -0.02, -0.02] });
+    await db.insert(resultMedia).values({ resultId: rejectedResultId, kind: "video", field: "velocity_magnitude", role: "instantaneous", storageKey: `jobs/${PREFIX}-rq/cases/c0/velocity_magnitude.mp4`, mimeType: "video/mp4" });
+    await onResultIngested(db, { airfoilId: rqAirfoilId, revisionId, aoaDeg: 0, resultId: rejectedResultId, status: "done" });
+    await refreshPolarCacheForRevision(db, rqAirfoilId, revisionId);
+
+    const [rc] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, rejectedResultId));
+    expect(rc?.state).toBe("accepted"); // the requeued point comes back clean
+
+    // Regime staleness must-catch (prod row 3db79ff8: regime='rans' stamped on
+    // an accepted urans verdict): re-solve a formerly-RANS row as URANS and the
+    // classification row updated IN PLACE must carry the new regime.
+    const [rcBefore] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, ransResultId));
+    expect(rcBefore?.regime).toBe("rans");
+    await db
+      .update(results)
+      .set({ regime: "urans", unsteady: true, stalled: true, converged: true })
+      .where(eq(results.id, ransResultId));
+    await db.insert(forceHistory).values({ resultId: ransResultId, t: [0, 0.1, 0.2, 0.3], cl: [0.38, 0.42, 0.4, 0.41], cd: [0.019, 0.021, 0.02, 0.02], cm: [-0.02, -0.02, -0.02, -0.02] });
+    await db.insert(resultMedia).values({ resultId: ransResultId, kind: "video", field: "velocity_magnitude", role: "instantaneous", storageKey: `jobs/${PREFIX}-rq/cases/c1/velocity_magnitude.mp4`, mimeType: "video/mp4" });
+    await refreshPolarCacheForRevision(db, rqAirfoilId, revisionId);
+    const [rcAfter] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, ransResultId));
+    expect(rcAfter?.state).toBe("accepted");
+    expect(rcAfter?.regime).toBe("urans"); // NOT the stale 'rans' from the first verdict
+
+    // Campaign settles clean after the re-solve verdict.
+    await db.transaction(async (tx) => {
+      await recomputeCampaignProgress(tx, campaignId);
+    });
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.solved).toBe(5);
+    expect(totals.rejected).toBe(0);
+    expect(deriveCampaignCompletion(totals)).toBe("completed");
   });
 });
 

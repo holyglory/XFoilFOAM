@@ -15,6 +15,7 @@ import {
   campaignLaneDetail,
   campaignLanes,
   campaignRate,
+  campaignRejected,
   campaignSummary,
   cancelCampaign,
   classifyPlanChange,
@@ -232,7 +233,7 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
     }
   });
 
-  // ---- failures (requeue dialog data) ----
+  // ---- failures + rejected (requeue dialog data) ----
   app.get("/api/admin/campaigns/:id/failures", { preHandler: requireAdmin }, async (req, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
     const q = z
@@ -243,7 +244,10 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
       })
       .parse(req.query);
     try {
-      return await campaignFailures(db, id, { conditionId: q.conditionId, airfoilId: q.airfoilId });
+      const scope = { conditionId: q.conditionId, airfoilId: q.airfoilId };
+      const failures = await campaignFailures(db, id, scope);
+      const rejected = await campaignRejected(db, id, scope);
+      return { ...failures, rejected };
     } catch (e) {
       return sendCampaignError(reply, e);
     }
@@ -445,6 +449,11 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
         conditionId: z.string().uuid().optional(),
         airfoilId: z.string().uuid().optional(),
         expectedCount: z.coerce.number().int().min(0),
+        // Rejected bucket opt-in: expectedRejectedCount defaults to 0 in the
+        // DB layer, so includeRejected without a count 409s on drift instead
+        // of silently requeueing unconfirmed points.
+        includeRejected: z.boolean().optional(),
+        expectedRejectedCount: z.coerce.number().int().min(0).optional(),
       })
       .parse(req.body);
     try {

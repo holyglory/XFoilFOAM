@@ -1027,6 +1027,22 @@ export interface AdminCampaignFailureGroup {
   }>;
 }
 
+export interface AdminCampaignRejectedSample {
+  resultId: string;
+  conditionId: string;
+  airfoilId: string;
+  airfoilSlug: string;
+  airfoilName: string;
+  aoaDeg: number;
+  reasons: string[];
+  attempts: number;
+}
+
+export interface AdminCampaignRejected {
+  total: number;
+  samples: AdminCampaignRejectedSample[];
+}
+
 export interface AdminCampaignLane {
   campaignId: string;
   airfoilId: string;
@@ -1216,7 +1232,7 @@ export const getCampaignFailures = (id: string, opts?: { conditionId?: string; a
   if (opts?.conditionId) qs.set("conditionId", opts.conditionId);
   if (opts?.airfoilId) qs.set("airfoilId", opts.airfoilId);
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
-  return aj<{ total: number; groups: AdminCampaignFailureGroup[] }>(
+  return aj<{ total: number; groups: AdminCampaignFailureGroup[]; rejected: AdminCampaignRejected }>(
     `/api/admin/campaigns/${encodeURIComponent(id)}/failures${suffix}`,
   );
 };
@@ -1300,9 +1316,16 @@ export const continueLane = (id: string, laneKey: CampaignLaneKey, extraRounds: 
 
 export const requeueCampaignFailed = (
   id: string,
-  body: { errorClasses?: CampaignErrorClass[]; conditionId?: string; airfoilId?: string; expectedCount: number },
+  body: {
+    errorClasses?: CampaignErrorClass[];
+    conditionId?: string;
+    airfoilId?: string;
+    expectedCount: number;
+    includeRejected?: boolean;
+    expectedRejectedCount?: number;
+  },
 ) =>
-  aj<{ requeued: number; totals: CampaignProgressTotals }>(
+  aj<{ requeued: number; requeuedFailed: number; requeuedRejected: number; totals: CampaignProgressTotals }>(
     `/api/admin/campaigns/${encodeURIComponent(id)}/requeue-failed`,
     { method: "POST", body: JSON.stringify(body) },
   );

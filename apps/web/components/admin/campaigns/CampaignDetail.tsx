@@ -277,10 +277,16 @@ export function CampaignDetail({
       { key: "add-airfoils", label: "Add airfoils", onClick: () => setAddAirfoilsOpen(true), testId: "campaign-action-add-airfoils" },
     );
   }
-  if (totals.failed > 0 && editable) {
+  if ((totals.failed > 0 || totals.rejected > 0) && editable) {
+    // Both review buckets open the same dialog: failed points always, rejected
+    // (done-but-physics-rejected) points behind the dialog's opt-in section.
+    const parts = [
+      ...(totals.failed > 0 ? [`failed (${fCount(totals.failed)})`] : []),
+      ...(totals.rejected > 0 ? [`rejected (${fCount(totals.rejected)})`] : []),
+    ];
     actions.push({
       key: "requeue",
-      label: `Requeue failed (${fCount(totals.failed)})`,
+      label: `Requeue ${parts.join(" / ")}`,
       tone: "amber",
       onClick: () => setRequeueOpen(true),
       testId: "campaign-action-requeue",
@@ -570,7 +576,7 @@ export function CampaignDetail({
           conditions={conditions}
           onClose={() => setRequeueOpen(false)}
           onApplied={(requeued) => {
-            setNotice(`requeued ${fCount(requeued)} failed point${requeued === 1 ? "" : "s"}`);
+            setNotice(`requeued ${fCount(requeued)} point${requeued === 1 ? "" : "s"}`);
             void refresh();
           }}
         />
