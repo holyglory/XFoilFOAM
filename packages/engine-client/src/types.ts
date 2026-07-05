@@ -114,6 +114,19 @@ export interface PolarRequest {
 
 export type JobState = "pending" | "running" | "completed" | "failed" | "cancelled";
 
+/** Engine worker-boot orphan reconciliation message — pinned byte-for-byte to
+ *  `ORPHAN_MESSAGE` in src/airfoilfoam/storage.py. A failed job status/result
+ *  carrying exactly this message means "the worker container restarted
+ *  mid-solve and the celery task died": an infrastructure interruption, NOT
+ *  solver failure evidence. The sweeper matches on this literal to release the
+ *  job's unsolved claims for a re-solve instead of terminal-failing them
+ *  (incident 2026-07-04: 12 campaign points +3 symmetry mirrors were
+ *  terminal-failed with empty error text by a worker restart).
+ *  Drift is a test failure on BOTH sides:
+ *  - node:   apps/sweeper/test/orphan-message-pin.test.ts
+ *  - python: tests/test_orphan_reconcile.py::test_orphan_message_is_pinned_for_node_clients */
+export const WORKER_RESTART_ORPHAN_MESSAGE = "worker restarted mid-solve; task lost";
+
 export type JobPhase =
   | "pending"
   | "waiting_cpu"

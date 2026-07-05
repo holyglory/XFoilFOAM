@@ -36,6 +36,21 @@ def now_utc() -> datetime:
 
 
 # --------------------------------------------------------------------------- #
+# Cross-runtime message pin
+# --------------------------------------------------------------------------- #
+def test_orphan_message_is_pinned_for_node_clients():
+    """The node sweeper matches this literal to tell worker-restart
+    interruptions apart from real solver failures (release + re-solve, never
+    fake terminal-failed evidence): packages/engine-client/src/types.ts
+    WORKER_RESTART_ORPHAN_MESSAGE, consumed in apps/sweeper/src/reconcile.ts.
+    The literal is hardcoded on BOTH sides on purpose — changing it here
+    without the node side (or vice versa) must fail a test, never silently
+    turn restarts back into fake failures. Node twin:
+    apps/sweeper/test/orphan-message-pin.test.ts."""
+    assert ORPHAN_MESSAGE == "worker restarted mid-solve; task lost"
+
+
+# --------------------------------------------------------------------------- #
 # JobStore.reconcile_orphans
 # --------------------------------------------------------------------------- #
 def test_running_job_from_before_boot_is_marked_failed(tmp_path):

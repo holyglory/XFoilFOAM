@@ -1057,6 +1057,53 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   views. Chosen over an "accepted-with-reservations" tier (over-engineering at
   this stage); revisit if polar fits degrade on weak-shedding points.
 
+## 2026-07-06 — Worker-restart orphans release claims; failed rows always carry an error
+
+- Incident (2026-07-04, airfoils.pro): the engine's worker-boot orphan
+  reconciliation marks restart-killed jobs state=failed with
+  "worker restarted mid-solve; task lost". The sweeper's failed-job ingest
+  treated that as solver failure: `failJob` terminal-failed 12 campaign
+  points (+3 symmetry mirrors) with EMPTY results.error (failJob never
+  stamped error text; ERROR_CLASS_SQL buckets NULL/'' as 'unknown' → the
+  "15 failed / unknown" monitor view). Infrastructure interruption became
+  fake failure evidence. Repaired live via requeue-failed; this entry is the
+  recurrence prevention.
+- Decision: the orphan message is a cross-runtime protocol constant —
+  `WORKER_RESTART_ORPHAN_MESSAGE` in packages/engine-client (pinned to
+  storage.py ORPHAN_MESSAGE by hardcoded-literal tests on BOTH sides:
+  apps/sweeper/test/orphan-message-pin.test.ts and
+  tests/test_orphan_reconcile.py::test_orphan_message_is_pinned_for_node_clients;
+  drift = test failure). On exact match, ingestFailedEngineJob routes to
+  releaseWorkerRestartOrphan: solved cases in the partial result.json still
+  ingest as done evidence (filtered to solved points only), every remaining
+  claimed row is RELEASED via the cancelJobAndReleaseClaims semantics
+  (pending, job refs nulled, re-claimable next tick), the sim_job ends
+  'cancelled' with "worker restarted mid-solve; points released for
+  re-solve", and NOTHING is marked failed — campaign points stay/return to
+  'requested'. Loud console.error one-liner.
+- Deliberately NO URANS retry submit on the orphan path: retry plans read
+  revision-wide classifications, where just-released unsolved rows snapshot
+  as 'rejected' until re-solved — deciding now could escalate interrupted
+  points to whole-polar URANS. The follow-up re-solve job runs the same
+  revision-wide retry pass on real evidence.
+- Genuine failed jobs keep failing rows, but results.error must NEVER be
+  empty: failJob now stamps the engine job message on every row it fails,
+  and ingestResult gained failedPointErrorFallback so a failed point whose
+  own p.error is null inherits the job-level message (fallback: "engine job
+  failed without a message (job <id>)", which classes 'engine'). No new
+  error class added — with stamps in place the existing text-derived classes
+  are sufficient and orphan messages never reach results.error anymore.
+- Must-catch coverage (recall proven by running them against the pre-fix
+  code: both fail with the incident signatures): worker-restart-orphan.test.ts
+  (orphan partial → 1 done + 2 released + 0 failed + campaign failed=0 +
+  failures endpoint total 0 + gap batch re-picks; genuine failure → rows
+  failed with exact message, campaignFailures class 'mesh' not 'unknown')
+  plus two sweeper.test.ts cases for the no-result and partial-result
+  genuine-failure message stamping.
+- Known residual (pre-existing, unchanged): a genuinely failed job that DID
+  ingest partial points leaves its untouched claimed rows 'queued' until the
+  next sweeper restart's resetOrphans releases them.
+
 ## 2026-07-06 — Rejected-point repair, scaled-media retry, classifier regime staleness
 
 - Rejected points get a first-class repair path: `requeueCampaignFailed` now
