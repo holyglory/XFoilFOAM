@@ -887,6 +887,9 @@ export interface CampaignProgressTotals {
   running: number;
   superseded: number;
   derived: number;
+  /** Terminal-done points whose result classified 'rejected' (physics-invalid
+   *  evidence): settled but NOT solved — surfaced like failed. */
+  rejected: number;
   remaining: number;
 }
 
@@ -927,6 +930,7 @@ export interface AdminCampaignListItem {
   priority: number;
   notes: string | null;
   closedWithFailedCount: number | null;
+  closedWithRejectedCount: number | null;
   completedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -969,6 +973,7 @@ export interface AdminCampaignSummary {
     priority: number;
     idempotencyKey: string;
     closedWithFailedCount: number | null;
+    closedWithRejectedCount: number | null;
     completedAt: string | null;
     createdAt: string;
     updatedAt: string;

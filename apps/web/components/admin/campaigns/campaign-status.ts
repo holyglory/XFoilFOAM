@@ -28,12 +28,33 @@ export function campaignStatusLine(s: AdminCampaignSummary): { text: string; ton
       return jobs > 0
         ? { text: `Cancelled — ${fCount(jobs)} job${jobs === 1 ? "" : "s"} finishing.`, tone: "dim" }
         : { text: "Cancelled.", tone: "dim" };
-    case "completed":
-      return campaign.closedWithFailedCount != null
-        ? { text: `Completed — closed with ${fCount(campaign.closedWithFailedCount)} failed point${campaign.closedWithFailedCount === 1 ? "" : "s"}.`, tone: "teal" }
-        : { text: "Completed — every obligated point is terminal.", tone: "teal" };
-    case "attention":
-      return { text: `All obligated work is terminal — ${fCount(totals.failed)} failed point${totals.failed === 1 ? "" : "s"} need review.`, tone: "red" };
+    case "completed": {
+      // Honest close record (F2): a close from attention can be driven by
+      // failed AND/OR rejected points. Omit each clause when 0/null — never
+      // render "closed with 0 failed points" for a rejected-only close.
+      const closedFailed = campaign.closedWithFailedCount ?? 0;
+      const closedRejected = campaign.closedWithRejectedCount ?? 0;
+      if (closedFailed > 0 && closedRejected > 0) {
+        return {
+          text: `Completed — closed with ${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"} · ${fCount(closedRejected)} rejected.`,
+          tone: "teal",
+        };
+      }
+      if (closedFailed > 0) {
+        return { text: `Completed — closed with ${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"}.`, tone: "teal" };
+      }
+      if (closedRejected > 0) {
+        return { text: `Completed — closed with ${fCount(closedRejected)} rejected point${closedRejected === 1 ? "" : "s"}.`, tone: "teal" };
+      }
+      return { text: "Completed — every obligated point is terminal.", tone: "teal" };
+    }
+    case "attention": {
+      const parts: string[] = [];
+      if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
+      if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);
+      const needs = parts.length ? parts.join(" + ") : "0 failed";
+      return { text: `All obligated work is terminal — ${needs} point${totals.failed + totals.rejected === 1 ? "" : "s"} need review.`, tone: "red" };
+    }
     case "paused":
       return {
         text: `Paused by you — no new points will be scheduled${jobs > 0 ? `; ${fCount(jobs)} running job${jobs === 1 ? "" : "s"} will finish` : ""}.`,

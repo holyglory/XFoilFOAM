@@ -1051,6 +1051,9 @@ export interface CampaignProgressTotals {
   running: number;
   superseded: number;
   derived: number;
+  /** Terminal-done points whose classification is 'rejected' — settled but
+   *  NOT solved (physics-invalid evidence, surfaced like failed). */
+  rejected: number;
   remaining: number;
 }
 
@@ -1065,6 +1068,9 @@ export interface CampaignProgressTotals {
  *  superseded" mean:
  *   - requested: state <> 'released' (TOTAL obligation, the UI denominator)
  *   - solved:    state = 'terminal' AND NOT derived AND result.status = 'done'
+ *                AND classification IS NOT 'rejected'
+ *   - rejected:  state = 'terminal' AND NOT derived AND result.status = 'done'
+ *                AND result_classifications.state = 'rejected'
  *   - failed:    state = 'terminal' AND result.status = 'failed'
  *   - running:   state = 'requested' AND live-cell result.status IN (queued, running)
  *   - superseded: result_classifications.state = 'superseded_by_urans'
@@ -1090,11 +1096,12 @@ export async function campaignProgressTotals(db: DbTx, campaignId: string): Prom
       COALESCE(sum(failed), 0)::int AS failed,
       COALESCE(sum(running), 0)::int AS running,
       COALESCE(sum(superseded), 0)::int AS superseded,
-      COALESCE(sum(derived), 0)::int AS derived
+      COALESCE(sum(derived), 0)::int AS derived,
+      COALESCE(sum(rejected), 0)::int AS rejected
     FROM sim_campaign_progress
     WHERE campaign_id = ${campaignId}
   `)) as unknown as Array<Omit<CampaignProgressTotals, "remaining">>;
-  const totals = row ?? { requested: 0, solved: 0, failed: 0, running: 0, superseded: 0, derived: 0 };
+  const totals = row ?? { requested: 0, solved: 0, failed: 0, running: 0, superseded: 0, derived: 0, rejected: 0 };
   return {
     requested: Number(totals.requested),
     solved: Number(totals.solved),
@@ -1102,14 +1109,20 @@ export async function campaignProgressTotals(db: DbTx, campaignId: string): Prom
     running: Number(totals.running),
     superseded: Number(totals.superseded),
     derived: Number(totals.derived),
-    remaining: Math.max(0, Number(totals.requested) - Number(totals.solved) - Number(totals.derived) - Number(totals.failed)),
+    rejected: Number(totals.rejected),
+    remaining: Math.max(
+      0,
+      Number(totals.requested) - Number(totals.solved) - Number(totals.derived) - Number(totals.failed) - Number(totals.rejected),
+    ),
   };
 }
 
 /** Completion-state derivation (spec §6.4): every obligated cell settled and
- *  zero failed → completed; settled with failures → attention; else active. */
+ *  zero failed/rejected → completed; settled with failures OR physics-rejected
+ *  points → attention (a rejected point is settled but NOT solved work); else
+ *  active. */
 export function deriveCampaignCompletion(totals: CampaignProgressTotals): "active" | "attention" | "completed" {
-  if (totals.requested > 0 && totals.remaining <= 0) return totals.failed > 0 ? "attention" : "completed";
+  if (totals.requested > 0 && totals.remaining <= 0) return totals.failed > 0 || totals.rejected > 0 ? "attention" : "completed";
   return "active";
 }
 
@@ -2468,12 +2481,14 @@ export async function closeCampaignWithFailures(db: DB, campaignId: string) {
       throw new CampaignError("invalid_state", `only attention campaigns can be closed with failures (status: ${campaign.status})`);
     }
     const totals = await campaignProgressTotals(tx, campaignId);
+    // Record BOTH review buckets: attention fires on failed>0 OR rejected>0,
+    // so a rejected-only close must not book "closed with 0 failed points".
     const [row] = await asDb(tx)
       .update(simCampaigns)
-      .set({ status: "completed", closedWithFailedCount: totals.failed, completedAt: new Date() })
+      .set({ status: "completed", closedWithFailedCount: totals.failed, closedWithRejectedCount: totals.rejected, completedAt: new Date() })
       .where(eq(simCampaigns.id, campaignId))
       .returning();
-    return { campaign: row, closedWithFailedCount: totals.failed };
+    return { campaign: row, closedWithFailedCount: totals.failed, closedWithRejectedCount: totals.rejected };
   });
 }
 
@@ -2803,6 +2818,7 @@ export interface CampaignListItem {
   priority: number;
   notes: string | null;
   closedWithFailedCount: number | null;
+  closedWithRejectedCount: number | null;
   completedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -2823,7 +2839,7 @@ export async function listCampaigns(
   const rows = (await db.execute(sql`
     SELECT
       c.id, c.slug, c.name, c.status, c.priority, c.notes,
-      c.closed_with_failed_count, c."completedAt" AS completed_at, c."createdAt" AS created_at, c."updatedAt" AS updated_at,
+      c.closed_with_failed_count, c.closed_with_rejected_count, c."completedAt" AS completed_at, c."createdAt" AS created_at, c."updatedAt" AS updated_at,
       (SELECT count(*)::int FROM sim_campaign_conditions cc WHERE cc.campaign_id = c.id) AS condition_count,
       (SELECT count(*)::int FROM sim_campaign_airfoils ca WHERE ca.campaign_id = c.id) AS airfoil_count,
       COALESCE(pr.requested, 0)::int AS requested,
@@ -2832,11 +2848,12 @@ export async function listCampaigns(
       COALESCE(pr.running, 0)::int AS running,
       COALESCE(pr.superseded, 0)::int AS superseded,
       COALESCE(pr.derived, 0)::int AS derived,
+      COALESCE(pr.rejected, 0)::int AS rejected,
       count(*) OVER ()::int AS total
     FROM sim_campaigns c
     LEFT JOIN (
       SELECT campaign_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
-             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived
+             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived, sum(rejected) AS rejected
       FROM sim_campaign_progress GROUP BY campaign_id
     ) pr ON pr.campaign_id = c.id
     ${statusFilter}
@@ -2854,6 +2871,7 @@ export async function listCampaigns(
       priority: Number(r.priority),
       notes: (r.notes as string | null) ?? null,
       closedWithFailedCount: r.closed_with_failed_count == null ? null : Number(r.closed_with_failed_count),
+      closedWithRejectedCount: r.closed_with_rejected_count == null ? null : Number(r.closed_with_rejected_count),
       completedAt: isoOf(r.completed_at as Date | string | null),
       createdAt: isoOf(r.created_at as Date | string | null)!,
       updatedAt: isoOf(r.updated_at as Date | string | null)!,
@@ -2866,7 +2884,8 @@ export async function listCampaigns(
         running: Number(r.running),
         superseded: Number(r.superseded),
         derived: Number(r.derived),
-        remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed)),
+        rejected: Number(r.rejected),
+        remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed) - Number(r.rejected)),
       },
     })),
   };
@@ -2905,6 +2924,7 @@ export interface CampaignSummary {
     priority: number;
     idempotencyKey: string;
     closedWithFailedCount: number | null;
+    closedWithRejectedCount: number | null;
     completedAt: string | null;
     createdAt: string;
     updatedAt: string;
@@ -2951,13 +2971,14 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
       COALESCE(pr.failed, 0)::int AS failed,
       COALESCE(pr.running, 0)::int AS running,
       COALESCE(pr.superseded, 0)::int AS superseded,
-      COALESCE(pr.derived, 0)::int AS derived
+      COALESCE(pr.derived, 0)::int AS derived,
+      COALESCE(pr.rejected, 0)::int AS rejected
     FROM sim_campaign_conditions cc
     JOIN simulation_presets p ON p.id = cc.preset_id
     JOIN simulation_preset_revisions rev ON rev.id = cc.simulation_preset_revision_id
     LEFT JOIN (
       SELECT condition_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
-             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived
+             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived, sum(rejected) AS rejected
       FROM sim_campaign_progress WHERE campaign_id = ${campaignId} GROUP BY condition_id
     ) pr ON pr.condition_id = cc.id
     WHERE cc.campaign_id = ${campaignId}
@@ -2981,6 +3002,7 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
       priority: campaign.priority,
       idempotencyKey: campaign.idempotencyKey,
       closedWithFailedCount: campaign.closedWithFailedCount,
+      closedWithRejectedCount: campaign.closedWithRejectedCount,
       completedAt: isoOf(campaign.completedAt),
       createdAt: isoOf(campaign.createdAt)!,
       updatedAt: isoOf(campaign.updatedAt)!,
@@ -3017,7 +3039,8 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
         running: Number(r.running),
         superseded: Number(r.superseded),
         derived: Number(r.derived),
-        remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed)),
+        rejected: Number(r.rejected),
+        remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed) - Number(r.rejected)),
       },
     })),
     lanesSummary,
@@ -3068,7 +3091,8 @@ export async function campaignAirfoilRows(
       running: row.running,
       superseded: row.superseded,
       derived: row.derived,
-      remaining: Math.max(0, row.requested - row.solved - row.derived - row.failed),
+      rejected: row.rejected,
+      remaining: Math.max(0, row.requested - row.solved - row.derived - row.failed - row.rejected),
     });
     byAirfoil.set(row.airfoilId, bucket);
   }
@@ -3259,7 +3283,7 @@ export interface CampaignBacklogStripEntry {
 export async function campaignBacklogStrip(db: DB): Promise<CampaignBacklogStripEntry[]> {
   const rows = (await db.execute(sql`
     SELECT c.id, c.slug, c.name, c.status, c.priority,
-      COALESCE(sum(pr.requested - pr.solved - pr.derived - pr.failed), 0)::int AS remaining,
+      COALESCE(sum(pr.requested - pr.solved - pr.derived - pr.failed - pr.rejected), 0)::int AS remaining,
       COALESCE(sum(pr.failed), 0)::int AS failed,
       COALESCE(sum(pr.running), 0)::int AS running
     FROM sim_campaigns c

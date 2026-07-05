@@ -8,7 +8,12 @@ import type {
   ResultRegime,
 } from "./types";
 
-export const POLAR_CLASSIFIER_VERSION = "rans-stall-v1";
+// v2: solver-stalled applies only to non-converged STEADY points; unsteady
+// rows are judged on the URANS evidence gate (converged + force history +
+// video). Under v1 every unsteady row carried stalled=true from ingest and was
+// mislabelled solver-stalled → rejected, so no URANS point could ever be
+// accepted and RANS supersession was dead in practice.
+export const POLAR_CLASSIFIER_VERSION = "rans-stall-v2";
 export const POLAR_FIT_VERSION = "evidence-lowess-v2";
 
 export interface PolarEvidencePoint {
@@ -96,7 +101,12 @@ function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   if (finite(p.cd) && p.cd <= 0) reasons.push("non-positive-drag");
   if (p.error) reasons.push("solver-error");
   if (p.converged !== true) reasons.push("not-converged");
-  if (p.stalled) reasons.push("solver-stalled");
+  // `stalled` is the AERODYNAMIC post-stall marker (ingest sets it true for
+  // every unsteady point by construction). Solver-stalled is a SOLVER defect:
+  // only a non-converged steady point earns it. Unsteady evidence is judged on
+  // its own gate below — converged + force history + video (evidence-first
+  // honesty; without this split no URANS row could ever classify accepted).
+  if (p.stalled && !p.unsteady) reasons.push("solver-stalled");
   if (p.regime === "urans") {
     if (!p.hasForceHistory) reasons.push("missing-force-history");
     if (!p.hasVideo) reasons.push("missing-urans-video");

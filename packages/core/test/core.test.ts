@@ -221,6 +221,74 @@ describe("RANS stall classification and fitted polar", () => {
   });
 });
 
+describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-stall)", () => {
+  // MUST-CATCH: built with the sweeper's exact ingest semantics
+  // (stalledForPoint: stalled = unsteady || converged === false), i.e. the
+  // shape every real URANS results row has in the database. Under the v1
+  // classifier this row was rejected "solver-stalled" and NO unsteady point
+  // could ever be accepted (prod DB: 0 accepted URANS rows, ever).
+  const ingestShapedUrans = {
+    a: 16,
+    cl: 1.12,
+    cd: 0.21,
+    cm: -0.06,
+    status: "done",
+    source: "solved",
+    regime: "urans" as const,
+    converged: true,
+    stalled: true, // true BECAUSE unsteady:true — the aerodynamic marker
+    unsteady: true,
+    hasForceHistory: true,
+    hasVideo: true,
+  };
+
+  it("accepts a converged unsteady row with force history + video", () => {
+    const classified = classifyPolarEvidence([ingestShapedUrans]);
+    expect(classified.classifications[0].state).toBe("accepted");
+    expect(classified.classifications[0].reasons).toEqual([]);
+    expect(classified.hardRejectedAoas).toEqual([]);
+  });
+
+  it("still rejects a non-converged STEADY row as solver-stalled", () => {
+    const classified = classifyPolarEvidence([
+      {
+        a: 4,
+        cl: 0.5,
+        cd: 0.02,
+        cm: -0.01,
+        status: "done",
+        source: "solved",
+        regime: "rans" as const,
+        converged: false,
+        stalled: true,
+        unsteady: false,
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toContain("solver-stalled");
+    expect(classified.classifications[0].reasons).toContain("not-converged");
+  });
+
+  it("rejects an unsteady row missing its video (evidence-first honesty)", () => {
+    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, hasVideo: false }]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["missing-urans-video"]);
+  });
+
+  it("rejects an unsteady row missing its force history", () => {
+    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, hasForceHistory: false }]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["missing-force-history"]);
+  });
+
+  it("rejects a non-converged unsteady row (not-converged, without solver-stalled)", () => {
+    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, converged: false }]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toContain("not-converged");
+    expect(classified.classifications[0].reasons).not.toContain("solver-stalled");
+  });
+});
+
 describe("URANS media quality", () => {
   it("flags the old NACA 0012 Re 500k AoA 20 sparse animation", () => {
     const quality = evaluateUransMediaQuality({

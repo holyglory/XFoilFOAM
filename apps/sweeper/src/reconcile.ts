@@ -5,7 +5,9 @@ import {
   laneKeyId,
   laneTick,
   onResultIngested,
+  probeCampaignCompletion,
   reconcileCampaigns,
+  recomputeProgressForCampaign,
   refreshPolarCacheForRevision,
   results,
   simCampaignLanes,
@@ -349,6 +351,11 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
     .returning({ id: simJobs.id });
 
   if (retry.queueCanonicalAoas.length) {
+    // The stored classification must stay the AT-INGEST verdict (already
+    // refreshed above, before the retry plan): flipping rows to queued and
+    // re-refreshing here rewrote every retried point's classification to a
+    // synthetic post-requeue "not-solved" snapshot, destroying the evidence
+    // trail (prod row 741db07a). No refresh after this flip.
     await db
       .update(results)
       .set({ status: "queued", source: "queued", simJobId: job.id })
@@ -359,7 +366,6 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
           inArray(results.aoaDeg, retry.queueCanonicalAoas),
         ),
       );
-    await refreshPolarCacheForRevision(db, a.id, setup.revisionId);
   }
 
   try {
@@ -499,6 +505,9 @@ async function submitCampaignUransRetries(
       .returning({ id: simJobs.id });
 
     if (retry.queueCanonicalAoas.length) {
+      // Same at-ingest-verdict rule as the single-revision path: the cache was
+      // refreshed BEFORE the retry plan; a post-flip refresh would overwrite
+      // the stored classification with a post-requeue "not-solved" snapshot.
       await db
         .update(results)
         .set({ status: "queued", source: "queued", simJobId: job.id })
@@ -509,7 +518,6 @@ async function submitCampaignUransRetries(
             inArray(results.aoaDeg, retry.queueCanonicalAoas),
           ),
         );
-      await refreshPolarCacheForRevision(db, a.id, entry.revisionId);
     }
 
     try {
@@ -556,6 +564,24 @@ async function submitCampaignUransRetries(
   }
 }
 
+/** Post-refresh campaign settlement: the ingest-time completion probe fires
+ *  BEFORE the polar cache refresh classifies fresh rows (it blocks on those
+ *  unjudged points), so after the refresh the campaign's counters must absorb
+ *  the verdicts (rejected bucket) and the probe must run again to settle
+ *  completed vs attention honestly. */
+async function settleCampaignAfterRefresh(db: DB, job: SimJobRow): Promise<void> {
+  if (!job.campaignId) return;
+  try {
+    await recomputeProgressForCampaign(db, job.campaignId);
+    await probeCampaignCompletion(db, job.campaignId);
+  } catch (e) {
+    // Counters/probe hiccups (e.g. a recompute deadlock against the periodic
+    // reconciler) must not fail an already-ingested job — the reconciler
+    // heals counters and re-probes within its 5-minute sweep. Loud, never silent.
+    console.error(`[sweeper] campaign settle failed (campaign ${job.campaignId}, job ${job.id}): ${errorMessage(e)}`);
+  }
+}
+
 async function ingestCompletedJob(db: DB, engine: EngineClient, job: SimJobRow): Promise<void> {
   if (!job.engineJobId) return;
   const result = await engine.getResult(job.engineJobId);
@@ -577,6 +603,7 @@ async function ingestCompletedJob(db: DB, engine: EngineClient, job: SimJobRow):
     .set({ status: "done", engineState: "completed", error: null, ingestedAt: new Date(), finishedAt: new Date() })
     .where(reconcilableJobWhere(job.id));
   await submitUransRetryForJob(db, engine, job);
+  await settleCampaignAfterRefresh(db, job);
 }
 
 async function ingestRunningPartialJob(db: DB, engine: EngineClient, job: SimJobRow): Promise<boolean> {
@@ -641,6 +668,7 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       .set({ status: "failed", engineState: "failed", error: msg, ingestedAt: new Date(), finishedAt: new Date() })
       .where(reconcilableJobWhere(job.id));
     await submitUransRetryForJob(db, engine, job);
+    await settleCampaignAfterRefresh(db, job);
   } catch {
     await failJob(db, job.id, msg);
   }

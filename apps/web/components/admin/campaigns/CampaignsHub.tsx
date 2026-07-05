@@ -73,7 +73,10 @@ function statusLine(
     return `Paused by you — no new points will be scheduled${running > 0 ? `; ${running} running job${running === 1 ? "" : "s"} will finish` : ""}.`;
   }
   if (item.status === "attention") {
-    return `All work settled with ${fCount(totals.failed)} failed point${totals.failed === 1 ? "" : "s"} — review or close with failures.`;
+    const needs: string[] = [];
+    if (totals.failed > 0) needs.push(`${fCount(totals.failed)} failed`);
+    if (totals.rejected > 0) needs.push(`${fCount(totals.rejected)} rejected`);
+    return `All work settled with ${needs.length ? needs.join(" + ") : "0 failed"} point${totals.failed + totals.rejected === 1 ? "" : "s"} — review or close with failures.`;
   }
   // active — scheduler-dependent suffix from the shared solver derivation
   // first: never a bare "Active — waiting" while nothing can run.
@@ -95,6 +98,7 @@ function statusLine(
   const parts = [`${fCount(totals.remaining)} points remaining`];
   if (totals.running > 0) parts.push(`${fCount(totals.running)} running`);
   if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
+  if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);
   return `Active — ${parts.join(" · ")}.`;
 }
 
@@ -302,11 +306,12 @@ export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver }: Ca
 
                 <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "center" }}>
                   <div aria-label={`progress ${settled} of ${totals.requested}`} style={{ height: 6, borderRadius: 4, background: C.panel3, overflow: "hidden" }}>
-                    <div style={{ width: `${progress * 100}%`, height: "100%", background: totals.failed > 0 ? C.amber : C.teal }} />
+                    <div style={{ width: `${progress * 100}%`, height: "100%", background: totals.failed > 0 || totals.rejected > 0 ? C.amber : C.teal }} />
                   </div>
                   <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, whiteSpace: "nowrap" }}>
                     {fCount(settled)} / {fCount(totals.requested)}
                     {totals.failed > 0 && <span style={{ color: C.red }}> · {fCount(totals.failed)} failed</span>}
+                    {totals.rejected > 0 && <span style={{ color: C.red }}> · {fCount(totals.rejected)} rejected</span>}
                   </span>
                 </div>
 

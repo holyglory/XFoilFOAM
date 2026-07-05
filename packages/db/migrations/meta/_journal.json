@@ -190,6 +190,20 @@
       "when": 1783209600000,
       "tag": "0026_sweeper_engine_backoff",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1783296000000,
+      "tag": "0027_campaign_progress_rejected",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1783382400000,
+      "tag": "0028_campaign_closed_rejected_count",
+      "breakpoints": true
     }
   ]
 }

@@ -556,7 +556,11 @@ describe("catalog solved-metric evidence", () => {
     expect(summary.ldmax).not.toBeNull();
     expect(summary.clmax).not.toBeNull();
     expect(summary.cdmin).not.toBeNull();
-    expect(summary.polarCount).toBe(3);
+    // 3 needs_urans RANS points + the ACCEPTED URANS replacement (it ships
+    // real force history + instantaneous video, so the evidence gate passes —
+    // the earlier expectation of 3 relied on a correlated-subquery bug that
+    // made hasForceHistory/hasVideo permanently false for result rows).
+    expect(summary.polarCount).toBe(4);
     expect(summary.metricsSource).toBe("solved");
     expect(summary.fitStatus).toBe("provisional");
     detail = await assembleDetail(unique);

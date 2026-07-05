@@ -9,6 +9,7 @@ import {
   meshProfiles,
   outputProfiles,
   polarFitSets,
+  refreshPolarCacheForRevision,
   referenceGeometryProfiles,
   resultClassifications,
   resultAttempts,
@@ -534,8 +535,10 @@ describe("sweeper: gap → claim → ingest", () => {
       result,
     });
     expect(r1.points).toBe(2);
-    // steady AoA: 2 instantaneous images; URANS AoA: 1 instantaneous + 1 mean image + 1 video = 5 total
-    expect(r1.media).toBe(5);
+    // Engine-shipped media register at ingest (steady: 2 images; URANS: 1
+    // image + 1 mean + 1 video = 5) and the scaled-render pass upserts the
+    // same 5 (result, kind, field, role) tuples with scale info = 10 writes.
+    expect(r1.media).toBe(10);
 
     const rows = await db
       .select()
@@ -608,6 +611,157 @@ describe("sweeper: gap → claim → ingest", () => {
       .from(resultAttempts)
       .where(and(eq(resultAttempts.simJobId, job.id), inArray(resultAttempts.aoaDeg, [steadyAoa, uransAoa])));
     expect(attemptsAfter.length).toBe(3);
+  }, 60000);
+
+  // MUST-CATCH (prod "missing-urans-video" regression): engine-shipped media
+  // must land in result_media at ingest even when the scaled-render chain
+  // (extents + render) fails — previously those failures were swallowed and
+  // NO video row ever registered, so every URANS point stayed rejected.
+  it("registers engine-shipped URANS media even when the scaled-render chain fails", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 83.001;
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 2,
+        status: "ingesting",
+        engineJobId: "shipped-media-job",
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+
+    const failingEngine = {
+      baseUrl: "http://engine.test",
+      computeFieldExtents: async () => {
+        throw new Error("render backend down");
+      },
+      renderDefaultMedia: async () => {
+        throw new Error("render backend down");
+      },
+    } as unknown as EngineClient;
+
+    const result: JobResult = {
+      job_id: "shipped-media-job",
+      state: "completed",
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: 0.1,
+          points: [
+            {
+              case_slug: "cs1",
+              aoa_deg: aoa,
+              cl: 1.05,
+              cd: 0.19,
+              cm: -0.05,
+              cl_cd: 5.5,
+              cl_std: 0.07,
+              cd_std: 0.02,
+              unsteady: true,
+              converged: true,
+              first_order_fallback: false,
+              strouhal: 0.19,
+              evidence_artifacts: [
+                {
+                  kind: "manifest",
+                  path: "/jobs/shipped-media-job/files/evidence/cs1/evidence_manifest.json",
+                  url: "/jobs/shipped-media-job/files/evidence/cs1/evidence_manifest.json",
+                  mime_type: "application/json",
+                  sha256: "sha-shipped-cs1",
+                  byte_size: 128,
+                  metadata: { evidenceBase: "/tmp/evidence/cs1" },
+                },
+              ],
+              images: { velocity_magnitude: "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude.png" },
+              mean_images: { velocity_magnitude: "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude_mean.png" },
+              video: { velocity_magnitude: "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude.mp4" },
+              force_history: {
+                t: [0, 0.1, 0.2, 0.3],
+                cl: [1.0, 1.1, 1.05, 1.06],
+                cd: [0.18, 0.2, 0.19, 0.19],
+                cm: [-0.05, -0.05, -0.05, -0.05],
+                shedding_freq_hz: 3.7,
+                samples: 240,
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const r = await ingestResult({
+      db,
+      engine: failingEngine,
+      engineJobId: "shipped-media-job",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+      result,
+    });
+    expect(r.points).toBe(1);
+    expect(r.media).toBe(3); // shipped image + mean image + video, no scaled renders
+
+    const [row] = await db
+      .select()
+      .from(results)
+      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    cleanupResultIds.add(row.id);
+    const media = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
+    expect(media.length).toBe(3);
+    const video = media.find((m) => m.kind === "video" && m.role === "instantaneous");
+    expect(video?.storageKey).toBe("jobs/shipped-media-job/cases/cs1/images/velocity_magnitude.mp4");
+    expect(video?.mimeType).toBe("video/mp4");
+    expect(media.some((m) => m.kind === "image" && m.role === "mean")).toBe(true);
+
+    // End-to-end D3 unlock: the ingest-shaped URANS row (stalled=true because
+    // unsteady, converged, with force history + video) classifies ACCEPTED.
+    await refreshPolarCacheForRevision(db, a.id, presetRevisionId);
+    const [rc] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, row.id));
+    expect(rc?.state).toBe("accepted");
+
+    // Idempotent re-ingest: still exactly 3 media rows.
+    await ingestResult({
+      db,
+      engine: failingEngine,
+      engineJobId: "shipped-media-job",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+      result,
+    });
+    const mediaAfter = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
+    expect(mediaAfter.length).toBe(3);
+
+    // MUST-CATCH (review F3): a wave-2 re-solve shipping NO video (video:{})
+    // must not leave the wave-1 video row satisfying the classifier's
+    // hasVideo gate for the NEW coefficients — ingest reconciles kind='video'
+    // rows to the current shipment, and the classification honestly drops to
+    // rejected missing-urans-video.
+    const noVideoResult: JobResult = JSON.parse(JSON.stringify(result));
+    noVideoResult.polars[0].points[0].video = {};
+    await ingestResult({
+      db,
+      engine: failingEngine,
+      engineJobId: "shipped-media-job",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+      result: noVideoResult,
+    });
+    const mediaNoVideo = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
+    expect(mediaNoVideo.some((m) => m.kind === "video")).toBe(false); // stale wave-1 video row is GONE
+    expect(mediaNoVideo.length).toBe(2); // shipped image + mean image survive
+    await refreshPolarCacheForRevision(db, a.id, presetRevisionId);
+    const [rcNoVideo] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, row.id));
+    expect(rcNoVideo?.state).toBe("rejected");
+    expect(rcNoVideo?.reasons).toContain("missing-urans-video");
   }, 60000);
 
   it("promotes an unreliable RANS sweep to one whole-polar URANS retry", async () => {

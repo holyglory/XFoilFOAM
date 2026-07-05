@@ -1213,6 +1213,7 @@ export const simCampaigns = pgTable(
       (): AnyPgColumn => simCampaignPlanRevisions.id,
     ),
     closedWithFailedCount: integer("closed_with_failed_count"), // set by "Close with failures"
+    closedWithRejectedCount: integer("closed_with_rejected_count"), // set alongside; null on pre-0028 closes (unknown, not zero)
     completedAt: ts(),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
@@ -1382,6 +1383,10 @@ export const simCampaignProgress = pgTable(
     running: integer("running").notNull().default(0),
     superseded: integer("superseded").notNull().default(0),
     derived: integer("derived").notNull().default(0),
+    // Terminal-done points whose result CLASSIFIED rejected (physics-invalid
+    // evidence). Excluded from solved — surfaced like failed so a campaign
+    // never books a rejected point as solved work.
+    rejected: integer("rejected").notNull().default(0),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()

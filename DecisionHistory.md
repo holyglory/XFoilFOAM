@@ -957,3 +957,72 @@
   the verifier's scrolled sample position; at scrollY=0 the buttons are fully
   visible and clickable (elementFromPoint hit). Pre-existing, identical on
   baseline; needs a sticky-header-aware occlusion rule in the verifier skill.
+
+## 2026-07-05 — URANS evidence honesty: classifier gate, shipped media, at-ingest verdicts, rejected bucket (D3–D6)
+
+Live prod campaign evidence showed no URANS result had EVER classified
+accepted (4/4 done urans rejected), no kind='video' media row had ever been
+registered, and a physics-rejected point still booked the campaign "solved".
+Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
+
+- D3 (classifier): `results.stalled` stays the AERODYNAMIC post-stall marker
+  (ingest sets it true for every unsteady point by construction). The
+  classifier's `solver-stalled` reason now fires only for `stalled &&
+  !unsteady` (non-converged steady points). Unsteady rows are judged on their
+  own gate: converged + force history + VIDEO are hard requirements for
+  `accepted` (evidence-first honesty). POLAR_CLASSIFIER_VERSION →
+  `rans-stall-v2`. Must-catch core tests use the exact ingest-shaped row
+  (stalled:true BECAUSE unsteady:true); reverting the one-line gate makes 4
+  tests fail (recall proven).
+- Found while proving D3 end-to-end — correlated-subquery bug in
+  `packages/db/src/polar-cache.ts`: drizzle renders `${results.id}` inside a
+  sql`` fragment as UNQUALIFIED `"id"`, which Postgres scope-resolves to the
+  subquery's own table (`fh.result_id = fh.id` — always false; on the attempt
+  path `media.result_id = media.result_id` — always true). hasForceHistory/
+  hasVideo were permanently false for result rows, so even registered video
+  could never be seen. Rule: hand-qualify correlated outer columns in raw sql
+  fragments (`"results"."id"`).
+- D4 (ingest media): engine-shipped media (`p.images`, `p.mean_images`,
+  `p.video`) now register into result_media AT INGEST, before the scaled-render
+  round-trip, on the same (result, kind, field, role) upsert key — a
+  successful scaled render simply overwrites them with scale-stamped rows.
+  computeFieldExtents failures, missing evidence bases, and scaled-render
+  failures are LOUD (console.error with job/case/aoa/result addressing; render
+  failures also keep recording status='failed' + failureReason on the scale
+  row). Must-catch sweeper test: extents/render backend down → 3 shipped rows
+  registered, URANS row classifies accepted end-to-end.
+- D5 (at-ingest verdicts): both URANS retry submit paths (single-revision and
+  batched campaign) no longer re-refresh the polar cache AFTER flipping
+  retried rows to queued — the pre-plan refresh IS the stored at-ingest
+  verdict; the post-flip refresh had been rewriting classifications into
+  synthetic post-requeue "not-solved" snapshots (prod row 741db07a).
+- D6 (campaign honesty): new `sim_campaign_progress.rejected` bucket
+  (migration 0027) = terminal, non-derived, result done, classification
+  'rejected'. `solved` EXCLUDES it; remaining = requested − solved − derived −
+  failed − rejected; deriveCampaignCompletion → attention when failed>0 OR
+  rejected>0. probeCampaignCompletion gained two blockers closing the
+  premature-completion window: (a) a terminal point whose cell-key results row
+  is queued/running (wave-2 re-solve in flight), and (b) a terminal done point
+  with NO classification yet (awaiting_verdict — the ingest-time probe fires
+  before the polar-cache refresh, so a campaign must not book completed on
+  unjudged evidence). The sweeper re-settles after each terminal ingest
+  (`settleCampaignAfterRefresh`: recomputeProgressForCampaign + probe,
+  non-fatal but loud on failure). Rejected counts surface across the campaign
+  list/detail/hub/status-line/coverage-matrix ("N rejected", attention copy).
+- Known residual: a terminal-done point on evidence that predates the
+  classifier and is never refreshed would hold `awaiting_verdict` open until
+  its revision's polar cache is refreshed (any ingest for that revision, or
+  backfill-polar-cache). Acceptable: every ingest pass refreshes its
+  revisions; prod data postdates the classifier.
+- Wave-2 retry chain stays bounded (wave ≤ 2; gap finder cannot re-claim done
+  rows) — unchanged by design.
+
+## 2026-07-05 — Sign-off: sub-cycle URANS evidence may classify accepted
+
+- When URANS refinement is skipped as wall-clock infeasible (feasibility
+  guard), the base transient window is graded honestly: if it ships converged
+  coefficients + force history + video it classifies accepted even when the
+  retained cycle count is low (e.g. 0.87 cycles for weak shedding). Quality
+  warnings are preserved in the evidence manifest and visible in evidence
+  views. Chosen over an "accepted-with-reservations" tier (over-engineering at
+  this stage); revisit if polar fits degrade on weak-shedding points.

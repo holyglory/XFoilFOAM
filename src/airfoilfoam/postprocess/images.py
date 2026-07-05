@@ -7,9 +7,10 @@ triangles inside the airfoil are masked and the airfoil is drawn on top. Animati
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from typing import Callable, Optional
 
@@ -57,7 +58,24 @@ def find_all_vtus(case_dir: Path) -> list[Path]:
 
 
 def _vtu_time(p: Path) -> float:
-    """Best-effort time index from a foamToVTK path (dir name or trailing _<n>)."""
+    """Physical solution time of a foamToVTK output file.
+
+    foamToVTK on current stacks names output directories by TIMESTEP INDEX
+    (e.g. ``transient_0`` .. ``transient_921``), not by physical time, so the
+    trailing name token must never be trusted first. Resolution order:
+
+    1. the VTK ``.series`` file written by foamToVTK (name -> time map),
+    2. an inline ``TimeValue`` FieldData entry in the sibling ``.vtm`` file or
+       in the VTU/VTM file itself,
+    3. the legacy ``time='...'`` header attribute (older ``case_*`` layout),
+    4. float-parse of the trailing name token (legacy time-named dirs).
+    """
+    vtk_root, key = _vtk_root_and_key(p)
+    t = _series_time(vtk_root, key)
+    if t is None:
+        t = _xml_time_value(p, vtk_root, key)
+    if t is not None:
+        return t
     if p.parent.name.startswith("case_"):
         header_time = _vtu_header_time(str(p))
         if header_time is not None:
@@ -69,6 +87,106 @@ def _vtu_time(p: Path) -> float:
         except ValueError:
             continue
     return 0.0
+
+
+def _vtk_root_and_key(p: Path) -> tuple[Path, str]:
+    """The VTK output root and the frame key (dir name / file stem) for ``p``.
+
+    Handles both foamToVTK layouts: ``VTK/<frame>/internal.vtu`` (directory per
+    time step) and flat ``VTK/<frame>.vtu``.
+    """
+    parent = p.parent
+    if parent.name == "VTK":
+        return parent, p.stem
+    return parent.parent, parent.name
+
+
+def _series_time(vtk_root: Path, key: str) -> float | None:
+    """Look ``key`` up in any ``.series`` file foamToVTK wrote next to the frames."""
+    try:
+        stat = vtk_root.stat()
+    except OSError:
+        return None
+    for mapping in _root_series_maps(str(vtk_root), stat.st_mtime_ns):
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+@lru_cache(maxsize=64)
+def _root_series_maps(vtk_root: str, _mtime_ns: int) -> tuple[dict[str, float], ...]:
+    maps: list[dict[str, float]] = []
+    for series in sorted(Path(vtk_root).glob("*.series")):
+        try:
+            stat = series.stat()
+        except OSError:
+            continue
+        mapping = _series_time_map(str(series), stat.st_mtime_ns, stat.st_size)
+        if mapping:
+            maps.append(mapping)
+    return tuple(maps)
+
+
+@lru_cache(maxsize=256)
+def _series_time_map(series_path: str, _mtime_ns: int, _size: int) -> dict[str, float] | None:
+    """Parse a VTK ``.series`` file (``{"files": [{"name": ..., "time": ...}]}``)."""
+    try:
+        data = json.loads(Path(series_path).read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, ValueError):
+        return None
+    entries = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return None
+    mapping: dict[str, float] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        try:
+            time_value = float(entry.get("time"))
+        except (TypeError, ValueError):
+            continue
+        rel = PurePosixPath(name)
+        # "transient_12.vtm" -> key "transient_12" (matches the frame dir name);
+        # "transient_12/internal.vtu" -> also map the leading directory.
+        mapping[rel.stem] = time_value
+        if len(rel.parts) > 1:
+            mapping[rel.parts[0]] = time_value
+    return mapping or None
+
+
+_TIME_VALUE_RE = re.compile(r"Name=['\"]TimeValue['\"][^>]*>\s*([^<\s]+)")
+
+
+def _xml_time_value(p: Path, vtk_root: Path, key: str) -> float | None:
+    """``TimeValue`` FieldData from the sibling ``.vtm`` or the file itself."""
+    for candidate in (vtk_root / f"{key}.vtm", p):
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        t = _time_value_in_head(str(candidate), stat.st_mtime_ns, stat.st_size)
+        if t is not None:
+            return t
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _time_value_in_head(path: str, _mtime_ns: int, _size: int) -> float | None:
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192).decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+    match = _TIME_VALUE_RE.search(head)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 @lru_cache(maxsize=4096)

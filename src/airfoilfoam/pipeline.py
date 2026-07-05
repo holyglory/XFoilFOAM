@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import tarfile
+import time
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -161,6 +162,10 @@ URANS_MIN_FRAMES_PER_CYCLE = 20.0
 URANS_ANIMATION_FRAMES = 141
 URANS_MAX_ANIMATION_FRAMES = 220
 URANS_EARLY_STOP_MARKER = "urans_early_stop.json"
+#: Fraction of the per-attempt solver timeout the projected refined URANS pass
+#: may consume; beyond this the refinement is skipped (it would deterministically
+#: time out and burn hours of CPU) and the base window is graded honestly.
+URANS_REFINE_BUDGET_FRACTION = 0.8
 
 
 @dataclass
@@ -199,6 +204,9 @@ class TransientResult:
     run_time: float
     refined: bool = False
     early_stopped: bool = False
+    #: Measured wall-clock seconds spent inside the transient solver run; used
+    #: to project whether a refined pass can fit the solver timeout budget.
+    wall_seconds: float = 0.0
 
 
 def _numeric_time_dirs(case_dir: Path) -> list[float]:
@@ -552,6 +560,7 @@ def _run_transient_attempt(
         write_interval=write_interval,
         max_delta_t=max_delta_t,
     )
+    solve_started = time.monotonic()
     res = runner.solver(
         tcase,
         "pimpleFoam",
@@ -560,6 +569,7 @@ def _run_transient_attempt(
         restart=True,
         monitor=_make_urans_monitor(tcase, spec),
     )
+    wall_seconds = max(0.0, time.monotonic() - solve_started)
     _check_cancel(cancel_check)
     if not res.ok:
         (tcase / "log.pimpleFoam").write_text(res.stdout)
@@ -630,6 +640,7 @@ def _run_transient_attempt(
         run_time=run_time,
         refined=refined,
         early_stopped=bool(early_stop),
+        wall_seconds=wall_seconds,
     )
 
 
@@ -687,6 +698,45 @@ def _run_transient(
             spec.speed, spec.chord, strouhal=URANS_REFINED_CADENCE_STROUHAL
         ),
     )
+    # Feasibility guard: weak-shedding points can need a refined window whose
+    # Courant-limited timestep makes the pass deterministically exceed the
+    # solver timeout (seen in prod: ~6h projected vs a 2h budget, burning the
+    # whole budget for nothing). Project the refined wall time from the
+    # measured base-pass solve rate (simulated seconds per wall second); if it
+    # cannot fit the same per-attempt timeout budget, skip the refinement and
+    # grade the base window honestly instead.
+    base_span = max(0.0, _latest_time(tcase) - first.start_time)
+    if base_span <= 0.0:
+        base_span = first.run_time
+    if timeout and first.wall_seconds > 0.0 and base_span > 0.0:
+        rate = base_span / first.wall_seconds  # simulated seconds per wall second
+        projected_wall_s = refined_timing.run_time_s / rate if rate > 0.0 else math.inf
+        if projected_wall_s > URANS_REFINE_BUDGET_FRACTION * timeout:
+            reason = (
+                f"URANS refinement skipped: projected {projected_wall_s / 3600.0:.1f}h wall time "
+                f"exceeds {URANS_REFINE_BUDGET_FRACTION:.0%} of the {timeout / 3600.0:.1f}h solver "
+                f"timeout budget; {first.quality.reason}"
+            )
+            logger.warning(
+                "%s (base pass: %.3g simulated s in %.0f wall s; refined window: %.3g simulated s)",
+                reason,
+                base_span,
+                first.wall_seconds,
+                refined_timing.run_time_s,
+            )
+            first.quality = UransQuality(
+                ok=False,
+                can_refine=False,
+                reason=reason,
+                measured_period_s=first.quality.measured_period_s,
+                retained_cycles=first.quality.retained_cycles,
+                retained_frame_count=first.quality.retained_frame_count,
+                frames_per_cycle=first.quality.frames_per_cycle,
+                retained_start_time=first.quality.retained_start_time,
+                retained_end_time=first.quality.retained_end_time,
+            )
+            return first
+
     refined_case = case_dir / f"{subdir}_refined"
     _copy_initialized_transient_case(tcase, refined_case, first.start_time)
     refined = _run_transient_attempt(
@@ -866,6 +916,16 @@ def _archive_case_evidence(
         dst = dst_parent / vtu.name
         shutil.copy2(vtu, dst)
         entries.append(_file_entry(evidence_dir, dst, "vtk_window"))
+    if selected_vtus:
+        # foamToVTK names frame dirs by timestep index; the .series file is the
+        # name -> physical-time map, so archive it with the frames it describes.
+        first_vtu = selected_vtus[0]
+        vtk_src_root = first_vtu.parent if first_vtu.parent.name == "VTK" else first_vtu.parent.parent
+        for series in sorted(vtk_src_root.glob("*.series")):
+            vtk_dir.mkdir(parents=True, exist_ok=True)
+            dst = vtk_dir / series.name
+            shutil.copy2(series, dst)
+            entries.append(_file_entry(evidence_dir, dst, "vtk_window"))
 
     time_dir_root = evidence_dir / "time_directories"
     for time_dir in _numeric_dirs_in_window(post_dir, start_time, end_time):
@@ -1044,6 +1104,10 @@ def _finalize_outcome(
                 title_suffix=suffix + " (URANS instant)", freestream_speed=spec.speed,
             )
             outcome.images = {k: f"{prefix}images/{v}" for k, v in inst.items()}
+            # Media loss is degradation, not failure: the job keeps its
+            # coefficients, but every render failure must be LOUD (logged and
+            # recorded as a quality warning) so the evidence manifest and the
+            # classifier see the gap instead of a silent empty map.
             try:
                 means = render_mean_contours(
                     post_dir, img_out, airfoil.contour, spec.chord, fields,
@@ -1054,11 +1118,12 @@ def _finalize_outcome(
                     end_time=media_end_time,
                 )
                 outcome.mean_images = {k: f"{prefix}images/{v}" for k, v in means.items()}
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                vids: dict[str, str] = {}
-                for fld in fields:
+            except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
+                logger.warning("URANS mean-image render failed for %s: %s", case_dir, exc, exc_info=True)
+                outcome.quality_warnings.append(f"mean-image render failed: {exc}")
+            vids: dict[str, str] = {}
+            for fld in fields:
+                try:
                     name = render_animation(
                         post_dir, img_out, airfoil.contour, spec.chord, fld,
                         freestream_speed=spec.speed, zoom_chords=solver_params.image_zoom_chords,
@@ -1067,11 +1132,16 @@ def _finalize_outcome(
                         end_time=media_end_time,
                         title_suffix=suffix,
                     )
-                    if name:
-                        vids[fld.value] = f"{prefix}images/{name}"
-                outcome.video = vids
-            except Exception:  # noqa: BLE001
-                pass
+                except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
+                    logger.warning(
+                        "URANS animation render failed for %s field %s: %s",
+                        case_dir, fld.value, exc, exc_info=True,
+                    )
+                    outcome.quality_warnings.append(f"animation render failed ({fld.value}): {exc}")
+                    continue
+                if name:
+                    vids[fld.value] = f"{prefix}images/{name}"
+            outcome.video = vids
         else:
             runner.application(post_dir, "foamToVTK -latestTime").check()
             _check_cancel(cancel_check)

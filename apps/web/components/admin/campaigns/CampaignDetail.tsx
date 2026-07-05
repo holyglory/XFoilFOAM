@@ -466,12 +466,18 @@ export function CampaignDetail({
           <span style={{ width: pct(totals.derived), background: "rgba(45,212,191,0.45)", display: "block" }} />
           <span style={{ width: pct(totals.running), background: C.amber, display: "block" }} />
           <span style={{ width: pct(totals.failed), background: C.red, display: "block" }} />
+          <span style={{ width: pct(totals.rejected), background: C.red, opacity: 0.55, display: "block" }} />
         </div>
         <div data-testid="campaign-counts-line" style={{ fontFamily: MONO, fontSize: 10.5, color: C.muted, display: "flex", gap: 14, flexWrap: "wrap" }}>
           <span style={{ color: C.teal }}>{fCount(totals.solved)} solved</span>
           {totals.derived > 0 && <span title="derived by symmetry — not solver runs">◌ {fCount(totals.derived)} derived</span>}
           {totals.running > 0 && <span style={{ color: C.amber }}>{fCount(totals.running)} running</span>}
           {totals.failed > 0 && <span style={{ color: C.redText }}>{fCount(totals.failed)} failed</span>}
+          {totals.rejected > 0 && (
+            <span title="solver finished but the evidence classified rejected — not counted as solved" style={{ color: C.redText }}>
+              {fCount(totals.rejected)} rejected
+            </span>
+          )}
           {totals.superseded > 0 && <span style={{ color: C.dim }}>{fCount(totals.superseded)} superseded</span>}
           <span>{fCount(totals.remaining)} remaining of {fCount(totals.requested)} points</span>
           <span style={{ color: C.dim }}>

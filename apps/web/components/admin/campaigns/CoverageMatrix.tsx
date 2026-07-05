@@ -245,9 +245,9 @@ export function CoverageMatrix({
       return <span style={{ color: C.dimmest }}>·</span>;
     }
     const solvedish = cell.solved + cell.derived;
-    const complete = cell.remaining === 0 && cell.failed === 0;
+    const complete = cell.remaining === 0 && cell.failed === 0 && cell.rejected === 0;
     const sync = syncPromisedCount(cell);
-    const color = released ? C.dim : cell.failed > 0 ? C.redText : complete ? C.teal : cell.running > 0 ? C.amber : C.muted;
+    const color = released ? C.dim : cell.failed > 0 || cell.rejected > 0 ? C.redText : complete ? C.teal : cell.running > 0 ? C.amber : C.muted;
     return (
       <span style={{ color, display: "inline-flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}>
         {fCount(solvedish)}/{fCount(cell.requested)}
@@ -255,6 +255,7 @@ export function CoverageMatrix({
           <span title={`${cell.derived} derived by symmetry`} style={{ color: C.dim }}>◌</span>
         )}
         {cell.failed > 0 && <span title={`${cell.failed} failed`}>✕{cell.failed}</span>}
+        {cell.rejected > 0 && <span title={`${cell.rejected} rejected — solver finished but the evidence classified rejected`}>⊘{cell.rejected}</span>}
         {cell.running > 0 && <span title={`${cell.running} running`} style={{ color: C.amber }}>●</span>}
         {sync > 0 && <span title={`${sync} sync-promised to a remote solver`} style={{ color: C.dim }}>⇄</span>}
       </span>
@@ -262,7 +263,7 @@ export function CoverageMatrix({
   };
 
   const narrowBar = (row: AdminCampaignAirfoilRow) => {
-    const agg = { solved: 0, derived: 0, running: 0, failed: 0, remaining: 0, requested: 0 };
+    const agg = { solved: 0, derived: 0, running: 0, failed: 0, rejected: 0, remaining: 0, requested: 0 };
     const byId = cellByCondition(row);
     for (const c of visibleConditions) {
       const cell = byId.get(c.id);
@@ -271,6 +272,7 @@ export function CoverageMatrix({
       agg.derived += cell.derived;
       agg.running += cell.running;
       agg.failed += cell.failed;
+      agg.rejected += cell.rejected;
       agg.remaining += cell.remaining;
       agg.requested += cell.requested;
     }
@@ -283,6 +285,7 @@ export function CoverageMatrix({
         {seg(agg.derived, "rgba(45,212,191,0.45)", "d")}
         {seg(agg.running, C.amber, "r")}
         {seg(agg.failed, C.red, "f")}
+        {seg(agg.rejected, "rgba(248,113,113,0.55)", "j")}
       </div>
     );
   };

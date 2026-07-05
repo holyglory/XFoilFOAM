@@ -23,7 +23,7 @@ import {
   type PolarPoint,
   type RenderedDefaultMedia,
 } from "@aerodb/engine-client";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -201,6 +201,59 @@ async function registerMedia(
 
 function finiteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function shippedMimeType(kind: "image" | "video", urlPath: string): string {
+  const ext = urlPath.split(".").pop()?.toLowerCase() ?? "";
+  if (kind === "video") return ext === "webm" ? "video/webm" : "video/mp4";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  return "image/png";
+}
+
+/** Engine-shipped media (contour PNGs, URANS animation mp4, mean images) are
+ *  registered at INGEST time, before any scaled-render round-trip. The
+ *  classifier's hasVideo gate and the detail page read result_media, so a
+ *  coefficient-complete URANS point must never lose its video row just
+ *  because the later extents/render pass failed. Rows share the scaled-render
+ *  path's (result, kind, field, role) upsert key, so a successful scaled
+ *  render simply overwrites these with the scale-stamped versions.
+ *
+ *  Video rows are additionally RECONCILED to the current shipment: upserts
+ *  never delete, so a wave-2 re-solve that ships no video (video:{}) would
+ *  otherwise leave the wave-1 video row satisfying the classifier's hasVideo
+ *  gate for the NEW coefficients. Only kind='video' rows whose field is
+ *  absent from the current p.video map are removed — scaled-render video
+ *  rows share the same (result, kind, field, role) key, so for any field the
+ *  new shipment DOES cover, the row survives and is overwritten/re-rendered
+ *  by the chain instead of being orphaned. */
+async function registerShippedMedia(db: DB, engine: EngineClient, resultId: string, p: PolarPoint): Promise<number> {
+  const groups: Array<{ kind: "image" | "video"; role: "instantaneous" | "mean"; entries: Record<string, string> }> = [
+    { kind: "image", role: "instantaneous", entries: p.images ?? {} },
+    { kind: "image", role: "mean", entries: p.mean_images ?? {} },
+    { kind: "video", role: "instantaneous", entries: p.video ?? {} },
+  ];
+  const shippedVideoFields = Object.entries(p.video ?? {})
+    .filter(([, urlPath]) => Boolean(urlPath))
+    .map(([field]) => field);
+  await db
+    .delete(resultMedia)
+    .where(
+      and(
+        eq(resultMedia.resultId, resultId),
+        eq(resultMedia.kind, "video"),
+        shippedVideoFields.length ? notInArray(resultMedia.field, shippedVideoFields) : undefined,
+      ),
+    );
+  let count = 0;
+  for (const group of groups) {
+    for (const [field, urlPath] of Object.entries(group.entries)) {
+      if (!urlPath) continue;
+      await registerMedia(db, engine, resultId, group.kind, group.role, field, urlPath, shippedMimeType(group.kind, urlPath));
+      count++;
+    }
+  }
+  return count;
 }
 
 function stalledForPoint(p: PolarPoint): boolean {
@@ -416,7 +469,14 @@ async function computeAndStoreFieldExtents(opts: {
   const { db, engine, engineJobId, airfoilId, presetRevisionId, resultId, point, speed, chord, airfoilPoints, groups } = opts;
   if (!presetRevisionId || !point.case_slug || failedForPoint(point)) return;
   const evidenceBase = evidenceBaseFromPoint(point);
-  if (!evidenceBase) return;
+  if (!evidenceBase) {
+    // Loud, never silent: without an evidence base the point can never get
+    // scaled media, and downstream that reads as "missing-urans-video".
+    console.error(
+      `[sweeper] field extents skipped: no evidence base in manifest (job ${engineJobId}, case ${point.case_slug}, aoa ${point.aoa_deg}, result ${resultId})`,
+    );
+    return;
+  }
   let response;
   try {
     response = await engine.computeFieldExtents(engineJobId, {
@@ -429,7 +489,14 @@ async function computeAndStoreFieldExtents(opts: {
       zoom_chords: 2,
       max_frames: 220,
     });
-  } catch {
+  } catch (error) {
+    // Loud, never silent: a swallowed extents failure is exactly how prod
+    // points ended up coefficient-complete but "missing-urans-video".
+    console.error(
+      `[sweeper] computeFieldExtents FAILED (job ${engineJobId}, case ${point.case_slug}, aoa ${point.aoa_deg}, result ${resultId}): ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
     return;
   }
   const evidenceSha256 = evidenceShaFromPoint(point);
@@ -674,9 +741,15 @@ async function rebalanceFieldScales(opts: {
         });
       });
     } catch (error) {
+      const reason = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+      // Loud + recorded: the failure lands on the scale row (status='failed',
+      // failureReason) AND in the log with full addressing, never silently.
+      console.error(
+        `[sweeper] scaled-media render FAILED (airfoil ${group.airfoilId}, revision ${group.presetRevisionId}, field ${group.field}, scale v${scale.version}): ${reason}`,
+      );
       await opts.db
         .update(fieldColorScales)
-        .set({ status: "failed", failureReason: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500) })
+        .set({ status: "failed", failureReason: reason })
         .where(eq(fieldColorScales.id, scale.id));
     }
   }
@@ -796,6 +869,10 @@ export async function ingestResult(opts: {
         regime: p.unsteady ? "urans" : "rans",
       });
       for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
+
+      if (!failed) {
+        media += await registerShippedMedia(db, engine, row.id, p);
+      }
 
       for (const artifact of p.evidence_artifacts ?? []) {
         await registerEvidenceArtifacts({

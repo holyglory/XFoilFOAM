@@ -128,8 +128,13 @@ async function loadResultEvidence(db: DB, airfoilId: string, simulationPresetRev
       iterations: results.iterations,
       firstOrderFallback: results.firstOrderFallback,
       updatedAt: results.updatedAt,
-      hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = ${results.id})`,
-      hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = ${results.id} and media.kind = 'video' and media.role = 'instantaneous')`,
+      // NOTE: the correlated column MUST be table-qualified by hand. Drizzle
+      // renders `${results.id}` inside a sql`` fragment as unqualified "id",
+      // which Postgres scope-resolves to the SUBQUERY's own table
+      // (fh.result_id = fh.id — always false), silently reporting every
+      // result as having no force history / video (prod defect, 2026-07-05).
+      hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = "results"."id")`,
+      hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = "results"."id" and media.kind = 'video' and media.role = 'instantaneous')`,
     })
     .from(results)
     .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, simulationPresetRevisionId)));
@@ -159,8 +164,12 @@ async function loadAttemptEvidence(db: DB, airfoilId: string, simulationPresetRe
       validForPolar: resultAttempts.validForPolar,
       simJobId: resultAttempts.simJobId,
       updatedAt: resultAttempts.createdAt,
-      hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = ${resultAttempts.resultId})`,
-      hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = ${resultAttempts.resultId} and media.kind = 'video' and media.role = 'instantaneous')`,
+      // Same hand-qualification rule as loadResultEvidence: an unqualified
+      // "result_id" here binds to the subquery's OWN result_id column
+      // (media.result_id = media.result_id — always true), inventing
+      // evidence for every attempt.
+      hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = "result_attempts"."result_id")`,
+      hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = "result_attempts"."result_id" and media.kind = 'video' and media.role = 'instantaneous')`,
     })
     .from(resultAttempts)
     .where(and(eq(resultAttempts.airfoilId, airfoilId), eq(resultAttempts.simulationPresetRevisionId, simulationPresetRevisionId)));

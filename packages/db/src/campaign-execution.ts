@@ -392,7 +392,12 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
  *   - requested:  state <> 'released' — TOTAL obligation (the UI denominator
  *                 and deriveCampaignCompletion both read it as the whole
  *                 obligated cell count, not just still-open cells)
- *   - solved:     terminal, non-derived, result.status='done'
+ *   - solved:     terminal, non-derived, result.status='done' AND the point's
+ *                 classification is NOT 'rejected' (accepted / needs_urans /
+ *                 superseded_by_urans / not-yet-classified all count; a
+ *                 physics-REJECTED point must never book as solved work)
+ *   - rejected:   terminal, non-derived, result.status='done' AND
+ *                 result_classifications.state='rejected'
  *   - failed:     terminal, result.status='failed'
  *   - running:    requested AND live-cell result.status IN (queued, running)
  *   - superseded: result_classifications.state='superseded_by_urans'
@@ -417,14 +422,15 @@ async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise
     sql`, `,
   );
   await db.execute(sql`
-    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived)
+    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected)
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IS DISTINCT FROM 'rejected')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND r.status = 'failed')::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected')::int
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN results live
@@ -439,6 +445,7 @@ async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise
       running = excluded.running,
       superseded = excluded.superseded,
       derived = excluded.derived,
+      rejected = excluded.rejected,
       "updatedAt" = now()
   `);
 }
@@ -447,14 +454,15 @@ async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise
  *  the reconciler's heal path for campaigns whose key count can reach 10^5. */
 export async function recomputeProgressForCampaign(db: DB, campaignId: string): Promise<void> {
   await db.execute(sql`
-    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived)
+    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected)
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IS DISTINCT FROM 'rejected')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND r.status = 'failed')::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected')::int
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN results live
@@ -469,13 +477,24 @@ export async function recomputeProgressForCampaign(db: DB, campaignId: string): 
       running = excluded.running,
       superseded = excluded.superseded,
       derived = excluded.derived,
+      rejected = excluded.rejected,
       "updatedAt" = now()
   `);
 }
 
 /** Cheap completion probe (partial-index EXISTS; spec §6.4): flips an active
- *  campaign to completed (zero failed) or attention (all terminal, failed>0)
- *  once no obligated cell is open and no lane is still seeding/iterating. */
+ *  campaign to completed (zero failed/rejected) or attention (all terminal,
+ *  failed>0 OR rejected>0) once no obligated cell is open, no lane is still
+ *  seeding/iterating, and no terminal point's live cell is being re-solved.
+ *
+ *  The in-flight guard closes the premature-completion window: during a
+ *  wave-2 URANS re-solve the campaign point stays 'terminal' while its
+ *  cell-key results row is queued/running — neither "open" nor "running" by
+ *  the older probes, so any probe could flip the campaign to completed
+ *  mid-solve. Such a point now blocks the transition. 'pending' and 'stale'
+ *  block too: a lost wave-2 job resets its cell row to 'pending' (reconcile
+ *  requeueLostJob) — still re-solve intent, and the sweeper re-claims pending
+ *  rows, so this cannot deadlock the probe. */
 export async function probeCampaignCompletion(db: DB, campaignId: string): Promise<void> {
   const [probe] = (await db.execute(sql`
     SELECT
@@ -491,13 +510,48 @@ export async function probeCampaignCompletion(db: DB, campaignId: string): Promi
       EXISTS (
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN results live
+          ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
+        WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
+          AND live.status IN ('queued', 'running', 'pending', 'stale')
+      ) AS in_flight,
+      EXISTS (
+        -- Done-but-not-yet-classified: the ingest-time probe fires BEFORE the
+        -- polar cache refresh classifies the fresh rows, so a campaign whose
+        -- last point just landed must wait for its verdict instead of booking
+        -- completed on unjudged evidence (the sweeper re-probes after refresh).
+        SELECT 1 FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN results r ON r.id = p.result_id
+        WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
+          AND p.derived_by_symmetry = false AND r.status = 'done'
+          AND NOT EXISTS (SELECT 1 FROM result_classifications rc2 WHERE rc2.result_id = r.id)
+      ) AS awaiting_verdict,
+      EXISTS (
+        SELECT 1 FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results r ON r.id = p.result_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
           AND r.status = 'failed'
-      ) AS has_failed
-  `)) as unknown as { open: boolean; lanes_open: boolean; has_failed: boolean }[];
-  if (!probe || probe.open || probe.lanes_open) return;
-  if (probe.has_failed) {
+      ) AS has_failed,
+      EXISTS (
+        SELECT 1 FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN results r ON r.id = p.result_id
+        JOIN result_classifications rc ON rc.result_id = r.id
+        WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
+          AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected'
+      ) AS has_rejected
+  `)) as unknown as {
+    open: boolean;
+    lanes_open: boolean;
+    in_flight: boolean;
+    awaiting_verdict: boolean;
+    has_failed: boolean;
+    has_rejected: boolean;
+  }[];
+  if (!probe || probe.open || probe.lanes_open || probe.in_flight || probe.awaiting_verdict) return;
+  if (probe.has_failed || probe.has_rejected) {
     await db
       .update(simCampaigns)
       .set({ status: "attention" })
