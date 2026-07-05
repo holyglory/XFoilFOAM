@@ -451,7 +451,7 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
   // Read-only against the live queue: navigation + tab switching only — no
   // sweeper-state mutation (Pause/Resume, CPU slots, requeue are never
   // clicked), safe to run while a campaign is actively solving.
-  test("admin Solver page shows activity, background, and engine surfaces", async ({ page }) => {
+  test("admin Solver page shows activity, background, and engine surfaces", async ({ page, request }) => {
     await page.goto("/admin");
     await gotoAdminSection(page, "queue");
     await expect(page.getByTestId("openfoam-queue-page")).toBeVisible();
@@ -464,6 +464,25 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     await expect(page.getByText("OpenFOAM CPU slots")).toBeVisible();
     await expect(page.getByTestId("queue-active-jobs")).toContainText("Active jobs");
     await expect(page.getByTestId("queue-finished-jobs")).toContainText("Finished job log");
+
+    // Solved-points badge (screen 5): honest against the real API state —
+    // shown with the true count when results were solved today, absent at 0
+    // (the badge never invents a number).
+    const solvedPoints = await json<{ items: unknown[]; solvedToday: number }>(request, "get", "/api/admin/solved-points?limit=1");
+    const solvedBadge = page.getByTestId("solved-today-badge");
+    if (solvedPoints.solvedToday > 0) {
+      await expect(solvedBadge).toContainText(`${solvedPoints.solvedToday.toLocaleString()} solved today`);
+      await solvedBadge.click();
+      const popover = page.getByTestId("solved-points-popover");
+      await expect(popover).toBeVisible();
+      // Only real solved rows are listed; a non-zero today-count guarantees at
+      // least one row on the first page (newest first).
+      await expect(popover.getByTestId("solved-point-row").first()).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(popover).not.toBeVisible();
+    } else {
+      await expect(solvedBadge).toHaveCount(0);
+    }
 
     // Background tab (?tab=background): pending sweeps + external promises.
     await page.getByTestId("solver-tab-background").click();

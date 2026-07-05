@@ -424,7 +424,10 @@ def _copy_initialized_transient_case(src: Path, dst: Path, start_time: float) ->
                 break
         except ValueError:
             continue
-    if start_dir is not None:
+    # start_time == 0.0 resolves to the "0" directory already copied above
+    # (seen in production: symmetric airfoil at alpha=0 -> no shedding ->
+    # auto-refine with a degenerate retained window -> FileExistsError).
+    if start_dir is not None and not (dst / start_dir.name).exists():
         shutil.copytree(start_dir, dst / start_dir.name, symlinks=True)
 
 

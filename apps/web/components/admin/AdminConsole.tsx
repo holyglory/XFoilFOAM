@@ -17,6 +17,8 @@ import {
   type AdminPendingSweep,
   type AdminQueue,
   type AdminQueueBacklogStrip,
+  type AdminQueueScope,
+  mergeAdminQueue,
   type AdminReferenceGeometryProfile,
   type AdminSchedulingProfile,
   type AdminSyncPermission,
@@ -88,6 +90,7 @@ import { AddAirfoilsPanel } from "./AddAirfoilsPanel";
 import { momentumSchemeSelect } from "./solver-schemes";
 import { CategoriesAdminPanel, HashtagsAdminPanel } from "./CatalogAdminPanels";
 import { UnitNumberField } from "./UnitNumberField";
+import { SolvedPointsPopover, type SolvedPopoverAnchor } from "./SolvedPointsPopover";
 import { CampaignDetail } from "./campaigns/CampaignDetail";
 import { CampaignsHub } from "./campaigns/CampaignsHub";
 import { CampaignWizard } from "./campaigns/CampaignWizard";
@@ -289,9 +292,13 @@ export function AdminConsole() {
   }, []);
 
   useEffect(() => {
+    // Parallelize the first paint: the Solver page's scoped queue fetch starts
+    // alongside adminMe instead of waiting for the auth gate to resolve.
+    if (section === "queue") prefetchQueueScope(solverScopeForTab(parseSolverTab(tabParam)));
     adminMe()
       .then(setMe)
       .catch((e) => setErr((e as Error).message));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const doLogin = async () => {
@@ -912,6 +919,33 @@ const SOLVER_TABS: { k: SolverTab; label: string }[] = [
 
 function parseSolverTab(raw: string | null): SolverTab {
   return SOLVER_TABS.some((t) => t.k === raw) ? (raw as SolverTab) : "activity";
+}
+
+/** Each Solver tab polls only its own scope (spec §10/§12) — the expensive
+ *  background gap scan runs only while the Background tab is actually open. */
+function solverScopeForTab(tab: SolverTab): AdminQueueScope {
+  return tab === "background" ? "background" : tab === "engine" ? "engine" : "activity";
+}
+
+// First-load waterfall fix: AdminConsole mounts QueueDashboard only after
+// adminMe() resolves, so without this the queue fetch would start a full
+// auth round-trip late. The console kicks the scoped queue fetch off in
+// parallel with adminMe; the dashboard consumes it once if it is still fresh.
+const QUEUE_PREFETCH_MAX_AGE_MS = 30_000;
+let queuePrefetch: { scope: AdminQueueScope; startedAt: number; promise: Promise<AdminQueue> } | null = null;
+function prefetchQueueScope(scope: AdminQueueScope): void {
+  const promise = getAdminQueue(scope);
+  // Swallow here so an unauthenticated 401 never surfaces as an unhandled
+  // rejection; the consumer awaits the original promise and handles errors.
+  promise.catch(() => undefined);
+  queuePrefetch = { scope, startedAt: Date.now(), promise };
+}
+function consumeQueuePrefetch(scope: AdminQueueScope): Promise<AdminQueue> | null {
+  const entry = queuePrefetch;
+  queuePrefetch = null;
+  if (!entry || entry.scope !== scope) return null;
+  if (Date.now() - entry.startedAt > QUEUE_PREFETCH_MAX_AGE_MS) return null;
+  return entry.promise;
 }
 
 function CatalogPanel({ tab, onTabChange }: { tab: CatalogTab; onTabChange: (t: CatalogTab) => void }) {
@@ -2524,14 +2558,35 @@ function QueueDashboard({
   const [busy, setBusy] = useState(false);
   const [maintenanceNotice, setMaintenanceNotice] = useState<string | null>(null);
   const [purgePrefix, setPurgePrefix] = useState("pw-");
+  // Solved-points viewer (screen 5). Its state lives HERE — outside the queue
+  // payload — so the 10 s poll can update badge counts and job cards without
+  // yanking an open popover shut; the popover fetches its own rows on open.
+  const [solvedPopover, setSolvedPopover] = useState<{ jobId: string | null; label: string | null; anchor: SolvedPopoverAnchor } | null>(null);
+  const openSolvedPopover = useCallback((jobId: string | null, label: string | null, rect: DOMRect) => {
+    setSolvedPopover({ jobId, label, anchor: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom } });
+  }, []);
   const refreshingRef = useRef(false);
+  // The poll always fetches the ACTIVE tab's scope (spec §10/§12); the ref
+  // keeps the callback stable so usePoll's interval is not reset by tab moves.
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
 
   const refresh = useCallback(async () => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
     try {
-      setQueue(await getAdminQueue());
-      setErr(null);
+      let scope = solverScopeForTab(tabRef.current);
+      // Loop guard: if the user switches tabs while a fetch is in flight, the
+      // just-fetched scope may no longer match the active tab — fetch again
+      // instead of leaving the new tab stale for a full poll interval.
+      for (;;) {
+        const next = await (consumeQueuePrefetch(scope) ?? getAdminQueue(scope));
+        setQueue((prev) => mergeAdminQueue(prev, next));
+        setErr(null);
+        const active = solverScopeForTab(tabRef.current);
+        if (active === scope) break;
+        scope = active;
+      }
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -2540,8 +2595,14 @@ function QueueDashboard({
   }, []);
 
   // Shared admin poll: paused while document.hidden, immediate refetch on
-  // visibility resume (spec §11).
+  // visibility resume (spec §11). Poll covers only the active tab's scope.
   usePoll(refresh, 10000);
+
+  // Immediate fetch when the user switches tabs, so the newly opened tab's
+  // sections are not up to a poll interval stale.
+  useEffect(() => {
+    void refresh();
+  }, [tab, refresh]);
 
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -2560,7 +2621,7 @@ function QueueDashboard({
   const externalPromises = queue?.externalPromises ?? [];
   const activeJobs = queue?.activeJobs ?? [];
   const finishedJobs = queue?.finishedJobs ?? [];
-  const failed = queue?.results.failed ?? 0;
+  const failed = queue?.results?.failed ?? 0;
   const staleCount = activeJobs.filter((job) => job.stale).length;
   const engineQueue = queue?.engineQueue;
   const duplicateCount = Object.keys(engineQueue?.duplicates ?? {}).length;
@@ -2570,8 +2631,11 @@ function QueueDashboard({
   // ONE derivation feeds the banner, the empty states, and the control
   // gating — the same module the hub / campaign surfaces use (lib/solver-state).
   const engineHealthy = !!queue?.engineHealth && queue.engineHealth.status === "ok" && !queue.engineHealthError;
+  // Gap-fill counters may be null before the first scan (served from cache
+  // with computedAt); unknown must not read as "backlog closed".
+  const pendingPointsKnown = queue?.pendingPointsTotal ?? queue?.backlog ?? null;
   const backlogOpen = queue
-    ? (queue.pendingPointsTotal ?? queue.backlog) > 0 || queue.backlogStrip.campaigns.some((c) => c.remainingPoints > 0)
+    ? (pendingPointsKnown != null && pendingPointsKnown > 0) || (queue.backlogStrip?.campaigns.some((c) => c.remainingPoints > 0) ?? false)
     : undefined;
   const solver = deriveSolverState({
     fetchOk: queue != null,
@@ -2648,6 +2712,30 @@ function QueueDashboard({
                 {solverStateLabel(solver.state)}
               </span>
               <span style={{ fontFamily: MONO, fontSize: 11.5, color: C.text }}>{solver.headline}</span>
+              {/* Solved-points badge (screen 5): real count of results solved
+                  since the start of the server day; hidden at 0. */}
+              {(queue?.solvedToday ?? 0) > 0 && (
+                <button
+                  type="button"
+                  data-testid="solved-today-badge"
+                  title="View the most recent solved points across all jobs"
+                  onClick={(e) => openSolvedPopover(null, null, e.currentTarget.getBoundingClientRect())}
+                  style={{
+                    marginLeft: "auto",
+                    fontFamily: MONO,
+                    fontSize: 10.5,
+                    color: C.teal,
+                    background: C.tealFill,
+                    border: `1px solid ${C.tealBorder}`,
+                    borderRadius: 999,
+                    padding: "4px 10px",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {queue!.solvedToday!.toLocaleString()} solved today ▾
+                </button>
+              )}
             </div>
             {solver.detail && (
               <div style={{ fontFamily: MONO, fontSize: 10.5, color: toneColor, lineHeight: 1.5 }}>{solver.detail}</div>
@@ -2739,7 +2827,7 @@ function QueueDashboard({
             ) : (
               <div style={{ display: "grid", gap: 10, padding: "10px 16px 16px" }}>
                 {activeJobs.map((job) => (
-                  <ActiveJobCard key={job.id} job={job} busy={busy} onCancel={() => act(() => cancelJob(job.id))} onOpenCampaign={onOpenCampaign} />
+                  <ActiveJobCard key={job.id} job={job} busy={busy} onCancel={() => act(() => cancelJob(job.id))} onOpenCampaign={onOpenCampaign} onOpenSolved={openSolvedPopover} />
                 ))}
               </div>
             )}
@@ -2758,7 +2846,7 @@ function QueueDashboard({
               ) : (
                 <div style={{ display: "grid", gap: 10, padding: "10px 16px 16px" }}>
                   {finishedJobs.slice(0, 8).map((job) => (
-                    <FinishedJobCard key={job.id} job={job} onOpenCampaign={onOpenCampaign} />
+                    <FinishedJobCard key={job.id} job={job} onOpenCampaign={onOpenCampaign} onOpenSolved={openSolvedPopover} />
                   ))}
                 </div>
               )}
@@ -2860,7 +2948,7 @@ function QueueDashboard({
                   </span>
                 )}
                 <span style={{ color: C.dim, fontSize: 10 }}>
-                  {queue.inFlight} db jobs in flight · {detachedCount} detached runner{detachedCount === 1 ? "" : "s"}
+                  {queue.inFlight ?? "—"} db jobs in flight · {detachedCount} detached runner{detachedCount === 1 ? "" : "s"}
                 </span>
               </div>
             )}
@@ -2923,6 +3011,18 @@ function QueueDashboard({
             {maintenanceNotice && <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>{maintenanceNotice}</div>}
           </section>
         </div>
+      )}
+
+      {/* Solved-points viewer (screen 5): keyed by scope so switching between
+          the page badge and a job chip remounts with a fresh first page. */}
+      {solvedPopover && (
+        <SolvedPointsPopover
+          key={solvedPopover.jobId ?? "all"}
+          jobId={solvedPopover.jobId}
+          scopeLabel={solvedPopover.label}
+          anchor={solvedPopover.anchor}
+          onClose={() => setSolvedPopover(null)}
+        />
       )}
     </div>
   );
@@ -3008,8 +3108,16 @@ function CampaignBacklogStrip({
         </div>
       )}
       <div style={{ marginTop: 8, fontFamily: MONO, fontSize: 10, color: C.dim }}>
-        Background gap-fill: {gap.pendingPoints.toLocaleString()} points in {gap.pendingSweeps.toLocaleString()} sweeps
-        {strip.campaigns.length > 0 ? " waiting behind campaign work" : ""} · computed {ago(gap.computedAt)}
+        {gap ? (
+          <>
+            Background gap-fill: {gap.pendingPoints.toLocaleString()} points in {gap.pendingSweeps.toLocaleString()} sweeps
+            {strip.campaigns.length > 0 ? " waiting behind campaign work" : ""} · computed {ago(gap.computedAt)}
+          </>
+        ) : (
+          // Honest empty state: the scan has not completed yet (it refreshes in
+          // the background) — the strip never invents counters.
+          <>Background gap-fill backlog not computed yet — refreshing in the background.</>
+        )}
       </div>
     </section>
   );
@@ -3150,7 +3258,34 @@ function runtimeTone(job: AdminJob): string {
   return C.dim;
 }
 
-function ActiveJobCard({ job, busy, onCancel, onOpenCampaign }: { job: AdminJob; busy: boolean; onCancel: () => void; onOpenCampaign: (id: string) => void }) {
+/** Solved-count chip on a queue job card (screen 5): opens the solved-points
+ *  popover scoped to that job. Rendered only when real solved rows exist. */
+function SolvedCountChip({ job, onOpenSolved }: { job: AdminJob; onOpenSolved: (jobId: string, label: string | null, rect: DOMRect) => void }) {
+  if (job.solvedCount <= 0) return null;
+  return (
+    <button
+      type="button"
+      data-testid={`solved-chip-${job.id}`}
+      title={`View the ${job.solvedCount} solved point${job.solvedCount === 1 ? "" : "s"} of this job`}
+      onClick={(e) => onOpenSolved(job.id, job.airfoilName ?? job.airfoilSlug, e.currentTarget.getBoundingClientRect())}
+      style={{
+        fontFamily: MONO,
+        fontSize: 10,
+        color: C.teal,
+        background: C.tealFill,
+        border: `1px solid ${C.tealBorder}`,
+        borderRadius: 5,
+        padding: "2px 6px",
+        cursor: "pointer",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {job.solvedCount} solved ▾
+    </button>
+  );
+}
+
+function ActiveJobCard({ job, busy, onCancel, onOpenCampaign, onOpenSolved }: { job: AdminJob; busy: boolean; onCancel: () => void; onOpenCampaign: (id: string) => void; onOpenSolved: (jobId: string, label: string | null, rect: DOMRect) => void }) {
   const inFlight = ["submitted", "running", "ingesting", "pending"].includes(job.status);
   const progress = job.totalCases > 0 ? Math.min(100, Math.round((job.completedCases / job.totalCases) * 100)) : 0;
   return (
@@ -3167,6 +3302,7 @@ function ActiveJobCard({ job, busy, onCancel, onOpenCampaign }: { job: AdminJob;
           <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginTop: 8 }}>
             <KindBadge kind={job.kind} />
             <CampaignJobChip job={job} onOpenCampaign={onOpenCampaign} />
+            <SolvedCountChip job={job} onOpenSolved={onOpenSolved} />
             <span style={{ fontFamily: MONO, fontSize: 10, color: STATUS_COLOR[job.status] ?? C.muted }}>wave {job.wave} · {job.status}</span>
             <span style={{ fontFamily: MONO, fontSize: 10, color: phaseTone(job), border: `1px solid ${C.stroke}`, borderRadius: 5, padding: "2px 5px" }}>
               {phaseLabel(job)}
@@ -3222,7 +3358,7 @@ function ActiveJobCard({ job, busy, onCancel, onOpenCampaign }: { job: AdminJob;
   );
 }
 
-function FinishedJobCard({ job, onOpenCampaign }: { job: AdminJob; onOpenCampaign: (id: string) => void }) {
+function FinishedJobCard({ job, onOpenCampaign, onOpenSolved }: { job: AdminJob; onOpenCampaign: (id: string) => void; onOpenSolved: (jobId: string, label: string | null, rect: DOMRect) => void }) {
   return (
     <div style={{ background: C.panel2, border: `1px solid ${C.stroke}`, borderRadius: 8, padding: 12 }}>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "start" }}>
@@ -3231,6 +3367,7 @@ function FinishedJobCard({ job, onOpenCampaign }: { job: AdminJob; onOpenCampaig
             <span style={{ fontFamily: MONO, fontSize: 10, color: STATUS_COLOR[job.status] ?? C.muted }}>{job.status}</span>
             <KindBadge kind={job.kind} />
             <CampaignJobChip job={job} onOpenCampaign={onOpenCampaign} />
+            <SolvedCountChip job={job} onOpenSolved={onOpenSolved} />
           </div>
           {job.airfoilSlug ? (
             <Link href={`/airfoils/${job.airfoilSlug}`} style={{ display: "block", marginTop: 8, color: C.text, textDecoration: "none", fontFamily: MONO, fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>

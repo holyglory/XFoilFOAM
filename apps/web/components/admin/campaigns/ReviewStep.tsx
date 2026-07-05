@@ -135,7 +135,7 @@ export function ReviewStep({
     setSweeperError(null);
     try {
       await patchSweeper({ enabled: true });
-      setQueue(await getAdminQueue());
+      setQueue(await getAdminQueue("activity"));
     } catch (e) {
       setSweeperError((e as Error).message);
     } finally {
@@ -205,10 +205,12 @@ export function ReviewStep({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [previewPayloadKey, planReady]);
 
-  // Queue context poll (10 s, hidden-tab aware).
+  // Queue context poll (10 s, hidden-tab aware). The review context needs
+  // backlog counters + sweeper + engine reachability only — the cheap
+  // activity scope, never the full gap-scan payload (spec §10/§12).
   usePoll(async () => {
     try {
-      setQueue(await getAdminQueue());
+      setQueue(await getAdminQueue("activity"));
       setQueueError(null);
     } catch (e) {
       setQueueError((e as Error).message);
@@ -439,9 +441,13 @@ export function ReviewStep({
         ) : (
           <div style={{ display: "grid", gap: 6 }}>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 8 }}>
-              <MetricChip label="Pending points" value={fCount(queue.backlog)} />
-              <MetricChip label="Jobs in flight" value={fCount(queue.inFlight)} />
-              <MetricChip label="Campaign backlog" value={fCount(queue.backlogStrip.campaigns.reduce((n, c) => n + c.remainingPoints, 0))} />
+              {/* backlog counters may be null before the first gap scan completes — shown as "—", never invented */}
+              <MetricChip label="Pending points" value={queue.backlog == null ? "—" : fCount(queue.backlog)} />
+              <MetricChip label="Jobs in flight" value={queue.inFlight == null ? "—" : fCount(queue.inFlight)} />
+              <MetricChip
+                label="Campaign backlog"
+                value={queue.backlogStrip == null ? "—" : fCount(queue.backlogStrip.campaigns.reduce((n, c) => n + c.remainingPoints, 0))}
+              />
               <MetricChip
                 label="Sweeper"
                 value={isProcessDead(queue.sweeper.heartbeatAt) ? "process not running" : queue.sweeper.enabled ? "enabled" : "disabled"}

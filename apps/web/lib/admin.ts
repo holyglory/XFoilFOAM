@@ -229,11 +229,13 @@ export interface AdminCampaignBacklogEntry {
 
 export interface AdminQueueBacklogStrip {
   campaigns: AdminCampaignBacklogEntry[];
+  /** Cached gap-fill counters served with the time they were computed; null
+   *  until the first gap scan ever completes (shown as "not computed yet"). */
   backgroundGapFill: {
     pendingPoints: number;
     pendingSweeps: number;
     computedAt: string;
-  };
+  } | null;
 }
 
 /** Disk truth from the engine's GET /cache/stats (mesh/seed cache volume);
@@ -246,21 +248,35 @@ export interface AdminEngineCacheStats {
   oldestLastUsedAt: string | null;
 }
 
+/** Tab-scoped queue fetches (spec §10/§12): the payload always has the full
+ *  AdminQueue shape, but sections outside the requested scope come back null —
+ *  a section is either present-and-real or explicitly absent, never invented.
+ *  - activity   → sweeper + backlogStrip + jobs/activeJobs/finishedJobs +
+ *                 results + cached engine chips
+ *  - background → pendingSweeps + externalPromises (+ sweeper)
+ *  - engine     → engine health/queue/cache + activeJobs (+ sweeper)
+ *  - all        → everything (back-compat default) */
+export type AdminQueueScope = "activity" | "background" | "engine" | "all";
+
 export interface AdminQueue {
+  scope: AdminQueueScope;
   mode: "dev" | "prod";
   engineUrl: string;
   sweeper: SweeperState;
   /** true while sweeper.cpuSlots is 0 (auto — no cpu cap sent to the engine). */
   cpuSlotsAuto: boolean;
   engineUnreachableSince: string | null;
-  backlogStrip: AdminQueueBacklogStrip;
-  backlog: number;
-  inFlight: number;
-  results: Record<string, number>;
-  pendingPointsTotal: number;
-  pendingSweepsTotal: number;
-  pendingSweeps: AdminPendingSweep[];
-  externalPromises: AdminExternalPromise[];
+  backlogStrip: AdminQueueBacklogStrip | null;
+  backlog: number | null;
+  inFlight: number | null;
+  results: Record<string, number> | null;
+  /** Results solved since the start of the current server day (activity scope
+   *  only; null outside it). Drives the "N solved today" badge — hidden at 0. */
+  solvedToday: number | null;
+  pendingPointsTotal: number | null;
+  pendingSweepsTotal: number | null;
+  pendingSweeps: AdminPendingSweep[] | null;
+  externalPromises: AdminExternalPromise[] | null;
   engineQueue: EngineQueueState | null;
   engineQueueError: string | null;
   engineHealth: {
@@ -271,11 +287,70 @@ export interface AdminQueue {
   } | null;
   engineHealthError: string | null;
   engineExpectedBuildId: string | null;
+  engineBuildId: string | null;
   engineBuildMismatch: boolean;
   engineCache: AdminEngineCacheStats | null;
-  activeJobs: AdminJob[];
-  finishedJobs: AdminJob[];
-  jobs: AdminJob[];
+  /** When the per-job runtime annotations were actually fetched from the
+   *  engine; stale-while-refresh may serve an older snapshot — this timestamp
+   *  is its true fetch time. null = no runtime data (jobs annotate unknown). */
+  engineRuntimeAsOf: string | null;
+  engineRuntimeError: string | null;
+  activeJobs: AdminJob[] | null;
+  finishedJobs: AdminJob[] | null;
+  jobs: AdminJob[] | null;
+}
+
+/** Merge a scoped queue payload over the previously known one. Only sections
+ *  covered by the incoming scope are overwritten (including with null/error
+ *  values — a fresh "unavailable" must replace stale data). Sections outside
+ *  the scope keep their previous values; the UI only renders those on their
+ *  own tabs, where that tab's scope poll refreshes them. */
+export function mergeAdminQueue(prev: AdminQueue | null, next: AdminQueue): AdminQueue {
+  if (!prev || next.scope === "all") return next;
+  const merged: AdminQueue = { ...prev };
+  // Shell state ships with every scope.
+  merged.scope = next.scope;
+  merged.mode = next.mode;
+  merged.engineUrl = next.engineUrl;
+  merged.sweeper = next.sweeper;
+  merged.cpuSlotsAuto = next.cpuSlotsAuto;
+  merged.engineUnreachableSince = next.engineUnreachableSince;
+  const activity = next.scope === "activity";
+  const background = next.scope === "background";
+  const engineScope = next.scope === "engine";
+  if (activity) {
+    merged.backlogStrip = next.backlogStrip;
+    merged.results = next.results;
+    merged.solvedToday = next.solvedToday;
+    merged.jobs = next.jobs;
+    merged.finishedJobs = next.finishedJobs;
+  }
+  if (activity || background) {
+    merged.backlog = next.backlog;
+    merged.pendingPointsTotal = next.pendingPointsTotal;
+    merged.pendingSweepsTotal = next.pendingSweepsTotal;
+  }
+  if (background) {
+    merged.pendingSweeps = next.pendingSweeps;
+    merged.externalPromises = next.externalPromises;
+  }
+  if (activity || engineScope) {
+    merged.activeJobs = next.activeJobs;
+    merged.inFlight = next.inFlight;
+    merged.engineQueue = next.engineQueue;
+    merged.engineQueueError = next.engineQueueError;
+    merged.engineHealth = next.engineHealth;
+    merged.engineHealthError = next.engineHealthError;
+    merged.engineExpectedBuildId = next.engineExpectedBuildId;
+    merged.engineBuildId = next.engineBuildId;
+    merged.engineBuildMismatch = next.engineBuildMismatch;
+    merged.engineRuntimeAsOf = next.engineRuntimeAsOf;
+    merged.engineRuntimeError = next.engineRuntimeError;
+  }
+  if (engineScope) {
+    merged.engineCache = next.engineCache;
+  }
+  return merged;
 }
 
 export type SyncDataType =
@@ -362,7 +437,41 @@ export const adminLogin = (email: string, password: string) =>
 export const adminGoogleLoginUrl = (returnTo = "/admin") =>
   `${BASE}/api/admin/oauth/google?returnTo=${encodeURIComponent(returnTo)}`;
 export const adminLogout = () => aj<{ ok: boolean }>("/api/admin/logout", { method: "POST" });
-export const getAdminQueue = () => aj<AdminQueue>("/api/admin/queue");
+export const getAdminQueue = (scope: AdminQueueScope = "all") =>
+  aj<AdminQueue>(`/api/admin/queue${scope === "all" ? "" : `?scope=${scope}`}`);
+
+/** One REAL solved result row (results: status=done, source=solved, solvedAt
+ *  set) — derived/mirrored display points are never listed here. */
+export interface AdminSolvedPoint {
+  resultId: string;
+  simJobId: string | null;
+  airfoilSlug: string;
+  airfoilName: string;
+  aoaDeg: number;
+  speed: number | null;
+  reynolds: number | null;
+  cl: number | null;
+  cd: number | null;
+  clCd: number | null;
+  classificationState: string | null;
+  solvedAt: string;
+}
+export interface AdminSolvedPointsPage {
+  items: AdminSolvedPoint[];
+  /** Keyset cursor (`solvedAtISO|resultId`) for the next page; null at the end. */
+  nextCursor: string | null;
+  /** Count of solved results for the current server day, over the SAME scope
+   *  (jobId or global) as items — the count always accompanies its rows. */
+  solvedToday: number;
+}
+export const getSolvedPoints = (opts: { jobId?: string | null; cursor?: string | null; limit?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.jobId) qs.set("jobId", opts.jobId);
+  if (opts.cursor) qs.set("cursor", opts.cursor);
+  if (opts.limit != null) qs.set("limit", String(opts.limit));
+  const suffix = qs.toString();
+  return aj<AdminSolvedPointsPage>(`/api/admin/solved-points${suffix ? `?${suffix}` : ""}`);
+};
 export const getAdminSync = () => aj<AdminSyncState>("/api/admin/sync");
 export const patchAdminSync = (body: Partial<AdminSyncState["settings"]> & { permissions?: AdminSyncPermission[] }) =>
   aj<AdminSyncState>("/api/admin/sync", { method: "PATCH", body: JSON.stringify(body) });

@@ -446,6 +446,23 @@ airfoils. Keep the engine request untouched otherwise.
 - Queue payload additions: backlog strip (per-campaign remaining, background gap-fill
   waiting note, cached 5 min with computed-at time), campaign chips per job
   (via sim_jobs.campaignId; admin payload only), engineUnreachableSince, cpuSlots.
+- GET `/api/admin/queue?scope=activity|background|engine|all` (default `all`,
+  back-compat) — tab-scoped payloads. Every scope returns the FULL AdminQueue
+  shape with out-of-scope sections explicitly `null` (a section is
+  present-and-real or absent, never invented): `activity` = sweeper +
+  backlogStrip + jobs/activeJobs/finishedJobs + results + cached engine chips;
+  `background` = pendingSweeps + externalPromises (+ sweeper) and is the ONLY
+  scope that awaits the full gap scan; `engine` = engine health/queue/cache
+  blocks + activeJobs (stale/detached counts) + sweeper. Invalid scope → 400.
+- EVERY engine-dependent block in the queue payload is TTL-cached with
+  stale-while-refresh and a bounded race cap on its cold path (health ~15 s /
+  queue ~5 s / cache-stats ~30 s, cap 750 ms; per-job runtime annotations
+  keyed by the engineJobId set, TTL ~5 s, cap 500 ms). The handler NEVER
+  awaits a live engine round-trip: while OpenFOAM solves saturate the CPU the
+  engine responds in seconds, and the admin queue page must stay usable
+  exactly then (§12). Stale runtime annotations ship with
+  `engineRuntimeAsOf` — the snapshot's true fetch time — and degraded probes
+  carry their error strings; missing data is null, never invented.
 - PATCH `/api/admin/sweeper` gains cpuSlots. **Move `PATCH /api/sweeper` and
   `GET /api/sim-jobs` under requireAdmin** (keep GET /api/sweeper public read if the
   public UI needs it — verify usages; sim-jobs payload must not leak campaign names

@@ -226,6 +226,14 @@
   Keep queue polling bounded, prevent overlapping browser polls, cache or
   stale-while-refresh slow observability probes, and page or defer large queue
   detail lists.
+- Polled admin payload handlers must never await a live engine/observability
+  round-trip — EVERY engine-dependent block goes through a TTL cache with
+  stale-while-refresh AND a bounded race cap on its cold path (the fresh-cache
+  hit must also be capped: returning an in-flight refresh promise reintroduces
+  the live wait). Test this class with a slow-endpoint stub (sleep seconds),
+  not only a connection-refused stub — refused connections fail fast and hide
+  the saturation defect. Stale snapshots ship with their true fetch timestamp
+  (asOf/checkedAt); missing data is null plus an error string, never invented.
 - Long-running Playwright solver monitors must be observe-only after the sweep
   is launched. Do not reuse setup/launch E2E specs as detached monitors because
   retries can mutate presets, pause/resume the sweeper, or restart scope

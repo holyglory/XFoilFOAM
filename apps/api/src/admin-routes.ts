@@ -209,6 +209,8 @@ const ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS = 750;
 const ENGINE_HEALTH_FRESH_TTL_MS = 15_000;
 const ENGINE_CACHE_STATS_FRESH_TTL_MS = 30_000;
 const ENGINE_RUNTIME_UNSUPPORTED_TTL_MS = 60_000;
+const ENGINE_RUNTIME_FRESH_TTL_MS = 5_000;
+const ENGINE_RUNTIME_RACE_CAP_MS = 500;
 
 let queueRevisionEnsureAt = 0;
 let queueRevisionEnsurePromise: Promise<void> | null = null;
@@ -217,28 +219,115 @@ let queueRevisionEnsurePromise: Promise<void> | null = null;
 // cached ~5 min; the strip never triggers its own full gap scan).
 const GAP_FILL_CACHE_TTL_MS = 5 * 60 * 1000;
 let gapFillBacklogCache: { pendingPoints: number; pendingSweeps: number; computedAt: string } | null = null;
+
+/** One row of the Background tab's pending-sweeps list (gap scan output). */
+interface GapScanPendingSweep {
+  airfoilId: string;
+  airfoilSlug: string;
+  airfoilName: string;
+  categoryName: string;
+  categoryPath: string;
+  bcId: string;
+  bcSlug: string;
+  bcName: string;
+  mediumSlug: string;
+  mediumName: string;
+  reynolds: number;
+  mach: number | null;
+  speedMps: number;
+  referenceChordM: number;
+  temperatureK: number;
+  pressurePa: number;
+  turbulenceModel: string;
+  turbulenceIntensity: number;
+  viscosityRatio: number;
+  schedulingPolicy: string;
+  cpuBudget: number | null;
+  caseConcurrency: number | null;
+  solverProcesses: number | null;
+  aoaCount: number;
+  aoaMin: number;
+  aoaMax: number;
+  aoas: number[];
+  status: string;
+  priority: number;
+  kind: "sweep-rans" | "point-rans" | "point-urans";
+  requestedAt: string | null;
+}
+interface GapScanResult {
+  pendingSweeps: GapScanPendingSweep[];
+  pendingSweepsTotal: number;
+  pendingPointsTotal: number;
+  computedAt: string;
+}
+// Single-flight guard: concurrent queue requests share one running gap scan.
+let gapFillScanPromise: Promise<GapScanResult> | null = null;
 let engineRuntimeUnsupportedUntil = 0;
-let engineQueueCache:
-  | {
-      expiresAt: number;
-      promise: Promise<{ queue: EngineQueueState | null; error: string | null }>;
-      value: { queue: EngineQueueState | null; error: string | null } | null;
-    }
-  | null = null;
-let engineHealthCache:
-  | {
-      expiresAt: number;
-      promise: Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }>;
-      value: { health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null } | null;
-    }
-  | null = null;
-let engineCacheStatsCache:
-  | {
-      expiresAt: number;
-      promise: Promise<{ stats: EngineCacheStats | null; error: string | null }>;
-      value: { stats: EngineCacheStats | null; error: string | null } | null;
-    }
-  | null = null;
+
+/** TTL cache + stale-while-refresh + bounded race cap shared by every engine
+ *  probe the queue payload depends on (spec §10/§12): the handler must NEVER
+ *  await a live engine round-trip — while OpenFOAM solves saturate the CPU
+ *  the engine's uvicorn takes seconds to answer, and that is exactly when the
+ *  admin queue page must stay usable.
+ *  - fresh entry with a known snapshot (stale or fresh) → served immediately;
+ *  - fresh entry still resolving (cold path) → raced against the cap;
+ *  - expired entry → refresh kicked off; the previous snapshot is served
+ *    immediately when one exists, else the new probe races the cap.
+ *  `probe` must never reject (each caller catches into an error-carrying
+ *  value); `capValue` is the honest "still running" placeholder. */
+type ProbeCacheEntry<T> = { key: string; expiresAt: number; promise: Promise<T>; value: T | null };
+type ProbeCacheStore<T> = { current: ProbeCacheEntry<T> | null };
+function raceCachedProbe<T>(
+  store: ProbeCacheStore<T>,
+  key: string,
+  ttlMs: number,
+  capMs: number,
+  probe: () => Promise<T>,
+  capValue: () => T,
+): Promise<T> {
+  const now = Date.now();
+  const existing = store.current;
+  if (existing && existing.key === key && existing.expiresAt > now) {
+    if (existing.value) return Promise.resolve(existing.value);
+    return Promise.race([
+      existing.promise,
+      new Promise<T>((resolve) => setTimeout(() => resolve(capValue()), capMs)),
+    ]);
+  }
+  // Last-known snapshot (for the runtime probe possibly an older job set —
+  // still served with its own asOf timestamp, never presented as fresh).
+  const previous = existing?.value ?? null;
+  const entry: ProbeCacheEntry<T> = {
+    key,
+    expiresAt: now + ttlMs,
+    promise: probe().then((value) => {
+      if (store.current === entry) entry.value = value;
+      return value;
+    }),
+    value: previous,
+  };
+  store.current = entry;
+  if (previous) {
+    void entry.promise.catch(() => undefined);
+    return Promise.resolve(previous);
+  }
+  return Promise.race([
+    entry.promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(capValue()), capMs)),
+  ]);
+}
+
+const engineQueueCacheStore: ProbeCacheStore<{ queue: EngineQueueState | null; error: string | null }> = { current: null };
+const engineHealthCacheStore: ProbeCacheStore<{
+  health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null;
+  error: string | null;
+}> = { current: null };
+const engineCacheStatsCacheStore: ProbeCacheStore<{ stats: EngineCacheStats | null; error: string | null }> = { current: null };
+/** Last-known per-job runtime annotations from POST /jobs/runtime. `asOf` is
+ *  the time the snapshot was actually fetched from the engine — stale data is
+ *  always served WITH that timestamp, never presented as fresh. */
+type EngineRuntimeSnapshot = { runtimes: Map<string, JobRuntimeSummary>; asOf: string | null; error: string | null };
+const engineRuntimeCacheStore: ProbeCacheStore<EngineRuntimeSnapshot> = { current: null };
 
 async function ensureQueueRevisionsFresh() {
   const now = Date.now();
@@ -255,97 +344,54 @@ async function ensureQueueRevisionsFresh() {
   await queueRevisionEnsurePromise;
 }
 
-async function getCachedEngineQueue(engine: EngineClient): Promise<{ queue: EngineQueueState | null; error: string | null }> {
-  const now = Date.now();
-  if (engineQueueCache && engineQueueCache.expiresAt > now) return engineQueueCache.promise;
-
-  const previous = engineQueueCache?.value ?? null;
-  const promise = engine
-    .getQueue()
-    .then((queue) => ({ queue, error: null }))
-    .catch((e) => ({ queue: null, error: (e as Error).message }));
-
-  const entry: NonNullable<typeof engineQueueCache> = {
-    expiresAt: now + ENGINE_QUEUE_FRESH_TTL_MS,
-    promise: promise.then((value) => {
-      if (engineQueueCache === entry) entry.value = value;
-      return value;
-    }),
-    value: previous,
-  };
-  engineQueueCache = entry;
-
-  if (previous) {
-    void entry.promise.catch(() => undefined);
-    return previous;
-  }
-
-  return Promise.race([
-    entry.promise,
-    new Promise<{ queue: EngineQueueState | null; error: string | null }>((resolve) =>
-      setTimeout(() => resolve({ queue: null, error: "engine queue refresh is still running" }), ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS),
-    ),
-  ]);
+function getCachedEngineQueue(engine: EngineClient): Promise<{ queue: EngineQueueState | null; error: string | null }> {
+  return raceCachedProbe(
+    engineQueueCacheStore,
+    "engine-queue",
+    ENGINE_QUEUE_FRESH_TTL_MS,
+    ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+    () =>
+      engine
+        .getQueue()
+        .then((queue) => ({ queue, error: null as string | null }))
+        .catch((e) => ({ queue: null, error: (e as Error).message })),
+    () => ({ queue: null, error: "engine queue refresh is still running" }),
+  );
 }
 
-export async function getCachedEngineHealth(engine: EngineClient): Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }> {
-  const now = Date.now();
-  if (engineHealthCache && engineHealthCache.expiresAt > now) return engineHealthCache.promise;
-  const previous = engineHealthCache?.value ?? null;
-  const promise = engine
-    .healthDetails()
-    .then((health) => ({ health, error: null }))
-    .catch((e) => ({ health: null, error: (e as Error).message }));
-  const entry: NonNullable<typeof engineHealthCache> = {
-    expiresAt: now + ENGINE_HEALTH_FRESH_TTL_MS,
-    promise: promise.then((value) => {
-      if (engineHealthCache === entry) entry.value = value;
-      return value;
-    }),
-    value: previous,
-  };
-  engineHealthCache = entry;
-  if (previous) {
-    void entry.promise.catch(() => undefined);
-    return previous;
-  }
-  return Promise.race([
-    entry.promise,
-    new Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }>((resolve) =>
-      setTimeout(() => resolve({ health: null, error: "engine health refresh is still running" }), ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS),
-    ),
-  ]);
+export function getCachedEngineHealth(
+  engine: EngineClient,
+): Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }> {
+  return raceCachedProbe(
+    engineHealthCacheStore,
+    "engine-health",
+    ENGINE_HEALTH_FRESH_TTL_MS,
+    ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+    () =>
+      engine
+        .healthDetails()
+        .then((health) => ({ health, error: null as string | null }))
+        .catch((e) => ({ health: null, error: (e as Error).message })),
+    () => ({ health: null, error: "engine health refresh is still running" }),
+  );
 }
 
 /** Bounded engine cache-stats probe (~30 s cache, same approach as the engine
- *  health probe). Errors resolve to { stats: null } — never invented numbers. */
-async function getCachedEngineCacheStats(engine: EngineClient): Promise<{ stats: EngineCacheStats | null; error: string | null }> {
-  const now = Date.now();
-  if (engineCacheStatsCache && engineCacheStatsCache.expiresAt > now) return engineCacheStatsCache.promise;
-  const previous = engineCacheStatsCache?.value ?? null;
-  const promise = engine
-    .cacheStats()
-    .then((stats) => ({ stats, error: null as string | null }))
-    .catch((e) => ({ stats: null, error: (e as Error).message }));
-  const entry: NonNullable<typeof engineCacheStatsCache> = {
-    expiresAt: now + ENGINE_CACHE_STATS_FRESH_TTL_MS,
-    promise: promise.then((value) => {
-      if (engineCacheStatsCache === entry) entry.value = value;
-      return value;
-    }),
-    value: previous,
-  };
-  engineCacheStatsCache = entry;
-  if (previous) {
-    void entry.promise.catch(() => undefined);
-    return previous;
-  }
-  return Promise.race([
-    entry.promise,
-    new Promise<{ stats: EngineCacheStats | null; error: string | null }>((resolve) =>
-      setTimeout(() => resolve({ stats: null, error: "engine cache-stats refresh is still running" }), ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS),
-    ),
-  ]);
+ *  health probe — including the race cap on the COLD first request after a
+ *  restart). Errors resolve to { stats: null } — never invented numbers. */
+function getCachedEngineCacheStats(engine: EngineClient): Promise<{ stats: EngineCacheStats | null; error: string | null }> {
+  return raceCachedProbe(
+    engineCacheStatsCacheStore,
+    "engine-cache-stats",
+    ENGINE_CACHE_STATS_FRESH_TTL_MS,
+    ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+    () =>
+      engine
+        .cacheStats()
+        .then((stats) => ({ stats, error: null as string | null }))
+        .catch((e) => ({ stats: null, error: (e as Error).message })),
+    () => ({ stats: null, error: "engine cache-stats refresh is still running" }),
+  );
 }
 
 function toQueueJob(r: QueueJobRow) {
@@ -413,6 +459,52 @@ function toQueueJob(r: QueueJobRow) {
   };
 }
 
+/** Race-capped + TTL-cached runtime annotations for the queue payload (same
+ *  stale-while-refresh approach as getCachedEngineHealth): keyed by the
+ *  engineJobId set, ~5 s TTL, ~500 ms race cap on the cold path. When the cap
+ *  trips or the engine errors, the last-known snapshot is served with its
+ *  original asOf timestamp; with no snapshot at all the jobs are annotated as
+ *  runtime-unknown — never invented. */
+function getCachedEngineRuntimes(engine: EngineClient, jobIds: string[]): Promise<EngineRuntimeSnapshot> {
+  const unique = Array.from(new Set(jobIds.filter(Boolean))).sort();
+  if (unique.length === 0) return Promise.resolve({ runtimes: new Map(), asOf: new Date().toISOString(), error: null });
+  if (Date.now() < engineRuntimeUnsupportedUntil) {
+    return Promise.resolve({ runtimes: new Map(), asOf: null, error: "engine build does not support POST /jobs/runtime" });
+  }
+  // Last-known snapshot (possibly for an older job set) — kept on refresh
+  // errors so its true asOf keeps travelling with it.
+  const previous = engineRuntimeCacheStore.current?.value ?? null;
+  return raceCachedProbe(
+    engineRuntimeCacheStore,
+    unique.join(","),
+    ENGINE_RUNTIME_FRESH_TTL_MS,
+    ENGINE_RUNTIME_RACE_CAP_MS,
+    () =>
+      engine
+        .getJobRuntimes(unique)
+        .then((response) => ({
+          runtimes: new Map(response.jobs.map((job) => [job.job_id, job])),
+          asOf: new Date().toISOString(),
+          error: null as string | null,
+        }))
+        .catch((e) => {
+          if (e instanceof EngineError && e.status === 405) {
+            engineRuntimeUnsupportedUntil = Date.now() + ENGINE_RUNTIME_UNSUPPORTED_TTL_MS;
+          }
+          // Keep the last good snapshot (with its true asOf) and carry the error.
+          return {
+            runtimes: previous?.runtimes ?? new Map<string, JobRuntimeSummary>(),
+            asOf: previous?.asOf ?? null,
+            error: (e as Error).message,
+          };
+        }),
+    () => ({ runtimes: new Map(), asOf: null, error: "engine runtime refresh is still running" }),
+  );
+}
+
+/** Live (uncached) runtime lookup — reserved for explicit admin actions such
+ *  as recover-stale, where the admin asked for a fresh engine check. The
+ *  polled queue payload must use getCachedEngineRuntimes instead. */
 async function engineRuntimeMap(engine: EngineClient, jobIds: string[]): Promise<Map<string, JobRuntimeSummary>> {
   const unique = Array.from(new Set(jobIds.filter(Boolean)));
   if (unique.length === 0) return new Map();
@@ -1193,7 +1285,11 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/api/admin/login", async (req, reply) => {
-    const { email, password } = z.object({ email: z.string(), password: z.string() }).parse(req.body);
+    // safeParse → 400 with a plain error (matching the purge route); a bare
+    // .parse would bubble a raw ZodError out as a 500.
+    const parsed = z.object({ email: z.string(), password: z.string() }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "email and password are required" });
+    const { email, password } = parsed.data;
     if (!checkCredentials(email, password)) return reply.code(401).send({ error: "invalid email or password" });
     reply.setCookie(COOKIE_NAME, signSession(email, 86_400_000, "password"), {
       httpOnly: true,
@@ -2169,12 +2265,13 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ---- queue (protected) ----
-  app.get("/api/admin/queue", { preHandler: requireAdmin }, async () => {
-    await ensureQueueRevisionsFresh();
-    const s = await readSweeperState();
-
-    // Pending work = (airfoil × enabled setup revision × AoA) gaps. Keep counts and the
-    // visible list in one scan so the queue page does not recompute the same gap set.
+  // Pending work = (airfoil × enabled setup revision × AoA) gaps. Keep counts and the
+  // visible list in one scan so the queue page does not recompute the same gap set.
+  // Single-flight: scope=background/all awaits it; other scopes only trigger a
+  // background refresh and serve gapFillBacklogCache with its computedAt.
+  const runGapFillScan = (): Promise<GapScanResult> => {
+    if (gapFillScanPromise) return gapFillScanPromise;
+    const scan = (async (): Promise<GapScanResult> => {
     const pendingSweepRows = (await db.execute(sql`
       WITH latest_revision AS (
         SELECT DISTINCT ON (preset_id) preset_id, id, reynolds
@@ -2342,9 +2439,10 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       pending_points_total: number;
     }[];
     const pendingSweepsTotal = Number(pendingSweepRows[0]?.pending_sweeps_total ?? 0);
-    const backlog = Number(pendingSweepRows[0]?.pending_points_total ?? 0);
-    gapFillBacklogCache = { pendingPoints: backlog, pendingSweeps: pendingSweepsTotal, computedAt: new Date().toISOString() };
-    const pendingSweeps = pendingSweepRows.map((r) => ({
+    const pendingPointsTotal = Number(pendingSweepRows[0]?.pending_points_total ?? 0);
+    const computedAt = new Date().toISOString();
+    gapFillBacklogCache = { pendingPoints: pendingPointsTotal, pendingSweeps: pendingSweepsTotal, computedAt };
+    const pendingSweeps: GapScanPendingSweep[] = pendingSweepRows.map((r) => ({
       airfoilId: r.airfoil_id,
       airfoilSlug: r.airfoil_slug,
       airfoilName: r.airfoil_name,
@@ -2377,8 +2475,51 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       kind: r.kind,
       requestedAt: iso(r.requested_at),
     }));
+    return { pendingSweeps, pendingSweepsTotal, pendingPointsTotal, computedAt };
+    })();
+    gapFillScanPromise = scan.finally(() => {
+      gapFillScanPromise = null;
+    });
+    return gapFillScanPromise;
+  };
 
-    const externalPromises = (await db.execute(sql`
+  app.get("/api/admin/queue", { preHandler: requireAdmin }, async (req, reply) => {
+    // Tab-scoped payloads (spec §10/§12): every scope returns the full
+    // AdminQueue shape; out-of-scope sections are null so the web types stay
+    // honest — a section is either present-and-real or explicitly absent.
+    const parsedScope = z
+      .object({ scope: z.enum(["activity", "background", "engine", "all"]).default("all") })
+      .safeParse(req.query ?? {});
+    if (!parsedScope.success) {
+      return reply.code(400).send({ error: "invalid scope — expected one of activity, background, engine, all" });
+    }
+    const scope = parsedScope.data.scope;
+    const wantActivity = scope === "activity" || scope === "all";
+    const wantBackground = scope === "background" || scope === "all";
+    const wantEngine = scope === "engine" || scope === "all";
+    // Engine tab shows stale/detached counts derived from activeJobs, so both
+    // activity and engine scopes carry job lists + runtime annotations.
+    const wantJobs = wantActivity || wantEngine;
+    const wantEngineChips = wantActivity || wantEngine;
+
+    await ensureQueueRevisionsFresh();
+    const s = await readSweeperState();
+
+    // Full gap scan only where the Background tab needs the visible list
+    // (scope=background/all). The hot Activity polling path serves the cached
+    // counters with their computedAt and, when stale, refreshes in the
+    // background (spec §10: the strip never triggers its own full gap scan).
+    let gapScan: GapScanResult | null = null;
+    if (wantBackground) {
+      gapScan = await runGapFillScan();
+    } else if (!gapFillBacklogCache || Date.now() - new Date(gapFillBacklogCache.computedAt).getTime() >= GAP_FILL_CACHE_TTL_MS) {
+      void runGapFillScan().catch(() => undefined);
+    }
+    const gapCounters = gapScan
+      ? { pendingPoints: gapScan.pendingPointsTotal, pendingSweeps: gapScan.pendingSweepsTotal, computedAt: gapScan.computedAt }
+      : gapFillBacklogCache;
+
+    const externalPromiseRows = !wantBackground ? null : ((await db.execute(sql`
       SELECT
         pr.id,
         pr.source_instance_id,
@@ -2415,26 +2556,71 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       aoa_count: number;
       aoa_min: number;
       aoa_max: number;
-    }[];
+    }[]);
 
-    const statusRows = (await db.execute(
-      sql`SELECT status, count(*)::int AS n FROM results GROUP BY status`,
-    )) as unknown as { status: string; n: number }[];
-    const byStatus: Record<string, number> = {};
-    for (const r of statusRows) byStatus[r.status] = Number(r.n);
-    const [solved] = await db.select({ n: count() }).from(results).where(and(eq(results.source, "solved"), eq(results.status, "done")));
+    let byStatus: Record<string, number> | null = null;
+    // Solved-points badge (screen 5): real count of results solved since the
+    // start of the current server day; null outside the activity scope.
+    let solvedToday: number | null = null;
+    if (wantActivity) {
+      const statusRows = (await db.execute(
+        sql`SELECT status, count(*)::int AS n FROM results GROUP BY status`,
+      )) as unknown as { status: string; n: number }[];
+      byStatus = {};
+      for (const r of statusRows) byStatus[r.status] = Number(r.n);
+      const [solved] = await db.select({ n: count() }).from(results).where(and(eq(results.source, "solved"), eq(results.status, "done")));
+      byStatus.solved = solved?.n ?? 0;
+      const [today] = await db
+        .select({ n: count() })
+        .from(results)
+        .where(
+          and(
+            eq(results.source, "solved"),
+            eq(results.status, "done"),
+            isNotNull(results.solvedAt),
+            sql`${results.solvedAt} >= date_trunc('day', now())`,
+          ),
+        );
+      solvedToday = today?.n ?? 0;
+    }
 
-    const [jobsRaw, activeJobsRaw, finishedJobsRaw] = await Promise.all([queueJobs("recent", 50), queueJobs("active", 40), queueJobs("finished", 80)]);
+    const [jobsRaw, activeJobsRaw, finishedJobsRaw] = await Promise.all([
+      wantActivity ? queueJobs("recent", 50) : Promise.resolve(null),
+      wantJobs ? queueJobs("active", 40) : Promise.resolve(null),
+      wantActivity ? queueJobs("finished", 80) : Promise.resolve(null),
+    ]);
     const engine = new EngineClient(env.engineUrl);
+    // Every engine probe below is TTL-cached with stale-while-refresh and a
+    // bounded race cap on its cold path — the queue payload NEVER waits on a
+    // live engine round-trip (the engine's uvicorn can take seconds while
+    // OpenFOAM solves saturate the CPU; spec §10/§12 requires this page to
+    // stay usable exactly then).
+    const emptyRuntimeSnapshot: EngineRuntimeSnapshot = { runtimes: new Map(), asOf: null, error: null };
     const [
       { queue: engineQueue, error: engineQueueError },
       { health: engineHealth, error: engineHealthError },
       { stats: engineCacheStats },
-    ] = await Promise.all([getCachedEngineQueue(engine), getCachedEngineHealth(engine), getCachedEngineCacheStats(engine)]);
-    const runtimeByEngineJobId = await engineRuntimeMap(
-      engine,
-      [...jobsRaw, ...activeJobsRaw, ...finishedJobsRaw].map((job) => job.engineJobId).filter((id): id is string => Boolean(id)),
-    );
+      runtimeSnapshot,
+    ] = await Promise.all([
+      wantEngineChips
+        ? getCachedEngineQueue(engine)
+        : Promise.resolve<Awaited<ReturnType<typeof getCachedEngineQueue>>>({ queue: null, error: null }),
+      wantEngineChips
+        ? getCachedEngineHealth(engine)
+        : Promise.resolve<Awaited<ReturnType<typeof getCachedEngineHealth>>>({ health: null, error: null }),
+      wantEngine
+        ? getCachedEngineCacheStats(engine)
+        : Promise.resolve<Awaited<ReturnType<typeof getCachedEngineCacheStats>>>({ stats: null, error: null }),
+      wantJobs
+        ? getCachedEngineRuntimes(
+            engine,
+            [...(jobsRaw ?? []), ...(activeJobsRaw ?? []), ...(finishedJobsRaw ?? [])]
+              .map((job) => job.engineJobId)
+              .filter((id): id is string => Boolean(id)),
+          )
+        : Promise.resolve(emptyRuntimeSnapshot),
+    ]);
+    const runtimeByEngineJobId = runtimeSnapshot.runtimes;
     const annotateJob = <T extends ReturnType<typeof toQueueJob>>(job: T) => ({
       ...job,
       ...(() => {
@@ -2490,23 +2676,23 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         };
       })(),
     });
-    const jobs = jobsRaw.map(annotateJob);
-    const activeJobs = activeJobsRaw.map(annotateJob);
-    const finishedJobs = finishedJobsRaw.map(annotateJob);
-    const inFlight = activeJobs.filter((j) => ["submitted", "running", "ingesting"].includes(j.status)).length;
+    const jobs = jobsRaw?.map(annotateJob) ?? null;
+    const activeJobs = activeJobsRaw?.map(annotateJob) ?? null;
+    const finishedJobs = finishedJobsRaw?.map(annotateJob) ?? null;
+    const inFlight = activeJobs ? activeJobs.filter((j) => ["submitted", "running", "ingesting"].includes(j.status)).length : null;
 
     // Backlog strip (spec §10): per-active-campaign remaining from counters +
-    // the cached background gap-fill note with its computed-at time.
-    const campaignBacklog = await campaignBacklogStrip(db);
-    const gapFillFresh =
-      gapFillBacklogCache && Date.now() - new Date(gapFillBacklogCache.computedAt).getTime() < GAP_FILL_CACHE_TTL_MS
-        ? gapFillBacklogCache
-        : { pendingPoints: backlog, pendingSweeps: pendingSweepsTotal, computedAt: new Date().toISOString() };
+    // the cached background gap-fill note with its computed-at time (null
+    // until the first scan ever completes — shown as "not computed yet",
+    // never invented).
+    const campaignBacklog = wantActivity ? await campaignBacklogStrip(db) : null;
     // engineUnreachableSince lands with the sweeper phase (migration 0026);
     // readSweeperState() reads it defensively while the column may be absent.
     const engineUnreachableSinceRaw = s?.engineUnreachableSince ?? null;
+    const gapCountersInScope = wantActivity || wantBackground ? gapCounters : null;
 
     return {
+      scope,
       mode: authMode(),
       engineUrl: env.engineUrl,
       // sweeper includes cpuSlots — THE single global solver-capacity setting;
@@ -2514,17 +2700,20 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       sweeper: s ?? SWEEPER_STATE_DEFAULTS,
       cpuSlotsAuto: (s?.cpuSlots ?? 0) === 0,
       engineUnreachableSince: iso(engineUnreachableSinceRaw),
-      backlogStrip: {
-        campaigns: campaignBacklog,
-        backgroundGapFill: gapFillFresh,
-      },
-      backlog,
+      backlogStrip: campaignBacklog
+        ? {
+            campaigns: campaignBacklog,
+            backgroundGapFill: gapCounters,
+          }
+        : null,
+      backlog: gapCountersInScope?.pendingPoints ?? null,
       inFlight,
-      results: { ...byStatus, solved: solved?.n ?? 0 },
-      pendingPointsTotal: backlog,
-      pendingSweepsTotal,
-      pendingSweeps,
-      externalPromises: externalPromises.map((row) => ({
+      results: byStatus,
+      solvedToday,
+      pendingPointsTotal: gapCountersInScope?.pendingPoints ?? null,
+      pendingSweepsTotal: gapCountersInScope?.pendingSweeps ?? null,
+      pendingSweeps: gapScan?.pendingSweeps ?? null,
+      externalPromises: externalPromiseRows?.map((row) => ({
         id: row.id,
         sourceInstanceId: row.source_instance_id,
         sourceInstanceName: row.source_instance_name,
@@ -2538,7 +2727,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         aoaCount: Number(row.aoa_count),
         aoaMin: Number(row.aoa_min),
         aoaMax: Number(row.aoa_max),
-      })),
+      })) ?? null,
       engineQueue,
       engineQueueError,
       engineHealth,
@@ -2558,6 +2747,11 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
               capBytes: Number(engineCacheStats.cap_bytes),
               oldestLastUsedAt: engineCacheStats.oldest_last_used ?? null,
             },
+      // When the runtime snapshot is stale (race cap tripped / engine error),
+      // asOf carries the time it was actually fetched; null = no runtime data
+      // at all (jobs annotate as runtime-unknown).
+      engineRuntimeAsOf: wantJobs ? runtimeSnapshot.asOf : null,
+      engineRuntimeError: wantJobs ? runtimeSnapshot.error : null,
       activeJobs,
       finishedJobs,
       jobs,

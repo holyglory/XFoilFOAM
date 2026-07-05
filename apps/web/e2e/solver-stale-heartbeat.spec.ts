@@ -23,7 +23,9 @@ const STALE_HEARTBEAT_ISO = new Date(Date.now() - 3 * 86_400_000).toISOString();
  *  enabled=true, heartbeat days stale, no active jobs. Read-only for the
  *  server — only the response seen by this page is modified. */
 async function interceptQueueWithStaleHeartbeat(page: Page) {
-  await page.route("**/api/admin/queue", async (route) => {
+  // `*` suffix: the Solver page now fetches tab-scoped payloads
+  // (?scope=activity|background|engine) — match them all.
+  await page.route("**/api/admin/queue*", async (route) => {
     const response = await route.fetch();
     const body = (await response.json()) as {
       sweeper: { enabled: boolean; heartbeatAt: string | null };

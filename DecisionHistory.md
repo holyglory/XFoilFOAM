@@ -768,3 +768,70 @@
 - Consequence recorded: sweeper/campaign test suites require exclusive
   scheduler control and now fail-fast (by design) while a live campaign runs;
   isolation on a scratch DB is queued as follow-up work.
+
+## 2026-07-05 — Queue Endpoint Under Solver Saturation: Scoped + Race-Capped
+
+- Incident (measured on airfoils.pro): authenticated GET /api/admin/queue took
+  1.8–3.0 s per call on localhost while 4 OpenFOAM solves saturated the CPU,
+  with near-empty data (4 jobs, 18 KB). Root cause verified by reading the
+  handler and reproducing with a 3 s sleeping engine stub: the handler awaited
+  a LIVE `POST /jobs/runtime` per request (engineRuntimeMap — no cache, no
+  cap, and EngineClient has no fetch timeout), and the cached engine probes
+  had a latent hole — a fresh-cache hit returned the still-in-flight refresh
+  promise, so within-TTL requests also waited on the slow engine. Connection
+  refused (engine off) resolves instantly, which is why dev never showed it.
+- Fix: one shared `raceCachedProbe` helper (TTL + stale-while-refresh + race
+  cap on BOTH the cold path and the fresh-hit-while-resolving path) now backs
+  engine health (15 s/750 ms), queue introspection (5 s/750 ms), cache stats
+  (30 s/750 ms), and the new per-job runtime snapshot keyed by the engineJobId
+  set (5 s/500 ms). Stale runtime annotations ship with `engineRuntimeAsOf`
+  (true fetch time) + `engineRuntimeError`; missing data stays null.
+  `engineRuntimeMap` (live) remains only for the explicit recover-stale admin
+  action.
+- Tab-scoped payloads: GET /api/admin/queue?scope=activity|background|engine
+  (default `all` for back-compat; invalid → 400). Full AdminQueue shape with
+  out-of-scope sections null (web types made nullable; mergeAdminQueue folds
+  scoped responses client-side). Only scope=background/all awaits the full
+  gap scan (single-flight); activity serves the cached counters with
+  computedAt and refreshes the scan in the background — cold cache renders
+  "not computed yet", never invented zeros. QueueDashboard polls only the
+  active tab's scope; ReviewStep queue context uses scope=activity.
+- First-load waterfall: AdminConsole now prefetches the Solver page's scoped
+  queue payload in parallel with adminMe (30 s-fresh, consumed once).
+- Also fixed in scope: POST /api/admin/login with a missing body 500'd with a
+  raw ZodError; now safeParse → 400 {error}.
+- Must-catch recall proven: apps/api/test/admin-queue.test.ts drives a 3 s
+  sleeping engine stub + seeded active jobs with engine ids; the timing tests
+  (cold <1.5 s, warm <1 s) were run against a temporary reintroduction of the
+  live-await behavior and failed at 3.1 s as required, then pass post-fix at
+  ~0.87 s cold / ~0.05 s cached. Guardrail generalized in AGENTS.md (slow-stub
+  testing requirement — refused-connection stubs hide this class).
+
+## 2026-07-05 — Solved-Points Viewer (Solver Page Screen 5)
+
+- New GET /api/admin/solved-points (requireAdmin, apps/api/src/solved-points-
+  routes.ts): the newest REAL solved rows (results status=done, source=solved,
+  solvedAt set — derived/mirrored display points never listed), keyset-paged
+  on (solvedAt DESC, id DESC) with cursor `solvedAtISO|resultId`, optional
+  jobId scope, and `solvedToday` computed over the SAME scope as the rows
+  (counts always accompany the rows they count). Malformed cursor/limit/jobId
+  → 400.
+- Web: "N solved today ▾" badge in the Activity truth banner (count comes from
+  the queue payload's activity-scoped solvedToday — no extra poll request;
+  hidden at 0), and per-job "N solved ▾" chips on active/finished job cards
+  (rendered only when solvedCount > 0). Both open SolvedPointsPopover, a
+  self-owned popover (fetch-on-open + manual refresh) so the 10 s Activity
+  poll can never yank it shut or reset its pages. Row click opens the
+  EXISTING SimModal (by resultId via getSim; not forked); α prev/next is the
+  modal's own track/onTrackPoint contract fed with the popover's row list,
+  plus overlay prev/next buttons that load the next keyset page when stepping
+  past the loaded end. Escape closes modal back to popover; outside click
+  closes the popover; no page navigation anywhere.
+- Pure stepping/merge logic isolated in apps/web/lib/solved-points.ts
+  (mergeSolvedPointsPages dedupes on resultId and never re-orders loaded rows,
+  keeping the open row's index stable; stepSolvedPoint returns move /
+  load-more / none) with unit tests; API behavior pinned by
+  apps/api/test/solved-points.test.ts against the shared dev DB (scoped
+  assertions own their seeded job; cleanup in afterAll). E2e asserts the badge
+  honestly matches the live API count (absent at 0 — never an invented
+  number).
