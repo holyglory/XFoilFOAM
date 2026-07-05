@@ -2061,4 +2061,153 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(gotResult.simJobId).toBe(job.id);
     await db.delete(results).where(eq(results.id, row.id));
   }, 60000);
+
+  // MUST-CATCH (incident 2026-07-04, empty-error class): a genuinely failed
+  // engine job (total failure — the engine writes a failed result with a
+  // message and NO polars, exactly tasks.py's exception path) must stamp the
+  // job-level failure message onto EVERY failed evidence row. Before the fix,
+  // failJob flipped rows to status='failed' without touching results.error,
+  // so the failures endpoint bucketed them errorClass='unknown' with no error
+  // text anywhere.
+  it("stamps the engine failure message onto failed rows (genuine failure, no partial result)", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const MSG = "MeshError: blockMesh exited 1 (boundary layer collapse)";
+    const aoas = [131.101, 132.101, 133.101];
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId: "genuine-total-failure",
+        submittedAt: new Date(Date.now() - 10 * 60 * 1000),
+        totalCases: aoas.length,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const rowIds: string[] = [];
+    for (const aoa of aoas) {
+      const [row] = await db
+        .insert(results)
+        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: job.id })
+        .returning({ id: results.id });
+      cleanupResultIds.add(row.id);
+      rowIds.push(row.id);
+    }
+
+    const failedEngine = {
+      getQueue: async () => emptyQueue(),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: "genuine-total-failure",
+        state: "failed",
+        total_cases: aoas.length,
+        completed_cases: 0,
+        message: MSG,
+      }),
+      // tasks.py exception path: JobResult(state=failed, message=..., polars=[]).
+      getResult: async (): Promise<JobResult> => ({ job_id: "genuine-total-failure", state: "failed", message: MSG, polars: [] }),
+    } as unknown as EngineClient;
+
+    await reconcile(db, failedEngine, { jobIds: [job.id], skipFailedRecovery: true });
+
+    const rows = await db.select({ status: results.status, error: results.error }).from(results).where(inArray(results.id, rowIds));
+    expect(rows.length).toBe(aoas.length);
+    for (const row of rows) {
+      expect(row.status).toBe("failed");
+      expect(row.error).toBe(MSG); // exact engine message — never empty, never 'unknown'-classed
+      expect((row.error ?? "").trim().length).toBeGreaterThan(0);
+    }
+    const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
+    expect(gotJob.status).toBe("failed");
+    expect(gotJob.error).toBe(MSG);
+    await db.delete(results).where(inArray(results.id, rowIds));
+  }, 60000);
+
+  // MUST-CATCH (incident 2026-07-04, propagation half): when a genuinely
+  // failed job DOES ship a partial result, a failed point whose own p.error is
+  // null (the engine recorded no per-case error) must inherit the job-level
+  // failure message — the solved point still ingests as real evidence.
+  it("propagates the job-level message to failed partial-result points with no per-point error", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const MSG = "SolverCrash: pimpleFoam terminated by signal 9";
+    const solvedAoa = 134.101;
+    const erroredAoa = 135.101;
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [solvedAoa, erroredAoa])));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        // wave 2: a failed URANS retry is the realistic partial-failure shape
+        // AND keeps this test off the wave-2 composer (bounded retry chain).
+        wave: 2,
+        status: "running",
+        engineJobId: "genuine-partial-failure",
+        submittedAt: new Date(Date.now() - 10 * 60 * 1000),
+        totalCases: 2,
+        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }] },
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const rowIds: string[] = [];
+    for (const aoa of [solvedAoa, erroredAoa]) {
+      const [row] = await db
+        .insert(results)
+        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+        .returning({ id: results.id });
+      cleanupResultIds.add(row.id);
+      rowIds.push(row.id);
+    }
+
+    const partialFailureResult: JobResult = {
+      job_id: "genuine-partial-failure",
+      state: "failed",
+      message: MSG,
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: 1,
+          reynolds: 500000,
+          points: [
+            { aoa_deg: solvedAoa, cl: 0.42, cd: 0.021, cm: -0.03, cl_cd: 20, unsteady: true, converged: true, first_order_fallback: false, images: {} },
+            // The worker died before this case wrote coefficients or an error:
+            // p.error is null — exactly the shape that used to ingest as a
+            // failed row with EMPTY error text.
+            { aoa_deg: erroredAoa, cl: null, cd: null, cm: null, unsteady: true, converged: false, first_order_fallback: false, images: {}, error: null },
+          ],
+        },
+      ],
+    };
+    const partialFailureEngine = {
+      getQueue: async () => emptyQueue(),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: "genuine-partial-failure",
+        state: "failed",
+        total_cases: 2,
+        completed_cases: 1,
+        message: MSG,
+      }),
+      getResult: async () => partialFailureResult,
+    } as unknown as EngineClient;
+
+    await reconcile(db, partialFailureEngine, { jobIds: [job.id], skipFailedRecovery: true });
+
+    const [solvedRow] = await db.select({ status: results.status, cl: results.cl, error: results.error }).from(results).where(eq(results.id, rowIds[0]));
+    expect(solvedRow.status).toBe("done"); // real partial evidence survives the failure
+    expect(solvedRow.cl).toBeCloseTo(0.42, 8);
+    expect(solvedRow.error).toBeNull();
+    const [failedRow] = await db.select({ status: results.status, error: results.error }).from(results).where(eq(results.id, rowIds[1]));
+    expect(failedRow.status).toBe("failed");
+    expect(failedRow.error).toBe(MSG); // job-level message propagated — never empty
+    const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
+    expect(gotJob.status).toBe("failed");
+    expect(gotJob.error).toBe(MSG);
+    await db.delete(results).where(inArray(results.id, rowIds));
+  }, 60000);
 });

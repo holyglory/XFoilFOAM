@@ -19,10 +19,12 @@ import {
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
   EngineError,
+  WORKER_RESTART_ORPHAN_MESSAGE,
   classifyQueueLifecycle,
   engineQueueListsJob,
   type EngineClient,
   type EngineQueueState,
+  type JobResult,
   type JobRuntimeSummary,
   type JobStatus,
 } from "@aerodb/engine-client";
@@ -31,7 +33,7 @@ import { and, count, eq, inArray, isNotNull, isNull, notInArray, or, sql } from 
 import { buildPolarRequest } from "./build-request";
 import { isEngineConnectionFailure, recordEngineUnreachable } from "./engine-backoff";
 import { touchHeartbeat } from "./heartbeat";
-import { type ConditionMapEntry, ingestResult, type SpeedBc } from "./ingest";
+import { type ConditionMapEntry, failedForPoint, ingestResult, type SpeedBc } from "./ingest";
 import { ransRetryPlanForJobScoped } from "./retry-plan";
 
 export { touchHeartbeat } from "./heartbeat";
@@ -77,9 +79,13 @@ function reconcilableJobWhere(jobId: string) {
 }
 
 async function failJob(db: DB, jobId: string, msg: string): Promise<void> {
+  // Failed evidence rows must carry WHY: without the error stamp the failures
+  // endpoint classifies them 'unknown' (ERROR_CLASS_SQL treats NULL/'' as
+  // unknown — incident 2026-07-04: 12 campaign points terminal-failed with
+  // empty error). Callers guarantee msg is non-empty (nonEmptyFailureMessage).
   const failedRows = await db
     .update(results)
-    .set({ status: "failed", source: "queued" })
+    .set({ status: "failed", source: "queued", error: msg })
     .where(and(eq(results.simJobId, jobId), inArray(results.status, ["queued", "running"])))
     .returning({
       id: results.id,
@@ -735,9 +741,88 @@ function speedMapForJob(job: SimJobRow): SpeedBc[] {
   }));
 }
 
+/** Guarantee every failure message stamped onto evidence rows is non-empty:
+ *  ERROR_CLASS_SQL (packages/db/src/campaigns.ts) buckets NULL/'' as
+ *  'unknown', which is exactly how the 2026-07-04 worker-restart incident
+ *  surfaced ("15 failed", errorClass unknown, no error text anywhere). */
+function nonEmptyFailureMessage(job: SimJobRow, msg: string): string {
+  return msg.trim() ? msg : `engine job failed without a message (job ${job.engineJobId ?? job.id})`;
+}
+
+/** Keep ONLY solved points of a partial result: worker-restart orphan ingest
+ *  must preserve real solved evidence while every unreached/unsolved point is
+ *  released for a re-solve — never ingested as failure evidence. Attempt rows
+ *  survive unfiltered: they are historical solver attempts that genuinely
+ *  happened before the restart (result_attempts evidence, not results rows). */
+function solvedPointsOnly(result: JobResult): JobResult {
+  return {
+    ...result,
+    polars: result.polars.map((polar) => ({ ...polar, points: polar.points.filter((p) => !failedForPoint(p)) })),
+  };
+}
+
+/** Worker-restart orphan (incident 2026-07-04): the engine's worker-boot
+ *  reconciliation (src/airfoilfoam/storage.py reconcile_orphans) marks jobs
+ *  whose celery task died with a restarted worker container as state=failed
+ *  with the pinned WORKER_RESTART_ORPHAN_MESSAGE. That is an infrastructure
+ *  interruption, NOT solver failure evidence — before this branch existed the
+ *  failed-job ingest terminal-failed 12 campaign points (+3 symmetry mirrors)
+ *  with empty error text for points that were merely interrupted.
+ *
+ *  Truthful handling: solved cases present in the partial result.json are
+ *  real evidence and ingest as done; every remaining claimed row is RELEASED
+ *  back to pending (the cancelJobAndReleaseClaims claim-release semantics, so
+ *  the gap finders re-claim the points next tick) and the sim_job terminates
+ *  'cancelled'. NOTHING is marked failed, so campaign points never
+ *  terminal-fail on a restart. No URANS retry is submitted here: retry plans
+ *  read revision-wide classifications, where just-released unsolved rows
+ *  snapshot as 'rejected' until re-solved — deciding now could escalate
+ *  interrupted points to whole-polar URANS; the follow-up re-solve job runs
+ *  the same revision-wide retry pass on real evidence instead. */
+async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: SimJobRow): Promise<void> {
+  let solvedPoints = 0;
+  if (job.engineJobId) {
+    try {
+      const result = await engine.getResult(job.engineJobId);
+      const ingested = await ingestResult({
+        db,
+        engine,
+        engineJobId: job.engineJobId,
+        simJobId: job.id,
+        airfoilId: job.airfoilId,
+        speedMap: speedMapForJob(job),
+        conditionMap: conditionMapForJob(job) ?? undefined,
+        result: solvedPointsOnly(result),
+      });
+      collectDirtyLanes(ingested.dirtyLanes);
+      solvedPoints = ingested.points;
+    } catch (e) {
+      // No readable partial result (or ingest hiccup): nothing solved to
+      // preserve — release everything below. Loud, never silent.
+      console.error(
+        `[sweeper] worker-restart orphan ${job.engineJobId} (sim_job ${job.id}): partial-result ingest unavailable (${errorMessage(e)}); releasing all claims`,
+      );
+    }
+  }
+  console.error(
+    `[sweeper] WORKER RESTART orphan ${job.engineJobId ?? "(unsubmitted)"} (sim_job ${job.id}): ${solvedPoints} solved point(s) kept as evidence, remaining claims released for re-solve — nothing marked failed`,
+  );
+  await cancelJobAndReleaseClaims(db, job, "worker restarted mid-solve; points released for re-solve");
+  if (solvedPoints > 0) {
+    await refreshPolarCachesForJob(db, job);
+    await settleCampaignAfterRefresh(db, job);
+  }
+}
+
 async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRow, msg: string): Promise<void> {
+  if (msg === WORKER_RESTART_ORPHAN_MESSAGE) {
+    // Infrastructure interruption, not solver failure — release, never fail.
+    await releaseWorkerRestartOrphan(db, engine, job);
+    return;
+  }
+  const failure = nonEmptyFailureMessage(job, msg);
   if (!job.engineJobId) {
-    await failJob(db, job.id, msg);
+    await failJob(db, job.id, failure);
     return;
   }
   try {
@@ -751,21 +836,22 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       speedMap: speedMapForJob(job),
       conditionMap: conditionMapForJob(job) ?? undefined,
       result,
+      failedPointErrorFallback: failure,
     });
     collectDirtyLanes(ingested.dirtyLanes);
     if (ingested.points === 0) {
-      await failJob(db, job.id, msg);
+      await failJob(db, job.id, failure);
       return;
     }
     await refreshPolarCachesForJob(db, job);
     await db
       .update(simJobs)
-      .set({ status: "failed", engineState: "failed", error: msg, ingestedAt: new Date(), finishedAt: new Date() })
+      .set({ status: "failed", engineState: "failed", error: failure, ingestedAt: new Date(), finishedAt: new Date() })
       .where(reconcilableJobWhere(job.id));
     await submitUransRetryForJob(db, engine, job);
     await settleCampaignAfterRefresh(db, job);
   } catch {
-    await failJob(db, job.id, msg);
+    await failJob(db, job.id, failure);
   }
 }
 

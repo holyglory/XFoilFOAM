@@ -268,7 +268,10 @@ function validForPolarPoint(p: PolarPoint): boolean {
   return p.converged === true && !stalledForPoint(p) && !p.error && hasCoefficients;
 }
 
-function failedForPoint(p: PolarPoint): boolean {
+/** A point with an error or without finite coefficients is failure/absence —
+ *  exported so reconcile's worker-restart orphan path can keep ONLY solved
+ *  points as evidence and release everything else for a re-solve. */
+export function failedForPoint(p: PolarPoint): boolean {
   return Boolean(p.error) || !finiteNumber(p.cl) || !finiteNumber(p.cd);
 }
 
@@ -785,6 +788,11 @@ export async function ingestResult(opts: {
    *  the single-revision nearest-speed path unchanged. */
   conditionMap?: ConditionMapEntry[];
   result: JobResult;
+  /** Job-level failure message stamped onto failed points whose own `error`
+   *  is empty (incident 2026-07-04: failed rows landed with NULL error →
+   *  failures endpoint errorClass 'unknown'). Only the failed-job ingest path
+   *  passes this; results.error must never be empty for a failed row. */
+  failedPointErrorFallback?: string;
   /** Heartbeat hook, called per point / per scaled-render batch so a
    *  multi-minute ingest never lets sweeper_state.heartbeatAt go stale past
    *  the web's 90 s truth gate (2026-07-06: 204 s stale under 7 jobs in
@@ -836,6 +844,10 @@ export async function ingestResult(opts: {
       await heartbeat();
       const stalled = stalledForPoint(p);
       const failed = failedForPoint(p);
+      // A failed row must carry WHY it failed: the point's own error when the
+      // solver produced one, else the job-level failure message (see
+      // failedPointErrorFallback above). Never NULL/empty on a failed row.
+      const pointError = p.error?.trim() ? p.error : failed ? (opts.failedPointErrorFallback ?? null) : null;
       const v: ResultInsert = {
         airfoilId,
         bcId,
@@ -865,7 +877,7 @@ export async function ingestResult(opts: {
         nCells: p.n_cells ?? null,
         firstOrderFallback: p.first_order_fallback,
         strouhal: p.strouhal ?? null,
-        error: p.error ?? null,
+        error: pointError,
         engineJobId,
         engineCaseSlug: p.case_slug ?? null,
         simJobId,
