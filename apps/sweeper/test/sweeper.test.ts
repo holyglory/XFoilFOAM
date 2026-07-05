@@ -35,6 +35,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildPolarRequest } from "../src/build-request";
 import { claimAoas } from "../src/claim";
 import { findGaps, firstBatch } from "../src/gaps";
+import { touchHeartbeat } from "../src/heartbeat";
 import { ingestResult } from "../src/ingest";
 import { reconcile, resetOrphans } from "../src/reconcile";
 
@@ -764,6 +765,122 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(rcNoVideo?.reasons).toContain("missing-urans-video");
   }, 60000);
 
+  // MUST-CATCH (prod 2026-07-06 heartbeat-under-load regression): with 7 jobs
+  // in flight, a multi-minute per-point ingest left sweeper_state.heartbeatAt
+  // 204 s stale MID-TICK, so the Solver page's >90 s truth gate honestly
+  // reported PROCESS NOT RUNNING on a healthy process. The invariant is one
+  // heartbeat touch per ingested point (plus per scaled-render batch) — never
+  // a single touch bracketing the whole ingest.
+  it("touches the heartbeat per point during a slow multi-point ingest", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoas = [84.001, 85.001, 86.001];
+    await db
+      .delete(results)
+      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "ingesting",
+        engineJobId: "heartbeat-job",
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+
+    // Slow fake engine, shaped like real saturation: every per-point extents
+    // round-trip crawls (120 ms here, seconds-to-minutes in prod). It returns
+    // no extents so the scaled-render chain (which has its own per-result
+    // touch) stays out of this measurement.
+    const slowEngine = {
+      baseUrl: "http://engine.test",
+      computeFieldExtents: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        return { fields: {}, window_start: null, window_end: null };
+      },
+    } as unknown as EngineClient;
+
+    const result: JobResult = {
+      job_id: "heartbeat-job",
+      state: "completed",
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: 0.1,
+          points: aoas.map((aoa, i) => ({
+            case_slug: `hb${i}`,
+            aoa_deg: aoa,
+            cl: 0.3 + i * 0.1,
+            cd: 0.01,
+            cm: -0.01,
+            cl_cd: 30,
+            unsteady: false,
+            converged: true,
+            first_order_fallback: false,
+            images: {},
+            evidence_artifacts: [
+              {
+                kind: "manifest",
+                path: `/jobs/heartbeat-job/files/evidence/hb${i}/evidence_manifest.json`,
+                url: `/jobs/heartbeat-job/files/evidence/hb${i}/evidence_manifest.json`,
+                mime_type: "application/json",
+                sha256: `sha-hb${i}`,
+                byte_size: 128,
+                metadata: { evidenceBase: `/tmp/evidence/hb${i}` },
+              },
+            ],
+          })),
+        },
+      ],
+    };
+
+    // Age the heartbeat far past the web's 90 s stale gate, then observe REAL
+    // sweeper_state updates through the injected spy (count + DB truth).
+    const before = new Date(Date.now() - 10 * 60_000);
+    await db
+      .insert(sweeperState)
+      .values({ id: 1, heartbeatAt: before })
+      .onConflictDoUpdate({ target: sweeperState.id, set: { heartbeatAt: before } });
+    const observed: number[] = [];
+    const r = await ingestResult({
+      db,
+      engine: slowEngine,
+      engineJobId: "heartbeat-job",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+      result,
+      heartbeat: async () => {
+        await touchHeartbeat(db);
+        const [row] = await db
+          .select({ heartbeatAt: sweeperState.heartbeatAt })
+          .from(sweeperState)
+          .where(eq(sweeperState.id, 1))
+          .limit(1);
+        if (row?.heartbeatAt) observed.push(row.heartbeatAt.getTime());
+      },
+    });
+    expect(r.points).toBe(3);
+    const rows = await db
+      .select({ id: results.id })
+      .from(results)
+      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+    rows.forEach((row) => cleanupResultIds.add(row.id));
+    // At least one touch per point — the coverage that keeps a long ingest
+    // from starving the heartbeat.
+    expect(observed.length).toBeGreaterThanOrEqual(3);
+    // heartbeatAt genuinely ADVANCED during the ingest: >=3 distinct values
+    // (points are separated by the slow engine call), all newer than the aged
+    // pre-ingest timestamp.
+    expect(new Set(observed).size).toBeGreaterThanOrEqual(3);
+    expect(Math.min(...observed)).toBeGreaterThan(before.getTime());
+  }, 60000);
+
   it("promotes an unreliable RANS sweep to one whole-polar URANS retry", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoas = [130.01, 131.01, 132.01, 133.01, 134.01, 135.01];
@@ -856,7 +973,11 @@ describe("sweeper: gap → claim → ingest", () => {
       .where(and(eq(resultAttempts.simJobId, parent.id), inArray(resultAttempts.aoaDeg, aoas)));
     expect(attempts.length).toBe(aoas.length);
     expect(attempts.filter((a) => a.validForPolar).length).toBe(2);
-  }, 60000);
+    // 120 s: the FIRST reconcile() in the process pays the one-shot lane
+    // safety sweep + campaign reconciler against the shared dev DB (~57 s at
+    // current data volume, measured 2026-07-06) — over the old 60 s cap when
+    // vitest runs the other DB-heavy test files in parallel.
+  }, 120000);
 
   it("submits one URANS retry for rejected RANS attempts stored outside canonical results", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
@@ -1704,4 +1825,240 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(gotJob.engineState).toBe("cancelled");
     expect(gotJob.error).toContain("engine job is absent");
   });
+
+  // MUST-CATCH (G2, incident 2026-07-05): the engine cancelled 4 zombie jobs
+  // via POST /jobs/<id>/cancel, but the sweeper's status mapping had no
+  // 'cancelled' branch — the state fell through to "running" and the sweeper
+  // polled the dead jobs forever while their claimed points stayed queued.
+  it("releases claims and marks the job cancelled when the engine reports state=cancelled", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 91.001; // in the test sweep definition, so findGaps can re-pick it
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId: "engine-side-cancelled-job",
+        submittedAt: new Date(Date.now() - 60 * 60 * 1000),
+        totalCases: 1,
+        completedCases: 0,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+
+    let fetchedResult = false;
+    const cancelledEngine = {
+      getQueue: async () => emptyQueue(),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: "engine-side-cancelled-job",
+        state: "cancelled",
+        total_cases: 1,
+        completed_cases: 0,
+        message: "cancelled via engine API",
+      }),
+      getResult: async (): Promise<JobResult> => {
+        fetchedResult = true;
+        throw new Error("must not ingest a cancelled job");
+      },
+    } as unknown as EngineClient;
+
+    await reconcile(db, cancelledEngine, { jobIds: [job.id], skipFailedRecovery: true });
+
+    const [gotJob] = await db
+      .select({ status: simJobs.status, engineState: simJobs.engineState, finishedAt: simJobs.finishedAt })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [gotResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId, engineJobId: results.engineJobId, cl: results.cl })
+      .from(results)
+      .where(eq(results.id, row.id));
+    expect(gotJob.status).toBe("cancelled");
+    expect(gotJob.engineState).toBe("cancelled");
+    expect(gotJob.finishedAt).not.toBeNull();
+    expect(gotResult.status).toBe("pending");
+    expect(gotResult.simJobId).toBeNull();
+    expect(gotResult.engineJobId).toBeNull();
+    expect(gotResult.cl).toBeNull(); // no coefficient ingest from a cancelled job
+    expect(fetchedResult).toBe(false);
+
+    // The released point is a re-claimable gap again for the next tick.
+    const gaps = await testGaps(10000);
+    expect(gaps.some((gap) => gap.airfoilId === a.id && gap.presetRevisionId === presetRevisionId && gap.aoaDeg === aoa)).toBe(true);
+    await db.delete(results).where(eq(results.id, row.id));
+  }, 60000);
+
+  // MUST-CATCH (G3, incident 2026-07-05): a force-recreated worker killed the
+  // celery tasks, but the engine's persisted status store kept returning
+  // state=running (active_pids [], last_progress_at hours stale) — zombies the
+  // sweeper polled for ~2.3 h. Shape: running + zero processes + stale worker
+  // heartbeat + absent from Celery + last progress beyond the 30 min grace.
+  it("cancels and requeues a lost engine job that reports running with no processes and stale progress", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 129.456;
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId: "zombie-after-worker-restart",
+        submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+        totalCases: 4,
+        completedCases: 1,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+
+    const engineCancels: string[] = [];
+    const zombieEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: "zombie-after-worker-restart",
+            exists: true,
+            cancelled: false,
+            process_count: 0,
+            active_pids: [],
+            runtime_heartbeat_age_sec: 9000,
+            status_readable: true,
+            status_error: null,
+            status_state: "running",
+            status_total_cases: 4,
+            status_completed_cases: 1,
+            result_readable: false,
+            result_error: null,
+            has_result: false,
+            result_state: null,
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: "zombie-after-worker-restart",
+        state: "running",
+        total_cases: 4,
+        completed_cases: 1,
+        active_pids: [],
+        last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+      }),
+      cancelJob: async (jobId: string) => {
+        engineCancels.push(jobId);
+        return { job_id: jobId, cancelled: true };
+      },
+    } as unknown as EngineClient;
+
+    await reconcile(db, zombieEngine, { jobIds: [job.id], skipFailedRecovery: true });
+
+    const [gotJob] = await db
+      .select({ status: simJobs.status, engineState: simJobs.engineState, error: simJobs.error, finishedAt: simJobs.finishedAt })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [gotResult] = await db.select({ status: results.status, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+    expect(engineCancels).toEqual(["zombie-after-worker-restart"]);
+    expect(gotJob.status).toBe("cancelled");
+    expect(gotJob.engineState).toBe("cancelled");
+    expect(gotJob.error).toContain("task lost");
+    expect(gotJob.finishedAt).not.toBeNull();
+    expect(gotResult.status).toBe("pending");
+    expect(gotResult.simJobId).toBeNull();
+    await db.delete(results).where(eq(results.id, row.id));
+  }, 60000);
+
+  // FALSE-POSITIVE GUARD (G3): the identical zombie shape but with recent
+  // progress (5 min < 30 min grace) is a legitimately quiet job — e.g. a long
+  // single case between completed_cases bumps — and must be left untouched.
+  it("keeps a quiet-but-recent running job untouched (lost-job grace not exceeded)", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 129.856;
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId: "quiet-but-alive-job",
+        submittedAt: new Date(Date.now() - 60 * 60 * 1000),
+        totalCases: 4,
+        completedCases: 1,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+
+    const engineCancels: string[] = [];
+    const quietEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: "quiet-but-alive-job",
+            exists: true,
+            cancelled: false,
+            process_count: 0,
+            active_pids: [],
+            runtime_heartbeat_age_sec: 9000,
+            status_readable: true,
+            status_error: null,
+            status_state: "running",
+            status_total_cases: 4,
+            status_completed_cases: 1,
+            result_readable: false,
+            result_error: null,
+            has_result: false,
+            result_state: null,
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: "quiet-but-alive-job",
+        state: "running",
+        total_cases: 4,
+        completed_cases: 1,
+        active_pids: [],
+        last_progress_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      }),
+      cancelJob: async (jobId: string) => {
+        engineCancels.push(jobId);
+        return { job_id: jobId, cancelled: true };
+      },
+    } as unknown as EngineClient;
+
+    await reconcile(db, quietEngine, { jobIds: [job.id], skipFailedRecovery: true });
+
+    const [gotJob] = await db.select({ status: simJobs.status, engineState: simJobs.engineState }).from(simJobs).where(eq(simJobs.id, job.id));
+    const [gotResult] = await db.select({ status: results.status, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+    expect(engineCancels).toEqual([]);
+    expect(gotJob.status).toBe("running");
+    expect(gotJob.engineState).toBe("running");
+    expect(gotResult.status).toBe("running");
+    expect(gotResult.simJobId).toBe(job.id);
+    await db.delete(results).where(eq(results.id, row.id));
+  }, 60000);
 });

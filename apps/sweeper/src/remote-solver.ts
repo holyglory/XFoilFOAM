@@ -31,6 +31,7 @@ import { join } from "node:path";
 
 import { buildPolarRequest } from "./build-request";
 import { claimAoas } from "./claim";
+import { touchHeartbeat } from "./heartbeat";
 
 const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
 
@@ -479,6 +480,9 @@ async function pushCompletedJob(db: DB, settings: Settings, job: typeof simJobs.
   await setStatus(db, "pushing", null);
   const payloadResults = [];
   for (const result of resultRows) {
+    // Invariant: no code path may run >30 s without a heartbeat touch — each
+    // result base64-encodes its full media set (URANS videos included).
+    await touchHeartbeat(db);
     const artifacts = await db.select().from(solverEvidenceArtifacts).where(eq(solverEvidenceArtifacts.resultId, result.id));
     const media = await db.select().from(resultMedia).where(eq(resultMedia.resultId, result.id));
     const extents = await db.select().from(resultFieldExtents).where(eq(resultFieldExtents.resultId, result.id));

@@ -31,6 +31,8 @@ import { createHash } from "node:crypto";
 import { resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
+import { touchHeartbeat } from "./heartbeat";
+
 const execFileAsync = promisify(execFile);
 const DEFAULT_RENDER_PROFILE_KEY = "default:v1:zoom2";
 
@@ -555,10 +557,15 @@ async function renderScaledMediaRows(opts: {
   field: ImageFieldName;
   scale: { id: string; version: number; vmin: number; vmax: number; policy: string };
   airfoilPoints: [number, number][];
+  heartbeat: () => Promise<void>;
 }): Promise<{ resultId: string; media: RenderedDefaultMedia[] }[]> {
   const rendered: { resultId: string; media: RenderedDefaultMedia[] }[] = [];
   for (const result of opts.resultRows) {
     if (!result.engineJobId || !result.engineCaseSlug || result.status !== "done" || result.source !== "solved") continue;
+    // Invariant: no ingest code path may run >30 s without a heartbeat touch.
+    // Each renderDefaultMedia call is a full engine render round-trip (video
+    // re-encode included) — the longest single stretch of the ingest chain.
+    await opts.heartbeat();
     const evidenceBase = await manifestEvidenceBaseForResult(opts.db, result.id);
     if (!evidenceBase) continue;
     const response = await opts.engine.renderDefaultMedia(result.engineJobId, {
@@ -607,9 +614,14 @@ async function rebalanceFieldScales(opts: {
   engine: EngineClient;
   groups: Map<ScaleGroupKey, ScaleGroup>;
   airfoilPoints: [number, number][];
+  heartbeat: () => Promise<void>;
 }): Promise<number> {
   let mediaCount = 0;
   for (const group of opts.groups.values()) {
+    // Invariant: no ingest code path may run >30 s without a heartbeat touch.
+    // One touch per scaled-render field batch; renderScaledMediaRows touches
+    // again per result inside the batch (heartbeat 204 s stale, 2026-07-06).
+    await opts.heartbeat();
     const extents = await opts.db
       .select()
       .from(resultFieldExtents)
@@ -675,6 +687,7 @@ async function rebalanceFieldScales(opts: {
         field: group.field,
         scale: { id: active.id, version: active.version, vmin: active.vmin, vmax: active.vmax, policy: active.scalePolicy },
         airfoilPoints: opts.airfoilPoints,
+        heartbeat: opts.heartbeat,
       });
       mediaCount += await registerRenderedMediaSet(opts.db, opts.engine, rendered, {
         id: active.id,
@@ -714,6 +727,7 @@ async function rebalanceFieldScales(opts: {
         field: group.field,
         scale: { id: scale.id, version: scale.version, vmin: scale.vmin, vmax: scale.vmax, policy: scale.scalePolicy },
         airfoilPoints: opts.airfoilPoints,
+        heartbeat: opts.heartbeat,
       });
       await opts.db.transaction(async (tx) => {
         await tx
@@ -771,8 +785,15 @@ export async function ingestResult(opts: {
    *  the single-revision nearest-speed path unchanged. */
   conditionMap?: ConditionMapEntry[];
   result: JobResult;
+  /** Heartbeat hook, called per point / per scaled-render batch so a
+   *  multi-minute ingest never lets sweeper_state.heartbeatAt go stale past
+   *  the web's 90 s truth gate (2026-07-06: 204 s stale under 7 jobs in
+   *  flight read as PROCESS NOT RUNNING on a healthy process). Defaults to
+   *  the real touchHeartbeat; tests inject a spy to count touches. */
+  heartbeat?: () => Promise<void>;
 }): Promise<{ points: number; media: number; dirtyLanes: CampaignLaneKey[] }> {
   const { db, engine, engineJobId, simJobId, airfoilId, speedMap, conditionMap, result } = opts;
+  const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(db));
   let points = 0;
   let media = 0;
   const airfoilPoints = await airfoilContourPoints(db, airfoilId);
@@ -808,6 +829,11 @@ export async function ingestResult(opts: {
     const resultIdsByAoa = new Map<number, string>();
 
     for (const p of polar.points) {
+      // Invariant: no ingest code path may run >30 s without a heartbeat
+      // touch. Each point below does result/attempt/evidence upserts plus a
+      // computeFieldExtents engine round-trip — a many-point ingest is the
+      // prime multi-minute stretch that starved the heartbeat on 2026-07-06.
+      await heartbeat();
       const stalled = stalledForPoint(p);
       const failed = failedForPoint(p);
       const v: ResultInsert = {
@@ -929,6 +955,9 @@ export async function ingestResult(opts: {
       }
     }
     for (const p of polar.attempts ?? []) {
+      // Invariant: no ingest code path may run >30 s without a heartbeat
+      // touch — attempt rows carry evidence-artifact registration too.
+      await heartbeat();
       const attemptId = await insertResultAttempt({
         db,
         resultId: resultIdsByAoa.get(p.aoa_deg) ?? null,
@@ -955,7 +984,7 @@ export async function ingestResult(opts: {
     }
   }
   if (airfoilPoints && scaleGroups.size) {
-    media += await rebalanceFieldScales({ db, engine, groups: scaleGroups, airfoilPoints });
+    media += await rebalanceFieldScales({ db, engine, groups: scaleGroups, airfoilPoints, heartbeat });
   }
   return { points, media, dirtyLanes: [...dirtyLanes.values()] };
 }

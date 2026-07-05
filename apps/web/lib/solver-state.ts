@@ -39,6 +39,13 @@ export interface SolverStateInput {
   /** celery introspection failed — ALWAYS a secondary chip, never primary. */
   engineQueueError?: boolean;
   activeJobCount?: number;
+  /** Campaign points currently claimed by running jobs (sum of the activity
+   *  payload's backlogStrip runningPoints) — a POINTS unit, distinct from
+   *  activeJobCount's ENGINE-JOB-BATCH unit (2026-07-06 user report: "7 jobs
+   *  in flight but 15 are running?"). null/undefined = not carried by the
+   *  caller's payload; the headline then labels the job count "engine jobs"
+   *  instead of inventing a points number. */
+  campaignPointsSolving?: number | null;
   /** true while any pending work exists (sweeps, campaign points). */
   backlogOpen?: boolean;
 }
@@ -210,13 +217,24 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
       secondary,
     };
   }
+  // Unit-label truth (2026-07-06 "7 jobs in flight but 15 are running?"):
+  // the banner counts ENGINE JOB BATCHES while the campaign backlog strip
+  // counts POINTS. When the same payload carries the campaign points-solving
+  // total, both units render side by side; otherwise the job count is
+  // labelled "engine jobs" so it can never read as a points count.
+  // campaignPointsSolving covers CAMPAIGN points only, so 0 is treated as
+  // absent — printing "0 points solving" next to live background gap-fill
+  // jobs (whose non-campaign points ARE solving) would be a false number.
+  const jobsInFlight =
+    input.activeJobCount != null
+      ? input.campaignPointsSolving != null && input.campaignPointsSolving > 0
+        ? `${input.activeJobCount} job${input.activeJobCount === 1 ? "" : "s"} in flight · ${input.campaignPointsSolving.toLocaleString()} point${input.campaignPointsSolving === 1 ? "" : "s"} solving`
+        : `${input.activeJobCount} engine job${input.activeJobCount === 1 ? "" : "s"} in flight`
+      : null;
   return {
     state: "running",
     tone: "teal",
-    headline:
-      input.activeJobCount != null
-        ? `Running — ${input.activeJobCount} job${input.activeJobCount === 1 ? "" : "s"} in flight · ${heartbeat}`
-        : `Running — ${heartbeat}`,
+    headline: jobsInFlight != null ? `Running — ${jobsInFlight} · ${heartbeat}` : `Running — ${heartbeat}`,
     secondary,
   };
 }

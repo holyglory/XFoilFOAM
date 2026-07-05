@@ -1,5 +1,35 @@
 # Decision History
 
+## 2026-07-05 — Engine Rebuilds Get A Script; Sweeper Handles Cancelled And Lost Engine Jobs
+
+- Incident root causes (airfoils.pro): a manual
+  `docker compose up -d --force-recreate api worker` (1) left node-api with a
+  stale env-baked `ENGINE_EXPECTED_BUILD_ID` (recreated before `.env.deploy`
+  was edited → misleading "Engine build mismatch" banner), and (2) killed 4
+  in-flight celery tasks whose persisted engine status store kept answering
+  `state=running` (zombies the sweeper polled indefinitely). (3) When those
+  zombies were cancelled engine-side, the sweeper's status mapping had no
+  `cancelled` branch — the state fell through to "running" and nothing was
+  released.
+- Decision: engine state `cancelled` is a failed-class terminal in the sweeper
+  (`cancelJobAndReleaseClaims` in `apps/sweeper/src/reconcile.ts`, wired into
+  both the status mapping and the terminal result-file handling): job →
+  `cancelled`, claimed results rows → `pending` via the same claim-release the
+  admin cancel route uses, never ingest coefficients from a cancelled job.
+- Decision: zombie auto-recovery (`classifyLostRunning`): engine-reported
+  `running` with zero OpenFOAM processes, a stale worker runtime heartbeat,
+  absence from Celery, and last progress older than a 30-minute grace
+  (`SWEEPER_LOST_RUNNING_GRACE_MS`) is LOST — engine-side cancel + node-side
+  cancel + claim release, loudly logged. The grace exceeds legitimate quiet
+  gaps because the engine bumps `last_progress_at` only when a case completes.
+- Decision: manual engine rebuilds go through
+  `scripts/deploy/rebuild-engine.sh` (env edit first, force-recreate exactly
+  the build-id-reading services, `/health` build check, recover-stale kick);
+  ops rule recorded in `AGENTS.md`.
+- Companion engine-side guardrail (separate change, `src/airfoilfoam`): worker
+  startup reconciliation marks status-store `running` jobs failed on boot,
+  since a starting worker cannot have inherited running tasks.
+
 ## 2026-07-05 — Campaign Wizard Numerics Slots Get Inline Quick-Create And Single-Row Defaults
 
 - Decision: The wizard Review step's four numerics slots (Boundary / Mesh /

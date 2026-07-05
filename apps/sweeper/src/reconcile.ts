@@ -20,6 +20,7 @@ import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
   EngineError,
   classifyQueueLifecycle,
+  engineQueueListsJob,
   type EngineClient,
   type EngineQueueState,
   type JobRuntimeSummary,
@@ -29,8 +30,11 @@ import { and, count, eq, inArray, isNotNull, isNull, notInArray, or, sql } from 
 
 import { buildPolarRequest } from "./build-request";
 import { isEngineConnectionFailure, recordEngineUnreachable } from "./engine-backoff";
+import { touchHeartbeat } from "./heartbeat";
 import { type ConditionMapEntry, ingestResult, type SpeedBc } from "./ingest";
 import { ransRetryPlanForJobScoped } from "./retry-plan";
+
+export { touchHeartbeat } from "./heartbeat";
 
 const MISSING_JOB_REQUEUE_MS = Number(process.env.SWEEPER_MISSING_JOB_REQUEUE_MS ?? 10 * 60 * 1000);
 type SimJobRow = typeof simJobs.$inferSelect;
@@ -162,6 +166,10 @@ async function refreshPolarCachesForJob(db: DB, job: SimJobRow): Promise<void> {
   const conditionMap = conditionMapForJob(job);
   if (conditionMap) {
     for (const revisionId of new Set(conditionMap.map((entry) => entry.revisionId))) {
+      // Invariant: no code path may run >30 s without a heartbeat touch —
+      // each revision refresh re-fits + re-classifies a whole lane and a
+      // batched campaign job can span many revisions.
+      await touchHeartbeat(db);
       await refreshPolarCacheForRevision(db, job.airfoilId, revisionId);
     }
     return;
@@ -189,7 +197,87 @@ async function setupSnapshotForJob(
   return { snapshot: revision.snapshot as unknown as SimulationSetupSnapshot, revisionId: revision.id };
 }
 
+/** Engine-side cancellation (G2, incident 2026-07-05): a job the ENGINE
+ *  reports as `cancelled` is terminal — mark the sim_job cancelled and release
+ *  its claimed results rows back to `pending` so the gap finders
+ *  (findGaps/findCampaignGapBatch) re-claim the points on the next tick. This
+ *  is the exact claim-release the node-side admin cancel route performs
+ *  (apps/api/src/admin-routes.ts POST /api/admin/jobs/:id/cancel); before this
+ *  helper existed, engine state `cancelled` fell through the status mapping to
+ *  "running" and the sweeper polled the dead job forever. Never ingests
+ *  coefficients — released rows stay coefficient-free until re-solved. */
+async function cancelJobAndReleaseClaims(db: DB, job: SimJobRow, msg: string): Promise<void> {
+  await db
+    .update(results)
+    .set({ status: "pending", source: "queued", simJobId: null, engineJobId: null, engineCaseSlug: null })
+    .where(and(eq(results.simJobId, job.id), inArray(results.status, ["queued", "running"])));
+  await db
+    .update(simJobs)
+    .set({ status: "cancelled", engineState: "cancelled", error: msg, finishedAt: new Date() })
+    .where(reconcilableJobWhere(job.id));
+}
+
+/** Zombie auto-recovery (G3, incident 2026-07-05): 4 in-flight celery tasks
+ *  died with a force-recreated worker, but the engine's persisted status store
+ *  kept answering state=running (HTTP 200, active_pids: [], last_progress_at
+ *  hours stale), so the sweeper polled them as "running" for ~2.3 h. Detect
+ *  that shape and treat it as LOST: engine says running, but
+ *    - the runtime probe finds ZERO OpenFOAM processes,
+ *    - the worker runtime heartbeat is stale/absent (a live celery task
+ *      refreshes it even while waiting for CPU tokens),
+ *    - Celery does not list the task (queue evidence required — a null queue
+ *      probe never condemns a job), and
+ *    - last progress is older than the grace below.
+ *  Returns the loud reason string, or null when the job must be left alone. */
+function classifyLostRunning(
+  job: SimJobRow,
+  status: JobStatus,
+  runtime: JobRuntimeSummary | null,
+  queue: EngineQueueState | null,
+  now = Date.now(),
+): string | null {
+  if (status.state !== "running") return null;
+  if (!runtime || !runtime.exists || runtime.process_count > 0) return null;
+  const heartbeatAlive =
+    runtime.runtime_heartbeat_age_sec != null &&
+    Number.isFinite(Number(runtime.runtime_heartbeat_age_sec)) &&
+    Number(runtime.runtime_heartbeat_age_sec) <= 120;
+  if (heartbeatAlive) return null;
+  if (!queue || engineQueueListsJob(queue, job.engineJobId)) return null;
+  const lastProgress =
+    parseEngineDate(status.last_progress_at) ?? parseEngineDate(status.started_at) ?? parseEngineDate(status.queued_at);
+  if (!lastProgress) return null;
+  const quietMs = now - lastProgress.getTime();
+  if (quietMs < LOST_RUNNING_GRACE_MS) return null;
+  return (
+    `engine reports running but no OpenFOAM process exists, the worker heartbeat is stale, Celery does not list the task, ` +
+    `and last progress was ${Math.round(quietMs / 60000)} min ago — task lost (worker restarted mid-solve); cancelled and requeued`
+  );
+}
+
+/** Grace before declaring an engine-"running" job lost. The engine bumps
+ *  status last_progress_at ONLY when completed_cases increases or the job goes
+ *  terminal (src/airfoilfoam/storage.py write_status), so a single long case
+ *  (meshing + a URANS march can legitimately run 20+ min) shows no progress
+ *  while perfectly healthy. 30 min comfortably exceeds those quiet gaps, and
+ *  process liveness is the primary signal anyway: the lost path additionally
+ *  requires process_count == 0, a stale worker heartbeat, and absence from
+ *  Celery — a healthy quiet case fails all three of those guards. */
+const LOST_RUNNING_GRACE_MS = Number(process.env.SWEEPER_LOST_RUNNING_GRACE_MS ?? 30 * 60 * 1000);
+
+function parseEngineDate(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 async function updateJobFromEngineStatus(db: DB, job: SimJobRow, status: JobStatus): Promise<void> {
+  if (status.state === "cancelled") {
+    // G2 dispatch site 1 (status mapping): `cancelled` used to fall through
+    // the ternary below to status "running".
+    await cancelJobAndReleaseClaims(db, job, status.message ?? "engine reported job cancelled; claims released");
+    return;
+  }
   await db
     .update(simJobs)
     .set({
@@ -255,6 +343,10 @@ async function cancelTerminalEngineTasks(db: DB, engine: EngineClient, queue: En
 
   for (const row of terminalRows) {
     if (!row.engineJobId) continue;
+    // Invariant: no code path may run >30 s without a heartbeat touch — each
+    // engine-side cancel is a round-trip that crawls when the worker is
+    // saturated, and a restart can leave a batch of obsolete tasks.
+    await touchHeartbeat(db);
     try {
       await engine.cancelJob(row.engineJobId);
       await db
@@ -457,6 +549,9 @@ async function submitCampaignUransRetries(
     if (retriedConditionIds.has(entry.conditionId)) continue;
     const revision = revisionById.get(entry.revisionId);
     if (!revision) continue;
+    // Invariant: no code path may run >30 s without a heartbeat touch. Each
+    // retrying condition does a cache refresh + retry plan + engine submit.
+    await touchHeartbeat(db);
     await refreshPolarCacheForRevision(db, parent.airfoilId, entry.revisionId);
     const retry = await ransRetryPlanForJobScoped(db, {
       parentJobId: parent.id,
@@ -690,6 +785,12 @@ async function ingestResultFileIfReady(db: DB, engine: EngineClient, job: SimJob
     await ingestFailedEngineJob(db, engine, job, result.message ?? failedMessage);
     return true;
   }
+  if (result.state === "cancelled") {
+    // G2 dispatch site 2 (terminal result handling): a cancelled result file
+    // is terminal like failed, but its coefficients must NEVER be ingested.
+    await cancelJobAndReleaseClaims(db, job, result.message ?? "engine result marks job cancelled; claims released");
+    return true;
+  }
   return false;
 }
 
@@ -713,6 +814,11 @@ async function recoverFailedEngineJobs(db: DB, engine: EngineClient, ids?: strin
 
   for (const job of jobs) {
     if (!job.engineJobId) continue;
+    // Invariant: no code path may run >30 s without a heartbeat touch. Each
+    // recovery candidate can cost an engine round-trip PLUS a full re-ingest;
+    // a 25-job sweep must not leave the heartbeat silent meanwhile (2026-07-06:
+    // 204 s stale mid-tick read as PROCESS NOT RUNNING on a healthy process).
+    await touchHeartbeat(db);
     let status: JobStatus | null = null;
     try {
       status = await engine.getJob(job.engineJobId);
@@ -832,16 +938,6 @@ async function handlePollMiss(db: DB, engine: EngineClient, job: SimJobRow, e: u
 }
 
 /** Poll in-flight engine jobs; completed jobs ingest, transient engine misses recover or requeue. */
-/** Single-row heartbeat upsert (~1 ms). Called between the slow phases of a
- *  tick so "process not running" (stale heartbeat) never lies during long
- *  reconcile passes — the state that masked a wedged first tick on 2026-07-05. */
-export async function touchHeartbeat(db: DB): Promise<void> {
-  await db
-    .insert(sweeperState)
-    .values({ id: 1 })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { heartbeatAt: new Date() } });
-}
-
 export async function reconcile(db: DB, engine: EngineClient, options: ReconcileOptions = {}): Promise<void> {
   if (!options.skipFailedRecovery) {
     await recoverFailedEngineJobs(db, engine, options.recoverFailedJobIds);
@@ -915,6 +1011,18 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
       await handlePollMiss(db, engine, job, e, queue, runtime);
       continue;
     }
+    const lostReason = classifyLostRunning(job, status, runtime, queue);
+    if (lostReason) {
+      // G3: loud by design — this is a worker-restart zombie, not a routine state.
+      console.error(`[sweeper] LOST engine job ${job.engineJobId} (sim_job ${job.id}): ${lostReason}`);
+      try {
+        await engine.cancelJob(job.engineJobId);
+      } catch (cancelError) {
+        console.error(`[sweeper] engine-side cancel of lost job ${job.engineJobId} failed: ${errorMessage(cancelError)}`);
+      }
+      await cancelJobAndReleaseClaims(db, job, lostReason);
+      continue;
+    }
     if (status.state === "running" && status.completed_cases > job.completedCases) {
       await ingestRunningPartialJob(db, engine, job);
     }
@@ -946,6 +1054,7 @@ const DIRTY_LANE_DRAIN_CAP = 100;
  *  reconciler (spec §7/§8). All in-memory timers — no schema state. */
 async function drainCampaignMaintenance(db: DB): Promise<void> {
   const dirty = [...pendingDirtyLanes.values()].slice(0, DIRTY_LANE_DRAIN_CAP);
+  let drained = 0;
   for (const key of dirty) {
     pendingDirtyLanes.delete(laneKeyId(key));
     try {
@@ -953,6 +1062,9 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
     } catch (e) {
       console.error("[sweeper] lane tick failed:", laneKeyId(key), errorMessage(e));
     }
+    // Invariant: no code path may run >30 s without a heartbeat touch — a
+    // 100-lane drain under DB load must beat mid-drain, not only after it.
+    if (++drained % 10 === 0) await touchHeartbeat(db);
   }
   if (pendingDirtyLanes.size > 0) {
     console.log(`[sweeper] dirty-lane backlog: ${pendingDirtyLanes.size} lanes carried to next tick`);
@@ -981,7 +1093,10 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
         } catch (e) {
           console.error("[sweeper] lane sweep tick failed:", laneKeyId(key), errorMessage(e));
         }
-        if (++sweepCount % 50 === 0) await touchHeartbeat(db);
+        // Invariant: no code path may run >30 s without a heartbeat touch —
+        // per-10 (was per-50): 50 lane ticks at ~1 s each under load is a
+        // 50 s silent stretch, past the web's 90 s truth-gate margin.
+        if (++sweepCount % 10 === 0) await touchHeartbeat(db);
       }
     } catch (e) {
       console.error("[sweeper] lane safety sweep failed:", errorMessage(e));
@@ -992,12 +1107,15 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
     lastCampaignReconcileAt = now;
     try {
       const healed = await reconcileCampaigns(db);
+      let healedCount = 0;
       for (const key of healed.staleLanes) {
         try {
           await laneTick(db, key);
         } catch (e) {
           console.error("[sweeper] reconciler lane tick failed:", laneKeyId(key), errorMessage(e));
         }
+        // Invariant: no code path may run >30 s without a heartbeat touch.
+        if (++healedCount % 10 === 0) await touchHeartbeat(db);
       }
     } catch (e) {
       console.error("[sweeper] campaign reconciler failed:", errorMessage(e));

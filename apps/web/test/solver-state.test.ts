@@ -124,12 +124,14 @@ describe("deriveSolverState gate precedence", () => {
     const d = deriveSolverState(healthy, NOW);
     expect(d.state).toBe("running");
     expect(d.tone).toBe("teal");
-    expect(d.headline).toBe("Running — 3 jobs in flight · heartbeat 5s ago");
+    // Without a points total in the payload the job count carries its own
+    // unit label — "engine jobs" — so it can never be misread as points.
+    expect(d.headline).toBe("Running — 3 engine jobs in flight · heartbeat 5s ago");
   });
 
-  it("singular job count reads '1 job in flight'", () => {
+  it("singular job count reads '1 engine job in flight'", () => {
     const d = deriveSolverState({ ...healthy, activeJobCount: 1 }, NOW);
-    expect(d.headline).toContain("1 job in flight");
+    expect(d.headline).toContain("1 engine job in flight");
   });
 
   it("idle only when 0 jobs AND backlog closed", () => {
@@ -147,6 +149,34 @@ describe("deriveSolverState gate precedence", () => {
   it("unknown backlog (undefined) never claims idle", () => {
     const d = deriveSolverState({ ...healthy, activeJobCount: 0, backlogOpen: undefined }, NOW);
     expect(d.state).toBe("running");
+  });
+});
+
+// MUST-CATCH (2026-07-06 user report "7 jobs in flight but 15 are running?"):
+// the banner counts ENGINE JOB BATCHES, the campaign backlog strip counts
+// POINTS — adjacent unlabelled counts in different units read as a
+// contradiction on a healthy system.
+describe("running headline unit labels (jobs vs points)", () => {
+  it("payload carries the campaign points total -> both units, side by side", () => {
+    const d = deriveSolverState({ ...healthy, activeJobCount: 7, campaignPointsSolving: 14 }, NOW);
+    expect(d.headline).toBe("Running — 7 jobs in flight · 14 points solving · heartbeat 5s ago");
+  });
+
+  it("singular point count reads '1 point solving'", () => {
+    const d = deriveSolverState({ ...healthy, campaignPointsSolving: 1 }, NOW);
+    expect(d.headline).toContain("1 point solving");
+  });
+
+  it("points total ABSENT from the payload -> jobs relabelled 'engine jobs', no invented points count", () => {
+    const d = deriveSolverState({ ...healthy, campaignPointsSolving: null }, NOW);
+    expect(d.headline).toBe("Running — 3 engine jobs in flight · heartbeat 5s ago");
+    expect(d.headline).not.toMatch(/points solving/);
+  });
+
+  it("zero campaign points is treated as absent (background gap-fill jobs DO solve non-campaign points — '0 points solving' would be a false number)", () => {
+    const d = deriveSolverState({ ...healthy, campaignPointsSolving: 0 }, NOW);
+    expect(d.headline).toBe("Running — 3 engine jobs in flight · heartbeat 5s ago");
+    expect(d.headline).not.toMatch(/0 points/);
   });
 });
 

@@ -2655,6 +2655,13 @@ function QueueDashboard({
   const backlogOpen = queue
     ? (pendingPointsKnown != null && pendingPointsKnown > 0) || (queue.backlogStrip?.campaigns.some((c) => c.remainingPoints > 0) ?? false)
     : undefined;
+  // Campaign points currently solving (sum of the backlog strip's per-campaign
+  // runningPoints) — already in the activity payload, no extra fetch. null
+  // until the strip arrives: the banner then labels the job count "engine
+  // jobs" instead of inventing a points number (unit-label truth, 2026-07-06).
+  const campaignPointsSolving = queue?.backlogStrip
+    ? queue.backlogStrip.campaigns.reduce((sum, c) => sum + c.runningPoints, 0)
+    : null;
   const solver = deriveSolverState({
     fetchOk: queue != null,
     heartbeatAt: sw?.heartbeatAt ?? null,
@@ -2664,6 +2671,7 @@ function QueueDashboard({
     engineBuildMismatch: queue?.engineBuildMismatch ?? false,
     engineQueueError: !!queue?.engineQueueError,
     activeJobCount: queue ? activeJobs.length : undefined,
+    campaignPointsSolving,
     backlogOpen,
   });
   const processDead = solver.state === "process_not_running";
@@ -3110,7 +3118,9 @@ function CampaignBacklogStrip({
               </button>
               <span style={{ color: C.dim }}>{campaignPriorityName(c.priority)}</span>
               <span style={{ color: C.text }}>{c.remainingPoints.toLocaleString()} points remaining</span>
-              {c.runningPoints > 0 && <span style={{ color: C.amber }}>{c.runningPoints.toLocaleString()} running</span>}
+              {/* Same POINTS unit as "points remaining" — labelled so it can
+                  never be misread as the banner's engine-job count. */}
+              {c.runningPoints > 0 && <span style={{ color: C.amber }}>{c.runningPoints.toLocaleString()} points solving</span>}
               {c.failedPoints > 0 && <span style={{ color: C.redText }}>{c.failedPoints.toLocaleString()} failed</span>}
               {c.status !== "active" && <span style={{ color: C.amber }}>{c.status}</span>}
             </div>

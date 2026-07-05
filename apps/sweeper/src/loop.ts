@@ -291,6 +291,9 @@ export async function submitCampaignBatch(
   const claimedUnion = new Set<number>();
   const activeEntries: ResolvedCampaignEntry[] = [];
   for (const entry of entries) {
+    // Invariant: no code path may run >30 s without a heartbeat touch — each
+    // claim is an UPDATE over up to 500 result rows and can crawl under load.
+    await touchHeartbeat(db);
     const claimed = await claimAoas(db, a.id, entry.bcId, entry.revisionId, batch.angles, job.id);
     if (claimed.length === 0) continue;
     for (const aoa of claimed) claimedUnion.add(aoa);
@@ -333,6 +336,10 @@ export async function submitOneBatch(db: DB, engine: EngineClient, cpuSlots = 0)
   const gaps = await findGaps(db, 500);
   const continuous = firstBatch(gaps);
   const campaign = await findCampaignGapBatch(db, { limit: 500 });
+  // Invariant: no code path may run >30 s without a heartbeat touch — the two
+  // gap scans above are heavy queries at 10^5-point scale, and composing +
+  // claiming + submitting the winner below adds more DB/engine round-trips.
+  await touchHeartbeat(db);
   if (!continuous && !campaign) return false;
 
   const continuousGroups = new Set(gaps.map((g) => `${g.airfoilId}:${g.bcId}`)).size;

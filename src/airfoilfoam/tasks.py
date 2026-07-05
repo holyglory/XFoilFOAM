@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import signal
 import threading
 import time
+from datetime import datetime, timezone
+
+from celery.signals import worker_ready
 
 from .cancellation import JobCancelled
 from .celery_app import celery_app
@@ -16,6 +20,50 @@ from .openfoam.runner import install_subprocess_signal_handlers
 from .storage import JobStore
 
 HEARTBEAT_INTERVAL_S = 10
+
+logger = logging.getLogger(__name__)
+
+# Captured at import time in the worker's main process, i.e. strictly before
+# the consumer accepts any task. Any status.json touched at/after this instant
+# belongs to a task started by THIS worker and must not be reconciled.
+_WORKER_BOOT_TIME = datetime.now(timezone.utc)
+
+
+@worker_ready.connect
+def reconcile_orphaned_jobs(sender=None, **_kwargs) -> None:
+    """Fail jobs whose celery task died with a previous worker process.
+
+    Hooked at ``worker_ready`` (not API startup) because the worker owns task
+    execution: an API restart while a healthy worker is mid-solve must not
+    fail live jobs, whereas a freshly booted worker provably inherited no
+    running tasks — they die with the process. A cross-worker ``inspect``
+    plus the boot-time guard keeps this safe even if multiple workers or
+    racy restart orders ever appear.
+    """
+    store = JobStore(get_settings())
+    app = getattr(sender, "app", None) or celery_app
+    active_ids: set[str] = set()
+    try:
+        replies = app.control.inspect(timeout=2.0).active() or {}
+        for rows in replies.values():
+            for row in rows or []:
+                task_id = (row or {}).get("id")
+                if task_id:
+                    active_ids.add(str(task_id))
+    except Exception:  # noqa: BLE001 - best effort; the boot-time guard still protects fresh tasks
+        logger.warning("orphan reconcile: celery inspect failed; relying on boot-time guard", exc_info=True)
+    reconciled = store.reconcile_orphans(boot_time=_WORKER_BOOT_TIME, active_task_ids=active_ids)
+    for job_id in reconciled:
+        # acks_late means Redis may redeliver the lost task after its
+        # visibility timeout; revoke so a redelivery is discarded instead of
+        # resurrecting a job the node already failed (task_id == job_id).
+        try:
+            app.control.revoke(job_id)
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("orphan reconcile: job %s marked failed (worker restarted mid-solve; task lost)", job_id)
+    if reconciled:
+        logger.warning("orphan reconcile: %d job(s) reconciled at worker boot", len(reconciled))
 
 
 def _kill_pids(pids: list[int], sig: int) -> None:

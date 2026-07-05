@@ -13,6 +13,18 @@ from .models import JobPhase, JobResult, JobState, JobStatus, PolarRequest
 
 T = TypeVar("T", JobResult, JobStatus, PolarRequest)
 
+#: Message written to jobs whose celery task died with a restarted worker.
+#: The node sweeper's failed-path keys off state=failed and ingests this
+#: message as attempt evidence, so keep it stable.
+ORPHAN_MESSAGE = "worker restarted mid-solve; task lost"
+
+_TERMINAL_STATES = {JobState.completed, JobState.failed, JobState.cancelled}
+_STATE_TO_PHASE = {
+    JobState.completed: JobPhase.completed,
+    JobState.failed: JobPhase.failed,
+    JobState.cancelled: JobPhase.cancelled,
+}
+
 
 class JobStore:
     def __init__(self, settings: Optional[Settings] = None):
@@ -165,6 +177,81 @@ class JobStore:
 
     def exists(self, job_id: str) -> bool:
         return self.job_dir(job_id).exists()
+
+    def list_job_ids(self) -> list[str]:
+        jobs_root = self.settings.data_dir / "jobs"
+        if not jobs_root.is_dir():
+            return []
+        return sorted(entry.name for entry in jobs_root.iterdir() if entry.is_dir())
+
+    # -- orphan reconciliation ---------------------------------------------- #
+    def reconcile_orphans(
+        self,
+        *,
+        boot_time: Optional[datetime] = None,
+        active_task_ids: Optional[set[str]] = None,
+    ) -> list[str]:
+        """Mark jobs stranded at state=running by a dead worker as failed.
+
+        Celery tasks die with the worker process, so at worker boot any job
+        still persisted as ``running`` (and not touched since ``boot_time``,
+        and not active on another worker) can no longer be making progress.
+        Without this sweep the API keeps answering ``state=running`` forever
+        and node-side pollers treat the job as a zombie.
+
+        ``pending`` jobs are deliberately left alone: their queue messages
+        survive a worker restart (acks_late) and the fresh worker will pick
+        them up normally.
+
+        Returns the list of reconciled job ids.
+        """
+        boot_time = boot_time or datetime.now(timezone.utc)
+        active = active_task_ids or set()
+        reconciled: list[str] = []
+        for job_id in self.list_job_ids():
+            status = self.read_status(job_id)
+            if status is None or status.state is not JobState.running:
+                continue
+            # Genuinely active on some worker (task ids double as job ids for
+            # run_polar, so check both).
+            if job_id in active or (status.task_id and status.task_id in active):
+                continue
+            # Touched at/after this worker booted -> a fresh task owns it.
+            updated = status.updated_at
+            if updated is not None:
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if updated >= boot_time:
+                    continue
+            existing_result = self.read_result(job_id)
+            if existing_result is not None and existing_result.state in _TERMINAL_STATES:
+                # Crash landed between write_result() and the final status
+                # write: the result is the truth, so sync status to it instead
+                # of inventing a failure.
+                status.state = existing_result.state
+                status.phase = _STATE_TO_PHASE[existing_result.state]
+                status.message = existing_result.message or status.message
+            else:
+                status.state = JobState.failed
+                status.phase = JobPhase.failed
+                status.message = ORPHAN_MESSAGE
+                if existing_result is not None:
+                    # Partial result from mid-run: keep the solved-point /
+                    # attempt evidence, only flip the terminal state.
+                    existing_result.state = JobState.failed
+                    existing_result.message = ORPHAN_MESSAGE
+                    self.write_result(existing_result)
+                else:
+                    self.write_result(JobResult(job_id=job_id, state=JobState.failed, message=ORPHAN_MESSAGE))
+            status.active_solver = None
+            status.active_case_slug = None
+            status.active_aoa_deg = None
+            status.active_pids = []
+            status.cpu_tokens_waiting = 0
+            status.cpu_tokens_held = 0
+            self.write_status(status)
+            reconciled.append(job_id)
+        return reconciled
 
     def job_processes(self, job_id: str) -> list[int]:
         return [proc["pid"] for proc in self.job_process_details(job_id)]

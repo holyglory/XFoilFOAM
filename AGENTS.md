@@ -151,6 +151,16 @@
   `simpleFoam`, `pimpleFoam`, meshing, decomposition, reconstruction, or
   related OpenFOAM processes first. If such processes are active, preserve them
   and defer the solver-service redeploy.
+- Manual engine rebuilds MUST go through `scripts/deploy/rebuild-engine.sh`
+  (never a raw `docker compose up -d --force-recreate api worker`). Build-id
+  expectations are baked into container env at recreate time
+  (`AIRFOILFOAM_BUILD_ID` for api/worker/sweeper, `ENGINE_EXPECTED_BUILD_ID`
+  for node-api), so recreating services before editing `.env.deploy` leaves a
+  stale "Engine build mismatch" banner; and a worker recreate kills in-flight
+  celery tasks whose persisted engine status keeps reporting `running`
+  (zombie jobs). The script edits both env vars first, force-recreates exactly
+  the services that read them, verifies the engine `/health` build id, and
+  triggers `POST /api/admin/jobs/recover-stale`.
 
 ## Solver Evidence Versus Valid Polars
 
