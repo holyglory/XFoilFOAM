@@ -7,6 +7,10 @@ export interface Gap {
   presetId: string;
   presetRevisionId: string;
   aoaDeg: number;
+  /** effectivePriority of this candidate (results.priority; 0 default, 10 public). */
+  priority: number;
+  reynolds: number;
+  slug: string;
 }
 
 /**
@@ -36,7 +40,7 @@ export async function findGaps(db: DB, limit = 500): Promise<Gap[]> {
     )
     SELECT a.id AS airfoil_id, b.id AS bc_id, g.aoa::float8 AS aoa_deg,
            p.id AS preset_id, rev.id AS preset_revision_id,
-           COALESCE(r.priority, 0) AS priority
+           COALESCE(r.priority, 0) AS priority, rev.reynolds AS reynolds, a.slug AS slug
     FROM airfoils a
     CROSS JOIN simulation_presets p
     JOIN latest_revision rev ON rev.preset_id = p.id
@@ -75,23 +79,50 @@ export async function findGaps(db: DB, limit = 500): Promise<Gap[]> {
     ORDER BY COALESCE(r.priority, 0) DESC, rev.reynolds ASC, a.slug ASC, g.aoa ASC
     LIMIT ${limit}
   `);
-  return (rows as unknown as { airfoil_id: string; bc_id: string; preset_id: string; preset_revision_id: string; aoa_deg: number }[]).map((r) => ({
+  return (rows as unknown as { airfoil_id: string; bc_id: string; preset_id: string; preset_revision_id: string; aoa_deg: number; priority: number; reynolds: number; slug: string }[]).map((r) => ({
     airfoilId: r.airfoil_id,
     bcId: r.bc_id,
     presetId: r.preset_id,
     presetRevisionId: r.preset_revision_id,
     aoaDeg: Number(r.aoa_deg),
+    priority: Number(r.priority),
+    reynolds: Number(r.reynolds),
+    slug: r.slug,
   }));
+}
+
+export interface ContinuousBatch {
+  airfoilId: string;
+  bcId: string;
+  presetId: string;
+  presetRevisionId: string;
+  aoas: number[];
+  /** Head-candidate ordering keys for the one-total-order comparison (spec §7).
+   *  The head gap carries the group's max results.priority (DESC sort). */
+  effectivePriority: number;
+  reynolds: number;
+  slug: string;
+  headAoa: number;
 }
 
 /** Pick the highest-priority (airfoil, bc) group from a gap list — one job's worth
  *  of work (one mesh, the BC's gap AoAs). */
-export function firstBatch(gaps: Gap[]): { airfoilId: string; bcId: string; presetId: string; presetRevisionId: string; aoas: number[] } | null {
+export function firstBatch(gaps: Gap[]): ContinuousBatch | null {
   if (gaps.length === 0) return null;
   const head = gaps[0];
   const aoas = gaps
     .filter((g) => g.airfoilId === head.airfoilId && g.presetRevisionId === head.presetRevisionId)
     .map((g) => g.aoaDeg)
     .sort((x, y) => x - y);
-  return { airfoilId: head.airfoilId, bcId: head.bcId, presetId: head.presetId, presetRevisionId: head.presetRevisionId, aoas };
+  return {
+    airfoilId: head.airfoilId,
+    bcId: head.bcId,
+    presetId: head.presetId,
+    presetRevisionId: head.presetRevisionId,
+    aoas,
+    effectivePriority: head.priority,
+    reynolds: head.reynolds,
+    slug: head.slug,
+    headAoa: head.aoaDeg,
+  };
 }

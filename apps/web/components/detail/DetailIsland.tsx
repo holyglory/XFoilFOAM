@@ -6,6 +6,7 @@ import {
   type ChartType,
   type FieldId,
   type FieldTrackPoint,
+  derivedBySymmetryInfo,
   f1,
   f2,
   f4,
@@ -54,7 +55,7 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
   const [hover, setHover] = useState<HoverState | null>(null);
 
   const [simOpen, setSimOpen] = useState(false);
-  const [simCtx, setSimCtx] = useState<{ re: number; aoa: number; resultId?: string | null } | null>(null);
+  const [simCtx, setSimCtx] = useState<{ re: number; aoa: number; resultId?: string | null; mirrored?: boolean; mirroredFromAoaDeg?: number | null } | null>(null);
   const [simDetail, setSimDetail] = useState<SimulationDetail | null>(null);
   const [simMessage, setSimMessage] = useState<string | null>(null);
   const [simField, setSimField] = useState<FieldId>("vorticity");
@@ -69,7 +70,12 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
     setVisibleRe(visibleDefaults(detail));
   }, [detail]);
 
-  const solvedPointCount = useMemo(() => detail.polars.reduce((sum, p) => sum + p.points.length, 0), [detail.polars]);
+  // Real solver evidence only — derived-by-symmetry mirrors are display points,
+  // never counted as solved runs (spec §9.3 "solver runs vs points").
+  const solvedPointCount = useMemo(
+    () => detail.polars.reduce((sum, p) => sum + p.points.filter((pt) => !derivedBySymmetryInfo(pt).derived).length, 0),
+    [detail.polars],
+  );
   const solvedPointKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const polar of detail.polars) {
@@ -117,7 +123,16 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
 
   const onPointClick = useCallback((vm: ChartPointVM) => {
     if (vm.point.source !== "solved" || !vm.point.resultId) return;
-    setSimCtx({ re: vm.re, aoa: vm.point.a, resultId: vm.point.resultId });
+    // Derived-by-symmetry points open the +α SOURCE evidence, mirrored and
+    // labeled (spec §9.3) — never presented as an independent solver run.
+    const derived = derivedBySymmetryInfo(vm.point);
+    setSimCtx({
+      re: vm.re,
+      aoa: vm.point.a,
+      resultId: derived.derived ? derived.derivedFromResultId ?? vm.point.resultId : vm.point.resultId,
+      mirrored: derived.derived,
+      mirroredFromAoaDeg: derived.derivedFromAoaDeg,
+    });
     setSimDetail(null);
     setSimMessage(null);
     setPlaying(true);

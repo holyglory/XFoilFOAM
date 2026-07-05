@@ -1,4 +1,5 @@
 import type {
+  EngineCacheStats,
   EngineHealth,
   EngineQueueState,
   FieldExtentsRequest,
@@ -73,6 +74,11 @@ export class EngineClient {
 
   getQueue(): Promise<EngineQueueState> {
     return this.json<EngineQueueState>("/queue");
+  }
+
+  /** Mesh/seed cache stats scanned from the engine's cache volume. */
+  cacheStats(): Promise<EngineCacheStats> {
+    return this.json<EngineCacheStats>("/cache/stats");
   }
 
   getJobRuntimes(jobIds: string[]): Promise<JobRuntimeResponse> {

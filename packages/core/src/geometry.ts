@@ -202,7 +202,8 @@ export function splitSurfaces(contour: Point[]): { upper: Point[]; lower: Point[
   return { upper, lower };
 }
 
-function interpY(surf: Point[], x: number): number {
+/** Linear y-interpolation along one surface sorted LE→TE by x (shared with symmetry detection). */
+export function interpY(surf: Point[], x: number): number {
   if (surf.length === 0) return 0;
   if (x <= surf[0].x) return surf[0].y;
   const last = surf[surf.length - 1];

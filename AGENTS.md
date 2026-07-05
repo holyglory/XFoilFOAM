@@ -30,6 +30,18 @@
   result evidence, not on reusable flow-state records.
 - Submitted jobs and solved results must reference an immutable resolved setup
   snapshot/revision so editing a reusable profile affects only future work.
+- Reusable setup/profile editors must make record lifecycle explicit. Selecting
+  an existing profile to use as a starting point must not make ambiguous "save"
+  mutate that canonical record by default. Provide a visible New/create action,
+  a primary save-as-new path for selected records, an explicit update-selected
+  path for intentional mutation, and a safe remove/archive affordance where the
+  record is not referenced by immutable presets, jobs, or evidence.
+- Loading a reusable setup/profile row into an editor is not the same as
+  selecting it for destructive list operations. Shared update/remove/archive
+  actions are allowed only when the profile list has an explicit independent
+  selection mode such as checkboxes/radios, a visible selected count, and clear
+  selection state. For single-profile removal or archiving, put a labeled
+  icon/button on each row so the affected reusable record owns the action.
 
 ## Cross-Instance Sync Boundaries
 
@@ -80,6 +92,48 @@
 - Password admin login is a fallback/development path only when explicitly
   configured. If OAuth credentials are missing in production, the UI must show a
   misconfigured/unavailable auth state rather than pretending OAuth works.
+
+## UI Concept Implementation Verification
+
+- When ImageGen or any visual concept is used to guide a product UI, preserve
+  the concept's hierarchy, scale, and first-viewport intent. Do not compress the
+  primary visual artifact into a narrow form column, secondary card, or inline
+  helper just because that is the easiest component insertion point.
+- Before delivery, capture the affected browser route and compare the rendered
+  page against the concept at the same journey point. Verification must check
+  visual priority, occupied space, placement, and whether the primary artifact
+  appears before low-frequency controls, not only whether labels or text exist.
+- Explanatory infographics in admin setup screens belong in the wide context
+  panel next to the compact editor, or in a dedicated details surface. Numeric
+  inputs and raw engine parameters stay in the editor; the teaching diagram
+  must not be buried among form fields.
+- If the user explicitly prefers the generated bitmap itself, use that image as
+  a project asset instead of recreating it with weaker code-native drawing.
+  Overlay only real live values or interactive controls, and mask or remove any
+  decorative generated UI chrome that would look like a fake control.
+- Infographic assets used behind live setup controls must not bake in dynamic
+  values, counts, units, defaults, or placeholder numbers. Generate empty visual
+  anchor pads and place real HTML controls over them so form state, focus,
+  validation, accessibility, and tests remain owned by the application.
+- Generated infographic detail panels and zoom callouts must correspond to a
+  real user-facing explanation. Remove decorative callouts that point to the
+  wrong place or explain nothing. If repeated detail panels are kept as part of
+  the visual concept, fill them with accessible HTML explanatory text or real
+  controls; do not leave empty fake inspector pads in the delivered UI.
+- If explanatory text is moved out of a generated image, regenerate or edit the
+  image to remove the now-empty explanation boxes, callouts, zoom panels, and
+  placeholder pads. Keep only anchor pads that will be occupied by real live
+  application controls.
+- Do not fix an explanatory gap by placing paragraphs over the primary bitmap,
+  chart, image, or simulation artifact. Overlays on primary visuals are for live
+  controls, small markers, or direct annotations that do not compete with the
+  artifact. Longer explanatory copy belongs below or beside the artifact in a
+  caption, legend, disclosure, or details panel.
+- When overlaying HTML on a responsive bitmap, verify overlay geometry at the
+  actual user-facing viewport and at a narrower breakpoint. Percentage
+  positions scale with the image, but text, padding, borders, and sliders may
+  not; tests must assert that overlay text and borders stay inside the image or
+  intentionally move outside it without clipping.
 
 ## Production Deployment And OpenFOAM Safety
 
@@ -220,6 +274,11 @@
   to the exact user-facing route class affected by the work, not only `/`, a
   package build, or a shallow health endpoint. For Detail-page work, hit at
   least one real seeded detail URL such as `/airfoils/ag24`.
+- After substantive multi-file edits to apps/web, do not rely on HMR for
+  browser verification: the Next dev compiler can wedge (requests hang before
+  reaching the request logger while /health keeps answering). Restart the web
+  server through the coordinator (its start command clears .next) and verify
+  the affected route class afterwards.
 - A coordinator health check that returns 200 before a route is compiled is not
   enough evidence that a Next dev server is healthy. Check server logs for
   `MODULE_NOT_FOUND`, missing chunk, or cache errors after route verification,

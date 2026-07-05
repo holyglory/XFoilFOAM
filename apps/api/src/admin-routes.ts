@@ -23,14 +23,18 @@ import {
   solverProfiles,
   sweeperState,
   sweepDefinitions,
+  campaignBacklogStrip,
+  syncLegacyBoundaryConditionForPreset as syncLegacyBoundaryConditionForPresetDb,
 } from "@aerodb/db";
+import { ensureEnabledSimulationPresetRevisions, ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import {
-  ensureEnabledSimulationPresetRevisions,
-  ensureSimulationPresetRevision,
-  resolveSimulationPresetSnapshot,
-  type SimulationSetupSnapshot,
-} from "@aerodb/db/simulation-setup";
-import { EngineClient, EngineError, classifyQueueLifecycle, type EngineQueueState, type JobRuntimeSummary } from "@aerodb/engine-client";
+  EngineClient,
+  EngineError,
+  classifyQueueLifecycle,
+  type EngineCacheStats,
+  type EngineQueueState,
+  type JobRuntimeSummary,
+} from "@aerodb/engine-client";
 import { and, asc, count, desc, eq, inArray, isNotNull, isNull, like, or, sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
@@ -64,6 +68,7 @@ import {
   tablePointsDTO,
   toMediumDTO,
 } from "./services/mediums";
+import { readSweeperState, SWEEPER_STATE_DEFAULTS, type SweeperStateRow, writeSweeperState } from "./services/sweeper-state";
 
 const activeSimJobStatuses: Array<"submitted" | "running" | "ingesting"> = ["submitted", "running", "ingesting"];
 const imageFieldName = z.enum(ALL_IMAGE_FIELDS);
@@ -183,6 +188,14 @@ interface QueueJobRow {
   cl_max: number | null;
   cd_min: number | null;
   ld_max: number | null;
+  campaign_id: string | null;
+  campaign_slug: string | null;
+  campaign_name: string | null;
+  job_kind: string | null;
+  // Batched campaign jobs (requestPayload conditionMap): Re range + speed count.
+  reynolds_min: number | null;
+  reynolds_max: number | null;
+  speed_count: number | null;
 }
 
 function iso(v: Date | string | null): string | null {
@@ -194,10 +207,16 @@ const QUEUE_REVISION_ENSURE_TTL_MS = 10_000;
 const ENGINE_QUEUE_FRESH_TTL_MS = 5_000;
 const ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS = 750;
 const ENGINE_HEALTH_FRESH_TTL_MS = 15_000;
+const ENGINE_CACHE_STATS_FRESH_TTL_MS = 30_000;
 const ENGINE_RUNTIME_UNSUPPORTED_TTL_MS = 60_000;
 
 let queueRevisionEnsureAt = 0;
 let queueRevisionEnsurePromise: Promise<void> | null = null;
+// Background gap-fill backlog count for the queue backlog strip — lazily
+// refreshed by the queue scan and served with its computedAt (spec §10:
+// cached ~5 min; the strip never triggers its own full gap scan).
+const GAP_FILL_CACHE_TTL_MS = 5 * 60 * 1000;
+let gapFillBacklogCache: { pendingPoints: number; pendingSweeps: number; computedAt: string } | null = null;
 let engineRuntimeUnsupportedUntil = 0;
 let engineQueueCache:
   | {
@@ -211,6 +230,13 @@ let engineHealthCache:
       expiresAt: number;
       promise: Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }>;
       value: { health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null } | null;
+    }
+  | null = null;
+let engineCacheStatsCache:
+  | {
+      expiresAt: number;
+      promise: Promise<{ stats: EngineCacheStats | null; error: string | null }>;
+      value: { stats: EngineCacheStats | null; error: string | null } | null;
     }
   | null = null;
 
@@ -262,7 +288,7 @@ async function getCachedEngineQueue(engine: EngineClient): Promise<{ queue: Engi
   ]);
 }
 
-async function getCachedEngineHealth(engine: EngineClient): Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }> {
+export async function getCachedEngineHealth(engine: EngineClient): Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }> {
   const now = Date.now();
   if (engineHealthCache && engineHealthCache.expiresAt > now) return engineHealthCache.promise;
   const previous = engineHealthCache?.value ?? null;
@@ -287,6 +313,37 @@ async function getCachedEngineHealth(engine: EngineClient): Promise<{ health: Aw
     entry.promise,
     new Promise<{ health: Awaited<ReturnType<EngineClient["healthDetails"]>> | null; error: string | null }>((resolve) =>
       setTimeout(() => resolve({ health: null, error: "engine health refresh is still running" }), ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS),
+    ),
+  ]);
+}
+
+/** Bounded engine cache-stats probe (~30 s cache, same approach as the engine
+ *  health probe). Errors resolve to { stats: null } — never invented numbers. */
+async function getCachedEngineCacheStats(engine: EngineClient): Promise<{ stats: EngineCacheStats | null; error: string | null }> {
+  const now = Date.now();
+  if (engineCacheStatsCache && engineCacheStatsCache.expiresAt > now) return engineCacheStatsCache.promise;
+  const previous = engineCacheStatsCache?.value ?? null;
+  const promise = engine
+    .cacheStats()
+    .then((stats) => ({ stats, error: null as string | null }))
+    .catch((e) => ({ stats: null, error: (e as Error).message }));
+  const entry: NonNullable<typeof engineCacheStatsCache> = {
+    expiresAt: now + ENGINE_CACHE_STATS_FRESH_TTL_MS,
+    promise: promise.then((value) => {
+      if (engineCacheStatsCache === entry) entry.value = value;
+      return value;
+    }),
+    value: previous,
+  };
+  engineCacheStatsCache = entry;
+  if (previous) {
+    void entry.promise.catch(() => undefined);
+    return previous;
+  }
+  return Promise.race([
+    entry.promise,
+    new Promise<{ stats: EngineCacheStats | null; error: string | null }>((resolve) =>
+      setTimeout(() => resolve({ stats: null, error: "engine cache-stats refresh is still running" }), ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS),
     ),
   ]);
 }
@@ -343,6 +400,16 @@ function toQueueJob(r: QueueJobRow) {
     clMax: r.cl_max == null ? null : Number(r.cl_max),
     cdMin: r.cd_min == null ? null : Number(r.cd_min),
     ldMax: r.ld_max == null ? null : Number(r.ld_max),
+    // Campaign chip (admin payload only, spec §10).
+    campaignId: r.campaign_id,
+    campaignSlug: r.campaign_slug,
+    campaignName: r.campaign_name,
+    jobKind: r.job_kind ?? "sweep",
+    // Batched campaign jobs: the card shows "Re min–max · N speeds" when the
+    // bundled conditions span a Reynolds range; null for single-speed jobs.
+    reynoldsMin: r.reynolds_min == null ? null : Number(r.reynolds_min),
+    reynoldsMax: r.reynolds_max == null ? null : Number(r.reynolds_max),
+    speedCount: r.speed_count == null ? null : Number(r.speed_count),
   };
 }
 
@@ -399,6 +466,10 @@ async function queueJobs(group: QueueJobStatusGroup, limit: number) {
       j.engine_state,
       j.total_cases,
       j.completed_cases,
+      j.campaign_id,
+      camp.slug AS campaign_slug,
+      camp.name AS campaign_name,
+      j.job_kind,
       j.error,
       j."createdAt" AS created_at,
       j."submittedAt" AS submitted_at,
@@ -461,6 +532,21 @@ async function queueJobs(group: QueueJobStatusGroup, limit: number) {
           THEN (j.request_payload->'scheduling'->>'aoa_case_count')::int
         ELSE j.total_cases
       END AS aoa_case_count,
+      CASE
+        WHEN jsonb_typeof(j.request_payload->'conditionMap') = 'array'
+          THEN (SELECT min((e->>'reynolds')::float8) FROM jsonb_array_elements(j.request_payload->'conditionMap') e)
+        ELSE NULL
+      END AS reynolds_min,
+      CASE
+        WHEN jsonb_typeof(j.request_payload->'conditionMap') = 'array'
+          THEN (SELECT max((e->>'reynolds')::float8) FROM jsonb_array_elements(j.request_payload->'conditionMap') e)
+        ELSE NULL
+      END AS reynolds_max,
+      CASE
+        WHEN jsonb_typeof(j.request_payload->'conditionMap') = 'array'
+          THEN jsonb_array_length(j.request_payload->'conditionMap')
+        ELSE NULL
+      END AS speed_count,
       COALESCE(rs.result_count, 0)::int AS result_count,
       COALESCE(rs.solved_count, 0)::int AS solved_count,
       COALESCE(rs.failed_count, 0)::int AS failed_count,
@@ -471,6 +557,7 @@ async function queueJobs(group: QueueJobStatusGroup, limit: number) {
       rs.ld_max
     FROM sim_jobs j
     LEFT JOIN airfoils a ON a.id = j.airfoil_id
+    LEFT JOIN sim_campaigns camp ON camp.id = j.campaign_id
     LEFT JOIN simulation_preset_revisions rev ON rev.id = j.simulation_preset_revision_id
     LEFT JOIN boundary_conditions b ON b.id = NULLIF(j.bc_ids->>0, '')::uuid
     LEFT JOIN mediums m ON m.id = b.medium_id
@@ -698,17 +785,6 @@ async function saveMediumTableRows(mediumId: string, rows: NonNullable<z.infer<t
   );
 }
 
-async function uniqueBoundarySlug(base: string): Promise<string> {
-  let slug = base;
-  let n = 2;
-  for (let i = 0; i < 1000; i++) {
-    const [exists] = await db.select({ id: boundaryConditions.id }).from(boundaryConditions).where(eq(boundaryConditions.slug, slug)).limit(1);
-    if (!exists) return slug;
-    slug = `${base}-${n++}`;
-  }
-  return `${base}-${Date.now()}`;
-}
-
 async function uniqueSetupSlug(tableName: string, base: string): Promise<string> {
   let slug = base || "setup";
   let n = 2;
@@ -926,7 +1002,7 @@ async function rowsForSimulationSetup() {
     db.select().from(simulationPresetRevisions).orderBy(desc(simulationPresetRevisions.revisionNumber)),
     db.select().from(simulationPresetAirfoilTargets),
     db
-      .select({ id: airfoils.id, slug: airfoils.slug, name: airfoils.name })
+      .select({ id: airfoils.id, slug: airfoils.slug, name: airfoils.name, isSymmetric: airfoils.isSymmetric })
       .from(airfoils)
       .where(and(isNull(airfoils.archivedAt), isNull(airfoils.deletedAt)))
       .orderBy(asc(airfoils.name)),
@@ -1025,67 +1101,10 @@ async function refreshBoundaryConditionsForMedium(mediumId: string) {
   for (const row of rows) await refreshBoundaryConditionDerived(row.id);
 }
 
-function legacyBoundaryValuesFromSnapshot(snapshot: SimulationSetupSnapshot) {
-  return {
-    name: snapshot.preset.name,
-    mediumId: snapshot.flowState.mediumId,
-    reynolds: Math.round(snapshot.derived.reynolds),
-    referenceChordM: snapshot.referenceGeometry.referenceLengthM,
-    temperatureK: snapshot.flowState.temperatureK,
-    pressurePa: snapshot.flowState.pressurePa,
-    speedMps: snapshot.flowState.speedMps,
-    density: snapshot.flowState.density,
-    dynamicViscosity: snapshot.flowState.dynamicViscosity,
-    kinematicViscosity: snapshot.flowState.kinematicViscosity,
-    mach: snapshot.flowState.mach,
-    turbulenceModel: snapshot.solver.turbulenceModel,
-    turbulenceIntensity: snapshot.boundary.turbulenceIntensity,
-    viscosityRatio: snapshot.boundary.viscosityRatio,
-    sandGrainHeight: snapshot.boundary.sandGrainHeight,
-    roughnessConstant: snapshot.boundary.roughnessConstant,
-    mesher: snapshot.mesh.mesher,
-    farfieldRadiusChords: snapshot.mesh.farfieldRadiusChords,
-    wakeLengthChords: snapshot.mesh.wakeLengthChords,
-    nSurface: snapshot.mesh.nSurface,
-    nRadial: snapshot.mesh.nRadial,
-    nWake: snapshot.mesh.nWake,
-    targetYPlus: snapshot.mesh.targetYPlus,
-    spanChords: snapshot.mesh.spanChords,
-    nIterations: snapshot.solver.nIterations,
-    convergenceTolerance: snapshot.solver.convergenceTolerance,
-    momentumScheme: snapshot.solver.momentumScheme,
-    transientCycles: snapshot.solver.transientCycles,
-    transientDiscardFraction: snapshot.solver.transientDiscardFraction,
-    transientMaxCourant: snapshot.solver.transientMaxCourant,
-    writeImages: snapshot.output.writeImages,
-    imageZoomChords: snapshot.output.imageZoomChords,
-    schedulingPolicy: snapshot.scheduling.schedulingPolicy,
-    cpuBudget: snapshot.scheduling.cpuBudget,
-    caseConcurrency: snapshot.scheduling.caseConcurrency,
-    solverProcesses: snapshot.scheduling.solverProcesses,
-    aoaStart: snapshot.sweep.aoaStart,
-    aoaStop: snapshot.sweep.aoaStop,
-    aoaStep: snapshot.sweep.aoaStep,
-    aoaList: snapshot.sweep.aoaList,
-    enabled: snapshot.preset.enabled,
-  };
-}
-
+// The legacy boundary-condition bridge is shared with the campaign
+// materializer — single implementation lives in @aerodb/db (campaigns.ts).
 async function syncLegacyBoundaryConditionForPreset(presetId: string): Promise<string | null> {
-  const snapshot = await resolveSimulationPresetSnapshot(db, presetId);
-  if (!snapshot) return null;
-  const values = legacyBoundaryValuesFromSnapshot(snapshot);
-  if (snapshot.preset.legacyBoundaryConditionId) {
-    await db
-      .update(boundaryConditions)
-      .set(values)
-      .where(eq(boundaryConditions.id, snapshot.preset.legacyBoundaryConditionId));
-    return snapshot.preset.legacyBoundaryConditionId;
-  }
-  const slug = await uniqueBoundarySlug(slugifyGeneric(snapshot.preset.slug || snapshot.preset.name));
-  const [legacy] = await db.insert(boundaryConditions).values({ ...values, slug }).returning({ id: boundaryConditions.id });
-  await db.update(simulationPresets).set({ legacyBoundaryConditionId: legacy.id }).where(eq(simulationPresets.id, presetId));
-  return legacy.id;
+  return syncLegacyBoundaryConditionForPresetDb(db, presetId);
 }
 
 async function refreshPresetRevisionsForRows(rows: { id: string }[]) {
@@ -1133,6 +1152,12 @@ async function refreshPresetsByOutputProfileId(id: string) {
 async function refreshPresetsBySweepDefinitionId(id: string) {
   const rows = await db.select({ id: simulationPresets.id }).from(simulationPresets).where(eq(simulationPresets.sweepDefinitionId, id));
   await refreshPresetRevisionsForRows(rows);
+}
+
+function referencedProfileError(kind: string, rows: { name: string }[]) {
+  const names = rows.map((row) => row.name).join(", ");
+  const noun = rows.length === 1 ? "simulation preset" : "simulation presets";
+  return `Cannot remove ${kind}; it is used by ${rows.length} ${noun}${names ? `: ${names}` : ""}. Update those presets first.`;
 }
 
 function normalizeTargetAirfoilIds(ids: string[] | undefined): string[] {
@@ -1366,6 +1391,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ...row, mediumSlug: medium.slug, mediumName: medium.name, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
   });
 
+  app.delete("/api/admin/flow-conditions/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.flowConditionId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("flow state", refs) });
+    const [row] = await db.delete(flowConditions).where(eq(flowConditions.id, id)).returning({ id: flowConditions.id });
+    if (!row) return reply.code(404).send({ error: "flow condition not found" });
+    return { ok: true };
+  });
+
   app.post("/api/admin/reference-geometry-profiles", { preHandler: requireAdmin }, async (req, reply) => {
     const b = referenceGeometryProfileBody.parse(req.body);
     const slug = b.slug ? slugifyGeneric(b.slug) : await uniqueSetupSlug("reference_geometry_profiles", slugifyGeneric(b.name));
@@ -1401,6 +1435,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ...row, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
   });
 
+  app.delete("/api/admin/reference-geometry-profiles/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.referenceGeometryProfileId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("reference geometry profile", refs) });
+    const [row] = await db.delete(referenceGeometryProfiles).where(eq(referenceGeometryProfiles.id, id)).returning({ id: referenceGeometryProfiles.id });
+    if (!row) return reply.code(404).send({ error: "reference geometry profile not found" });
+    return { ok: true };
+  });
+
   app.post("/api/admin/boundary-profiles", { preHandler: requireAdmin }, async (req, reply) => {
     const b = boundaryProfileBody.parse(req.body);
     const slug = b.slug ? slugifyGeneric(b.slug) : await uniqueSetupSlug("boundary_profiles", slugifyGeneric(b.name));
@@ -1427,6 +1470,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ...row, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
   });
 
+  app.delete("/api/admin/boundary-profiles/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.boundaryProfileId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("boundary profile", refs) });
+    const [row] = await db.delete(boundaryProfiles).where(eq(boundaryProfiles.id, id)).returning({ id: boundaryProfiles.id });
+    if (!row) return reply.code(404).send({ error: "boundary profile not found" });
+    return { ok: true };
+  });
+
   app.post("/api/admin/mesh-profiles", { preHandler: requireAdmin }, async (req, reply) => {
     const b = meshProfileBody.parse(req.body);
     const slug = b.slug ? slugifyGeneric(b.slug) : await uniqueSetupSlug("mesh_profiles", slugifyGeneric(b.name));
@@ -1443,6 +1495,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ...row, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
   });
 
+  app.delete("/api/admin/mesh-profiles/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.meshProfileId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("mesh profile", refs) });
+    const [row] = await db.delete(meshProfiles).where(eq(meshProfiles.id, id)).returning({ id: meshProfiles.id });
+    if (!row) return reply.code(404).send({ error: "mesh profile not found" });
+    return { ok: true };
+  });
+
   app.post("/api/admin/solver-profiles", { preHandler: requireAdmin }, async (req, reply) => {
     const b = solverProfileBody.parse(req.body);
     const slug = b.slug ? slugifyGeneric(b.slug) : await uniqueSetupSlug("solver_profiles", slugifyGeneric(b.name));
@@ -1457,6 +1518,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!row) return reply.code(404).send({ error: "solver profile not found" });
     await refreshPresetsBySolverProfileId(id);
     return { ...row, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
+  });
+
+  app.delete("/api/admin/solver-profiles/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.solverProfileId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("solver profile", refs) });
+    const [row] = await db.delete(solverProfiles).where(eq(solverProfiles.id, id)).returning({ id: solverProfiles.id });
+    if (!row) return reply.code(404).send({ error: "solver profile not found" });
+    return { ok: true };
   });
 
   app.post("/api/admin/scheduling-profiles", { preHandler: requireAdmin }, async (req, reply) => {
@@ -1485,6 +1555,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ...row, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
   });
 
+  app.delete("/api/admin/scheduling-profiles/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.schedulingProfileId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("scheduling profile", refs) });
+    const [row] = await db.delete(schedulingProfiles).where(eq(schedulingProfiles.id, id)).returning({ id: schedulingProfiles.id });
+    if (!row) return reply.code(404).send({ error: "scheduling profile not found" });
+    return { ok: true };
+  });
+
   app.post("/api/admin/output-profiles", { preHandler: requireAdmin }, async (req, reply) => {
     const b = outputProfileBody.parse(req.body);
     const slug = b.slug ? slugifyGeneric(b.slug) : await uniqueSetupSlug("output_profiles", slugifyGeneric(b.name));
@@ -1499,6 +1578,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!row) return reply.code(404).send({ error: "output profile not found" });
     await refreshPresetsByOutputProfileId(id);
     return { ...row, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
+  });
+
+  app.delete("/api/admin/output-profiles/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.outputProfileId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("output profile", refs) });
+    const [row] = await db.delete(outputProfiles).where(eq(outputProfiles.id, id)).returning({ id: outputProfiles.id });
+    if (!row) return reply.code(404).send({ error: "output profile not found" });
+    return { ok: true };
   });
 
   app.post("/api/admin/sweep-definitions", { preHandler: requireAdmin }, async (req, reply) => {
@@ -1525,6 +1613,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     if (!row) return reply.code(404).send({ error: "sweep definition not found" });
     await refreshPresetsBySweepDefinitionId(id);
     return { ...row, createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
+  });
+
+  app.delete("/api/admin/sweep-definitions/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const refs = await db.select({ name: simulationPresets.name }).from(simulationPresets).where(eq(simulationPresets.sweepDefinitionId, id));
+    if (refs.length) return reply.code(409).send({ error: referencedProfileError("sweep definition", refs) });
+    const [row] = await db.delete(sweepDefinitions).where(eq(sweepDefinitions.id, id)).returning({ id: sweepDefinitions.id });
+    if (!row) return reply.code(404).send({ error: "sweep definition not found" });
+    return { ok: true };
   });
 
   app.post("/api/admin/simulation-presets", { preHandler: requireAdmin }, async (req, reply) => {
@@ -2074,7 +2171,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // ---- queue (protected) ----
   app.get("/api/admin/queue", { preHandler: requireAdmin }, async () => {
     await ensureQueueRevisionsFresh();
-    const [s] = await db.select().from(sweeperState).where(eq(sweeperState.id, 1)).limit(1);
+    const s = await readSweeperState();
 
     // Pending work = (airfoil × enabled setup revision × AoA) gaps. Keep counts and the
     // visible list in one scan so the queue page does not recompute the same gap set.
@@ -2246,6 +2343,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     }[];
     const pendingSweepsTotal = Number(pendingSweepRows[0]?.pending_sweeps_total ?? 0);
     const backlog = Number(pendingSweepRows[0]?.pending_points_total ?? 0);
+    gapFillBacklogCache = { pendingPoints: backlog, pendingSweeps: pendingSweepsTotal, computedAt: new Date().toISOString() };
     const pendingSweeps = pendingSweepRows.map((r) => ({
       airfoilId: r.airfoil_id,
       airfoilSlug: r.airfoil_slug,
@@ -2328,10 +2426,11 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
     const [jobsRaw, activeJobsRaw, finishedJobsRaw] = await Promise.all([queueJobs("recent", 50), queueJobs("active", 40), queueJobs("finished", 80)]);
     const engine = new EngineClient(env.engineUrl);
-    const [{ queue: engineQueue, error: engineQueueError }, { health: engineHealth, error: engineHealthError }] = await Promise.all([
-      getCachedEngineQueue(engine),
-      getCachedEngineHealth(engine),
-    ]);
+    const [
+      { queue: engineQueue, error: engineQueueError },
+      { health: engineHealth, error: engineHealthError },
+      { stats: engineCacheStats },
+    ] = await Promise.all([getCachedEngineQueue(engine), getCachedEngineHealth(engine), getCachedEngineCacheStats(engine)]);
     const runtimeByEngineJobId = await engineRuntimeMap(
       engine,
       [...jobsRaw, ...activeJobsRaw, ...finishedJobsRaw].map((job) => job.engineJobId).filter((id): id is string => Boolean(id)),
@@ -2396,10 +2495,29 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     const finishedJobs = finishedJobsRaw.map(annotateJob);
     const inFlight = activeJobs.filter((j) => ["submitted", "running", "ingesting"].includes(j.status)).length;
 
+    // Backlog strip (spec §10): per-active-campaign remaining from counters +
+    // the cached background gap-fill note with its computed-at time.
+    const campaignBacklog = await campaignBacklogStrip(db);
+    const gapFillFresh =
+      gapFillBacklogCache && Date.now() - new Date(gapFillBacklogCache.computedAt).getTime() < GAP_FILL_CACHE_TTL_MS
+        ? gapFillBacklogCache
+        : { pendingPoints: backlog, pendingSweeps: pendingSweepsTotal, computedAt: new Date().toISOString() };
+    // engineUnreachableSince lands with the sweeper phase (migration 0026);
+    // readSweeperState() reads it defensively while the column may be absent.
+    const engineUnreachableSinceRaw = s?.engineUnreachableSince ?? null;
+
     return {
       mode: authMode(),
       engineUrl: env.engineUrl,
-      sweeper: s ?? { id: 1, enabled: false, maxConcurrentJobs: 2, pollIntervalMs: 5000, submitIntervalMs: 15000, heartbeatAt: null },
+      // sweeper includes cpuSlots — THE single global solver-capacity setting;
+      // 0 = auto (no cpu_budget cap is sent to the engine).
+      sweeper: s ?? SWEEPER_STATE_DEFAULTS,
+      cpuSlotsAuto: (s?.cpuSlots ?? 0) === 0,
+      engineUnreachableSince: iso(engineUnreachableSinceRaw),
+      backlogStrip: {
+        campaigns: campaignBacklog,
+        backgroundGapFill: gapFillFresh,
+      },
       backlog,
       inFlight,
       results: { ...byStatus, solved: solved?.n ?? 0 },
@@ -2428,10 +2546,36 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       engineExpectedBuildId: env.engineExpectedBuildId,
       engineBuildId: engineHealth?.build_id ?? null,
       engineBuildMismatch: Boolean(env.engineExpectedBuildId && engineHealth?.build_id && engineHealth.build_id !== env.engineExpectedBuildId),
+      // Disk truth from the engine's GET /cache/stats (~30 s cache); null when
+      // the endpoint is unreachable or errors — never invented (pinned contract).
+      engineCache:
+        engineCacheStats == null
+          ? null
+          : {
+              meshEntries: Number(engineCacheStats.mesh_entries),
+              seedEntries: Number(engineCacheStats.seed_entries),
+              totalBytes: Number(engineCacheStats.total_bytes),
+              capBytes: Number(engineCacheStats.cap_bytes),
+              oldestLastUsedAt: engineCacheStats.oldest_last_used ?? null,
+            },
       activeJobs,
       finishedJobs,
       jobs,
     };
+  });
+
+  const sweeperResponse = (s: SweeperStateRow) => ({
+    ...s,
+    // 0 = auto: no cpu_budget cap is sent to the engine; the engine resolves
+    // its own worker budget (pre-campaign behavior). Positive values are
+    // passed into the engine `resources` block at job-compose time.
+    cpuSlotsAuto: (s.cpuSlots ?? 0) === 0,
+    cpuSlotsMeaning: "0 = auto (no cpu_budget cap sent to the engine); positive = global OpenFOAM CPU slots",
+  });
+
+  app.get("/api/admin/sweeper", { preHandler: requireAdmin }, async () => {
+    const s = await readSweeperState();
+    return sweeperResponse(s ?? SWEEPER_STATE_DEFAULTS);
   });
 
   app.patch("/api/admin/sweeper", { preHandler: requireAdmin }, async (req) => {
@@ -2439,12 +2583,13 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       .object({
         enabled: z.boolean().optional(),
         maxConcurrentJobs: z.number().int().positive().max(64).optional(),
+        // 0 = auto (see sweeperResponse); capped to keep budgets sane.
+        cpuSlots: z.number().int().min(0).max(512).optional(),
         pollIntervalMs: z.number().int().min(1000).optional(),
         submitIntervalMs: z.number().int().min(1000).optional(),
       })
       .parse(req.body);
-    const [s] = await db.insert(sweeperState).values({ id: 1, ...b }).onConflictDoUpdate({ target: sweeperState.id, set: b }).returning();
-    return s;
+    return sweeperResponse(await writeSweeperState(b));
   });
 
   app.post("/api/admin/results/requeue-failed", { preHandler: requireAdmin }, async () => {
@@ -2472,7 +2617,8 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 	        (SELECT count(*)::int FROM reference_geometry_profiles WHERE slug LIKE ${likePrefix} OR name ILIKE ${likePrefix}) AS reference_geometry_profiles,
 	        (SELECT count(*)::int FROM operating_conditions WHERE slug LIKE ${likePrefix} OR name ILIKE ${likePrefix}) AS operating_conditions,
         (SELECT count(*)::int FROM mediums WHERE slug LIKE ${likePrefix} OR name ILIKE ${likePrefix}) AS mediums,
-        (SELECT count(*)::int FROM hashtags WHERE slug LIKE ${likePrefix} OR name ILIKE ${likePrefix}) AS hashtags
+        (SELECT count(*)::int FROM hashtags WHERE slug LIKE ${likePrefix} OR name ILIKE ${likePrefix}) AS hashtags,
+        (SELECT count(*)::int FROM sim_campaigns WHERE slug LIKE ${likePrefix} OR name ILIKE ${likePrefix} OR idempotency_key LIKE ${likePrefix}) AS sim_campaigns
     `)) as unknown as {
       airfoils: number;
       categories: number;
@@ -2483,8 +2629,125 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 	      operating_conditions: number;
       mediums: number;
       hashtags: number;
+      sim_campaigns: number;
     }[];
-    if (dryRun) return { dryRun: true, purged: counts ?? { airfoils: 0, categories: 0, boundary_conditions: 0, mediums: 0, hashtags: 0 } };
+    if (dryRun) return { dryRun: true, purged: counts ?? { airfoils: 0, categories: 0, boundary_conditions: 0, mediums: 0, hashtags: 0, sim_campaigns: 0 } };
+
+    // ---- campaign-family purge (spec §13 test hygiene) ------------------
+    // pw- campaigns are matched on slug/name/idempotency key. Delete order is
+    // FK-driven: results landed at campaign points → campaign sim_jobs →
+    // campaigns (FK-cascades sim_campaign_airfoils / plan_revisions /
+    // conditions / points / progress / lanes / lane_steps) → now-orphaned
+    // origin='campaign' presets (+ revisions via cascade, + legacy
+    // boundary_conditions mirrors) → campaign-created flow_conditions /
+    // reference_geometry_profiles that nothing references anymore. Presets,
+    // flow rows and geometry rows are shared across campaigns by physics
+    // hash / canonical key, so every derived delete carries NOT EXISTS
+    // reference guards instead of deleting blindly.
+    const campaignRows = (await db.execute(sql`
+      SELECT id FROM sim_campaigns
+      WHERE slug LIKE ${likePrefix} OR name ILIKE ${likePrefix} OR idempotency_key LIKE ${likePrefix}
+    `)) as unknown as Array<{ id: string }>;
+    const campaignIds = campaignRows.map((r) => r.id);
+    const campaignPurged = {
+      campaign_results: 0,
+      campaign_sim_jobs: 0,
+      campaign_presets: 0,
+      campaign_legacy_boundary_conditions: 0,
+      campaign_flow_conditions: 0,
+      campaign_reference_geometry_profiles: 0,
+    };
+    if (campaignIds.length > 0) {
+      const idsArray = `{${campaignIds.join(",")}}`;
+      const deletedResults = (await db.execute(sql`
+        DELETE FROM results r
+        USING sim_campaign_points p
+        WHERE p.campaign_id = ANY(${idsArray}::uuid[])
+          AND r.airfoil_id = p.airfoil_id
+          AND r.simulation_preset_revision_id = p.revision_id
+          AND r.aoa_deg = p.aoa_deg
+        RETURNING r.id
+      `)) as unknown as unknown[];
+      campaignPurged.campaign_results = deletedResults.length;
+      const deletedJobs = (await db.execute(sql`
+        DELETE FROM sim_jobs WHERE campaign_id = ANY(${idsArray}::uuid[]) RETURNING id
+      `)) as unknown as unknown[];
+      campaignPurged.campaign_sim_jobs = deletedJobs.length;
+
+      // Capture derived-artifact ids BEFORE the campaign delete: the
+      // created_by_campaign_id back-references null out on cascade.
+      const presetIdRows = (await db.execute(sql`
+        SELECT DISTINCT preset_id AS id FROM sim_campaign_conditions WHERE campaign_id = ANY(${idsArray}::uuid[])
+      `)) as unknown as Array<{ id: string }>;
+      const flowIdRows = (await db.execute(sql`
+        SELECT id FROM flow_conditions WHERE created_by_campaign_id = ANY(${idsArray}::uuid[])
+      `)) as unknown as Array<{ id: string }>;
+      const geoIdRows = (await db.execute(sql`
+        SELECT id FROM reference_geometry_profiles WHERE created_by_campaign_id = ANY(${idsArray}::uuid[])
+      `)) as unknown as Array<{ id: string }>;
+
+      await db.execute(sql`DELETE FROM sim_campaigns WHERE id = ANY(${idsArray}::uuid[])`);
+
+      if (presetIdRows.length > 0) {
+        const presetIdsArray = `{${presetIdRows.map((r) => r.id).join(",")}}`;
+        // Same reference guards as gcOrphanedCampaignPresets (spec §6.4),
+        // restricted to the presets these campaigns pinned.
+        const deletedPresets = (await db.execute(sql`
+          DELETE FROM simulation_presets sp
+          WHERE sp.id = ANY(${presetIdsArray}::uuid[])
+            AND sp.origin = 'campaign'
+            AND NOT EXISTS (SELECT 1 FROM sim_campaign_conditions cc WHERE cc.preset_id = sp.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM simulation_preset_revisions rev
+              WHERE rev.preset_id = sp.id AND (
+                EXISTS (SELECT 1 FROM results r WHERE r.simulation_preset_revision_id = rev.id)
+                OR EXISTS (SELECT 1 FROM result_attempts ra WHERE ra.simulation_preset_revision_id = rev.id)
+                OR EXISTS (SELECT 1 FROM sim_jobs j WHERE j.simulation_preset_revision_id = rev.id)
+                OR EXISTS (SELECT 1 FROM sim_campaign_conditions cc2 WHERE cc2.simulation_preset_revision_id = rev.id)
+                OR EXISTS (SELECT 1 FROM sync_sweep_promises pr WHERE pr.simulation_preset_revision_id = rev.id)
+              )
+            )
+          RETURNING sp.legacy_boundary_condition_id
+        `)) as unknown as Array<{ legacy_boundary_condition_id: string | null }>;
+        campaignPurged.campaign_presets = deletedPresets.length;
+        const legacyIds = deletedPresets.map((r) => r.legacy_boundary_condition_id).filter((x): x is string => Boolean(x));
+        if (legacyIds.length > 0) {
+          const legacyIdsArray = `{${legacyIds.join(",")}}`;
+          const deletedLegacy = (await db.execute(sql`
+            DELETE FROM boundary_conditions b
+            WHERE b.id = ANY(${legacyIdsArray}::uuid[])
+              AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.legacy_boundary_condition_id = b.id)
+            RETURNING b.id
+          `)) as unknown as unknown[];
+          campaignPurged.campaign_legacy_boundary_conditions = deletedLegacy.length;
+        }
+      }
+      if (flowIdRows.length > 0) {
+        const flowIdsArray = `{${flowIdRows.map((r) => r.id).join(",")}}`;
+        const deletedFlow = (await db.execute(sql`
+          DELETE FROM flow_conditions f
+          WHERE f.id = ANY(${flowIdsArray}::uuid[])
+            AND f.origin = 'campaign'
+            AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.flow_condition_id = f.id)
+            AND NOT EXISTS (SELECT 1 FROM sim_campaign_conditions cc WHERE cc.flow_condition_id = f.id)
+          RETURNING f.id
+        `)) as unknown as unknown[];
+        campaignPurged.campaign_flow_conditions = deletedFlow.length;
+      }
+      if (geoIdRows.length > 0) {
+        const geoIdsArray = `{${geoIdRows.map((r) => r.id).join(",")}}`;
+        const deletedGeo = (await db.execute(sql`
+          DELETE FROM reference_geometry_profiles g
+          WHERE g.id = ANY(${geoIdsArray}::uuid[])
+            AND g.origin = 'campaign'
+            AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.reference_geometry_profile_id = g.id)
+            AND NOT EXISTS (SELECT 1 FROM sim_campaign_conditions cc WHERE cc.reference_geometry_profile_id = g.id)
+          RETURNING g.id
+        `)) as unknown as unknown[];
+        campaignPurged.campaign_reference_geometry_profiles = deletedGeo.length;
+      }
+    }
+
     await db.delete(airfoils).where(or(like(airfoils.slug, likePrefix), like(airfoils.name, likePrefix)));
     await db.execute(sql`
       DELETE FROM sim_jobs j
@@ -2518,8 +2781,14 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       WHERE (m.slug LIKE ${likePrefix} OR m.name ILIKE ${likePrefix})
         AND NOT EXISTS (SELECT 1 FROM boundary_conditions b WHERE b.medium_id = m.id)
         AND NOT EXISTS (SELECT 1 FROM operating_conditions oc WHERE oc.medium_id = m.id)
+        AND NOT EXISTS (SELECT 1 FROM flow_conditions f WHERE f.medium_id = m.id)
     `);
-    return { purged: counts ?? { airfoils: 0, categories: 0, boundary_conditions: 0, mediums: 0, hashtags: 0 } };
+    return {
+      purged: {
+        ...(counts ?? { airfoils: 0, categories: 0, boundary_conditions: 0, mediums: 0, hashtags: 0, sim_campaigns: 0 }),
+        ...campaignPurged,
+      },
+    };
   });
 
   app.post("/api/admin/jobs/recover-stale", { preHandler: requireAdmin }, async (req) => {

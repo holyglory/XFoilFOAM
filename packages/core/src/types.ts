@@ -58,6 +58,11 @@ export interface PolarFitMetrics {
   clmax: number;
   aStall: number;
   cm0: number;
+  /** Refinement fine target (spec §8): LOWESS-evaluated L/D argmax, 0.01°. */
+  alphaLdmaxFine: number;
+  /** Refinement fine target (spec §8): LOWESS-evaluated Cl root, 0.01°; null
+   *  when Cl never crosses zero in the evidence range. */
+  alphaClZeroFine: number | null;
 }
 
 export interface PolarFit {

@@ -68,7 +68,9 @@ const miniInput: CSSProperties = {
 
 export function SimModal(props: {
   open: boolean;
-  ctx: { re: number; aoa: number; resultId?: string | null } | null;
+  /** mirrored: derived-by-symmetry evidence view (spec §9.3) — the stored +α
+   *  artifacts are flipped client-side and labeled; aoa stays the mirrored −α. */
+  ctx: { re: number; aoa: number; resultId?: string | null; mirrored?: boolean; mirroredFromAoaDeg?: number | null } | null;
   sim: SimulationDetail | null;
   name: string;
   machStr: string;
@@ -205,7 +207,9 @@ export function SimModal(props: {
   if (!open) return null;
 
   const reStr = fRe(sim?.re ?? ctx?.re ?? 0);
-  const alphaStr = f1(sim?.alpha ?? ctx?.aoa ?? 0);
+  // Mirrored view: the header keeps the derived −α the user opened; the badge
+  // on the media states the +α source (spec §9.3).
+  const alphaStr = ctx?.mirrored ? f1(ctx.aoa) : f1(sim?.alpha ?? ctx?.aoa ?? 0);
   const modeTag = sim ? (stalled ? "URANS · POST-STALL" : "RANS · STEADY") : unavailableMessage ? "OPENFOAM RESULT" : "LOADING";
   const shownMach = sim ? f2(sim.mach) : machStr;
   const fieldLabel = FIELD_LABELS[field];
@@ -405,7 +409,7 @@ export function SimModal(props: {
               {renderControlButton("levels", "levels", String(levels))}
               {renderControlButton("scale", "scale", scaleLabel)}
               {renderControlButton("resolution", "size", `${widthPx}x${heightPx}`)}
-              <button type="button" disabled={renderBusy || !ctx?.resultId} onClick={requestCustomRender} style={{ ...dlBtn, color: C.teal, marginLeft: "auto" }}>
+              <button type="button" disabled={renderBusy || !ctx?.resultId} title={!ctx?.resultId ? "No solved result is selected for custom rendering" : undefined} onClick={requestCustomRender} style={{ ...dlBtn, color: C.teal, marginLeft: "auto" }}>
                 {renderBusy ? "rendering..." : "re-render"}
               </button>
               <button type="button" onClick={() => { setRenderToolsOpen(false); setExpandedRenderControl(null); }} style={dlBtn}>
@@ -493,21 +497,64 @@ export function SimModal(props: {
     );
   };
 
+  // Derived-by-symmetry view (spec §9.3): the media element itself is flipped
+  // vertically — overlays, labels and charts are never mirrored.
+  const mirrored = Boolean(ctx?.mirrored);
+  const mirroredSourceAoa = ctx?.mirroredFromAoaDeg ?? (ctx ? Math.abs(ctx.aoa) : null);
+  const mediaStyle: CSSProperties = mirrored
+    ? { display: "block", width: "100%", height: "auto", transform: "scaleY(-1)" }
+    : { display: "block", width: "100%", height: "auto" };
+  const mirroredBadge = mirrored ? (
+    <span
+      data-testid="sim-mirrored-badge"
+      style={{
+        position: "absolute",
+        bottom: 9,
+        left: 10,
+        fontFamily: MONO,
+        fontSize: 9,
+        fontWeight: 600,
+        color: C.teal,
+        background: "rgba(7,11,16,0.78)",
+        border: `1px solid ${C.tealBorder}`,
+        borderRadius: 5,
+        padding: "2px 6px",
+      }}
+    >
+      mirrored — derived from α = +{mirroredSourceAoa == null ? "?" : f1(mirroredSourceAoa)}° (symmetric airfoil)
+    </span>
+  ) : null;
+
   const fieldViewport = (which: "live" | "mean") => {
     const media = realField(field);
     const customUrl = customRenderFor(which);
     if (customUrl) {
-      return <img src={browserUrl(customUrl)} alt={`${fieldLabel} custom`} style={{ display: "block", width: "100%", height: "auto" }} />;
+      return (
+        <>
+          <img src={browserUrl(customUrl)} alt={`${fieldLabel} custom`} style={mediaStyle} />
+          {mirroredBadge}
+        </>
+      );
     }
     if (media && which === "live") {
-      return media.kind === "video" ? (
-        <video src={browserUrl(media.url)} autoPlay loop muted playsInline style={{ display: "block", width: "100%", height: "auto" }} />
-      ) : (
-        <img src={browserUrl(media.url)} alt={fieldLabel} style={{ display: "block", width: "100%", height: "auto" }} />
+      return (
+        <>
+          {media.kind === "video" ? (
+            <video src={browserUrl(media.url)} autoPlay loop muted playsInline style={mediaStyle} />
+          ) : (
+            <img src={browserUrl(media.url)} alt={fieldLabel} style={mediaStyle} />
+          )}
+          {mirroredBadge}
+        </>
       );
     }
     if (media?.meanUrl && which === "mean") {
-      return <img src={browserUrl(media.meanUrl)} alt={`${fieldLabel} mean`} style={{ display: "block", width: "100%", height: "auto" }} />;
+      return (
+        <>
+          <img src={browserUrl(media.meanUrl)} alt={`${fieldLabel} mean`} style={mediaStyle} />
+          {mirroredBadge}
+        </>
+      );
     }
     if (sim?.status === "solved") {
       return <MediaEmpty text={which === "mean" ? "No time-averaged field stored for this solver output." : "No stored OpenFOAM media for this field."} />;

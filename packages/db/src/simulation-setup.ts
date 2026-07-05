@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { canonicalSiString } from "@aerodb/core";
 import { desc, eq, type InferSelectModel } from "drizzle-orm";
 
 import type { DB } from "./client";
@@ -86,6 +87,97 @@ function stableStringify(value: unknown): string {
 
 export function simulationSetupSignature(snapshot: SimulationSetupSnapshot): string {
   return createHash("md5").update(stableStringify(snapshot)).digest("hex");
+}
+
+/**
+ * Physics-only hash (spec §4/§3.2): sha256 over a stable-stringified subset of
+ * the snapshot so value-identical physics+numerics hash equal across presets
+ * and profile rows. EXACT field list:
+ *  - flowState: medium identity (mediumId, mediumSlug) + temperatureK /
+ *    pressurePa / speedMps + resolved density / dynamicViscosity /
+ *    kinematicViscosity
+ *  - referenceGeometry: geometryType, referenceLengthKind, referenceLengthM,
+ *    spanM, referenceAreaM2
+ *  - boundary: turbulenceIntensity, viscosityRatio, sandGrainHeight,
+ *    roughnessConstant
+ *  - mesh / solver: full numeric payloads minus row identity (id/slug/name)
+ *  - derived: reynolds, mach
+ * EXCLUDED: preset name/slug, sweep block, scheduling block, output block,
+ * every registry-row id/slug/name, and timestamps — two profile rows with the
+ * same values must produce the same hash.
+ */
+export function physicsHashForSnapshot(snapshot: SimulationSetupSnapshot): string {
+  const { flowState, referenceGeometry, boundary, mesh, solver, derived } = snapshot;
+  const { id: _meshId, slug: _meshSlug, name: _meshName, ...meshPhysics } = mesh;
+  const { id: _solverId, slug: _solverSlug, name: _solverName, ...solverPhysics } = solver;
+  const subset = {
+    flowState: {
+      mediumId: flowState.mediumId,
+      mediumSlug: flowState.mediumSlug,
+      temperatureK: flowState.temperatureK,
+      pressurePa: flowState.pressurePa,
+      speedMps: flowState.speedMps,
+      density: flowState.density,
+      dynamicViscosity: flowState.dynamicViscosity,
+      kinematicViscosity: flowState.kinematicViscosity,
+    },
+    referenceGeometry: {
+      geometryType: referenceGeometry.geometryType,
+      referenceLengthKind: referenceGeometry.referenceLengthKind,
+      referenceLengthM: referenceGeometry.referenceLengthM,
+      spanM: referenceGeometry.spanM,
+      referenceAreaM2: referenceGeometry.referenceAreaM2,
+    },
+    boundary: {
+      turbulenceIntensity: boundary.turbulenceIntensity,
+      viscosityRatio: boundary.viscosityRatio,
+      sandGrainHeight: boundary.sandGrainHeight,
+      roughnessConstant: boundary.roughnessConstant,
+    },
+    mesh: meshPhysics,
+    solver: solverPhysics,
+    derived: { reynolds: derived.reynolds, mach: derived.mach },
+  };
+  return createHash("sha256").update(stableStringify(subset)).digest("hex");
+}
+
+export interface FlowConditionCanonicalInput {
+  mediumId: string;
+  temperatureK: number;
+  pressurePa: number;
+  speedMps: number;
+}
+
+/** flow_conditions.canonicalKey: mediumId|T|P|speed over INPUT values only
+ *  (never derived density/viscosity), at canonical SI precision (spec §4). */
+export function flowConditionCanonicalKey(input: FlowConditionCanonicalInput): string {
+  return [
+    input.mediumId,
+    canonicalSiString("temperatureK", input.temperatureK),
+    canonicalSiString("pressurePa", input.pressurePa),
+    canonicalSiString("speedMps", input.speedMps),
+  ].join("|");
+}
+
+export interface ReferenceGeometryCanonicalInput {
+  geometryType: string;
+  referenceLengthKind: string;
+  referenceLengthM: number;
+  spanM: number | null;
+  referenceAreaM2: number | null;
+}
+
+/** reference_geometry_profiles.canonicalKey: type|kind|chord|span|area over
+ *  INPUT values only at canonical SI precision; absent span/area serialize as
+ *  the empty segment so the key stays deterministic. */
+export function referenceGeometryCanonicalKey(input: ReferenceGeometryCanonicalInput): string {
+  return [
+    input.geometryType,
+    input.referenceLengthKind,
+    canonicalSiString("chordM", input.referenceLengthM),
+    input.spanM == null ? "" : canonicalSiString("spanM", input.spanM),
+    input.referenceAreaM2 == null ? "" : canonicalSiString("areaM2", input.referenceAreaM2),
+  ].join("|");
 }
 
 export function snapshotAoas(snapshot: SimulationSetupSnapshot): number[] {

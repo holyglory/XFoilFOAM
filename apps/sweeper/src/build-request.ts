@@ -11,15 +11,25 @@ export function buildPolarRequest(opts: {
   aoaList: number[];
   wave: number;
   queuePressure?: number;
+  /** Global solver capacity (sweeper_state.cpuSlots). >0 → cpu_budget cap;
+   *  0 → auto: omit cpu_budget so the engine resolves its own worker budget;
+   *  undefined → legacy behavior (scheduling-profile snapshot value). */
+  cpuSlots?: number;
+  /** Batched campaign jobs: canonical speeds of every (condition, speed) entry
+   *  (one shared mesh per chord, all speeds×angles march warm-started).
+   *  Omitted → the snapshot's single speed (legacy behavior). */
+  speeds?: number[];
 }): { request: PolarRequest; speed: number; nu: number } {
-  const { airfoil, setup, aoaList, wave, queuePressure } = opts;
+  const { airfoil, setup, aoaList, wave, queuePressure, cpuSlots, speeds } = opts;
+  const cpuBudget =
+    cpuSlots == null ? (setup.scheduling.cpuBudget ?? undefined) : cpuSlots > 0 ? cpuSlots : undefined;
   const nu = setup.flowState.kinematicViscosity;
   const speed = setup.flowState.speedMps;
   const points = (airfoil.points as Point[]).map((p) => [p.x, p.y] as [number, number]);
   const request: PolarRequest = {
     airfoil: { name: airfoil.name, format: airfoil.pointFormat as AirfoilFormat, points },
     chord_lengths: [setup.referenceGeometry.referenceLengthM],
-    speeds: [speed],
+    speeds: speeds && speeds.length ? speeds : [speed],
     aoa: { angles: aoaList },
     fluid: { density: setup.flowState.density, kinematic_viscosity: nu },
     roughness: { sand_grain_height: setup.boundary.sandGrainHeight, roughness_constant: setup.boundary.roughnessConstant },
@@ -53,7 +63,7 @@ export function buildPolarRequest(opts: {
     },
     resources: {
       policy: (setup.scheduling.schedulingPolicy ?? "auto") as ResourcePolicy,
-      cpu_budget: setup.scheduling.cpuBudget ?? undefined,
+      cpu_budget: cpuBudget,
       case_concurrency: setup.scheduling.caseConcurrency ?? undefined,
       solver_processes: setup.scheduling.solverProcesses ?? undefined,
       queue_pressure: queuePressure ?? undefined,

@@ -91,6 +91,27 @@ async function getSimulationSetup(request: APIRequestContext): Promise<Simulatio
   return json<SimulationSetupRow>(request, "get", "/api/admin/simulation-setup");
 }
 
+// ---- admin IA navigation (nav: Simulations / Solver / Setup library /
+// Catalog / Sync API; the Solver section keeps URL key ?section=queue;
+// Mediums is a Setup-library tab; Add airfoils / Categories / Hashtags are
+// Catalog tabs; URL search-param routing) ----
+type AdminSection = "simulations" | "queue" | "setup" | "catalog" | "sync";
+
+async function gotoAdminSection(page: Page, section: AdminSection) {
+  if (!page.url().includes("/admin")) await page.goto("/admin");
+  await page.getByTestId(`admin-nav-${section}`).click();
+}
+
+async function openSetupTab(page: Page, tab: string) {
+  await gotoAdminSection(page, "setup");
+  await page.getByRole("button", { name: new RegExp(`^${tab}$`, "i") }).click();
+}
+
+async function openCatalogTab(page: Page, tab: "add" | "categories" | "hashtags") {
+  await gotoAdminSection(page, "catalog");
+  await page.getByTestId(`catalog-tab-${tab}`).click();
+}
+
 async function fillWrappedField(page: Page, label: string, value: string) {
   const accessible = page.getByLabel(label, { exact: true });
   if ((await accessible.count()) > 0) {
@@ -133,6 +154,10 @@ function slugify(value: string): string {
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function isAirfoilQueryFor(responseUrl: string, categorySlug: string, includeSubcategories: boolean): boolean {
@@ -186,6 +211,79 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     if (state.stamp?.startsWith("pw-")) {
       await json(request, "post", "/api/admin/test-artifacts/purge", { prefix: state.stamp });
     }
+  });
+
+  test("admin preset save validates missing preset name without creating a row", async ({ page, request }) => {
+    const before = (await getSimulationSetup(request)).simulationPresets.length;
+
+    await page.goto("/admin");
+    await openSetupTab(page, "Presets");
+    await selectWrappedField(page, "Enabled", "no");
+
+    const saveButton = page.getByRole("button", { name: /save new simulation preset/i });
+    await expect(saveButton).toBeEnabled();
+    await saveButton.click();
+
+    await expect(page.getByText("Preset name is required").first()).toBeVisible();
+    await expect(page.getByLabel("Preset name", { exact: true })).toBeFocused();
+    expect((await getSimulationSetup(request)).simulationPresets).toHaveLength(before);
+  });
+
+  test("admin setup create and update actions validate required fields instead of disabling", async ({ page }) => {
+    await page.goto("/admin");
+    await gotoAdminSection(page, "setup");
+
+    const cases = [
+      { tab: "Flow state", button: /add flow state/i, message: "Name is required" },
+      { tab: "Reference geometry", button: /add reference geometry/i, message: "Name is required" },
+      { tab: "Boundary", button: /add boundary profile/i, message: "Name is required" },
+      { tab: "Mesh", button: /add mesh profile/i, message: "Name is required" },
+      { tab: "Solver", button: /add solver profile/i, message: "Name is required" },
+      { tab: "Scheduling", button: /add scheduling profile/i, message: "Name is required" },
+      { tab: "Output", button: /add output profile/i, message: "Name is required" },
+      { tab: "Sweeps", button: /add sweep definition/i, message: "Name is required" },
+      { tab: "Presets", button: /save new simulation preset/i, message: "Preset name is required" },
+    ];
+
+    for (const item of cases) {
+      await page.getByRole("button", { name: new RegExp(`^${item.tab}$`, "i") }).click();
+      const button = page.getByRole("button", { name: item.button });
+      await expect(button).toBeEnabled();
+      await button.click();
+      await expect(page.getByText(item.message).first()).toBeVisible();
+    }
+  });
+
+  test("adjacent admin forms validate missing user input without silent disabled buttons", async ({ page }) => {
+    await page.goto("/admin");
+
+    await openSetupTab(page, "Mediums");
+    await expect(page.getByRole("button", { name: /add medium/i })).toBeEnabled();
+    await page.getByRole("button", { name: /add medium/i }).click();
+    await expect(page.getByText("Name is required").first()).toBeVisible();
+
+    await openCatalogTab(page, "categories");
+    await expect(page.getByRole("button", { name: /create category/i })).toBeEnabled();
+    await page.getByRole("button", { name: /create category/i }).click();
+    await expect(page.getByText("Name is required").first()).toBeVisible();
+
+    await openCatalogTab(page, "hashtags");
+    await expect(page.getByRole("button", { name: /add hashtag/i })).toBeEnabled();
+    await page.getByRole("button", { name: /add hashtag/i }).click();
+    await expect(page.getByText("Name is required").first()).toBeVisible();
+
+    await openCatalogTab(page, "add");
+    await page.getByRole("button", { name: /^Single$/i }).click();
+    await page.getByRole("button", { name: /^Coordinates$/i }).click();
+    await expect(page.getByRole("button", { name: /^Add airfoil$/i })).toBeEnabled();
+    await page.getByRole("button", { name: /^Add airfoil$/i }).click();
+    await expect(page.getByText("Coordinates are required")).toBeVisible();
+
+    await gotoAdminSection(page, "sync");
+    await fillWrappedField(page, "Up-tier endpoint", "");
+    await expect(page.getByRole("button", { name: /sync DB \+ remote refs/i })).toBeEnabled();
+    await page.getByRole("button", { name: /sync DB \+ remote refs/i }).click();
+    await expect(page.getByText("Up-tier endpoint is required").first()).toBeVisible();
   });
 
   test("browse tree scopes direct and descendant airfoils", async ({ page }) => {
@@ -307,7 +405,7 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
 
   test("admin category editor creates, renames, blocks nonempty delete, moves, and deletes empty category", async ({ page }) => {
     await page.goto("/admin");
-    await page.getByRole("button", { name: /Categories/i }).click();
+    await openCatalogTab(page, "categories");
 
     await page.getByTestId("new-category-name").fill(`${state.stamp} Empty`);
     await page.getByTestId("new-category-parent").selectOption(state.root.id);
@@ -336,7 +434,7 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     const dragA = await createCategory(request, `${state.stamp} Drag A`);
     const dragB = await createCategory(request, `${state.stamp} Drag B`);
     await page.goto("/admin");
-    await page.getByRole("button", { name: /Categories/i }).click();
+    await openCatalogTab(page, "categories");
 
     await dragCategory(page, dragA.slug, state.dest.slug, 0.5);
     await page.getByTestId(`admin-category-${dragA.slug}`).click();
@@ -350,19 +448,50 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     expect(aBox?.y ?? 0).toBeGreaterThan(bBox?.y ?? 0);
   });
 
-  test("admin OpenFOAM queue shows pending, active, and finished surfaces", async ({ page }) => {
+  // Read-only against the live queue: navigation + tab switching only — no
+  // sweeper-state mutation (Pause/Resume, CPU slots, requeue are never
+  // clicked), safe to run while a campaign is actively solving.
+  test("admin Solver page shows activity, background, and engine surfaces", async ({ page }) => {
     await page.goto("/admin");
+    await gotoAdminSection(page, "queue");
     await expect(page.getByTestId("openfoam-queue-page")).toBeVisible();
-    await expect(page.getByTestId("queue-pending-sweeps")).toContainText("Pending sweeps");
+    await expect(page.getByRole("heading", { name: "Solver" })).toBeVisible();
+
+    // Activity (default tab): truth banner + controls + active jobs +
+    // collapsed finished log.
+    await expect(page.getByTestId("solver-banner")).toBeVisible();
+    await expect(page.getByTestId("sweeper-process-state")).not.toBeEmpty();
+    await expect(page.getByText("OpenFOAM CPU slots")).toBeVisible();
     await expect(page.getByTestId("queue-active-jobs")).toContainText("Active jobs");
     await expect(page.getByTestId("queue-finished-jobs")).toContainText("Finished job log");
+
+    // Background tab (?tab=background): pending sweeps + external promises.
+    await page.getByTestId("solver-tab-background").click();
+    await expect(page).toHaveURL(/section=queue/);
+    await expect(page).toHaveURL(/tab=background/);
+    await expect(page.getByTestId("queue-pending-sweeps")).toContainText("Pending sweeps");
     await expect(page.getByText(/AoA sweep|No pending sweeps/).first()).toBeVisible();
+    await expect(page.getByTestId("queue-external-promises")).toContainText("Externally promised");
+
+    // Engine tab (?tab=engine): identity, celery introspection, cache stats
+    // (real values or the honest unavailable line — never invented numbers).
+    await page.getByTestId("solver-tab-engine").click();
+    await expect(page).toHaveURL(/tab=engine/);
+    await expect(page.getByTestId("engine-identity")).toContainText("url");
+    await expect(page.getByTestId("engine-celery")).toBeVisible();
+    await expect(page.getByTestId("engine-cache-card")).toContainText(/Mesh entries|cache stats unavailable/);
+    await expect(page.getByTestId("engine-recover-stale")).toContainText("recover stale");
+
+    // Back to Activity drops the tab param.
+    await page.getByTestId("solver-tab-activity").click();
+    await expect(page).not.toHaveURL(/tab=/);
+    await expect(page.getByTestId("solver-banner")).toBeVisible();
   });
 
   test("admin creates and edits mediums from the UI", async ({ page, request }) => {
     const name = `${state.stamp} UI Medium`;
     await page.goto("/admin");
-    await page.getByRole("button", { name: /Mediums/i }).click();
+    await openSetupTab(page, "Mediums");
 
     await fillWrappedField(page, "Name", name);
     await fillWrappedField(page, "Slug optional", slugify(name));
@@ -404,7 +533,7 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     });
 
     await page.goto("/admin");
-    await page.getByRole("button", { name: /Simulation setup/i }).click();
+    await gotoAdminSection(page, "setup");
 
     await page.getByRole("button", { name: /^Flow state$/i }).click();
     await fillWrappedField(page, "Name", `${bcName} flow`);
@@ -437,16 +566,52 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     await page.getByRole("button", { name: /^Boundary$/i }).click();
     await fillWrappedField(page, "Name", `${bcName} boundary`);
     await expect(page.getByLabel("Turbulent viscosity ratio νt/ν")).toBeVisible();
+    const viscosityPresetBox = await page.getByLabel("Turbulent viscosity ratio νt/ν").boundingBox();
+    expect(viscosityPresetBox?.width ?? 0).toBeGreaterThan(300);
     await expect(page.getByText("advanced raw value")).toBeVisible();
     await page.getByRole("button", { name: /add boundary profile/i }).click();
 
     await page.getByRole("button", { name: /^Mesh$/i }).click();
     await fillWrappedField(page, "Name", `${bcName} mesh`);
     await expect(page.getByLabel("Mesher")).toHaveCount(0);
-    await expect(page.getByLabel("Mesh parameter guide")).toBeVisible();
-    await expect(page.getByText("~30,400 cells")).toBeVisible();
-    await expect(page.getByText("this wake block stays chord-aligned")).toBeVisible();
+    const meshGuide = page.getByLabel("Mesh parameter guide");
+    await expect(meshGuide).toBeVisible();
+    await expect(meshGuide.getByRole("img", { name: /c-grid airfoil mesh infographic/i })).toBeVisible();
+    await expect(page.getByText("30,400")).toHaveCount(0);
+    await expect(page.getByLabel("Surface", { exact: true })).toBeVisible();
+    await page.getByLabel("Surface", { exact: true }).focus();
+    await expect(page.getByLabel("Surface slider")).toBeVisible();
+    await expect(meshGuide.locator("[data-mesh-note]")).toHaveCount(0);
+    const meshArtifact = page.getByTestId("mesh-infographic-artifact");
+    const meshExplanations = page.getByTestId("mesh-explanation-grid");
+    await expect(meshExplanations).toBeVisible();
+    await expect(page.getByText("Chordwise wall cells along the airfoil surface")).toBeVisible();
+    await expect(page.getByText("The mesh stays chord-aligned while AoA sweeps rotate")).toBeVisible();
+    const guideBox = await meshGuide.boundingBox();
+    expect(guideBox?.width ?? 0).toBeGreaterThan(700);
+    const artifactBox = await meshArtifact.boundingBox();
+    const explanationBox = await meshExplanations.boundingBox();
+    expect(explanationBox?.y ?? 0).toBeGreaterThan((artifactBox?.y ?? 0) + (artifactBox?.height ?? 0) - 1);
+    await page.setViewportSize({ width: 900, height: 900 });
+    await expect(meshGuide).toBeVisible();
+    await expect(meshGuide.locator("[data-mesh-note]")).toHaveCount(0);
+    await expect(meshExplanations).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 720 });
     await page.getByRole("button", { name: /add mesh profile/i }).click();
+    const originalMeshRow = page.getByRole("button", { name: new RegExp(`${bcName} mesh blockmesh`) });
+    const variantMeshRow = page.getByRole("button", { name: new RegExp(`${bcName} mesh variant blockmesh`) });
+    await expect(originalMeshRow).toBeVisible();
+
+    await originalMeshRow.click();
+    await expect(originalMeshRow).toContainText("loaded");
+    await fillWrappedField(page, "Name", `${bcName} mesh variant`);
+    await page.getByRole("button", { name: /save as new mesh profile/i }).click();
+    await expect(variantMeshRow).toBeVisible();
+    await expect(originalMeshRow).toBeVisible();
+    await expect(page.getByRole("button", { name: /remove selected/i })).toHaveCount(0);
+    await page.getByRole("button", { name: new RegExp(`^Remove ${escapeRegExp(`${bcName} mesh variant`)}$`) }).click();
+    await expect(variantMeshRow).toHaveCount(0);
+    await expect(originalMeshRow).toBeVisible();
 
     await page.getByRole("button", { name: /^Solver$/i }).click();
     await fillWrappedField(page, "Name", `${bcName} solver`);
@@ -468,6 +633,7 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     await page.getByRole("button", { name: /add sweep definition/i }).click();
 
     await page.getByRole("button", { name: /^Presets$/i }).click();
+    await expect(page.getByText("Draft changes are not saved automatically").first()).toBeVisible();
     await fillWrappedField(page, "Preset name", bcName);
     await fillWrappedField(page, "Slug optional", slugify(bcName));
     await selectWrappedField(page, "Flow state", `${bcName} flow`);
@@ -483,16 +649,16 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     await page.getByTestId("preset-airfoil-option-naca-0012").click();
     await expect(page.getByTestId("preset-airfoil-selected-count")).toContainText("1 selected");
     await selectWrappedField(page, "Enabled", "no");
-    await page.getByRole("button", { name: /add simulation preset/i }).click();
+    await page.getByRole("button", { name: /save new simulation preset/i }).click();
 
     await expect(page.getByRole("button", { name: new RegExp(bcName) })).toBeVisible();
 
     await page.getByRole("button", { name: /^Flow state$/i }).click();
-    await page.getByRole("button", { name: new RegExp(`${bcName} flow`) }).click();
+    await page.getByRole("button", { name: new RegExp(`^(?!Remove )${escapeRegExp(`${bcName} flow`)}`) }).click();
     await selectUnit(page, "Speed", "m/s");
     await fillWrappedField(page, "Speed", "50");
     await expect(page.getByText(/0\.147/).last()).toBeVisible();
-    await page.getByRole("button", { name: /save flow state/i }).click();
+    await page.getByRole("button", { name: /update selected flow state/i }).click();
 
     await expect.poll(async () => (await listBoundaryConditions(request)).find((item) => item.slug === slugify(bcName))?.speedMps, {
       message: "boundary condition edit should persist",
@@ -513,7 +679,7 @@ test.describe.serial("catalog tree, filters, hashtags, and bulk management", () 
     const name = `${state.stamp} UI Tag`;
     const renamed = `${state.stamp} UI Tag Renamed`;
     await page.goto("/admin");
-    await page.getByRole("button", { name: /Hashtags/i }).click();
+    await openCatalogTab(page, "hashtags");
 
     await page.getByTestId("new-hashtag-name").fill(name);
     await page.getByRole("button", { name: /add hashtag/i }).click();

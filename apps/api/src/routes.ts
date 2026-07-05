@@ -49,6 +49,7 @@ import {
   toMediumDTO,
 } from "./services/mediums";
 import { assembleSim } from "./services/sim";
+import { readSweeperState, writeSweeperState } from "./services/sweeper-state";
 
 const nacaSchema = z.object({ t: z.number().positive(), m: z.number().min(0), p: z.number().min(0) });
 const imageFieldSchema = z.enum([
@@ -392,7 +393,10 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/airfoils/:slug", async (req, reply) => {
     const { slug } = req.params as { slug: string };
-    const detail = await assembleDetail(slug);
+    // revisionId: minimal pinned-revision scope for the campaign cell side
+    // panel (spec §11 surgical exception) — omits nothing, invents nothing.
+    const { revisionId } = z.object({ revisionId: z.string().uuid().optional() }).parse(req.query);
+    const detail = await assembleDetail(slug, { revisionId });
     if (!detail) return reply.code(404).send({ error: "airfoil not found" });
     return detail;
   });
@@ -884,28 +888,29 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
   // ---- sweeper control / observability ----
   app.get("/api/sweeper", async () => {
-    const [s] = await db.select().from(sweeperState).where(eq(sweeperState.id, 1)).limit(1);
+    const s = await readSweeperState();
     return s ?? { id: 1, enabled: false };
   });
 
-  app.patch("/api/sweeper", async (req) => {
+  // Admin-only (spec §10 auth hardening): sweeper writes control the solver
+  // fleet. GET /api/sweeper stays a public status read (no campaign data).
+  app.patch("/api/sweeper", { preHandler: requireAdmin }, async (req) => {
     const b = z
       .object({
         enabled: z.boolean().optional(),
         maxConcurrentJobs: z.number().int().positive().optional(),
+        cpuSlots: z.number().int().min(0).max(512).optional(),
         pollIntervalMs: z.number().int().positive().optional(),
         submitIntervalMs: z.number().int().positive().optional(),
       })
       .parse(req.body);
-    const [s] = await db
-      .insert(sweeperState)
-      .values({ id: 1, ...b })
-      .onConflictDoUpdate({ target: sweeperState.id, set: b })
-      .returning();
-    return s;
+    return writeSweeperState(b);
   });
 
-  app.get("/api/sim-jobs", async () => ({
+  // Admin-only (spec §10): sim_jobs rows now carry campaignId and must not
+  // leak campaign metadata through a public route. No public caller exists
+  // (verified: apps/web, e2e, scripts, README all unaffected).
+  app.get("/api/sim-jobs", { preHandler: requireAdmin }, async () => ({
     items: await db.select().from(simJobs).orderBy(desc(simJobs.createdAt)).limit(100),
   }));
 }

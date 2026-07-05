@@ -1,5 +1,6 @@
 import {
   type AirfoilDetailPayload,
+  canonicalAoa,
   colorForRe,
   type PolarFit,
   type Polar,
@@ -59,6 +60,57 @@ function solvedToPoint(
     classificationReasons: classification?.reasons ?? [],
     classificationConfidence: classification?.confidence ?? null,
   };
+}
+
+/** Display-only mirrored polar point for a symmetric airfoil (spec §9.2–§9.3).
+ *  The UI codes against the exact field names derived/derivedFromResultId/
+ *  derivedFromAoaDeg; resultId keeps pointing at the +α source row so evidence
+ *  navigation opens the real solve. */
+type DerivedPolarPointData = PolarPointData & {
+  derived: true;
+  derivedFromResultId: string;
+  derivedFromAoaDeg: number;
+};
+
+type SolvedClassification = {
+  state: ResultClassificationState | null;
+  region: ResultClassificationRegion | null;
+  reasons: string[] | null;
+  confidence: number | null;
+};
+
+/** Odd-function negation that never emits -0. */
+function negated(v: number): number {
+  return v === 0 ? 0 : -v;
+}
+
+/** Mirror accepted/needs_urans +α solved points onto the negative side for
+ *  display (Cl/Cm/L/D negated, Cd kept). Mirrors are evidence-navigation
+ *  entries only — never counted as solver runs — and a real solve at the
+ *  mirrored α suppresses the mirror. */
+function mirroredSolvedPoints(rows: { result: Result; classification: SolvedClassification }[]): DerivedPolarPointData[] {
+  const realAoas = new Set(rows.map((row) => canonicalAoa(row.result.aoaDeg)));
+  const mirrored: DerivedPolarPointData[] = [];
+  for (const row of rows) {
+    const sourceAoa = row.result.aoaDeg;
+    if (sourceAoa <= 0) continue;
+    const state = row.classification.state ?? "accepted";
+    if (state !== "accepted" && state !== "needs_urans") continue;
+    const mirroredAoa = canonicalAoa(-sourceAoa);
+    if (realAoas.has(mirroredAoa)) continue;
+    const source = solvedToPoint(row.result, row.classification);
+    mirrored.push({
+      ...source,
+      a: mirroredAoa,
+      cl: negated(source.cl),
+      cm: negated(source.cm),
+      ld: negated(source.ld),
+      derived: true,
+      derivedFromResultId: row.result.id,
+      derivedFromAoaDeg: sourceAoa,
+    });
+  }
+  return mirrored;
 }
 
 function numericAoas(value: unknown): number[] {
@@ -210,7 +262,15 @@ const validPolarPoint = sql<boolean>`(
   )
 )`;
 
-export async function assembleDetail(slug: string): Promise<AirfoilDetailPayload | null> {
+/** Assemble the public airfoil detail payload.
+ *
+ *  `opts.revisionId` (campaign spec §11 surgical exception): scope the polar
+ *  evidence to ONE pinned simulation_preset_revisions row so the campaign
+ *  cell side panel can reuse this payload for its pinned-revision PolarViewer.
+ *  Scoped mode always emits that revision's Re entry (possibly with zero
+ *  points) so "no solved points yet" renders honestly instead of hiding the
+ *  curve. Default (no revisionId) behaviour is unchanged. */
+export async function assembleDetail(slug: string, opts: { revisionId?: string | null } = {}): Promise<AirfoilDetailPayload | null> {
   const [a] = await db
     .select()
     .from(airfoils)
@@ -228,7 +288,33 @@ export async function assembleDetail(slug: string): Promise<AirfoilDetailPayload
   const revisionsByRe = new Map<number, { id: string; createdAt: Date; revisionNumber: number; mach: number | null }[]>();
   const reByRevision = new Map<string, number>();
   const machByRevision = new Map<string, number | null>();
-  if (air) {
+  let scopedRe: number | null = null;
+  if (opts.revisionId) {
+    // Pinned-revision scope: exactly this revision, regardless of preset
+    // enabled state or medium (campaign presets are disabled by design).
+    const [rev] = await db
+      .select({
+        revisionId: simulationPresetRevisions.id,
+        reynolds: simulationPresetRevisions.reynolds,
+        mach: simulationPresetRevisions.mach,
+        createdAt: simulationPresetRevisions.createdAt,
+        revisionNumber: simulationPresetRevisions.revisionNumber,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, opts.revisionId))
+      .limit(1);
+    if (rev) {
+      const roundedRe = Math.round(rev.reynolds);
+      if (roundedRe > 0) {
+        scopedRe = roundedRe;
+        reByRevision.set(rev.revisionId, roundedRe);
+        machByRevision.set(rev.revisionId, rev.mach);
+        revisionsByRe.set(roundedRe, [
+          { id: rev.revisionId, createdAt: rev.createdAt, revisionNumber: rev.revisionNumber, mach: rev.mach },
+        ]);
+      }
+    }
+  } else if (air) {
     const rows = await db
       .select({
         revisionId: simulationPresetRevisions.id,
@@ -354,6 +440,9 @@ export async function assembleDetail(slug: string): Promise<AirfoilDetailPayload
             : {
                 ldmax: row.ldmax,
                 aLd: row.alphaLdmax,
+                // pre-v2 fit rows have no fine targets; the coarse peak stands in until refit
+                alphaLdmaxFine: row.alphaLdmaxFine ?? row.alphaLdmax,
+                alphaClZeroFine: row.alphaClZeroFine ?? null,
                 cdmin: row.cdmin,
                 clCd: row.clAtCdmin,
                 cd0: row.cd0,
@@ -378,15 +467,27 @@ export async function assembleDetail(slug: string): Promise<AirfoilDetailPayload
       if (re !== undefined) solvedReValues.add(re);
     }
   }
+  // Pinned-revision scope: always surface the revision's Re so an empty
+  // polar renders as explicitly-empty evidence, never as a missing curve.
+  if (scopedRe != null) solvedReValues.add(scopedRe);
   const reList = [...solvedReValues].sort((a, b) => a - b);
   const polars: Polar[] = reList.map((re) => {
-    const revision = (revisionsByRe.get(re) ?? []).find(
-      (candidate) => (solvedByRevision.get(candidate.id)?.length ?? 0) > 0 || Boolean(fitByRevision.get(candidate.id)?.points.length),
-    );
+    const revision =
+      (revisionsByRe.get(re) ?? []).find(
+        (candidate) => (solvedByRevision.get(candidate.id)?.length ?? 0) > 0 || Boolean(fitByRevision.get(candidate.id)?.points.length),
+      ) ?? (scopedRe != null ? (revisionsByRe.get(re) ?? [])[0] : undefined);
     const rows = revision ? solvedByRevision.get(revision.id) : undefined;
     const fit = revision ? fitByRevision.get(revision.id) : undefined;
     if (revision && rows && rows.length) {
-      const points = rows.sort((x, y) => x.result.aoaDeg - y.result.aoaDeg).map((row) => solvedToPoint(row.result, row.classification));
+      const points: PolarPointData[] = rows
+        .sort((x, y) => x.result.aoaDeg - y.result.aoaDeg)
+        .map((row) => solvedToPoint(row.result, row.classification));
+      if (a.isSymmetric) {
+        // Spec §9.2–§9.3: append display-only mirrored points; results rows and
+        // solver-run counts stay real solves only.
+        points.push(...mirroredSolvedPoints(rows));
+        points.sort((x, y) => x.a - y.a);
+      }
       return { re, mach: machByRevision.get(revision.id) ?? undefined, color: colorForRe(re), source: "solved", points, fit };
     }
     return { re, color: colorForRe(re), source: "queued", points: [], fit };

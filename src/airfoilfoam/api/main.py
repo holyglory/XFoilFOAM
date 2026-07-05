@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .. import __version__, physics
 from ..airfoil import load_airfoil
+from ..cache import EngineCache
 from ..config import get_settings
 from ..meshing.base import list_meshers
 from ..models import (
@@ -202,6 +203,12 @@ def create_app() -> FastAPI:
             "openfoam_image": settings.openfoam_image,
             "runner": settings.openfoam_runner,
         }
+
+    @app.get("/cache/stats")
+    def cache_stats() -> dict:
+        """Disk truth about the mesh/seed cache: entry counts, bytes, cap and
+        the oldest last-used manifest. Missing/empty cache dir → zeros."""
+        return EngineCache.from_settings(settings).stats()
 
     @app.post("/airfoils/parse")
     def parse_airfoil(airfoil: AirfoilInput) -> dict:

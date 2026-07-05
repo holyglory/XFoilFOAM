@@ -16,6 +16,9 @@
     "push": "drizzle-kit push",
     "seed": "tsx seed/index.ts",
     "backfill:polar-cache": "tsx src/backfill-polar-cache.ts",
+    "backfill:physics-hash": "tsx src/backfill-physics-hash.ts",
+    "backfill:canonical-keys": "tsx src/backfill-canonical-keys.ts",
+    "backfill:airfoil-symmetry": "tsx src/backfill-airfoil-symmetry.ts",
     "reset": "tsx src/reset.ts && pnpm run migrate && pnpm run seed",
     "studio": "drizzle-kit studio",
     "typecheck": "tsc --noEmit"

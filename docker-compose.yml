@@ -13,15 +13,20 @@ services:
       context: .
       dockerfile: docker/Dockerfile.api
       args:
-        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
+        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
     environment:
       AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
-      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
+      # Same cache location + cap as the worker so GET /cache/stats reports the
+      # real store; the API only reads it (stats), hence the :ro mount below.
+      AIRFOILFOAM_CACHE_DIR: /data/airfoilfoam-cache
+      AIRFOILFOAM_CACHE_MAX_GB: "20"
     ports:
       - "8000:8000"
     volumes:
       - results:/data/airfoilfoam
+      - engine_cache:/data/airfoilfoam-cache:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -31,19 +36,23 @@ services:
       context: .
       dockerfile: docker/Dockerfile.worker
       args:
-        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
+        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
     environment:
       AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
-      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
       AIRFOILFOAM_OPENFOAM_RUNNER: local
       AIRFOILFOAM_WORKER_CPU_BUDGET: "18"
       AIRFOILFOAM_CASE_CONCURRENCY: "18"
       AIRFOILFOAM_CELERY_CONCURRENCY: "18"
       AIRFOILFOAM_RANS_SOLVER_TIMEOUT: "1200"
       AIRFOILFOAM_RANS_MAX_ITERATIONS: "600"
+      # Persistent cross-job mesh + steady-solution-seed cache (LRU, size-capped).
+      AIRFOILFOAM_CACHE_DIR: /data/airfoilfoam-cache
+      AIRFOILFOAM_CACHE_MAX_GB: "20"
     volumes:
       - results:/data/airfoilfoam
+      - engine_cache:/data/airfoilfoam-cache
     depends_on:
       redis:
         condition: service_healthy
@@ -79,7 +88,7 @@ services:
     environment:
       DATABASE_URL: postgres://aerodb:aerodb@postgres:5432/aerodb
       ENGINE_URL: http://api:8000
-      ENGINE_EXPECTED_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260630-evidence-media}
+      ENGINE_EXPECTED_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
       MEDIA_DIR: /data/airfoilfoam
       API_PORT: "4000"
       API_HOST: 0.0.0.0
@@ -137,3 +146,4 @@ services:
 volumes:
   results:
   pgdata:
+  engine_cache: # persistent engine mesh/seed cache (survives worker image rebuilds)

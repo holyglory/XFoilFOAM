@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -21,9 +22,10 @@ from typing import Callable, Optional
 
 from . import physics
 from .airfoil import Airfoil
+from .cache import EngineCache, SeedHit
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
-from .meshing.base import Mesher, get_mesher
+from .meshing.base import Mesher, MeshResult, get_mesher
 from .models import CaseSpec, EvidenceArtifact, FluidProperties, JobPhase, MeshParams, RoughnessParams, SolverParams
 from .openfoam.runner import OpenFOAMError, RunResult, Runner
 from .postprocess.forces import (
@@ -43,6 +45,12 @@ from .postprocess.unsteady import (
 )
 
 CancelCheck = Optional[Callable[[], None]]
+
+logger = logging.getLogger(__name__)
+
+#: A fresh steady case may seed its initial fields from a previously solved
+#: angle at the same mesh/fluid/speed when the donor is within this many degrees.
+SEED_MAX_ANGLE_DELTA_DEG = 2.0
 
 
 def _check_cancel(cancel_check: CancelCheck) -> None:
@@ -1067,9 +1075,12 @@ def run_case(
     rans_max_iterations: Optional[int] = None,
     mesh_dir: Optional[Path] = None,
     cancel_check: CancelCheck = None,
+    cache: Optional[EngineCache] = None,
 ) -> CaseOutcome:
     """Run one self-contained case. If ``mesh_dir`` is given, reuse that prebuilt
-    mesh (skip blockMesh) instead of meshing in the case directory."""
+    mesh (skip blockMesh) instead of meshing in the case directory. With a
+    ``cache``, the steady start seeds from the nearest previously solved angle
+    at the same mesh/fluid/speed, and accepted steady fields are published back."""
     case_dir.mkdir(parents=True, exist_ok=True)
     re = physics.reynolds(spec.speed, spec.chord, fluid.nu)
     outcome = CaseOutcome(spec=spec, reynolds=re)
@@ -1102,8 +1113,13 @@ def run_case(
         def solve_once(sp) -> "RunResult":
             _check_cancel(cancel_check)
             write_case(sp)
-            # Potential-flow initialisation greatly stabilises the cold RANS start.
-            runner.application(case_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+            seeded = _try_seed_initial_field(
+                case_dir, airfoil, spec.chord, resolved, spec, fluid, roughness, sp,
+                runner, cache, cancel_check=cancel_check,
+            )
+            if not seeded:
+                # Potential-flow initialisation greatly stabilises the cold RANS start.
+                runner.application(case_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
             _check_cancel(cancel_check)
             res = runner.solver(case_dir, "simpleFoam", n_proc, timeout=steady_timeout)
             _check_cancel(cancel_check)
@@ -1131,6 +1147,16 @@ def run_case(
             runner, n_proc, render_images, solver_timeout, shared_mesh_dir=mesh_dir,
             cancel_check=cancel_check,
         )
+
+        if (
+            cache is not None
+            and not solver_params.force_transient
+            and not rans_outcome_rejected_for_polar(outcome)
+        ):
+            _publish_steady_seed(
+                cache, case_dir, airfoil, spec.chord, resolved, spec, fluid,
+                roughness, steady_solver_params,
+            )
 
     except JobCancelled:
         raise
@@ -1165,15 +1191,38 @@ def _steady_rans_params(solver_params: SolverParams, rans_max_iterations: Option
     return solver_params.model_copy(update={"n_iterations": cap})
 
 
-def prepare_mesh(mesh_dir: Path, airfoil, resolved, chord, mesher, runner, cancel_check: CancelCheck = None):
+def prepare_mesh(
+    mesh_dir: Path, airfoil, resolved, chord, mesher, runner,
+    cancel_check: CancelCheck = None, cache: Optional[EngineCache] = None,
+):
     """Build the mesh once (blockMesh) into ``mesh_dir`` for reuse across a polar
-    set (all speeds/AoAs of one airfoil at one chord share this mesh)."""
+    set (all speeds/AoAs of one airfoil at one chord share this mesh).
+
+    With a ``cache``, a mesh whose (airfoil geometry, chord, resolved params) was
+    built by a previous job is copied from the persistent cache instead of
+    re-running blockMesh; fresh builds are published back for future jobs."""
     _check_cancel(cancel_check)
     mesh_dir.mkdir(parents=True, exist_ok=True)
     mesher.write_inputs(mesh_dir, airfoil, resolved, chord)
     _write_minimal_controldict(mesh_dir)
+    mesh_key = cache.mesh_key(airfoil, chord, resolved) if cache is not None else None
+    if cache is not None and mesh_key is not None:
+        manifest = cache.fetch_mesh(mesh_key, mesh_dir / "constant" / "polyMesh")
+        if manifest is not None:
+            _check_cancel(cancel_check)
+            n_cells = int(manifest.get("nCells") or 0)
+            if n_cells <= 0 and hasattr(mesher, "cell_count"):
+                n_cells = mesher.cell_count(resolved)
+            return MeshResult(
+                patches=mesher.patches(resolved),
+                span_chords=resolved.span_chords,
+                n_cells=n_cells,
+                log=f"reused cached mesh (key {mesh_key})",
+            )
     result = mesher.run_mesh(mesh_dir, resolved, runner)
     _check_cancel(cancel_check)
+    if cache is not None and mesh_key is not None:
+        cache.publish_mesh(mesh_key, mesh_dir / "constant" / "polyMesh", n_cells=result.n_cells)
     return result
 
 
@@ -1197,11 +1246,102 @@ def _link_mesh(case_dir: Path, mesh_dir: Path, runner: Runner) -> None:
         shutil.copytree(src, dst)
 
 
+def _rewrite_carried_inlet_velocity(
+    case_dir: Path, spec: CaseSpec, field_dir: str, runner: Runner, cancel_check: CancelCheck = None
+) -> None:
+    """Point a carried (previously converged) field at a new angle of attack by
+    rewriting only the freestream velocity BC values in ``<field_dir>/U``.
+
+    This is the single field-carry mechanism shared by the in-polar warm-start
+    march and cross-job solution seeding; the case dictionaries written by the
+    CaseBuilder stay authoritative for everything else."""
+    fv = physics.freestream_vector(spec.speed, spec.aoa_deg)
+    uval = f'"uniform ({fv.ux:.10g} {fv.uy:.10g} 0)"'
+    for cmd in (
+        f"foamDictionary -entry boundaryField.inlet.value -set {uval} {field_dir}/U",
+        f"foamDictionary -entry boundaryField.outlet.value -set {uval} {field_dir}/U",
+    ):
+        _check_cancel(cancel_check)
+        runner.application(case_dir, cmd).check()
+
+
+def _try_seed_initial_field(
+    case_dir: Path, airfoil, chord, resolved, spec, fluid, roughness, solver_params,
+    runner: Runner, cache: Optional[EngineCache], cancel_check: CancelCheck = None,
+) -> bool:
+    """Seed a fresh steady case's ``0/`` fields from the nearest previously
+    accepted angle at the same (mesh, fluid, speed) instead of a potentialFoam
+    cold start. The donor fields are staged inside the case, the inlet velocity
+    is rewritten for this angle exactly like the warm-start march does, and only
+    then do they replace the CaseBuilder's ``0/`` files — any earlier failure
+    leaves the case pristine for the normal potentialFoam path."""
+    if cache is None:
+        return False
+    stage = case_dir / "_seed_stage"
+    try:
+        mesh_key = cache.mesh_key(airfoil, chord, resolved)
+        seed_key = cache.seed_key(mesh_key, fluid, spec.speed)
+        signature = cache.solver_signature(solver_params, roughness)
+        hit: Optional[SeedHit] = cache.find_seed(
+            seed_key, spec.aoa_deg, signature, max_delta_deg=SEED_MAX_ANGLE_DELTA_DEG
+        )
+        if hit is None:
+            return False
+        if stage.exists():
+            shutil.rmtree(stage)
+        copied = cache.materialize_seed(hit, stage)
+        if "U" not in copied:
+            shutil.rmtree(stage, ignore_errors=True)
+            return False
+        _rewrite_carried_inlet_velocity(case_dir, spec, stage.name, runner, cancel_check=cancel_check)
+        zero = case_dir / "0"
+        zero.mkdir(parents=True, exist_ok=True)
+        for name in copied:
+            os.replace(stage / name, zero / name)
+        shutil.rmtree(stage, ignore_errors=True)
+        logger.info(
+            "seeded %s (aoa %g) from cached solution at aoa %g (fields: %s)",
+            case_dir.name, spec.aoa_deg, hit.aoa_deg, ", ".join(copied),
+        )
+        return True
+    except JobCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 - seeding must never fail the solve
+        logger.warning("solution seeding failed for %s: %s", case_dir, exc)
+        shutil.rmtree(stage, ignore_errors=True)
+        return False
+
+
+def _publish_steady_seed(
+    cache: Optional[EngineCache], case_dir: Path, airfoil, chord, resolved, spec, fluid,
+    roughness, solver_params, solver: str = "simpleFoam",
+) -> None:
+    """Publish the latest-time fields of an ACCEPTED steady solve so later jobs
+    at the same (mesh, fluid, speed) can seed nearby angles from them."""
+    if cache is None:
+        return
+    try:
+        lt_dir = _latest_time_dir(case_dir)
+        if lt_dir is None or float(lt_dir.name) <= 0:
+            return
+        mesh_key = cache.mesh_key(airfoil, chord, resolved)
+        seed_key = cache.seed_key(mesh_key, fluid, spec.speed)
+        signature = cache.solver_signature(solver_params, roughness)
+        cache.publish_seed(
+            seed_key, spec.aoa_deg, signature, lt_dir,
+            solver=solver, speed=spec.speed, fluid=fluid,
+        )
+    except Exception as exc:  # noqa: BLE001 - publishing is best-effort
+        logger.warning("seed publish failed for %s: %s", case_dir, exc)
+
+
 def _solve_cold_marched(
     polar_dir, mesh_dir, airfoil, patches, resolved, spec, fluid, roughness,
     solver_params, runner, solver_timeout, outcome, n_proc=1, cancel_check: CancelCheck = None,
+    cache: Optional[EngineCache] = None,
 ):
-    """Cold-start the first AoA of a polar (build case, reuse mesh, potentialFoam)."""
+    """Cold-start the first AoA of a polar (build case, reuse mesh, potentialFoam,
+    or a cached-solution seed from a previous job when one is close enough)."""
     def write_case(sp):
         _check_cancel(cancel_check)
         CaseBuilder(airfoil, patches, resolved, spec, fluid, roughness, sp, n_proc=n_proc).write(polar_dir)
@@ -1212,7 +1352,12 @@ def _solve_cold_marched(
     def solve_once(sp):
         _check_cancel(cancel_check)
         write_case(sp)
-        runner.application(polar_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+        seeded = _try_seed_initial_field(
+            polar_dir, airfoil, spec.chord, resolved, spec, fluid, roughness, sp,
+            runner, cache, cancel_check=cancel_check,
+        )
+        if not seeded:
+            runner.application(polar_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
         _check_cancel(cancel_check)
         res = runner.solver(polar_dir, "simpleFoam", n_proc, timeout=solver_timeout)
         _check_cancel(cancel_check)
@@ -1232,12 +1377,10 @@ def _solve_warm(polar_dir, spec, solver_params, runner, solver_timeout, n_proc=1
     lt_dir = _latest_time_dir(polar_dir)
     lt = lt_dir.name
     lt_v = int(float(lt))
-    uval = f'"uniform ({fv.ux:.10g} {fv.uy:.10g} 0)"'
+    _rewrite_carried_inlet_velocity(polar_dir, spec, lt, runner, cancel_check=cancel_check)
     ld = f'"({fv.lift_dir[0]:.10g} {fv.lift_dir[1]:.10g} 0)"'
     dd = f'"({fv.drag_dir[0]:.10g} {fv.drag_dir[1]:.10g} 0)"'
     for cmd in (
-        f"foamDictionary -entry boundaryField.inlet.value -set {uval} {lt}/U",
-        f"foamDictionary -entry boundaryField.outlet.value -set {uval} {lt}/U",
         f"foamDictionary -entry functions.forceCoeffs1.liftDir -set {ld} system/controlDict",
         f"foamDictionary -entry functions.forceCoeffs1.dragDir -set {dd} system/controlDict",
         f"foamDictionary -entry endTime -set {lt_v + solver_params.n_iterations} system/controlDict",
@@ -1344,6 +1487,7 @@ def solve_polar_marched(
     solver_timeout=7200, rans_solver_timeout: Optional[int] = None,
     rans_max_iterations: Optional[int] = None, progress=None,
     phase_progress=None, outcome_progress=None, cancel_check: CancelCheck = None,
+    cache: Optional[EngineCache] = None,
 ) -> PolarMarchResult:
     """Run one polar (fixed chord+speed) over the AoA sweep, reusing ``mesh_dir``
     and warm-starting each AoA from the previous converged field (marching).
@@ -1378,7 +1522,7 @@ def solve_polar_marched(
                 res = _solve_cold_marched(
                     polar_dir, mesh_dir, airfoil, patches, resolved, spec, fluid, roughness,
                     rans_solver, runner, steady_timeout, outcome, n_proc=n_proc,
-                    cancel_check=cancel_check,
+                    cancel_check=cancel_check, cache=cache,
                 )
             else:
                 res = _solve_warm(
@@ -1448,6 +1592,11 @@ def solve_polar_marched(
             )
         if not solver_params.force_transient and rans_outcome_rejected_for_polar(outcome):
             continue
+        if not solver_params.force_transient:
+            # Accepted steady point: its converged field becomes a cross-job seed.
+            _publish_steady_seed(
+                cache, polar_dir, airfoil, chord, resolved, spec, fluid, roughness, rans_solver,
+            )
         final_points.append(stored)
         if outcome_progress:
             outcome_progress(stored, True)

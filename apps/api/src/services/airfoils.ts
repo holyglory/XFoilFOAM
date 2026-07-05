@@ -2,6 +2,7 @@ import {
   type AirfoilGeometry,
   type AirfoilSummary,
   deriveGeometry,
+  isAirfoilSymmetric,
   nacaGeometry,
   type NacaParams,
   parseCoordinates,
@@ -135,6 +136,20 @@ export async function createAirfoil(input: CreateAirfoilInput): Promise<AirfoilS
   const slug = await uniqueSlug(slugify(name));
   const tags = [cat.name.toUpperCase(), geo.camberPct > 0.5 ? "CAMBERED" : "SYMMETRIC"];
 
+  // Real geometric symmetry (spec §9.1) — computed at creation time from the
+  // stored contour so campaign symmetry planning applies to new airfoils, not
+  // only rows touched by the one-off backfill script. Detection failure is
+  // recorded honestly: isSymmetric=false with symmetryCheckedAt=null (unknown).
+  let isSymmetric = false;
+  let symmetryCheckedAt: Date | null = null;
+  try {
+    isSymmetric = isAirfoilSymmetric(geo.contour);
+    symmetryCheckedAt = new Date();
+  } catch {
+    isSymmetric = false;
+    symmetryCheckedAt = null;
+  }
+
   const [row] = await db
     .insert(airfoils)
     .values({
@@ -147,6 +162,8 @@ export async function createAirfoil(input: CreateAirfoilInput): Promise<AirfoilS
       nacaT: naca?.t ?? null,
       nacaM: naca?.m ?? null,
       nacaP: naca?.p ?? null,
+      isSymmetric,
+      symmetryCheckedAt,
       thicknessPct: geo.thicknessPct,
       thicknessXPct: geo.thicknessXPct,
       camberPct: geo.camberPct,

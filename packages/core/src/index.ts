@@ -10,6 +10,8 @@ export * from "./solver-presets";
 export * from "./geometry";
 export * from "./metrics";
 export * from "./polar-fit";
+export * from "./canonical";
+export * from "./symmetry";
 export * from "./chart";
 export * from "./naca";
 export * from "./urans-quality";

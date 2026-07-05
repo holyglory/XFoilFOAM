@@ -9,7 +9,7 @@ import type {
 } from "./types";
 
 export const POLAR_CLASSIFIER_VERSION = "rans-stall-v1";
-export const POLAR_FIT_VERSION = "evidence-lowess-v1";
+export const POLAR_FIT_VERSION = "evidence-lowess-v2";
 
 export interface PolarEvidencePoint {
   id?: string | null;
@@ -286,13 +286,96 @@ function interpolateAtClZero(points: PolarFitPoint[], key: "cd" | "cm"): number 
   return [...points].sort((a, b) => Math.abs(a.cl) - Math.abs(b.cl))[0]?.[key] ?? 0;
 }
 
-function fitMetrics(points: PolarFitPoint[]): PolarFitMetrics | null {
+interface FineTargetContext {
+  evaluate: (a: number, key: "cl" | "cd" | "cm") => number;
+  stepDeg: number;
+  minA: number;
+  maxA: number;
+}
+
+const roundCenti = (x: number): number => Number(x.toFixed(2));
+
+function goldenSectionMax(f: (x: number) => number, lo: number, hi: number): number {
+  const invPhi = (Math.sqrt(5) - 1) / 2;
+  let a = lo;
+  let b = hi;
+  let c = b - invPhi * (b - a);
+  let d = a + invPhi * (b - a);
+  let fc = f(c);
+  let fd = f(d);
+  while (b - a > 1e-5) {
+    if (fc > fd) {
+      b = d;
+      d = c;
+      fd = fc;
+      c = b - invPhi * (b - a);
+      fc = f(c);
+    } else {
+      a = c;
+      c = d;
+      fc = fd;
+      d = a + invPhi * (b - a);
+      fd = f(d);
+    }
+  }
+  return (a + b) / 2;
+}
+
+function bisectRoot(f: (x: number) => number, lo: number, hi: number): number {
+  let a = lo;
+  let b = hi;
+  let fa = f(a);
+  if (fa === 0) return a;
+  for (let i = 0; i < 80 && b - a > 1e-7; i++) {
+    const mid = (a + b) / 2;
+    const fm = f(mid);
+    if (fm === 0) return mid;
+    if ((fa < 0 && fm < 0) || (fa > 0 && fm > 0)) {
+      a = mid;
+      fa = fm;
+    } else {
+      b = mid;
+    }
+  }
+  return (a + b) / 2;
+}
+
+function fitMetrics(points: PolarFitPoint[], fine: FineTargetContext): PolarFitMetrics | null {
   if (points.length < 3) return null;
   const finitePoints = points.filter((p) => finite(p.cl) && finite(p.cd) && finite(p.cm) && finite(p.ld));
   if (finitePoints.length < 3) return null;
   const byLd = [...finitePoints].sort((a, b) => b.ld - a.ld)[0];
   const byCl = [...finitePoints].sort((a, b) => b.cl - a.cl)[0];
   const byCd = [...finitePoints].sort((a, b) => a.cd - b.cd)[0];
+
+  // Fine targets (spec §8): golden-section argmax of the LOWESS-evaluated L/D
+  // bracketed ±1 sample step around the coarse-grid argmax, and the Cl root in
+  // the sample interval bracketing the coarse Cl = 0 crossing.
+  const alphaLdmaxFine = roundCenti(
+    goldenSectionMax(
+      (a) => fine.evaluate(a, "cl") / fine.evaluate(a, "cd"),
+      Math.max(fine.minA, byLd.a - fine.stepDeg),
+      Math.min(fine.maxA, byLd.a + fine.stepDeg),
+    ),
+  );
+  let alphaClZeroFine: number | null = null;
+  for (let i = 1; i < finitePoints.length; i++) {
+    const a = finitePoints[i - 1];
+    const b = finitePoints[i];
+    if (a.cl === 0) {
+      alphaClZeroFine = roundCenti(a.a);
+      break;
+    }
+    if (b.cl === 0) {
+      alphaClZeroFine = roundCenti(b.a);
+      break;
+    }
+    if ((a.cl < 0 && b.cl > 0) || (a.cl > 0 && b.cl < 0)) {
+      alphaClZeroFine = roundCenti(bisectRoot((x) => fine.evaluate(x, "cl"), a.a, b.a));
+      break;
+    }
+  }
+
   return {
     ldmax: byLd.ld,
     aLd: byLd.a,
@@ -302,6 +385,8 @@ function fitMetrics(points: PolarFitPoint[]): PolarFitMetrics | null {
     clmax: byCl.cl,
     aStall: byCl.a,
     cm0: interpolateAtClZero(finitePoints, "cm"),
+    alphaLdmaxFine,
+    alphaClZeroFine,
   };
 }
 
@@ -338,11 +423,15 @@ export function buildPolarFit(classifications: PolarEvidenceClassification[]): P
   const minA = fitInputs[0].a;
   const maxA = fitInputs[fitInputs.length - 1].a;
   const span = Math.max(step * 6, 2.5);
+  const evaluate = (a: number, key: "cl" | "cd" | "cm"): number => {
+    const value = localQuadratic(fitInputs, a, key, span);
+    return key === "cd" ? Math.max(1e-6, value) : value;
+  };
   const samples: PolarFitPoint[] = [];
   for (let a = minA; a <= maxA + step * 0.5; a += step) {
-    const cl = localQuadratic(fitInputs, a, "cl", span);
-    const cd = Math.max(1e-6, localQuadratic(fitInputs, a, "cd", span));
-    const cm = localQuadratic(fitInputs, a, "cm", span);
+    const cl = evaluate(a, "cl");
+    const cd = evaluate(a, "cd");
+    const cm = evaluate(a, "cm");
     samples.push({ a: Number(a.toFixed(4)), cl, cd, cm, ld: cl / cd });
   }
   const status: PolarFitStatus = provisionalPointCount > 0 ? "provisional" : "final";
@@ -350,7 +439,7 @@ export function buildPolarFit(classifications: PolarEvidenceClassification[]): P
   return {
     status,
     confidence: status === "provisional" ? Math.min(confidenceBase, 0.74) : confidenceBase,
-    metrics: fitMetrics(samples),
+    metrics: fitMetrics(samples, { evaluate, stepDeg: step, minA, maxA }),
     points: samples,
     acceptedPointCount,
     provisionalPointCount,

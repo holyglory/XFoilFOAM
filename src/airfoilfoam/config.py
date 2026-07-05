@@ -21,6 +21,16 @@ class Settings(BaseSettings):
         default=Path("/data/airfoilfoam"),
         description="Directory where job cases and results are stored (shared between API and worker).",
     )
+    cache_dir: Path | None = Field(
+        default=None,
+        description="Persistent cross-job cache for built meshes and steady-solution seeds "
+        "(a Docker volume in production so it survives worker rebuilds). Defaults to <data_dir>/cache.",
+    )
+    cache_max_gb: float = Field(
+        default=20.0,
+        gt=0,
+        description="Size cap [GiB] for the mesh/seed cache; least-recently-used entries are evicted beyond it.",
+    )
 
     # --- OpenFOAM execution ---
     openfoam_image: str = Field(
@@ -84,6 +94,9 @@ class Settings(BaseSettings):
 
     def job_dir(self, job_id: str) -> Path:
         return self.data_dir / "jobs" / job_id
+
+    def resolved_cache_dir(self) -> Path:
+        return self.cache_dir if self.cache_dir is not None else self.data_dir / "cache"
 
     def resolved_worker_cpu_budget(self) -> int:
         if self.worker_cpu_budget is not None:

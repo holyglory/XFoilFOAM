@@ -168,6 +168,15 @@ export interface EngineHealth {
   package_file?: string | null;
 }
 
+/** GET /cache/stats — disk truth about the engine mesh/seed cache. */
+export interface EngineCacheStats {
+  mesh_entries: number;
+  seed_entries: number;
+  total_bytes: number;
+  cap_bytes: number;
+  oldest_last_used: string | null;
+}
+
 export interface EngineTaskSummary {
   worker: string;
   task_id: string | null;

@@ -4,6 +4,7 @@ import multipart from "@fastify/multipart";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { registerAdminRoutes } from "./admin-routes";
+import { registerCampaignRoutes } from "./campaign-routes";
 import { registerRoutes } from "./routes";
 import { registerSyncRoutes } from "./sync-routes";
 
@@ -16,6 +17,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerRoutes(app);
   await registerSyncRoutes(app);
   await registerAdminRoutes(app);
+  await registerCampaignRoutes(app);
   app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
     const status = err.statusCode ?? 500;
     if (status >= 500) app.log.error(err);

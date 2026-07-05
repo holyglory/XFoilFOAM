@@ -1,7 +1,10 @@
 import {
   airfoils,
+  type CampaignLaneKey,
   fieldColorScales,
   forceHistory,
+  laneKeyId,
+  onResultIngested,
   type DB,
   type ResultInsert,
   resultAttempts,
@@ -10,6 +13,7 @@ import {
   resultMedia,
   solverEvidenceArtifacts,
 } from "@aerodb/db";
+import { canonicalSi } from "@aerodb/core";
 import {
   ALL_IMAGE_FIELDS,
   type EngineClient,
@@ -42,6 +46,27 @@ export interface SpeedBc {
   bcId: string;
   presetRevisionId?: string | null;
   mach?: number | null;
+}
+
+/** One (condition, speed) member of a batched campaign job's requestPayload
+ *  conditionMap. Speeds are canonical SI values (canonicalSi('speedMps', …))
+ *  stamped at compose time, so ingest maps each engine polar back to its
+ *  condition by exact canonical equality — never by nearest-speed guessing. */
+export interface ConditionMapEntry {
+  conditionId: string;
+  revisionId: string;
+  presetId: string;
+  speed: number;
+  reynolds: number;
+  bcId: string;
+}
+
+/** Pure speed→condition mapping for batched jobs: canonical float equality.
+ *  Returns null when no entry matches (a mismatched polar must be skipped, not
+ *  misattributed to the nearest revision). */
+export function matchConditionEntryBySpeed(entries: ConditionMapEntry[], polarSpeed: number): ConditionMapEntry | null {
+  const canonical = canonicalSi("speedMps", polarSpeed);
+  return entries.find((entry) => entry.speed === canonical) ?? null;
 }
 
 /** Engine image URL ("/jobs/<id>/files/cases/x/v.png") → media store key
@@ -668,21 +693,45 @@ export async function ingestResult(opts: {
   simJobId: string;
   airfoilId: string;
   speedMap: SpeedBc[];
+  /** Batched campaign jobs only: each polar is mapped to its (condition,
+   *  revision, bc) by exact canonical speed. Jobs without a conditionMap keep
+   *  the single-revision nearest-speed path unchanged. */
+  conditionMap?: ConditionMapEntry[];
   result: JobResult;
-}): Promise<{ points: number; media: number }> {
-  const { db, engine, engineJobId, simJobId, airfoilId, speedMap, result } = opts;
+}): Promise<{ points: number; media: number; dirtyLanes: CampaignLaneKey[] }> {
+  const { db, engine, engineJobId, simJobId, airfoilId, speedMap, conditionMap, result } = opts;
   let points = 0;
   let media = 0;
   const airfoilPoints = await airfoilContourPoints(db, airfoilId);
   const scaleGroups = new Map<ScaleGroupKey, ScaleGroup>();
+  const dirtyLanes = new Map<string, CampaignLaneKey>();
 
   for (const polar of result.polars) {
-    if (speedMap.length === 0) continue;
-    const match = speedMap.reduce((best, s) =>
-      Math.abs(s.speed - polar.speed) < Math.abs(best.speed - polar.speed) ? s : best,
-    );
-    const bcId = match.bcId;
-    const presetRevisionId = match.presetRevisionId ?? null;
+    let bcId: string;
+    let presetRevisionId: string | null;
+    let mappedMach: number | null;
+    if (conditionMap?.length) {
+      // Batched campaign job: exact canonical speed → condition entry. A polar
+      // with no matching entry is skipped — never misattributed to a revision.
+      const entry = matchConditionEntryBySpeed(conditionMap, polar.speed);
+      if (!entry) {
+        console.error(
+          `[sweeper] ingest ${engineJobId}: polar speed ${polar.speed} has no conditionMap entry (canonical ${canonicalSi("speedMps", polar.speed)}) — skipping polar`,
+        );
+        continue;
+      }
+      bcId = entry.bcId;
+      presetRevisionId = entry.revisionId;
+      mappedMach = speedMap.find((s) => canonicalSi("speedMps", s.speed) === entry.speed)?.mach ?? null;
+    } else {
+      if (speedMap.length === 0) continue;
+      const match = speedMap.reduce((best, s) =>
+        Math.abs(s.speed - polar.speed) < Math.abs(best.speed - polar.speed) ? s : best,
+      );
+      bcId = match.bcId;
+      presetRevisionId = match.presetRevisionId ?? null;
+      mappedMach = match.mach ?? null;
+    }
     const resultIdsByAoa = new Map<number, string>();
 
     for (const p of polar.points) {
@@ -699,7 +748,7 @@ export async function ingestResult(opts: {
         reynolds: Math.round(polar.reynolds),
         speed: polar.speed,
         chord: polar.chord,
-        mach: polar.mach ?? match.mach ?? null,
+        mach: polar.mach ?? mappedMach,
         cl: p.cl ?? null,
         cd: p.cd ?? null,
         cm: p.cm ?? null,
@@ -733,6 +782,20 @@ export async function ingestResult(opts: {
       resultIdsByAoa.set(p.aoa_deg, row.id);
       const attemptId = await insertResultAttempt({ db, resultId: row.id, airfoilId, bcId, presetRevisionId, simJobId, engineJobId, point: p });
       points++;
+
+      // Campaign ingest hook (spec §7): terminal-link matching campaign points
+      // (incl. derived-by-symmetry cells), bump progress counters, collect
+      // dirty lane keys. Lanes are drained by the caller AFTER the polar fit
+      // cache refresh so laneTick sees the new fit.
+      const laneKeys = await onResultIngested(db, {
+        airfoilId,
+        revisionId: presetRevisionId,
+        aoaDeg: p.aoa_deg,
+        resultId: row.id,
+        status: failed ? "failed" : "done",
+        regime: p.unsteady ? "urans" : "rans",
+      });
+      for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
 
       for (const artifact of p.evidence_artifacts ?? []) {
         await registerEvidenceArtifacts({
@@ -817,5 +880,5 @@ export async function ingestResult(opts: {
   if (airfoilPoints && scaleGroups.size) {
     media += await rebalanceFieldScales({ db, engine, groups: scaleGroups, airfoilPoints });
   }
-  return { points, media };
+  return { points, media, dirtyLanes: [...dirtyLanes.values()] };
 }

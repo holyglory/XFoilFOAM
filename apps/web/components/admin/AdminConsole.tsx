@@ -3,7 +3,8 @@
 import type { MediumDTO } from "@aerodb/core";
 import { type CSSProperties, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Activity, CheckCircle2, Clock3, ExternalLink, Pause, Play, RotateCcw, ShieldAlert, XCircle } from "lucide-react";
+import { usePathname, useSearchParams } from "next/navigation";
+import { ExternalLink, Pause, Play, RotateCcw, ShieldAlert, Trash2 } from "lucide-react";
 
 import {
   type AdminBoundaryProfile,
@@ -15,6 +16,7 @@ import {
   type AdminAirfoilOption,
   type AdminPendingSweep,
   type AdminQueue,
+  type AdminQueueBacklogStrip,
   type AdminReferenceGeometryProfile,
   type AdminSchedulingProfile,
   type AdminSyncPermission,
@@ -24,6 +26,7 @@ import {
   type AdminSolverProfile,
   type AdminSweepDefinition,
   type BoundaryProfileInput,
+  type CampaignDuplicatePrefill,
   type FlowConditionInput,
   type MeshProfileInput,
   type MediumInput,
@@ -49,6 +52,14 @@ import {
   createSimulationPreset,
   createSolverProfile,
   createSweepDefinition,
+  deleteBoundaryProfile,
+  deleteFlowCondition,
+  deleteMeshProfile,
+  deleteOutputProfile,
+  deleteReferenceGeometryProfile,
+  deleteSchedulingProfile,
+  deleteSolverProfile,
+  deleteSweepDefinition,
   getAdminMediums,
   getAdminQueue,
   getAdminSync,
@@ -56,6 +67,7 @@ import {
   patchSweeper,
   patchAdminSync,
   promoteSyncConflict,
+  purgeTestArtifacts,
   recoverStaleJobs,
   requeueFailed,
   runUpstreamSync,
@@ -71,19 +83,34 @@ import {
   updateSweepDefinition,
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
+import { deriveSolverState, solverStateLabel } from "@/lib/solver-state";
 import { AddAirfoilsPanel } from "./AddAirfoilsPanel";
+import { momentumSchemeSelect } from "./solver-schemes";
 import { CategoriesAdminPanel, HashtagsAdminPanel } from "./CatalogAdminPanels";
 import { UnitNumberField } from "./UnitNumberField";
+import { CampaignDetail } from "./campaigns/CampaignDetail";
+import { CampaignsHub } from "./campaigns/CampaignsHub";
+import { CampaignWizard } from "./campaigns/CampaignWizard";
+import { usePoll } from "./campaigns/usePoll";
+import { stashDuplicatePrefill } from "./campaigns/wizard-draft";
 
-type Section = "queue" | "mediums" | "boundaryConditions" | "sync" | "add" | "categories" | "hashtags";
+type Section = "simulations" | "queue" | "setup" | "catalog" | "sync";
 const SECTIONS: { k: Section; label: string; icon: string }[] = [
-  { k: "queue", label: "OpenFOAM queue", icon: "◷" },
-  { k: "mediums", label: "Mediums", icon: "μ" },
-  { k: "boundaryConditions", label: "Simulation setup", icon: "β" },
+  { k: "simulations", label: "Simulations", icon: "∿" },
+  // Label "Solver" (approved redesign); the URL key stays ?section=queue so
+  // links, tests, and bookmarks keep working (§11 routing contract).
+  { k: "queue", label: "Solver", icon: "◷" },
+  { k: "setup", label: "Setup library", icon: "β" },
+  { k: "catalog", label: "Catalog", icon: "▸" },
   { k: "sync", label: "Sync API", icon: "⇄" },
-  { k: "add", label: "Add airfoils", icon: "＋" },
-  { k: "categories", label: "Categories", icon: "▸" },
-  { k: "hashtags", label: "Hashtags", icon: "#" },
+];
+const SECTION_KEYS = new Set<string>(SECTIONS.map((s) => s.k));
+
+type CatalogTab = "add" | "categories" | "hashtags";
+const CATALOG_TABS: { k: CatalogTab; label: string }[] = [
+  { k: "add", label: "Add airfoils" },
+  { k: "categories", label: "Categories" },
+  { k: "hashtags", label: "Hashtags" },
 ];
 
 function ago(iso: string | null): string {
@@ -114,6 +141,10 @@ const STATUS_COLOR: Record<string, string> = {
 };
 
 const PENDING_COLUMNS = "minmax(90px, .85fr) 104px 104px 70px 70px 92px minmax(100px, .85fr) 62px";
+// Sum of the PENDING_COLUMNS minimums (692) + 7 column gaps (70) + row padding
+// (32): below this width the pending table scrolls inside .admin-table-scroll
+// instead of letting the panel's overflow clip the trailing columns.
+const PENDING_TABLE_MIN_WIDTH = 794;
 
 const KIND_META: Record<AdminJob["kind"], { label: string; regime: string; tone: string; fill: string; border: string }> = {
   "sweep-rans": { label: "AoA sweep", regime: "RANS", tone: C.teal, fill: C.tealFill, border: C.tealBorder },
@@ -187,12 +218,75 @@ const label: CSSProperties = { fontFamily: MONO, fontSize: 10, letterSpacing: "0
 
 export function AdminConsole() {
   const [me, setMe] = useState<AdminMe | null>(null);
-  const [section, setSection] = useState<Section>("queue");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loginErr, setLoginErr] = useState<string | null>(null);
+
+  // ---- routing (spec §11): URL search params are the single source of truth
+  // for section / campaign / wizard / step / tab — no mirrored useState.
+  // push = section change, campaign open, wizard enter; replace = step/tab.
+  // popstate is handled by Next's router re-rendering from the new params.
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const rawSection = searchParams.get("section") ?? "";
+  const section: Section = SECTION_KEYS.has(rawSection) ? (rawSection as Section) : "simulations";
+  const campaignParam = section === "simulations" ? searchParams.get("campaign") : null;
+  const wizardParam = section === "simulations" ? searchParams.get("wizard") : null;
+  const wizardKind = wizardParam === "polar_sweep" || wizardParam === "ld_refine" ? wizardParam : null;
+  const stepRaw = Number(searchParams.get("step") ?? "1");
+  const wizardStep = Number.isInteger(stepRaw) ? Math.min(4, Math.max(1, stepRaw)) : 1;
+  const tabParam = searchParams.get("tab");
+
+  // Dirty flag reported by the wizard (drafts persist to sessionStorage; the
+  // guard is about accidental navigation, not data loss — copy stays honest).
+  const wizardDirtyRef = useRef(false);
+
+  const navigate = useCallback(
+    (params: Record<string, string>, mode: "push" | "replace") => {
+      const qs = new URLSearchParams(params).toString();
+      const url = qs ? `${pathname}?${qs}` : pathname;
+      // Shallow client-side URL updates (Next ≥14.1 keeps useSearchParams in
+      // sync with the native history API). The admin page is force-dynamic,
+      // so router.push/replace would refetch the RSC payload and REMOUNT the
+      // console a beat after every section/tab/step change — wiping form
+      // state the user already typed into the freshly opened panel. All admin
+      // routing state is client-derived from searchParams; no server
+      // round-trip is needed.
+      if (mode === "push") {
+        window.history.pushState(null, "", url);
+        window.scrollTo(0, 0); // preserve router.push's scroll-to-top behavior
+      } else {
+        window.history.replaceState(null, "", url);
+      }
+    },
+    [pathname],
+  );
+
+  const confirmLeaveWizard = useCallback(() => {
+    if (!(section === "simulations" && !campaignParam && wizardKind && wizardDirtyRef.current)) return true;
+    return window.confirm(
+      "Leave the campaign wizard? Your draft is saved in this tab and will be restored the next time you open this wizard type.",
+    );
+  }, [section, campaignParam, wizardKind]);
+
+  const openCampaign = useCallback((id: string) => navigate({ campaign: id }, "push"), [navigate]);
+  const openWizard = useCallback((kind: "polar_sweep" | "ld_refine") => navigate({ wizard: kind, step: "1" }, "push"), [navigate]);
+  const backToHub = useCallback(() => navigate({}, "push"), [navigate]);
+  const duplicateCampaign = useCallback(
+    (prefill: CampaignDuplicatePrefill) => {
+      // The prefill travels via the sessionStorage stash (consumed once by the
+      // next wizard mount) so the URL stays the routing source of truth.
+      stashDuplicatePrefill(prefill);
+      openWizard(prefill.plan.objectives.ldMax.enabled ? "ld_refine" : "polar_sweep");
+    },
+    [openWizard],
+  );
+  const handleWizardDirty = useCallback((dirty: boolean) => {
+    wizardDirtyRef.current = dirty;
+  }, []);
 
   useEffect(() => {
     adminMe()
@@ -337,19 +431,11 @@ export function AdminConsole() {
           grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
           gap: 8px;
         }
-        .queue-header-grid {
-          display: grid;
-          grid-template-columns: minmax(0, 1fr) auto;
-          gap: 16px;
-          align-items: start;
-          margin-bottom: 16px;
-        }
-        .queue-main-grid {
-          display: grid;
-          grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.75fr);
-          gap: 14px;
-          align-items: start;
-          margin-bottom: 14px;
+        .admin-tab-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin-bottom: 12px;
         }
         @media (max-width: 940px) {
           .admin-shell-grid {
@@ -367,9 +453,15 @@ export function AdminConsole() {
           .admin-editor-grid {
             grid-template-columns: minmax(0, 1fr);
           }
-          .queue-header-grid,
-          .queue-main-grid {
-            grid-template-columns: minmax(0, 1fr);
+          .admin-tab-row {
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            padding-bottom: 4px;
+            -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 28px), transparent 100%);
+            mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 28px), transparent 100%);
+          }
+          .admin-tab-row button {
+            flex: 0 0 auto;
           }
         }
         @media (max-width: 620px) {
@@ -426,7 +518,15 @@ export function AdminConsole() {
               <button
                 key={s.k}
                 type="button"
-                onClick={() => setSection(s.k)}
+                data-testid={`admin-nav-${s.k}`}
+                onClick={() => {
+                  // Clicking the active section with no sub-state is a no-op
+                  // (no duplicate history entries).
+                  if (on && !campaignParam && !wizardKind && !tabParam) return;
+                  if (!confirmLeaveWizard()) return;
+                  wizardDirtyRef.current = false;
+                  navigate(s.k === "simulations" ? {} : { section: s.k }, "push");
+                }}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -451,13 +551,55 @@ export function AdminConsole() {
         </nav>
 
         <div style={{ minWidth: 0 }}>
-          {section === "queue" && <QueueDashboard />}
-          {section === "mediums" && <MediumsPanel />}
-          {section === "boundaryConditions" && <SimulationSetupPanel />}
+          {section === "simulations" && campaignParam && (
+            <CampaignDetail campaignId={campaignParam} onBack={backToHub} onDuplicate={duplicateCampaign} />
+          )}
+          {section === "simulations" && !campaignParam && wizardKind && (
+            <CampaignWizard
+              key={wizardKind}
+              initialKind={wizardKind}
+              step={wizardStep}
+              onStepChange={(n) => navigate({ wizard: wizardKind, step: String(n) }, "replace")}
+              onLaunched={(id) => {
+                wizardDirtyRef.current = false;
+                openCampaign(id);
+              }}
+              onExit={() => {
+                if (!confirmLeaveWizard()) return;
+                wizardDirtyRef.current = false;
+                backToHub();
+              }}
+              onDirtyChange={handleWizardDirty}
+            />
+          )}
+          {section === "simulations" && !campaignParam && !wizardKind && (
+            <CampaignsHub
+              onOpenCampaign={openCampaign}
+              onNewCampaign={openWizard}
+              onOpenSolver={() => navigate({ section: "queue" }, "push")}
+            />
+          )}
+          {section === "queue" && (
+            <QueueDashboard
+              tab={parseSolverTab(tabParam)}
+              onTabChange={(t) => navigate(t === "activity" ? { section: "queue" } : { section: "queue", tab: t }, "replace")}
+              onOpenCampaign={openCampaign}
+              onOpenSimulations={() => navigate({}, "push")}
+            />
+          )}
+          {section === "setup" && (
+            <SimulationSetupPanel
+              tab={parseSetupTab(tabParam)}
+              onTabChange={(t) => navigate(t === "presets" ? { section: "setup" } : { section: "setup", tab: t }, "replace")}
+            />
+          )}
+          {section === "catalog" && (
+            <CatalogPanel
+              tab={parseCatalogTab(tabParam)}
+              onTabChange={(t) => navigate(t === "add" ? { section: "catalog" } : { section: "catalog", tab: t }, "replace")}
+            />
+          )}
           {section === "sync" && <SyncApiPanel />}
-          {section === "add" && <AddAirfoilsPanel />}
-          {section === "categories" && <CategoriesAdminPanel />}
-          {section === "hashtags" && <HashtagsAdminPanel />}
         </div>
       </div>
     </div>
@@ -482,12 +624,64 @@ const defaultMediumForm: MediumInput = {
   notes: "",
 };
 
+type ValidationIssue = {
+  field: string;
+  message: string;
+};
+
+function requiredIssue(value: string | null | undefined, field: string, message = `${field} is required`): ValidationIssue | null {
+  return value?.trim() ? null : { field, message };
+}
+
+function requiredChoiceIssue(value: string | null | undefined, field: string): ValidationIssue | null {
+  return value ? null : { field, message: `Choose ${field.toLowerCase()}` };
+}
+
+function positiveIssue(value: number | null | undefined, field: string): ValidationIssue | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? null : { field, message: `${field} must be greater than 0` };
+}
+
+function nonNegativeIssue(value: number | null | undefined, field: string): ValidationIssue | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? null : { field, message: `${field} must be 0 or greater` };
+}
+
+function optionalPositiveIntegerIssue(value: number | null | undefined, field: string): ValidationIssue | null {
+  if (value == null) return null;
+  return Number.isInteger(value) && value > 0 ? null : { field, message: `${field} must be a positive integer or blank` };
+}
+
+function positiveIntegerIssue(value: number | null | undefined, field: string): ValidationIssue | null {
+  return Number.isInteger(value) && typeof value === "number" && value > 0 ? null : { field, message: `${field} must be a positive integer` };
+}
+
+function compactIssues(issues: Array<ValidationIssue | null>): ValidationIssue[] {
+  return issues.filter((issue): issue is ValidationIssue => !!issue);
+}
+
+function adminFieldSelector(field: string) {
+  const escaped = field.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+  return `[data-admin-field="${escaped}"] input, [data-admin-field="${escaped}"] select, [data-admin-field="${escaped}"] textarea, [data-admin-field="${escaped}"] button`;
+}
+
+function focusValidationIssue(issue: ValidationIssue | undefined) {
+  if (!issue) return;
+  window.setTimeout(() => {
+    const target = document.querySelector<HTMLElement>(adminFieldSelector(issue.field));
+    target?.focus();
+  }, 0);
+}
+
+function issueFor(issues: ValidationIssue[], field: string) {
+  return issues.find((issue) => issue.field === field)?.message;
+}
+
 function MediumsPanel() {
   const [items, setItems] = useState<MediumDTO[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [form, setForm] = useState<MediumInput>(defaultMediumForm);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [validationIssues, setValidationIssues] = useState<ValidationIssue[]>([]);
   const selected = items.find((m) => m.id === selectedId) ?? null;
 
   const refresh = async () => setItems((await getAdminMediums()).items);
@@ -496,6 +690,7 @@ function MediumsPanel() {
   }, []);
 
   const select = (m: MediumDTO) => {
+    setValidationIssues([]);
     setSelectedId(m.id);
     const next: MediumInput = {
       name: m.name,
@@ -515,7 +710,36 @@ function MediumsPanel() {
     setForm(next);
   };
 
+  const validateMedium = () => compactIssues([
+    requiredIssue(form.name, "Name"),
+    positiveIssue(form.density, "Density kg/m³"),
+    positiveIssue(form.refTemperatureK, "Ref temp"),
+    positiveIssue(form.refPressurePa, "Ref pressure"),
+    form.speedOfSound == null || form.speedOfSound === 0 ? null : positiveIssue(form.speedOfSound, "Speed of sound"),
+    form.viscosityModel === "constant" ? positiveIssue(form.constantDynamicViscosity ?? 0, "Dynamic viscosity μ [Pa·s]") : null,
+    form.viscosityModel === "sutherland" ? positiveIssue(form.sutherlandMuRef ?? 0, "μ ref [Pa·s]") : null,
+    form.viscosityModel === "sutherland" ? positiveIssue(form.sutherlandTRef ?? 0, "T ref") : null,
+    form.viscosityModel === "sutherland" ? positiveIssue(form.sutherlandS ?? 0, "Sutherland S") : null,
+    ...(form.viscosityModel === "table"
+      ? (form.viscosityTable ?? []).flatMap((row, i) => [
+          positiveIssue(row.temperatureK, `T ${i + 1}`),
+          positiveIssue(row.dynamicViscosity, `μ [Pa·s] ${i + 1}`),
+        ])
+      : []),
+  ]);
+
+  useEffect(() => {
+    if (validationIssues.length) setValidationIssues(validateMedium());
+  }, [form, validationIssues.length]);
+
   const save = async () => {
+    const issues = validateMedium();
+    if (issues.length) {
+      setValidationIssues(issues);
+      focusValidationIssue(issues[0]);
+      return;
+    }
+    setValidationIssues([]);
     setBusy(true);
     setErr(null);
     try {
@@ -536,6 +760,7 @@ function MediumsPanel() {
 
   const reset = () => {
     setSelectedId("");
+    setValidationIssues([]);
     setForm({ ...defaultMediumForm, viscosityTable: [...(defaultMediumForm.viscosityTable ?? [])] });
   };
 
@@ -549,7 +774,6 @@ function MediumsPanel() {
 
   return (
     <div>
-      <SectionHeader title="Mediums" subtitle="Material registry for OpenFOAM flow states." />
       {err && <ErrorLine text={err} />}
       <div className="admin-editor-grid">
         <div style={card}>
@@ -580,28 +804,29 @@ function MediumsPanel() {
               new
             </button>
           </div>
-          <TextField label="Name" value={form.name} onChange={(name) => setForm((f) => ({ ...f, name }))} />
+          <TextField label="Name" value={form.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setForm((f) => ({ ...f, name }))} />
           {!selected && <TextField label="Slug optional" value={form.slug ?? ""} onChange={(slug) => setForm((f) => ({ ...f, slug }))} />}
           <div className="admin-form-grid">
             <SelectField label="Phase" value={form.phase} options={["gas", "liquid"]} onChange={(phase) => setForm((f) => ({ ...f, phase: phase as "gas" | "liquid" }))} />
-            <NumberField label="Density kg/m³" value={form.density} onChange={(density) => setForm((f) => ({ ...f, density }))} />
-            <UnitNumberField label="Ref temp" dimension="temperature" valueSi={form.refTemperatureK} min={0} onChangeSi={(refTemperatureK) => setForm((f) => ({ ...f, refTemperatureK }))} />
-            <UnitNumberField label="Ref pressure" dimension="pressure" valueSi={form.refPressurePa} min={0} onChangeSi={(refPressurePa) => setForm((f) => ({ ...f, refPressurePa }))} />
+            <NumberField label="Density kg/m³" value={form.density} error={issueFor(validationIssues, "Density kg/m³")} onChange={(density) => setForm((f) => ({ ...f, density }))} />
+            <UnitNumberField label="Ref temp" dimension="temperature" valueSi={form.refTemperatureK} min={0} error={issueFor(validationIssues, "Ref temp")} onChangeSi={(refTemperatureK) => setForm((f) => ({ ...f, refTemperatureK }))} />
+            <UnitNumberField label="Ref pressure" dimension="pressure" valueSi={form.refPressurePa} min={0} error={issueFor(validationIssues, "Ref pressure")} onChangeSi={(refPressurePa) => setForm((f) => ({ ...f, refPressurePa }))} />
             <SelectField label="Viscosity model" value={form.viscosityModel} options={["constant", "sutherland", "table"]} onChange={(viscosityModel) => setForm((f) => ({ ...f, viscosityModel: viscosityModel as MediumInput["viscosityModel"] }))} />
-            <UnitNumberField label="Speed of sound" dimension="speed" valueSi={form.speedOfSound ?? 0} min={0} onChangeSi={(speedOfSound) => setForm((f) => ({ ...f, speedOfSound }))} />
+            <UnitNumberField label="Speed of sound" dimension="speed" valueSi={form.speedOfSound ?? 0} min={0} error={issueFor(validationIssues, "Speed of sound")} onChangeSi={(speedOfSound) => setForm((f) => ({ ...f, speedOfSound }))} />
           </div>
           {form.viscosityModel === "constant" && (
             <NumberField
               label="Dynamic viscosity μ [Pa·s]"
               value={form.constantDynamicViscosity ?? 0}
+              error={issueFor(validationIssues, "Dynamic viscosity μ [Pa·s]")}
               onChange={(constantDynamicViscosity) => setForm((f) => ({ ...f, constantDynamicViscosity }))}
             />
           )}
           {form.viscosityModel === "sutherland" && (
             <div className="admin-form-grid">
-              <NumberField label="μ ref [Pa·s]" value={form.sutherlandMuRef ?? 0} onChange={(sutherlandMuRef) => setForm((f) => ({ ...f, sutherlandMuRef }))} />
-              <UnitNumberField label="T ref" dimension="temperature" valueSi={form.sutherlandTRef ?? 0} min={0} onChangeSi={(sutherlandTRef) => setForm((f) => ({ ...f, sutherlandTRef }))} />
-              <UnitNumberField label="Sutherland S" dimension="temperature" valueSi={form.sutherlandS ?? 0} min={0} onChangeSi={(sutherlandS) => setForm((f) => ({ ...f, sutherlandS }))} />
+              <NumberField label="μ ref [Pa·s]" value={form.sutherlandMuRef ?? 0} error={issueFor(validationIssues, "μ ref [Pa·s]")} onChange={(sutherlandMuRef) => setForm((f) => ({ ...f, sutherlandMuRef }))} />
+              <UnitNumberField label="T ref" dimension="temperature" valueSi={form.sutherlandTRef ?? 0} min={0} error={issueFor(validationIssues, "T ref")} onChangeSi={(sutherlandTRef) => setForm((f) => ({ ...f, sutherlandTRef }))} />
+              <UnitNumberField label="Sutherland S" dimension="temperature" valueSi={form.sutherlandS ?? 0} min={0} error={issueFor(validationIssues, "Sutherland S")} onChangeSi={(sutherlandS) => setForm((f) => ({ ...f, sutherlandS }))} />
             </div>
           )}
           {form.viscosityModel === "table" && (
@@ -609,8 +834,8 @@ function MediumsPanel() {
               <div style={miniLabel}>Viscosity table</div>
               {(form.viscosityTable ?? []).map((row, i) => (
                 <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 34px", gap: 8, alignItems: "end", marginBottom: 6 }}>
-                  <UnitNumberField label="T" dimension="temperature" valueSi={row.temperatureK} min={0} onChangeSi={(temperatureK) => setTableRow(i, { temperatureK })} />
-                  <NumberField label="μ [Pa·s]" value={row.dynamicViscosity} onChange={(dynamicViscosity) => setTableRow(i, { dynamicViscosity })} />
+                  <UnitNumberField label={`T ${i + 1}`} dimension="temperature" valueSi={row.temperatureK} min={0} error={issueFor(validationIssues, `T ${i + 1}`)} onChangeSi={(temperatureK) => setTableRow(i, { temperatureK })} />
+                  <NumberField label={`μ [Pa·s] ${i + 1}`} value={row.dynamicViscosity} error={issueFor(validationIssues, `μ [Pa·s] ${i + 1}`)} onChange={(dynamicViscosity) => setTableRow(i, { dynamicViscosity })} />
                   <button
                     type="button"
                     aria-label="Remove table point"
@@ -631,7 +856,8 @@ function MediumsPanel() {
             </div>
           )}
           <TextField label="Notes" value={form.notes ?? ""} onChange={(notes) => setForm((f) => ({ ...f, notes }))} />
-          <button type="button" disabled={busy || !form.name.trim()} onClick={save} style={{ ...primaryBtn(busy), width: "100%", marginTop: 12 }}>
+          <ValidationSummary issues={validationIssues} />
+          <button type="button" disabled={busy} onClick={save} style={{ ...primaryBtn(busy), width: "100%", marginTop: 12 }}>
             {busy ? "saving…" : selected ? "save medium" : "add medium"}
           </button>
         </div>
@@ -653,7 +879,7 @@ const EMPTY_SETUP: AdminSimulationSetup = {
   simulationPresets: [],
 };
 
-type SetupTab = "presets" | "flow" | "referenceGeometry" | "boundary" | "mesh" | "solver" | "scheduling" | "output" | "sweeps";
+type SetupTab = "presets" | "flow" | "referenceGeometry" | "boundary" | "mesh" | "solver" | "scheduling" | "output" | "sweeps" | "mediums";
 const SETUP_TABS: { k: SetupTab; label: string }[] = [
   { k: "presets", label: "Presets" },
   { k: "flow", label: "Flow state" },
@@ -664,9 +890,62 @@ const SETUP_TABS: { k: SetupTab; label: string }[] = [
   { k: "scheduling", label: "Scheduling" },
   { k: "output", label: "Output" },
   { k: "sweeps", label: "Sweeps" },
+  { k: "mediums", label: "Mediums" },
 ];
 
-const ALL_IMAGE_FIELDS = [
+function parseSetupTab(raw: string | null): SetupTab {
+  return SETUP_TABS.some((t) => t.k === raw) ? (raw as SetupTab) : "presets";
+}
+
+function parseCatalogTab(raw: string | null): CatalogTab {
+  return CATALOG_TABS.some((t) => t.k === raw) ? (raw as CatalogTab) : "add";
+}
+
+// Solver page tabs (approved redesign): Activity is the default (no ?tab
+// param), Background and Engine are replace-semantics tabs per §11.
+type SolverTab = "activity" | "background" | "engine";
+const SOLVER_TABS: { k: SolverTab; label: string }[] = [
+  { k: "activity", label: "Activity" },
+  { k: "background", label: "Background" },
+  { k: "engine", label: "Engine" },
+];
+
+function parseSolverTab(raw: string | null): SolverTab {
+  return SOLVER_TABS.some((t) => t.k === raw) ? (raw as SolverTab) : "activity";
+}
+
+function CatalogPanel({ tab, onTabChange }: { tab: CatalogTab; onTabChange: (t: CatalogTab) => void }) {
+  return (
+    <div>
+      <div className="admin-tab-row">
+        {CATALOG_TABS.map((item) => (
+          <button
+            key={item.k}
+            type="button"
+            data-testid={`catalog-tab-${item.k}`}
+            onClick={() => onTabChange(item.k)}
+            style={{
+              ...ghostBtn,
+              padding: "7px 10px",
+              color: tab === item.k ? C.teal : C.muted,
+              borderColor: tab === item.k ? C.tealBorder : C.stroke,
+              background: tab === item.k ? C.tealFill : C.panel3,
+            }}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      {tab === "add" && <AddAirfoilsPanel />}
+      {tab === "categories" && <CategoriesAdminPanel />}
+      {tab === "hashtags" && <HashtagsAdminPanel />}
+    </div>
+  );
+}
+
+// Exported for the campaign wizard's numerics quick-create (spec §11): the
+// same 8 engine image fields and labels the Setup output editor shows.
+export const ALL_IMAGE_FIELDS = [
   "velocity_magnitude",
   "velocity_x",
   "velocity_y",
@@ -676,7 +955,7 @@ const ALL_IMAGE_FIELDS = [
   "turbulent_kinetic_energy",
   "turbulent_viscosity",
 ];
-const IMAGE_FIELD_LABELS: Record<string, string> = {
+export const IMAGE_FIELD_LABELS: Record<string, string> = {
   velocity_magnitude: "Velocity |U|",
   velocity_x: "Velocity Ux",
   velocity_y: "Velocity Uy",
@@ -765,52 +1044,138 @@ function SetupRecordList<T extends { id: string; name: string }>({
   items,
   selectedId,
   onSelect,
+  onRemove,
   describe,
   emptyText,
+  busy = false,
 }: {
   items: T[];
   selectedId: string;
   onSelect: (item: T) => void;
+  onRemove?: (item: T) => void;
   describe: (item: T) => string;
   emptyText: string;
+  busy?: boolean;
 }) {
   if (!items.length) return <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim, padding: "10px 0" }}>{emptyText}</div>;
   return (
     <div style={{ display: "grid", gap: 6 }}>
-      {items.map((item) => (
-        <button
-          key={item.id}
-          type="button"
-          onClick={() => onSelect(item)}
-          style={{
-            width: "100%",
-            display: "grid",
-            gridTemplateColumns: "minmax(0, 1fr) auto",
-            gap: 10,
-            alignItems: "center",
-            textAlign: "left",
-            fontFamily: MONO,
-            fontSize: 11,
-            color: selectedId === item.id ? C.teal : C.muted,
-            background: selectedId === item.id ? C.rowActive : "transparent",
-            border: `1px solid ${selectedId === item.id ? C.tealBorder : C.stroke}`,
-            borderRadius: 8,
-            padding: "8px 10px",
-            cursor: "pointer",
-          }}
-        >
-          <span style={{ color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.name}</span>
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 240 }}>{describe(item)}</span>
-        </button>
-      ))}
+      {items.map((item) => {
+        const loaded = selectedId === item.id;
+        return (
+          <div
+            key={item.id}
+            style={{
+              display: "grid",
+              gridTemplateColumns: onRemove ? "minmax(0, 1fr) 32px" : "minmax(0, 1fr)",
+              gap: 6,
+              alignItems: "stretch",
+            }}
+          >
+            <button
+              type="button"
+              aria-pressed={loaded}
+              onClick={() => onSelect(item)}
+              style={{
+                width: "100%",
+                display: "grid",
+                gridTemplateColumns: "minmax(0, 1fr) auto auto",
+                gap: 10,
+                alignItems: "center",
+                textAlign: "left",
+                fontFamily: MONO,
+                fontSize: 11,
+                color: loaded ? C.teal : C.muted,
+                background: loaded ? C.rowActive : "transparent",
+                border: `1px solid ${loaded ? C.tealBorder : C.stroke}`,
+                borderRadius: 8,
+                padding: "8px 10px",
+                cursor: "pointer",
+              }}
+            >
+              <span style={{ color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.name}</span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 240 }}>{describe(item)}</span>
+              {loaded && (
+                <span
+                  style={{
+                    color: C.teal,
+                    border: `1px solid ${C.tealBorder}`,
+                    background: "rgba(45, 212, 191, 0.08)",
+                    borderRadius: 999,
+                    padding: "2px 6px",
+                    fontSize: 9,
+                  }}
+                >
+                  loaded
+                </span>
+              )}
+            </button>
+            {onRemove && (
+              <button
+                type="button"
+                aria-label={`Remove ${item.name}`}
+                title={`Remove ${item.name}`}
+                disabled={busy}
+                onClick={() => onRemove(item)}
+                style={{
+                  ...ghostBtn,
+                  display: "grid",
+                  placeItems: "center",
+                  minWidth: 0,
+                  padding: 0,
+                  color: C.redText,
+                  opacity: busy ? 0.55 : 1,
+                }}
+              >
+                <Trash2 size={14} aria-hidden="true" />
+              </button>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function SimulationSetupPanel() {
+function SetupRecordListPanel<T extends { id: string; name: string }>({
+  title,
+  items,
+  selectedId,
+  onSelect,
+  onNew,
+  onRemove,
+  describe,
+  emptyText,
+  busy = false,
+}: {
+  title: string;
+  items: T[];
+  selectedId: string;
+  onSelect: (item: T) => void;
+  onNew: () => void;
+  onRemove?: (item: T) => void;
+  describe: (item: T) => string;
+  emptyText: string;
+  busy?: boolean;
+}) {
+  return (
+    <div style={card}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
+        <div style={label}>{title}</div>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <button type="button" disabled={busy} onClick={onNew} style={{ ...ghostBtn, padding: "5px 9px", fontSize: 10, color: C.teal }}>
+            New
+          </button>
+        </div>
+      </div>
+      <SetupRecordList items={items} selectedId={selectedId} onSelect={onSelect} onRemove={onRemove} describe={describe} emptyText={emptyText} busy={busy} />
+    </div>
+  );
+}
+
+function SimulationSetupPanel({ tab, onTabChange }: { tab: SetupTab; onTabChange: (t: SetupTab) => void }) {
   const [setup, setSetup] = useState<AdminSimulationSetup>(EMPTY_SETUP);
   const [mediumsList, setMediumsList] = useState<MediumDTO[]>([]);
-  const [tab, setTab] = useState<SetupTab>("presets");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -835,6 +1200,7 @@ function SimulationSetupPanel() {
   const [presetForm, setPresetForm] = useState<SimulationPresetInput>(defaultPresetForm(EMPTY_SETUP));
   const [aoaListText, setAoaListText] = useState("");
   const [targetAirfoilQuery, setTargetAirfoilQuery] = useState("");
+  const [validationIssues, setValidationIssues] = useState<ValidationIssue[]>([]);
 
   const medium = mediumsList.find((m) => m.id === flowForm.mediumId) ?? mediumsList[0] ?? null;
   const selectedFlowForPreset = setup.flowConditions.find((row) => row.id === presetForm.flowConditionId);
@@ -847,17 +1213,6 @@ function SimulationSetupPanel() {
     : null;
   const flowPreview = medium ? previewFlow(medium, flowForm) : null;
   const selectedPreset = setup.simulationPresets.find((p) => p.id === presetId) ?? null;
-  const presetReady =
-    !!presetForm.name.trim() &&
-    !!presetForm.flowConditionId &&
-    !!presetForm.referenceGeometryProfileId &&
-    !!presetForm.boundaryProfileId &&
-    !!presetForm.meshProfileId &&
-    !!presetForm.solverProfileId &&
-    !!presetForm.schedulingProfileId &&
-    !!presetForm.outputProfileId &&
-    !!presetForm.sweepDefinitionId &&
-    (presetForm.targetScope === "all" || presetForm.targetAirfoilIds.length > 0);
 
   const refresh = async () => {
     const [ms, data] = await Promise.all([getAdminMediums(), getAdminSimulationSetup()]);
@@ -893,6 +1248,10 @@ function SimulationSetupPanel() {
     refresh().catch((e) => setErr((e as Error).message));
   }, []);
 
+  useEffect(() => {
+    setValidationIssues([]);
+  }, [tab]);
+
   const runSave = async (fn: () => Promise<void>) => {
     setBusy(true);
     setErr(null);
@@ -904,6 +1263,133 @@ function SimulationSetupPanel() {
       setBusy(false);
     }
   };
+
+  const submitSetupForm = (issues: ValidationIssue[], fn: () => void) => {
+    if (issues.length) {
+      setValidationIssues(issues);
+      focusValidationIssue(issues[0]);
+      return;
+    }
+    setValidationIssues([]);
+    fn();
+  };
+
+  const validateFlow = () => compactIssues([
+    requiredIssue(flowForm.name, "Name"),
+    requiredChoiceIssue(flowForm.mediumId, "Medium"),
+    positiveIssue(flowForm.temperatureK, "Temperature"),
+    positiveIssue(flowForm.pressurePa, "Pressure"),
+    positiveIssue(flowForm.speedMps, "Speed"),
+  ]);
+
+  const validateReferenceGeometry = () => compactIssues([
+    requiredIssue(referenceGeometryForm.name, "Name"),
+    requiredChoiceIssue(referenceGeometryForm.geometryType, "Geometry type"),
+    requiredChoiceIssue(referenceGeometryForm.referenceLengthKind, "Reference length kind"),
+    positiveIssue(referenceGeometryForm.referenceLengthM, "Reference length"),
+    referenceGeometryForm.spanM == null ? null : nonNegativeIssue(referenceGeometryForm.spanM, "Span"),
+    referenceGeometryForm.referenceAreaM2 == null ? null : nonNegativeIssue(referenceGeometryForm.referenceAreaM2, "Reference area m^2"),
+  ]);
+
+  const validateBoundary = () => compactIssues([
+    requiredIssue(boundaryForm.name, "Name"),
+    nonNegativeIssue(boundaryForm.turbulenceIntensity, "Turbulence intensity"),
+    positiveIssue(boundaryForm.viscosityRatio, "Turbulent viscosity ratio νt/ν"),
+    nonNegativeIssue(boundaryForm.sandGrainHeight, "Roughness Ks"),
+    positiveIssue(boundaryForm.roughnessConstant, "Roughness constant"),
+  ]);
+
+  const validateMesh = () => compactIssues([
+    requiredIssue(meshForm.name, "Name"),
+    requiredChoiceIssue(meshForm.mesher, "Mesher"),
+    positiveIssue(meshForm.farfieldRadiusChords, "Farfield"),
+    positiveIssue(meshForm.wakeLengthChords, "Wake length"),
+    positiveIntegerIssue(meshForm.nSurface, "Surface"),
+    positiveIntegerIssue(meshForm.nRadial, "Radial"),
+    positiveIntegerIssue(meshForm.nWake, "Wake cells"),
+    positiveIssue(meshForm.targetYPlus, "Target y+"),
+    positiveIssue(meshForm.spanChords, "Span"),
+  ]);
+
+  const validateSolver = () => compactIssues([
+    requiredIssue(solverForm.name, "Name"),
+    requiredChoiceIssue(solverForm.turbulenceModel, "Turbulence model"),
+    positiveIntegerIssue(solverForm.nIterations, "Iterations"),
+    positiveIssue(solverForm.convergenceTolerance, "Tolerance"),
+    requiredIssue(solverForm.momentumScheme, "Momentum scheme"),
+    positiveIntegerIssue(solverForm.transientCycles, "URANS cycles"),
+    solverForm.transientDiscardFraction >= 0 && solverForm.transientDiscardFraction < 1 ? null : { field: "URANS discard", message: "URANS discard must be from 0 to less than 1" },
+    positiveIssue(solverForm.transientMaxCourant, "URANS max Co"),
+  ]);
+
+  const validateScheduling = () => compactIssues([
+    requiredIssue(schedulingForm.name, "Name"),
+    requiredChoiceIssue(schedulingForm.schedulingPolicy, "CPU policy"),
+    optionalPositiveIntegerIssue(schedulingForm.cpuBudget, "CPU budget"),
+    optionalPositiveIntegerIssue(schedulingForm.caseConcurrency, "AoA concurrency"),
+    optionalPositiveIntegerIssue(schedulingForm.solverProcesses, "Solver processes"),
+  ]);
+
+  const validateOutput = () => compactIssues([
+    requiredIssue(outputForm.name, "Name"),
+    positiveIssue(outputForm.imageZoomChords, "Image zoom chords"),
+  ]);
+
+  const validateSweep = () => {
+    const listText = aoaListText.trim();
+    const badList = listText
+      ? listText.split(",").some((value) => !Number.isFinite(Number(value.trim())))
+      : false;
+    return compactIssues([
+      requiredIssue(sweepForm.name, "Name"),
+      sweepForm.aoaStep === 0 ? { field: "AoA step", message: "AoA step must not be 0" } : null,
+      badList ? { field: "Explicit AoA list optional", message: "Use comma-separated numeric AoA values" } : null,
+    ]);
+  };
+
+  const validatePreset = () => compactIssues([
+    requiredIssue(presetForm.name, "Preset name", "Preset name is required"),
+    requiredChoiceIssue(presetForm.flowConditionId, "Flow state"),
+    requiredChoiceIssue(presetForm.referenceGeometryProfileId, "Reference geometry"),
+    requiredChoiceIssue(presetForm.boundaryProfileId, "Boundary profile"),
+    requiredChoiceIssue(presetForm.meshProfileId, "Mesh profile"),
+    requiredChoiceIssue(presetForm.solverProfileId, "Solver profile"),
+    requiredChoiceIssue(presetForm.schedulingProfileId, "Scheduling profile"),
+    requiredChoiceIssue(presetForm.outputProfileId, "Output profile"),
+    requiredChoiceIssue(presetForm.sweepDefinitionId, "Sweep definition"),
+    presetForm.targetScope === "airfoils" && presetForm.targetAirfoilIds.length === 0
+      ? { field: "Run scope", message: "Select at least one airfoil for selected-profile scope" }
+      : null,
+  ]);
+
+  useEffect(() => {
+    if (!validationIssues.length) return;
+    const next = (() => {
+      if (tab === "presets") return validatePreset();
+      if (tab === "flow") return validateFlow();
+      if (tab === "referenceGeometry") return validateReferenceGeometry();
+      if (tab === "boundary") return validateBoundary();
+      if (tab === "mesh") return validateMesh();
+      if (tab === "solver") return validateSolver();
+      if (tab === "scheduling") return validateScheduling();
+      if (tab === "output") return validateOutput();
+      return validateSweep();
+    })();
+    setValidationIssues(next);
+  }, [
+    tab,
+    validationIssues.length,
+    flowForm,
+    referenceGeometryForm,
+    boundaryForm,
+    meshForm,
+    solverForm,
+    schedulingForm,
+    outputForm,
+    sweepForm,
+    presetForm,
+    aoaListText,
+  ]);
 
   const selectFlow = (row: AdminFlowCondition) => {
     setFlowId(row.id);
@@ -970,58 +1456,170 @@ function SimulationSetupPanel() {
   };
 
   const saveFlow = () => runSave(async () => {
-    const saved = flowId ? await updateFlowCondition(flowId, flowForm) : await createFlowCondition(flowForm);
+    const saved = await createFlowCondition(flowForm);
     setFlowId(saved.id);
     selectFlow(saved);
     await refresh();
   });
+  const updateSelectedFlow = () => flowId && runSave(async () => {
+    const saved = await updateFlowCondition(flowId, flowForm);
+    selectFlow(saved);
+    await refresh();
+  });
+  const removeFlow = (id: string) => runSave(async () => {
+    await deleteFlowCondition(id);
+    if (flowId === id) {
+      setFlowId("");
+      setFlowForm(defaultFlowForm(mediumsList[0]));
+    }
+    await refresh();
+  });
   const saveReferenceGeometry = () => runSave(async () => {
-    const saved = referenceGeometryId ? await updateReferenceGeometryProfile(referenceGeometryId, referenceGeometryForm) : await createReferenceGeometryProfile(referenceGeometryForm);
+    const saved = await createReferenceGeometryProfile(referenceGeometryForm);
     setReferenceGeometryId(saved.id);
     selectReferenceGeometry(saved);
     await refresh();
   });
+  const updateSelectedReferenceGeometry = () => referenceGeometryId && runSave(async () => {
+    const saved = await updateReferenceGeometryProfile(referenceGeometryId, referenceGeometryForm);
+    selectReferenceGeometry(saved);
+    await refresh();
+  });
+  const removeReferenceGeometry = (id: string) => runSave(async () => {
+    await deleteReferenceGeometryProfile(id);
+    if (referenceGeometryId === id) {
+      setReferenceGeometryId("");
+      setReferenceGeometryForm(defaultReferenceGeometryForm());
+    }
+    await refresh();
+  });
   const saveBoundary = () => runSave(async () => {
-    const saved = boundaryId ? await updateBoundaryProfile(boundaryId, boundaryForm) : await createBoundaryProfile(boundaryForm);
+    const saved = await createBoundaryProfile(boundaryForm);
     setBoundaryId(saved.id);
     selectBoundary(saved);
     await refresh();
   });
+  const updateSelectedBoundary = () => boundaryId && runSave(async () => {
+    const saved = await updateBoundaryProfile(boundaryId, boundaryForm);
+    selectBoundary(saved);
+    await refresh();
+  });
+  const removeBoundary = (id: string) => runSave(async () => {
+    await deleteBoundaryProfile(id);
+    if (boundaryId === id) {
+      setBoundaryId("");
+      setBoundaryForm(defaultBoundaryForm());
+    }
+    await refresh();
+  });
   const saveMesh = () => runSave(async () => {
-    const saved = meshId ? await updateMeshProfile(meshId, meshForm) : await createMeshProfile(meshForm);
+    const saved = await createMeshProfile(meshForm);
     setMeshId(saved.id);
     selectMesh(saved);
     await refresh();
   });
+  const updateSelectedMesh = () => meshId && runSave(async () => {
+    const saved = await updateMeshProfile(meshId, meshForm);
+    selectMesh(saved);
+    await refresh();
+  });
+  const removeMesh = (id: string) => runSave(async () => {
+    await deleteMeshProfile(id);
+    if (meshId === id) {
+      setMeshId("");
+      setMeshForm(defaultMeshForm());
+    }
+    await refresh();
+  });
   const saveSolver = () => runSave(async () => {
-    const saved = solverId ? await updateSolverProfile(solverId, solverForm) : await createSolverProfile(solverForm);
+    const saved = await createSolverProfile(solverForm);
     setSolverId(saved.id);
     selectSolver(saved);
     await refresh();
   });
+  const updateSelectedSolver = () => solverId && runSave(async () => {
+    const saved = await updateSolverProfile(solverId, solverForm);
+    selectSolver(saved);
+    await refresh();
+  });
+  const removeSolver = (id: string) => runSave(async () => {
+    await deleteSolverProfile(id);
+    if (solverId === id) {
+      setSolverId("");
+      setSolverForm(defaultSolverForm());
+    }
+    await refresh();
+  });
   const saveScheduling = () => runSave(async () => {
-    const saved = schedulingId ? await updateSchedulingProfile(schedulingId, schedulingForm) : await createSchedulingProfile(schedulingForm);
+    const saved = await createSchedulingProfile(schedulingForm);
     setSchedulingId(saved.id);
     selectScheduling(saved);
     await refresh();
   });
+  const updateSelectedScheduling = () => schedulingId && runSave(async () => {
+    const saved = await updateSchedulingProfile(schedulingId, schedulingForm);
+    selectScheduling(saved);
+    await refresh();
+  });
+  const removeScheduling = (id: string) => runSave(async () => {
+    await deleteSchedulingProfile(id);
+    if (schedulingId === id) {
+      setSchedulingId("");
+      setSchedulingForm(defaultSchedulingForm());
+    }
+    await refresh();
+  });
   const saveOutput = () => runSave(async () => {
     const body = { ...outputForm, writeImages: [...ALL_IMAGE_FIELDS] };
-    const saved = outputId ? await updateOutputProfile(outputId, body) : await createOutputProfile(body);
+    const saved = await createOutputProfile(body);
     setOutputId(saved.id);
     selectOutput(saved);
     await refresh();
   });
+  const updateSelectedOutput = () => outputId && runSave(async () => {
+    const body = { ...outputForm, writeImages: [...ALL_IMAGE_FIELDS] };
+    const saved = await updateOutputProfile(outputId, body);
+    selectOutput(saved);
+    await refresh();
+  });
+  const removeOutput = (id: string) => runSave(async () => {
+    await deleteOutputProfile(id);
+    if (outputId === id) {
+      setOutputId("");
+      setOutputForm(defaultOutputForm());
+    }
+    await refresh();
+  });
   const saveSweep = () => runSave(async () => {
     const body = { ...sweepForm, aoaList: parseNumberList(aoaListText) };
-    const saved = sweepId ? await updateSweepDefinition(sweepId, body) : await createSweepDefinition(body);
+    const saved = await createSweepDefinition(body);
     setSweepId(saved.id);
     selectSweep(saved);
     await refresh();
   });
+  const updateSelectedSweep = () => sweepId && runSave(async () => {
+    const body = { ...sweepForm, aoaList: parseNumberList(aoaListText) };
+    const saved = await updateSweepDefinition(sweepId, body);
+    selectSweep(saved);
+    await refresh();
+  });
+  const removeSweep = (id: string) => runSave(async () => {
+    await deleteSweepDefinition(id);
+    if (sweepId === id) {
+      setSweepId("");
+      setSweepForm(defaultSweepForm());
+      setAoaListText("");
+    }
+    await refresh();
+  });
   const savePreset = () => runSave(async () => {
-    const saved = presetId ? await updateSimulationPreset(presetId, presetForm) : await createSimulationPreset(presetForm);
+    const saved = await createSimulationPreset(presetForm);
     setPresetId(saved.id);
+    selectPreset(saved);
+    await refresh();
+  });
+  const updateSelectedPreset = () => presetId && runSave(async () => {
+    const saved = await updateSimulationPreset(presetId, presetForm);
     selectPreset(saved);
     await refresh();
   });
@@ -1030,7 +1628,8 @@ function SimulationSetupPanel() {
     <button
       key={item.k}
       type="button"
-      onClick={() => setTab(item.k)}
+      data-testid={`setup-tab-${item.k}`}
+      onClick={() => onTabChange(item.k)}
       style={{
         ...ghostBtn,
         padding: "7px 10px",
@@ -1045,44 +1644,62 @@ function SimulationSetupPanel() {
 
   return (
     <div>
-      <SectionHeader title="Simulation Setup" subtitle="Reusable setup records compose named presets. Revisions are immutable snapshots used by queue jobs and results." />
+      <SectionHeader title="Setup library" subtitle="Reusable setup records compose named presets. Revisions are immutable snapshots used by queue jobs and results." />
       {err && <ErrorLine text={err} />}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>{SETUP_TABS.map(tabButton)}</div>
+      <div className="admin-tab-row">{SETUP_TABS.map(tabButton)}</div>
       {tab === "presets" && (
         <div className="admin-editor-grid">
-          <div style={card}>
-            <div style={label}>SIMULATION PRESETS</div>
-            <SetupRecordList
-              items={setup.simulationPresets}
-              selectedId={presetId}
-              onSelect={selectPreset}
-              describe={(p) => {
-                const flow = setup.flowConditions.find((row) => row.id === p.flowConditionId);
-                const ref = setup.referenceGeometryProfiles.find((row) => row.id === p.referenceGeometryProfileId);
-                const re = flow && ref ? formatRe((flow.speedMps * ref.referenceLengthM) / flow.kinematicViscosity) : "Re";
-                const scope = p.targetScope === "airfoils" ? `${p.targetAirfoilIds.length} selected` : "all profiles";
-                return `${flow?.mediumName ?? "medium"} · ${ref?.referenceLengthKind ?? "reference"} · ${re} · ${scope} · rev ${p.currentRevisionNumber ?? "—"} · ${p.enabled ? "on" : "off"}`;
-              }}
-              emptyText="No presets yet. Create the component records, then compose a preset here."
-            />
-          </div>
+          <SetupRecordListPanel
+            title="SIMULATION PRESETS"
+            items={setup.simulationPresets}
+            selectedId={presetId}
+            onSelect={selectPreset}
+            onNew={() => { setPresetId(""); setPresetForm(defaultPresetForm(setup)); setTargetAirfoilQuery(""); }}
+            describe={(p) => {
+              const flow = setup.flowConditions.find((row) => row.id === p.flowConditionId);
+              const ref = setup.referenceGeometryProfiles.find((row) => row.id === p.referenceGeometryProfileId);
+              const re = flow && ref ? formatRe((flow.speedMps * ref.referenceLengthM) / flow.kinematicViscosity) : "Re";
+              const scope = p.targetScope === "airfoils" ? `${p.targetAirfoilIds.length} selected` : "all profiles";
+              return `${flow?.mediumName ?? "medium"} · ${ref?.referenceLengthKind ?? "reference"} · ${re} · ${scope} · rev ${p.currentRevisionNumber ?? "—"} · ${p.enabled ? "on" : "off"}`;
+            }}
+            emptyText="No presets yet. Create the component records, then compose a preset here."
+            busy={busy}
+          />
           <div style={card}>
             <EditorHeader text={selectedPreset ? "EDIT PRESET" : "ADD PRESET"} onNew={() => { setPresetId(""); setPresetForm(defaultPresetForm(setup)); setTargetAirfoilQuery(""); }} />
-            <TextField label="Preset name" value={presetForm.name} onChange={(name) => setPresetForm((f) => ({ ...f, name }))} />
+            <TextField label="Preset name" value={presetForm.name} error={issueFor(validationIssues, "Preset name")} onChange={(name) => setPresetForm((f) => ({ ...f, name }))} />
+            <div
+              role="status"
+              style={{
+                border: `1px solid ${C.stroke2}`,
+                borderRadius: 8,
+                padding: "8px 10px",
+                color: C.dim,
+                background: C.panel2,
+                fontFamily: MONO,
+                fontSize: 11,
+                lineHeight: 1.35,
+              }}
+            >
+              {selectedPreset
+                ? "Draft changes are not saved automatically. Use update selected preset to persist them."
+                : "Draft changes are not saved automatically. Use save new preset to create a preset."}
+            </div>
             {!selectedPreset && <TextField label="Slug optional" value={presetForm.slug ?? ""} onChange={(slug) => setPresetForm((f) => ({ ...f, slug }))} />}
-            <SelectField label="Flow state" value={presetForm.flowConditionId} options={optionValues(setup.flowConditions)} optionLabels={optionLabels(setup.flowConditions)} onChange={(flowConditionId) => setPresetForm((f) => ({ ...f, flowConditionId }))} />
-            <SelectField label="Reference geometry" value={presetForm.referenceGeometryProfileId} options={optionValues(setup.referenceGeometryProfiles)} optionLabels={optionLabels(setup.referenceGeometryProfiles)} onChange={(referenceGeometryProfileId) => setPresetForm((f) => ({ ...f, referenceGeometryProfileId }))} />
-            <SelectField label="Boundary profile" value={presetForm.boundaryProfileId} options={optionValues(setup.boundaryProfiles)} optionLabels={optionLabels(setup.boundaryProfiles)} onChange={(boundaryProfileId) => setPresetForm((f) => ({ ...f, boundaryProfileId }))} />
-            <SelectField label="Mesh profile" value={presetForm.meshProfileId} options={optionValues(setup.meshProfiles)} optionLabels={optionLabels(setup.meshProfiles)} onChange={(meshProfileId) => setPresetForm((f) => ({ ...f, meshProfileId }))} />
-            <SelectField label="Solver profile" value={presetForm.solverProfileId} options={optionValues(setup.solverProfiles)} optionLabels={optionLabels(setup.solverProfiles)} onChange={(solverProfileId) => setPresetForm((f) => ({ ...f, solverProfileId }))} />
-            <SelectField label="Scheduling profile" value={presetForm.schedulingProfileId} options={optionValues(setup.schedulingProfiles)} optionLabels={optionLabels(setup.schedulingProfiles)} onChange={(schedulingProfileId) => setPresetForm((f) => ({ ...f, schedulingProfileId }))} />
-            <SelectField label="Output profile" value={presetForm.outputProfileId} options={optionValues(setup.outputProfiles)} optionLabels={optionLabels(setup.outputProfiles)} onChange={(outputProfileId) => setPresetForm((f) => ({ ...f, outputProfileId }))} />
-            <SelectField label="Sweep definition" value={presetForm.sweepDefinitionId} options={optionValues(setup.sweepDefinitions)} optionLabels={optionLabels(setup.sweepDefinitions)} onChange={(sweepDefinitionId) => setPresetForm((f) => ({ ...f, sweepDefinitionId }))} />
+            <SelectField label="Flow state" value={presetForm.flowConditionId} options={optionValues(setup.flowConditions)} optionLabels={optionLabels(setup.flowConditions)} error={issueFor(validationIssues, "Flow state")} onChange={(flowConditionId) => setPresetForm((f) => ({ ...f, flowConditionId }))} />
+            <SelectField label="Reference geometry" value={presetForm.referenceGeometryProfileId} options={optionValues(setup.referenceGeometryProfiles)} optionLabels={optionLabels(setup.referenceGeometryProfiles)} error={issueFor(validationIssues, "Reference geometry")} onChange={(referenceGeometryProfileId) => setPresetForm((f) => ({ ...f, referenceGeometryProfileId }))} />
+            <SelectField label="Boundary profile" value={presetForm.boundaryProfileId} options={optionValues(setup.boundaryProfiles)} optionLabels={optionLabels(setup.boundaryProfiles)} error={issueFor(validationIssues, "Boundary profile")} onChange={(boundaryProfileId) => setPresetForm((f) => ({ ...f, boundaryProfileId }))} />
+            <SelectField label="Mesh profile" value={presetForm.meshProfileId} options={optionValues(setup.meshProfiles)} optionLabels={optionLabels(setup.meshProfiles)} error={issueFor(validationIssues, "Mesh profile")} onChange={(meshProfileId) => setPresetForm((f) => ({ ...f, meshProfileId }))} />
+            <SelectField label="Solver profile" value={presetForm.solverProfileId} options={optionValues(setup.solverProfiles)} optionLabels={optionLabels(setup.solverProfiles)} error={issueFor(validationIssues, "Solver profile")} onChange={(solverProfileId) => setPresetForm((f) => ({ ...f, solverProfileId }))} />
+            <SelectField label="Scheduling profile" value={presetForm.schedulingProfileId} options={optionValues(setup.schedulingProfiles)} optionLabels={optionLabels(setup.schedulingProfiles)} error={issueFor(validationIssues, "Scheduling profile")} onChange={(schedulingProfileId) => setPresetForm((f) => ({ ...f, schedulingProfileId }))} />
+            <SelectField label="Output profile" value={presetForm.outputProfileId} options={optionValues(setup.outputProfiles)} optionLabels={optionLabels(setup.outputProfiles)} error={issueFor(validationIssues, "Output profile")} onChange={(outputProfileId) => setPresetForm((f) => ({ ...f, outputProfileId }))} />
+            <SelectField label="Sweep definition" value={presetForm.sweepDefinitionId} options={optionValues(setup.sweepDefinitions)} optionLabels={optionLabels(setup.sweepDefinitions)} error={issueFor(validationIssues, "Sweep definition")} onChange={(sweepDefinitionId) => setPresetForm((f) => ({ ...f, sweepDefinitionId }))} />
             <SelectField
               label="Run scope"
               value={presetForm.targetScope}
               options={["all", "airfoils"]}
               optionLabels={{ all: "all profiles", airfoils: "selected profiles" }}
+              error={issueFor(validationIssues, "Run scope")}
               onChange={(targetScope) => setPresetForm((f) => ({ ...f, targetScope: targetScope as SimulationPresetInput["targetScope"] }))}
             />
             {presetForm.targetScope === "airfoils" && (
@@ -1099,157 +1716,224 @@ function SimulationSetupPanel() {
               <MetricChip label="Derived Re" value={presetPreview ? formatRe(presetPreview.reynolds) : "—"} />
               <MetricChip label="Derived Mach" value={presetPreview ? f(presetPreview.mach, 3) : "—"} />
             </div>
-            <button type="button" disabled={busy || !presetReady} onClick={savePreset} style={{ ...primaryBtn(busy || !presetReady), width: "100%", marginTop: 12 }}>
-              {busy ? "saving…" : selectedPreset ? "save simulation preset" : "add simulation preset"}
-            </button>
+            <ProfileSaveActions
+              busy={busy}
+              selected={!!selectedPreset}
+              noun="simulation preset"
+              createLabel="save new simulation preset"
+              cloneLabel="save as new simulation preset"
+              updateLabel="update selected preset"
+              issues={validationIssues}
+              onCreate={() => submitSetupForm(validatePreset(), savePreset)}
+              onUpdateSelected={() => submitSetupForm(validatePreset(), updateSelectedPreset)}
+            />
           </div>
         </div>
       )}
       {tab === "flow" && (
         <div className="admin-editor-grid">
-          <div style={card}>
-            <div style={label}>FLOW STATES</div>
-            <SetupRecordList items={setup.flowConditions} selectedId={flowId} onSelect={selectFlow} describe={(o) => `${o.mediumName} · ${fSpeed(o.speedMps)} · M ${f(o.mach, 3)}`} emptyText="No flow states yet." />
-          </div>
+          <SetupRecordListPanel
+            title="FLOW STATES"
+            items={setup.flowConditions}
+            selectedId={flowId}
+            onSelect={selectFlow}
+            onNew={() => { setFlowId(""); setFlowForm(defaultFlowForm(mediumsList[0])); }}
+            onRemove={(row) => removeFlow(row.id)}
+            describe={(o) => `${o.mediumName} · ${fSpeed(o.speedMps)} · M ${f(o.mach, 3)}`}
+            emptyText="No flow states yet."
+            busy={busy}
+          />
           <div style={card}>
             <EditorHeader text={flowId ? "EDIT FLOW STATE" : "ADD FLOW STATE"} onNew={() => { setFlowId(""); setFlowForm(defaultFlowForm(mediumsList[0])); }} />
-            <TextField label="Name" value={flowForm.name} onChange={(name) => setFlowForm((f) => ({ ...f, name }))} />
+            <TextField label="Name" value={flowForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setFlowForm((f) => ({ ...f, name }))} />
             {!flowId && <TextField label="Slug optional" value={flowForm.slug ?? ""} onChange={(slug) => setFlowForm((f) => ({ ...f, slug }))} />}
-            <SelectField label="Medium" value={flowForm.mediumId} options={mediumsList.map((m) => m.id)} optionLabels={Object.fromEntries(mediumsList.map((m) => [m.id, m.name]))} onChange={(mediumId) => {
+            <SelectField label="Medium" value={flowForm.mediumId} options={mediumsList.map((m) => m.id)} optionLabels={Object.fromEntries(mediumsList.map((m) => [m.id, m.name]))} error={issueFor(validationIssues, "Medium")} onChange={(mediumId) => {
               const m = mediumsList.find((item) => item.id === mediumId);
               setFlowForm((f) => ({ ...f, mediumId, temperatureK: m?.refTemperatureK ?? f.temperatureK, pressurePa: m?.refPressurePa ?? f.pressurePa }));
             }} />
             <div className="admin-form-grid">
-              <UnitNumberField label="Temperature" dimension="temperature" valueSi={flowForm.temperatureK} min={0} onChangeSi={(temperatureK) => setFlowForm((f) => ({ ...f, temperatureK }))} />
-              <UnitNumberField label="Pressure" dimension="pressure" valueSi={flowForm.pressurePa} min={0} onChangeSi={(pressurePa) => setFlowForm((f) => ({ ...f, pressurePa }))} />
-              <UnitNumberField label="Speed" dimension="speed" valueSi={flowForm.speedMps} min={0} onChangeSi={(speedMps) => setFlowForm((f) => ({ ...f, speedMps }))} />
+              <UnitNumberField label="Temperature" dimension="temperature" valueSi={flowForm.temperatureK} min={0} error={issueFor(validationIssues, "Temperature")} onChangeSi={(temperatureK) => setFlowForm((f) => ({ ...f, temperatureK }))} />
+              <UnitNumberField label="Pressure" dimension="pressure" valueSi={flowForm.pressurePa} min={0} error={issueFor(validationIssues, "Pressure")} onChangeSi={(pressurePa) => setFlowForm((f) => ({ ...f, pressurePa }))} />
+              <UnitNumberField label="Speed" dimension="speed" valueSi={flowForm.speedMps} min={0} error={issueFor(validationIssues, "Speed")} onChangeSi={(speedMps) => setFlowForm((f) => ({ ...f, speedMps }))} />
             </div>
             <div className="admin-metric-grid" style={{ marginTop: 10 }}>
               <MetricChip label="Derived Mach" value={flowPreview ? f(flowPreview.mach, 3) : "—"} />
               <MetricChip label="ρ" value={flowPreview ? f(flowPreview.density, 4) : "—"} />
               <MetricChip label="ν" value={flowPreview ? fSci(flowPreview.kinematicViscosity, 2) : "—"} />
             </div>
-            <button type="button" disabled={busy || !flowForm.name.trim() || !flowForm.mediumId} onClick={saveFlow} style={{ ...primaryBtn(busy || !flowForm.name.trim() || !flowForm.mediumId), width: "100%", marginTop: 12 }}>
-              {busy ? "saving…" : flowId ? "save flow state" : "add flow state"}
-            </button>
+            <ProfileSaveActions busy={busy} selected={!!flowId} noun="flow state" issues={validationIssues} onCreate={() => submitSetupForm(validateFlow(), saveFlow)} onUpdateSelected={() => submitSetupForm(validateFlow(), updateSelectedFlow)} />
           </div>
         </div>
       )}
       {tab === "referenceGeometry" && (
         <div className="admin-editor-grid">
-          <div style={card}>
-            <div style={label}>REFERENCE GEOMETRY</div>
-            <SetupRecordList items={setup.referenceGeometryProfiles} selectedId={referenceGeometryId} onSelect={selectReferenceGeometry} describe={(g) => `${g.geometryType} · ${g.referenceLengthKind} ${f(g.referenceLengthM, 3)} m`} emptyText="No reference geometry profiles yet." />
-          </div>
+          <SetupRecordListPanel
+            title="REFERENCE GEOMETRY"
+            items={setup.referenceGeometryProfiles}
+            selectedId={referenceGeometryId}
+            onSelect={selectReferenceGeometry}
+            onNew={() => { setReferenceGeometryId(""); setReferenceGeometryForm(defaultReferenceGeometryForm()); }}
+            onRemove={(row) => removeReferenceGeometry(row.id)}
+            describe={(g) => `${g.geometryType} · ${g.referenceLengthKind} ${f(g.referenceLengthM, 3)} m`}
+            emptyText="No reference geometry profiles yet."
+            busy={busy}
+          />
           <div style={card}>
             <EditorHeader text={referenceGeometryId ? "EDIT REFERENCE GEOMETRY" : "ADD REFERENCE GEOMETRY"} onNew={() => { setReferenceGeometryId(""); setReferenceGeometryForm(defaultReferenceGeometryForm()); }} />
-            <TextField label="Name" value={referenceGeometryForm.name} onChange={(name) => setReferenceGeometryForm((g) => ({ ...g, name }))} />
+            <TextField label="Name" value={referenceGeometryForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setReferenceGeometryForm((g) => ({ ...g, name }))} />
             {!referenceGeometryId && <TextField label="Slug optional" value={referenceGeometryForm.slug ?? ""} onChange={(slug) => setReferenceGeometryForm((g) => ({ ...g, slug }))} />}
             {shouldShowSetupOption(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType) && (
               <SelectField
                 label="Geometry type"
                 value={referenceGeometryForm.geometryType}
-                options={setupOptionValues(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType)}
-                optionLabels={setupOptionLabels(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType)}
-                onChange={(geometryType) => setReferenceGeometryForm((g) => ({ ...g, geometryType }))}
-              />
+                  options={setupOptionValues(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType)}
+                  optionLabels={setupOptionLabels(REFERENCE_GEOMETRY_TYPE_OPTIONS, referenceGeometryForm.geometryType)}
+                  error={issueFor(validationIssues, "Geometry type")}
+                  onChange={(geometryType) => setReferenceGeometryForm((g) => ({ ...g, geometryType }))}
+                />
             )}
             {shouldShowSetupOption(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind) && (
               <SelectField
                 label="Reference length kind"
                 value={referenceGeometryForm.referenceLengthKind}
-                options={setupOptionValues(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind)}
-                optionLabels={setupOptionLabels(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind)}
-                onChange={(referenceLengthKind) => setReferenceGeometryForm((g) => ({ ...g, referenceLengthKind }))}
-              />
+                  options={setupOptionValues(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind)}
+                  optionLabels={setupOptionLabels(REFERENCE_LENGTH_KIND_OPTIONS, referenceGeometryForm.referenceLengthKind)}
+                  error={issueFor(validationIssues, "Reference length kind")}
+                  onChange={(referenceLengthKind) => setReferenceGeometryForm((g) => ({ ...g, referenceLengthKind }))}
+                />
             )}
             <div className="admin-form-grid">
-              <UnitNumberField label="Reference length" dimension="length" valueSi={referenceGeometryForm.referenceLengthM} min={0} onChangeSi={(referenceLengthM) => setReferenceGeometryForm((g) => ({ ...g, referenceLengthM }))} />
-              <UnitNumberField label="Span" dimension="length" valueSi={referenceGeometryForm.spanM ?? 0} min={0} onChangeSi={(spanM) => setReferenceGeometryForm((g) => ({ ...g, spanM: spanM > 0 ? spanM : null }))} />
-              <NumberField label="Reference area m^2" value={referenceGeometryForm.referenceAreaM2 ?? 0} onChange={(referenceAreaM2) => setReferenceGeometryForm((g) => ({ ...g, referenceAreaM2: referenceAreaM2 > 0 ? referenceAreaM2 : null }))} />
+              <UnitNumberField label="Reference length" dimension="length" valueSi={referenceGeometryForm.referenceLengthM} min={0} error={issueFor(validationIssues, "Reference length")} onChangeSi={(referenceLengthM) => setReferenceGeometryForm((g) => ({ ...g, referenceLengthM }))} />
+              <UnitNumberField label="Span" dimension="length" valueSi={referenceGeometryForm.spanM ?? 0} min={0} error={issueFor(validationIssues, "Span")} onChangeSi={(spanM) => setReferenceGeometryForm((g) => ({ ...g, spanM: spanM > 0 ? spanM : null }))} />
+              <NumberField label="Reference area m^2" value={referenceGeometryForm.referenceAreaM2 ?? 0} error={issueFor(validationIssues, "Reference area m^2")} onChange={(referenceAreaM2) => setReferenceGeometryForm((g) => ({ ...g, referenceAreaM2: referenceAreaM2 > 0 ? referenceAreaM2 : null }))} />
             </div>
-            <button type="button" disabled={busy || !referenceGeometryForm.name.trim()} onClick={saveReferenceGeometry} style={{ ...primaryBtn(busy || !referenceGeometryForm.name.trim()), width: "100%", marginTop: 12 }}>
-              {busy ? "saving…" : referenceGeometryId ? "save reference geometry" : "add reference geometry"}
-            </button>
+            <ProfileSaveActions busy={busy} selected={!!referenceGeometryId} noun="reference geometry" issues={validationIssues} onCreate={() => submitSetupForm(validateReferenceGeometry(), saveReferenceGeometry)} onUpdateSelected={() => submitSetupForm(validateReferenceGeometry(), updateSelectedReferenceGeometry)} />
           </div>
         </div>
       )}
       {tab === "boundary" && (
-        <ProfileEditorShell title="BOUNDARY PROFILES" items={setup.boundaryProfiles} selectedId={boundaryId} onSelect={selectBoundary} describe={(b) => `Tu ${f(b.turbulenceIntensity, 4)} · νt/ν ${f(b.viscosityRatio, 1)}`} emptyText="No boundary profiles yet.">
+        <ProfileEditorShell
+          title="BOUNDARY PROFILES"
+          items={setup.boundaryProfiles}
+          selectedId={boundaryId}
+          onSelect={selectBoundary}
+          onNew={() => { setBoundaryId(""); setBoundaryForm(defaultBoundaryForm()); }}
+          onRemove={(row) => removeBoundary(row.id)}
+          describe={(b) => `Tu ${f(b.turbulenceIntensity, 4)} · νt/ν ${f(b.viscosityRatio, 1)}`}
+          emptyText="No boundary profiles yet."
+          busy={busy}
+        >
           <EditorHeader text={boundaryId ? "EDIT BOUNDARY PROFILE" : "ADD BOUNDARY PROFILE"} onNew={() => { setBoundaryId(""); setBoundaryForm(defaultBoundaryForm()); }} />
-          <TextField label="Name" value={boundaryForm.name} onChange={(name) => setBoundaryForm((f) => ({ ...f, name }))} />
+          <TextField label="Name" value={boundaryForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setBoundaryForm((f) => ({ ...f, name }))} />
           {!boundaryId && <TextField label="Slug optional" value={boundaryForm.slug ?? ""} onChange={(slug) => setBoundaryForm((f) => ({ ...f, slug }))} />}
           <div className="admin-form-grid">
-            <NumberField label="Turbulence intensity" value={boundaryForm.turbulenceIntensity} onChange={(turbulenceIntensity) => setBoundaryForm((f) => ({ ...f, turbulenceIntensity }))} />
-            <TurbulentViscosityRatioField value={boundaryForm.viscosityRatio} onChange={(viscosityRatio) => setBoundaryForm((f) => ({ ...f, viscosityRatio }))} />
-            <NumberField label="Roughness Ks" value={boundaryForm.sandGrainHeight} onChange={(sandGrainHeight) => setBoundaryForm((f) => ({ ...f, sandGrainHeight }))} />
-            <NumberField label="Roughness constant" value={boundaryForm.roughnessConstant} onChange={(roughnessConstant) => setBoundaryForm((f) => ({ ...f, roughnessConstant }))} />
+            <NumberField label="Turbulence intensity" value={boundaryForm.turbulenceIntensity} error={issueFor(validationIssues, "Turbulence intensity")} onChange={(turbulenceIntensity) => setBoundaryForm((f) => ({ ...f, turbulenceIntensity }))} />
+            <TurbulentViscosityRatioField value={boundaryForm.viscosityRatio} error={issueFor(validationIssues, "Turbulent viscosity ratio νt/ν")} onChange={(viscosityRatio) => setBoundaryForm((f) => ({ ...f, viscosityRatio }))} />
+            <NumberField label="Roughness Ks" value={boundaryForm.sandGrainHeight} error={issueFor(validationIssues, "Roughness Ks")} onChange={(sandGrainHeight) => setBoundaryForm((f) => ({ ...f, sandGrainHeight }))} />
+            <NumberField label="Roughness constant" value={boundaryForm.roughnessConstant} error={issueFor(validationIssues, "Roughness constant")} onChange={(roughnessConstant) => setBoundaryForm((f) => ({ ...f, roughnessConstant }))} />
           </div>
-          <button type="button" disabled={busy || !boundaryForm.name.trim()} onClick={saveBoundary} style={{ ...primaryBtn(busy || !boundaryForm.name.trim()), width: "100%", marginTop: 12 }}>{busy ? "saving…" : boundaryId ? "save boundary profile" : "add boundary profile"}</button>
+          <ProfileSaveActions busy={busy} selected={!!boundaryId} noun="boundary profile" issues={validationIssues} onCreate={() => submitSetupForm(validateBoundary(), saveBoundary)} onUpdateSelected={() => submitSetupForm(validateBoundary(), updateSelectedBoundary)} />
         </ProfileEditorShell>
       )}
       {tab === "mesh" && (
-        <ProfileEditorShell title="MESH PROFILES" items={setup.meshProfiles} selectedId={meshId} onSelect={selectMesh} describe={(m) => `${m.mesher} · ${m.nSurface}/${m.nRadial}/${m.nWake}`} emptyText="No mesh profiles yet.">
-          <EditorHeader text={meshId ? "EDIT MESH PROFILE" : "ADD MESH PROFILE"} onNew={() => { setMeshId(""); setMeshForm(defaultMeshForm()); }} />
-          <TextField label="Name" value={meshForm.name} onChange={(name) => setMeshForm((f) => ({ ...f, name }))} />
-          {!meshId && <TextField label="Slug optional" value={meshForm.slug ?? ""} onChange={(slug) => setMeshForm((f) => ({ ...f, slug }))} />}
-          {shouldShowSetupOption(MESH_MESHER_OPTIONS, meshForm.mesher) && (
-            <SelectField
-              label="Mesher"
-              value={meshForm.mesher}
-              options={setupOptionValues(MESH_MESHER_OPTIONS, meshForm.mesher)}
-              optionLabels={setupOptionLabels(MESH_MESHER_OPTIONS, meshForm.mesher)}
-              onChange={(mesher) => setMeshForm((f) => ({ ...f, mesher }))}
-            />
-          )}
-          <MeshSettingsGuide form={meshForm} />
-          <div className="admin-form-grid">
-            <NumberField label="Farfield chords" value={meshForm.farfieldRadiusChords} onChange={(farfieldRadiusChords) => setMeshForm((f) => ({ ...f, farfieldRadiusChords }))} />
-            <NumberField label="Wake chords" value={meshForm.wakeLengthChords} onChange={(wakeLengthChords) => setMeshForm((f) => ({ ...f, wakeLengthChords }))} />
-            <NumberField label="Surface cells" value={meshForm.nSurface} onChange={(nSurface) => setMeshForm((f) => ({ ...f, nSurface }))} />
-            <NumberField label="Radial cells" value={meshForm.nRadial} onChange={(nRadial) => setMeshForm((f) => ({ ...f, nRadial }))} />
-            <NumberField label="Wake cells" value={meshForm.nWake} onChange={(nWake) => setMeshForm((f) => ({ ...f, nWake }))} />
-            <NumberField label="Target y+" value={meshForm.targetYPlus} onChange={(targetYPlus) => setMeshForm((f) => ({ ...f, targetYPlus }))} />
-            <NumberField label="Span chords" value={meshForm.spanChords} onChange={(spanChords) => setMeshForm((f) => ({ ...f, spanChords }))} />
-          </div>
-          <button type="button" disabled={busy || !meshForm.name.trim()} onClick={saveMesh} style={{ ...primaryBtn(busy || !meshForm.name.trim()), width: "100%", marginTop: 12 }}>{busy ? "saving…" : meshId ? "save mesh profile" : "add mesh profile"}</button>
-        </ProfileEditorShell>
+	        <div style={{ display: "grid", gap: 16 }}>
+	          <MeshSettingsGuide form={meshForm} onChange={(patch) => setMeshForm((f) => ({ ...f, ...patch }))} />
+	          <div className="admin-editor-grid">
+	            <SetupRecordListPanel
+	              title="MESH PROFILES"
+	              items={setup.meshProfiles}
+	              selectedId={meshId}
+	              onSelect={selectMesh}
+	              onNew={() => { setMeshId(""); setMeshForm(defaultMeshForm()); }}
+	              onRemove={(row) => removeMesh(row.id)}
+	              describe={(m) => `${m.mesher} · ${m.nSurface}/${m.nRadial}/${m.nWake}`}
+	              emptyText="No mesh profiles yet."
+	              busy={busy}
+	            />
+	            <div style={card}>
+	              <EditorHeader text={meshId ? "EDIT MESH PROFILE" : "ADD MESH PROFILE"} onNew={() => { setMeshId(""); setMeshForm(defaultMeshForm()); }} />
+              <TextField label="Name" value={meshForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setMeshForm((f) => ({ ...f, name }))} />
+              {!meshId && <TextField label="Slug optional" value={meshForm.slug ?? ""} onChange={(slug) => setMeshForm((f) => ({ ...f, slug }))} />}
+              {shouldShowSetupOption(MESH_MESHER_OPTIONS, meshForm.mesher) && (
+                <SelectField
+                  label="Mesher"
+                  value={meshForm.mesher}
+                  options={setupOptionValues(MESH_MESHER_OPTIONS, meshForm.mesher)}
+                  optionLabels={setupOptionLabels(MESH_MESHER_OPTIONS, meshForm.mesher)}
+                  error={issueFor(validationIssues, "Mesher")}
+	                  onChange={(mesher) => setMeshForm((f) => ({ ...f, mesher }))}
+	                />
+	              )}
+	              <ProfileSaveActions busy={busy} selected={!!meshId} noun="mesh profile" issues={validationIssues} onCreate={() => submitSetupForm(validateMesh(), saveMesh)} onUpdateSelected={() => submitSetupForm(validateMesh(), updateSelectedMesh)} />
+	            </div>
+	          </div>
+	        </div>
       )}
       {tab === "solver" && (
-        <ProfileEditorShell title="SOLVER PROFILES" items={setup.solverProfiles} selectedId={solverId} onSelect={selectSolver} describe={(s) => `${s.turbulenceModel} · ${s.nIterations} iters · ${s.transientCycles} cycles`} emptyText="No solver profiles yet.">
+        <ProfileEditorShell
+          title="SOLVER PROFILES"
+          items={setup.solverProfiles}
+          selectedId={solverId}
+          onSelect={selectSolver}
+          onNew={() => { setSolverId(""); setSolverForm(defaultSolverForm()); }}
+          onRemove={(row) => removeSolver(row.id)}
+          describe={(s) => `${s.turbulenceModel} · ${s.nIterations} iters · ${s.transientCycles} cycles`}
+          emptyText="No solver profiles yet."
+          busy={busy}
+        >
           <EditorHeader text={solverId ? "EDIT SOLVER PROFILE" : "ADD SOLVER PROFILE"} onNew={() => { setSolverId(""); setSolverForm(defaultSolverForm()); }} />
-          <TextField label="Name" value={solverForm.name} onChange={(name) => setSolverForm((f) => ({ ...f, name }))} />
+          <TextField label="Name" value={solverForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setSolverForm((f) => ({ ...f, name }))} />
           {!solverId && <TextField label="Slug optional" value={solverForm.slug ?? ""} onChange={(slug) => setSolverForm((f) => ({ ...f, slug }))} />}
           <div className="admin-form-grid">
-            <SelectField label="Turbulence model" value={solverForm.turbulenceModel} options={["kOmegaSST", "kOmegaSSTLM", "kOmega", "kEpsilon", "SpalartAllmaras"]} onChange={(turbulenceModel) => setSolverForm((f) => ({ ...f, turbulenceModel }))} />
-            <NumberField label="Iterations" value={solverForm.nIterations} onChange={(nIterations) => setSolverForm((f) => ({ ...f, nIterations }))} />
-            <NumberField label="Tolerance" value={solverForm.convergenceTolerance} onChange={(convergenceTolerance) => setSolverForm((f) => ({ ...f, convergenceTolerance }))} />
-            <TextField label="Momentum scheme" value={solverForm.momentumScheme} onChange={(momentumScheme) => setSolverForm((f) => ({ ...f, momentumScheme }))} />
-            <NumberField label="URANS cycles" value={solverForm.transientCycles} onChange={(transientCycles) => setSolverForm((f) => ({ ...f, transientCycles }))} />
-            <NumberField label="URANS discard" value={solverForm.transientDiscardFraction} onChange={(transientDiscardFraction) => setSolverForm((f) => ({ ...f, transientDiscardFraction }))} />
-            <NumberField label="URANS max Co" value={solverForm.transientMaxCourant} onChange={(transientMaxCourant) => setSolverForm((f) => ({ ...f, transientMaxCourant }))} />
+            <SelectField label="Turbulence model" value={solverForm.turbulenceModel} options={["kOmegaSST", "kOmegaSSTLM", "kOmega", "kEpsilon", "SpalartAllmaras"]} error={issueFor(validationIssues, "Turbulence model")} onChange={(turbulenceModel) => setSolverForm((f) => ({ ...f, turbulenceModel }))} />
+            <NumberField label="Iterations" value={solverForm.nIterations} error={issueFor(validationIssues, "Iterations")} onChange={(nIterations) => setSolverForm((f) => ({ ...f, nIterations }))} />
+            <NumberField label="Tolerance" value={solverForm.convergenceTolerance} error={issueFor(validationIssues, "Tolerance")} onChange={(convergenceTolerance) => setSolverForm((f) => ({ ...f, convergenceTolerance }))} />
+            <SelectField label="Momentum scheme" value={solverForm.momentumScheme} {...momentumSchemeSelect(solverForm.momentumScheme)} error={issueFor(validationIssues, "Momentum scheme")} onChange={(momentumScheme) => setSolverForm((f) => ({ ...f, momentumScheme }))} />
+            <NumberField label="URANS cycles" value={solverForm.transientCycles} error={issueFor(validationIssues, "URANS cycles")} onChange={(transientCycles) => setSolverForm((f) => ({ ...f, transientCycles }))} />
+            <NumberField label="URANS discard" value={solverForm.transientDiscardFraction} error={issueFor(validationIssues, "URANS discard")} onChange={(transientDiscardFraction) => setSolverForm((f) => ({ ...f, transientDiscardFraction }))} />
+            <NumberField label="URANS max Co" value={solverForm.transientMaxCourant} error={issueFor(validationIssues, "URANS max Co")} onChange={(transientMaxCourant) => setSolverForm((f) => ({ ...f, transientMaxCourant }))} />
           </div>
-          <button type="button" disabled={busy || !solverForm.name.trim()} onClick={saveSolver} style={{ ...primaryBtn(busy || !solverForm.name.trim()), width: "100%", marginTop: 12 }}>{busy ? "saving…" : solverId ? "save solver profile" : "add solver profile"}</button>
+          <ProfileSaveActions busy={busy} selected={!!solverId} noun="solver profile" issues={validationIssues} onCreate={() => submitSetupForm(validateSolver(), saveSolver)} onUpdateSelected={() => submitSetupForm(validateSolver(), updateSelectedSolver)} />
         </ProfileEditorShell>
       )}
       {tab === "scheduling" && (
-        <ProfileEditorShell title="SCHEDULING PROFILES" items={setup.schedulingProfiles} selectedId={schedulingId} onSelect={selectScheduling} describe={(s) => schedulingSummary({ schedulingPolicy: s.schedulingPolicy, cpuBudget: s.cpuBudget, caseConcurrency: s.caseConcurrency, solverProcesses: s.solverProcesses })} emptyText="No scheduling profiles yet.">
+        <ProfileEditorShell
+          title="SCHEDULING PROFILES"
+          items={setup.schedulingProfiles}
+          selectedId={schedulingId}
+          onSelect={selectScheduling}
+          onNew={() => { setSchedulingId(""); setSchedulingForm(defaultSchedulingForm()); }}
+          onRemove={(row) => removeScheduling(row.id)}
+          describe={(s) => schedulingSummary({ schedulingPolicy: s.schedulingPolicy, cpuBudget: s.cpuBudget, caseConcurrency: s.caseConcurrency, solverProcesses: s.solverProcesses })}
+          emptyText="No scheduling profiles yet."
+          busy={busy}
+        >
           <EditorHeader text={schedulingId ? "EDIT SCHEDULING PROFILE" : "ADD SCHEDULING PROFILE"} onNew={() => { setSchedulingId(""); setSchedulingForm(defaultSchedulingForm()); }} />
-          <TextField label="Name" value={schedulingForm.name} onChange={(name) => setSchedulingForm((f) => ({ ...f, name }))} />
+          <TextField label="Name" value={schedulingForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setSchedulingForm((f) => ({ ...f, name }))} />
           {!schedulingId && <TextField label="Slug optional" value={schedulingForm.slug ?? ""} onChange={(slug) => setSchedulingForm((f) => ({ ...f, slug }))} />}
           <div className="admin-form-grid">
-            <SelectField label="CPU policy" value={schedulingForm.schedulingPolicy} options={["auto", "airfoil_parallel", "case_parallel", "exclusive"]} optionLabels={{ auto: "auto", airfoil_parallel: "airfoil parallel", case_parallel: "case parallel", exclusive: "exclusive" }} onChange={(schedulingPolicy) => setSchedulingForm((f) => ({ ...f, schedulingPolicy: schedulingPolicy as SchedulingProfileInput["schedulingPolicy"] }))} />
-            <OptionalNumberField label="CPU budget" value={schedulingForm.cpuBudget} onChange={(cpuBudget) => setSchedulingForm((f) => ({ ...f, cpuBudget }))} />
-            <OptionalNumberField label="AoA concurrency" value={schedulingForm.caseConcurrency} onChange={(caseConcurrency) => setSchedulingForm((f) => ({ ...f, caseConcurrency }))} />
-            <OptionalNumberField label="Solver processes" value={schedulingForm.solverProcesses} onChange={(solverProcesses) => setSchedulingForm((f) => ({ ...f, solverProcesses }))} />
+            <SelectField label="CPU policy" value={schedulingForm.schedulingPolicy} options={["auto", "airfoil_parallel", "case_parallel", "exclusive"]} optionLabels={{ auto: "auto", airfoil_parallel: "airfoil parallel", case_parallel: "case parallel", exclusive: "exclusive" }} error={issueFor(validationIssues, "CPU policy")} onChange={(schedulingPolicy) => setSchedulingForm((f) => ({ ...f, schedulingPolicy: schedulingPolicy as SchedulingProfileInput["schedulingPolicy"] }))} />
+            <OptionalNumberField label="CPU budget" value={schedulingForm.cpuBudget} error={issueFor(validationIssues, "CPU budget")} onChange={(cpuBudget) => setSchedulingForm((f) => ({ ...f, cpuBudget }))} />
+            <OptionalNumberField label="AoA concurrency" value={schedulingForm.caseConcurrency} error={issueFor(validationIssues, "AoA concurrency")} onChange={(caseConcurrency) => setSchedulingForm((f) => ({ ...f, caseConcurrency }))} />
+            <OptionalNumberField label="Solver processes" value={schedulingForm.solverProcesses} error={issueFor(validationIssues, "Solver processes")} onChange={(solverProcesses) => setSchedulingForm((f) => ({ ...f, solverProcesses }))} />
           </div>
-          <button type="button" disabled={busy || !schedulingForm.name.trim()} onClick={saveScheduling} style={{ ...primaryBtn(busy || !schedulingForm.name.trim()), width: "100%", marginTop: 12 }}>{busy ? "saving…" : schedulingId ? "save scheduling profile" : "add scheduling profile"}</button>
+          <ProfileSaveActions busy={busy} selected={!!schedulingId} noun="scheduling profile" issues={validationIssues} onCreate={() => submitSetupForm(validateScheduling(), saveScheduling)} onUpdateSelected={() => submitSetupForm(validateScheduling(), updateSelectedScheduling)} />
         </ProfileEditorShell>
       )}
       {tab === "output" && (
-        <ProfileEditorShell title="OUTPUT PROFILES" items={setup.outputProfiles} selectedId={outputId} onSelect={selectOutput} describe={(o) => `${ALL_IMAGE_FIELDS.length} default fields · zoom ${f(o.imageZoomChords, 1)}c`} emptyText="No output profiles yet.">
+        <ProfileEditorShell
+          title="OUTPUT PROFILES"
+          items={setup.outputProfiles}
+          selectedId={outputId}
+          onSelect={selectOutput}
+          onNew={() => { setOutputId(""); setOutputForm(defaultOutputForm()); }}
+          onRemove={(row) => removeOutput(row.id)}
+          describe={(o) => `${ALL_IMAGE_FIELDS.length} default fields · zoom ${f(o.imageZoomChords, 1)}c`}
+          emptyText="No output profiles yet."
+          busy={busy}
+        >
           <EditorHeader text={outputId ? "EDIT OUTPUT PROFILE" : "ADD OUTPUT PROFILE"} onNew={() => { setOutputId(""); setOutputForm(defaultOutputForm()); }} />
-          <TextField label="Name" value={outputForm.name} onChange={(name) => setOutputForm((f) => ({ ...f, name }))} />
+          <TextField label="Name" value={outputForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setOutputForm((f) => ({ ...f, name }))} />
           {!outputId && <TextField label="Slug optional" value={outputForm.slug ?? ""} onChange={(slug) => setOutputForm((f) => ({ ...f, slug }))} />}
           <div className="admin-field-panel">
             <div className="label">Default stored fields</div>
@@ -1259,24 +1943,35 @@ function SimulationSetupPanel() {
               ))}
             </div>
           </div>
-          <NumberField label="Image zoom chords" value={outputForm.imageZoomChords} onChange={(imageZoomChords) => setOutputForm((f) => ({ ...f, imageZoomChords }))} />
-          <button type="button" disabled={busy || !outputForm.name.trim()} onClick={saveOutput} style={{ ...primaryBtn(busy || !outputForm.name.trim()), width: "100%", marginTop: 12 }}>{busy ? "saving…" : outputId ? "save output profile" : "add output profile"}</button>
+          <NumberField label="Image zoom chords" value={outputForm.imageZoomChords} error={issueFor(validationIssues, "Image zoom chords")} onChange={(imageZoomChords) => setOutputForm((f) => ({ ...f, imageZoomChords }))} />
+          <ProfileSaveActions busy={busy} selected={!!outputId} noun="output profile" issues={validationIssues} onCreate={() => submitSetupForm(validateOutput(), saveOutput)} onUpdateSelected={() => submitSetupForm(validateOutput(), updateSelectedOutput)} />
         </ProfileEditorShell>
       )}
       {tab === "sweeps" && (
-        <ProfileEditorShell title="SWEEP DEFINITIONS" items={setup.sweepDefinitions} selectedId={sweepId} onSelect={selectSweep} describe={(s) => s.aoaList?.length ? `${s.aoaList.length} listed AoAs` : `${aoaSpan(s.aoaStart, s.aoaStop)} step ${s.aoaStep}`} emptyText="No sweep definitions yet.">
+        <ProfileEditorShell
+          title="SWEEP DEFINITIONS"
+          items={setup.sweepDefinitions}
+          selectedId={sweepId}
+          onSelect={selectSweep}
+          onNew={() => { setSweepId(""); setSweepForm(defaultSweepForm()); setAoaListText(""); }}
+          onRemove={(row) => removeSweep(row.id)}
+          describe={(s) => s.aoaList?.length ? `${s.aoaList.length} listed AoAs` : `${aoaSpan(s.aoaStart, s.aoaStop)} step ${s.aoaStep}`}
+          emptyText="No sweep definitions yet."
+          busy={busy}
+        >
           <EditorHeader text={sweepId ? "EDIT SWEEP DEFINITION" : "ADD SWEEP DEFINITION"} onNew={() => { setSweepId(""); setSweepForm(defaultSweepForm()); setAoaListText(""); }} />
-          <TextField label="Name" value={sweepForm.name} onChange={(name) => setSweepForm((f) => ({ ...f, name }))} />
+          <TextField label="Name" value={sweepForm.name} error={issueFor(validationIssues, "Name")} onChange={(name) => setSweepForm((f) => ({ ...f, name }))} />
           {!sweepId && <TextField label="Slug optional" value={sweepForm.slug ?? ""} onChange={(slug) => setSweepForm((f) => ({ ...f, slug }))} />}
           <div className="admin-form-grid">
-            <NumberField label="AoA start" value={sweepForm.aoaStart} onChange={(aoaStart) => setSweepForm((f) => ({ ...f, aoaStart }))} />
-            <NumberField label="AoA stop" value={sweepForm.aoaStop} onChange={(aoaStop) => setSweepForm((f) => ({ ...f, aoaStop }))} />
-            <NumberField label="AoA step" value={sweepForm.aoaStep} onChange={(aoaStep) => setSweepForm((f) => ({ ...f, aoaStep }))} />
+            <NumberField label="AoA start" value={sweepForm.aoaStart} error={issueFor(validationIssues, "AoA start")} onChange={(aoaStart) => setSweepForm((f) => ({ ...f, aoaStart }))} />
+            <NumberField label="AoA stop" value={sweepForm.aoaStop} error={issueFor(validationIssues, "AoA stop")} onChange={(aoaStop) => setSweepForm((f) => ({ ...f, aoaStop }))} />
+            <NumberField label="AoA step" value={sweepForm.aoaStep} error={issueFor(validationIssues, "AoA step")} onChange={(aoaStep) => setSweepForm((f) => ({ ...f, aoaStep }))} />
           </div>
-          <TextField label="Explicit AoA list optional" value={aoaListText} onChange={setAoaListText} />
-          <button type="button" disabled={busy || !sweepForm.name.trim()} onClick={saveSweep} style={{ ...primaryBtn(busy || !sweepForm.name.trim()), width: "100%", marginTop: 12 }}>{busy ? "saving…" : sweepId ? "save sweep definition" : "add sweep definition"}</button>
+          <TextField label="Explicit AoA list optional" value={aoaListText} error={issueFor(validationIssues, "Explicit AoA list optional")} onChange={setAoaListText} />
+          <ProfileSaveActions busy={busy} selected={!!sweepId} noun="sweep definition" issues={validationIssues} onCreate={() => submitSetupForm(validateSweep(), saveSweep)} onUpdateSelected={() => submitSetupForm(validateSweep(), updateSelectedSweep)} />
         </ProfileEditorShell>
       )}
+      {tab === "mediums" && <MediumsPanel />}
     </div>
   );
 }
@@ -1292,29 +1987,79 @@ function EditorHeader({ text, onNew }: { text: string; onNew: () => void }) {
   );
 }
 
+function ProfileSaveActions({
+  busy,
+  selected,
+  noun,
+  createLabel,
+  cloneLabel,
+  updateLabel,
+  issues,
+  onCreate,
+  onUpdateSelected,
+}: {
+  busy: boolean;
+  selected: boolean;
+  noun: string;
+  createLabel?: string;
+  cloneLabel?: string;
+  updateLabel?: string;
+  issues?: ValidationIssue[];
+  onCreate: () => void;
+  onUpdateSelected?: () => void;
+}) {
+  const primaryLabel = selected ? cloneLabel ?? `save as new ${noun}` : createLabel ?? `add ${noun}`;
+  return (
+    <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
+      <ValidationSummary issues={issues ?? []} />
+      <button type="button" disabled={busy} onClick={onCreate} style={{ ...primaryBtn(busy), width: "100%" }}>
+        {busy ? "saving…" : primaryLabel}
+      </button>
+      {selected && onUpdateSelected && (
+        <button type="button" disabled={busy} onClick={onUpdateSelected} style={{ ...ghostBtn, width: "100%", color: C.amber, opacity: busy ? 0.6 : 1, cursor: busy ? "not-allowed" : "pointer" }}>
+          {updateLabel ?? `update selected ${noun}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function ProfileEditorShell<T extends { id: string; name: string }>({
   title,
   items,
   selectedId,
   onSelect,
+  onNew,
+  onRemove,
   describe,
   emptyText,
+  busy,
   children,
 }: {
   title: string;
   items: T[];
   selectedId: string;
   onSelect: (item: T) => void;
+  onNew: () => void;
+  onRemove?: (item: T) => void;
   describe: (item: T) => string;
   emptyText: string;
+  busy: boolean;
   children: ReactNode;
 }) {
   return (
     <div className="admin-editor-grid">
-      <div style={card}>
-        <div style={label}>{title}</div>
-        <SetupRecordList items={items} selectedId={selectedId} onSelect={onSelect} describe={describe} emptyText={emptyText} />
-      </div>
+      <SetupRecordListPanel
+        title={title}
+        items={items}
+        selectedId={selectedId}
+        onSelect={onSelect}
+        onNew={onNew}
+        onRemove={onRemove}
+        describe={describe}
+        emptyText={emptyText}
+        busy={busy}
+      />
       <div style={card}>{children}</div>
     </div>
   );
@@ -1444,6 +2189,7 @@ function SyncApiPanel() {
   const [draft, setDraft] = useState<SyncDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [validationIssues, setValidationIssues] = useState<ValidationIssue[]>([]);
 
   const refresh = useCallback(async () => {
     const next = await getAdminSync();
@@ -1484,7 +2230,22 @@ function SyncApiPanel() {
     }
   };
 
+  const validateUpstream = () => compactIssues([
+    requiredIssue(draft?.upstreamBaseUrl, "Up-tier endpoint", "Up-tier endpoint is required"),
+  ]);
+
+  useEffect(() => {
+    if (validationIssues.length) setValidationIssues(validateUpstream());
+  }, [draft?.upstreamBaseUrl, validationIssues.length]);
+
   const runMirror = async (mode?: "full" | "db_only_remote_assets") => {
+    const issues = validateUpstream();
+    if (issues.length) {
+      setValidationIssues(issues);
+      focusValidationIssue(issues[0]);
+      return;
+    }
+    setValidationIssues([]);
     setBusy(true);
     setErr(null);
     try {
@@ -1575,7 +2336,7 @@ function SyncApiPanel() {
 	            <div style={card}>
 	              <div style={label}>UP-TIER CONNECTION</div>
 	              <div className="admin-form-grid">
-	                <TextField label="Up-tier endpoint" value={draft.upstreamBaseUrl} onChange={(upstreamBaseUrl) => setDraft((current) => current && { ...current, upstreamBaseUrl })} />
+	                <TextField label="Up-tier endpoint" value={draft.upstreamBaseUrl} error={issueFor(validationIssues, "Up-tier endpoint")} onChange={(upstreamBaseUrl) => setDraft((current) => current && { ...current, upstreamBaseUrl })} />
 	                <TextField label="Up-tier secret" value={draft.upstreamSecret} onChange={(upstreamSecret) => setDraft((current) => current && { ...current, upstreamSecret })} />
 	                <SelectField
 	                  label="Sync mode"
@@ -1588,11 +2349,14 @@ function SyncApiPanel() {
 	                <NumberField label="Claim size" value={draft.remoteSolverClaimSize} onChange={(remoteSolverClaimSize) => setDraft((current) => current && { ...current, remoteSolverClaimSize })} />
 	                <NumberField label="Heartbeat seconds" value={draft.remoteSolverHeartbeatIntervalSeconds} onChange={(remoteSolverHeartbeatIntervalSeconds) => setDraft((current) => current && { ...current, remoteSolverHeartbeatIntervalSeconds })} />
 	              </div>
+                  <div style={{ marginTop: 10 }}>
+                    <ValidationSummary issues={validationIssues} />
+                  </div>
 	              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
-	                <button type="button" disabled={busy || !draft.upstreamBaseUrl.trim()} onClick={() => runMirror("db_only_remote_assets")} style={{ ...ghostBtn, padding: "8px 10px" }}>
+	                <button type="button" disabled={busy} onClick={() => runMirror("db_only_remote_assets")} style={{ ...ghostBtn, padding: "8px 10px", opacity: busy ? 0.6 : 1, cursor: busy ? "not-allowed" : "pointer" }}>
 	                  sync DB + remote refs
 	                </button>
-	                <button type="button" disabled={busy || !draft.upstreamBaseUrl.trim()} onClick={() => runMirror("full")} style={{ ...ghostBtn, padding: "8px 10px" }}>
+	                <button type="button" disabled={busy} onClick={() => runMirror("full")} style={{ ...ghostBtn, padding: "8px 10px", opacity: busy ? 0.6 : 1, cursor: busy ? "not-allowed" : "pointer" }}>
 	                  full sync
 	                </button>
 	                <button type="button" disabled={busy} onClick={save} style={{ ...primaryBtn(busy) }}>
@@ -1744,11 +2508,22 @@ function SyncApiPanel() {
   );
 }
 
-function QueueDashboard() {
+function QueueDashboard({
+  tab,
+  onTabChange,
+  onOpenCampaign,
+  onOpenSimulations,
+}: {
+  tab: SolverTab;
+  onTabChange: (t: SolverTab) => void;
+  onOpenCampaign: (id: string) => void;
+  onOpenSimulations: () => void;
+}) {
   const [queue, setQueue] = useState<AdminQueue | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [maintenanceNotice, setMaintenanceNotice] = useState<string | null>(null);
+  const [purgePrefix, setPurgePrefix] = useState("pw-");
   const refreshingRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -1764,13 +2539,9 @@ function QueueDashboard() {
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
-    pollRef.current = setInterval(refresh, 10000);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, [refresh]);
+  // Shared admin poll: paused while document.hidden, immediate refetch on
+  // visibility resume (spec §11).
+  usePoll(refresh, 10000);
 
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -1794,102 +2565,227 @@ function QueueDashboard() {
   const engineQueue = queue?.engineQueue;
   const duplicateCount = Object.keys(engineQueue?.duplicates ?? {}).length;
   const detachedCount = activeJobs.filter((job) => job.runtimeState === "detached_running" || (job.processCount > 0 && !job.engineQueueMatch)).length;
+  const pendingSweepsTotal = queue?.pendingSweepsTotal ?? 0;
+
+  // ONE derivation feeds the banner, the empty states, and the control
+  // gating — the same module the hub / campaign surfaces use (lib/solver-state).
+  const engineHealthy = !!queue?.engineHealth && queue.engineHealth.status === "ok" && !queue.engineHealthError;
+  const backlogOpen = queue
+    ? (queue.pendingPointsTotal ?? queue.backlog) > 0 || queue.backlogStrip.campaigns.some((c) => c.remainingPoints > 0)
+    : undefined;
+  const solver = deriveSolverState({
+    fetchOk: queue != null,
+    heartbeatAt: sw?.heartbeatAt ?? null,
+    enabled: sw?.enabled ?? false,
+    engineUnreachableSince: queue?.engineUnreachableSince ?? null,
+    engineHealthy,
+    engineBuildMismatch: queue?.engineBuildMismatch ?? false,
+    engineQueueError: !!queue?.engineQueueError,
+    activeJobCount: queue ? activeJobs.length : undefined,
+    backlogOpen,
+  });
+  const processDead = solver.state === "process_not_running";
+  const toneColor = solver.tone === "red" ? C.redText : solver.tone === "amber" ? C.amber : C.teal;
+  const toneDot = solver.tone === "red" ? C.red : solver.tone === "amber" ? C.amber : C.teal;
+  const toneBorder = solver.tone === "red" ? "rgba(245, 101, 101, 0.34)" : solver.tone === "amber" ? "rgba(245, 165, 36, 0.38)" : C.tealBorder;
+  const toneFill = solver.tone === "red" ? "rgba(245, 101, 101, 0.08)" : solver.tone === "amber" ? "rgba(245, 165, 36, 0.07)" : C.tealFill;
+
+  const purgeArtifacts = () => {
+    const prefix = purgePrefix.trim();
+    if (!prefix) return;
+    if (!window.confirm(`Purge all test artifacts with prefix "${prefix}"? Matching rows are deleted permanently.`)) return;
+    void act(async () => {
+      const res = await purgeTestArtifacts(prefix);
+      const entries = Object.entries(res.purged).filter(([, n]) => n > 0);
+      const total = entries.reduce((sum, [, n]) => sum + n, 0);
+      setMaintenanceNotice(
+        total > 0
+          ? `purged ${total.toLocaleString()} row${total === 1 ? "" : "s"} — ${entries.map(([k, n]) => `${k} ${n}`).join(", ")}`
+          : `nothing matched prefix "${prefix}"`,
+      );
+    });
+  };
+
   return (
     <div data-testid="openfoam-queue-page">
-      <div className="queue-header-grid">
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>OpenFOAM queue</h2>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 6, fontFamily: MONO, fontSize: 11, color: C.dim }}>
-            <span>engine {queue?.engineUrl ?? "…"}</span>
-            {queue?.engineHealth && (
-              <span
-                title={queue.engineHealth.package_file ?? undefined}
-                style={{
-                  color: queue.engineBuildMismatch ? C.redText : C.dim,
-                  border: `1px solid ${queue.engineBuildMismatch ? C.redText : C.stroke}`,
-                  borderRadius: 5,
-                  padding: "2px 7px",
-                }}
-              >
-                engine build {queue.engineHealth.build_id ?? queue.engineHealth.version}
-                {queue.engineBuildMismatch ? ` expected ${queue.engineExpectedBuildId}` : ""}
-              </span>
-            )}
-            {queue?.engineHealthError && <span style={{ color: C.amber }}>engine health: {queue.engineHealthError.slice(0, 80)}</span>}
-            {sw && (
-              <span style={{ color: sw.enabled ? C.teal : C.amber, border: `1px solid ${sw.enabled ? C.tealBorder : C.stroke}`, borderRadius: 5, padding: "2px 7px" }}>
-                {sw.enabled ? "sweeper running" : "sweeper paused"}
-              </span>
-            )}
-          </div>
-        </div>
-        {sw && (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => act(() => patchSweeper({ enabled: !sw.enabled }))}
-              style={{ ...(sw.enabled ? ghostBtn : primaryBtn(busy)), display: "inline-flex", alignItems: "center", gap: 7 }}
-            >
-              {sw.enabled ? <Pause size={14} /> : <Play size={14} />}
-              {sw.enabled ? "Pause" : "Resume"}
-            </button>
-            {failed > 0 && (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => act(async () => void (await requeueFailed()))}
-                style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 7, color: C.amber }}
-              >
-                <RotateCcw size={14} />
-                requeue failed
-              </button>
-            )}
-            {staleCount > 0 && (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => act(() => recoverStaleJobs())}
-                style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 7, color: C.redText }}
-              >
-                <ShieldAlert size={14} />
-                recover stale
-              </button>
-            )}
-          </div>
-        )}
+      <div style={{ marginBottom: 12 }}>
+        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>Solver</h2>
+      </div>
+
+      <div className="admin-tab-row">
+        {SOLVER_TABS.map((item) => (
+          <button
+            key={item.k}
+            type="button"
+            data-testid={`solver-tab-${item.k}`}
+            aria-pressed={tab === item.k}
+            onClick={() => onTabChange(item.k)}
+            style={{
+              ...ghostBtn,
+              padding: "7px 10px",
+              color: tab === item.k ? C.teal : C.muted,
+              borderColor: tab === item.k ? C.tealBorder : C.stroke,
+              background: tab === item.k ? C.tealFill : C.panel3,
+            }}
+          >
+            {item.label}
+          </button>
+        ))}
       </div>
 
       {err && <div style={{ fontFamily: MONO, fontSize: 11, color: C.red, marginBottom: 12 }}>{err}</div>}
 
-      <div className="admin-metric-grid" style={{ marginBottom: 14 }}>
-        <QueueMetric icon={<Clock3 size={15} />} label="Pending sweeps" value={queue ? (queue.pendingSweepsTotal ?? 0).toLocaleString() : "…"} sub={`${queue?.pendingPointsTotal ?? queue?.backlog ?? 0} AoA points`} accent={C.amber} />
-        <QueueMetric icon={<Activity size={15} />} label="Active jobs" value={queue ? String(activeJobs.length) : "…"} sub={`${queue?.inFlight ?? 0} in engine`} accent={C.teal} />
-        <QueueMetric icon={<Activity size={15} />} label="Celery queue" value={queue ? String(engineQueue?.queue_depth ?? "—") : "…"} sub={`${engineQueue?.active_count ?? 0} active · ${engineQueue?.reserved_count ?? 0} reserved`} accent={duplicateCount ? C.redText : C.dim} />
-        <QueueMetric icon={<CheckCircle2 size={15} />} label="Solved points" value={queue ? String(queue.results.solved ?? 0) : "…"} sub="source solved" accent={C.teal} />
-        <QueueMetric icon={<XCircle size={15} />} label="Failed points" value={queue ? String(failed) : "…"} sub="needs requeue" accent={failed > 0 ? C.red : C.dim} />
-        <QueueMetric icon={<ShieldAlert size={15} />} label="Stale jobs" value={queue ? String(staleCount) : "…"} sub={detachedCount ? `${detachedCount} detached runner${detachedCount === 1 ? "" : "s"}` : duplicateCount ? `${duplicateCount} duplicate IDs` : "orphan detector"} accent={staleCount || duplicateCount ? C.redText : C.text} />
-      </div>
-
-      <div className="queue-main-grid">
-        <QueuePanel title="Pending sweeps" count={queue ? `${pendingSweeps.length} of ${queue.pendingSweepsTotal ?? 0}` : undefined} testId="queue-pending-sweeps">
-          {!queue ? (
-            <EmptyQueueLine text="Loading pending CFD sweeps…" />
-          ) : pendingSweeps.length === 0 ? (
-            <EmptyQueueLine text="No pending sweeps. The enabled boundary-condition set is fully solved." />
-          ) : (
-            <div>
-              <div style={{ minWidth: 0 }}>
-                <TableHead columns={PENDING_COLUMNS} labels={["Airfoil", "Type", "CPU", "Speed", "Re", "AoA", "Condition", "State"]} />
-                {pendingSweeps.map((p) => (
-                  <PendingSweepRow key={`${p.airfoilId}-${p.bcId}-${p.kind}`} item={p} />
+      {tab === "activity" && (
+        <div style={{ display: "grid", gap: 14 }}>
+          {/* ---- solver banner: THE single truth line (deriveSolverState) ---- */}
+          <section
+            data-testid="solver-banner"
+            style={{ background: toneFill, border: `1px solid ${toneBorder}`, borderRadius: 10, padding: "12px 14px", display: "grid", gap: 7 }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <span data-testid="sweeper-process-state" style={{ display: "inline-flex", alignItems: "center", gap: 8, fontFamily: MONO, fontSize: 12, color: toneColor, fontWeight: 700, letterSpacing: "0.04em" }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: toneDot, animation: solver.state === "running" ? "recpulse 1.6s infinite" : "none" }} />
+                {solverStateLabel(solver.state)}
+              </span>
+              <span style={{ fontFamily: MONO, fontSize: 11.5, color: C.text }}>{solver.headline}</span>
+            </div>
+            {solver.detail && (
+              <div style={{ fontFamily: MONO, fontSize: 10.5, color: toneColor, lineHeight: 1.5 }}>{solver.detail}</div>
+            )}
+            {solver.secondary.length > 0 && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {solver.secondary.map((s) => (
+                  <span key={s} style={{ fontFamily: MONO, fontSize: 10, color: C.amber, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 8px" }}>
+                    {s}
+                  </span>
                 ))}
+              </div>
+            )}
+          </section>
+
+          {/* ---- controls: Pause/Resume + CPU slots. When the process is not
+                running, Pause/Resume would be fake controls (and a Start
+                button would be a lie — the web app cannot start an OS
+                process), so guidance text renders instead. ---- */}
+          {sw && (
+            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              {processDead ? (
+                <span data-testid="solver-controls-guidance" style={{ fontFamily: MONO, fontSize: 10.5, color: C.redText }}>
+                  Pause/Resume is unavailable while the solver process is down.
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => act(() => patchSweeper({ enabled: !sw.enabled }))}
+                  style={{ ...(sw.enabled ? ghostBtn : primaryBtn(busy)), display: "inline-flex", alignItems: "center", gap: 7 }}
+                >
+                  {sw.enabled ? <Pause size={14} /> : <Play size={14} />}
+                  {sw.enabled ? "Pause" : "Resume"}
+                </button>
+              )}
+              <div data-admin-field="OpenFOAM CPU slots" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>OpenFOAM CPU slots</span>
+                <CpuSlotsStepper value={sw.cpuSlots} disabled={busy} onChange={(n) => act(() => patchSweeper({ cpuSlots: n }))} />
               </div>
             </div>
           )}
-        </QueuePanel>
 
+          {/* ---- at most two attention chips ---- */}
+          {(failed > 0 || pendingSweepsTotal > 0) && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {failed > 0 && (
+                <button
+                  type="button"
+                  data-testid="attention-requeue-failed"
+                  disabled={busy}
+                  onClick={() => act(async () => void (await requeueFailed()))}
+                  style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 7, color: C.amber, borderColor: "rgba(245, 165, 36, 0.45)", padding: "6px 11px", fontSize: 11 }}
+                >
+                  <RotateCcw size={13} />
+                  {failed.toLocaleString()} failed point{failed === 1 ? "" : "s"} need review · requeue…
+                </button>
+              )}
+              {pendingSweepsTotal > 0 && (
+                <button
+                  type="button"
+                  data-testid="attention-background-pending"
+                  onClick={() => onTabChange("background")}
+                  style={{ ...ghostBtn, padding: "6px 11px", fontSize: 11 }}
+                >
+                  {pendingSweepsTotal.toLocaleString()} background sweep{pendingSweepsTotal === 1 ? "" : "s"} pending · view Background
+                </button>
+              )}
+            </div>
+          )}
+
+          {queue?.backlogStrip && (
+            <CampaignBacklogStrip strip={queue.backlogStrip} onOpenCampaign={onOpenCampaign} onOpenSimulations={onOpenSimulations} />
+          )}
+
+          <QueuePanel title="Active jobs" count={queue ? `${activeJobs.length}` : undefined} testId="queue-active-jobs">
+            {!queue ? (
+              <EmptyQueueLine text="Loading active OpenFOAM jobs…" />
+            ) : activeJobs.length === 0 ? (
+              <EmptyQueueLine
+                text={
+                  processDead
+                    ? `No active jobs — the solver process is not running (${queue.sweeper.heartbeatAt ? `last heartbeat ${ago(queue.sweeper.heartbeatAt)}` : "no heartbeat ever recorded"}), so nothing can be submitted.`
+                    : queue.sweeper.enabled
+                      ? "No active jobs. The sweeper is running and will submit the next pending case on its coming tick."
+                      : "No active jobs. Resume the sweeper to submit pending cases."
+                }
+              />
+            ) : (
+              <div style={{ display: "grid", gap: 10, padding: "10px 16px 16px" }}>
+                {activeJobs.map((job) => (
+                  <ActiveJobCard key={job.id} job={job} busy={busy} onCancel={() => act(() => cancelJob(job.id))} onOpenCampaign={onOpenCampaign} />
+                ))}
+              </div>
+            )}
+          </QueuePanel>
+
+          <details data-testid="queue-finished-jobs" style={{ ...card, padding: 0, borderRadius: 8, overflow: "hidden" }}>
+            <summary style={{ cursor: "pointer", padding: "12px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <span style={{ fontFamily: MONO, fontSize: 12, fontWeight: 700, color: C.text }}>Finished job log</span>
+              <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>{queue ? `${finishedJobs.length} latest` : "…"}</span>
+            </summary>
+            <div style={{ borderTop: `1px solid ${C.borderSoft}` }}>
+              {!queue ? (
+                <EmptyQueueLine text="Loading finished jobs…" />
+              ) : finishedJobs.length === 0 ? (
+                <EmptyQueueLine text="No finished jobs yet. Completed, failed, and cancelled engine jobs will appear here." />
+              ) : (
+                <div style={{ display: "grid", gap: 10, padding: "10px 16px 16px" }}>
+                  {finishedJobs.slice(0, 8).map((job) => (
+                    <FinishedJobCard key={job.id} job={job} onOpenCampaign={onOpenCampaign} />
+                  ))}
+                </div>
+              )}
+            </div>
+          </details>
+        </div>
+      )}
+
+      {tab === "background" && (
         <div style={{ display: "grid", gap: 14 }}>
+          <QueuePanel title="Pending sweeps" count={queue ? `${pendingSweeps.length} of ${pendingSweepsTotal}` : undefined} testId="queue-pending-sweeps">
+            {!queue ? (
+              <EmptyQueueLine text="Loading pending CFD sweeps…" />
+            ) : pendingSweeps.length === 0 ? (
+              <EmptyQueueLine text="No pending sweeps. The enabled boundary-condition set is fully solved." />
+            ) : (
+              <div className="admin-table-scroll">
+                <div style={{ minWidth: PENDING_TABLE_MIN_WIDTH }}>
+                  <TableHead columns={PENDING_COLUMNS} labels={["Airfoil", "Type", "CPU", "Speed", "Re", "AoA", "Condition", "State"]} />
+                  {pendingSweeps.map((p) => (
+                    <PendingSweepRow key={`${p.airfoilId}-${p.bcId}-${p.kind}`} item={p} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </QueuePanel>
+
           <QueuePanel title="Externally promised" count={queue ? `${externalPromises.length}` : undefined} testId="queue-external-promises">
             {!queue ? (
               <EmptyQueueLine text="Loading external sync promises…" />
@@ -1915,86 +2811,207 @@ function QueueDashboard() {
               </div>
             )}
           </QueuePanel>
-
-          <QueuePanel title="Active jobs" count={queue ? `${activeJobs.length}` : undefined} testId="queue-active-jobs">
-            {sw && (
-              <div style={{ borderBottom: `1px solid ${C.borderSoft}`, padding: "0 16px 12px", marginBottom: 2 }}>
-                <div style={{ display: "grid", gap: 6, marginBottom: 10, fontFamily: MONO, fontSize: 10, color: C.dim }}>
-                  {queue?.engineQueueError ? (
-                    <span style={{ color: C.redText }}>engine queue unavailable · {queue.engineQueueError.slice(0, 120)}</span>
-                  ) : (
-                    <span>
-                      Celery {engineQueue?.queue_depth ?? "—"} queued · {engineQueue?.active_count ?? 0} active · {engineQueue?.reserved_count ?? 0} reserved
-                    </span>
-                  )}
-                  {(duplicateCount > 0 || (engineQueue?.redelivered.length ?? 0) > 0) && (
-                    <span style={{ color: C.redText }}>
-                      {duplicateCount} duplicate job IDs · {engineQueue?.redelivered.length ?? 0} redelivered tasks
-                    </span>
-                  )}
-                </div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center", fontFamily: MONO, fontSize: 12 }}>
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: 8, color: sw.enabled ? C.teal : C.muted, fontWeight: 600 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: sw.enabled ? C.teal : C.dim, animation: sw.enabled ? "recpulse 1.6s infinite" : "none" }} />
-                    {sw.enabled ? "RUNNING" : "PAUSED"}
-                  </span>
-                  <span style={{ color: C.dim }}>heartbeat {ago(sw.heartbeatAt)}</span>
-                </div>
-                {!sw.enabled && (
-                  <div style={{ marginTop: 7, fontFamily: MONO, fontSize: 10, color: C.amber }}>
-                    submissions are paused; already-started OpenFOAM processes continue until they finish or are cancelled
-                  </div>
-                )}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", marginTop: 10 }}>
-                  <span style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>concurrency</span>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <Stepper value={sw.maxConcurrentJobs} disabled={busy} onChange={(n) => act(() => patchSweeper({ maxConcurrentJobs: n }))} />
-                    <span style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>jobs</span>
-                  </div>
-                </div>
-              </div>
-            )}
-            {!queue ? (
-              <EmptyQueueLine text="Loading active OpenFOAM jobs…" />
-            ) : activeJobs.length === 0 ? (
-              <EmptyQueueLine text="No active jobs. Resume the sweeper to submit pending cases." />
-            ) : (
-              <div style={{ display: "grid", gap: 10, padding: "10px 16px 16px" }}>
-                {activeJobs.map((job) => (
-                  <ActiveJobCard key={job.id} job={job} busy={busy} onCancel={() => act(() => cancelJob(job.id))} />
-                ))}
-              </div>
-            )}
-          </QueuePanel>
-
-          <QueuePanel title="Finished job log" count={queue ? `${finishedJobs.length} latest` : undefined} testId="queue-finished-jobs">
-            {!queue ? (
-              <EmptyQueueLine text="Loading finished jobs…" />
-            ) : finishedJobs.length === 0 ? (
-              <EmptyQueueLine text="No finished jobs yet. Completed, failed, and cancelled engine jobs will appear here." />
-            ) : (
-              <div style={{ display: "grid", gap: 10, padding: "10px 16px 16px" }}>
-                {finishedJobs.slice(0, 8).map((job) => (
-                  <FinishedJobCard key={job.id} job={job} />
-                ))}
-              </div>
-            )}
-          </QueuePanel>
         </div>
-      </div>
+      )}
+
+      {tab === "engine" && (
+        <div style={{ display: "grid", gap: 14 }}>
+          <section data-testid="engine-identity" style={{ ...card, padding: 14, borderRadius: 8 }}>
+            <div style={label}>ENGINE</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontFamily: MONO, fontSize: 11, color: C.dim }}>
+              <span>url {queue?.engineUrl ?? "…"}</span>
+              {queue?.engineHealth && (
+                <span
+                  title={queue.engineHealth.package_file ?? undefined}
+                  style={{
+                    color: queue.engineBuildMismatch ? C.redText : C.dim,
+                    border: `1px solid ${queue.engineBuildMismatch ? C.redText : C.stroke}`,
+                    borderRadius: 5,
+                    padding: "2px 7px",
+                  }}
+                >
+                  build {queue.engineHealth.build_id ?? queue.engineHealth.version}
+                  {queue.engineBuildMismatch ? ` expected ${queue.engineExpectedBuildId}` : ""}
+                </span>
+              )}
+              {queue && (
+                <span style={{ color: engineHealthy ? C.teal : C.amber, border: `1px solid ${engineHealthy ? C.tealBorder : C.stroke}`, borderRadius: 5, padding: "2px 7px" }}>
+                  {engineHealthy ? "health ok" : queue.engineUnreachableSince ? `unreachable since ${new Date(queue.engineUnreachableSince).toLocaleTimeString()}` : "health degraded"}
+                </span>
+              )}
+              {queue?.engineHealthError && <span style={{ color: C.amber }}>health probe: {queue.engineHealthError.slice(0, 100)}</span>}
+            </div>
+          </section>
+
+          <section data-testid="engine-celery" style={{ ...card, padding: 14, borderRadius: 8 }}>
+            <div style={label}>CELERY INTROSPECTION</div>
+            {!queue ? (
+              <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>loading…</div>
+            ) : queue.engineQueueError ? (
+              <div style={{ fontFamily: MONO, fontSize: 11, color: C.redText }}>unavailable · {queue.engineQueueError.slice(0, 160)}</div>
+            ) : (
+              <div style={{ display: "grid", gap: 6, fontFamily: MONO, fontSize: 11, color: C.text }}>
+                <span>
+                  {engineQueue?.queue_depth ?? "—"} queued · {engineQueue?.active_count ?? 0} active · {engineQueue?.reserved_count ?? 0} reserved · {engineQueue?.scheduled_count ?? 0} scheduled
+                </span>
+                {(duplicateCount > 0 || (engineQueue?.redelivered.length ?? 0) > 0) && (
+                  <span style={{ color: C.redText }}>
+                    {duplicateCount} duplicate job IDs · {engineQueue?.redelivered.length ?? 0} redelivered tasks
+                  </span>
+                )}
+                <span style={{ color: C.dim, fontSize: 10 }}>
+                  {queue.inFlight} db jobs in flight · {detachedCount} detached runner{detachedCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
+          </section>
+
+          <section data-testid="engine-cache-card" style={{ ...card, padding: 14, borderRadius: 8 }}>
+            <div style={label}>MESH / SEED CACHE</div>
+            {!queue ? (
+              <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>loading…</div>
+            ) : queue.engineCache != null ? (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 8 }}>
+                <MetricChip label="Mesh entries" value={queue.engineCache.meshEntries.toLocaleString()} />
+                <MetricChip label="Seed entries" value={queue.engineCache.seedEntries.toLocaleString()} />
+                <MetricChip label="Size" value={`${formatBytes(queue.engineCache.totalBytes)} of ${formatBytes(queue.engineCache.capBytes)}`} />
+                <MetricChip label="Oldest last-used" value={queue.engineCache.oldestLastUsedAt ? ago(queue.engineCache.oldestLastUsedAt) : "—"} />
+              </div>
+            ) : (
+              // Never invented numbers: the card says why the data is missing.
+              <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>
+                cache stats unavailable — engine endpoint unreachable or not deployed
+              </div>
+            )}
+          </section>
+
+          <section data-testid="engine-maintenance" style={{ ...card, padding: 14, borderRadius: 8, display: "grid", gap: 10 }}>
+            <div style={label}>MAINTENANCE</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                data-testid="engine-recover-stale"
+                disabled={busy || staleCount === 0}
+                onClick={() => act(() => recoverStaleJobs())}
+                style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 7, color: staleCount > 0 ? C.redText : C.dim, opacity: busy || staleCount === 0 ? 0.6 : 1 }}
+              >
+                <ShieldAlert size={14} />
+                recover stale ({staleCount})
+              </button>
+              <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
+                re-queues jobs whose engine runtime disappeared · enabled only while stale jobs exist
+              </span>
+            </div>
+            <div style={{ display: "flex", alignItems: "end", gap: 8, flexWrap: "wrap" }}>
+              <label style={{ display: "block", width: 140 }} data-admin-field="Purge prefix">
+                <div style={miniLabel}>Purge prefix</div>
+                <input aria-label="Purge prefix" value={purgePrefix} onChange={(e) => setPurgePrefix(e.target.value)} style={inputStyle} />
+              </label>
+              <button
+                type="button"
+                data-testid="engine-purge-artifacts"
+                disabled={busy || !purgePrefix.trim()}
+                onClick={purgeArtifacts}
+                style={{ ...ghostBtn, color: C.redText, borderColor: "rgba(245, 101, 101, 0.45)", opacity: busy || !purgePrefix.trim() ? 0.6 : 1 }}
+              >
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
+                  <Trash2 size={14} />
+                  purge test artifacts
+                </span>
+              </button>
+            </div>
+            {maintenanceNotice && <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>{maintenanceNotice}</div>}
+          </section>
+        </div>
+      )}
     </div>
   );
 }
-function QueueMetric({ icon, label: l, value, sub, accent }: { icon: React.ReactNode; label: string; value: string; sub: string; accent: string }) {
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n >= 2 ** 30) return `${(n / 2 ** 30).toFixed(1)} GiB`;
+  if (n >= 2 ** 20) return `${(n / 2 ** 20).toFixed(1)} MiB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KiB`;
+  return `${Math.round(n)} B`;
+}
+/** Priority band names shown in the wizard/hub (spec §7): Background (0) /
+ *  Standard (5) / High (8); any other value renders as its raw level. */
+function campaignPriorityName(priority: number): string {
+  if (priority === 0) return "Background";
+  if (priority === 5) return "Standard";
+  if (priority === 8) return "High";
+  return `P${priority}`;
+}
+
+function CampaignBacklogStrip({
+  strip,
+  onOpenCampaign,
+  onOpenSimulations,
+}: {
+  strip: AdminQueueBacklogStrip;
+  onOpenCampaign: (id: string) => void;
+  onOpenSimulations: () => void;
+}) {
+  const gap = strip.backgroundGapFill;
   return (
-    <div style={{ ...card, padding: 12, borderRadius: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: MONO, fontSize: 10, color: C.dim, marginBottom: 6 }}>
-        <span style={{ color: accent, display: "inline-flex" }}>{icon}</span>
-        <span>{l}</span>
+    <section data-testid="queue-backlog-strip" style={{ ...card, padding: 12, borderRadius: 8 }}>
+      <div style={label}>CAMPAIGN BACKLOG</div>
+      {strip.campaigns.length === 0 ? (
+        <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>No campaign backlog — all queued work is background gap-fill.</div>
+      ) : (
+        <div style={{ display: "grid", gap: 6 }}>
+          {/* Capped at 3 rows (approved design); the full list lives on Simulations. */}
+          {strip.campaigns.slice(0, 3).map((c) => (
+            <div
+              key={c.id}
+              data-testid={`backlog-campaign-${c.slug}`}
+              style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontFamily: MONO, fontSize: 11 }}
+            >
+              <button
+                type="button"
+                onClick={() => onOpenCampaign(c.id)}
+                title={`Open campaign ${c.name}`}
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: C.teal,
+                  background: C.tealFill,
+                  border: `1px solid ${C.tealBorder}`,
+                  borderRadius: 5,
+                  padding: "3px 8px",
+                  cursor: "pointer",
+                  maxWidth: 240,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {c.name}
+              </button>
+              <span style={{ color: C.dim }}>{campaignPriorityName(c.priority)}</span>
+              <span style={{ color: C.text }}>{c.remainingPoints.toLocaleString()} points remaining</span>
+              {c.runningPoints > 0 && <span style={{ color: C.amber }}>{c.runningPoints.toLocaleString()} running</span>}
+              {c.failedPoints > 0 && <span style={{ color: C.redText }}>{c.failedPoints.toLocaleString()} failed</span>}
+              {c.status !== "active" && <span style={{ color: C.amber }}>{c.status}</span>}
+            </div>
+          ))}
+          <button
+            type="button"
+            data-testid="backlog-all-campaigns"
+            onClick={onOpenSimulations}
+            style={{ justifySelf: "start", fontFamily: MONO, fontSize: 10, color: C.teal, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+          >
+            all campaigns ({strip.campaigns.length})
+          </button>
+        </div>
+      )}
+      <div style={{ marginTop: 8, fontFamily: MONO, fontSize: 10, color: C.dim }}>
+        Background gap-fill: {gap.pendingPoints.toLocaleString()} points in {gap.pendingSweeps.toLocaleString()} sweeps
+        {strip.campaigns.length > 0 ? " waiting behind campaign work" : ""} · computed {ago(gap.computedAt)}
       </div>
-      <div style={{ fontFamily: MONO, fontSize: 24, fontWeight: 650, color: accent, lineHeight: 1.15 }}>{value}</div>
-      <div style={{ fontFamily: MONO, fontSize: 10, color: C.dim, marginTop: 4 }}>{sub}</div>
-    </div>
+    </section>
   );
 }
 
@@ -2048,7 +3065,7 @@ function KindBadge({ kind }: { kind: AdminJob["kind"] }) {
 function PendingSweepRow({ item }: { item: AdminPendingSweep }) {
   return (
     <div style={{ display: "grid", gridTemplateColumns: PENDING_COLUMNS, gap: 10, alignItems: "center", fontFamily: MONO, fontSize: 11, padding: "9px 16px", borderBottom: `1px solid ${C.borderRow}` }}>
-      <Link href={`/airfoils/${item.airfoilSlug}`} style={{ minWidth: 0, color: C.text, textDecoration: "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <Link href={`/airfoils/${item.airfoilSlug}`} title={item.airfoilName} style={{ minWidth: 0, color: C.text, textDecoration: "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {item.airfoilName}
       </Link>
       <KindBadge kind={item.kind} />
@@ -2133,7 +3150,7 @@ function runtimeTone(job: AdminJob): string {
   return C.dim;
 }
 
-function ActiveJobCard({ job, busy, onCancel }: { job: AdminJob; busy: boolean; onCancel: () => void }) {
+function ActiveJobCard({ job, busy, onCancel, onOpenCampaign }: { job: AdminJob; busy: boolean; onCancel: () => void; onOpenCampaign: (id: string) => void }) {
   const inFlight = ["submitted", "running", "ingesting", "pending"].includes(job.status);
   const progress = job.totalCases > 0 ? Math.min(100, Math.round((job.completedCases / job.totalCases) * 100)) : 0;
   return (
@@ -2149,6 +3166,7 @@ function ActiveJobCard({ job, busy, onCancel }: { job: AdminJob; busy: boolean; 
           )}
           <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginTop: 8 }}>
             <KindBadge kind={job.kind} />
+            <CampaignJobChip job={job} onOpenCampaign={onOpenCampaign} />
             <span style={{ fontFamily: MONO, fontSize: 10, color: STATUS_COLOR[job.status] ?? C.muted }}>wave {job.wave} · {job.status}</span>
             <span style={{ fontFamily: MONO, fontSize: 10, color: phaseTone(job), border: `1px solid ${C.stroke}`, borderRadius: 5, padding: "2px 5px" }}>
               {phaseLabel(job)}
@@ -2204,7 +3222,7 @@ function ActiveJobCard({ job, busy, onCancel }: { job: AdminJob; busy: boolean; 
   );
 }
 
-function FinishedJobCard({ job }: { job: AdminJob }) {
+function FinishedJobCard({ job, onOpenCampaign }: { job: AdminJob; onOpenCampaign: (id: string) => void }) {
   return (
     <div style={{ background: C.panel2, border: `1px solid ${C.stroke}`, borderRadius: 8, padding: 12 }}>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "start" }}>
@@ -2212,6 +3230,7 @@ function FinishedJobCard({ job }: { job: AdminJob }) {
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <span style={{ fontFamily: MONO, fontSize: 10, color: STATUS_COLOR[job.status] ?? C.muted }}>{job.status}</span>
             <KindBadge kind={job.kind} />
+            <CampaignJobChip job={job} onOpenCampaign={onOpenCampaign} />
           </div>
           {job.airfoilSlug ? (
             <Link href={`/airfoils/${job.airfoilSlug}`} style={{ display: "block", marginTop: 8, color: C.text, textDecoration: "none", fontFamily: MONO, fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -2241,12 +3260,51 @@ function FinishedJobCard({ job }: { job: AdminJob }) {
   );
 }
 
+/** Campaign chip on a queue job card (spec §10/§11): links to the campaign
+ *  page; rendered only when the admin payload attributes the job to one. */
+function CampaignJobChip({ job, onOpenCampaign }: { job: AdminJob; onOpenCampaign: (id: string) => void }) {
+  const campaignId = job.campaignId;
+  if (!campaignId) return null;
+  const name = job.campaignName ?? job.campaignSlug ?? "campaign";
+  return (
+    <button
+      type="button"
+      data-testid={`job-campaign-chip-${job.campaignSlug ?? campaignId}`}
+      title={`Open campaign ${name}`}
+      onClick={() => onOpenCampaign(campaignId)}
+      style={{
+        fontFamily: MONO,
+        fontSize: 10,
+        color: C.teal,
+        background: C.tealFill,
+        border: `1px solid ${C.tealBorder}`,
+        borderRadius: 5,
+        padding: "2px 6px",
+        cursor: "pointer",
+        maxWidth: 200,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {name}
+      {job.jobKind === "targeted" ? " · targeted" : ""}
+    </button>
+  );
+}
+
 function JobConditionChips({ job }: { job: AdminJob }) {
+  // Batched campaign jobs bundle several speeds: show the honest Re range +
+  // speed count instead of a single misleading value.
+  const reLabel =
+    job.speedCount != null && job.speedCount > 1 && job.reynoldsMin != null && job.reynoldsMax != null && job.reynoldsMin !== job.reynoldsMax
+      ? `Re ${formatRe(job.reynoldsMin)}–${formatRe(job.reynoldsMax)} · ${job.speedCount} speeds`
+      : `Re ${job.reynolds ? formatRe(job.reynolds) : "—"}`;
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(96px, 1fr))", gap: 8, marginTop: 10, fontFamily: MONO, fontSize: 10, color: C.dim }}>
       <MetricChip label="Flow" value={`${job.mediumName ?? "—"} · ${f(job.speedMps, 2)} m/s`} />
       <MetricChip label="Thermo" value={`${fTemp(job.temperatureK)} · ${fPressure(job.pressurePa)} · M ${f(job.mach, 3)}`} />
-      <MetricChip label="Reference" value={`chord ${f(job.referenceChordM, 3)} m · Re ${job.reynolds ? formatRe(job.reynolds) : "—"}`} />
+      <MetricChip label="Reference" value={`chord ${f(job.referenceChordM, 3)} m · ${reLabel}`} />
       <MetricChip label="Boundary" value={job.bcName ?? "—"} />
       <MetricChip label="Solver" value={job.turbulenceModel ?? "—"} />
       <MetricChip label="Scheduling" value={`${policyLabel(job.schedulingPolicy)} · ${job.caseConcurrency == null ? "engine" : `${job.caseConcurrency}x${job.solverProcesses ?? 1}`}`} />
@@ -2285,44 +3343,67 @@ function ErrorLine({ text }: { text: string }) {
 }
 
 const miniLabel: CSSProperties = { fontFamily: MONO, fontSize: 10, color: C.dim, margin: "8px 0 4px" };
+const validationText: CSSProperties = { marginTop: 4, fontFamily: MONO, fontSize: 10, color: C.red };
 
-function TextField({ label: l, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+function ValidationSummary({ issues }: { issues: ValidationIssue[] }) {
+  if (!issues.length) return null;
   return (
-    <label style={{ display: "block" }}>
+    <div role="alert" style={{ border: `1px solid ${C.red}`, borderRadius: 8, padding: "8px 10px", color: C.red, background: "rgba(245, 101, 101, 0.08)", fontFamily: MONO, fontSize: 11, lineHeight: 1.35 }}>
+      {issues[0].message}
+      {issues.length > 1 && <span style={{ color: C.redText }}> · {issues.length - 1} more</span>}
+    </div>
+  );
+}
+
+function TextField({ label: l, value, onChange, error }: { label: string; value: string; onChange: (v: string) => void; error?: string }) {
+  const id = `admin-field-${l.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+  return (
+    <label style={{ display: "block" }} data-admin-field={l}>
       <div style={miniLabel}>{l}</div>
-      <input value={value} onChange={(e) => onChange(e.target.value)} style={inputStyle} />
+      <input aria-label={l} value={value} onChange={(e) => onChange(e.target.value)} aria-invalid={!!error} aria-describedby={error ? `${id}-error` : undefined} style={{ ...inputStyle, borderColor: error ? C.red : C.stroke }} />
+      {error && <div id={`${id}-error`} style={validationText}>{error}</div>}
     </label>
   );
 }
 
-function NumberField({ label: l, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {
+function NumberField({ label: l, value, onChange, error }: { label: string; value: number; onChange: (v: number) => void; error?: string }) {
+  const id = `admin-field-${l.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
   return (
-    <label style={{ display: "block" }}>
+    <label style={{ display: "block" }} data-admin-field={l}>
       <div style={miniLabel}>{l}</div>
-      <input type="number" value={Number.isFinite(value) ? value : 0} onChange={(e) => onChange(Number(e.target.value))} style={inputStyle} />
+      <input aria-label={l} type="number" value={Number.isFinite(value) ? value : 0} onChange={(e) => onChange(Number(e.target.value))} aria-invalid={!!error} aria-describedby={error ? `${id}-error` : undefined} style={{ ...inputStyle, borderColor: error ? C.red : C.stroke }} />
+      {error && <div id={`${id}-error`} style={validationText}>{error}</div>}
     </label>
   );
 }
 
-function OptionalNumberField({ label: l, value, onChange }: { label: string; value: number | null | undefined; onChange: (v: number | null) => void }) {
+function OptionalNumberField({ label: l, value, onChange, error }: { label: string; value: number | null | undefined; onChange: (v: number | null) => void; error?: string }) {
+  const id = `admin-field-${l.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
   return (
-    <label style={{ display: "block" }}>
+    <label style={{ display: "block" }} data-admin-field={l}>
       <div style={miniLabel}>{l}</div>
       <input
         type="number"
+        aria-label={l}
         value={typeof value === "number" && Number.isFinite(value) ? value : ""}
         placeholder="auto"
         onChange={(e) => {
           const raw = e.target.value.trim();
           onChange(raw ? Number(raw) : null);
         }}
-        style={inputStyle}
+        aria-invalid={!!error}
+        aria-describedby={error ? `${id}-error` : undefined}
+        style={{ ...inputStyle, borderColor: error ? C.red : C.stroke }}
       />
+      {error && <div id={`${id}-error`} style={validationText}>{error}</div>}
     </label>
   );
 }
 
-function TurbulentViscosityRatioField({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+// Exported for the campaign wizard's boundary quick-create (DecisionHistory
+// 2026-07-01 boundary presets decision): preset select first, raw νt/ν value
+// behind the advanced disclosure.
+export function TurbulentViscosityRatioField({ value, onChange, error }: { value: number; onChange: (v: number) => void; error?: string }) {
   const rounded = Number.isFinite(value) ? String(value) : "10";
   const presetValue = TURBULENT_VISCOSITY_RATIO_PRESETS.some((preset) => preset.value === rounded) ? rounded : "custom";
   const options = presetValue === "custom" ? ["custom", ...TURBULENT_VISCOSITY_RATIO_PRESETS.map((preset) => preset.value)] : TURBULENT_VISCOSITY_RATIO_PRESETS.map((preset) => preset.value);
@@ -2331,12 +3412,13 @@ function TurbulentViscosityRatioField({ value, onChange }: { value: number; onCh
     custom: `Custom · νt/ν ${f(value, 2)}`,
   };
   return (
-    <div style={{ display: "grid", gap: 6 }}>
+    <div style={{ display: "grid", gap: 6, gridColumn: "1 / -1" }}>
       <SelectField
         label="Turbulent viscosity ratio νt/ν"
         value={presetValue}
         options={options}
         optionLabels={optionLabels}
+        error={error}
         onChange={(next) => {
           if (next !== "custom") onChange(Number(next));
         }}
@@ -2351,63 +3433,164 @@ function TurbulentViscosityRatioField({ value, onChange }: { value: number; onCh
   );
 }
 
-function MeshSettingsGuide({ form }: { form: MeshProfileInput }) {
-  const safeSurface = Math.max(0, Math.round(form.nSurface || 0));
-  const safeRadial = Math.max(0, Math.round(form.nRadial || 0));
-  const safeWake = Math.max(0, Math.round(form.nWake || 0));
-  const cellCount = 2 * safeSurface * safeRadial + 2 * safeWake * safeRadial;
-  const items = [
-    { k: "surface", v: `${safeSurface.toLocaleString()} per side`, d: "Chordwise cells on upper and lower airfoil walls." },
-    { k: "radial", v: `${safeRadial.toLocaleString()} outward`, d: "Wall-normal cells from airfoil to farfield." },
-    { k: "wake", v: `${safeWake.toLocaleString()} downstream`, d: "Cells from trailing edge to the fixed outlet." },
-    { k: "target y+", v: f(form.targetYPlus, 2), d: "Sets first wall-normal height per case." },
-    { k: "span", v: `${f(form.spanChords, 2)}c`, d: "Thin empty-patch slab thickness, not wing span." },
+// Exported for the campaign wizard's mesh quick-create (DecisionHistory
+// 2026-07-01 mesh-infographic decisions are binding): the ONE live C-grid
+// infographic with overlay controls — reused, never duplicated.
+export function MeshSettingsGuide({
+  form,
+  onChange,
+}: {
+  form: MeshProfileInput;
+  onChange: (patch: Partial<MeshProfileInput>) => void;
+}) {
+  const setField = (key: keyof MeshProfileInput) => (value: number) => onChange({ [key]: value } as Partial<MeshProfileInput>);
+  const notes = [
+    {
+      title: "Surface cells",
+      body: "Chordwise wall cells along the airfoil surface. More cells resolve nose curvature and pressure peaks.",
+      color: "#f59e0b",
+    },
+    {
+      title: "Radial / farfield",
+      body: "Wall-normal layers grow from the airfoil toward the outer boundary. Larger farfield distance reduces boundary influence.",
+      color: C.teal,
+    },
+    {
+      title: "Wake block",
+      body: "Cells downstream of the trailing edge. The mesh stays chord-aligned while AoA sweeps rotate the freestream velocity.",
+      color: "#f59e0b",
+    },
+    {
+      title: "Target y+",
+      body: "First wall-cell height target. Lower y+ gives a finer near-wall mesh for turbulence models.",
+      color: "#a855f7",
+    },
+    {
+      title: "Span",
+      body: "Numerical slab thickness for the 2D OpenFOAM case. It is not the physical wing span.",
+      color: "#60a5fa",
+    },
   ];
 
   return (
-    <section aria-label="Mesh parameter guide" style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, background: C.panel2, padding: 12, display: "grid", gap: 10 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
-        <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.08em", color: C.dim, textTransform: "uppercase" }}>C-grid mesh guide</div>
-        <div style={{ fontFamily: MONO, fontSize: 11, color: C.teal }}>~{cellCount.toLocaleString()} cells</div>
+    <section aria-label="Mesh parameter guide" style={{ display: "grid", gap: 12 }}>
+      <div data-testid="mesh-infographic-artifact" style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 12, overflow: "hidden", background: "#071016", boxShadow: "0 18px 40px rgba(0,0,0,0.24)" }}>
+        <img
+          src="/infographics/mesh-settings-cgrid-editable.png"
+          alt="C-grid airfoil mesh infographic with seven blank anchor pads for editable farfield, radial, surface, wake, target y+ and span controls."
+          style={{ display: "block", width: "100%", height: "auto" }}
+        />
+        <MeshPictureNumberField label="Farfield" unit="c" value={form.farfieldRadiusChords} min={5} max={50} step={1} color={C.teal} style={{ left: "0.9%", top: "27.0%", width: "7.8%" }} onChange={setField("farfieldRadiusChords")} />
+        <MeshPictureNumberField label="Radial" value={form.nRadial} min={20} max={220} step={1} color={C.teal} style={{ left: "37.2%", top: "16.0%", width: "13.6%" }} onChange={setField("nRadial")} />
+        <MeshPictureNumberField label="Surface" value={form.nSurface} min={40} max={420} step={1} color="#f59e0b" style={{ left: "25.2%", top: "61.3%", width: "13.5%" }} onChange={setField("nSurface")} />
+        <MeshPictureNumberField label="Wake cells" value={form.nWake} min={20} max={220} step={1} color="#f59e0b" style={{ left: "64.8%", top: "24.0%", width: "14.2%" }} onChange={setField("nWake")} />
+        <MeshPictureNumberField label="Wake length" unit="c" value={form.wakeLengthChords} min={4} max={40} step={1} color="#f59e0b" style={{ left: "89.2%", top: "21.4%", width: "9.4%" }} onChange={setField("wakeLengthChords")} />
+        <MeshPictureNumberField label="Target y+" value={form.targetYPlus} min={0.1} max={5} step={0.1} color="#a855f7" style={{ left: "44.5%", top: "61.0%", width: "11.4%" }} onChange={setField("targetYPlus")} />
+        <MeshPictureNumberField label="Span" unit="c" value={form.spanChords} min={0.01} max={1} step={0.01} color="#60a5fa" style={{ left: "85.5%", top: "76.2%", width: "9.3%" }} onChange={setField("spanChords")} />
       </div>
-      <svg viewBox="0 0 520 250" role="img" aria-label="C-grid airfoil mesh infographic" style={{ width: "100%", height: "auto", display: "block", borderRadius: 8, background: "#071016" }}>
-        <defs>
-          <marker id="meshArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill={C.teal} />
-          </marker>
-          <marker id="meshAmberArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill={C.amber} />
-          </marker>
-        </defs>
-        <path d="M 240 40 Q 92 40 70 125 Q 92 210 240 210 L 430 210 M 240 40 L 430 40" fill="none" stroke={C.stroke} strokeWidth="2" />
-        <path d="M 245 82 Q 130 82 105 125 Q 130 168 245 168 L 430 168 M 245 82 L 430 82" fill="none" stroke="#1f3140" strokeWidth="1.5" strokeDasharray="4 7" />
-        <path d="M 250 124 C 292 105 350 107 392 124 C 349 132 294 135 250 124 Z" fill="#102838" stroke={C.teal} strokeWidth="2" />
-        <path d="M 252 125 C 298 122 346 122 392 124" fill="none" stroke={C.amber} strokeDasharray="4 5" />
-        <path d="M 255 106 C 300 91 350 93 390 117" fill="none" stroke={C.teal} strokeWidth="2.5" markerEnd="url(#meshArrow)" />
-        <text x="280" y="92" fill={C.teal} fontFamily={MONO} fontSize="12">surface</text>
-        <path d="M 250 124 C 207 123 168 122 120 124" fill="none" stroke={C.teal} strokeWidth="2.5" markerEnd="url(#meshArrow)" />
-        <text x="126" y="114" fill={C.teal} fontFamily={MONO} fontSize="12">radial</text>
-        <path d="M 392 124 L 474 124" fill="none" stroke={C.amber} strokeWidth="3" markerEnd="url(#meshAmberArrow)" />
-        <text x="414" y="114" fill={C.amber} fontFamily={MONO} fontSize="12">wake</text>
-        <path d="M 262 129 L 262 147" fill="none" stroke="#f97316" strokeWidth="2" markerEnd="url(#meshAmberArrow)" />
-        <text x="271" y="151" fill="#fb923c" fontFamily={MONO} fontSize="11">target y+</text>
-        <path d="M 230 195 L 260 225 L 410 225 L 380 195 Z" fill="#0e2431" stroke={C.stroke} strokeWidth="1.5" />
-        <path d="M 260 225 L 260 207 M 410 225 L 410 207" stroke={C.stroke} strokeWidth="1.2" />
-        <text x="312" y="219" fill={C.muted} fontFamily={MONO} fontSize="11">span</text>
-        <text x="28" y="235" fill={C.dim} fontFamily={MONO} fontSize="10">AoA sweep rotates freestream velocity; this wake block stays chord-aligned.</text>
-      </svg>
-      <div className="admin-mesh-guide-grid">
-        {items.map((item) => (
-          <div key={item.k} style={{ border: `1px solid ${C.stroke}`, borderRadius: 8, background: C.panel, padding: "8px 9px", minWidth: 0 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
-              <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, textTransform: "uppercase" }}>{item.k}</span>
-              <span style={{ fontFamily: MONO, fontSize: 11, color: C.text }}>{item.v}</span>
-            </div>
-            <p style={{ margin: "6px 0 0", color: C.muted, fontSize: 11, lineHeight: 1.35 }}>{item.d}</p>
+      <div data-testid="mesh-explanation-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
+        {notes.map((note) => (
+          <div key={note.title} style={{ display: "grid", gap: 5, alignContent: "start", borderTop: `2px solid ${note.color}`, background: "rgba(15,23,42,0.44)", borderRadius: 8, padding: "8px 9px" }}>
+            <div style={{ color: note.color, fontFamily: MONO, fontSize: 10, fontWeight: 800, textTransform: "uppercase" }}>{note.title}</div>
+            <p style={{ margin: 0, color: C.dim, fontSize: 11, lineHeight: 1.35 }}>{note.body}</p>
           </div>
         ))}
       </div>
     </section>
+  );
+}
+
+function MeshPictureNumberField({
+  label: l,
+  value,
+  min,
+  max,
+  step,
+  unit,
+  color,
+  style,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  unit?: string;
+  color: string;
+  style: CSSProperties;
+  onChange: (value: number) => void;
+}) {
+  const [focused, setFocused] = useState(false);
+  const current = Number.isFinite(value) ? value : 0;
+  const normalized = Math.min(max, Math.max(min, current));
+  const apply = (raw: string) => {
+    const next = Number(raw);
+    if (Number.isFinite(next)) onChange(next);
+  };
+
+  return (
+    <label
+      data-admin-field={l}
+      style={{
+        position: "absolute",
+        display: "grid",
+        gridTemplateRows: "auto auto",
+        gap: 2,
+        padding: "4px 6px",
+        border: `1px solid ${focused ? color : "rgba(148, 163, 184, 0.42)"}`,
+        borderRadius: 9,
+        background: "rgba(7,16,22,0.84)",
+        boxShadow: focused ? `0 0 0 2px ${color}33, 0 10px 26px rgba(0,0,0,0.42)` : "0 8px 20px rgba(0,0,0,0.26)",
+        color: C.text,
+        ...style,
+      }}
+      onMouseDown={() => setFocused(true)}
+      onFocus={() => setFocused(true)}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocused(false);
+      }}
+    >
+      <span style={{ color, fontFamily: MONO, fontSize: 9, lineHeight: 1, textTransform: "uppercase", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{l}</span>
+      <span style={{ display: "grid", gridTemplateColumns: unit ? "minmax(0, 1fr) auto" : "minmax(0, 1fr)", gap: 4, alignItems: "center" }}>
+        <input
+          aria-label={l}
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={Number.isFinite(value) ? value : 0}
+          onChange={(e) => apply(e.currentTarget.value)}
+          style={{
+            width: "100%",
+            minWidth: 0,
+            border: "none",
+            background: "transparent",
+            color: C.text,
+            fontFamily: MONO,
+            fontSize: 14,
+            fontWeight: 800,
+            padding: 0,
+            outline: "none",
+          }}
+        />
+        {unit && <span style={{ color: C.muted, fontFamily: MONO, fontSize: 10 }}>{unit}</span>}
+      </span>
+      {focused && (
+        <div style={{ position: "absolute", left: 0, right: 0, top: "calc(100% + 5px)", zIndex: 8, border: `1px solid ${C.stroke2}`, borderRadius: 9, background: "rgba(7,16,22,0.98)", padding: "8px 9px", boxShadow: "0 14px 32px rgba(0,0,0,0.4)" }}>
+          <input
+            aria-label={`${l} slider`}
+            type="range"
+            min={min}
+            max={max}
+            step={step}
+            value={normalized}
+            onChange={(e) => apply(e.currentTarget.value)}
+            style={{ width: "100%", display: "block" }}
+          />
+        </div>
+      )}
+    </label>
   );
 }
 
@@ -2417,23 +3600,27 @@ function SelectField({
   options,
   optionLabels,
   onChange,
+  error,
 }: {
   label: string;
   value: string;
   options: string[];
   optionLabels?: Record<string, string>;
   onChange: (v: string) => void;
+  error?: string;
 }) {
+  const id = `admin-field-${l.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
   return (
-    <label style={{ display: "block" }}>
+    <label style={{ display: "block" }} data-admin-field={l}>
       <div style={miniLabel}>{l}</div>
-      <select value={value} onChange={(e) => onChange(e.target.value)} style={inputStyle}>
+      <select aria-label={l} value={value} onChange={(e) => onChange(e.target.value)} aria-invalid={!!error} aria-describedby={error ? `${id}-error` : undefined} style={{ ...inputStyle, borderColor: error ? C.red : C.stroke }}>
         {options.map((o) => (
           <option key={o} value={o}>
             {optionLabels?.[o] ?? o}
           </option>
         ))}
       </select>
+      {error && <div id={`${id}-error`} style={validationText}>{error}</div>}
     </label>
   );
 }
@@ -2471,19 +3658,25 @@ function previewFlow(medium: MediumDTO, form: Pick<FlowConditionInput, "temperat
   return { dynamicViscosity: mu, density, kinematicViscosity, mach };
 }
 
-function Stepper({ value, onChange, disabled }: { value: number; onChange: (n: number) => void; disabled: boolean }) {
+/** THE single global solver-capacity control (sweeper_state.cpuSlots, spec
+ *  §3.2/§7): 0 renders as "auto" (no cpu cap sent to the engine); the API
+ *  accepts 0..512. Replaces the old per-job concurrency stepper. */
+function CpuSlotsStepper({ value, onChange, disabled }: { value: number; onChange: (n: number) => void; disabled: boolean }) {
   const btn: CSSProperties = { fontFamily: MONO, fontSize: 13, width: 24, height: 24, borderRadius: 6, background: C.panel3, border: `1px solid ${C.stroke}`, color: C.text, cursor: disabled ? "not-allowed" : "pointer" };
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      <button type="button" disabled={disabled || value <= 1} onClick={() => onChange(value - 1)} style={btn}>−</button>
-      <span style={{ fontFamily: MONO, fontSize: 13, color: C.text, minWidth: 16, textAlign: "center" }}>{value}</span>
-      <button type="button" disabled={disabled || value >= 32} onClick={() => onChange(value + 1)} style={btn}>+</button>
+      <button type="button" aria-label="Decrease CPU slots" disabled={disabled || value <= 0} onClick={() => onChange(value - 1)} style={btn}>−</button>
+      <span data-testid="queue-cpu-slots-value" style={{ fontFamily: MONO, fontSize: 13, color: value === 0 ? C.dim : C.text, minWidth: 34, textAlign: "center" }}>
+        {value === 0 ? "auto" : value}
+      </span>
+      <button type="button" aria-label="Increase CPU slots" disabled={disabled || value >= 512} onClick={() => onChange(value + 1)} style={btn}>+</button>
     </span>
   );
 }
 
 const inputStyle: CSSProperties = {
   width: "100%",
+  boxSizing: "border-box",
   fontFamily: MONO,
   fontSize: 13,
   color: C.text,

@@ -47,3 +47,4 @@ product-design-audits/
 
 # --- local SSH credentials ---
 .ssh/
+apps/web/.next-e2e/

@@ -49,8 +49,9 @@ async function apiFetch(path: string, init?: RequestInit, retries = 4): Promise<
   throw lastErr;
 }
 
-export async function getAirfoilDetail(slug: string): Promise<AirfoilDetailPayload | null> {
-  const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}`, {
+export async function getAirfoilDetail(slug: string, revisionId?: string | null): Promise<AirfoilDetailPayload | null> {
+  const qs = revisionId ? `?revisionId=${encodeURIComponent(revisionId)}` : "";
+  const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}${qs}`, {
     cache: "no-store",
   });
   if (res.status === 404) return null;

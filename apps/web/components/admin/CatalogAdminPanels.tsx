@@ -32,8 +32,12 @@ export function CategoriesAdminPanel() {
   const [editParent, setEditParent] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [newNameError, setNewNameError] = useState("");
+  const [editNameError, setEditNameError] = useState("");
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dropHint, setDropHint] = useState<{ targetId: string; position: DropPosition } | null>(null);
+  const newNameRef = useRef<HTMLInputElement | null>(null);
+  const editNameRef = useRef<HTMLInputElement | null>(null);
   const draggedIdRef = useRef<string | null>(null);
   const rows = useMemo(() => flatten(tree), [tree]);
   const selected = rows.find((r) => r.id === selectedId) ?? null;
@@ -46,6 +50,7 @@ export function CategoriesAdminPanel() {
 
   useEffect(() => {
     if (selected) {
+      setEditNameError("");
       setEditName(selected.name);
       const parentPath = selected.path.split("/").slice(0, -1).join("/");
       setEditParent(rows.find((r) => r.path === parentPath)?.id ?? "");
@@ -63,6 +68,31 @@ export function CategoriesAdminPanel() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const createCategory = () => {
+    if (!newName.trim()) {
+      setNewNameError("Name is required");
+      newNameRef.current?.focus();
+      return;
+    }
+    setNewNameError("");
+    act(async () => {
+      await createAdminCategory({ name: newName, parentId: newParent || null });
+      setNewName("");
+      setNewParent("");
+    });
+  };
+
+  const saveCategory = () => {
+    if (!selected) return;
+    if (!editName.trim()) {
+      setEditNameError("Name is required");
+      editNameRef.current?.focus();
+      return;
+    }
+    setEditNameError("");
+    act(() => updateAdminCategory(selected.id, { name: editName, parentId: editParent || null }));
   };
 
   const dropPosition = (event: React.DragEvent<HTMLElement>): DropPosition => {
@@ -186,7 +216,8 @@ export function CategoriesAdminPanel() {
         <div style={{ display: "grid", gap: 16 }}>
           <div style={card}>
             <div style={label}>CREATE</div>
-            <input data-testid="new-category-name" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="category name" style={input} />
+            <input ref={newNameRef} data-testid="new-category-name" value={newName} onChange={(e) => { setNewName(e.target.value); if (newNameError) setNewNameError(e.target.value.trim() ? "" : newNameError); }} placeholder="category name" aria-invalid={!!newNameError} style={{ ...input, borderColor: newNameError ? C.red : C.stroke }} />
+            {newNameError && <InlineError text={newNameError} />}
             <select data-testid="new-category-parent" value={newParent} onChange={(e) => setNewParent(e.target.value)} style={{ ...input, marginTop: 8 }}>
               <option value="">root category</option>
               {rows.map((r) => (
@@ -198,14 +229,8 @@ export function CategoriesAdminPanel() {
             </select>
             <button
               type="button"
-              disabled={busy || !newName.trim()}
-              onClick={() =>
-                act(async () => {
-                  await createAdminCategory({ name: newName, parentId: newParent || null });
-                  setNewName("");
-                  setNewParent("");
-                })
-              }
+              disabled={busy}
+              onClick={createCategory}
               style={{ ...primaryBtn, marginTop: 10, width: "100%" }}
             >
               <Plus size={14} /> create category
@@ -218,7 +243,8 @@ export function CategoriesAdminPanel() {
               <div style={{ fontFamily: MONO, fontSize: 12, color: C.dim }}>Select a category.</div>
             ) : (
               <>
-                <input data-testid="edit-category-name" value={editName} onChange={(e) => setEditName(e.target.value)} style={input} />
+                <input ref={editNameRef} data-testid="edit-category-name" value={editName} onChange={(e) => { setEditName(e.target.value); if (editNameError) setEditNameError(e.target.value.trim() ? "" : editNameError); }} aria-invalid={!!editNameError} style={{ ...input, borderColor: editNameError ? C.red : C.stroke }} />
+                {editNameError && <InlineError text={editNameError} />}
                 <select data-testid="edit-category-parent" value={editParent} onChange={(e) => setEditParent(e.target.value)} style={{ ...input, marginTop: 8 }}>
                   <option value="">root category</option>
                   {rows
@@ -231,7 +257,7 @@ export function CategoriesAdminPanel() {
                     ))}
                 </select>
                 <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                  <button type="button" disabled={busy || !editName.trim()} onClick={() => act(() => updateAdminCategory(selected.id, { name: editName, parentId: editParent || null }))} style={primaryBtn}>
+                  <button type="button" disabled={busy} onClick={saveCategory} style={primaryBtn}>
                     <Check size={14} /> save
                   </button>
                   <button
@@ -258,6 +284,9 @@ export function HashtagsAdminPanel() {
   const [editing, setEditing] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [newNameError, setNewNameError] = useState("");
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const newNameRef = useRef<HTMLInputElement | null>(null);
 
   const refresh = async () => setItems((await getAdminHashtags()).items);
   useEffect(() => {
@@ -277,6 +306,34 @@ export function HashtagsAdminPanel() {
     }
   };
 
+  const createHashtag = () => {
+    if (!newName.trim()) {
+      setNewNameError("Name is required");
+      newNameRef.current?.focus();
+      return;
+    }
+    setNewNameError("");
+    act(async () => {
+      await createAdminHashtag(newName);
+      setNewName("");
+    });
+  };
+
+  const saveHashtag = (item: HashtagDTO) => {
+    const next = editing[item.id] ?? item.name;
+    if (!next.trim()) {
+      setRowErrors((current) => ({ ...current, [item.id]: "Name is required" }));
+      window.setTimeout(() => document.querySelector<HTMLInputElement>(`[data-testid="hashtag-name-${item.slug}"]`)?.focus(), 0);
+      return;
+    }
+    setRowErrors((current) => {
+      const copy = { ...current };
+      delete copy[item.id];
+      return copy;
+    });
+    act(() => updateAdminHashtag(item.id, next));
+  };
+
   return (
     <div>
       <SectionHeader title="Hashtags" subtitle="Managed hashtag vocabulary for profiles and filters." />
@@ -284,16 +341,12 @@ export function HashtagsAdminPanel() {
       <div style={{ display: "grid", gridTemplateColumns: "360px minmax(0, 1fr)", gap: 16, alignItems: "start" }}>
         <div style={card}>
           <div style={label}>ADD HASHTAG</div>
-          <input data-testid="new-hashtag-name" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="hashtag name" style={input} />
+          <input ref={newNameRef} data-testid="new-hashtag-name" value={newName} onChange={(e) => { setNewName(e.target.value); if (newNameError) setNewNameError(e.target.value.trim() ? "" : newNameError); }} placeholder="hashtag name" aria-invalid={!!newNameError} style={{ ...input, borderColor: newNameError ? C.red : C.stroke }} />
+          {newNameError && <InlineError text={newNameError} />}
           <button
             type="button"
-            disabled={busy || !newName.trim()}
-            onClick={() =>
-              act(async () => {
-                await createAdminHashtag(newName);
-                setNewName("");
-              })
-            }
+            disabled={busy}
+            onClick={createHashtag}
             style={{ ...primaryBtn, marginTop: 10, width: "100%" }}
           >
             <Plus size={14} /> add hashtag
@@ -302,14 +355,27 @@ export function HashtagsAdminPanel() {
         <div style={{ ...card, padding: 0 }}>
           <div style={{ ...label, padding: "14px 16px 0" }}>HASHTAGS</div>
           {items.map((h) => (
-            <div key={h.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8, alignItems: "center", padding: "10px 16px", borderTop: `1px solid ${C.borderRow}` }}>
-              <input
-                data-testid={`hashtag-name-${h.slug}`}
-                value={editing[h.id] ?? h.name}
-                onChange={(e) => setEditing((old) => ({ ...old, [h.id]: e.target.value }))}
-                style={input}
-              />
-              <button type="button" disabled={busy || !(editing[h.id] ?? h.name).trim()} onClick={() => act(() => updateAdminHashtag(h.id, editing[h.id] ?? h.name))} style={ghostBtn}>
+            <div key={h.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8, alignItems: "start", padding: "10px 16px", borderTop: `1px solid ${C.borderRow}` }}>
+              <div>
+                <input
+                  data-testid={`hashtag-name-${h.slug}`}
+                  value={editing[h.id] ?? h.name}
+                  onChange={(e) => {
+                    setEditing((old) => ({ ...old, [h.id]: e.target.value }));
+                    if (rowErrors[h.id] && e.target.value.trim()) {
+                      setRowErrors((current) => {
+                        const copy = { ...current };
+                        delete copy[h.id];
+                        return copy;
+                      });
+                    }
+                  }}
+                  aria-invalid={!!rowErrors[h.id]}
+                  style={{ ...input, borderColor: rowErrors[h.id] ? C.red : C.stroke }}
+                />
+                {rowErrors[h.id] && <InlineError text={rowErrors[h.id]} />}
+              </div>
+              <button type="button" disabled={busy} onClick={() => saveHashtag(h)} style={ghostBtn}>
                 <Pencil size={14} /> save
               </button>
               <button type="button" disabled={busy} onClick={() => window.confirm(`Delete #${h.name}?`) && act(() => deleteAdminHashtag(h.id))} style={{ ...ghostBtn, color: C.red }}>
@@ -335,6 +401,10 @@ function SectionHeader({ title, subtitle }: { title: string; subtitle: string })
 
 function ErrorLine({ text }: { text: string }) {
   return <div style={{ fontFamily: MONO, fontSize: 11, color: C.red, marginBottom: 12 }}>{text}</div>;
+}
+
+function InlineError({ text }: { text: string }) {
+  return <div role="alert" style={{ fontFamily: MONO, fontSize: 10, color: C.red, marginTop: 4 }}>{text}</div>;
 }
 
 const card: React.CSSProperties = { background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16 };

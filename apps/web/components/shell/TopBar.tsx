@@ -44,6 +44,20 @@ export function TopBar({ active }: { active: string }) {
             text-overflow: ellipsis;
             white-space: nowrap;
           }
+          /* Narrow viewports: the nav tab row scrolls inside its own container
+             instead of pushing the actions group past the document edge. */
+          .topbar-brand,
+          .topbar-actions {
+            flex-shrink: 0;
+          }
+          .topbar-tabs {
+            min-width: 0;
+            overflow-x: auto;
+          }
+          .topbar-tabs > * {
+            flex-shrink: 0;
+            white-space: nowrap;
+          }
         }
         @media (max-width: 640px) {
           .topbar-brand-text {
@@ -54,13 +68,13 @@ export function TopBar({ active }: { active: string }) {
           }
         }
       `}</style>
-      <Link href="/" aria-label="Airfoils.Pro home" style={{ display: "flex", alignItems: "center", gap: 9 }}>
+      <Link href="/" aria-label="Airfoils.Pro home" className="topbar-brand" style={{ display: "flex", alignItems: "center", gap: 9 }}>
         <BrandMark size={24} />
         <span className="topbar-brand-text" style={{ fontWeight: 700, letterSpacing: 0, fontSize: 14 }}>
           Airfoils<span style={{ color: C.teal }}>.Pro</span>
         </span>
       </Link>
-      <div style={{ display: "flex", gap: 2, fontSize: 13 }}>
+      <div className="topbar-tabs" style={{ display: "flex", gap: 2, fontSize: 13 }}>
         {TABS.map((t) => {
           const on = t.k === active;
           if (t.k === "detail") return <DetailNavLink key={t.k} active={on} />;
@@ -82,6 +96,7 @@ export function TopBar({ active }: { active: string }) {
         })}
       </div>
       <div
+        className="topbar-actions"
         style={{
           marginLeft: "auto",
           display: "flex",

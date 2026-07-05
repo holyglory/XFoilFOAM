@@ -1,6 +1,6 @@
 "use client";
 
-import { type ChartPointVM, type ChartProjection, type ChartType, colorForRe, fRe } from "@aerodb/core";
+import { type ChartPointVM, type ChartProjection, type ChartType, colorForRe, derivedBySymmetryInfo, fRe } from "@aerodb/core";
 import type { CSSProperties } from "react";
 
 import { C, MONO, VIZ } from "@/lib/tokens";
@@ -32,6 +32,7 @@ export function PolarViewer(props: {
   const solvedPointLabel = `${solvedPointCount} solved point${solvedPointCount === 1 ? "" : "s"}`;
   const hasPostStallPoints = projection.points.some((p) => p.stalled || p.point.unsteady);
   const hasProvisionalPoints = projection.points.some((p) => p.point.classificationState === "needs_urans");
+  const hasDerivedPoints = projection.points.some((p) => derivedBySymmetryInfo(p.point).derived);
   const hasFitCurve = projection.curves.some((c) => c.kind === "fit");
 
   let hoverStyle: CSSProperties = { display: "none" };
@@ -209,6 +210,12 @@ export function PolarViewer(props: {
           <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted, display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ width: 16, borderTop: `2px dashed ${C.teal}`, display: "inline-block" }} />
             best-fit
+          </span>
+        )}
+        {hasDerivedPoints && (
+          <span data-testid="polar-derived-legend" style={{ fontFamily: MONO, fontSize: 10, color: C.muted, display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", border: `1.6px solid ${C.teal}`, background: "transparent", display: "inline-block" }} />
+            derived by symmetry
           </span>
         )}
         {hasProvisionalPoints && (

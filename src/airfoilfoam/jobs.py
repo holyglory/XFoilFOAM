@@ -7,6 +7,7 @@ from typing import Callable, Optional
 
 from . import physics
 from .airfoil import load_airfoil
+from .cache import EngineCache
 from .cancellation import JobCancelled
 from .config import Settings, get_settings
 from .meshing.base import get_mesher
@@ -105,6 +106,10 @@ def execute_job(
     cpu_tokens = CpuTokenPool(settings.cpu_token_state_path, plan.worker_cpu_budget)
     mesh_stats = {"count": 0}
     mesh_reuse_mode = "symlink" if runner.external_paths_visible else "copy"
+    # Persistent cross-job cache: meshes are copied instead of rebuilt when a
+    # previous job already built the same (geometry, chord, resolved params), and
+    # steady cases seed from the nearest previously solved angle.
+    cache = EngineCache.from_settings(settings)
 
     lock = threading.Lock()
     completed = {"n": 0}
@@ -224,7 +229,10 @@ def execute_job(
             on_wait=lambda _snapshot, c=chord: wait_for_cpu(1, f"waiting for CPU before meshing chord {c:g}"),
             on_acquired=lambda _snapshot, c=chord: cpu_acquired(1, JobPhase.meshing, f"meshing chord {c:g}"),
         ):
-            mr = prepare_mesh(mesh_dir, airfoil, resolved, chord, mesher, runner, cancel_check=ensure_not_cancelled)
+            mr = prepare_mesh(
+                mesh_dir, airfoil, resolved, chord, mesher, runner,
+                cancel_check=ensure_not_cancelled, cache=cache,
+            )
         mesh_stats["count"] += 1
         set_status(JobState.running, "mesh ready", phase=JobPhase.waiting_cpu, cpu_tokens_waiting=0, cpu_tokens_held=0)
         meshes[chord] = (mesh_dir, resolved, mr.n_cells)
@@ -325,6 +333,7 @@ def execute_job(
                     phase_progress=phase_progress,
                     outcome_progress=lambda item, accepted, c=chord, s=speed: record_outcome(c, s, item, accepted),
                     cancel_check=ensure_not_cancelled,
+                    cache=cache,
                 )
             ensure_not_cancelled()
             set_status(JobState.running, "polar complete", phase=JobPhase.ingesting, cpu_tokens_waiting=0, cpu_tokens_held=0)
@@ -365,15 +374,18 @@ def execute_job(
                     case=case,
                 ),
             ):
+                # Pass the RESOLVED params of the shared mesh (not the raw request)
+                # so the cache keys fields by the mesh geometry actually in use.
                 outcome = run_case(
                     store.case_dir(job_id, spec.slug), airfoil, spec, request.fluid, request.roughness,
-                    request.mesh, request.solver, mesher, runner, n_proc=plan.solver_processes,
+                    resolved, request.solver, mesher, runner, n_proc=plan.solver_processes,
                     render_images=render_images,
                     solver_timeout=settings.solver_timeout,
                     rans_solver_timeout=settings.rans_solver_timeout,
                     rans_max_iterations=settings.rans_max_iterations,
                     mesh_dir=mesh_dir,
                     cancel_check=ensure_not_cancelled,
+                    cache=cache,
                 )
             bump()
             return spec, outcome

@@ -1,15 +1,90 @@
 # Decision History
 
-## 2026-07-01 — Mesh Settings Need In-Context Visual Explanations
+## 2026-07-05 — Campaign Wizard Numerics Slots Get Inline Quick-Create And Single-Row Defaults
 
-- Decision: Mesh profiles include an in-form C-grid infographic, current
-  estimated cell count, and compact explanations for surface, radial, wake,
-  target y+, and span.
+- Decision: The wizard Review step's four numerics slots (Boundary / Mesh /
+  Solver / Output) resolve defaults from real rows only: exactly one existing
+  profile of any origin auto-selects; with multiple rows exactly one seeded row
+  auto-selects; zero rows stay unresolved and render the inline quick-create as
+  the only path (no select with one dead option).
+- Decision: Each slot carries a quiet "+ new profile" affordance opening a
+  save-as-new modal (NumericsQuickCreate) that replicates the Setup library
+  editors' full field set and domain conventions — νt/ν presets with the raw
+  value behind an advanced disclosure, the live mesh infographic (reused via an
+  exported MeshSettingsGuide, never duplicated), URANS knobs behind an advanced
+  disclosure, and the stored-image multi-select. Prefill comes from the slot's
+  currently selected profile or the Setup editors' exact new-record defaults;
+  existing rows are never mutated from the wizard.
+- Why: The Review step showed "unresolved — choose" with library-only selects,
+  so an admin without a fitting profile had to abandon the wizard (losing
+  context) to visit the Setup library, and a library holding exactly one
+  non-seeded profile per slot still stayed unresolved even though the
+  single-option decision (2026-07-01) established that single-option choices
+  need no user decision. Default resolution had been restricted to seeded rows
+  only.
+- Expected effect: The wizard never dead-ends on the numerics library, defaults
+  stay honest (only ever real rows, never invented values), and the setup
+  registries keep their save-as-new immutability semantics from inside the
+  wizard.
+
+## 2026-07-01 — Simulation Setup Profile Editors Separate Clone, Update, And Remove
+
+- Decision: Selecting an existing flow, reference geometry, boundary, mesh,
+  solver, scheduling, output, sweep, or simulation preset loads it as a starting
+  point. The primary save action creates a new record from those values; updating
+  the selected record is a separate explicit action.
+- Decision: Reusable component profiles expose a visible New action beside the
+  list and a row-scoped remove icon on each removable profile. Loading a row
+  into the editor is not treated as selecting it for deletion.
+- Why: The previous UI used one save button for both create and update. A user
+  who selected a mesh profile, changed values, and changed the name reasonably
+  expected to create a variant, but the old profile was renamed and overwritten.
+  The first fix incorrectly added `Remove selected`, which reused the
+  editor-loaded row as destructive selection and made it unclear which row would
+  be removed.
+- Expected effect: Making setup variants is the default, destructive mutation is
+  deliberate, and unused profile cleanup is available directly on the row it
+  affects.
+
+## 2026-07-01 — Mesh Settings Need A Wide In-Context Infographic
+
+- Decision: Mesh profiles include a wide C-grid infographic in the main context
+  panel using the selected ImageGen bitmap, with compact live controls for
+  surface, radial, wake, farfield, target y+, and span overlaid on empty visual
+  anchor pads. The right editor remains a compact form for name/identity
+  fields.
+- Decision: ImageGen-guided admin visuals require browser screenshot
+  verification against the concept's hierarchy and first-viewport intent before
+  delivery.
+- Decision: When the user prefers a generated infographic, preserve the bitmap
+  as a project asset and overlay only real app values. Do not rebuild the
+  artwork as a lower-quality SVG unless the user asks for a deterministic
+  vector version.
+- Decision: Mesh infographics must contain no baked dynamic values. The bitmap
+  provides only visual mesh context and empty anchor pads; React renders the
+  actual inputs, current values, and focus-only sliders on top.
+- Decision: Generated mesh detail panels remain only when they carry real
+  explanatory overlay text. The meaningless circular zoom callout was removed
+  because it did not correspond to the indicated mesh region.
+- Decision: Explanatory overlays on the responsive bitmap use short copy and
+  viewport-aware font/padding sizes, with regression checks for clipping.
 - Why: The raw fields are meaningful only in the context of the app's fixed
-  chord-aligned C-grid. Users need to see that AoA sweeps rotate freestream
-  velocity while the wake block remains fixed to the chord line.
+  chord-aligned C-grid. The first implementation squeezed the generated
+  infographic concept into the narrow edit-form column, then a code-native SVG
+  replacement still failed to match the generated artwork's quality. The next
+  bitmap pass still contained a generated `30,400 cells` value, which made
+  mutable form state look like static artwork. The following pass removed the
+  fake zoom callout but left lower detail panels with empty pads, so the page
+  still looked like it contained unfinished inspector widgets. The first text
+  overlay pass then used fixed pixel text inside percentage-positioned boxes;
+  at smaller rendered image sizes the text/borders were clipped by the image
+  wrapper.
 - Expected effect: Mesh setup choices become understandable without requiring
-  users to inspect OpenFOAM topology or source code.
+  users to inspect OpenFOAM topology or source code, and future generated UI
+  concepts are used or judged by rendered hierarchy instead of text-only checks.
+  Dynamic values remain searchable, focusable, validated DOM controls rather
+  than pixels inside an image, and every retained detail panel has a visible
+  explanation.
 
 ## 2026-07-01 — Boundary Forms Prefer Domain Presets Over Raw Solver Numbers
 
@@ -354,3 +429,342 @@
   and control-plane API while preserving any running OpenFOAM jobs. Engine or
   worker changes can still be rolled out deliberately during an idle solver
   window.
+
+## 2026-07-01 — Mesh Infographic Explanations Must Not Occlude The Diagram
+
+- Decision: Mesh setup explanations live below the generated C-grid bitmap as a
+  compact legend/caption grid. The bitmap itself keeps only live numeric
+  controls and direct, small anchors.
+- Decision: Generated detail panels that visually support the concept may
+  remain in the image, but explanatory paragraphs must not be painted over
+  them if that competes with the mesh picture.
+- Why: A previous fix verified that overlay text was not clipped, but it missed
+  the more important visual-readability defect: the text interfered with the
+  primary diagram and made the page worse.
+- Expected effect: The mesh picture remains the first readable artifact, while
+  users still get parameter explanations in a nearby, accessible surface.
+
+## 2026-07-01 — Mesh Infographic Bitmap Has Only Live-Control Anchor Pads
+
+- Decision: The mesh infographic bitmap was regenerated with a single main
+  C-grid diagram and exactly the anchor pads used by live HTML inputs. Empty
+  lower detail panels, decorative placeholder blocks, and unused zoom/callout
+  chrome were removed from the asset.
+- Why: Once explanatory copy moved below the image, the old generated detail
+  panels became meaningless empty UI-like boxes. Keeping them made the product
+  look unfinished even though the React controls were real.
+- Expected effect: The image reads as a clean CFD diagram, and every blank pad
+  visible inside the bitmap has a live application control placed over it.
+
+## 2026-07-04 — Simulation Campaigns: Wizard, Set-Valued Plans, Refinement Objectives
+
+- Decision: Batch solving gets a first-class Campaign concept (pure
+  execution/work-definition records) with a 4-step wizard (Airfoils →
+  Conditions → Angle plan → Review & launch). Full spec in
+  `docs/simulation-campaigns-spec.md`; approved mockups (rev 4) in the
+  "Simulations UX" artifact. Admin nav regroups to Simulations / Queue /
+  Setup library / Catalog / Sync API, with URL search params as the single
+  source of truth for section/campaign/wizard state.
+- Decision: Campaign conditions and the angle plan are set-valued and editable
+  for the campaign's whole life. Conditions = ambient (T,P pairs — never
+  independent T×P axes) × speeds × chords, defined in place (library prefill
+  only adds); the angle plan = base sweep + refinement objectives (max L/D and
+  zero-lift α₀, each with tolerance and round budget). Every post-launch edit
+  goes through a previewed, server-re-verified acknowledge dialog with
+  optimistic concurrency. The medium locks at launch.
+- Decision: Completeness (closure) rule — work solved for at least one campaign
+  airfoil is completed for all campaign airfoils even after removal from the
+  plan, at per-(condition, angle) granularity for sweeps; released work with no
+  evidence is cancelled; no silent resurrection (restore is an explicit
+  suggestion); blocked kept work has an audited force-release.
+- Decision: Each campaign condition pins an immutable preset revision; extends/
+  refinements append plan revisions and reuse solved evidence natively via the
+  (airfoil, revision, angle) key. Cross-campaign dedup is anchored by a
+  physics-only hash on revisions (globally indexed) plus canonical value keys
+  on flow/geometry registries (fixed-precision find-or-create). Campaign-
+  created presets/registry rows carry origin provenance and are filtered from
+  library lists by default; no ownership columns — linkage lives in
+  campaign-conditions joins.
+- Decision: One scheduler, one priority scale (gap-fill 0, campaigns 0–9
+  default 5, public on-demand 10), one capacity knob — a single global
+  "OpenFOAM CPU slots" setting on the Queue page; per-preset scheduling
+  profiles leave campaign composition. Campaign jobs carry only their own
+  points; refinement iterations are single-angle targeted jobs exempt from the
+  tiny-polar whole-URANS heuristic (judged against revision-wide evidence).
+  Engine-down triggers health-gated backoff with a truthful banner instead of
+  failed-job spam.
+- Decision: Refinement objectives are generalized target functions on the
+  stored polar fit (max-L/D peak, Cl=0 crossing) computed at 0.01° inside
+  buildPolarFit; lanes converge only on accepted evidence within tolerance of
+  a stable fit, oscillation terminates as an honest ±window, URANS
+  supersession reopens convergence, tolerance edits reopen/close lanes.
+- Decision: Symmetric airfoils (a computed, stored geometric property) solve
+  only α ≥ 0; negative angles are derived (Cl/Cm negated, Cd equal) at
+  read/assembly time, labeled "derived by symmetry" with links to the source
+  solve; media renders mirrored from stored +α artifacts with the same label;
+  α₀ = 0° by definition; L/D lanes search the positive side only.
+- Decision: All progress/ETA surfaces are truth-table and counter backed:
+  status lines never read "Active" while the sweeper is disabled or the engine
+  is unreachable; projections only from measured trailing ingest rates and
+  suppressed while blocked; previews are real dry-run counts with visible
+  computing/degrade states.
+- Decision: PATCH /api/sweeper and GET /api/sim-jobs move under admin auth as
+  part of this work (previously public; campaigns make an open
+  pause-the-scheduler endpoint materially more damaging).
+- Why: The prior flow required walking nine setup tabs with no launch button,
+  no batch grouping, no way to see or refine a batch, and extending a sweep
+  minted a new revision that orphaned solved points (the sweep block is inside
+  the snapshot signature). User asked for wizard, batch review/refine,
+  multi-Re sweeps, and iterative max-L/D refinement; design went through three
+  adversarial critique passes plus four rounds of user mockup review.
+- Expected effect: One guided launch path; batches with exact reuse on
+  refinement; honest operational visibility at 10^5-point scale; refinement
+  objectives that are auditable evidence chains rather than claims.
+
+## 2026-07-04 — Campaign detail UI: pinned-revision detail scope (surgical API exception)
+- Decision: `GET /api/airfoils/:slug` accepts an optional `revisionId` query
+  param (`assembleDetail(slug, { revisionId })`) that scopes the polar payload
+  to ONE pinned `simulation_preset_revisions` row, bypassing the
+  enabled-preset/air-medium filter, and always emits that revision's Re entry
+  (possibly empty) so "no solved points yet" renders honestly. Default
+  behaviour (no param) is byte-identical to before.
+- Why: The campaign cell side panel (spec §11) must show the stored polar for
+  the campaign's pinned revision through the existing PolarViewer; the public
+  payload could not previously filter to one revision. The spec authorized
+  exactly this minimal exception.
+- Expected effect: Campaign evidence views reuse the public detail pipeline
+  (incl. derived-by-symmetry marking) with zero duplication; the campaign UI
+  never re-implements polar assembly.
+
+## 2026-07-04 — Admin shell integration: URL routing, nav regroup, queue campaign surfaces
+- Decision: `/admin` navigation regrouped to five sections (Simulations first +
+  default, Queue, Setup library with Mediums folded in as a 10th tab, Catalog
+  with Add airfoils/Categories/Hashtags tabs, Sync API) and all admin routing
+  state (`?section`, `?campaign`, `?wizard`, `?step`, `?tab`) now reads from
+  `useSearchParams` with no mirrored useState — push for section/campaign/
+  wizard-enter transitions, replace for step/tab changes. Wizard dirty-exit
+  guard runs at the shell level via a new optional `onDirtyChange` wizard prop
+  (drafts stay in sessionStorage, so the confirm copy says the draft is kept).
+  Queue page renamed to "Queue", polls via the shared hidden-tab-aware
+  `usePoll`, and gains the campaign backlog strip, per-job campaign chips,
+  the engine-unreachable banner, and a single "OpenFOAM CPU slots" stepper
+  (0 = auto) replacing the per-job concurrency stepper (spec §11).
+- Why: Spec §11 routing contract (browser back/forward and deep links must
+  just work) and §12 honesty rules (no engine branding in nav; queue shows
+  real backlog/engine state).
+- Expected effect: Deep-linkable admin surfaces; campaign work reachable from
+  queue job cards; exactly one global solver-capacity control.
+
+## 2026-07-04 — API integration tests serialized (vitest fileParallelism=false)
+- Decision: `apps/api/vitest.config.ts` disables test-file parallelism.
+- Why: All four API test files are shared-Postgres integration tests; run in
+  parallel they race — observed: the catalog sync-claim test claimed a pending
+  sweep created by the concurrently running campaigns test whose preset
+  revision was purged before the promise insert (FK 23503 → 500, flaky suite).
+- Expected effect: Deterministic API suite; per-file DB assumptions hold.
+
+## 2026-07-04 — Admin routing goes shallow (native history API, no RSC refetch)
+- Decision: `AdminConsole.navigate()` now uses `window.history.pushState/
+  replaceState` (Next ≥14.1 syncs `useSearchParams` with the native history
+  API) instead of `router.push/replace` for all section/tab/step/campaign/
+  wizard URL transitions; push mode keeps an explicit `scrollTo(0, 0)`.
+- Why: `/admin` is `force-dynamic`, so every router navigation refetched the
+  RSC payload and remounted the whole console ~100 ms after the transition,
+  wiping form state already typed into the freshly opened panel (surfaced by
+  the repaired catalog e2e: the Mediums "Name" field emptied mid-fill; only
+  the wizard survived because its draft rehydrates from sessionStorage). All
+  admin routing state is client-derived from searchParams — no server data
+  changes with the query string, so the round-trip bought nothing.
+- Expected effect: No mid-interaction remounts; back/forward still work via
+  Next's popstate handling; e2e navigation is deterministic.
+
+## 2026-07-04 — Airfoil symmetry computed at creation time
+- Decision: `createAirfoil` (apps/api/src/services/airfoils.ts) computes
+  `isSymmetric` + `symmetryCheckedAt` via `isAirfoilSymmetric(geo.contour)`
+  at insert time (detection failure records false + null checked-at, never a
+  guess). Previously only the one-off backfill script set these columns, so
+  every airfoil created after the backfill silently lost campaign symmetry
+  planning (spec §9.1). Known remaining gap (reported, not yet closed): the
+  sync-import (`apps/api/src/sync-routes.ts upsertAirfoilFromPayload`) and
+  remote-solver (`apps/sweeper/src/remote-solver.ts ensureRemoteAirfoil`)
+  insert paths still don't compute symmetry.
+- Expected effect: New airfoils get real symmetric planning (α ≥ 0 solver
+  runs + derived negative points) without manual backfills; covered by
+  apps/api/test/purge.test.ts and the campaign wizard e2e.
+
+## 2026-07-04 — Test-artifact purge cascades the campaign family
+- Decision: `POST /api/admin/test-artifacts/purge` now removes, for pw-
+  prefixed campaigns (matched on slug/name/idempotency key), in FK order:
+  results landed at campaign points → campaign sim_jobs → campaigns (FK
+  cascades airfoils/plan_revisions/conditions/points/progress/lanes/steps) →
+  now-orphaned origin='campaign' presets (same NOT EXISTS reference guards as
+  the §6.4 GC, restricted to the pinned preset ids) → their legacy
+  boundary_conditions mirrors → campaign-created flow_conditions/
+  reference_geometry_profiles nothing references anymore. The mediums delete
+  gained a flow_conditions reference guard (previously a surviving flow row
+  referencing a pw- medium made the whole purge 500 on FK). Response reports
+  per-family purge counts; dry-run reports `sim_campaigns`.
+- Why: Campaign e2e suites must leave zero residue on the shared dev DB;
+  presets/flow/geometry are shared across campaigns by physics hash /
+  canonical key, so blind slug deletes were both incomplete and unsafe.
+- Expected effect: One purge call per stamp cleans everything; recall proven
+  by apps/api/test/purge.test.ts (launch + plan edit + solved evidence →
+  purge → zero-residue assertions across 21 queries).
+
+## 2026-07-04 — Formal UI verification pass: zero criticals on admin surfaces
+- Decision: (1) TopBar nav tabs become their own overflow-x scroll container
+  at ≤860px (`.topbar-tabs` min-width:0 + overflow-x:auto; brand/actions
+  flex-shrink:0) instead of pushing the actions group past the document edge —
+  this was the single root cause of the 390px document-horizontal-overflow on
+  all four admin routes. (2) The Queue "Pending sweeps" 8-column grid is
+  wrapped in the existing `.admin-table-scroll` house pattern with an inner
+  `PENDING_TABLE_MIN_WIDTH = 794` (column minimums + gaps + padding), so
+  trailing Condition/State columns scroll inside the panel instead of being
+  clipped by the panel's overflow:hidden and hit-testing under the adjacent
+  panels; the airfoil link gained a `title` for its ellipsis.
+- Verifier (formal-web-ui-verification skill) fixes shipped with recall +
+  false-positive fixtures in its self_test.py, mirrored to ~/src/holyskills:
+  occlusion sampling now honors inner scroll containers as a reachability path
+  (scrolls them into view like the window case, clamps sample points to the
+  scrollable-ancestor clip box); `visible()` respects `checkVisibility()` so
+  closed-`<details>` content (layout boxes kept via content-visibility) is not
+  reported occluded; Next.js dev-overlay portals (`nextjs-portal`) are ignored
+  as occluders. All previous must-catch fixtures still pass.
+- Expected effect: 54 → 0 critical findings across /admin, wizard step 2,
+  queue, and Setup library at 390x844 + 1440x900; queue columns reachable on
+  mobile (previously fully hidden); no behavior or visual-language changes;
+  campaign + catalog e2e (20) stay green with the sweeper disabled.
+
+## 2026-07-04 — No Point-Count Launch Limit; Step-2 Scale Line Honesty
+
+- Decision (user): the 100,000-point campaign launch limit is removed entirely
+  (db validation, review gate, wizard warnings). Million-point launches are a
+  legitimate use of the instance; the >10k type-to-confirm friction and honest
+  scale/backlog lines remain the only guards. The launch transaction is
+  set-based and was measured at seven-figure point counts before delivery.
+- Decision: wizard step 2 must not multiply by an angle count the user has not
+  defined yet. The scale line shows conditions × airfoils until step 3 has
+  actually been visited (or the draft came from a duplicate prefill with a real
+  plan); the full product appears only after the angle plan is touched.
+  Post-launch Edit Conditions always shows the full product (the plan exists).
+- Why: the step-2 line silently used the draft's default sweep (31 angles),
+  presenting a decision the user never made as fact — an honesty violation of
+  the same class the no-fake policy bans; and the point cap was a designed-in
+  operational guess that contradicted the user's actual scale of work.
+
+## 2026-07-04 — Engine persistent mesh cache + cross-job solution seeding
+
+- Decision (user, approved execution-efficiency phase): the Python engine gains
+  a persistent, content-addressed cross-job cache (`src/airfoilfoam/cache.py`,
+  `EngineCache`) with two stores under one root (env `AIRFOILFOAM_CACHE_DIR`,
+  default `<data_dir>/cache`; a named `engine_cache` Docker volume in compose):
+  - **mesh/**: a built `constant/polyMesh` keyed by sha256 over the normalized
+    airfoil contour exactly as meshed + canonical chord + RESOLVED mesh params
+    (keyed after y+/speed sizing). `prepare_mesh` copies a hit into the job
+    workspace instead of re-running blockMesh and publishes fresh builds.
+  - **seed/**: latest-time fields of ACCEPTED steady solves, keyed by mesh key
+    + fluid (density, dynamic viscosity) + canonical speed; entries also carry
+    a solver signature (turbulence model/intensity/ratio + roughness) so seeds
+    only apply where the 0/-file boundary conditions match. A fresh steady case
+    with no in-job previous field seeds from the nearest donor within 2.0 deg
+    instead of a potentialFoam cold start.
+- Seeding deliberately reuses the SAME field-carry mechanism as the in-polar
+  warm-start march (`_rewrite_carried_inlet_velocity`, extracted from
+  `_solve_warm`): donor fields are staged inside the case, the inlet/outlet U
+  values are rewritten for the new angle via foamDictionary, then the staged
+  files replace `0/`. Any failure before the swap leaves the case pristine for
+  the normal potentialFoam path. Case dictionaries stay CaseBuilder-authored.
+- Integrity/ops: atomic publish (tmp stage + rename), per-entry manifest with
+  per-file sha256 (verified on every hit; corrupt/partial entries removed),
+  size-capped LRU eviction (`AIRFOILFOAM_CACHE_MAX_GB`, default 20) under a
+  non-blocking file lock, real hit/miss/evict/publish logging with sizes. The
+  cache is an optimisation layer only: every failure degrades to a miss.
+- Consistency fix folded in: the case-parallel path now passes the shared
+  mesh's RESOLVED params into `run_case` (previously the raw request mesh was
+  re-resolved per case speed), so cache keys — and the case dictionaries —
+  always describe the mesh geometry actually in use.
+- URANS keeps its existing steady-init path (it benefits transitively when the
+  steady stage was seeded). Archived openfoam evidence bundles are unaffected.
+- Build id bumped to `dev-20260704-batch-cache` (compose defaults,
+  `.codex/dev-runtime.json`); worker image rebuild required to pick it up;
+  README deploy section documents the volume and rebuild.
+- Verified: 105 unit tests pass (88 pre-existing + 17 new in
+  `tests/test_cache.py`: key stability/sensitivity, atomic publish, corruption
+  removal, LRU cap, 2.0-deg nearest-angle boundary, speed/signature scoping,
+  inlet-rewrite direction for the new angle, and fake-solver pipeline proof
+  that a second job re-uses the cached mesh with zero blockMesh invocations
+  and seeds a nearby angle with zero potentialFoam calls).
+
+## 2026-07-04 — Campaign Jobs Batched Per Airfoil×Chord×Ambient
+
+- Decision (user): campaign work is batched so an airfoil is meshed once and
+  the solver marches all speeds×angles over that mesh. One job = (campaign,
+  airfoil, chord, compatible physics group, identical open-angle set) × all
+  open speeds, capped at 256 cases with reynolds-ordered chunking. Grouping is
+  value-based (identical ambient + boundary/mesh/solver/output blocks); one
+  chord per job (meshes are per-chord); identical open-angle sets only (one
+  angle list per engine request — unioning would re-solve solved points).
+- Decision: batched jobs carry a conditionMap in requestPayload; ingest maps
+  each returned polar to its pinned revision by exact canonical speed (never
+  nearest-guess); URANS wave-2 plans are computed per condition and submitted
+  as single-revision targeted children; jobs without a conditionMap keep the
+  legacy single-revision path byte-for-byte.
+- Bug found en route (pre-existing, in committed HEAD): wave-2 URANS child
+  jobs were inserted as pending but the post-submit status stamp was guarded
+  by an active-only WHERE clause, so successful child submissions were
+  silently no-oped — children sat pending forever with no engineJobId. Fixed
+  (pending+active guard) with a must-catch regression test asserting the child
+  reaches submitted with an engine job id.
+- Constraint recorded: result_attempts' unique index
+  (sim_job_id, engine_job_id, aoa_deg, regime) collapses same-angle attempts
+  across bundled speeds; per-entry retry evidence is reconstructed from the
+  job's own results rows + result-level classifications instead of adding a
+  migration. Revisit if per-speed attempt audit rows become necessary.
+- Verified: 43/43 sweeper tests (grouping must-catches: different ambients /
+  angle sets / chords never share; 256-case chunking; no-nearest-guess ingest)
+  plus a live-DB batched flow (one job, correct conditionMap, per-revision
+  ingest, one deduped wave-2 child); real-OpenFOAM cache proof logged
+  "mesh cache hit" + "seeded … from cached solution at aoa 2" on the second
+  job (engine build dev-20260704-batch-cache; api/worker rebuilt idle-guarded).
+
+## 2026-07-05 — Momentum Scheme Is A Two-Value Select, Not Free Text
+
+- Decision: the solver-profile "Momentum scheme" field is a select fed by a
+  shared constant (apps/web/components/admin/solver-schemes.ts) in BOTH the
+  Setup library editor and the wizard quick-create modal. Engine ground truth
+  (src/airfoilfoam/case/builder.py _write_fv_schemes): "upwind" maps to
+  "bounded Gauss upwind"; every other string silently maps to
+  "bounded Gauss linearUpwind grad(U)" — so free text was a
+  silent-wrong-behavior trap (typing "LUST" ran linearUpwind without error).
+  Unrecognized stored values render as an honestly-labeled extra option, never
+  silently re-mapped by the UI. The automatic 1st-order retry on
+  non-convergence (firstOrderFallback evidence flag) is stated next to the
+  control in decision language.
+- Why: UI enums must mirror the engine-accepted value set exactly (no
+  schema-shaped free text); this is a scalar inside solver_profiles, not a
+  separate registry — a profile selector for a two-value enum would violate
+  the schema-boundary rule against over-normalization.
+
+## 2026-07-05 — First Real Campaign Run: Scale Incidents And Fixes
+
+- Incident: the dev environment never ran the sweeper process (only api/web +
+  engine containers were coordinator-managed), so an enabled sweeper flag did
+  nothing and the Queue page prescribed "Resume the sweeper" while the
+  heartbeat was days stale. Fix: sweeper added to .codex/dev-runtime.json and
+  started under the coordinator; Queue UI now derives a distinct
+  "PROCESS NOT RUNNING" state from heartbeat staleness (>90 s) with honest
+  guidance, separate from paused.
+- Incident: campaign reconciler crashed with a JS stack overflow at 1.5M-point
+  scale — whole-campaign counter heal enumerated 48,630 (condition, airfoil)
+  keys as SQL tuples (~146k bound params). Fix: campaign-scoped set-based
+  recompute (recomputeProgressForCampaign); tuple-list path defensively
+  chunked at 500.
+- Incident: first tick after restart ran 10+ minutes silently — engine API
+  latency is seconds under full solver load (13 jobs saturating cores) and a
+  dual-objective campaign dirties two refinement lanes per ingested point, so
+  the unbounded dirty-lane drain starved job submission and the heartbeat.
+  Fix: dirty-lane drain capped at 100/tick with deduped carryover; heartbeat
+  beats at tick start, between per-job engine polls, and every 50 lane ticks.
+- Consequence recorded: sweeper/campaign test suites require exclusive
+  scheduler control and now fail-fast (by design) while a live campaign runs;
+  isolation on a scratch DB is queued as follow-up work.

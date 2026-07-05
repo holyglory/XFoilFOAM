@@ -13,6 +13,7 @@ interface UnitNumberFieldProps {
   preferredUnitKey?: string;
   min?: number;
   step?: string | number;
+  error?: string;
 }
 
 const fieldLabel: CSSProperties = { fontFamily: MONO, fontSize: 10, color: C.dim };
@@ -27,6 +28,7 @@ const inputStyle: CSSProperties = {
   padding: "10px 12px",
   outline: "none",
 };
+const errorStyle: CSSProperties = { marginTop: 4, fontFamily: MONO, fontSize: 10, color: C.red };
 
 function fieldSlug(label: string): string {
   return label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -40,6 +42,7 @@ export function UnitNumberField({
   preferredUnitKey,
   min,
   step,
+  error,
 }: UnitNumberFieldProps) {
   const id = useId();
   const [unitKey, setUnitKey] = useState(() => unitFor(dimension, preferredUnitKey).key);
@@ -72,6 +75,7 @@ export function UnitNumberField({
     <div
       style={{ display: "block", position: "relative" }}
       data-testid={`unit-field-${fieldSlug(label)}`}
+      data-admin-field={label}
       onBlur={(e) => {
         const next = e.relatedTarget;
         if (!(next instanceof Node) || !e.currentTarget.contains(next)) setOpen(false);
@@ -112,8 +116,11 @@ export function UnitNumberField({
           setFocused(false);
         }}
         onChange={(e) => changeText(e.target.value)}
-        style={inputStyle}
+        aria-invalid={!!error}
+        aria-describedby={error ? `${id}-error` : undefined}
+        style={{ ...inputStyle, borderColor: error ? C.red : C.stroke }}
       />
+      {error && <div id={`${id}-error`} style={errorStyle}>{error}</div>}
       {open && (
         <div
           role="menu"

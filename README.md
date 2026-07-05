@@ -61,6 +61,12 @@ pnpm --filter @aerodb/web dev       # UI on :3100
 pnpm --filter @aerodb/core test     # golden tests vs the design's airfoil-db.js
 ```
 
+> When a dev-coordinator-managed runtime is already running for this checkout
+> (`.codex/dev-runtime.json` — web on **http://127.0.0.1:3004**, API on :4000),
+> use that URL instead of starting a second `pnpm --filter @aerodb/web dev`:
+> two Next dev servers share one `apps/web/.next` and corrupt each other's
+> route manifests (symptom: every page 404s on one of them).
+
 ### Admin console
 
 `/admin` shows and manages the OpenFOAM queue: the CFD sweeper (pause/resume,
@@ -100,6 +106,15 @@ VPS host itself does not install OpenFOAM; OpenFOAM is provided by the Docker
 `worker` image. To update `api`/`worker`, run the same script with
 `DEPLOY_OPENFOAM_SERVICES=1`; it refuses that mode while `simpleFoam`,
 `pimpleFoam`, meshing, or related OpenFOAM processes are active.
+
+The engine's persistent mesh/steady-seed cache (build `dev-20260704-batch-cache`
+and later) requires a **worker image rebuild** to pick up
+(`DEPLOY_OPENFOAM_SERVICES=1`, or `docker compose build worker` locally). The
+cache itself lives on the named `engine_cache` volume (mounted at
+`/data/airfoilfoam-cache`, `AIRFOILFOAM_CACHE_DIR`), so cached meshes and
+solution seeds survive image rebuilds and container restarts; it is
+size-capped by `AIRFOILFOAM_CACHE_MAX_GB` (default 20) with LRU eviction, and
+deleting the volume only costs re-meshing/cold starts, never results.
 
 **Status.** Both phases are implemented and tested. *Phase 1*: the Postgres database
 (categories, airfoils, mediums, boundary conditions, results), the control-plane API,

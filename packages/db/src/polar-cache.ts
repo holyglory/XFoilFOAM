@@ -1,6 +1,8 @@
 import {
   buildPolarFit,
+  canonicalAoa,
   classifyPolarEvidence,
+  mirrorClassifiedEvidence,
   POLAR_CLASSIFIER_VERSION,
   POLAR_FIT_VERSION,
   type PolarEvidenceClassification,
@@ -12,6 +14,7 @@ import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
 import {
+  airfoils,
   forceHistory,
   polarFitPoints,
   polarFitSets,
@@ -219,7 +222,7 @@ async function upsertClassification(
     });
 }
 
-function signatureFor(classifications: PolarEvidenceClassification[]): string {
+function signatureFor(classifications: PolarEvidenceClassification[], symmetryMirrored: boolean): string {
   const payload = classifications
     .filter((c) => {
       const e = c.evidence as EvidenceWithDbIds;
@@ -240,7 +243,11 @@ function signatureFor(classifications: PolarEvidenceClassification[]): string {
     })
     .sort()
     .join("|");
-  return createHash("sha256").update(payload).digest("hex");
+  // Toggling airfoils.isSymmetric must refresh fit sets even when the real
+  // evidence rows are unchanged (spec §9.2), so mirroring marks the signature.
+  return createHash("sha256")
+    .update(symmetryMirrored ? `${payload}|sym:1` : payload)
+    .digest("hex");
 }
 
 async function supersedeRansWithAcceptedUrans(db: DB, airfoilId: string, simulationPresetRevisionId: string): Promise<void> {
@@ -283,16 +290,37 @@ async function storeFit(
   airfoilId: string,
   simulationPresetRevisionId: string,
   classifications: PolarEvidenceClassification[],
+  symmetric: boolean,
 ): Promise<{ fitSetId: string | null; status: string }> {
   const [revision] = await db
     .select({ reynolds: simulationPresetRevisions.reynolds, mach: simulationPresetRevisions.mach })
     .from(simulationPresetRevisions)
     .where(eq(simulationPresetRevisions.id, simulationPresetRevisionId))
     .limit(1);
-  const fit = buildPolarFit(classifications);
+  // Symmetric airfoils mirror accepted/needs_urans +α evidence onto the negative
+  // side at fit-assembly time only (spec §9.2) — result_classifications rows stay
+  // real solves. A real solve at the mirrored α always wins over a mirror copy.
+  let fitInput = classifications;
+  if (symmetric) {
+    const realUsableAoas = new Set(
+      classifications
+        .filter((c) => c.state === "accepted" || c.state === "needs_urans")
+        .map((c) => canonicalAoa(c.evidence.a)),
+    );
+    const mirrored = mirrorClassifiedEvidence(classifications).filter(
+      (m) => !realUsableAoas.has(canonicalAoa(m.evidence.a)),
+    );
+    fitInput = [...classifications, ...mirrored];
+  }
+  const fit = buildPolarFit(fitInput);
   const metrics = fit.metrics;
   const aoas = fit.points.map((p) => p.a);
-  const evidenceSignature = signatureFor(classifications);
+  const evidenceSignature = signatureFor(classifications, symmetric);
+  // Stored point counts stay real-solve-only (they feed Browse polarCount and
+  // ranking tie-breaks); mirrored copies only widen fit points/metrics.
+  const acceptedPointCount = classifications.filter((c) => c.state === "accepted").length;
+  const provisionalPointCount = classifications.filter((c) => c.state === "needs_urans").length;
+  const rejectedPointCount = classifications.filter((c) => c.state === "rejected" || c.state === "superseded_by_urans").length;
   await db
     .update(polarFitSets)
     .set({ isCurrent: false })
@@ -312,13 +340,15 @@ async function storeFit(
       evidenceSignature,
       status: fit.status,
       confidence: fit.confidence,
-      acceptedPointCount: fit.acceptedPointCount,
-      provisionalPointCount: fit.provisionalPointCount,
-      rejectedPointCount: fit.rejectedPointCount,
+      acceptedPointCount,
+      provisionalPointCount,
+      rejectedPointCount,
       reynolds: revision?.reynolds ?? null,
       mach: revision?.mach ?? null,
       ldmax: metrics?.ldmax ?? null,
       alphaLdmax: metrics?.aLd ?? null,
+      alphaLdmaxFine: metrics?.alphaLdmaxFine ?? null,
+      alphaClZeroFine: metrics?.alphaClZeroFine ?? null,
       clmax: metrics?.clmax ?? null,
       alphaClmax: metrics?.aStall ?? null,
       cdmin: metrics?.cdmin ?? null,
@@ -334,13 +364,15 @@ async function storeFit(
       set: {
         status: fit.status,
         confidence: fit.confidence,
-        acceptedPointCount: fit.acceptedPointCount,
-        provisionalPointCount: fit.provisionalPointCount,
-        rejectedPointCount: fit.rejectedPointCount,
+        acceptedPointCount,
+        provisionalPointCount,
+        rejectedPointCount,
         reynolds: revision?.reynolds ?? null,
         mach: revision?.mach ?? null,
         ldmax: metrics?.ldmax ?? null,
         alphaLdmax: metrics?.aLd ?? null,
+        alphaLdmaxFine: metrics?.alphaLdmaxFine ?? null,
+        alphaClZeroFine: metrics?.alphaClZeroFine ?? null,
         clmax: metrics?.clmax ?? null,
         alphaClmax: metrics?.aStall ?? null,
         cdmin: metrics?.cdmin ?? null,
@@ -376,6 +408,12 @@ export async function refreshPolarCacheForRevision(
   airfoilId: string,
   simulationPresetRevisionId: string,
 ): Promise<PolarCacheRefreshResult> {
+  const [airfoilRow] = await db
+    .select({ isSymmetric: airfoils.isSymmetric })
+    .from(airfoils)
+    .where(eq(airfoils.id, airfoilId))
+    .limit(1);
+  const symmetric = airfoilRow?.isSymmetric ?? false;
   const resultEvidence = await loadResultEvidence(db, airfoilId, simulationPresetRevisionId);
   const attemptEvidence = await loadAttemptEvidence(db, airfoilId, simulationPresetRevisionId);
   const resultClassified = classifyPolarEvidence(resultEvidence);
@@ -436,7 +474,7 @@ export async function refreshPolarCacheForRevision(
     confidence: row.confidence,
     reasons: row.reasons,
   }));
-  const storedFit = await storeFit(db, airfoilId, simulationPresetRevisionId, fitClassifications);
+  const storedFit = await storeFit(db, airfoilId, simulationPresetRevisionId, fitClassifications, symmetric);
   const attemptNeeds = attemptClassifiedGroups.flatMap((group) => group.needsUransAoas);
   const resultNeeds = resultClassified.needsUransAoas;
   const attemptRejected = attemptClassifiedGroups.flatMap((group) => group.hardRejectedAoas);

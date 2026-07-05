@@ -9,7 +9,7 @@ import {
   type Point,
 } from "@aerodb/core";
 import { strFromU8, unzipSync } from "fflate";
-import { type CSSProperties, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 
 import { AirfoilGlyph } from "@/components/AirfoilGlyph";
 import { bulkCreateAirfoils, type BulkResult, type CategoryListItem, createAirfoil, getCategories } from "@/lib/api";
@@ -77,6 +77,8 @@ export function AddAirfoilsPanel() {
   const [name, setName] = useState("");
   const [digits, setDigits] = useState("2412");
   const [coords, setCoords] = useState("");
+  const digitsRef = useRef<HTMLInputElement | null>(null);
+  const coordsRef = useRef<HTMLTextAreaElement | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -177,6 +179,16 @@ export function AddAirfoilsPanel() {
   };
 
   const submitSingle = async () => {
+    if (mode === "coords" && !coords.trim()) {
+      setError("Coordinates are required");
+      coordsRef.current?.focus();
+      return;
+    }
+    if (preview?.error) {
+      setError(preview.error);
+      (mode === "naca" ? digitsRef.current : coordsRef.current)?.focus();
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -277,7 +289,7 @@ export function AddAirfoilsPanel() {
               <span style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>
                 {busy && progress ? `importing ${progress.done}/${progress.total}…` : `${files.length} file${files.length === 1 ? "" : "s"} staged`}
               </span>
-              <button type="button" disabled={busy || files.length === 0} onClick={importAll} style={primaryBtn(busy || files.length === 0)}>
+              <button type="button" disabled={busy || files.length === 0} title={files.length === 0 ? "Choose files before importing" : undefined} onClick={importAll} style={primaryBtn(busy || files.length === 0)}>
                 {busy ? "Importing…" : `Import ${files.length} file${files.length === 1 ? "" : "s"}`}
               </button>
             </div>
@@ -306,12 +318,12 @@ export function AddAirfoilsPanel() {
                 {mode === "naca" ? (
                   <div>
                     <div style={labelStyle}>4-DIGIT CODE</div>
-                    <input value={digits} onChange={(e) => setDigits(e.target.value)} placeholder="e.g. 2412" style={fieldStyle} />
+                    <input ref={digitsRef} value={digits} onChange={(e) => setDigits(e.target.value)} placeholder="e.g. 2412" style={fieldStyle} />
                   </div>
                 ) : (
                   <div>
                     <div style={labelStyle}>COORDINATES (Selig or Lednicer .dat)</div>
-                    <textarea value={coords} onChange={(e) => setCoords(e.target.value)} placeholder={"NACA 0012\n1.000000 0.001260\n0.950000 ..."} rows={8} style={{ ...fieldStyle, resize: "vertical", lineHeight: 1.4 }} />
+                    <textarea ref={coordsRef} value={coords} onChange={(e) => setCoords(e.target.value)} placeholder={"NACA 0012\n1.000000 0.001260\n0.950000 ..."} rows={8} style={{ ...fieldStyle, resize: "vertical", lineHeight: 1.4 }} />
                   </div>
                 )}
               </div>
@@ -337,7 +349,7 @@ export function AddAirfoilsPanel() {
 
             {error && <div style={{ fontFamily: MONO, fontSize: 11, color: C.red }}>{error}</div>}
             <div style={{ display: "flex", justifyContent: "flex-end" }}>
-              <button type="button" disabled={busy || !!preview?.error || (mode === "coords" && !coords.trim())} onClick={submitSingle} style={primaryBtn(busy || !!preview?.error || (mode === "coords" && !coords.trim()))}>
+              <button type="button" disabled={busy} onClick={submitSingle} style={primaryBtn(busy)}>
                 {busy ? "Adding…" : "Add airfoil"}
               </button>
             </div>

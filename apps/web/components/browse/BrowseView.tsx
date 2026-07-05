@@ -949,10 +949,10 @@ function BulkToolbar(props: {
           </div>
         )}
       </span>
-      <button type="button" disabled={props.busy || props.hashtagIds.length === 0} onClick={props.onAssignTags} style={toolbarBtn}>
+      <button type="button" disabled={props.busy || props.hashtagIds.length === 0} title={props.hashtagIds.length === 0 ? "Choose at least one hashtag first" : "Assign selected hashtags"} onClick={props.onAssignTags} style={toolbarBtn}>
         <Tags size={14} /> <span className="bulk-action-label">assign</span>
       </button>
-      <button type="button" disabled={props.busy || props.hashtagIds.length === 0} onClick={props.onRemoveTags} style={toolbarBtn} aria-label="Remove selected hashtags" title="Remove selected hashtags">
+      <button type="button" disabled={props.busy || props.hashtagIds.length === 0} onClick={props.onRemoveTags} style={toolbarBtn} aria-label="Remove selected hashtags" title={props.hashtagIds.length === 0 ? "Choose at least one hashtag first" : "Remove selected hashtags"}>
         <Tags size={14} /> <span className="bulk-action-label">untag</span>
       </button>
       <button type="button" disabled={props.busy} onClick={props.onArchive} style={toolbarBtn} aria-label="Archive selected airfoils" title="Archive">

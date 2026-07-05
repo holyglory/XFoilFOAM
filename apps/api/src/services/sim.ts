@@ -1,4 +1,4 @@
-import { type FieldId, type FieldMedia, type SimulationDetail } from "@aerodb/core";
+import { canonicalAoa, type FieldId, type FieldMedia, type SimulationDetail } from "@aerodb/core";
 import {
   airfoils,
   boundaryConditions,
@@ -275,7 +275,12 @@ export async function assembleSim(
           and(
             eq(results.airfoilId, a.id),
             inArray(results.simulationPresetRevisionId, revisionIds),
-            eq(results.aoaDeg, Math.round(aoa)),
+            // Exact-float AoA match (spec §10): results.aoaDeg is written at
+            // canonical 1e-4° precision, so canonicalizing the query param
+            // makes fractional campaign/refinement angles addressable instead
+            // of being rounded to the nearest integer. Fractional evidence can
+            // also always be opened by resultId.
+            eq(results.aoaDeg, canonicalAoa(aoa)),
             eq(results.source, "solved"),
             eq(results.status, "done"),
           ),

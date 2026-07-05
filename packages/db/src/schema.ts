@@ -4,7 +4,9 @@ import {
   type AnyPgColumn,
   bigint,
   boolean,
+  check,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -174,6 +176,10 @@ export const airfoils = pgTable(
     refClmax: doublePrecision("ref_clmax"),
     refCdmin: doublePrecision("ref_cdmin"),
     refMetricsSource: dataSourceEnum("ref_metrics_source").notNull().default("queued"),
+    // Computed geometric property (see @aerodb/core isAirfoilSymmetric); campaigns
+    // solve only α ≥ 0 for symmetric airfoils and derive the negative side.
+    isSymmetric: boolean("is_symmetric").notNull().default(false),
+    symmetryCheckedAt: ts(),
     tags: text("tags")
       .array()
       .notNull()
@@ -303,6 +309,13 @@ export const flowConditions = pgTable(
     kinematicViscosity: doublePrecision("kinematic_viscosity").notNull().default(1.46e-5),
     mach: doublePrecision("mach"),
     isSeeded: boolean("is_seeded").notNull().default(false),
+    origin: text("origin").notNull().default("user"), // seeded | user | campaign — set once at INSERT
+    createdByCampaignId: uuid("created_by_campaign_id").references((): AnyPgColumn => simCampaigns.id, {
+      onDelete: "set null",
+    }),
+    // mediumId|T|P|speed at canonical SI precision, INPUT values only (see
+    // flowConditionCanonicalKey in simulation-setup.ts). Nullable until backfilled.
+    canonicalKey: text("canonical_key"),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -311,6 +324,7 @@ export const flowConditions = pgTable(
   },
   (t) => ({
     mediumIdx: index("flow_conditions_medium_idx").on(t.mediumId),
+    canonicalKeyUq: uniqueIndex("flow_conditions_canonical_key_uq").on(t.canonicalKey),
   }),
 );
 
@@ -326,6 +340,13 @@ export const referenceGeometryProfiles = pgTable(
     spanM: doublePrecision("span_m"),
     referenceAreaM2: doublePrecision("reference_area_m2"),
     isSeeded: boolean("is_seeded").notNull().default(false),
+    origin: text("origin").notNull().default("user"), // seeded | user | campaign — set once at INSERT
+    createdByCampaignId: uuid("created_by_campaign_id").references((): AnyPgColumn => simCampaigns.id, {
+      onDelete: "set null",
+    }),
+    // type|kind|chord|span|area at canonical SI precision, INPUT values only (see
+    // referenceGeometryCanonicalKey in simulation-setup.ts). Nullable until backfilled.
+    canonicalKey: text("canonical_key"),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -334,6 +355,7 @@ export const referenceGeometryProfiles = pgTable(
   },
   (t) => ({
     geometryTypeIdx: index("reference_geometry_profiles_type_idx").on(t.geometryType),
+    canonicalKeyUq: uniqueIndex("reference_geometry_profiles_canonical_key_uq").on(t.canonicalKey),
   }),
 );
 
@@ -585,6 +607,9 @@ export const simulationPresets = pgTable(
       .references(() => sweepDefinitions.id),
     legacyBoundaryConditionId: uuid("legacy_boundary_condition_id").references(() => boundaryConditions.id),
     targetScope: presetTargetScopeEnum("target_scope").notNull().default("all"),
+    // library | campaign — set ONCE at INSERT, never reassigned. No campaignId
+    // column: campaign linkage is many-to-many via sim_campaign_conditions.
+    origin: text("origin").notNull().default("library"),
     enabled: boolean("enabled").notNull().default(true),
     isSeeded: boolean("is_seeded").notNull().default(false),
     createdAt: ts().notNull().defaultNow(),
@@ -630,6 +655,13 @@ export const simulationPresetRevisions = pgTable(
     mach: doublePrecision("mach"),
     referenceLengthM: doublePrecision("reference_length_m").notNull(),
     snapshot: jsonb("snapshot").$type<Record<string, unknown>>().notNull(),
+    // sha256 over ONLY the physics+numerics snapshot blocks (see
+    // physicsHashForSnapshot in simulation-setup.ts). Nullable until backfilled.
+    physicsHash: text("physics_hash"),
+    // Deterministic canonical-revision election per physicsHash: the campaign
+    // launch materializer reuses the canonical row (prefer enabled-preset
+    // revision, else oldest createdAt, tie-break lowest id).
+    isCanonicalPhysics: boolean("is_canonical_physics").notNull().default(false),
     createdAt: ts().notNull().defaultNow(),
   },
   (t) => ({
@@ -637,6 +669,10 @@ export const simulationPresetRevisions = pgTable(
     reynoldsIdx: index("simulation_preset_revisions_reynolds_idx").on(t.reynolds),
     signatureUq: uniqueIndex("simulation_preset_revisions_signature_uq").on(t.presetId, t.signatureHash),
     revisionUq: uniqueIndex("simulation_preset_revisions_revision_uq").on(t.presetId, t.revisionNumber),
+    physicsHashIdx: index("simulation_preset_revisions_physics_hash_idx").on(t.physicsHash),
+    canonicalPhysicsUq: uniqueIndex("simulation_preset_revisions_canonical_physics_uq")
+      .on(t.physicsHash)
+      .where(sql`${t.isCanonicalPhysics}`),
   }),
 );
 
@@ -1039,6 +1075,10 @@ export const polarFitSets = pgTable(
     mach: doublePrecision("mach"),
     ldmax: doublePrecision("ldmax"),
     alphaLdmax: doublePrecision("alpha_ldmax"),
+    // Fine refinement targets computed inside buildPolarFit (densified argmax /
+    // root near the coarse grid value, canonical 0.01°) — see spec §8.
+    alphaLdmaxFine: doublePrecision("alpha_ldmax_fine"),
+    alphaClZeroFine: doublePrecision("alpha_cl_zero_fine"),
     clmax: doublePrecision("clmax"),
     alphaClmax: doublePrecision("alpha_clmax"),
     cdmin: doublePrecision("cdmin"),
@@ -1095,6 +1135,8 @@ export const simJobs = pgTable(
       .references(() => airfoils.id, { onDelete: "cascade" }),
     bcIds: jsonb("bc_ids").$type<string[]>().notNull(),
     simulationPresetRevisionId: uuid("simulation_preset_revision_id").references(() => simulationPresetRevisions.id),
+    campaignId: uuid("campaign_id").references((): AnyPgColumn => simCampaigns.id, { onDelete: "set null" }),
+    jobKind: text("job_kind").notNull().default("sweep"), // sweep | targeted
     referenceChordM: doublePrecision("reference_chord_m").notNull(),
     wave: integer("wave").notNull().default(1),
     status: simJobStatusEnum("status").notNull().default("pending"),
@@ -1118,6 +1160,7 @@ export const simJobs = pgTable(
     engineJobIdx: index("sim_jobs_engine_job_idx").on(t.engineJobId),
     airfoilIdx: index("sim_jobs_airfoil_idx").on(t.airfoilId),
     presetRevisionIdx: index("sim_jobs_preset_revision_idx").on(t.simulationPresetRevisionId),
+    campaignIdx: index("sim_jobs_campaign_idx").on(t.campaignId),
   }),
 );
 
@@ -1128,6 +1171,18 @@ export const sweeperState = pgTable("sweeper_state", {
   id: integer("id").primaryKey().default(1),
   enabled: boolean("enabled").notNull().default(false),
   maxConcurrentJobs: integer("max_concurrent_jobs").notNull().default(2),
+  // THE single global solver-capacity setting ("OpenFOAM CPU slots").
+  // 0 = auto: submit jobs without a cpu_budget cap so the engine resolves its
+  // own worker budget — exactly the pre-campaign effective behavior (scheduling
+  // profiles defaulted cpuBudget to NULL). Job building passes a positive value
+  // into the engine `resources` block; maxConcurrentJobs is subordinate to it.
+  cpuSlots: integer("cpu_slots").notNull().default(0),
+  // Engine-down backoff (spec §7): set when a submit-path probe/submit fails
+  // with a connection error, cleared on the first successful probe/submit.
+  // While set, Queue + campaign pages show one truthful "Engine unreachable
+  // since …" banner; job status `failed` stays reserved for jobs the engine
+  // actually rejected/ran.
+  engineUnreachableSince: ts(),
   pollIntervalMs: integer("poll_interval_ms").notNull().default(5000),
   submitIntervalMs: integer("submit_interval_ms").notNull().default(15000),
   heartbeatAt: ts(),
@@ -1136,6 +1191,282 @@ export const sweeperState = pgTable("sweeper_state", {
     .defaultNow()
     .$onUpdate(() => new Date()),
 });
+
+// ---------------------------------------------------------------------------
+// 12b. Simulation campaigns — user-launched batch execution records (spec:
+//     docs/simulation-campaigns-spec.md §3.1). Campaigns own NO physics values:
+//     every condition pins an immutable simulation_preset_revisions row, and
+//     points/lanes/progress are pure execution ledger state. Status/state
+//     domains are plain text (Python-mirroring/growing domains policy above).
+// ---------------------------------------------------------------------------
+export const simCampaigns = pgTable(
+  "sim_campaigns",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slug: text("slug").notNull(), // auto-suffixed -2, -3 on collision at launch
+    name: text("name").notNull(),
+    notes: text("notes"),
+    status: text("status").notNull().default("active"), // active | paused | attention | completed | cancelled | archived
+    priority: integer("priority").notNull().default(5),
+    idempotencyKey: text("idempotency_key").notNull(), // client-generated at Review; replay returns the existing campaign
+    currentPlanRevisionId: uuid("current_plan_revision_id").references(
+      (): AnyPgColumn => simCampaignPlanRevisions.id,
+    ),
+    closedWithFailedCount: integer("closed_with_failed_count"), // set by "Close with failures"
+    completedAt: ts(),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    slugUq: uniqueIndex("sim_campaigns_slug_uq").on(t.slug),
+    idempotencyKeyUq: uniqueIndex("sim_campaigns_idempotency_key_uq").on(t.idempotencyKey),
+    statusIdx: index("sim_campaigns_status_idx").on(t.status),
+    priorityCheck: check("sim_campaigns_priority_check", sql`${t.priority} >= 0 AND ${t.priority} <= 9`),
+  }),
+);
+
+// Campaign scope resolved to an explicit airfoil list at launch; growth is via
+// the Add airfoils action only.
+export const simCampaignAirfoils = pgTable(
+  "sim_campaign_airfoils",
+  {
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.campaignId, t.airfoilId] }),
+    airfoilIdx: index("sim_campaign_airfoils_airfoil_idx").on(t.airfoilId),
+  }),
+);
+
+// Append-only audit trail of the campaign's editable intent; also the
+// optimistic-concurrency anchor for the plan-edit acknowledge protocol.
+export const simCampaignPlanRevisions = pgTable(
+  "sim_campaign_plan_revisions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    revisionNumber: integer("revision_number").notNull(),
+    kind: text("kind").notNull(), // initial | edit | force_release
+    plan: jsonb("plan").$type<Record<string, unknown>>().notNull(), // canonical byte-stable plan document (spec §3.1)
+    summary: jsonb("summary").$type<Record<string, unknown>>().notNull(),
+    createdBy: text("created_by"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    revisionUq: uniqueIndex("sim_campaign_plan_revisions_revision_uq").on(t.campaignId, t.revisionNumber),
+    campaignIdx: index("sim_campaign_plan_revisions_campaign_idx").on(t.campaignId),
+  }),
+);
+
+export const simCampaignConditions = pgTable(
+  "sim_campaign_conditions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    ord: integer("ord").notNull(),
+    // Provenance only — display reads the pinned revision snapshot, never live
+    // registry rows.
+    flowConditionId: uuid("flow_condition_id")
+      .notNull()
+      .references(() => flowConditions.id),
+    referenceGeometryProfileId: uuid("reference_geometry_profile_id")
+      .notNull()
+      .references(() => referenceGeometryProfiles.id),
+    presetId: uuid("preset_id")
+      .notNull()
+      .references(() => simulationPresets.id),
+    // PINNED at creation, never re-pinned.
+    simulationPresetRevisionId: uuid("simulation_preset_revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id),
+    // Cached from the pinned revision.
+    reynolds: bigint("reynolds", { mode: "number" }).notNull(),
+    mach: doublePrecision("mach"),
+    status: text("status").notNull().default("active"), // active | kept | released
+    introducedInPlanRevisionId: uuid("introduced_in_plan_revision_id")
+      .notNull()
+      .references(() => simCampaignPlanRevisions.id),
+    statusChangedInPlanRevisionId: uuid("status_changed_in_plan_revision_id").references(
+      () => simCampaignPlanRevisions.id,
+    ),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    // Re-adding a previously released combo RE-ACTIVATES this row (same pinned
+    // revision; evidence continuity; no duplicate rows).
+    comboUq: uniqueIndex("sim_campaign_conditions_combo_uq").on(
+      t.campaignId,
+      t.flowConditionId,
+      t.referenceGeometryProfileId,
+    ),
+    campaignStatusIdx: index("sim_campaign_conditions_campaign_status_idx").on(t.campaignId, t.status),
+    revisionIdx: index("sim_campaign_conditions_revision_idx").on(t.simulationPresetRevisionId),
+  }),
+);
+
+// Materialized execution ledger: one row per requested solve cell. Writes are
+// set-based (INSERT…SELECT ON CONFLICT DO NOTHING; UPDATE…FROM results).
+export const simCampaignPoints = pgTable(
+  "sim_campaign_points",
+  {
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    conditionId: uuid("condition_id")
+      .notNull()
+      .references(() => simCampaignConditions.id, { onDelete: "cascade" }),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(), // canonicalAoa at every write
+    revisionId: uuid("revision_id").notNull(), // denormalized pin (join key with results)
+    planRevisionNumber: integer("plan_revision_number").notNull(),
+    state: text("state").notNull().default("requested"), // requested | released | terminal
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    // Negative-α cells of symmetric airfoils; terminal immediately when the +α
+    // source is terminal (spec §9).
+    derivedBySymmetry: boolean("derived_by_symmetry").notNull().default(false),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.campaignId, t.conditionId, t.airfoilId, t.aoaDeg] }),
+    requestedIdx: index("sim_campaign_points_requested_idx")
+      .on(t.campaignId)
+      .where(sql`${t.state} = 'requested'`),
+    requestedRevisionIdx: index("sim_campaign_points_requested_revision_idx")
+      .on(t.revisionId, t.airfoilId, t.aoaDeg)
+      .where(sql`${t.state} = 'requested'`),
+    resultIdx: index("sim_campaign_points_result_idx").on(t.resultId),
+  }),
+);
+
+// Counters — the only thing polled reads scan. Written at launch/plan-edit in
+// the same transaction, incremented in the sweeper ingest path, healed by a
+// low-frequency reconciler. Completion flip = counter comparison on ingest.
+export const simCampaignProgress = pgTable(
+  "sim_campaign_progress",
+  {
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    conditionId: uuid("condition_id")
+      .notNull()
+      .references(() => simCampaignConditions.id, { onDelete: "cascade" }),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    requested: integer("requested").notNull().default(0),
+    solved: integer("solved").notNull().default(0),
+    failed: integer("failed").notNull().default(0),
+    running: integer("running").notNull().default(0),
+    superseded: integer("superseded").notNull().default(0),
+    derived: integer("derived").notNull().default(0),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.campaignId, t.conditionId, t.airfoilId] }),
+    conditionIdx: index("sim_campaign_progress_condition_idx").on(t.conditionId),
+  }),
+);
+
+// One refinement track per (airfoil, condition, objective) — spec §8.
+export const simCampaignLanes = pgTable(
+  "sim_campaign_lanes",
+  {
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    conditionId: uuid("condition_id")
+      .notNull()
+      .references(() => simCampaignConditions.id, { onDelete: "cascade" }),
+    objective: text("objective").notNull(), // ld_max | cl_zero
+    // awaiting_seed | iterating | converged_provisional | converged_final |
+    // converged_window | converged_stale | stalled | insufficient_evidence |
+    // failed | symmetric_definition
+    state: text("state").notNull().default("awaiting_seed"),
+    currentTargetAlpha: doublePrecision("current_target_alpha"),
+    iterationCount: integer("iteration_count").notNull().default(0),
+    // The fit convergence was judged against.
+    witnessFitSetId: uuid("witness_fit_set_id").references(() => polarFitSets.id, { onDelete: "set null" }),
+    extraRoundsGranted: integer("extra_rounds_granted").notNull().default(0), // "Continue +N iterations"
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.campaignId, t.airfoilId, t.conditionId, t.objective] }),
+    stateIdx: index("sim_campaign_lanes_state_idx").on(t.campaignId, t.objective, t.state),
+  }),
+);
+
+// Append-only refinement evidence: one row per lane iteration.
+export const simCampaignLaneSteps = pgTable(
+  "sim_campaign_lane_steps",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    campaignId: uuid("campaign_id").notNull(),
+    airfoilId: uuid("airfoil_id").notNull(),
+    conditionId: uuid("condition_id").notNull(),
+    objective: text("objective").notNull(),
+    iteration: integer("iteration").notNull(),
+    predictedAlpha: doublePrecision("predicted_alpha").notNull(), // canonical 0.01°
+    fitSetId: uuid("fit_set_id")
+      .notNull()
+      .references(() => polarFitSets.id),
+    solvedResultId: uuid("solved_result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    outcome: text("outcome").notNull().default("predicted"), // predicted | solved | superseded | released
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    laneFk: foreignKey({
+      columns: [t.campaignId, t.airfoilId, t.conditionId, t.objective],
+      foreignColumns: [
+        simCampaignLanes.campaignId,
+        simCampaignLanes.airfoilId,
+        simCampaignLanes.conditionId,
+        simCampaignLanes.objective,
+      ],
+      name: "sim_campaign_lane_steps_lane_fk",
+    }).onDelete("cascade"),
+    iterationUq: uniqueIndex("sim_campaign_lane_steps_iteration_uq").on(
+      t.campaignId,
+      t.airfoilId,
+      t.conditionId,
+      t.objective,
+      t.iteration,
+    ),
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // 13. Cross-instance sync — settings, permissions, external scheduling leases,
@@ -1394,3 +1725,15 @@ export type PolarFitSet = typeof polarFitSets.$inferSelect;
 export type PolarFitPointRow = typeof polarFitPoints.$inferSelect;
 export type SimJob = typeof simJobs.$inferSelect;
 export type SweeperState = typeof sweeperState.$inferSelect;
+export type SimCampaign = typeof simCampaigns.$inferSelect;
+export type SimCampaignInsert = typeof simCampaigns.$inferInsert;
+export type SimCampaignAirfoil = typeof simCampaignAirfoils.$inferSelect;
+export type SimCampaignPlanRevision = typeof simCampaignPlanRevisions.$inferSelect;
+export type SimCampaignPlanRevisionInsert = typeof simCampaignPlanRevisions.$inferInsert;
+export type SimCampaignCondition = typeof simCampaignConditions.$inferSelect;
+export type SimCampaignConditionInsert = typeof simCampaignConditions.$inferInsert;
+export type SimCampaignPoint = typeof simCampaignPoints.$inferSelect;
+export type SimCampaignPointInsert = typeof simCampaignPoints.$inferInsert;
+export type SimCampaignProgressRow = typeof simCampaignProgress.$inferSelect;
+export type SimCampaignLane = typeof simCampaignLanes.$inferSelect;
+export type SimCampaignLaneStep = typeof simCampaignLaneSteps.$inferSelect;

@@ -355,7 +355,10 @@ test.describe.serial("long OpenFOAM sweep verification", () => {
     }
     await expect.poll(async () => (await getQueue(request)).sweeper.enabled, { timeout: 20_000 }).toBe(true);
     await page.reload();
-    await expect(page.getByText(/sweeper running/i)).toBeVisible({ timeout: 20_000 });
+    // Solver redesign: the old "sweeper running" header chip became the
+    // Activity banner state label (deriveSolverState). RUNNING or IDLE both
+    // mean the process is alive and enabled.
+    await expect(page.getByTestId("sweeper-process-state")).toHaveText(/^(RUNNING|IDLE)$/, { timeout: 20_000 });
   }
 
   async function monitorQueue(

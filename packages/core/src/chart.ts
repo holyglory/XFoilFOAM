@@ -32,6 +32,40 @@ const Y_TITLE: Record<ChartType, string> = {
   cma: "Cm",
 };
 
+/** Provenance of a derived-by-symmetry display point (spec §9.3). The detail
+ *  payload marks mirrored points with derived/derivedFromResultId/
+ *  derivedFromAoaDeg; core PolarPointData keeps them structural so producers
+ *  can attach them without widening every polar consumer. */
+export interface DerivedBySymmetryInfo {
+  derived: boolean;
+  derivedFromResultId: string | null;
+  derivedFromAoaDeg: number | null;
+}
+
+/** Read the derived-by-symmetry marker off a polar point (absent → not derived). */
+export function derivedBySymmetryInfo(p: PolarPointData): DerivedBySymmetryInfo {
+  const d = p as PolarPointData & { derived?: boolean; derivedFromResultId?: string | null; derivedFromAoaDeg?: number | null };
+  if (d.derived !== true) return { derived: false, derivedFromResultId: null, derivedFromAoaDeg: null };
+  return {
+    derived: true,
+    derivedFromResultId: d.derivedFromResultId ?? p.resultId ?? null,
+    derivedFromAoaDeg: typeof d.derivedFromAoaDeg === "number" ? d.derivedFromAoaDeg : null,
+  };
+}
+
+/** Exact §9.3 tooltip note for a mirrored point, e.g. "derived by symmetry (from +4°)". */
+export function derivedBySymmetryNote(p: PolarPointData): string | null {
+  const info = derivedBySymmetryInfo(p);
+  if (!info.derived) return null;
+  const src = info.derivedFromAoaDeg ?? Math.abs(p.a);
+  return `derived by symmetry (from +${formatSourceAoa(src)}°)`;
+}
+
+function formatSourceAoa(a: number): string {
+  // canonical 0.01° display, trailing zeros trimmed ("4", "4.5", "4.25")
+  return String(Math.round(a * 100) / 100);
+}
+
 export function xyOf(p: PolarPointData, type: ChartType): [number, number] {
   if (type === "cla") return [p.a, p.cl];
   if (type === "clcd") return [p.cd, p.cl];
@@ -214,20 +248,25 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
       if (!Number.isFinite(xx) || !Number.isFinite(yy)) continue;
       const cx = mapX(xx);
       const cy = mapY(yy);
-      const key = c.label + ":" + (p.resultId ?? p.a);
+      // Derived-by-symmetry mirrors share the source resultId, so their key
+      // (and hover identity) must also carry the mirrored angle (spec §9.3).
+      const derivedNote = derivedBySymmetryNote(p);
+      const key = c.label + ":" + (p.resultId ?? p.a) + (derivedNote ? ":d" + p.a : "");
       const hovered = key === hoverKey;
       const provisional = p.classificationState === "needs_urans";
-      const fill = p.stalled ? "#0a0f15" : provisional ? "#0a0f15" : c.color;
-      const stroke = p.stalled ? "#ef4444" : provisional ? "#f59e0b" : "rgba(7,11,16,0.6)";
+      // Derived points render hollow in the curve colour — visually distinct
+      // from provisional (amber) and post-stall (red) outlines.
+      const fill = derivedNote ? "#0a0f15" : p.stalled ? "#0a0f15" : provisional ? "#0a0f15" : c.color;
+      const stroke = p.stalled ? "#ef4444" : provisional ? "#f59e0b" : derivedNote ? c.color : "rgba(7,11,16,0.6)";
       points.push({
         cx,
         cy,
         r: hovered ? 5.5 : 3,
         fill,
         stroke,
-        sw: p.stalled || provisional ? 1.8 : 1,
+        sw: p.stalled || provisional ? 1.8 : derivedNote ? 1.6 : 1,
         re: c.re,
-        label: c.label,
+        label: derivedNote ? c.label + " · " + derivedNote : c.label,
         stalled: p.stalled,
         key,
         point: p,
