@@ -27,6 +27,8 @@ import {
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
 import { PROCESS_NOT_RUNNING_DETAIL, isProcessDead } from "@/lib/solver-state";
+import { campaignStatusLine } from "./campaign-status";
+export { campaignStatusLine };
 import { AddAirfoilsDialog } from "./AddAirfoilsDialog";
 import { CellSidePanel, type CellPanelAirfoil } from "./CellSidePanel";
 import { ConditionStrip, nextUpConditionId } from "./ConditionStrip";
@@ -38,56 +40,6 @@ import { fCount, ghostBtn, primaryBtn } from "./ui";
 import { usePoll } from "./usePoll";
 
 const PRIORITY_LABEL: Record<number, string> = { 0: "Background", 5: "Standard", 8: "High" };
-
-function hhmm(iso: string): string {
-  const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
-
-/** §12 truth table: campaign status × sweeper.enabled × engine health.
- *  Never a bare "Active" while nothing can run. */
-export function campaignStatusLine(s: AdminCampaignSummary): { text: string; tone: "teal" | "amber" | "red" | "dim" } {
-  const { campaign, totals, scheduler } = s;
-  const jobs = scheduler.campaignJobsRunning;
-  switch (campaign.status) {
-    case "archived":
-      return { text: "Archived — read-only.", tone: "dim" };
-    case "cancelled":
-      return jobs > 0
-        ? { text: `Cancelled — ${fCount(jobs)} job${jobs === 1 ? "" : "s"} finishing.`, tone: "dim" }
-        : { text: "Cancelled.", tone: "dim" };
-    case "completed":
-      return campaign.closedWithFailedCount != null
-        ? { text: `Completed — closed with ${fCount(campaign.closedWithFailedCount)} failed point${campaign.closedWithFailedCount === 1 ? "" : "s"}.`, tone: "teal" }
-        : { text: "Completed — every obligated point is terminal.", tone: "teal" };
-    case "attention":
-      return { text: `All obligated work is terminal — ${fCount(totals.failed)} failed point${totals.failed === 1 ? "" : "s"} need review.`, tone: "red" };
-    case "paused":
-      return {
-        text: `Paused by you — no new points will be scheduled${jobs > 0 ? `; ${fCount(jobs)} running job${jobs === 1 ? "" : "s"} will finish` : ""}.`,
-        tone: "amber",
-      };
-    default: {
-      // active — gate precedence mirrors lib/solver-state deriveSolverState:
-      // a dead solver process outranks every engine/enabled clause (the
-      // stale-heartbeat state that misled a real launch on 2026-07-05).
-      if (isProcessDead(scheduler.heartbeatAt)) {
-        return { text: "Solver process is not running — nothing is being scheduled.", tone: "red" };
-      }
-      if (scheduler.engineUnreachableSince) {
-        return { text: `Engine unreachable since ${hhmm(scheduler.engineUnreachableSince)} — no jobs are being submitted.`, tone: "red" };
-      }
-      if (!scheduler.sweeperEnabled) return { text: "Sweeper disabled — nothing is being scheduled.", tone: "amber" };
-      if (!scheduler.engineHealthy) {
-        return { text: `Engine unhealthy${scheduler.engineError ? ` (${scheduler.engineError})` : ""} — no jobs are being submitted.`, tone: "red" };
-      }
-      return {
-        text: `Active — ${fCount(totals.running)} point${totals.running === 1 ? "" : "s"} running, ${fCount(totals.remaining)} remaining.`,
-        tone: "teal",
-      };
-    }
-  }
-}
 
 const STATUS_CHIP_COLOR: Record<string, { color: string; border: string }> = {
   active: { color: "var(--aero-teal)", border: "var(--aero-teal-border)" },
