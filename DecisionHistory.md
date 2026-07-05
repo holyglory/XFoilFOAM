@@ -769,6 +769,51 @@
   scheduler control and now fail-fast (by design) while a live campaign runs;
   isolation on a scratch DB is queued as follow-up work.
 
+## 2026-07-05 — Degenerate No-Shedding URANS Resolves As Steady, Not A Crash
+
+- Incident (validation-campaign-20260705, airfoils.pro): three campaign points
+  failed as `terminal | failed` with `result_classifications.state=rejected` —
+  clarky α−2 and sd8020 α0 with `FileExistsError`, naca-0012 α0 with
+  `OpenFOAMError "URANS transient produced no coefficient.dat"`. RANS-at-α0 for
+  these near-zero-lift cases genuinely did not converge (converged=f, stalled=t,
+  valid_for_polar=f), so the URANS escalation was legitimate; the failure was in
+  the degenerate URANS-with-no-shedding path.
+- Root cause: a symmetric airfoil at α≈0 (or any weakly-loaded point) escalated
+  to URANS runs a physically steady transient — no vortex shedding, so the force
+  history is flat. `evaluate_urans_quality` only treated `strouhal <= 0` as
+  "no shedding"; a flat-but-noisy lift signal can still produce a spurious FFT
+  peak (nonzero strouhal), which routed the case into the auto-refine branch.
+  Auto-refining a non-shedding case copies a degenerate retained window (start
+  time resolving to 0.0 → `FileExistsError`), and the transient produced no
+  usable periodic coefficient history to analyze.
+- Decision: detect no-shedding from the fluctuation AMPLITUDE (not the presence
+  of an FFT bin) BEFORE any refine decision. New `is_no_shedding(history)`
+  (postprocess/unsteady.py) fires when `max(cl_rms, cd_rms)` is negligible vs a
+  relative-plus-absolute-floor threshold. When it fires, `evaluate_urans_quality`
+  returns `ok=True, can_refine=False, no_shedding=True`: the time-averaged
+  coefficients over the retained transient window ARE the physical answer
+  (evidence-first: a non-shedding URANS is a converged steady case). The point
+  is finalized as `converged=True, unsteady=False`, gets steady single-frame
+  media, and reports no Strouhal. naca-0012-α0-class points are now recovered as
+  real solved steady evidence (cl≈0) instead of failing.
+- Honest-failure boundary preserved: no-shedding requires real force data. If
+  the coefficient history is genuinely absent (solver truly failed), the case
+  still fails cleanly with retained attempt evidence — coefficients are never
+  fabricated.
+- The prior crash-(a) guard in `_copy_initialized_transient_case` (skip the
+  start-dir copy when it equals the already-copied `0` dir) is kept as
+  defense-in-depth; the no-shedding branch now prevents reaching auto-refine for
+  these cases at all.
+- Tests (unit, no real solves): tests/test_no_shedding_urans.py covers the
+  detector (flat/periodic/absent), the decision routing through
+  evaluate_urans_quality, mean-equals-average of the steady history via
+  `_run_transient_attempt`, and the naca-0012-α0 steady recovery through
+  `_finalize_outcome`; tests/test_pipeline_refined_copy.py (crash-a) retained.
+  Suite: 111 → 119 passing.
+- Deploy: engine (worker + api) rebuild REQUIRED — pipeline behavior changed
+  (previously-failed near-zero-lift points now solve as steady). Build-id bump
+  handled by the orchestrator.
+
 ## 2026-07-05 — Queue Endpoint Under Solver Saturation: Scoped + Race-Capped
 
 - Incident (measured on airfoils.pro): authenticated GET /api/admin/queue took

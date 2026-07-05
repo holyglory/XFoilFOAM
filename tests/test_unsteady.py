@@ -132,7 +132,7 @@ def test_stable_two_period_window_requires_animation_frames(tmp_path: Path):
     assert "frames/cycle" in result.reason
 
 
-def _history(t0, t1, st=0.6634408650015379, n=400):
+def _history(t0, t1, st=0.6634408650015379, n=400, cl_rms=0.05, cd_rms=0.01):
     ts = [t0 + (t1 - t0) * i / (n - 1) for i in range(n)]
     return ForceHistory(
         t=ts,
@@ -140,9 +140,9 @@ def _history(t0, t1, st=0.6634408650015379, n=400):
         cd=[0.3] * n,
         cm=[-0.1] * n,
         cl_mean=0.7,
-        cl_rms=0.0,
+        cl_rms=cl_rms,
         cd_mean=0.3,
-        cd_rms=0.0,
+        cd_rms=cd_rms,
         cm_mean=-0.1,
         cm_rms=0.0,
         shedding_freq_hz=st * 7.303255616469686,
@@ -226,13 +226,19 @@ def test_refined_transient_timing_can_use_safer_write_cadence():
 
 
 def test_urans_quality_missing_strouhal_does_not_refine(tmp_path):
-    hist = _history(0.0, 1.0, st=0.0)
+    # Flat force history with no strouhal AND no fluctuation: a physically
+    # steady (no-shedding) URANS. It must resolve as a valid steady-mean point,
+    # never as a refinable shedding case (auto-refining it triggers the
+    # degenerate refined-copy crash).
+    hist = _history(0.0, 1.0, st=0.0, cl_rms=0.0, cd_rms=0.0)
 
     quality = evaluate_urans_quality(tmp_path, hist, speed=10.0, chord=1.0)
 
-    assert not quality.ok
+    assert quality.ok
+    assert quality.no_shedding
     assert not quality.can_refine
-    assert "could not be measured" in quality.reason
+    assert quality.measured_period_s is None
+    assert "no vortex shedding" in quality.reason
 
 
 def test_vtu_selector_returns_final_retained_window(tmp_path):

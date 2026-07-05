@@ -386,7 +386,19 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
 }
 
 /** Idempotent counter maintenance: recompute the affected (campaign, condition,
- *  airfoil) rows from sim_campaign_points + results instead of incrementing. */
+ *  airfoil) rows from sim_campaign_points + results instead of incrementing.
+ *  CANONICAL counter model (shared verbatim with recomputeProgressForCampaign
+ *  and the launch/plan-edit recomputeCampaignProgress wrapper in campaigns.ts):
+ *   - requested:  state <> 'released' — TOTAL obligation (the UI denominator
+ *                 and deriveCampaignCompletion both read it as the whole
+ *                 obligated cell count, not just still-open cells)
+ *   - solved:     terminal, non-derived, result.status='done'
+ *   - failed:     terminal, result.status='failed'
+ *   - running:    requested AND live-cell result.status IN (queued, running)
+ *   - superseded: result_classifications.state='superseded_by_urans'
+ *   - derived:    terminal AND derived_by_symmetry
+ *  Do not diverge these between the incremental and whole-campaign paths — the
+ *  first production campaign drifted precisely because two paths disagreed. */
 /** Tuple lists are bounded per statement: beyond this, template flattening
  *  overflows the JS stack and postgres's 65,534-parameter cap looms. Callers
  *  with whole-campaign scope use recomputeProgressForCampaign instead. */
@@ -407,7 +419,7 @@ async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise
   await db.execute(sql`
     INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived)
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
-           COUNT(*) FILTER (WHERE p.state = 'requested')::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND r.status = 'failed')::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
@@ -437,7 +449,7 @@ export async function recomputeProgressForCampaign(db: DB, campaignId: string): 
   await db.execute(sql`
     INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived)
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
-           COUNT(*) FILTER (WHERE p.state = 'requested')::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND r.status = 'failed')::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,

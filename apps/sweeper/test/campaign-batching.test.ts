@@ -383,7 +383,10 @@ describe("batched campaign jobs: one mesh per airfoil-chord, all speeds warm-sta
         );
       expect(progress).toBeTruthy();
       expect(progress.solved).toBe(solvedAngles.length);
-      expect(progress.requested).toBe(entry.speed === 30 ? 1 : 0);
+      // requested = total obligation (state <> 'released'), not open-only:
+      // none of these points are released, so every angle counts here even
+      // after it terminalizes (canonical model, DecisionHistory 2026-07-05).
+      expect(progress.requested).toBe(ANGLES.length);
       expect(progress.failed).toBe(0);
     }
 

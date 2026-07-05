@@ -41,6 +41,7 @@ from .postprocess.unsteady import (
     ForceHistory,
     StablePeriodResult,
     force_history as compute_force_history,
+    is_no_shedding,
     stable_two_period_window,
 )
 
@@ -173,6 +174,9 @@ class UransQuality:
     frames_per_cycle: float = 0.0
     retained_start_time: Optional[float] = None
     retained_end_time: Optional[float] = None
+    # True when the transient is physically steady (no vortex shedding); its
+    # time-averaged coefficients are the valid answer and no refine is possible.
+    no_shedding: bool = False
 
 
 @dataclass
@@ -330,6 +334,31 @@ def evaluate_urans_quality(
     min_cycles: float = URANS_MIN_RETAINED_CYCLES,
     min_frames_per_cycle: float = URANS_MIN_FRAMES_PER_CYCLE,
 ) -> UransQuality:
+    # No-shedding first: a symmetric airfoil at alpha~0 (or any weakly-loaded
+    # point) escalated to URANS runs a physically steady transient. Its force
+    # history exists and its time-average IS the physical answer, so accept the
+    # steady-equivalent mean and never auto-refine (auto-refining a non-shedding
+    # case is pointless and copies a degenerate retained window). This must be
+    # decided from the fluctuation amplitude, not from the presence of a
+    # (possibly spurious) FFT peak on numerical noise.
+    if history is not None and len(history.t) >= 2 and is_no_shedding(history):
+        retained_start = float(history.t[0])
+        retained_end = float(history.t[-1])
+        return UransQuality(
+            ok=True,
+            can_refine=False,
+            no_shedding=True,
+            reason=(
+                "URANS steady (no vortex shedding): time-averaged coefficients "
+                "are the physical answer."
+            ),
+            measured_period_s=None,
+            retained_cycles=0.0,
+            retained_frame_count=_field_frame_count(case_dir, retained_start, retained_end),
+            frames_per_cycle=0.0,
+            retained_start_time=retained_start,
+            retained_end_time=retained_end,
+        )
     if history is None or history.strouhal <= 0 or speed <= 0 or chord <= 0 or len(history.t) < 2:
         return UransQuality(
             ok=False,
@@ -966,11 +995,14 @@ def _finalize_outcome(
             outcome.cl, outcome.cd, outcome.cm = avg.cl, avg.cd, avg.cm
             outcome.cl_cd = avg.cl_cd
             outcome.cl_std, outcome.cd_std, outcome.cm_std = avg.cl_std, avg.cd_std, avg.cm_std
-            outcome.unsteady = True
+            # A non-shedding transient is physically steady: report it as a
+            # converged steady point (mean coefficients), not as unsteady, so it
+            # gets steady single-frame media rather than a periodic animation.
+            outcome.unsteady = not transient.quality.no_shedding
             outcome.converged = True
             post_dir = transient.case_dir
             outcome.force_history = transient.force_history
-            if transient.force_history is not None:
+            if transient.force_history is not None and not transient.quality.no_shedding:
                 outcome.strouhal = transient.force_history.strouhal
             if not transient.quality.ok:
                 outcome.quality_warnings.append(transient.quality.reason)

@@ -317,6 +317,42 @@ def stable_two_period_window(
     return replace(base, ok=True, reason="two stable periods with sufficient frames")
 
 
+# Below this relative fluctuation the transient force signal is treated as
+# steady: a symmetric airfoil at alpha~0 (or any weakly-loaded point) sheds no
+# vortices, so the pimpleFoam history is a flat line plus numerical noise. The
+# FFT of that noise can still report a spurious "shedding" peak, so amplitude —
+# not the presence of a frequency bin — is the honest no-shedding signal.
+NO_SHEDDING_REL_TOL = 5e-3
+# Absolute fluctuation floor for near-zero-load cases (e.g. cl_mean ~= 0), so a
+# genuinely flat lift signal whose mean is ~0 is still classified as steady
+# rather than being judged only against its own (tiny) mean.
+NO_SHEDDING_ABS_FLOOR = 1e-3
+
+
+def is_no_shedding(
+    history: "ForceHistory | None",
+    rel_tol: float = NO_SHEDDING_REL_TOL,
+    abs_floor: float = NO_SHEDDING_ABS_FLOOR,
+) -> bool:
+    """True when a transient force history shows no meaningful vortex shedding.
+
+    The case is non-shedding when the retained lift and drag oscillations are
+    negligible relative to the signal magnitude (with an absolute floor for
+    near-zero-load cases). Such a URANS run is physically steady, so its
+    time-averaged coefficients — not a periodic analysis — are the answer.
+
+    Requires real force data: an absent/empty history is *not* classified as
+    no-shedding (that is an honest failure, handled by the caller), because
+    there is nothing to average.
+    """
+    if history is None or history.samples < 2 or len(history.t) < 2:
+        return False
+    fluctuation = max(abs(history.cl_rms), abs(history.cd_rms))
+    scale = abs(history.cl_mean) + abs(history.cd_mean)
+    threshold = max(rel_tol * scale, abs_floor)
+    return fluctuation <= threshold
+
+
 def force_history(
     path: Path,
     speed: float,

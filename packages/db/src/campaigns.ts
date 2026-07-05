@@ -18,6 +18,7 @@ import {
 } from "@aerodb/core";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 
+import { recomputeProgressForCampaign } from "./campaign-execution";
 import type { DB } from "./client";
 import {
   airfoils,
@@ -1053,34 +1054,32 @@ export interface CampaignProgressTotals {
   remaining: number;
 }
 
-/** Set-based recompute of sim_campaign_progress from the points ledger joined
- *  to results (spec §3.1: written at launch/plan-edit inside the same
- *  transaction; the sweeper increments and the reconciler heals afterwards).
- *  Counter semantics:
- *   - requested: obligated cells (state != released)
- *   - solved:    terminal solver cells; derived: terminal symmetry cells
- *   - failed / running / superseded: open solver cells whose results row is
- *     failed / queued+running / stale. */
+/** Whole-campaign recompute of sim_campaign_progress (spec §3.1: written at
+ *  launch/plan-edit inside the same transaction; the sweeper increments and the
+ *  reconciler heals afterwards).
+ *
+ *  Counter model is CANONICAL and single-sourced: the exact SELECT/joins live in
+ *  recomputeProgressForCampaign (./campaign-execution.ts) — the same definitions
+ *  the sweeper's incremental recomputeProgressForKeys uses, so both the launch/
+ *  plan-edit path and the ingest path agree on what "solved/failed/running/
+ *  superseded" mean:
+ *   - requested: state <> 'released' (TOTAL obligation, the UI denominator)
+ *   - solved:    state = 'terminal' AND NOT derived AND result.status = 'done'
+ *   - failed:    state = 'terminal' AND result.status = 'failed'
+ *   - running:   state = 'requested' AND live-cell result.status IN (queued, running)
+ *   - superseded: result_classifications.state = 'superseded_by_urans'
+ *   - derived:   state = 'terminal' AND derived
+ *  (result joined ON r.id = p.result_id; live joined ON the cell key.)
+ *
+ *  This wrapper additionally DELETEs the campaign's progress rows first so that
+ *  (condition, airfoil) keys whose points were removed by a plan edit lose their
+ *  stale counter row — the transactional launch/plan-edit callers rely on this
+ *  DELETE-then-recompute cleanup (the reconciler prunes vanished rows out of
+ *  band; here we must prune synchronously). The delegate's INSERT...ON CONFLICT
+ *  then repopulates every surviving key from scratch. */
 export async function recomputeCampaignProgress(tx: CampaignTx, campaignId: string): Promise<void> {
   await asDb(tx).execute(sql`DELETE FROM sim_campaign_progress WHERE campaign_id = ${campaignId}`);
-  await asDb(tx).execute(sql`
-    INSERT INTO sim_campaign_progress
-      (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived)
-    SELECT
-      p.campaign_id,
-      p.condition_id,
-      p.airfoil_id,
-      count(*) FILTER (WHERE p.state <> 'released')::int,
-      count(*) FILTER (WHERE p.state = 'terminal' AND NOT p.derived_by_symmetry)::int,
-      count(*) FILTER (WHERE p.state = 'requested' AND NOT p.derived_by_symmetry AND r.status = 'failed')::int,
-      count(*) FILTER (WHERE p.state = 'requested' AND NOT p.derived_by_symmetry AND r.status IN ('queued', 'running'))::int,
-      count(*) FILTER (WHERE p.state = 'requested' AND NOT p.derived_by_symmetry AND r.status = 'stale')::int,
-      count(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry)::int
-    FROM sim_campaign_points p
-    LEFT JOIN results r ON ${POINT_CELL_JOIN} AND NOT p.derived_by_symmetry
-    WHERE p.campaign_id = ${campaignId}
-    GROUP BY p.campaign_id, p.condition_id, p.airfoil_id
-  `);
+  await recomputeProgressForCampaign(asDb(tx), campaignId);
 }
 
 export async function campaignProgressTotals(db: DbTx, campaignId: string): Promise<CampaignProgressTotals> {
@@ -2645,12 +2644,18 @@ const ERROR_CLASS_SQL = sql`CASE
   ELSE 'solver'
 END`;
 
+// A failed campaign point is TERMINAL with its authoritative results row
+// (r.id = p.result_id) at status='failed' — NOT state='requested' with a
+// cell-key join. Failed points are terminal-linked at ingest (onResultIngested
+// sets state='terminal', result_id=<failed result>), so the failures list,
+// counters, and requeue must all match on the terminal model and join by
+// result_id. Callers MUST join `results r ON r.id = p.result_id`.
 function failedResultsWhere(campaignId: string, filters: { conditionId?: string; airfoilId?: string }) {
   return sql`
     p.campaign_id = ${campaignId}
-    AND p.state = 'requested'
+    AND p.state = 'terminal'
     AND NOT p.derived_by_symmetry
-    AND ${POINT_CELL_JOIN}
+    AND r.id = p.result_id
     AND r.status = 'failed'
     ${filters.conditionId ? sql`AND p.condition_id = ${filters.conditionId}` : sql``}
     ${filters.airfoilId ? sql`AND p.airfoil_id = ${filters.airfoilId}` : sql``}
@@ -2693,7 +2698,7 @@ export async function campaignFailures(
         count(*) OVER (PARTITION BY ${ERROR_CLASS_SQL})::int AS class_count,
         row_number() OVER (PARTITION BY ${ERROR_CLASS_SQL} ORDER BY r."updatedAt" DESC) AS rn
       FROM results r
-      JOIN sim_campaign_points p ON ${POINT_CELL_JOIN}
+      JOIN sim_campaign_points p ON p.result_id = r.id
       JOIN airfoils af ON af.id = p.airfoil_id
       WHERE ${failedResultsWhere(campaignId, filters)}
     ) ranked
@@ -2750,7 +2755,7 @@ export async function requeueCampaignFailed(
     const matching = (await asDb(tx).execute(sql`
       SELECT r.id
       FROM results r
-      JOIN sim_campaign_points p ON ${POINT_CELL_JOIN}
+      JOIN sim_campaign_points p ON p.result_id = r.id
       WHERE ${failedResultsWhere(campaignId, { conditionId: args.conditionId, airfoilId: args.airfoilId })}
         ${classFilter}
       FOR UPDATE OF r
@@ -2762,10 +2767,24 @@ export async function requeueCampaignFailed(
       });
     }
     if (matching.length > 0) {
-      await asDb(tx)
-        .update(results)
-        .set({ status: "pending", simJobId: null })
-        .where(inArray(results.id, matching.map((m) => m.id)));
+      const ids = matching.map((m) => m.id);
+      // Reset the failed evidence rows to re-claimable pending work.
+      await asDb(tx).update(results).set({ status: "pending", simJobId: null }).where(inArray(results.id, ids));
+      // Flip the terminal-failed points back to 'requested' so the campaign
+      // sweeper branch (which schedules only state='requested' points) will
+      // actually reschedule them. Without this the point would be a terminal
+      // orphan pointing at a pending result that never gets re-solved. The
+      // result_id is left intact: onResultIngested re-terminal-links this same
+      // cell by (airfoil, revision, aoa) when the re-solve lands, and the
+      // pending result is now re-claimable by the gap query (r.status='pending').
+      await asDb(tx).execute(sql`
+        UPDATE sim_campaign_points
+        SET state = 'requested', "updatedAt" = now()
+        WHERE campaign_id = ${campaignId}
+          AND result_id = ANY(${pgUuidArray(ids)}::uuid[])
+          AND state = 'terminal'
+          AND NOT derived_by_symmetry
+      `);
     }
     await recomputeCampaignProgress(tx, campaignId);
     const totals = await refreshCampaignCompletion(tx, campaignId);

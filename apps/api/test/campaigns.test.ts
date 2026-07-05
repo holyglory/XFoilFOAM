@@ -7,12 +7,18 @@ import {
   airfoils,
   boundaryConditions,
   boundaryProfiles,
+  campaignFailures,
+  campaignProgressTotals,
   categories,
+  deriveCampaignCompletion,
   flowConditions,
   mediums,
   meshProfiles,
+  onResultIngested,
   outputProfiles,
+  recomputeCampaignProgress,
   referenceGeometryProfiles,
+  requeueCampaignFailed,
   results,
   simCampaigns,
   simulationPresetRevisions,
@@ -472,6 +478,176 @@ describe("campaign launch (§5)", () => {
     expect(body.airfoilIds.sort()).toEqual([asymId, symId].sort());
     const after = await db.select({ id: simCampaigns.id }).from(simCampaigns);
     expect(after.length).toBe(before.length);
+  });
+});
+
+// Regression guard for the counter/failures/requeue drift found on the first
+// production campaign (validation-campaign-20260705): two recompute paths and
+// the failures/requeue queries disagreed on what a FAILED point is. A failed
+// campaign point is TERMINAL with its results row status='failed' — NOT
+// state='requested'. The whole solved/failed/attention/requeue cycle below is
+// the must-catch shape of that real breakage.
+describe("counter/failures/requeue coherence (production drift regression)", () => {
+  let campaignId = "";
+  let conditionId = "";
+  let revisionId = "";
+  let bcId = "";
+  // Dedicated airfoil + a unique speed so this campaign's physics hash (and thus
+  // its pinned revision) is unique — no pre-solved evidence from the other tests
+  // can terminal-link my points at launch, keeping the counts deterministic.
+  let driftAirfoilId = "";
+  const DRIFT_SPEED = 13.5;
+
+  beforeAll(async () => {
+    const [af] = await db
+      .insert(airfoils)
+      .values({ slug: `${PREFIX}-drift-af`, name: `${PREFIX} drift af`, categoryId: cleanupCategoryIds[0], points: camberedPoints, isSymmetric: false })
+      .returning();
+    driftAirfoilId = af.id;
+    cleanupAirfoilIds.push(af.id);
+  });
+
+  // One cambered (asymmetric) airfoil, single chord, single α-list -2..2 so the
+  // obligation is exactly 5 points on one condition — small enough to drive by
+  // hand into done / failed / requested and assert precise counts.
+  it("seeds a one-condition campaign and drives points to done/failed/requested", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} drift`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-drift-key`,
+        airfoilIds: [driftAirfoilId],
+        plan: planBody({ chordsM: [0.2], speedsMps: [DRIFT_SPEED], objectives: { ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 }, clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 } } }),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    campaignId = res.json().campaign.id;
+    cleanupCampaignIds.push(campaignId);
+    // 5 angles × 1 airfoil × 1 condition = 5 obligated points, all open.
+    expect(res.json().totals.requested).toBe(5);
+    expect(res.json().totals.remaining).toBe(5);
+
+    const [cond] = (await db.execute(sql`
+      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id, p.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc
+      JOIN simulation_presets p ON p.id = cc.preset_id
+      WHERE cc.campaign_id = ${campaignId}
+    `)) as unknown as Array<{ id: string; revision_id: string; bc_id: string }>;
+    conditionId = cond.id;
+    revisionId = cond.revision_id;
+    bcId = cond.bc_id;
+
+    // α=+2 → DONE (a genuine solved solver cell).
+    const [doneRow] = await db
+      .insert(results)
+      .values({ airfoilId: driftAirfoilId, bcId, simulationPresetRevisionId: revisionId, aoaDeg: 2, status: "done", source: "solved", cl: 0.6, cd: 0.012 })
+      .returning({ id: results.id });
+    cleanupResultIds.push(doneRow.id);
+    await onResultIngested(db, { airfoilId: driftAirfoilId, revisionId, aoaDeg: 2, resultId: doneRow.id, status: "done" });
+
+    // α=0 → FAILED, ingested exactly as the engine reports it: the point goes
+    // TERMINAL linked to a results row at status='failed' (the URANS-no-shedding
+    // degenerate path from the live campaign).
+    const [failRow] = await db
+      .insert(results)
+      .values({ airfoilId: driftAirfoilId, bcId, simulationPresetRevisionId: revisionId, aoaDeg: 0, status: "failed", source: "solved", error: "OpenFOAMError: URANS transient produced no coefficient.dat" })
+      .returning({ id: results.id });
+    cleanupResultIds.push(failRow.id);
+    await onResultIngested(db, { airfoilId: driftAirfoilId, revisionId, aoaDeg: 0, resultId: failRow.id, status: "failed" });
+
+    // Ground-truth DB shape: the failed point is terminal + failed, NOT requested.
+    const [failPoint] = (await db.execute(sql`
+      SELECT p.state, r.status
+      FROM sim_campaign_points p JOIN results r ON r.id = p.result_id
+      WHERE p.campaign_id = ${campaignId} AND p.aoa_deg = 0
+    `)) as unknown as Array<{ state: string; status: string }>;
+    expect(failPoint.state).toBe("terminal");
+    expect(failPoint.status).toBe("failed");
+    // α=-2,-1,+1 remain open (state='requested').
+    const [open] = (await db.execute(sql`
+      SELECT count(*)::int AS n FROM sim_campaign_points WHERE campaign_id = ${campaignId} AND state = 'requested'
+    `)) as unknown as Array<{ n: number }>;
+    expect(Number(open.n)).toBe(3);
+  });
+
+  it("recomputeCampaignProgress counts solved=done-only and failed=terminal-failed (not the reverse)", async () => {
+    // The whole-campaign recompute (launch/plan-edit path) must agree with the
+    // incremental ingest path: solved excludes the failure, failed sees it.
+    await db.transaction(async (tx) => {
+      await recomputeCampaignProgress(tx, campaignId);
+    });
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.requested).toBe(5); // total obligation, the UI denominator
+    expect(totals.solved).toBe(1); // only α=+2 done — the failure is NOT absorbed
+    expect(totals.failed).toBe(1); // α=0 terminal-failed — NOT silently 0
+    expect(totals.derived).toBe(0);
+    // remaining = requested - solved - derived - failed = 5-1-0-1 = 3 open.
+    expect(totals.remaining).toBe(3);
+  });
+
+  it("campaignFailures finds the terminal-failed point with the right error class", async () => {
+    const failures = await campaignFailures(db, campaignId);
+    expect(failures.total).toBe(1); // the live monitor saw total:0 here — the bug
+    expect(failures.groups.length).toBe(1);
+    const group = failures.groups[0];
+    expect(group.errorClass).toBe("solver"); // "URANS transient produced no coefficient.dat"
+    expect(group.count).toBe(1);
+    expect(group.samples[0].aoaDeg).toBe(0);
+    expect(group.samples[0].resultId).toBeTruthy();
+  });
+
+  it("resolves to attention (not completed) once every obligated point is terminal with failed>0", async () => {
+    // Solve the three remaining open points so the campaign is fully settled
+    // with exactly one failure — the completion state must be 'attention'.
+    for (const aoa of [-2, -1, 1]) {
+      const [row] = await db
+        .insert(results)
+        .values({ airfoilId: driftAirfoilId, bcId, simulationPresetRevisionId: revisionId, aoaDeg: aoa, status: "done", source: "solved", cl: 0.1 * aoa, cd: 0.011 })
+        .returning({ id: results.id });
+      cleanupResultIds.push(row.id);
+      await onResultIngested(db, { airfoilId: driftAirfoilId, revisionId, aoaDeg: aoa, resultId: row.id, status: "done" });
+    }
+    await db.transaction(async (tx) => {
+      await recomputeCampaignProgress(tx, campaignId);
+    });
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.solved).toBe(4);
+    expect(totals.failed).toBe(1);
+    expect(totals.remaining).toBe(0);
+    expect(deriveCampaignCompletion(totals)).toBe("attention");
+    // The ingest completion probe drove the live campaign row the same way.
+    const [camp] = (await db.execute(
+      sql`SELECT status FROM sim_campaigns WHERE id = ${campaignId}`,
+    )) as unknown as Array<{ status: string }>;
+    expect(camp.status).toBe("attention");
+  });
+
+  it("requeueCampaignFailed flips the terminal-failed point back to requested + pending, then finds zero", async () => {
+    // Drift guard still holds: wrong expectedCount → 409-class error.
+    await expect(requeueCampaignFailed(db, campaignId, { expectedCount: 5 })).rejects.toMatchObject({ code: "drift" });
+
+    const out = await requeueCampaignFailed(db, campaignId, { expectedCount: 1 });
+    expect(out.requeued).toBe(1);
+
+    // The point is re-claimable: state back to 'requested', result back to 'pending'.
+    const [point] = (await db.execute(sql`
+      SELECT p.state, r.status
+      FROM sim_campaign_points p JOIN results r ON r.id = p.result_id
+      WHERE p.campaign_id = ${campaignId} AND p.aoa_deg = 0
+    `)) as unknown as Array<{ state: string; status: string }>;
+    expect(point.state).toBe("requested");
+    expect(point.status).toBe("pending");
+
+    // A second failures read now returns zero — nothing failed remains.
+    const after = await campaignFailures(db, campaignId);
+    expect(after.total).toBe(0);
+    // Reopening a settled campaign drops it out of attention back to active.
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.failed).toBe(0);
+    expect(totals.remaining).toBe(1);
+    expect(out.totals.remaining).toBe(1);
   });
 });
 
