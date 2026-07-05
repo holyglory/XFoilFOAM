@@ -196,6 +196,9 @@ interface QueueJobRow {
   reynolds_min: number | null;
   reynolds_max: number | null;
   speed_count: number | null;
+  // Pinned-detail evidence links (campaign spec §11): the job's single setup
+  // revision, or NULL for multi-revision batched jobs (no single pinned view).
+  pinned_revision_id: string | null;
 }
 
 function iso(v: Date | string | null): string | null {
@@ -456,6 +459,9 @@ function toQueueJob(r: QueueJobRow) {
     reynoldsMin: r.reynolds_min == null ? null : Number(r.reynolds_min),
     reynoldsMax: r.reynolds_max == null ? null : Number(r.reynolds_max),
     speedCount: r.speed_count == null ? null : Number(r.speed_count),
+    // Evidence links pin this revision on the public detail page (?revision=);
+    // null for multi-revision batched jobs, whose links stay unpinned.
+    revisionId: r.pinned_revision_id,
   };
 }
 
@@ -639,6 +645,12 @@ async function queueJobs(group: QueueJobStatusGroup, limit: number) {
           THEN jsonb_array_length(j.request_payload->'conditionMap')
         ELSE NULL
       END AS speed_count,
+      CASE
+        WHEN jsonb_typeof(j.request_payload->'conditionMap') = 'array'
+          AND (SELECT count(DISTINCT e->>'revisionId') FROM jsonb_array_elements(j.request_payload->'conditionMap') e) > 1
+          THEN NULL
+        ELSE j.simulation_preset_revision_id
+      END AS pinned_revision_id,
       COALESCE(rs.result_count, 0)::int AS result_count,
       COALESCE(rs.solved_count, 0)::int AS solved_count,
       COALESCE(rs.failed_count, 0)::int AS failed_count,

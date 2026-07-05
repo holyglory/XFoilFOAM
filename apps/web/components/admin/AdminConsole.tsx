@@ -1,7 +1,7 @@
 "use client";
 
 import type { MediumDTO } from "@aerodb/core";
-import { type CSSProperties, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { type CSSProperties, type ReactNode, type SyntheticEvent, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { ExternalLink, Pause, Play, RotateCcw, ShieldAlert, Trash2 } from "lucide-react";
@@ -85,6 +85,8 @@ import {
   updateSweepDefinition,
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
+import { airfoilDetailHref } from "@/lib/detail-links";
+import { isFinishedLogOpen, withFinishedLogParam } from "@/lib/finished-log-param";
 import { deriveSolverState, solverStateLabel } from "@/lib/solver-state";
 import { AddAirfoilsPanel } from "./AddAirfoilsPanel";
 import { momentumSchemeSelect } from "./solver-schemes";
@@ -2558,6 +2560,22 @@ function QueueDashboard({
   const [busy, setBusy] = useState(false);
   const [maintenanceNotice, setMaintenanceNotice] = useState<string | null>(null);
   const [purgePrefix, setPurgePrefix] = useState("pw-");
+  // Finished-job-log open state is URL-owned (?flog=1, spec §11 "search
+  // params are the single source of truth"): a native <details> keeps its
+  // state only in the DOM, so browser-back from an evidence link used to
+  // land on a re-collapsed log. replaceState (same shallow mechanism as the
+  // console's navigate()) keeps history clean — no entry per toggle.
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const finishedLogOpen = isFinishedLogOpen(searchParams.toString());
+  const onFinishedLogToggle = useCallback(
+    (e: SyntheticEvent<HTMLDetailsElement>) => {
+      const next = withFinishedLogParam(window.location.search, e.currentTarget.open);
+      if (next === (window.location.search || "")) return;
+      window.history.replaceState(null, "", `${pathname}${next}`);
+    },
+    [pathname],
+  );
   // Solved-points viewer (screen 5). Its state lives HERE — outside the queue
   // payload — so the 10 s poll can update badge counts and job cards without
   // yanking an open popover shut; the popover fetches its own rows on open.
@@ -2833,7 +2851,7 @@ function QueueDashboard({
             )}
           </QueuePanel>
 
-          <details data-testid="queue-finished-jobs" style={{ ...card, padding: 0, borderRadius: 8, overflow: "hidden" }}>
+          <details data-testid="queue-finished-jobs" open={finishedLogOpen} onToggle={onFinishedLogToggle} style={{ ...card, padding: 0, borderRadius: 8, overflow: "hidden" }}>
             <summary style={{ cursor: "pointer", padding: "12px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
               <span style={{ fontFamily: MONO, fontSize: 12, fontWeight: 700, color: C.text }}>Finished job log</span>
               <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>{queue ? `${finishedJobs.length} latest` : "…"}</span>
@@ -3293,7 +3311,11 @@ function ActiveJobCard({ job, busy, onCancel, onOpenCampaign, onOpenSolved }: { 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "start" }}>
         <div style={{ minWidth: 0 }}>
           {job.airfoilSlug ? (
-            <Link href={`/airfoils/${job.airfoilSlug}`} style={{ display: "block", color: C.text, textDecoration: "none", fontFamily: MONO, fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            // Same affordance + pinned-revision rules as FinishedJobCard.
+            <Link
+              href={airfoilDetailHref(job.airfoilSlug, job.revisionId)}
+              style={{ display: "block", width: "fit-content", maxWidth: "100%", color: C.teal, textDecoration: "underline dotted", textUnderlineOffset: 3, fontFamily: MONO, fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
               {job.airfoilName ?? job.airfoilSlug}
             </Link>
           ) : (
@@ -3370,7 +3392,15 @@ function FinishedJobCard({ job, onOpenCampaign, onOpenSolved }: { job: AdminJob;
             <SolvedCountChip job={job} onOpenSolved={onOpenSolved} />
           </div>
           {job.airfoilSlug ? (
-            <Link href={`/airfoils/${job.airfoilSlug}`} style={{ display: "block", marginTop: 8, color: C.text, textDecoration: "none", fontFamily: MONO, fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            // A real-looking link, not a caption: teal + dotted underline,
+            // fit-content so only the name itself is the click target. The
+            // href pins the job's setup revision (campaign spec §11) so the
+            // detail page shows THIS job's evidence even when its campaign
+            // preset is disabled by design.
+            <Link
+              href={airfoilDetailHref(job.airfoilSlug, job.revisionId)}
+              style={{ display: "block", width: "fit-content", maxWidth: "100%", marginTop: 8, color: C.teal, textDecoration: "underline dotted", textUnderlineOffset: 3, fontFamily: MONO, fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
               {job.airfoilName ?? job.airfoilSlug}
             </Link>
           ) : (
@@ -3378,7 +3408,7 @@ function FinishedJobCard({ job, onOpenCampaign, onOpenSolved }: { job: AdminJob;
           )}
         </div>
         {job.airfoilSlug ? (
-          <Link href={`/airfoils/${job.airfoilSlug}`} style={{ display: "inline-flex", alignItems: "center", gap: 4, color: C.teal, textDecoration: "none", border: `1px solid ${C.tealBorder}`, borderRadius: 6, padding: "4px 7px", fontFamily: MONO, fontSize: 10 }}>
+          <Link href={airfoilDetailHref(job.airfoilSlug, job.revisionId)} style={{ display: "inline-flex", alignItems: "center", gap: 4, color: C.teal, textDecoration: "none", border: `1px solid ${C.tealBorder}`, borderRadius: 6, padding: "4px 7px", fontFamily: MONO, fontSize: 10 }}>
             Detail <ExternalLink size={12} />
           </Link>
         ) : (

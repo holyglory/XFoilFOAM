@@ -101,6 +101,10 @@ export interface AdminJob {
   reynoldsMin: number | null;
   reynoldsMax: number | null;
   speedCount: number | null;
+  /** Pinned-detail evidence links (campaign spec §11): the job's single setup
+   *  revision (→ /airfoils/<slug>?revision=<uuid>); null for multi-revision
+   *  batched jobs, whose detail links stay unpinned. */
+  revisionId: string | null;
   error: string | null;
   createdAt: string;
   submittedAt: string | null;

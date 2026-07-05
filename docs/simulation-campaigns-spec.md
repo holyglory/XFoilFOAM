@@ -525,6 +525,20 @@ airfoils. Keep the engine request untouched otherwise.
   new fit target → Δ); "Continue +N"; provisional/stale/symmetric states.
 - **Queue page**: backlog strip, campaign chips on job cards, engine-unreachable
   banner, single "OpenFOAM CPU slots" control (replaces the concurrency stepper).
+- **Pinned-detail admin journey**: every admin surface that deep-links to
+  `/airfoils/<slug>` as evidence of a job/result (finished/active job cards,
+  campaign cell side panel) appends `?revision=<uuid>` with the job's setup
+  revision, because the public detail page builds polars from ENABLED presets
+  only and campaign presets are disabled by design — an unpinned link on a
+  campaign-only database lands on zero polar groups. The detail page validates
+  the param (UUID shape; invalid → ignored), fetches the §10 pinned scope
+  (`GET /api/airfoils/:slug?revisionId=`), and shows a compact dismissible
+  "Pinned to setup revision …" chip above the charts linking back to the
+  public view. The queue payload carries `AdminJob.revisionId` (single-revision
+  jobs; NULL for multi-revision batched jobs, which link unpinned — no single
+  pinned view exists). The finished-job log's open state is URL-owned
+  (`?flog=1`, replace semantics) so browser-back from an evidence link returns
+  with the log still expanded.
 - All admin polls pause on document.hidden, resume with immediate fetch.
 
 ## 12. Honesty rules (binding, from the global no-fake policy)

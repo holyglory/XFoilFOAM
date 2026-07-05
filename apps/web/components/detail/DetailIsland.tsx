@@ -14,6 +14,7 @@ import {
   projectChart,
   type SimulationDetail,
 } from "@aerodb/core";
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { getFieldTrack, getSim } from "@/lib/api";
@@ -40,7 +41,10 @@ const DEFAULT_VISIBLE: Record<number, boolean> = {
   1000000: false,
 };
 
-function visibleDefaults(detail: AirfoilDetailPayload): Record<number, boolean> {
+function visibleDefaults(detail: AirfoilDetailPayload, pinned: boolean): Record<number, boolean> {
+  // Pinned-revision scope carries exactly one curve — it must start visible
+  // (the catalog defaults would hide e.g. a pinned Re 200k curve entirely).
+  if (pinned) return Object.fromEntries(detail.polars.map((polar) => [polar.re, true]));
   return Object.fromEntries(
     detail.polars.map((polar) => [
       polar.re,
@@ -49,9 +53,13 @@ function visibleDefaults(detail: AirfoilDetailPayload): Record<number, boolean> 
   );
 }
 
-export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
+/** `pinnedRevisionId` (campaign spec §11 pinned-detail admin journey): the
+ *  page was opened from an admin evidence link with ?revision=<uuid>, so the
+ *  payload is scoped to that one setup revision (enabled or not). A compact
+ *  context chip above the charts says so and links back to the public view. */
+export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: AirfoilDetailPayload; pinnedRevisionId?: string | null }) {
   const [chartType, setChartType] = useState<ChartType>("cla");
-  const [visibleRe, setVisibleRe] = useState<Record<number, boolean>>(() => visibleDefaults(detail));
+  const [visibleRe, setVisibleRe] = useState<Record<number, boolean>>(() => visibleDefaults(detail, !!pinnedRevisionId));
   const [hover, setHover] = useState<HoverState | null>(null);
 
   const [simOpen, setSimOpen] = useState(false);
@@ -67,8 +75,8 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
   }, [detail.slug]);
 
   useEffect(() => {
-    setVisibleRe(visibleDefaults(detail));
-  }, [detail]);
+    setVisibleRe(visibleDefaults(detail, !!pinnedRevisionId));
+  }, [detail, pinnedRevisionId]);
 
   // Real solver evidence only — derived-by-symmetry mirrors are display points,
   // never counted as solved runs (spec §9.3 "solver runs vs points").
@@ -175,7 +183,7 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
   useEffect(() => {
     if (!simOpen) return;
     let cancelled = false;
-    getFieldTrack(detail.slug)
+    getFieldTrack(detail.slug, pinnedRevisionId)
       .then((items) => {
         if (!cancelled) setSimTrack(items);
       })
@@ -185,7 +193,7 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
     return () => {
       cancelled = true;
     };
-  }, [simOpen, detail.slug]);
+  }, [simOpen, detail.slug, pinnedRevisionId]);
 
   const selectTrackPoint = useCallback((point: FieldTrackPoint) => {
     setSimCtx({ re: point.re, aoa: point.aoa, resultId: point.resultId });
@@ -196,7 +204,22 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
 
   return (
     <>
-      <div style={{ display: "grid", gridTemplateColumns: "344px 1fr", gap: 20, alignItems: "start" }}>
+      {/* Stack the spec sheet above the charts on narrow viewports — the fixed
+          344px column otherwise pushes the whole chart column off-canvas. */}
+      <style jsx>{`
+        .detail-two-col {
+          display: grid;
+          grid-template-columns: 344px minmax(0, 1fr);
+          gap: 20px;
+          align-items: start;
+        }
+        @media (max-width: 760px) {
+          .detail-two-col {
+            grid-template-columns: minmax(0, 1fr);
+          }
+        }
+      `}</style>
+      <div className="detail-two-col">
         <SpecSheet
           detail={detail}
           polarRows={polarRows}
@@ -205,7 +228,43 @@ export function DetailIsland({ detail }: { detail: AirfoilDetailPayload }) {
           machStr={detail.mach.toFixed(2)}
           fitStatus={metricPolar?.fit?.status ?? null}
         />
-        <div style={{ display: "grid", gap: 14 }}>
+        {/* minWidth 0 so the pinned chip's text cannot widen the 1fr track past the viewport */}
+        <div style={{ display: "grid", gap: 14, minWidth: 0 }}>
+          {pinnedRevisionId && (
+            <span
+              data-testid="pinned-revision-chip"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 8,
+                width: "fit-content",
+                maxWidth: "100%",
+                minWidth: 0,
+                // Clip like the sibling chart cards so the chip can never widen
+                // the document horizontally on narrow viewports.
+                overflow: "hidden",
+                fontFamily: MONO,
+                fontSize: 10,
+                color: C.teal,
+                background: C.tealFill,
+                border: `1px solid ${C.tealBorder}`,
+                borderRadius: 999,
+                padding: "3px 6px 3px 10px",
+              }}
+            >
+              Pinned to setup revision {pinnedRevisionId.slice(0, 8)}
+              {detail.reList.length === 1 ? ` · Re ${fRe(detail.reList[0])}` : ""}
+              <Link
+                href={`/airfoils/${encodeURIComponent(detail.slug)}`}
+                title="View public data (enabled setups only)"
+                aria-label="Unpin — view public data"
+                style={{ color: C.teal, textDecoration: "none", fontWeight: 700, padding: "0 4px", lineHeight: 1 }}
+              >
+                ×
+              </Link>
+            </span>
+          )}
           <PolarViewer
             chartType={chartType}
             onChartType={setChartType}

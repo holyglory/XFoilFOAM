@@ -907,3 +907,53 @@
   exact production breakage (solved absorbs the failure, failed=0, failures
   endpoint empty, requeue drift error). apps/api/test/campaigns.test.ts
   "counter/failures/requeue coherence".
+
+## 2026-07-05 — Admin evidence links pin the preset revision (prod-reported broken journey)
+
+- Incident (airfoils.pro, ?section=queue Finished job log): clicking a finished
+  campaign job's airfoil name/Detail opened the UNPINNED public detail page,
+  which is enabled-presets-only by design — campaign presets are disabled, so a
+  campaign-only DB rendered zero polar groups (live repro: clarky α=-2 accepted
+  in DB, /api/airfoils/clarky → reList:[]). Two adjacent defects: the name link
+  looked like a caption (full-row block, no link affordance), and the Finished
+  job log <details> open state lived only in the DOM, so browser-back returned
+  it collapsed.
+- Decision: public detail stays enabled-presets-only (unchanged, by design);
+  admin evidence links must pin the setup revision instead. Every admin
+  deep-link to /airfoils/<slug> that presents job/result evidence appends
+  ?revision=<uuid> (AdminJob.revisionId from the queue payload; NULL → unpinned
+  for multi-revision batched jobs, which have no single pinned view; campaign
+  cell panel uses condition.revisionId). The page validates the UUID shape,
+  fetches the existing pinned scope (routes.ts revisionId "surgical
+  exception"), and shows a compact dismissible "Pinned to setup revision" chip
+  above the charts. Name links became real-looking links (teal, dotted
+  underline, fit-content). Finished-log open state is URL-owned (?flog=1,
+  replaceState) per the §11 routing contract.
+- Guardrails: apps/api/test/pinned-detail.test.ts (must-catch: pinned
+  assembleDetail surfaces disabled-preset accepted evidence + queue payload
+  revisionId single/batched mapping — recall value is against REGRESSION of
+  the already-working pinned scope and of the new payload plumbing);
+  apps/web/test/detail-links.test.ts (href pin contract + flog round-trip);
+  apps/web/e2e/solver-finished-log.spec.ts (expand → ?flog=1 → reload stays
+  expanded; read-only, safe while solving).
+- Recall proof: with product files reverted (helper unpinning stripped, pinned
+  scope branch disabled), both unit/API must-catch tests fail; restored → all
+  green. The missed-coverage class was "finished job → detail → evidence
+  visible on a campaign-only DB"; no test walked that journey before.
+- Follow-up (formal UI verification of the pinned-detail delivery): the
+  formal-web-ui-verification run on /airfoils/* mobile (390x844) failed with
+  criticals. Root causes: (a) pre-existing — DetailIsland's two-column grid was
+  a fixed `344px 1fr`, so at 390px the whole chart column rendered off-canvas
+  (confirmed identical criticals on the committed baseline via git stash);
+  (b) new — the pinned-revision chip's min-content widened the 1fr track and
+  added document horizontal overflow (scrollWidth 390→474).
+- Decision: the detail grid now stacks (`minmax(0,1fr)` single column) below
+  760px via a styled-jsx media query; desktop layout unchanged. The chip got
+  flexWrap/maxWidth/minWidth/overflow guards so it can never widen the
+  document. After the fix: 0 criticals on unpinned + pinned detail mobile and
+  on /admin?section=queue (both viewports).
+- Known verifier artifact (not fixed here): 4 desktop "occluded" criticals on
+  /airfoils/clarky are the 52px sticky topbar covering chart-type buttons at
+  the verifier's scrolled sample position; at scrollY=0 the buttons are fully
+  visible and clickable (elementFromPoint hit). Pre-existing, identical on
+  baseline; needs a sticky-header-aware occlusion rule in the verifier skill.

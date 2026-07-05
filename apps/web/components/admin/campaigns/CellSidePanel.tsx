@@ -27,6 +27,7 @@ import {
   requeueCampaignFailed,
 } from "@/lib/admin";
 import { getAirfoilDetail, getFieldTrack, getSim } from "@/lib/api";
+import { airfoilDetailHref } from "@/lib/detail-links";
 import { C, MONO } from "@/lib/tokens";
 import type { HoverState } from "../../detail/DetailIsland";
 import { PolarViewer } from "../../detail/PolarViewer";
@@ -297,7 +298,10 @@ export function CellSidePanel({
           <span style={chip(C.muted, C.stroke)}>Re {formatRe(condition.reynolds)} · #{condition.ord}</span>
           {airfoil.isSymmetric && <span style={chip(C.dim, C.stroke)}>symmetric</span>}
           <a
-            href={`/airfoils/${encodeURIComponent(airfoil.slug)}`}
+            // Pinned to the cell's setup revision (spec §11 pinned-detail
+            // journey): the public unpinned page hides campaign evidence
+            // because campaign presets are disabled by design.
+            href={airfoilDetailHref(airfoil.slug, condition.revisionId)}
             target="_blank"
             rel="noreferrer"
             data-testid="cell-open-detail-page"
