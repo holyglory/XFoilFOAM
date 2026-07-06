@@ -120,6 +120,48 @@ def _coeff_files(case_dir: Path) -> list:
     )
 
 
+def _coeff_last_time(coeff_path: Path) -> Optional[float]:
+    """Last simulated time recorded in a forceCoeffs coefficient.dat (None if empty)."""
+    try:
+        last: Optional[str] = None
+        with coeff_path.open() as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                last = stripped
+        return float(last.split()[0]) if last else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+_LOG_DELTA_T_RE = re.compile(r"deltaT = ([0-9+\-.eE]+)")
+
+
+def _last_log_delta_t(log_text: str) -> Optional[float]:
+    """Last adaptive 'deltaT = ...' the solver reported (None if it never did)."""
+    value: Optional[float] = None
+    for match in _LOG_DELTA_T_RE.finditer(log_text):
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            continue
+    return value
+
+
+def _transient_timeout_message(
+    timeout_s: float, reached_t: Optional[float], end_t: float, delta_t: Optional[float]
+) -> str:
+    """Truthful description of a URANS solver-timeout failure (never blames a
+    'missing' coefficient.dat for a run that simply ran out of wall-clock budget)."""
+    reached = f"{reached_t:.6g}" if reached_t is not None else "unknown"
+    dt = f"{delta_t:.3g}" if delta_t is not None else "unknown"
+    return (
+        f"URANS transient timed out after {timeout_s:g}s at t={reached} of {end_t:.6g}s "
+        f"(dt collapsed to {dt})"
+    )
+
+
 def _latest_time_dir(case_dir: Path):
     best, best_v = None, -1.0
     for d in case_dir.iterdir():
@@ -468,6 +510,22 @@ def _copy_initialized_transient_case(src: Path, dst: Path, start_time: float) ->
         shutil.copytree(start_dir, dst / start_dir.name, symlinks=True)
 
 
+def _seed_transient_from_steady(steady_time_dir: Path, tcase: Path) -> bool:
+    """Warm-start a transient case from the in-job steady RANS field: replace the
+    CaseBuilder's uniform ``0/`` fields with the developed steady fields. Only
+    valid when both cases share the same mesh (shared job mesh). Returns False
+    (leaving the case pristine for the potentialFoam path) if the essential
+    fields are missing."""
+    field_names = [f.name for f in steady_time_dir.iterdir() if f.is_file()]
+    if "U" not in field_names or "p" not in field_names:
+        return False
+    zero = tcase / "0"
+    zero.mkdir(parents=True, exist_ok=True)
+    for name in field_names:
+        shutil.copy2(steady_time_dir / name, zero / name)
+    return True
+
+
 def _prepare_transient_case(
     tcase: Path,
     airfoil,
@@ -480,6 +538,7 @@ def _prepare_transient_case(
     n_proc,
     timeout,
     shared_mesh_dir: Optional[Path] = None,
+    steady_field_dir: Optional[Path] = None,
     cancel_check: CancelCheck = None,
 ) -> tuple[MeshParams, object]:
     _check_cancel(cancel_check)
@@ -517,10 +576,25 @@ def _prepare_transient_case(
     else:
         _link_mesh(tcase, shared_mesh_dir, runner)
     _check_cancel(cancel_check)
+    # Preferred warm start: continue from the in-job steady RANS field solved on
+    # the SAME shared mesh (URANS-only jobs run that stage first). A developed
+    # steady field is a vastly better initial condition than a uniform-flow cold
+    # start — prod evidence: cambered clarky at alpha=4 cold-started URANS,
+    # Courant control collapsed dt to ~1e-6 s and the run timed out at t=0.010
+    # of 0.333 s.
+    if (
+        steady_field_dir is not None
+        and shared_mesh_dir is not None
+        and steady_field_dir.is_dir()
+        and _seed_transient_from_steady(steady_field_dir, tcase)
+    ):
+        logger.info("transient %s warm-started from steady field %s", tcase, steady_field_dir)
+        return tmesh, patches
     runner.application(tcase, "potentialFoam -writephi -initialiseUBCs", timeout=600)
     _check_cancel(cancel_check)
-    if solver_params.force_transient:
-        return tmesh, patches
+    # Unconditional steady (RANS) initialisation stage, for the URANS-only path
+    # too: even a short, non-converged SIMPLE field gives the transient a
+    # developed, already-separated start instead of violent uniform flow.
     init = runner.solver(tcase, "simpleFoam", n_proc, timeout=timeout)
     _check_cancel(cancel_check)
     (tcase / "log.simpleFoam.init").write_text(init.stdout)
@@ -571,16 +645,35 @@ def _run_transient_attempt(
     )
     wall_seconds = max(0.0, time.monotonic() - solve_started)
     _check_cancel(cancel_check)
-    if not res.ok:
-        (tcase / "log.pimpleFoam").write_text(res.stdout)
-        return None
     (tcase / "log.pimpleFoam").write_text(res.stdout)
+    # A solver TIMEOUT is not a crash: the run may have written a gradable
+    # partial coefficient window. Only a genuine solver failure aborts here.
+    timed_out = bool(getattr(res, "timed_out", False)) or (
+        not res.ok and getattr(res, "returncode", None) == 124
+    )
+    if not res.ok and not timed_out:
+        return None
     if n_proc > 1:
-        if not runner.application(tcase, "reconstructPar -newTimes", timeout=timeout).ok:
+        recon_ok = runner.application(tcase, "reconstructPar -newTimes", timeout=timeout).ok
+        if not recon_ok and not timed_out:
             return None
         _check_cancel(cancel_check)
+
+    def _timeout_error() -> OpenFOAMError:
+        files_now = _coeff_files(tcase)
+        reached = _coeff_last_time(files_now[-1]) if files_now else None
+        if reached is None:
+            reached = _latest_time(tcase) or None
+        return OpenFOAMError(
+            _transient_timeout_message(timeout, reached, end_t, _last_log_delta_t(res.stdout))
+        )
+
     files = _coeff_files(tcase)
     if not files:
+        if timed_out:
+            # Truthful failure: the transient ran out of wall-clock budget and
+            # left nothing gradable — never "produced no coefficient.dat".
+            raise _timeout_error()
         return None
     early_stop = _read_early_stop_marker(tcase)
     history: Optional[ForceHistory] = None
@@ -610,6 +703,8 @@ def _run_transient_attempt(
         else:
             avg = time_averaged_coefficients(files[-1], solver_params.transient_discard_fraction)
     except Exception:  # noqa: BLE001 - no usable force rows
+        if timed_out:
+            raise _timeout_error() from None
         return None
     quality = evaluate_urans_quality(
         tcase,
@@ -630,6 +725,29 @@ def _run_transient_attempt(
             retained_start_time=quality.retained_start_time,
             retained_end_time=quality.retained_end_time,
         )
+    if timed_out:
+        # Honest partial grade: the requested span was NOT simulated, so the
+        # point can never claim full quality, and refining a run that already
+        # exhausted its wall-clock budget would deterministically time out too.
+        reached = _coeff_last_time(files[-1])
+        if reached is None:
+            reached = _latest_time(tcase)
+        quality = UransQuality(
+            ok=False,
+            can_refine=False,
+            reason=(
+                f"{'refined' if refined else 'base'} transient timed out at t={reached:.6g}s "
+                f"of {end_t:.6g}s (solver timeout {timeout:g}s); graded partial window; "
+                f"{quality.reason}"
+            ),
+            measured_period_s=quality.measured_period_s,
+            retained_cycles=quality.retained_cycles,
+            retained_frame_count=quality.retained_frame_count,
+            frames_per_cycle=quality.frames_per_cycle,
+            retained_start_time=quality.retained_start_time,
+            retained_end_time=quality.retained_end_time,
+            no_shedding=quality.no_shedding,
+        )
     return TransientResult(
         avg=avg,
         case_dir=tcase,
@@ -646,7 +764,8 @@ def _run_transient_attempt(
 
 def _run_transient(
     case_dir, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
-    subdir="transient", shared_mesh_dir: Optional[Path] = None, cancel_check: CancelCheck = None,
+    subdir="transient", shared_mesh_dir: Optional[Path] = None,
+    steady_field_dir: Optional[Path] = None, cancel_check: CancelCheck = None,
 ):
     """Run URANS once, then automatically refine sparse/short transient media once."""
     tcase = case_dir / subdir
@@ -654,6 +773,7 @@ def _run_transient(
         tmesh, patches = _prepare_transient_case(
             tcase, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
             shared_mesh_dir=shared_mesh_dir,
+            steady_field_dir=steady_field_dir,
             cancel_check=cancel_check,
         )
     except OpenFOAMError:
@@ -739,25 +859,30 @@ def _run_transient(
 
     refined_case = case_dir / f"{subdir}_refined"
     _copy_initialized_transient_case(tcase, refined_case, first.start_time)
-    refined = _run_transient_attempt(
-        refined_case,
-        airfoil,
-        tmesh,
-        patches,
-        spec,
-        fluid,
-        roughness,
-        solver_params,
-        runner,
-        n_proc,
-        timeout,
-        run_time=refined_timing.run_time_s,
-        delta_t=refined_timing.delta_t,
-        write_interval=refined_timing.write_interval,
-        max_delta_t=refined_timing.max_delta_t,
-        refined=True,
-        cancel_check=cancel_check,
-    )
+    try:
+        refined = _run_transient_attempt(
+            refined_case,
+            airfoil,
+            tmesh,
+            patches,
+            spec,
+            fluid,
+            roughness,
+            solver_params,
+            runner,
+            n_proc,
+            timeout,
+            run_time=refined_timing.run_time_s,
+            delta_t=refined_timing.delta_t,
+            write_interval=refined_timing.write_interval,
+            max_delta_t=refined_timing.max_delta_t,
+            refined=True,
+            cancel_check=cancel_check,
+        )
+    except OpenFOAMError:
+        # A refined pass that timed out without gradable data must not discard
+        # the completed base pass — fall back to the base result below.
+        refined = None
     if refined is None:
         first.quality = UransQuality(
             ok=False,
@@ -1022,7 +1147,8 @@ def _archive_case_evidence(
 def _finalize_outcome(
     case_dir, outcome, airfoil, resolved, spec, fluid, roughness, solver_params,
     runner, n_proc, render_images, solver_timeout, transient_subdir="transient", image_subdir="",
-    shared_mesh_dir: Optional[Path] = None, cancel_check: CancelCheck = None,
+    shared_mesh_dir: Optional[Path] = None, steady_field_dir: Optional[Path] = None,
+    cancel_check: CancelCheck = None,
 ):
     """Parse forces, run the transient fallback if needed, compute y+ and images.
 
@@ -1047,6 +1173,7 @@ def _finalize_outcome(
         transient = _run_transient(
             case_dir, airfoil, resolved, spec, fluid, roughness, solver_params,
             runner, n_proc, solver_timeout, subdir=transient_subdir, shared_mesh_dir=shared_mesh_dir,
+            steady_field_dir=steady_field_dir,
             cancel_check=cancel_check,
         )
         _check_cancel(cancel_check)
@@ -1066,7 +1193,23 @@ def _finalize_outcome(
                 outcome.strouhal = transient.force_history.strouhal
             if not transient.quality.ok:
                 outcome.quality_warnings.append(transient.quality.reason)
-        elif not coeff_files:
+        elif solver_params.force_transient or not coeff_files:
+            # A URANS-only case must never silently fall back to the steady
+            # coefficients; a fallback case with steady coefficients keeps them.
+            transient_coeffs = _coeff_files(case_dir / transient_subdir)
+            if transient_coeffs:
+                # The file EXISTS — never claim it was not produced (prod
+                # incident: timed-out clarky URANS runs had healthy
+                # coefficient.dat rows but were reported as "produced no
+                # coefficient.dat"). Timeouts raise their own truthful error
+                # inside _run_transient_attempt; this branch covers crashes
+                # after partial output.
+                reached = _coeff_last_time(transient_coeffs[-1])
+                reached_s = f"{reached:.6g}" if reached is not None else "unknown"
+                raise OpenFOAMError(
+                    f"URANS transient failed before grading (coefficient.dat has data up to "
+                    f"t={reached_s}s); see {transient_subdir}/log.pimpleFoam"
+                )
             raise OpenFOAMError("URANS transient produced no coefficient.dat")
 
     # y+
@@ -1233,23 +1376,40 @@ def run_case(
         # 4/5. solve, with an automatic first-order fallback for fragile cases
         # (e.g. the delicate symmetric AoA=0 state) that diverge with 2nd-order
         # convection. The fallback is more dissipative but reliably stable.
-        if not solver_params.force_transient:
-            res = solve_once(steady_solver_params)
-            if not res.ok and steady_solver_params.momentum_scheme != "upwind":
-                outcome.first_order_fallback = True
-                res = solve_once(steady_solver_params.model_copy(update={"momentum_scheme": "upwind"}))
+        #
+        # URANS-only (force_transient) cases run this steady RANS stage too:
+        # even a non-converged steady field is a vastly better transient initial
+        # condition than a uniform-flow cold start (prod: cambered airfoil at
+        # alpha=4 cold-started URANS -> dt collapsed to ~1e-6 s -> timeout), and
+        # the steady log/coefficients are valuable attempt evidence. The only
+        # differences: a steady failure must not abort the URANS attempt, and
+        # the steady coefficients are never accepted as the reported result.
+        steady_field_dir: Optional[Path] = None
+        res = solve_once(steady_solver_params)
+        if not res.ok and steady_solver_params.momentum_scheme != "upwind":
+            outcome.first_order_fallback = True
+            res = solve_once(steady_solver_params.model_copy(update={"momentum_scheme": "upwind"}))
+        if solver_params.force_transient and not res.ok:
+            (case_dir / "log.simpleFoam").write_text(res.stdout)
+            outcome.quality_warnings.append(
+                "steady RANS initialisation stage failed; URANS falls back to a short steady init"
+            )
+        else:
             log = res.check().stdout
             (case_dir / "log.simpleFoam").write_text(log)
             conv = parse_convergence(log)
             outcome.converged = conv.converged
             outcome.iterations = conv.iterations
             outcome.final_residual = conv.final_residual
-        else:
-            write_case(solver_params)
+            if solver_params.force_transient:
+                lt_dir = _latest_time_dir(case_dir)
+                if lt_dir is not None and float(lt_dir.name) > 0:
+                    steady_field_dir = lt_dir
 
         _finalize_outcome(
             case_dir, outcome, airfoil, resolved, spec, fluid, roughness, solver_params,
             runner, n_proc, render_images, solver_timeout, shared_mesh_dir=mesh_dir,
+            steady_field_dir=steady_field_dir,
             cancel_check=cancel_check,
         )
 
@@ -1288,7 +1448,9 @@ def _write_minimal_controldict(case_dir: Path) -> None:
 
 
 def _steady_rans_params(solver_params: SolverParams, rans_max_iterations: Optional[int]) -> SolverParams:
-    if solver_params.force_transient or rans_max_iterations is None:
+    # The cap applies to force_transient (URANS-only) cases too: their steady
+    # stage is an initialisation + evidence pass, exactly like the normal path.
+    if rans_max_iterations is None:
         return solver_params
     cap = max(50, int(rans_max_iterations))
     if solver_params.n_iterations <= cap:

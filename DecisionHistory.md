@@ -1155,3 +1155,49 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   whole-polar promotion heuristics read REVISION-WIDE classifications, so
   leaked evidence shifts later suites' decisions (caught: the new scale-retry
   test's α=87 accepted point flipped whole-polar-urans → invalid-rans-points).
+## 2026-07-06 — Targeted URANS: steady-RANS-first warm start + timeout honesty (prod clarky -2..4 timeouts)
+
+- Prod evidence (job 9ab16d4b, clarky alpha=4, single-point targeted-urans):
+  URANS-only cases skipped every steady stage (`run_case` skipped the RANS
+  solve AND `_prepare_transient_case` returned right after potentialFoam for
+  `force_transient`), so a cambered airfoil at alpha=4 cold-started from
+  near-uniform flow; the Courant cap collapsed dt to ~1e-6 s and the run hit
+  the 7200 s solver timeout at t=0.010 of 0.333 s. The recorded error "URANS
+  transient produced no coefficient.dat" was FALSE — the file existed with
+  healthy rows.
+- F1 decision (warm-start design): URANS-only (`force_transient`) cases now run
+  the steady RANS stage first, exactly like the normal path (same
+  `solve_once` incl. seed-cache donor lookup, first-order fallback,
+  `rans_max_iterations` cap — the `force_transient` bypass in
+  `_steady_rans_params` was removed), but a steady failure is tolerated (logged
+  + quality warning) and steady coefficients are never accepted as the URANS
+  result. When the steady field exists on the shared job mesh, its latest-time
+  fields are copied into the transient's `0/` (`_seed_transient_from_steady`)
+  — potentialFoam is skipped so it cannot clobber the developed field.
+  Otherwise the transient prep now runs the short potentialFoam+simpleFoam
+  init UNCONDITIONALLY (previously skipped for force_transient). Batch
+  fallback-path behavior is unchanged; the batch URANS-promotion path
+  (`_run_full_urans_replacement`) inherits the same steady-first fix.
+- F2 decision: a transient solver TIMEOUT is not a crash. `RunResult` gained
+  `timed_out`; a timed-out attempt with gradable coefficient.dat rows is graded
+  through the existing history/quality machinery and reported with
+  `ok=False, can_refine=False` and the honest reason "base/refined transient
+  timed out at t=X of Ys; graded partial window; ..." (never refined — the
+  budget is already spent). A timeout with nothing gradable raises the truthful
+  "URANS transient timed out after Ns at t=X of Ys (dt collapsed to D)". A
+  refined-pass timeout falls back to the completed base pass.
+- F3 decision: "URANS transient produced no coefficient.dat" is raised ONLY
+  when the transient's coefficient.dat is actually absent; when it exists but
+  grading failed, the error says so ("coefficient.dat has data up to t=...").
+  Also: a force_transient case whose transient fails must raise instead of
+  silently reporting the (now-present) steady coefficients as the URANS point.
+- Node compatibility: targeted result.json shape unchanged (no `attempts` added
+  on the concurrent path); points may now carry `iterations`/`final_residual`/
+  `first_order_fallback` from the steady stage plus extra `quality_warnings`
+  strings — ingest.ts maps all of these already; `regime` still derives from
+  `p.unsteady`.
+- Recall proven: tests/test_targeted_urans_warmstart.py (13 tests) reproduce
+  the incident shapes (prod-like dt-collapse pimpleFoam log, timeout with/
+  without coefficient rows, transient-file-present false error) and fail
+  against the pre-fix code; false-positive guard keeps genuine non-timeout
+  crashes returning None. Engine rebuild/redeploy required for prod.

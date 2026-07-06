@@ -23,6 +23,10 @@ class RunResult:
     command: str
     returncode: int
     stdout: str
+    #: True when the command was killed by the wall-clock timeout (returncode is
+    #: forced to 124). Callers distinguish "solver crashed" from "solver ran out
+    #: of budget" — a timed-out transient may still have gradable partial output.
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:
@@ -122,7 +126,7 @@ def _run_subprocess(
                     _terminate_process_group(pgid, signal.SIGKILL)
                     stdout, _ = proc.communicate()
                 msg = f"\nCommand timed out after {timeout}s"
-                return RunResult(command=command, returncode=124, stdout=(stdout or "") + msg)
+                return RunResult(command=command, returncode=124, stdout=(stdout or "") + msg, timed_out=True)
 
         chunks: list[str] = []
 
@@ -158,7 +162,7 @@ def _run_subprocess(
                 proc.wait()
             reader.join(timeout=2)
             msg = f"\nCommand timed out after {timeout}s"
-            return RunResult(command=command, returncode=124, stdout="".join(chunks) + msg)
+            return RunResult(command=command, returncode=124, stdout="".join(chunks) + msg, timed_out=True)
         reader.join(timeout=2)
         return RunResult(command=command, returncode=proc.returncode or 0, stdout="".join(chunks))
     finally:
