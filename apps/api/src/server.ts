@@ -5,6 +5,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import { registerAdminRoutes } from "./admin-routes";
 import { registerCampaignRoutes } from "./campaign-routes";
+import { registerPointHistoryRoutes } from "./point-history-routes";
 import { registerRoutes } from "./routes";
 import { registerSolvedPointsRoutes } from "./solved-points-routes";
 import { registerSyncRoutes } from "./sync-routes";
@@ -19,6 +20,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerSyncRoutes(app);
   await registerAdminRoutes(app);
   await registerSolvedPointsRoutes(app);
+  await registerPointHistoryRoutes(app);
   await registerCampaignRoutes(app);
   app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
     const status = err.statusCode ?? 500;

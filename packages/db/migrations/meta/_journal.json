@@ -211,6 +211,20 @@
       "when": 1783468800000,
       "tag": "0029_field_color_scale_render_attempts",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1783555200000,
+      "tag": "0030_attempt_quality_warnings",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1783641600000,
+      "tag": "0031_point_history_indexes",
+      "breakpoints": true
     }
   ]
 }

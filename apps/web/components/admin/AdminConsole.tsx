@@ -92,6 +92,7 @@ import { AddAirfoilsPanel } from "./AddAirfoilsPanel";
 import { momentumSchemeSelect } from "./solver-schemes";
 import { CategoriesAdminPanel, HashtagsAdminPanel } from "./CatalogAdminPanels";
 import { UnitNumberField } from "./UnitNumberField";
+import { PointHistoryPanel } from "./PointHistoryPanel";
 import { SolvedPointsPopover, type SolvedPopoverAnchor } from "./SolvedPointsPopover";
 import { CampaignDetail } from "./campaigns/CampaignDetail";
 import { CampaignsHub } from "./campaigns/CampaignsHub";
@@ -296,7 +297,10 @@ export function AdminConsole() {
   useEffect(() => {
     // Parallelize the first paint: the Solver page's scoped queue fetch starts
     // alongside adminMe instead of waiting for the auth gate to resolve.
-    if (section === "queue") prefetchQueueScope(solverScopeForTab(parseSolverTab(tabParam)));
+    if (section === "queue") {
+      const prefetchScope = solverScopeForTab(parseSolverTab(tabParam));
+      if (prefetchScope) prefetchQueueScope(prefetchScope);
+    }
     adminMe()
       .then(setMe)
       .catch((e) => setErr((e as Error).message));
@@ -911,12 +915,15 @@ function parseCatalogTab(raw: string | null): CatalogTab {
 }
 
 // Solver page tabs (approved redesign): Activity is the default (no ?tab
-// param), Background and Engine are replace-semantics tabs per §11.
-type SolverTab = "activity" | "background" | "engine";
+// param), Background / Engine / Points are replace-semantics tabs per §11.
+// Points = the Point History Explorer (approved 2026-07-06) — it owns its own
+// data fetches, so the queue poll skips it entirely.
+type SolverTab = "activity" | "background" | "engine" | "points";
 const SOLVER_TABS: { k: SolverTab; label: string }[] = [
   { k: "activity", label: "Activity" },
   { k: "background", label: "Background" },
   { k: "engine", label: "Engine" },
+  { k: "points", label: "Points" },
 ];
 
 function parseSolverTab(raw: string | null): SolverTab {
@@ -924,8 +931,11 @@ function parseSolverTab(raw: string | null): SolverTab {
 }
 
 /** Each Solver tab polls only its own scope (spec §10/§12) — the expensive
- *  background gap scan runs only while the Background tab is actually open. */
-function solverScopeForTab(tab: SolverTab): AdminQueueScope {
+ *  background gap scan runs only while the Background tab is actually open.
+ *  The Points tab returns null: the explorer fetches its own bounded pages
+ *  and the queue payload is never needed there. */
+function solverScopeForTab(tab: SolverTab): AdminQueueScope | null {
+  if (tab === "points") return null;
   return tab === "background" ? "background" : tab === "engine" ? "engine" : "activity";
 }
 
@@ -2597,7 +2607,9 @@ function QueueDashboard({
       // Loop guard: if the user switches tabs while a fetch is in flight, the
       // just-fetched scope may no longer match the active tab — fetch again
       // instead of leaving the new tab stale for a full poll interval.
-      for (;;) {
+      // scope=null (Points tab): the explorer owns its own fetches — no queue
+      // traffic at all while it is open.
+      while (scope) {
         const next = await (consumeQueuePrefetch(scope) ?? getAdminQueue(scope));
         setQueue((prev) => mergeAdminQueue(prev, next));
         setErr(null);
@@ -3038,6 +3050,10 @@ function QueueDashboard({
           </section>
         </div>
       )}
+
+      {/* Point History Explorer (fourth tab): owns its data — the queue poll
+          is fully suspended while it is open (solverScopeForTab → null). */}
+      {tab === "points" && <PointHistoryPanel />}
 
       {/* Solved-points viewer (screen 5): keyed by scope so switching between
           the page badge and a job chip remounts with a fresh first page. */}

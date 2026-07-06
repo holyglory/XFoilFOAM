@@ -719,6 +719,9 @@ export const results = pgTable(
     firstOrderFallback: boolean("first_order_fallback").notNull().default(false),
     strouhal: doublePrecision("strouhal"),
     error: text("error"),
+    /** Engine per-point non-fatal quality warnings (PolarPoint.quality_warnings),
+     *  persisted at ingest. NULL on pre-0030 rows — honest absence, no backfill. */
+    qualityWarnings: text("quality_warnings").array(),
     // linkage to the engine run
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
     engineJobId: text("engine_job_id"),
@@ -792,6 +795,10 @@ export const resultAttempts = pgTable(
     firstOrderFallback: boolean("first_order_fallback").notNull().default(false),
     strouhal: doublePrecision("strouhal"),
     error: text("error"),
+    /** Engine per-attempt non-fatal quality warnings (PolarPoint.quality_warnings)
+     *  — the honest "why" lines on the point-story timeline. NULL on pre-0030
+     *  attempts (no backfill; absence is shown as absence). */
+    qualityWarnings: text("quality_warnings").array(),
     evidencePayload: jsonb("evidence_payload"),
     solvedAt: ts(),
     createdAt: ts().notNull().defaultNow(),

@@ -320,6 +320,10 @@ async function insertResultAttempt(opts: {
       firstOrderFallback: p.first_order_fallback,
       strouhal: p.strouhal ?? null,
       error: p.error ?? null,
+      // Engine non-fatal quality warnings — persisted verbatim so the point
+      // story timeline can show the honest "why" (empty list → NULL, absence
+      // stays absence).
+      qualityWarnings: p.quality_warnings?.length ? p.quality_warnings : null,
       evidencePayload: p,
       solvedAt: new Date(),
     })
@@ -1045,6 +1049,7 @@ export async function ingestResult(opts: {
         firstOrderFallback: p.first_order_fallback,
         strouhal: p.strouhal ?? null,
         error: pointError,
+        qualityWarnings: p.quality_warnings?.length ? p.quality_warnings : null,
         engineJobId,
         engineCaseSlug: p.case_slug ?? null,
         simJobId,

@@ -495,6 +495,9 @@ describe("sweeper: gap → claim → ingest", () => {
               first_order_fallback: false,
               images: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude.png" },
               evidence_artifacts: [manifestArtifact("c2")],
+              // Engine non-fatal quality warnings (0030): ingest must persist
+              // them verbatim on the results row AND the attempt evidence row.
+              quality_warnings: ["URANS window shorter than 3 shedding periods"],
               strouhal: 0.21,
               mean_images: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude_mean.png" },
               video: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude.mp4" },
@@ -558,6 +561,12 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(attempts.length).toBe(3);
     expect(attempts.filter((a) => a.validForPolar).length).toBe(2);
     expect(attempts.some((a) => a.regime === "rans" && a.validForPolar === false)).toBe(true);
+    // Quality warnings (0030) persisted verbatim on both evidence layers; the
+    // steady point shipped none → honest NULL, not [].
+    expect(rows.find((r) => r.aoaDeg === uransAoa)?.qualityWarnings).toEqual(["URANS window shorter than 3 shedding periods"]);
+    expect(rows.find((r) => r.aoaDeg === steadyAoa)?.qualityWarnings).toBeNull();
+    const uransAttempt = attempts.find((a) => a.regime === "urans" && a.aoaDeg === uransAoa);
+    expect(uransAttempt?.qualityWarnings).toEqual(["URANS window shorter than 3 shedding periods"]);
 
     const r0 = rows.find((r) => r.aoaDeg === steadyAoa)!;
     const media = await db.select().from(resultMedia).where(eq(resultMedia.resultId, r0.id));

@@ -2647,9 +2647,9 @@ export async function continueLane(
 export const CAMPAIGN_ERROR_CLASSES = ["mesh", "diverged", "timeout", "engine", "cancelled", "solver", "unknown"] as const;
 export type CampaignErrorClass = (typeof CAMPAIGN_ERROR_CLASSES)[number];
 
-/** Deterministic error-class bucket, shared by the failures view and the
- *  scoped requeue so counts always agree. */
-const ERROR_CLASS_SQL = sql`CASE
+/** Deterministic error-class bucket, shared by the failures view, the scoped
+ *  requeue, AND the point-history explorer so counts always agree. */
+export const ERROR_CLASS_SQL = sql`CASE
   WHEN r.error IS NULL OR btrim(r.error) = '' THEN 'unknown'
   WHEN r.error ILIKE '%mesh%' THEN 'mesh'
   WHEN r.error ILIKE '%diverg%' OR r.error ILIKE '%residual%' OR r.error ILIKE '% nan%' THEN 'diverged'

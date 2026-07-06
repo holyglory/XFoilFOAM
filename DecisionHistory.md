@@ -1201,3 +1201,47 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   without coefficient rows, transient-file-present false error) and fail
   against the pre-fix code; false-positive guard keeps genuine non-timeout
   crashes returning None. Engine rebuild/redeploy required for prod.
+
+## 2026-07-06 — Point History Explorer (Solver ▸ Points tab)
+
+- Approved feature (mockups artifact 268e8b16): a fourth Solver tab
+  (`?section=queue&tab=points`, replace semantics like Background/Engine)
+  giving admins a global filterable point table plus an in-place story side
+  panel — the honest per-point narrative (attempt chain, interruptions,
+  classification verdicts, campaign closure context) that previously required
+  raw SQL.
+- Read model decision: the row universe is every `results` row (the canonical
+  per-(airfoil, revision, α) state — solved, failed, rejected, solving,
+  backlog) UNION terminal derived-by-symmetry campaign cells (the −α mirror
+  rows, shown as "mirror of +X°", no timeline of their own — source point
+  link instead). Keyset pagination on (`results."updatedAt"` DESC, row key)
+  with `r:<uuid>` / `d:<cell key>` row keys; page ≤50 rows, one lateral
+  attempt-digest JSON per row (no N+1). Status chips and the bucket filter
+  share ONE SQL CASE (`packages/db/src/point-history.ts BUCKET_SQL`) so chip
+  counts always describe exactly the listed rows; `solving` covers
+  pending+queued+running, done-but-superseded/unclassified rows appear under
+  "all" only.
+- Interruption attribution decision: cancelled `sim_jobs` are matched to a
+  point through the immutable `request_payload` (aoas list + pinned revision
+  or batched conditionMap) because claim release clears `results.sim_job_id`.
+  Worker-restart cancels render as "interrupted — worker restarted mid-solve;
+  point released" (amber). Escalation semantics: RANS→URANS is amber/normal;
+  red strictly for crashes/timeouts.
+- Data addition (0030): `result_attempts.quality_warnings text[]` +
+  `results.quality_warnings text[]` persist the engine's non-fatal
+  `PolarPoint.quality_warnings` at ingest (empty → NULL; no backfill —
+  historical absence stays absent). Timeline renders them as the honest
+  "why" lines. 0031 adds the explorer indexes (results activity keyset,
+  partial terminal-derived cells, condition+aoa closure probe) — plans
+  verified on the dev DB (index scans, <1 ms).
+- Single-point requeue (`requeueSinglePoint`, POST
+  `/api/admin/point-history/:id/requeue`) reuses the requeue-failed /
+  requeue-rejected (PR #1) reset semantics scoped to one result row: failed
+  or done+rejected only (else 409), result → pending + sim_job cleared,
+  terminal campaign cells → requested, campaign progress/completion
+  recomputed in the same transaction.
+- The Points tab owns its own bounded fetches; the Solver queue poll is fully
+  suspended while it is open (`solverScopeForTab` → null). Filters live in
+  the URL (`pstatus/pairfoil/pcampaign/pregime/perr/pre`, defaults omitted)
+  via pure round-trip helpers in `apps/web/lib/point-history.ts` (digest +
+  timeline builders unit-tested there too).

@@ -476,6 +476,39 @@ export const getSolvedPoints = (opts: { jobId?: string | null; cursor?: string |
   const suffix = qs.toString();
   return aj<AdminSolvedPointsPage>(`/api/admin/solved-points${suffix ? `?${suffix}` : ""}`);
 };
+// ---- Point History Explorer (Solver ▸ Points tab) ----
+export const getPointHistory = (opts: {
+  status?: string;
+  airfoil?: string;
+  campaignId?: string;
+  regime?: string;
+  errorClass?: string;
+  reynolds?: string;
+  cursor?: string | null;
+  limit?: number;
+  facets?: boolean;
+} = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.status && opts.status !== "all") qs.set("status", opts.status);
+  if (opts.airfoil?.trim()) qs.set("airfoil", opts.airfoil.trim());
+  if (opts.campaignId) qs.set("campaignId", opts.campaignId);
+  if (opts.regime) qs.set("regime", opts.regime);
+  if (opts.errorClass) qs.set("errorClass", opts.errorClass);
+  if (opts.reynolds) qs.set("reynolds", opts.reynolds);
+  if (opts.cursor) qs.set("cursor", opts.cursor);
+  if (opts.limit != null) qs.set("limit", String(opts.limit));
+  if (opts.facets) qs.set("facets", "true");
+  const suffix = qs.toString();
+  return aj<import("./point-history").PointHistoryPagePayload>(`/api/admin/point-history${suffix ? `?${suffix}` : ""}`);
+};
+export const getPointStory = (resultId: string) =>
+  aj<import("./point-history").PointStoryPayload>(`/api/admin/point-history/${encodeURIComponent(resultId)}/story`);
+export const requeuePoint = (resultId: string) =>
+  aj<{ requeued: 1; scope: "failed" | "rejected"; campaignIds: string[] }>(
+    `/api/admin/point-history/${encodeURIComponent(resultId)}/requeue`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+
 export const getAdminSync = () => aj<AdminSyncState>("/api/admin/sync");
 export const patchAdminSync = (body: Partial<AdminSyncState["settings"]> & { permissions?: AdminSyncPermission[] }) =>
   aj<AdminSyncState>("/api/admin/sync", { method: "PATCH", body: JSON.stringify(body) });
