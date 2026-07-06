@@ -389,6 +389,33 @@ export interface ForceHistory {
   cd: number[];
 }
 
+/** One frame of the URANS frame track as served to the modal: instantaneous
+ *  coefficients plus the per-field frame PNG URLs (resolved /api/media keys).
+ *  A field key is present only when its frame image evidence is registered —
+ *  missing frames are shown as missing, never invented. */
+export interface FrameTrackFrameDetail {
+  i: number;
+  t: number;
+  cl: number;
+  cd: number;
+  cm: number;
+  imageUrls: Record<string, string>;
+}
+
+/** URANS recording contract payload (results.frame_track) resolved for the
+ *  sim modal: period-locked window, time-weighted stats over an integer
+ *  number of periods, and <=120 frames with media URLs. */
+export interface FrameTrackDetail {
+  periodS: number | null;
+  periodsRetained: number;
+  stationary: boolean;
+  driftFrac: number;
+  window: { tStart: number; tEnd: number };
+  stats: Record<"cl" | "cd" | "cm", { mean: number; std: number; min: number; max: number }>;
+  fields: string[];
+  frames: FrameTrackFrameDetail[];
+}
+
 export interface SimulationDetail {
   status: SimStatus;
   regime: SimRegime;
@@ -407,6 +434,9 @@ export interface SimulationDetail {
   availableFields: FieldId[];
   evidenceArtifacts?: EvidenceArtifactDTO[];
   history: ForceHistory | null;
+  /** URANS frame track (engine recording contract). null = steady point,
+   *  no-shedding, or legacy pre-contract evidence. */
+  frameTrack?: FrameTrackDetail | null;
   condition?: {
     boundaryConditionName: string;
     mediumName: string;

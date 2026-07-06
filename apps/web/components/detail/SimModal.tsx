@@ -1,10 +1,27 @@
 "use client";
 
 import { f1, f2, f4, type FieldId, type FieldTrackPoint, fRe, type Point, type SimulationDetail } from "@aerodb/core";
-import { type CSSProperties, type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type MouseEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { browserUrl, renderResultField } from "@/lib/api";
-import { C, MONO } from "@/lib/tokens";
+import {
+  advancePlayback,
+  buildFramePlayerModel,
+  chartXForTime,
+  clampFrameIndex,
+  defaultFrameField,
+  frameForChartX,
+  frameImageUrl,
+  frameIndexForTime,
+  historyFracForTime,
+  PLAYER_CHART_GEOMETRY,
+  periodOrdinal,
+  type FramePlayerModel,
+  type PlaybackSpeed,
+  timeForFrameIndex,
+  windowPeriodCount,
+} from "@/lib/frame-player";
+import { C, MONO, VIZ } from "@/lib/tokens";
 
 const PERIOD = 4;
 const FIELDS: FieldId[] = [
@@ -112,7 +129,23 @@ export function SimModal(props: {
   const [lockAspect, setLockAspect] = useState(true);
   const [setupDetailsOpen, setSetupDetailsOpen] = useState(false);
 
+  // ---- URANS frame player (task #25): ONE state drives every surface. ----
+  const [frameIndex, setFrameIndex] = useState(0);
+  const [playSpeed, setPlaySpeed] = useState<PlaybackSpeed>(1);
+  const [frameField, setFrameField] = useState<string | null>(null);
+  const [preload, setPreload] = useState<{ field: string; loaded: number; failed: number; total: number } | null>(null);
+  const playerSimTimeRef = useRef(0);
+  const playerChartRef = useRef<HTMLCanvasElement>(null);
+  const chartDragRef = useRef(false);
+  const preloadImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+
   const stalled = sim?.regime === "stalled";
+  // Engine-recorded frame track → player model; null = legacy evidence (steady,
+  // no-shedding, pre-contract, or drifted payload) → the stored mp4 stays.
+  const playerModel = useMemo(() => buildFramePlayerModel(sim?.frameTrack ?? null), [sim?.frameTrack]);
+  const framesMode = Boolean(playerModel && stalled);
+  const frameIdx = playerModel ? clampFrameIndex(playerModel.frames.length, frameIndex) : -1;
+  const currentFrame = playerModel && frameIdx >= 0 ? playerModel.frames[frameIdx] : null;
   const realField = (f: FieldId) => (sim?.status === "solved" ? sim.media?.[f] : undefined);
   const selectedTrackIndex = useMemo(() => {
     if (!track.length) return -1;
@@ -142,6 +175,20 @@ export function SimModal(props: {
       ld: historySeries.ld[idx],
     };
   }, [historySeries, scrubFrac]);
+  // Frames mode: the monitors' "exact at cursor" readout follows the frame
+  // clock (nearest full-history sample to frames[frameIndex].t).
+  const historyCursor = useMemo(() => {
+    if (!framesMode || !playerModel || !historySeries || historySeries.cl.length === 0) return null;
+    const t = timeForFrameIndex(playerModel, frameIdx);
+    const idx = Math.max(0, Math.min(historySeries.cl.length - 1, frameIndexForTime(historySeries.t, t)));
+    return {
+      idx,
+      t: historySeries.t[idx] ?? t,
+      cl: historySeries.cl[idx],
+      cd: historySeries.cd[idx],
+      ld: historySeries.ld[idx],
+    };
+  }, [framesMode, playerModel, historySeries, frameIdx]);
 
   // reset the animation clock when a new point is opened
   useEffect(() => {
@@ -151,16 +198,133 @@ export function SimModal(props: {
     setRenderError(null);
     setRenderToolsOpen(false);
     setExpandedRenderControl(null);
+    setPlaySpeed(1);
   }, [ctx?.re, ctx?.aoa, ctx?.resultId]);
+
+  // new frame track loaded → rewind the player and pick the default field
+  useEffect(() => {
+    setFrameIndex(0);
+    playerSimTimeRef.current = playerModel?.tStart ?? 0;
+    setFrameField(playerModel ? defaultFrameField(playerModel) : null);
+  }, [playerModel]);
+
+  // Lazily preload every frame PNG of the selected field so scrubbing and
+  // playback don't flash. Absent URLs (unregistered evidence) are never
+  // requested — the pane shows the honest gap instead.
+  useEffect(() => {
+    if (!open || !playerModel || !frameField) {
+      setPreload(null);
+      return;
+    }
+    const urls: string[] = [];
+    for (let k = 0; k < playerModel.frames.length; k++) {
+      const url = frameImageUrl(playerModel, k, frameField);
+      if (url) urls.push(browserUrl(url));
+    }
+    const total = urls.length;
+    let cancelled = false;
+    let loaded = 0;
+    let failed = 0;
+    const publish = () => {
+      if (!cancelled) setPreload({ field: frameField, loaded, failed, total });
+    };
+    for (const abs of urls) {
+      let img = preloadImagesRef.current.get(abs);
+      if (img && img.complete) {
+        if (img.naturalWidth > 0) loaded += 1;
+        else failed += 1;
+        continue;
+      }
+      if (!img) {
+        img = new Image();
+        preloadImagesRef.current.set(abs, img);
+        img.src = abs;
+      }
+      img.addEventListener("load", () => { loaded += 1; publish(); }, { once: true });
+      img.addEventListener("error", () => { failed += 1; publish(); }, { once: true });
+    }
+    publish();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, playerModel, frameField]);
+
+  // Playback: rAF advances the sim clock at real-time-scaled speed (one
+  // shedding period per wall second at 1×) and snaps to the nearest frame.
+  useEffect(() => {
+    if (!open || !framesMode || !playerModel || !playing) return;
+    let raf = 0;
+    let last = performance.now();
+    const loop = (now: number) => {
+      raf = requestAnimationFrame(loop);
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      playerSimTimeRef.current = advancePlayback(playerSimTimeRef.current, dt, playSpeed, playerModel);
+      const idx = frameIndexForTime(playerModel.times, playerSimTimeRef.current);
+      if (idx >= 0) setFrameIndex((prev) => (prev === idx ? prev : idx));
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [open, framesMode, playerModel, playing, playSpeed]);
+
+  // Frames mode drawing: the window Cl(t) chart cursor sits at
+  // frames[frameIndex].t and the secondary full-history monitors sync to the
+  // same instant (nearest history sample).
+  useEffect(() => {
+    if (!open || !framesMode || !playerModel) return;
+    const chart = playerChartRef.current;
+    if (chart) {
+      const g = chart.getContext("2d");
+      if (g) drawWindowChart(g, { width: chart.width, height: chart.height, model: playerModel, frameIndex: frameIdx });
+    }
+    const frac = historySeries ? historyFracForTime(historySeries.t, timeForFrameIndex(playerModel, frameIdx)) : 0;
+    const monitors: Array<[HTMLCanvasElement | null, number[] | undefined, string]> = [
+      [clMonRef.current, historySeries?.cl, "#2dd4bf"],
+      [cdMonRef.current, historySeries?.cd, "#f59e0b"],
+      [ldMonRef.current, historySeries?.ld, "#e6edf3"],
+    ];
+    for (const [canvas, values, color] of monitors) {
+      if (!canvas) continue;
+      const g = canvas.getContext("2d");
+      if (!g) continue;
+      if (values && values.length) drawForceChart(g, { width: canvas.width, height: canvas.height, values, color, frac });
+      else drawEmptyChart(g, { width: canvas.width, height: canvas.height });
+    }
+  }, [open, framesMode, playerModel, frameIdx, historySeries]);
+
+  const seekFrame = useCallback(
+    (idx: number) => {
+      if (!playerModel) return;
+      const k = clampFrameIndex(playerModel.frames.length, idx);
+      if (k < 0) return;
+      setFrameIndex(k);
+      playerSimTimeRef.current = timeForFrameIndex(playerModel, k);
+      if (playing) onTogglePlay();
+    },
+    [playerModel, playing, onTogglePlay],
+  );
+
+  const chartPointerToFrame = useCallback(
+    (e: ReactPointerEvent<HTMLCanvasElement>) => {
+      const canvas = playerChartRef.current;
+      if (!canvas || !playerModel) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / Math.max(1, rect.width)) * canvas.width;
+      seekFrame(frameForChartX(x, playerModel, { width: canvas.width, ...PLAYER_CHART_GEOMETRY }));
+    },
+    [playerModel, seekFrame],
+  );
 
   useEffect(() => {
     if (!open || sim?.status !== "solved" || !sim.availableFields.length) return;
     if (!sim.availableFields.includes(field)) onField(sim.availableFields[0]);
   }, [open, sim?.status, sim?.availableFields, field, onField]);
 
-  // Keep the scrubber and real force-history charts moving without inventing CFD fields.
+  // Legacy loop (no frame track): keep the scrubber and real force-history
+  // charts moving without inventing CFD fields. Frames mode drives the same
+  // canvases from the frame index instead.
   useEffect(() => {
-    if (!open || !sim) return;
+    if (!open || !sim || framesMode) return;
     let raf = 0;
     let last = performance.now();
     const loop = (now: number) => {
@@ -202,7 +366,7 @@ export function SimModal(props: {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [open, sim, playing, historySeries]);
+  }, [open, sim, playing, historySeries, framesMode]);
 
   if (!open) return null;
 
@@ -427,6 +591,100 @@ export function SimModal(props: {
       </div>
     );
   };
+  const fieldTabsRow = () => (
+    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 13 }}>
+      {FIELDS.map((fid) => {
+        const on = field === fid;
+        const available = !sim || sim.availableFields.length === 0 || sim.availableFields.includes(fid);
+        const storedFields = sim?.availableFields.map((stored) => FIELD_LABELS[stored]).join(", ") || "none";
+        return (
+          <button
+            key={fid}
+            type="button"
+            disabled={!available}
+            onClick={() => onField(fid)}
+            title={available ? FIELD_LABELS[fid] : `No stored ${FIELD_LABELS[fid]} media for this result. Stored fields: ${storedFields}.`}
+            style={{
+              fontFamily: MONO,
+              fontSize: 11,
+              borderRadius: 7,
+              padding: "6px 12px",
+              cursor: available ? "pointer" : "not-allowed",
+              border: `1px solid ${on ? C.tealBorder : C.stroke}`,
+              background: on ? C.tealFill : C.panel3,
+              color: on ? C.teal : C.muted,
+              fontWeight: on ? 600 : 400,
+              opacity: available ? 1 : 0.45,
+            }}
+          >
+            {FIELD_LABELS[fid]}
+          </button>
+        );
+      })}
+      <div style={{ marginLeft: "auto", display: "flex", gap: 7 }}>
+        {currentDownloadUrl() ? (
+          <a href={browserUrl(currentDownloadUrl()!)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ render .png</a>
+        ) : (
+          <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ render .png</button>
+        )}
+        {evidenceBundle ? (
+          <a href={browserUrl(evidenceBundle.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ evidence</a>
+        ) : (
+          <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ evidence</button>
+        )}
+        {fieldDataArtifact ? (
+          <a href={browserUrl(fieldDataArtifact.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ field data</a>
+        ) : (
+          <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ field data</button>
+        )}
+      </div>
+    </div>
+  );
+
+  // live + mean stored-media pair (URANS). Frames mode shows the same pair as
+  // a secondary evidence surface below the player — unchanged, just demoted.
+  const mediaPairGrid = () => (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: "#070b10" }}>
+        {fieldViewport("live")}
+        <span style={{ position: "absolute", top: 9, left: 10, display: "flex", alignItems: "center", gap: 5, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.red }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", background: C.red, animation: "recpulse 1.2s infinite" }} />
+          LIVE · UNSTEADY
+        </span>
+        <span style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.muted, background: "rgba(7,11,16,0.7)", borderRadius: 5, padding: "2px 6px" }}>
+          {fieldLabel}
+        </span>
+      </div>
+      <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: "#070b10" }}>
+        {fieldViewport("mean")}
+        <span style={{ position: "absolute", top: 9, left: 10, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.muted }}>TIME-AVERAGED  x̄</span>
+        <span style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.muted, background: "rgba(7,11,16,0.7)", borderRadius: 5, padding: "2px 6px" }}>
+          {fieldLabel}
+        </span>
+      </div>
+    </div>
+  );
+
+  const forceMonitorsGrid = () => {
+    const cursor = framesMode ? historyCursor : currentHistory;
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginTop: 13 }}>
+        <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
+          <ChartHeader title="Cl(t)" color={C.teal} values={historySeries?.cl} current={cursor?.cl} />
+          <canvas ref={clMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
+        </div>
+        <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
+          <ChartHeader title="Cd(t)" color={C.amber} values={historySeries?.cd} current={cursor?.cd} digits={5} />
+          <canvas ref={cdMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
+        </div>
+        <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
+          <ChartHeader title="L/D(t)" color={C.text} values={historySeries?.ld} current={cursor?.ld} digits={3} />
+          <canvas ref={ldMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
+        </div>
+      </div>
+    );
+  };
+
   const setupDetails = () => {
     if (!sim?.condition) return null;
     return (
@@ -564,6 +822,7 @@ export function SimModal(props: {
 
   return (
     <div
+      data-ui-allow-overlap="modal overlay intentionally covers the page"
       style={{
         position: "fixed",
         inset: 0,
@@ -620,54 +879,7 @@ export function SimModal(props: {
         </div>
 
         <div style={{ padding: "16px 18px 20px" }}>
-          {/* field tabs */}
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 13 }}>
-            {FIELDS.map((fid) => {
-              const on = field === fid;
-              const available = !sim || sim.availableFields.length === 0 || sim.availableFields.includes(fid);
-              const storedFields = sim?.availableFields.map((stored) => FIELD_LABELS[stored]).join(", ") || "none";
-              return (
-                <button
-                  key={fid}
-                  type="button"
-                  disabled={!available}
-                  onClick={() => onField(fid)}
-                  title={available ? FIELD_LABELS[fid] : `No stored ${FIELD_LABELS[fid]} media for this result. Stored fields: ${storedFields}.`}
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 11,
-                    borderRadius: 7,
-                    padding: "6px 12px",
-                    cursor: available ? "pointer" : "not-allowed",
-                    border: `1px solid ${on ? C.tealBorder : C.stroke}`,
-                    background: on ? C.tealFill : C.panel3,
-                    color: on ? C.teal : C.muted,
-                    fontWeight: on ? 600 : 400,
-                    opacity: available ? 1 : 0.45,
-                  }}
-                >
-                  {FIELD_LABELS[fid]}
-                </button>
-              );
-            })}
-            <div style={{ marginLeft: "auto", display: "flex", gap: 7 }}>
-              {currentDownloadUrl() ? (
-                <a href={browserUrl(currentDownloadUrl()!)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ render .png</a>
-              ) : (
-                <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ render .png</button>
-              )}
-              {evidenceBundle ? (
-                <a href={browserUrl(evidenceBundle.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ evidence</a>
-              ) : (
-                <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ evidence</button>
-              )}
-              {fieldDataArtifact ? (
-                <a href={browserUrl(fieldDataArtifact.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ field data</a>
-              ) : (
-                <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ field data</button>
-              )}
-            </div>
-          </div>
+          {framesMode ? null : fieldTabsRow()}
           {track.length > 1 && selectedTrackIndex >= 0 && (
             <div style={{ display: "grid", gap: 6, margin: "0 0 13px", padding: "8px 10px", border: `1px solid ${C.stroke2}`, borderRadius: 9, background: C.panel2 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontFamily: MONO, fontSize: 10, color: C.dim }}>
@@ -690,30 +902,194 @@ export function SimModal(props: {
             <div style={{ fontFamily: MONO, fontSize: 12, color: unavailableMessage ? C.amber : C.muted, padding: "60px 0", textAlign: "center", lineHeight: 1.6 }}>
               {unavailableMessage ?? "loading OpenFOAM result..."}
             </div>
+          ) : framesMode && playerModel && currentFrame ? (
+            <>
+              {/* header chips: regime / classification / periods / stationarity / St */}
+              <div data-testid="sim-frame-chips" style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+                <HeaderChip color={C.teal} border={C.tealBorder} text={sim.strouhal != null ? "URANS · vortex shedding" : "URANS · post-stall"} />
+                <HeaderChip color={C.muted} border={C.stroke} text={`${playerModel.periodsRetained} periods retained`} />
+                <HeaderChip
+                  testId="sim-chip-stationary"
+                  color={playerModel.stationary ? C.teal : C.red}
+                  border={playerModel.stationary ? C.tealBorder : C.stroke}
+                  text={`${playerModel.stationary ? "stationary ✓" : "non-stationary ✗"} · drift ${fmt(playerModel.driftFrac * 100, 1)}%`}
+                />
+                {sim.strouhal != null && <HeaderChip color={C.muted} border={C.stroke} text={`St ${f2(sim.strouhal)}`} />}
+                <HeaderChip color={C.dim} border={C.stroke} text={`${playerModel.frames.length} frames · ${windowPeriodCount(playerModel) ?? "?"} periods recorded`} />
+              </div>
+
+              {/* accent stats: time-weighted means over the integer-period window */}
+              <div data-testid="sim-accent-stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(148px, 1fr))", gap: 10, margin: "0 0 12px" }}>
+                <AccentStat label="Cl mean" color={C.teal} value={fmt(playerModel.stats.cl.mean, 3)} sub={`± ${fmt(playerModel.stats.cl.std, 3)} std`} />
+                <AccentStat label="Cd mean" color={C.amber} value={fmt(playerModel.stats.cd.mean, 4)} sub={`± ${fmt(playerModel.stats.cd.std, 4)} std`} />
+                <AccentStat label="Cm mean" color={C.text} value={fmt(playerModel.stats.cm.mean, 3)} sub={`± ${fmt(playerModel.stats.cm.std, 3)} std`} />
+                <AccentStat
+                  label="L/D"
+                  color={C.teal}
+                  value={Math.abs(playerModel.stats.cd.mean) > 1e-9 ? fmt(playerModel.stats.cl.mean / playerModel.stats.cd.mean, 2) : "—"}
+                  sub="time-weighted means"
+                />
+                <AccentStat
+                  label="Period"
+                  color={C.muted}
+                  value={playerModel.periodS != null ? `${fmt(playerModel.periodS, 3)} s` : "—"}
+                  sub={playerModel.periodS != null ? `f ${fmt(1 / playerModel.periodS, 2)} Hz` : "no measured period"}
+                />
+              </div>
+
+              {/* frame player: image + window chart, both driven by frameIndex */}
+              <div data-testid="sim-frame-player" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.15fr) minmax(0, 1fr)", gap: 12, alignItems: "stretch" }}>
+                <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: VIZ.bg, minHeight: 240 }}>
+                  {(() => {
+                    const frameUrl = frameImageUrl(playerModel, frameIdx, frameField);
+                    if (frameUrl) return <img data-testid="sim-frame-image" src={browserUrl(frameUrl)} alt={`${frameField ?? "frame"} f${String(currentFrame.i).padStart(4, "0")}`} style={mediaStyle} />;
+                    const fieldHasImages = frameField ? (playerModel.frameImageCounts[frameField] ?? 0) > 0 : false;
+                    return (
+                      <MediaEmpty
+                        text={
+                          fieldHasImages
+                            ? "This frame's image evidence is not registered — the gap is shown, never interpolated."
+                            : "No frame images are registered for this field yet — engine evidence files pending."
+                        }
+                      />
+                    );
+                  })()}
+                  <span style={{ position: "absolute", top: 9, left: 10, display: "flex", alignItems: "center", gap: 5, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.teal }}>
+                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: C.teal }} />
+                    RECORDED FRAMES · URANS
+                  </span>
+                  {mirroredBadge}
+                  {preload && preload.total > 0 && preload.loaded + preload.failed < preload.total && (
+                    <span data-testid="sim-frame-loading" style={{ position: "absolute", top: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.amber, background: "rgba(7,11,16,0.78)", borderRadius: 5, padding: "2px 6px" }}>
+                      loading frames {preload.loaded + preload.failed}/{preload.total}
+                    </span>
+                  )}
+                  {preload && preload.failed > 0 && preload.loaded + preload.failed >= preload.total && (
+                    <span style={{ position: "absolute", top: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.red, background: "rgba(7,11,16,0.78)", borderRadius: 5, padding: "2px 6px" }}>
+                      {preload.failed}/{preload.total} frames failed to load
+                    </span>
+                  )}
+                  <span
+                    data-testid="sim-frame-readout"
+                    style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: "#e6edf3", background: "rgba(7,11,16,0.78)", border: "1px solid rgba(148,163,184,0.25)", borderRadius: 5, padding: "3px 7px" }}
+                  >
+                    Cl {fmt(currentFrame.cl, 3)} · Cd {fmt(currentFrame.cd, 4)} · Cm {fmt(currentFrame.cm, 3)} · t {fmt(currentFrame.t, 3)} s
+                    {(() => {
+                      const po = periodOrdinal(playerModel, frameIdx);
+                      return po ? ` · period ${po.ordinal}/${po.total}` : "";
+                    })()}
+                  </span>
+                </div>
+                <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2, display: "grid", gap: 5, alignContent: "start" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", fontFamily: MONO }}>
+                    <span style={{ fontSize: 10, color: C.teal }}>Cl(t) · recorded window</span>
+                    <span style={{ fontSize: 9, color: C.dim }}>click / drag to seek</span>
+                  </div>
+                  <canvas
+                    data-testid="sim-frame-chart"
+                    ref={playerChartRef}
+                    width={520}
+                    height={236}
+                    onPointerDown={(e) => {
+                      chartDragRef.current = true;
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      chartPointerToFrame(e);
+                    }}
+                    onPointerMove={(e) => {
+                      if (chartDragRef.current) chartPointerToFrame(e);
+                    }}
+                    onPointerUp={() => { chartDragRef.current = false; }}
+                    onPointerCancel={() => { chartDragRef.current = false; }}
+                    style={{ display: "block", width: "100%", height: "auto", borderRadius: 5, touchAction: "none", cursor: "crosshair" }}
+                  />
+                </div>
+              </div>
+
+              {/* single transport: scrub + play/pause + speed */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
+                <button
+                  data-testid="sim-frame-play"
+                  type="button"
+                  onClick={onTogglePlay}
+                  style={{ width: 34, height: 34, borderRadius: 9, background: C.teal, border: "none", color: C.tealInk, cursor: "pointer", fontSize: 13, flex: "none" }}
+                >
+                  {playing ? "❚❚" : "▶"}
+                </button>
+                <input
+                  data-testid="sim-frame-scrub"
+                  type="range"
+                  min={0}
+                  max={Math.max(0, playerModel.frames.length - 1)}
+                  step={1}
+                  value={frameIdx}
+                  onChange={(e) => seekFrame(Number(e.currentTarget.value))}
+                  style={{ flex: 1 }}
+                />
+                <button data-testid="sim-frame-speed" type="button" onClick={() => setPlaySpeed((s) => (s === 1 ? 0.5 : 1))} style={{ ...dlBtn, color: C.teal }}>
+                  {playSpeed === 1 ? "1.0×" : "0.5×"}
+                </button>
+                <span style={{ fontFamily: MONO, fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>
+                  frame {frameIdx + 1}/{playerModel.frames.length}
+                </span>
+              </div>
+
+              {/* frame field selector (contract fields; disabled = no evidence) */}
+              <div data-testid="sim-frame-fields" style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 12 }}>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.1em" }}>FRAME FIELD</span>
+                {playerModel.fields.map((f) => {
+                  const count = playerModel.frameImageCounts[f] ?? 0;
+                  const on = frameField === f;
+                  return (
+                    <button
+                      key={f}
+                      data-testid={`sim-frame-field-${f}`}
+                      type="button"
+                      disabled={count === 0}
+                      onClick={() => setFrameField(f)}
+                      title={count === 0 ? "No frame images registered for this field." : `${count}/${playerModel.frames.length} frame images registered`}
+                      style={{
+                        fontFamily: MONO,
+                        fontSize: 11,
+                        borderRadius: 7,
+                        padding: "6px 12px",
+                        cursor: count === 0 ? "not-allowed" : "pointer",
+                        border: `1px solid ${on ? C.tealBorder : C.stroke}`,
+                        background: on ? C.tealFill : C.panel3,
+                        color: on ? C.teal : C.muted,
+                        fontWeight: on ? 600 : 400,
+                        opacity: count === 0 ? 0.45 : 1,
+                      }}
+                    >
+                      {FIELD_LABELS[f as FieldId] ?? f}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* secondary: stored field media + evidence, unchanged */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "18px 0 10px" }}>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.12em", whiteSpace: "nowrap" }}>STORED FIELD MEDIA &amp; EVIDENCE</span>
+                <div style={{ flex: 1, height: 1, background: C.stroke2 }} />
+              </div>
+              {fieldTabsRow()}
+              {renderTools()}
+              {activeScaleChip()}
+              {mediaPairGrid()}
+              {forceMonitorsGrid()}
+              <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, lineHeight: 1.5 }}>
+                URANS, k-ω SST · player frames are the engine-recorded period-locked window; means are time-weighted over an integer number of periods. Full force histories above are synced to the same frame clock.
+              </div>
+              {setupDetails()}
+            </>
           ) : stalled ? (
             <>
               {renderTools()}
               {activeScaleChip()}
-              {/* live + mean pair */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: "#070b10" }}>
-                  {fieldViewport("live")}
-                  <span style={{ position: "absolute", top: 9, left: 10, display: "flex", alignItems: "center", gap: 5, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.red }}>
-                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: C.red, animation: "recpulse 1.2s infinite" }} />
-                    LIVE · UNSTEADY
-                  </span>
-                  <span style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.muted, background: "rgba(7,11,16,0.7)", borderRadius: 5, padding: "2px 6px" }}>
-                    {fieldLabel}
-                  </span>
-                </div>
-                <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: "#070b10" }}>
-                  {fieldViewport("mean")}
-                  <span style={{ position: "absolute", top: 9, left: 10, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.muted }}>TIME-AVERAGED  x̄</span>
-                  <span style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.muted, background: "rgba(7,11,16,0.7)", borderRadius: 5, padding: "2px 6px" }}>
-                    {fieldLabel}
-                  </span>
-                </div>
+              {/* legacy pre-contract URANS evidence: no frame track recorded */}
+              <div data-testid="sim-legacy-note" style={{ fontFamily: MONO, fontSize: 10, color: C.amber, border: `1px solid ${C.stroke2}`, background: C.panel2, borderRadius: 8, padding: "7px 10px", margin: "0 0 10px", lineHeight: 1.5 }}>
+                legacy evidence — no frame track. This result predates the URANS recording contract, so the stored mp4 loop is shown instead of frame-synced playback. Re-solving the point records frames.
               </div>
+              {mediaPairGrid()}
 
               {/* mean force readout */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 10, marginTop: 12 }}>
@@ -740,20 +1116,7 @@ export function SimModal(props: {
               </div>
 
               {/* force monitors */}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginTop: 13 }}>
-                <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
-                  <ChartHeader title="Cl(t)" color={C.teal} values={historySeries?.cl} current={currentHistory?.cl} />
-                  <canvas ref={clMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
-                </div>
-                <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
-                  <ChartHeader title="Cd(t)" color={C.amber} values={historySeries?.cd} current={currentHistory?.cd} digits={5} />
-                  <canvas ref={cdMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
-                </div>
-                <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
-                  <ChartHeader title="L/D(t)" color={C.text} values={historySeries?.ld} current={currentHistory?.ld} digits={3} />
-                  <canvas ref={ldMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
-                </div>
-              </div>
+              {forceMonitorsGrid()}
               <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, lineHeight: 1.5 }}>
                 URANS, k-ω SST · vortex shedding past stall. Scrubber cursor is synced to the force histories. Mean field is the time-average over the sampling window.
               </div>
@@ -771,11 +1134,12 @@ export function SimModal(props: {
                   {fieldLabel}
                 </span>
               </div>
-              <div style={{ display: "flex", gap: 22, justifyContent: "center", marginTop: 13, fontFamily: MONO, fontSize: 12 }}>
-                <span style={{ color: C.muted }}>Cl <span style={{ color: C.text }}>{f2(sim.cl)}</span></span>
-                <span style={{ color: C.muted }}>Cd <span style={{ color: C.text }}>{f4(sim.cd)}</span></span>
-                <span style={{ color: C.muted }}>L/D <span style={{ color: C.text }}>{f1(sim.ld)}</span></span>
-                <span style={{ color: C.muted }}>Cm <span style={{ color: C.text }}>{f2(sim.cm)}</span></span>
+              {/* accent stats block (steady: single converged values, no player) */}
+              <div data-testid="sim-accent-stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(148px, 1fr))", gap: 10, marginTop: 13 }}>
+                <AccentStat label="Cl" color={C.teal} value={f2(sim.cl)} sub="converged steady value" />
+                <AccentStat label="Cd" color={C.amber} value={f4(sim.cd)} sub="converged steady value" />
+                <AccentStat label="Cm" color={C.text} value={f2(sim.cm)} sub="converged steady value" />
+                <AccentStat label="L/D" color={C.teal} value={f1(sim.ld)} sub="Cl / Cd" />
               </div>
               <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, textAlign: "center" }}>
                 Attached flow — steady RANS converges to a single field, so no animation or force history.
@@ -787,6 +1151,134 @@ export function SimModal(props: {
       </div>
     </div>
   );
+}
+
+function HeaderChip({ text, color, border, testId }: { text: string; color: string; border: string; testId?: string }) {
+  return (
+    <span
+      data-testid={testId}
+      style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.05em", color, border: `1px solid ${border}`, borderRadius: 999, padding: "4px 9px", background: C.panel2, whiteSpace: "nowrap" }}
+    >
+      {text}
+    </span>
+  );
+}
+
+function AccentStat({ label, color, value, sub }: { label: string; color: string; value: string; sub: string }) {
+  return (
+    <div style={{ border: `1px solid ${C.tealBorder}`, borderRadius: 9, background: C.tealFill, padding: "9px 12px", minWidth: 0 }}>
+      <div style={{ fontFamily: MONO, fontSize: 9, color, letterSpacing: "0.06em" }}>{label}</div>
+      <div style={{ fontFamily: MONO, fontSize: 18, color: C.text, fontWeight: 600, lineHeight: 1.25 }}>{value}</div>
+      <div style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>{sub}</div>
+    </div>
+  );
+}
+
+/** Cl(t) over the recorded frame window: teal trace through every frame
+ *  sample (time-positioned x), dashed time-weighted mean, dotted period
+ *  boundaries, and a cursor line + marker at frames[frameIndex].t. Pointer
+ *  mapping shares PLAYER_CHART_GEOMETRY with frameForChartX so a click lands
+ *  exactly on the frame under the cursor. */
+function drawWindowChart(
+  g: CanvasRenderingContext2D,
+  opts: { width: number; height: number; model: FramePlayerModel; frameIndex: number },
+) {
+  const { width: W, height: H, model, frameIndex } = opts;
+  const geom = { width: W, ...PLAYER_CHART_GEOMETRY };
+  const padT = 12;
+  const padB = 24;
+  const plotH = H - padT - padB;
+  g.fillStyle = VIZ.panel;
+  g.fillRect(0, 0, W, H);
+  const values = model.frames.map((f) => f.cl).filter(Number.isFinite);
+  if (values.length === 0) return;
+  let lo = Math.min(...values);
+  let hi = Math.max(...values);
+  if (hi - lo < 1e-12) {
+    lo -= 0.5;
+    hi += 0.5;
+  }
+  const span = hi - lo;
+  const yv = (v: number) => padT + (1 - (v - lo) / span) * plotH;
+  const xv = (t: number) => chartXForTime(t, model, geom);
+
+  // horizontal grid
+  g.strokeStyle = "rgba(148,163,184,0.16)";
+  g.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const y = padT + (i / 3) * plotH;
+    g.beginPath();
+    g.moveTo(geom.padLeft, y);
+    g.lineTo(W - geom.padRight, y);
+    g.stroke();
+  }
+  // period boundaries
+  const total = windowPeriodCount(model);
+  if (total != null && model.periodS != null) {
+    g.strokeStyle = "rgba(148,163,184,0.22)";
+    g.setLineDash([2, 4]);
+    for (let k = 1; k < total; k++) {
+      const x = xv(model.tStart + k * model.periodS);
+      g.beginPath();
+      g.moveTo(x, padT);
+      g.lineTo(x, H - padB);
+      g.stroke();
+    }
+    g.setLineDash([]);
+  }
+  // axes
+  g.strokeStyle = "rgba(148,163,184,0.3)";
+  g.beginPath();
+  g.moveTo(geom.padLeft, padT);
+  g.lineTo(geom.padLeft, H - padB);
+  g.lineTo(W - geom.padRight, H - padB);
+  g.stroke();
+  // labels
+  g.fillStyle = "rgba(148,163,184,0.75)";
+  g.font = "9px ui-monospace, SFMono-Regular, Menlo, monospace";
+  g.textAlign = "right";
+  g.fillText(fmt(hi, 3), geom.padLeft - 6, padT + 4);
+  g.fillText(fmt(lo, 3), geom.padLeft - 6, H - padB + 3);
+  g.textAlign = "left";
+  g.fillText(`${fmt(model.tStart, 2)}s`, geom.padLeft, H - padB + 13);
+  g.textAlign = "right";
+  g.fillText(`${fmt(model.tEnd, 2)}s`, W - geom.padRight, H - padB + 13);
+  // time-weighted mean (the pinned point-level Cl)
+  const mean = model.stats.cl.mean;
+  if (Number.isFinite(mean) && mean >= lo && mean <= hi) {
+    g.strokeStyle = "rgba(230,237,243,0.25)";
+    g.setLineDash([4, 4]);
+    g.beginPath();
+    g.moveTo(geom.padLeft, yv(mean));
+    g.lineTo(W - geom.padRight, yv(mean));
+    g.stroke();
+    g.setLineDash([]);
+  }
+  // trace through the frame samples
+  g.strokeStyle = "#2dd4bf";
+  g.lineWidth = 1.6;
+  g.beginPath();
+  model.frames.forEach((f, k) => {
+    const x = xv(f.t);
+    const y = yv(f.cl);
+    if (k === 0) g.moveTo(x, y);
+    else g.lineTo(x, y);
+  });
+  g.stroke();
+  // cursor at the current frame
+  const idx = Math.max(0, Math.min(model.frames.length - 1, frameIndex));
+  const cur = model.frames[idx];
+  const cx = xv(cur.t);
+  g.strokeStyle = "rgba(230,237,243,0.5)";
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(cx, padT);
+  g.lineTo(cx, H - padB);
+  g.stroke();
+  g.fillStyle = "#e6edf3";
+  g.beginPath();
+  g.arc(cx, yv(cur.cl), 3.4, 0, Math.PI * 2);
+  g.fill();
 }
 
 function Stat({ label, color, value, sub }: { label: string; color: string; value: string; sub: string }) {

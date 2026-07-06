@@ -1,4 +1,11 @@
-import { canonicalAoa, type FieldId, type FieldMedia, type SimulationDetail } from "@aerodb/core";
+import {
+  canonicalAoa,
+  type FieldId,
+  type FieldMedia,
+  type FrameTrackDetail,
+  type SimulationDetail,
+} from "@aerodb/core";
+import { FRAME_IMAGE_ARTIFACT_KIND, parseFrameTrack } from "@aerodb/engine-client";
 import {
   airfoils,
   boundaryConditions,
@@ -68,6 +75,57 @@ function snapshotParts(snapshot: SimulationSetupSnapshot | undefined) {
   };
 }
 
+type EvidenceRow = typeof solverEvidenceArtifacts.$inferSelect;
+
+function frameIndexOf(row: EvidenceRow): number | null {
+  const meta = (row.metadata ?? {}) as Record<string, unknown>;
+  if (typeof meta.frameIndex === "number" && Number.isInteger(meta.frameIndex)) return meta.frameIndex;
+  const match = /f(\d{4})\.(?:png|jpg|jpeg)$/i.exec(row.storageKey);
+  return match ? Number(match[1]) : null;
+}
+
+/** Resolve results.frame_track (verbatim engine contract jsonb) + registered
+ *  frame_image evidence rows into the modal payload: camelCase stats/window
+ *  plus per-frame /api/media image URLs. Frames whose PNG evidence is not
+ *  registered ship WITHOUT that field's URL — absence stays absence. A
+ *  contract-drifted payload resolves to null (the classifier already rejects
+ *  such points; the raw jsonb stays on the row as evidence). */
+function frameTrackDetailOf(r: Result, frameArtifacts: EvidenceRow[]): FrameTrackDetail | null {
+  if (r.frameTrack === null || r.frameTrack === undefined) return null;
+  const parsed = parseFrameTrack(r.frameTrack);
+  if (!parsed.ok) return null;
+  const ft = parsed.value;
+  const urlByFieldFrame = new Map<string, string>();
+  for (const row of frameArtifacts) {
+    const index = frameIndexOf(row);
+    const field = row.field ?? ft.fields.find((f) => row.storageKey.includes(`/${f}/`)) ?? null;
+    if (index === null || !field) continue;
+    urlByFieldFrame.set(`${field}:${index}`, mediaStore.url(row.storageKey));
+  }
+  return {
+    periodS: ft.period_s,
+    periodsRetained: ft.periods_retained,
+    stationary: ft.stationary,
+    driftFrac: ft.drift_frac,
+    window: { tStart: ft.window.t_start, tEnd: ft.window.t_end },
+    stats: ft.stats,
+    fields: ft.fields,
+    frames: ft.frames.map((frame) => ({
+      i: frame.i,
+      t: frame.t,
+      cl: frame.cl,
+      cd: frame.cd,
+      cm: frame.cm,
+      imageUrls: Object.fromEntries(
+        ft.fields.flatMap((field) => {
+          const url = urlByFieldFrame.get(`${field}:${frame.i}`);
+          return url ? [[field, url] as const] : [];
+        }),
+      ),
+    })),
+  };
+}
+
 async function solvedDetail(name: string, re: number, r: Result): Promise<SimulationDetail | null> {
   const cl = r.cl ?? 0;
   const cd = r.cd ?? 0;
@@ -109,11 +167,16 @@ async function solvedDetail(name: string, re: number, r: Result): Promise<Simula
       entry.imageUrl = mediaStore.url(mrow.storageKey);
     }
   }
-  const evidenceRows = await db
+  const allEvidenceRows = await db
     .select()
     .from(solverEvidenceArtifacts)
     .where(eq(solverEvidenceArtifacts.resultId, r.id))
     .orderBy(desc(solverEvidenceArtifacts.createdAt));
+  // Per-frame URANS PNGs feed frameTrack.frames[].imageUrls; keeping their
+  // <=240 rows out of the generic evidenceArtifacts list keeps the payload
+  // bounded and the evidence panel readable.
+  const frameArtifacts = allEvidenceRows.filter((row) => row.kind === FRAME_IMAGE_ARTIFACT_KIND);
+  const evidenceRows = allEvidenceRows.filter((row) => row.kind !== FRAME_IMAGE_ARTIFACT_KIND);
   const [hist] = await db.select().from(forceHistory).where(eq(forceHistory.resultId, r.id)).limit(1);
   const [revision] = r.simulationPresetRevisionId
     ? await db.select().from(simulationPresetRevisions).where(eq(simulationPresetRevisions.id, r.simulationPresetRevisionId)).limit(1)
@@ -157,6 +220,7 @@ async function solvedDetail(name: string, re: number, r: Result): Promise<Simula
       metadata: row.metadata ?? {},
     })),
     history: hist ? { t: hist.t, cl: hist.cl, cd: hist.cd } : null,
+    frameTrack: frameTrackDetailOf(r, frameArtifacts),
     condition: snapshot && setup
       ? {
           boundaryConditionName: snapshot.preset.name,

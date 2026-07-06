@@ -17,6 +17,7 @@ import {
   parseCoordinates,
   projectChart,
   evaluateUransMediaQuality,
+  FRAME_TRACK_MIN_PERIODS,
   reynolds,
   reynoldsFromFlowReference,
   speedForReynolds,
@@ -227,6 +228,24 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
   // shape every real URANS results row has in the database. Under the v1
   // classifier this row was rejected "solver-stalled" and NO unsteady point
   // could ever be accepted (prod DB: 0 accepted URANS rows, ever).
+  // Frame-track contract payload exactly as ingest persists it (verbatim
+  // snake_case engine shape, results.frame_track jsonb — migration 0032).
+  const contractFrameTrack = {
+    period_s: 0.137,
+    periods_retained: 6,
+    stationary: true,
+    drift_frac: 0.012,
+    window: { t_start: 10.21, t_end: 11.03 },
+    stats: {
+      cl: { mean: 1.12, std: 0.18, min: 0.83, max: 1.41 },
+      cd: { mean: 0.21, std: 0.03, min: 0.16, max: 0.27 },
+      cm: { mean: -0.06, std: 0.01, min: -0.09, max: -0.03 },
+    },
+    fields: ["vorticity", "velocity_magnitude"],
+    frames: [{ i: 0, t: 10.76, cl: 1.1, cd: 0.21, cm: -0.06 }],
+    image_pattern: "frames/{field}/f{i04}.png",
+  };
+
   const ingestShapedUrans = {
     a: 16,
     cl: 1.12,
@@ -240,13 +259,74 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
     unsteady: true,
     hasForceHistory: true,
     hasVideo: true,
+    frameTrack: contractFrameTrack,
   };
 
-  it("accepts a converged unsteady row with force history + video", () => {
+  it("accepts a converged unsteady row with force history + video + stationary frame track", () => {
     const classified = classifyPolarEvidence([ingestShapedUrans]);
     expect(classified.classifications[0].state).toBe("accepted");
     expect(classified.classifications[0].reasons).toEqual([]);
     expect(classified.hardRejectedAoas).toEqual([]);
+  });
+
+  it("BACKWARD COMPAT: still accepts legacy URANS evidence with frame_track NULL/absent (pre-0032 rows keep the v2 gate — deploy must not mass-reject history)", () => {
+    const { frameTrack: _ft, ...legacyShape } = ingestShapedUrans;
+    for (const legacy of [legacyShape, { ...legacyShape, frameTrack: null }]) {
+      const classified = classifyPolarEvidence([legacy]);
+      expect(classified.classifications[0].state).toBe("accepted");
+      expect(classified.classifications[0].reasons).toEqual([]);
+    }
+  });
+
+  it("rejects a non-stationary frame track with the honest reason (confidence high)", () => {
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, frameTrack: { ...contractFrameTrack, stationary: false } },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["non-stationary"]);
+    expect(classified.classifications[0].confidence).toBe(1);
+  });
+
+  it(`rejects a short recording window (< ${FRAME_TRACK_MIN_PERIODS} retained periods)`, () => {
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, frameTrack: { ...contractFrameTrack, periods_retained: FRAME_TRACK_MIN_PERIODS - 1 } },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["insufficient-periods"]);
+    expect(classified.classifications[0].confidence).toBe(1);
+  });
+
+  it(`accepts exactly ${FRAME_TRACK_MIN_PERIODS} retained periods (gate is >=)`, () => {
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, frameTrack: { ...contractFrameTrack, periods_retained: FRAME_TRACK_MIN_PERIODS } },
+    ]);
+    expect(classified.classifications[0].state).toBe("accepted");
+  });
+
+  it("MUST-CATCH: the ingest MISSING-frame_track sentinel is rejected (shedding point without stationarity evidence)", () => {
+    // F3: the sweeper persists this sentinel when a post-contract engine
+    // ships a shedding URANS point WITHOUT frame_track (period unmeasurable /
+    // stats failed). It must gate-fail — null would have skipped the gate as
+    // legacy evidence.
+    const sentinel = {
+      missing: true,
+      stationary: false,
+      periods_retained: null,
+      reason: "engine shipped no frame_track for a shedding URANS point",
+    };
+    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, frameTrack: sentinel }]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["non-stationary", "insufficient-periods"]);
+  });
+
+  it("MUST-CATCH: a contract-drifted frame track FAILS CLOSED (missing verdict fields reject, never accept)", () => {
+    // Shaped like a real drifted engine payload (renamed/retyped keys), not
+    // like the parser's own fixtures.
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, frameTrack: { periodsRetained: 9, stationary: "true" } },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["non-stationary", "insufficient-periods"]);
   });
 
   it("still rejects a non-converged STEADY row as solver-stalled", () => {

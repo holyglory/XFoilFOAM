@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 import re
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import matplotlib
 
@@ -557,6 +557,98 @@ def render_animation(
     fname = f"{field.value}.mp4"
     written = write_animation_mp4(out_dir / fname, draw, len(frames), fps=fps)
     return fname if written is not None else None
+
+
+def nearest_vtu_indices(vtu_times: Sequence[float], target_times: Sequence[float]) -> list[int]:
+    """Index of the stored VTU frame nearest each target time, with consecutive
+    duplicates collapsed (sparse field writes may map two targets to the same
+    stored frame; the exported track keeps each stored frame once)."""
+    if not len(vtu_times):
+        return []
+    arr = np.asarray(vtu_times, dtype=float)
+    out: list[int] = []
+    for target in target_times:
+        k = int(np.argmin(np.abs(arr - float(target))))
+        if not out or out[-1] != k:
+            out.append(k)
+    return out
+
+
+def render_frame_track_images(
+    case_dir: Path,
+    out_root: Path,
+    airfoil_contour_unit: np.ndarray,
+    chord: float,
+    fields: list[ImageField],
+    target_times: Sequence[float],
+    *,
+    freestream_speed: float = 0.0,
+    zoom_chords: float = 2.0,
+    width_px: int = 640,
+) -> tuple[list[float], list[str]]:
+    """Render the frame_track PNG sequence (contract: 640px wide) from the VTU
+    frames nearest each target time.
+
+    Writes ``out_root/{field}/f{i:04d}.png`` per rendered field with a
+    consistent per-field color scale across the sequence (2nd..98th percentile
+    over all frames). Returns ``(actual_frame_times, rendered_field_names)``;
+    a field whose source data is missing in the VTUs is skipped (reported by
+    omission, never invented)."""
+    vtus = find_all_vtus(case_dir)
+    times = [_vtu_time(v) for v in vtus]
+    picks = nearest_vtu_indices(times, target_times)
+    if len(picks) < 2:
+        return [], []
+    chosen = [vtus[k] for k in picks]
+    chosen_times = [float(times[k]) for k in picks]
+
+    airfoil_xy = airfoil_contour_unit * chord
+    mask, f2d = _build_triangulation(meshio.read(chosen[0]), airfoil_xy)
+    per_field: dict[ImageField, list[np.ndarray]] = {f: [] for f in fields}
+    failed: set[ImageField] = set()
+    for vtu in chosen:
+        mesh = meshio.read(vtu)
+        for field in fields:
+            if field in failed:
+                continue
+            try:
+                per_field[field].append(_field_values(mesh, mask, f2d, field, freestream_speed))
+            except (KeyError, ValueError):
+                failed.add(field)
+
+    xlim = (-zoom_chords * chord, (1.0 + zoom_chords) * chord)
+    ylim = (-zoom_chords * chord, zoom_chords * chord)
+    dpi = 100
+    width_px = max(64, int(width_px))
+    height_px = max(64, int(round(width_px * (ylim[1] - ylim[0]) / (xlim[1] - xlim[0]))))
+
+    rendered: list[str] = []
+    for field in fields:
+        frames_vals = per_field.get(field, [])
+        if field in failed or len(frames_vals) != len(chosen):
+            continue
+        allv = np.concatenate(frames_vals)
+        vmin, vmax = float(np.percentile(allv, 2)), float(np.percentile(allv, 98))
+        if vmax <= vmin:
+            vmax = vmin + 1e-9
+        _label, cmap = _FIELD_STYLE[field]
+        field_dir = out_root / field.value
+        field_dir.mkdir(parents=True, exist_ok=True)
+        for i, values in enumerate(frames_vals):
+            fig = plt.figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
+            ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
+            ax.set_axis_off()
+            ax.tricontourf(
+                f2d.triang, values, levels=40, cmap=cmap, extend="both", vmin=vmin, vmax=vmax
+            )
+            ax.fill(airfoil_xy[:, 0], airfoil_xy[:, 1], color="white", zorder=3)
+            ax.plot(airfoil_xy[:, 0], airfoil_xy[:, 1], color="black", lw=1.0, zorder=4)
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            fig.savefig(field_dir / f"f{i:04d}.png", dpi=dpi)
+            plt.close(fig)
+        rendered.append(field.value)
+    return chosen_times, rendered
 
 
 def render_custom_field(

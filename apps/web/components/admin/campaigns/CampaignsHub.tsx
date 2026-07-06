@@ -17,6 +17,7 @@ import {
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
 import { deriveSolverState, solverChipText, type SolverStateName } from "@/lib/solver-state";
+import { gateFromSolverState } from "./campaign-status";
 import { stashDuplicatePrefill } from "./wizard-draft";
 import { usePoll } from "./usePoll";
 import { ago, card, ErrorLine, fCount, formatRe, ghostBtn, primaryBtn } from "./ui";
@@ -37,6 +38,8 @@ export interface CampaignsHubProps {
   onNewCampaign: (kind: "polar_sweep" | "ld_refine") => void;
   /** Router-navigates to ?section=queue (the Solver page). */
   onOpenSolver: () => void;
+  /** Opens Solver ▸ Points pre-filtered to a campaign + bucket. */
+  onOpenPoints: (campaignId: string, status: "failed" | "rejected") => void;
 }
 
 function priorityLabel(priority: number): string {
@@ -78,22 +81,30 @@ function statusLine(
     if (totals.rejected > 0) needs.push(`${fCount(totals.rejected)} rejected`);
     return `All work settled with ${needs.length ? needs.join(" + ") : "0 failed"} point${totals.failed + totals.rejected === 1 ? "" : "s"} — review or close with failures.`;
   }
-  // active — scheduler-dependent suffix from the shared solver derivation
-  // first: never a bare "Active — waiting" while nothing can run.
+  // active — scheduler-dependent clause from the shared solver derivation
+  // first: never a bare "Active — waiting" while nothing can run. Gated
+  // lines drop the "Active —" prefix entirely (mockup fec7b453 screen 3):
+  // the gate badge is the headline and the small lifecycle chip says active.
   if (solverState === "process_not_running") {
-    return "Active — solver process is not running: nothing is being scheduled.";
+    return "Solver process is not running — nothing is being scheduled.";
   }
   if (scheduler?.engineUnreachableSince) {
     return `Engine unreachable since ${new Date(scheduler.engineUnreachableSince).toLocaleTimeString()} — no jobs are being submitted.`;
   }
   if (solverState === "engine_unreachable") {
-    return "Active — engine unreachable: submissions are held with backoff.";
+    return "Engine unreachable — submissions are held with backoff.";
   }
   if (scheduler && !scheduler.sweeperEnabled) {
-    return "Active — sweeper disabled: no new points are being scheduled.";
+    return "Sweeper disabled — no new points are being scheduled.";
   }
   if (solverState === "paused") {
-    return "Active — sweeper paused: no new points are being scheduled.";
+    return "Sweeper disabled — no new points are being scheduled.";
+  }
+  if (solverState === "tick_stalled") {
+    return "Tick running — engine responding slowly; scheduling continues next tick.";
+  }
+  if (solverState === "engine_unhealthy") {
+    return "Engine unhealthy — no jobs are being submitted.";
   }
   const parts = [`${fCount(totals.remaining)} points remaining`];
   if (totals.running > 0) parts.push(`${fCount(totals.running)} running`);
@@ -111,7 +122,7 @@ function kindChip(summary: AdminCampaignSummary | undefined): string | null {
   return "polar sweep";
 }
 
-export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver }: CampaignsHubProps) {
+export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver, onOpenPoints }: CampaignsHubProps) {
   const [segment, setSegment] = useState<"active" | "all">("active");
   const [items, setItems] = useState<AdminCampaignListItem[] | null>(null);
   const [total, setTotal] = useState(0);
@@ -160,6 +171,8 @@ export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver }: Ca
           engineUnreachableSince: solverPayload.engineUnreachableSince,
           engineHealthy: solverPayload.engineHealthy,
           activeJobCount: solverPayload.activeJobCount,
+          lastTickStartedAt: solverPayload.lastTickStartedAt ?? null,
+          lastTickCompletedAt: solverPayload.lastTickCompletedAt ?? null,
         }
       : { fetchOk: false, heartbeatAt: null, enabled: false, engineUnreachableSince: null, engineHealthy: false },
   );
@@ -266,11 +279,40 @@ export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver }: Ca
               ? [...new Set(summary.conditions.filter((c) => c.status !== "released").map((c) => formatRe(c.reynolds)))]
               : [];
             const statusColor = STATUS_COLOR[item.status] ?? C.muted;
+            // Gate badge (mockup fec7b453 screen 3): while a scheduler gate
+            // blocks an ACTIVE campaign, the gate is the PRIMARY chip and the
+            // lifecycle demotes to a small dim chip — never an "Active"
+            // headline next to a contradictory red line.
+            const gate = item.status === "active" ? gateFromSolverState(solver.state) : null;
             return (
               <div key={item.id} data-testid={`campaign-row-${item.slug}`} style={{ ...card, display: "grid", gap: 8 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                   <span style={{ fontFamily: MONO, fontSize: 14, fontWeight: 600, color: C.text }}>{item.name}</span>
-                  <span style={{ fontFamily: MONO, fontSize: 9, letterSpacing: "0.06em", color: statusColor, border: `1px solid ${statusColor}`, borderRadius: 999, padding: "2px 8px", textTransform: "uppercase" }}>
+                  {gate && (
+                    <span
+                      data-testid={`campaign-gate-${item.slug}`}
+                      style={{
+                        fontFamily: MONO,
+                        fontSize: 9,
+                        fontWeight: 700,
+                        letterSpacing: "0.06em",
+                        color: gate.tone === "red" ? C.redText : C.amber,
+                        background: gate.tone === "red" ? "rgba(245,101,101,0.08)" : "rgba(245,158,11,0.08)",
+                        border: `1px solid ${gate.tone === "red" ? "rgba(245,101,101,0.5)" : "rgba(245,158,11,0.45)"}`,
+                        borderRadius: 999,
+                        padding: "2px 9px",
+                      }}
+                    >
+                      {gate.text}
+                    </span>
+                  )}
+                  <span
+                    style={
+                      gate
+                        ? { fontFamily: MONO, fontSize: 9, letterSpacing: "0.06em", color: C.dim, border: `1px solid ${C.borderSoft}`, borderRadius: 999, padding: "2px 8px", textTransform: "uppercase" as const }
+                        : { fontFamily: MONO, fontSize: 9, letterSpacing: "0.06em", color: statusColor, border: `1px solid ${statusColor}`, borderRadius: 999, padding: "2px 8px", textTransform: "uppercase" as const }
+                    }
+                  >
                     {item.status}
                   </span>
                   {chip && (
@@ -300,7 +342,10 @@ export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver }: Ca
                   </span>
                 </div>
 
-                <div data-testid={`campaign-status-line-${item.slug}`} style={{ fontFamily: MONO, fontSize: 11, color: item.status === "attention" ? C.red : C.text2 }}>
+                <div
+                  data-testid={`campaign-status-line-${item.slug}`}
+                  style={{ fontFamily: MONO, fontSize: 11, color: item.status === "attention" ? C.red : gate ? (gate.tone === "red" ? C.redText : C.amber) : C.text2 }}
+                >
                   {statusLine(item, summary, solver.state)}
                 </div>
 
@@ -310,8 +355,37 @@ export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver }: Ca
                   </div>
                   <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, whiteSpace: "nowrap" }}>
                     {fCount(settled)} / {fCount(totals.requested)}
-                    {totals.failed > 0 && <span style={{ color: C.red }}> · {fCount(totals.failed)} failed</span>}
-                    {totals.rejected > 0 && <span style={{ color: C.red }}> · {fCount(totals.rejected)} rejected</span>}
+                    {/* Non-zero failed/rejected counts link to the Points
+                        explorer pre-filtered to this campaign + bucket; zero
+                        counts never render (no link to an empty view). */}
+                    {totals.failed > 0 && (
+                      <>
+                        {" · "}
+                        <button
+                          type="button"
+                          data-testid={`campaign-failed-link-${item.slug}`}
+                          title="Open these failed points in the Points explorer"
+                          onClick={() => onOpenPoints(item.id, "failed")}
+                          style={{ fontFamily: MONO, fontSize: 10, color: C.red, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                        >
+                          {fCount(totals.failed)} failed
+                        </button>
+                      </>
+                    )}
+                    {totals.rejected > 0 && (
+                      <>
+                        {" · "}
+                        <button
+                          type="button"
+                          data-testid={`campaign-rejected-link-${item.slug}`}
+                          title="Open these rejected points in the Points explorer"
+                          onClick={() => onOpenPoints(item.id, "rejected")}
+                          style={{ fontFamily: MONO, fontSize: 10, color: C.red, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                        >
+                          {fCount(totals.rejected)} rejected
+                        </button>
+                      </>
+                    )}
                   </span>
                 </div>
 

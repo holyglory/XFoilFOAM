@@ -1,5 +1,51 @@
 # Decision History
 
+## 2026-07-07 — Sweeper Liveness/Progress Split; Engine Fetch Timeouts
+
+- Incident (prod, 2026-07-06): sweeper_state.heartbeatAt was only written
+  inside tick work, so ONE engine HTTP call that hung (engine API saturated by
+  solvers; heartbeat age observed climbing 0–49 s between touches,
+  "computeFieldExtents FAILED … fetch failed" only after unbounded stalls)
+  starved the heartbeat past the web's 90 s truth gate — a LIVE process
+  rendered red "PROCESS NOT RUNNING". The per-call touchHeartbeat invariant
+  can never fully prevent this: any single awaited call between touches can
+  hang indefinitely.
+- Decision — split liveness from progress. LIVENESS: an independent 15 s
+  `setInterval` in the sweeper process (`startHeartbeatTimer`,
+  `apps/sweeper/src/heartbeat.ts`, wired in `index.ts`) writes heartbeatAt
+  unconditionally — own DB call, in-flight flag so a hung write never stacks,
+  10 s statement timeout (SET LOCAL in a transaction), cleared on shutdown.
+  Tick-path touchHeartbeat calls stay, but liveness no longer depends on them.
+  PROGRESS: migration 0033 adds sweeper_state.lastTickStartedAt /
+  lastTickCompletedAt, stamped by the loop at tick begin/end (`markTickStarted`
+  / `markTickCompleted`; completed deliberately NOT stamped on a thrown tick).
+- Decision — truth derivation: stale heartbeat >90 s now means TRUE process
+  death (red, regardless of tick fields). NEW amber `tick_stalled` state
+  (lib/solver-state + campaign-status gate model): heartbeat fresh but
+  lastTickStartedAt newer than lastTickCompletedAt AND >5 min old — copy
+  "Tick running Xm — engine responding slowly; scheduling continues next
+  tick.", campaign badge "SLOW — …" (not BLOCKED: scheduling genuinely
+  continues). Enabled-path precedence: process death > engine unreachable >
+  engine unhealthy > tick_stalled > healthy. Paused keeps its pre-existing
+  pinned position above the engine gates (a paused sweeper saying "scheduling
+  continues next tick" would be a false line).
+- Decision — every EngineClient call carries an AbortSignal timeout with a
+  per-call override (packages/engine-client): polls (health/status/queue/
+  runtimes/cache) 15 s, submit/cancel/result 60 s (result JSON can be MBs of
+  evidence), extents/render 120 s. A hung request aborts as
+  `EngineTimeoutError` — deliberately NOT an EngineError, so
+  isEngineConnectionFailure() routes it through the EXISTING release +
+  engine-backoff path, never `failed`. Remote-solver hub fetches got the same
+  treatment (15 s polls, 120 s media push) since they run inside the tick.
+- API exposure: services/sweeper-state.ts reads the tick pair column-tolerantly
+  (same pattern as 0026); campaigns list solverState + summary scheduler carry
+  lastTickStartedAt/lastTickCompletedAt.
+- Outcome: typecheck 6/6; core 66, api 74, web 152 (138+14), sweeper 78
+  (68+10) — new must-catch pins: fresh-heartbeat+hung-tick → amber never red,
+  stale heartbeat → red regardless of tick fields, timer beats while a fake
+  never-resolving engine hangs a real tick, hung fetch aborts at budget into
+  the connection-failure class, answered HTTP 500 stays EngineError.
+
 ## 2026-07-05 — Engine Rebuilds Get A Script; Sweeper Handles Cancelled And Lost Engine Jobs
 
 - Incident root causes (airfoils.pro): a manual
@@ -1245,3 +1291,192 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   the URL (`pstatus/pairfoil/pcampaign/pregime/perr/pre`, defaults omitted)
   via pure round-trip helpers in `apps/web/lib/point-history.ts` (digest +
   timeline builders unit-tested there too).
+
+## 2026-07-06 — URANS frame-track contract: node ingest + stationarity gate (task #24)
+
+- Cross-runtime contract pin (same pattern as the worker-restart orphan
+  message): the engine ships per URANS point `result.json →
+  point.frame_track` = `{ period_s, periods_retained, stationary, drift_frac,
+  window{t_start,t_end}, stats{cl,cd,cm × mean/std/min/max — time-weighted
+  trapezoidal over an INTEGER number of periods}, fields[], frames[≤120 ×
+  {i,t,cl,cd,cm}], image_pattern "frames/{field}/f{i04}.png" }`. Point-level
+  cl/cd/cm/strouhal = frame_track.stats means / measured St (single source of
+  truth). No-shedding steady points ship `frame_track = null`. Node pins the
+  shape with a strict parser (`parseFrameTrack`, rejects added/removed/
+  renamed/retyped keys at every level) + fixture JSON test
+  (`apps/sweeper/test/frame-track-contract-pin.test.ts`,
+  `fixtures/frame-track-contract.json`); the engine pins it with a
+  serialization test. Drift on either side fails that side's tests.
+- Migration 0032: `results.frame_track jsonb NULL` (persisted VERBATIM at
+  ingest — snake_case engine shape, evidence stays byte-honest) + enum value
+  `evidence_artifact_kind 'frame_image'`. Attempts need no new column: the
+  full PolarPoint (frame_track included) already lands in
+  `result_attempts.evidence_payload`, and the classifier reads
+  `evidence_payload -> 'frame_track'`.
+- Classifier gate (`frame-track-v3`): a URANS point with NON-NULL frameTrack
+  must also have `stationary === true` (else reason `non-stationary`) and
+  numeric `periods_retained >= 5` (else `insufficient-periods`) to classify
+  accepted; rejected confidence stays 1. The gate FAILS CLOSED: a drifted
+  frame_track payload (missing/renamed/retyped verdict fields) rejects,
+  never accepts. BACKWARD COMPAT decision: frameTrack NULL/absent = legacy
+  pre-contract evidence (or steady point) → the v2 gate (converged + force
+  history + video) stands unchanged, so deploying the gate cannot
+  mass-reject historical accepted URANS rows; they re-gate naturally only
+  when re-solved under the new engine. Pinned by an explicit BACKWARD COMPAT
+  test in `packages/core/test/core.test.ts`.
+- Ingest drift behaviour: `frameTrackForPoint` validates against the contract
+  and logs `frame_track CONTRACT DRIFT` loudly but persists the raw payload
+  anyway — it is solver evidence, and a malformed shape can only ever REJECT
+  a point downstream. Unknown evidence-artifact kinds from a newer engine are
+  now loud-skipped per artifact instead of aborting the whole ingest on a pg
+  enum error.
+- Frames registration choice: frame PNGs are registered as
+  `solver_evidence_artifacts` rows with kind `'frame_image'`
+  (FRAME_IMAGE_ARTIFACT_KIND, pinned in @aerodb/engine-client) through the
+  EXISTING ingest evidence sweep — NOT as `result_media`: result_media's
+  unique key is (result, kind, field, role) with a closed image/video enum,
+  i.e. one row per field/role — structurally wrong for ≤240 per-frame files,
+  and the modal fetch needs per-(field, frame-index) URLs, which the
+  evidence rows carry naturally (field column + frame index from
+  metadata.frameIndex or the `f{i04}.png` filename).
+- API exposure (`assembleSim → services/sim.ts`): the sim payload ships
+  `frameTrack` (camelCase stats/window + frames[].imageUrls resolved to
+  /api/media keys). Frames with unregistered PNGs ship WITHOUT that field's
+  URL (absence stays absence); frame_image rows are excluded from the
+  generic `evidenceArtifacts` list to keep the payload bounded; a
+  contract-drifted stored payload resolves `frameTrack: null` (the point is
+  rejected by the classifier anyway, raw jsonb stays on the row as
+  evidence).
+
+## 2026-07-06 — URANS frame-track contract: engine recording side (task #23)
+
+- The engine now ships `point.frame_track` per shedding URANS point in
+  result.json, matching the pinned cross-runtime shape in
+  `packages/engine-client/src/frame-track.ts` EXACTLY (period_s,
+  periods_retained, stationary, drift_frac, window{t_start,t_end},
+  stats{cl,cd,cm}{mean,std,min,max}, fields, frames[{i,t,cl,cd,cm}],
+  image_pattern). Engine pin: `tests/test_frame_track.py`
+  (`test_frame_track_contract_pin_exact_keys_and_types`); drift on either
+  side fails tests (orphan-message-pin pattern). A real engine-serialized
+  payload was validated against the node strict parser during delivery.
+- INTEGRATE UNTIL N WHOLE PERIODS: new solver-profile fields
+  `urans_min_periods` (default 7), `urans_drift_tolerance` (default 0.05)
+  and output field `frame_fields` (default vorticity+velocity_magnitude) on
+  `SolverParams` (models → request → pipeline, same wiring as
+  transient_cycles). The transient extends in continuation chunks by
+  REUSING the existing restart mechanics (`write_transient` from latestTime
+  + solver restart) — deliberately no second continuation path. Each chunk's
+  coefficient.dat segment is merged for grading
+  (`_transient_coeff_selection` excludes the steady-init pseudo-time
+  history; must-catch test proves cl=99 init rows can never contaminate).
+- Period tracking: autocorrelation (`measure_period`) on the Cl signal
+  (uniform resample, demean, first peak past the first zero crossing,
+  parabolic refinement) — chosen over zero crossings because it is robust to
+  noise on the shedding signal; FFT `period_s` remains the fallback.
+- Budget honesty: the continuation loop reuses the refine feasibility logic
+  (measured simulated-seconds-per-wall-second rate vs
+  URANS_REFINE_BUDGET_FRACTION × solver timeout). A budget stop grades
+  "retained M.x of N periods (budget)" and disables the refined pass (it
+  would blow the same budget). No-shedding early exit and the
+  two-stable-period early stop remain untouched and break the loop first.
+- Stats = SINGLE SOURCE OF TRUTH: point cl/cd/cm(+std) and strouhal come
+  from time-weighted trapezoidal stats over exactly K=floor(retained) whole
+  periods (`period_window_stats`); the biased-phase fixture proves the
+  integer-period window kills the fractional-period mean bias that plain
+  row-averaging carries. Stationarity = whole-period-half Cl mean drift
+  (floor(K/2) periods per half, middle period skipped when K is odd, so the
+  drift metric itself carries no phase bias); non-stationary windows ship a
+  loud quality warning and stationary=false for the node gate.
+- Frame export: ~24 frames/period over the last min(3,K) periods, cap 120,
+  rendered at the contract's 640px width from the VTU frames nearest each
+  target time (`render_frame_track_images`, consistent per-field color
+  scale); per-frame coefficients interpolated from coefficient.dat at the
+  frame's exact time. PNGs live at `frames/{field}/f{i04}.png` under the
+  case dir (namespaced under the AoA subdir for marched polars) and ship in
+  the evidence bundle with the pinned artifact kind `frame_image`. The mp4
+  animation now renders FROM the same frame-export window so video and
+  frames agree; mean images/evidence keep the full K-period window.
+- No-shedding steady points ship `frame_track=null` (existing steady path
+  untouched); a shedding point whose period is genuinely unmeasurable also
+  ships null plus its existing quality warning — missing data is shown as
+  missing, never invented.
+- Verification: 174 engine tests green (151 baseline + 23 new); recall
+  proven by mutation (steady-init contamination, disabled budget guard,
+  plain-mean regression, contract-drift extra key — all caught). Docker
+  engine image rebuild required to ship.
+
+## 2026-07-07 — Solver-results modal redesign (task #25): frame-synced player
+
+- The SimModal URANS view is rebuilt around ONE piece of truth: the current
+  frame index into the engine-recorded frame track (`results.frame_track` →
+  `SimulationDetail.frameTrack`). Scrub bar, Cl(t) window chart cursor, frame
+  image pane, and overlay readout all derive from that index through pure
+  helpers in `apps/web/lib/frame-player.ts` (no DOM/React — fully covered by
+  vitest). Playback paces per shedding period (1 wall-second per period at
+  1×, 0.5× available), so ~24 engine frames/period play at ~24 fps.
+- Legacy fallback decision: points with `frameTrack` null/absent (steady,
+  no-shedding, pre-contract evidence) or an empty frame list fall back to the
+  stored mp4 loop with an explicit legacy-evidence note — frames are never
+  invented client-side.
+- Frame PNG URLs resolve from registered `frame_image` evidence rows only;
+  frames whose PNG is unregistered render an honest missing state (absence
+  stays absence). E2E `apps/web/e2e/sim-frame-player.spec.ts` drives the
+  player against the live dev stack.
+
+## 2026-07-07 — Adversarial-review reconciliation: early-stop retention, gate coherence, honest gaps (F1–F8)
+
+Final pre-#27 adversarial review of the combined URANS overhaul confirmed 8
+defects; fixes, in decision form:
+
+- F1/F2 — the {early-stop 2, node gate 5, engine target 7} period triangle
+  was incoherent: every early-stopped point retained ~2 startup-adjacent
+  periods with a ZERO startup discard, shipping +~9%-biased time-weighted
+  means that the frame-track gate then deterministically rejected
+  (non-stationary + insufficient-periods). DECISION: the two-period
+  comparator remains only the DETECTOR; `URANS_STABLE_RETAINED_CYCLES` is
+  now 5.0 (cross-runtime parity with `FRAME_TRACK_MIN_PERIODS = 5`, +0.5
+  period stop margin so downstream period re-measurement can never floor
+  below the gate), the early-stop monitor keeps integrating until that many
+  periods exist past the START of the first stable window, records
+  `retain_from` in the marker, and `_finalize_outcome` windows early-stopped
+  frame-track stats to that certified-stable tail (never a fraction discard,
+  never the raw span). The 7-period full-path target stays the ideal; budget
+  stops that still retain >=5 stationary periods remain acceptable evidence.
+  RESIDUAL RISK (deferred to #27 by necessity): real prod wall-time per
+  URANS point at Re≈6.8M is unverifiable from this machine (remote-solving
+  mode, admin-only prod timings); validate ONE real URANS point end-to-end
+  on prod hardware before launching the 450-point campaign.
+- F3 — a shedding point whose period was unmeasurable shipped
+  `frame_track=null`, indistinguishable from legacy pre-contract evidence,
+  silently skipping the gate. DECISION: ingest is the trust boundary — any
+  FRESH ingest is post-contract by definition, so `frameTrackForPoint` now
+  persists a fail-closed sentinel (`{missing:true, stationary:false,
+  periods_retained:null, reason}`) for shedding points missing frame_track;
+  the gate rejects it honestly, the modal falls back to the mp4. NULL
+  remains reserved for steady/no-shedding points and pre-existing legacy
+  rows.
+- F4 — the player scrub/playback/chart domain was the full K-period stats
+  window while frames cover only the last min(3,K) periods (~57% of every
+  loop frozen on frame 0 at K=7). DECISION: `buildFramePlayerModel` clamps
+  the playback domain to the frame-covered span; the window STATS stay the
+  full-K truth and are displayed unchanged.
+- F5 — frame PNGs were stored 3× engine-side (~110–215MB/point). DECISION:
+  the evidence tar bundle now EXCLUDES `frames/` (PNG is incompressible;
+  manifest carries `bundleExcludes:["frames"]`); frames still ship as
+  individual `frame_image` artifacts + the case-dir copy the image_pattern
+  points at. Check VPS disk headroom before #27 regardless.
+- F6 — campaign-batching suite flaked on shared-dev-DB residue: flow
+  conditions / reference geometry profiles are find-or-create (canonical-key
+  dedupe), so another suite's preset can reference "our" rows. DECISION:
+  suite cleanup deletes those rows only when nothing references them
+  (NOT EXISTS guard) — own-row cleanup stays, foreign referents no longer
+  explode the suite.
+- F7 — both image_pattern pins only covered the bare single-case literal
+  while production multi-AoA jobs ship `a{i}/frames/{field}/f{i04}.png`.
+  Pins added on both runtimes for the prefixed production shape.
+- F8 — frame-image URL resolution rested solely on undocumented filename
+  parsing (`f{i04}.png` regex); the claimed `metadata.frameIndex` mechanism
+  did not exist engine-side. DECISION: the engine now stamps `field` +
+  `metadata.frameIndex` on every frame_image artifact at the writer (the
+  filename coupling stays engine-internal); the node regex remains only as
+  a legacy fallback.

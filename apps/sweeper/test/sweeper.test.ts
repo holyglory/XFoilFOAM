@@ -21,6 +21,7 @@ import {
   simJobs,
   simulationPresetAirfoilTargets,
   simulationPresets,
+  solverEvidenceArtifacts,
   solverProfiles,
   syncSweepPromises,
   syncSweepPromisePoints,
@@ -494,10 +495,42 @@ describe("sweeper: gap → claim → ingest", () => {
               converged: false,
               first_order_fallback: false,
               images: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude.png" },
-              evidence_artifacts: [manifestArtifact("c2")],
+              evidence_artifacts: [
+                manifestArtifact("c2"),
+                // Frame-track contract: per-frame PNG shipped as an evidence
+                // file with the pinned 'frame_image' kind (migration 0032).
+                {
+                  kind: "frame_image",
+                  path: "/jobs/testjob/files/cases/c2/frames/vorticity/f0000.png",
+                  url: "/jobs/testjob/files/cases/c2/frames/vorticity/f0000.png",
+                  mime_type: "image/png",
+                  sha256: "sha-c2-frame-0",
+                  byte_size: 4096,
+                  field: "vorticity",
+                  role: "instantaneous",
+                  metadata: { frameIndex: 0 },
+                },
+              ],
               // Engine non-fatal quality warnings (0030): ingest must persist
               // them verbatim on the results row AND the attempt evidence row.
               quality_warnings: ["URANS window shorter than 3 shedding periods"],
+              // Frame-track contract payload (0032): must land VERBATIM on
+              // results.frame_track.
+              frame_track: {
+                period_s: 0.238,
+                periods_retained: 6,
+                stationary: true,
+                drift_frac: 0.011,
+                window: { t_start: 0.05, t_end: 0.3 },
+                stats: {
+                  cl: { mean: 1.2, std: 0.08, min: 1.05, max: 1.34 },
+                  cd: { mean: 0.18, std: 0.02, min: 0.15, max: 0.21 },
+                  cm: { mean: -0.04, std: 0.005, min: -0.05, max: -0.03 },
+                },
+                fields: ["vorticity", "velocity_magnitude"],
+                frames: [{ i: 0, t: 0.25, cl: 1.21, cd: 0.18, cm: -0.04 }],
+                image_pattern: "frames/{field}/f{i04}.png",
+              },
               strouhal: 0.21,
               mean_images: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude_mean.png" },
               video: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude.mp4" },
@@ -579,6 +612,25 @@ describe("sweeper: gap → claim → ingest", () => {
     // URANS point: Strouhal + animation video + time-averaged image + force history
     const r16 = rows.find((r) => r.aoaDeg === uransAoa)!;
     expect(r16.strouhal).toBeCloseTo(0.21, 5);
+    // Frame-track contract (0032): the engine payload lands VERBATIM on the
+    // results row; the steady point (no shedding → no frame_track) stays NULL.
+    expect(r16.frameTrack).toMatchObject({
+      periods_retained: 6,
+      stationary: true,
+      image_pattern: "frames/{field}/f{i04}.png",
+    });
+    expect((r16.frameTrack as { frames: unknown[] }).frames).toHaveLength(1);
+    expect(rows.find((r) => r.aoaDeg === steadyAoa)?.frameTrack).toBeNull();
+    // The frame PNG registered through the existing evidence sweep with the
+    // pinned 'frame_image' kind + field + frameIndex metadata.
+    const frameEvidence = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(and(eq(solverEvidenceArtifacts.resultId, r16.id), eq(solverEvidenceArtifacts.kind, "frame_image")));
+    expect(frameEvidence).toHaveLength(1);
+    expect(frameEvidence[0].field).toBe("vorticity");
+    expect(frameEvidence[0].storageKey).toBe("jobs/testjob/cases/c2/frames/vorticity/f0000.png");
+    expect(frameEvidence[0].metadata).toMatchObject({ frameIndex: 0 });
     const m16 = await db.select().from(resultMedia).where(eq(resultMedia.resultId, r16.id));
     expect(m16.some((mm) => mm.kind === "video" && mm.role === "instantaneous")).toBe(true);
     expect(m16.some((mm) => mm.kind === "image" && mm.role === "mean")).toBe(true);
@@ -678,6 +730,24 @@ describe("sweeper: gap → claim → ingest", () => {
               converged: true,
               first_order_fallback: false,
               strouhal: 0.19,
+              // Post-contract engines ship frame_track on every shedding
+              // point; without it ingest persists a fail-closed sentinel and
+              // the classifier rejects (see frame-track-contract-pin tests).
+              frame_track: {
+                period_s: 0.27,
+                periods_retained: 6.2,
+                stationary: true,
+                drift_frac: 0.01,
+                window: { t_start: 1.0, t_end: 2.62 },
+                stats: {
+                  cl: { mean: 1.05, std: 0.07, min: 0.9, max: 1.2 },
+                  cd: { mean: 0.19, std: 0.02, min: 0.16, max: 0.22 },
+                  cm: { mean: -0.05, std: 0.004, min: -0.06, max: -0.04 },
+                },
+                fields: [],
+                frames: [],
+                image_pattern: "frames/{field}/f{i04}.png",
+              },
               evidence_artifacts: [
                 {
                   kind: "manifest",

@@ -19,6 +19,7 @@ import {
   simJobs,
   schedulingProfiles,
   simulationPresets,
+  solverEvidenceArtifacts,
   solverProfiles,
   syncApiPermissions,
   syncApiSettings,
@@ -812,5 +813,128 @@ describe("simulation media evidence", () => {
     const [stillDone] = await db.select().from(results).where(eq(results.id, staticOnly.id)).limit(1);
     expect(stillDone.status).toBe("done");
     expect(stillDone.error).toBeNull();
+
+    // Frame-track contract exposure (task #24): a legacy URANS row without
+    // frame_track ships frameTrack: null — absence stays absence.
+    expect(staticSim?.frameTrack).toBeNull();
+  });
+
+  it("exposes the URANS frame track with per-frame /api/media image URLs (frame-track contract)", async () => {
+    const unique = `sim-frametrack-${Date.now()}`;
+    const bc = await createTestBoundaryCondition(unique, true, 120000);
+
+    const [cat] = await db
+      .insert(categories)
+      .values({ slug: unique, name: "Frame Track Test", path: unique, depth: 0, sortOrder: 999 })
+      .returning({ id: categories.id });
+    cleanupCategoryIds.add(cat.id);
+    const [airfoil] = await db
+      .insert(airfoils)
+      .values({
+        slug: unique,
+        name: `${unique} Airfoil`,
+        categoryId: cat.id,
+        source: "test",
+        points,
+        thicknessPct: 12,
+        camberPct: 0,
+        tags: [],
+      })
+      .returning({ id: airfoils.id });
+    cleanupAirfoilIds.add(airfoil.id);
+
+    // Verbatim engine contract shape, exactly as sweeper ingest persists it.
+    const frameTrack = {
+      period_s: 0.137,
+      periods_retained: 6,
+      stationary: true,
+      drift_frac: 0.012,
+      window: { t_start: 10.21, t_end: 11.03 },
+      stats: {
+        cl: { mean: 1.12, std: 0.18, min: 0.83, max: 1.41 },
+        cd: { mean: 0.21, std: 0.03, min: 0.16, max: 0.27 },
+        cm: { mean: -0.06, std: 0.01, min: -0.09, max: -0.03 },
+      },
+      fields: ["vorticity", "velocity_magnitude"],
+      frames: [
+        { i: 0, t: 10.76, cl: 1.1, cd: 0.21, cm: -0.06 },
+        { i: 1, t: 10.77, cl: 1.19, cd: 0.22, cm: -0.07 },
+      ],
+      image_pattern: "frames/{field}/f{i04}.png",
+    };
+    const [tracked] = await db
+      .insert(results)
+      .values({
+        airfoilId: airfoil.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: bc.presetRevisionId,
+        aoaDeg: 18,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        reynolds: bc.reynolds,
+        speed: bc.speed,
+        chord: bc.chord,
+        cl: 1.12,
+        cd: 0.21,
+        cm: -0.06,
+        clCd: 5.33,
+        unsteady: true,
+        converged: true,
+        strouhal: 0.5,
+        frameTrack,
+        engineJobId: "ft-job",
+        engineCaseSlug: "ft-case",
+        solvedAt: new Date(),
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(tracked.id);
+
+    // Frame PNGs registered by the ingest evidence sweep (kind frame_image).
+    // Frame 1's velocity_magnitude PNG is deliberately MISSING: its URL must
+    // be absent from the payload, never invented.
+    const frameArtifacts = [
+      { field: "vorticity", index: 0 },
+      { field: "vorticity", index: 1 },
+      { field: "velocity_magnitude", index: 0 },
+    ];
+    await db.insert(solverEvidenceArtifacts).values(
+      frameArtifacts.map(({ field, index }) => ({
+        resultId: tracked.id,
+        airfoilId: airfoil.id,
+        engineJobId: "ft-job",
+        engineCaseSlug: "ft-case",
+        aoaDeg: 18,
+        kind: "frame_image" as const,
+        field,
+        role: "instantaneous",
+        storageKey: `jobs/ft-job/cases/ft-case/frames/${field}/f${String(index).padStart(4, "0")}.png`,
+        mimeType: "image/png",
+        sha256: `sha-${field}-${index}`,
+        byteSize: 1000 + index,
+        metadata: { frameIndex: index },
+      })),
+    );
+
+    const sim = await assembleSim(unique, bc.reynolds, 18);
+    expect(sim?.frameTrack).toBeTruthy();
+    expect(sim?.frameTrack?.periodsRetained).toBe(6);
+    expect(sim?.frameTrack?.stationary).toBe(true);
+    expect(sim?.frameTrack?.periodS).toBeCloseTo(0.137);
+    expect(sim?.frameTrack?.window).toEqual({ tStart: 10.21, tEnd: 11.03 });
+    expect(sim?.frameTrack?.stats.cl.mean).toBeCloseTo(1.12);
+    expect(sim?.frameTrack?.fields).toEqual(["vorticity", "velocity_magnitude"]);
+    expect(sim?.frameTrack?.frames).toHaveLength(2);
+    expect(sim?.frameTrack?.frames[0]).toMatchObject({ i: 0, cl: 1.1 });
+    expect(sim?.frameTrack?.frames[0].imageUrls).toEqual({
+      vorticity: "/api/media/jobs/ft-job/cases/ft-case/frames/vorticity/f0000.png",
+      velocity_magnitude: "/api/media/jobs/ft-job/cases/ft-case/frames/velocity_magnitude/f0000.png",
+    });
+    // Missing PNG evidence → missing URL (honest absence).
+    expect(sim?.frameTrack?.frames[1].imageUrls).toEqual({
+      vorticity: "/api/media/jobs/ft-job/cases/ft-case/frames/vorticity/f0001.png",
+    });
+    // Frame PNGs stay OUT of the generic evidence panel list (payload bound).
+    expect(sim?.evidenceArtifacts?.some((artifact) => artifact.kind === "frame_image")).toBe(false);
   });
 });

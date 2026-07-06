@@ -17,6 +17,11 @@ export interface SweeperStateRow {
   heartbeatAt: Date | string | null;
   updatedAt: Date | string | null;
   engineUnreachableSince: Date | string | null;
+  /** Tick-progress pair (migration 0033, liveness/progress split): stamped by
+   *  the sweeper loop at tick begin/end. Null until the migration applies —
+   *  the web then simply never derives tick_stalled. */
+  lastTickStartedAt: Date | string | null;
+  lastTickCompletedAt: Date | string | null;
 }
 
 export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
@@ -29,6 +34,8 @@ export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
   heartbeatAt: null,
   updatedAt: null,
   engineUnreachableSince: null,
+  lastTickStartedAt: null,
+  lastTickCompletedAt: null,
 };
 
 let engineUnreachableColumnExists: boolean | null = null;
@@ -44,8 +51,23 @@ async function hasEngineUnreachableColumn(): Promise<boolean> {
   return engineUnreachableColumnExists;
 }
 
+// Migration 0033 adds the pair together — one probe covers both columns.
+let tickProgressColumnsExist: boolean | null = null;
+
+async function hasTickProgressColumns(): Promise<boolean> {
+  if (tickProgressColumnsExist != null) return tickProgressColumnsExist;
+  const rows = (await db.execute(sql`
+    SELECT 1 AS present FROM information_schema.columns
+    WHERE table_name = 'sweeper_state' AND column_name = 'lastTickStartedAt'
+    LIMIT 1
+  `)) as unknown as unknown[];
+  tickProgressColumnsExist = rows.length > 0;
+  return tickProgressColumnsExist;
+}
+
 export async function readSweeperState(): Promise<SweeperStateRow | null> {
   const withUnreachable = await hasEngineUnreachableColumn();
+  const withTickProgress = await hasTickProgressColumns();
   const rows = (await db.execute(sql`
     SELECT
       id,
@@ -57,6 +79,11 @@ export async function readSweeperState(): Promise<SweeperStateRow | null> {
       "heartbeatAt",
       "updatedAt"
       ${withUnreachable ? sql`, "engineUnreachableSince"` : sql`, NULL::timestamptz AS "engineUnreachableSince"`}
+      ${
+        withTickProgress
+          ? sql`, "lastTickStartedAt", "lastTickCompletedAt"`
+          : sql`, NULL::timestamptz AS "lastTickStartedAt", NULL::timestamptz AS "lastTickCompletedAt"`
+      }
     FROM sweeper_state
     WHERE id = 1
     LIMIT 1

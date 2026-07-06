@@ -47,6 +47,9 @@ export const evidenceArtifactKindEnum = pgEnum("evidence_artifact_kind", [
   "mesh",
   "dictionary",
   "field_data",
+  // Per-frame URANS PNGs from the frame-track contract (migration 0032) —
+  // pinned cross-runtime as FRAME_IMAGE_ARTIFACT_KIND in @aerodb/engine-client.
+  "frame_image",
 ]);
 export const presetTargetScopeEnum = pgEnum("preset_target_scope", ["all", "airfoils"]);
 export const simJobStatusEnum = pgEnum("sim_job_status", [
@@ -722,6 +725,13 @@ export const results = pgTable(
     /** Engine per-point non-fatal quality warnings (PolarPoint.quality_warnings),
      *  persisted at ingest. NULL on pre-0030 rows — honest absence, no backfill. */
     qualityWarnings: text("quality_warnings").array(),
+    /** URANS frame-track contract payload (PolarPoint.frame_track, migration
+     *  0032): period-locked recording window, time-weighted stats, <=120
+     *  frame samples, image_pattern. Persisted verbatim (snake_case engine
+     *  shape). NULL = steady/no-shedding point OR legacy pre-contract
+     *  evidence — the classifier's stationarity gate applies only to non-NULL
+     *  values, so history is never mass-rejected by deploy. */
+    frameTrack: jsonb("frame_track"),
     // linkage to the engine run
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
     engineJobId: text("engine_job_id"),
@@ -1196,6 +1206,15 @@ export const sweeperState = pgTable("sweeper_state", {
   pollIntervalMs: integer("poll_interval_ms").notNull().default(5000),
   submitIntervalMs: integer("submit_interval_ms").notNull().default(15000),
   heartbeatAt: ts(),
+  // Liveness/progress split (migration 0033): heartbeatAt is written by an
+  // INDEPENDENT 15 s timer in the sweeper process (pure liveness — stale >90 s
+  // now really means process death), while these two are stamped by the loop
+  // at tick begin/end (pure progress). A fresh heartbeat with a started-but-
+  // not-completed tick older than 5 min derives the AMBER tick_stalled state
+  // instead of a false red "PROCESS NOT RUNNING" (2026-07-06 prod incident:
+  // one hung engine HTTP call starved the in-tick heartbeat writes).
+  lastTickStartedAt: ts(),
+  lastTickCompletedAt: ts(),
   updatedAt: ts()
     .notNull()
     .defaultNow()

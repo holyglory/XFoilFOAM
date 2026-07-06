@@ -188,6 +188,26 @@ class SolverParams(BaseModel):
         "pimpleFoam solver tolerates Co>1; a larger value avoids the tiny wall cells (y+~1) "
         "throttling the step to an impractically small size.",
     )
+    urans_min_periods: int = Field(
+        default=7,
+        ge=2,
+        le=40,
+        description="Whole vortex-shedding periods that must be retained (after startup discard) "
+        "before a URANS transient stops integrating. The transient is extended in continuation "
+        "chunks until this many periods are retained or the wall-clock budget guard fires.",
+    )
+    urans_drift_tolerance: float = Field(
+        default=0.05,
+        gt=0,
+        lt=1,
+        description="Stationarity tolerance for the retained URANS window: relative drift of the "
+        "Cl mean between the first and second half of the integer-period window.",
+    )
+    frame_fields: list[ImageField] = Field(
+        default_factory=lambda: [ImageField.vorticity, ImageField.velocity_magnitude],
+        description="Fields rendered as per-frame 640px PNGs for the frame-synced URANS player "
+        "(frame_track contract). Output-profile configurable.",
+    )
     transient_auto_refine: bool = Field(
         default=True,
         description="After a URANS run, rerun once with measured shedding timing if the retained "
@@ -338,6 +358,72 @@ class ForceHistory(BaseModel):
     window_end: Optional[float] = Field(default=None, description="End time of the retained integer-period window.")
 
 
+# --------------------------------------------------------------------------- #
+# FRAME-TRACK CONTRACT (pinned 2026-07-06, task #23/#24). Shipped per URANS
+# point in result.json as ``point.frame_track`` with EXACTLY this shape; the
+# node side pins the same shape in packages/engine-client/src/frame-track.ts
+# (strict parser: missing/extra/wrongly-typed keys are contract drift and fail
+# tests on BOTH sides, same pattern as the orphan-message pin).
+#
+# The point-level cl/cd/cm/strouhal = frame_track.stats means / measured St
+# (single source of truth). No-shedding steady points ship frame_track=null.
+# --------------------------------------------------------------------------- #
+class FrameTrackWindow(BaseModel):
+    """Retained integer-period averaging window [t_start, t_end]."""
+
+    t_start: float
+    t_end: float
+
+
+class FrameChannelStats(BaseModel):
+    """Time-weighted trapezoidal stats over an INTEGER number of periods."""
+
+    mean: float
+    std: float
+    min: float
+    max: float
+
+
+class FrameTrackStats(BaseModel):
+    cl: FrameChannelStats
+    cd: FrameChannelStats
+    cm: FrameChannelStats
+
+
+class FrameSample(BaseModel):
+    """One recorded frame: index, physical time, instantaneous coefficients."""
+
+    i: int
+    t: float
+    cl: float
+    cd: float
+    cm: float
+
+
+#: Hard payload bound pinned by the contract: len(frames) <= 120.
+FRAME_TRACK_MAX_FRAMES = 120
+
+#: Evidence-artifact kind stamped on per-frame PNGs (pinned cross-runtime:
+#: node FRAME_IMAGE_ARTIFACT_KIND must match this literal exactly).
+FRAME_IMAGE_ARTIFACT_KIND = "frame_image"
+
+
+class FrameTrack(BaseModel):
+    period_s: Optional[float] = None
+    periods_retained: float
+    stationary: bool
+    drift_frac: float
+    window: FrameTrackWindow
+    stats: FrameTrackStats
+    # Frame-image fields (output-profile configurable; default vorticity +
+    # velocity_magnitude). Only fields whose PNGs actually rendered are listed.
+    fields: list[str] = Field(default_factory=list)
+    # <=120 frames, ~24/period over the last 2-3 periods.
+    frames: list[FrameSample] = Field(default_factory=list)
+    # 640px-wide PNGs under the case dir, shipped as evidence files.
+    image_pattern: str = "frames/{field}/f{i04}.png"
+
+
 class EvidenceArtifact(BaseModel):
     """Immutable raw/derived evidence file emitted by the engine.
 
@@ -395,6 +481,12 @@ class PolarPoint(BaseModel):
     )
     force_history: Optional[ForceHistory] = Field(
         default=None, description="Cl/Cd/Cm time series for the force monitors (transient only)."
+    )
+    frame_track: Optional[FrameTrack] = Field(
+        default=None,
+        description="Pinned URANS recording contract: integer-period window, time-weighted stats, "
+        "stationarity verdict and per-frame coefficient samples. None for steady and no-shedding "
+        "points (frame_track=null in result.json).",
     )
     quality_warnings: list[str] = Field(
         default_factory=list,

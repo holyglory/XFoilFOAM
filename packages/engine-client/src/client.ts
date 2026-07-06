@@ -24,94 +24,146 @@ export class EngineError extends Error {
   }
 }
 
-/** Thin typed client for the Python CFD solver API (FastAPI). */
+/** A request the engine never answered within its timeout budget. Deliberately
+ *  NOT an EngineError: EngineError means "the engine answered (badly)", while
+ *  a timeout is a connection-class failure — the sweeper's
+ *  isEngineConnectionFailure(e) treats it like ECONNREFUSED (release work,
+ *  record engine backoff, never mark jobs failed). Root cause 2026-07-06: a
+ *  single hung engine HTTP call (engine API saturated by solvers) stalled a
+ *  sweeper tick indefinitely and starved the in-tick heartbeat writes. */
+export class EngineTimeoutError extends Error {
+  constructor(
+    message: string,
+    readonly timeoutMs: number,
+  ) {
+    super(message);
+    this.name = "EngineTimeoutError";
+  }
+}
+
+/** Per-call override for the built-in timeout defaults. */
+export interface EngineCallOptions {
+  timeoutMs?: number;
+}
+
+/** Status/runtime polls (health, job status, queue, cache stats, runtimes). */
+export const ENGINE_POLL_TIMEOUT_MS = 15_000;
+/** Mutating calls + full-result reads (submit, cancel, result JSON). */
+export const ENGINE_SUBMIT_TIMEOUT_MS = 60_000;
+/** Field-extents / render round-trips (the engine rasterizes frames). */
+export const ENGINE_RENDER_TIMEOUT_MS = 120_000;
+
+/** Thin typed client for the Python CFD solver API (FastAPI). Every call
+ *  carries an AbortSignal timeout so a saturated engine can stall a caller
+ *  for at most its budget — a hung fetch surfaces as EngineTimeoutError. */
 export class EngineClient {
   readonly baseUrl: string;
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
-  private async json<T>(path: string, init?: RequestInit): Promise<T> {
-    const res = await fetch(this.baseUrl + path, {
-      ...init,
-      headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new EngineError(`${init?.method ?? "GET"} ${path} → ${res.status} ${body.slice(0, 300)}`, res.status);
+  private async json<T>(path: string, timeoutMs: number, init?: RequestInit): Promise<T> {
+    const signal = AbortSignal.timeout(timeoutMs);
+    try {
+      const res = await fetch(this.baseUrl + path, {
+        ...init,
+        signal,
+        headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new EngineError(`${init?.method ?? "GET"} ${path} → ${res.status} ${body.slice(0, 300)}`, res.status);
+      }
+      return (await res.json()) as T;
+    } catch (e) {
+      if (e instanceof EngineError) throw e;
+      if (signal.aborted) {
+        throw new EngineTimeoutError(
+          `${init?.method ?? "GET"} ${path} timed out after ${timeoutMs} ms — engine did not answer (request aborted)`,
+          timeoutMs,
+        );
+      }
+      throw e;
     }
-    return (await res.json()) as T;
   }
 
-  async health(): Promise<boolean> {
+  async health(opts?: EngineCallOptions): Promise<boolean> {
     try {
-      await this.json("/health");
+      await this.json("/health", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
       return true;
     } catch {
       return false;
     }
   }
 
-  healthDetails(): Promise<EngineHealth> {
-    return this.json<EngineHealth>("/health");
+  healthDetails(opts?: EngineCallOptions): Promise<EngineHealth> {
+    return this.json<EngineHealth>("/health", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
   }
 
   /** Submit a polar job → 202 with a job_id. */
-  submitPolar(request: PolarRequest): Promise<JobStatus> {
-    return this.json<JobStatus>("/polars", { method: "POST", body: JSON.stringify(request) });
-  }
-
-  getJob(jobId: string): Promise<JobStatus> {
-    return this.json<JobStatus>(`/jobs/${encodeURIComponent(jobId)}`);
-  }
-
-  cancelJob(jobId: string): Promise<{ job_id: string; cancelled: boolean }> {
-    return this.json<{ job_id: string; cancelled: boolean }>(`/jobs/${encodeURIComponent(jobId)}/cancel`, {
+  submitPolar(request: PolarRequest, opts?: EngineCallOptions): Promise<JobStatus> {
+    return this.json<JobStatus>("/polars", opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS, {
       method: "POST",
-      body: "{}",
+      body: JSON.stringify(request),
     });
   }
 
-  getQueue(): Promise<EngineQueueState> {
-    return this.json<EngineQueueState>("/queue");
+  getJob(jobId: string, opts?: EngineCallOptions): Promise<JobStatus> {
+    return this.json<JobStatus>(`/jobs/${encodeURIComponent(jobId)}`, opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+  }
+
+  cancelJob(jobId: string, opts?: EngineCallOptions): Promise<{ job_id: string; cancelled: boolean }> {
+    return this.json<{ job_id: string; cancelled: boolean }>(
+      `/jobs/${encodeURIComponent(jobId)}/cancel`,
+      opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+      { method: "POST", body: "{}" },
+    );
+  }
+
+  getQueue(opts?: EngineCallOptions): Promise<EngineQueueState> {
+    return this.json<EngineQueueState>("/queue", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
   }
 
   /** Mesh/seed cache stats scanned from the engine's cache volume. */
-  cacheStats(): Promise<EngineCacheStats> {
-    return this.json<EngineCacheStats>("/cache/stats");
+  cacheStats(opts?: EngineCallOptions): Promise<EngineCacheStats> {
+    return this.json<EngineCacheStats>("/cache/stats", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
   }
 
-  getJobRuntimes(jobIds: string[]): Promise<JobRuntimeResponse> {
-    return this.json<JobRuntimeResponse>("/jobs/runtime", {
+  getJobRuntimes(jobIds: string[], opts?: EngineCallOptions): Promise<JobRuntimeResponse> {
+    return this.json<JobRuntimeResponse>("/jobs/runtime", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS, {
       method: "POST",
       body: JSON.stringify({ job_ids: jobIds }),
     });
   }
 
-  /** Full result (the API returns 409 until the job completes). */
-  getResult(jobId: string): Promise<JobResult> {
-    return this.json<JobResult>(`/jobs/${encodeURIComponent(jobId)}/result`);
+  /** Full result (the API returns 409 until the job completes). The payload
+   *  can be MBs of polar/frame evidence — budgeted like a submit, not a poll. */
+  getResult(jobId: string, opts?: EngineCallOptions): Promise<JobResult> {
+    return this.json<JobResult>(`/jobs/${encodeURIComponent(jobId)}/result`, opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS);
   }
 
-  renderField(jobId: string, request: RenderFieldRequest): Promise<RenderFieldResponse> {
-    return this.json<RenderFieldResponse>(`/jobs/${encodeURIComponent(jobId)}/render-field`, {
-      method: "POST",
-      body: JSON.stringify(request),
-    });
+  renderField(jobId: string, request: RenderFieldRequest, opts?: EngineCallOptions): Promise<RenderFieldResponse> {
+    return this.json<RenderFieldResponse>(
+      `/jobs/${encodeURIComponent(jobId)}/render-field`,
+      opts?.timeoutMs ?? ENGINE_RENDER_TIMEOUT_MS,
+      { method: "POST", body: JSON.stringify(request) },
+    );
   }
 
-  computeFieldExtents(jobId: string, request: FieldExtentsRequest): Promise<FieldExtentsResponse> {
-    return this.json<FieldExtentsResponse>(`/jobs/${encodeURIComponent(jobId)}/field-extents`, {
-      method: "POST",
-      body: JSON.stringify(request),
-    });
+  computeFieldExtents(jobId: string, request: FieldExtentsRequest, opts?: EngineCallOptions): Promise<FieldExtentsResponse> {
+    return this.json<FieldExtentsResponse>(
+      `/jobs/${encodeURIComponent(jobId)}/field-extents`,
+      opts?.timeoutMs ?? ENGINE_RENDER_TIMEOUT_MS,
+      { method: "POST", body: JSON.stringify(request) },
+    );
   }
 
-  renderDefaultMedia(jobId: string, request: RenderDefaultMediaRequest): Promise<RenderDefaultMediaResponse> {
-    return this.json<RenderDefaultMediaResponse>(`/jobs/${encodeURIComponent(jobId)}/render-default-media`, {
-      method: "POST",
-      body: JSON.stringify(request),
-    });
+  renderDefaultMedia(jobId: string, request: RenderDefaultMediaRequest, opts?: EngineCallOptions): Promise<RenderDefaultMediaResponse> {
+    return this.json<RenderDefaultMediaResponse>(
+      `/jobs/${encodeURIComponent(jobId)}/render-default-media`,
+      opts?.timeoutMs ?? ENGINE_RENDER_TIMEOUT_MS,
+      { method: "POST", body: JSON.stringify(request) },
+    );
   }
 
   /** Absolute URL of a result artifact (image/log) on the engine. */

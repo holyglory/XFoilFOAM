@@ -188,6 +188,15 @@ export function pointFiltersToSearch(search: string, filters: PointFilters): str
   return s ? `?${s}` : "";
 }
 
+/** Canonical explorer link target for a campaign's rejected/failed counts
+ *  (hub cards, campaign detail header, backlog strip): the Solver ▸ Points
+ *  tab pre-filtered to that campaign + bucket. Built through
+ *  pointFiltersToSearch so the param names can never drift from the
+ *  explorer's own URL round-trip. */
+export function campaignPointsSearch(campaignId: string, status: "failed" | "rejected"): string {
+  return pointFiltersToSearch("?section=queue&tab=points", { ...DEFAULT_POINT_FILTERS, campaignId, status });
+}
+
 // ---------------------------------------------------------------------------
 // Client mirror of the server's single bucket expression (BUCKET_SQL in
 // packages/db point-history): used to keep the story-panel header chips

@@ -64,6 +64,10 @@ export interface SweeperState {
   submitIntervalMs: number;
   heartbeatAt: string | null;
   engineUnreachableSince: string | null;
+  /** Tick-progress pair (liveness/progress split, migration 0033): stamped by
+   *  the sweeper loop at tick begin/end; null pre-migration. */
+  lastTickStartedAt: string | null;
+  lastTickCompletedAt: string | null;
 }
 export interface AdminJob {
   id: string;
@@ -1027,6 +1031,9 @@ export interface AdminCampaignSummary {
     engineError: string | null;
     engineUnreachableSince: string | null;
     campaignJobsRunning: number;
+    /** Tick-progress pair (liveness/progress split, migration 0033). */
+    lastTickStartedAt: string | null;
+    lastTickCompletedAt: string | null;
   };
   rate: {
     pointsLast24h: number;
@@ -1237,6 +1244,9 @@ export interface AdminCampaignsSolverState {
   engineUnreachableSince: string | null;
   engineHealthy: boolean;
   activeJobCount: number;
+  /** Tick-progress pair (liveness/progress split, migration 0033). */
+  lastTickStartedAt: string | null;
+  lastTickCompletedAt: string | null;
 }
 
 export const listCampaigns = (params?: { statuses?: string[]; limit?: number; offset?: number }) => {

@@ -27,7 +27,8 @@ import {
   recordEngineUnreachable,
 } from "./engine-backoff";
 import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
-import { reconcile, resetOrphans, touchHeartbeat } from "./reconcile";
+import { markTickCompleted, markTickStarted, touchHeartbeat } from "./heartbeat";
+import { reconcile, resetOrphans } from "./reconcile";
 import { remoteSolverTick } from "./remote-solver";
 
 interface SweeperConfig {
@@ -363,10 +364,21 @@ export async function submitOneBatch(db: DB, engine: EngineClient, cpuSlots = 0)
     : submitContinuousBatch(db, engine, continuous as ContinuousBatch, queuePressure, cpuSlots);
 }
 
-export async function tick(db: DB, engine: EngineClient): Promise<void> {
+/** One scheduler tick. `reconcileOptions` exists for the integration tests
+ *  (they scope reconcile to their own job ids, the established harness
+ *  pattern); the production loop always runs unscoped. */
+export async function tick(
+  db: DB,
+  engine: EngineClient,
+  reconcileOptions?: Parameters<typeof reconcile>[2],
+): Promise<void> {
   const state = await getState(db);
-  await touchHeartbeat(db); // beat at tick START — long reconciles must not read as a dead process
-  await reconcile(db, engine); // always reconcile, even when paused
+  // Tick PROGRESS stamp (liveness/progress split, migration 0033): started
+  // here, completed at the end. The web derives the amber tick_stalled state
+  // (heartbeat fresh, tick >5 min without completing) from this pair —
+  // liveness itself is the independent index.ts timer.
+  await markTickStarted(db);
+  await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
   await remoteSolverTick(db, engine);
   if (state.enabled && (await inFlight(db)) < state.maxConcurrentJobs) {
     // Engine-down backoff (§7): check the cached engine probe before composing.
@@ -385,10 +397,7 @@ export async function tick(db: DB, engine: EngineClient): Promise<void> {
       }
     }
   }
-  await db
-    .insert(sweeperState)
-    .values({ id: 1 })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { heartbeatAt: new Date() } });
+  await markTickCompleted(db);
 }
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {

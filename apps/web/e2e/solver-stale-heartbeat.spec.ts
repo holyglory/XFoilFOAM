@@ -82,12 +82,17 @@ test.describe("stale heartbeat renders PROCESS NOT RUNNING, never running", () =
 
     await expect(page.getByTestId("hub-solver-chip")).toHaveText("solver · process not running");
 
-    // Every ACTIVE campaign row must carry the scheduler-dependent suffix —
-    // never a bare "Active — N points remaining" while nothing can run.
-    const activeRows = page.locator('[data-testid^="campaign-status-line-"]', { hasText: /^Active/ });
-    const count = await activeRows.count();
-    for (let i = 0; i < count; i++) {
-      await expect(activeRows.nth(i)).toContainText("solver process is not running");
+    // Every ACTIVE campaign row leads with the BLOCKED gate badge (mockup
+    // fec7b453 screen 3) — the lifecycle chip demotes; NO status line may
+    // still read as a bare "Active — …" headline while nothing can run.
+    const gates = page.locator('[data-testid^="campaign-gate-"]');
+    const gateCount = await gates.count();
+    for (let i = 0; i < gateCount; i++) {
+      await expect(gates.nth(i)).toHaveText("BLOCKED — solver process not running");
     }
+    await expect(page.locator('[data-testid^="campaign-status-line-"]', { hasText: /^Active/ })).toHaveCount(0);
+    // Blocked rows still explain the reason in their status line.
+    const blockedLines = page.locator('[data-testid^="campaign-status-line-"]', { hasText: /process is not running/ });
+    expect(await blockedLines.count()).toBe(gateCount);
   });
 });

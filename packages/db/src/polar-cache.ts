@@ -2,6 +2,7 @@ import {
   buildPolarFit,
   canonicalAoa,
   classifyPolarEvidence,
+  type FrameTrackEvidence,
   mirrorClassifiedEvidence,
   POLAR_CLASSIFIER_VERSION,
   POLAR_FIT_VERSION,
@@ -77,6 +78,7 @@ function toEvidence(row: {
   validForPolar?: boolean | null;
   hasForceHistory?: boolean | null;
   hasVideo?: boolean | null;
+  frameTrack?: unknown;
   simJobId?: string | null;
   updatedAt?: Date | null;
 }): EvidenceWithDbIds {
@@ -103,6 +105,9 @@ function toEvidence(row: {
     validForPolar: row.validForPolar,
     hasForceHistory: row.hasForceHistory ?? false,
     hasVideo: row.hasVideo ?? false,
+    // Raw jsonb passthrough: null/undefined = legacy pre-contract evidence →
+    // the classifier's frame-track gate is not applied (no mass-reject).
+    frameTrack: (row.frameTrack ?? null) as FrameTrackEvidence | null,
     simJobId: row.simJobId ?? null,
     updatedAt: row.updatedAt ?? null,
   };
@@ -135,6 +140,7 @@ async function loadResultEvidence(db: DB, airfoilId: string, simulationPresetRev
       // result as having no force history / video (prod defect, 2026-07-05).
       hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = "results"."id")`,
       hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = "results"."id" and media.kind = 'video' and media.role = 'instantaneous')`,
+      frameTrack: results.frameTrack,
     })
     .from(results)
     .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, simulationPresetRevisionId)));
@@ -170,6 +176,10 @@ async function loadAttemptEvidence(db: DB, airfoilId: string, simulationPresetRe
       // evidence for every attempt.
       hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = "result_attempts"."result_id")`,
       hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = "result_attempts"."result_id" and media.kind = 'video' and media.role = 'instantaneous')`,
+      // Attempts keep the whole engine PolarPoint as evidence_payload; the
+      // frame_track key inside it feeds the same stationarity gate. JSON null
+      // and key-absent both surface as SQL NULL → legacy gate.
+      frameTrack: sql<unknown>`"result_attempts"."evidence_payload" -> 'frame_track'`,
     })
     .from(resultAttempts)
     .where(and(eq(resultAttempts.airfoilId, airfoilId), eq(resultAttempts.simulationPresetRevisionId, simulationPresetRevisionId)));

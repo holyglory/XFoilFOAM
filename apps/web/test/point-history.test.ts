@@ -7,6 +7,7 @@ import {
   assembleTimeline,
   bucketOfPoint,
   buildStoryDigest,
+  campaignPointsSearch,
   DEFAULT_POINT_FILTERS,
   parsePointFilters,
   type PointAttemptDigestEvent,
@@ -65,6 +66,21 @@ describe("point filter query-param round-trip", () => {
     const cleared = pointFiltersToSearch(withStatus, DEFAULT_POINT_FILTERS);
     expect(cleared).not.toContain("pstatus");
     expect(cleared).toContain("section=queue");
+  });
+
+  it("campaignPointsSearch targets Solver ▸ Points filtered to campaign + bucket and parses back", () => {
+    const id = "0f097f76-c1b9-4794-a8e7-8ba9ae27d565";
+    for (const status of ["failed", "rejected"] as const) {
+      const search = campaignPointsSearch(id, status);
+      const params = new URLSearchParams(search.slice(1));
+      expect(params.get("section")).toBe("queue");
+      expect(params.get("tab")).toBe("points");
+      // Param names come from the explorer's own round-trip — pin them so a
+      // rename there cannot silently break the campaign-surface links.
+      expect(parsePointFilters(search)).toEqual({ ...DEFAULT_POINT_FILTERS, campaignId: id, status });
+      expect(params.get("pcampaign")).toBe(id);
+      expect(params.get("pstatus")).toBe(status);
+    }
   });
 
   it("rejects malformed URL values (user-editable input) back to defaults", () => {

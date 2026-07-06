@@ -60,10 +60,13 @@ export function CampaignDetail({
   campaignId,
   onBack,
   onDuplicate,
+  onOpenPoints,
 }: {
   campaignId: string;
   onBack: () => void;
   onDuplicate: (prefill: CampaignDuplicatePrefill) => void;
+  /** Opens Solver ▸ Points pre-filtered to this campaign + bucket. */
+  onOpenPoints: (status: "failed" | "rejected") => void;
 }) {
   const [summary, setSummary] = useState<AdminCampaignSummary | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -373,9 +376,34 @@ export function CampaignDetail({
           ←
         </button>
         <h2 style={{ margin: 0, fontSize: 19, fontWeight: 700, letterSpacing: "-0.01em", color: C.text }}>{campaign.name}</h2>
+        {/* Gate badge is PRIMARY while a scheduler gate blocks work (mockup
+            fec7b453 screen 3): never an "Active" headline next to a
+            contradictory red line — the lifecycle demotes to a small chip. */}
+        {line.gate && (
+          <span
+            data-testid="campaign-gate-badge"
+            style={{
+              fontFamily: MONO,
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: "0.06em",
+              color: line.gate.tone === "red" ? C.redText : C.amber,
+              background: line.gate.tone === "red" ? "rgba(245,101,101,0.08)" : "rgba(245,158,11,0.08)",
+              border: `1px solid ${line.gate.tone === "red" ? "rgba(245,101,101,0.5)" : "rgba(245,158,11,0.45)"}`,
+              borderRadius: 999,
+              padding: "3px 10px",
+            }}
+          >
+            {line.gate.text}
+          </span>
+        )}
         <span
           data-testid="campaign-status-chip"
-          style={{ fontFamily: MONO, fontSize: 10, fontWeight: 600, letterSpacing: "0.06em", color: statusChip.color, border: `1px solid ${statusChip.border}`, borderRadius: 999, padding: "3px 9px" }}
+          style={
+            line.gate
+              ? { fontFamily: MONO, fontSize: 9, fontWeight: 600, letterSpacing: "0.06em", color: C.dim, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 8px" }
+              : { fontFamily: MONO, fontSize: 10, fontWeight: 600, letterSpacing: "0.06em", color: statusChip.color, border: `1px solid ${statusChip.border}`, borderRadius: 999, padding: "3px 9px" }
+          }
         >
           {status.toUpperCase()}
         </span>
@@ -478,11 +506,30 @@ export function CampaignDetail({
           <span style={{ color: C.teal }}>{fCount(totals.solved)} solved</span>
           {totals.derived > 0 && <span title="derived by symmetry — not solver runs">◌ {fCount(totals.derived)} derived</span>}
           {totals.running > 0 && <span style={{ color: C.amber }}>{fCount(totals.running)} running</span>}
-          {totals.failed > 0 && <span style={{ color: C.redText }}>{fCount(totals.failed)} failed</span>}
+          {/* Non-zero failed/rejected counts link to the Points explorer
+              pre-filtered to this campaign + bucket; zero counts never render
+              (no link to an empty view). */}
+          {totals.failed > 0 && (
+            <button
+              type="button"
+              data-testid="campaign-failed-link"
+              title="Open these failed points in the Points explorer"
+              onClick={() => onOpenPoints("failed")}
+              style={{ fontFamily: MONO, fontSize: 10.5, color: C.redText, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+            >
+              {fCount(totals.failed)} failed
+            </button>
+          )}
           {totals.rejected > 0 && (
-            <span title="solver finished but the evidence classified rejected — not counted as solved" style={{ color: C.redText }}>
+            <button
+              type="button"
+              data-testid="campaign-rejected-link"
+              title="Solver finished but the evidence classified rejected — open these points in the Points explorer"
+              onClick={() => onOpenPoints("rejected")}
+              style={{ fontFamily: MONO, fontSize: 10.5, color: C.redText, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+            >
               {fCount(totals.rejected)} rejected
-            </span>
+            </button>
           )}
           {totals.superseded > 0 && <span style={{ color: C.dim }}>{fCount(totals.superseded)} superseded</span>}
           <span>{fCount(totals.remaining)} remaining of {fCount(totals.requested)} points</span>

@@ -148,9 +148,20 @@ afterAll(async () => {
     const legacyIds = campaignPresets.map((p) => p.legacyId).filter((x): x is string => Boolean(x));
     if (legacyIds.length) await db.delete(boundaryConditions).where(inArray(boundaryConditions.id, legacyIds));
   }
-  if (campaignFlowIds.length) await db.delete(flowConditions).where(inArray(flowConditions.id, campaignFlowIds));
+  // Flow conditions and reference geometry profiles are FIND-OR-CREATE
+  // (canonical-key dedupe), so a row this campaign "created" can also be
+  // referenced by presets from OTHER suites/e2e residue on the shared dev DB.
+  // Delete only rows nothing references anymore — an unconditional delete
+  // flaked the whole suite with an FK violation from foreign referents.
+  if (campaignFlowIds.length) {
+    await db.execute(
+      dsql`DELETE FROM flow_conditions fc WHERE fc.id = ANY(ARRAY[${dsql.join(campaignFlowIds.map((id) => dsql`${id}::uuid`), dsql`, `)}]) AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.flow_condition_id = fc.id)`,
+    );
+  }
   if (campaignGeoIds.length) {
-    await db.execute(dsql`DELETE FROM reference_geometry_profiles WHERE id = ANY(ARRAY[${dsql.join(campaignGeoIds.map((id) => dsql`${id}::uuid`), dsql`, `)}])`);
+    await db.execute(
+      dsql`DELETE FROM reference_geometry_profiles rgp WHERE rgp.id = ANY(ARRAY[${dsql.join(campaignGeoIds.map((id) => dsql`${id}::uuid`), dsql`, `)}]) AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.reference_geometry_profile_id = rgp.id)`,
+    );
   }
   await db.delete(sweepDefinitions).where(like(sweepDefinitions.slug, `campaign-${PREFIX.toLowerCase()}%`));
   if (profileIds.boundary) await db.delete(boundaryProfiles).where(eq(boundaryProfiles.id, profileIds.boundary));

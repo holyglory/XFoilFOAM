@@ -27,7 +27,21 @@ from .cache import EngineCache, SeedHit
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
 from .meshing.base import Mesher, MeshResult, get_mesher
-from .models import CaseSpec, EvidenceArtifact, FluidProperties, JobPhase, MeshParams, RoughnessParams, SolverParams
+from .models import (
+    FRAME_IMAGE_ARTIFACT_KIND,
+    CaseSpec,
+    EvidenceArtifact,
+    FluidProperties,
+    FrameChannelStats,
+    FrameSample,
+    FrameTrack,
+    FrameTrackStats,
+    FrameTrackWindow,
+    JobPhase,
+    MeshParams,
+    RoughnessParams,
+    SolverParams,
+)
 from .openfoam.runner import OpenFOAMError, RunResult, Runner
 from .postprocess.forces import (
     AveragedCoefficients,
@@ -36,13 +50,28 @@ from .postprocess.forces import (
     parse_y_plus,
     time_averaged_coefficients,
 )
-from .postprocess.images import find_all_vtus, render_animation, render_contours, render_mean_contours, select_vtus
+from .postprocess.images import (
+    find_all_vtus,
+    render_animation,
+    render_contours,
+    render_frame_track_images,
+    render_mean_contours,
+    select_vtus,
+)
 from .postprocess.residuals import parse_convergence
 from .postprocess.unsteady import (
+    ChannelWindowStats,
     ForceHistory,
+    PeriodWindowStats,
     StablePeriodResult,
+    coefficient_series,
+    discard_startup,
     force_history as compute_force_history,
+    frame_coefficients,
+    frame_target_times,
     is_no_shedding,
+    measure_period,
+    period_window_stats,
     stable_two_period_window,
 )
 
@@ -85,6 +114,7 @@ class CaseOutcome:
     mean_images: dict[str, str] = field(default_factory=dict)  # field -> mean png path
     evidence_artifacts: list[EvidenceArtifact] = field(default_factory=list)
     force_history: Optional[ForceHistory] = None
+    frame_track: Optional[FrameTrack] = None
     quality_warnings: list[str] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -118,6 +148,21 @@ def _coeff_files(case_dir: Path) -> list:
     return sorted(
         case_dir.glob("postProcessing/forceCoeffs1/*/coefficient.dat"), key=_time_of
     )
+
+
+def _transient_coeff_selection(case_dir: Path, since: Optional[float]) -> list:
+    """The coefficient.dat segments belonging to the transient itself.
+
+    A restart writes each continuation segment into its own
+    ``forceCoeffs1/<startTime>`` directory; the steady-initialisation history
+    (pseudo-time iteration counts, written before ``since``) must never be
+    merged into the transient force signal."""
+    files = _coeff_files(case_dir)
+    if not files:
+        return []
+    if since is None:
+        return [files[-1]]
+    return [f for f in files if _time_of(f) >= since - 1e-9] or [files[-1]]
 
 
 def _coeff_last_time(coeff_path: Path) -> Optional[float]:
@@ -199,11 +244,24 @@ TRANSIENT_INIT_ITERS = 600  # short steady init before the transient
 TRANSIENT_INITIAL_STROUHAL = 0.5
 URANS_REFINED_CADENCE_STROUHAL = 0.75
 URANS_MIN_RETAINED_CYCLES = 7.0
-URANS_STABLE_RETAINED_CYCLES = 2.0
+#: Early-stop retention target. The two-period comparator only DETECTS a
+#: repeatable limit cycle; once detected the run keeps integrating until this
+#: many periods of certified-stable data exist (measured from the start of the
+#: first stable window), so early-stopped points retain at least the node
+#: acceptance gate (packages/core/src/polar-fit.ts FRAME_TRACK_MIN_PERIODS = 5,
+#: pinned cross-runtime). Stopping at 2 stable periods shipped startup-biased
+#: means and points the classifier then deterministically rejected.
+URANS_STABLE_RETAINED_CYCLES = 5.0
+#: Extra periods integrated past the retention target before the early stop
+#: fires, so the downstream re-measured period (autocorrelation on the retained
+#: tail) can never floor the whole-period count below the retention target.
+URANS_STABLE_STOP_MARGIN_CYCLES = 0.5
 URANS_MIN_FRAMES_PER_CYCLE = 20.0
 URANS_ANIMATION_FRAMES = 141
 URANS_MAX_ANIMATION_FRAMES = 220
 URANS_EARLY_STOP_MARKER = "urans_early_stop.json"
+#: Frame-export window pinned by the contract: last min(3, K) whole periods.
+URANS_FRAME_SPAN_PERIODS = 3
 #: Fraction of the per-attempt solver timeout the projected refined URANS pass
 #: may consume; beyond this the refinement is skipped (it would deterministically
 #: time out and burn hours of CPU) and the base window is graded honestly.
@@ -249,6 +307,9 @@ class TransientResult:
     #: Measured wall-clock seconds spent inside the transient solver run; used
     #: to project whether a refined pass can fit the solver timeout budget.
     wall_seconds: float = 0.0
+    #: coefficient.dat segments of THIS transient (steady-init history
+    #: excluded), merged for grading and for the frame_track stats.
+    coeff_paths: list[Path] = field(default_factory=list)
 
 
 def _numeric_time_dirs(case_dir: Path) -> list[float]:
@@ -303,10 +364,49 @@ def _read_early_stop_marker(case_dir: Path) -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
-def _write_early_stop_marker(case_dir: Path, result: StablePeriodResult) -> None:
+def _early_stop_retained_series(tcase: Path, t, cl, cd, cm):
+    """Certified-stable tail of an early-stopped run's coefficient series.
+
+    Early-stopped runs must NOT use a fraction-based startup discard (their
+    span is short, a fraction either over- or under-cuts) and must NOT use the
+    raw full span (the startup transient biases the time-weighted means and
+    trips the stationarity drift check). The early-stop marker records
+    ``retain_from`` — the start of the certified-stable region — so the stats
+    window is exactly the data the two-period comparator certified. Falls back
+    to the last retention-target periods via the marker period, then to the
+    full series (graded honestly downstream) when no marker data exists.
+    """
+    marker = _read_early_stop_marker(tcase) or {}
+    retain_from = marker.get("retain_from")
+    if not isinstance(retain_from, (int, float)) or not math.isfinite(float(retain_from)):
+        retain_from = None
+        period = marker.get("period_s")
+        if (
+            isinstance(period, (int, float))
+            and math.isfinite(float(period))
+            and float(period) > 0
+            and len(t)
+        ):
+            retain_from = float(t[-1]) - (
+                URANS_STABLE_RETAINED_CYCLES + URANS_STABLE_STOP_MARGIN_CYCLES
+            ) * float(period)
+    if retain_from is None:
+        return t, cl, cd, cm
+    mask = t >= float(retain_from)
+    if int(mask.sum()) < 4:
+        return t, cl, cd, cm
+    return t[mask], cl[mask], cd[mask], cm[mask]
+
+
+def _write_early_stop_marker(
+    case_dir: Path, result: StablePeriodResult, retain_from: float | None = None
+) -> None:
     (case_dir / URANS_EARLY_STOP_MARKER).write_text(
         json.dumps(
             {
+                # Start of the certified-stable region: downstream frame-track
+                # stats retain ONLY t >= retain_from (startup excluded).
+                "retain_from": retain_from,
                 "reason": result.reason,
                 "period_s": result.period_s,
                 "window_start": result.window_start,
@@ -324,15 +424,17 @@ def _write_early_stop_marker(case_dir: Path, result: StablePeriodResult) -> None
     )
 
 
-def _make_urans_monitor(tcase: Path, spec: CaseSpec) -> Callable[[], None]:
+def _make_urans_monitor(
+    tcase: Path, spec: CaseSpec, coeff_start_time: Optional[float] = None
+) -> Callable[[], None]:
     state: dict[str, object] = {"cadence_period": None, "target_period": None, "stop_requested": False}
 
     def monitor() -> None:
-        coeff_files = _coeff_files(tcase)
+        coeff_files = _transient_coeff_selection(tcase, coeff_start_time)
         if not coeff_files:
             return
         result = stable_two_period_window(
-            coeff_files[-1],
+            coeff_files,
             speed=spec.speed,
             chord=spec.chord,
             frame_times=_numeric_time_dirs(tcase),
@@ -353,25 +455,43 @@ def _make_urans_monitor(tcase: Path, spec: CaseSpec) -> Callable[[], None]:
                     },
                 )
                 state["cadence_period"] = period
-        if result.stable and period is not None and period > 0 and not result.ok:
-            target_period = state.get("target_period")
-            if target_period is None or abs(float(target_period) - period) / max(period, 1e-12) > 0.15:
+        if result.stable and period is not None and period > 0:
+            # Certification clock: retention is measured from the START of the
+            # first stable two-period window, and the stop only fires once
+            # URANS_STABLE_RETAINED_CYCLES (+ margin) periods of certified-
+            # stable data exist — never at bare detection, which retained ~2
+            # startup-adjacent periods and was rejected by the node gate.
+            stable_since = state.get("stable_since")
+            if stable_since is None and result.window_start is not None:
+                stable_since = float(result.window_start)
+                state["stable_since"] = stable_since
+            if stable_since is not None:
+                required_end = float(stable_since) + (
+                    URANS_STABLE_RETAINED_CYCLES + URANS_STABLE_STOP_MARGIN_CYCLES
+                ) * period
                 latest = _latest_time(tcase)
-                _set_control_dict_entries(
-                    tcase / "system" / "controlDict",
-                    {
-                        "endTime": latest + URANS_STABLE_RETAINED_CYCLES * period,
-                        "runTimeModifiable": True,
-                    },
-                )
-                state["target_period"] = period
-        if result.ok and not state.get("stop_requested"):
-            _write_early_stop_marker(tcase, result)
-            _set_control_dict_entries(
-                tcase / "system" / "controlDict",
-                {"stopAt": "writeNow", "runTimeModifiable": True},
-            )
-            state["stop_requested"] = True
+                if result.ok and latest + 1e-9 >= required_end and not state.get("stop_requested"):
+                    _write_early_stop_marker(tcase, result, retain_from=float(stable_since))
+                    _set_control_dict_entries(
+                        tcase / "system" / "controlDict",
+                        {"stopAt": "writeNow", "runTimeModifiable": True},
+                    )
+                    state["stop_requested"] = True
+                else:
+                    target_period = state.get("target_period")
+                    if target_period is None or abs(float(target_period) - period) / max(period, 1e-12) > 0.15:
+                        _set_control_dict_entries(
+                            tcase / "system" / "controlDict",
+                            {
+                                "endTime": max(required_end, latest + period),
+                                "runTimeModifiable": True,
+                            },
+                        )
+                        state["target_period"] = period
+        else:
+            # Stability lost (or never established): restart the certification
+            # clock so a transient wobble cannot count toward retention.
+            state["stable_since"] = None
 
     return monitor
 
@@ -621,6 +741,7 @@ def _run_transient_attempt(
     write_interval: float | None = None,
     max_delta_t: float | None = None,
     refined: bool = False,
+    coeff_start_time: float | None = None,
     cancel_check: CancelCheck = None,
 ) -> Optional[TransientResult]:
     _check_cancel(cancel_check)
@@ -641,7 +762,7 @@ def _run_transient_attempt(
         n_proc,
         timeout=timeout,
         restart=True,
-        monitor=_make_urans_monitor(tcase, spec),
+        monitor=_make_urans_monitor(tcase, spec, coeff_start_time),
     )
     wall_seconds = max(0.0, time.monotonic() - solve_started)
     _check_cancel(cancel_check)
@@ -675,13 +796,16 @@ def _run_transient_attempt(
             # left nothing gradable — never "produced no coefficient.dat".
             raise _timeout_error()
         return None
+    coeff_paths = _transient_coeff_selection(tcase, coeff_start_time)
     early_stop = _read_early_stop_marker(tcase)
     history: Optional[ForceHistory] = None
     history_discard = 0.0 if early_stop else solver_params.transient_discard_fraction
-    target_cycles = int(URANS_STABLE_RETAINED_CYCLES) if early_stop else int(URANS_MIN_RETAINED_CYCLES)
+    target_cycles = (
+        int(URANS_STABLE_RETAINED_CYCLES) if early_stop else int(solver_params.urans_min_periods)
+    )
     try:
         history = compute_force_history(
-            files[-1],
+            coeff_paths,
             spec.speed,
             spec.chord,
             history_discard,
@@ -701,7 +825,7 @@ def _run_transient_attempt(
                 samples=history.samples,
             )
         else:
-            avg = time_averaged_coefficients(files[-1], solver_params.transient_discard_fraction)
+            avg = time_averaged_coefficients(coeff_paths[-1], solver_params.transient_discard_fraction)
     except Exception:  # noqa: BLE001 - no usable force rows
         if timed_out:
             raise _timeout_error() from None
@@ -711,7 +835,7 @@ def _run_transient_attempt(
         history,
         spec.speed,
         spec.chord,
-        min_cycles=URANS_STABLE_RETAINED_CYCLES if early_stop else URANS_MIN_RETAINED_CYCLES,
+        min_cycles=URANS_STABLE_RETAINED_CYCLES if early_stop else float(solver_params.urans_min_periods),
     )
     if early_stop and quality.ok:
         quality = UransQuality(
@@ -759,7 +883,158 @@ def _run_transient_attempt(
         refined=refined,
         early_stopped=bool(early_stop),
         wall_seconds=wall_seconds,
+        coeff_paths=list(coeff_paths),
     )
+
+
+#: Safety cap on URANS continuation chunks: the period estimate normally
+#: converges within a couple of extensions; a drifting estimate must not loop
+#: the solver forever.
+URANS_CONTINUATION_MAX_CHUNKS = 6
+
+
+def _quality_with(quality: UransQuality, **updates) -> UransQuality:
+    """Copy a UransQuality with the given fields replaced (measurements kept)."""
+    base = dict(
+        ok=quality.ok,
+        can_refine=quality.can_refine,
+        reason=quality.reason,
+        measured_period_s=quality.measured_period_s,
+        retained_cycles=quality.retained_cycles,
+        retained_frame_count=quality.retained_frame_count,
+        frames_per_cycle=quality.frames_per_cycle,
+        retained_start_time=quality.retained_start_time,
+        retained_end_time=quality.retained_end_time,
+        no_shedding=quality.no_shedding,
+    )
+    base.update(updates)
+    return UransQuality(**base)
+
+
+def _extend_transient_until_periods(
+    tcase: Path,
+    first: TransientResult,
+    transient_start: float,
+    airfoil,
+    tmesh,
+    patches,
+    spec,
+    fluid,
+    roughness,
+    solver_params,
+    runner,
+    n_proc,
+    timeout,
+    initial_delta_t: float,
+    cancel_check: CancelCheck = None,
+) -> TransientResult:
+    """Integrate until ``urans_min_periods`` WHOLE shedding periods are retained
+    after startup discard, extending the SAME transient case in continuation
+    chunks (the existing restart mechanics: ``write_transient`` from latestTime
+    + solver restart — no second continuation path). The period is tracked on
+    the fly from the Cl signal by autocorrelation (``measure_period``).
+
+    Stops early — grading honestly — when the wall-clock budget guard projects
+    (from the measured solve rate) that the next chunk cannot fit the solver
+    timeout budget: quality then carries "retained M.x of N periods (budget)".
+    The no-shedding early exit and the two-stable-period early stop are
+    respected untouched (they break the loop immediately).
+    """
+    target = float(solver_params.urans_min_periods)
+    discard = min(max(solver_params.transient_discard_fraction, 0.0), 0.95)
+    result = first
+    total_wall = max(0.0, first.wall_seconds)
+    end_time = first.end_time
+    chunks = 0
+    while chunks < URANS_CONTINUATION_MAX_CHUNKS:
+        history = result.force_history
+        if (
+            result.early_stopped
+            or result.quality.no_shedding
+            or not result.quality.can_refine
+            or history is None
+            or len(history.t) < 8
+        ):
+            break
+        period = measure_period(history.t, history.cl)
+        if period is None:
+            period = history.period_s or result.quality.measured_period_s
+        if period is None or not math.isfinite(period) or period <= 0:
+            break
+        span = max(0.0, _latest_time(tcase) - transient_start)
+        if span <= 0.0:
+            break
+        retained = span * (1.0 - discard) / period
+        if retained + 1e-6 >= target:
+            break
+        chunk_sim = (target - retained) * period / max(1e-6, 1.0 - discard)
+        if timeout and total_wall > 0.0:
+            rate = span / total_wall  # simulated seconds per wall second
+            projected_wall_s = chunk_sim / rate if rate > 0.0 else math.inf
+            if total_wall + projected_wall_s > URANS_REFINE_BUDGET_FRACTION * timeout:
+                reason = (
+                    f"URANS integration stopped by the wall-clock budget guard: "
+                    f"retained {retained:.1f} of {target:g} periods (budget); "
+                    f"projected {projected_wall_s / 3600.0:.1f}h continuation exceeds "
+                    f"{URANS_REFINE_BUDGET_FRACTION:.0%} of the {timeout / 3600.0:.1f}h "
+                    f"solver timeout; {result.quality.reason}"
+                )
+                logger.warning(reason)
+                result.quality = _quality_with(
+                    result.quality,
+                    ok=False,
+                    can_refine=False,
+                    reason=reason,
+                    measured_period_s=result.quality.measured_period_s or period,
+                )
+                break
+        write_interval = period / URANS_MIN_FRAMES_PER_CYCLE
+        try:
+            nxt = _run_transient_attempt(
+                tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params,
+                runner, n_proc, timeout,
+                run_time=chunk_sim,
+                delta_t=min(initial_delta_t, period / 5000.0),
+                write_interval=write_interval,
+                max_delta_t=write_interval,
+                coeff_start_time=transient_start,
+                cancel_check=cancel_check,
+            )
+        except OpenFOAMError as exc:
+            # A chunk that timed out without gradable data must not discard the
+            # already-graded window; the point keeps its honest partial grade.
+            result.quality = _quality_with(
+                result.quality,
+                ok=False,
+                can_refine=False,
+                reason=(
+                    f"URANS continuation chunk failed after retaining {retained:.1f} of "
+                    f"{target:g} periods: {exc}; {result.quality.reason}"
+                ),
+            )
+            break
+        if nxt is None:
+            result.quality = _quality_with(
+                result.quality,
+                ok=False,
+                can_refine=False,
+                reason=(
+                    f"URANS continuation chunk crashed after retaining {retained:.1f} of "
+                    f"{target:g} periods; {result.quality.reason}"
+                ),
+            )
+            break
+        chunks += 1
+        total_wall += max(0.0, nxt.wall_seconds)
+        end_time = nxt.end_time
+        result = nxt
+    if chunks > 0:
+        # The returned result grades the WHOLE merged transient window.
+        result.start_time = transient_start
+        result.end_time = end_time
+        result.run_time = max(0.0, end_time - transient_start)
+        result.wall_seconds = total_wall
+    return result
 
 
 def _run_transient(
@@ -767,7 +1042,8 @@ def _run_transient(
     subdir="transient", shared_mesh_dir: Optional[Path] = None,
     steady_field_dir: Optional[Path] = None, cancel_check: CancelCheck = None,
 ):
-    """Run URANS once, then automatically refine sparse/short transient media once."""
+    """Run URANS, extend it until enough whole periods are retained, then
+    automatically refine sparse/short transient media once."""
     tcase = case_dir / subdir
     try:
         tmesh, patches = _prepare_transient_case(
@@ -782,13 +1058,19 @@ def _run_transient(
     initial_period = physics.shedding_period(spec.speed, spec.chord, strouhal=TRANSIENT_INITIAL_STROUHAL)
     initial_run_time = solver_params.transient_cycles * initial_period
     initial_delta_t = initial_period / 5000.0
+    transient_start = _latest_time(tcase)
     first = _run_transient_attempt(
         tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
         run_time=initial_run_time, delta_t=initial_delta_t,
+        coeff_start_time=transient_start,
         cancel_check=cancel_check,
     )
     if first is None:
         return None
+    first = _extend_transient_until_periods(
+        tcase, first, transient_start, airfoil, tmesh, patches, spec, fluid, roughness,
+        solver_params, runner, n_proc, timeout, initial_delta_t, cancel_check=cancel_check,
+    )
     if (
         first.quality.ok
         or not solver_params.transient_auto_refine
@@ -817,6 +1099,7 @@ def _run_transient(
         cadence_period_s=physics.shedding_period(
             spec.speed, spec.chord, strouhal=URANS_REFINED_CADENCE_STROUHAL
         ),
+        min_cycles=float(solver_params.urans_min_periods),
     )
     # Feasibility guard: weak-shedding points can need a refined window whose
     # Courant-limited timestep makes the pass deterministically exceed the
@@ -877,6 +1160,7 @@ def _run_transient(
             write_interval=refined_timing.write_interval,
             max_delta_t=refined_timing.max_delta_t,
             refined=True,
+            coeff_start_time=first.start_time,
             cancel_check=cancel_check,
         )
     except OpenFOAMError:
@@ -962,6 +1246,8 @@ def _evidence_mime(path: Path) -> str:
         return "application/vnd.vtk"
     if suffix in {".dat", ".log", ".txt"}:
         return "text/plain"
+    if suffix == ".png":
+        return "image/png"
     return "application/octet-stream"
 
 
@@ -973,6 +1259,7 @@ def _artifact_kind_for_role(role: str) -> str:
         "force_coefficients",
         "mesh",
         "dictionary",
+        FRAME_IMAGE_ARTIFACT_KIND,
     } else "field_data"
 
 
@@ -1056,6 +1343,11 @@ def _archive_case_evidence(
     for time_dir in _numeric_dirs_in_window(post_dir, start_time, end_time):
         _copy_tree_files(time_dir, time_dir_root / time_dir.name, entries, "time_directory", manifest_base=evidence_dir)
 
+    # frame_track PNG sequence (contract: frames/{field}/f{i04}.png under the
+    # case dir) ships inside the evidence bundle with the pinned artifact kind.
+    frames_src = (case_dir / image_subdir / "frames") if image_subdir else (case_dir / "frames")
+    _copy_tree_files(frames_src, evidence_dir / "frames", entries, FRAME_IMAGE_ARTIFACT_KIND, manifest_base=evidence_dir)
+
     expected_roles = ["instantaneous", "mean", "video"] if outcome.unsteady else ["instantaneous"]
     unavailable: dict[str, list[str]] = {}
     if requested_fields:
@@ -1087,6 +1379,12 @@ def _archive_case_evidence(
             "video": outcome.video,
             "unavailable": unavailable,
         },
+        # frames/ ships as individual frame_image artifacts (below) but is
+        # EXCLUDED from the tar bundle: PNGs are incompressible, and bundling
+        # them tripled the ~36-72MB per-point frame volume on the engine
+        # volume. Consumers of the bundle get everything else; frame PNGs are
+        # fetched through their own registered artifacts.
+        "bundleExcludes": ["frames"],
         "files": entries,
     }
     manifest_path = evidence_dir / "evidence_manifest.json"
@@ -1095,7 +1393,7 @@ def _archive_case_evidence(
     bundle_path = evidence_dir / "openfoam_evidence.tar.gz"
     with tarfile.open(bundle_path, "w:gz") as tar:
         for child in sorted(evidence_dir.iterdir()):
-            if child.name == bundle_path.name:
+            if child.name == bundle_path.name or child.name == "frames":
                 continue
             tar.add(child, arcname=child.name, recursive=True)
 
@@ -1125,20 +1423,34 @@ def _archive_case_evidence(
         if not path.is_file():
             continue
         role = str(entry["role"])
+        kind = _artifact_kind_for_role(role)
+        metadata: dict[str, object] = {
+            "evidenceBase": str(evidence_rel),
+            "manifestPath": str(manifest_path.relative_to(case_dir)),
+            "windowStart": start_time,
+            "windowEnd": end_time,
+        }
+        field_name: str | None = None
+        if kind == FRAME_IMAGE_ARTIFACT_KIND:
+            # The frame writer (render_frame_track_images) owns the
+            # frames/{field}/f{i04}.png naming; stamp field + frameIndex
+            # explicitly on the artifact so downstream URL resolution never
+            # has to re-parse filenames (the filename coupling stays engine-
+            # internal, pinned by tests on both runtimes).
+            frame_match = re.match(r"^frames/([^/]+)/f(\d+)\.\w+$", str(entry["path"]))
+            if frame_match:
+                field_name = frame_match.group(1)
+                metadata["frameIndex"] = int(frame_match.group(2))
         artifacts.append(
             EvidenceArtifact(
-                kind=_artifact_kind_for_role(role),
+                kind=kind,
                 path=str(path.relative_to(case_dir)),
                 mime_type=_evidence_mime(path),
                 sha256=str(entry["sha256"]),
                 byte_size=int(entry["byteSize"]),
                 role=role,
-                metadata={
-                    "evidenceBase": str(evidence_rel),
-                    "manifestPath": str(manifest_path.relative_to(case_dir)),
-                    "windowStart": start_time,
-                    "windowEnd": end_time,
-                },
+                field=field_name,
+                metadata=metadata,
             )
         )
     outcome.evidence_artifacts = artifacts
@@ -1169,6 +1481,8 @@ def _finalize_outcome(
 
     # transient (URANS) fallback for unsteady (e.g. post-stall) conditions
     post_dir = case_dir
+    frame_stats: Optional[PeriodWindowStats] = None
+    frame_series: Optional[tuple] = None  # merged (t, cl, cd, cm) coefficient arrays
     if solver_params.force_transient or (not outcome.converged and solver_params.transient_fallback):
         transient = _run_transient(
             case_dir, airfoil, resolved, spec, fluid, roughness, solver_params,
@@ -1193,6 +1507,55 @@ def _finalize_outcome(
                 outcome.strouhal = transient.force_history.strouhal
             if not transient.quality.ok:
                 outcome.quality_warnings.append(transient.quality.reason)
+            # Frame-track recording contract: integer-period time-weighted stats
+            # become the SINGLE SOURCE OF TRUTH for the point coefficients and
+            # the measured Strouhal number. No-shedding points stay on the plain
+            # time-average path (frame_track stays None).
+            if not transient.quality.no_shedding and transient.coeff_paths:
+                try:
+                    t_all, cl_all, cd_all, cm_all = coefficient_series(transient.coeff_paths)
+                    if transient.early_stopped:
+                        # Certified-stable tail only (marker retain_from):
+                        # a zero discard windowed the startup transient into
+                        # the means (+~9% Cl bias) and tripped the drift check.
+                        t_c, cl_c, cd_c, cm_c = _early_stop_retained_series(
+                            transient.case_dir, t_all, cl_all, cd_all, cm_all
+                        )
+                    else:
+                        t_c, cl_c, cd_c, cm_c = discard_startup(
+                            t_all, cl_all, cd_all, cm_all,
+                            fraction=solver_params.transient_discard_fraction,
+                        )
+                    frame_period = measure_period(t_c, cl_c)
+                    if frame_period is None and transient.force_history is not None:
+                        frame_period = transient.force_history.period_s
+                    if frame_period is not None and frame_period > 0:
+                        frame_stats = period_window_stats(
+                            t_c, cl_c, cd_c, cm_c, frame_period,
+                            drift_tolerance=solver_params.urans_drift_tolerance,
+                        )
+                        frame_series = (t_all, cl_all, cd_all, cm_all)
+                except Exception as exc:  # noqa: BLE001 - stats loss is loud degradation
+                    logger.warning("frame-track stats failed for %s: %s", case_dir, exc, exc_info=True)
+                    outcome.quality_warnings.append(f"frame-track stats failed: {exc}")
+            if frame_stats is not None:
+                outcome.cl = frame_stats.cl.mean
+                outcome.cd = frame_stats.cd.mean
+                outcome.cm = frame_stats.cm.mean
+                outcome.cl_cd = (
+                    frame_stats.cl.mean / frame_stats.cd.mean if frame_stats.cd.mean else None
+                )
+                outcome.cl_std, outcome.cd_std, outcome.cm_std = (
+                    frame_stats.cl.std, frame_stats.cd.std, frame_stats.cm.std,
+                )
+                if spec.speed > 0 and frame_stats.period_s > 0:
+                    outcome.strouhal = spec.chord / (frame_stats.period_s * spec.speed)
+                if not frame_stats.stationary:
+                    outcome.quality_warnings.append(
+                        f"URANS window not stationary: Cl drift {frame_stats.drift_frac:.3f} "
+                        f"exceeds tolerance {solver_params.urans_drift_tolerance:g} over "
+                        f"{frame_stats.whole_periods} whole periods"
+                    )
         elif solver_params.force_transient or not coeff_files:
             # A URANS-only case must never silently fall back to the steady
             # coefficients; a fallback case with steady coefficients keeps them.
@@ -1223,6 +1586,8 @@ def _finalize_outcome(
     # contour images
     media_start_time = None
     media_end_time = None
+    frame_times: list[float] = []
+    frame_fields_rendered: list[str] = []
     requested_fields = [field.value if hasattr(field, "value") else str(field) for field in solver_params.write_images]
     if render_images and solver_params.write_images:
         img_out = (case_dir / image_subdir / "images") if image_subdir else (case_dir / "images")
@@ -1237,6 +1602,20 @@ def _finalize_outcome(
                     media_start_time = outcome.force_history.t[0]
                 if media_end_time is None and outcome.force_history.t:
                     media_end_time = outcome.force_history.t[-1]
+            anim_start_time = media_start_time
+            anim_end_time = media_end_time
+            if frame_stats is not None:
+                # The integer-period stats window is the media window, and the
+                # video is rendered FROM the frame-export window (last
+                # min(3, K) periods) so video and frames agree.
+                media_start_time = frame_stats.window_start
+                media_end_time = frame_stats.window_end
+                frame_span = (
+                    min(URANS_FRAME_SPAN_PERIODS, frame_stats.whole_periods)
+                    * frame_stats.period_s
+                )
+                anim_start_time = frame_stats.window_end - frame_span
+                anim_end_time = frame_stats.window_end
             # Convert the transient fields; mean/animation use the retained measured
             # shedding window so dense refined runs become readable media.
             runner.application(post_dir, "foamToVTK").check()
@@ -1271,8 +1650,8 @@ def _finalize_outcome(
                         post_dir, img_out, airfoil.contour, spec.chord, fld,
                         freestream_speed=spec.speed, zoom_chords=solver_params.image_zoom_chords,
                         max_frames=min(URANS_ANIMATION_FRAMES, URANS_MAX_ANIMATION_FRAMES),
-                        start_time=media_start_time,
-                        end_time=media_end_time,
+                        start_time=anim_start_time,
+                        end_time=anim_end_time,
                         title_suffix=suffix,
                     )
                 except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
@@ -1285,6 +1664,37 @@ def _finalize_outcome(
                 if name:
                     vids[fld.value] = f"{prefix}images/{name}"
             outcome.video = vids
+            # Frame-track PNG export: ~24 frames/period over the last
+            # min(3, K) periods (cap 120), rendered from the VTU frames nearest
+            # each target time at the contract's 640px width.
+            if frame_stats is not None and solver_params.frame_fields:
+                frames_out = (
+                    (case_dir / image_subdir / "frames") if image_subdir else (case_dir / "frames")
+                )
+                try:
+                    targets = frame_target_times(
+                        frame_stats.window_end, frame_stats.period_s, frame_stats.whole_periods,
+                        span_periods=URANS_FRAME_SPAN_PERIODS,
+                    )
+                    frame_times, frame_fields_rendered = render_frame_track_images(
+                        post_dir, frames_out, airfoil.contour, spec.chord,
+                        solver_params.frame_fields, targets,
+                        freestream_speed=spec.speed,
+                        zoom_chords=solver_params.image_zoom_chords,
+                    )
+                except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
+                    logger.warning(
+                        "URANS frame-track image export failed for %s: %s", case_dir, exc, exc_info=True
+                    )
+                    outcome.quality_warnings.append(f"frame image export failed: {exc}")
+                    frame_times, frame_fields_rendered = [], []
+                missing_frame_fields = sorted(
+                    {f.value for f in solver_params.frame_fields} - set(frame_fields_rendered)
+                )
+                if missing_frame_fields:
+                    outcome.quality_warnings.append(
+                        "frame images unavailable for fields: " + ", ".join(missing_frame_fields)
+                    )
         else:
             runner.application(post_dir, "foamToVTK -latestTime").check()
             _check_cancel(cancel_check)
@@ -1294,6 +1704,39 @@ def _finalize_outcome(
                 freestream_speed=spec.speed,
             )
             outcome.images = {k: f"{prefix}images/{v}" for k, v in imgs.items()}
+
+    # Ship the pinned frame_track contract on every shedding URANS point (the
+    # stats are real even when media rendering is disabled/unavailable —
+    # missing frames are shipped as an empty list, never invented). Steady and
+    # no-shedding points ship frame_track=None.
+    if outcome.unsteady and frame_stats is not None:
+        samples: list[FrameSample] = []
+        if frame_times and frame_series is not None:
+            samples = [
+                FrameSample(i=i, t=t, cl=cl, cd=cd, cm=cm)
+                for i, t, cl, cd, cm in frame_coefficients(frame_times, *frame_series)
+            ]
+
+        def channel(stats: ChannelWindowStats) -> FrameChannelStats:
+            return FrameChannelStats(mean=stats.mean, std=stats.std, min=stats.min, max=stats.max)
+
+        outcome.frame_track = FrameTrack(
+            period_s=frame_stats.period_s,
+            periods_retained=frame_stats.periods_retained,
+            stationary=frame_stats.stationary,
+            drift_frac=frame_stats.drift_frac,
+            window=FrameTrackWindow(t_start=frame_stats.window_start, t_end=frame_stats.window_end),
+            stats=FrameTrackStats(
+                cl=channel(frame_stats.cl), cd=channel(frame_stats.cd), cm=channel(frame_stats.cm)
+            ),
+            fields=frame_fields_rendered,
+            frames=samples,
+            image_pattern=(
+                f"{image_subdir}/frames/{{field}}/f{{i04}}.png"
+                if image_subdir
+                else "frames/{field}/f{i04}.png"
+            ),
+        )
 
     _archive_case_evidence(
         case_dir,

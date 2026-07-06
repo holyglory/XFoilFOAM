@@ -1,6 +1,8 @@
 // Request/response shapes for the Python CFD solver API, ported from
 // src/airfoilfoam/models.py. JSON uses snake_case — keep these field names exact.
 
+import type { FrameTrack } from "./frame-track";
+
 export type AirfoilFormat = "auto" | "selig" | "lednicer";
 
 export interface AirfoilInput {
@@ -292,6 +294,10 @@ export interface PolarPoint {
   video?: Record<string, string>;
   mean_images?: Record<string, string>;
   force_history?: EngineForceHistory | null;
+  /** URANS recording contract (task #23/#24): period-locked frame track with
+   *  time-weighted stats. `null` on steady/no-shedding points; absent on
+   *  legacy engine versions that predate the contract. */
+  frame_track?: FrameTrack | null;
   quality_warnings?: string[];
   evidence_artifacts?: EngineEvidenceArtifact[];
   error?: string | null;

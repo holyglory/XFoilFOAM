@@ -479,9 +479,15 @@ def test_transient_attempt_accepts_force_coefficients_under_zero_folder(tmp_path
     assert result.avg.cd == pytest.approx(0.02)
 
 
-def test_transient_attempt_early_stop_uses_two_period_window(tmp_path, monkeypatch):
+def test_transient_attempt_early_stop_retains_gate_minimum_periods(tmp_path, monkeypatch):
+    """Early stop fires only after URANS_STABLE_RETAINED_CYCLES (+margin)
+    periods of certified-stable data exist past the FIRST stable window start,
+    so early-stopped points retain >= the node acceptance gate (5 periods) —
+    never the old 2-period stop the classifier deterministically rejected."""
     from airfoilfoam import pipeline
     from airfoilfoam.models import FluidProperties, RoughnessParams, SolverParams
+
+    period = 0.2  # f = 5 Hz
 
     class FakeCaseBuilder:
         def __init__(self, *_args, **_kwargs):
@@ -491,16 +497,30 @@ def test_transient_attempt_early_stop_uses_two_period_window(tmp_path, monkeypat
             system = case_dir / "system"
             system.mkdir(parents=True, exist_ok=True)
             (system / "controlDict").write_text(
-                "stopAt endTime;\nendTime 1;\nwriteInterval 0.1;\nmaxDeltaT 0.1;\nrunTimeModifiable true;\n"
+                "stopAt endTime;\nendTime 3;\nwriteInterval 0.1;\nmaxDeltaT 0.1;\nrunTimeModifiable true;\n"
             )
 
     class FakeRunner:
         def solver(self, case_dir, *_args, monitor=None, **_kwargs):
             coeff = case_dir / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
             coeff.parent.mkdir(parents=True, exist_ok=True)
-            _write_coeff(coeff, f=5.0, n=500, dt=0.002, cl0=0.7, cd0=0.2)
-            for i in range(41):
-                (case_dir / f"{0.6 + i * 0.01:.6f}").mkdir(parents=True, exist_ok=True)
+
+            def grow_to(t_end: float) -> None:
+                n = int(round(t_end / 0.002))
+                _write_coeff(coeff, f=5.0, n=n, dt=0.002, cl0=0.7, cd0=0.2)
+                i = 0
+                while 0.6 + i * 0.005 <= t_end + 1e-9:
+                    (case_dir / f"{0.6 + i * 0.005:.6f}").mkdir(parents=True, exist_ok=True)
+                    i += 1
+
+            # First poll: stable two-period window detected (window start
+            # ~t=0.8) but retention target not reached -> NO stop yet.
+            grow_to(1.2)
+            if monitor is not None:
+                monitor()
+            assert not (case_dir / "urans_early_stop.json").exists()
+            # Data accumulates past stable_since + (5 + 0.5) periods -> stop.
+            grow_to(2.2)
             if monitor is not None:
                 monitor()
             return SimpleNamespace(ok=True, stdout="pimple ok")
@@ -521,16 +541,25 @@ def test_transient_attempt_early_stop_uses_two_period_window(tmp_path, monkeypat
         runner=FakeRunner(),
         n_proc=1,
         timeout=120,
-        run_time=1.0,
+        run_time=3.0,
         delta_t=0.001,
     )
 
     assert result is not None
     assert result.early_stopped
+    marker = pipeline._read_early_stop_marker(tcase)
+    assert marker is not None
+    # retain_from = start of the FIRST certified-stable window.
+    assert isinstance(marker.get("retain_from"), float)
     assert result.force_history is not None
-    assert result.force_history.retained_cycles == 2
+    # Retention floor: the early stop must never retain fewer whole periods
+    # than the node gate (packages/core FRAME_TRACK_MIN_PERIODS = 5).
+    assert result.force_history.retained_cycles == int(pipeline.URANS_STABLE_RETAINED_CYCLES)
+    assert result.force_history.retained_cycles >= 5
     assert result.quality.ok
-    assert result.quality.retained_cycles == pytest.approx(2.0, rel=0.05)
+    assert result.quality.retained_cycles == pytest.approx(
+        pipeline.URANS_STABLE_RETAINED_CYCLES, rel=0.05
+    )
     assert "early-stop target met" in result.quality.reason
 
 

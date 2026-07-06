@@ -13,8 +13,31 @@ import type {
 // video). Under v1 every unsteady row carried stalled=true from ingest and was
 // mislabelled solver-stalled → rejected, so no URANS point could ever be
 // accepted and RANS supersession was dead in practice.
-export const POLAR_CLASSIFIER_VERSION = "rans-stall-v2";
+// v3 (frame-track): unsteady acceptance ALSO requires, for evidence carrying
+// the engine's frame_track payload, stationary=true and periods_retained >=
+// FRAME_TRACK_MIN_PERIODS — honest reasons "non-stationary" /
+// "insufficient-periods". frameTrack null/absent = legacy pre-contract
+// evidence (or steady point) → the v2 gate stands unchanged, so a deploy
+// never mass-rejects history.
+export const POLAR_CLASSIFIER_VERSION = "frame-track-v3";
 export const POLAR_FIT_VERSION = "evidence-lowess-v2";
+
+/** Minimum retained shedding periods for URANS acceptance (frame-track gate).
+ *  Cross-runtime parity pin: the engine's early-stop retention
+ *  (src/airfoilfoam/pipeline.py URANS_STABLE_RETAINED_CYCLES) must be >= this
+ *  value, or every early-stopped point would be rejected here by
+ *  construction (adversarial review F1/F2, 2026-07-07). */
+export const FRAME_TRACK_MIN_PERIODS = 5;
+
+/** Raw frame_track jsonb as persisted at ingest (snake_case engine contract
+ *  shape). Typed loosely on purpose: the gate reads only the two verdict
+ *  fields and FAILS CLOSED on drifted/missing values — a malformed payload
+ *  can never be accepted as stationary evidence. */
+export interface FrameTrackEvidence {
+  stationary?: unknown;
+  periods_retained?: unknown;
+  [key: string]: unknown;
+}
 
 export interface PolarEvidencePoint {
   id?: string | null;
@@ -37,6 +60,10 @@ export interface PolarEvidencePoint {
   validForPolar?: boolean | null;
   hasForceHistory?: boolean;
   hasVideo?: boolean;
+  /** Engine frame_track payload (results.frame_track / attempt evidence
+   *  payload). null/undefined = legacy pre-contract evidence or steady point
+   *  → frame-track gate not applied. */
+  frameTrack?: FrameTrackEvidence | null;
 }
 
 export interface PolarEvidenceClassification {
@@ -110,6 +137,17 @@ function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   if (p.regime === "urans") {
     if (!p.hasForceHistory) reasons.push("missing-force-history");
     if (!p.hasVideo) reasons.push("missing-urans-video");
+    // Frame-track stationarity gate (v3): applies ONLY to evidence whose
+    // engine version shipped frame_track (non-null). Reads fail closed — a
+    // drifted payload without a literal stationary=true / numeric
+    // periods_retained is rejected, never silently accepted.
+    if (p.frameTrack !== null && p.frameTrack !== undefined) {
+      if (p.frameTrack.stationary !== true) reasons.push("non-stationary");
+      const periods = p.frameTrack.periods_retained;
+      if (!(typeof periods === "number" && Number.isFinite(periods) && periods >= FRAME_TRACK_MIN_PERIODS)) {
+        reasons.push("insufficient-periods");
+      }
+    }
   }
   return reasons;
 }

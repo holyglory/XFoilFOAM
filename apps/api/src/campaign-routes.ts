@@ -169,6 +169,11 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
         engineUnreachableSince: isoOrNull(sweeper?.engineUnreachableSince),
         engineHealthy: Boolean(health) && !engineError,
         activeJobCount: Number(jobsRow?.n ?? 0),
+        // Tick-progress pair (liveness/progress split, migration 0033) —
+        // lets every solverState consumer derive the amber tick_stalled
+        // state instead of a false red while a tick crawls on a slow engine.
+        lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
+        lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
       },
     };
   });
@@ -212,6 +217,9 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
           engineError: engineError ?? null,
           engineUnreachableSince: isoOrNull(engineUnreachableSince),
           campaignJobsRunning: Number(jobsRow?.n ?? 0),
+          // Tick-progress pair (liveness/progress split, migration 0033).
+          lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
+          lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
         },
         rate,
       };

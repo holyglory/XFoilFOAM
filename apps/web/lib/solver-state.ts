@@ -10,6 +10,13 @@
 
 export const HEARTBEAT_STALE_MS = 90_000;
 
+/** A tick that started this long ago without completing (while the liveness
+ *  heartbeat stays fresh) is "stalled": the process is alive but a slow
+ *  engine call is holding the current scheduler tick. Amber, never red —
+ *  the 2026-07-06 prod incident showed a saturated engine starving the old
+ *  in-tick heartbeat into a false "PROCESS NOT RUNNING". */
+export const TICK_STALLED_AFTER_MS = 300_000;
+
 /** Guidance shown wherever Pause/Resume/enable controls would be fake while
  *  the process is down. A Start button is never rendered — the web app
  *  cannot start an OS process, so the honest affordance is instructions. */
@@ -22,6 +29,7 @@ export type SolverStateName =
   | "paused"
   | "engine_unreachable"
   | "engine_unhealthy"
+  | "tick_stalled"
   | "idle"
   | "running";
 
@@ -48,6 +56,11 @@ export interface SolverStateInput {
   campaignPointsSolving?: number | null;
   /** true while any pending work exists (sweeps, campaign points). */
   backlogOpen?: boolean;
+  /** Tick-progress pair (liveness/progress split, migration 0033): stamped by
+   *  the sweeper loop at tick begin/end. undefined/null (payload without the
+   *  columns, or pre-migration DB) simply never derives tick_stalled. */
+  lastTickStartedAt?: string | null;
+  lastTickCompletedAt?: string | null;
 }
 
 export interface DerivedSolverState {
@@ -65,6 +78,8 @@ export interface SolverStateListPayload {
   engineUnreachableSince: string | null;
   engineHealthy: boolean;
   activeJobCount: number;
+  lastTickStartedAt: string | null;
+  lastTickCompletedAt: string | null;
 }
 
 export function heartbeatAgeMs(heartbeatAt: string | null, nowMs: number = Date.now()): number | null {
@@ -74,10 +89,30 @@ export function heartbeatAgeMs(heartbeatAt: string | null, nowMs: number = Date.
   return Math.max(0, nowMs - t);
 }
 
-/** null / unparsable / >90 s stale heartbeat ⇒ the process is not running. */
+/** null / unparsable / >90 s stale heartbeat ⇒ the process is not running.
+ *  With the liveness/progress split this is TRUE process death: the liveness
+ *  timer writes every 15 s regardless of tick work, so tick fields can never
+ *  rescue (or excuse) a stale heartbeat. */
 export function isProcessDead(heartbeatAt: string | null, nowMs: number = Date.now()): boolean {
   const age = heartbeatAgeMs(heartbeatAt, nowMs);
   return age == null || age > HEARTBEAT_STALE_MS;
+}
+
+/** How long the CURRENT tick has been running when it counts as stalled
+ *  (started, not completed, older than 5 min); null otherwise. Unparsable
+ *  stamps are treated as absent — never invent a stall. */
+export function tickStalledForMs(
+  lastTickStartedAt: string | null | undefined,
+  lastTickCompletedAt: string | null | undefined,
+  nowMs: number = Date.now(),
+): number | null {
+  if (!lastTickStartedAt) return null;
+  const started = new Date(lastTickStartedAt).getTime();
+  if (!Number.isFinite(started)) return null;
+  const completed = lastTickCompletedAt ? new Date(lastTickCompletedAt).getTime() : Number.NaN;
+  if (Number.isFinite(completed) && completed >= started) return null; // last tick finished
+  const age = nowMs - started;
+  return age > TICK_STALLED_AFTER_MS ? age : null;
 }
 
 export function formatAge(ms: number): string {
@@ -104,6 +139,8 @@ export function solverStateLabel(state: SolverStateName): string {
       return "ENGINE UNREACHABLE";
     case "engine_unhealthy":
       return "ENGINE UNHEALTHY";
+    case "tick_stalled":
+      return "TICK STALLED";
     case "idle":
       return "IDLE";
     case "running":
@@ -129,16 +166,26 @@ export function solverChipText(state: SolverStateName, activeJobCount?: number):
       return "solver · engine unreachable";
     case "engine_unhealthy":
       return "solver · engine unhealthy";
+    case "tick_stalled":
+      return "solver · tick stalled";
     case "unknown":
       return "solver · status unknown";
   }
 }
 
 /** GATE PRECEDENCE (approved design, binding):
- *  fetch failed → unknown; heartbeat null/stale → process_not_running;
- *  alive+disabled → paused; alive+enabled+unreachable → engine_unreachable;
- *  reachable but unhealthy/build-mismatch → engine_unhealthy (advisory);
- *  else running / idle. engineQueueError is always secondary. */
+ *  fetch failed → unknown; heartbeat null/stale → process_not_running (TRUE
+ *  process death now that liveness is an independent timer — red regardless
+ *  of tick fields); alive+disabled → paused (the pinned paused-first order:
+ *  while disabled, engine trouble and slow ticks are secondary because
+ *  "scheduling continues" copy would be false); alive+enabled+unreachable →
+ *  engine_unreachable; reachable but unhealthy/build-mismatch →
+ *  engine_unhealthy (advisory); heartbeat fresh but the current tick started
+ *  >5 min ago without completing → tick_stalled (AMBER, never red — the
+ *  2026-07-06 false "PROCESS NOT RUNNING"); else running / idle. Enabled-path
+ *  order matches the locked design: process death > engine unreachable >
+ *  engine unhealthy > tick_stalled > healthy. engineQueueError is always
+ *  secondary. */
 export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.now()): DerivedSolverState {
   const secondary: string[] = [];
   if (input.engineQueueError) secondary.push("celery introspection unavailable");
@@ -203,6 +250,17 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
         ? "Engine build mismatch — the running engine build differs from the expected build."
         : "Engine reachable but reporting unhealthy.",
       detail: "Advisory — scheduling continues; inspect the Engine tab.",
+      secondary,
+    };
+  }
+
+  const stalledForMs = tickStalledForMs(input.lastTickStartedAt ?? null, input.lastTickCompletedAt ?? null, nowMs);
+  if (stalledForMs != null) {
+    return {
+      state: "tick_stalled",
+      tone: "amber",
+      headline: `Tick running ${formatAge(stalledForMs)} — engine responding slowly; scheduling continues next tick.`,
+      detail: "Process heartbeat is fresh — the sweeper is alive; a slow engine call is holding the current scheduler tick.",
       secondary,
     };
   }

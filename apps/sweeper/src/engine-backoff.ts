@@ -25,8 +25,10 @@ export function currentBackoffMs(): number {
   return Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** (consecutiveFailures - 1));
 }
 
-/** Connection-level failure (fetch refused/timeout). EngineError means the
- *  engine answered — those failures stay on the `failed` path. */
+/** Connection-level failure (fetch refused, DNS, or an EngineTimeoutError
+ *  abort — the engine never answered within its AbortSignal budget).
+ *  EngineError means the engine answered — those failures stay on the
+ *  `failed` path. */
 export function isEngineConnectionFailure(e: unknown): boolean {
   return !(e instanceof EngineError);
 }

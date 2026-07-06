@@ -87,6 +87,7 @@ import {
 import { C, MONO } from "@/lib/tokens";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import { isFinishedLogOpen, withFinishedLogParam } from "@/lib/finished-log-param";
+import { campaignPointsSearch } from "@/lib/point-history";
 import { deriveSolverState, solverStateLabel } from "@/lib/solver-state";
 import { AddAirfoilsPanel } from "./AddAirfoilsPanel";
 import { momentumSchemeSelect } from "./solver-schemes";
@@ -95,6 +96,7 @@ import { UnitNumberField } from "./UnitNumberField";
 import { PointHistoryPanel } from "./PointHistoryPanel";
 import { SolvedPointsPopover, type SolvedPopoverAnchor } from "./SolvedPointsPopover";
 import { CampaignDetail } from "./campaigns/CampaignDetail";
+import { gateFromSolverState, type CampaignGate } from "./campaigns/campaign-status";
 import { CampaignsHub } from "./campaigns/CampaignsHub";
 import { CampaignWizard } from "./campaigns/CampaignWizard";
 import { usePoll } from "./campaigns/usePoll";
@@ -279,6 +281,17 @@ export function AdminConsole() {
   }, [section, campaignParam, wizardKind]);
 
   const openCampaign = useCallback((id: string) => navigate({ campaign: id }, "push"), [navigate]);
+  // Explorer links (mockup fec7b453 screen 3): rejected/failed counts on the
+  // campaign surfaces open Solver ▸ Points pre-filtered to that campaign +
+  // bucket. The search string comes from campaignPointsSearch (the explorer's
+  // own filter round-trip) — never hand-built param names.
+  const openCampaignPoints = useCallback(
+    (campaignId: string, status: "failed" | "rejected") => {
+      const qs = campaignPointsSearch(campaignId, status);
+      navigate(Object.fromEntries(new URLSearchParams(qs.slice(1))), "push");
+    },
+    [navigate],
+  );
   const openWizard = useCallback((kind: "polar_sweep" | "ld_refine") => navigate({ wizard: kind, step: "1" }, "push"), [navigate]);
   const backToHub = useCallback(() => navigate({}, "push"), [navigate]);
   const duplicateCampaign = useCallback(
@@ -565,7 +578,12 @@ export function AdminConsole() {
 
         <div style={{ minWidth: 0 }}>
           {section === "simulations" && campaignParam && (
-            <CampaignDetail campaignId={campaignParam} onBack={backToHub} onDuplicate={duplicateCampaign} />
+            <CampaignDetail
+              campaignId={campaignParam}
+              onBack={backToHub}
+              onDuplicate={duplicateCampaign}
+              onOpenPoints={(status) => openCampaignPoints(campaignParam, status)}
+            />
           )}
           {section === "simulations" && !campaignParam && wizardKind && (
             <CampaignWizard
@@ -590,6 +608,7 @@ export function AdminConsole() {
               onOpenCampaign={openCampaign}
               onNewCampaign={openWizard}
               onOpenSolver={() => navigate({ section: "queue" }, "push")}
+              onOpenPoints={openCampaignPoints}
             />
           )}
           {section === "queue" && (
@@ -598,6 +617,7 @@ export function AdminConsole() {
               onTabChange={(t) => navigate(t === "activity" ? { section: "queue" } : { section: "queue", tab: t }, "replace")}
               onOpenCampaign={openCampaign}
               onOpenSimulations={() => navigate({}, "push")}
+              onOpenPoints={openCampaignPoints}
             />
           )}
           {section === "setup" && (
@@ -2559,11 +2579,13 @@ function QueueDashboard({
   onTabChange,
   onOpenCampaign,
   onOpenSimulations,
+  onOpenPoints,
 }: {
   tab: SolverTab;
   onTabChange: (t: SolverTab) => void;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
+  onOpenPoints: (campaignId: string, status: "failed" | "rejected") => void;
 }) {
   const [queue, setQueue] = useState<AdminQueue | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -2685,6 +2707,11 @@ function QueueDashboard({
     activeJobCount: queue ? activeJobs.length : undefined,
     campaignPointsSolving,
     backlogOpen,
+    // Tick-progress pair (liveness/progress split): a fresh heartbeat with a
+    // >5 min unfinished tick derives the amber TICK STALLED banner instead of
+    // a false red PROCESS NOT RUNNING (2026-07-06 prod incident).
+    lastTickStartedAt: sw?.lastTickStartedAt ?? null,
+    lastTickCompletedAt: sw?.lastTickCompletedAt ?? null,
   });
   const processDead = solver.state === "process_not_running";
   const toneColor = solver.tone === "red" ? C.redText : solver.tone === "amber" ? C.amber : C.teal;
@@ -2846,7 +2873,13 @@ function QueueDashboard({
           )}
 
           {queue?.backlogStrip && (
-            <CampaignBacklogStrip strip={queue.backlogStrip} onOpenCampaign={onOpenCampaign} onOpenSimulations={onOpenSimulations} />
+            <CampaignBacklogStrip
+              strip={queue.backlogStrip}
+              gate={gateFromSolverState(solver.state)}
+              onOpenCampaign={onOpenCampaign}
+              onOpenSimulations={onOpenSimulations}
+              onOpenPoints={onOpenPoints}
+            />
           )}
 
           <QueuePanel title="Active jobs" count={queue ? `${activeJobs.length}` : undefined} testId="queue-active-jobs">
@@ -3088,12 +3121,18 @@ function campaignPriorityName(priority: number): string {
 
 function CampaignBacklogStrip({
   strip,
+  gate,
   onOpenCampaign,
   onOpenSimulations,
+  onOpenPoints,
 }: {
   strip: AdminQueueBacklogStrip;
+  /** Scheduler gate from the SAME deriveSolverState the banner uses — the
+   *  strip's active rows must never read as quietly working while blocked. */
+  gate: CampaignGate | null;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
+  onOpenPoints: (campaignId: string, status: "failed" | "rejected") => void;
 }) {
   const gap = strip.backgroundGapFill;
   return (
@@ -3132,12 +3171,48 @@ function CampaignBacklogStrip({
               >
                 {c.name}
               </button>
+              {/* Gate badge is PRIMARY for blocked active rows (mockup
+                  fec7b453 screen 3); the lifecycle demotes to a dim chip. */}
+              {gate && c.status === "active" && (
+                <span
+                  data-testid={`backlog-gate-${c.slug}`}
+                  style={{
+                    fontSize: 9,
+                    fontWeight: 700,
+                    letterSpacing: "0.06em",
+                    color: gate.tone === "red" ? C.redText : C.amber,
+                    background: gate.tone === "red" ? "rgba(245,101,101,0.08)" : "rgba(245,158,11,0.08)",
+                    border: `1px solid ${gate.tone === "red" ? "rgba(245,101,101,0.5)" : "rgba(245,158,11,0.45)"}`,
+                    borderRadius: 999,
+                    padding: "2px 9px",
+                  }}
+                >
+                  {gate.text}
+                </span>
+              )}
+              {gate && c.status === "active" && (
+                <span style={{ fontSize: 9, letterSpacing: "0.06em", color: C.dim, border: `1px solid ${C.borderSoft}`, borderRadius: 999, padding: "2px 8px", textTransform: "uppercase" }}>
+                  active
+                </span>
+              )}
               <span style={{ color: C.dim }}>{campaignPriorityName(c.priority)}</span>
               <span style={{ color: C.text }}>{c.remainingPoints.toLocaleString()} points remaining</span>
               {/* Same POINTS unit as "points remaining" — labelled so it can
                   never be misread as the banner's engine-job count. */}
               {c.runningPoints > 0 && <span style={{ color: C.amber }}>{c.runningPoints.toLocaleString()} points solving</span>}
-              {c.failedPoints > 0 && <span style={{ color: C.redText }}>{c.failedPoints.toLocaleString()} failed</span>}
+              {/* Non-zero failed counts link to the Points explorer filtered
+                  to this campaign; zero counts never render. */}
+              {c.failedPoints > 0 && (
+                <button
+                  type="button"
+                  data-testid={`backlog-failed-link-${c.slug}`}
+                  title="Open these failed points in the Points explorer"
+                  onClick={() => onOpenPoints(c.id, "failed")}
+                  style={{ fontFamily: MONO, fontSize: 11, color: C.redText, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                >
+                  {c.failedPoints.toLocaleString()} failed
+                </button>
+              )}
               {c.status !== "active" && <span style={{ color: C.amber }}>{c.status}</span>}
             </div>
           ))}

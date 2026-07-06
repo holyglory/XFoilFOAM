@@ -20,6 +20,7 @@ import {
   type EngineEvidenceArtifact,
   type ImageFieldName,
   type JobResult,
+  parseFrameTrack,
   type PolarPoint,
   type RenderedDefaultMedia,
 } from "@aerodb/engine-client";
@@ -275,6 +276,45 @@ export function failedForPoint(p: PolarPoint): boolean {
   return Boolean(p.error) || !finiteNumber(p.cl) || !finiteNumber(p.cd);
 }
 
+/** frame_track value to persist on the results row: the engine payload
+ *  VERBATIM (null-safe). Contract drift is validated loudly here but the raw
+ *  value is still persisted — it is solver evidence, and the classifier's
+ *  stationarity gate fails closed on drifted shapes (a malformed frame_track
+ *  can only ever REJECT a point, never sneak one through). Exported for the
+ *  contract pin test. */
+export function frameTrackForPoint(p: PolarPoint, context: string): unknown {
+  const raw = p.frame_track ?? null;
+  if (raw === null) {
+    if (p.unsteady) {
+      // Post-contract engines ship frame_track on EVERY shedding URANS point.
+      // A shedding point arriving WITHOUT it (period unmeasurable / stats
+      // computation failed engine-side) has zero stationarity evidence, so it
+      // must NOT persist as null — null means legacy pre-contract evidence
+      // and skips the classifier's stationarity gate entirely. Persist a
+      // fail-closed sentinel: the gate reads stationary / periods_retained
+      // and rejects honestly (non-stationary + insufficient-periods).
+      console.error(
+        `[sweeper] frame_track MISSING on shedding URANS point (${context}); persisting fail-closed sentinel`,
+      );
+      return {
+        missing: true,
+        stationary: false,
+        periods_retained: null,
+        reason: "engine shipped no frame_track for a shedding URANS point",
+      };
+    }
+    return null;
+  }
+  const parsed = parseFrameTrack(raw);
+  if (!parsed.ok) {
+    // Loud, never silent: a drifted engine payload means the pinned
+    // frame-track contract broke on one side. Tests pin both sides; this log
+    // is the production tripwire.
+    console.error(`[sweeper] frame_track CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`);
+  }
+  return raw;
+}
+
 async function insertResultAttempt(opts: {
   db: DB;
   resultId?: string | null;
@@ -362,7 +402,29 @@ async function registerEvidenceArtifacts(opts: {
   const urlPath = artifact.url ?? artifact.path;
   if (!urlPath) return;
   const storageKey = storageKeyOf(urlPath);
-  const kind = artifact.kind as "manifest" | "openfoam_bundle" | "vtk_window" | "time_directory" | "log" | "force_coefficients" | "mesh" | "dictionary" | "field_data";
+  const knownKinds = [
+    "manifest",
+    "openfoam_bundle",
+    "vtk_window",
+    "time_directory",
+    "log",
+    "force_coefficients",
+    "mesh",
+    "dictionary",
+    "field_data",
+    // Per-frame URANS PNGs (frame-track contract, FRAME_IMAGE_ARTIFACT_KIND).
+    "frame_image",
+  ] as const;
+  const kind = knownKinds.find((k) => k === artifact.kind);
+  if (!kind) {
+    // Loud skip instead of a pg enum error that would abort the WHOLE ingest:
+    // one unknown artifact kind from a newer engine must not cost the point's
+    // coefficients, media, and every other artifact.
+    console.error(
+      `[sweeper] evidence artifact kind "${artifact.kind}" unknown to this build — SKIPPED (job ${engineJobId}, case ${point.case_slug}, aoa ${point.aoa_deg}, path ${artifact.path})`,
+    );
+    return;
+  }
   await db
     .insert(solverEvidenceArtifacts)
     .values({
@@ -1050,6 +1112,9 @@ export async function ingestResult(opts: {
         strouhal: p.strouhal ?? null,
         error: pointError,
         qualityWarnings: p.quality_warnings?.length ? p.quality_warnings : null,
+        // URANS frame-track contract payload, verbatim. NULL = steady /
+        // no-shedding / legacy engine — the classifier gates only non-NULL.
+        frameTrack: frameTrackForPoint(p, `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`),
         engineJobId,
         engineCaseSlug: p.case_slug ?? null,
         simJobId,

@@ -75,6 +75,7 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
         video={field: url(rel) for field, rel in outcome.video.items()},
         mean_images={field: url(rel) for field, rel in outcome.mean_images.items()},
         force_history=history,
+        frame_track=outcome.frame_track,
         quality_warnings=outcome.quality_warnings,
         evidence_artifacts=[
             artifact.model_copy(update={"url": url(artifact.path)})

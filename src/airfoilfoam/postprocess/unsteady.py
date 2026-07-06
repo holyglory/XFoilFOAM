@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -195,7 +196,36 @@ def _time_weighted_mean_std(times: np.ndarray, values: np.ndarray) -> tuple[floa
     return mean, max(variance, 0.0) ** 0.5
 
 
-def _coefficient_series(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _coefficient_series(
+    path: "Path | Sequence[Path]",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Coefficient time series from one coefficient.dat, or MERGED from several
+    restart segments (each pimpleFoam continuation writes its own
+    ``postProcessing/forceCoeffs1/<startTime>/coefficient.dat``). Merging sorts
+    by time and drops duplicate timestamps at the restart seams."""
+    if isinstance(path, (list, tuple)):
+        parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        last_exc: Exception | None = None
+        for p in path:
+            try:
+                parts.append(_coefficient_series_one(Path(p)))
+            except (OSError, ValueError) as exc:  # in-flight segment may be header-only
+                last_exc = exc
+        if not parts:
+            raise last_exc or ValueError("No coefficient data found (no segments)")
+        merged = tuple(np.concatenate([part[k] for part in parts]) for k in range(4))
+        return _normalise_series(*merged)
+    return _coefficient_series_one(Path(path))
+
+
+def coefficient_series(
+    path: "Path | Sequence[Path]",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Public alias: (t, cl, cd, cm) arrays, merged across restart segments."""
+    return _coefficient_series(path)
+
+
+def _coefficient_series_one(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     header, rows = _data_rows(path)
     if not rows:
         raise ValueError(f"No coefficient data found in {path}")
@@ -219,7 +249,7 @@ def _coefficient_series(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray,
 
 
 def stable_two_period_window(
-    path: Path,
+    path: "Path | Sequence[Path]",
     speed: float,
     chord: float,
     frame_times: "list[float] | np.ndarray",
@@ -317,6 +347,237 @@ def stable_two_period_window(
     return replace(base, ok=True, reason="two stable periods with sufficient frames")
 
 
+# --------------------------------------------------------------------------- #
+# Frame-track recording contract (task #23): robust period tracking,
+# integer-period time-weighted stats, stationarity, and frame targeting.
+# --------------------------------------------------------------------------- #
+
+#: eps in the stationarity denominator |mean(cl)| + eps.
+DRIFT_EPS = 1e-6
+#: Frame-export cadence pinned by the contract: ~24 frames/period ...
+FRAME_EXPORT_FRAMES_PER_PERIOD = 24.0
+#: ... over the last min(3, K) whole periods ...
+FRAME_EXPORT_SPAN_PERIODS = 3
+#: ... capped at 120 frames total.
+FRAME_EXPORT_MAX_FRAMES = 120
+
+
+def measure_period(
+    times: "np.ndarray | list[float]",
+    values: "np.ndarray | list[float]",
+    min_cycles: float = 2.0,
+    corr_threshold: float = 0.2,
+) -> float | None:
+    """Shedding period [s] measured by AUTOCORRELATION of the (uniformly
+    resampled, demeaned) signal — robust for noisy periodic force histories
+    where zero crossings jitter and an FFT bin can land between peaks.
+
+    Returns None when no credible period exists: flat/short signals, no
+    positive autocorrelation peak past the first zero crossing, or fewer than
+    ``min_cycles`` cycles of data. The peak lag is refined by parabolic
+    interpolation of the autocorrelation maximum.
+    """
+    t, v = _normalise_series(times, values)
+    if t.size < 16 or float(t[-1]) <= float(t[0]):
+        return None
+    n = int(min(8192, max(256, t.size)))
+    tu = np.linspace(float(t[0]), float(t[-1]), n)
+    vu = np.interp(tu, t, v)
+    vu = vu - vu.mean()
+    if not np.any(np.abs(vu) > 0):
+        return None
+    ac = np.correlate(vu, vu, mode="full")[n - 1 :]
+    if ac[0] <= 0:
+        return None
+    ac = ac / ac[0]
+    below = np.where(ac < 0)[0]
+    if below.size == 0:
+        return None
+    first_negative = int(below[0])
+    if first_negative >= n - 1:
+        return None
+    k = first_negative + int(np.argmax(ac[first_negative:]))
+    if k <= 0 or k >= n - 1 or float(ac[k]) < corr_threshold:
+        return None
+    y0, y1, y2 = float(ac[k - 1]), float(ac[k]), float(ac[k + 1])
+    denom = y0 - 2.0 * y1 + y2
+    shift = 0.5 * (y0 - y2) / denom if abs(denom) > 1e-12 else 0.0
+    shift = min(0.5, max(-0.5, shift))
+    dt = (float(tu[-1]) - float(tu[0])) / (n - 1)
+    period = (k + shift) * dt
+    span = float(t[-1]) - float(t[0])
+    if not math.isfinite(period) or period <= 0 or span < min_cycles * period:
+        return None
+    return float(period)
+
+
+def discard_startup(
+    times: "np.ndarray | list[float]",
+    *values: "np.ndarray | list[float]",
+    fraction: float,
+) -> tuple[np.ndarray, ...]:
+    """Drop the first ``fraction`` of the time span (startup transient)."""
+    t = np.asarray(times, dtype=float)
+    arrays = [np.asarray(v, dtype=float) for v in values]
+    if fraction <= 0 or t.size == 0 or float(t[-1]) <= float(t[0]):
+        return (t, *arrays)
+    cut = float(t[0]) + min(max(float(fraction), 0.0), 0.999999) * float(t[-1] - t[0])
+    mask = t >= cut
+    return (t[mask], *(a[mask] for a in arrays))
+
+
+@dataclass(frozen=True)
+class ChannelWindowStats:
+    """Time-weighted trapezoidal stats of one coefficient over the window."""
+
+    mean: float
+    std: float
+    min: float
+    max: float
+
+
+@dataclass(frozen=True)
+class PeriodWindowStats:
+    """Integer-period window stats backing the frame_track contract."""
+
+    period_s: float
+    periods_retained: float  # fractional periods available in the series (M.x)
+    whole_periods: int  # K = floor(periods_retained); the stats window
+    window_start: float
+    window_end: float
+    cl: ChannelWindowStats
+    cd: ChannelWindowStats
+    cm: ChannelWindowStats
+    drift_frac: float
+    stationary: bool
+
+
+def _windowed_mean(t: np.ndarray, v: np.ndarray, a: float, b: float) -> float:
+    """Time-weighted trapezoidal mean of v over [a, b] with interpolated ends."""
+    interior = (t > a) & (t < b)
+    tt = np.concatenate(([a], t[interior], [b]))
+    vv = np.concatenate(([np.interp(a, t, v)], v[interior], [np.interp(b, t, v)]))
+    mean, _std = _time_weighted_mean_std(tt, vv)
+    return mean
+
+
+def period_window_stats(
+    times: "np.ndarray | list[float]",
+    cl: "np.ndarray | list[float]",
+    cd: "np.ndarray | list[float]",
+    cm: "np.ndarray | list[float]",
+    period_s: float,
+    drift_tolerance: float = 0.05,
+) -> PeriodWindowStats | None:
+    """Stats over exactly K = floor(available periods) whole periods ending at
+    the last sample: time-weighted trapezoidal mean/std (non-uniform dt, so an
+    integer-period window yields phase-bias-free means) plus min/max, and the
+    stationarity verdict |mean(first half) - mean(second half)| / (|mean|+eps)
+    on Cl. The halves are whole-period halves (floor(K/2) periods each, middle
+    period skipped when K is odd) so the drift metric itself carries no
+    half-period phase bias.
+
+    Pass the POST-DISCARD series; ``periods_retained`` is the fractional
+    number of periods it spans. Returns None when less than one whole period
+    is available or the period is invalid.
+    """
+    t, wcl, wcd, wcm = _normalise_series(times, cl, cd, cm)
+    if t.size < 4 or not math.isfinite(period_s) or period_s <= 0:
+        return None
+    first = float(t[0])
+    end = float(t[-1])
+    if end <= first:
+        return None
+    available = (end - first) / period_s
+    k = math.floor(available + 1e-9)
+    if k < 1:
+        return None
+    start = end - k * period_s
+    window = PeriodWindow(start=start, end=end, cycles=k, period_s=period_s)
+    st, scl, scd, scm = _window_series(t, wcl, wcd, wcm, window)
+
+    def channel(values: np.ndarray) -> ChannelWindowStats:
+        mean, std = _time_weighted_mean_std(st, values)
+        return ChannelWindowStats(
+            mean=float(mean), std=float(std), min=float(np.min(values)), max=float(np.max(values))
+        )
+
+    cl_stats = channel(scl)
+    cd_stats = channel(scd)
+    cm_stats = channel(scm)
+
+    half = k // 2
+    if half >= 1:
+        m1 = _windowed_mean(st, scl, start, start + half * period_s)
+        m2 = _windowed_mean(st, scl, end - half * period_s, end)
+    else:
+        mid = 0.5 * (start + end)
+        m1 = _windowed_mean(st, scl, start, mid)
+        m2 = _windowed_mean(st, scl, mid, end)
+    drift = abs(m1 - m2) / (abs(cl_stats.mean) + DRIFT_EPS)
+    return PeriodWindowStats(
+        period_s=float(period_s),
+        periods_retained=float(available),
+        whole_periods=int(k),
+        window_start=float(start),
+        window_end=float(end),
+        cl=cl_stats,
+        cd=cd_stats,
+        cm=cm_stats,
+        drift_frac=float(drift),
+        stationary=bool(drift <= drift_tolerance),
+    )
+
+
+def frame_target_times(
+    window_end: float,
+    period_s: float,
+    whole_periods: int,
+    frames_per_period: float = FRAME_EXPORT_FRAMES_PER_PERIOD,
+    max_frames: int = FRAME_EXPORT_MAX_FRAMES,
+    span_periods: int = FRAME_EXPORT_SPAN_PERIODS,
+) -> list[float]:
+    """Target frame times: ~``frames_per_period`` per period over the LAST
+    min(``span_periods``, K) whole periods, ending exactly at ``window_end``,
+    capped at ``max_frames``. The window start itself is excluded so the phase
+    coverage is uniform (no duplicated endpoint phase)."""
+    if not math.isfinite(period_s) or period_s <= 0 or whole_periods < 1:
+        return []
+    p = max(1, min(int(span_periods), int(whole_periods)))
+    n = int(round(frames_per_period * p))
+    n = max(2, min(int(max_frames), n))
+    span = p * period_s
+    step = span / n
+    return [window_end - span + (j + 1) * step for j in range(n)]
+
+
+def frame_coefficients(
+    frame_times: Sequence[float],
+    times: "np.ndarray | list[float]",
+    cl: "np.ndarray | list[float]",
+    cd: "np.ndarray | list[float]",
+    cm: "np.ndarray | list[float]",
+) -> list[tuple[int, float, float, float, float]]:
+    """Per-frame (i, t, cl, cd, cm): coefficients linearly interpolated from
+    the coefficient.dat series at each frame's exact physical time."""
+    t, vcl, vcd, vcm = _normalise_series(times, cl, cd, cm)
+    if t.size == 0:
+        return []
+    out: list[tuple[int, float, float, float, float]] = []
+    for i, ft in enumerate(frame_times):
+        ftf = float(ft)
+        out.append(
+            (
+                i,
+                ftf,
+                float(np.interp(ftf, t, vcl)),
+                float(np.interp(ftf, t, vcd)),
+                float(np.interp(ftf, t, vcm)),
+            )
+        )
+    return out
+
+
 # Below this relative fluctuation the transient force signal is treated as
 # steady: a symmetric airfoil at alpha~0 (or any weakly-loaded point) sheds no
 # vortices, so the pimpleFoam history is a flat line plus numerical noise. The
@@ -354,7 +615,7 @@ def is_no_shedding(
 
 
 def force_history(
-    path: Path,
+    path: "Path | Sequence[Path]",
     speed: float,
     chord: float,
     discard_fraction: float = 0.4,

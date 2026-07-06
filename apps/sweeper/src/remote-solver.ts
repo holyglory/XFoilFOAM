@@ -35,6 +35,13 @@ import { touchHeartbeat } from "./heartbeat";
 
 const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
 
+// Remote-hub HTTP calls run INSIDE the sweeper tick — a hung fetch here would
+// stall tick progress exactly like a hung engine call (2026-07-06 incident
+// class), so every call carries an AbortSignal timeout. Aborts surface through
+// the existing failure handling (remoteSolverTick's catch → setStatus error).
+const REMOTE_POLL_TIMEOUT_MS = 15_000;
+const REMOTE_PUSH_TIMEOUT_MS = 120_000; // /polars ships media payloads
+
 type Settings = typeof syncApiSettings.$inferSelect;
 
 interface RemoteClaimResponse {
@@ -345,6 +352,7 @@ async function ensureRemoteRevision(db: DB, claim: NonNullable<RemoteClaimRespon
 async function registerSolver(db: DB, settings: Settings): Promise<string> {
   const res = await fetch(`${syncBase(settings)}/solvers/register`, {
     method: "POST",
+    signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
     headers: headers(settings),
     body: JSON.stringify({
       instanceId: settings.instanceId,
@@ -368,6 +376,7 @@ async function heartbeat(settings: Settings, status: Settings["remoteSolverLastS
   if (!settings.remoteSolverRegisteredId) return;
   await fetch(`${syncBase(settings)}/solvers/${settings.remoteSolverRegisteredId}/heartbeat`, {
     method: "POST",
+    signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
     headers: headers(settings),
     body: JSON.stringify({
       status,
@@ -389,6 +398,7 @@ async function claimRemoteWork(db: DB, engine: EngineClient, settings: Settings)
   await setStatus(db, "claiming", null);
   const res = await fetch(`${syncBase(settings)}/sweeps/claim`, {
     method: "POST",
+    signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
     headers: headers(settings),
     body: JSON.stringify({ solverId, limit: settings.remoteSolverClaimSize }),
   });
@@ -542,6 +552,7 @@ async function pushCompletedJob(db: DB, settings: Settings, job: typeof simJobs.
   }
   const res = await fetch(`${syncBase(settings)}/polars`, {
     method: "POST",
+    signal: AbortSignal.timeout(REMOTE_PUSH_TIMEOUT_MS),
     headers: headers(settings),
     body: JSON.stringify({
       promiseId: payload.syncPromiseId,
@@ -556,6 +567,7 @@ async function pushCompletedJob(db: DB, settings: Settings, job: typeof simJobs.
   if (!res.ok) throw new Error(`remote polar push failed (${res.status})`);
   await fetch(`${syncBase(settings)}/sweeps/${payload.syncPromiseId}/complete`, {
     method: "POST",
+    signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
     headers: headers(settings),
     body: JSON.stringify({ localJobId: job.id, pushedAt: new Date().toISOString() }),
   });

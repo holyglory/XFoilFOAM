@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AdminCampaignSummary } from "../lib/admin";
-import { campaignStatusLine } from "../components/admin/campaigns/campaign-status";
+import { campaignStatusLine, gateFromSolverState } from "../components/admin/campaigns/campaign-status";
 
 function summary(overrides: {
   status?: string;
@@ -14,6 +14,11 @@ function summary(overrides: {
   remaining?: number;
   jobs?: number;
   heartbeatAt?: string | null;
+  sweeperEnabled?: boolean;
+  engineHealthy?: boolean;
+  engineUnreachableSince?: string | null;
+  lastTickStartedAt?: string | null;
+  lastTickCompletedAt?: string | null;
   failed?: number;
   rejected?: number;
   closedWithFailedCount?: number | null;
@@ -37,12 +42,14 @@ function summary(overrides: {
       remaining: overrides.remaining ?? 32,
     } as AdminCampaignSummary["totals"],
     scheduler: {
-      sweeperEnabled: true,
-      engineHealthy: true,
-      engineUnreachableSince: null,
+      sweeperEnabled: overrides.sweeperEnabled ?? true,
+      engineHealthy: overrides.engineHealthy ?? true,
+      engineUnreachableSince: overrides.engineUnreachableSince ?? null,
       engineError: null,
       campaignJobsRunning: overrides.jobs ?? 0,
       heartbeatAt: overrides.heartbeatAt === undefined ? now : overrides.heartbeatAt,
+      lastTickStartedAt: overrides.lastTickStartedAt ?? null,
+      lastTickCompletedAt: overrides.lastTickCompletedAt ?? null,
     } as AdminCampaignSummary["scheduler"],
   } as AdminCampaignSummary;
 }
@@ -65,6 +72,128 @@ describe("campaignStatusLine — active gate", () => {
     const line = campaignStatusLine(summary({ jobs: 0, heartbeatAt: "2026-07-01T00:00:00Z" }));
     expect(line.tone).toBe("red");
     expect(line.text).toContain("Solver process is not running");
+  });
+});
+
+describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)", () => {
+  it("dead process → gate badge BLOCKED + lifecycle 'active', never a bare Active headline", () => {
+    const line = campaignStatusLine(summary({ heartbeatAt: "2026-07-01T00:00:00Z" }));
+    expect(line.gate).toEqual({ text: "BLOCKED — solver process not running", tone: "red" });
+    expect(line.lifecycle).toBe("active");
+    expect(line.text).not.toMatch(/^Active/);
+  });
+
+  it("engine unreachable → red gate badge", () => {
+    const line = campaignStatusLine(summary({ engineUnreachableSince: new Date().toISOString() }));
+    expect(line.gate).toEqual({ text: "BLOCKED — engine unreachable", tone: "red" });
+    expect(line.lifecycle).toBe("active");
+    expect(line.text).not.toMatch(/^Active/);
+  });
+
+  it("sweeper disabled → amber gate badge", () => {
+    const line = campaignStatusLine(summary({ sweeperEnabled: false }));
+    expect(line.gate).toEqual({ text: "BLOCKED — sweeper disabled", tone: "amber" });
+    expect(line.text).not.toMatch(/^Active/);
+  });
+
+  it("engine unhealthy → red gate badge", () => {
+    const line = campaignStatusLine(summary({ engineHealthy: false }));
+    expect(line.gate).toEqual({ text: "BLOCKED — engine unhealthy", tone: "red" });
+    expect(line.text).not.toMatch(/^Active/);
+  });
+
+  it("dead process outranks every other gate (precedence)", () => {
+    const line = campaignStatusLine(
+      summary({ heartbeatAt: "2026-07-01T00:00:00Z", sweeperEnabled: false, engineHealthy: false, engineUnreachableSince: new Date().toISOString() }),
+    );
+    expect(line.gate?.text).toBe("BLOCKED — solver process not running");
+  });
+
+  it("healthy active campaign has NO gate and keeps the Active line", () => {
+    const line = campaignStatusLine(summary({ jobs: 2 }));
+    expect(line.gate).toBeNull();
+    expect(line.lifecycle).toBe("active");
+    expect(line.text).toMatch(/^Active/);
+  });
+
+  it("non-active lifecycles never carry a gate (paused/completed/attention)", () => {
+    expect(campaignStatusLine(summary({ status: "paused", heartbeatAt: "2026-07-01T00:00:00Z" })).gate).toBeNull();
+    expect(campaignStatusLine(summary({ status: "completed" })).gate).toBeNull();
+    expect(campaignStatusLine(summary({ status: "attention", failed: 1 })).gate).toBeNull();
+  });
+});
+
+describe("gateFromSolverState — hub/backlog gate from the global derivation", () => {
+  it("maps the four blocking solver states to gate badges", () => {
+    expect(gateFromSolverState("process_not_running")).toEqual({ text: "BLOCKED — solver process not running", tone: "red" });
+    expect(gateFromSolverState("engine_unreachable")).toEqual({ text: "BLOCKED — engine unreachable", tone: "red" });
+    expect(gateFromSolverState("engine_unhealthy")).toEqual({ text: "BLOCKED — engine unhealthy", tone: "red" });
+    expect(gateFromSolverState("paused")).toEqual({ text: "BLOCKED — sweeper disabled", tone: "amber" });
+  });
+
+  it("running / idle / unknown produce no gate", () => {
+    expect(gateFromSolverState("running")).toBeNull();
+    expect(gateFromSolverState("idle")).toBeNull();
+    expect(gateFromSolverState("unknown")).toBeNull();
+  });
+
+  it("tick_stalled maps to the amber SLOW badge — honest slowness, never a BLOCKED lie", () => {
+    const gate = gateFromSolverState("tick_stalled");
+    expect(gate).toEqual({ text: "SLOW — tick running; engine responding slowly", tone: "amber" });
+    expect(gate?.text).not.toContain("BLOCKED");
+    expect(gate?.tone).not.toBe("red");
+  });
+});
+
+// Liveness/progress split (2026-07-06 prod false "PROCESS NOT RUNNING"): the
+// campaign line must show the amber tick_stalled state while the liveness
+// heartbeat is fresh but a slow engine call holds the current tick, and keep
+// the red process gate ONLY for a genuinely stale heartbeat.
+describe("campaignStatusLine — tick_stalled (fresh heartbeat, slow tick)", () => {
+  const NOW = Date.parse("2026-07-06T12:00:00.000Z");
+  const iso = (msAgo: number) => new Date(NOW - msAgo).toISOString();
+  const stalledOverrides = {
+    heartbeatAt: iso(5_000),
+    lastTickStartedAt: iso(6 * 60_000),
+    lastTickCompletedAt: iso(11 * 60_000),
+  };
+
+  it("MUST-CATCH: fresh heartbeat + >5 min unfinished tick → amber SLOW gate with the tick copy, NEVER red", () => {
+    const line = campaignStatusLine(summary(stalledOverrides), NOW);
+    expect(line.gate).toEqual({ text: "SLOW — tick running; engine responding slowly", tone: "amber" });
+    expect(line.tone).toBe("amber");
+    expect(line.text).toBe("Tick running 6m — engine responding slowly; scheduling continues next tick.");
+    expect(line.lifecycle).toBe("active");
+  });
+
+  it("MUST-CATCH: stale heartbeat with the same tick fields is still the red process gate", () => {
+    const line = campaignStatusLine(summary({ ...stalledOverrides, heartbeatAt: iso(120_000) }), NOW);
+    expect(line.gate?.text).toBe("BLOCKED — solver process not running");
+    expect(line.tone).toBe("red");
+  });
+
+  it("precedence: every BLOCKED gate outranks tick_stalled", () => {
+    expect(campaignStatusLine(summary({ ...stalledOverrides, engineUnreachableSince: iso(60_000) }), NOW).gate?.text).toBe(
+      "BLOCKED — engine unreachable",
+    );
+    expect(campaignStatusLine(summary({ ...stalledOverrides, sweeperEnabled: false }), NOW).gate?.text).toBe(
+      "BLOCKED — sweeper disabled",
+    );
+    expect(campaignStatusLine(summary({ ...stalledOverrides, engineHealthy: false }), NOW).gate?.text).toBe(
+      "BLOCKED — engine unhealthy",
+    );
+  });
+
+  it("false-positive guards: short ticks and completed ticks keep the Active line", () => {
+    const quick = campaignStatusLine(summary({ ...stalledOverrides, lastTickStartedAt: iso(60_000) }), NOW);
+    expect(quick.gate).toBeNull();
+    expect(quick.text).toMatch(/^Active/);
+    const finished = campaignStatusLine(summary({ ...stalledOverrides, lastTickCompletedAt: iso(30_000) }), NOW);
+    expect(finished.gate).toBeNull();
+    expect(finished.text).toMatch(/^Active/);
+    const preMigration = campaignStatusLine(summary({ heartbeatAt: iso(5_000), lastTickStartedAt: null, lastTickCompletedAt: null }), NOW);
+    expect(preMigration.gate).toBeNull();
+    expect(preMigration.text).toMatch(/^Active/);
   });
 });
 
