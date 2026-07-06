@@ -2677,6 +2677,93 @@ function failedResultsWhere(campaignId: string, filters: { conditionId?: string;
   `;
 }
 
+// A rejected campaign point is TERMINAL with its authoritative results row
+// DONE but classified 'rejected' (physics-invalid evidence) — the same
+// terminal+result_id model as failedResultsWhere, with the classification
+// join matching the canonical counter (rc.result_id = p.result_id,
+// rc.state='rejected'). Callers MUST join `results r ON r.id = p.result_id`.
+function rejectedResultsWhere(campaignId: string, filters: { conditionId?: string; airfoilId?: string }) {
+  return sql`
+    p.campaign_id = ${campaignId}
+    AND p.state = 'terminal'
+    AND NOT p.derived_by_symmetry
+    AND r.id = p.result_id
+    AND r.status = 'done'
+    AND EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected')
+    ${filters.conditionId ? sql`AND p.condition_id = ${filters.conditionId}` : sql``}
+    ${filters.airfoilId ? sql`AND p.airfoil_id = ${filters.airfoilId}` : sql``}
+  `;
+}
+
+export interface CampaignRejectedSample {
+  resultId: string;
+  conditionId: string;
+  airfoilId: string;
+  airfoilSlug: string;
+  airfoilName: string;
+  aoaDeg: number;
+  reasons: string[];
+  attempts: number;
+}
+
+/** Rejected (done-but-physics-rejected) points in scope, for the requeue
+ *  dialog: exact total plus bounded samples. Shares rejectedResultsWhere with
+ *  requeueCampaignFailed so the dialog count and the requeue predicate can
+ *  never disagree (same coherence rule as failures/requeue). */
+export async function campaignRejected(
+  db: DB,
+  campaignId: string,
+  filters: { conditionId?: string; airfoilId?: string } = {},
+): Promise<{ total: number; samples: CampaignRejectedSample[] }> {
+  await requireCampaign(db, campaignId);
+  const rows = (await db.execute(sql`
+    SELECT * FROM (
+      SELECT
+        r.id AS result_id,
+        p.condition_id,
+        p.airfoil_id,
+        af.slug AS airfoil_slug,
+        af.name AS airfoil_name,
+        p.aoa_deg::float8 AS aoa_deg,
+        rc.reasons,
+        (SELECT count(*)::int FROM result_attempts ra WHERE ra.result_id = r.id) AS attempts,
+        count(*) OVER ()::int AS total,
+        row_number() OVER (ORDER BY r."updatedAt" DESC) AS rn
+      FROM results r
+      JOIN sim_campaign_points p ON p.result_id = r.id
+      JOIN airfoils af ON af.id = p.airfoil_id
+      JOIN result_classifications rc ON rc.result_id = r.id
+      WHERE ${rejectedResultsWhere(campaignId, filters)}
+    ) ranked
+    WHERE rn <= 20
+    ORDER BY rn ASC
+  `)) as unknown as Array<{
+    result_id: string;
+    condition_id: string;
+    airfoil_id: string;
+    airfoil_slug: string;
+    airfoil_name: string;
+    aoa_deg: number;
+    reasons: string[] | null;
+    attempts: number;
+    total: number;
+    rn: number;
+  }>;
+  return {
+    total: rows.length > 0 ? Number(rows[0].total) : 0,
+    samples: rows.map((row) => ({
+      resultId: row.result_id,
+      conditionId: row.condition_id,
+      airfoilId: row.airfoil_id,
+      airfoilSlug: row.airfoil_slug,
+      airfoilName: row.airfoil_name,
+      aoaDeg: Number(row.aoa_deg),
+      reasons: row.reasons ?? [],
+      attempts: Number(row.attempts),
+    })),
+  };
+}
+
 export interface CampaignFailureGroup {
   errorClass: CampaignErrorClass;
   count: number;
@@ -2755,12 +2842,24 @@ export async function campaignFailures(
   return { total, groups: [...groups.values()] };
 }
 
-/** Scoped requeue with exact expected-count verification (409 on drift). */
+/** Scoped requeue with exact expected-count verification (409 on drift).
+ *  Covers BOTH review buckets: terminal-FAILED points (always) and, when
+ *  includeRejected is set, terminal-DONE points whose classification is
+ *  'rejected' (physics-invalid evidence that should re-solve, e.g. on a fixed
+ *  engine build). Each bucket carries its own expected count so a stale dialog
+ *  can never silently requeue more (or fewer) points than the admin confirmed. */
 export async function requeueCampaignFailed(
   db: DB,
   campaignId: string,
-  args: { errorClasses?: CampaignErrorClass[]; conditionId?: string; airfoilId?: string; expectedCount: number },
-): Promise<{ requeued: number; totals: CampaignProgressTotals }> {
+  args: {
+    errorClasses?: CampaignErrorClass[];
+    conditionId?: string;
+    airfoilId?: string;
+    expectedCount: number;
+    includeRejected?: boolean;
+    expectedRejectedCount?: number;
+  },
+): Promise<{ requeued: number; requeuedFailed: number; requeuedRejected: number; totals: CampaignProgressTotals }> {
   return db.transaction(async (tx) => {
     await requireCampaign(tx, campaignId);
     const classFilter =
@@ -2781,17 +2880,39 @@ export async function requeueCampaignFailed(
         actual: matching.length,
       });
     }
-    if (matching.length > 0) {
-      const ids = matching.map((m) => m.id);
-      // Reset the failed evidence rows to re-claimable pending work.
+    let matchingRejected: Array<{ id: string }> = [];
+    if (args.includeRejected) {
+      matchingRejected = (await asDb(tx).execute(sql`
+        SELECT r.id
+        FROM results r
+        JOIN sim_campaign_points p ON p.result_id = r.id
+        WHERE ${rejectedResultsWhere(campaignId, { conditionId: args.conditionId, airfoilId: args.airfoilId })}
+        FOR UPDATE OF r
+      `)) as unknown as Array<{ id: string }>;
+      const expectedRejected = args.expectedRejectedCount ?? 0;
+      if (matchingRejected.length !== expectedRejected) {
+        throw new CampaignError(
+          "drift",
+          `expected ${expectedRejected} rejected points but found ${matchingRejected.length} — refresh and confirm again`,
+          { expected: expectedRejected, actual: matchingRejected.length },
+        );
+      }
+    }
+    const ids = [...matching.map((m) => m.id), ...matchingRejected.map((m) => m.id)];
+    if (ids.length > 0) {
+      // Reset the failed/rejected evidence rows to re-claimable pending work.
+      // (A rejected row was status='done'; flipping it to 'pending' keeps its
+      // attempts/evidence history and lets the re-solve overwrite in place —
+      // the still-'rejected' classification row is re-verdicted by the polar
+      // cache refresh after the new evidence lands.)
       await asDb(tx).update(results).set({ status: "pending", simJobId: null }).where(inArray(results.id, ids));
-      // Flip the terminal-failed points back to 'requested' so the campaign
-      // sweeper branch (which schedules only state='requested' points) will
-      // actually reschedule them. Without this the point would be a terminal
-      // orphan pointing at a pending result that never gets re-solved. The
-      // result_id is left intact: onResultIngested re-terminal-links this same
-      // cell by (airfoil, revision, aoa) when the re-solve lands, and the
-      // pending result is now re-claimable by the gap query (r.status='pending').
+      // Flip the terminal points back to 'requested' so the campaign sweeper
+      // branch (which schedules only state='requested' points) will actually
+      // reschedule them. Without this the point would be a terminal orphan
+      // pointing at a pending result that never gets re-solved. The result_id
+      // is left intact: onResultIngested re-terminal-links this same cell by
+      // (airfoil, revision, aoa) when the re-solve lands, and the pending
+      // result is now re-claimable by the gap query (r.status='pending').
       await asDb(tx).execute(sql`
         UPDATE sim_campaign_points
         SET state = 'requested', "updatedAt" = now()
@@ -2803,7 +2924,12 @@ export async function requeueCampaignFailed(
     }
     await recomputeCampaignProgress(tx, campaignId);
     const totals = await refreshCampaignCompletion(tx, campaignId);
-    return { requeued: matching.length, totals };
+    return {
+      requeued: ids.length,
+      requeuedFailed: matching.length,
+      requeuedRejected: matchingRejected.length,
+      totals,
+    };
   });
 }
 

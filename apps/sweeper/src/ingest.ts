@@ -23,7 +23,7 @@ import {
   type PolarPoint,
   type RenderedDefaultMedia,
 } from "@aerodb/engine-client";
-import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, notInArray, sql } from "drizzle-orm";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -760,14 +760,181 @@ async function rebalanceFieldScales(opts: {
     } catch (error) {
       const reason = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
       // Loud + recorded: the failure lands on the scale row (status='failed',
-      // failureReason) AND in the log with full addressing, never silently.
+      // failureReason, render_attempts) AND in the log with full addressing,
+      // never silently. The reconcile retry pass re-attempts failed rows until
+      // MAX_SCALE_RENDER_ATTEMPTS (a one-shot transient engine fetch failure
+      // must not orphan the scale permanently — live proof 2026-07-05).
       console.error(
         `[sweeper] scaled-media render FAILED (airfoil ${group.airfoilId}, revision ${group.presetRevisionId}, field ${group.field}, scale v${scale.version}): ${reason}`,
       );
       await opts.db
         .update(fieldColorScales)
-        .set({ status: "failed", failureReason: reason })
+        .set({ status: "failed", failureReason: reason, renderAttempts: sql`${fieldColorScales.renderAttempts} + 1` })
         .where(eq(fieldColorScales.id, scale.id));
+    }
+  }
+  return mediaCount;
+}
+
+/** Bounded cap on scale render attempts: the first attempt happens at ingest;
+ *  the reconcile retry pass re-runs failed rows until the count reaches this. */
+export const MAX_SCALE_RENDER_ATTEMPTS = 3;
+
+/** Re-attempt failed shared-scale renders (bounded). A scale row that failed
+ *  its render at ingest time (e.g. one transient engine fetch failure) is
+ *  retried here with FRESH extents: only latest-version failed rows are live
+ *  rebalance intent — a later ingest that rebalanced the same scope created a
+ *  newer version that already re-rendered every extents row, so older failed
+ *  rows are dead history and stay untouched. Returns registered media count. */
+export async function retryFailedScaleRenders(
+  db: DB,
+  engine: EngineClient,
+  opts: { heartbeat?: () => Promise<void>; maxAttempts?: number } = {},
+): Promise<number> {
+  const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(db));
+  const maxAttempts = opts.maxAttempts ?? MAX_SCALE_RENDER_ATTEMPTS;
+  const retryable = await db
+    .select()
+    .from(fieldColorScales)
+    .where(
+      and(
+        eq(fieldColorScales.status, "failed"),
+        lt(fieldColorScales.renderAttempts, maxAttempts),
+        sql`NOT EXISTS (
+          SELECT 1 FROM field_color_scales newer
+          WHERE newer.airfoil_id = ${fieldColorScales.airfoilId}
+            AND newer.simulation_preset_revision_id = ${fieldColorScales.simulationPresetRevisionId}
+            AND newer.field = ${fieldColorScales.field}
+            AND newer.render_profile_key = ${fieldColorScales.renderProfileKey}
+            AND newer.version > ${fieldColorScales.version}
+        )`,
+      ),
+    );
+  let mediaCount = 0;
+  for (const scaleRow of retryable) {
+    if (!isImageFieldName(scaleRow.field)) continue;
+    const field: ImageFieldName = scaleRow.field;
+    // Invariant: no code path may run >30 s without a heartbeat touch — each
+    // retry is a per-result engine render round-trip chain.
+    await heartbeat();
+    const airfoilPoints = await airfoilContourPoints(db, scaleRow.airfoilId);
+    if (!airfoilPoints) continue;
+    const extents = await db
+      .select()
+      .from(resultFieldExtents)
+      .where(
+        and(
+          eq(resultFieldExtents.airfoilId, scaleRow.airfoilId),
+          eq(resultFieldExtents.simulationPresetRevisionId, scaleRow.simulationPresetRevisionId),
+          eq(resultFieldExtents.field, scaleRow.field),
+          eq(resultFieldExtents.renderProfileKey, scaleRow.renderProfileKey),
+        ),
+      );
+    if (!extents.length) {
+      // Nothing left to scale (results pruned since the failure): the pending
+      // rebalance is moot and nothing references a never-activated row.
+      await db.delete(fieldColorScales).where(eq(fieldColorScales.id, scaleRow.id));
+      continue;
+    }
+    const minValue = Math.min(...extents.map((row) => row.vmin));
+    const maxValue = Math.max(...extents.map((row) => row.vmax));
+    const normalized = normalizeScale(field, minValue, maxValue);
+    const evidenceSignature = stableHash(
+      extents
+        .map((row) => ({ resultId: row.resultId, field: row.field, min: row.vmin, max: row.vmax, evidenceSha256: row.evidenceSha256 }))
+        .sort((a, b) => a.resultId.localeCompare(b.resultId)),
+    );
+    const [active] = await db
+      .select()
+      .from(fieldColorScales)
+      .where(
+        and(
+          eq(fieldColorScales.airfoilId, scaleRow.airfoilId),
+          eq(fieldColorScales.simulationPresetRevisionId, scaleRow.simulationPresetRevisionId),
+          eq(fieldColorScales.field, scaleRow.field),
+          eq(fieldColorScales.renderProfileKey, scaleRow.renderProfileKey),
+          eq(fieldColorScales.active, true),
+        ),
+      )
+      .limit(1);
+    const targets = await db.select().from(results).where(inArray(results.id, [...new Set(extents.map((row) => row.resultId))]));
+    try {
+      if (active && nearlyEqual(active.vmin, normalized.vmin) && nearlyEqual(active.vmax, normalized.vmax)) {
+        // Extents drifted back to the ACTIVE scale since the failure: the
+        // pending rebalance is moot — heal media at the active scale and
+        // retire the never-activated failed row.
+        const rendered = await renderScaledMediaRows({
+          db,
+          engine,
+          resultRows: targets,
+          field,
+          scale: { id: active.id, version: active.version, vmin: active.vmin, vmax: active.vmax, policy: active.scalePolicy },
+          airfoilPoints,
+          heartbeat,
+        });
+        mediaCount += await registerRenderedMediaSet(db, engine, rendered, {
+          id: active.id,
+          version: active.version,
+          vmin: active.vmin,
+          vmax: active.vmax,
+          policy: active.scalePolicy,
+        });
+        await db.delete(fieldColorScales).where(eq(fieldColorScales.id, scaleRow.id));
+        continue;
+      }
+      // Re-run the rebalance on the SAME version row with fresh values (no
+      // version churn per retry — the version was already allocated).
+      await db
+        .update(fieldColorScales)
+        .set({ status: "rebalancing", scalePolicy: normalized.policy, vmin: normalized.vmin, vmax: normalized.vmax, evidenceSignature })
+        .where(eq(fieldColorScales.id, scaleRow.id));
+      const rendered = await renderScaledMediaRows({
+        db,
+        engine,
+        resultRows: targets,
+        field,
+        scale: { id: scaleRow.id, version: scaleRow.version, vmin: normalized.vmin, vmax: normalized.vmax, policy: normalized.policy },
+        airfoilPoints,
+        heartbeat,
+      });
+      await db.transaction(async (tx) => {
+        await tx
+          .update(fieldColorScales)
+          .set({ active: false })
+          .where(
+            and(
+              eq(fieldColorScales.airfoilId, scaleRow.airfoilId),
+              eq(fieldColorScales.simulationPresetRevisionId, scaleRow.simulationPresetRevisionId),
+              eq(fieldColorScales.field, scaleRow.field),
+              eq(fieldColorScales.renderProfileKey, scaleRow.renderProfileKey),
+              eq(fieldColorScales.active, true),
+            ),
+          );
+        await tx
+          .update(fieldColorScales)
+          .set({ active: true, status: "active", activatedAt: new Date(), failureReason: null })
+          .where(eq(fieldColorScales.id, scaleRow.id));
+        mediaCount += await registerRenderedMediaSet(tx as unknown as DB, engine, rendered, {
+          id: scaleRow.id,
+          version: scaleRow.version,
+          vmin: normalized.vmin,
+          vmax: normalized.vmax,
+          policy: normalized.policy,
+        });
+      });
+      console.log(
+        `[sweeper] scaled-media retry RECOVERED (airfoil ${scaleRow.airfoilId}, revision ${scaleRow.simulationPresetRevisionId}, field ${scaleRow.field}, scale v${scaleRow.version}, attempt ${scaleRow.renderAttempts + 1})`,
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+      const attempt = scaleRow.renderAttempts + 1;
+      console.error(
+        `[sweeper] scaled-media retry FAILED (airfoil ${scaleRow.airfoilId}, revision ${scaleRow.simulationPresetRevisionId}, field ${scaleRow.field}, scale v${scaleRow.version}, attempt ${attempt}/${maxAttempts}${attempt >= maxAttempts ? " — EXHAUSTED, no further retries" : ""}): ${reason}`,
+      );
+      await db
+        .update(fieldColorScales)
+        .set({ status: "failed", failureReason: reason, renderAttempts: sql`${fieldColorScales.renderAttempts} + 1` })
+        .where(eq(fieldColorScales.id, scaleRow.id));
     }
   }
   return mediaCount;

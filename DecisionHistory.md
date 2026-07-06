@@ -1103,3 +1103,55 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
 - Known residual (pre-existing, unchanged): a genuinely failed job that DID
   ingest partial points leaves its untouched claimed rows 'queued' until the
   next sweeper restart's resetOrphans releases them.
+
+## 2026-07-06 — Rejected-point repair, scaled-media retry, classifier regime staleness
+
+- Rejected points get a first-class repair path: `requeueCampaignFailed` now
+  optionally covers the REJECTED bucket (`includeRejected` +
+  `expectedRejectedCount`, its own 409 drift check) using
+  `rejectedResultsWhere` — terminal + result done + rc.state='rejected', the
+  same terminal+result_id model as failed/counters, and shared verbatim with
+  the new `campaignRejected` dialog-count query so counts and requeue can
+  never disagree (the failures/requeue coherence rule extended to the second
+  review bucket). Flip semantics mirror the failed path exactly: result →
+  pending (evidence history kept, re-solve overwrites in place; the stale
+  'rejected' classification row is re-verdicted by the post-ingest polar
+  refresh), point → requested. Requeue response now returns
+  requeued/requeuedFailed/requeuedRejected. UI: RequeueDialog gained an
+  OPT-IN "also requeue N rejected points" section (default unchecked — the
+  admin confirms the count explicitly); the CampaignDetail requeue action now
+  also appears for rejected>0 with an honest label ("Requeue rejected (N)"),
+  closing the journey gap where a 0-failed/N-rejected campaign had NO way to
+  open the dialog. Rationale: prod campaign 592d40c6 had 4 done-but-rejected
+  points that needed manual SQL to re-solve on the fixed engine build.
+- Failed shared-scale renders now retry BOUNDED instead of failing
+  permanently (live proof 2026-07-05: one transient engine fetch failure
+  orphaned the vorticity scale forever). `field_color_scales.render_attempts`
+  (migration 0029) counts FAILED attempts; `retryFailedScaleRenders`
+  (ingest.ts) re-runs status='failed' rows on the reconcile pass every 5 min:
+  fresh extents, SAME version row re-activated on success (no version churn),
+  attempts+1 + failureReason on failure, capped at
+  MAX_SCALE_RENDER_ATTEMPTS=3 (ingest attempt + 2 retries), loud EXHAUSTED
+  log at the cap. Failed rows obsoleted by a newer version in scope are dead
+  history — never retried (a later ingest's rebalance already re-rendered
+  every extents row). The retry timer initializes at module load, so the
+  first pass runs one interval after boot — long-lived sweeper semantics are
+  unchanged and short-lived test processes never fire it implicitly (a
+  0-initialized timer made every vitest worker's first reconcile() race the
+  sweeper suite's failed-scale fixtures across parallel files).
+- Known residual (pre-existing, unchanged): a hard process crash mid-render
+  leaves a scale row stuck 'rebalancing' (not 'failed'), which the retry pass
+  ignores; the next ingest for that scope self-heals by allocating the next
+  version. Revisit only if crash-orphaned 'rebalancing' rows show up in prod.
+- Classifier upsert staleness: `upsertClassification`'s conflict UPDATE now
+  rewrites `regime` too (prod row 3db79ff8 kept regime='rans' on an accepted
+  URANS verdict after the same results row re-solved as URANS).
+  classifierVersion was already rewritten; the rule is that the conflict SET
+  must cover EVERY verdict-scoped column. Recall proven: reverting the two
+  regime lines fails the new 3db79ff8 must-catch test ('rans' ≠ 'urans');
+  reverting the render_attempts increment fails the scale-retry must-catch.
+- Test-isolation rule (sweeper suite): tests that add classifiable results to
+  the SHARED test revision must delete them in-test before finishing — the
+  whole-polar promotion heuristics read REVISION-WIDE classifications, so
+  leaked evidence shifts later suites' decisions (caught: the new scale-retry
+  test's α=87 accepted point flipped whole-polar-urans → invalid-rans-points).

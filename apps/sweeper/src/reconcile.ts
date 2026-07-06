@@ -33,7 +33,7 @@ import { and, count, eq, inArray, isNotNull, isNull, notInArray, or, sql } from 
 import { buildPolarRequest } from "./build-request";
 import { isEngineConnectionFailure, recordEngineUnreachable } from "./engine-backoff";
 import { touchHeartbeat } from "./heartbeat";
-import { type ConditionMapEntry, failedForPoint, ingestResult, type SpeedBc } from "./ingest";
+import { type ConditionMapEntry, failedForPoint, ingestResult, retryFailedScaleRenders, type SpeedBc } from "./ingest";
 import { ransRetryPlanForJobScoped } from "./retry-plan";
 
 export { touchHeartbeat } from "./heartbeat";
@@ -54,9 +54,17 @@ const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = ["submit
 // low-frequency campaign reconciler.
 const LANE_SAFETY_SWEEP_MS = 60_000;
 const CAMPAIGN_RECONCILE_MS = 5 * 60_000;
+// Failed shared-scale renders retry on this cadence (bounded per row by
+// MAX_SCALE_RENDER_ATTEMPTS): spaced retries outlast the transient engine
+// hiccups that a burst of immediate retries would just re-hit. The timer
+// starts at module load (not 0) so the first pass runs one full interval
+// after boot: recovery semantics are unchanged for the long-lived sweeper,
+// and short-lived processes (tests) never fire it implicitly.
+const SCALE_RENDER_RETRY_MS = 5 * 60_000;
 const pendingDirtyLanes = new Map<string, CampaignLaneKey>();
 let lastLaneSweepAt = 0;
 let lastCampaignReconcileAt = 0;
+let lastScaleRenderRetryAt = Date.now();
 
 function collectDirtyLanes(keys: CampaignLaneKey[]): void {
   for (const key of keys) pendingDirtyLanes.set(laneKeyId(key), key);
@@ -1126,6 +1134,19 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
   }
 
   await drainCampaignMaintenance(db);
+
+  // Bounded re-attempt of failed shared-scale renders (one transient engine
+  // fetch failure must not orphan a scale permanently — live proof 2026-07-05).
+  const now = Date.now();
+  if (now - lastScaleRenderRetryAt >= SCALE_RENDER_RETRY_MS) {
+    lastScaleRenderRetryAt = now;
+    try {
+      const recovered = await retryFailedScaleRenders(db, engine);
+      if (recovered > 0) console.log(`[sweeper] scaled-media retry pass registered ${recovered} media rows`);
+    } catch (e) {
+      console.error("[sweeper] scaled-media retry pass failed:", errorMessage(e));
+    }
+  }
 }
 
 /** Per-tick cap on dirty-lane processing. A dual-objective campaign dirties

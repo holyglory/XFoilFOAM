@@ -838,6 +838,9 @@ export const fieldColorScales = pgTable(
     version: integer("version").notNull(),
     active: boolean("active").notNull().default(true),
     failureReason: text("failure_reason"),
+    /** FAILED render attempts for this scale row; the sweeper retries
+     *  status='failed' rows until this reaches MAX_SCALE_RENDER_ATTEMPTS. */
+    renderAttempts: integer("render_attempts").notNull().default(0),
     createdAt: ts().notNull().defaultNow(),
     activatedAt: ts(),
   },

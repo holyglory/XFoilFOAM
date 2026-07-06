@@ -36,7 +36,7 @@ import { buildPolarRequest } from "../src/build-request";
 import { claimAoas } from "../src/claim";
 import { findGaps, firstBatch } from "../src/gaps";
 import { touchHeartbeat } from "../src/heartbeat";
-import { ingestResult } from "../src/ingest";
+import { ingestResult, retryFailedScaleRenders } from "../src/ingest";
 import { reconcile, resetOrphans } from "../src/reconcile";
 
 const { db, sql } = createClient({ max: 2 });
@@ -763,6 +763,213 @@ describe("sweeper: gap → claim → ingest", () => {
     const [rcNoVideo] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, row.id));
     expect(rcNoVideo?.state).toBe("rejected");
     expect(rcNoVideo?.reasons).toContain("missing-urans-video");
+  }, 60000);
+
+  // MUST-CATCH (live proof 2026-07-05): "[sweeper] scaled-media render FAILED
+  // (field vorticity, scale v1): fetch failed" — ONE transient engine fetch
+  // failure during the shared-scale re-render marked the scale row failed
+  // PERMANENTLY; no code path ever re-attempted it. The reconcile retry pass
+  // must (a) record each failed attempt on the row, (b) recover the SAME
+  // version row once the engine responds, and (c) stop retrying at
+  // MAX_SCALE_RENDER_ATTEMPTS and skip rows a newer version obsoleted.
+  it("retries a failed scaled-media render (bounded) and activates the scale on recovery", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 87.001;
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "ingesting",
+        engineJobId: "scale-retry-job",
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+
+    // Extents compute fine; every render fetch fails — the exact transient
+    // failure shape from the live campaign.
+    let renderCalls = 0;
+    const renderDownEngine = {
+      baseUrl: "http://engine.test",
+      computeFieldExtents: async () => ({
+        fields: { velocity_magnitude: { min: 0, max: 90, finite_count: 100 } },
+        window_start: null,
+        window_end: null,
+      }),
+      renderDefaultMedia: async () => {
+        renderCalls++;
+        throw new Error("fetch failed");
+      },
+    } as unknown as EngineClient;
+
+    const result: JobResult = {
+      job_id: "scale-retry-job",
+      state: "completed",
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: 0.1,
+          points: [
+            {
+              case_slug: "srt1",
+              aoa_deg: aoa,
+              cl: 0.5,
+              cd: 0.011,
+              cm: -0.02,
+              cl_cd: 45,
+              unsteady: false,
+              converged: true,
+              first_order_fallback: false,
+              images: { velocity_magnitude: "/jobs/scale-retry-job/files/cases/srt1/images/velocity_magnitude.png" },
+              evidence_artifacts: [
+                {
+                  kind: "manifest",
+                  path: "/jobs/scale-retry-job/files/evidence/srt1/evidence_manifest.json",
+                  url: "/jobs/scale-retry-job/files/evidence/srt1/evidence_manifest.json",
+                  mime_type: "application/json",
+                  sha256: "sha-srt1",
+                  byte_size: 128,
+                  metadata: { evidenceBase: "/tmp/evidence/srt1" },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    await ingestResult({
+      db,
+      engine: renderDownEngine,
+      engineJobId: "scale-retry-job",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+      result,
+    });
+    const [row] = await db
+      .select()
+      .from(results)
+      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    cleanupResultIds.add(row.id);
+
+    // (a) the failed render lands on the scale row with the attempt recorded.
+    const scaleScope = and(
+      eq(fieldColorScales.airfoilId, a.id),
+      eq(fieldColorScales.simulationPresetRevisionId, presetRevisionId),
+      eq(fieldColorScales.field, "velocity_magnitude"),
+    );
+    const failedScales = await db
+      .select()
+      .from(fieldColorScales)
+      .where(and(scaleScope, eq(fieldColorScales.status, "failed")));
+    expect(failedScales.length).toBe(1);
+    const failedScale = failedScales[0];
+    expect(failedScale.renderAttempts).toBe(1);
+    expect(failedScale.failureReason).toContain("fetch failed");
+    expect(failedScale.active).toBe(false);
+
+    // Engine still down on the next pass: the attempt advances, row stays failed.
+    await retryFailedScaleRenders(db, renderDownEngine);
+    const [stillFailed] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    expect(stillFailed.status).toBe("failed");
+    expect(stillFailed.renderAttempts).toBe(2);
+
+    // (b) engine recovers: the SAME version row re-renders, activates, and the
+    // media registers stamped with this scale.
+    const healthyEngine = {
+      baseUrl: "http://engine.test",
+      computeFieldExtents: (renderDownEngine as unknown as { computeFieldExtents: unknown }).computeFieldExtents,
+      renderDefaultMedia: async (
+        jobId: string,
+        request: { case_slug: string; fields?: string[]; unsteady?: boolean; scale_version?: number; render_profile_key?: string },
+      ) => {
+        const version = request.scale_version ?? 1;
+        const profile = request.render_profile_key ?? "default:v1:zoom2";
+        const base = `/jobs/${jobId}/files/evidence/scaled_media/${profile}/v${version}/${request.case_slug}`;
+        const fields = request.fields ?? [];
+        return {
+          images: fields.map((field) => ({
+            kind: "image" as const,
+            field,
+            role: "instantaneous" as const,
+            path: `${base}/${field}.png`,
+            url: `${base}/${field}.png`,
+            mime_type: "image/png",
+            sha256: `retry-${request.case_slug}-${field}-v${version}`,
+            byte_size: 256,
+          })),
+          mean_images: [],
+          videos: [],
+          window_start: null,
+          window_end: null,
+          scale_version: version,
+          render_profile_key: profile,
+        };
+      },
+    } as unknown as EngineClient;
+    const recovered = await retryFailedScaleRenders(db, healthyEngine);
+    expect(recovered).toBeGreaterThan(0);
+    const [afterRecover] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    expect(afterRecover.status).toBe("active");
+    expect(afterRecover.active).toBe(true);
+    expect(afterRecover.failureReason).toBeNull();
+    expect(afterRecover.version).toBe(failedScale.version); // no version churn on retry
+    const activeRows = await db.select().from(fieldColorScales).where(and(scaleScope, eq(fieldColorScales.active, true)));
+    expect(activeRows.length).toBe(1); // the old active scale was deactivated
+    const media = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
+    expect(media.some((m) => m.colorScaleId === failedScale.id && m.colorScaleVersion === failedScale.version)).toBe(true);
+
+    // (c) bounded: a row at the attempt cap is never re-attempted…
+    await db
+      .update(fieldColorScales)
+      .set({ status: "failed", active: false, renderAttempts: 3, failureReason: "fetch failed" })
+      .where(eq(fieldColorScales.id, failedScale.id));
+    const callsAtCap = renderCalls;
+    await retryFailedScaleRenders(db, renderDownEngine);
+    expect(renderCalls).toBe(callsAtCap);
+    const [exhausted] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    expect(exhausted.status).toBe("failed");
+    expect(exhausted.renderAttempts).toBe(3);
+
+    // …and a failed row obsoleted by a NEWER version is dead history, skipped
+    // even with attempts remaining.
+    await db.update(fieldColorScales).set({ renderAttempts: 0 }).where(eq(fieldColorScales.id, failedScale.id));
+    await db.insert(fieldColorScales).values({
+      airfoilId: a.id,
+      simulationPresetRevisionId: presetRevisionId,
+      field: "velocity_magnitude",
+      renderProfileKey: failedScale.renderProfileKey,
+      scalePolicy: "sequential_zero",
+      vmin: 0,
+      vmax: 90,
+      evidenceSignature: "sig-newer-version",
+      status: "active",
+      version: failedScale.version + 1,
+      active: true,
+    });
+    await retryFailedScaleRenders(db, renderDownEngine);
+    expect(renderCalls).toBe(callsAtCap); // still zero re-attempts
+    const [obsolete] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    expect(obsolete.status).toBe("failed");
+
+    // Restore the shared-revision evidence this test added: the whole-polar
+    // promotion test later in this file decides over REVISION-WIDE
+    // classifications, so an extra classifiable result at this scope would
+    // shift its heuristics. Deleting the result cascades its extents; the
+    // synthetic scale versions go explicitly and the pre-test active scale
+    // comes back.
+    await db.delete(results).where(eq(results.id, row.id));
+    cleanupResultIds.delete(row.id);
+    await db
+      .delete(fieldColorScales)
+      .where(and(scaleScope, inArray(fieldColorScales.version, [failedScale.version, failedScale.version + 1])));
+    await db.update(fieldColorScales).set({ active: true }).where(and(scaleScope, eq(fieldColorScales.status, "active")));
   }, 60000);
 
   // MUST-CATCH (prod 2026-07-06 heartbeat-under-load regression): with 7 jobs
