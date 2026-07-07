@@ -41,8 +41,11 @@ import {
   sweepDefinitions,
   sweeperState,
 } from "@aerodb/db";
-import { type EngineClient, type JobResult, type JobStatus, type PolarRequest } from "@aerodb/engine-client";
+import { type EngineClient, type JobResult, type JobStatus, type PolarPoint, type PolarRequest } from "@aerodb/engine-client";
 import { and, eq, inArray, like, sql as dsql } from "drizzle-orm";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { reconcile, submitUransRetryForJob } from "../src/reconcile";
@@ -50,6 +53,10 @@ import { resetUransLadderMemory, uransLadderTick } from "../src/urans-ladder";
 
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `sw-ladder-${process.pid}-${Date.now().toString(36)}`;
+
+const here = dirname(fileURLToPath(import.meta.url));
+const frameTrackFixture = (): Record<string, unknown> =>
+  JSON.parse(readFileSync(resolve(here, "fixtures/frame-track-contract.json"), "utf8"));
 
 const ANGLES = [4, 8];
 const SPEED = 20;
@@ -455,11 +462,13 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
 
   it("consumes the verify item at FULL fidelity once no campaign RANS/precalc work exists, then records a DISAGREEMENT at ingest", async () => {
     // The verify tier's gate is MACHINE-WIDE by design (contract 5): another
-    // suite's live campaign fixture (campaign-batching, worker-restart) running
-    // concurrently against the shared dev DB legitimately holds it open for a
-    // few seconds. Bounded wait for quiet — a PERMANENTLY open gate (the real
-    // regression this test must catch) still fails below after the timeout.
-    const quietDeadline = Date.now() + 60_000;
+    // suite's live campaign fixture (campaign-batching, worker-restart,
+    // sweeper, replace-guard) running concurrently against the shared dev DB
+    // legitimately holds it open for as long as that suite's campaign stays
+    // active — minutes, not seconds, on the remote DB. Bounded wait for quiet
+    // sized past the longest sibling suite — a PERMANENTLY open gate (the
+    // real regression this test must catch) still fails below at the deadline.
+    const quietDeadline = Date.now() + 180_000;
     while ((await hasOpenCampaignLadderWork(db)) && Date.now() < quietDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
@@ -487,6 +496,12 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     expect(beforeCampaign.status).toBe("active");
 
     // Verified full-fidelity solve disagrees on Cl: 1.2 vs precalc 1.0.
+    // Evidence-complete payload, like a real full-tier engine solve: frame
+    // track (stationary, 6 retained periods >= the full-tier bar of 5), video
+    // and force history shipped — it must pre-classify ACCEPT so the ingest
+    // replace guard (gate incident 2026-07-07) lets it supersede the accepted
+    // precalc row; a would-REJECT verify solve keeps the precalc evidence and
+    // cancels the item instead (covered by the replace-guard suite).
     const verified: JobResult = {
       job_id: `${PREFIX}-verify-job`,
       state: "completed",
@@ -506,8 +521,19 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
               unsteady: true,
               converged: true,
               first_order_fallback: false,
+              fidelity: "urans_full",
+              frame_track: frameTrackFixture() as unknown as PolarPoint["frame_track"],
               images: {},
-            },
+              video: { velocity_magnitude: `/jobs/${PREFIX}-verify-job/files/cases/a0/images/velocity_magnitude.mp4` },
+              force_history: {
+                t: [0, 0.1, 0.2, 0.3],
+                cl: [1.1, 1.3, 1.15, 1.25],
+                cd: [0.05, 0.06, 0.05, 0.06],
+                cm: [-0.04, -0.06, -0.05, -0.05],
+                shedding_freq_hz: 7.3,
+                samples: 240,
+              },
+            } as PolarPoint,
           ],
         },
       ],
@@ -553,7 +579,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     // the ladder no longer blocks).
     const tiers = await campaignOpenTierCounts(db, campaignId);
     expect(tiers.verifyOpen).toBe(0);
-  }, 120000);
+  }, 300000);
 });
 
 describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-07)", () => {
@@ -565,6 +591,11 @@ describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-
   // occupied the window and the needy parent was never fetched → its
   // needs_urans cell never re-solved → phase stuck running_precalc forever.
   it("reaches a needy parent ranked past the first finishedAt window despite 13 earlier no-retry parents", async () => {
+    // The verify test above ends with every tier terminal and the aoa-8 cell
+    // ACCEPTED at full fidelity, so the completion probe settles the shared
+    // fixture campaign to 'completed'. This scenario needs a LIVE mid-ladder
+    // campaign (the gate just opened, gated retries still owed) — reactivate.
+    await db.update(simCampaigns).set({ status: "active" }).where(eq(simCampaigns.id, campaignId));
     const base = Date.now() - 60 * 60 * 1000;
     // 13 completed, ingested, childless wave-1 parents with EMPTY retry plans
     // (no attempts at all) — one more than the old 12-slot scan window.

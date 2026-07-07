@@ -189,7 +189,14 @@ export function isOscillatingSteadyStable(p: PolarEvidencePoint): boolean {
   return !p.unsteady && p.steadyHistory != null && p.steadyHistory.mean_stable === true;
 }
 
-function baseRejectionReasons(p: PolarEvidencePoint): string[] {
+/** Pointwise evidence gate: every rejection reason derivable from the point
+ *  ALONE (no polar-shape context). Empty array = the point would classify
+ *  accepted (or needs_urans, which only ever DOWNGRADES an accepted point via
+ *  polar-shape heuristics — never resurrects a rejected one). Exported (pure)
+ *  so the sweeper's ingest replace-guard can pre-classify an INCOMING payload
+ *  with the exact gate the post-ingest classifier applies, instead of a
+ *  drift-prone re-implementation. */
+export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   const reasons: string[] = [];
   if (p.status !== "done" || p.source !== "solved") reasons.push("not-solved");
   if (!finite(p.cl) || !finite(p.cd) || !finite(p.cm)) reasons.push("missing-coefficients");

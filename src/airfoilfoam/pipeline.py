@@ -1645,8 +1645,8 @@ def _finalize_outcome(
     frame_series: Optional[tuple] = None  # merged (t, cl, cd, cm) coefficient arrays
     if solver_params.force_transient or (not outcome.converged and solver_params.transient_fallback):
         # Fidelity tier: the tier owns the retained-period target and the
-        # transient wall-clock budget (precalc: 3 periods / 3600 s; full:
-        # 7 periods / 21600 s) — contract item 1, pinned cross-runtime.
+        # transient wall-clock budget (precalc: 3 periods / 7200 s; full:
+        # 7 periods / 43200 s) — contract item 1, pinned cross-runtime.
         urans_params = apply_urans_fidelity(solver_params)
         urans_timeout = urans_budget_seconds(solver_params)
         transient = _run_transient(

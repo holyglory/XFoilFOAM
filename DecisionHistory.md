@@ -2008,3 +2008,94 @@ Recall proven: the new must-catch test (failed job, zero points, shipped
 attempts → attempts+evidence ingested, "All cases failed" stamped, precalc
 retry child enqueued, loud lines) fails on the pre-fix sources exactly on the
 prod defect. Suites: sweeper 114/114, api 82/82, pnpm typecheck clean.
+
+## 2026-07-07 — URANS fidelity budgets retuned to measured prod rates (gate tier-2, engine half)
+
+Decision: raise the URANS fidelity-tier wall budgets to what the gate campaign
+actually measured. `URANS_FIDELITY_BUDGET_S` precalc 3600 → 7200 s, full
+21600 → 43200 s (`src/airfoilfoam/models.py`), with the parity constants in
+`packages/engine-client/src/fidelity.ts` updated in the same change so the
+cross-runtime pin stays atomic (the sweeper pin test values are the node
+agent's suite: `URANS_PRECALC_SOLVER_BUDGET_S` 7200,
+`URANS_FULL_SOLVER_BUDGET_S` 43200).
+
+Measured basis (ladder-gate campaign, naca-0012 alpha=15°, 25 m/s, 0.1 m
+chord — quality_warnings quote): "URANS integration stopped by the wall-clock
+budget guard: retained 1.4 of 3 periods; projected 0.6h continuation exceeds
+80% of the 1.0h solver timeout". That is ~14 min/period on the HALF-RES
+precalc mesh at the worst campaign class (c/U = 0.1/25), so the 3-period
+precalc target needs ~1.4 h → 7200 s (the old 3600 s budget just missed a
+healthy run: St 0.118, cl mean 0.689 coherent with the accepted RANS 0.652).
+The full tier runs the FULL mesh (~8× cost → ~2 h/period), so 7 periods need
+~14 h of integration headroom under the 80% wall-guard fraction → 43200 s;
+full is the background trickle tier per the approved ladder design, so a
+12 h budget is acceptable there.
+
+Celery hard-limit derivation updated (`celery_app.py`
+`task_hard_time_limit_s`): the per-case solver term is now
+`2 * max(solver_timeout, max(URANS_FIDELITY_BUDGET_S))` because the full-tier
+budget (43200 s) exceeds the default `solver_timeout` (7200 s) — the old
+`2 * solver_timeout` formula would have let celery SIGKILL healthy full-tier
+transients. Worst-case fit verified in the test: steady init (1200 s) + two
+0.8-wall-guarded transients (~34.6 ks each) + media (3600 s) + margin ≈ 75 ks
+under the 90 900 s single-case ceiling.
+
+Tests: pins updated in `tests/test_fidelity_tiers.py` (7200/43200); celery
+math test in `tests/test_media_grind_guardrails.py` now asserts the ceiling
+covers the largest tier budget, keeps a solver_timeout-dominates case, and
+proves the worst-case fit. Engine suite 253 passed;
+`@aerodb/engine-client` typecheck clean (the package has no test runner —
+its pins are exercised by the sweeper suite).
+
+Open item this does NOT fix (finding 1 of the same gate review): ingest
+UPSERTs cell-unique results before classification, so a REJECTED
+higher-fidelity attempt can clobber an ACCEPTED lower-fidelity row — that
+clobber guard is node-side work, tracked separately.
+
+## 2026-07-07 — Ingest replace guard (gate tier-2 finding 1, node half) + verification hardening
+
+Decision: an incoming point that would FAIL the classifier's pointwise
+evidence gate must never replace a canonical row holding accepted (or
+needs_urans — provisional accepted) evidence. `apps/sweeper/src/ingest.ts`
+pre-classifies the incoming payload with the EXACT post-ingest gate
+(`baseRejectionReasons`, now exported from `packages/core/src/polar-fit.ts`
+— no re-implementation, so gate changes can't drift), and when the guard
+engages the attempt row is ingested with a loud
+`"higher-tier attempt rejected: …"` quality marker, evidence artifacts land
+on the ATTEMPT with `resultId: null`, and campaign/request/verify
+bookkeeping settles against the KEPT row. Decision matrix (all cells
+pinned in `apps/sweeper/test/replace-guard.test.ts`): incoming
+accept × {accepted, rejected, absent} → replace as always; incoming
+reject × accepted/needs_urans → KEEP; incoming reject × {rejected, absent,
+failed, claimed, unclassified, legacy-no-revision} → replace ("any honest
+evidence beats none").
+
+Drift fail-safety (verified by construction + a pinned probe test): every
+gate in `baseRejectionReasons` fails CLOSED and the pre-gate's media checks
+judge the payload's own shipment (which the same ingest persists), so
+pre/post divergence within an ingest can only OVER-reject the incoming
+point — the safe direction (guard keeps accepted evidence). Post-time
+evidence loss (e.g. media rows deleted later) honestly flips the cell via
+the post-classifier, which stays the sole source of truth for the canonical
+row; the guard is advisory at ingest time and never resurrects.
+
+Verification found and fixed one hole in the guard's artifact isolation:
+the engine's warm-start march ships every point ALSO in
+`polars[].attempts` (same evidence_artifacts, same storageKey+sha256), and
+the artifact upsert's conflict SET rewrites `resultId` — so the attempts
+loop re-attached the rejected shipment's manifest to the KEPT row,
+re-poisoning `manifestEvidenceBaseForResult` for future re-renders of the
+accepted row. Fixed with a per-polar `guardedAoas` set (attempts-loop
+artifacts for guarded cells register with `resultId: null`); recall proven
+by temporarily reverting the fix (the new MUST-CATCH warm-start-duplicate
+test fails exactly on the poisoned resultId). Also pinned the previously
+untested rejected-verify interaction: a guard-rejected FULL verify solve
+keeps the accepted precalc row and reconcile's verified-row-is-the-judge
+check cancels the queue item terminally (never silently supersedes, never
+strands the item).
+
+Suites after the combined change: engine pytest 253 (6 deselected),
+typecheck 6/6, core 82, api 82, web 174, sweeper full battery green with
+replace-guard at 9 tests (incident MUST-CATCH, supersede, matrix cells,
+needs_urans false-positive guard, warm-start duplicate, verify-cancel,
+drift probe, gate mirror).

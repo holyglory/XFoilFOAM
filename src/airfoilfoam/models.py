@@ -131,14 +131,25 @@ class MeshParams(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# URANS FIDELITY TIERS (pinned 2026-07-07, task #30). The request field
+# URANS FIDELITY TIERS (pinned 2026-07-07, task #30; budgets retuned
+# 2026-07-07 to measured prod rates — ladder-gate campaign, naca-0012
+# alpha=15 deg, 25 m/s, 0.1 m chord). The request field
 # ``solver.urans_fidelity`` selects the tier; the node side builds requests
 # against EXACTLY these tier constants (contract pin tests on both runtimes):
-#   precalc => urans_min_periods 3, solver budget 3600 s, mesh scale 0.5
+#   precalc => urans_min_periods 3, solver budget 7200 s (2 h), mesh scale 0.5
 #              (derived half-resolution URANS mesh: n_surface/n_radial/n_wake
 #              halved, same y+ target; the mesh cache keys on the resolved
 #              params, so the derived mesh caches separately from the full one)
-#   full    => urans_min_periods 7, solver budget 21600 s (6 h), full mesh
+#   full    => urans_min_periods 7, solver budget 43200 s (12 h), full mesh
+#              (background trickle tier per the approved ladder design)
+# Measured basis for the budgets (gate tier-2 quality_warnings): under the
+# original 3600 s precalc budget the guard stopped at "retained 1.4 of 3
+# periods; projected 0.6h continuation exceeds 80% of the 1.0h solver
+# timeout" — i.e. ~14 min/period on the half-res precalc mesh at the
+# worst campaign class (c/U = 0.1 m / 25 m/s), so 3 periods need ~1.4 h
+# => 7200 s. The full tier runs the FULL mesh (~8x cost => ~2 h/period),
+# so 7 periods need ~14 h of integration headroom under the 80% wall-guard
+# fraction => 43200 s.
 # The tier is echoed on PolarPoint.fidelity: "rans" | "urans_precalc" |
 # "urans_full".
 # --------------------------------------------------------------------------- #
@@ -154,9 +165,13 @@ URANS_FIDELITY_MIN_PERIODS: dict[UransFidelity, int] = {
 }
 
 #: Wall-clock solver budget [s] for the URANS transient of each tier.
+#: Retuned to measured prod rates (see the tier block comment above):
+#: precalc 7200 s (~14 min/period half-res mesh at the worst class => 3
+#: periods ~1.4 h), full 43200 s (~2 h/period full mesh => 7 periods,
+#: background trickle tier).
 URANS_FIDELITY_BUDGET_S: dict[UransFidelity, int] = {
-    UransFidelity.precalc: 3600,
-    UransFidelity.full: 21600,
+    UransFidelity.precalc: 7200,
+    UransFidelity.full: 43200,
 }
 
 #: Mesh resolution scale of the derived precalc URANS mesh.
@@ -227,8 +242,10 @@ class SolverParams(BaseModel):
     urans_fidelity: UransFidelity = Field(
         default=UransFidelity.full,
         description="URANS fidelity tier (pinned cross-runtime): 'precalc' runs a fast 3-period "
-        "transient on a derived half-resolution mesh with a 3600 s solver budget; 'full' runs "
-        "7 periods on the full mesh with a 21600 s (6 h) budget. Echoed on PolarPoint.fidelity.",
+        "transient on a derived half-resolution mesh with a 7200 s (2 h) solver budget; 'full' "
+        "runs 7 periods on the full mesh with a 43200 s (12 h) budget (background trickle tier). "
+        "Budgets sized to measured prod rates: ~14 min/period half-res, ~2 h/period full mesh at "
+        "the worst campaign class (0.1 m chord, 25 m/s). Echoed on PolarPoint.fidelity.",
     )
     steady_oscillation_window: int = Field(
         default=400,

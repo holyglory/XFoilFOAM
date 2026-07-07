@@ -677,14 +677,45 @@ def test_celery_hard_time_limit_math_derives_from_config():
     from airfoilfoam.celery_app import TASK_TIME_LIMIT_MARGIN_S, celery_app, task_hard_time_limit_s
     from airfoilfoam.config import get_settings
 
+    from airfoilfoam.models import URANS_FIDELITY_BUDGET_S, UransFidelity
+
+    # The solver ceiling in the formula must cover the LARGEST fidelity-tier
+    # URANS wall budget (full tier 43200 s > default solver_timeout 7200 s
+    # since the 2026-07-07 measured-rate retune) — otherwise celery would
+    # SIGKILL healthy full-tier transients mid-run.
+    max_urans = max(URANS_FIDELITY_BUDGET_S.values())
+    assert max_urans == URANS_FIDELITY_BUDGET_S[UransFidelity.full] == 43200
+
     settings = Settings(solver_timeout=7200, media_budget_fraction=0.5)
-    per_case = 2 * 7200 + 0.5 * 7200 + TASK_TIME_LIMIT_MARGIN_S
+    per_case = 2 * max(7200, max_urans) + 0.5 * 7200 + TASK_TIME_LIMIT_MARGIN_S
     assert task_hard_time_limit_s(settings) == int(math.ceil(per_case))
     assert task_hard_time_limit_s(settings, total_cases=12) == int(math.ceil(12 * per_case))
     assert task_hard_time_limit_s(settings, total_cases=0) == int(math.ceil(per_case))
 
     other = Settings(solver_timeout=3600, media_budget_fraction=0.25)
-    assert task_hard_time_limit_s(other) == int(math.ceil(2 * 3600 + 0.25 * 3600 + TASK_TIME_LIMIT_MARGIN_S))
+    assert task_hard_time_limit_s(other) == int(
+        math.ceil(2 * max(3600, max_urans) + 0.25 * 3600 + TASK_TIME_LIMIT_MARGIN_S)
+    )
+
+    # A solver_timeout ABOVE every tier budget still drives the ceiling.
+    huge = Settings(solver_timeout=100_000, media_budget_fraction=0.25)
+    assert task_hard_time_limit_s(huge) == int(
+        math.ceil(2 * 100_000 + 0.25 * 100_000 + TASK_TIME_LIMIT_MARGIN_S)
+    )
+
+    # Worst-case fit: steady init + two wall-guarded transients + media +
+    # margin must fit under the single-case ceiling (full tier, defaults).
+    defaults = Settings()
+    from airfoilfoam.pipeline import URANS_REFINE_BUDGET_FRACTION
+
+    guard_fraction = URANS_REFINE_BUDGET_FRACTION  # in-run wall guard
+    worst = (
+        defaults.rans_solver_timeout
+        + 2 * guard_fraction * max_urans
+        + defaults.media_budget_seconds()
+        + TASK_TIME_LIMIT_MARGIN_S
+    )
+    assert worst <= task_hard_time_limit_s(defaults)
 
     # the app-level default is wired from the live settings (no magic constant)
     assert celery_app.conf.task_time_limit == task_hard_time_limit_s(get_settings())

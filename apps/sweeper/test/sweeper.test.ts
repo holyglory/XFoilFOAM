@@ -835,13 +835,33 @@ describe("sweeper: gap → claim → ingest", () => {
     const mediaAfter = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
     expect(mediaAfter.length).toBe(3);
 
-    // MUST-CATCH (review F3): a wave-2 re-solve shipping NO video (video:{})
-    // must not leave the wave-1 video row satisfying the classifier's
-    // hasVideo gate for the NEW coefficients — ingest reconciles kind='video'
-    // rows to the current shipment, and the classification honestly drops to
-    // rejected missing-urans-video.
+    // REPLACE GUARD interplay (gate incident 2026-07-07): while the cell's
+    // stored verdict is ACCEPTED, a re-solve shipping NO video pre-classifies
+    // rejected (missing-urans-video) and must NOT clobber the accepted
+    // evidence — coefficients AND the coherent wave-1 video row stay.
     const noVideoResult: JobResult = JSON.parse(JSON.stringify(result));
     noVideoResult.polars[0].points[0].video = {};
+    await ingestResult({
+      db,
+      engine: failingEngine,
+      engineJobId: "shipped-media-job",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+      result: noVideoResult,
+    });
+    const mediaGuarded = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
+    expect(mediaGuarded.some((m) => m.kind === "video")).toBe(true); // accepted evidence kept intact
+    expect(mediaGuarded.length).toBe(3);
+
+    // MUST-CATCH (review F3): with no protective verdict on the cell
+    // (classification absent — unjudged/rejected cells replace as always), a
+    // wave-2 re-solve shipping NO video (video:{}) must not leave the wave-1
+    // video row satisfying the classifier's hasVideo gate for the NEW
+    // coefficients — ingest reconciles kind='video' rows to the current
+    // shipment, and the classification honestly drops to rejected
+    // missing-urans-video.
+    await db.delete(resultClassifications).where(eq(resultClassifications.resultId, row.id));
     await ingestResult({
       db,
       engine: failingEngine,

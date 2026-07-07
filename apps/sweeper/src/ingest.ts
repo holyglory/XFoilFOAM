@@ -8,12 +8,13 @@ import {
   type DB,
   type ResultInsert,
   resultAttempts,
+  resultClassifications,
   resultFieldExtents,
   results,
   resultMedia,
   solverEvidenceArtifacts,
 } from "@aerodb/db";
-import { canonicalSi } from "@aerodb/core";
+import { baseRejectionReasons, canonicalSi, type PolarEvidencePoint } from "@aerodb/core";
 import {
   ALL_IMAGE_FIELDS,
   type EngineClient,
@@ -371,6 +372,138 @@ export function qualityWarningsForPoint(p: PolarPoint): string[] | null {
   return warnings.length ? warnings : null;
 }
 
+/** Quality-warning marker prefix stamped on the ATTEMPT row when the replace
+ *  guard keeps the canonical row (gate incident 2026-07-07: a rejected precalc
+ *  URANS upserted OVER an accepted oscillating-steady RANS). Exported for the
+ *  must-catch tests and every point-story surface that reads the marker. */
+export const REPLACE_GUARD_MARKER = "higher-tier attempt rejected";
+
+/** Classification states whose canonical row the replace guard protects.
+ *  needs_urans is PROVISIONAL ACCEPTED evidence (it feeds the polar fit), so
+ *  it is protected exactly like accepted — never treated as rejected. */
+const REPLACE_GUARD_PROTECTED_STATES = new Set<string>(["accepted", "needs_urans"]);
+
+/** Evidence view of an INCOMING engine point, shaped exactly like the row the
+ *  post-ingest classifier would load from the results table (polar-cache
+ *  loadResultEvidence → toEvidence). Media-presence gates (hasVideo /
+ *  hasForceHistory) evaluate against what the payload SHIPS — the same media
+ *  that registerShippedMedia / the force-history upsert would persist for this
+ *  row. Exported for the replace-guard tests. */
+export function incomingPointEvidence(
+  p: PolarPoint,
+  derived: { fidelity: PointFidelity; frameTrack: unknown; steadyHistory: unknown; error: string | null },
+): PolarEvidencePoint {
+  const failed = failedForPoint(p);
+  return {
+    a: p.aoa_deg,
+    cl: p.cl ?? null,
+    cd: p.cd ?? null,
+    cm: p.cm ?? null,
+    ld: p.cl_cd ?? null,
+    status: failed ? "failed" : "done",
+    source: failed ? "queued" : "solved",
+    regime: p.unsteady ? "urans" : "rans",
+    converged: p.converged,
+    stalled: stalledForPoint(p),
+    unsteady: p.unsteady,
+    error: derived.error,
+    finalResidual: p.final_residual ?? null,
+    iterations: p.iterations ?? null,
+    firstOrderFallback: p.first_order_fallback,
+    validForPolar: validForPolarPoint(p),
+    hasForceHistory: Boolean(p.force_history),
+    hasVideo: Object.values(p.video ?? {}).some(Boolean),
+    frameTrack: (derived.frameTrack ?? null) as PolarEvidencePoint["frameTrack"],
+    fidelity: derived.fidelity,
+    steadyHistory: (derived.steadyHistory ?? null) as PolarEvidencePoint["steadyHistory"],
+  };
+}
+
+/** Advisory pre-classification for the replace decision ONLY: the pointwise
+ *  rejection reasons the classifier's evidence gate (packages/core
+ *  baseRejectionReasons — the exact function the post-ingest classifier runs)
+ *  would raise for the incoming payload. Empty = the point would classify
+ *  accepted or needs_urans-eligible (needs_urans only ever downgrades an
+ *  ACCEPTED point via polar-shape context, never resurrects a rejected one, so
+ *  the pointwise gate alone decides accept-vs-reject).
+ *
+ *  DRIFT FAILS SAFE by construction: the post-ingest classifier remains the
+ *  source of truth for whatever row IS canonical. Every gate in
+ *  baseRejectionReasons fails CLOSED (malformed frame_track / steady_history
+ *  can only ever add reasons), and the media gates here see the payload's own
+ *  shipment — so any pre/post disagreement can only make this function REJECT
+ *  a point the classifier might have accepted (guard keeps the existing
+ *  accepted evidence: the safe direction), never accept one the classifier
+ *  rejects. Exported for the replace-guard tests. */
+export function incomingRejectionReasons(
+  p: PolarPoint,
+  derived: { fidelity: PointFidelity; frameTrack: unknown; steadyHistory: unknown; error: string | null },
+): string[] {
+  return baseRejectionReasons(incomingPointEvidence(p, derived));
+}
+
+interface ReplaceGuardVerdict {
+  /** Existing canonical row id (guard engaged: NOT upserted, kept as-is). */
+  keptResultId: string;
+  keptFidelity: string | null;
+  keptRegime: "rans" | "urans" | null;
+  keptState: string;
+  reasons: string[];
+}
+
+/** Replace-guard decision for one incoming point (gate incident 2026-07-07):
+ *  results are cell-unique (airfoil, revision, aoa) and classification runs
+ *  AFTER the upsert, so before this guard a higher-fidelity ATTEMPT that
+ *  failed its evidence gate silently replaced an accepted row. Returns a
+ *  verdict when the canonical row must be KEPT (existing row is status=done
+ *  with an accepted/needs_urans classification AND the incoming point would
+ *  reject); null = upsert as today. Claimed rows (pending/queued/running) are
+ *  never guarded — a re-solve in flight owns its cell, and blocking it would
+ *  strand the row in a non-terminal status. */
+async function replaceGuardVerdict(opts: {
+  db: DB;
+  airfoilId: string;
+  presetRevisionId: string | null;
+  point: PolarPoint;
+  derived: { fidelity: PointFidelity; frameTrack: unknown; steadyHistory: unknown; error: string | null };
+}): Promise<ReplaceGuardVerdict | null> {
+  const { db, airfoilId, presetRevisionId, point: p, derived } = opts;
+  // Legacy rows without a revision can't be addressed by the upsert's natural
+  // key semantics here (NULL never equals NULL) — never guarded.
+  if (!presetRevisionId) return null;
+  const reasons = incomingRejectionReasons(p, derived);
+  if (!reasons.length) return null; // would-accept (or needs_urans-eligible): normal replacement.
+  const [existing] = await db
+    .select({
+      id: results.id,
+      status: results.status,
+      fidelity: results.fidelity,
+      regime: results.regime,
+      state: resultClassifications.state,
+    })
+    .from(results)
+    .leftJoin(resultClassifications, eq(resultClassifications.resultId, results.id))
+    .where(
+      and(
+        eq(results.airfoilId, airfoilId),
+        eq(results.simulationPresetRevisionId, presetRevisionId),
+        eq(results.aoaDeg, p.aoa_deg),
+      ),
+    )
+    .limit(1);
+  // Absent / failed / claimed / rejected / unclassified existing evidence:
+  // any honest evidence beats none — upsert as today.
+  if (!existing || existing.status !== "done") return null;
+  if (!existing.state || !REPLACE_GUARD_PROTECTED_STATES.has(existing.state)) return null;
+  return {
+    keptResultId: existing.id,
+    keptFidelity: existing.fidelity ?? null,
+    keptRegime: existing.regime,
+    keptState: existing.state,
+    reasons,
+  };
+}
+
 async function insertResultAttempt(opts: {
   db: DB;
   resultId?: string | null;
@@ -380,9 +513,16 @@ async function insertResultAttempt(opts: {
   simJobId: string;
   engineJobId: string;
   point: PolarPoint;
+  /** Extra honest markers appended to the attempt's quality warnings (replace
+   *  guard: "higher-tier attempt rejected: …"). Never duplicated. */
+  extraQualityWarnings?: string[];
 }): Promise<string | null> {
   const { db, resultId, airfoilId, bcId, presetRevisionId, simJobId, engineJobId, point: p } = opts;
   const stalled = stalledForPoint(p);
+  const warnings = [...(qualityWarningsForPoint(p) ?? [])];
+  for (const extra of opts.extraQualityWarnings ?? []) {
+    if (!warnings.includes(extra)) warnings.push(extra);
+  }
   const [inserted] = await db
     .insert(resultAttempts)
     .values({
@@ -419,8 +559,9 @@ async function insertResultAttempt(opts: {
       // Engine non-fatal quality warnings — persisted verbatim so the point
       // story timeline can show the honest "why" (empty list → NULL, absence
       // stays absence). The oscillating-steady mean-stable marker is appended
-      // here too (ladder contract 2).
-      qualityWarnings: qualityWarningsForPoint(p),
+      // here too (ladder contract 2), plus any caller-supplied markers
+      // (replace guard).
+      qualityWarnings: warnings.length ? warnings : null,
       evidencePayload: p,
       solvedAt: new Date(),
     })
@@ -1135,6 +1276,13 @@ export async function ingestResult(opts: {
       mappedMach = match.mach ?? null;
     }
     const resultIdsByAoa = new Map<number, string>();
+    // AoAs whose canonical row the replace guard KEPT in this polar: the
+    // engine's warm-start march ships every point ALSO in polars[].attempts
+    // (same evidence_artifacts, same storageKey+sha256), and the artifact
+    // upsert's conflict SET rewrites resultId — without this set, the
+    // attempts loop below would re-attach the rejected shipment's manifest
+    // to the kept row, undoing the guard's resultId:null isolation.
+    const guardedAoas = new Set<number>();
 
     for (const p of polar.points) {
       // Invariant: no ingest code path may run >30 s without a heartbeat
@@ -1148,6 +1296,76 @@ export async function ingestResult(opts: {
       // solver produced one, else the job-level failure message (see
       // failedPointErrorFallback above). Never NULL/empty on a failed row.
       const pointError = p.error?.trim() ? p.error : failed ? (opts.failedPointErrorFallback ?? null) : null;
+      const pointContext = `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`;
+      // Evidence derivations shared by the results row AND the replace-guard
+      // pre-classification — derived ONCE so both see identical values.
+      const derived = {
+        frameTrack: frameTrackForPoint(p, pointContext),
+        fidelity: fidelityForPoint(p, opts.uransFidelity, pointContext),
+        steadyHistory: steadyHistoryForPoint(p, pointContext),
+        error: pointError,
+      };
+
+      // REPLACE GUARD (gate incident 2026-07-07): an incoming point that would
+      // fail the classifier's evidence gate must NOT replace a canonical row
+      // holding accepted (or needs_urans) evidence — the attempt + its
+      // evidence artifacts are ingested instead, and the canonical row stays
+      // untouched (verify/request bookkeeping settles in reconcile against
+      // the unchanged row). Advisory pre-classification only: the post-ingest
+      // classifier remains the source of truth for whatever row IS canonical.
+      const guard = await replaceGuardVerdict({ db, airfoilId, presetRevisionId, point: p, derived });
+      if (guard) {
+        const keptLabel = guard.keptFidelity ?? guard.keptRegime ?? "existing";
+        console.error(
+          `[sweeper] REPLACE GUARD: higher-tier ${derived.fidelity} attempt rejected {${guard.reasons.join(", ")}} (${pointContext}) — kept ${keptLabel} ${guard.keptState} evidence on canonical row ${guard.keptResultId}; attempt + evidence artifacts ingested, canonical row NOT replaced`,
+        );
+        resultIdsByAoa.set(p.aoa_deg, guard.keptResultId);
+        guardedAoas.add(p.aoa_deg);
+        const attemptId = await insertResultAttempt({
+          db,
+          resultId: guard.keptResultId,
+          airfoilId,
+          bcId,
+          presetRevisionId,
+          simJobId,
+          engineJobId,
+          point: p,
+          extraQualityWarnings: [`${REPLACE_GUARD_MARKER}: ${guard.reasons.join(", ")}; kept ${keptLabel} ${guard.keptState} evidence`],
+        });
+        attempts++;
+        for (const artifact of p.evidence_artifacts ?? []) {
+          await registerEvidenceArtifacts({
+            db,
+            engine,
+            // resultId stays NULL on purpose: attaching the rejected attempt's
+            // manifest to the kept row would let manifestEvidenceBaseForResult
+            // re-render the ACCEPTED row's media from the rejected attempt's
+            // evidence base. The attempt row owns this evidence.
+            resultId: null,
+            resultAttemptId: attemptId,
+            airfoilId,
+            simJobId,
+            engineJobId,
+            point: p,
+            artifact,
+          });
+        }
+        // Campaign bookkeeping still settles against the KEPT canonical row
+        // (idempotent terminal-link + counters + completion probe) — the cell
+        // HAS accepted evidence; nothing else (media, force history, field
+        // extents) may touch the kept row.
+        const laneKeys = await onResultIngested(db, {
+          airfoilId,
+          revisionId: presetRevisionId,
+          aoaDeg: p.aoa_deg,
+          resultId: guard.keptResultId,
+          status: "done",
+          regime: guard.keptRegime,
+        });
+        for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
+        continue;
+      }
+
       const v: ResultInsert = {
         airfoilId,
         bcId,
@@ -1181,11 +1399,11 @@ export async function ingestResult(opts: {
         qualityWarnings: qualityWarningsForPoint(p),
         // URANS frame-track contract payload, verbatim. NULL = steady /
         // no-shedding / legacy engine — the classifier gates only non-NULL.
-        frameTrack: frameTrackForPoint(p, `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`),
+        frameTrack: derived.frameTrack,
         // Fidelity ladder (contract 1/3): tier the evidence was solved at.
-        fidelity: fidelityForPoint(p, opts.uransFidelity, `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`),
+        fidelity: derived.fidelity,
         // Oscillating-averaged steady evidence (contract 2), verbatim.
-        steadyHistory: steadyHistoryForPoint(p, `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`),
+        steadyHistory: derived.steadyHistory,
         engineJobId,
         engineCaseSlug: p.case_slug ?? null,
         simJobId,
@@ -1293,7 +1511,13 @@ export async function ingestResult(opts: {
         await registerEvidenceArtifacts({
           db,
           engine,
-          resultId: resultIdsByAoa.get(p.aoa_deg) ?? null,
+          // Guarded cell: the attempt duplicate of a guard-rejected point (or
+          // any sibling attempt of that shipment) must NOT re-attach its
+          // manifest to the KEPT row — the (storageKey, sha256) conflict SET
+          // would overwrite the guard's deliberate resultId:null and let
+          // manifestEvidenceBaseForResult re-render the accepted row's media
+          // from the rejected shipment's evidence base.
+          resultId: guardedAoas.has(p.aoa_deg) ? null : (resultIdsByAoa.get(p.aoa_deg) ?? null),
           resultAttemptId: attemptId,
           airfoilId,
           simJobId,

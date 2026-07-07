@@ -47,8 +47,12 @@ describe("fidelity ladder literals + engine-derived values (contract 1, cross-ru
   it("pins the engine-derived per-fidelity values (parity with models.py)", () => {
     expect(URANS_PRECALC_MIN_PERIODS).toBe(3);
     expect(URANS_FULL_MIN_PERIODS).toBe(7);
-    expect(URANS_PRECALC_SOLVER_BUDGET_S).toBe(3600);
-    expect(URANS_FULL_SOLVER_BUDGET_S).toBe(21600);
+    // Budgets retuned 2026-07-07 to measured prod rates (ladder-gate campaign,
+    // naca-0012 alpha=15, 25 m/s, 0.1 m chord): ~14 min/period on the half-res
+    // precalc mesh → 3 periods ≈ 1.4 h → 7200 s; ~8x on the full mesh
+    // ≈ 2 h/period → 7 periods → 43200 s (see models.py + fidelity.ts).
+    expect(URANS_PRECALC_SOLVER_BUDGET_S).toBe(7200);
+    expect(URANS_FULL_SOLVER_BUDGET_S).toBe(43200);
     expect(URANS_PRECALC_MESH_SCALE).toBe(0.5);
   });
 
