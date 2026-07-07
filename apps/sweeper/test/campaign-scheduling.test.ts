@@ -7,6 +7,7 @@
 
 import {
   CAMPAIGN_MAX_CASES_PER_JOB,
+  deriveCampaignPhase,
   type CampaignBatchSnapshot,
   type CampaignConditionCandidate,
   campaignBatchGroupKey,
@@ -70,38 +71,23 @@ describe("oscillation window (spec §8 step 4): last 3 predictions within 2·tol
   });
 });
 
-describe("RANS→URANS retry scoping (spec §7): revision-wide heuristics, targeted isolation", () => {
-  const healthyRevision: RetryEvidenceRow[] = Array.from({ length: 20 }, (_, i) => ({
-    aoaDeg: i - 4,
-    state: "accepted" as const,
-  }));
-
-  it("MUST-CATCH: a single-angle targeted job does NOT trigger whole-polar URANS when revision-wide evidence is healthy", () => {
+describe("RANS→URANS retry scoping (ladder R2): TARGETED-ONLY, whole-polar escalation is dead", () => {
+  it("MUST-CATCH: a single-angle targeted job retries only its own angle", () => {
     const decision = decideRansRetry({
       jobKind: "targeted",
       jobRows: [{ aoaDeg: 12.3, state: "rejected" }],
-      revisionRows: healthyRevision,
     });
     expect(decision).not.toBeNull();
-    expect(decision!.fullUrans).toBe(false);
     expect(decision!.retryMode).toBe("targeted-urans");
     expect(decision!.aoas).toEqual([12.3]);
     expect(decision!.queueCanonicalAoas).toEqual([12.3]);
   });
 
-  it("MUST-CATCH: a single-angle SWEEP job on a healthy revision also stays targeted (the old job-local '<5 valid' rule would have whole-polar'd it)", () => {
-    const decision = decideRansRetry({
-      jobKind: "sweep",
-      jobRows: [{ aoaDeg: 12.3, state: "rejected" }],
-      revisionRows: healthyRevision,
-    });
-    expect(decision).not.toBeNull();
-    expect(decision!.fullUrans).toBe(false);
-    expect(decision!.retryMode).toBe("invalid-rans-points");
-    expect(decision!.aoas).toEqual([12.3]);
-  });
-
-  it("promotes a sweep job to whole-polar URANS when the revision has fewer than 5 valid points", () => {
+  it("MUST-CATCH (R2 kill): the old '<5 valid points' tiny-polar input NEVER whole-polars — only the bad angles retry", () => {
+    // Pre-R2, this exact shape promoted the WHOLE polar to URANS (fullUrans
+    // true, retryMode whole-polar-urans) and burned URANS on the two accepted
+    // angles too. The ladder retries ONLY the rejected angles at precalc
+    // fidelity; whole-polar URANS is an explicit admin request now.
     const jobRows: RetryEvidenceRow[] = [
       { aoaDeg: 0, state: "accepted" },
       { aoaDeg: 1, state: "rejected" },
@@ -109,65 +95,44 @@ describe("RANS→URANS retry scoping (spec §7): revision-wide heuristics, targe
       { aoaDeg: 3, state: "accepted" },
       { aoaDeg: 4, state: "rejected" },
     ];
-    const decision = decideRansRetry({ jobKind: "sweep", jobRows, revisionRows: jobRows });
+    const decision = decideRansRetry({ jobKind: "sweep", jobRows });
     expect(decision).not.toBeNull();
-    expect(decision!.fullUrans).toBe(true);
-    expect(decision!.retryMode).toBe("whole-polar-urans");
-    expect(decision!.aoas).toEqual([0, 1, 2, 3, 4]);
-    expect(decision!.queueCanonicalAoas).toEqual([0, 1, 2, 3, 4]);
+    expect(decision!.retryMode).toBe("invalid-rans-points");
+    expect(decision!.aoas).toEqual([1, 2, 4]);
+    expect(decision!.queueCanonicalAoas).toEqual([1, 2, 4]);
+    expect(decision).not.toHaveProperty("fullUrans");
   });
 
-  it("applies the 0..5° whole-polar rule at revision scope for sweep jobs", () => {
-    const decision = decideRansRetry({
-      jobKind: "sweep",
-      jobRows: [{ aoaDeg: 18, state: "rejected" }],
-      revisionRows: [...healthyRevision.filter((r) => r.aoaDeg !== 2), { aoaDeg: 2, state: "rejected" }],
-    });
-    expect(decision).not.toBeNull();
-    expect(decision!.fullUrans).toBe(true);
-    expect(decision!.retryMode).toBe("whole-polar-urans");
-  });
-
-  it("targeted jobs escalate only their own angles even when the revision has a 0..5° rejection", () => {
-    const decision = decideRansRetry({
-      jobKind: "targeted",
-      jobRows: [{ aoaDeg: 18, state: "rejected" }],
-      revisionRows: [...healthyRevision.filter((r) => r.aoaDeg !== 2), { aoaDeg: 2, state: "rejected" }],
-    });
-    expect(decision).not.toBeNull();
-    expect(decision!.fullUrans).toBe(false);
-    expect(decision!.aoas).toEqual([18]);
-  });
-
-  it("false-positive guard: mixed refinement grids (fractional lane angles) do not shatter the longest-run detection", () => {
-    // Base sweep 0..14 at 1° plus two fractional refinement angles: with a
-    // min-diff step the 1° gaps would break every run; the median step keeps
-    // the polar recognized as healthy.
-    const revisionRows: RetryEvidenceRow[] = [
-      ...Array.from({ length: 15 }, (_, i) => ({ aoaDeg: i, state: "accepted" as const })),
-      { aoaDeg: 5.23, state: "accepted" },
-      { aoaDeg: 5.31, state: "accepted" },
-      { aoaDeg: 16, state: "rejected" },
-    ];
-    const decision = decideRansRetry({
-      jobKind: "sweep",
-      jobRows: [{ aoaDeg: 16, state: "rejected" }],
-      revisionRows,
-    });
-    expect(decision).not.toBeNull();
-    expect(decision!.fullUrans).toBe(false);
-    expect(decision!.aoas).toEqual([16]);
-  });
-
-  it("false-positive guard: a fully valid job never retries, regardless of revision health", () => {
+  it("MUST-CATCH (R2 kill): the old 0..5° low-AoA rejection input stays scoped to the job's own bad angles", () => {
+    // Pre-R2, a rejection anywhere in 0..5° at revision scope whole-polar'd
+    // every background sweep touching the revision.
     const decision = decideRansRetry({
       jobKind: "sweep",
       jobRows: [
-        { aoaDeg: 140.01, state: "accepted" },
-        { aoaDeg: 141.01, state: "accepted" },
+        { aoaDeg: 2, state: "rejected" },
+        { aoaDeg: 18, state: "rejected" },
+        { aoaDeg: 3, state: "accepted" },
       ],
-      revisionRows: [
-        { aoaDeg: 0, state: "rejected" }, // unhealthy revision elsewhere
+    });
+    expect(decision).not.toBeNull();
+    expect(decision!.retryMode).toBe("invalid-rans-points");
+    expect(decision!.aoas).toEqual([2, 18]);
+  });
+
+  it("a single-angle SWEEP job on a healthy revision stays targeted", () => {
+    const decision = decideRansRetry({
+      jobKind: "sweep",
+      jobRows: [{ aoaDeg: 12.3, state: "rejected" }],
+    });
+    expect(decision).not.toBeNull();
+    expect(decision!.retryMode).toBe("invalid-rans-points");
+    expect(decision!.aoas).toEqual([12.3]);
+  });
+
+  it("false-positive guard: a fully valid job never retries", () => {
+    const decision = decideRansRetry({
+      jobKind: "sweep",
+      jobRows: [
         { aoaDeg: 140.01, state: "accepted" },
         { aoaDeg: 141.01, state: "accepted" },
       ],
@@ -175,12 +140,7 @@ describe("RANS→URANS retry scoping (spec §7): revision-wide heuristics, targe
     expect(decision).toBeNull();
   });
 
-  it("keeps needs_urans confirmation angles alongside hard rejections for sweep jobs", () => {
-    const revisionRows: RetryEvidenceRow[] = [
-      ...Array.from({ length: 14 }, (_, i) => ({ aoaDeg: i, state: "accepted" as const })),
-      { aoaDeg: 14, state: "needs_urans" },
-      { aoaDeg: 15, state: "needs_urans" },
-    ];
+  it("keeps needs_urans confirmation angles alongside hard rejections; only hard rejections queue-flip", () => {
     const decision = decideRansRetry({
       jobKind: "sweep",
       jobRows: [
@@ -188,13 +148,22 @@ describe("RANS→URANS retry scoping (spec §7): revision-wide heuristics, targe
         { aoaDeg: 15, state: "needs_urans" },
         { aoaDeg: 16, state: "rejected" },
       ],
-      revisionRows,
     });
     expect(decision).not.toBeNull();
-    expect(decision!.fullUrans).toBe(false);
     expect(decision!.retryMode).toBe("needs-urans-confirmation");
     expect(decision!.aoas).toEqual([14, 15, 16]);
     expect(decision!.queueCanonicalAoas).toEqual([16]);
+  });
+
+  it("superseded_by_urans angles never retry (the URANS replacement already landed)", () => {
+    const decision = decideRansRetry({
+      jobKind: "sweep",
+      jobRows: [
+        { aoaDeg: 14, state: "superseded_by_urans" },
+        { aoaDeg: 15, state: "accepted" },
+      ],
+    });
+    expect(decision).toBeNull();
   });
 });
 
@@ -363,5 +332,25 @@ describe("batched ingest speed→condition mapping (canonical float equality)", 
     expect(matchConditionEntryBySpeed(entries, 12.346)).toBeNull();
     expect(matchConditionEntryBySpeed(entries, 11)).toBeNull();
     expect(matchConditionEntryBySpeed([], 10)).toBeNull();
+  });
+});
+
+describe("campaign phase derivation (fidelity ladder contract 7 — derived, no stored enum)", () => {
+  const tiers = (ransOpen: number, precalcOpen: number, verifyOpen: number) => ({ ransOpen, precalcOpen, verifyOpen });
+
+  it("walks running_rans → running_precalc → running_refinement → completed as tiers drain", () => {
+    expect(deriveCampaignPhase("active", tiers(5, 2, 1))).toBe("running_rans");
+    expect(deriveCampaignPhase("active", tiers(0, 2, 1))).toBe("running_precalc");
+    expect(deriveCampaignPhase("active", tiers(0, 0, 1))).toBe("running_refinement");
+    expect(deriveCampaignPhase("active", tiers(0, 0, 0))).toBe("completed");
+    expect(deriveCampaignPhase("completed", tiers(0, 0, 0))).toBe("completed");
+  });
+
+  it("non-running statuses carry no ladder phase; attention reports open tiers honestly", () => {
+    expect(deriveCampaignPhase("paused", tiers(3, 0, 0))).toBeNull();
+    expect(deriveCampaignPhase("cancelled", tiers(0, 0, 0))).toBeNull();
+    expect(deriveCampaignPhase("archived", tiers(0, 0, 0))).toBeNull();
+    expect(deriveCampaignPhase("attention", tiers(0, 0, 2))).toBe("running_refinement");
+    expect(deriveCampaignPhase("attention", tiers(0, 0, 0))).toBeNull();
   });
 });

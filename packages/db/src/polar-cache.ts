@@ -4,11 +4,11 @@ import {
   classifyPolarEvidence,
   type FrameTrackEvidence,
   mirrorClassifiedEvidence,
+  type SteadyHistoryEvidence,
   POLAR_CLASSIFIER_VERSION,
   POLAR_FIT_VERSION,
   type PolarEvidenceClassification,
   type PolarEvidencePoint,
-  type ResultClassificationState,
 } from "@aerodb/core";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
@@ -43,20 +43,6 @@ export interface PolarCacheRefreshResult {
   fitStatus: string;
 }
 
-export interface RansRetryPlan {
-  aoas: number[];
-  queueCanonicalAoas: number[];
-  retryMode: "whole-polar-urans" | "needs-urans-confirmation" | "invalid-rans-points";
-  fullUrans: boolean;
-  validRansPointCount: number;
-  needsUransCount: number;
-  hardRejectedCount: number;
-}
-
-function finite(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
 function toEvidence(row: {
   id?: string | null;
   attemptId?: string | null;
@@ -79,6 +65,8 @@ function toEvidence(row: {
   hasForceHistory?: boolean | null;
   hasVideo?: boolean | null;
   frameTrack?: unknown;
+  fidelity?: string | null;
+  steadyHistory?: unknown;
   simJobId?: string | null;
   updatedAt?: Date | null;
 }): EvidenceWithDbIds {
@@ -108,6 +96,10 @@ function toEvidence(row: {
     // Raw jsonb passthrough: null/undefined = legacy pre-contract evidence →
     // the classifier's frame-track gate is not applied (no mass-reject).
     frameTrack: (row.frameTrack ?? null) as FrameTrackEvidence | null,
+    // Fidelity ladder (v4): tier string drives the fidelity-aware period bar;
+    // steady_history.mean_stable === true accepts oscillating-steady rows.
+    fidelity: row.fidelity ?? null,
+    steadyHistory: (row.steadyHistory ?? null) as SteadyHistoryEvidence | null,
     simJobId: row.simJobId ?? null,
     updatedAt: row.updatedAt ?? null,
   };
@@ -141,6 +133,8 @@ async function loadResultEvidence(db: DB, airfoilId: string, simulationPresetRev
       hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = "results"."id")`,
       hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = "results"."id" and media.kind = 'video' and media.role = 'instantaneous')`,
       frameTrack: results.frameTrack,
+      fidelity: results.fidelity,
+      steadyHistory: results.steadyHistory,
     })
     .from(results)
     .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, simulationPresetRevisionId)));
@@ -180,6 +174,9 @@ async function loadAttemptEvidence(db: DB, airfoilId: string, simulationPresetRe
       // frame_track key inside it feeds the same stationarity gate. JSON null
       // and key-absent both surface as SQL NULL → legacy gate.
       frameTrack: sql<unknown>`"result_attempts"."evidence_payload" -> 'frame_track'`,
+      // Ladder evidence lives inside the same verbatim engine PolarPoint.
+      fidelity: sql<string | null>`"result_attempts"."evidence_payload" ->> 'fidelity'`,
+      steadyHistory: sql<unknown>`"result_attempts"."evidence_payload" -> 'steady_history'`,
     })
     .from(resultAttempts)
     .where(and(eq(resultAttempts.airfoilId, airfoilId), eq(resultAttempts.simulationPresetRevisionId, simulationPresetRevisionId)));
@@ -309,6 +306,40 @@ async function supersedeRansWithAcceptedUrans(db: DB, airfoilId: string, simulat
         ),
       );
   }
+}
+
+/** Fidelity ladder (contract 4): once a cell's results row holds an ACCEPTED
+ *  full-fidelity URANS verification, the surviving precalc ATTEMPT evidence at
+ *  the same angle is marked superseded_by_urans pointing at the verified row.
+ *  Runs after every classification upsert pass (same re-assert discipline as
+ *  supersedeRansWithAcceptedUrans — the upsert rewrites attempt verdicts each
+ *  refresh, so the supersession must be re-derived each refresh too). */
+async function supersedePrecalcWithVerifiedUrans(db: DB, airfoilId: string, simulationPresetRevisionId: string): Promise<void> {
+  await db.execute(sql`
+    UPDATE result_classifications rc
+    SET state = 'superseded_by_urans',
+        superseded_by_result_id = r.id,
+        reasons = array(SELECT DISTINCT unnest(rc.reasons || ARRAY['urans-verify-replacement']::text[])),
+        "updatedAt" = now()
+    FROM results r
+    JOIN result_classifications vrc ON vrc.result_id = r.id
+    WHERE r.airfoil_id = ${airfoilId}
+      AND r.simulation_preset_revision_id = ${simulationPresetRevisionId}
+      AND r.regime = 'urans'
+      AND r.fidelity = 'urans_full'
+      AND vrc.state = 'accepted'
+      AND rc.result_attempt_id IS NOT NULL
+      AND rc.airfoil_id = ${airfoilId}
+      AND rc.simulation_preset_revision_id = ${simulationPresetRevisionId}
+      AND rc.aoa_deg = r.aoa_deg
+      AND rc.regime = 'urans'
+      AND rc.state IN ('accepted', 'needs_urans')
+      AND EXISTS (
+        SELECT 1 FROM result_attempts ra
+        WHERE ra.id = rc.result_attempt_id
+          AND ra.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      )
+  `);
 }
 
 async function storeFit(
@@ -460,6 +491,7 @@ export async function refreshPolarCacheForRevision(
     await upsertClassification(db, c, airfoilId, simulationPresetRevisionId);
   }
   await supersedeRansWithAcceptedUrans(db, airfoilId, simulationPresetRevisionId);
+  await supersedePrecalcWithVerifiedUrans(db, airfoilId, simulationPresetRevisionId);
 
   const freshResultClassifications = await db
     .select({
@@ -517,53 +549,9 @@ export async function refreshPolarCacheForRevision(
   };
 }
 
-function shouldPromoteWholePolarToUrans(rows: { aoaDeg: number; state: ResultClassificationState }[]): boolean {
-  const hasRejected = rows.some((r) => r.state === "rejected");
-  if (rows.some((r) => r.aoaDeg >= 0 && r.aoaDeg <= 5 && r.state === "rejected")) return true;
-  if (!hasRejected) return false;
-  const validAoas = rows
-    .filter((r) => r.state === "accepted" || r.state === "needs_urans")
-    .map((r) => r.aoaDeg)
-    .sort((a, b) => a - b);
-  if (validAoas.length < 5) return true;
-  const step = validAoas.length > 1 ? Math.min(...validAoas.slice(1).map((x, i) => x - validAoas[i]).filter((d) => d > 0)) : 1;
-  let longest = validAoas.length ? 1 : 0;
-  let current = longest;
-  for (let i = 1; i < validAoas.length; i++) {
-    if (validAoas[i] - validAoas[i - 1] <= step * 1.5 + 1e-9) {
-      current += 1;
-    } else {
-      longest = Math.max(longest, current);
-      current = 1;
-    }
-  }
-  longest = Math.max(longest, current);
-  return longest < 5;
-}
-
-export async function ransRetryPlanForJob(db: DB, parentJobId: string): Promise<RansRetryPlan | null> {
-  const rows = await db
-    .select({
-      aoaDeg: resultAttempts.aoaDeg,
-      state: resultClassifications.state,
-    })
-    .from(resultAttempts)
-    .innerJoin(resultClassifications, eq(resultClassifications.resultAttemptId, resultAttempts.id))
-    .where(and(eq(resultAttempts.simJobId, parentJobId), eq(resultAttempts.regime, "rans")));
-  if (!rows.length) return null;
-
-  const fullUrans = shouldPromoteWholePolarToUrans(rows);
-  const hardRejectedAoas = rows.filter((r) => r.state === "rejected").map((r) => r.aoaDeg);
-  const needsUransAoas = rows.filter((r) => r.state === "needs_urans").map((r) => r.aoaDeg);
-  const aoas = (fullUrans ? rows.map((r) => r.aoaDeg) : [...needsUransAoas, ...hardRejectedAoas]).sort((a, b) => a - b);
-  if (!aoas.length) return null;
-  return {
-    aoas: [...new Set(aoas)],
-    queueCanonicalAoas: fullUrans ? [...new Set(aoas)] : [...new Set(hardRejectedAoas)].sort((a, b) => a - b),
-    retryMode: fullUrans ? "whole-polar-urans" : needsUransAoas.length ? "needs-urans-confirmation" : "invalid-rans-points",
-    fullUrans,
-    validRansPointCount: rows.filter((r) => r.state === "accepted").length,
-    needsUransCount: needsUransAoas.length,
-    hardRejectedCount: hardRejectedAoas.length,
-  };
-}
+// Whole-polar URANS promotion was KILLED by the fidelity ladder (R2,
+// 2026-07-07): background retries are targeted-only (apps/sweeper/src/
+// retry-plan.ts decideRansRetry); whole-polar URANS is an explicit admin
+// request (sim_urans_requests, aoa_deg NULL). The old shouldPromoteWholePolar
+// heuristics and ransRetryPlanForJob were removed so no future caller can
+// silently revive the escalation.

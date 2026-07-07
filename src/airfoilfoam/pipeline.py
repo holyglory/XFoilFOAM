@@ -41,10 +41,17 @@ from .models import (
     MeshParams,
     RoughnessParams,
     SolverParams,
+    SteadyHistory,
+    SteadyHistoryWindow,
+    apply_urans_fidelity,
+    effective_mesh_params,
+    urans_budget_seconds,
+    urans_point_fidelity,
 )
 from .openfoam.runner import OpenFOAMError, RunResult, Runner
 from .postprocess.forces import (
     AveragedCoefficients,
+    analyze_steady_oscillation,
     force_is_steady,
     parse_force_coefficients,
     parse_y_plus,
@@ -115,6 +122,13 @@ class CaseOutcome:
     evidence_artifacts: list[EvidenceArtifact] = field(default_factory=list)
     force_history: Optional[ForceHistory] = None
     frame_track: Optional[FrameTrack] = None
+    #: Solve tier that produced the reported values (contract echo):
+    #: "rans" | "urans_precalc" | "urans_full".
+    fidelity: str = "rans"
+    #: Steady-solve coefficient history (steady_history contract): shipped for
+    #: oscillating-averaged acceptances AND for non-stabilising steady solves;
+    #: None for classic pointwise convergence.
+    steady_history: Optional[SteadyHistory] = None
     quality_warnings: list[str] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -1569,6 +1583,38 @@ def _finalize_outcome(
         outcome.cl_cd = coeffs.cl_cd
         if not outcome.converged and force_is_steady(steady_coeff):
             outcome.converged = True
+        # Oscillating-steady averaging (R1): a steady solve that failed both
+        # residual convergence and the pointwise force plateau, but oscillates
+        # BOUNDEDLY with a stable windowed mean, is accepted with the window
+        # average as the point values. The full coefficient history ships as
+        # steady_history in BOTH the accepted and the still-failing case (the
+        # failing history is analysis evidence on the escalation path);
+        # classic converged solves ship steady_history=null.
+        if not outcome.converged and not solver_params.force_transient:
+            try:
+                osc = analyze_steady_oscillation(
+                    steady_coeff, window=solver_params.steady_oscillation_window
+                )
+            except Exception as exc:  # noqa: BLE001 - analysis loss must not fail the case
+                logger.warning("oscillating-steady analysis failed for %s: %s", case_dir, exc)
+                osc = None
+            if osc is not None:
+                outcome.steady_history = SteadyHistory(
+                    iterations=osc.iterations,
+                    cl=osc.cl,
+                    cd=osc.cd,
+                    cm=osc.cm,
+                    window=SteadyHistoryWindow(
+                        start_iter=osc.window_start_iter, end_iter=osc.window_end_iter
+                    ),
+                    mean_stable=osc.mean_stable,
+                    note=osc.note,
+                )
+                if osc.mean_stable:
+                    outcome.cl, outcome.cd, outcome.cm = osc.cl_mean, osc.cd_mean, osc.cm_mean
+                    outcome.cl_cd = osc.cl_mean / osc.cd_mean if osc.cd_mean else None
+                    outcome.converged = True
+                    outcome.quality_warnings.append(osc.note)
     elif not solver_params.force_transient:
         raise OpenFOAMError("forceCoeffs produced no coefficient.dat")
 
@@ -1577,9 +1623,14 @@ def _finalize_outcome(
     frame_stats: Optional[PeriodWindowStats] = None
     frame_series: Optional[tuple] = None  # merged (t, cl, cd, cm) coefficient arrays
     if solver_params.force_transient or (not outcome.converged and solver_params.transient_fallback):
+        # Fidelity tier: the tier owns the retained-period target and the
+        # transient wall-clock budget (precalc: 3 periods / 3600 s; full:
+        # 7 periods / 21600 s) — contract item 1, pinned cross-runtime.
+        urans_params = apply_urans_fidelity(solver_params)
+        urans_timeout = urans_budget_seconds(solver_params)
         transient = _run_transient(
-            case_dir, airfoil, resolved, spec, fluid, roughness, solver_params,
-            runner, n_proc, solver_timeout, subdir=transient_subdir, shared_mesh_dir=shared_mesh_dir,
+            case_dir, airfoil, resolved, spec, fluid, roughness, urans_params,
+            runner, n_proc, urans_timeout, subdir=transient_subdir, shared_mesh_dir=shared_mesh_dir,
             steady_field_dir=steady_field_dir,
             cancel_check=cancel_check,
         )
@@ -1594,6 +1645,10 @@ def _finalize_outcome(
             # gets steady single-frame media rather than a periodic animation.
             outcome.unsteady = not transient.quality.no_shedding
             outcome.converged = True
+            # Truthful tier echo: these values came from the URANS transient
+            # of this request's fidelity tier (a no-shedding steady-equivalent
+            # mean is STILL a URANS-produced value, so it echoes urans_*).
+            outcome.fidelity = urans_point_fidelity(solver_params)
             post_dir = transient.case_dir
             outcome.force_history = transient.force_history
             if transient.force_history is not None and not transient.quality.no_shedding:
@@ -1914,6 +1969,11 @@ def run_case(
 
     try:
         _check_cancel(cancel_check)
+        if mesh_dir is None:
+            # Standalone case builds its own mesh: a precalc URANS request
+            # meshes the derived half-resolution grid (contract item 1). With
+            # a prebuilt mesh_dir the caller already derived before building.
+            mesh_params = effective_mesh_params(mesh_params, solver_params)
         resolved = resolve_mesh_params(mesh_params, spec, fluid)
         patches = mesher.patches(resolved)
         if mesh_dir is None:

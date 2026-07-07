@@ -532,6 +532,114 @@ describe("point-history story endpoint", () => {
   });
 });
 
+describe("fidelity ladder fields + verify filter (migration 0034)", () => {
+  const verifyItemIds: string[] = [];
+
+  beforeAll(async () => {
+    // α=+2 → precalc row with an OPEN verify item (pending).
+    // α=+1 → full row whose LATEST verify item DISAGREED (Δcl 0.06).
+    // α=-1 → precalc row with an old disagreed item SUPERSEDED by a newer
+    //        done item — "latest decides", it must NOT match disagreed.
+    await db.execute(sql`UPDATE results SET fidelity = 'urans_precalc' WHERE id = ${resultIdByAoa.get(2)}`);
+    await db.execute(sql`UPDATE results SET fidelity = 'urans_full' WHERE id = ${resultIdByAoa.get(1)}`);
+    await db.execute(sql`UPDATE results SET fidelity = 'urans_precalc' WHERE id = ${resultIdByAoa.get(-1)}`);
+    const rows = (await db.execute(sql`
+      INSERT INTO sim_urans_verify_queue
+        (airfoil_id, revision_id, aoa_deg, campaign_id, state, precalc_result_id, delta_cl, delta_cd, "createdAt")
+      VALUES
+        (${airfoilId}, ${revisionId}, 2, ${campaignId}, 'pending', ${resultIdByAoa.get(2)}, NULL, NULL, now()),
+        (${airfoilId}, ${revisionId}, 1, ${campaignId}, 'disagreed', ${resultIdByAoa.get(1)}, 0.06, 0.002, now()),
+        (${airfoilId}, ${revisionId}, -1, ${campaignId}, 'disagreed', ${resultIdByAoa.get(-1)}, 0.09, NULL, now() - interval '1 hour'),
+        (${airfoilId}, ${revisionId}, -1, ${campaignId}, 'done', ${resultIdByAoa.get(-1)}, 0.01, 0.001, now())
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    for (const r of rows) verifyItemIds.push(r.id);
+  });
+
+  afterAll(async () => {
+    if (verifyItemIds.length) {
+      const idList = sql.join(verifyItemIds.map((id) => sql`${id}::uuid`), sql`, `);
+      await db.execute(sql`DELETE FROM sim_urans_verify_queue WHERE id IN (${idList})`);
+    }
+  });
+
+  it("rows carry results.fidelity and the LATEST verify item (state + real deltas)", async () => {
+    const res = await app.inject({ method: "GET", url: listUrl({ airfoil: `${PREFIX} Story` }) });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<Record<string, unknown>>;
+    const byId = new Map(items.map((i) => [i.resultId, i]));
+    const precalc = byId.get(resultIdByAoa.get(2)) as { fidelity: string; verify: { state: string } };
+    expect(precalc.fidelity).toBe("urans_precalc");
+    expect(precalc.verify.state).toBe("pending");
+    const disagreed = byId.get(resultIdByAoa.get(1)) as { fidelity: string; verify: { state: string; deltaCl: number; deltaCd: number } };
+    expect(disagreed.fidelity).toBe("urans_full");
+    expect(disagreed.verify).toMatchObject({ state: "disagreed", deltaCl: 0.06, deltaCd: 0.002 });
+    // latest decides: the re-verified α=-1 cell reads done, not disagreed
+    const reverified = byId.get(resultIdByAoa.get(-1)) as { verify: { state: string } };
+    expect(reverified.verify.state).toBe("done");
+    // never-queued cell stays null
+    const failed = byId.get(resultIdByAoa.get(0)) as { fidelity: string | null; verify: unknown };
+    expect(failed.verify).toBeNull();
+  });
+
+  it("verify=pending returns only cells with an OPEN verify item", async () => {
+    const res = await app.inject({ method: "GET", url: listUrl({ airfoil: `${PREFIX} Story`, verify: "pending" }) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().items.map((i: { resultId: string }) => i.resultId)).toEqual([resultIdByAoa.get(2)]);
+  });
+
+  it("verify=disagreed matches on the LATEST item only (a re-verified cell drops out)", async () => {
+    const res = await app.inject({ method: "GET", url: listUrl({ airfoil: `${PREFIX} Story`, verify: "disagreed" }) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().items.map((i: { resultId: string }) => i.resultId)).toEqual([resultIdByAoa.get(1)]);
+    const bad = await app.inject({ method: "GET", url: listUrl({ verify: "bogus" }) });
+    expect(bad.statusCode).toBe(400);
+  });
+
+  it("the story payload carries fidelity + the latest verify item", async () => {
+    const res = await app.inject({ method: "GET", url: `/api/admin/point-history/${resultIdByAoa.get(1)}/story` });
+    expect(res.statusCode).toBe(200);
+    const story = res.json();
+    expect(story.point.fidelity).toBe("urans_full");
+    expect(story.point.verify).toMatchObject({ state: "disagreed", deltaCl: 0.06 });
+  });
+
+  it("sim detail ships fidelity + camelCase steady_history + verify state (modal contract)", async () => {
+    // Exact contract-2 shape → parsed and camelCased for the modal chart.
+    const steadyHistory = {
+      iterations: [100, 200, 300, 400],
+      cl: [0.6, 0.62, 0.61, 0.61],
+      cd: [0.013, 0.0131, 0.013, 0.013],
+      cm: [-0.05, -0.051, -0.05, -0.05],
+      window: { start_iter: 200, end_iter: 400 },
+      mean_stable: true,
+      note: "steady oscillating mean over trailing window",
+    };
+    await db.execute(sql`UPDATE results SET steady_history = ${JSON.stringify(steadyHistory)}::jsonb WHERE id = ${resultIdByAoa.get(2)}`);
+    const res = await app.inject({ method: "GET", url: `/api/airfoils/${PREFIX}-af/sim?resultId=${resultIdByAoa.get(2)}` });
+    expect(res.statusCode).toBe(200);
+    const sim = res.json();
+    expect(sim.fidelity).toBe("urans_precalc");
+    expect(sim.uransVerify).toMatchObject({ state: "pending" });
+    expect(sim.steadyHistory).toMatchObject({
+      window: { startIter: 200, endIter: 400 },
+      meanStable: true,
+      note: "steady oscillating mean over trailing window",
+    });
+    expect(sim.steadyHistory.cl).toEqual(steadyHistory.cl);
+
+    // Drifted payload (unexpected key) → strict parse fails → null, never a
+    // half-invented chart.
+    await db.execute(sql`
+      UPDATE results SET steady_history = ${JSON.stringify({ ...steadyHistory, surprise: 1 })}::jsonb WHERE id = ${resultIdByAoa.get(2)}
+    `);
+    const drifted = await app.inject({ method: "GET", url: `/api/airfoils/${PREFIX}-af/sim?resultId=${resultIdByAoa.get(2)}` });
+    expect(drifted.statusCode).toBe(200);
+    expect(drifted.json().steadyHistory).toBeNull();
+    await db.execute(sql`UPDATE results SET steady_history = NULL WHERE id = ${resultIdByAoa.get(2)}`);
+  });
+});
+
 describe("single-point requeue", () => {
   it("requeues a FAILED point: result → pending, campaign point → requested", async () => {
     const id = resultIdByAoa.get(0)!;

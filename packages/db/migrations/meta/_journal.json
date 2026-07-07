@@ -239,6 +239,13 @@
       "when": 1783814400000,
       "tag": "0033_sweeper_tick_progress",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1783900800000,
+      "tag": "0034_urans_fidelity_ladder",
+      "breakpoints": true
     }
   ]
 }

@@ -53,6 +53,7 @@ describe("point filter query-param round-trip", () => {
       regime: "urans",
       errorClass: "timeout",
       reynolds: "400000",
+      verify: "pending",
     };
     const search = pointFiltersToSearch("?section=queue&tab=points", filters);
     expect(search).toContain("section=queue");
@@ -215,6 +216,8 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
       conditionId: null,
       solvedAt: "2026-07-06T12:00:00.000Z",
       updatedAt: "2026-07-06T12:00:00.000Z",
+      fidelity: null,
+      verify: null,
       ...(over.point ?? {}),
     },
     attempts: over.attempts ?? [],

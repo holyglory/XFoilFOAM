@@ -20,6 +20,7 @@ import { count, eq, inArray, sql } from "drizzle-orm";
 
 import { buildPolarRequest } from "./build-request";
 import { claimAoas } from "./claim";
+import { uransLadderTick } from "./urans-ladder";
 import {
   clearEngineUnreachable,
   engineBackoffActive,
@@ -393,7 +394,13 @@ export async function tick(
         await recordEngineUnreachable(db);
       } else {
         await clearEngineUnreachable(db);
-        await submitOneBatch(db, engine, state.cpuSlots);
+        const ransSubmitted = await submitOneBatch(db, engine, state.cpuSlots);
+        // Fidelity ladder (contract 5): precalc-rank and verify work run ONLY
+        // when the RANS branch submitted nothing this tick and capacity
+        // remains — one existing priority scale, RANS always first.
+        if (!ransSubmitted && (await inFlight(db)) < state.maxConcurrentJobs) {
+          await uransLadderTick(db, engine, state.cpuSlots);
+        }
       }
     }
   }

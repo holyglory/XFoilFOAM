@@ -732,6 +732,17 @@ export const results = pgTable(
      *  evidence — the classifier's stationarity gate applies only to non-NULL
      *  values, so history is never mass-rejected by deploy. */
     frameTrack: jsonb("frame_track"),
+    /** Fidelity ladder tier this row's evidence was solved at (contract 3,
+     *  migration 0034): 'rans' | 'urans_precalc' | 'urans_full'. Echoed by the
+     *  engine on PolarPoint.fidelity; backfill graded pre-ladder urans rows
+     *  'urans_full' and steady rows 'rans'. NULL = unsolved row. */
+    fidelity: text("fidelity"),
+    /** Oscillating-averaged steady solve evidence (contract 2, migration
+     *  0034): { iterations[], cl[], cd[], cm[], window{start_iter,end_iter},
+     *  mean_stable, note }, <=2000 samples downsampled engine-side. NULL =
+     *  classic pointwise convergence or legacy pre-contract evidence.
+     *  result_attempts carry it inside evidence_payload (whole PolarPoint). */
+    steadyHistory: jsonb("steady_history"),
     // linkage to the engine run
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
     engineJobId: text("engine_job_id"),
@@ -1503,6 +1514,81 @@ export const simCampaignLaneSteps = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// 12c. URANS fidelity ladder (migration 0034).
+//   sim_urans_verify_queue (pinned contract 4): precalc-accepted points queued
+//   for a full-fidelity verification re-solve at the LOWEST scheduler rank.
+//   sim_urans_requests (contract 6): admin request-URANS work items scheduled
+//   at precalc rank, idempotent per (cell, fidelity); aoaDeg NULL = whole polar.
+// ---------------------------------------------------------------------------
+export const simUransVerifyQueue = pgTable(
+  "sim_urans_verify_queue",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    revisionId: uuid("revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    campaignId: uuid("campaign_id").references((): AnyPgColumn => simCampaigns.id, { onDelete: "set null" }),
+    // pending | running | done | disagreed | cancelled
+    state: text("state").notNull().default("pending"),
+    precalcResultId: uuid("precalc_result_id")
+      .notNull()
+      .references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
+    verifyResultId: uuid("verify_result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    deltaCl: doublePrecision("delta_cl"),
+    deltaCd: doublePrecision("delta_cd"),
+    deltaCm: doublePrecision("delta_cm"),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    // Idempotent enqueue: one open item per cell (partial unique).
+    openCellUq: uniqueIndex("sim_urans_verify_queue_open_cell_uq")
+      .on(t.airfoilId, t.revisionId, t.aoaDeg)
+      .where(sql`${t.state} IN ('pending', 'running')`),
+    stateIdx: index("sim_urans_verify_queue_state_idx").on(t.state),
+    campaignIdx: index("sim_urans_verify_queue_campaign_idx").on(t.campaignId, t.state),
+  }),
+);
+
+export const simUransRequests = pgTable(
+  "sim_urans_requests",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    revisionId: uuid("revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    /** NULL = whole polar (every angle of the pinned revision's sweep). */
+    aoaDeg: doublePrecision("aoa_deg"),
+    // precalc | full (contract 1 request fidelities)
+    fidelity: text("fidelity").notNull(),
+    // pending | running | done | cancelled
+    state: text("state").notNull().default("pending"),
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
+    requestedBy: text("requested_by"),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    // The idempotency unique index is an EXPRESSION index (COALESCE(aoa_deg,
+    // 'NaN')) created in raw SQL by migration 0034 — drizzle cannot express it.
+    stateIdx: index("sim_urans_requests_state_idx").on(t.state),
+  }),
+);
+
+// ---------------------------------------------------------------------------
 // 13. Cross-instance sync — settings, permissions, external scheduling leases,
 //     and reviewable import conflicts. Promises are scheduling metadata only;
 //     real solver evidence still lands in results/result_attempts/artifacts.
@@ -1771,3 +1857,5 @@ export type SimCampaignPointInsert = typeof simCampaignPoints.$inferInsert;
 export type SimCampaignProgressRow = typeof simCampaignProgress.$inferSelect;
 export type SimCampaignLane = typeof simCampaignLanes.$inferSelect;
 export type SimCampaignLaneStep = typeof simCampaignLaneSteps.$inferSelect;
+export type SimUransVerifyQueueItem = typeof simUransVerifyQueue.$inferSelect;
+export type SimUransRequest = typeof simUransRequests.$inferSelect;

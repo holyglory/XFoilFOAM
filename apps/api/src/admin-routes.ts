@@ -24,6 +24,9 @@ import {
   sweeperState,
   sweepDefinitions,
   campaignBacklogStrip,
+  createUransRequest,
+  simUransRequests,
+  simUransVerifyQueue,
   syncLegacyBoundaryConditionForPreset as syncLegacyBoundaryConditionForPresetDb,
 } from "@aerodb/db";
 import { ensureEnabledSimulationPresetRevisions, ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
@@ -50,6 +53,7 @@ import {
   googleOAuthConfigured,
   googleSessionFromCode,
   requireAdmin,
+  sessionEmail,
   signOAuthState,
   signSession,
   verifyOAuthState,
@@ -2805,6 +2809,61 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(results.status, "failed"))
       .returning({ id: results.id });
     return { requeued: rows.length };
+  });
+
+  // Admin request-URANS (fidelity ladder contract 6): creates a work item the
+  // sweeper schedules at PRECALC rank (after all RANS gaps, before the verify
+  // queue). aoaDeg absent = whole polar. Idempotent per (cell, fidelity) —
+  // replaying returns the existing open request with created=false.
+  app.post("/api/admin/urans-requests", { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = z
+      .object({
+        airfoilId: z.string().uuid(),
+        revisionId: z.string().uuid(),
+        aoaDeg: z.number().finite().optional(),
+        fidelity: z.enum(["precalc", "full"]),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "invalid request" });
+    const [airfoil] = await db.select({ id: airfoils.id }).from(airfoils).where(eq(airfoils.id, parsed.data.airfoilId)).limit(1);
+    if (!airfoil) return reply.code(404).send({ error: "airfoil not found" });
+    const [revision] = await db
+      .select({ id: simulationPresetRevisions.id })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, parsed.data.revisionId))
+      .limit(1);
+    if (!revision) return reply.code(404).send({ error: "simulation preset revision not found" });
+    const { request, created } = await createUransRequest(db, {
+      airfoilId: parsed.data.airfoilId,
+      revisionId: parsed.data.revisionId,
+      aoaDeg: parsed.data.aoaDeg ?? null,
+      fidelity: parsed.data.fidelity,
+      requestedBy: sessionEmail(req),
+    });
+    return reply.code(created ? 201 : 200).send({ request, created });
+  });
+
+  // Open/settled request-URANS items + verify-queue items for one cell scope —
+  // the Points tab / cell panel reads this to render the action state honestly
+  // (idempotent replay shows the already-open item, never a fake new one).
+  app.get("/api/admin/urans-requests", { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = z
+      .object({ airfoilId: z.string().uuid(), revisionId: z.string().uuid() })
+      .safeParse((req.query ?? {}) as Record<string, unknown>);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "invalid query" });
+    const requests = await db
+      .select()
+      .from(simUransRequests)
+      .where(and(eq(simUransRequests.airfoilId, parsed.data.airfoilId), eq(simUransRequests.revisionId, parsed.data.revisionId)))
+      .orderBy(desc(simUransRequests.createdAt))
+      .limit(100);
+    const verifyItems = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(and(eq(simUransVerifyQueue.airfoilId, parsed.data.airfoilId), eq(simUransVerifyQueue.revisionId, parsed.data.revisionId)))
+      .orderBy(desc(simUransVerifyQueue.createdAt))
+      .limit(100);
+    return { requests, verifyItems };
   });
 
   app.post("/api/admin/test-artifacts/purge", { preHandler: requireAdmin }, async (req, reply) => {

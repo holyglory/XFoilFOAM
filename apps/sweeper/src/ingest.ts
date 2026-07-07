@@ -21,8 +21,12 @@ import {
   type ImageFieldName,
   type JobResult,
   parseFrameTrack,
+  parsePointFidelity,
+  parseSteadyHistory,
+  type PointFidelity,
   type PolarPoint,
   type RenderedDefaultMedia,
+  type UransFidelity,
 } from "@aerodb/engine-client";
 import { and, desc, eq, inArray, lt, notInArray, sql } from "drizzle-orm";
 import { constants } from "node:fs";
@@ -315,6 +319,58 @@ export function frameTrackForPoint(p: PolarPoint, context: string): unknown {
   return raw;
 }
 
+/** Fidelity tier to persist on the results row (ladder contract 1/3).
+ *  Precedence: the engine's strict-parsed echo; else the tier the JOB
+ *  requested (for URANS points of fidelity-requesting wave-2 jobs — with a
+ *  loud drift log, because a post-ladder engine must echo); else the honest
+ *  regime-derived tier matching the 0034 backfill semantics (pre-ladder
+ *  engines: urans = full behavior, steady = rans). Exported for the pin test. */
+export function fidelityForPoint(p: PolarPoint, requestedUransFidelity: UransFidelity | undefined, context: string): PointFidelity {
+  const echoed = parsePointFidelity(p.fidelity);
+  if (echoed) return echoed;
+  if (p.unsteady && requestedUransFidelity) {
+    console.error(
+      `[sweeper] fidelity echo MISSING on URANS point of a '${requestedUransFidelity}'-fidelity job (${context}); persisting the requested tier — engine contract drift`,
+    );
+    return requestedUransFidelity === "precalc" ? "urans_precalc" : "urans_full";
+  }
+  return p.unsteady ? "urans_full" : "rans";
+}
+
+/** steady_history value to persist verbatim (ladder contract 2). Like
+ *  frame_track: drift is validated loudly but the raw payload is still
+ *  persisted (solver evidence) — the classifier reads mean_stable fail-closed,
+ *  so a malformed payload can never WAIVE a convergence gate. Exported for the
+ *  pin test. */
+export function steadyHistoryForPoint(p: PolarPoint, context: string): unknown {
+  const raw = p.steady_history ?? null;
+  if (raw === null) return null;
+  const parsed = parseSteadyHistory(raw);
+  if (!parsed.ok) {
+    console.error(`[sweeper] steady_history CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`);
+  }
+  return raw;
+}
+
+/** Oscillating-steady quality marker (ladder contract 2): a steady point
+ *  accepted through mean-stable oscillating averaging carries the honest
+ *  note in quality_warnings — the marker every point-story surface already
+ *  reads. Never duplicates an engine-shipped warning. Exported for tests. */
+export const STEADY_OSCILLATING_MARKER = "steady-oscillating-mean";
+
+export function qualityWarningsForPoint(p: PolarPoint): string[] | null {
+  const warnings = [...(p.quality_warnings ?? [])];
+  const history = p.steady_history;
+  if (!p.unsteady && history && typeof history === "object" && (history as { mean_stable?: unknown }).mean_stable === true) {
+    const note = typeof (history as { note?: unknown }).note === "string" && (history as { note: string }).note.trim()
+      ? (history as { note: string }).note
+      : "steady solve settled into a bounded oscillation; coefficients are stable window means";
+    const marker = `${STEADY_OSCILLATING_MARKER}: ${note}`;
+    if (!warnings.includes(marker)) warnings.push(marker);
+  }
+  return warnings.length ? warnings : null;
+}
+
 async function insertResultAttempt(opts: {
   db: DB;
   resultId?: string | null;
@@ -362,8 +418,9 @@ async function insertResultAttempt(opts: {
       error: p.error ?? null,
       // Engine non-fatal quality warnings — persisted verbatim so the point
       // story timeline can show the honest "why" (empty list → NULL, absence
-      // stays absence).
-      qualityWarnings: p.quality_warnings?.length ? p.quality_warnings : null,
+      // stays absence). The oscillating-steady mean-stable marker is appended
+      // here too (ladder contract 2).
+      qualityWarnings: qualityWarningsForPoint(p),
       evidencePayload: p,
       solvedAt: new Date(),
     })
@@ -1020,6 +1077,10 @@ export async function ingestResult(opts: {
    *  revision, bc) by exact canonical speed. Jobs without a conditionMap keep
    *  the single-revision nearest-speed path unchanged. */
   conditionMap?: ConditionMapEntry[];
+  /** URANS fidelity tier the JOB requested (wave-2 requestPayload
+   *  uransFidelity) — the honest fallback when a point's fidelity echo is
+   *  missing (with a loud drift log). Absent on wave-1/legacy jobs. */
+  uransFidelity?: UransFidelity;
   result: JobResult;
   /** Job-level failure message stamped onto failed points whose own `error`
    *  is empty (incident 2026-07-04: failed rows landed with NULL error →
@@ -1111,10 +1172,14 @@ export async function ingestResult(opts: {
         firstOrderFallback: p.first_order_fallback,
         strouhal: p.strouhal ?? null,
         error: pointError,
-        qualityWarnings: p.quality_warnings?.length ? p.quality_warnings : null,
+        qualityWarnings: qualityWarningsForPoint(p),
         // URANS frame-track contract payload, verbatim. NULL = steady /
         // no-shedding / legacy engine — the classifier gates only non-NULL.
         frameTrack: frameTrackForPoint(p, `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`),
+        // Fidelity ladder (contract 1/3): tier the evidence was solved at.
+        fidelity: fidelityForPoint(p, opts.uransFidelity, `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`),
+        // Oscillating-averaged steady evidence (contract 2), verbatim.
+        steadyHistory: steadyHistoryForPoint(p, `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`),
         engineJobId,
         engineCaseSlug: p.case_slug ?? null,
         simJobId,

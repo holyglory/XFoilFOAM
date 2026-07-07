@@ -22,6 +22,7 @@ from .models import (
     PolarPoint,
     PolarRequest,
     ResourcePolicy,
+    effective_mesh_params,
 )
 from .openfoam.runner import get_runner
 from .pipeline import CaseOutcome, PolarMarchResult, StoredCaseOutcome, prepare_mesh, resolve_mesh_params, run_case, solve_polar_marched
@@ -76,6 +77,8 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
         mean_images={field: url(rel) for field, rel in outcome.mean_images.items()},
         force_history=history,
         frame_track=outcome.frame_track,
+        fidelity=outcome.fidelity,
+        steady_history=outcome.steady_history,
         quality_warnings=outcome.quality_warnings,
         evidence_artifacts=[
             artifact.model_copy(update={"url": url(artifact.path)})
@@ -215,13 +218,16 @@ def execute_job(
     set_status(JobState.running, "resolving job resources", phase=JobPhase.waiting_cpu)
 
     # 1. Mesh ONCE per chord (sized for the highest speed -> finest wall; reused by
-    #    every speed/AoA of that chord).
+    #    every speed/AoA of that chord). URANS precalc jobs build the DERIVED
+    #    half-resolution mesh (contract item 1) — the mesh cache keys on the
+    #    resolved params, so it caches separately from the full mesh.
+    job_mesh = effective_mesh_params(request.mesh, request.solver)
     max_speed = max(speeds)
     meshes: dict[float, tuple] = {}
     for chord in chords:
         ensure_not_cancelled()
         resolved = resolve_mesh_params(
-            request.mesh, CaseSpec(chord=chord, speed=max_speed, aoa_deg=0.0), request.fluid
+            job_mesh, CaseSpec(chord=chord, speed=max_speed, aoa_deg=0.0), request.fluid
         )
         mesh_dir = store.job_dir(job_id) / "meshes" / _chord_slug(chord)
         wait_for_cpu(1, f"waiting for CPU before meshing chord {chord:g}")

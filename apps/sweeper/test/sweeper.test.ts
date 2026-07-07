@@ -1167,7 +1167,12 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(Math.min(...observed)).toBeGreaterThan(before.getTime());
   }, 60000);
 
-  it("promotes an unreliable RANS sweep to one whole-polar URANS retry", async () => {
+  // MUST-CATCH (ladder R2 whole-polar kill): this exact input — an unreliable
+  // sweep with only 2 of 6 points converged — WHOLE-POLAR'd under the pre-R2
+  // heuristics (retryMode whole-polar-urans, all 6 angles re-queued, accepted
+  // evidence re-solved). The ladder retry must stay scoped to the 4 rejected
+  // angles at PRECALC fidelity and must never touch the accepted rows.
+  it("retries only the rejected angles of an unreliable RANS sweep (no whole-polar escalation)", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoas = [130.01, 131.01, 132.01, 133.01, 134.01, 135.01];
     await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
@@ -1229,7 +1234,10 @@ describe("sweeper: gap → claim → ingest", () => {
       getResult: async () => unreliableResult,
       submitPolar: async (request: unknown): Promise<JobStatus> => {
         submittedRequest = request;
-        return { job_id: "whole-urans-child", state: "pending", total_cases: aoas.length, completed_cases: 0 };
+        // Echo the REQUEST's case count (the engine's behavior) — a hardcoded
+        // count would mask a wrongly-scoped retry via the post-submit stamp.
+        const angles = (request as { aoa?: { angles?: number[] } }).aoa?.angles ?? [];
+        return { job_id: "targeted-urans-child", state: "pending", total_cases: angles.length, completed_cases: 0 };
       },
       fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
@@ -1243,16 +1251,32 @@ describe("sweeper: gap → claim → ingest", () => {
       .limit(1);
     expect(child).toBeTruthy();
     cleanupJobIds.add(child.id);
-    expect(child.totalCases).toBe(aoas.length);
-    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe("whole-polar-urans");
-    expect((submittedRequest as { solver?: { force_transient?: boolean }; aoa?: { angles?: number[] } })?.solver?.force_transient).toBe(true);
-    expect((submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles).toEqual(aoas);
+    // Only the 4 rejected angles (i=1 and i=4 converged/accepted) retry.
+    const rejectedAoas = [130.01, 132.01, 133.01, 135.01];
+    expect(child.totalCases).toBe(rejectedAoas.length);
+    expect(child.jobKind).toBe("targeted");
+    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe("invalid-rans-points");
+    // Fidelity ladder contract 1: automatic wave-2 retries run at PRECALC.
+    expect((child.requestPayload as { uransFidelity?: string })?.uransFidelity).toBe("precalc");
+    expect((submittedRequest as { solver?: { force_transient?: boolean; urans_fidelity?: string } })?.solver?.force_transient).toBe(true);
+    expect((submittedRequest as { solver?: { urans_fidelity?: string } })?.solver?.urans_fidelity).toBe("precalc");
+    expect((submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles).toEqual(rejectedAoas);
 
     const claimed = await db
-      .select({ status: results.status, simJobId: results.simJobId })
+      .select({ aoaDeg: results.aoaDeg, status: results.status, simJobId: results.simJobId })
       .from(results)
       .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
-    expect(claimed.every((r) => r.status === "queued" && r.simJobId === child.id)).toBe(true);
+    // Rejected angles re-queue under the child; ACCEPTED evidence is never
+    // re-claimed (the old whole-polar path flipped all 6 rows).
+    for (const row of claimed) {
+      if (rejectedAoas.includes(row.aoaDeg)) {
+        expect(row.status).toBe("queued");
+        expect(row.simJobId).toBe(child.id);
+      } else {
+        expect(row.status).toBe("done");
+        expect(row.simJobId).toBe(parent.id);
+      }
+    }
     const attempts = await db
       .select()
       .from(resultAttempts)

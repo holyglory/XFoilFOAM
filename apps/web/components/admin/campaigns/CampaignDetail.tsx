@@ -27,7 +27,7 @@ import {
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
 import { PROCESS_NOT_RUNNING_DETAIL, isProcessDead } from "@/lib/solver-state";
-import { campaignStatusLine } from "./campaign-status";
+import { campaignPhaseBadge, campaignStatusLine, tierCountsLine } from "./campaign-status";
 export { campaignStatusLine };
 import { AddAirfoilsDialog } from "./AddAirfoilsDialog";
 import { CellSidePanel, type CellPanelAirfoil } from "./CellSidePanel";
@@ -243,6 +243,10 @@ export function CampaignDetail({
   const line = campaignStatusLine(summary);
   const lineColor = line.tone === "teal" ? C.teal : line.tone === "amber" ? C.amber : line.tone === "red" ? C.redText : C.dim;
   const statusChip = STATUS_CHIP_COLOR[status] ?? STATUS_CHIP_COLOR.active;
+  // Fidelity ladder phase (contract 7): rendered only while nothing blocks —
+  // the liveness-split gate badge always outranks the phase.
+  const phaseBadge = campaignPhaseBadge(summary.phase, status, line.gate);
+  const tiersLine = tierCountsLine(summary.tierCounts);
 
   const objectives = campaign.plan.objectives;
   const editable = ["active", "paused", "attention", "completed"].includes(status);
@@ -407,6 +411,23 @@ export function CampaignDetail({
         >
           {status.toUpperCase()}
         </span>
+        {phaseBadge && (
+          <span
+            data-testid="campaign-phase-badge"
+            style={{
+              fontFamily: MONO,
+              fontSize: 10,
+              fontWeight: 600,
+              letterSpacing: "0.06em",
+              color: phaseBadge.tone === "amber" ? C.amber : C.teal,
+              border: `1px solid ${phaseBadge.tone === "amber" ? "rgba(245,158,11,0.45)" : "var(--aero-teal-border)"}`,
+              borderRadius: 999,
+              padding: "3px 10px",
+            }}
+          >
+            {phaseBadge.label}
+          </span>
+        )}
         <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "3px 9px" }}>
           polar sweep
         </span>
@@ -536,6 +557,11 @@ export function CampaignDetail({
           <span style={{ color: C.dim }}>
             {fCount(summary.airfoilCount)} airfoils · {fCount(conditions.filter((c) => c.status !== "released").length)} conditions
           </span>
+          {tiersLine && (
+            <span data-testid="campaign-tier-counts" style={{ color: C.dim }} title="Fidelity ladder: RANS gaps, then precalc URANS, then full-fidelity verification">
+              {tiersLine}
+            </span>
+          )}
         </div>
         {rate && (
           <div data-testid="campaign-rate-line" style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
@@ -557,7 +583,13 @@ export function CampaignDetail({
       </div>
 
       {/* ---- condition strip ---- */}
-      <div ref={stripRef}>
+      {/* minWidth 0: as a grid item this wrapper's automatic minimum is the
+          strip's min-content (all nowrap condition cards side by side, which
+          can be thousands of px on set-valued campaigns); without it the grid
+          track inflates and the strip's own overflowX:auto never engages —
+          the whole PAGE scrolled horizontally (formal-ui critical,
+          2026-07-07). */}
+      <div ref={stripRef} style={{ minWidth: 0 }}>
         <ConditionStrip
           conditions={conditions}
           nextUpId={nextUpId}

@@ -1,7 +1,9 @@
 import {
   airfoils,
   type CampaignLaneKey,
+  campaignHasOpenRansGaps,
   type DB,
+  enqueuePrecalcVerifications,
   laneKeyId,
   laneTick,
   onResultIngested,
@@ -14,11 +16,15 @@ import {
   simCampaigns,
   simJobs,
   simulationPresetRevisions,
+  simUransRequests,
+  simUransVerifyQueue,
   sweeperState,
 } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
   EngineError,
+  URANS_VERIFY_DELTA_CD_LIMIT,
+  URANS_VERIFY_DELTA_CL_LIMIT,
   WORKER_RESTART_ORPHAN_MESSAGE,
   classifyQueueLifecycle,
   engineQueueListsJob,
@@ -27,6 +33,7 @@ import {
   type JobResult,
   type JobRuntimeSummary,
   type JobStatus,
+  type UransFidelity,
 } from "@aerodb/engine-client";
 import { and, count, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 
@@ -171,6 +178,127 @@ function requestPayload(job: SimJobRow): Record<string, unknown> {
 function conditionMapForJob(job: SimJobRow): ConditionMapEntry[] | null {
   const raw = (requestPayload(job) as { conditionMap?: ConditionMapEntry[] }).conditionMap;
   return Array.isArray(raw) && raw.length > 0 ? raw : null;
+}
+
+/** URANS fidelity tier a wave-2 job requested (requestPayload.uransFidelity),
+ *  the honest fallback for points whose engine fidelity echo is missing. */
+function uransFidelityForJob(job: SimJobRow): UransFidelity | undefined {
+  const raw = (requestPayload(job) as { uransFidelity?: unknown }).uransFidelity;
+  return raw === "precalc" || raw === "full" ? raw : undefined;
+}
+
+/** Ladder contract 4: after the polar-cache refresh classified a job's fresh
+ *  rows, every ACCEPTED urans_precalc results row in the job's revisions owes
+ *  a full-fidelity verification — enqueue idempotently (partial unique index).
+ *  campaign_id rides along for phase derivation; continuous rows enqueue with
+ *  NULL campaign. Loud, never silent on failure (the verify tier must not
+ *  silently starve). */
+async function enqueueVerificationsForJob(db: DB, job: SimJobRow): Promise<void> {
+  const conditionMap = conditionMapForJob(job);
+  const revisionIds = conditionMap
+    ? [...new Set(conditionMap.map((entry) => entry.revisionId))]
+    : job.simulationPresetRevisionId
+      ? [job.simulationPresetRevisionId]
+      : [];
+  for (const revisionId of revisionIds) {
+    try {
+      const enqueued = await enqueuePrecalcVerifications(db, {
+        airfoilId: job.airfoilId,
+        revisionId,
+        campaignId: job.campaignId,
+      });
+      if (enqueued > 0) {
+        console.log(`[sweeper] verify queue: enqueued ${enqueued} precalc-accepted point(s) (job ${job.id}, revision ${revisionId})`);
+      }
+    } catch (e) {
+      console.error(`[sweeper] verify-queue enqueue FAILED (job ${job.id}, revision ${revisionId}): ${errorMessage(e)}`);
+    }
+  }
+}
+
+interface VerifyJobPayload {
+  verifyQueueItemId?: string;
+  verifyPrecalc?: { cl?: number | null; cd?: number | null; cm?: number | null };
+  uransRequestId?: string;
+}
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Settle fidelity-ladder bookkeeping after a job's terminal ingest:
+ *  - verify jobs (payload.verifyQueueItemId): complete the queue item —
+ *    record deltas vs the precalc snapshot captured at consume time, mark
+ *    done, or DISAGREED when |ΔCl| > 0.05 or |ΔCd| > 0.01 (contract 4). The
+ *    classification stays on the VERIFIED row (it IS the results row now);
+ *    the disagreement is surfaced via a quality-warning marker on that row
+ *    and the queue deltas — nothing silently swapped. A failed verify solve
+ *    cancels the item loudly (the failure evidence lives on the results row).
+ *  - admin request jobs (payload.uransRequestId): flip the request done. */
+async function settleUransLadderForJob(db: DB, job: SimJobRow): Promise<void> {
+  const payload = requestPayload(job) as VerifyJobPayload;
+  if (payload.uransRequestId) {
+    await db
+      .update(simUransRequests)
+      .set({ state: "done" })
+      .where(and(eq(simUransRequests.id, payload.uransRequestId), eq(simUransRequests.state, "running")));
+  }
+  if (!payload.verifyQueueItemId) return;
+  const [item] = await db.select().from(simUransVerifyQueue).where(eq(simUransVerifyQueue.id, payload.verifyQueueItemId)).limit(1);
+  if (!item || (item.state !== "running" && item.state !== "pending")) return;
+  const [verified] = await db
+    .select({ id: results.id, status: results.status, fidelity: results.fidelity, cl: results.cl, cd: results.cd, cm: results.cm, qualityWarnings: results.qualityWarnings })
+    .from(results)
+    .where(and(eq(results.airfoilId, item.airfoilId), eq(results.simulationPresetRevisionId, item.revisionId), eq(results.aoaDeg, item.aoaDeg)))
+    .limit(1);
+  // The verified ROW is the judge, not the job verdict: a partially-failed
+  // job whose verify angle still solved (done, full fidelity) completes the
+  // item honestly; anything else cancels it loudly.
+  const verifiedSolved = Boolean(verified && verified.status === "done" && verified.fidelity === "urans_full");
+  if (!verifiedSolved || !verified) {
+    console.error(
+      `[sweeper] URANS verify solve did not complete (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}) — item cancelled; failure evidence stays on the results row`,
+    );
+    await db
+      .update(simUransVerifyQueue)
+      .set({ state: "cancelled", verifyResultId: verified?.id ?? null })
+      .where(eq(simUransVerifyQueue.id, item.id));
+    return;
+  }
+  const precalc = payload.verifyPrecalc ?? {};
+  const deltaOf = (a: unknown, b: number | null): number | null => {
+    const pa = finiteOrNull(a);
+    return pa !== null && b !== null ? b - pa : null;
+  };
+  const deltaCl = deltaOf(precalc.cl, finiteOrNull(verified.cl));
+  const deltaCd = deltaOf(precalc.cd, finiteOrNull(verified.cd));
+  const deltaCm = deltaOf(precalc.cm, finiteOrNull(verified.cm));
+  const disagreed =
+    (deltaCl !== null && Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
+    (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
+  await db
+    .update(simUransVerifyQueue)
+    .set({
+      state: disagreed ? "disagreed" : "done",
+      verifyResultId: verified.id,
+      deltaCl,
+      deltaCd,
+      deltaCm,
+    })
+    .where(eq(simUransVerifyQueue.id, item.id));
+  if (disagreed) {
+    const marker =
+      `urans-verify-disagreement: full-fidelity verification differs from precalc beyond bounds ` +
+      `(ΔCl=${deltaCl?.toFixed(4) ?? "n/a"}, ΔCd=${deltaCd?.toFixed(5) ?? "n/a"}; limits ${URANS_VERIFY_DELTA_CL_LIMIT}/${URANS_VERIFY_DELTA_CD_LIMIT}) — point flagged for review`;
+    console.error(`[sweeper] ${marker} (item ${item.id}, result ${verified.id})`);
+    const warnings = verified.qualityWarnings ?? [];
+    if (!warnings.some((w) => w.startsWith("urans-verify-disagreement:"))) {
+      await db
+        .update(results)
+        .set({ qualityWarnings: [...warnings, marker] })
+        .where(eq(results.id, verified.id));
+    }
+  }
 }
 
 /** Refresh polar-fit caches for every revision a job touched: each
@@ -387,6 +515,15 @@ async function cancelTerminalEngineTasks(db: DB, engine: EngineClient, queue: En
 
 export async function submitUransRetryForJob(db: DB, engine: EngineClient, parent: typeof simJobs.$inferSelect): Promise<void> {
   if (parent.wave !== 1 || parent.bcIds.length === 0 || !parent.simulationPresetRevisionId) return;
+  // Fidelity ladder gate (contract 5): within a campaign, URANS (precalc)
+  // work is gated until the campaign has ZERO open RANS gaps. Gated parents
+  // are re-attempted by the sweeper's ladder tick once the gaps close.
+  if (parent.campaignId && (await campaignHasOpenRansGaps(db, parent.campaignId))) {
+    console.log(
+      `[sweeper] URANS retry for job ${parent.id} deferred: campaign ${parent.campaignId} still has open RANS gaps (ladder gate)`,
+    );
+    return;
+  }
   const conditionMap = conditionMapForJob(parent);
   if (conditionMap) {
     // Batched campaign parent: the retry plan is computed PER conditionMap
@@ -403,8 +540,9 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
   if (existing) return;
 
   await refreshPolarCacheForRevision(db, parent.airfoilId, parent.simulationPresetRevisionId);
-  // Retry scoping (spec §7): whole-polar heuristics run against REVISION-WIDE
-  // evidence; `targeted` parents escalate only their own bad angles.
+  // Retry scoping (ladder R2): TARGETED-ONLY — every retry re-solves only the
+  // job's own rejected/needs_urans angles at 'precalc' fidelity; whole-polar
+  // URANS is an explicit admin action, never an automatic escalation.
   const retry = await ransRetryPlanForJobScoped(db, {
     parentJobId: parent.id,
     airfoilId: parent.airfoilId,
@@ -429,6 +567,7 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
     setup: setup.snapshot,
     aoaList: aoas,
     wave: 2,
+    uransFidelity: "precalc",
     queuePressure: await dbQueuePressure(db),
     cpuSlots: capacity?.cpuSlots ?? 0,
   });
@@ -440,7 +579,7 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
       bcIds: [bcId],
       simulationPresetRevisionId: setup.revisionId,
       campaignId: parent.campaignId,
-      jobKind: retry.fullUrans ? "sweep" : "targeted",
+      jobKind: "targeted",
       referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
       wave: 2,
       status: "pending",
@@ -450,6 +589,7 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
         speedMap: [{ speed, bcId, presetRevisionId: setup.revisionId, mach: setup.snapshot.flowState.mach }],
         aoas,
         parentJobId: parent.id,
+        uransFidelity: "precalc",
         retryMode: retry.retryMode,
         validRansPointCount: retry.validRansPointCount,
         needsUransCount: retry.needsUransCount,
@@ -585,6 +725,7 @@ async function submitCampaignUransRetries(
       setup: snapshot,
       aoaList: retry.aoas,
       wave: 2,
+      uransFidelity: "precalc",
       queuePressure: await dbQueuePressure(db),
       cpuSlots: capacity?.cpuSlots ?? 0,
     });
@@ -596,7 +737,7 @@ async function submitCampaignUransRetries(
         bcIds: [entry.bcId],
         simulationPresetRevisionId: entry.revisionId,
         campaignId: parent.campaignId,
-        jobKind: retry.fullUrans ? "sweep" : "targeted",
+        jobKind: "targeted",
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,
         wave: 2,
         status: "pending",
@@ -607,6 +748,7 @@ async function submitCampaignUransRetries(
           aoas: retry.aoas,
           parentJobId: parent.id,
           conditionId: entry.conditionId,
+          uransFidelity: "precalc",
           retryMode: retry.retryMode,
           validRansPointCount: retry.validRansPointCount,
           needsUransCount: retry.needsUransCount,
@@ -707,10 +849,15 @@ async function ingestCompletedJob(db: DB, engine: EngineClient, job: SimJobRow):
     airfoilId: job.airfoilId,
     speedMap,
     conditionMap: conditionMapForJob(job) ?? undefined,
+    uransFidelity: uransFidelityForJob(job),
     result,
   });
   collectDirtyLanes(ingested.dirtyLanes);
   await refreshPolarCachesForJob(db, job);
+  // Fidelity ladder: fresh verdicts exist now — enqueue verifications for
+  // accepted precalc rows and settle verify/request bookkeeping.
+  await enqueueVerificationsForJob(db, job);
+  await settleUransLadderForJob(db, job);
   await db
     .update(simJobs)
     .set({ status: "done", engineState: "completed", error: null, ingestedAt: new Date(), finishedAt: new Date() })
@@ -736,6 +883,7 @@ async function ingestRunningPartialJob(db: DB, engine: EngineClient, job: SimJob
     airfoilId: job.airfoilId,
     speedMap: speedMapForJob(job),
     conditionMap: conditionMapForJob(job) ?? undefined,
+    uransFidelity: uransFidelityForJob(job),
     result,
   });
   collectDirtyLanes(ingested.dirtyLanes);
@@ -804,6 +952,7 @@ async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: Sim
         airfoilId: job.airfoilId,
         speedMap: speedMapForJob(job),
         conditionMap: conditionMapForJob(job) ?? undefined,
+        uransFidelity: uransFidelityForJob(job),
         result: solvedPointsOnly(result),
       });
       collectDirtyLanes(ingested.dirtyLanes);
@@ -822,6 +971,7 @@ async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: Sim
   await cancelJobAndReleaseClaims(db, job, "worker restarted mid-solve; points released for re-solve");
   if (solvedPoints > 0) {
     await refreshPolarCachesForJob(db, job);
+    await enqueueVerificationsForJob(db, job);
     await settleCampaignAfterRefresh(db, job);
   }
 }
@@ -835,6 +985,7 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
   const failure = nonEmptyFailureMessage(job, msg);
   if (!job.engineJobId) {
     await failJob(db, job.id, failure);
+    await settleUransLadderForJob(db, job);
     return;
   }
   try {
@@ -847,15 +998,19 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       airfoilId: job.airfoilId,
       speedMap: speedMapForJob(job),
       conditionMap: conditionMapForJob(job) ?? undefined,
+      uransFidelity: uransFidelityForJob(job),
       result,
       failedPointErrorFallback: failure,
     });
     collectDirtyLanes(ingested.dirtyLanes);
     if (ingested.points === 0) {
       await failJob(db, job.id, failure);
+      await settleUransLadderForJob(db, job);
       return;
     }
     await refreshPolarCachesForJob(db, job);
+    await enqueueVerificationsForJob(db, job);
+    await settleUransLadderForJob(db, job);
     await db
       .update(simJobs)
       .set({ status: "failed", engineState: "failed", error: failure, ingestedAt: new Date(), finishedAt: new Date() })
@@ -864,6 +1019,7 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
     await settleCampaignAfterRefresh(db, job);
   } catch {
     await failJob(db, job.id, failure);
+    await settleUransLadderForJob(db, job);
   }
 }
 

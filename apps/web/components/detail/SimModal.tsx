@@ -21,6 +21,8 @@ import {
   timeForFrameIndex,
   windowPeriodCount,
 } from "@/lib/frame-player";
+import { fidelityChipView } from "@/lib/point-history";
+import { buildSteadyHistoryModel, type SteadyHistoryModel } from "@/lib/steady-history";
 import { C, MONO, VIZ } from "@/lib/tokens";
 
 const PERIOD = 4;
@@ -143,6 +145,12 @@ export function SimModal(props: {
   // Engine-recorded frame track → player model; null = legacy evidence (steady,
   // no-shedding, pre-contract, or drifted payload) → the stored mp4 stays.
   const playerModel = useMemo(() => buildFramePlayerModel(sim?.frameTrack ?? null), [sim?.frameTrack]);
+  // Oscillating-steady iteration history (fidelity ladder contract 2): null =
+  // classic pointwise convergence — the section renders nothing new.
+  const steadyModel = useMemo(() => buildSteadyHistoryModel(sim?.steadyHistory ?? null), [sim?.steadyHistory]);
+  const steadyClRef = useRef<HTMLCanvasElement>(null);
+  const steadyCdRef = useRef<HTMLCanvasElement>(null);
+  const steadyCmRef = useRef<HTMLCanvasElement>(null);
   const framesMode = Boolean(playerModel && stalled);
   const frameIdx = playerModel ? clampFrameIndex(playerModel.frames.length, frameIndex) : -1;
   const currentFrame = playerModel && frameIdx >= 0 ? playerModel.frames[frameIdx] : null;
@@ -319,6 +327,23 @@ export function SimModal(props: {
     if (!open || sim?.status !== "solved" || !sim.availableFields.length) return;
     if (!sim.availableFields.includes(field)) onField(sim.availableFields[0]);
   }, [open, sim?.status, sim?.availableFields, field, onField]);
+
+  // Static oscillating-steady iteration charts (real recorded samples, shaded
+  // averaging window). Drawn once per model — no animation clock.
+  useEffect(() => {
+    if (!open || !steadyModel) return;
+    const charts: Array<[HTMLCanvasElement | null, number[], string]> = [
+      [steadyClRef.current, steadyModel.cl, "#2dd4bf"],
+      [steadyCdRef.current, steadyModel.cd, "#f59e0b"],
+      [steadyCmRef.current, steadyModel.cm, "#e6edf3"],
+    ];
+    for (const [canvas, values, color] of charts) {
+      if (!canvas) continue;
+      const g = canvas.getContext("2d");
+      if (!g) continue;
+      drawSteadyHistoryChart(g, { width: canvas.width, height: canvas.height, values, color, model: steadyModel });
+    }
+  }, [open, steadyModel]);
 
   // Legacy loop (no frame track): keep the scrubber and real force-history
   // charts moving without inventing CFD fields. Frames mode drives the same
@@ -685,6 +710,44 @@ export function SimModal(props: {
     );
   };
 
+  // Oscillating-steady iteration history (fidelity ladder contract 2): the
+  // REAL recorded Cl/Cd/Cm(iteration) samples with the averaging window
+  // shaded, plus the honest "averaged over last N iterations" note. Absent
+  // steady_history renders nothing.
+  const steadyHistorySection = () => {
+    if (!steadyModel) return null;
+    return (
+      <div data-testid="sim-steady-history" style={{ marginTop: 13, display: "grid", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.12em", whiteSpace: "nowrap" }}>
+            STEADY SOLVE · ITERATION HISTORY
+          </span>
+          <div style={{ flex: 1, height: 1, background: C.stroke2 }} />
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
+          {(
+            [
+              ["Cl(iter)", steadyClRef, steadyModel.cl, C.teal],
+              ["Cd(iter)", steadyCdRef, steadyModel.cd, C.amber],
+              ["Cm(iter)", steadyCmRef, steadyModel.cm, C.text],
+            ] as const
+          ).map(([title, ref, values, color]) => (
+            <div key={title} style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
+              <ChartHeader title={title} color={color} values={[...values]} current={values[values.length - 1]} />
+              <canvas ref={ref} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
+            </div>
+          ))}
+        </div>
+        <div data-testid="sim-steady-history-note" style={{ fontFamily: MONO, fontSize: 10, color: steadyModel.meanStable ? C.dimmest : C.amber, lineHeight: 1.5 }}>
+          Oscillating steady solve — coefficients averaged over the last {steadyModel.windowIterCount.toLocaleString()} iterations
+          (iter {steadyModel.windowStartIter.toLocaleString()}–{steadyModel.windowEndIter.toLocaleString()}, shaded window
+          {steadyModel.meanStable ? ", mean stable" : ", MEAN NOT STABLE"}).
+          {steadyModel.note ? ` Engine: ${steadyModel.note}` : ""}
+        </div>
+      </div>
+    );
+  };
+
   const setupDetails = () => {
     if (!sim?.condition) return null;
     return (
@@ -865,6 +928,19 @@ export function SimModal(props: {
           <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.1em", color: C.teal, border: `1px solid ${C.tealBorder}`, borderRadius: 5, padding: "3px 8px" }}>
             {modeTag}
           </span>
+          {(() => {
+            // Fidelity ladder chip (same truth table as every classification
+            // surface): plain for RANS/pre-ladder rows.
+            const view = sim ? fidelityChipView(sim.fidelity ?? null, sim.uransVerify ?? null) : null;
+            if (!view) return null;
+            const color = view.tone === "teal" ? C.teal : view.tone === "amber" ? C.amber : C.red;
+            const border = view.tone === "teal" ? C.tealBorder : view.tone === "amber" ? "rgba(245,158,11,0.45)" : "rgba(245,101,101,0.5)";
+            return (
+              <span data-testid="sim-fidelity-chip" style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.05em", color, border: `1px solid ${border}`, borderRadius: 999, padding: "3px 9px", whiteSpace: "nowrap" }}>
+                {view.label}
+              </span>
+            );
+          })()}
           <span style={{ fontWeight: 600, fontSize: 15 }}>{name}</span>
           <span style={{ fontFamily: MONO, fontSize: 12, color: C.muted }}>
             α {alphaStr}°&nbsp;&nbsp;·&nbsp;&nbsp;Re {reStr}&nbsp;&nbsp;·&nbsp;&nbsp;M {shownMach}
@@ -1117,6 +1193,7 @@ export function SimModal(props: {
 
               {/* force monitors */}
               {forceMonitorsGrid()}
+              {steadyHistorySection()}
               <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, lineHeight: 1.5 }}>
                 URANS, k-ω SST · vortex shedding past stall. Scrubber cursor is synced to the force histories. Mean field is the time-average over the sampling window.
               </div>
@@ -1141,9 +1218,13 @@ export function SimModal(props: {
                 <AccentStat label="Cm" color={C.text} value={f2(sim.cm)} sub="converged steady value" />
                 <AccentStat label="L/D" color={C.teal} value={f1(sim.ld)} sub="Cl / Cd" />
               </div>
-              <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, textAlign: "center" }}>
-                Attached flow — steady RANS converges to a single field, so no animation or force history.
-              </div>
+              {steadyModel ? (
+                steadyHistorySection()
+              ) : (
+                <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, textAlign: "center" }}>
+                  Attached flow — steady RANS converges to a single field, so no animation or force history.
+                </div>
+              )}
               {setupDetails()}
             </>
           )}
@@ -1440,6 +1521,91 @@ function drawForceChart(
   ctx.beginPath();
   ctx.arc(cx, cy, 3, 0, Math.PI * 2);
   ctx.fill();
+}
+
+/** Oscillating-steady iteration trace: same visual language as the force
+ *  monitors (grid, axes, min/max labels, dashed mean) plus the shaded
+ *  averaging window — a static chart, no cursor. */
+function drawSteadyHistoryChart(
+  ctx: CanvasRenderingContext2D,
+  opts: { width: number; height: number; values: number[]; color: string; model: SteadyHistoryModel },
+) {
+  const { width: W, height: H, values, color, model } = opts;
+  ctx.fillStyle = "#0a0f15";
+  ctx.fillRect(0, 0, W, H);
+  if (values.length < 2) return;
+  const finite = values.filter(Number.isFinite);
+  if (finite.length === 0) return;
+  const lo = Math.min(...finite);
+  const hi = Math.max(...finite);
+  const span = hi - lo || 1;
+  const padL = 44;
+  const padR = 10;
+  const padT = 10;
+  const padB = 22;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const yv = (v: number) => padT + (1 - (v - lo) / span) * plotH;
+  const xv = (i: number) => padL + (i / (values.length - 1)) * plotW;
+
+  // averaging window shading (real window bounds from the engine payload)
+  const wx0 = padL + model.windowStartFrac * plotW;
+  const wx1 = padL + model.windowEndFrac * plotW;
+  ctx.fillStyle = "rgba(45,212,191,0.08)";
+  ctx.fillRect(wx0, padT, Math.max(1, wx1 - wx0), plotH);
+
+  ctx.strokeStyle = "rgba(148,163,184,0.16)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const y = padT + (i / 3) * plotH;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(W - padR, y);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = "rgba(148,163,184,0.3)";
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, H - padB);
+  ctx.lineTo(W - padR, H - padB);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(148,163,184,0.75)";
+  ctx.font = "9px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.textAlign = "right";
+  ctx.fillText(fmt(hi, 3), padL - 6, padT + 4);
+  ctx.fillText(fmt(lo, 3), padL - 6, H - padB + 3);
+  ctx.textAlign = "left";
+  ctx.fillText(`iter ${model.iterations[0]}`, padL, H - padB + 13);
+  ctx.textAlign = "right";
+  ctx.fillText(`${model.iterations[model.iterations.length - 1]}`, W - padR, H - padB + 13);
+
+  // dashed window mean (the value the point-level coefficient reports)
+  const winValues = values.slice(
+    Math.round(model.windowStartFrac * (values.length - 1)),
+    Math.round(model.windowEndFrac * (values.length - 1)) + 1,
+  ).filter(Number.isFinite);
+  if (winValues.length) {
+    const mean = winValues.reduce((s, v) => s + v, 0) / winValues.length;
+    ctx.strokeStyle = "rgba(230,237,243,0.22)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, yv(mean));
+    ctx.lineTo(W - padR, yv(mean));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  values.forEach((v, i) => {
+    const x = xv(i);
+    const y = yv(v);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
 }
 
 function drawEmptyChart(ctx: CanvasRenderingContext2D, opts: { width: number; height: number }) {

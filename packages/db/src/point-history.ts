@@ -55,6 +55,9 @@ export interface PointHistoryCursor {
   rowKey: string;
 }
 
+export const POINT_VERIFY_FILTERS = ["pending", "disagreed"] as const;
+export type PointVerifyFilter = (typeof POINT_VERIFY_FILTERS)[number];
+
 export interface PointHistoryFilters {
   bucket?: PointHistoryBucket;
   /** Case-insensitive substring over airfoil name/slug. */
@@ -63,6 +66,10 @@ export interface PointHistoryFilters {
   regime?: "rans" | "urans";
   errorClass?: CampaignErrorClass;
   reynolds?: number;
+  /** Fidelity-ladder verify-queue filter: 'pending' = an open (pending or
+   *  running) verify item covers the cell+angle; 'disagreed' = the latest
+   *  settled item flagged a full-vs-precalc disagreement. */
+  verify?: PointVerifyFilter;
 }
 
 /** Compact per-attempt digest event for the STORY column (bounded: first 12
@@ -102,6 +109,20 @@ export interface PointHistoryItem {
   conditionId: string | null;
   revisionId: string | null;
   lastActivityAt: string;
+  /** Fidelity ladder echo (results.fidelity). Derived mirrors carry their +α
+   *  source row's fidelity. null = pre-ladder/unsolved row. */
+  fidelity: string | null;
+  /** Latest verify-queue item covering this point's cell+angle; null = never
+   *  queued for full-fidelity verification. */
+  verify: PointVerifyInfo | null;
+}
+
+/** Latest sim_urans_verify_queue item for a point (contract 4). */
+export interface PointVerifyInfo {
+  state: string;
+  deltaCl: number | null;
+  deltaCd: number | null;
+  deltaCm: number | null;
 }
 
 export interface PointHistoryCounts {
@@ -164,6 +185,22 @@ function resultArmFilters(f: PointHistoryFilters, opts: { includeBucket: boolean
   if (f.regime) parts.push(sql`r.regime = ${f.regime}`);
   if (f.reynolds != null) parts.push(sql`r.reynolds = ${f.reynolds}`);
   if (f.errorClass) parts.push(sql`r.status = 'failed' AND ${ERROR_CLASS_SQL} = ${f.errorClass}`);
+  if (f.verify === "pending") {
+    parts.push(sql`EXISTS (
+      SELECT 1 FROM sim_urans_verify_queue q
+      WHERE q.airfoil_id = r.airfoil_id AND q.revision_id = r.simulation_preset_revision_id
+        AND q.aoa_deg = r.aoa_deg AND q.state IN ('pending', 'running')
+    )`);
+  } else if (f.verify === "disagreed") {
+    // Latest item decides: a cell whose disagreement was re-verified clean
+    // must not keep matching the disagreed filter.
+    parts.push(sql`(
+      SELECT q.state FROM sim_urans_verify_queue q
+      WHERE q.airfoil_id = r.airfoil_id AND q.revision_id = r.simulation_preset_revision_id
+        AND q.aoa_deg = r.aoa_deg
+      ORDER BY q."createdAt" DESC LIMIT 1
+    ) = 'disagreed'`);
+  }
   if (opts.includeBucket && f.bucket) parts.push(sql`${BUCKET_SQL} = ${f.bucket}`);
   return sql.join(parts, sql` AND `);
 }
@@ -207,6 +244,11 @@ interface PageRow {
   campaign_id: string | null;
   campaign_name: string | null;
   condition_id: string | null;
+  fidelity: string | null;
+  verify_state: string | null;
+  verify_delta_cl: number | string | null;
+  verify_delta_cd: number | string | null;
+  verify_delta_cm: number | string | null;
 }
 
 const isoOf = (v: Date | string): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
@@ -222,7 +264,7 @@ export async function pointHistoryPage(
       ? sql`AND (${activityCol}, ${keyExpr}) < (${page.cursor.lastActivity}::timestamptz, ${page.cursor.rowKey})`
       : sql``;
 
-  const includeDerived = !filters.bucket && !filters.errorClass;
+  const includeDerived = !filters.bucket && !filters.errorClass && !filters.verify;
   const resultKey = sql`('r:' || r.id::text)`;
   const derivedKey = sql`('d:' || p.campaign_id::text || ':' || p.condition_id::text || ':' || p.airfoil_id::text || ':' || p.aoa_deg::text)`;
 
@@ -248,7 +290,8 @@ export async function pointHistoryPage(
         p.revision_id AS revision_id,
         p."updatedAt" AS last_activity,
         p.campaign_id AS campaign_id,
-        p.condition_id AS condition_id
+        p.condition_id AS condition_id,
+        r.fidelity AS fidelity
       FROM sim_campaign_points p
       JOIN results r ON r.id = p.result_id
       JOIN airfoils af ON af.id = p.airfoil_id
@@ -280,7 +323,8 @@ export async function pointHistoryPage(
         r.simulation_preset_revision_id AS revision_id,
         r."updatedAt" AS last_activity,
         NULL::uuid AS campaign_id,
-        NULL::uuid AS condition_id
+        NULL::uuid AS condition_id,
+        r.fidelity AS fidelity
       FROM results r
       JOIN airfoils af ON af.id = r.airfoil_id
       LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -300,6 +344,10 @@ export async function pointHistoryPage(
       to_char(page.last_activity AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS last_activity_us,
       att.attempt_count,
       att.attempt_digest,
+      vq.verify_state,
+      vq.verify_delta_cl,
+      vq.verify_delta_cd,
+      vq.verify_delta_cm,
       COALESCE(page.campaign_id, cp.campaign_id) AS campaign_id_final,
       COALESCE(page.condition_id, cp.condition_id) AS condition_id_final,
       sc.name AS campaign_name
@@ -338,6 +386,16 @@ export async function pointHistoryPage(
           AND NOT p.derived_by_symmetry
       ) x LIMIT 1
     ) cp ON page.kind = 'result'
+    -- Latest verify-queue item for the cell+angle (fidelity ladder contract
+    -- 4): 'latest decides' so a re-verified cell stops reading disagreed.
+    -- Derived mirrors are never verified in their own right (kind gate).
+    LEFT JOIN LATERAL (
+      SELECT q.state AS verify_state, q.delta_cl AS verify_delta_cl,
+             q.delta_cd AS verify_delta_cd, q.delta_cm AS verify_delta_cm
+      FROM sim_urans_verify_queue q
+      WHERE q.airfoil_id = page.airfoil_id AND q.revision_id = page.revision_id AND q.aoa_deg = page.aoa_deg
+      ORDER BY q."createdAt" DESC LIMIT 1
+    ) vq ON page.kind = 'result'
     LEFT JOIN sim_campaigns sc ON sc.id = COALESCE(page.campaign_id, cp.campaign_id)
     ORDER BY page.last_activity DESC, page.row_key DESC
   `)) as unknown as Array<PageRow & { last_activity_us: string; campaign_id_final: string | null; condition_id_final: string | null }>;
@@ -416,6 +474,16 @@ export async function pointHistoryPage(
       conditionId: row.condition_id_final,
       revisionId: row.revision_id,
       lastActivityAt: isoOf(row.last_activity),
+      fidelity: row.fidelity,
+      verify:
+        row.verify_state == null
+          ? null
+          : {
+              state: row.verify_state,
+              deltaCl: row.verify_delta_cl == null ? null : Number(row.verify_delta_cl),
+              deltaCd: row.verify_delta_cd == null ? null : Number(row.verify_delta_cd),
+              deltaCm: row.verify_delta_cm == null ? null : Number(row.verify_delta_cm),
+            },
     })),
     nextCursor: hasMore && last ? encodePointHistoryCursor(last.last_activity_us, last.row_key) : null,
     counts: {
@@ -487,6 +555,10 @@ export interface PointStory {
     conditionId: string | null;
     solvedAt: string | null;
     updatedAt: string;
+    /** Fidelity ladder echo (results.fidelity); null = pre-ladder/unsolved. */
+    fidelity: string | null;
+    /** Latest verify-queue item for this cell+angle; null = never queued. */
+    verify: PointVerifyInfo | null;
   };
   attempts: PointStoryAttempt[];
   interruptions: PointStoryInterruption[];
@@ -501,10 +573,11 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
       r.id AS result_id, r.airfoil_id, af.slug AS airfoil_slug, af.name AS airfoil_name,
       r.aoa_deg::float8 AS aoa_deg, r.reynolds, r.mach, r.speed, r.regime, r.status::text AS status,
       r.error, r.quality_warnings, r.simulation_preset_revision_id AS revision_id,
-      r."solvedAt" AS solved_at, r."updatedAt" AS updated_at,
+      r."solvedAt" AS solved_at, r."updatedAt" AS updated_at, r.fidelity,
       rc.state::text AS cls_state, rc.reasons AS cls_reasons, rc.confidence AS cls_confidence,
       rc.classifier_version AS cls_version,
-      cp.campaign_id, cp.condition_id, sc.name AS campaign_name
+      cp.campaign_id, cp.condition_id, sc.name AS campaign_name,
+      vq.verify_state, vq.verify_delta_cl, vq.verify_delta_cd, vq.verify_delta_cm
     FROM results r
     JOIN airfoils af ON af.id = r.airfoil_id
     LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -519,6 +592,13 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
       ) x LIMIT 1
     ) cp ON TRUE
     LEFT JOIN sim_campaigns sc ON sc.id = cp.campaign_id
+    LEFT JOIN LATERAL (
+      SELECT q.state AS verify_state, q.delta_cl AS verify_delta_cl,
+             q.delta_cd AS verify_delta_cd, q.delta_cm AS verify_delta_cm
+      FROM sim_urans_verify_queue q
+      WHERE q.airfoil_id = r.airfoil_id AND q.revision_id = r.simulation_preset_revision_id AND q.aoa_deg = r.aoa_deg
+      ORDER BY q."createdAt" DESC LIMIT 1
+    ) vq ON TRUE
     WHERE r.id = ${resultId}
     LIMIT 1
   `)) as unknown as Array<{
@@ -544,6 +624,11 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
     campaign_id: string | null;
     condition_id: string | null;
     campaign_name: string | null;
+    fidelity: string | null;
+    verify_state: string | null;
+    verify_delta_cl: number | string | null;
+    verify_delta_cd: number | string | null;
+    verify_delta_cm: number | string | null;
   }>;
   const p = pointRows[0];
   if (!p) throw new CampaignError("not_found", "point not found");
@@ -679,6 +764,16 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
       conditionId: p.condition_id,
       solvedAt: isoOrNull(p.solved_at),
       updatedAt: iso(p.updated_at),
+      fidelity: p.fidelity,
+      verify:
+        p.verify_state == null
+          ? null
+          : {
+              state: p.verify_state,
+              deltaCl: p.verify_delta_cl == null ? null : Number(p.verify_delta_cl),
+              deltaCd: p.verify_delta_cd == null ? null : Number(p.verify_delta_cd),
+              deltaCm: p.verify_delta_cm == null ? null : Number(p.verify_delta_cm),
+            },
     },
     attempts: attemptRows.map((a) => ({
       id: a.id,

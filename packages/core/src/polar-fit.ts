@@ -26,15 +26,35 @@ import type {
 // column on each refresh) — no code path compares it to trigger
 // re-classification, so bumping would change nothing and only fragment the
 // stamp history.
-export const POLAR_CLASSIFIER_VERSION = "frame-track-v3";
+// v4 (fidelity ladder, 2026-07-07): the frame-track period gate becomes
+// FIDELITY-AWARE (urans_precalc >= 3 retained periods, urans_full >= 5 —
+// unknown/legacy fidelity keeps the strict full bar), and oscillating-steady
+// rows whose steady_history.mean_stable is literally true are accepted as
+// RANS evidence (the not-converged / solver-stalled gates are waived for
+// exactly that shape; every other gate still applies). Reasons stay
+// rejection-only — the oscillating-averaging note is surfaced through the
+// quality-warnings marker the ingest path persists, never through reasons.
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v4";
 export const POLAR_FIT_VERSION = "evidence-lowess-v2";
 
-/** Minimum retained shedding periods for URANS acceptance (frame-track gate).
- *  Cross-runtime parity pin: the engine's early-stop retention
- *  (src/airfoilfoam/pipeline.py URANS_STABLE_RETAINED_CYCLES) must be >= this
- *  value, or every early-stopped point would be rejected here by
- *  construction (adversarial review F1/F2, 2026-07-07). */
+/** Minimum retained shedding periods for FULL-fidelity URANS acceptance
+ *  (frame-track gate). Cross-runtime parity pin: the engine's early-stop
+ *  retention (src/airfoilfoam/pipeline.py URANS_STABLE_RETAINED_CYCLES) must
+ *  be >= this value, or every early-stopped point would be rejected here by
+ *  construction (adversarial review F1/F2, 2026-07-07). Kept exported under
+ *  the historical name; fidelity-aware callers read the pair below. */
 export const FRAME_TRACK_MIN_PERIODS = 5;
+export const FRAME_TRACK_MIN_PERIODS_FULL = FRAME_TRACK_MIN_PERIODS;
+/** Precalc tier (fidelity ladder contract 1): the engine records >= 3 periods
+ *  on the half-resolution mesh, so acceptance demands >= 3 — the verify queue
+ *  re-solves accepted precalc points at full fidelity afterwards. */
+export const FRAME_TRACK_MIN_PERIODS_PRECALC = 3;
+
+/** Minimum retained periods demanded of a frame_track given the row's
+ *  fidelity tier. Unknown/legacy/absent fidelity keeps the strict full bar. */
+export function frameTrackMinPeriodsFor(fidelity: string | null | undefined): number {
+  return fidelity === "urans_precalc" ? FRAME_TRACK_MIN_PERIODS_PRECALC : FRAME_TRACK_MIN_PERIODS_FULL;
+}
 
 /** Non-physical coefficient magnitude bound (|cl| / |cm| beyond this =
  *  numerically diverged evidence, never real aerodynamics).
@@ -57,6 +77,16 @@ export const NON_PHYSICAL_COEFFICIENT_LIMIT = 5;
 export interface FrameTrackEvidence {
   stationary?: unknown;
   periods_retained?: unknown;
+  [key: string]: unknown;
+}
+
+/** Raw steady_history jsonb as persisted at ingest (snake_case engine
+ *  contract shape, ladder contract 2). Typed loosely on purpose: the gate
+ *  reads only mean_stable and FAILS CLOSED — anything but a literal `true`
+ *  never waives the steady convergence gates. */
+export interface SteadyHistoryEvidence {
+  mean_stable?: unknown;
+  note?: unknown;
   [key: string]: unknown;
 }
 
@@ -85,6 +115,15 @@ export interface PolarEvidencePoint {
    *  payload). null/undefined = legacy pre-contract evidence or steady point
    *  → frame-track gate not applied. */
   frameTrack?: FrameTrackEvidence | null;
+  /** Fidelity ladder tier ('rans' | 'urans_precalc' | 'urans_full';
+   *  results.fidelity / attempt evidence payload). null/undefined = legacy
+   *  pre-ladder evidence → strict full-fidelity period bar. */
+  fidelity?: string | null;
+  /** Oscillating-averaged steady solve evidence (results.steady_history /
+   *  attempt evidence payload). mean_stable === true accepts the row as RANS
+   *  evidence despite converged=false. null/undefined = classic pointwise
+   *  convergence or legacy evidence. */
+  steadyHistory?: SteadyHistoryEvidence | null;
 }
 
 export interface PolarEvidenceClassification {
@@ -142,6 +181,14 @@ function linearSlope(points: PolarEvidencePoint[]): number | null {
   return den > 0 ? num / den : null;
 }
 
+/** Oscillating-steady acceptance shape (v4): a STEADY row whose solve settled
+ *  into a bounded oscillation and shipped steady_history with a literal
+ *  mean_stable === true. Fails closed on anything else (drifted payloads,
+ *  unsteady rows, missing history). */
+export function isOscillatingSteadyStable(p: PolarEvidencePoint): boolean {
+  return !p.unsteady && p.steadyHistory != null && p.steadyHistory.mean_stable === true;
+}
+
 function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   const reasons: string[] = [];
   if (p.status !== "done" || p.source !== "solved") reasons.push("not-solved");
@@ -157,13 +204,21 @@ function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     reasons.push("non-physical-coefficients");
   }
   if (p.error) reasons.push("solver-error");
-  if (p.converged !== true) reasons.push("not-converged");
+  // Oscillating-steady acceptance (v4, ladder contract 2): a steady solve that
+  // settled into a bounded oscillation and was mean-averaged over a stable
+  // window (steady_history.mean_stable === true) IS valid RANS evidence — the
+  // pointwise not-converged / solver-stalled verdicts are waived for exactly
+  // that shape. Every other gate (coefficients, magnitude, error) still
+  // applies, and the honest note is surfaced via the ingest quality-warning
+  // marker, never via reasons (reasons are rejection-only).
+  const oscillatingSteady = isOscillatingSteadyStable(p);
+  if (p.converged !== true && !oscillatingSteady) reasons.push("not-converged");
   // `stalled` is the AERODYNAMIC post-stall marker (ingest sets it true for
   // every unsteady point by construction). Solver-stalled is a SOLVER defect:
   // only a non-converged steady point earns it. Unsteady evidence is judged on
   // its own gate below — converged + force history + video (evidence-first
   // honesty; without this split no URANS row could ever classify accepted).
-  if (p.stalled && !p.unsteady) reasons.push("solver-stalled");
+  if (p.stalled && !p.unsteady && !oscillatingSteady) reasons.push("solver-stalled");
   if (p.regime === "urans") {
     if (!p.hasForceHistory) reasons.push("missing-force-history");
     if (!p.hasVideo) reasons.push("missing-urans-video");
@@ -171,10 +226,14 @@ function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     // engine version shipped frame_track (non-null). Reads fail closed — a
     // drifted payload without a literal stationary=true / numeric
     // periods_retained is rejected, never silently accepted.
+    // v4: the period bar is fidelity-aware — precalc rows (half-resolution
+    // pre-calculation tier) accept at >= 3 retained periods, full/legacy rows
+    // keep the strict >= 5 bar.
     if (p.frameTrack !== null && p.frameTrack !== undefined) {
       if (p.frameTrack.stationary !== true) reasons.push("non-stationary");
       const periods = p.frameTrack.periods_retained;
-      if (!(typeof periods === "number" && Number.isFinite(periods) && periods >= FRAME_TRACK_MIN_PERIODS)) {
+      const minPeriods = frameTrackMinPeriodsFor(p.fidelity);
+      if (!(typeof periods === "number" && Number.isFinite(periods) && periods >= minPeriods)) {
         reasons.push("insufficient-periods");
       }
     }

@@ -10,6 +10,7 @@ import {
   CampaignError,
   parsePointHistoryCursor,
   POINT_HISTORY_BUCKETS,
+  POINT_VERIFY_FILTERS,
   pointHistoryPage,
   pointStory,
   requeueSinglePoint,
@@ -27,6 +28,7 @@ const listQuerySchema = z.object({
   regime: z.enum(["rans", "urans"]).optional(),
   errorClass: z.enum(CAMPAIGN_ERROR_CLASSES).optional(),
   reynolds: z.coerce.number().int().positive().optional(),
+  verify: z.enum(POINT_VERIFY_FILTERS).optional(),
   cursor: z.string().min(3).optional(),
   limit: z.coerce.number().int().min(1).max(50).default(50),
   // NOT z.coerce.boolean(): that coerces ANY non-empty string ("false", "0")
@@ -62,6 +64,7 @@ export async function registerPointHistoryRoutes(app: FastifyInstance): Promise<
         regime: q.regime,
         errorClass: q.errorClass,
         reynolds: q.reynolds,
+        verify: q.verify,
       },
       { cursor, limit: q.limit, includeFacets: q.facets === "true" || q.facets === "1" },
     );

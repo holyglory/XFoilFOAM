@@ -22,6 +22,14 @@ export interface PointAttemptDigestEvent {
   error: string | null;
 }
 
+/** Latest sim_urans_verify_queue item for a point (fidelity ladder contract 4). */
+export interface PointVerifyInfo {
+  state: string;
+  deltaCl: number | null;
+  deltaCd: number | null;
+  deltaCm: number | null;
+}
+
 export interface PointHistoryItem {
   kind: "result" | "derived";
   rowKey: string;
@@ -45,6 +53,11 @@ export interface PointHistoryItem {
   conditionId: string | null;
   revisionId: string | null;
   lastActivityAt: string;
+  /** Fidelity ladder echo (results.fidelity): 'rans' | 'urans_precalc' |
+   *  'urans_full' | null (pre-ladder/unsolved). */
+  fidelity: string | null;
+  /** Latest verify-queue item covering this cell+angle; null = never queued. */
+  verify: PointVerifyInfo | null;
 }
 
 export interface PointHistoryCounts {
@@ -122,6 +135,10 @@ export interface PointStoryPayload {
     conditionId: string | null;
     solvedAt: string | null;
     updatedAt: string;
+    /** Fidelity ladder echo (results.fidelity); null = pre-ladder/unsolved. */
+    fidelity: string | null;
+    /** Latest verify-queue item for this cell+angle; null = never queued. */
+    verify: PointVerifyInfo | null;
   };
   attempts: PointStoryAttempt[];
   interruptions: PointStoryInterruption[];
@@ -134,6 +151,9 @@ export interface PointStoryPayload {
 // values are OMITTED from the URL so plain ?section=queue&tab=points stays
 // canonical.
 // ---------------------------------------------------------------------------
+export const POINT_VERIFY_FILTERS = ["pending", "disagreed"] as const;
+export type PointVerifyFilterValue = "" | (typeof POINT_VERIFY_FILTERS)[number];
+
 export interface PointFilters {
   status: PointStatusChip;
   airfoil: string;
@@ -141,6 +161,9 @@ export interface PointFilters {
   regime: "" | "rans" | "urans";
   errorClass: "" | PointErrorClass;
   reynolds: string; // keep as string: '' = any; URL/select round-trip value
+  /** Fidelity-ladder verify filter: '' = any, 'pending' = open verify item,
+   *  'disagreed' = latest verify item flagged a disagreement. */
+  verify: PointVerifyFilterValue;
 }
 
 export const DEFAULT_POINT_FILTERS: PointFilters = {
@@ -150,6 +173,7 @@ export const DEFAULT_POINT_FILTERS: PointFilters = {
   regime: "",
   errorClass: "",
   reynolds: "",
+  verify: "",
 };
 
 /** Parse the point filters out of a location.search string (extra params are
@@ -160,6 +184,7 @@ export function parsePointFilters(search: string): PointFilters {
   const regime = params.get("pregime") ?? "";
   const errorClass = params.get("perr") ?? "";
   const reynolds = params.get("pre") ?? "";
+  const verify = params.get("pverify") ?? "";
   return {
     status: (POINT_STATUS_CHIPS as readonly string[]).includes(status) ? (status as PointStatusChip) : "all",
     airfoil: params.get("pairfoil") ?? "",
@@ -167,6 +192,7 @@ export function parsePointFilters(search: string): PointFilters {
     regime: regime === "rans" || regime === "urans" ? regime : "",
     errorClass: (POINT_ERROR_CLASSES as readonly string[]).includes(errorClass) ? (errorClass as PointErrorClass) : "",
     reynolds: /^\d+$/.test(reynolds) ? reynolds : "",
+    verify: (POINT_VERIFY_FILTERS as readonly string[]).includes(verify) ? (verify as PointVerifyFilterValue) : "",
   };
 }
 
@@ -184,6 +210,7 @@ export function pointFiltersToSearch(search: string, filters: PointFilters): str
   setOrDelete("pregime", filters.regime, "");
   setOrDelete("perr", filters.errorClass, "");
   setOrDelete("pre", filters.reynolds, "");
+  setOrDelete("pverify", filters.verify, "");
   const s = params.toString();
   return s ? `?${s}` : "";
 }
@@ -195,6 +222,71 @@ export function pointFiltersToSearch(search: string, filters: PointFilters): str
  *  explorer's own URL round-trip. */
 export function campaignPointsSearch(campaignId: string, status: "failed" | "rejected"): string {
   return pointFiltersToSearch("?section=queue&tab=points", { ...DEFAULT_POINT_FILTERS, campaignId, status });
+}
+
+/** Explorer link for a cell's verify-ladder chips (campaign cell panel):
+ *  Solver ▸ Points pre-filtered to the airfoil + verify state, built through
+ *  the same round-trip so param names can never drift. */
+export function verifyPointsSearch(airfoilSlug: string, verify: "pending" | "disagreed"): string {
+  return pointFiltersToSearch("?section=queue&tab=points", { ...DEFAULT_POINT_FILTERS, airfoil: airfoilSlug, verify });
+}
+
+// ---------------------------------------------------------------------------
+// Fidelity chip (ladder contract): the ONE presentation rule for every surface
+// that renders a classification chip (Points rows, story header, cell panel,
+// solver-results modal). Pure so node vitest pins the truth table.
+//   rans / null            → no chip (plain — steady evidence needs no badge)
+//   urans_precalc          → amber 'precalc' (+ honest verify-queue suffix)
+//   urans_full             → teal 'verified' (full-fidelity tier)
+//   latest verify disagreed → red 'verify disagreed (Δcl 0.06)' — the deltas
+//     rendered are the REAL stored deltas, bound-annotated by the pinned
+//     contract limits below.
+// ---------------------------------------------------------------------------
+/** Contract-4 disagreement bounds — pinned here for label emphasis only; the
+ *  authoritative comparison lives in the sweeper (engine-client fidelity.ts).
+ *  Drift is caught by the fidelity-ladder web test pinning the same values. */
+export const URANS_VERIFY_DELTA_CL_LIMIT = 0.05;
+export const URANS_VERIFY_DELTA_CD_LIMIT = 0.01;
+
+export interface FidelityChipView {
+  label: string;
+  tone: "teal" | "amber" | "red";
+}
+
+function fmtDelta(v: number): string {
+  const s = Math.abs(v).toFixed(3);
+  return s.replace(/0+$/, "").replace(/\.$/, ".0");
+}
+
+/** Human label for the offending deltas of a disagreed verify item. Lists the
+ *  deltas that exceeded their contract bound; falls back to every recorded
+ *  delta (a disagreement always stores its evidence — an empty suffix means
+ *  the deltas were never recorded, and we say nothing rather than invent). */
+export function disagreedDeltaLabel(verify: PointVerifyInfo): string {
+  const parts: string[] = [];
+  if (verify.deltaCl != null && Math.abs(verify.deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) parts.push(`Δcl ${fmtDelta(verify.deltaCl)}`);
+  if (verify.deltaCd != null && Math.abs(verify.deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT) parts.push(`Δcd ${fmtDelta(verify.deltaCd)}`);
+  if (parts.length === 0) {
+    if (verify.deltaCl != null) parts.push(`Δcl ${fmtDelta(verify.deltaCl)}`);
+    if (verify.deltaCd != null) parts.push(`Δcd ${fmtDelta(verify.deltaCd)}`);
+  }
+  return parts.join(" · ");
+}
+
+/** null = render nothing (plain RANS / pre-ladder rows stay unbadged). */
+export function fidelityChipView(fidelity: string | null, verify: PointVerifyInfo | null): FidelityChipView | null {
+  if (verify?.state === "disagreed") {
+    const deltas = disagreedDeltaLabel(verify);
+    return { label: deltas ? `verify disagreed (${deltas})` : "verify disagreed", tone: "red" };
+  }
+  if (fidelity === "urans_full") return { label: "verified", tone: "teal" };
+  if (fidelity === "urans_precalc") {
+    if (verify?.state === "pending" || verify?.state === "running") return { label: "precalc · verify pending", tone: "amber" };
+    if (verify?.state === "done") return { label: "precalc · verified", tone: "teal" };
+    if (verify?.state === "cancelled") return { label: "precalc · verify cancelled", tone: "amber" };
+    return { label: "precalc", tone: "amber" };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +446,31 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
       tone,
       title: `classified ${cls.state.replaceAll("_", " ")} (confidence ${Math.round(cls.confidence * 100)}%)`,
       detail: cls.reasons.length ? cls.reasons.join(", ") : null,
+      whyLines: [],
+    });
+  }
+
+  // Fidelity ladder verification (contract 4): the verify queue's REAL state
+  // for this cell+angle. Pending/running = honest "scheduled last" note;
+  // disagreed = red event carrying the stored deltas.
+  const verify = story.point.verify;
+  if (verify && (verify.state === "pending" || verify.state === "running")) {
+    events.push({
+      kind: "classification",
+      at: null,
+      tone: "amber",
+      title: verify.state === "running" ? "full-fidelity verification running" : "full-fidelity verification queued",
+      detail: "precalc URANS evidence — a full-mesh 7-period re-solve verifies it at the lowest scheduler priority",
+      whyLines: [],
+    });
+  } else if (verify && verify.state === "disagreed") {
+    const deltas = disagreedDeltaLabel(verify);
+    events.push({
+      kind: "classification",
+      at: null,
+      tone: "red",
+      title: "full-fidelity verification DISAGREED",
+      detail: `${deltas ? `${deltas} — ` : ""}classification stays on the verified full-fidelity row; the precalc/full disagreement is flagged for review`,
       whyLines: [],
     });
   }

@@ -4,8 +4,10 @@ import {
   type FieldMedia,
   type FrameTrackDetail,
   type SimulationDetail,
+  type SteadyHistoryDetail,
+  type UransVerifyDetail,
 } from "@aerodb/core";
-import { FRAME_IMAGE_ARTIFACT_KIND, parseFrameTrack } from "@aerodb/engine-client";
+import { FRAME_IMAGE_ARTIFACT_KIND, parseFrameTrack, parsePointFidelity, parseSteadyHistory } from "@aerodb/engine-client";
 import {
   airfoils,
   boundaryConditions,
@@ -18,6 +20,7 @@ import {
   results,
   simulationPresetRevisions,
   simulationPresets,
+  simUransVerifyQueue,
   solverEvidenceArtifacts,
 } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
@@ -126,6 +129,50 @@ function frameTrackDetailOf(r: Result, frameArtifacts: EvidenceRow[]): FrameTrac
   };
 }
 
+/** Strict-parse results.steady_history into the modal's camelCase shape.
+ *  A drifted payload resolves to null — the chart never renders invented
+ *  samples (the raw jsonb stays on the row as evidence). */
+function steadyHistoryDetailOf(r: Result): SteadyHistoryDetail | null {
+  if (r.steadyHistory === null || r.steadyHistory === undefined) return null;
+  const parsed = parseSteadyHistory(r.steadyHistory);
+  if (!parsed.ok) return null;
+  const sh = parsed.value;
+  return {
+    iterations: sh.iterations,
+    cl: sh.cl,
+    cd: sh.cd,
+    cm: sh.cm,
+    window: { startIter: sh.window.start_iter, endIter: sh.window.end_iter },
+    meanStable: sh.mean_stable,
+    note: sh.note,
+  };
+}
+
+/** Latest verify-queue item covering this point's cell+angle (contract 4) —
+ *  the modal header renders "verify pending"/"disagreed" from the REAL queue
+ *  row, never inferred from fidelity alone. */
+async function uransVerifyDetailOf(r: Result): Promise<UransVerifyDetail | null> {
+  if (!r.simulationPresetRevisionId) return null;
+  const [item] = await db
+    .select({
+      state: simUransVerifyQueue.state,
+      deltaCl: simUransVerifyQueue.deltaCl,
+      deltaCd: simUransVerifyQueue.deltaCd,
+      deltaCm: simUransVerifyQueue.deltaCm,
+    })
+    .from(simUransVerifyQueue)
+    .where(
+      and(
+        eq(simUransVerifyQueue.airfoilId, r.airfoilId),
+        eq(simUransVerifyQueue.revisionId, r.simulationPresetRevisionId),
+        eq(simUransVerifyQueue.aoaDeg, r.aoaDeg),
+      ),
+    )
+    .orderBy(desc(simUransVerifyQueue.createdAt))
+    .limit(1);
+  return item ?? null;
+}
+
 async function solvedDetail(name: string, re: number, r: Result): Promise<SimulationDetail | null> {
   const cl = r.cl ?? 0;
   const cd = r.cd ?? 0;
@@ -221,6 +268,9 @@ async function solvedDetail(name: string, re: number, r: Result): Promise<Simula
     })),
     history: hist ? { t: hist.t, cl: hist.cl, cd: hist.cd } : null,
     frameTrack: frameTrackDetailOf(r, frameArtifacts),
+    fidelity: parsePointFidelity(r.fidelity),
+    steadyHistory: steadyHistoryDetailOf(r),
+    uransVerify: await uransVerifyDetailOf(r),
     condition: snapshot && setup
       ? {
           boundaryConditionName: snapshot.preset.name,

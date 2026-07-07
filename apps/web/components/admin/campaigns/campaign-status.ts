@@ -63,6 +63,56 @@ export function gateFromSolverState(state: SolverStateName): CampaignGate | null
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fidelity ladder phase (contract 7 — DERIVED server-side, rendered here).
+// The phase badge decorates a RUNNING ladder; the liveness-split gate badge
+// always outranks it (a blocked campaign shows BLOCKED, not a phase).
+// ---------------------------------------------------------------------------
+export type CampaignLadderPhase = "running_rans" | "running_precalc" | "running_refinement" | "completed" | null;
+
+export interface CampaignTierCounts {
+  ransOpen: number;
+  precalcOpen: number;
+  verifyOpen: number;
+}
+
+export interface CampaignPhaseBadge {
+  key: Exclude<CampaignLadderPhase, null>;
+  label: string;
+  tone: "teal" | "amber";
+}
+
+/** null = no badge: no phase in the payload (older API), a gate is blocking
+ *  (gate badge outranks the phase), or lifecycle already says "completed"
+ *  (the status chip covers it — no duplicate badge). */
+export function campaignPhaseBadge(
+  phase: CampaignLadderPhase | undefined,
+  lifecycleStatus: string,
+  gate: CampaignGate | null,
+): CampaignPhaseBadge | null {
+  if (!phase || gate) return null;
+  switch (phase) {
+    case "running_rans":
+      return { key: phase, label: "RUNNING RANS", tone: "teal" };
+    case "running_precalc":
+      return { key: phase, label: "RUNNING PRECALC URANS", tone: "amber" };
+    case "running_refinement":
+      return { key: phase, label: "RUNNING URANS REFINEMENT", tone: "amber" };
+    case "completed":
+      // Transient window: every tier terminal but the completion probe has
+      // not flipped the lifecycle yet. Once the chip says COMPLETED the badge
+      // would be a duplicate.
+      return lifecycleStatus === "completed" ? null : { key: phase, label: "ALL TIERS TERMINAL", tone: "teal" };
+  }
+}
+
+/** Header-strip per-tier open counts (contract 7). null = payload has no tier
+ *  counts (older API) — render nothing rather than invented zeros. */
+export function tierCountsLine(tiers: CampaignTierCounts | undefined | null): string | null {
+  if (!tiers) return null;
+  return `tiers open — RANS ${fCount(tiers.ransOpen)} · precalc ${fCount(tiers.precalcOpen)} · verify ${fCount(tiers.verifyOpen)}`;
+}
+
 /** Never a bare "Active" while nothing can run. `nowMs` is injectable for
  *  deterministic tests of the heartbeat/tick-staleness clauses. */
 export function campaignStatusLine(s: AdminCampaignSummary, nowMs: number = Date.now()): CampaignStatusView {

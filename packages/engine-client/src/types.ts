@@ -1,6 +1,7 @@
 // Request/response shapes for the Python CFD solver API, ported from
 // src/airfoilfoam/models.py. JSON uses snake_case — keep these field names exact.
 
+import type { PointFidelity, SteadyHistory, UransFidelity } from "./fidelity";
 import type { FrameTrack } from "./frame-track";
 
 export type AirfoilFormat = "auto" | "selig" | "lednicer";
@@ -81,6 +82,10 @@ export interface SolverParams {
   transient_discard_fraction?: number;
   transient_max_courant?: number;
   transient_auto_refine?: boolean;
+  /** URANS fidelity ladder (pinned contract 1, see fidelity.ts): the engine
+   *  derives min periods / solver budget / mesh scale from this literal.
+   *  Absent = engine defaults (legacy full-fidelity behavior). */
+  urans_fidelity?: UransFidelity;
   write_images?: ImageFieldName[];
   image_zoom_chords?: number;
 }
@@ -298,6 +303,13 @@ export interface PolarPoint {
    *  time-weighted stats. `null` on steady/no-shedding points; absent on
    *  legacy engine versions that predate the contract. */
   frame_track?: FrameTrack | null;
+  /** Fidelity ladder echo (pinned contract 1): the tier this point was solved
+   *  at. Absent on legacy engine versions that predate the ladder. */
+  fidelity?: PointFidelity | null;
+  /** Oscillating-averaged steady solve evidence (pinned contract 2): shipped
+   *  whenever the steady solve used oscillating-averaging; null for classic
+   *  pointwise convergence; absent on legacy engine versions. */
+  steady_history?: SteadyHistory | null;
   quality_warnings?: string[];
   evidence_artifacts?: EngineEvidenceArtifact[];
   error?: string | null;

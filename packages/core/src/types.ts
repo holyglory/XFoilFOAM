@@ -416,6 +416,31 @@ export interface FrameTrackDetail {
   frames: FrameTrackFrameDetail[];
 }
 
+/** Oscillating-steady iteration history (fidelity ladder contract 2,
+ *  results.steady_history) as served to the sim modal. Present only when the
+ *  steady solve used oscillating-averaging; classic pointwise convergence and
+ *  drifted payloads resolve to null (absence stays absence). */
+export interface SteadyHistoryDetail {
+  iterations: number[];
+  cl: number[];
+  cd: number[];
+  cm: number[];
+  window: { startIter: number; endIter: number };
+  meanStable: boolean;
+  note: string;
+}
+
+/** Latest verify-queue item covering a point's cell+angle (fidelity ladder
+ *  contract 4). Deltas are null until the verification solve settles. */
+export interface UransVerifyDetail {
+  state: "pending" | "running" | "done" | "disagreed" | "cancelled" | string;
+  deltaCl: number | null;
+  deltaCd: number | null;
+  deltaCm: number | null;
+}
+
+export type PointFidelityTier = "rans" | "urans_precalc" | "urans_full";
+
 export interface SimulationDetail {
   status: SimStatus;
   regime: SimRegime;
@@ -437,6 +462,14 @@ export interface SimulationDetail {
   /** URANS frame track (engine recording contract). null = steady point,
    *  no-shedding, or legacy pre-contract evidence. */
   frameTrack?: FrameTrackDetail | null;
+  /** Fidelity ladder echo (results.fidelity, migration 0034). null = pre-ladder
+   *  row whose tier is unknown — rendered plain, never guessed. */
+  fidelity?: PointFidelityTier | null;
+  /** Oscillating-steady iteration history; null = classic pointwise
+   *  convergence or drifted/absent payload. */
+  steadyHistory?: SteadyHistoryDetail | null;
+  /** Latest verify-queue item for this cell+angle; null = never queued. */
+  uransVerify?: UransVerifyDetail | null;
   condition?: {
     boundaryConditionName: string;
     mediumName: string;

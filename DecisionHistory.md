@@ -1,5 +1,228 @@
 # Decision History
 
+## 2026-07-07 — Fidelity-ladder final adversarial review: starvation fix + deferred design notes
+
+- CONFIRMED fix — tier-2a gated-retry scan-window starvation
+  (apps/sweeper/src/urans-ladder.ts): parents with EMPTY retry plans never
+  grow a wave-2 child, so they never left the NOT-EXISTS SQL filter; they
+  were skipped only via the in-memory settled set, which did not shrink the
+  finishedAt-ASC LIMIT window. With more no-retry parents than the window
+  (the common healthy majority — needy parents finish last because the gate
+  stays closed until the final RANS gap), parents past the window were never
+  fetched → needs_urans cells never re-solved → phase stuck
+  `running_precalc` forever, restart re-blocked identically. Fix: settled
+  parents are now ALSO excluded in SQL (`NOT IN`), so the window slides
+  forward every tick (bounded progress ≥3 parents/tick; restart re-settles
+  from the front and still advances). MUST-CATCH added
+  (urans-ladder.test.ts "scan-window starvation": 13 no-retry parents ahead
+  of one needy parent); recall proven by running it against the pre-fix
+  code (fails: no child after 10 ticks) and the fixed code (passes).
+- CONFIRMED fix — campaign detail page scrolled horizontally
+  (formal-ui critical, desktop + mobile): the condition-strip wrapper in
+  CampaignDetail.tsx is a grid item whose automatic minimum size was the
+  strip's min-content (~6.7k px on the paused 1.5M-point campaign), which
+  inflated the grid track and defeated the strip's own overflowX:auto.
+  Fix: `minWidth: 0` on the wrapper; verifier re-run = 0 criticals.
+- PLAUSIBLE, deferred by design (documented, not silently accepted):
+  - `OSCILLATING_AMPLITUDE_REL_MAX = 2.0` certifies a ±100%-of-scale ripple
+    as "steady with a ripple" and suppresses automatic URANS escalation.
+    Deferred: the acceptance ships the full steady_history + an explicit
+    amplitude note (±a Cl, ±b Cd) as evidence, the classifier only waives
+    not-converged/solver-stalled when `mean_stable === true`, and an admin
+    can request-URANS any such cell. Tightening the bound is a physics
+    policy change (would reject mid-campaign points already certified under
+    R1) and needs user sign-off — flagged as an open decision.
+  - Verify-disagreement thresholds are ABSOLUTE only (|ΔCl|>0.05,
+    |ΔCd|>0.01, pinned contract 4). Near zero-lift a 0.049 ΔCl (~250 %
+    relative, enough to shift α₀ visibly) still counts "agreed". Deferred:
+    contract-pinned; a relative-or-absolute hybrid is a contract amendment,
+    not a bug fix. Flagged as design risk for the α₀-objective lanes.
+  - Verify tier can be delayed indefinitely while the continuous catalog
+    sweep keeps submitting (ladder tick only runs on RANS-idle ticks).
+    Deferred: intentional rank ordering (verify is the GLOBAL lowest tier);
+    bounded by the finite catalog.
+  - Cosmetic: a no-shedding precalc attempt classifies at regime `rans`, so
+    `supersedePrecalcWithVerifiedUrans` (requires rc.regime='urans') never
+    marks it `superseded_by_urans` after verification. Display-only
+    (attempt-history chip); the results row itself is the verified solve.
+  - Minor request-URANS notes: the insert race-retry recursion is unbounded
+    in theory (each pass either inserts or finds — terminates in practice);
+    `aoaDeg` is not validated against the revision's angle grid (admin can
+    mint an off-grid cell); an engine-rejected request is cancelled with a
+    log line and surfaces only via GET state. All admin-only surfaces.
+
+## 2026-07-07 — URANS Fidelity Ladder: web surfaces (task #30, web side)
+
+- ONE chip rule for every classification surface (`fidelityChipView` in
+  apps/web/lib/point-history.ts, pure + pinned by
+  test/fidelity-ladder.test.ts): plain for `rans`/pre-ladder/drifted values
+  (never guessed), amber `precalc · verify pending` while an open verify item
+  covers the cell, teal `verified` for `urans_full`, red
+  `verify disagreed (Δcl 0.06)` with the REAL stored deltas — the disagreed
+  state always outranks the fidelity label. Rendered in Points-tab rows,
+  story header, campaign cell panel, and the solver-results modal header.
+- Verify truth comes from the verify QUEUE, not inferred from fidelity: the
+  point-history read model (packages/db/src/point-history.ts) and the sim
+  detail (apps/api/src/services/sim.ts) join the LATEST
+  sim_urans_verify_queue item per cell+angle ("latest decides" — a
+  re-verified cell stops reading disagreed; API-pinned in
+  apps/api/test/point-history.test.ts).
+- Points tab filters: `pverify=pending|disagreed` URL param (same replace
+  semantics as the other p* params); the derived-mirror arm is excluded under
+  a verify filter (mirrors are never verified in their own right).
+- Request-URANS (contract 6) wired on three surfaces: story panel
+  (single point, idempotent-aware buttons fed by GET /api/admin/urans-requests
+  — an open item disables the button and names its state), Points-tab row
+  overflow menu (POST response `created` flag is the honest replay signal),
+  and the campaign cell panel (whole polar, aoaDeg omitted). Confirm copy
+  states the engine-derived budget (3 periods/1 h/half mesh vs 7 periods/6 h)
+  but the request carries only the fidelity literal.
+- Campaign phase display (contract 7): `campaignPhaseBadge` renders
+  RUNNING RANS / RUNNING PRECALC URANS / RUNNING URANS REFINEMENT from the
+  summary payload's derived phase; the liveness-split gate badge OUTRANKS the
+  phase (a blocked campaign never shows a running phase), and a `completed`
+  phase is suppressed once the lifecycle chip already says COMPLETED.
+  Per-tier open counts render via `tierCountsLine` in the header strip; older
+  payloads without tierCounts render nothing (no invented zeros).
+- Solver-results modal: oscillating-steady points draw the REAL recorded
+  Cl/Cd/Cm(iteration) samples (lib/steady-history.ts model; strict-parsed
+  server-side — a drifted steady_history payload resolves to null and the
+  modal renders nothing new) with the averaging window shaded and the
+  "averaged over the last N iterations" note + engine note verbatim.
+- E2E for the ladder surfaces intentionally deferred: deterministic coverage
+  needs live verify-queue/disagreed rows, which the dev seed does not carry
+  yet; the pure rules are unit-pinned and the SQL/API paths are pinned by the
+  DB-backed api suite instead.
+
+## 2026-07-07 — URANS Fidelity Ladder: node data + scheduler (task #30, node side)
+
+- Migration `0034_urans_fidelity_ladder` (dev :5544 applied; verified backup
+  taken first): `results.fidelity` text (backfill: urans ⇒ `urans_full`,
+  rans ⇒ `rans`, unsolved stays NULL), `results.steady_history` jsonb
+  (attempts need no column — `evidence_payload` persists the whole engine
+  PolarPoint), `sim_urans_verify_queue` (pinned contract 4 column set,
+  partial-unique open-item-per-cell), `sim_urans_requests` (admin work items,
+  expression-unique per (cell, fidelity) with `COALESCE(aoa_deg,'NaN')` so
+  whole-polar requests are idempotent too).
+- Contract pins mirrored node-side in `@aerodb/engine-client/fidelity.ts`
+  (same pattern as frame-track): fidelity literals, engine-derived values
+  (3/7 periods, 3600/21600 s, mesh scale 0.5) as parity constants only —
+  requests carry ONLY the literal; strict `parseSteadyHistory` (exact keys,
+  ≤2000 samples) + fixture pin tests
+  (`apps/sweeper/test/fidelity-contract-pin.test.ts`,
+  `fixtures/steady-history-contract.json`). Verify disagreement bounds pinned
+  as `URANS_VERIFY_DELTA_CL_LIMIT`/`_CD_LIMIT` (0.05 / 0.01).
+- Classifier bumped to `fidelity-ladder-v4` (packages/core/polar-fit.ts):
+  frame-track period bar is fidelity-aware (`urans_precalc` ≥ 3,
+  full/legacy/unknown ≥ 5, fail-closed on unknown strings), and
+  oscillating-steady rows accept as RANS evidence iff
+  `steady_history.mean_stable === true` (waives ONLY not-converged /
+  solver-stalled; reasons stay rejection-only — the honest note surfaces via
+  the `steady-oscillating-mean:` quality-warning marker appended at ingest,
+  which the existing point-story UI already reads).
+- R2 whole-polar kill: `decideRansRetry` is TARGETED-ONLY (job's own
+  rejected/needs_urans angles; `whole-polar-urans` mode, `fullUrans`, the
+  tiny-polar `<5 valid` and 0..5° revision heuristics all removed, including
+  the dead legacy copies in packages/db/polar-cache.ts). Whole-polar URANS is
+  now exclusively an admin request (`aoa_deg NULL`). Must-catch tests pin the
+  old promotion inputs producing targeted plans
+  (campaign-scheduling.test.ts, sweeper.test.ts).
+- Scheduler ladder (ONE priority scale): RANS branch (`submitOneBatch`)
+  always wins the tick; `uransLadderTick` (apps/sweeper/src/urans-ladder.ts)
+  runs only when it submitted nothing and capacity remains — tier 2 = gated
+  campaign wave-2 retries + admin requests, tier 3 = verify queue only when
+  no campaign RANS/precalc work exists machine-wide (stale claims of
+  paused/cancelled campaigns deliberately do NOT starve the verify tier).
+  "Open RANS gap" = the gap-finder definition (schedulable cells) plus
+  in-flight wave-1 claims — a cell parked queued for its wave-2 child is
+  URANS work, not a RANS gap (otherwise the gate would deadlock the very
+  retry that resolves it). Wave-2 retries run at `precalc` fidelity;
+  `submitUransRetryForJob` defers when its campaign still has open RANS gaps
+  and the ladder tick re-attempts (in-memory settled-parent set; restart
+  rescans).
+- Verify queue lifecycle: precalc-ACCEPTED rows enqueue idempotently after
+  every classification refresh; consuming stashes the precalc cl/cd/cm in the
+  verify job payload (the results row is overwritten in place by the
+  full-fidelity ingest — same natural key); settle computes deltas, flips
+  done/disagreed, and on disagreement appends a `urans-verify-disagreement:`
+  quality marker to the VERIFIED row (classification stays on it; nothing
+  silently swapped). Ladder jobs never claim-flip done rows: a failed verify
+  or admin re-solve must not destroy previously good evidence.
+- Campaign phases (contract 7, derived — no stored enum):
+  `campaignOpenTierCounts` + `deriveCampaignPhase` feed
+  `campaignSummary.tierCounts`/`phase`; completion now flips only when all
+  three tiers are terminal (probeCampaignCompletion gains `precalc_open`
+  (needs_urans cells) + `verify_open` guards; `refreshCampaignCompletion`
+  holds `active` while tiers are open). NOTE: needs_urans cells previously
+  allowed `completed` — they now hold the campaign in `running_precalc`
+  until the URANS verdict supersedes or rejects them.
+- Admin request-URANS: `POST /api/admin/urans-requests`
+  {airfoilId, revisionId, aoaDeg?, fidelity} (requireAdmin, idempotent
+  replay returns the open item, created=false) + cell-scope GET returning
+  open requests and verify items for the Points tab / cell panel.
+- Suites green: core 82, api 77, web 152 (untouched), sweeper 107;
+  `pnpm typecheck` clean; migration applied + schema pinned by
+  apps/sweeper/test/urans-ladder.test.ts.
+
+## 2026-07-07 — Engine Fidelity Tiers (precalc/full URANS) + Oscillating-Steady Averaging (task #30, engine side)
+
+- Contract (pinned cross-runtime, same pattern as frame_track; node mirrors in
+  build-request + engine-client parser + own pin tests):
+  - `solver.urans_fidelity`: `"precalc" | "full"` (default full).
+    precalc ⇒ urans_min_periods 3, transient solver budget 3600 s, derived
+    half-resolution URANS mesh (n_surface/n_radial/n_wake halved, SAME y+
+    target and domain extents); full ⇒ 7 periods, 21600 s (6 h), full mesh.
+    Echoed on `PolarPoint.fidelity`: `"rans" | "urans_precalc" | "urans_full"`.
+  - `PolarPoint.steady_history` (nullable): `{iterations, cl, cd, cm,
+    window{start_iter, end_iter}, mean_stable, note}`, ≤ 2000 samples
+    (`STEADY_HISTORY_MAX_SAMPLES`), shipped whenever the steady solve used
+    oscillating-averaging OR failed to stabilise (analysis evidence on the
+    escalation path); null for classic pointwise convergence.
+- Decision — tier ownership: the fidelity tier owns the URANS period target
+  and wall budget (`apply_urans_fidelity` / `urans_budget_seconds` in
+  models.py, applied at the `_finalize_outcome` → `_run_transient` boundary),
+  so the transient stage no longer inherits `settings.solver_timeout`
+  (full-tier transients now get 21600 s, not 7200 s). Steady stages keep the
+  existing `rans_solver_timeout` cap; media budgets stay derived from
+  `settings.solver_timeout`.
+- Decision — precalc mesh derivation is param-level (`derive_precalc_mesh_
+  params` + `effective_mesh_params` in models.py): the mesh cache keys on the
+  resolved MeshParams, so the derived half mesh caches under its OWN key with
+  zero cache-schema changes. Applied in jobs.execute_job (job mesh for
+  force_transient+precalc requests) and in run_case when it builds its own
+  mesh; a passed-in `mesh_dir` is trusted (the caller derived before
+  building), which keeps steady warm-starting of the transient valid (same
+  shared mesh).
+- Decision — oscillating-steady averaging (R1): a steady solve failing BOTH
+  residual convergence and the force plateau is accepted when the last N
+  iterations (`solver.steady_oscillation_window`, default 400) show a bounded
+  oscillation: half-window means agree within rel tol 0.02 for Cl AND Cd
+  (scale = max(|mean|, 0.05)), window peak-to-peak ≤ 2.0× scale, and
+  second-half peak-to-peak ≤ 1.3× first-half (+1e-4·scale noise floor).
+  Accepted ⇒ window-averaged cl/cd/cm, converged=true, quality note
+  "converged (oscillating steady, averaged over last N iterations;
+  amplitude ±a Cl, ±b Cd)", steady_history shipped (mean_stable=true), NO
+  URANS escalation. Not accepted ⇒ existing not-converged escalation path
+  with steady_history STILL shipped (mean_stable=false + reason). Detector in
+  postprocess/forces.py (`analyze_steady_oscillation`); force_transient
+  jobs never run it (their steady stage is init-only, never a result).
+- Decision — fidelity echo reflects the solver that PRODUCED the values: a
+  no-shedding URANS run reported as a steady-equivalent point still echoes
+  `urans_<tier>` (its mean came from the transient), plain steady points echo
+  `rans`.
+- Tests: tests/test_fidelity_tiers.py (tier/echo/mesh-derivation/cache-key
+  pins + budget/period wiring through `_finalize_outcome` + execute_job-level
+  derived-mesh build proof) and tests/test_oscillating_steady.py
+  (steady_history shape pin; realistic decay-into-limit-cycle acceptance with
+  no escalation; must-catch rejects: growing amplitude, drifting mean,
+  oversized oscillation; classic-converged null history both accept paths;
+  ≤2000 downsample; noise-floor false-positive guard). Suite: 244 passed
+  (baseline 220 + 24), `pytest -m "not integration" -q`.
+- Node-side follow-ups owned by other #30 work items: fidelity-aware
+  classifier gate (FRAME_TRACK_MIN_PERIODS must accept periods_retained ≥ 3
+  for urans_precalc rows), results.fidelity migration, verify queue,
+  scheduler ladder, request-URANS endpoint, campaign phases.
+
 ## 2026-07-07 — Courant Default 4; In-Run Divergence Watchdog; Drift Denominator Floor
 
 - Incident (prod, job b01a7d46, naca-0012 a0 u15, build

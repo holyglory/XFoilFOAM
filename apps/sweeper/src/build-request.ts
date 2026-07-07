@@ -1,15 +1,28 @@
 import { type Point } from "@aerodb/core";
 import type { Airfoil } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
-import { ALL_IMAGE_FIELDS, type AirfoilFormat, type PolarRequest, type ResourcePolicy, type TurbulenceModelName } from "@aerodb/engine-client";
+import {
+  ALL_IMAGE_FIELDS,
+  type AirfoilFormat,
+  type PolarRequest,
+  type ResourcePolicy,
+  type TurbulenceModelName,
+  type UransFidelity,
+} from "@aerodb/engine-client";
 
 /** Map an immutable simulation setup revision + airfoil into a Python PolarRequest.
- *  wave 1 = steady (transient_fallback off); wave 2 = re-run post-stall as URANS. */
+ *  wave 1 = steady (transient_fallback off); wave 2 = re-run post-stall as URANS.
+ *  Wave-2 requests carry solver.urans_fidelity (ladder contract 1): 'precalc'
+ *  by default (3 periods, 1 h budget, half-resolution mesh — engine-derived);
+ *  verify-queue / admin-full jobs pass 'full' explicitly. */
 export function buildPolarRequest(opts: {
   airfoil: Airfoil;
   setup: SimulationSetupSnapshot;
   aoaList: number[];
   wave: number;
+  /** URANS fidelity tier for wave-2 requests. Default 'precalc'. Ignored on
+   *  wave 1 (steady solves have no URANS tier). */
+  uransFidelity?: UransFidelity;
   queuePressure?: number;
   /** Global solver capacity (sweeper_state.cpuSlots). >0 → cpu_budget cap;
    *  0 → auto: omit cpu_budget so the engine resolves its own worker budget;
@@ -20,7 +33,7 @@ export function buildPolarRequest(opts: {
    *  Omitted → the snapshot's single speed (legacy behavior). */
   speeds?: number[];
 }): { request: PolarRequest; speed: number; nu: number } {
-  const { airfoil, setup, aoaList, wave, queuePressure, cpuSlots, speeds } = opts;
+  const { airfoil, setup, aoaList, wave, uransFidelity, queuePressure, cpuSlots, speeds } = opts;
   const cpuBudget =
     cpuSlots == null ? (setup.scheduling.cpuBudget ?? undefined) : cpuSlots > 0 ? cpuSlots : undefined;
   const nu = setup.flowState.kinematicViscosity;
@@ -54,6 +67,9 @@ export function buildPolarRequest(opts: {
       momentum_scheme: setup.solver.momentumScheme,
       transient_fallback: wave === 2,
       force_transient: wave === 2,
+      // Ladder contract 1: the node sends ONLY the fidelity literal; the
+      // engine derives min periods / budget / mesh scale from it.
+      ...(wave === 2 ? { urans_fidelity: uransFidelity ?? "precalc" } : {}),
       warm_start: wave === 1,
       transient_cycles: setup.solver.transientCycles,
       transient_discard_fraction: setup.solver.transientDiscardFraction,

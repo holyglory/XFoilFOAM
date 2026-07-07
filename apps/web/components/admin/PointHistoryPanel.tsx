@@ -19,7 +19,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 
-import { getPointHistory, getPointStory, isAdminApiError, requeuePoint } from "@/lib/admin";
+import { type AdminUransRequest, getPointHistory, getPointStory, getUransRequests, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
 import { getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import {
@@ -27,6 +27,7 @@ import {
   bucketOfPoint,
   buildStoryDigest,
   DEFAULT_POINT_FILTERS,
+  fidelityChipView,
   parsePointFilters,
   type PointFilters,
   type PointHistoryCounts,
@@ -34,6 +35,7 @@ import {
   type PointHistoryItem,
   pointFiltersToSearch,
   type PointStoryPayload,
+  type PointVerifyInfo,
   POINT_ERROR_CLASSES,
   POINT_STATUS_CHIPS,
   type TimelineTone,
@@ -130,7 +132,21 @@ function classificationChip(item: PointHistoryItem) {
   );
 }
 
-const ROW_COLUMNS = "minmax(0, 1.3fr) 46px 74px 86px minmax(80px, 0.8fr) minmax(0, 1.6fr) 40px 74px";
+/** Fidelity ladder chip — renders wherever a classification chip renders
+ *  (rows + story header). null view (plain RANS / pre-ladder) renders nothing. */
+function fidelityChip(fidelity: string | null, verify: PointVerifyInfo | null) {
+  const view = fidelityChipView(fidelity, verify);
+  if (!view) return null;
+  const color = view.tone === "teal" ? C.teal : view.tone === "amber" ? C.amber : C.redText;
+  const border = view.tone === "teal" ? C.tealBorder : view.tone === "amber" ? "rgba(245,158,11,0.45)" : "rgba(245,101,101,0.5)";
+  return (
+    <span data-testid="point-fidelity-chip" style={{ fontFamily: MONO, fontSize: 9, color, border: `1px solid ${border}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+      {view.label}
+    </span>
+  );
+}
+
+const ROW_COLUMNS = "minmax(0, 1.3fr) 46px 74px 86px minmax(110px, 1fr) minmax(0, 1.5fr) 40px 74px 26px";
 
 export function PointHistoryPanel() {
   const pathname = usePathname();
@@ -150,6 +166,13 @@ export function PointHistoryPanel() {
   const [storyError, setStoryError] = useState<string | null>(null);
   const [requeueBusy, setRequeueBusy] = useState(false);
   const [requeueNotice, setRequeueNotice] = useState<string | null>(null);
+  // Request-URANS (fidelity ladder contract 6) state: the per-row overflow
+  // menu, in-flight guard, table-level notice, and the open cell's existing
+  // request items (idempotent-aware button state in the story panel).
+  const [rowMenuKey, setRowMenuKey] = useState<string | null>(null);
+  const [uransBusy, setUransBusy] = useState(false);
+  const [uransNotice, setUransNotice] = useState<string | null>(null);
+  const [cellRequests, setCellRequests] = useState<AdminUransRequest[] | null>(null);
   // SimModal state (same wiring as SolvedPointsPopover).
   const [simOpen, setSimOpen] = useState(false);
   const [sim, setSim] = useState<SimulationDetail | null>(null);
@@ -249,6 +272,7 @@ export function PointHistoryPanel() {
     setStory(null);
     setStoryError(null);
     setRequeueNotice(null);
+    setCellRequests(null);
     getPointStory(item.resultId)
       .then((s) => {
         if (openItemRef.current?.rowKey === item.rowKey) setStory(s);
@@ -256,6 +280,19 @@ export function PointHistoryPanel() {
       .catch((e) => {
         if (openItemRef.current?.rowKey === item.rowKey) setStoryError((e as Error).message);
       });
+    // Existing request-URANS items for this cell: the panel's action buttons
+    // reflect the REAL open item (idempotent replay), never a guessed state.
+    if (item.revisionId) {
+      getUransRequests(item.airfoilId, item.revisionId)
+        .then((res) => {
+          if (openItemRef.current?.rowKey === item.rowKey) setCellRequests(res.requests);
+        })
+        .catch(() => {
+          // Absent list = state unknown; buttons stay enabled and the POST
+          // response (created flag) remains the source of truth.
+          if (openItemRef.current?.rowKey === item.rowKey) setCellRequests(null);
+        });
+    }
   }, []);
 
   const closeStory = useCallback(() => {
@@ -342,6 +379,70 @@ export function PointHistoryPanel() {
       setRequeueBusy(false);
     }
   }, [requeueBusy, openStory, fetchFirstPage]);
+
+  // ---- request-URANS (fidelity ladder contract 6) ----
+  // Close any open row overflow menu on outside click.
+  useEffect(() => {
+    if (!rowMenuKey) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.target instanceof Element && e.target.closest("[data-urans-menu]")) return;
+      setRowMenuKey(null);
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [rowMenuKey]);
+
+  const doRequestUrans = useCallback(
+    async (
+      target: { airfoilId: string; revisionId: string; aoaDeg: number | null; label: string },
+      fidelity: "precalc" | "full",
+      opts?: { refreshStory?: PointHistoryItem },
+    ) => {
+      if (uransBusy) return;
+      const scope = target.aoaDeg == null ? "the whole polar" : `α ${f(target.aoaDeg, 2)}°`;
+      const budget = fidelity === "precalc" ? "half-resolution mesh, 3 shedding periods, 1 h budget" : "full mesh, 7 shedding periods, 6 h budget";
+      if (!window.confirm(`Queue a ${fidelity}-fidelity URANS solve for ${target.label} (${scope})? ${budget}. It runs after all RANS gaps, at precalc rank.`)) return;
+      setUransBusy(true);
+      setUransNotice(null);
+      try {
+        const res = await requestUrans({
+          airfoilId: target.airfoilId,
+          revisionId: target.revisionId,
+          ...(target.aoaDeg == null ? {} : { aoaDeg: target.aoaDeg }),
+          fidelity,
+        });
+        setUransNotice(
+          res.created
+            ? `URANS ${fidelity} requested for ${target.label} (${scope}) — scheduled after all RANS gaps`
+            : `already requested — the open ${fidelity} request for ${scope} is reused (${res.request.state})`,
+        );
+        if (opts?.refreshStory && openItemRef.current?.rowKey === opts.refreshStory.rowKey) openStory(opts.refreshStory);
+      } catch (e) {
+        setUransNotice(isAdminApiError(e) ? e.message : (e as Error).message);
+      } finally {
+        setUransBusy(false);
+        setRowMenuKey(null);
+      }
+    },
+    [uransBusy, openStory],
+  );
+
+  /** Open (pending/running) request covering this point at the given
+   *  fidelity: exact-angle item or a whole-polar item. */
+  const openRequestFor = useCallback(
+    (aoaDeg: number, fidelity: "precalc" | "full"): AdminUransRequest | null => {
+      if (!cellRequests) return null;
+      return (
+        cellRequests.find(
+          (r) =>
+            (r.state === "pending" || r.state === "running") &&
+            r.fidelity === fidelity &&
+            (r.aoaDeg == null || Math.abs(r.aoaDeg - aoaDeg) < 1e-6),
+        ) ?? null
+      );
+    },
+    [cellRequests],
+  );
 
   const chipCount = (k: string): number | null => {
     if (!counts) return null;
@@ -453,6 +554,16 @@ export function PointHistoryPanel() {
               </option>
             ))}
           </select>
+          <select
+            data-testid="points-filter-verify"
+            value={filters.verify}
+            onChange={(e) => applyFilters({ ...filters, verify: e.target.value as PointFilters["verify"] })}
+            style={selectStyle}
+          >
+            <option value="">verify: any</option>
+            <option value="pending">verify pending</option>
+            <option value="disagreed">verify disagreed</option>
+          </select>
           <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>sorted by last activity</span>
           <button type="button" data-testid="points-refresh" disabled={loading} onClick={() => void fetchFirstPage(filters)} style={{ ...smallBtn, marginLeft: "auto", opacity: loading ? 0.6 : 1 }}>
             {loading ? "loading…" : "refresh"}
@@ -466,6 +577,11 @@ export function PointHistoryPanel() {
           <button type="button" onClick={() => void fetchFirstPage(filters)} style={{ ...smallBtn, marginLeft: 8 }}>
             retry
           </button>
+        </div>
+      )}
+      {uransNotice && !openItem && (
+        <div data-testid="points-urans-notice" style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>
+          {uransNotice}
         </div>
       )}
 
@@ -482,6 +598,7 @@ export function PointHistoryPanel() {
               <span>Story</span>
               <span style={{ textAlign: "right" }}>Att.</span>
               <span style={{ textAlign: "right" }}>Activity</span>
+              <span aria-hidden />
             </div>
             {!loading && items.length === 0 && !error && (
               <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, padding: "16px 12px" }}>
@@ -492,39 +609,98 @@ export function PointHistoryPanel() {
               <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, padding: "16px 12px" }}>Loading points…</div>
             )}
             {items.map((item) => (
-              <button
-                key={item.rowKey}
-                type="button"
-                data-testid="point-history-row"
-                onClick={() => openStory(item)}
-                style={{
-                  width: "100%",
-                  display: "grid",
-                  gridTemplateColumns: ROW_COLUMNS,
-                  gap: 8,
-                  alignItems: "center",
-                  textAlign: "left",
-                  fontFamily: MONO,
-                  fontSize: 10.5,
-                  padding: "8px 12px",
-                  background: openItem?.rowKey === item.rowKey ? C.rowActive : "transparent",
-                  border: "none",
-                  borderBottom: `1px solid ${C.borderRow}`,
-                  cursor: "pointer",
-                  color: C.text,
-                }}
-              >
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>{item.airfoilName}</span>
-                <span style={{ textAlign: "right" }}>{f(item.aoaDeg, 1)}°</span>
-                <span style={{ color: C.muted }}>{item.reynolds != null ? formatRe(item.reynolds) : "—"}</span>
-                <span>{rowStatusChip(item)}</span>
-                <span>{classificationChip(item)}</span>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.muted }} title={buildStoryDigest(item)}>
-                  {buildStoryDigest(item)}
-                </span>
-                <span style={{ textAlign: "right", color: C.muted }}>{item.kind === "derived" ? "—" : item.attemptCount}</span>
-                <span style={{ textAlign: "right", color: C.dim, fontSize: 9.5 }}>{ago(item.lastActivityAt)}</span>
-              </button>
+              <div key={item.rowKey} style={{ position: "relative" }}>
+                <div
+                  role="button"
+                  tabIndex={0}
+                  data-testid="point-history-row"
+                  onClick={() => openStory(item)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      openStory(item);
+                    }
+                  }}
+                  style={{
+                    width: "100%",
+                    display: "grid",
+                    gridTemplateColumns: ROW_COLUMNS,
+                    gap: 8,
+                    alignItems: "center",
+                    textAlign: "left",
+                    fontFamily: MONO,
+                    fontSize: 10.5,
+                    padding: "8px 12px",
+                    background: openItem?.rowKey === item.rowKey ? C.rowActive : "transparent",
+                    borderBottom: `1px solid ${C.borderRow}`,
+                    cursor: "pointer",
+                    color: C.text,
+                  }}
+                >
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>{item.airfoilName}</span>
+                  <span style={{ textAlign: "right" }}>{f(item.aoaDeg, 1)}°</span>
+                  <span style={{ color: C.muted }}>{item.reynolds != null ? formatRe(item.reynolds) : "—"}</span>
+                  <span>{rowStatusChip(item)}</span>
+                  <span style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+                    {classificationChip(item)}
+                    {fidelityChip(item.fidelity, item.kind === "derived" ? null : item.verify)}
+                  </span>
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.muted }} title={buildStoryDigest(item)}>
+                    {buildStoryDigest(item)}
+                  </span>
+                  <span style={{ textAlign: "right", color: C.muted }}>{item.kind === "derived" ? "—" : item.attemptCount}</span>
+                  <span style={{ textAlign: "right", color: C.dim, fontSize: 9.5 }}>{ago(item.lastActivityAt)}</span>
+                  <button
+                    type="button"
+                    data-testid="point-row-overflow"
+                    data-urans-menu
+                    aria-label={`Actions for ${item.airfoilName} α ${f(item.aoaDeg, 1)}°`}
+                    aria-expanded={rowMenuKey === item.rowKey}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setRowMenuKey((k) => (k === item.rowKey ? null : item.rowKey));
+                    }}
+                    style={{ ...smallBtn, padding: "2px 6px", lineHeight: 1.2 }}
+                  >
+                    ⋯
+                  </button>
+                </div>
+                {rowMenuKey === item.rowKey && (
+                  <div
+                    data-urans-menu
+                    data-testid="point-row-menu"
+                    style={{ position: "absolute", right: 8, top: "calc(100% - 4px)", zIndex: 30, minWidth: 230, background: C.popover, border: `1px solid ${C.stroke}`, borderRadius: 8, boxShadow: `0 12px 28px ${C.shadow}`, padding: 6, display: "grid", gap: 4 }}
+                  >
+                    {(["precalc", "full"] as const).map((fid) => {
+                      const eligible = item.kind === "result" && item.revisionId != null;
+                      const title = item.kind === "derived"
+                        ? "Derived mirror — request URANS on the +α source point instead"
+                        : item.revisionId == null
+                          ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
+                          : undefined;
+                      return (
+                        <button
+                          key={fid}
+                          type="button"
+                          data-testid={`point-row-request-urans-${fid}`}
+                          disabled={!eligible || uransBusy}
+                          title={title}
+                          onClick={() =>
+                            void doRequestUrans(
+                              { airfoilId: item.airfoilId, revisionId: item.revisionId!, aoaDeg: item.aoaDeg, label: item.airfoilName },
+                              fid,
+                              { refreshStory: openItemRef.current?.rowKey === item.rowKey ? item : undefined },
+                            )
+                          }
+                          style={{ ...smallBtn, width: "100%", textAlign: "left", color: eligible ? C.teal : C.dimmest, borderColor: eligible ? C.tealBorder : C.stroke, opacity: uransBusy ? 0.6 : 1 }}
+                        >
+                          {uransBusy ? "requesting…" : `request URANS · ${fid}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         </div>
@@ -587,6 +763,13 @@ export function PointHistoryPanel() {
               )}
               {!headerChipsPending && headerItem && rowStatusChip(headerItem)}
               {!headerChipsPending && headerItem && classificationChip(headerItem)}
+              {!headerChipsPending &&
+                headerItem &&
+                openItem.kind !== "derived" &&
+                fidelityChip(
+                  storyMatchesOpen ? story.point.fidelity : openItem.fidelity,
+                  storyMatchesOpen ? story.point.verify : openItem.verify,
+                )}
             </div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               <button
@@ -616,7 +799,52 @@ export function PointHistoryPanel() {
                 detail page ↗
               </Link>
             </div>
+            {/* request-URANS (contract 6): single-point actions with
+                idempotent-aware state from the REAL open request items. */}
+            {openItem.kind !== "derived" && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.08em" }}>REQUEST URANS</span>
+                {(["precalc", "full"] as const).map((fid) => {
+                  const open = openRequestFor(openItem.aoaDeg, fid);
+                  const eligible = openItem.revisionId != null && !open;
+                  return (
+                    <button
+                      key={fid}
+                      type="button"
+                      data-testid={`point-request-urans-${fid}`}
+                      disabled={!eligible || uransBusy}
+                      title={
+                        open
+                          ? `An open ${fid} request already covers this ${open.aoaDeg == null ? "cell (whole polar)" : "angle"} — requests are idempotent`
+                          : openItem.revisionId == null
+                            ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
+                            : fid === "precalc"
+                              ? "Half-resolution mesh, 3 shedding periods, 1 h budget — schedules after all RANS gaps"
+                              : "Full mesh, 7 shedding periods, 6 h budget — schedules after all RANS gaps"
+                      }
+                      onClick={() =>
+                        void doRequestUrans(
+                          { airfoilId: openItem.airfoilId, revisionId: openItem.revisionId!, aoaDeg: openItem.aoaDeg, label: openItem.airfoilName },
+                          fid,
+                          { refreshStory: openItem },
+                        )
+                      }
+                      style={{
+                        ...smallBtn,
+                        color: open ? C.dim : C.teal,
+                        borderColor: open ? C.stroke : C.tealBorder,
+                        opacity: uransBusy ? 0.6 : 1,
+                        cursor: eligible && !uransBusy ? "pointer" : "not-allowed",
+                      }}
+                    >
+                      {open ? `${fid} requested (${open.state}${open.aoaDeg == null ? " · whole polar" : ""})` : fid}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             {requeueNotice && <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>{requeueNotice}</div>}
+            {uransNotice && openItem && <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>{uransNotice}</div>}
           </div>
 
           {/* body */}

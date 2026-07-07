@@ -21,6 +21,12 @@ import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { recomputeProgressForCampaign } from "./campaign-execution";
 import type { DB } from "./client";
 import {
+  campaignOpenTierCounts,
+  type CampaignPhase,
+  type CampaignTierCounts,
+  deriveCampaignPhase,
+} from "./urans-ladder";
+import {
   airfoils,
   boundaryConditions,
   boundaryProfiles,
@@ -1133,7 +1139,15 @@ export async function refreshCampaignCompletion(tx: CampaignTx, campaignId: stri
   const [campaign] = await asDb(tx).select().from(simCampaigns).where(eq(simCampaigns.id, campaignId)).limit(1);
   if (!campaign) return totals;
   if (!["active", "attention", "completed"].includes(campaign.status)) return totals;
-  const next = deriveCampaignCompletion(totals);
+  let next = deriveCampaignCompletion(totals);
+  if (next !== "active") {
+    // Fidelity ladder (contract 7): completion flips only when ALL THREE tiers
+    // are terminal — open precalc obligations (needs_urans verdicts / live
+    // wave-2 re-solves) or open verify-queue items keep the campaign active,
+    // matching probeCampaignCompletion's early return.
+    const tiers = await campaignOpenTierCounts(asDb(tx), campaignId);
+    if (tiers.precalcOpen > 0 || tiers.verifyOpen > 0) next = "active";
+  }
   if (next !== campaign.status || (next === "completed") !== Boolean(campaign.completedAt)) {
     await asDb(tx)
       .update(simCampaigns)
@@ -3059,6 +3073,11 @@ export interface CampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  /** Fidelity ladder per-tier open counts (contract 7). */
+  tierCounts: CampaignTierCounts;
+  /** Derived ladder phase (contract 7): running_rans → running_precalc →
+   *  running_refinement → completed; null for paused/cancelled/archived. */
+  phase: CampaignPhase;
   airfoilCount: number;
   conditions: CampaignConditionSummary[];
   lanesSummary: Record<string, Record<string, number>>;
@@ -3068,6 +3087,7 @@ export interface CampaignSummary {
 export async function campaignSummary(db: DB, campaignId: string): Promise<CampaignSummary> {
   const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(db, campaignId);
   const totals = await campaignProgressTotals(db, campaignId);
+  const tierCounts = await campaignOpenTierCounts(db, campaignId);
   const [airfoilCountRow] = (await db.execute(
     sql`SELECT count(*)::int AS n FROM sim_campaign_airfoils WHERE campaign_id = ${campaignId}`,
   )) as unknown as Array<{ n: number }>;
@@ -3137,6 +3157,8 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
       rateBaselineAt: typeof summaryRateBaseline === "string" ? summaryRateBaseline : isoOf(revision.createdAt),
     },
     totals,
+    tierCounts,
+    phase: deriveCampaignPhase(campaign.status, tierCounts),
     airfoilCount: Number(airfoilCountRow?.n ?? 0),
     conditions: conditionRows.map((r) => ({
       id: String(r.id),

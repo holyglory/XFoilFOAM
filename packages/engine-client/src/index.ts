@@ -1,5 +1,6 @@
 export * from "./types";
 export * from "./frame-track";
+export * from "./fidelity";
 export * from "./lifecycle";
 export {
   ENGINE_POLL_TIMEOUT_MS,

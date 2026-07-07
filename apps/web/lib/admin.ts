@@ -488,6 +488,7 @@ export const getPointHistory = (opts: {
   regime?: string;
   errorClass?: string;
   reynolds?: string;
+  verify?: string;
   cursor?: string | null;
   limit?: number;
   facets?: boolean;
@@ -499,6 +500,7 @@ export const getPointHistory = (opts: {
   if (opts.regime) qs.set("regime", opts.regime);
   if (opts.errorClass) qs.set("errorClass", opts.errorClass);
   if (opts.reynolds) qs.set("reynolds", opts.reynolds);
+  if (opts.verify) qs.set("verify", opts.verify);
   if (opts.cursor) qs.set("cursor", opts.cursor);
   if (opts.limit != null) qs.set("limit", String(opts.limit));
   if (opts.facets) qs.set("facets", "true");
@@ -511,6 +513,53 @@ export const requeuePoint = (resultId: string) =>
   aj<{ requeued: 1; scope: "failed" | "rejected"; campaignIds: string[] }>(
     `/api/admin/point-history/${encodeURIComponent(resultId)}/requeue`,
     { method: "POST", body: JSON.stringify({}) },
+  );
+
+// ---- Fidelity ladder: admin request-URANS (contract 6) ----
+/** One sim_urans_requests row: an admin work item the scheduler runs at
+ *  precalc rank. aoaDeg null = whole polar. */
+export interface AdminUransRequest {
+  id: string;
+  airfoilId: string;
+  revisionId: string;
+  aoaDeg: number | null;
+  fidelity: "precalc" | "full" | string;
+  state: "pending" | "running" | "done" | "cancelled" | string;
+  simJobId: string | null;
+  requestedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One sim_urans_verify_queue row (contract 4) for the cell scope. */
+export interface AdminUransVerifyItem {
+  id: string;
+  airfoilId: string;
+  revisionId: string;
+  aoaDeg: number;
+  campaignId: string | null;
+  state: "pending" | "running" | "done" | "disagreed" | "cancelled" | string;
+  precalcResultId: string;
+  verifyResultId: string | null;
+  deltaCl: number | null;
+  deltaCd: number | null;
+  deltaCm: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Idempotent per (cell, fidelity): created=false replays the open item. */
+export const requestUrans = (body: { airfoilId: string; revisionId: string; aoaDeg?: number; fidelity: "precalc" | "full" }) =>
+  aj<{ request: AdminUransRequest; created: boolean }>("/api/admin/urans-requests", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+/** Open/settled request items + verify-queue items for one cell scope — the
+ *  action surfaces read this to render idempotent-aware button state. */
+export const getUransRequests = (airfoilId: string, revisionId: string) =>
+  aj<{ requests: AdminUransRequest[]; verifyItems: AdminUransVerifyItem[] }>(
+    `/api/admin/urans-requests?airfoilId=${encodeURIComponent(airfoilId)}&revisionId=${encodeURIComponent(revisionId)}`,
   );
 
 export const getAdminSync = () => aj<AdminSyncState>("/api/admin/sync");
@@ -1019,6 +1068,12 @@ export interface AdminCampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  /** Fidelity ladder per-tier open counts (contract 7). Optional: older API
+   *  payloads omit it — render nothing, never invented zeros. */
+  tierCounts?: { ransOpen: number; precalcOpen: number; verifyOpen: number };
+  /** Derived ladder phase (contract 7): running_rans → running_precalc →
+   *  running_refinement → completed; null for paused/cancelled/archived. */
+  phase?: "running_rans" | "running_precalc" | "running_refinement" | "completed" | null;
   airfoilCount: number;
   conditions: AdminCampaignConditionSummary[];
   lanesSummary: Record<string, Record<string, number>>;

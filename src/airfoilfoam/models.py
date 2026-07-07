@@ -130,6 +130,39 @@ class MeshParams(BaseModel):
     )
 
 
+# --------------------------------------------------------------------------- #
+# URANS FIDELITY TIERS (pinned 2026-07-07, task #30). The request field
+# ``solver.urans_fidelity`` selects the tier; the node side builds requests
+# against EXACTLY these tier constants (contract pin tests on both runtimes):
+#   precalc => urans_min_periods 3, solver budget 3600 s, mesh scale 0.5
+#              (derived half-resolution URANS mesh: n_surface/n_radial/n_wake
+#              halved, same y+ target; the mesh cache keys on the resolved
+#              params, so the derived mesh caches separately from the full one)
+#   full    => urans_min_periods 7, solver budget 21600 s (6 h), full mesh
+# The tier is echoed on PolarPoint.fidelity: "rans" | "urans_precalc" |
+# "urans_full".
+# --------------------------------------------------------------------------- #
+class UransFidelity(str, Enum):
+    precalc = "precalc"
+    full = "full"
+
+
+#: Whole shedding periods each tier must retain (contract item 1).
+URANS_FIDELITY_MIN_PERIODS: dict[UransFidelity, int] = {
+    UransFidelity.precalc: 3,
+    UransFidelity.full: 7,
+}
+
+#: Wall-clock solver budget [s] for the URANS transient of each tier.
+URANS_FIDELITY_BUDGET_S: dict[UransFidelity, int] = {
+    UransFidelity.precalc: 3600,
+    UransFidelity.full: 21600,
+}
+
+#: Mesh resolution scale of the derived precalc URANS mesh.
+URANS_PRECALC_MESH_SCALE = 0.5
+
+
 class ImageField(str, Enum):
     velocity_magnitude = "velocity_magnitude"
     velocity_x = "velocity_x"
@@ -191,6 +224,22 @@ class SolverParams(BaseModel):
         "into a velocity singularity, k bounding blow-up and dt collapse). 4 is the "
         "practitioner-standard ceiling for relaxed-PIMPLE URANS; profiles may still override.",
     )
+    urans_fidelity: UransFidelity = Field(
+        default=UransFidelity.full,
+        description="URANS fidelity tier (pinned cross-runtime): 'precalc' runs a fast 3-period "
+        "transient on a derived half-resolution mesh with a 3600 s solver budget; 'full' runs "
+        "7 periods on the full mesh with a 21600 s (6 h) budget. Echoed on PolarPoint.fidelity.",
+    )
+    steady_oscillation_window: int = Field(
+        default=400,
+        ge=50,
+        le=5000,
+        description="Iteration window for the oscillating-steady averaging detector: a steady "
+        "solve that fails pointwise convergence but oscillates boundedly is accepted when the "
+        "means of the two half-windows of the last N iterations agree within 2% and the "
+        "oscillation amplitude is bounded; the window average is then reported with the full "
+        "coefficient history shipped as steady_history.",
+    )
     urans_min_periods: int = Field(
         default=7,
         ge=2,
@@ -224,6 +273,54 @@ class SolverParams(BaseModel):
     image_zoom_chords: float = Field(
         default=2.0, gt=0, description="Half-window (in chords) around the airfoil for contour images."
     )
+
+
+def urans_budget_seconds(solver: "SolverParams") -> int:
+    """Wall-clock solver budget for the URANS transient of this request's tier."""
+    return URANS_FIDELITY_BUDGET_S[solver.urans_fidelity]
+
+
+def apply_urans_fidelity(solver: "SolverParams") -> "SolverParams":
+    """Effective solver params for the URANS stage of this request's tier.
+
+    The tier owns the retained-period target (contract pin: precalc => 3,
+    full => 7); everything else on the profile stands untouched.
+    """
+    target = URANS_FIDELITY_MIN_PERIODS[solver.urans_fidelity]
+    if solver.urans_min_periods == target:
+        return solver
+    return solver.model_copy(update={"urans_min_periods": target})
+
+
+def urans_point_fidelity(solver: "SolverParams") -> str:
+    """PolarPoint.fidelity echo for values produced by this request's URANS tier."""
+    return f"urans_{solver.urans_fidelity.value}"
+
+
+def derive_precalc_mesh_params(mesh: MeshParams) -> MeshParams:
+    """Derived half-resolution URANS mesh for the precalc tier.
+
+    Halves n_surface/n_radial/n_wake (clamped to the field minimums) and keeps
+    the SAME y+ target / explicit first-cell height, farfield and wake extents.
+    The mesh cache keys on the resolved params, so this derived mesh caches
+    under its own key, separate from the full-resolution mesh.
+    """
+    return mesh.model_copy(
+        update={
+            "n_surface": max(20, round(mesh.n_surface * URANS_PRECALC_MESH_SCALE)),
+            "n_radial": max(20, round(mesh.n_radial * URANS_PRECALC_MESH_SCALE)),
+            "n_wake": max(10, round(mesh.n_wake * URANS_PRECALC_MESH_SCALE)),
+        }
+    )
+
+
+def effective_mesh_params(mesh: MeshParams, solver: "SolverParams") -> MeshParams:
+    """The mesh params a job/case must actually build for this request: URANS
+    precalc requests mesh the derived half-resolution grid; everything else
+    (RANS and full-tier URANS) meshes the requested full grid."""
+    if solver.force_transient and solver.urans_fidelity == UransFidelity.precalc:
+        return derive_precalc_mesh_params(mesh)
+    return mesh
 
 
 class ResourcePolicy(str, Enum):
@@ -427,6 +524,39 @@ class FrameTrack(BaseModel):
     image_pattern: str = "frames/{field}/f{i04}.png"
 
 
+# --------------------------------------------------------------------------- #
+# STEADY-HISTORY CONTRACT (pinned 2026-07-07, task #30). Shipped per steady
+# point in result.json as ``point.steady_history`` with EXACTLY this shape
+# whenever the steady solve used oscillating-averaging OR failed both
+# pointwise convergence and mean stabilisation (history kept for analysis);
+# null for classic pointwise convergence. Downsampled to <= 2000 samples
+# engine-side. The node side pins the same shape (contract drift fails tests
+# on BOTH runtimes, same pattern as frame_track).
+# --------------------------------------------------------------------------- #
+
+#: Hard payload bound pinned by the contract: len(iterations) <= 2000.
+STEADY_HISTORY_MAX_SAMPLES = 2000
+
+
+class SteadyHistoryWindow(BaseModel):
+    """Averaging window of the oscillating-steady detector [start_iter, end_iter]."""
+
+    start_iter: int
+    end_iter: int
+
+
+class SteadyHistory(BaseModel):
+    """Steady-solve coefficient iteration history (oscillating-averaging evidence)."""
+
+    iterations: list[int]
+    cl: list[float]
+    cd: list[float]
+    cm: list[float]
+    window: SteadyHistoryWindow
+    mean_stable: bool
+    note: str
+
+
 class EvidenceArtifact(BaseModel):
     """Immutable raw/derived evidence file emitted by the engine.
 
@@ -490,6 +620,19 @@ class PolarPoint(BaseModel):
         description="Pinned URANS recording contract: integer-period window, time-weighted stats, "
         "stationarity verdict and per-frame coefficient samples. None for steady and no-shedding "
         "points (frame_track=null in result.json).",
+    )
+    fidelity: Literal["rans", "urans_precalc", "urans_full"] = Field(
+        default="rans",
+        description="Solve tier that produced the reported values (pinned cross-runtime): "
+        "'rans' for steady points, 'urans_precalc'/'urans_full' when the URANS transient of "
+        "that tier produced them (including no-shedding steady-equivalent URANS means).",
+    )
+    steady_history: Optional[SteadyHistory] = Field(
+        default=None,
+        description="Pinned steady-history contract: the steady solve's Cl/Cd/Cm iteration "
+        "history (<= 2000 samples) with the oscillating-averaging window and verdict. Shipped "
+        "when the steady solve used oscillating-averaging or failed to stabilise; null for "
+        "classic pointwise convergence.",
     )
     quality_warnings: list[str] = Field(
         default_factory=list,

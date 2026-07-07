@@ -22,12 +22,18 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   type AdminCampaignConditionSummary,
   type AdminCampaignFailureGroup,
+  type AdminUransRequest,
+  type AdminUransVerifyItem,
   type CampaignProgressTotals,
   getCampaignFailures,
+  getUransRequests,
+  isAdminApiError,
+  requestUrans,
   requeueCampaignFailed,
 } from "@/lib/admin";
 import { getAirfoilDetail, getFieldTrack, getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
+import { disagreedDeltaLabel, verifyPointsSearch } from "@/lib/point-history";
 import { C, MONO } from "@/lib/tokens";
 import type { HoverState } from "../../detail/DetailIsland";
 import { PolarViewer } from "../../detail/PolarViewer";
@@ -76,6 +82,12 @@ export function CellSidePanel({
 
   const [failures, setFailures] = useState<{ total: number; groups: AdminCampaignFailureGroup[] } | null>(null);
   const [failuresError, setFailuresError] = useState<string | null>(null);
+  // Fidelity ladder state for this cell: verify-queue items + open admin
+  // request-URANS items (idempotent-aware whole-polar action).
+  const [ladder, setLadder] = useState<{ requests: AdminUransRequest[]; verifyItems: AdminUransVerifyItem[] } | null>(null);
+  const [ladderError, setLadderError] = useState<string | null>(null);
+  const [uransBusy, setUransBusy] = useState(false);
+  const [uransNotice, setUransNotice] = useState<string | null>(null);
   const [requeueBusy, setRequeueBusy] = useState(false);
   const [confirmKey, setConfirmKey] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -140,6 +152,42 @@ export function CellSidePanel({
   useEffect(() => {
     void loadFailures();
   }, [loadFailures]);
+
+  // ---- fidelity ladder items for this cell ----
+  const loadLadder = useCallback(async () => {
+    setLadderError(null);
+    try {
+      setLadder(await getUransRequests(airfoil.airfoilId, condition.revisionId));
+    } catch (e) {
+      setLadderError((e as Error).message);
+    }
+  }, [airfoil.airfoilId, condition.revisionId]);
+
+  useEffect(() => {
+    void loadLadder();
+  }, [loadLadder]);
+
+  const doRequestUrans = async (fidelity: "precalc" | "full") => {
+    if (uransBusy) return;
+    const budget = fidelity === "precalc" ? "half-resolution mesh, 3 shedding periods, 1 h budget per point" : "full mesh, 7 shedding periods, 6 h budget per point";
+    if (!window.confirm(`Queue ${fidelity}-fidelity URANS solves for the WHOLE polar of ${airfoil.name} at Re ${formatRe(condition.reynolds)}? ${budget}. Work schedules after all RANS gaps, at precalc rank.`)) return;
+    setUransBusy(true);
+    setUransNotice(null);
+    try {
+      const res = await requestUrans({ airfoilId: airfoil.airfoilId, revisionId: condition.revisionId, fidelity });
+      setUransNotice(
+        res.created
+          ? `URANS ${fidelity} requested for the whole polar — scheduled after all RANS gaps`
+          : `already requested — the open whole-polar ${fidelity} request is reused (${res.request.state})`,
+      );
+      await loadLadder();
+      onChanged();
+    } catch (e) {
+      setUransNotice(isAdminApiError(e) ? e.message : (e as Error).message);
+    } finally {
+      setUransBusy(false);
+    }
+  };
 
   const projection = useMemo(
     () =>
@@ -352,6 +400,107 @@ export function CellSidePanel({
         )}
 
         {notice && <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>{notice}</div>}
+
+        {/* fidelity ladder: verify-queue chips + whole-polar request-URANS */}
+        <div data-testid="cell-fidelity-ladder" style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderBottom: `1px solid ${C.borderSoft}`, flexWrap: "wrap" }}>
+            <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.1em", color: C.dim }}>URANS FIDELITY</span>
+            {ladder && (() => {
+              const pending = ladder.verifyItems.filter((v) => v.state === "pending" || v.state === "running");
+              const done = ladder.verifyItems.filter((v) => v.state === "done");
+              const disagreed = ladder.verifyItems.filter((v) => v.state === "disagreed");
+              if (pending.length === 0 && done.length === 0 && disagreed.length === 0) {
+                return <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>no verify-queue items for this cell</span>;
+              }
+              return (
+                <>
+                  {pending.length > 0 && (
+                    <a
+                      href={`/admin${verifyPointsSearch(airfoil.slug, "pending")}`}
+                      data-testid="cell-chip-verify-pending"
+                      title="precalc URANS evidence awaiting the full-fidelity verification re-solve — open these points"
+                      style={{ ...chip(C.amber, "rgba(245,158,11,0.45)"), textDecoration: "none" }}
+                    >
+                      {fCount(pending.length)} precalc · verify pending
+                    </a>
+                  )}
+                  {done.length > 0 && (
+                    <span data-testid="cell-chip-verified" style={chip(C.teal, C.tealBorder)}>
+                      {fCount(done.length)} verified
+                    </span>
+                  )}
+                  {disagreed.length > 0 && (
+                    <a
+                      href={`/admin${verifyPointsSearch(airfoil.slug, "disagreed")}`}
+                      data-testid="cell-chip-verify-disagreed"
+                      title="Full-fidelity verification disagreed with the precalc solve — open these points' stories"
+                      style={{ ...chip(C.redText, "rgba(245,101,101,0.5)"), textDecoration: "none" }}
+                    >
+                      {fCount(disagreed.length)} verify disagreed
+                    </a>
+                  )}
+                </>
+              );
+            })()}
+            {!ladder && !ladderError && <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>…</span>}
+            <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+              <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>request URANS (whole polar)</span>
+              {(["precalc", "full"] as const).map((fid) => {
+                const open = ladder?.requests.find(
+                  (r) => r.aoaDeg == null && r.fidelity === fid && (r.state === "pending" || r.state === "running"),
+                );
+                return (
+                  <button
+                    key={fid}
+                    type="button"
+                    data-testid={`cell-request-urans-${fid}`}
+                    disabled={uransBusy || !!open}
+                    title={
+                      open
+                        ? `An open whole-polar ${fid} request already exists (${open.state}) — requests are idempotent`
+                        : fid === "precalc"
+                          ? "Half-resolution mesh, 3 shedding periods, 1 h budget per point"
+                          : "Full mesh, 7 shedding periods, 6 h budget per point"
+                    }
+                    onClick={() => void doRequestUrans(fid)}
+                    style={{
+                      ...ghostBtn,
+                      padding: "4px 9px",
+                      fontSize: 10,
+                      color: open ? C.dim : C.teal,
+                      borderColor: open ? C.stroke : C.tealBorder,
+                      opacity: uransBusy ? 0.6 : 1,
+                      cursor: uransBusy || open ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    {open ? `${fid} requested (${open.state})` : fid}
+                  </button>
+                );
+              })}
+            </span>
+          </div>
+          {ladderError && (
+            <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.red, padding: "8px 12px" }}>
+              couldn&apos;t load the cell&apos;s fidelity-ladder items: {ladderError}
+            </div>
+          )}
+          {uransNotice && <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber, padding: "8px 12px" }}>{uransNotice}</div>}
+          {ladder && ladder.verifyItems.some((v) => v.state === "disagreed") && (
+            <div style={{ display: "grid", gap: 2, padding: "6px 12px 9px" }}>
+              {ladder.verifyItems
+                .filter((v) => v.state === "disagreed")
+                .map((v) => (
+                  <div key={v.id} style={{ display: "flex", gap: 10, alignItems: "baseline", fontFamily: MONO, fontSize: 10, color: C.muted }}>
+                    <span style={{ color: C.text, minWidth: 52 }}>α {f1(v.aoaDeg)}°</span>
+                    <span style={{ color: C.redText }}>
+                      {disagreedDeltaLabel({ state: v.state, deltaCl: v.deltaCl, deltaCd: v.deltaCd, deltaCm: v.deltaCm }) || "deltas not recorded"}
+                    </span>
+                    <span style={{ color: C.dimmest }}>classification stays on the verified row — flagged for review</span>
+                  </div>
+                ))}
+            </div>
+          )}
+        </div>
 
         {/* failed list + scoped requeue */}
         <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>

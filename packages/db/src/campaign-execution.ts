@@ -541,7 +541,25 @@ export async function probeCampaignCompletion(db: DB, campaignId: string): Promi
         JOIN result_classifications rc ON rc.result_id = r.id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
           AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected'
-      ) AS has_rejected
+      ) AS has_rejected,
+      EXISTS (
+        -- Fidelity ladder tier 2 (contract 7): a solved cell whose verdict is
+        -- needs_urans still owes a (pre-calculation) URANS solve — the ladder
+        -- submits it once the campaign's RANS gaps hit zero. Completion must
+        -- wait for the verdict to be superseded/replaced, not book the RANS
+        -- provisional point as final.
+        SELECT 1 FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN result_classifications rc ON rc.result_id = p.result_id
+        WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
+          AND p.derived_by_symmetry = false AND rc.state = 'needs_urans'
+      ) AS precalc_open,
+      EXISTS (
+        -- Fidelity ladder tier 3 (contract 7): open verify-queue items block
+        -- completion — the campaign is running_refinement, not done.
+        SELECT 1 FROM sim_urans_verify_queue q
+        WHERE q.campaign_id = ${campaignId} AND q.state IN ('pending', 'running')
+      ) AS verify_open
   `)) as unknown as {
     open: boolean;
     lanes_open: boolean;
@@ -549,8 +567,11 @@ export async function probeCampaignCompletion(db: DB, campaignId: string): Promi
     awaiting_verdict: boolean;
     has_failed: boolean;
     has_rejected: boolean;
+    precalc_open: boolean;
+    verify_open: boolean;
   }[];
-  if (!probe || probe.open || probe.lanes_open || probe.in_flight || probe.awaiting_verdict) return;
+  if (!probe || probe.open || probe.lanes_open || probe.in_flight || probe.awaiting_verdict || probe.precalc_open || probe.verify_open)
+    return;
   if (probe.has_failed || probe.has_rejected) {
     await db
       .update(simCampaigns)
