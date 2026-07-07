@@ -9,33 +9,24 @@
 
 import {
   airfoils,
-  boundaryConditions,
   boundaryProfiles,
   categories,
   createClient,
   findCampaignGapBatch,
-  flowConditions,
   materializeCampaignLaunch,
   mediums,
   meshProfiles,
   outputProfiles,
-  polarFitSets,
-  referenceGeometryProfiles,
-  resultAttempts,
-  resultClassifications,
   results,
   simCampaignPoints,
   simCampaignProgress,
-  simCampaigns,
   simJobs,
-  simulationPresetRevisions,
-  simulationPresets,
   solverProfiles,
-  sweepDefinitions,
   sweeperState,
 } from "@aerodb/db";
+import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { type EngineClient, type JobResult, type JobStatus, type PolarRequest } from "@aerodb/engine-client";
-import { and, asc, eq, inArray, like, sql as dsql } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { ConditionMapEntry } from "../src/ingest";
@@ -109,61 +100,14 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  // Order matters: evidence → results → jobs → campaign-created registry rows
-  // → campaign (cascades points/conditions/progress) → presets/support rows.
-  const campaignPresets = campaignId
-    ? await db
-        .select({ id: simulationPresets.id, legacyId: simulationPresets.legacyBoundaryConditionId })
-        .from(simulationPresets)
-        .where(like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}%`))
-    : [];
-  const revisionRows = campaignPresets.length
-    ? await db
-        .select({ id: simulationPresetRevisions.id })
-        .from(simulationPresetRevisions)
-        .where(inArray(simulationPresetRevisions.presetId, campaignPresets.map((p) => p.id)))
-    : [];
-  const revisionIds = revisionRows.map((r) => r.id);
-  if (revisionIds.length) {
-    await db.delete(polarFitSets).where(inArray(polarFitSets.simulationPresetRevisionId, revisionIds));
-    await db.delete(resultClassifications).where(inArray(resultClassifications.simulationPresetRevisionId, revisionIds));
-    await db.delete(resultAttempts).where(inArray(resultAttempts.simulationPresetRevisionId, revisionIds));
-    await db.delete(results).where(inArray(results.simulationPresetRevisionId, revisionIds));
-    await db.delete(simJobs).where(inArray(simJobs.simulationPresetRevisionId, revisionIds));
-  }
-  // Capture campaign-created registry rows BEFORE the campaign delete nulls
-  // their created_by_campaign_id (ON DELETE SET NULL).
-  const campaignFlowIds = campaignId
-    ? (await db.select({ id: flowConditions.id }).from(flowConditions).where(eq(flowConditions.createdByCampaignId, campaignId))).map((r) => r.id)
-    : [];
-  const campaignGeoIds = campaignId
-    ? ((await db.execute(dsql`SELECT id FROM reference_geometry_profiles WHERE created_by_campaign_id = ${campaignId}`)) as unknown as { id: string }[]).map((r) => r.id)
-    : [];
-  if (campaignId) {
-    await db.delete(simJobs).where(eq(simJobs.campaignId, campaignId));
-    await db.delete(simCampaigns).where(eq(simCampaigns.id, campaignId));
-  }
-  if (campaignPresets.length) {
-    await db.delete(simulationPresets).where(inArray(simulationPresets.id, campaignPresets.map((p) => p.id)));
-    const legacyIds = campaignPresets.map((p) => p.legacyId).filter((x): x is string => Boolean(x));
-    if (legacyIds.length) await db.delete(boundaryConditions).where(inArray(boundaryConditions.id, legacyIds));
-  }
-  // Flow conditions and reference geometry profiles are FIND-OR-CREATE
-  // (canonical-key dedupe), so a row this campaign "created" can also be
-  // referenced by presets from OTHER suites/e2e residue on the shared dev DB.
-  // Delete only rows nothing references anymore — an unconditional delete
-  // flaked the whole suite with an FK violation from foreign referents.
-  if (campaignFlowIds.length) {
-    await db.execute(
-      dsql`DELETE FROM flow_conditions fc WHERE fc.id = ANY(ARRAY[${dsql.join(campaignFlowIds.map((id) => dsql`${id}::uuid`), dsql`, `)}]) AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.flow_condition_id = fc.id)`,
-    );
-  }
-  if (campaignGeoIds.length) {
-    await db.execute(
-      dsql`DELETE FROM reference_geometry_profiles rgp WHERE rgp.id = ANY(ARRAY[${dsql.join(campaignGeoIds.map((id) => dsql`${id}::uuid`), dsql`, `)}]) AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.reference_geometry_profile_id = rgp.id)`,
-    );
-  }
-  await db.delete(sweepDefinitions).where(like(sweepDefinitions.slug, `campaign-${PREFIX.toLowerCase()}%`));
+  // Campaign fixture graph cleanup is owned by the shared helper: dependency
+  // order, plus guarded deletes for the FIND-OR-CREATE registries
+  // (flow_conditions, reference_geometry_profiles are canonical-key deduped,
+  // so parallel suites can reference "our" rows — DecisionHistory F6/F9).
+  await cleanupCampaignFixtures(db, {
+    campaignIds: [campaignId],
+    presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
+  });
   if (profileIds.boundary) await db.delete(boundaryProfiles).where(eq(boundaryProfiles.id, profileIds.boundary));
   if (profileIds.mesh) await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
   if (profileIds.solver) await db.delete(solverProfiles).where(eq(solverProfiles.id, profileIds.solver));

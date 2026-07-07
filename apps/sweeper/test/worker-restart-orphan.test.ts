@@ -23,32 +23,23 @@
 
 import {
   airfoils,
-  boundaryConditions,
   boundaryProfiles,
   campaignFailures,
   categories,
   createClient,
   findCampaignGapBatch,
-  flowConditions,
   materializeCampaignLaunch,
   mediums,
   meshProfiles,
   outputProfiles,
-  polarFitSets,
-  referenceGeometryProfiles,
-  resultAttempts,
-  resultClassifications,
   results,
   simCampaignPoints,
   simCampaignProgress,
-  simCampaigns,
   simJobs,
-  simulationPresetRevisions,
-  simulationPresets,
   solverProfiles,
-  sweepDefinitions,
   sweeperState,
 } from "@aerodb/db";
+import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import {
   WORKER_RESTART_ORPHAN_MESSAGE,
   type EngineClient,
@@ -56,7 +47,7 @@ import {
   type JobStatus,
   type PolarRequest,
 } from "@aerodb/engine-client";
-import { and, asc, eq, inArray, like, sql as dsql } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { ConditionMapEntry } from "../src/ingest";
@@ -67,7 +58,11 @@ const { db, sql } = createClient({ max: 2 });
 const PREFIX = `sw-orphan-${process.pid}-${Date.now().toString(36)}`;
 
 const ANGLES = [6, 7, 8];
-const CHORD = 0.2;
+// File-unique chord: reference_geometry_profiles dedupe on canonical physical
+// keys, so sharing 0.2/1 with campaign-batching.test.ts entangles the two
+// parallel files' fixture graphs (the F9 flake). Every campaign-launching
+// suite must pick a chord no other suite uses.
+const CHORD = 0.19;
 const SOLVED_AOA = 6;
 const NU = 1.789e-5 / 1.225;
 
@@ -185,51 +180,14 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  // Order matters: evidence → results → jobs → campaign-created registry rows
-  // → campaigns (cascade points/conditions/progress) → presets/support rows.
-  const campaignIds = [orphanCampaignId, genuineCampaignId].filter(Boolean);
-  const campaignPresets = await db
-    .select({ id: simulationPresets.id, legacyId: simulationPresets.legacyBoundaryConditionId })
-    .from(simulationPresets)
-    .where(like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}%`));
-  const revisionRows = campaignPresets.length
-    ? await db
-        .select({ id: simulationPresetRevisions.id })
-        .from(simulationPresetRevisions)
-        .where(inArray(simulationPresetRevisions.presetId, campaignPresets.map((p) => p.id)))
-    : [];
-  const revisionIds = revisionRows.map((r) => r.id);
-  if (revisionIds.length) {
-    await db.delete(polarFitSets).where(inArray(polarFitSets.simulationPresetRevisionId, revisionIds));
-    await db.delete(resultClassifications).where(inArray(resultClassifications.simulationPresetRevisionId, revisionIds));
-    await db.delete(resultAttempts).where(inArray(resultAttempts.simulationPresetRevisionId, revisionIds));
-    await db.delete(results).where(inArray(results.simulationPresetRevisionId, revisionIds));
-    await db.delete(simJobs).where(inArray(simJobs.simulationPresetRevisionId, revisionIds));
-  }
-  const campaignFlowIds = campaignIds.length
-    ? (await db.select({ id: flowConditions.id }).from(flowConditions).where(inArray(flowConditions.createdByCampaignId, campaignIds))).map((r) => r.id)
-    : [];
-  const campaignGeoIds = campaignIds.length
-    ? (
-        (await db.execute(
-          dsql`SELECT id FROM reference_geometry_profiles WHERE created_by_campaign_id = ANY(ARRAY[${dsql.join(campaignIds.map((id) => dsql`${id}::uuid`), dsql`, `)}])`,
-        )) as unknown as { id: string }[]
-      ).map((r) => r.id)
-    : [];
-  if (campaignIds.length) {
-    await db.delete(simJobs).where(inArray(simJobs.campaignId, campaignIds));
-    await db.delete(simCampaigns).where(inArray(simCampaigns.id, campaignIds));
-  }
-  if (campaignPresets.length) {
-    await db.delete(simulationPresets).where(inArray(simulationPresets.id, campaignPresets.map((p) => p.id)));
-    const legacyIds = campaignPresets.map((p) => p.legacyId).filter((x): x is string => Boolean(x));
-    if (legacyIds.length) await db.delete(boundaryConditions).where(inArray(boundaryConditions.id, legacyIds));
-  }
-  if (campaignFlowIds.length) await db.delete(flowConditions).where(inArray(flowConditions.id, campaignFlowIds));
-  if (campaignGeoIds.length) {
-    await db.execute(dsql`DELETE FROM reference_geometry_profiles WHERE id = ANY(ARRAY[${dsql.join(campaignGeoIds.map((id) => dsql`${id}::uuid`), dsql`, `)}])`);
-  }
-  await db.delete(sweepDefinitions).where(like(sweepDefinitions.slug, `campaign-${PREFIX.toLowerCase()}%`));
+  // Campaign fixture graph (evidence → jobs → campaigns → presets → guarded
+  // find-or-create registry rows → sweeps) is owned by the shared helper —
+  // registry rows are canonical-key deduped and can be referenced by parallel
+  // suites, so hand-rolled unconditional deletes flake (DecisionHistory F9).
+  await cleanupCampaignFixtures(db, {
+    campaignIds: [orphanCampaignId, genuineCampaignId],
+    presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
+  });
   if (profileIds.boundary) await db.delete(boundaryProfiles).where(eq(boundaryProfiles.id, profileIds.boundary));
   if (profileIds.mesh) await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
   if (profileIds.solver) await db.delete(solverProfiles).where(eq(solverProfiles.id, profileIds.solver));

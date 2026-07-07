@@ -240,7 +240,14 @@ afterAll(async () => {
   }
   await db.delete(sweepDefinitions).where(like(sweepDefinitions.slug, `campaign-${PREFIX}-%`));
   await db.execute(sql`DELETE FROM flow_conditions WHERE medium_id = ${mediumId}`);
-  await db.execute(sql`DELETE FROM reference_geometry_profiles WHERE origin = 'campaign' AND slug LIKE 'chord-0-2000m-span-1-0000m%' AND created_by_campaign_id IS NULL`);
+  // Reference-guarded mop-up: find-or-create registry rows can be referenced
+  // by crashed-run residue presets/conditions (F9 FK flake shape).
+  await db.execute(sql`
+    DELETE FROM reference_geometry_profiles rgp
+    WHERE rgp.origin = 'campaign' AND rgp.slug LIKE 'chord-0-2000m-span-1-0000m%' AND rgp.created_by_campaign_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.reference_geometry_profile_id = rgp.id)
+      AND NOT EXISTS (SELECT 1 FROM sim_campaign_conditions scc WHERE scc.reference_geometry_profile_id = rgp.id)
+  `);
   await db.execute(sql`DELETE FROM boundary_profiles WHERE slug = ${`${PREFIX}-boundary`}`);
   await db.execute(sql`DELETE FROM mesh_profiles WHERE slug = ${`${PREFIX}-mesh`}`);
   await db.execute(sql`DELETE FROM solver_profiles WHERE slug = ${`${PREFIX}-solver`}`);

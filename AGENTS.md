@@ -322,3 +322,28 @@
 - Tests for sweep scheduling must assert the early-abort path, full-polar URANS
   promotion, attempt evidence retention, mesh reuse, and the stable-period
   early-stop rule.
+
+## Live-DB Test Fixture Cleanup
+
+- Vitest files inside one workspace run in parallel against the shared dev
+  database. `flow_conditions` and `reference_geometry_profiles` are
+  find-or-create registries deduped on canonical keys of physical values only,
+  so "rows my campaign created" and "rows my presets reference" are different
+  sets that can overlap other concurrently running files.
+- Any test that launches campaigns (via `materializeCampaignLaunch` or API
+  routes) must clean up with `cleanupCampaignFixtures` from
+  `@aerodb/db/test-cleanup` (dependency-ordered deletes; registry rows removed
+  only when nothing references them; candidate set is created-by ∪
+  referenced-by so the last suite standing removes shared rows). Do not
+  hand-roll a new `afterAll` delete sequence for campaign fixtures.
+- Raw registry mop-up deletes (slug/origin-scoped `DELETE FROM
+  flow_conditions|reference_geometry_profiles`) must carry `NOT EXISTS` guards
+  against every referencing table (`simulation_presets` AND
+  `sim_campaign_conditions`); a new FK into these registries must be added to
+  the guards in `packages/db/src/test-cleanup.ts` in the same change.
+- Campaign-launching test files should use file-unique physical values (e.g. a
+  chord no other suite uses) so canonical-key dedupe cannot entangle two
+  parallel files' fixture graphs in the first place.
+- When hardening one test file's cleanup against a shared-DB flake, sweep every
+  sibling suite for the same pattern in the same change (the 2026-07-07
+  worker-restart-orphan flake was the batching guard fix not being generalized).

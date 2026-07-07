@@ -1667,3 +1667,22 @@ defects; fixes, in decision form:
   `metadata.frameIndex` on every frame_image artifact at the writer (the
   filename coupling stays engine-internal); the node regex remains only as
   a legacy fallback.
+- F9 — worker-restart-orphan.test.ts flaked at file level (2 of 3 full
+  `pnpm test` runs, 2026-07-07): its afterAll deleted
+  reference_geometry_profiles rows unconditionally while campaign-batching's
+  presets (same chord 0.2/span 1 → same canonical key → shared find-or-create
+  row) still referenced them. Creation path: the file was written 2026-07-06
+  copying the batching live-DB pattern; the NOT EXISTS guard fixing this exact
+  flake landed in campaign-batching only (F6, 2026-07-07) without sweeping the
+  sibling file — a generalization miss, not a new mechanism. DECISION:
+  campaign fixture cleanup is centralized in `@aerodb/db/test-cleanup`
+  (`cleanupCampaignFixtures`: dependency order; guarded registry deletes
+  covering BOTH simulation_presets and sim_campaign_conditions — F6's guard
+  only checked presets; candidate set = created-by ∪ referenced-by so the
+  last-finishing suite removes shared rows instead of leaking them with
+  created_by NULL). worker-restart-orphan now uses a file-unique chord (0.19)
+  so parallel suites cannot entangle geometry at all; api-suite raw mop-ups
+  (campaigns.test.ts, point-history.test.ts) gained the same guards; a
+  deterministic must-catch test (campaign-fixture-cleanup.test.ts) pins the
+  incident interleaving: unguarded delete raises 23503, helper cleanup of
+  suite A skips the shared row, helper cleanup of suite B removes it.

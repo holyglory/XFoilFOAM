@@ -156,11 +156,21 @@ afterAll(async () => {
   }
   await db.delete(sweepDefinitions).where(like(sweepDefinitions.slug, "campaign-pw-camp-%"));
   await db.delete(flowConditions).where(eq(flowConditions.mediumId, mediumId));
+  // Registry mop-ups must be reference-guarded: these rows are find-or-create
+  // (canonical-key dedupe) and crashed-run residue can still be referenced by
+  // live presets/conditions — an unguarded delete is the F9 FK flake shape.
   await db.execute(sql`
-    DELETE FROM reference_geometry_profiles
-    WHERE origin = 'campaign' AND created_by_campaign_id IS NULL AND slug LIKE 'chord-0-2000m-span-1-0000m%'
+    DELETE FROM reference_geometry_profiles rgp
+    WHERE rgp.origin = 'campaign' AND rgp.created_by_campaign_id IS NULL AND rgp.slug LIKE 'chord-0-2000m-span-1-0000m%'
+      AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.reference_geometry_profile_id = rgp.id)
+      AND NOT EXISTS (SELECT 1 FROM sim_campaign_conditions scc WHERE scc.reference_geometry_profile_id = rgp.id)
   `);
-  await db.execute(sql`DELETE FROM reference_geometry_profiles WHERE slug LIKE 'chord-0-4000m-span-1-0000m%' AND origin = 'campaign'`);
+  await db.execute(sql`
+    DELETE FROM reference_geometry_profiles rgp
+    WHERE rgp.slug LIKE 'chord-0-4000m-span-1-0000m%' AND rgp.origin = 'campaign'
+      AND NOT EXISTS (SELECT 1 FROM simulation_presets sp WHERE sp.reference_geometry_profile_id = rgp.id)
+      AND NOT EXISTS (SELECT 1 FROM sim_campaign_conditions scc WHERE scc.reference_geometry_profile_id = rgp.id)
+  `);
   if (cleanupProfileIds.boundary.length) await db.delete(boundaryProfiles).where(inArray(boundaryProfiles.id, cleanupProfileIds.boundary));
   if (cleanupProfileIds.mesh.length) await db.delete(meshProfiles).where(inArray(meshProfiles.id, cleanupProfileIds.mesh));
   if (cleanupProfileIds.solver.length) await db.delete(solverProfiles).where(inArray(solverProfiles.id, cleanupProfileIds.solver));
