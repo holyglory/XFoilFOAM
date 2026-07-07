@@ -1,5 +1,100 @@
 # Decision History
 
+## 2026-07-07 — Courant Default 4; In-Run Divergence Watchdog; Drift Denominator Floor
+
+- Incident (prod, job b01a7d46, naca-0012 a0 u15, build
+  prod-20260707-4ac0e77-fastrender): long-horizon URANS at
+  transientMaxCourant=15 with the relaxed quasi-PISO PIMPLE setup (3 outer
+  correctors, p relax 0.3, no residualControl, Euler ddt) accumulated
+  splitting error over the 7-period horizon into a velocity singularity: Co
+  spiked to 61 despite the cap, k bounding blew up (avg 9480 at 15 m/s
+  freestream), dt collapsed 8e-6 → 5e-8, simulated time froze at 0.069 of
+  0.333 s for the FULL 7200 s budget, and Cl exploded (mean −79.8, std 10795,
+  excursions ±9.45e5). The honesty machinery all worked (honest timeout,
+  partial grading, valid_for_polar=f, v3 gate rejected non-positive-drag +
+  non-stationary; garbage never entered fits) — but 2 h of CPU produced
+  nothing, and EVERY weak-shedding point of the 450-point campaign
+  (25/50/100 m/s) is exposed, worse at higher Re.
+- Decision — Courant default: `SolverParams.transient_max_courant` default
+  15.0 → 4.0 (models.py), the practitioner-standard ceiling for
+  relaxed-PIMPLE URANS; the field stays profile-overridable and its
+  description now states honestly that >4 risks accumulating splitting error
+  over multi-period horizons. Deliberately NOT changed in this pass
+  (alternatives for a later pass if Co=4 alone is insufficient): tightening
+  PIMPLE (more outer correctors, residualControl, less aggressive p
+  relaxation), backward/CrankNicolson ddt, or a per-Re Courant schedule.
+  Node-side note: the DB numerics profiles column default is still 15
+  (packages/db/schema.ts); the sweeper always sends the profile value, so
+  new profiles created after a node-side follow-up should adopt 4 there too.
+- Decision — in-run divergence watchdog (tasks.py, same heartbeat thread as
+  the stall detector): while phase is solving_rans/solving_urans it reads the
+  newest live coefficient.dat tail (last 20 rows, header-aware, tail-bytes
+  read) per case every 10 s beat and condemns when EITHER |Cl| >
+  `divergence_cl_bound` (=50, Settings) on 3 consecutive beats, OR the
+  adaptive dt (median of coefficient time deltas) stays below
+  `divergence_dt_floor` (=1e-7, Settings) with no recovery for
+  `divergence_grace_minutes` (=5, Settings). Condemn = SIGTERM the CASE's
+  solver process group (SIGKILL escalation next beat — the runner-timeout
+  kill ladder) + a `divergence_condemned.json` marker with the truthful
+  message "transient diverged at t=X: |Cl|=Y, dt=Z". The pipeline clears
+  stale markers before every fresh attempt and, on solver exit, raises the
+  marker reason as OpenFOAMError — so the case flows the EXISTING
+  failed/timeout grading path (attempt evidence retained, honest error, job
+  continues its other cases), NEVER the stall detector's whole-job os._exit,
+  and a condemned partial window is NEVER graded like an honest timeout
+  (the garbage must not even reach the node gate). False-positive guards
+  pinned by tests: post-stall |Cl|~3 never trips the bound; startup-ramp
+  small dt (first 60 s of a segment's observation, plus reset-on-recovery)
+  never condemns; a prod-shaped blow-up fixture IS condemned within the
+  grace.
+- Decision — drift denominator floor (postprocess/unsteady.py): the
+  stationarity metric was structurally unjudgeable at alpha~0 — drift_frac =
+  |half-window mean delta| / |mean cl| divides by ~0 for symmetric airfoils,
+  so those points could NEVER pass regardless of quality. Now drift =
+  |mean(H2)−mean(H1)| / max(|mean cl|, retained cl rms, DRIFT_ABS_FLOOR=0.05).
+  A clean near-zero periodic signal passes; a genuinely drifting near-zero
+  signal still fails via the rms/absolute-floor scale (both pinned by
+  tests). No existing drift tests needed recalibration: their fixtures are
+  mean-dominated, so the denominator is unchanged there.
+- Verification: 217 non-integration tests green (200 baseline + 17 new:
+  watchdog condemn both classes, both spare guards, tail parsing, heartbeat
+  integration incl. per-case kill isolation + phase guards + stale-segment
+  skip, pipeline truthful-error flow + stale-marker clearing, Courant pin,
+  Settings pins, drift floor both ways). Engine image rebuild REQUIRED for
+  prod (models/config/tasks/pipeline/unsteady changed).
+- Adversarial verify pass (same day) — CONFIRMED + fixed: the watchdog's
+  in-memory per-segment verdict survived a retry that REUSES the condemned
+  coefficient.dat path (the steady upwind fallback rewrites
+  forceCoeffs1/0/coefficient.dat in the same case dir), so the designed
+  recovery attempt was re-killed on its first beat with the stale verdict.
+  Fix (tasks.py): `observe()` now takes the on-disk marker's presence —
+  marker present keeps the TERM→KILL escalation; marker cleared by the
+  pipeline means a retry owns the path: an UNCHANGED dead tail is not judged
+  at all, and the first changed tail resets the segment for a fresh verdict
+  (a retry that diverges again is re-condemned — all three pinned by
+  must-catch tests, 220 total green).
+- Adversarial verify pass — drift-floor side effect (accepted, layered):
+  prod-shaped diverged garbage (cl std ~1e4) now reads STATIONARY (the rms
+  term swallows the denominator), so the v3 "non-stationary" reason that
+  co-fired in the incident will NOT fire on such garbage anymore. Divergence
+  rejection now rests on (1) the engine watchdog killing the run and (2) the
+  node classifier's non-physical-coefficients bound — DEPLOYMENT COUPLING:
+  the engine image with the drift floor must not ship without the node
+  classifier bound (same release train).
+- Adversarial verify pass — wall-time envelope at Co=4 (measured from prod
+  job b01a7d46 logs: healthy Courant-limited dt at Co=15 ≈ 3.5–6e-5 s,
+  ~0.85 s/step on the VPS): dt(Co=4) ≈ 1.3e-5 s → ~65,000 wall-s per
+  simulated second at c=0.25/U=15 scale. The 7-period contract horizon
+  (0.39 s sim at the St=0.5 planning period; ~0.97 s at physical St≈0.2)
+  projects to ≈7–17.5 h of transient wall — 4–11x over the 0.8×7200 s
+  continuation budget. A shedding case will burn its full ~2 h budget and
+  retain only ~0.6–1.6 periods → rejected by the FRAME_TRACK_MIN_PERIODS=5
+  gate. Steps-per-period is speed- and chord-invariant, so this holds for
+  the whole 25/50/100 m/s campaign class on the current mesh resolution and
+  hardware. Campaign economics decision REQUIRED before launch (options:
+  bigger per-point budget, coarser URANS mesh profile, PIMPLE tightening at
+  moderate Co, lower min-periods, or URANS only for fast-certifying points).
+
 ## 2026-07-07 — Engine Render Grind Killed; Media Wall Budget; Truthful Postprocessing Phase; Stall Detector; Celery Hard Limit
 
 - Incident (prod, py-spy-proven, build prod-20260707-1dc13ea-frametrack): the

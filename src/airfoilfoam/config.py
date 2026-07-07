@@ -93,6 +93,31 @@ class Settings(BaseSettings):
         "('stalled in <phase> — no progress for Nm') and the worker child exits, converting an "
         "eternal in-process grind into the already-handled failed job class.",
     )
+    divergence_cl_bound: float = Field(
+        default=50.0,
+        gt=0,
+        description="In-run divergence watchdog: |Cl| sanity bound. A solving case whose newest "
+        "coefficient.dat rows exceed this on 3 consecutive heartbeat samples is condemned (solver "
+        "process group killed; the case fails with a truthful 'transient diverged' error and flows "
+        "the normal failed/timeout grading path). Physical post-stall |Cl| stays below ~3; a "
+        "diverging URANS run shoots past 50 within seconds (prod 2026-07-07: |Cl| excursions "
+        "reached ±9.45e5).",
+    )
+    divergence_dt_floor: float = Field(
+        default=1e-7,
+        gt=0,
+        description="In-run divergence watchdog: adaptive-timestep floor [s], estimated from the "
+        "coefficient.dat time deltas. A transient whose dt stays below this floor persistently for "
+        "divergence_grace_minutes is condemned (prod 2026-07-07: dt collapsed 8e-6 -> 5e-8 and the "
+        "simulated time froze for the whole 7200 s budget). Legitimate startup ramps recover above "
+        "the floor within the grace and are never condemned.",
+    )
+    divergence_grace_minutes: float = Field(
+        default=5.0,
+        gt=0,
+        description="In-run divergence watchdog: how long the timestep must stay below "
+        "divergence_dt_floor (with no recovery) before the case is condemned.",
+    )
     build_id: str = Field(
         default="dev",
         description="Source/image build identifier reported to the API for UI version-parity checks.",

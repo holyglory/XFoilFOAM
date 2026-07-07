@@ -352,8 +352,15 @@ def stable_two_period_window(
 # integer-period time-weighted stats, stationarity, and frame targeting.
 # --------------------------------------------------------------------------- #
 
-#: eps in the stationarity denominator |mean(cl)| + eps.
-DRIFT_EPS = 1e-6
+#: Absolute floor of the stationarity drift denominator. The drift metric
+#: normalises the half-window mean delta by max(|mean(cl)|, retained cl rms,
+#: DRIFT_ABS_FLOOR): a symmetric airfoil at alpha~0 has mean cl ~ 0, so a bare
+#: |mean| denominator made such points UNJUDGEABLE — any femto-scale numerical
+#: wobble divided by ~0 failed stationarity forever (prod 2026-07-07: alpha=0
+#: points could only ever exercise reject paths). A truly drifting near-zero
+#: signal still fails: its half-window delta is judged against the rms/absolute
+#: floor scale instead of an accidentally tiny mean.
+DRIFT_ABS_FLOOR = 0.05
 #: Frame-export cadence pinned by the contract: ~24 frames/period ...
 FRAME_EXPORT_FRAMES_PER_PERIOD = 24.0
 #: ... over the last min(3, K) whole periods ...
@@ -472,8 +479,9 @@ def period_window_stats(
     """Stats over exactly K = floor(available periods) whole periods ending at
     the last sample: time-weighted trapezoidal mean/std (non-uniform dt, so an
     integer-period window yields phase-bias-free means) plus min/max, and the
-    stationarity verdict |mean(first half) - mean(second half)| / (|mean|+eps)
-    on Cl. The halves are whole-period halves (floor(K/2) periods each, middle
+    stationarity verdict |mean(first half) - mean(second half)| /
+    max(|mean(cl)|, retained cl rms, DRIFT_ABS_FLOOR) on Cl. The halves are
+    whole-period halves (floor(K/2) periods each, middle
     period skipped when K is odd) so the drift metric itself carries no
     half-period phase bias.
 
@@ -514,7 +522,13 @@ def period_window_stats(
         mid = 0.5 * (start + end)
         m1 = _windowed_mean(st, scl, start, mid)
         m2 = _windowed_mean(st, scl, mid, end)
-    drift = abs(m1 - m2) / (abs(cl_stats.mean) + DRIFT_EPS)
+    # Denominator floor: judge the drift against the LARGEST honest scale of
+    # the signal — |mean|, the retained oscillation rms, or the absolute floor.
+    # This keeps alpha~0 symmetric cases (mean cl ~ 0) judgeable instead of
+    # auto-failing on a near-zero denominator, while a genuinely drifting
+    # near-zero signal still fails via the rms/absolute-floor scale.
+    drift_scale = max(abs(cl_stats.mean), abs(cl_stats.std), DRIFT_ABS_FLOOR)
+    drift = abs(m1 - m2) / drift_scale
     return PeriodWindowStats(
         period_s=float(period_s),
         periods_retained=float(available),

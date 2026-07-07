@@ -182,11 +182,14 @@ class SolverParams(BaseModel):
         default=0.4, ge=0, lt=1, description="Initial fraction of the transient run discarded as startup."
     )
     transient_max_courant: float = Field(
-        default=15.0,
+        default=4.0,
         gt=0,
         description="Max Courant number for the adaptive transient time step. The implicit "
-        "pimpleFoam solver tolerates Co>1; a larger value avoids the tiny wall cells (y+~1) "
-        "throttling the step to an impractically small size.",
+        "pimpleFoam solver tolerates Co>1, and a larger value avoids the tiny wall cells "
+        "throttling the step — but >4 risks accumulating splitting error over multi-period "
+        "horizons (prod 2026-07-07: relaxed-PIMPLE URANS at Co=15 accumulated splitting error "
+        "into a velocity singularity, k bounding blow-up and dt collapse). 4 is the "
+        "practitioner-standard ceiling for relaxed-PIMPLE URANS; profiles may still override.",
     )
     urans_min_periods: int = Field(
         default=7,

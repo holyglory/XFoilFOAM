@@ -207,6 +207,51 @@ def _transient_timeout_message(
     )
 
 
+#: Marker dropped into a case directory by the heartbeat-thread divergence
+#: watchdog (tasks.py) when it kills a diverging solver. The pipeline turns it
+#: into a truthful OpenFOAMError so the case flows the EXISTING failed/timeout
+#: grading path (attempt evidence retained, honest error) — never the stall
+#: detector's whole-job kill, and never a graded window of garbage.
+DIVERGENCE_MARKER_FILENAME = "divergence_condemned.json"
+
+
+def write_divergence_condemnation(case_dir: Path, reason: str) -> None:
+    """Persist the watchdog's truthful condemnation for the solving pipeline."""
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / DIVERGENCE_MARKER_FILENAME).write_text(
+        json.dumps({"reason": reason, "condemned_at": time.time()}, indent=2) + "\n"
+    )
+
+
+def read_divergence_condemnation(case_dir: Path) -> Optional[str]:
+    """The watchdog's condemnation reason for this case, or None."""
+    marker = case_dir / DIVERGENCE_MARKER_FILENAME
+    try:
+        payload = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return None
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return str(reason) if reason else None
+
+
+def clear_divergence_condemnation(case_dir: Path) -> None:
+    """Drop a stale marker before a FRESH solver attempt (each attempt earns
+    its own verdict; a condemned steady init must not poison the URANS pass,
+    and a condemned 2nd-order steady solve must not poison the upwind retry)."""
+    try:
+        (case_dir / DIVERGENCE_MARKER_FILENAME).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _raise_if_condemned(case_dir: Path) -> None:
+    reason = read_divergence_condemnation(case_dir)
+    if reason:
+        raise OpenFOAMError(reason)
+
+
 def _latest_time_dir(case_dir: Path):
     best, best_v = None, -1.0
     for d in case_dir.iterdir():
@@ -772,6 +817,9 @@ def _run_transient_attempt(
     cancel_check: CancelCheck = None,
 ) -> Optional[TransientResult]:
     _check_cancel(cancel_check)
+    # Fresh attempt = fresh verdict: a marker left by a condemned earlier stage
+    # (e.g. the steady init) must not poison this pimpleFoam pass.
+    clear_divergence_condemnation(tcase)
     start_t = _latest_time(tcase)
     end_t = start_t + run_time
     CaseBuilder(airfoil, patches, tmesh, spec, fluid, roughness, solver_params, n_proc=n_proc).write_transient(
@@ -794,6 +842,11 @@ def _run_transient_attempt(
     wall_seconds = max(0.0, time.monotonic() - solve_started)
     _check_cancel(cancel_check)
     (tcase / "log.pimpleFoam").write_text(res.stdout)
+    # Divergence watchdog condemnation: the heartbeat thread killed a solver
+    # whose coefficients blew past the sanity bound (or whose dt collapsed
+    # persistently). The partial window is GARBAGE — never grade it like a
+    # timeout; fail the case with the watchdog's truthful message instead.
+    _raise_if_condemned(tcase)
     # A solver TIMEOUT is not a crash: the run may have written a gradable
     # partial coefficient window. Only a genuine solver failure aborts here.
     timed_out = bool(getattr(res, "timed_out", False)) or (
@@ -1885,6 +1938,9 @@ def run_case(
         def solve_once(sp) -> "RunResult":
             _check_cancel(cancel_check)
             write_case(sp)
+            # Each steady attempt earns its own divergence verdict (the upwind
+            # fallback retry must not inherit the 2nd-order condemnation).
+            clear_divergence_condemnation(case_dir)
             seeded = _try_seed_initial_field(
                 case_dir, airfoil, spec.chord, resolved, spec, fluid, roughness, sp,
                 runner, cache, cancel_check=cancel_check,
@@ -1919,6 +1975,10 @@ def run_case(
                 "steady RANS initialisation stage failed; URANS falls back to a short steady init"
             )
         else:
+            # Prefer the watchdog's truthful divergence message over the
+            # generic "Command failed" tail when the solver was condemned.
+            if not res.ok:
+                _raise_if_condemned(case_dir)
             log = res.check().stdout
             (case_dir / "log.simpleFoam").write_text(log)
             conv = parse_convergence(log)
@@ -2146,6 +2206,7 @@ def _solve_cold_marched(
     def solve_once(sp):
         _check_cancel(cancel_check)
         write_case(sp)
+        clear_divergence_condemnation(polar_dir)
         seeded = _try_seed_initial_field(
             polar_dir, airfoil, spec.chord, resolved, spec, fluid, roughness, sp,
             runner, cache, cancel_check=cancel_check,
@@ -2168,6 +2229,7 @@ def _solve_warm(polar_dir, spec, solver_params, runner, solver_timeout, n_proc=1
     """Warm-start one AoA: rewrite only the velocity BC + lift/drag dirs at the
     latest (previous-AoA) field and continue simpleFoam from it."""
     fv = physics.freestream_vector(spec.speed, spec.aoa_deg)
+    clear_divergence_condemnation(polar_dir)
     lt_dir = _latest_time_dir(polar_dir)
     lt = lt_dir.name
     lt_v = int(float(lt))
@@ -2328,6 +2390,9 @@ def solve_polar_marched(
                     cancel_check=cancel_check,
                 )
             _check_cancel(cancel_check)
+            if not res.ok:
+                # Truthful divergence message beats the generic command tail.
+                _raise_if_condemned(polar_dir)
             log = res.check().stdout
             (polar_dir / f"log.a{i}").write_text(log)
             conv = parse_convergence(log)

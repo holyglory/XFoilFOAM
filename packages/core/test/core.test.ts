@@ -18,6 +18,7 @@ import {
   projectChart,
   evaluateUransMediaQuality,
   FRAME_TRACK_MIN_PERIODS,
+  NON_PHYSICAL_COEFFICIENT_LIMIT,
   reynolds,
   reynoldsFromFlowReference,
   speedForReynolds,
@@ -366,6 +367,94 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
     expect(classified.classifications[0].state).toBe("rejected");
     expect(classified.classifications[0].reasons).toContain("not-converged");
     expect(classified.classifications[0].reasons).not.toContain("solver-stalled");
+  });
+
+  // -------------------------------------------------------------------------
+  // Non-physical coefficient magnitude gate (prod job b01a7d46, naca-0012
+  // a0 u15): long-horizon URANS splitting-error blow-up graded cl mean -79.8
+  // (std 10795, excursions ±945k). That row happened to be caught by other
+  // gates; the same divergence with POSITIVE drag and legacy (absent)
+  // frame_track would have passed everything. These fixtures are shaped like
+  // that real breakage, not like the gate's implementation.
+  // -------------------------------------------------------------------------
+  it("MUST-CATCH: a diverged unsteady row with POSITIVE drag and NO frame_track is rejected non-physical-coefficients (every other gate passes)", () => {
+    const { frameTrack: _ft, ...legacyShape } = ingestShapedUrans;
+    const diverged = { ...legacyShape, cl: -79.8, cd: 12.4, cm: 0.31 };
+    const classified = classifyPolarEvidence([diverged]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    // EXACTLY this reason: proves the pre-existing gates were all silent and
+    // only the magnitude bound caught the divergence.
+    expect(classified.classifications[0].reasons).toEqual(["non-physical-coefficients"]);
+  });
+
+  it("MUST-CATCH: the same divergence WITH a non-stationary frame track carries both honest reasons", () => {
+    const classified = classifyPolarEvidence([
+      {
+        ...ingestShapedUrans,
+        cl: -79.8,
+        cd: 12.4,
+        cm: 0.31,
+        frameTrack: { ...contractFrameTrack, stationary: false, drift_frac: 0.94 },
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toContain("non-physical-coefficients");
+    expect(classified.classifications[0].reasons).toContain("non-stationary");
+  });
+
+  it("MUST-CATCH: a diverged STEADY row (converged, positive drag) is equally non-physical", () => {
+    const classified = classifyPolarEvidence([
+      {
+        a: 8,
+        cl: 214.6, // blown-up pseudo-steady state that still reported converged
+        cd: 3.2,
+        cm: -41.9,
+        status: "done",
+        source: "solved",
+        regime: "rans" as const,
+        converged: true,
+        stalled: false,
+        unsteady: false,
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["non-physical-coefficients"]);
+  });
+
+  it("triggers on |cm| alone (moment blow-up with plausible lift)", () => {
+    const { frameTrack: _ft, ...legacyShape } = ingestShapedUrans;
+    const classified = classifyPolarEvidence([{ ...legacyShape, cl: 0.9, cd: 0.08, cm: -37.2 }]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(["non-physical-coefficients"]);
+  });
+
+  it("FALSE-POSITIVE GUARD: legitimate extreme aerodynamics stay accepted (post-stall cl 2.5, high-lift S1223-like cl 2.4)", () => {
+    // Highest physical section coefficients this database can produce — the
+    // bound (5) must clear them with margin.
+    const postStallFlatPlate = { ...ingestShapedUrans, a: 42, cl: 2.5, cd: 1.8, cm: -0.55 };
+    const s1223HighLift = {
+      a: 12,
+      cl: 2.4,
+      cd: 0.045,
+      cm: -0.28,
+      status: "done",
+      source: "solved",
+      regime: "rans" as const,
+      converged: true,
+      stalled: false,
+      unsteady: false,
+    };
+    const classified = classifyPolarEvidence([postStallFlatPlate, s1223HighLift]);
+    for (const c of classified.classifications) {
+      expect(c.state).toBe("accepted");
+      expect(c.reasons).toEqual([]);
+    }
+  });
+
+  it("FALSE-POSITIVE GUARD: the bound is strict (> limit) — |cl| exactly at the limit is not caught", () => {
+    const { frameTrack: _ft, ...legacyShape } = ingestShapedUrans;
+    const classified = classifyPolarEvidence([{ ...legacyShape, cl: -NON_PHYSICAL_COEFFICIENT_LIMIT, cd: 0.9, cm: 0.1 }]);
+    expect(classified.classifications[0].reasons).not.toContain("non-physical-coefficients");
   });
 });
 

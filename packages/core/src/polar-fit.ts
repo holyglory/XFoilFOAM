@@ -19,6 +19,13 @@ import type {
 // "insufficient-periods". frameTrack null/absent = legacy pre-contract
 // evidence (or steady point) → the v2 gate stands unchanged, so a deploy
 // never mass-rejects history.
+// frame-track-v3 addendum (2026-07-07): non-physical-coefficients magnitude
+// gate added for ALL rows (see NON_PHYSICAL_COEFFICIENT_LIMIT). The version
+// string is NOT bumped on purpose: it is a provenance stamp on
+// result_classifications rows (polar-cache upsert rewrites every verdict
+// column on each refresh) — no code path compares it to trigger
+// re-classification, so bumping would change nothing and only fragment the
+// stamp history.
 export const POLAR_CLASSIFIER_VERSION = "frame-track-v3";
 export const POLAR_FIT_VERSION = "evidence-lowess-v2";
 
@@ -28,6 +35,20 @@ export const POLAR_FIT_VERSION = "evidence-lowess-v2";
  *  value, or every early-stopped point would be rejected here by
  *  construction (adversarial review F1/F2, 2026-07-07). */
 export const FRAME_TRACK_MIN_PERIODS = 5;
+
+/** Non-physical coefficient magnitude bound (|cl| / |cm| beyond this =
+ *  numerically diverged evidence, never real aerodynamics).
+ *  Rationale for 5: the highest legitimate section coefficients this database
+ *  can produce stay far below it — post-stall flat-plate-like rows peak near
+ *  cl ~ 2.5, high-lift sections (e.g. S1223) near cl ~ 2.4, and |cm| for real
+ *  airfoils stays under ~1. A 2x+ margin over every physical case keeps false
+ *  rejections impossible while catching divergence, which lands orders of
+ *  magnitude beyond it (prod job b01a7d46: long-horizon URANS splitting-error
+ *  blow-up graded cl mean -79.8 with excursions ±945k). That case happened to
+ *  carry other reject reasons; a diverged row with POSITIVE drag and no
+ *  frame_track payload would have passed every prior numeric gate — this
+ *  bound closes that hole for steady and unsteady rows alike. */
+export const NON_PHYSICAL_COEFFICIENT_LIMIT = 5;
 
 /** Raw frame_track jsonb as persisted at ingest (snake_case engine contract
  *  shape). Typed loosely on purpose: the gate reads only the two verdict
@@ -126,6 +147,15 @@ function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   if (p.status !== "done" || p.source !== "solved") reasons.push("not-solved");
   if (!finite(p.cl) || !finite(p.cd) || !finite(p.cm)) reasons.push("missing-coefficients");
   if (finite(p.cd) && p.cd <= 0) reasons.push("non-positive-drag");
+  // Diverged-magnitude gate: catches numerically blown-up rows whose drag
+  // stayed positive (so non-positive-drag is silent) — steady and unsteady
+  // alike. See NON_PHYSICAL_COEFFICIENT_LIMIT for the bound rationale.
+  if (
+    (finite(p.cl) && Math.abs(p.cl) > NON_PHYSICAL_COEFFICIENT_LIMIT) ||
+    (finite(p.cm) && Math.abs(p.cm) > NON_PHYSICAL_COEFFICIENT_LIMIT)
+  ) {
+    reasons.push("non-physical-coefficients");
+  }
   if (p.error) reasons.push("solver-error");
   if (p.converged !== true) reasons.push("not-converged");
   // `stalled` is the AERODYNAMIC post-stall marker (ingest sets it true for

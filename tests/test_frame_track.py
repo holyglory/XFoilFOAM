@@ -222,6 +222,39 @@ def test_stationarity_flag_false_for_drifting_mean():
     assert stats.drift_frac > 0.05
 
 
+def test_alpha0_symmetric_near_zero_mean_is_judgeable_and_stationary():
+    """MUST-PASS (prod 2026-07-07 structural gap): a symmetric airfoil at
+    alpha=0 has mean cl ~ 0, so the old |mean(cl)| drift denominator made such
+    points fail stationarity FOREVER (femto-drift / ~0). With the denominator
+    floor max(|mean|, retained rms, 0.05) a clean periodic near-zero signal
+    passes."""
+    period = 0.5
+    t = np.linspace(0.0, 3.5, 3501)  # 7 whole periods
+    rng = np.random.default_rng(3)
+    # tiny symmetric shedding around zero + numerical noise (prod alpha=0 shape)
+    cl = 0.03 * np.sin(2 * np.pi * t / period) + 1e-5 * rng.standard_normal(t.size)
+    stats = period_window_stats(t, cl, np.full_like(t, 0.008), np.zeros_like(t), period)
+
+    assert stats is not None
+    assert abs(stats.cl.mean) < 5e-3  # genuinely near-zero mean
+    assert stats.stationary
+    assert stats.drift_frac < 0.05
+
+
+def test_drifting_near_zero_signal_still_fails_stationarity():
+    """The floor must not grant amnesty: a near-zero signal whose mean RAMPS
+    (unconverged transient) still fails via the rms/absolute-floor scale."""
+    period = 0.5
+    t = np.linspace(0.0, 3.5, 3501)
+    cl = 0.03 * np.sin(2 * np.pi * t / period) + 0.12 * (t / t[-1]) - 0.06
+    stats = period_window_stats(t, cl, np.full_like(t, 0.008), np.zeros_like(t), period)
+
+    assert stats is not None
+    assert abs(stats.cl.mean) < 0.05  # still a near-zero-mean case
+    assert not stats.stationary
+    assert stats.drift_frac > 0.05
+
+
 def test_period_window_stats_requires_one_whole_period():
     t = np.linspace(0.0, 0.4, 100)
     cl = 0.7 + 0.1 * np.sin(2 * np.pi * t / 0.5)

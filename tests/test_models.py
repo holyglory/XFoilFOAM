@@ -1,6 +1,6 @@
 import pytest
 
-from airfoilfoam.models import AoASpec, FluidProperties, PolarRequest
+from airfoilfoam.models import AoASpec, FluidProperties, PolarRequest, SolverParams
 
 
 def test_aoa_explicit_list():
@@ -42,6 +42,15 @@ def test_polar_request_cartesian_cases():
     assert len(cases) == 2 * 2 * 2
     slugs = {c.slug for c in cases}
     assert len(slugs) == 8  # all unique
+
+
+def test_transient_max_courant_default_pinned_at_practitioner_ceiling():
+    """PIN (prod 2026-07-07, job b01a7d46): relaxed-PIMPLE URANS at Co=15
+    accumulated splitting error over the multi-period horizon into a velocity
+    singularity (dt collapse, |Cl| excursions ±9.45e5). 4 is the
+    practitioner-standard ceiling; profiles may still override the field."""
+    assert SolverParams().transient_max_courant == pytest.approx(4.0)
+    assert SolverParams(transient_max_courant=15.0).transient_max_courant == pytest.approx(15.0)
 
 
 def test_case_slug_safe():
