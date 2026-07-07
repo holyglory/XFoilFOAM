@@ -1,11 +1,19 @@
 "use client";
 
-// Campaign coverage matrix (spec §11): virtualized airfoil rows over the
-// keyset /airfoils pages, sticky condition headers ≥940, stacked per-row
-// segment bars below 940 with tap-to-expand, search + failed-first filter,
-// "Show released (N)" toggle, derived-by-symmetry and sync-promise cell
-// states, legend only when non-active condition states exist. All counts are
-// real counters from sim_campaign_progress — nothing is invented.
+// Campaign coverage matrix (spec §11, approved mockup 1ed4374f): virtualized
+// airfoil rows over the keyset /airfoils pages with per-airfoil SEGMENTED
+// BARS — one flex segment per condition (2px gap), fill height = fraction of
+// that condition's angles terminal, amber fill = has rejected, solid red =
+// has failed, empty = panel background. The per-condition column headers are
+// gone: a slim AIRFOIL | DONE | CONDITIONS legend row sits above and the
+// hover tooltip + cell side panel carry the identification. Click on a
+// segment opens the existing cell side panel (same onCellClick contract).
+// Search, failed-first sort, "Show released (N)" and keyset paging/poll
+// refresh are unchanged. The bar flexes inside the row, so there is NO
+// horizontal overflow at any condition count or viewport; when segments
+// would drop under MIN_SEGMENT_PX the matrix groups conditions by chord
+// behind selector chips (see coverage-segments.ts). All counts are real
+// counters from sim_campaign_progress — nothing is invented.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -17,23 +25,25 @@ import {
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
 import { conditionDisplayState } from "./ConditionStrip";
-import { fCount, formatRe, ghostBtn, inputStyle } from "./ui";
+import {
+  SEGMENT_GAP_PX,
+  groupConditionsByChord,
+  needsChordGrouping,
+  rowDoneFraction,
+  segmentFillHeight,
+  segmentTitle,
+  segmentView,
+} from "./coverage-segments";
+import { fCount, ghostBtn, inputStyle } from "./ui";
 
 const PAGE_LIMIT = 50;
-const DESKTOP_ROW_H = 34;
-const NARROW_ROW_H = 46;
-const EXPANDED_LINE_H = 26;
+const ROW_H = 30; // 16px bar + 7px breathing top/bottom (mockup .cov)
+const BAR_H = 16;
 const VIEWPORT_H = 520;
 const OVERSCAN = 6;
-const NAME_COL = 220;
-const CELL_W = 92;
-
-/** Optional per-cell sync-promise flag: rendered ONLY when the row payload
- *  actually carries it (spec §11 "when the row payload flags it"). */
-function syncPromisedCount(cell: CampaignProgressTotals): number {
-  const v = (cell as CampaignProgressTotals & { syncPromised?: number }).syncPromised;
-  return typeof v === "number" && v > 0 ? v : 0;
-}
+const FRAC_COL = 64;
+const COL_GAP = 10;
+const ROW_PAD_X = 12;
 
 interface PageState {
   cursor: string | null; // cursor USED to fetch this page
@@ -42,6 +52,14 @@ interface PageState {
 
 function rowFailed(row: AdminCampaignAirfoilRow): number {
   return row.perCondition.reduce((s, c) => s + c.failed, 0);
+}
+
+interface HoverTip {
+  key: string; // `${slug}:${conditionId}`
+  label: string;
+  failed: boolean;
+  x: number;
+  y: number;
 }
 
 export function CoverageMatrix({
@@ -65,18 +83,29 @@ export function CoverageMatrix({
   const [search, setSearch] = useState("");
   const [failedFirst, setFailedFirst] = useState(true);
   const [showReleased, setShowReleased] = useState(false);
-  const [narrow, setNarrow] = useState(false);
-  const [expandedSlug, setExpandedSlug] = useState<string | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [rootWidth, setRootWidth] = useState(1024);
+  const [selectedChordKey, setSelectedChordKey] = useState<string | null>(null);
+  const [hover, setHover] = useState<HoverTip | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   const loadingRef = useRef(false);
 
+  // Measured root width drives the fixed name column (170–220px) and the
+  // chord-grouping threshold — no matchMedia, no horizontal overflow. The
+  // window-resize listener is a fallback for environments that throttle
+  // ResizeObserver delivery (e.g. hidden/background tabs).
   useEffect(() => {
-    const mq = window.matchMedia("(max-width: 940px)");
-    const apply = () => setNarrow(mq.matches);
-    apply();
-    mq.addEventListener("change", apply);
-    return () => mq.removeEventListener("change", apply);
+    const el = rootRef.current;
+    if (!el) return;
+    const measure = () => setRootWidth(el.clientWidth);
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener("resize", measure);
+    measure();
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
   }, []);
 
   const loadFirst = useCallback(async () => {
@@ -175,18 +204,24 @@ export function CoverageMatrix({
     return map;
   }, []);
 
-  // ---- windowing (single optionally-expanded row) ----
-  const rowH = narrow ? NARROW_ROW_H : DESKTOP_ROW_H;
-  const expandedIndex = narrow && expandedSlug ? rows.findIndex((r) => r.slug === expandedSlug) : -1;
-  const expandedExtra = expandedIndex >= 0 ? visibleConditions.length * EXPANDED_LINE_H + 10 : 0;
-  const totalHeight = rows.length * rowH + expandedExtra;
-  const rowTop = (i: number) => i * rowH + (expandedIndex >= 0 && i > expandedIndex ? expandedExtra : 0);
-  let start = Math.floor(scrollTop / rowH);
-  if (expandedIndex >= 0 && rowTop(start) > scrollTop) {
-    start = Math.max(0, Math.floor((scrollTop - expandedExtra) / rowH));
-  }
-  start = Math.max(0, start - OVERSCAN);
-  const visibleCount = Math.ceil(VIEWPORT_H / rowH) + OVERSCAN * 2;
+  // ---- segmented-bar geometry (mockup grid: name | done | flex bar) ----
+  const nameCol = rootWidth >= 720 ? 220 : 170;
+  const barWidth = Math.max(0, rootWidth - 2 * ROW_PAD_X - nameCol - FRAC_COL - 2 * COL_GAP);
+  const gridColumns = `${nameCol}px ${FRAC_COL}px minmax(0, 1fr)`;
+
+  // Chord grouping fallback: only when the measured bar cannot give every
+  // visible condition MIN_SEGMENT_PX (threshold documented in
+  // coverage-segments.ts) AND more than one chord exists to split by.
+  const chordGroups = useMemo(() => groupConditionsByChord(visibleConditions), [visibleConditions]);
+  const grouped = chordGroups.length > 1 && needsChordGrouping(visibleConditions.length, barWidth);
+  const activeGroup = grouped ? (chordGroups.find((g) => g.key === selectedChordKey) ?? chordGroups[0]) : null;
+  const renderedConditions = activeGroup ? activeGroup.conditions : visibleConditions;
+  const renderedConditionIds = useMemo(() => new Set(renderedConditions.map((c) => c.id)), [renderedConditions]);
+
+  // ---- windowing (constant-height rows) ----
+  const totalHeight = rows.length * ROW_H;
+  const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  const visibleCount = Math.ceil(VIEWPORT_H / ROW_H) + OVERSCAN * 2;
   const end = Math.min(rows.length, start + visibleCount);
 
   useEffect(() => {
@@ -204,94 +239,18 @@ export function CoverageMatrix({
     if (!exhausted && end >= loadedRows.length - OVERSCAN) void loadMore();
   }, [end, loadedRows.length, exhausted, loadMore]);
 
-  const anyDerived = useMemo(() => loadedRows.some((r) => r.perCondition.some((c) => c.derived > 0)), [loadedRows]);
-  const anySync = useMemo(() => loadedRows.some((r) => r.perCondition.some((c) => syncPromisedCount(c) > 0)), [loadedRows]);
-  const anyKept = conditions.some((c) => c.status === "kept");
-  const showLegend = anyKept || (showReleased && releasedConditions.length > 0) || anyDerived || anySync;
-
-  const minWidth = NAME_COL + visibleConditions.length * CELL_W;
-
-  const headerCell = (c: AdminCampaignConditionSummary) => {
-    const state = conditionDisplayState(c);
-    const released = state === "released";
-    return (
-      <div
-        key={c.id}
-        title={`Re ${formatRe(c.reynolds)} · condition #${c.ord}${released ? " · released" : state === "kept" || state === "blocked" || state === "retired" ? " · kept to finish" : ""}`}
-        style={{
-          width: CELL_W,
-          flex: "0 0 auto",
-          padding: "7px 6px",
-          fontFamily: MONO,
-          fontSize: 10,
-          color: released ? C.dimmest : state === "blocked" ? C.redText : C.muted,
-          borderLeft: `1px solid ${C.borderRow}`,
-          textAlign: "center",
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          opacity: released ? 0.6 : 1,
-        }}
-      >
-        {(state === "kept" || state === "blocked" || state === "retired") && <span style={{ color: C.amber }}>⚑ </span>}
-        Re {formatRe(c.reynolds)}
-        <span style={{ color: C.dimmest }}> · #{c.ord}</span>
-      </div>
-    );
-  };
-
-  const cellContent = (cell: (CampaignProgressTotals & { conditionId: string }) | undefined, released: boolean) => {
-    if (!cell || cell.requested === 0) {
-      return <span style={{ color: C.dimmest }}>·</span>;
-    }
-    const solvedish = cell.solved + cell.derived;
-    const complete = cell.remaining === 0 && cell.failed === 0 && cell.rejected === 0;
-    const sync = syncPromisedCount(cell);
-    const color = released ? C.dim : cell.failed > 0 || cell.rejected > 0 ? C.redText : complete ? C.teal : cell.running > 0 ? C.amber : C.muted;
-    return (
-      <span style={{ color, display: "inline-flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}>
-        {fCount(solvedish)}/{fCount(cell.requested)}
-        {cell.derived > 0 && (
-          <span title={`${cell.derived} derived by symmetry`} style={{ color: C.dim }}>◌</span>
-        )}
-        {cell.failed > 0 && <span title={`${cell.failed} failed`}>✕{cell.failed}</span>}
-        {cell.rejected > 0 && <span title={`${cell.rejected} rejected — solver finished but the evidence classified rejected`}>⊘{cell.rejected}</span>}
-        {cell.running > 0 && <span title={`${cell.running} running`} style={{ color: C.amber }}>●</span>}
-        {sync > 0 && <span title={`${sync} sync-promised to a remote solver`} style={{ color: C.dim }}>⇄</span>}
-      </span>
-    );
-  };
-
-  const narrowBar = (row: AdminCampaignAirfoilRow) => {
-    const agg = { solved: 0, derived: 0, running: 0, failed: 0, rejected: 0, remaining: 0, requested: 0 };
-    const byId = cellByCondition(row);
-    for (const c of visibleConditions) {
-      const cell = byId.get(c.id);
-      if (!cell) continue;
-      agg.solved += cell.solved;
-      agg.derived += cell.derived;
-      agg.running += cell.running;
-      agg.failed += cell.failed;
-      agg.rejected += cell.rejected;
-      agg.remaining += cell.remaining;
-      agg.requested += cell.requested;
-    }
-    const total = Math.max(1, agg.requested);
-    const seg = (n: number, color: string, key: string) =>
-      n > 0 ? <span key={key} style={{ width: `${(n / total) * 100}%`, background: color, display: "block" }} /> : null;
-    return (
-      <div style={{ height: 6, borderRadius: 3, overflow: "hidden", background: C.panel3, display: "flex" }}>
-        {seg(agg.solved, C.teal, "s")}
-        {seg(agg.derived, "rgba(45,212,191,0.45)", "d")}
-        {seg(agg.running, C.amber, "r")}
-        {seg(agg.failed, C.red, "f")}
-        {seg(agg.rejected, "rgba(248,113,113,0.55)", "j")}
-      </div>
-    );
-  };
+  const showTip = useCallback((el: HTMLElement, key: string, label: string, failed: boolean) => {
+    const r = el.getBoundingClientRect();
+    setHover({ key, label, failed, x: r.left + r.width / 2, y: r.top });
+  }, []);
+  const hideTip = useCallback(() => setHover(null), []);
 
   return (
-    <div data-testid="campaign-coverage-matrix" style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+    <div
+      ref={rootRef}
+      data-testid="campaign-coverage-matrix"
+      style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}
+    >
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "10px 12px", borderBottom: `1px solid ${C.borderSoft}` }}>
         <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.1em", color: C.dim }}>COVERAGE</span>
         <input
@@ -332,101 +291,113 @@ export function CoverageMatrix({
         </div>
       )}
 
-      {/* own overflow-x container: the page body never scrolls horizontally */}
-      <div style={{ overflowX: "auto" }}>
-        <div style={{ minWidth: narrow ? undefined : minWidth }}>
-          {!narrow && (
-            <div style={{ display: "flex", position: "sticky", top: 0, zIndex: 2, background: C.panel, borderBottom: `1px solid ${C.borderRow}` }}>
-              <div style={{ width: NAME_COL, flex: "0 0 auto", padding: "7px 12px", fontFamily: MONO, fontSize: 10, color: C.dim }}>
-                airfoil
-              </div>
-              {visibleConditions.map(headerCell)}
-            </div>
-          )}
-          <div
-            ref={scrollRef}
-            data-testid="matrix-scroll"
-            onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
-            style={{ height: Math.min(VIEWPORT_H, Math.max(rowH, totalHeight)), overflowY: "auto", position: "relative" }}
-          >
-            <div style={{ height: totalHeight, position: "relative" }}>
-              {rows.slice(start, end).map((row, sliceIdx) => {
-                const i = start + sliceIdx;
-                const byId = cellByCondition(row);
-                const expanded = narrow && expandedSlug === row.slug;
-                return (
-                  <div
-                    key={row.slug}
-                    data-testid={`matrix-row-${row.slug}`}
-                    style={{ position: "absolute", top: rowTop(i), left: 0, right: 0, borderBottom: `1px solid ${C.borderRow}` }}
-                  >
-                    {narrow ? (
-                      <div style={{ padding: "6px 12px", display: "grid", gap: 5 }}>
-                        <button
-                          type="button"
-                          onClick={() => setExpandedSlug(expanded ? null : row.slug)}
-                          aria-expanded={expanded}
-                          style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
-                        >
-                          <span style={{ fontFamily: MONO, fontSize: 11, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "55%" }}>
-                            {row.name}
-                          </span>
-                          {row.isSymmetric && <span title="symmetric airfoil — negative angles derived" style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>sym</span>}
-                          {rowFailed(row) > 0 && <span style={{ fontFamily: MONO, fontSize: 9, color: C.redText }}>✕{rowFailed(row)}</span>}
-                          <span style={{ marginLeft: "auto", fontFamily: MONO, fontSize: 9, color: C.dimmest }}>{expanded ? "▾" : "▸"}</span>
-                        </button>
-                        {narrowBar(row)}
-                        {expanded && (
-                          <div style={{ display: "grid", gap: 2, paddingBottom: 4 }}>
-                            {visibleConditions.map((c) => {
-                              const cell = byId.get(c.id);
-                              const released = c.status === "released";
-                              return (
-                                <button
-                                  key={c.id}
-                                  type="button"
-                                  data-testid={`matrix-cell-${row.slug}-${c.ord}`}
-                                  onClick={() => onCellClick(row, c, cell ?? null)}
-                                  style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", height: EXPANDED_LINE_H - 4, background: "transparent", border: `1px solid ${C.borderRow}`, borderRadius: 6, padding: "0 8px", cursor: "pointer", fontFamily: MONO, fontSize: 10, opacity: released ? 0.6 : 1 }}
-                                >
-                                  <span style={{ color: C.dim }}>Re {formatRe(c.reynolds)} · #{c.ord}</span>
-                                  {cellContent(cell, released)}
-                                </button>
-                              );
-                            })}
-                          </div>
+      {grouped && (
+        <div data-testid="matrix-chord-chips" style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", padding: "8px 12px", borderBottom: `1px solid ${C.borderSoft}` }}>
+          <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>
+            {fCount(visibleConditions.length)} conditions — grouped by chord, one chord per view
+          </span>
+          {chordGroups.map((g) => {
+            const active = g.key === (activeGroup?.key ?? "");
+            return (
+              <button
+                key={g.key}
+                type="button"
+                data-testid={`matrix-chord-${g.key}`}
+                onClick={() => setSelectedChordKey(g.key)}
+                style={{ ...ghostBtn, padding: "3px 9px", fontSize: 10, color: active ? C.teal : C.muted, borderColor: active ? C.tealBorder : C.stroke }}
+              >
+                {g.label} · {fCount(g.conditions.length)}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* slim legend row — replaces the per-condition column headers */}
+      <div
+        data-testid="matrix-legend"
+        style={{ display: "grid", gridTemplateColumns: gridColumns, gap: COL_GAP, alignItems: "center", padding: `6px ${ROW_PAD_X}px`, borderBottom: `1px solid ${C.borderRow}`, fontFamily: MONO, fontSize: 9.5, color: C.dimmest }}
+      >
+        <span style={{ letterSpacing: "0.1em" }}>AIRFOIL</span>
+        <span style={{ letterSpacing: "0.1em", textAlign: "right" }}>DONE</span>
+        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          CONDITIONS → fill = angles done · <span style={{ color: C.amber }}>amber</span> = rejected · <span style={{ color: C.redText }}>red</span> = failed · hover for detail · click opens the cell panel
+        </span>
+      </div>
+
+      <div
+        data-testid="matrix-scroll"
+        onScroll={(e) => {
+          setScrollTop(e.currentTarget.scrollTop);
+          setHover(null);
+        }}
+        style={{ height: Math.min(VIEWPORT_H, Math.max(ROW_H, totalHeight)), overflowY: "auto", position: "relative" }}
+      >
+        <div style={{ height: totalHeight, position: "relative" }}>
+          {rows.slice(start, end).map((row, sliceIdx) => {
+            const i = start + sliceIdx;
+            const byId = cellByCondition(row);
+            const frac = rowDoneFraction(row, renderedConditionIds);
+            return (
+              <div
+                key={row.slug}
+                data-testid={`matrix-row-${row.slug}`}
+                style={{ position: "absolute", top: i * ROW_H, left: 0, right: 0, height: ROW_H, boxSizing: "border-box", display: "grid", gridTemplateColumns: gridColumns, gap: COL_GAP, alignItems: "center", padding: `0 ${ROW_PAD_X}px`, borderBottom: `1px solid ${C.borderRow}` }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                  <span style={{ fontFamily: MONO, fontSize: 11, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {row.name}
+                  </span>
+                  {row.isSymmetric && <span title="symmetric airfoil — negative angles derived" style={{ fontFamily: MONO, fontSize: 9, color: C.dim, flex: "0 0 auto" }}>sym</span>}
+                </div>
+                <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+                  {fCount(frac.done)}/{fCount(frac.total)}
+                </span>
+                <div style={{ display: "flex", gap: SEGMENT_GAP_PX, height: BAR_H, minWidth: 0 }}>
+                  {renderedConditions.map((c) => {
+                    const cell = byId.get(c.id) ?? null;
+                    const view = segmentView(cell);
+                    const released = c.status === "released";
+                    const label = segmentTitle(c, cell, conditionDisplayState(c));
+                    const hoverKey = `${row.slug}:${c.id}`;
+                    const fillH = segmentFillHeight(view);
+                    const fillColor = view.state === "failed" ? C.red : view.state === "rejected" ? C.amber : C.teal;
+                    return (
+                      <button
+                        key={c.id}
+                        type="button"
+                        data-testid={`matrix-cell-${row.slug}-${c.ord}`}
+                        aria-label={label}
+                        onClick={() => onCellClick(row, c, cell)}
+                        onMouseEnter={(e) => showTip(e.currentTarget, hoverKey, label, view.state === "failed")}
+                        onMouseLeave={hideTip}
+                        onFocus={(e) => showTip(e.currentTarget, hoverKey, label, view.state === "failed")}
+                        onBlur={hideTip}
+                        style={{
+                          flex: "1 1 0",
+                          minWidth: 0,
+                          height: BAR_H,
+                          position: "relative",
+                          overflow: "hidden",
+                          borderRadius: 2,
+                          border: `1px solid ${C.borderRow}`,
+                          background: C.panel3,
+                          padding: 0,
+                          cursor: "pointer",
+                          opacity: released ? 0.55 : 1,
+                          outline: hover?.key === hoverKey ? `1px solid ${C.teal}` : undefined,
+                        }}
+                      >
+                        {view.state !== "empty" && fillH > 0 && (
+                          <span style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: `${fillH * 100}%`, background: fillColor, display: "block" }} />
                         )}
-                      </div>
-                    ) : (
-                      <div style={{ display: "flex", alignItems: "center", height: DESKTOP_ROW_H }}>
-                        <div style={{ width: NAME_COL, flex: "0 0 auto", padding: "0 12px", display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-                          <span style={{ fontFamily: MONO, fontSize: 11, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                            {row.name}
-                          </span>
-                          {row.isSymmetric && <span title="symmetric airfoil — negative angles derived" style={{ fontFamily: MONO, fontSize: 9, color: C.dim, flex: "0 0 auto" }}>sym</span>}
-                        </div>
-                        {visibleConditions.map((c) => {
-                          const cell = byId.get(c.id);
-                          const released = c.status === "released";
-                          return (
-                            <button
-                              key={c.id}
-                              type="button"
-                              data-testid={`matrix-cell-${row.slug}-${c.ord}`}
-                              onClick={() => onCellClick(row, c, cell ?? null)}
-                              style={{ width: CELL_W, flex: "0 0 auto", height: "100%", background: "transparent", border: "none", borderLeft: `1px solid ${C.borderRow}`, cursor: "pointer", fontFamily: MONO, fontSize: 10.5, opacity: released ? 0.55 : 1 }}
-                            >
-                              {cellContent(cell, released)}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -437,15 +408,35 @@ export function CoverageMatrix({
             {loadedRows.length === 0 ? "no airfoils in this campaign" : "no loaded airfoil matches the search"}
           </span>
         )}
-        {showLegend && (
-          <span data-testid="matrix-legend" style={{ marginLeft: "auto", fontFamily: MONO, fontSize: 9.5, color: C.dim, display: "flex", gap: 12, flexWrap: "wrap" }}>
-            {anyKept && <span><span style={{ color: C.amber }}>⚑</span> kept — finishing solved angles</span>}
-            {showReleased && releasedConditions.length > 0 && <span>dimmed — released (solved cells kept)</span>}
-            {anyDerived && <span>◌ derived by symmetry</span>}
-            {anySync && <span>⇄ sync-promised</span>}
-          </span>
+        {showReleased && releasedConditions.length > 0 && (
+          <span style={{ marginLeft: "auto", fontFamily: MONO, fontSize: 9.5, color: C.dim }}>dimmed — released (solved cells kept)</span>
         )}
       </div>
+
+      {hover && (
+        <div
+          role="tooltip"
+          data-testid="matrix-tooltip"
+          style={{
+            position: "fixed",
+            left: hover.x,
+            top: hover.y - 6,
+            transform: "translate(-50%, -100%)",
+            background: C.popover,
+            border: `1px solid ${hover.failed ? C.red : C.tealBorder}`,
+            borderRadius: 6,
+            padding: "5px 8px",
+            fontFamily: MONO,
+            fontSize: 9.5,
+            color: C.text,
+            whiteSpace: "nowrap",
+            zIndex: 40,
+            pointerEvents: "none",
+          }}
+        >
+          {hover.label}
+        </div>
+      )}
     </div>
   );
 }
