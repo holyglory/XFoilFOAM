@@ -1909,3 +1909,102 @@ defects; fixes, in decision form:
   deterministic must-catch test (campaign-fixture-cleanup.test.ts) pins the
   incident interleaving: unguarded delete raises 23503, helper cleanup of
   suite A skips the shared row, helper cleanup of suite B removes it.
+
+## 2026-07-07 — Ladder gate stage-1 FAIL: engine ships honest non-converged steady points; primary RANS honors the profile budget
+
+Prod evidence (campaign a1802299 ladder-gate-20260707, engine job a2379532,
+naca-0012 alpha=15 / 25 m/s / 0.1 m): the single steady point ran 600
+iterations, produced real force data (cl=0.5174, cd=0.1032, steady_history
+with an honest "Cl half-window means differ by 29.8%" rejection, 34 evidence
+artifacts) — yet result.json shipped `points: []` and the job FAILED in 73 s
+with "All cases failed", so the node ladder could never escalate.
+
+Regression mechanism (traced, engine side): NOT a raise in
+`_finalize_outcome` — the RANS-tier non-converged path completes fine. The
+drop lived in the warm-start marched path: `rans_outcome_rejected_for_polar`
+(`not converged` ⇒ rejected, unchanged since 5118ca45b) fed
+`solve_polar_marched`'s rejected-`continue`, which excluded the outcome from
+`final_points`; with every point non-converged, jobs.py's
+`any_ok = any(p.error is None ...)` saw zero points ⇒ JobState.failed /
+"All cases failed". Pre-ladder this was masked because non-converged steadies
+either escalated in-engine (`transient_fallback=true` requests) or flowed the
+case-parallel `run_case` path, which ships every outcome. The ladder's
+RANS-first tier (transient_fallback=false + marched scheduling) made the
+silent drop the terminal behavior, and the new oscillating-averaging gate
+(mean_stable=false keeps converged=false) put every honest post-stall steady
+into that hole.
+
+DECISIONS (engine):
+1. A steady case with real force data NEVER fails or vanishes for
+   non-convergence. `steady_outcome_shippable` (pipeline.py): a rejected
+   steady outcome with finite cl/cd and no error ships as an honest point
+   (converged=false, final-window coefficients per the pre-ladder
+   `parse_force_coefficients` tail-average convention, steady_history
+   attached) from `solve_polar_marched`; it still never publishes a
+   warm-start seed. `_finalize_outcome` adds a loud quality note
+   ("steady RANS did not converge; coefficients are the final-window …" plus
+   the detector's rejection note) whenever the RANS tier terminates
+   non-converged with no in-engine escalation configured. Case failure stays
+   reserved for true crashes (error / no coefficient data ⇒ evidence-only
+   attempt, honestly absent from the polar).
+2. `settings.rans_max_iterations` (default 600, config.py) is scoped to the
+   URANS-INIT steady stage only. Pre-fix source of the 600: jobs.py passes
+   the setting into every job; `_steady_rans_params` capped
+   `n_iterations` unconditionally; CaseBuilder writes
+   `endTime = solver.n_iterations` (case/builder.py:146) ⇒ controlDict
+   endTime 600 while the profile shipped 3000, starving moderate-AoA
+   convergence (the R1 goal). Now: `_steady_rans_params` caps only
+   `force_transient` params; a PRIMARY steady RANS solve runs the profile's
+   full n_iterations (wall clock still guarded by rans_solver_timeout).
+
+Guardrails: tests/test_ladder_gate_regression.py (fixtures shaped like the
+gate failure: 600-iteration drifting post-stall history, real
+`_finalize_outcome`, single-point marched polar) + updated marched-path pins
+in tests/test_unsteady.py. Recall proven: all 6 must-catch tests fail on the
+pre-fix pipeline; the false-positive guards (oscillating-accepted, true
+crash, URANS-init cap) pass on both. Suite: 244 → 253 green
+(`pytest -m "not integration"`). Node-side ingest gaps (zero result_attempts
+ingested, generic "engine job failed" message, silent sweeper claim→failure)
+are tracked separately on the Node runtime.
+
+## 2026-07-07 — Ladder gate stage-1 FAIL, Node half: failed-job evidence ingest, real engine message, reachable gated retry, loud sweeper events
+
+Context: campaign a1802299 (ladder-gate-20260707), engine job a2379532 FAILED
+"All cases failed" with points: [] but a real shipped attempt (cl=0.5174,
+cd=0.1032, converged=false, 600-sample steady_history, 34 evidence
+artifacts). Node symptoms: zero result_attempts ingested, results.error
+stamped with the generic "engine job failed", submitUransRetryForJob
+unreachable (points===0 → failJob + return), and no sweeper log line between
+claim and terminal failure.
+
+Decisions (apps/sweeper):
+1. `ingestResult` now reports `attempts` (rows ingested from
+   polars[].attempts) so the failed-job path can tell "evidence shipped" from
+   a true crash (ingest.ts).
+2. `ingestFailedEngineJob` (reconcile.ts): points===0 && attempts>0 ⇒ fail
+   the rows with the ENGINE's real message, stamp the sim_job
+   engineState='failed' + ingestedAt (the gated-ladder rescan requires
+   status='failed' AND ingested_at), refresh polar caches (classifies the
+   fresh attempt evidence), then run submitUransRetryForJob — the wave≤2
+   bound and the campaignHasOpenRansGaps gate are unchanged. points===0 &&
+   attempts===0 keeps the original terminal behavior (pinned false-positive
+   guard). Message preference: result.message → caller msg → pinned
+   non-empty fallback; the two runtime-probe dispatch sites now fall through
+   result_message → status_message → generic (the engine writes "All cases
+   failed" on the STATUS, not the result payload).
+3. Loud events: one `engine job FAILED (…campaign, airfoil, angles…): <msg> —
+   N point(s), M attempt(s) ingested; <verdict>` line per terminal failed
+   ingest (incl. the previously silent catch), one `job submitted → engine …`
+   line per wave-1 submit outcome (loop.ts submitComposedJob), one
+   `URANS retry submitted → engine …` line per wave-2 retry submit.
+4. Test-harness cross-file races fixed while proving the above: sweeper.test
+   bound its whole world to an unordered `airfoils LIMIT 1` pick that could
+   select another suite's `sw-*` fixture airfoil (deleted mid-run → 19
+   cascade failures); now non-fixture + ordered. The machine-wide verify-gate
+   test (urans-ladder.test) waits bounded for hasOpenCampaignLadderWork quiet
+   before ticking — a permanently open gate still fails.
+
+Recall proven: the new must-catch test (failed job, zero points, shipped
+attempts → attempts+evidence ingested, "All cases failed" stamped, precalc
+retry child enqueued, loud lines) fails on the pre-fix sources exactly on the
+prod defect. Suites: sweeper 114/114, api 82/82, pnpm typecheck clean.

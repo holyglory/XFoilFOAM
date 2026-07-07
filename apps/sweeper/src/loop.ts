@@ -88,7 +88,12 @@ async function submitComposedJob(
   engine: EngineClient,
   jobId: string,
   request: Parameters<EngineClient["submitPolar"]>[0],
+  /** Loud claim→submit addressing (campaign, airfoil, angles): the 2026-07-07
+   *  gate run's only campaign job went claim → submit → terminal failure with
+   *  ZERO sweeper log lines — every submit outcome logs exactly one line. */
+  context = "",
 ): Promise<boolean> {
+  const suffix = context ? `, ${context}` : "";
   try {
     const status = await engine.submitPolar(request);
     await db
@@ -102,15 +107,18 @@ async function submitComposedJob(
       })
       .where(eq(simJobs.id, jobId));
     await clearEngineUnreachable(db);
+    console.log(`[sweeper] job submitted → engine ${status.job_id} (sim_job ${jobId}${suffix})`);
     return true;
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     if (isEngineConnectionFailure(e)) {
       // Engine-down backoff (spec §7): do NOT mark the job failed.
+      console.error(`[sweeper] job submit RELEASED — engine unreachable (sim_job ${jobId}${suffix}): ${message}`);
       await releaseUnsubmittedJob(db, jobId, "engine unreachable at submit: " + message);
       await recordEngineUnreachable(db);
       return false;
     }
+    console.error(`[sweeper] job submit FAILED (sim_job ${jobId}${suffix}): ${message}`);
     await db.update(results).set({ status: "pending", simJobId: null }).where(eq(results.simJobId, jobId));
     await db.update(simJobs).set({ status: "failed", error: "submit failed: " + message }).where(eq(simJobs.id, jobId));
     return false;
@@ -156,7 +164,7 @@ async function submitContinuousBatch(
     return false;
   }
   request.aoa = { angles: claimed };
-  return submitComposedJob(db, engine, job.id, request);
+  return submitComposedJob(db, engine, job.id, request, `continuous, airfoil ${a.id}, angles [${claimed.join(", ")}]`);
 }
 
 interface ResolvedCampaignEntry {
@@ -328,7 +336,13 @@ export async function submitCampaignBatch(
   }
   request.speeds = activeEntries.map((e) => e.speed);
   request.aoa = { angles: claimedAoas };
-  return submitComposedJob(db, engine, job.id, request);
+  return submitComposedJob(
+    db,
+    engine,
+    job.id,
+    request,
+    `campaign ${batch.campaignId}, airfoil ${a.id}, ${activeEntries.length} condition(s), angles [${claimedAoas.join(", ")}]`,
+  );
 }
 
 /** ONE winner per tick across the continuous + campaign branches under the one

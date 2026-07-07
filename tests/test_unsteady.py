@@ -665,7 +665,12 @@ def test_marched_core_rans_failure_stops_rans_and_promotes_full_urans(tmp_path, 
     assert all(p.outcome.unsteady for p in result.points)
 
 
-def test_marched_rans_uses_short_timeout_but_urans_keeps_guard_timeout(tmp_path, monkeypatch):
+def test_marched_primary_rans_honors_profile_iterations_and_short_timeout(tmp_path, monkeypatch):
+    """The PRIMARY steady RANS stage runs the profile's full n_iterations
+    budget (the worker-side rans_max_iterations cap is scoped to URANS-init
+    steady stages; 2026-07-07 gate incident: profile n_iterations=3000 ran
+    with controlDict endTime 600) while still using the short RANS wall-clock
+    timeout; the promoted URANS replacement keeps the guard timeout."""
     from airfoilfoam import pipeline
     from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
 
@@ -721,7 +726,7 @@ def test_marched_rans_uses_short_timeout_but_urans_keeps_guard_timeout(tmp_path,
         fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
         roughness=RoughnessParams(),
         resolved=MeshParams(),
-        solver_params=SolverParams(),
+        solver_params=SolverParams(n_iterations=3000),
         mesher=FakeMesher(),
         runner=None,
         aoas=[0.0, 1.0],
@@ -733,11 +738,18 @@ def test_marched_rans_uses_short_timeout_but_urans_keeps_guard_timeout(tmp_path,
 
     assert result.promoted_to_urans
     assert rans_timeouts == [123, 123]
-    assert rans_iterations == [456, 456]
+    # MUST-CATCH (gate incident): the worker cap (456 here, 600 in prod) must
+    # NOT shrink the primary steady budget below the profile's n_iterations.
+    assert rans_iterations == [3000, 3000]
     assert urans_timeout == 7200
 
 
-def test_rejected_non_core_rans_is_evidence_not_valid_polar_point(tmp_path, monkeypatch):
+def test_rejected_non_core_rans_with_force_data_ships_honest_points(tmp_path, monkeypatch):
+    """MUST-CATCH (2026-07-07 ladder-gate incident, job a2379532): a
+    non-converged steady RANS point that produced REAL force data ships as an
+    honest point (converged=false) instead of silently vanishing into the
+    attempts bucket — a fully-non-converged (e.g. single-point) job must never
+    ship points=[] / "All cases failed" when force data exists."""
     from airfoilfoam import pipeline
     from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
 
@@ -768,6 +780,11 @@ def test_rejected_non_core_rans_is_evidence_not_valid_polar_point(tmp_path, monk
     monkeypatch.setattr(pipeline, "_solve_cold_marched", fake_cold)
     monkeypatch.setattr(pipeline, "_solve_warm", fake_warm)
     monkeypatch.setattr(pipeline, "_finalize_outcome", fake_finalize)
+    monkeypatch.setattr(pipeline, "_publish_steady_seed", lambda *a, **k: pytest.fail(
+        "a rejected (non-converged) steady point must never publish a warm-start seed"
+    ))
+
+    accepted_flags = []
 
     result = solve_polar_marched(
         tmp_path / "polar",
@@ -783,8 +800,62 @@ def test_rejected_non_core_rans_is_evidence_not_valid_polar_point(tmp_path, monk
         runner=None,
         aoas=[-1.0, 6.0],
         render_images=False,
+        outcome_progress=lambda _stored, accepted: accepted_flags.append(accepted),
     )
 
     assert not result.promoted_to_urans
-    assert result.points == []
+    # Honest points ship (converged=false) AND stay in attempts as evidence.
+    assert [p.outcome.spec.aoa_deg for p in result.points] == [-1.0, 6.0]
+    assert all(not p.outcome.converged for p in result.points)
+    assert all(p.outcome.error is None for p in result.points)
     assert [p.outcome.spec.aoa_deg for p in result.attempts] == [-1.0, 6.0]
+    # Each outcome is recorded first as an attempt, then as an accepted point.
+    assert accepted_flags == [False, True, False, True]
+
+
+def test_true_crash_rans_stays_evidence_only_attempt(tmp_path, monkeypatch):
+    """MUST-CATCH: a true crash (no coefficient data at all — _finalize_outcome
+    raises) keeps the pre-existing behavior: evidence-only attempt with a
+    truthful error, honestly ABSENT from the polar points."""
+    from airfoilfoam import pipeline
+    from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
+    from airfoilfoam.openfoam.runner import OpenFOAMError
+
+    class FakeMesher:
+        def patches(self, resolved):
+            return {}
+
+    class FakeRunResult:
+        ok = True
+        stdout = "Time = 1\n"
+
+        def check(self):
+            return self
+
+    monkeypatch.setattr(pipeline, "_solve_cold_marched", lambda *a, **k: FakeRunResult())
+    monkeypatch.setattr(pipeline, "_solve_warm", lambda *a, **k: FakeRunResult())
+
+    def fake_finalize(_case_dir, _outcome, *_args, **_kwargs):
+        raise OpenFOAMError("forceCoeffs produced no coefficient.dat")
+
+    monkeypatch.setattr(pipeline, "_finalize_outcome", fake_finalize)
+
+    result = solve_polar_marched(
+        tmp_path / "polar",
+        tmp_path / "mesh",
+        airfoil=None,
+        chord=1.0,
+        speed=10.0,
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        resolved=MeshParams(),
+        solver_params=SolverParams(),
+        mesher=FakeMesher(),
+        runner=None,
+        aoas=[6.0],
+        render_images=False,
+    )
+
+    assert result.points == []
+    assert len(result.attempts) == 1
+    assert "no coefficient.dat" in result.attempts[0].outcome.error

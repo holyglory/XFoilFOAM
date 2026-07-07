@@ -1093,11 +1093,17 @@ export async function ingestResult(opts: {
    *  flight read as PROCESS NOT RUNNING on a healthy process). Defaults to
    *  the real touchHeartbeat; tests inject a spy to count touches. */
   heartbeat?: () => Promise<void>;
-}): Promise<{ points: number; media: number; dirtyLanes: CampaignLaneKey[] }> {
+}): Promise<{ points: number; media: number; attempts: number; dirtyLanes: CampaignLaneKey[] }> {
   const { db, engine, engineJobId, simJobId, airfoilId, speedMap, conditionMap, result } = opts;
   const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(db));
   let points = 0;
   let media = 0;
+  // Attempt-evidence rows ingested from polars[].attempts. Reported separately
+  // from `points` because an all-rejected job ships points: [] with the real
+  // solver evidence ONLY in attempts (gate incident 2026-07-07, job a2379532):
+  // the failed-job ingest path must be able to tell "evidence shipped" from a
+  // true crash with an empty payload.
+  let attempts = 0;
   const airfoilPoints = await airfoilContourPoints(db, airfoilId);
   const scaleGroups = new Map<ScaleGroupKey, ScaleGroup>();
   const dirtyLanes = new Map<string, CampaignLaneKey>();
@@ -1272,6 +1278,7 @@ export async function ingestResult(opts: {
       // Invariant: no ingest code path may run >30 s without a heartbeat
       // touch — attempt rows carry evidence-artifact registration too.
       await heartbeat();
+      attempts++;
       const attemptId = await insertResultAttempt({
         db,
         resultId: resultIdsByAoa.get(p.aoa_deg) ?? null,
@@ -1300,5 +1307,5 @@ export async function ingestResult(opts: {
   if (airfoilPoints && scaleGroups.size) {
     media += await rebalanceFieldScales({ db, engine, groups: scaleGroups, airfoilPoints, heartbeat });
   }
-  return { points, media, dirtyLanes: [...dirtyLanes.values()] };
+  return { points, media, attempts, dirtyLanes: [...dirtyLanes.values()] };
 }

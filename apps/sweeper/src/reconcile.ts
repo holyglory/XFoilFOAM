@@ -630,6 +630,9 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
         totalCases: status.total_cases,
       })
       .where(submittableJobWhere(job.id));
+    console.log(
+      `[sweeper] URANS retry submitted → engine ${status.job_id} (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, airfoil ${parent.airfoilId}, precalc, angles [${aoas.join(", ")}])`,
+    );
   } catch (e) {
     if (retry.queueCanonicalAoas.length) {
       await db
@@ -787,6 +790,9 @@ async function submitCampaignUransRetries(
           totalCases: status.total_cases,
         })
         .where(submittableJobWhere(job.id));
+      console.log(
+        `[sweeper] URANS retry submitted → engine ${status.job_id} (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, airfoil ${parent.airfoilId}, condition ${entry.conditionId}, precalc, angles [${retry.aoas.join(", ")}])`,
+      );
     } catch (e) {
       if (retry.queueCanonicalAoas.length) {
         await db
@@ -976,20 +982,53 @@ async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: Sim
   }
 }
 
+/** Angle list a job was composed for (requestPayload.aoas) — loud-event
+ *  addressing only; absent/odd payloads render as an empty list. */
+function anglesForJob(job: SimJobRow): number[] {
+  const raw = (requestPayload(job) as { aoas?: unknown }).aoas;
+  return Array.isArray(raw) ? raw.filter((a): a is number => typeof a === "number" && Number.isFinite(a)) : [];
+}
+
+/** One-line job-failed event (gate incident 2026-07-07: campaign a1802299's
+ *  only job failed and the sweeper logged NOTHING between claim and terminal
+ *  failure). Every terminal failed-ingest outcome emits exactly one of these
+ *  with full addressing + an explicit verdict. */
+function logEngineJobFailed(job: SimJobRow, failure: string, counts: { points: number; attempts: number }, verdict: string): void {
+  console.error(
+    `[sweeper] engine job FAILED (engine ${job.engineJobId ?? "-"}, sim_job ${job.id}, campaign ${job.campaignId ?? "-"}, airfoil ${job.airfoilId}, angles [${anglesForJob(job).join(", ")}]): ${failure} — ${counts.points} point(s), ${counts.attempts} attempt(s) ingested; ${verdict}`,
+  );
+}
+
 async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRow, msg: string): Promise<void> {
   if (msg === WORKER_RESTART_ORPHAN_MESSAGE) {
     // Infrastructure interruption, not solver failure — release, never fail.
     await releaseWorkerRestartOrphan(db, engine, job);
     return;
   }
-  const failure = nonEmptyFailureMessage(job, msg);
   if (!job.engineJobId) {
+    const failure = nonEmptyFailureMessage(job, msg);
+    logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, "never submitted to the engine; rows failed");
     await failJob(db, job.id, failure);
     await settleUransLadderForJob(db, job);
     return;
   }
+  let result: JobResult;
   try {
-    const result = await engine.getResult(job.engineJobId);
+    result = await engine.getResult(job.engineJobId);
+  } catch (e) {
+    const failure = nonEmptyFailureMessage(job, msg);
+    logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, `result payload unreadable (${errorMessage(e)}); rows failed with the status message`);
+    await failJob(db, job.id, failure);
+    await settleUransLadderForJob(db, job);
+    return;
+  }
+  // The ENGINE's own failure message wins (gate incident 2026-07-07: the
+  // runtime-probe dispatch passed the generic "engine job failed" fallback and
+  // the real "All cases failed" never reached the evidence rows): prefer the
+  // result payload's message, then the caller's status-derived msg, then the
+  // pinned non-empty fallback.
+  const failure = nonEmptyFailureMessage(job, typeof result.message === "string" && result.message.trim() ? result.message : msg);
+  try {
     const ingested = await ingestResult({
       db,
       engine,
@@ -1005,7 +1044,30 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
     collectDirtyLanes(ingested.dirtyLanes);
     if (ingested.points === 0) {
       await failJob(db, job.id, failure);
+      if (ingested.attempts === 0) {
+        // True crash: the payload shipped no evidence at all — current
+        // terminal-fail behavior, now loud.
+        await settleUransLadderForJob(db, job);
+        logEngineJobFailed(job, failure, ingested, "no shipped evidence; rows failed");
+        return;
+      }
+      // All-rejected job (gate incident 2026-07-07, job a2379532): points: []
+      // but polars[].attempts carried the real solver evidence (forces,
+      // steady_history, evidence artifacts) — already ingested above. Stamp
+      // the job as evidence-ingested (the gated-ladder rescan requires
+      // status='failed' AND ingested_at), classify the fresh attempt rows,
+      // and keep the wave-2 gated retry reachable: before this branch existed
+      // points===0 returned ABOVE submitUransRetryForJob, so a fully-rejected
+      // (e.g. single-point) campaign job could never escalate to URANS.
+      await db
+        .update(simJobs)
+        .set({ engineState: "failed", ingestedAt: new Date(), finishedAt: new Date() })
+        .where(eq(simJobs.id, job.id));
+      await refreshPolarCachesForJob(db, job);
       await settleUransLadderForJob(db, job);
+      logEngineJobFailed(job, failure, ingested, "attempt evidence kept on the failed rows; gated URANS retry evaluated");
+      await submitUransRetryForJob(db, engine, job);
+      await settleCampaignAfterRefresh(db, job);
       return;
     }
     await refreshPolarCachesForJob(db, job);
@@ -1015,9 +1077,13 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       .update(simJobs)
       .set({ status: "failed", engineState: "failed", error: failure, ingestedAt: new Date(), finishedAt: new Date() })
       .where(reconcilableJobWhere(job.id));
+    logEngineJobFailed(job, failure, ingested, "partial evidence ingested; failed rows carry the engine message");
     await submitUransRetryForJob(db, engine, job);
     await settleCampaignAfterRefresh(db, job);
-  } catch {
+  } catch (e) {
+    // Loud, never silent (the old bare catch was exactly how a mid-ingest
+    // hiccup erased all trace of the shipped evidence).
+    logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, `failed-result ingest errored (${errorMessage(e)}); rows failed`);
     await failJob(db, job.id, failure);
     await settleUransLadderForJob(db, job);
   }
@@ -1145,7 +1211,10 @@ async function handlePollMiss(db: DB, engine: EngineClient, job: SimJobRow, e: u
         await markIngestRetry(db, job.id, ingestError);
       }
     } else if (runtime.result_state === "failed") {
-      await ingestFailedEngineJob(db, engine, job, runtime.result_message ?? "engine job failed");
+      // The engine's REAL failure message lives on the status ("All cases
+      // failed" — set_status), not necessarily on the result payload: fall
+      // through result → status → generic (gate incident 2026-07-07).
+      await ingestFailedEngineJob(db, engine, job, runtime.result_message ?? runtime.status_message ?? "engine job failed");
     } else if (
       runtime.result_state === "running" &&
       runtime.status_completed_cases !== null &&
@@ -1239,7 +1308,10 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
         }
         continue;
       } else if (runtime.result_state === "failed") {
-        await ingestFailedEngineJob(db, engine, job, runtime.result_message ?? "engine job failed");
+        // Same result → status → generic message fallthrough as handlePollMiss
+        // (the runtime dispatch is where "All cases failed" got lost to the
+        // generic fallback on the 2026-07-07 gate run).
+        await ingestFailedEngineJob(db, engine, job, runtime.result_message ?? runtime.status_message ?? "engine job failed");
         continue;
       } else if (
         runtime.result_state === "running" &&

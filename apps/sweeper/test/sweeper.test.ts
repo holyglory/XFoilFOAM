@@ -30,8 +30,8 @@ import {
 } from "@aerodb/db";
 import { EngineClient, EngineError, type EngineQueueState, type JobResult, type JobStatus } from "@aerodb/engine-client";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { and, asc, eq, inArray, isNotNull, notIlike } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { buildPolarRequest } from "../src/build-request";
 import { claimAoas } from "../src/claim";
@@ -102,7 +102,17 @@ async function testBatch(limit = 500) {
 async function ensureTestSetup() {
   const [medium] = await db.select().from(mediums).where(eq(mediums.slug, "air")).limit(1);
   if (!medium) throw new Error("seeded air medium required");
-  const [targetAirfoil] = await db.select({ id: airfoils.id }).from(airfoils).limit(1);
+  // STABLE seeded-airfoil pick (cross-file race, 2026-07-07): an unordered
+  // `limit(1)` can bind this whole file to ANOTHER suite's `sw-*` fixture
+  // airfoil, whose afterAll then cascades away every row mid-run (19 tests
+  // failed on "seeded airfoil ... required" / results FK). Pick only durable
+  // catalog airfoils, deterministically.
+  const [targetAirfoil] = await db
+    .select({ id: airfoils.id })
+    .from(airfoils)
+    .where(notIlike(airfoils.slug, "sw-%"))
+    .orderBy(asc(airfoils.slug))
+    .limit(1);
   if (!targetAirfoil) throw new Error("seeded airfoil required");
   airfoilId = targetAirfoil.id;
   const reynolds = 500_000;
@@ -248,7 +258,13 @@ describe("sweeper: gap → claim → ingest", () => {
   }, 60000);
 
   it("scopes preset gaps to selected airfoils", async () => {
-    const [target, excluded] = await db.select({ id: airfoils.id }).from(airfoils).limit(2);
+    // Same stable non-fixture pick as ensureTestSetup (cross-file race guard).
+    const [target, excluded] = await db
+      .select({ id: airfoils.id })
+      .from(airfoils)
+      .where(notIlike(airfoils.slug, "sw-%"))
+      .orderBy(asc(airfoils.slug))
+      .limit(2);
     expect(target?.id).toBeTruthy();
     expect(excluded?.id).toBeTruthy();
     await db.delete(results).where(and(eq(results.airfoilId, target.id), eq(results.simulationPresetRevisionId, testPresetRevisionId)));
@@ -2434,6 +2450,17 @@ describe("sweeper: gap → claim → ingest", () => {
     const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
     expect(gotJob.status).toBe("failed");
     expect(gotJob.error).toBe(MSG);
+    // FALSE-POSITIVE GUARD for the all-rejected escalation path (gate incident
+    // 2026-07-07): a TRUE crash — empty payload, zero points AND zero shipped
+    // attempts — must keep the original terminal behavior: no attempt-evidence
+    // rows and no wave-2 URANS retry child materialize out of nothing.
+    const crashAttempts = await db.select({ id: resultAttempts.id }).from(resultAttempts).where(eq(resultAttempts.simJobId, job.id));
+    expect(crashAttempts.length).toBe(0);
+    const crashChildren = await db
+      .select({ id: simJobs.id })
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, job.id), eq(simJobs.wave, 2)));
+    expect(crashChildren.length).toBe(0);
     await db.delete(results).where(inArray(results.id, rowIds));
   }, 60000);
 
@@ -2520,4 +2547,202 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(gotJob.error).toBe(MSG);
     await db.delete(results).where(inArray(results.id, rowIds));
   }, 60000);
+
+  // MUST-CATCH (gate incident 2026-07-07, prod job a2379532 / campaign
+  // a1802299): the ladder engine fails a job whose ONLY steady rejected
+  // (state=failed, "All cases failed" on the STATUS, result.message null,
+  // points: []) while polars[].attempts ships the REAL solver evidence
+  // (forces, iterations, steady_history, evidence manifest). Before the fix:
+  // zero result_attempts ingested, results.error stamped with the generic
+  // "engine job failed" (the runtime-probe dispatch's fallback), and
+  // ingestFailedEngineJob returned BEFORE submitUransRetryForJob — a
+  // fully-rejected campaign job could never escalate to URANS. Pinned here:
+  // attempts + evidence + steady_history ingested, the engine's real message
+  // stamped, the wave-2 precalc retry enqueued, and both transitions loud.
+  it("ingests shipped attempt evidence and enqueues the URANS retry when a failed job ships zero points", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const REAL_MSG = "All cases failed";
+    const aoa = 150.201;
+    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    const [parent] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId: "all-rejected-failfast",
+        submittedAt: new Date(Date.now() - 5 * 60 * 1000),
+        totalCases: 1,
+        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }], aoas: [aoa] },
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(parent.id);
+    const [row] = await db
+      .insert(results)
+      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: parent.id })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+
+    // The honest rejection evidence the engine recorded (600 steady samples in
+    // prod; 6 here — same pinned steady_history shape).
+    const steadyHistory = {
+      iterations: [100, 200, 300, 400, 500, 600],
+      cl: [0.31, 0.62, 0.44, 0.71, 0.39, 0.66],
+      cd: [0.09, 0.12, 0.1, 0.11, 0.1, 0.1],
+      cm: [-0.03, -0.05, -0.04, -0.04, -0.04, -0.04],
+      window: { start_iter: 300, end_iter: 600 },
+      mean_stable: false,
+      note: "Cl half-window means differ by 29.8%",
+    };
+    const failedResult: JobResult = {
+      job_id: "all-rejected-failfast",
+      state: "failed",
+      // The engine's run_polar_job writes NO result.message (the real message
+      // lives on the STATUS) — the exact prod shape that lost "All cases
+      // failed" to the generic runtime-dispatch fallback.
+      message: null,
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: bc.mach,
+          points: [],
+          attempts: [
+            {
+              case_slug: "aoa_150p201",
+              aoa_deg: aoa,
+              cl: 0.5174,
+              cd: 0.1032,
+              cm: -0.0412,
+              cl_cd: 5.01,
+              unsteady: false,
+              converged: false,
+              iterations: 600,
+              first_order_fallback: false,
+              images: {},
+              steady_history: steadyHistory,
+              evidence_artifacts: [
+                {
+                  kind: "manifest",
+                  path: "/jobs/all-rejected-failfast/files/evidence/aoa_150p201/evidence_manifest.json",
+                  url: "/jobs/all-rejected-failfast/files/evidence/aoa_150p201/evidence_manifest.json",
+                  mime_type: "application/json",
+                  sha256: "sha-all-rejected-manifest",
+                  byte_size: 64,
+                  metadata: { evidenceBase: "/tmp/evidence/aoa_150p201" },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    let submittedRequest: unknown = null;
+    const failFastEngine = {
+      baseUrl: "http://engine.test",
+      getQueue: async () => emptyQueue(),
+      // Runtime-probe dispatch (the prod path): result readable + failed, but
+      // result_message is NULL — the real message only on status_message.
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: "all-rejected-failfast",
+            exists: true,
+            cancelled: false,
+            process_count: 0,
+            active_pids: [],
+            status_readable: true,
+            status_error: null,
+            status_state: "failed",
+            status_message: REAL_MSG,
+            status_total_cases: 1,
+            status_completed_cases: 0,
+            result_readable: true,
+            result_error: null,
+            has_result: true,
+            result_state: "failed",
+            result_message: null,
+          },
+        ],
+      }),
+      getResult: async () => failedResult,
+      submitPolar: async (request: unknown): Promise<JobStatus> => {
+        submittedRequest = request;
+        const angles = (request as { aoa?: { angles?: number[] } }).aoa?.angles ?? [];
+        return { job_id: "all-rejected-urans-child", state: "pending", total_cases: angles.length, completed_cases: 0 };
+      },
+      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+    } as unknown as EngineClient;
+
+    const errorSpy = vi.spyOn(console, "error");
+    const logSpy = vi.spyOn(console, "log");
+    try {
+      await reconcile(db, failFastEngine, { jobIds: [parent.id], skipFailedRecovery: true });
+
+      // 1. The shipped attempt ingested with its REAL force data + steady_history.
+      const attempts = await db.select().from(resultAttempts).where(and(eq(resultAttempts.simJobId, parent.id), eq(resultAttempts.aoaDeg, aoa)));
+      attempts.forEach((attempt) => cleanupAttemptIds.add(attempt.id));
+      expect(attempts.length).toBe(1);
+      expect(attempts[0].cl).toBeCloseTo(0.5174, 8);
+      expect(attempts[0].cd).toBeCloseTo(0.1032, 8);
+      expect(attempts[0].iterations).toBe(600);
+      expect(attempts[0].converged).toBe(false);
+      expect(attempts[0].validForPolar).toBe(false);
+      expect((attempts[0].evidencePayload as { steady_history?: { note?: string } })?.steady_history?.note).toBe("Cl half-window means differ by 29.8%");
+      // 2. Evidence artifacts registered against the attempt.
+      const evidence = await db
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(and(eq(solverEvidenceArtifacts.simJobId, parent.id), eq(solverEvidenceArtifacts.aoaDeg, aoa)));
+      expect(evidence.length).toBe(1);
+      expect(evidence[0].kind).toBe("manifest");
+      expect(evidence[0].resultAttemptId).toBe(attempts[0].id);
+      // 3. The ENGINE's real message stamped — never the generic fallback.
+      const [gotRow] = await db.select({ status: results.status, error: results.error, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+      expect(gotRow.error).toBe(REAL_MSG);
+      // 4. Parent terminal-failed WITH the evidence-ingest stamp (the gated
+      //    ladder rescan requires status='failed' AND ingested_at NOT NULL).
+      const [gotParent] = await db
+        .select({ status: simJobs.status, error: simJobs.error, engineState: simJobs.engineState, ingestedAt: simJobs.ingestedAt })
+        .from(simJobs)
+        .where(eq(simJobs.id, parent.id));
+      expect(gotParent.status).toBe("failed");
+      expect(gotParent.error).toBe(REAL_MSG);
+      expect(gotParent.engineState).toBe("failed");
+      expect(gotParent.ingestedAt).not.toBeNull();
+      // 5. The gated wave-2 PRECALC retry enqueued for the hard-rejected angle
+      //    (before the fix: unreachable — points===0 returned first).
+      const [child] = await db
+        .select()
+        .from(simJobs)
+        .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)))
+        .limit(1);
+      expect(child).toBeTruthy();
+      cleanupJobIds.add(child.id);
+      expect(child.status).toBe("submitted");
+      expect(child.totalCases).toBe(1);
+      expect((child.requestPayload as { uransFidelity?: string })?.uransFidelity).toBe("precalc");
+      expect((submittedRequest as { solver?: { force_transient?: boolean } })?.solver?.force_transient).toBe(true);
+      expect((submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles).toEqual([aoa]);
+      expect(gotRow.status).toBe("queued"); // re-queued under the retry child
+      expect(gotRow.simJobId).toBe(child.id);
+      // 6. Loud transitions: one job-failed event with the real message +
+      //    verdict, one retry-submit event (the gate run logged NOTHING).
+      const failLine = errorSpy.mock.calls.map((call) => String(call[0])).find((line) => line.includes("engine job FAILED"));
+      expect(failLine).toBeTruthy();
+      expect(failLine).toContain(REAL_MSG);
+      expect(failLine).toContain(parent.id);
+      expect(failLine).toContain("gated URANS retry evaluated");
+      const submitLine = logSpy.mock.calls.map((call) => String(call[0])).find((line) => line.includes("URANS retry submitted"));
+      expect(submitLine).toBeTruthy();
+      expect(submitLine).toContain("all-rejected-urans-child");
+    } finally {
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  }, 120000);
 });

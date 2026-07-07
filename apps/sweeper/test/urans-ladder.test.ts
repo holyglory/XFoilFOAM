@@ -18,6 +18,7 @@ import {
   deriveCampaignPhase,
   enqueuePrecalcVerifications,
   flowConditions,
+  hasOpenCampaignLadderWork,
   materializeCampaignLaunch,
   mediums,
   meshProfiles,
@@ -453,6 +454,15 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
   }, 60000);
 
   it("consumes the verify item at FULL fidelity once no campaign RANS/precalc work exists, then records a DISAGREEMENT at ingest", async () => {
+    // The verify tier's gate is MACHINE-WIDE by design (contract 5): another
+    // suite's live campaign fixture (campaign-batching, worker-restart) running
+    // concurrently against the shared dev DB legitimately holds it open for a
+    // few seconds. Bounded wait for quiet — a PERMANENTLY open gate (the real
+    // regression this test must catch) still fails below after the timeout.
+    const quietDeadline = Date.now() + 60_000;
+    while ((await hasOpenCampaignLadderWork(db)) && Date.now() < quietDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
     const captured: PolarRequest[] = [];
     const submitted = await uransLadderTick(db, stubEngine(captured, `${PREFIX}-verify-job`), 0, { campaignIds: [campaignId] });
     expect(submitted).toBe(true);

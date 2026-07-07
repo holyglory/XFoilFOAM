@@ -1615,6 +1615,27 @@ def _finalize_outcome(
                     outcome.cl_cd = osc.cl_mean / osc.cd_mean if osc.cd_mean else None
                     outcome.converged = True
                     outcome.quality_warnings.append(osc.note)
+        if (
+            not outcome.converged
+            and not solver_params.force_transient
+            and not solver_params.transient_fallback
+        ):
+            # RANS-tier terminal non-convergence (2026-07-07 ladder-gate
+            # incident, job a2379532): with no in-engine escalation configured
+            # the case has REAL force data and must SHIP as an honest point —
+            # converged=false, final-window coefficients (parse_force_
+            # coefficients tail average, the pre-ladder convention),
+            # steady_history evidence and this loud note. The node-side ladder
+            # classifier owns the escalate-to-URANS decision; a case failure
+            # here turned a single-point gate campaign into "All cases failed"
+            # with zero ingestable points and made escalation unreachable.
+            note = (
+                "steady RANS did not converge; coefficients are the final-window "
+                "(last 50 iterations) values"
+            )
+            if outcome.steady_history is not None:
+                note += f" — {outcome.steady_history.note}"
+            outcome.quality_warnings.append(note)
     elif not solver_params.force_transient:
         raise OpenFOAMError("forceCoeffs produced no coefficient.dat")
 
@@ -2095,9 +2116,20 @@ def _write_minimal_controldict(case_dir: Path) -> None:
 
 
 def _steady_rans_params(solver_params: SolverParams, rans_max_iterations: Optional[int]) -> SolverParams:
-    # The cap applies to force_transient (URANS-only) cases too: their steady
-    # stage is an initialisation + evidence pass, exactly like the normal path.
-    if rans_max_iterations is None:
+    """Worker-side steady-iteration cap, scoped to the URANS-INIT steady stage.
+
+    A force_transient (URANS-only) case runs its steady RANS stage purely as a
+    transient initialisation + evidence pass, so the worker cap
+    (settings.rans_max_iterations, default 600) keeps that warm-up from
+    monopolising CPU — the warm-start fix this cap was built for.
+
+    A PRIMARY steady RANS solve must honor the profile's n_iterations budget.
+    2026-07-07 ladder-gate incident: the solver profile shipped
+    n_iterations=3000 but the steady controlDict got endTime=600 because this
+    cap was applied unconditionally (jobs.py passes
+    settings.rans_max_iterations to every job; CaseBuilder writes
+    endTime=self.solver.n_iterations), starving moderate-AoA convergence."""
+    if rans_max_iterations is None or not solver_params.force_transient:
         return solver_params
     cap = max(50, int(rans_max_iterations))
     if solver_params.n_iterations <= cap:
@@ -2329,6 +2361,25 @@ def rans_outcome_rejected_for_polar(outcome: CaseOutcome) -> bool:
     return outcome.cd <= 0
 
 
+def steady_outcome_shippable(outcome: CaseOutcome) -> bool:
+    """True when a REJECTED steady RANS outcome still carries real force data
+    and therefore ships as an honest point (converged=false, final-window
+    coefficients, steady_history, quality note) instead of vanishing into the
+    attempts-only bucket. Case/point failure stays reserved for true crashes:
+    an error set, or no finite coefficient data at all.
+
+    2026-07-07 ladder-gate incident (job a2379532): a non-converged,
+    non-oscillating steady at alpha=15 was dropped from final_points, the job
+    shipped points=[] and failed with "All cases failed", and the node side
+    (ingestFailedEngineJob short-circuits at points==0) could never submit the
+    gated URANS escalation for single-point campaigns."""
+    if outcome.error:
+        return False
+    if outcome.cl is None or outcome.cd is None:
+        return False
+    return math.isfinite(outcome.cl) and math.isfinite(outcome.cd)
+
+
 def should_abort_rans_sweep_for_urans(aoa_deg: float, outcome: CaseOutcome) -> bool:
     return (
         RANS_CORE_ABORT_AOA_MIN <= aoa_deg <= RANS_CORE_ABORT_AOA_MAX
@@ -2422,7 +2473,10 @@ def solve_polar_marched(
         rans_solver = solver_params.model_copy(
             update={"transient_fallback": False, "force_transient": False}
         )
-        rans_solver = _steady_rans_params(rans_solver, rans_max_iterations)
+        # PRIMARY steady RANS honors the profile's n_iterations budget; the
+        # worker-side rans_max_iterations cap is scoped to URANS-init steady
+        # stages only (see _steady_rans_params — 2026-07-07 gate incident:
+        # profile n_iterations=3000 ran with controlDict endTime 600).
     steady_timeout = solver_timeout if solver_params.force_transient else min(solver_timeout, rans_solver_timeout or solver_timeout)
     for i, aoa in enumerate(sorted_aoas):
         _check_cancel(cancel_check)
@@ -2518,6 +2572,16 @@ def solve_polar_marched(
                 abort_reason=reason,
             )
         if not solver_params.force_transient and rans_outcome_rejected_for_polar(outcome):
+            if not steady_outcome_shippable(outcome):
+                # True crash (error set / no force data at all): evidence-only
+                # attempt; the point is honestly ABSENT from the polar.
+                continue
+            # HONEST NON-CONVERGED (or otherwise rejected-with-data) POINT:
+            # ship it with converged=false so the node-side ladder classifier
+            # can reject + escalate. It never publishes a warm-start seed.
+            final_points.append(stored)
+            if outcome_progress:
+                outcome_progress(stored, True)
             continue
         if not solver_params.force_transient:
             # Accepted steady point: its converged field becomes a cross-job seed.
