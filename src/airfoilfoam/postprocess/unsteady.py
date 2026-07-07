@@ -61,12 +61,122 @@ class StablePeriodResult:
     mean_drift: float | None = None
 
 
-def dominant_frequency(times: "np.ndarray | list[float]", values: "np.ndarray | list[float]") -> float:
+# --------------------------------------------------------------------------- #
+# Physical shedding band + sub-harmonic preference (prod 2026-07-07 incident:
+# the unconstrained period tracker locked onto a low-frequency sub-harmonic /
+# modulation of a broadband post-stall signal, collapsing retained-cycle counts
+# and making the continuation budget guard reject honest precalc work).
+# --------------------------------------------------------------------------- #
+
+#: Plausible vortex-shedding Strouhal window for airfoil/bluff-body wakes.
+#: Post-stall airfoil shedding measures St ~ 0.1-0.2 on the chord, cylinder-like
+#: wakes sit near 0.2, and even exotic separated cases stay inside [0.05, 0.5].
+#: Spectral content below the band is modulation / sub-harmonic beating, above
+#: it is harmonics or numerical noise — neither is the shedding fundamental.
+SHEDDING_STROUHAL_BAND: tuple[float, float] = (0.05, 0.5)
+
+#: Sub-harmonic preference tolerance: within the physical band the HIGHEST-
+#: frequency peak whose autocorrelation (or in-band FFT magnitude) is at least
+#: this fraction of the strongest in-band peak wins. 0.8 because a genuine
+#: shedding fundamental keeps >= ~80% of a strong 1/2- or 1/4-sub-harmonic
+#: peak's correlation under comparable-amplitude modulation (the lottery regime
+#: where two window samplings flip between T and 2T), while spurious noise
+#: peaks fall well below 80% of the true peak. When modulation is so dominant
+#: that the fundamental's peak drops under 80%, the signal genuinely repeats
+#: only at the longer period and the stability check + conservative shorter
+#: period (see ``estimate_period``) guard the budget math instead.
+SUBHARMONIC_PEAK_TOLERANCE = 0.8
+
+#: Half-window period estimates differing by more than this fraction (relative
+#: to the larger one) flag the period as AMBIGUOUS: the estimate is disclosed
+#: with both values and the conservative SHORTER period is used for
+#: retained-cycle counting and budget projection (shorter period => more
+#: retained cycles => the projection can never inflate the required
+#: continuation hours off an accidental sub-harmonic lock).
+PERIOD_AMBIGUITY_TOLERANCE = 0.30
+
+#: An in-band spectral peak is CREDIBLE only when it reaches at least this
+#: fraction of the strongest spectral magnitude anywhere in the spectrum (DC
+#: excluded). A genuinely out-of-band phenomenon (bluff-body-like St < 0.05)
+#: leaves only its Hanning leakage skirt (~3% sidelobes) and the noise floor
+#: inside the band; locking a period onto those minted a silently wrong
+#: near-band-edge estimate. Below this fraction the honest answer is "no
+#: measurable in-band period" (None), which the callers grade as no lock —
+#: never a fabricated period. A real shedding line more than ~20x weaker than
+#: an out-of-band modulation line is likewise reported as no lock rather than
+#: guessed.
+IN_BAND_CREDIBILITY_FRACTION = 0.05
+
+#: The refined autocorrelation lag must not undercut the credibility-gated
+#: in-band FFT line's period by more than this fraction. When a strong
+#: out-of-band modulation dominates, the in-band autocorrelation ripple peaks
+#: ride the modulation's steep correlation slope and get dragged toward
+#: SHORTER lags (measured ~30-36% short at modulation/fundamental amplitude
+#: ratio ~2), while genuine modulated-shedding refinement stays within a few
+#: percent of the line. A dragged lag falls back to the FFT line period
+#: (corroborated by the repeat correlation, else None). Asymmetric on purpose:
+#: an autocorrelation period LONGER than the FFT line is legitimate (rule 2
+#: may certify a strong in-band harmonic while the signal's true repeat is the
+#: full period) and stays trusted.
+AC_FFT_UNDERCUT_TOLERANCE = 0.25
+
+
+def shedding_period_band(
+    speed: "float | None",
+    chord: "float | None",
+    st_band: tuple[float, float] = SHEDDING_STROUHAL_BAND,
+) -> "tuple[float, float] | None":
+    """Physically plausible shedding-period window [s] for the flow context:
+    St in ``st_band`` => period in [c/(St_max U), c/(St_min U)].
+
+    Returns None (no constraint — explicit legacy behavior) when the flow
+    context is missing or unusable.
+    """
+    try:
+        u = float(speed) if speed is not None else 0.0
+        c = float(chord) if chord is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(u) and math.isfinite(c)) or u <= 0 or c <= 0:
+        return None
+    lo, hi = float(st_band[0]), float(st_band[1])
+    if not (0 < lo < hi):
+        return None
+    return (c / (hi * u), c / (lo * u))
+
+
+def shedding_frequency_band(
+    speed: "float | None",
+    chord: "float | None",
+    st_band: tuple[float, float] = SHEDDING_STROUHAL_BAND,
+) -> "tuple[float, float] | None":
+    """Frequency-domain twin of :func:`shedding_period_band`: [St_min U / c,
+    St_max U / c] in Hz, or None without flow context."""
+    band = shedding_period_band(speed, chord, st_band)
+    if band is None:
+        return None
+    p_lo, p_hi = band
+    return (1.0 / p_hi, 1.0 / p_lo)
+
+
+def dominant_frequency(
+    times: "np.ndarray | list[float]",
+    values: "np.ndarray | list[float]",
+    freq_band: "tuple[float, float] | None" = None,
+    peak_tolerance: float = SUBHARMONIC_PEAK_TOLERANCE,
+) -> float:
     """Dominant oscillation frequency [Hz] of a (possibly non-uniformly sampled)
     signal, via the peak of its FFT magnitude (DC excluded).
 
     pimpleFoam uses an adaptive time step, so the samples are resampled onto a
     uniform grid (linear interpolation) before the FFT.
+
+    With ``freq_band`` (Hz) the peak search is restricted to the physically
+    plausible window and, within it, the HIGHEST-frequency local spectral peak
+    whose magnitude is at least ``peak_tolerance`` of the strongest in-band
+    peak wins — a strong sub-harmonic / modulation line must not displace the
+    shedding fundamental. Without a band the legacy global-argmax behavior is
+    kept unchanged.
     """
     t = np.asarray(times, dtype=float)
     v = np.asarray(values, dtype=float)
@@ -84,7 +194,33 @@ def dominant_frequency(times: "np.ndarray | list[float]", values: "np.ndarray | 
     freqs = np.fft.rfftfreq(n_fft, dt)
     if spec.size < 2:
         return 0.0
-    k = 1 + int(np.argmax(spec[1:]))  # skip the DC bin
+    if freq_band is None:
+        k = 1 + int(np.argmax(spec[1:]))  # skip the DC bin
+        return float(freqs[k])
+    f_lo, f_hi = float(freq_band[0]), float(freq_band[1])
+    if not (math.isfinite(f_lo) and math.isfinite(f_hi)) or not (0 < f_lo < f_hi):
+        k = 1 + int(np.argmax(spec[1:]))
+        return float(freqs[k])
+    in_band = np.where((freqs >= f_lo) & (freqs <= f_hi) & (freqs > 0))[0]
+    if in_band.size == 0:
+        return 0.0
+    interior = in_band[(in_band > 0) & (in_band < spec.size - 1)]
+    peaks = interior[
+        (spec[interior] >= spec[interior - 1]) & (spec[interior] >= spec[interior + 1])
+    ]
+    if peaks.size == 0:
+        # No local spectral maximum inside the band: the in-band energy is the
+        # monotonic leakage slope of an out-of-band line (or a noise ramp).
+        # Returning the in-band argmax here minted a band-edge frequency for a
+        # genuinely out-of-band phenomenon — honest answer: no in-band lock.
+        return 0.0
+    best = float(spec[peaks].max())
+    if best <= 0 or best < IN_BAND_CREDIBILITY_FRACTION * float(spec[1:].max()):
+        # The strongest in-band peak is dwarfed by out-of-band spectral
+        # content: sidelobe leakage / noise wiggles, not a shedding line.
+        return 0.0
+    eligible = peaks[spec[peaks] >= peak_tolerance * best]
+    k = int(eligible.max())  # highest in-band frequency within tolerance
     return float(freqs[k])
 
 
@@ -283,7 +419,7 @@ def stable_two_period_window(
     if t.size < max(16, min_samples_per_cycle * 2):
         return StablePeriodResult(ok=False, reason="not enough retained coefficient samples")
 
-    freq = dominant_frequency(t, cl)
+    freq = dominant_frequency(t, cl, freq_band=shedding_frequency_band(speed, chord))
     st = strouhal(freq, chord, speed)
     period = chord / (st * speed) if st > 0 else None
     if period is None or not math.isfinite(period) or period <= 0:
@@ -369,11 +505,22 @@ FRAME_EXPORT_SPAN_PERIODS = 3
 FRAME_EXPORT_MAX_FRAMES = 120
 
 
+def _refined_lag_period(ac: np.ndarray, k: int, dt: float) -> float:
+    """Parabolic interpolation of the autocorrelation maximum around lag k."""
+    y0, y1, y2 = float(ac[k - 1]), float(ac[k]), float(ac[k + 1])
+    denom = y0 - 2.0 * y1 + y2
+    shift = 0.5 * (y0 - y2) / denom if abs(denom) > 1e-12 else 0.0
+    shift = min(0.5, max(-0.5, shift))
+    return (k + shift) * dt
+
+
 def measure_period(
     times: "np.ndarray | list[float]",
     values: "np.ndarray | list[float]",
     min_cycles: float = 2.0,
     corr_threshold: float = 0.2,
+    period_band: "tuple[float, float] | None" = None,
+    peak_tolerance: float = SUBHARMONIC_PEAK_TOLERANCE,
 ) -> float | None:
     """Shedding period [s] measured by AUTOCORRELATION of the (uniformly
     resampled, demeaned) signal — robust for noisy periodic force histories
@@ -383,6 +530,18 @@ def measure_period(
     positive autocorrelation peak past the first zero crossing, or fewer than
     ``min_cycles`` cycles of data. The peak lag is refined by parabolic
     interpolation of the autocorrelation maximum.
+
+    ``period_band`` (seconds, from :func:`shedding_period_band`) restricts the
+    lag search to the physically plausible shedding window: a broadband
+    post-stall signal's low-frequency modulation / sub-harmonic (prod
+    2026-07-07: a ~0.12 s sub-harmonic of a 0.0338 s fundamental) then cannot
+    win the global argmax. Within the band the HIGHEST-frequency local
+    autocorrelation peak whose strength is >= ``peak_tolerance`` of the
+    strongest in-band peak is preferred (see SUBHARMONIC_PEAK_TOLERANCE), and
+    when no in-band autocorrelation peak clears ``corr_threshold`` the FFT of
+    the signal — restricted to the same band — is the fallback. Callers
+    without flow context pass ``period_band=None`` and keep the legacy
+    unconstrained behavior unchanged.
     """
     t, v = _normalise_series(times, values)
     if t.size < 16 or float(t[-1]) <= float(t[0]):
@@ -397,6 +556,71 @@ def measure_period(
     if ac[0] <= 0:
         return None
     ac = ac / ac[0]
+    dt = (float(tu[-1]) - float(tu[0])) / (n - 1)
+    span = float(t[-1]) - float(t[0])
+
+    if period_band is not None:
+        p_lo, p_hi = float(period_band[0]), float(period_band[1])
+        if math.isfinite(p_lo) and math.isfinite(p_hi) and 0 < p_lo < p_hi:
+            # Spectral credibility gate: the band must contain a REAL spectral
+            # line (see IN_BAND_CREDIBILITY_FRACTION) before any in-band lag
+            # may be locked. Without it, a genuinely out-of-band phenomenon
+            # (bluff-body-like St < 0.05) minted a silently wrong period from
+            # a noise wiggle on the sloping in-band autocorrelation, or from
+            # the FFT leakage skirt at the band edge.
+            freq = dominant_frequency(
+                t, v, freq_band=(1.0 / p_hi, 1.0 / p_lo), peak_tolerance=peak_tolerance
+            )
+            if freq <= 0:
+                return None
+            k_lo = max(1, int(math.ceil(p_lo / dt)))
+            k_hi = min(n - 2, int(math.floor(p_hi / dt)))
+            if k_hi >= k_lo:
+                lags = np.arange(k_lo, k_hi + 1)
+                seg = ac[k_lo : k_hi + 1]
+                is_peak = (
+                    (seg >= ac[k_lo - 1 : k_hi])
+                    & (seg >= ac[k_lo + 1 : k_hi + 2])
+                    & (seg >= corr_threshold)
+                )
+                peak_lags = lags[is_peak]
+                if peak_lags.size:
+                    best = float(ac[peak_lags].max())
+                    eligible = peak_lags[ac[peak_lags] >= peak_tolerance * best]
+                    k = int(eligible.min())  # shortest lag = highest frequency
+                    period = _refined_lag_period(ac, k, dt)
+                    if (
+                        math.isfinite(period)
+                        and period > 0
+                        and span >= min_cycles * period
+                        and period * freq >= 1.0 - AC_FFT_UNDERCUT_TOLERANCE
+                    ):
+                        return float(period)
+                    # The refined lag is unusable or undercuts the certified
+                    # in-band FFT line (a slope artifact of dominant
+                    # out-of-band modulation): fall through to the FFT line.
+            # FFT fallback (reusing the credibility-gated in-band line): the
+            # lag grid may be too coarse for the band, or no autocorrelation
+            # local maximum cleared the threshold on a very noisy signal. The
+            # FFT candidate must still be CORROBORATED by autocorrelation >=
+            # corr_threshold at its lag — a flat/noise-only signal must not
+            # mint a period, preserving the no-shedding honesty of the legacy
+            # behavior.
+            period = 1.0 / freq
+            lag = period / dt
+            corroborated = (
+                1 <= lag <= n - 2
+                and float(np.interp(lag, np.arange(n), ac)) >= corr_threshold
+            )
+            if (
+                math.isfinite(period)
+                and corroborated
+                and span >= min_cycles * period
+            ):
+                return float(period)
+            return None
+        # invalid band => explicit legacy behavior below
+
     below = np.where(ac < 0)[0]
     if below.size == 0:
         return None
@@ -406,16 +630,74 @@ def measure_period(
     k = first_negative + int(np.argmax(ac[first_negative:]))
     if k <= 0 or k >= n - 1 or float(ac[k]) < corr_threshold:
         return None
-    y0, y1, y2 = float(ac[k - 1]), float(ac[k]), float(ac[k + 1])
-    denom = y0 - 2.0 * y1 + y2
-    shift = 0.5 * (y0 - y2) / denom if abs(denom) > 1e-12 else 0.0
-    shift = min(0.5, max(-0.5, shift))
-    dt = (float(tu[-1]) - float(tu[0])) / (n - 1)
-    period = (k + shift) * dt
-    span = float(t[-1]) - float(t[0])
+    period = _refined_lag_period(ac, k, dt)
     if not math.isfinite(period) or period <= 0 or span < min_cycles * period:
         return None
     return float(period)
+
+
+@dataclass(frozen=True)
+class PeriodEstimate:
+    """Band-constrained period estimate with a half-window stability verdict."""
+
+    period_s: float
+    ambiguous: bool
+    first_half_s: "float | None"
+    second_half_s: "float | None"
+
+
+def estimate_period(
+    times: "np.ndarray | list[float]",
+    values: "np.ndarray | list[float]",
+    *,
+    speed: "float | None" = None,
+    chord: "float | None" = None,
+    min_cycles: float = 2.0,
+    corr_threshold: float = 0.2,
+    ambiguity_tolerance: float = PERIOD_AMBIGUITY_TOLERANCE,
+) -> "PeriodEstimate | None":
+    """Flow-context-aware shedding period with a stability check.
+
+    Wraps :func:`measure_period` with the physical Strouhal band derived from
+    ``speed``/``chord`` (legacy unconstrained search when either is missing),
+    then estimates the period independently on the two halves of the analysis
+    window. Half-window estimates differing by more than
+    ``ambiguity_tolerance`` mark the period AMBIGUOUS: both values are
+    disclosed and the conservative SHORTER estimate becomes ``period_s``, so
+    retained-cycle counting and budget projection can never be starved by an
+    accidental long-period (sub-harmonic) lock — the risk-averse choice for
+    the projection math, with the ambiguity reported as a quality warning by
+    the callers.
+    """
+    band = shedding_period_band(speed, chord)
+    t, v = _normalise_series(times, values)
+    if t.size == 0:
+        return None
+    full = measure_period(
+        t, v, min_cycles=min_cycles, corr_threshold=corr_threshold, period_band=band
+    )
+    if full is None:
+        return None
+    mid = 0.5 * (float(t[0]) + float(t[-1]))
+    first_mask = t <= mid
+    second_mask = t >= mid
+    p1 = measure_period(
+        t[first_mask], v[first_mask],
+        min_cycles=min_cycles, corr_threshold=corr_threshold, period_band=band,
+    )
+    p2 = measure_period(
+        t[second_mask], v[second_mask],
+        min_cycles=min_cycles, corr_threshold=corr_threshold, period_band=band,
+    )
+    if (
+        p1 is not None
+        and p2 is not None
+        and abs(p1 - p2) / max(p1, p2) > ambiguity_tolerance
+    ):
+        return PeriodEstimate(
+            period_s=float(min(p1, p2)), ambiguous=True, first_half_s=p1, second_half_s=p2
+        )
+    return PeriodEstimate(period_s=float(full), ambiguous=False, first_half_s=p1, second_half_s=p2)
 
 
 def discard_startup(
@@ -653,7 +935,12 @@ def force_history(
     if t_a.size == 0:
         raise ValueError(f"No usable coefficient data found in {path}")
 
-    freq = dominant_frequency(t_a, cl_a)
+    # Physical band constraint: the FFT peak search is restricted to the
+    # plausible shedding window for this flow (St in SHEDDING_STROUHAL_BAND),
+    # so history.strouhal / period_s — the quality-evaluation period chain —
+    # can never lock onto a low-frequency sub-harmonic of a broadband
+    # post-stall signal. Without speed/chord the band is None (legacy search).
+    freq = dominant_frequency(t_a, cl_a, freq_band=shedding_frequency_band(speed, chord))
     st = strouhal(freq, chord, speed)
     period = chord / (st * speed) if st > 0 and speed > 0 and chord > 0 else None
     window = integer_period_window(t_a, period, discard_fraction=0.0, target_cycles=target_cycles) if period else None

@@ -2099,3 +2099,107 @@ typecheck 6/6, core 82, api 82, web 174, sweeper full battery green with
 replace-guard at 9 tests (incident MUST-CATCH, supersede, matrix cells,
 needs_urans false-positive guard, warm-start duplicate, verify-cancel,
 drift probe, gate mirror).
+
+## 2026-07-07 — Period tracker hardened: physical Strouhal band, sub-harmonic preference, half-window stability (engine)
+
+Prod evidence (airfoils.pro, naca-0012 alpha=15, U=25 m/s, c=0.1 m,
+half-res precalc): two IDENTICAL precalc solves measured wildly different
+shedding periods. Run 1: period_s=0.0338 (St 0.118), 1.4 periods retained
+in ~25 min, coherent frame_track. Run 2: 0.8 "periods" in ~55 min with a
+projected 2.8 h continuation — budget-guard rejected {insufficient-periods}
+(airfoil 0e209725 aoa 15). Same physics/mesh/numerics: the PERIOD ESTIMATE
+moved ~4x, not the solver speed. `measure_period` (autocorrelation, global
+argmax past the first zero crossing) locked onto a ~0.12 s sub-harmonic /
+low-frequency modulation of the broadband post-stall lift signal, so
+retained-cycle counts collapsed and precalc acceptance became a lottery at
+exactly the deep-stall angles that need URANS.
+
+Decisions (src/airfoilfoam/postprocess/unsteady.py):
+1. PHYSICAL BAND: plausible shedding window St in [0.05, 0.5]
+   (`SHEDDING_STROUHAL_BAND`) -> period in [c/(0.5 U), c/(0.05 U)]
+   (`shedding_period_band` / `shedding_frequency_band`; U=25, c=0.1 =>
+   [0.008, 0.08] s — contains 0.0338, excludes 0.135). `measure_period`
+   gains `period_band` (restricts the autocorrelation lag search);
+   `dominant_frequency` gains `freq_band` (restricts the FFT peak search —
+   this is the `force_history`/`stable_two_period_window` path backing
+   history.strouhal/period_s and evaluate_urans_quality). Callers without
+   flow context pass None and keep the legacy behavior verbatim.
+2. SUB-HARMONIC PREFERENCE: within the band the HIGHEST-frequency local
+   peak whose strength is >= SUBHARMONIC_PEAK_TOLERANCE=0.8 of the
+   strongest in-band peak wins. 0.8 because the fundamental keeps >= ~80%
+   of a strong sub-harmonic's autocorrelation under comparable-amplitude
+   modulation (the T/2T lottery regime), while noise peaks fall well below;
+   when modulation is SO dominant the fundamental drops under 80%, the
+   signal genuinely repeats only at the longer period and rule 3 guards the
+   budget math instead. In-band FFT fallback (used when the lag grid cannot
+   resolve the band or no autocorrelation peak clears corr_threshold) must
+   be CORROBORATED by autocorrelation >= corr_threshold at its lag — pure
+   noise always has an in-band spectral argmax and must not mint a period.
+3. STABILITY CHECK: `estimate_period(times, values, speed=, chord=)`
+   measures the two halves of the analysis window independently; half
+   estimates differing by > PERIOD_AMBIGUITY_TOLERANCE=0.30 flag "period
+   ambiguous" (quality warning discloses both values) and the CONSERVATIVE
+   SHORTER period feeds retained-cycle counting and budget projection —
+   shorter period => more counted cycles => the guard can never inflate the
+   projected hours off a long-period lock, and the ambiguity is disclosed
+   rather than hidden.
+4. Plumbing (src/airfoilfoam/pipeline.py): continuation tracking in
+   `_extend_transient_until_periods` and frame_track assembly in
+   `_finalize_outcome` now call `estimate_period` with spec.speed/chord
+   (ambiguity -> quality warning at the frame_track site, note in the
+   budget-guard reason); the FFT chain (force_history -> history.strouhal
+   -> evaluate_urans_quality retained-cycle math; stable_two_period_window
+   early-stop monitor) is band-constrained at the source.
+
+Recall proven (tests/test_period_tracker.py, 14 tests): fixtures shaped
+like the prod breakage — broadband fundamental + 1/4-frequency modulation
+at comparable amplitude + noise locks the shedding band on BOTH of two
+different window samplings (legacy locks ~0.135 on both; the lottery is
+reproduced and killed); an in-band sub-harmonic-DOMINANT peak still
+resolves to the fundamental via rule 2; continuation budget guard sizes
+the chunk off the in-band period and ships the honest point (the prod
+rejection path); frame_track single-source-of-truth ignores the
+out-of-band modulation; ambiguous drift warns + uses the shorter period
+end to end; clean periodic / no-flow-context / no-shedding behavior pinned
+unchanged as false-positive guards. All six must-catch classes verified to
+FAIL with the band disabled (pre-fix simulation) and pass with it. Engine
+suite: 267 passed (253 baseline + 14), 6 deselected.
+
+Adversarial verification addendum (same day): an old-vs-new replay
+(HEAD-worktree legacy tracker vs banded tracker, prod-shaped broadband
+signal with narrowband phase-drifting modulation) reproduced the lottery —
+legacy locked 0.033/0.135/0.10-0.37 s across 20 identical-physics
+realizations (3/11/6 split), banded locked the 0.0339 s fundamental 20/20
+within ~5%. Verification also found and fixed three out-of-band honesty
+defects in the banded search (genuinely long-period phenomena, e.g.
+bluff-body-like St < 0.05):
+5. IN-BAND SPECTRAL CREDIBILITY GATE (`IN_BAND_CREDIBILITY_FRACTION`=0.05):
+   an in-band period may only be locked when the band contains a real
+   spectral LINE — an interior local FFT peak at >= 5% of the strongest
+   spectral magnitude anywhere. Pre-fix, a clean St 0.04 signal (T=0.100 s)
+   was silently reported as 0.0799 s (the band-edge Hanning leakage skirt,
+   corroborated by the rising autocorrelation slope), and a noisy one
+   minted 0.0117 s (8.5x short) from a noise wiggle on the sloping in-band
+   autocorrelation. The in-band-argmax fallback in `dominant_frequency`
+   (slope, not peak) was removed for banded searches. Post-fix these grade
+   as None — no lock, honest {no measurable period} — while legit St
+   0.05-0.06 (thick-airfoil) cases still resolve to <0.1% error.
+6. AC/FFT UNDERCUT GUARD (`AC_FFT_UNDERCUT_TOLERANCE`=0.25): at
+   modulation/fundamental amplitude ratio ~2 the in-band autocorrelation
+   ripple peaks ride the out-of-band modulation's correlation slope and
+   were dragged 30-36% SHORT of the fundamental, unflagged. The refined lag
+   must now agree with the credibility-gated FFT line (may not undercut it
+   by >25%); a dragged lag falls back to the corroborated FFT line, else
+   None. Asymmetric: an autocorrelation period LONGER than the FFT line
+   stays trusted (harmonic-rich signals). Known conservative edges: St
+   exactly at the 0.5 band edge and shedding lines >~20x weaker than an
+   out-of-band modulation line grade as no-lock (disclosed) rather than
+   guessed; an in-band harmonic >= 80% of the fundamental's FFT magnitude
+   could still halve the period in the pure-FFT chain (rule-2 design
+   trade-off; the autocorrelation-primary `estimate_period` paths require
+   ~3x amplitude for the same flip).
+Recall of the fixes proven the same way: 3 new must-catch tests (band-edge
+leakage lock, noise-minted period, slope-dragged period) fail on the
+pre-fix code and pass post-fix; a near-band-edge low-St false-positive
+guard passes in both worlds. Engine suite: 271 passed (253 baseline + 18),
+6 deselected; node typecheck 6/6 with zero node-side diff.

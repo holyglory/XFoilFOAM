@@ -67,17 +67,19 @@ from .postprocess.images import (
 )
 from .postprocess.residuals import parse_convergence
 from .postprocess.unsteady import (
+    PERIOD_AMBIGUITY_TOLERANCE,
     ChannelWindowStats,
     ForceHistory,
+    PeriodEstimate,
     PeriodWindowStats,
     StablePeriodResult,
     coefficient_series,
     discard_startup,
+    estimate_period,
     force_history as compute_force_history,
     frame_coefficients,
     frame_target_times,
     is_no_shedding,
-    measure_period,
     period_window_stats,
     stable_two_period_window,
 )
@@ -1026,7 +1028,11 @@ def _extend_transient_until_periods(
     after startup discard, extending the SAME transient case in continuation
     chunks (the existing restart mechanics: ``write_transient`` from latestTime
     + solver restart — no second continuation path). The period is tracked on
-    the fly from the Cl signal by autocorrelation (``measure_period``).
+    the fly from the Cl signal by band-constrained autocorrelation
+    (``estimate_period`` with the flow's plausible Strouhal window); an
+    ambiguous period (half-window estimates disagreeing) uses the conservative
+    SHORTER estimate so the budget projection is never inflated by a
+    sub-harmonic lock.
 
     Stops early — grading honestly — when the wall-clock budget guard projects
     (from the measured solve rate) that the next chunk cannot fit the solver
@@ -1050,7 +1056,16 @@ def _extend_transient_until_periods(
             or len(history.t) < 8
         ):
             break
-        period = measure_period(history.t, history.cl)
+        estimate = estimate_period(history.t, history.cl, speed=spec.speed, chord=spec.chord)
+        period = estimate.period_s if estimate is not None else None
+        period_note = ""
+        if estimate is not None and estimate.ambiguous:
+            period_note = (
+                f" (period ambiguous: half-window estimates {estimate.first_half_s:.4g}s / "
+                f"{estimate.second_half_s:.4g}s differ by >{PERIOD_AMBIGUITY_TOLERANCE:.0%}; "
+                f"using conservative shorter {estimate.period_s:.4g}s)"
+            )
+            logger.warning("URANS continuation period tracking%s", period_note)
         if period is None:
             period = history.period_s or result.quality.measured_period_s
         if period is None or not math.isfinite(period) or period <= 0:
@@ -1071,7 +1086,7 @@ def _extend_transient_until_periods(
                     f"retained {retained:.1f} of {target:g} periods (budget); "
                     f"projected {projected_wall_s / 3600.0:.1f}h continuation exceeds "
                     f"{URANS_REFINE_BUDGET_FRACTION:.0%} of the {timeout / 3600.0:.1f}h "
-                    f"solver timeout; {result.quality.reason}"
+                    f"solver timeout{period_note}; {result.quality.reason}"
                 )
                 logger.warning(reason)
                 result.quality = _quality_with(
@@ -1695,7 +1710,18 @@ def _finalize_outcome(
                             t_all, cl_all, cd_all, cm_all,
                             fraction=solver_params.transient_discard_fraction,
                         )
-                    frame_period = measure_period(t_c, cl_c)
+                    frame_estimate: Optional[PeriodEstimate] = estimate_period(
+                        t_c, cl_c, speed=spec.speed, chord=spec.chord
+                    )
+                    frame_period = frame_estimate.period_s if frame_estimate is not None else None
+                    if frame_estimate is not None and frame_estimate.ambiguous:
+                        outcome.quality_warnings.append(
+                            f"URANS period ambiguous: half-window estimates "
+                            f"{frame_estimate.first_half_s:.4g}s and "
+                            f"{frame_estimate.second_half_s:.4g}s differ by more than "
+                            f"{PERIOD_AMBIGUITY_TOLERANCE:.0%}; using the conservative "
+                            f"shorter period {frame_estimate.period_s:.4g}s"
+                        )
                     if frame_period is None and transient.force_history is not None:
                         frame_period = transient.force_history.period_s
                     if frame_period is not None and frame_period > 0:
