@@ -76,6 +76,23 @@ class Settings(BaseSettings):
         ge=50,
         description="Worker-side SIMPLE iteration cap for steady RANS. Prevents 2D points from monopolising CPU during large sweeps.",
     )
+    media_budget_fraction: float = Field(
+        default=0.5,
+        gt=0,
+        description="Wall-clock budget for the post-solve media/frame rendering stage of one case, "
+        "as a fraction of solver_timeout. On breach the job COMPLETES with whatever rendered, a loud "
+        "'media rendering budget exhausted' quality warning, and the evidence manifest unavailable map "
+        "recording the gaps (2026-07-07 incident: unbudgeted per-frame renders pinned workers for hours).",
+    )
+    stall_no_progress_minutes: float = Field(
+        default=20.0,
+        gt=0,
+        description="Engine-side stall detector threshold: a running task in a solving/postprocessing "
+        "phase with NO live OpenFOAM process and NO progress-token advance (status.json update, "
+        "coefficient.dat mtime, frame PNG mtime) for this many minutes is marked failed "
+        "('stalled in <phase> — no progress for Nm') and the worker child exits, converting an "
+        "eternal in-process grind into the already-handled failed job class.",
+    )
     build_id: str = Field(
         default="dev",
         description="Source/image build identifier reported to the API for UI version-parity checks.",
@@ -97,6 +114,10 @@ class Settings(BaseSettings):
 
     def resolved_cache_dir(self) -> Path:
         return self.cache_dir if self.cache_dir is not None else self.data_dir / "cache"
+
+    def media_budget_seconds(self) -> float:
+        """Wall-clock seconds one case's post-solve media/frame stage may consume."""
+        return self.media_budget_fraction * self.solver_timeout
 
     def resolved_worker_cpu_budget(self) -> int:
         if self.worker_cpu_budget is not None:

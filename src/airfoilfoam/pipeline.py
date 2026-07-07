@@ -52,7 +52,7 @@ from .postprocess.forces import (
 )
 from .postprocess.images import (
     find_all_vtus,
-    render_animation,
+    render_animations,
     render_contours,
     render_frame_track_images,
     render_mean_contours,
@@ -266,6 +266,33 @@ URANS_FRAME_SPAN_PERIODS = 3
 #: may consume; beyond this the refinement is skipped (it would deterministically
 #: time out and burn hours of CPU) and the base window is graded honestly.
 URANS_REFINE_BUDGET_FRACTION = 0.8
+#: Fallback media wall-budget fraction of solver_timeout when the caller does
+#: not pass an explicit budget (jobs.py passes Settings.media_budget_seconds()
+#: — same default). Mirrors Settings.media_budget_fraction.
+MEDIA_BUDGET_FRACTION_DEFAULT = 0.5
+
+
+class MediaBudget:
+    """Wall-clock budget for one case's post-solve media/frame stage.
+
+    No timeout covered post-solve rendering before 2026-07-07 (the 7200 s
+    guard is solver-subprocess-only), so an in-process render grind ran
+    forever. On breach the media stage degrades LOUDLY per the existing
+    media-loss machinery — the job completes with whatever rendered."""
+
+    def __init__(self, seconds: float):
+        self.seconds = max(0.0, float(seconds))
+        self._t0 = time.monotonic()
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._t0
+
+    def exceeded(self) -> bool:
+        return self.elapsed() >= self.seconds
+
+    def deadline(self) -> float:
+        """The ``time.monotonic`` instant the budget runs out (for renderers)."""
+        return self._t0 + self.seconds
 
 
 @dataclass
@@ -1461,11 +1488,24 @@ def _finalize_outcome(
     runner, n_proc, render_images, solver_timeout, transient_subdir="transient", image_subdir="",
     shared_mesh_dir: Optional[Path] = None, steady_field_dir: Optional[Path] = None,
     cancel_check: CancelCheck = None,
+    phase_progress=None, case_slug: Optional[str] = None,
+    media_budget_s: Optional[float] = None,
 ):
     """Parse forces, run the transient fallback if needed, compute y+ and images.
 
     ``image_subdir`` namespaces the output under the case dir (used to keep each
     marched AoA's artefacts separate within one polar directory).
+
+    ``phase_progress(phase, aoa, slug, solver, message=None)`` (optional) makes
+    the post-solve stage TRUTHFUL: the y+/VTK/render/frame block reports
+    ``JobPhase.postprocessing`` (2026-07-07 incident: the phase stayed
+    ``solving_urans`` through a 3+ hour render grind, so node-side zombie
+    detection correctly stayed silent) and render progress bumps the status
+    message (an observable progress token for the engine stall detector).
+
+    ``media_budget_s`` is the wall budget for the media/frame stage (default
+    ``MEDIA_BUDGET_FRACTION_DEFAULT * solver_timeout``); on breach the job
+    completes with partial media and a loud quality warning.
     """
     _check_cancel(cancel_check)
     coeff_files = _coeff_files(case_dir)
@@ -1575,6 +1615,15 @@ def _finalize_outcome(
                 )
             raise OpenFOAMError("URANS transient produced no coefficient.dat")
 
+    # Truthful stage transition: everything below (y+ / foamToVTK / renders /
+    # frame export) is post-processing, not solving. The phase change also
+    # bumps status phase_started_at + last_progress_at (storage.write_status).
+    def media_progress(message: str) -> None:
+        if phase_progress:
+            phase_progress(JobPhase.postprocessing, spec.aoa_deg, case_slug, None, message)
+
+    media_progress("postprocessing: y+ / VTK conversion / media rendering")
+
     # y+
     _check_cancel(cancel_check)
     runner.application(post_dir, "simpleFoam -postProcess -func yPlus -latestTime")
@@ -1589,6 +1638,10 @@ def _finalize_outcome(
     frame_times: list[float] = []
     frame_fields_rendered: list[str] = []
     requested_fields = [field.value if hasattr(field, "value") else str(field) for field in solver_params.write_images]
+    budget = MediaBudget(
+        media_budget_s if media_budget_s is not None else MEDIA_BUDGET_FRACTION_DEFAULT * solver_timeout
+    )
+    expected_artifacts = 0
     if render_images and solver_params.write_images:
         img_out = (case_dir / image_subdir / "images") if image_subdir else (case_dir / "images")
         prefix = f"{image_subdir}/" if image_subdir else ""
@@ -1616,53 +1669,63 @@ def _finalize_outcome(
                 )
                 anim_start_time = frame_stats.window_end - frame_span
                 anim_end_time = frame_stats.window_end
+            expected_artifacts = 3 * len(fields) + len(solver_params.frame_fields if frame_stats is not None else [])
             # Convert the transient fields; mean/animation use the retained measured
             # shedding window so dense refined runs become readable media.
+            # foamToVTK is never budget-skipped: the VTU frames are the raw
+            # EVIDENCE (archived below) — only derived media renders degrade.
             runner.application(post_dir, "foamToVTK").check()
             _check_cancel(cancel_check)
-            inst = render_contours(
-                post_dir, img_out, airfoil.contour, spec.chord, fields,
-                zoom_chords=solver_params.image_zoom_chords,
-                title_suffix=suffix + " (URANS instant)", freestream_speed=spec.speed,
-            )
-            outcome.images = {k: f"{prefix}images/{v}" for k, v in inst.items()}
+            if not budget.exceeded():
+                media_progress("rendering instantaneous contours")
+                inst = render_contours(
+                    post_dir, img_out, airfoil.contour, spec.chord, fields,
+                    zoom_chords=solver_params.image_zoom_chords,
+                    title_suffix=suffix + " (URANS instant)", freestream_speed=spec.speed,
+                )
+                outcome.images = {k: f"{prefix}images/{v}" for k, v in inst.items()}
             # Media loss is degradation, not failure: the job keeps its
             # coefficients, but every render failure must be LOUD (logged and
             # recorded as a quality warning) so the evidence manifest and the
             # classifier see the gap instead of a silent empty map.
-            try:
-                means = render_mean_contours(
-                    post_dir, img_out, airfoil.contour, spec.chord, fields,
-                    zoom_chords=solver_params.image_zoom_chords, title_suffix=suffix,
-                    freestream_speed=spec.speed,
-                    max_frames=URANS_ANIMATION_FRAMES,
-                    start_time=media_start_time,
-                    end_time=media_end_time,
-                )
-                outcome.mean_images = {k: f"{prefix}images/{v}" for k, v in means.items()}
-            except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
-                logger.warning("URANS mean-image render failed for %s: %s", case_dir, exc, exc_info=True)
-                outcome.quality_warnings.append(f"mean-image render failed: {exc}")
-            vids: dict[str, str] = {}
-            for fld in fields:
+            if not budget.exceeded():
+                media_progress("rendering mean contours")
                 try:
-                    name = render_animation(
-                        post_dir, img_out, airfoil.contour, spec.chord, fld,
+                    means = render_mean_contours(
+                        post_dir, img_out, airfoil.contour, spec.chord, fields,
+                        zoom_chords=solver_params.image_zoom_chords, title_suffix=suffix,
+                        freestream_speed=spec.speed,
+                        max_frames=URANS_ANIMATION_FRAMES,
+                        start_time=media_start_time,
+                        end_time=media_end_time,
+                    )
+                    outcome.mean_images = {k: f"{prefix}images/{v}" for k, v in means.items()}
+                except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
+                    logger.warning("URANS mean-image render failed for %s: %s", case_dir, exc, exc_info=True)
+                    outcome.quality_warnings.append(f"mean-image render failed: {exc}")
+            vids: dict[str, str] = {}
+            if not budget.exceeded():
+                try:
+                    batch = render_animations(
+                        post_dir, img_out, airfoil.contour, spec.chord, fields,
                         freestream_speed=spec.speed, zoom_chords=solver_params.image_zoom_chords,
                         max_frames=min(URANS_ANIMATION_FRAMES, URANS_MAX_ANIMATION_FRAMES),
                         start_time=anim_start_time,
                         end_time=anim_end_time,
                         title_suffix=suffix,
+                        deadline=budget.deadline(),
+                        progress=media_progress,
                     )
                 except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
-                    logger.warning(
-                        "URANS animation render failed for %s field %s: %s",
-                        case_dir, fld.value, exc, exc_info=True,
-                    )
-                    outcome.quality_warnings.append(f"animation render failed ({fld.value}): {exc}")
-                    continue
-                if name:
-                    vids[fld.value] = f"{prefix}images/{name}"
+                    logger.warning("URANS animation render failed for %s: %s", case_dir, exc, exc_info=True)
+                    outcome.quality_warnings.append(f"animation render failed: {exc}")
+                else:
+                    for field_name, err in batch.errors.items():
+                        logger.warning(
+                            "URANS animation render failed for %s field %s: %s", case_dir, field_name, err
+                        )
+                        outcome.quality_warnings.append(f"animation render failed ({field_name}): {err}")
+                    vids = {k: f"{prefix}images/{v}" for k, v in batch.videos.items()}
             outcome.video = vids
             # Frame-track PNG export: ~24 frames/period over the last
             # min(3, K) periods (cap 120), rendered from the VTU frames nearest
@@ -1671,23 +1734,26 @@ def _finalize_outcome(
                 frames_out = (
                     (case_dir / image_subdir / "frames") if image_subdir else (case_dir / "frames")
                 )
-                try:
-                    targets = frame_target_times(
-                        frame_stats.window_end, frame_stats.period_s, frame_stats.whole_periods,
-                        span_periods=URANS_FRAME_SPAN_PERIODS,
-                    )
-                    frame_times, frame_fields_rendered = render_frame_track_images(
-                        post_dir, frames_out, airfoil.contour, spec.chord,
-                        solver_params.frame_fields, targets,
-                        freestream_speed=spec.speed,
-                        zoom_chords=solver_params.image_zoom_chords,
-                    )
-                except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
-                    logger.warning(
-                        "URANS frame-track image export failed for %s: %s", case_dir, exc, exc_info=True
-                    )
-                    outcome.quality_warnings.append(f"frame image export failed: {exc}")
-                    frame_times, frame_fields_rendered = [], []
+                if not budget.exceeded():
+                    try:
+                        targets = frame_target_times(
+                            frame_stats.window_end, frame_stats.period_s, frame_stats.whole_periods,
+                            span_periods=URANS_FRAME_SPAN_PERIODS,
+                        )
+                        frame_times, frame_fields_rendered = render_frame_track_images(
+                            post_dir, frames_out, airfoil.contour, spec.chord,
+                            solver_params.frame_fields, targets,
+                            freestream_speed=spec.speed,
+                            zoom_chords=solver_params.image_zoom_chords,
+                            deadline=budget.deadline(),
+                            progress=media_progress,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
+                        logger.warning(
+                            "URANS frame-track image export failed for %s: %s", case_dir, exc, exc_info=True
+                        )
+                        outcome.quality_warnings.append(f"frame image export failed: {exc}")
+                        frame_times, frame_fields_rendered = [], []
                 missing_frame_fields = sorted(
                     {f.value for f in solver_params.frame_fields} - set(frame_fields_rendered)
                 )
@@ -1696,14 +1762,26 @@ def _finalize_outcome(
                         "frame images unavailable for fields: " + ", ".join(missing_frame_fields)
                     )
         else:
+            expected_artifacts = len(fields)
             runner.application(post_dir, "foamToVTK -latestTime").check()
             _check_cancel(cancel_check)
-            imgs = render_contours(
-                post_dir, img_out, airfoil.contour, spec.chord, fields,
-                zoom_chords=solver_params.image_zoom_chords, title_suffix=suffix,
-                freestream_speed=spec.speed,
+            if not budget.exceeded():
+                imgs = render_contours(
+                    post_dir, img_out, airfoil.contour, spec.chord, fields,
+                    zoom_chords=solver_params.image_zoom_chords, title_suffix=suffix,
+                    freestream_speed=spec.speed,
+                )
+                outcome.images = {k: f"{prefix}images/{v}" for k, v in imgs.items()}
+        rendered_artifacts = (
+            len(outcome.images) + len(outcome.mean_images) + len(outcome.video) + len(frame_fields_rendered)
+        )
+        if budget.exceeded() and rendered_artifacts < expected_artifacts:
+            warning = (
+                f"media rendering budget exhausted after {budget.elapsed():.0f}s: "
+                f"rendered {rendered_artifacts} of {expected_artifacts} artifacts"
             )
-            outcome.images = {k: f"{prefix}images/{v}" for k, v in imgs.items()}
+            logger.warning("%s (%s)", warning, case_dir)
+            outcome.quality_warnings.append(warning)
 
     # Ship the pinned frame_track contract on every shedding URANS point (the
     # stats are real even when media rendering is disabled/unavailable —
@@ -1767,6 +1845,9 @@ def run_case(
     mesh_dir: Optional[Path] = None,
     cancel_check: CancelCheck = None,
     cache: Optional[EngineCache] = None,
+    phase_progress=None,
+    case_slug: Optional[str] = None,
+    media_budget_s: Optional[float] = None,
 ) -> CaseOutcome:
     """Run one self-contained case. If ``mesh_dir`` is given, reuse that prebuilt
     mesh (skip blockMesh) instead of meshing in the case directory. With a
@@ -1854,6 +1935,9 @@ def run_case(
             runner, n_proc, render_images, solver_timeout, shared_mesh_dir=mesh_dir,
             steady_field_dir=steady_field_dir,
             cancel_check=cancel_check,
+            phase_progress=phase_progress,
+            case_slug=case_slug,
+            media_budget_s=media_budget_s,
         )
 
         if (
@@ -2152,6 +2236,7 @@ def _run_full_urans_replacement(
     outcome_progress=None,
     progress_budget: Optional[int] = None,
     cancel_check: CancelCheck = None,
+    media_budget_s: Optional[float] = None,
 ) -> list[StoredCaseOutcome]:
     urans_solver = solver_params.model_copy(
         update={"transient_fallback": True, "force_transient": True, "transient_auto_refine": True}
@@ -2179,6 +2264,9 @@ def _run_full_urans_replacement(
             solver_timeout=solver_timeout,
             mesh_dir=mesh_dir,
             cancel_check=cancel_check,
+            phase_progress=phase_progress,
+            case_slug=case_slug,
+            media_budget_s=media_budget_s,
         )
         _check_cancel(cancel_check)
         outcome.n_cells = outcome.n_cells or n_cells
@@ -2197,7 +2285,7 @@ def solve_polar_marched(
     solver_timeout=7200, rans_solver_timeout: Optional[int] = None,
     rans_max_iterations: Optional[int] = None, progress=None,
     phase_progress=None, outcome_progress=None, cancel_check: CancelCheck = None,
-    cache: Optional[EngineCache] = None,
+    cache: Optional[EngineCache] = None, media_budget_s: Optional[float] = None,
 ) -> PolarMarchResult:
     """Run one polar (fixed chord+speed) over the AoA sweep, reusing ``mesh_dir``
     and warm-starting each AoA from the previous converged field (marching).
@@ -2253,6 +2341,9 @@ def solve_polar_marched(
                 runner, n_proc, render_images, solver_timeout,
                 transient_subdir=f"transient_a{i}", image_subdir=f"a{i}", shared_mesh_dir=mesh_dir,
                 cancel_check=cancel_check,
+                phase_progress=phase_progress,
+                case_slug=f"{polar_dir.name}/a{i}",
+                media_budget_s=media_budget_s,
             )
         except JobCancelled:
             raise
@@ -2293,6 +2384,7 @@ def solve_polar_marched(
                 outcome_progress=outcome_progress,
                 progress_budget=remaining_progress,
                 cancel_check=cancel_check,
+                media_budget_s=media_budget_s,
             )
             return PolarMarchResult(
                 points=urans_points,

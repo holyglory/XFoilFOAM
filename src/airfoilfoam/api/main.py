@@ -29,7 +29,7 @@ from ..models import (
     PolarRequest,
     TurbulenceModel,
 )
-from ..postprocess.images import compute_field_extents, render_animation, render_contours, render_custom_field, render_mean_contours
+from ..postprocess.images import compute_field_extents, render_animations, render_contours, render_custom_field, render_mean_contours
 from ..storage import JobStore
 
 
@@ -241,9 +241,17 @@ def create_app() -> FastAPI:
         job_id = uuid.uuid4().hex
         store.create(job_id, request)
         # import here so the API can start even if the broker is unavailable at import time
+        from ..celery_app import task_hard_time_limit_s
         from ..tasks import run_polar
 
-        async_result = run_polar.apply_async(args=[job_id, request.model_dump_json()], task_id=job_id)
+        # Hard celery backstop scaled by THIS job's case count (one task runs
+        # the whole polar job; the app-level default only covers one case).
+        total_cases = max(1, len(request.cases()))
+        async_result = run_polar.apply_async(
+            args=[job_id, request.model_dump_json()],
+            task_id=job_id,
+            time_limit=task_hard_time_limit_s(get_settings(), total_cases),
+        )
         status = store.read_status(job_id)
         assert status is not None
         status.task_id = async_result.id
@@ -565,24 +573,26 @@ def create_app() -> FastAPI:
                     end_time=end_time,
                     field_scales=scales,
                 )
-                for field in fields:
-                    vmin, vmax = scales[field]
-                    name = render_animation(
-                        source_dir,
-                        out_dir,
-                        contour,
-                        request.chord,
-                        field,
-                        freestream_speed=request.speed,
-                        zoom_chords=request.zoom_chords,
-                        start_time=start_time,
-                        end_time=end_time,
-                        title_suffix=title_suffix,
-                        vmin=vmin,
-                        vmax=vmax,
-                    )
-                    if name:
-                        videos[field.value] = name
+                # One pass: every VTU is read ONCE for all fields (the per-field
+                # loop re-read the whole series per field and burned the API
+                # container at ~390% CPU in the 2026-07-07 incident).
+                batch = render_animations(
+                    source_dir,
+                    out_dir,
+                    contour,
+                    request.chord,
+                    fields,
+                    freestream_speed=request.speed,
+                    zoom_chords=request.zoom_chords,
+                    start_time=start_time,
+                    end_time=end_time,
+                    title_suffix=title_suffix,
+                    field_scales=scales,
+                )
+                if batch.errors:
+                    detail = "; ".join(f"{k}: {v}" for k, v in sorted(batch.errors.items()))
+                    raise RuntimeError(f"animation encode failed: {detail}")
+                videos = dict(batch.videos)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=422, detail=f"Could not render default media: {exc}")
 

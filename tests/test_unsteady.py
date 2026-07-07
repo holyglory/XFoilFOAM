@@ -321,6 +321,9 @@ def test_whole_polar_urans_replacement_reuses_shared_mesh(tmp_path, monkeypatch)
         solver_timeout=7200,
         mesh_dir=None,
         cancel_check=None,
+        phase_progress=None,
+        case_slug=None,
+        media_budget_s=None,
     ):
         seen_meshes.append(mesh_dir)
         assert solver_params.force_transient

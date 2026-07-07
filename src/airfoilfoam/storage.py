@@ -81,6 +81,13 @@ class JobStore:
                 status.last_progress_at = previous.last_progress_at
             if status.completed_cases > previous.completed_cases:
                 status.last_progress_at = now
+            if status.phase != previous.phase:
+                # A stage transition IS progress (solving -> postprocessing ->
+                # next case). Before 2026-07-07 last_progress_at froze at solve
+                # end while a render grind ran for hours inside the worker
+                # process, so the node-side detectors saw an eternally quiet
+                # but heartbeat-fresh job.
+                status.last_progress_at = now
         if status.state == JobState.running and status.started_at is None:
             status.started_at = now
         if status.phase_started_at is None:

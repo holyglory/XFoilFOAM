@@ -1,9 +1,47 @@
 """Celery application factory."""
 from __future__ import annotations
 
+import math
+
 from celery import Celery
 
-from .config import get_settings
+from .config import Settings, get_settings
+
+#: Fixed per-case teardown/overhead margin on top of the solver + media budgets:
+#: meshing, potentialFoam/steady init, y+, foamToVTK conversion, reconstructPar
+#: and evidence archiving (hash + tar of the VTU window) all run outside the
+#: solver timeout. Named and documented — never inline a bare number here.
+TASK_TIME_LIMIT_MARGIN_S = 900
+
+
+def task_hard_time_limit_s(settings: Settings, total_cases: int = 1) -> int:
+    """Hard celery wall ceiling for one ``run_polar`` task (LAST-RESORT backstop).
+
+    Per-case unit, computed from the SAME config source the runtime budgets
+    use (no magic constants):
+
+        2 * solver_timeout          (steady init + base/extended/refined URANS
+                                     attempts, each individually capped by
+                                     solver_timeout and the in-run wall-budget
+                                     guards)
+      + media_budget_seconds()      (post-solve media/frame stage budget)
+      + TASK_TIME_LIMIT_MARGIN_S    (meshing / y+ / foamToVTK / evidence)
+
+    One celery task runs a WHOLE polar job (possibly many chord x speed x AoA
+    cases, marched serially under warm start), so the unit scales linearly
+    with the job's case count at dispatch time (see the submit endpoint in
+    ``api/main.py``); the app-level default below covers the single-case job.
+
+    Hitting this limit means the engine-side stall detector (tasks.py) and the
+    media budget both failed — celery SIGKILLs the pool child, which converts
+    the job into the ALREADY-HANDLED death class: the runtime heartbeat goes
+    stale, the node's lost-running classifier (apps/sweeper/src/reconcile.ts
+    ``classifyLostRunning``) cancels + requeues the points, and any broker
+    redelivery is discarded by the terminal-result guard in
+    ``tasks.run_polar`` (same class as boot reconcile / redelivery).
+    """
+    per_case = 2 * settings.solver_timeout + settings.media_budget_seconds() + TASK_TIME_LIMIT_MARGIN_S
+    return int(math.ceil(per_case * max(1, int(total_cases))))
 
 
 def make_celery() -> Celery:
@@ -16,6 +54,9 @@ def make_celery() -> Celery:
         task_track_started=True,
         worker_prefetch_multiplier=1,
         task_acks_late=True,
+        # Default (single-case) hard ceiling; the submit endpoint overrides it
+        # per dispatch with the job's real case count.
+        task_time_limit=task_hard_time_limit_s(settings),
     )
     app.autodiscover_tasks(["airfoilfoam"])
     return app

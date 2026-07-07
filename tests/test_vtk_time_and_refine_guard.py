@@ -155,15 +155,21 @@ def test_urans_media_render_failures_are_loud_quality_warnings(tmp_path, monkeyp
     def boom_mean(*_args, **_kwargs):
         raise RuntimeError("no VTU frames in retained window")
 
-    def boom_animation(*_args, **_kwargs):
-        raise RuntimeError("encoder exploded")
+    def failed_animations(*_args, **_kwargs):
+        # Per-field encode failure surfaced through the batch result (the
+        # single-pass renderer collects per-field errors instead of raising).
+        from airfoilfoam.postprocess.images import AnimationBatchResult
+
+        return AnimationBatchResult(
+            videos={}, errors={"velocity_magnitude": "encoder exploded"}, budget_skipped=[]
+        )
 
     monkeypatch.setattr(pipeline, "_run_transient", fake_transient)
     monkeypatch.setattr(
         pipeline, "render_contours", lambda *_a, **_k: {"velocity_magnitude": "velocity_magnitude.png"}
     )
     monkeypatch.setattr(pipeline, "render_mean_contours", boom_mean)
-    monkeypatch.setattr(pipeline, "render_animation", boom_animation)
+    monkeypatch.setattr(pipeline, "render_animations", failed_animations)
 
     outcome = CaseOutcome(spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=12.0), reynolds=666_666)
     _finalize_outcome(

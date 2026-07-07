@@ -8,6 +8,8 @@ triangles inside the airfoil are masked and the airfoil is drawn on top. Animati
 from __future__ import annotations
 
 import json
+import shutil
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
@@ -21,7 +23,6 @@ import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.path import Path as MplPath  # noqa: E402
-from matplotlib.tri import CubicTriInterpolator  # noqa: E402
 
 import meshio  # noqa: E402
 
@@ -232,14 +233,83 @@ class _Field2D:
     triang: mtri.Triangulation
 
 
+class TriGradientOperator:
+    """Precomputed per-triangle P1 gradient operator with area-weighted nodal
+    recovery (Green-Gauss / linear finite-element gradient).
+
+    Numerical scheme (chosen over ``CubicTriInterpolator.gradient``): the nodal
+    field is treated as piecewise linear on each triangle, whose (constant)
+    gradient is exact for linear fields and first-order accurate on smooth
+    fields; each node then receives the area-weighted average of its incident
+    triangles' gradients — the standard Green-Gauss / ZZ-style recovery, which
+    restores near-second-order accuracy at interior nodes. The cubic min-E
+    interpolator solved a conjugate-gradient system over the FULL triangulation
+    on every construction (30-60 s per frame on a refined URANS mesh — the
+    2026-07-07 prod grind: 2 builds x 141 frames pinned workers for hours).
+    This operator is built ONCE per triangulation and applying it to a frame is
+    a handful of vectorised O(n_triangles) passes (milliseconds). The output
+    feeds 40-band contour plots; parity with the cubic gradient within
+    contour-band resolution is asserted in tests/test_images_extra.py.
+
+    Masked triangles (inside the airfoil) are excluded; nodes with no valid
+    incident triangle get 0.0, matching the previous masked-invalid fill.
+    """
+
+    def __init__(self, triang: mtri.Triangulation):
+        tris = np.asarray(triang.triangles)
+        mask = triang.mask
+        if mask is not None:
+            tris = tris[~np.asarray(mask, dtype=bool)]
+        x = np.asarray(triang.x, dtype=float)
+        y = np.asarray(triang.y, dtype=float)
+        x1, x2, x3 = (x[tris[:, k]] for k in range(3))
+        y1, y2, y3 = (y[tris[:, k]] for k in range(3))
+        det = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1)  # 2 * signed area
+        good = np.abs(det) > 1e-300
+        tris, det = tris[good], det[good]
+        x1, x2, x3 = x1[good], x2[good], x3[good]
+        y1, y2, y3 = y1[good], y2[good], y3[good]
+        # dz/dx = sum_k gx[:, k] * z[tri[:, k]] (analogously gy): the exact
+        # gradient of the linear interpolant on each triangle.
+        self._gx = np.stack([(y2 - y3) / det, (y3 - y1) / det, (y1 - y2) / det], axis=1)
+        self._gy = np.stack([(x3 - x2) / det, (x1 - x3) / det, (x2 - x1) / det], axis=1)
+        self._tri_flat = tris.ravel()
+        self._area3 = np.repeat(0.5 * np.abs(det), 3)
+        self._n_nodes = len(x)
+        wsum = np.bincount(self._tri_flat, weights=self._area3, minlength=self._n_nodes)
+        self._inv_wsum = np.where(wsum > 0.0, 1.0 / np.where(wsum > 0.0, wsum, 1.0), 0.0)
+        self._tris = tris
+
+    def gradient(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Nodal (dz/dx, dz/dy) of one frame's nodal values ``z``."""
+        zt = np.asarray(z, dtype=float)[self._tris]
+        gx_t = np.repeat((zt * self._gx).sum(axis=1), 3) * self._area3
+        gy_t = np.repeat((zt * self._gy).sum(axis=1), 3) * self._area3
+        gx = np.bincount(self._tri_flat, weights=gx_t, minlength=self._n_nodes) * self._inv_wsum
+        gy = np.bincount(self._tri_flat, weights=gy_t, minlength=self._n_nodes) * self._inv_wsum
+        return gx, gy
+
+
+def _gradient_operator(triang: mtri.Triangulation) -> TriGradientOperator:
+    """The (cached) gradient operator of a triangulation. The triangulation of a
+    case is identical across its frames, so the operator is built once and
+    reused for every frame's vorticity (the whole point of the 2026-07-07 fix).
+    The cache assumes the mask is not mutated after the first vorticity call —
+    ``_build_triangulation`` sets the mask before any field is evaluated."""
+    op = getattr(triang, "_airfoilfoam_grad_op", None)
+    if op is None:
+        op = TriGradientOperator(triang)
+        triang._airfoilfoam_grad_op = op
+    return op
+
+
 def compute_vorticity(triang: mtri.Triangulation, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Out-of-plane vorticity omega_z = dv/dx - du/dy, evaluated at the mesh nodes
-    via cubic interpolation of the in-plane velocity components."""
-    iu = CubicTriInterpolator(triang, np.asarray(u, dtype=float))
-    iv = CubicTriInterpolator(triang, np.asarray(v, dtype=float))
-    _, dudy = iu.gradient(triang.x, triang.y)
-    dvdx, _ = iv.gradient(triang.x, triang.y)
-    wz = np.asarray(dvdx, dtype=float) - np.asarray(dudy, dtype=float)
+    """Out-of-plane vorticity omega_z = dv/dx - du/dy at the mesh nodes, from the
+    precomputed linear gradient operator (built once per triangulation)."""
+    op = _gradient_operator(triang)
+    _, dudy = op.gradient(u)
+    dvdx, _ = op.gradient(v)
+    wz = dvdx - dudy
     return np.ma.filled(np.ma.masked_invalid(wz), 0.0)
 
 
@@ -342,23 +412,34 @@ def compute_field_extents(
     mask, f2d = _build_triangulation(meshio.read(vtus[0]), airfoil_xy)
     xlim = (-zoom_chords * chord, (1.0 + zoom_chords) * chord)
     ylim = (-zoom_chords * chord, zoom_chords * chord)
-    result: dict[str, dict[str, float | int]] = {}
-    for field in fields:
-        min_value = float("inf")
-        max_value = float("-inf")
-        finite_count = 0
-        for vtu in vtus:
+    # One meshio.read per VTU serves EVERY field (this API-process path burned
+    # len(fields) x len(vtus) reads plus per-frame cubic interpolator builds in
+    # the 2026-07-07 prod grind; the triangulation + gradient operator are now
+    # shared across all frames and fields).
+    stats: dict[ImageField, list] = {f: [float("inf"), float("-inf"), 0] for f in fields}
+    failed: set[ImageField] = set()
+    for vtu in vtus:
+        mesh = meshio.read(vtu)
+        for field in fields:
+            if field in failed:
+                continue
             try:
-                values = _field_values(meshio.read(vtu), mask, f2d, field, freestream_speed)
+                values = _field_values(mesh, mask, f2d, field, freestream_speed)
             except (KeyError, ValueError):
-                finite_count = 0
-                break
+                failed.add(field)
+                continue
             finite = _finite_visible_values(f2d, values, xlim, ylim)
             if finite.size == 0:
                 continue
-            min_value = min(min_value, float(np.min(finite)))
-            max_value = max(max_value, float(np.max(finite)))
-            finite_count += int(finite.size)
+            entry = stats[field]
+            entry[0] = min(entry[0], float(np.min(finite)))
+            entry[1] = max(entry[1], float(np.max(finite)))
+            entry[2] += int(finite.size)
+    result: dict[str, dict[str, float | int]] = {}
+    for field in fields:
+        if field in failed:
+            continue
+        min_value, max_value, finite_count = stats[field]
         if finite_count > 0 and np.isfinite(min_value) and np.isfinite(max_value):
             result[field.value] = {"min": min_value, "max": max_value, "finite_count": finite_count}
     return result
@@ -434,7 +515,15 @@ def render_mean_contours(
     end_time: float | None = None,
     field_scales: dict[ImageField, tuple[float, float]] | None = None,
 ) -> dict[str, str]:
-    """Render time-AVERAGED contours by averaging each field over the transient VTUs."""
+    """Render time-AVERAGED contours by averaging each field over the transient VTUs.
+
+    One pass, ONE ``meshio.read`` per VTU: pointwise fields accumulate their
+    per-frame nodal values (cheap array ops), while vorticity accumulates the
+    raw nodal U and takes ONE gradient of the mean velocity at the end — the
+    gradient operator is linear, so vorticity(mean U) == mean(vorticity(U_i))
+    exactly, and the per-frame interpolator builds of the 2026-07-07 prod
+    grind (2 CG solves x 141 frames) collapse to a single cheap operator
+    application. Each field is then interpolated/rendered exactly once."""
     out_dir.mkdir(parents=True, exist_ok=True)
     vtus = select_vtus(find_all_vtus(case_dir), start_time, end_time, max_frames)
     if not vtus:
@@ -442,23 +531,32 @@ def render_mean_contours(
     airfoil_xy = airfoil_contour_unit * chord
     mask, f2d = _build_triangulation(meshio.read(vtus[0]), airfoil_xy)
     acc: dict[ImageField, np.ndarray] = {}
+    u_sum: np.ndarray | None = None  # nodal (u, v) accumulator for mean vorticity
     supported: set[ImageField] | None = None
     for vtu in vtus:
         mesh = meshio.read(vtu)
         frame_supported: set[ImageField] = set()
         for field in fields:
             try:
+                if field == ImageField.vorticity:
+                    uv = np.asarray(mesh.point_data["U"])[mask][:, :2]
+                    u_sum = uv if u_sum is None else u_sum + uv
+                    frame_supported.add(field)
+                    continue
                 vals = _field_values(mesh, mask, f2d, field, freestream_speed)
             except (KeyError, ValueError):
                 continue
             frame_supported.add(field)
             acc[field] = vals if field not in acc else acc[field] + vals
         supported = frame_supported if supported is None else supported & frame_supported
+    if ImageField.vorticity in (supported or set()) and u_sum is not None:
+        u_mean = u_sum / len(vtus)
+        acc[ImageField.vorticity] = compute_vorticity(f2d.triang, u_mean[:, 0], u_mean[:, 1]) * len(vtus)
     xlim = (-zoom_chords * chord, (1.0 + zoom_chords) * chord)
     ylim = (-zoom_chords * chord, zoom_chords * chord)
     results: dict[str, str] = {}
     for field in fields:
-        if field not in (supported or set()):
+        if field not in (supported or set()) or field not in acc:
             continue
         label, cmap = _FIELD_STYLE[field]
         vmin, vmax = _scale_for(field_scales, field)
@@ -513,12 +611,21 @@ def write_animation_mp4(
     return path
 
 
-def render_animation(
+@dataclass
+class AnimationBatchResult:
+    """Outcome of one multi-field animation pass over a case's VTU series."""
+
+    videos: dict[str, str]  # field value -> mp4 filename
+    errors: dict[str, str]  # field value -> encode error (loud degradation)
+    budget_skipped: list[str]  # fields not attempted: media wall budget hit
+
+
+def render_animations(
     case_dir: Path,
     out_dir: Path,
     airfoil_contour_unit: np.ndarray,
     chord: float,
-    field: ImageField,
+    fields: Sequence[ImageField],
     freestream_speed: float = 0.0,
     zoom_chords: float = 2.0,
     fps: int = 20,
@@ -526,37 +633,72 @@ def render_animation(
     start_time: float | None = None,
     end_time: float | None = None,
     title_suffix: str = "",
-    vmin: float | None = None,
-    vmax: float | None = None,
-) -> Optional[str]:
-    """Encode an mp4 of one field over the transient time series. Returns the
-    filename, or None if there are too few frames / ffmpeg is unavailable."""
+    field_scales: dict[ImageField, tuple[float, float]] | None = None,
+    deadline: float | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> AnimationBatchResult:
+    """Encode mp4s of ALL requested fields over the transient time series,
+    reading each VTU exactly ONCE and reusing one triangulation (+ cached
+    gradient operator) across every frame and field. This replaces the
+    per-field ``render_animation`` loop that re-read the whole VTU series once
+    per field (8x re-read in the 2026-07-07 prod grind).
+
+    A field missing from the VTUs is skipped by omission (never invented); a
+    per-field encoding failure lands in ``errors`` so callers degrade loudly.
+    ``deadline`` (``time.monotonic`` clock) stops BEFORE starting another
+    field's encode once the media wall budget is exhausted; skipped fields are
+    reported in ``budget_skipped``."""
+    result = AnimationBatchResult(videos={}, errors={}, budget_skipped=[])
     vtus = select_vtus(find_all_vtus(case_dir), start_time, end_time, min(max_frames, 220))
     if len(vtus) < 2:
-        return None
+        return result
     out_dir.mkdir(parents=True, exist_ok=True)
     airfoil_xy = airfoil_contour_unit * chord
     mask, f2d = _build_triangulation(meshio.read(vtus[0]), airfoil_xy)
-    try:
-        frames = [_field_values(meshio.read(v), mask, f2d, field, freestream_speed) for v in vtus]
-    except (KeyError, ValueError):
-        return None
-    if vmin is None or vmax is None:
-        allv = np.concatenate(frames)
-        vmin, vmax = (float(np.percentile(allv, 2)), float(np.percentile(allv, 98)))
-    label, cmap = _FIELD_STYLE[field]
+    per_field: dict[ImageField, list[np.ndarray]] = {f: [] for f in fields}
+    failed: set[ImageField] = set()
+    for vtu in vtus:
+        mesh = meshio.read(vtu)  # ONE read serves every field
+        for field in fields:
+            if field in failed:
+                continue
+            try:
+                per_field[field].append(_field_values(mesh, mask, f2d, field, freestream_speed))
+            except (KeyError, ValueError):
+                failed.add(field)
+
     xlim = (-zoom_chords * chord, (1.0 + zoom_chords) * chord)
     ylim = (-zoom_chords * chord, zoom_chords * chord)
-    title = f"{label}{(' — ' + title_suffix) if title_suffix else ''}"
+    for k, field in enumerate(fields):
+        frames = per_field.get(field, [])
+        if field in failed or len(frames) != len(vtus):
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            result.budget_skipped.append(field.value)
+            continue
+        if progress is not None:
+            progress(f"rendering animation {field.value} ({k + 1}/{len(fields)})")
+        vmin, vmax = _scale_for(field_scales, field)
+        if vmin is None or vmax is None:
+            allv = np.concatenate(frames)
+            vmin, vmax = (float(np.percentile(allv, 2)), float(np.percentile(allv, 98)))
+        label, cmap = _FIELD_STYLE[field]
+        title = f"{label}{(' — ' + title_suffix) if title_suffix else ''}"
 
-    def draw(ax, i: int) -> None:
-        _draw_field(ax, f2d, frames[i], airfoil_xy, label, cmap, xlim, ylim, title, vmin=vmin, vmax=vmax)
-        ax.set_xticks([])
-        ax.set_yticks([])
+        def draw(ax, i: int, frames=frames, label=label, cmap=cmap, title=title, vmin=vmin, vmax=vmax) -> None:
+            _draw_field(ax, f2d, frames[i], airfoil_xy, label, cmap, xlim, ylim, title, vmin=vmin, vmax=vmax)
+            ax.set_xticks([])
+            ax.set_yticks([])
 
-    fname = f"{field.value}.mp4"
-    written = write_animation_mp4(out_dir / fname, draw, len(frames), fps=fps)
-    return fname if written is not None else None
+        fname = f"{field.value}.mp4"
+        try:
+            written = write_animation_mp4(out_dir / fname, draw, len(frames), fps=fps)
+        except Exception as exc:  # noqa: BLE001 - media is degradation, not failure
+            result.errors[field.value] = f"{exc}"
+            continue
+        if written is not None:
+            result.videos[field.value] = fname
+    return result
 
 
 def nearest_vtu_indices(vtu_times: Sequence[float], target_times: Sequence[float]) -> list[int]:
@@ -585,6 +727,8 @@ def render_frame_track_images(
     freestream_speed: float = 0.0,
     zoom_chords: float = 2.0,
     width_px: int = 640,
+    deadline: float | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[list[float], list[str]]:
     """Render the frame_track PNG sequence (contract: 640px wide) from the VTU
     frames nearest each target time.
@@ -593,7 +737,14 @@ def render_frame_track_images(
     consistent per-field color scale across the sequence (2nd..98th percentile
     over all frames). Returns ``(actual_frame_times, rendered_field_names)``;
     a field whose source data is missing in the VTUs is skipped (reported by
-    omission, never invented)."""
+    omission, never invented).
+
+    ``deadline`` (``time.monotonic`` clock) enforces the media wall budget:
+    when it passes mid-field, that field's PARTIAL PNG directory is removed
+    (the frame player contract requires complete sequences) and remaining
+    fields are not attempted — the rendered list stays truthful.
+    ``progress`` receives a human-readable token every 10 frames so the status
+    file shows observable progress while frames render."""
     vtus = find_all_vtus(case_dir)
     times = [_vtu_time(v) for v in vtus]
     picks = nearest_vtu_indices(times, target_times)
@@ -623,10 +774,13 @@ def render_frame_track_images(
     height_px = max(64, int(round(width_px * (ylim[1] - ylim[0]) / (xlim[1] - xlim[0]))))
 
     rendered: list[str] = []
-    for field in fields:
-        frames_vals = per_field.get(field, [])
-        if field in failed or len(frames_vals) != len(chosen):
-            continue
+    renderable = [f for f in fields if f not in failed and len(per_field.get(f, [])) == len(chosen)]
+    total_frames = len(chosen) * len(renderable)
+    frames_done = 0
+    for field in renderable:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        frames_vals = per_field[field]
         allv = np.concatenate(frames_vals)
         vmin, vmax = float(np.percentile(allv, 2)), float(np.percentile(allv, 98))
         if vmax <= vmin:
@@ -634,7 +788,14 @@ def render_frame_track_images(
         _label, cmap = _FIELD_STYLE[field]
         field_dir = out_root / field.value
         field_dir.mkdir(parents=True, exist_ok=True)
+        complete = True
         for i, values in enumerate(frames_vals):
+            if deadline is not None and time.monotonic() >= deadline:
+                # Budget hit mid-sequence: a partial sequence must never ship
+                # (the frame player pins frame index <-> coefficient samples),
+                # so the incomplete field directory is removed entirely.
+                complete = False
+                break
             fig = plt.figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
             ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
             ax.set_axis_off()
@@ -647,7 +808,14 @@ def render_frame_track_images(
             ax.set_ylim(*ylim)
             fig.savefig(field_dir / f"f{i:04d}.png", dpi=dpi)
             plt.close(fig)
-        rendered.append(field.value)
+            frames_done += 1
+            if progress is not None and (frames_done % 10 == 0 or frames_done == total_frames):
+                progress(f"rendering frames {frames_done}/{total_frames}")
+        if complete:
+            rendered.append(field.value)
+        else:
+            shutil.rmtree(field_dir, ignore_errors=True)
+            break
     return chosen_times, rendered
 
 
@@ -689,12 +857,23 @@ def render_custom_field(
     airfoil_xy = airfoil_contour_unit * chord
     mask, f2d = _build_triangulation(meshio.read(selected[0]), airfoil_xy)
     if role == "mean":
-        acc = None
-        for vtu in selected:
-            vals = _field_values(meshio.read(vtu), mask, f2d, field, freestream_speed)
-            acc = vals if acc is None else acc + vals
-        assert acc is not None
-        values = acc / len(selected)
+        if field == ImageField.vorticity:
+            # Curl is linear: vorticity(mean U) == mean(vorticity(U_i)) under
+            # the linear gradient operator — one gradient application total.
+            u_acc = None
+            for vtu in selected:
+                uv = np.asarray(meshio.read(vtu).point_data["U"])[mask][:, :2]
+                u_acc = uv if u_acc is None else u_acc + uv
+            assert u_acc is not None
+            u_mean = u_acc / len(selected)
+            values = compute_vorticity(f2d.triang, u_mean[:, 0], u_mean[:, 1])
+        else:
+            acc = None
+            for vtu in selected:
+                vals = _field_values(meshio.read(vtu), mask, f2d, field, freestream_speed)
+                acc = vals if acc is None else acc + vals
+            assert acc is not None
+            values = acc / len(selected)
     else:
         values = _field_values(meshio.read(selected[0]), mask, f2d, field, freestream_speed)
 

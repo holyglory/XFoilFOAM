@@ -8,12 +8,14 @@ import signal
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
 from celery.signals import worker_ready
 
 from .cancellation import JobCancelled
 from .celery_app import celery_app
-from .config import get_settings
+from .config import Settings, get_settings
 from .jobs import execute_job
 from .models import JobPhase, JobResult, JobState, JobStatus, PolarRequest
 from .openfoam.runner import install_subprocess_signal_handlers
@@ -21,7 +23,134 @@ from .storage import JobStore
 
 HEARTBEAT_INTERVAL_S = 10
 
+#: Exit code of a worker child that condemned its own stalled task (forensics
+#: in container logs; celery reports the task as failed either way).
+STALLED_TASK_EXIT_CODE = 70
+
+#: Phases the stall detector monitors. waiting_cpu is excluded (legitimately
+#: quiet and process-free); meshing/ingesting run external subprocesses or are
+#: short-lived and cheap.
+STALL_MONITORED_PHASES = frozenset(
+    {JobPhase.solving_rans, JobPhase.solving_urans, JobPhase.postprocessing}
+)
+
 logger = logging.getLogger(__name__)
+
+
+def newest_progress_file_mtime(job_dir: Path) -> Optional[float]:
+    """Newest mtime of the on-disk progress tokens under a job's cases tree:
+    ``coefficient.dat`` rows (a live pimpleFoam march appends continuously),
+    frame-track PNGs (an advancing media stage writes one per frame), and
+    ``.vtu`` frames (an advancing foamToVTK conversion — which runs in a
+    separate container under the docker runner, invisible to the /proc scan).
+    Returns None when no token file exists. Walks only when called — the
+    caller short-circuits on cheap status.json evidence first."""
+    newest: Optional[float] = None
+    cases_root = job_dir / "cases"
+    if not cases_root.exists():
+        return None
+    for root, _dirs, files in os.walk(cases_root):
+        in_frames = "frames" in Path(root).parts[-2:]
+        for name in files:
+            if (
+                name != "coefficient.dat"
+                and not name.endswith(".vtu")
+                and not (in_frames and name.endswith(".png"))
+            ):
+                continue
+            try:
+                mtime = (Path(root) / name).stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+    return newest
+
+
+def stall_reason(
+    status: Optional[JobStatus],
+    process_count: int,
+    newest_token_unix: Optional[float],
+    now_unix: float,
+    threshold_s: float,
+) -> Optional[str]:
+    """The condemnation reason for a stalled task, or None to leave it alone.
+
+    FALSE-POSITIVE GUARDS (must never condemn):
+      - any live process with cwd inside the job dir (a legitimate long
+        pimpleFoam march, foamToVTK, reconstructPar, ...): ``process_count > 0``;
+      - an advancing progress token: status.json updated (phase transitions,
+        completed cases, render progress messages all bump ``updated_at``),
+        coefficient.dat rows appended, or frame PNGs written within the
+        threshold;
+      - phases that are legitimately quiet (pending/waiting_cpu/terminal).
+    """
+    if status is None or status.state != JobState.running:
+        return None
+    if status.phase not in STALL_MONITORED_PHASES:
+        return None
+    if process_count > 0:
+        return None
+    tokens = [
+        t.timestamp()
+        for t in (status.updated_at, status.last_progress_at, status.phase_started_at)
+        if t is not None
+    ]
+    if newest_token_unix is not None:
+        tokens.append(float(newest_token_unix))
+    if not tokens:
+        return None
+    quiet_s = now_unix - max(tokens)
+    if quiet_s < threshold_s:
+        return None
+    return f"stalled in {status.phase.value} — no progress for {int(quiet_s // 60)}m"
+
+
+def _check_and_condemn_stall(store: JobStore, job_id: str, settings: Settings) -> None:
+    """Heartbeat-thread stall check. On a confirmed stall the job is marked
+    FAILED (the handled class: the node ingests the failure, releases the
+    points, and the terminal-result guard in ``run_polar`` discards any broker
+    redelivery) and the worker CHILD process exits — the only way to stop an
+    in-process C-level grind that cooperative cancel checks can never reach
+    (2026-07-07: matplotlib CubicTriInterpolator CG solves pinned tasks for
+    3+ hours with a fresh heartbeat)."""
+    threshold_s = settings.stall_no_progress_minutes * 60.0
+    status = store.read_status(job_id)
+    if status is None or status.state != JobState.running or status.phase not in STALL_MONITORED_PHASES:
+        return
+    now_unix = time.time()
+    # Cheap short-circuit: fresh status.json (any write bumps updated_at)
+    # spares the job without walking the cases tree.
+    if status.updated_at is not None and now_unix - status.updated_at.timestamp() < threshold_s:
+        return
+    processes = store.job_process_details(job_id)
+    reason = stall_reason(
+        status,
+        len(processes),
+        newest_progress_file_mtime(store.job_dir(job_id)),
+        now_unix,
+        threshold_s,
+    )
+    if reason is None:
+        return
+    logger.error("stall detector: job %s %s — failing job and exiting worker child", job_id, reason)
+    try:
+        existing = store.read_result(job_id)
+        status.state = JobState.failed
+        status.phase = JobPhase.failed
+        status.message = reason
+        store.write_status(status)
+        store.write_result(
+            JobResult(
+                job_id=job_id,
+                state=JobState.failed,
+                polars=existing.polars if existing is not None else [],
+                message=reason,
+            )
+        )
+    except Exception:  # noqa: BLE001 - the exit below still converts the grind to the handled death class
+        logger.exception("stall detector: failed to persist stalled state for job %s", job_id)
+    os._exit(STALLED_TASK_EXIT_CODE)
 
 # Captured at import time in the worker's main process, i.e. strictly before
 # the consumer accepts any task. Any status.json touched at/after this instant
@@ -97,8 +226,11 @@ def kill_job_processes(job_id: str) -> dict:
     return {"job_id": job_id, "terminated": pids, "killed": remaining}
 
 
-def _start_runtime_heartbeat(store: JobStore, job_id: str) -> tuple[threading.Event, threading.Thread]:
+def _start_runtime_heartbeat(
+    store: JobStore, job_id: str, settings: Optional[Settings] = None
+) -> tuple[threading.Event, threading.Thread]:
     stop = threading.Event()
+    settings = settings or get_settings()
 
     def loop() -> None:
         while not stop.is_set():
@@ -120,6 +252,13 @@ def _start_runtime_heartbeat(store: JobStore, job_id: str) -> tuple[threading.Ev
                     current_case=(active or {}).get("case_slug"),
                     last_progress_at=status.last_progress_at.isoformat() if status and status.last_progress_at else None,
                 )
+            except Exception:
+                pass
+            try:
+                # Engine-side stall guardrail: a solving/postprocessing task
+                # with no live processes and a frozen progress token is
+                # condemned instead of grinding forever (exits the process).
+                _check_and_condemn_stall(store, job_id, settings)
             except Exception:
                 pass
             stop.wait(HEARTBEAT_INTERVAL_S)
@@ -153,15 +292,19 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
             if existing:
                 return {"job_id": job_id, "state": existing.state.value}
             return {"job_id": job_id, "state": "duplicate-skipped"}
+        # Terminal results are never resurrected: a broker redelivery after the
+        # stall detector / boot reconcile / a hard time-limit kill failed the
+        # job must be discarded, not re-executed (the node already released and
+        # requeued the points into new jobs).
         existing = store.read_result(job_id)
-        if existing and existing.state == JobState.completed:
+        if existing and existing.state in {JobState.completed, JobState.failed, JobState.cancelled}:
             return {"job_id": job_id, "state": existing.state.value}
         status = store.read_status(job_id)
         if status:
             status.task_id = getattr(self.request, "id", None) or status.task_id
             status.state = JobState.running
             store.write_status(status)
-        stop_heartbeat, heartbeat_thread = _start_runtime_heartbeat(store, job_id)
+        stop_heartbeat, heartbeat_thread = _start_runtime_heartbeat(store, job_id, settings)
         try:
             result = execute_job(job_id, request, store=store, settings=settings)
         except JobCancelled:

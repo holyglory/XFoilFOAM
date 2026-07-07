@@ -265,7 +265,11 @@ function classifyLostRunning(
   if (quietMs < LOST_RUNNING_GRACE_MS) return null;
   return (
     `engine reports running but no OpenFOAM process exists, the worker heartbeat is stale, Celery does not list the task, ` +
-    `and last progress was ${Math.round(quietMs / 60000)} min ago — task lost (worker restarted mid-solve); cancelled and requeued`
+    // Honest cause set: this shape now also covers the engine's celery hard
+    // time-limit kill (task_time_limit, 2026-07-07), where the pool child is
+    // SIGKILLed without any worker restart — so the message must not assert a
+    // restart it cannot prove.
+    `and last progress was ${Math.round(quietMs / 60000)} min ago — task lost (worker process died, was hard-killed, or restarted mid-solve); cancelled and requeued`
   );
 }
 

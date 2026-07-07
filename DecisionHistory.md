@@ -1,5 +1,97 @@
 # Decision History
 
+## 2026-07-07 — Engine Render Grind Killed; Media Wall Budget; Truthful Postprocessing Phase; Stall Detector; Celery Hard Limit
+
+- Incident (prod, py-spy-proven, build prod-20260707-1dc13ea-frametrack): the
+  first URANS media runs pinned both worker tasks ALIVE at full CPU for 3+
+  hours inside `render_mean_contours -> compute_vorticity ->
+  matplotlib CubicTriInterpolator.__init__ -> _cg` — a min-energy
+  conjugate-gradient solve over the FULL refined triangulation, TWICE PER
+  FRAME x up to 141 frames, GIL-serialized with OpenBLAS spin threads; the
+  API container burned ~390% on the same class for scaled media. No timeout
+  covers post-solve rendering (the 7200 s guard is solver-subprocess-only),
+  status.json stayed phase=solving_urans with last_progress_at frozen at
+  solve end while the task heartbeat stayed fresh — so node-side zombie
+  detection correctly (per its design classes) stayed silent.
+- Decision — vorticity scheme (root cause): per-frame CubicTriInterpolator
+  builds replaced by a precomputed linear gradient operator
+  (`TriGradientOperator`, src/airfoilfoam/postprocess/images.py): exact
+  per-triangle P1 gradients + area-weighted (Green-Gauss) nodal recovery,
+  built ONCE per triangulation (cached on the Triangulation object) and
+  applied per frame in vectorised O(n_tri) bincount passes. Measured: 0.7 ms
+  vs 203 ms cubic on a 3.7 k-node fixture; 140 frames x 100 k nodes in
+  ~1.5 s total (was ~30–60 s PER FRAME). Parity vs the cubic gradient on a
+  smooth analytic flow: max |lin−cub| = 1.7 % of field range vs the 2.5 %
+  40-band contour resolution (p95 = 0.8 %) — visually identical banding;
+  pinned by tests.
+- Decision — single-pass rendering everywhere: `render_mean_contours`
+  accumulates nodal U and takes ONE gradient of the mean (curl is linear, so
+  vorticity(mean U) == mean(vorticity(U_i)) exactly — pinned by test);
+  pointwise fields keep mean-of-derived semantics (|U| stays mean of
+  magnitudes). New `render_animations` reads each VTU ONCE for ALL fields
+  (was once per field: 8x re-read) and reports per-field encode errors +
+  budget skips; the engine pipeline and the API `render-default-media`
+  endpoint both use it. `compute_field_extents` restructured to one read per
+  VTU for all fields (was fields x frames reads in the API process).
+  `render_custom_field` mean-role vorticity also computes from mean U.
+- Decision — media wall budget: the whole post-solve media/frame stage of a
+  case runs under `MediaBudget` (pipeline.py), default
+  `media_budget_fraction (=0.5, Settings) x solver_timeout`; foamToVTK is
+  never budget-skipped (VTUs are evidence, not media). On breach the job
+  COMPLETES: remaining renders are skipped, animations/frames stop at the
+  deadline (a partial frame-track FIELD directory is deleted — the frame
+  player contract forbids partial sequences), and ONE loud quality warning
+  ships: "media rendering budget exhausted after Ns: rendered X of Y
+  artifacts"; the evidence manifest unavailable map records the gaps.
+- Decision — truthful phase: `_finalize_outcome` emits
+  `JobPhase.postprocessing` (previously defined but UNUSED) through the
+  phase_progress callback (now also wired in the default cold-case path in
+  jobs.py), and render progress is observable: "rendering frames 40/120"
+  every 10 frames, per-field animation messages. storage.write_status now
+  bumps last_progress_at on any PHASE TRANSITION (a stage change is real
+  progress; previously only completed_cases bumps did).
+- Decision — engine-side stall detector (tasks.py, runs in the task
+  heartbeat thread): a running job in solving_rans/solving_urans/
+  postprocessing with ZERO live processes under the job dir AND no
+  progress-token advance for `stall_no_progress_minutes` (=20, Settings) is
+  marked failed "stalled in <phase> — no progress for Nm" and the worker
+  CHILD exits (os._exit 70) — the only way to stop an in-process C-level
+  grind. Progress tokens: status.json updated_at (any message/phase write),
+  coefficient.dat mtimes (live march), frame PNG mtimes (advancing media),
+  .vtu mtimes (docker-runner foamToVTK). FALSE-POSITIVE GUARDS pinned by
+  tests: live pids spare unconditionally; advancing tokens spare;
+  waiting_cpu/meshing/ingesting are never monitored. `run_polar` now
+  discards redeliveries of ANY terminal result (was completed-only) so a
+  stall-failed job is never resurrected by the broker.
+- Decision — celery backstop: `task_time_limit` computed from config
+  (celery_app.task_hard_time_limit_s): per-case unit = 2 x solver_timeout +
+  media_budget_seconds() + TASK_TIME_LIMIT_MARGIN_S (900 s, named: meshing/
+  y+/foamToVTK/evidence overhead), SCALED BY THE JOB'S CASE COUNT at
+  dispatch (api submit passes time_limit per apply_async) because one task
+  runs a whole batched polar job — a static 2x-solver limit would hard-kill
+  legitimate multi-case campaign batches. Hitting it converts to the
+  already-handled death class (stale heartbeat -> node classifyLostRunning
+  cancel+requeue; redelivery discarded by the terminal-result guard). ONE
+  node touch: reconcile.ts classifyLostRunning message no longer asserts
+  "worker restarted" (a hard-kill is not a restart) — now "worker process
+  died, was hard-killed, or restarted mid-solve"; the "task lost" pin all
+  tests rely on is unchanged.
+- Second job's dt-collapse timeout (9.2e-07 s at 25 m/s) confirmed honest and
+  already handled by the 2026-07-06 truthful-transient-timeout work; no
+  change needed there.
+- Tests: tests/test_media_grind_guardrails.py (23) — must-catch grind
+  ceiling (140 frames x 1e5 nodes < 30 s + CubicTriInterpolator constructor
+  bomb), linear-vs-cubic parity within contour band, mean-pass single
+  gradient build + single read per VTU + one render per field, linearity
+  pin, animations read-once + budget skip, frame progress cadence + no
+  partial sequences, budget breach loud degradation (partial + zero +
+  generous), postprocessing phase emission, write_status phase-transition
+  progress, stall detector both directions (condemn frozen; spare live pids/
+  advancing coefficient.dat/advancing frames/quiet phases), condemn path
+  persists failed + exits 70, redelivery terminal guard, celery limit math.
+  Engine suite: 200 passed (baseline 177 + 23), 6 integration deselected.
+  Engine image REBUILD REQUIRED to take effect in prod.
+
 ## 2026-07-07 — Sweeper Liveness/Progress Split; Engine Fetch Timeouts
 
 - Incident (prod, 2026-07-06): sweeper_state.heartbeatAt was only written

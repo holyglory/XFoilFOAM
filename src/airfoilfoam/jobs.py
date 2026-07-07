@@ -301,10 +301,16 @@ def execute_job(
             polar_dir = store.case_dir(job_id, polar_slug(chord, speed))
             wait_for_cpu(plan.solver_processes, f"waiting for CPU before polar U={speed:g}")
 
-            def phase_progress(phase: JobPhase, aoa: Optional[float], slug: Optional[str], solver: str) -> None:
+            def phase_progress(
+                phase: JobPhase,
+                aoa: Optional[float],
+                slug: Optional[str],
+                solver: Optional[str],
+                message: Optional[str] = None,
+            ) -> None:
                 set_status(
                     JobState.running,
-                    f"{phase.value.replace('_', ' ')}",
+                    message or f"{phase.value.replace('_', ' ')}",
                     phase=phase,
                     active_solver=solver,
                     active_case_slug=slug,
@@ -335,6 +341,7 @@ def execute_job(
                     outcome_progress=lambda item, accepted, c=chord, s=speed: record_outcome(c, s, item, accepted),
                     cancel_check=ensure_not_cancelled,
                     cache=cache,
+                    media_budget_s=settings.media_budget_seconds(),
                 )
             ensure_not_cancelled()
             set_status(JobState.running, "polar complete", phase=JobPhase.ingesting, cpu_tokens_waiting=0, cpu_tokens_held=0)
@@ -361,6 +368,26 @@ def execute_job(
             mesh_dir, resolved, n_cells = meshes[spec.chord]
             solver_phase = JobPhase.solving_urans if request.solver.force_transient else JobPhase.solving_rans
             solver_name = "pimpleFoam" if request.solver.force_transient else "simpleFoam"
+
+            def phase_progress(
+                phase: JobPhase,
+                aoa: Optional[float],
+                slug: Optional[str],
+                solver: Optional[str],
+                message: Optional[str] = None,
+            ) -> None:
+                # Truthful per-case stage reporting for the default (cold,
+                # case-parallel) path too: postprocessing must never masquerade
+                # as solving (2026-07-07 render-grind incident).
+                set_status(
+                    JobState.running,
+                    message or f"{phase.value.replace('_', ' ')} AoA {spec.aoa_deg:g}",
+                    phase=phase,
+                    active_solver=solver,
+                    active_case_slug=slug,
+                    active_aoa_deg=aoa,
+                )
+
             wait_for_cpu(plan.solver_processes, f"waiting for CPU before AoA {spec.aoa_deg:g}", case=spec)
             with cpu_tokens.acquire(
                 plan.solver_processes,
@@ -387,6 +414,9 @@ def execute_job(
                     mesh_dir=mesh_dir,
                     cancel_check=ensure_not_cancelled,
                     cache=cache,
+                    phase_progress=phase_progress,
+                    case_slug=spec.slug,
+                    media_budget_s=settings.media_budget_seconds(),
                 )
             bump()
             return spec, outcome
