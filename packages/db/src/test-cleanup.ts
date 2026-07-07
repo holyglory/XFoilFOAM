@@ -15,10 +15,12 @@
 // removes shared registry rows only when nothing references them anymore. The
 // candidate set is the UNION of rows the suite's campaigns created
 // (created_by_campaign_id) and rows its presets referenced — so whichever
-// suite finishes last removes a shared row, and crash residue adopted by a
-// re-run is swept too. Rows still referenced by a live foreign graph are left
-// for that suite's own cleanup (or the admin purge) instead of exploding this
-// one.
+// suite finishes last removes a shared row instead of leaking it with
+// created_by NULL. (A stale shared row from a crashed run is removed only if
+// a later run ADOPTS it via find-or-create — this helper never sweeps
+// unrelated residue outside its own campaignIds/prefix scope.) Rows still
+// referenced by a live foreign graph are left for that suite's own cleanup
+// (or the admin purge) instead of exploding this one.
 
 import { and, eq, inArray, like, notExists, sql } from "drizzle-orm";
 
@@ -61,7 +63,22 @@ export interface CampaignFixtureCleanupOptions {
  */
 export async function cleanupCampaignFixtures(db: DB, opts: CampaignFixtureCleanupOptions): Promise<void> {
   const campaignIds = opts.campaignIds.filter((id): id is string => Boolean(id));
-  const slugPattern = `${opts.presetSlugPrefix}%`;
+  // The prefix becomes a LIKE pattern against SHARED tables — a sloppy value
+  // (empty, wildcards, missing run entropy) would delete other suites' or
+  // even seeded rows. Fail loudly instead.
+  const prefix = opts.presetSlugPrefix;
+  if (prefix !== prefix.trim().toLowerCase()) {
+    throw new Error(`cleanupCampaignFixtures: presetSlugPrefix must be trimmed lowercase, got ${JSON.stringify(prefix)}`);
+  }
+  if (/[%_\\]/.test(prefix)) {
+    throw new Error(`cleanupCampaignFixtures: presetSlugPrefix must not contain LIKE wildcards, got ${JSON.stringify(prefix)}`);
+  }
+  if (!prefix.startsWith("campaign-") || prefix.length < "campaign-".length + 8) {
+    throw new Error(
+      `cleanupCampaignFixtures: presetSlugPrefix must be "campaign-" plus a run-unique suite prefix (pid+timestamp), got ${JSON.stringify(prefix)}`,
+    );
+  }
+  const slugPattern = `${prefix}%`;
 
   const campaignPresets = await db
     .select({

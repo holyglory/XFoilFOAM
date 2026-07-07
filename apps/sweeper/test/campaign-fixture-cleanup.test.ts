@@ -147,6 +147,13 @@ afterAll(async () => {
 });
 
 describe("campaign fixture cleanup: shared find-or-create registry rows", () => {
+  it("rejects sloppy presetSlugPrefix values before touching shared tables", async () => {
+    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: "" })).rejects.toThrow(/presetSlugPrefix/);
+    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: "campaign-%" })).rejects.toThrow(/wildcards/);
+    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: `Campaign-${PREFIX}` })).rejects.toThrow(/lowercase/);
+    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: "campaign-ab" })).rejects.toThrow(/run-unique/);
+  });
+
   it("shares ONE geometry row between the two campaigns (the flake precondition)", async () => {
     const created = await db
       .select({ id: referenceGeometryProfiles.id })
