@@ -65,6 +65,17 @@ export function buildPolarRequest(opts: {
       n_iterations: setup.solver.nIterations,
       convergence_tolerance: setup.solver.convergenceTolerance,
       momentum_scheme: setup.solver.momentumScheme,
+      // Wave-1 jobs (campaign RANS batches AND continuous/public sweeps) must
+      // ship transient_fallback:false EXPLICITLY — the engine defaults it to
+      // TRUE when the key is absent (models.py SolverParams), which re-runs
+      // every non-converged steady as an ungated in-job URANS with no tier
+      // fidelity/budget. Rejected wave-1 points reach URANS ONLY through the
+      // gated ladder (targeted wave-2 'precalc' retries in reconcile.ts).
+      // Incident pin: prod wave-1 sweep job 20b67295 (s1223 -5deg) diverged in
+      // an engine-side in-job escalation. MUST-CATCH payload-shape pins:
+      // build-request-transient-pin.test.ts. NOTE the engine's marched-sweep
+      // whole-polar abort (pipeline.py should_abort_rans_sweep_for_urans) is
+      // NOT gated on these flags — that gate is engine-side work.
       transient_fallback: wave === 2,
       force_transient: wave === 2,
       // Ladder contract 1: the node sends ONLY the fidelity literal; the
