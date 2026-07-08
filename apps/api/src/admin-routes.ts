@@ -2818,7 +2818,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   //
   // CONTINUATION mode (amendment C): { continueFromResultId, budgetOverrideS? }
   // resumes a budget-stopped URANS solve from its saved engine case state with
-  // an increased wall-clock budget (+2h/+6h UI choices). The cell, angle and
+  // an increased wall-clock budget (+2h/+6h/+24h UI choices). The cell, angle and
   // fidelity derive from the SOURCE results row — the client names only the
   // row it is continuing.
   app.post("/api/admin/urans-requests", { preHandler: requireAdmin }, async (req, reply) => {

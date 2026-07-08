@@ -1,9 +1,11 @@
 """URANS fidelity tiers (task #30, contract item 1) — pinned cross-runtime.
 
 Pins the tier constants the node build-request relies on (precalc: 3 periods /
-7200 s budget / half-resolution derived mesh; full: 7 periods / 43200 s /
-full mesh — budgets retuned 2026-07-07 to measured prod rates: ~14 min/period
-half-res, ~2 h/period full mesh at the worst campaign class c/U = 0.1/25), the PolarPoint.fidelity echo ("rans" | "urans_precalc" |
+14400 s budget / half-resolution derived mesh; full: 7 periods / 43200 s /
+full mesh — budgets retuned 2026-07-07 to measured prod rates and again
+2026-07-09 after the first prod tier-2 wave budget-stopped 9/9 points at
+7200 s: the feasible class projected up to ~3.1 h of continuation, so 4 h
+absorbs it while the march-rate guard stops the hopeless class early), the PolarPoint.fidelity echo ("rans" | "urans_precalc" |
 "urans_full"), the derived-mesh cache-key separation, and the wiring: the
 transient stage must receive the tier budget + period target, and precalc
 URANS jobs must BUILD the derived mesh. No OpenFOAM needed.
@@ -57,13 +59,13 @@ def test_fidelity_tier_contract_pin():
 
     # Tier constants pinned by the node build-request.
     assert URANS_FIDELITY_MIN_PERIODS == {UransFidelity.precalc: 3, UransFidelity.full: 7}
-    assert URANS_FIDELITY_BUDGET_S == {UransFidelity.precalc: 7200, UransFidelity.full: 43200}
+    assert URANS_FIDELITY_BUDGET_S == {UransFidelity.precalc: 14400, UransFidelity.full: 43200}
     assert URANS_PRECALC_MESH_SCALE == 0.5
 
     # Effective per-tier resolution.
     assert apply_urans_fidelity(SolverParams(urans_fidelity="precalc")).urans_min_periods == 3
     assert apply_urans_fidelity(SolverParams()).urans_min_periods == 7
-    assert urans_budget_seconds(SolverParams(urans_fidelity="precalc")) == 7200
+    assert urans_budget_seconds(SolverParams(urans_fidelity="precalc")) == 14400
     assert urans_budget_seconds(SolverParams()) == 43200
 
     # Point echo literals (node mirror parses exactly these).
@@ -155,7 +157,7 @@ def _finalize_force_transient(tmp_path, monkeypatch, solver_params, transient="n
 
 @pytest.mark.parametrize(
     "fidelity,budget,periods",
-    [("precalc", 7200, 3), ("full", 43200, 7)],
+    [("precalc", 14400, 3), ("full", 43200, 7)],
 )
 def test_transient_stage_receives_tier_budget_and_period_target(
     tmp_path, monkeypatch, fidelity, budget, periods

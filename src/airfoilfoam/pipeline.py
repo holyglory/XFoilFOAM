@@ -276,6 +276,86 @@ def _raise_if_condemned(case_dir: Path) -> None:
         raise OpenFOAMError(reason)
 
 
+# --------------------------------------------------------------------------- #
+# March-rate guard markers (in-chunk hopeless-march early stop).
+#
+# Prod 2026-07-09 (job 571efe9f, s1223 c1 u50 @ Re 3.4M): a precalc transient
+# reached t=0.0094 s of 0.4 s in the FULL 7200 s budget (~85 h projected).
+# With no shedding cycle completed there is no measurable period, so the
+# between-chunks budget projection guard can never engage — the run burns the
+# whole wall budget blind. The heartbeat thread's march-rate watchdog
+# (tasks.MarchRateWatchdog) projects the TRAILING simulated-time rate against
+# the chunk target and stops provably hopeless marches early, leaving
+# restartable state — graded through the same honest timeout path (continuable
+# budget-stop), NOT the divergence path (whose partial window is garbage).
+# --------------------------------------------------------------------------- #
+
+#: Written by the pipeline before every pimpleFoam chunk launch: the chunk's
+#: simulated-time target, its wall budget, and the launch wall-clock instant.
+#: Its presence is what arms the heartbeat march-rate watchdog for a case.
+MARCH_BUDGET_MARKER_FILENAME = "march_budget.json"
+
+#: Written by the march-rate watchdog when it stops a hopeless march; read by
+#: the grading path to grade the partial window as a continuable budget stop.
+MARCH_STOP_MARKER_FILENAME = "march_stopped.json"
+
+
+def write_march_budget_marker(case_dir: Path, end_t: float, budget_s: float, wall_start: float) -> None:
+    """Arm the march-rate watchdog for the chunk about to launch."""
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / MARCH_BUDGET_MARKER_FILENAME).write_text(
+        json.dumps(
+            {"end_t": float(end_t), "budget_s": float(budget_s), "wall_start": float(wall_start)},
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def read_march_budget_marker(case_dir: Path) -> Optional[dict]:
+    """The armed chunk's {end_t, budget_s, wall_start}, or None."""
+    try:
+        payload = json.loads((case_dir / MARCH_BUDGET_MARKER_FILENAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    out = {}
+    for key in ("end_t", "budget_s", "wall_start"):
+        value = payload.get(key)
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return None
+        out[key] = float(value)
+    return out
+
+
+def write_march_stop(case_dir: Path, reason: str) -> None:
+    """Persist the march-rate watchdog's truthful early-stop for grading."""
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / MARCH_STOP_MARKER_FILENAME).write_text(
+        json.dumps({"reason": reason, "stopped_at": time.time()}, indent=2) + "\n"
+    )
+
+
+def read_march_stop(case_dir: Path) -> Optional[str]:
+    """The march-rate watchdog's early-stop reason for this case, or None."""
+    try:
+        payload = json.loads((case_dir / MARCH_STOP_MARKER_FILENAME).read_text())
+    except (OSError, ValueError):
+        return None
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return str(reason) if reason else None
+
+
+def clear_march_markers(case_dir: Path) -> None:
+    """Disarm the guard and drop a stale stop verdict before a fresh chunk."""
+    for name in (MARCH_BUDGET_MARKER_FILENAME, MARCH_STOP_MARKER_FILENAME):
+        try:
+            (case_dir / name).unlink()
+        except OSError:
+            pass
+
+
 def _latest_time_dir(case_dir: Path):
     best, best_v = None, -1.0
     for d in case_dir.iterdir():
@@ -673,7 +753,13 @@ def _copy_case_tree(src_case: Path, dst_case: Path) -> None:
         dst_root = dst_case / rel_root
         dst_root.mkdir(parents=True, exist_ok=True)
         for name in sorted(files):
-            if name == DIVERGENCE_MARKER_FILENAME:
+            # Stale verdicts/arming from the SOURCE job must never poison the
+            # resumed run (the fresh chunk re-arms its own march budget).
+            if name in (
+                DIVERGENCE_MARKER_FILENAME,
+                MARCH_BUDGET_MARKER_FILENAME,
+                MARCH_STOP_MARKER_FILENAME,
+            ):
                 continue
             src = Path(root) / name
             if not src.is_file():
@@ -1077,6 +1163,7 @@ def _run_transient_attempt(
     # Fresh attempt = fresh verdict: a marker left by a condemned earlier stage
     # (e.g. the steady init) must not poison this pimpleFoam pass.
     clear_divergence_condemnation(tcase)
+    clear_march_markers(tcase)
     start_t = _latest_time(tcase)
     end_t = start_t + run_time
     CaseBuilder(airfoil, patches, tmesh, spec, fluid, roughness, solver_params, n_proc=n_proc).write_transient(
@@ -1087,6 +1174,11 @@ def _run_transient_attempt(
         write_interval=write_interval,
         max_delta_t=max_delta_t,
     )
+    # Arm the heartbeat march-rate watchdog for this chunk: it projects the
+    # trailing simulated-time rate against this target/budget and stops a
+    # provably hopeless march early (graded below as a continuable budget
+    # stop — restartable state, honest reason).
+    write_march_budget_marker(tcase, end_t=end_t, budget_s=float(timeout), wall_start=time.time())
     solve_started = time.monotonic()
     res = runner.solver(
         tcase,
@@ -1106,8 +1198,14 @@ def _run_transient_attempt(
     _raise_if_condemned(tcase)
     # A solver TIMEOUT is not a crash: the run may have written a gradable
     # partial coefficient window. Only a genuine solver failure aborts here.
-    timed_out = bool(getattr(res, "timed_out", False)) or (
-        not res.ok and getattr(res, "returncode", None) == 124
+    # A march-rate guard stop is the SAME class of outcome (wall-clock
+    # grounds, restartable state) — it just arrived early instead of at the
+    # budget wall, so it takes the same honest partial-grade path.
+    march_stop = read_march_stop(tcase)
+    timed_out = (
+        bool(getattr(res, "timed_out", False))
+        or (not res.ok and getattr(res, "returncode", None) == 124)
+        or march_stop is not None
     )
     if not res.ok and not timed_out:
         return None
@@ -1193,12 +1291,20 @@ def _run_transient_attempt(
         reached = _coeff_last_time(files[-1])
         if reached is None:
             reached = _latest_time(tcase)
+        stop_clause = (
+            f"stopped early at t={reached:.6g}s of {end_t:.6g}s — {march_stop}"
+            if march_stop
+            else (
+                f"timed out at t={reached:.6g}s of {end_t:.6g}s "
+                f"(solver timeout {timeout:g}s)"
+            )
+        )
         quality = UransQuality(
             ok=False,
             can_refine=False,
             reason=(
-                f"{'refined' if refined else 'base'} transient timed out at t={reached:.6g}s "
-                f"of {end_t:.6g}s (solver timeout {timeout:g}s); graded partial window; "
+                f"{'refined' if refined else 'base'} transient {stop_clause}; "
+                f"graded partial window; "
                 f"URANS integration {URANS_BUDGET_STOP_MARKER} mid-chunk — the saved "
                 f"case state resumes from the last written time step with a bigger "
                 f"budget; {quality.reason}"

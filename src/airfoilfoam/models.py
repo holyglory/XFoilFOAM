@@ -133,10 +133,11 @@ class MeshParams(BaseModel):
 # --------------------------------------------------------------------------- #
 # URANS FIDELITY TIERS (pinned 2026-07-07, task #30; budgets retuned
 # 2026-07-07 to measured prod rates — ladder-gate campaign, naca-0012
-# alpha=15 deg, 25 m/s, 0.1 m chord). The request field
+# alpha=15 deg, 25 m/s, 0.1 m chord; precalc retuned again 2026-07-09 to the
+# first prod tier-2 wave). The request field
 # ``solver.urans_fidelity`` selects the tier; the node side builds requests
 # against EXACTLY these tier constants (contract pin tests on both runtimes):
-#   precalc => urans_min_periods 3, solver budget 7200 s (2 h), mesh scale 0.5
+#   precalc => urans_min_periods 3, solver budget 14400 s (4 h), mesh scale 0.5
 #              (derived half-resolution URANS mesh: n_surface/n_radial/n_wake
 #              halved, same y+ target; the mesh cache keys on the resolved
 #              params, so the derived mesh caches separately from the full one)
@@ -147,9 +148,12 @@ class MeshParams(BaseModel):
 # periods; projected 0.6h continuation exceeds 80% of the 1.0h solver
 # timeout" — i.e. ~14 min/period on the half-res precalc mesh at the
 # worst campaign class (c/U = 0.1 m / 25 m/s), so 3 periods need ~1.4 h
-# => 7200 s. The full tier runs the FULL mesh (~8x cost => ~2 h/period),
-# so 7 periods need ~14 h of integration headroom under the 80% wall-guard
-# fraction => 43200 s.
+# => 7200 s. The first PROD tier-2 wave (2026-07-09) then budget-stopped
+# 9/9 points at 7200 s with the feasible class projecting up to ~3.1 h of
+# continuation past the stop point => 14400 s (the march-rate guard keeps
+# the hopeless class from burning the bigger budget blind). The full tier
+# runs the FULL mesh (~8x cost => ~2 h/period), so 7 periods need ~14 h of
+# integration headroom under the 80% wall-guard fraction => 43200 s.
 # The tier is echoed on PolarPoint.fidelity: "rans" | "urans_precalc" |
 # "urans_full".
 # --------------------------------------------------------------------------- #
@@ -166,11 +170,15 @@ URANS_FIDELITY_MIN_PERIODS: dict[UransFidelity, int] = {
 
 #: Wall-clock solver budget [s] for the URANS transient of each tier.
 #: Retuned to measured prod rates (see the tier block comment above):
-#: precalc 7200 s (~14 min/period half-res mesh at the worst class => 3
-#: periods ~1.4 h), full 43200 s (~2 h/period full mesh => 7 periods,
-#: background trickle tier).
+#: precalc 14400 s — the first prod tier-2 wave (2026-07-09) budget-stopped
+#: 9/9 points at the old 7200 s: the feasible class (Re ~170-340k) projected
+#: up to ~3.1 h of continuation past the stop point, so 4 h absorbs it,
+#: while the provably hopeless class (Re 3.4M: t=0.0094 s of 0.4 s in the
+#: full 2 h) is now stopped EARLY by the march-rate guard instead of burning
+#: the bigger budget blind. History: 3600 -> 7200 -> 14400.
+#: full 43200 s (~2 h/period full mesh => 7 periods, background trickle tier).
 URANS_FIDELITY_BUDGET_S: dict[UransFidelity, int] = {
-    UransFidelity.precalc: 7200,
+    UransFidelity.precalc: 14400,
     UransFidelity.full: 43200,
 }
 

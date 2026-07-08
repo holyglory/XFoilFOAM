@@ -99,11 +99,12 @@ export function assemblePipelineModel(input: {
 }
 
 /** Static stage annotations from the approved mockup — scheduling truths, not
- *  projections ("starts when stage 1 finishes · ~2h each" reflects the
- *  RANS-first scheduler rank; "background" the verify queue's lowest rank). */
+ *  projections ("starts when stage 1 finishes · ~4h each" reflects the
+ *  RANS-first scheduler rank; "background" the verify queue's lowest rank).
+ *  "~4 h" mirrors URANS_PRECALC_SOLVER_BUDGET_S (14400 s, raised 2026-07-09). */
 export const PIPELINE_STAGE_NOTES: Record<PipelineStageKey, string | null> = {
   steady: null,
-  unsteady: "starts when stage 1 finishes · ~2 h each",
+  unsteady: "starts when stage 1 finishes · ~4 h each",
   verify: "background, after stage 2",
 };
 

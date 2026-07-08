@@ -169,7 +169,7 @@ export function CellSidePanel({
 
   const doRequestUrans = async (fidelity: "precalc" | "full") => {
     if (uransBusy) return;
-    const budget = fidelity === "precalc" ? "half-resolution mesh, 3 shedding periods, 1 h budget per point" : "full mesh, 7 shedding periods, 6 h budget per point";
+    const budget = fidelity === "precalc" ? "half-resolution mesh, 3 shedding periods, 4 h budget per point" : "full mesh, 7 shedding periods, 12 h budget per point";
     if (!window.confirm(`Queue ${fidelity}-fidelity URANS solves for the WHOLE polar of ${airfoil.name} at Re ${formatRe(condition.reynolds)}? ${budget}. Work schedules after all RANS gaps, at precalc rank.`)) return;
     setUransBusy(true);
     setUransNotice(null);
@@ -459,8 +459,8 @@ export function CellSidePanel({
                       open
                         ? `An open whole-polar ${fid} request already exists (${open.state}) — requests are idempotent`
                         : fid === "precalc"
-                          ? "Half-resolution mesh, 3 shedding periods, 1 h budget per point"
-                          : "Full mesh, 7 shedding periods, 6 h budget per point"
+                          ? "Half-resolution mesh, 3 shedding periods, 4 h budget per point"
+                          : "Full mesh, 7 shedding periods, 12 h budget per point"
                     }
                     onClick={() => void doRequestUrans(fid)}
                     style={{

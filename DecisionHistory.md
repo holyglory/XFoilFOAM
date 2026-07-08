@@ -2552,3 +2552,46 @@ mean).
   keys-path and campaign-wide recompute agree row-for-row and re-ingest is
   idempotent. Recall proven: suite run against the reverted filter fails with
   failed=2.
+
+## 2026-07-09 — Precalc budget 7200 → 14400 s + in-run march-rate guard + continuation ops
+
+- Evidence (first prod tier-2 wave, production-campaign-20260707): 9/9
+  urans_precalc results budget-stopped at the 7200 s budget, zero completed.
+  Two distinct classes:
+  1. Feasible (naca-4412, Re 171–341k): the between-chunks period projection
+     guard stopped early, projecting 2.3–3.1 h of continuation vs the 2 h
+     budget. A 4 h budget absorbs this class outright.
+  2. Hopeless-at-tier (s1223, c=1 m u=50 m/s, Re 3.4M): t=0.0094 s of the
+     0.4 s chunk target in the FULL 7200 s (~85 h projected). No shedding
+     cycle ⇒ no measurable period ⇒ the period-based projection guard can
+     never engage ⇒ the budget burns blind to the wall.
+- Decision 1: URANS_FIDELITY_BUDGET_S[precalc] 7200 → 14400 (models.py +
+  engine-client fidelity.ts + pin tests on both runtimes). Full tier stays
+  43200. Celery hard limit derives from max(budgets) = 43200 — unchanged.
+- Decision 2 (companion, load-bearing for the raise): march-rate guard.
+  The pipeline arms every pimpleFoam chunk with march_budget.json
+  ({end_t, budget_s, wall_start}); the worker heartbeat's MarchRateWatchdog
+  (tasks.py) measures the TRAILING simulated-time rate (900 s window, 600 s
+  min span, never during the first 1800 s warmup) and, when the projected
+  total wall exceeds 3× the chunk budget, SIGTERMs the case and writes
+  march_stopped.json. The grading path routes that marker through the SAME
+  honest timeout partial grade — reason carries the march projection evidence
+  AND the pinned continuable literal ("stopped by the wall-clock budget
+  guard") so the node offers Continue, and the saved state stages for
+  continuation (markers never copied into staged cases). Divergence verdict
+  wins if both fire; a march-stopped grade sets can_refine=False so the
+  extension loop can never clear the verdict and relaunch a doomed chunk.
+  Rationale for 3×: a 1.3× over-projection should reach the wall and finish
+  via ONE continuation; >3× means even a full continuation cannot finish.
+- Guards against false positives (tests/test_march_guard.py, recall-shaped
+  from the s1223 breakage, driven through the REAL heartbeat check + kill
+  path and the REAL _run_transient_attempt grading seam): warmup never
+  judged; dt-ramp-then-recovery passes (trailing window sees only the
+  recovered rate); feasible-but-over-budget (<3×) left to grade at the wall;
+  completed chunks and zero-rate (stall watchdog's turf) never judged;
+  un-armed steady segments skipped; fresh chunks re-arm with a new
+  wall_start which resets sampling and any stale verdict.
+- UI/ops (same change set): Continue gains a +24h option (cap 86400 s is
+  API-inclusive, verified); stale tier-budget copy fixed at six sites
+  ("1 h"/"6 h" pre-7200 era → 4 h precalc / 12 h full; pipeline hero
+  "~2 h each" → "~4 h each").

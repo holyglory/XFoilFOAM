@@ -1,7 +1,7 @@
 // URANS FIDELITY LADDER CONTRACT PIN (same cross-runtime pattern as
 // frame-track-contract-pin.test.ts / orphan-message-pin.test.ts). Contracts:
 //   1. request solver.urans_fidelity 'precalc' | 'full' + engine-derived
-//      values (min periods 3/7, budget 3600/21600 s, precalc mesh scale 0.5)
+//      values (min periods 3/7, budget 14400/43200 s, precalc mesh scale 0.5)
 //      + PolarPoint.fidelity echo 'rans' | 'urans_precalc' | 'urans_full';
 //   2. PolarPoint.steady_history EXACT shape (<=2000 samples) —
 //      fixtures/steady-history-contract.json;
@@ -47,11 +47,12 @@ describe("fidelity ladder literals + engine-derived values (contract 1, cross-ru
   it("pins the engine-derived per-fidelity values (parity with models.py)", () => {
     expect(URANS_PRECALC_MIN_PERIODS).toBe(3);
     expect(URANS_FULL_MIN_PERIODS).toBe(7);
-    // Budgets retuned 2026-07-07 to measured prod rates (ladder-gate campaign,
-    // naca-0012 alpha=15, 25 m/s, 0.1 m chord): ~14 min/period on the half-res
-    // precalc mesh → 3 periods ≈ 1.4 h → 7200 s; ~8x on the full mesh
-    // ≈ 2 h/period → 7 periods → 43200 s (see models.py + fidelity.ts).
-    expect(URANS_PRECALC_SOLVER_BUDGET_S).toBe(7200);
+    // Precalc raised 2026-07-09 (3600 → 7200 → 14400 s): prod runs showed 9/9
+    // precalc points budget-stopped at 7200 s — the NACA 4412 class projected
+    // up to ~3.1 h of continuation beyond the stop point; 14400 s absorbs it.
+    // Full stays 43200 s: ~2 h/period on the full mesh → 7 periods under the
+    // 80% wall-guard fraction (see models.py + fidelity.ts).
+    expect(URANS_PRECALC_SOLVER_BUDGET_S).toBe(14400);
     expect(URANS_FULL_SOLVER_BUDGET_S).toBe(43200);
     expect(URANS_PRECALC_MESH_SCALE).toBe(0.5);
   });

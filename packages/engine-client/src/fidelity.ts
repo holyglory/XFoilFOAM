@@ -3,7 +3,7 @@
 //
 // Contract 1 — request field solver.urans_fidelity: "precalc" | "full".
 //   The ENGINE derives everything from the literal (src/airfoilfoam/models.py):
-//     precalc → urans_min_periods 3, solver budget 7200 s (2 h), mesh scale
+//     precalc → urans_min_periods 3, solver budget 14400 s (4 h), mesh scale
 //               0.5 (derived half-resolution URANS mesh: halve n_surface/
 //               n_radial/n_wake, same y+ target — engine-side derivation,
 //               cached separately in the mesh cache);
@@ -11,9 +11,11 @@
 //               (background trickle tier).
 //   Budgets retuned 2026-07-07 to measured prod rates (ladder-gate campaign,
 //   naca-0012 alpha=15, 25 m/s, 0.1 m chord): ~14 min/period on the half-res
-//   precalc mesh (3 periods ≈ 1.4 h → 7200 s; the old 3600 s budget stopped
-//   at "retained 1.4 of 3 periods"), ~8x on the full mesh ≈ 2 h/period
-//   (7 periods → 43200 s under the 80% wall-guard fraction).
+//   precalc mesh, ~8x on the full mesh ≈ 2 h/period (7 periods → 43200 s
+//   under the 80% wall-guard fraction). Precalc raised again 2026-07-09
+//   (3600 → 7200 → 14400 s): prod runs showed 9/9 precalc points
+//   budget-stopped at 7200 s — the NACA 4412 class projected up to ~3.1 h of
+//   continuation beyond the stop point; 14400 s absorbs that class.
 //   The node NEVER sends the derived numbers — only the literal. The constants
 //   below exist so node tests pin the SAME values the engine derives; drift is
 //   a test failure on both sides:
@@ -37,7 +39,7 @@ export const POINT_FIDELITY_VALUES: readonly PointFidelity[] = ["rans", "urans_p
  *  tests only; the request carries ONLY the fidelity literal. */
 export const URANS_PRECALC_MIN_PERIODS = 3;
 export const URANS_FULL_MIN_PERIODS = 7;
-export const URANS_PRECALC_SOLVER_BUDGET_S = 7200;
+export const URANS_PRECALC_SOLVER_BUDGET_S = 14400;
 export const URANS_FULL_SOLVER_BUDGET_S = 43200;
 export const URANS_PRECALC_MESH_SCALE = 0.5;
 

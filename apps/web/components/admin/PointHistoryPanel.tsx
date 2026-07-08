@@ -423,7 +423,7 @@ export function PointHistoryPanel() {
   // its saved engine case state with an increased wall-clock budget.
   const [continueBusy, setContinueBusy] = useState(false);
   const doContinue = useCallback(
-    async (extraHours: 2 | 6) => {
+    async (extraHours: 2 | 6 | 24) => {
       const item = openItemRef.current;
       if (!item || continueBusy) return;
       if (
@@ -472,7 +472,7 @@ export function PointHistoryPanel() {
     ) => {
       if (uransBusy) return;
       const scope = target.aoaDeg == null ? "the whole polar" : `α ${f(target.aoaDeg, 2)}°`;
-      const budget = fidelity === "precalc" ? "half-resolution mesh, 3 shedding periods, 1 h budget" : "full mesh, 7 shedding periods, 6 h budget";
+      const budget = fidelity === "precalc" ? "half-resolution mesh, 3 shedding periods, 4 h budget" : "full mesh, 7 shedding periods, 12 h budget";
       if (!window.confirm(`Queue a ${fidelity}-fidelity URANS solve for ${target.label} (${scope})? ${budget}. It runs after all RANS gaps, at precalc rank.`)) return;
       setUransBusy(true);
       setUransNotice(null);
@@ -872,7 +872,7 @@ export function PointHistoryPanel() {
                 </button>
               )}
               {continueEligible &&
-                ([2, 6] as const).map((h) => (
+                ([2, 6, 24] as const).map((h) => (
                   <button
                     key={h}
                     type="button"
@@ -921,8 +921,8 @@ export function PointHistoryPanel() {
                           : openItem.revisionId == null
                             ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
                             : fid === "precalc"
-                              ? "Half-resolution mesh, 3 shedding periods, 1 h budget — schedules after all RANS gaps"
-                              : "Full mesh, 7 shedding periods, 6 h budget — schedules after all RANS gaps"
+                              ? "Half-resolution mesh, 3 shedding periods, 4 h budget — schedules after all RANS gaps"
+                              : "Full mesh, 7 shedding periods, 12 h budget — schedules after all RANS gaps"
                       }
                       onClick={() =>
                         void doRequestUrans(

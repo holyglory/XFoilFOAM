@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import math
 import os
 import signal
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -20,7 +22,13 @@ from .config import Settings, get_settings
 from .jobs import execute_job
 from .models import JobPhase, JobResult, JobState, JobStatus, PolarRequest
 from .openfoam.runner import install_subprocess_signal_handlers
-from .pipeline import read_divergence_condemnation, write_divergence_condemnation
+from .pipeline import (
+    read_divergence_condemnation,
+    read_march_budget_marker,
+    read_march_stop,
+    write_divergence_condemnation,
+    write_march_stop,
+)
 from .storage import JobStore
 
 HEARTBEAT_INTERVAL_S = 10
@@ -455,6 +463,206 @@ def _check_and_condemn_divergence(
             _condemn_diverged_case(store, job_id, case_root, reason)
 
 
+# --------------------------------------------------------------------------- #
+# In-run march-rate guard (heartbeat thread, per beat).
+#
+# Prod 2026-07-09 (job 571efe9f, s1223 c1 u50 @ Re 3.4M, precalc tier): the
+# transient reached t=0.0094 s of the 0.4 s chunk target in the FULL 7200 s
+# budget — ~85 h projected at the observed rate. With no shedding cycle
+# completed there is no measurable period, so the between-chunks budget
+# projection guard could never engage and the run burned its whole wall
+# budget blind. This watchdog projects the TRAILING simulated-time rate of a
+# live transient chunk against the chunk target (armed by the pipeline's
+# march_budget.json) and stops a provably hopeless march early: SIGTERM to
+# the case's solver processes plus a truthful march_stopped.json marker that
+# routes the partial window through the HONEST timeout grading path
+# (continuable budget stop, restartable state) — NOT the divergence path,
+# whose partial window is garbage.
+# --------------------------------------------------------------------------- #
+
+#: Never judge a chunk's first 30 min of wall time: adaptive dt ramps up from
+#: a deliberately tiny startup value, so early cumulative rates undershoot.
+MARCH_WARMUP_WALL_S = 1800.0
+
+#: Trailing window the rate is measured over (the newest samples only — a
+#: slow startup ramp that has since recovered must not doom the projection).
+MARCH_TRAIL_WINDOW_S = 900.0
+
+#: Minimum wall span of samples inside the window before a rate is trusted.
+MARCH_TRAIL_MIN_SPAN_S = 600.0
+
+#: Stop only the PROVABLY hopeless: projected total wall (elapsed so far plus
+#: remaining simulated time at the trailing rate) beyond this multiple of the
+#: chunk's wall budget. A run merely projecting past its budget (e.g. 1.3x)
+#: is left to reach the budget wall and grade there — a single continuation
+#: finishes it; 3x+ means even one full continuation cannot.
+MARCH_HOPELESS_FACTOR = 3.0
+
+
+@dataclass
+class _MarchSegmentState:
+    """Per-coefficient-segment march-rate state (keyed by file path, like the
+    divergence watchdog's). ``wall_start`` mirrors the armed marker so a fresh
+    chunk (which rewrites march_budget.json) resets sampling and warmup."""
+
+    wall_start: float
+    samples: deque = field(default_factory=deque)  # (wall_time, sim_time)
+    stopped_reason: Optional[str] = None
+
+
+class MarchRateWatchdog:
+    """Pure hopeless-march verdict logic (deterministic, directly testable).
+
+    Stops a chunk when, after ``warmup_s`` of wall time, the trailing
+    simulated-time rate projects the total wall to reach the chunk target
+    beyond ``factor`` times the chunk's wall budget.
+
+    FALSE-POSITIVE GUARDS: nothing is judged during the warmup; the rate is
+    measured over a TRAILING window only (a slow dt-ramp start that has since
+    recovered never trips); a zero/negative rate is never judged here (a
+    frozen march is the stall/divergence watchdogs' verdict, not a
+    projection); and a run projecting past its budget by less than ``factor``
+    is left to grade honestly at the budget wall."""
+
+    def __init__(
+        self,
+        warmup_s: float = MARCH_WARMUP_WALL_S,
+        window_s: float = MARCH_TRAIL_WINDOW_S,
+        min_span_s: float = MARCH_TRAIL_MIN_SPAN_S,
+        factor: float = MARCH_HOPELESS_FACTOR,
+    ):
+        self.warmup_s = float(warmup_s)
+        self.window_s = float(window_s)
+        self.min_span_s = float(min_span_s)
+        self.factor = float(factor)
+        self._segments: dict[str, _MarchSegmentState] = {}
+
+    def observe(
+        self,
+        segment_key: str,
+        t_sim: float,
+        now: float,
+        end_t: float,
+        budget_s: float,
+        wall_start: float,
+        stop_marker_present: bool = True,
+    ) -> Optional[str]:
+        """One heartbeat sample for one live transient segment. Returns the
+        truthful stop reason, or None to leave the solver alone. A stopped
+        segment keeps reporting while the on-disk stop marker exists (so the
+        caller can escalate SIGTERM -> SIGKILL on stragglers); once the
+        pipeline clears the markers for a fresh chunk, the state resets."""
+        state = self._segments.get(segment_key)
+        if state is None or state.wall_start != wall_start:
+            # First sight, or a fresh chunk re-armed the marker: fresh state.
+            state = _MarchSegmentState(wall_start=wall_start)
+            self._segments[segment_key] = state
+        if state.stopped_reason is not None:
+            if stop_marker_present:
+                return state.stopped_reason
+            state = _MarchSegmentState(wall_start=wall_start)
+            self._segments[segment_key] = state
+        if budget_s <= 0:
+            return None
+        if state.samples and t_sim < state.samples[-1][1]:
+            # Simulated time went backwards: a restart rewrote the segment.
+            state.samples.clear()
+        if not state.samples or t_sim > state.samples[-1][1] or now > state.samples[-1][0]:
+            state.samples.append((now, t_sim))
+        while state.samples and now - state.samples[0][0] > self.window_s:
+            state.samples.popleft()
+        elapsed = now - wall_start
+        if elapsed < self.warmup_s:
+            return None
+        oldest_wall, oldest_t = state.samples[0]
+        span = now - oldest_wall
+        if span < self.min_span_s:
+            return None
+        rate = (t_sim - oldest_t) / span
+        if rate <= 0.0 or not math.isfinite(rate):
+            return None
+        remaining = end_t - t_sim
+        if remaining <= 0.0:
+            return None
+        projected_total_s = elapsed + remaining / rate
+        if projected_total_s <= self.factor * budget_s:
+            return None
+        state.stopped_reason = (
+            f"march-rate guard: at t={t_sim:.6g}s of {end_t:.6g}s after "
+            f"{elapsed / 60.0:.0f} min, the trailing simulated-time rate "
+            f"{rate:.3g} s/s projects ~{projected_total_s / 3600.0:.1f}h total wall "
+            f"vs the {budget_s / 3600.0:.1f}h budget (>{self.factor:g}x) — "
+            f"stopping the hopeless march early with restartable state"
+        )
+        return state.stopped_reason
+
+
+def _case_solver_pids(store: JobStore, job_id: str, case_root: Path) -> list[int]:
+    """PIDs of the job's solver processes working inside ``case_root``."""
+    case_pids = []
+    for proc in store.job_process_details(job_id):
+        cwd = proc.get("cwd")
+        if not cwd:
+            continue
+        try:
+            Path(cwd).relative_to(case_root)
+        except ValueError:
+            continue
+        case_pids.append(int(proc["pid"]))
+    return case_pids
+
+
+def _stop_hopeless_case(store: JobStore, job_id: str, case_root: Path, reason: str) -> None:
+    """Kill the hopeless case's solver process group and leave the truthful
+    march-stop marker: the pipeline grades the partial window through the
+    honest timeout path (continuable budget stop). Same TERM->KILL escalation
+    ladder as the divergence condemnation; the job's other cases keep running."""
+    already = read_march_stop(case_root) is not None
+    case_pids = _case_solver_pids(store, job_id, case_root)
+    if already:
+        if case_pids:
+            _kill_pids(case_pids, signal.SIGKILL)
+        return
+    logger.warning(
+        "march-rate guard: job %s case %s stopped early — %s (killing pids %s)",
+        job_id, case_root.name, reason, case_pids or "none visible",
+    )
+    write_march_stop(case_root, reason)
+    if case_pids:
+        _kill_pids(case_pids, signal.SIGTERM)
+
+
+def _check_and_stop_hopeless_march(
+    store: JobStore, job_id: str, watchdog: MarchRateWatchdog, now: Optional[float] = None
+) -> None:
+    """Heartbeat-thread march-rate check for armed transient chunks."""
+    status = store.read_status(job_id)
+    if status is None or status.state != JobState.running:
+        return
+    if status.phase not in DIVERGENCE_MONITORED_PHASES:
+        return
+    now = time.time() if now is None else now
+    for coeff in _live_coefficient_segments(store.job_dir(job_id), now):
+        case_root = _case_root_for_coefficient(coeff)
+        budget = read_march_budget_marker(case_root)
+        if budget is None:
+            continue  # not an armed transient chunk (e.g. a steady solve)
+        tail = coefficient_tail(coeff)
+        if not tail:
+            continue
+        reason = watchdog.observe(
+            str(coeff),
+            tail[-1][0],
+            now,
+            end_t=budget["end_t"],
+            budget_s=budget["budget_s"],
+            wall_start=budget["wall_start"],
+            stop_marker_present=read_march_stop(case_root) is not None,
+        )
+        if reason is not None:
+            _stop_hopeless_case(store, job_id, case_root, reason)
+
+
 # Captured at import time in the worker's main process, i.e. strictly before
 # the consumer accepts any task. Any status.json touched at/after this instant
 # belongs to a task started by THIS worker and must not be reconciled.
@@ -539,6 +747,7 @@ def _start_runtime_heartbeat(
         dt_floor=settings.divergence_dt_floor,
         grace_s=settings.divergence_grace_minutes * 60.0,
     )
+    march_watchdog = MarchRateWatchdog()
 
     def loop() -> None:
         while not stop.is_set():
@@ -576,6 +785,14 @@ def _start_runtime_heartbeat(
                 # fails that case through the normal grading path while the
                 # rest of the job continues.
                 _check_and_condemn_divergence(store, job_id, divergence_watchdog)
+            except Exception:
+                pass
+            try:
+                # In-run march-rate guard: a transient chunk whose trailing
+                # simulated-time rate projects provably hopeless total wall
+                # (>3x its budget) is stopped early per-CASE with restartable
+                # state and graded as an honest continuable budget stop.
+                _check_and_stop_hopeless_march(store, job_id, march_watchdog)
             except Exception:
                 pass
             stop.wait(HEARTBEAT_INTERVAL_S)
