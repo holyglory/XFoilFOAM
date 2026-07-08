@@ -378,6 +378,15 @@ export function qualityWarningsForPoint(p: PolarPoint): string[] | null {
  *  must-catch tests and every point-story surface that reads the marker. */
 export const REPLACE_GUARD_MARKER = "higher-tier attempt rejected";
 
+/** Quality-warning marker prefix stamped on the ATTEMPT row when the
+ *  released-cell guard quarantines a failed shipment (live gap 2026-07-08,
+ *  campaign 495d78e0): an incoming FAILED point must never re-terminalize a
+ *  cell its job no longer owns — the auto-retry-once pass (amendment B)
+ *  releases a crashed cell back to pending mid-job, and the same job's later
+ *  partial/terminal ingests re-ship the identical failed case. Exported for
+ *  the must-catch tests. */
+export const RELEASED_CELL_MARKER = "released-cell failure quarantined";
+
 /** Classification states whose canonical row the replace guard protects.
  *  needs_urans is PROVISIONAL ACCEPTED evidence (it feeds the polar fit), so
  *  it is protected exactly like accepted — never treated as rejected. */
@@ -1364,6 +1373,76 @@ export async function ingestResult(opts: {
         });
         for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
         continue;
+      }
+
+      // RELEASED-CELL GUARD (live gap 2026-07-08, campaign 495d78e0): an
+      // incoming FAILED point must not clobber a canonical row this job no
+      // longer owns. The running-partial auto-retry (amendment B) releases a
+      // crashed cell back to pending MID-JOB; the same job's later partial and
+      // terminal ingests re-ship the very same failed case, and without this
+      // guard the natural-key upsert re-failed the released row — re-claiming
+      // ownership and letting the terminal auto-retry pass falsely ESCALATE
+      // the cell to needs_review (one crash consumed both the retry and the
+      // escalation). Same protection when a NEW job already re-claimed the
+      // cell (queued/running under another sim_job): the failure still lands
+      // as attempt evidence; the canonical row stays with its current owner
+      // (spec §6.3 no-resurrection: late evidence stays evidence). Terminal
+      // rows (done/failed/stale) keep today's upsert semantics, incl. the
+      // replace guard above. Legacy rows without a revision are never guarded
+      // (NULL natural keys), mirroring the replace guard.
+      if (failed && presetRevisionId) {
+        const [owned] = await db
+          .select({ id: results.id, status: results.status, simJobId: results.simJobId })
+          .from(results)
+          .where(
+            and(
+              eq(results.airfoilId, airfoilId),
+              eq(results.simulationPresetRevisionId, presetRevisionId),
+              eq(results.aoaDeg, p.aoa_deg),
+            ),
+          )
+          .limit(1);
+        if (owned && owned.simJobId !== simJobId && ["pending", "queued", "running"].includes(owned.status)) {
+          console.error(
+            `[sweeper] RELEASED-CELL GUARD: failed point NOT re-terminalized — cell is ${owned.status} under ${owned.simJobId ?? "no job"}, not this job (${pointContext}); failure kept as attempt evidence only`,
+          );
+          resultIdsByAoa.set(p.aoa_deg, owned.id);
+          guardedAoas.add(p.aoa_deg);
+          const attemptId = await insertResultAttempt({
+            db,
+            resultId: owned.id,
+            airfoilId,
+            bcId,
+            presetRevisionId,
+            simJobId,
+            engineJobId,
+            point: p,
+            extraQualityWarnings: [
+              `${RELEASED_CELL_MARKER}: cell was ${owned.status}${owned.simJobId ? " under another job" : " (released)"} at ingest; canonical row not re-failed`,
+            ],
+          });
+          attempts++;
+          for (const artifact of p.evidence_artifacts ?? []) {
+            await registerEvidenceArtifacts({
+              db,
+              engine,
+              // resultId stays NULL on purpose (same isolation as the replace
+              // guard): the quarantined shipment's manifest must not become
+              // the cell's newest manifest.
+              resultId: null,
+              resultAttemptId: attemptId,
+              airfoilId,
+              simJobId,
+              engineJobId,
+              point: p,
+              artifact,
+            });
+          }
+          // No onResultIngested signal: the cell is OPEN (pending/claimed) —
+          // its campaign point state and counters were already settled by the
+          // release/claim that severed this job's ownership.
+          continue;
+        }
       }
 
       const v: ResultInsert = {

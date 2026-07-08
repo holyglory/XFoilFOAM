@@ -1,5 +1,48 @@
 # Decision History
 
+## 2026-07-08 — Auto-retry-once route gap: running-partial ingest + released-cell guard
+
+- LIVE GAP (prod campaign 495d78e0, minutes after stage-2 opened): s1223 −5°
+  @ 100 m/s / 1.0 m crashed in its precalc wave-2 child ("transient diverged
+  at t=1e-05", divergence watchdog — working as designed) and sat
+  status=failed / auto_retried_at NULL / needs_review with no marker and no
+  log line. Trace: the watchdog kills only the CASE (tasks.py
+  `_condemn_diverged_case`) and the marched engine path ships the failed
+  point in the RUNNING partial result immediately (jobs.py `record_outcome`
+  → `write_partial_result_locked`, `bump()` counts failed cases too), so the
+  point terminalized through `ingestRunningPartialJob` — the ONE ingest
+  route that can terminalize a point as failed without the amendment-B hook.
+  All terminal routes (ingestCompletedJob, every ingestFailedEngineJob
+  branch) already called `autoRetryFailedPointsForJob`; the retry would only
+  have fired when the whole child finally went terminal, many minutes later.
+- Fix 1 (apps/sweeper/src/reconcile.ts, ingestRunningPartialJob): run the
+  one-shot requeue after the partial-path polar-cache refresh too (same
+  refresh-before-flip ordering as the terminal paths — at-ingest
+  classification preserved, prod row 741db07a).
+- Fix 2 (apps/sweeper/src/ingest.ts, RELEASED-CELL GUARD +
+  `RELEASED_CELL_MARKER`): an incoming FAILED point never re-terminalizes a
+  cell its job no longer owns (row pending/queued/running under a
+  different/NULL sim_job). Required for exactly-once semantics: the same
+  job's later partial/terminal ingests re-ship the identical failed case,
+  and the natural-key upsert used to re-fail the released row — re-claiming
+  ownership and letting the terminal auto-retry pass falsely ESCALATE the
+  cell to needs_review (one crash consumed both the retry and the
+  escalation). Also fixes the same false escalation on
+  recoverFailedEngineJobs ingest replays. Failure evidence still lands as an
+  attempt row (artifacts isolated resultId:NULL, replace-guard style);
+  done-point upserts and rows still owned by the ingesting job are
+  unchanged; worker-restart orphan release (solvedPointsOnly) and manual
+  requeue paths untouched.
+- MUST-CATCH suite (apps/sweeper/test/auto-retry-partial.test.ts, driven
+  through the production reconcile() surface): (1) precalc wave-2 child's
+  diverged point in a RUNNING partial → retried immediately (marker +
+  requested + loud log + gap-finder re-pick); (2) same job's terminal failed
+  re-ship → released cell untouched, no false escalation, sibling claimed
+  rows get their own first retry; (3) second crash through the same path →
+  escalates, needs_review counts it; (4) batched-partial: one crashed point
+  inside an otherwise-COMPLETED campaign job → retried (regression pin).
+  Verified: sweeper 136/136, api 108/108, sweeper typecheck clean.
+
 ## 2026-07-07 — Fidelity-ladder final adversarial review: starvation fix + deferred design notes
 
 - CONFIRMED fix — tier-2a gated-retry scan-window starvation

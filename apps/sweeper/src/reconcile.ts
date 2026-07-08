@@ -925,6 +925,19 @@ async function ingestRunningPartialJob(db: DB, engine: EngineClient, job: SimJob
   collectDirtyLanes(ingested.dirtyLanes);
   if (ingested.points > 0) {
     await refreshPolarCachesForJob(db, job);
+    // Amendment B, live gap 2026-07-08 (campaign 495d78e0, s1223 −5°): a
+    // divergence-condemned case terminalizes its point MID-RUN — the engine's
+    // marched path ships the failed point in the RUNNING partial result
+    // (jobs.py record_outcome → write_partial_result_locked) while sibling
+    // angles keep marching for many more minutes, so a hook only on the
+    // TERMINAL ingest paths left the cell failed/needs_review with no retry
+    // marker and no log for the whole remainder of the job. The one-shot
+    // requeue runs here too, AFTER the refresh (at-ingest classification
+    // preserved — prod row 741db07a), exactly like every terminal-path call.
+    // The released row is protected from the same job's later partial/terminal
+    // re-ships of the identical failed case by the released-cell guard in
+    // ingestResult (a re-fail there would falsely consume the escalation).
+    await autoRetryFailedPointsForJob(db, job);
   }
   return ingested.points > 0 || ingested.media > 0;
 }
