@@ -252,6 +252,7 @@ export function ReviewStep({
   const objectiveSummary = [
     plan.objectives.ldMax.enabled ? `max L/D ±${plan.objectives.ldMax.toleranceDeg}° · ≤${plan.objectives.ldMax.maxRounds} rounds` : null,
     plan.objectives.clZero.enabled ? `zero lift ±${plan.objectives.clZero.toleranceDeg}° · ≤${plan.objectives.clZero.maxRounds} rounds` : null,
+    plan.objectives.clMax?.enabled ? `Cl_max ±${plan.objectives.clMax.toleranceDeg}° · ≤${plan.objectives.clMax.maxRounds} rounds` : null,
   ]
     .filter(Boolean)
     .join(" · ") || "none";

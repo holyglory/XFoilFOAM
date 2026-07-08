@@ -53,6 +53,13 @@ export type PlanEditMode = "conditions" | "angle";
 const CLOSURE_SENTENCE =
   "Conditions that already have results for any airfoil will stay and finish for all airfoils — removing values only cancels conditions nothing has been solved at yet.";
 
+/** Objective-delta chip labels in the acknowledge stage (all three lanes). */
+const OBJECTIVE_DELTA_LABEL: Record<string, string> = {
+  ld_max: "max L/D",
+  cl_zero: "α₀",
+  cl_max: "Cl_max",
+};
+
 const SEMANTICS_BANNER: Record<PlanEditMode, string> = {
   conditions: "Edits reshape future work only — conditions with results stay to finish for all airfoils; solved results are never deleted.",
   angle: "Angle edits reshape future work only — solved angles stay for all airfoils; removed unsolved angles are released.",
@@ -80,6 +87,10 @@ function anglePlanFromPlan(plan: CampaignPlanInput): WizardAnglePlan {
     listText: plan.baseSweep.listDeg?.map((a) => String(Number(a))).join(", ") ?? "",
     ldMax: { enabled: plan.objectives.ldMax.enabled, toleranceDeg: Number(plan.objectives.ldMax.toleranceDeg), maxRounds: plan.objectives.ldMax.maxRounds },
     clZero: { enabled: plan.objectives.clZero.enabled, toleranceDeg: Number(plan.objectives.clZero.toleranceDeg), maxRounds: plan.objectives.clZero.maxRounds },
+    // Pre-clMax plan revisions carry no block — edit from disabled defaults.
+    clMax: plan.objectives.clMax
+      ? { enabled: plan.objectives.clMax.enabled, toleranceDeg: Number(plan.objectives.clMax.toleranceDeg), maxRounds: plan.objectives.clMax.maxRounds }
+      : { enabled: false, toleranceDeg: 0.1, maxRounds: 8 },
   };
 }
 
@@ -175,11 +186,12 @@ export function PlanEditDialogs({
     if (mode === "angle") {
       const list: Array<ValidationIssue | null> = [];
       if (!expansion.sets) list.push({ field: angle.sweepMode === "list" ? "AoA list °" : "AoA step °", message: expansion.error ?? "invalid sweep" });
-      if ((angle.ldMax.enabled || angle.clZero.enabled) && expansion.sets && expansion.sets.angles.length < 3) {
+      if ((angle.ldMax.enabled || angle.clZero.enabled || angle.clMax.enabled) && expansion.sets && expansion.sets.angles.length < 3) {
         list.push({ field: angle.sweepMode === "list" ? "AoA list °" : "AoA from °", message: "Refinement objectives need a base sweep of at least 3 angles" });
       }
       if (angle.ldMax.enabled) list.push(positiveIssue(angle.ldMax.toleranceDeg, "Max L/D tolerance ±°"), positiveIssue(angle.ldMax.maxRounds, "Max L/D rounds"));
       if (angle.clZero.enabled) list.push(positiveIssue(angle.clZero.toleranceDeg, "Zero-lift tolerance ±°"), positiveIssue(angle.clZero.maxRounds, "Zero-lift rounds"));
+      if (angle.clMax.enabled) list.push(positiveIssue(angle.clMax.toleranceDeg, "Cl_max tolerance ±°"), positiveIssue(angle.clMax.maxRounds, "Cl_max rounds"));
       return compactIssues(list);
     }
     return compactIssues([
@@ -384,7 +396,7 @@ export function PlanEditDialogs({
                     <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>
                       objectives:{" "}
                       {diff.objectiveDeltas
-                        .map((d) => `${d.objective === "ld_max" ? "max L/D" : "α₀"} ${d.changes.join(", ").replaceAll("_", " ")} (±${d.toleranceDeg}°)`)
+                        .map((d) => `${OBJECTIVE_DELTA_LABEL[d.objective] ?? d.objective} ${d.changes.join(", ").replaceAll("_", " ")} (±${d.toleranceDeg}°)`)
                         .join(" · ")}
                     </span>
                   )}

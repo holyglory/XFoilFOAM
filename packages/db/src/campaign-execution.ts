@@ -703,6 +703,17 @@ interface PlanObjectiveConfig {
 const OBJECTIVE_DEFAULTS: Record<string, { toleranceDeg: number; maxRounds: number }> = {
   ld_max: { toleranceDeg: 0.1, maxRounds: 8 },
   cl_zero: { toleranceDeg: 0.05, maxRounds: 6 },
+  // Same defaults as ld_max: the Cl curve is flat near its peak, so α(Cl_max)
+  // is ill-conditioned — a tighter tolerance would burn rounds for negligible
+  // Cl gain (per-campaign adjustable in the wizard as usual).
+  cl_max: { toleranceDeg: 0.1, maxRounds: 8 },
+};
+
+/** Lane objective key (text column) → plan jsonb objectives key. */
+const OBJECTIVE_PLAN_KEYS: Record<string, "ldMax" | "clZero" | "clMax"> = {
+  ld_max: "ldMax",
+  cl_zero: "clZero",
+  cl_max: "clMax",
 };
 
 async function updateLaneState(
@@ -776,7 +787,7 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
         .limit(1)
     : [];
   const objectives = (planRev?.plan as { objectives?: Record<string, PlanObjectiveConfig> } | undefined)?.objectives;
-  const objectiveConfig = objectives?.[key.objective === "ld_max" ? "ldMax" : "clZero"];
+  const objectiveConfig = objectives?.[OBJECTIVE_PLAN_KEYS[key.objective] ?? "ldMax"];
   // Disabling an objective freezes its lanes at their last evidence-backed state.
   if (!objectiveConfig?.enabled) return frozen;
   const defaults = OBJECTIVE_DEFAULTS[key.objective] ?? OBJECTIVE_DEFAULTS.ld_max;
@@ -812,7 +823,13 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
     )
     .orderBy(desc(polarFitSets.createdAt))
     .limit(1);
-  const rawTarget = fit ? (key.objective === "ld_max" ? fit.alphaLdmaxFine : fit.alphaClZeroFine) : null;
+  const rawTarget = fit
+    ? key.objective === "ld_max"
+      ? fit.alphaLdmaxFine
+      : key.objective === "cl_max"
+        ? fit.alphaClmaxFine
+        : fit.alphaClZeroFine
+    : null;
 
   const openRows = (await db.execute(sql`
     SELECT 1 FROM sim_campaign_points
@@ -839,8 +856,10 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
   const wasConverged = CONVERGED_STATES.has(lane.state);
   if (wasConverged && lane.witnessFitSetId === fit.id) return frozen;
 
-  // Symmetric ld_max lanes search α ≥ 0 only (§8/§9).
-  const alphaStar = symmetric && key.objective === "ld_max" ? Math.max(0, rawTarget) : rawTarget;
+  // Symmetric ld_max / cl_max lanes search α ≥ 0 only (§8/§9): both are real
+  // nonzero-α targets on symmetric airfoils (unlike cl_zero's 0°-by-definition
+  // shortcut above), and the negative side is the mirror of the positive.
+  const alphaStar = symmetric && (key.objective === "ld_max" || key.objective === "cl_max") ? Math.max(0, rawTarget) : rawTarget;
   const predicted = canonicalAoa(Math.round(alphaStar * 100) / 100);
   // Supersession reopen (§8 step 6): witness replaced within tolerance keeps
   // the lane converged_stale unless the machine re-confirms or re-runs.

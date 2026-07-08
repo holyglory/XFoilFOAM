@@ -1110,6 +1110,7 @@ export const polarFitSets = pgTable(
     // root near the coarse grid value, canonical 0.01°) — see spec §8.
     alphaLdmaxFine: doublePrecision("alpha_ldmax_fine"),
     alphaClZeroFine: doublePrecision("alpha_cl_zero_fine"),
+    alphaClmaxFine: doublePrecision("alpha_cl_max_fine"),
     clmax: doublePrecision("clmax"),
     alphaClmax: doublePrecision("alpha_clmax"),
     cdmin: doublePrecision("cdmin"),

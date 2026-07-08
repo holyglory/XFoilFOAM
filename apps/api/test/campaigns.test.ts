@@ -2,7 +2,7 @@
 // revision reuse, legacy bcId bridge, symmetric point planning, reuse preview,
 // closure classification (kept vs released), force-release drift checks,
 // lifecycle verbs, and the §10 auth hardening.
-import { type Point } from "@aerodb/core";
+import { POLAR_FIT_VERSION, type Point } from "@aerodb/core";
 import {
   airfoils,
   boundaryConditions,
@@ -15,10 +15,12 @@ import {
   deriveCampaignCompletion,
   flowConditions,
   forceHistory,
+  laneTick,
   mediums,
   meshProfiles,
   onResultIngested,
   outputProfiles,
+  polarFitSets,
   probeCampaignCompletion,
   recomputeCampaignProgress,
   referenceGeometryProfiles,
@@ -83,6 +85,7 @@ function planBody(overrides: Record<string, unknown> = {}) {
     objectives: {
       ldMax: { enabled: true, toleranceDeg: 0.1, maxRounds: 4 },
       clZero: { enabled: true, toleranceDeg: 0.05, maxRounds: 4 },
+      clMax: { enabled: true, toleranceDeg: 0.1, maxRounds: 4 },
     },
     numerics,
     ...overrides,
@@ -250,11 +253,17 @@ describe("campaign launch (§5)", () => {
     const lanes = (await db.execute(sql`
       SELECT airfoil_id, objective, state FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}
     `)) as unknown as Array<{ airfoil_id: string; objective: string; state: string }>;
-    expect(lanes.length).toBe(8); // 2 airfoils × 2 conditions × 2 objectives
+    expect(lanes.length).toBe(12); // 2 airfoils × 2 conditions × 3 objectives
     for (const lane of lanes) {
       if (lane.objective === "cl_zero" && lane.airfoil_id === symId) expect(lane.state).toBe("symmetric_definition");
       else expect(lane.state).toBe("awaiting_seed");
     }
+    // Cl_max is a real nonzero-α target even on symmetric airfoils: its lanes
+    // must seed and iterate (α ≥ 0 clamped), NEVER take the cl_zero
+    // symmetric_definition shortcut.
+    const symClMaxLanes = lanes.filter((lane) => lane.objective === "cl_max" && lane.airfoil_id === symId);
+    expect(symClMaxLanes.length).toBe(2);
+    for (const lane of symClMaxLanes) expect(lane.state).toBe("awaiting_seed");
   });
 
   it("replays idempotently (double POST → one campaign, 200)", async () => {
@@ -496,6 +505,306 @@ describe("campaign launch (§5)", () => {
     expect(body.airfoilIds.sort()).toEqual([asymId, symId].sort());
     const after = await db.select({ id: simCampaigns.id }).from(simCampaigns);
     expect(after.length).toBe(before.length);
+  });
+});
+
+// Cl_max is a real nonzero-α target on symmetric airfoils (unlike cl_zero's
+// 0°-by-definition shortcut): the lane must iterate, and its predicted α must
+// be clamped to the α ≥ 0 half the symmetric planner actually solves — a
+// negative fine target would request a point the campaign then mirrors away.
+describe("cl_max lane on a symmetric airfoil clamps predicted α to ≥ 0 (laneTick)", () => {
+  const CLAMP_SPEED = 13; // unique speed → unique physics revision, isolated from the other campaigns
+  let campaignId = "";
+  let conditionId = "";
+  let revisionId = "";
+  let fitSetId = "";
+
+  afterAll(async () => {
+    // FK order: laneTick appended a lane step witnessing this fit set — drop
+    // the steps (scoped to this fixture fit) before the fit row itself.
+    if (fitSetId) {
+      await db.execute(sql`DELETE FROM sim_campaign_lane_steps WHERE fit_set_id = ${fitSetId}`);
+      await db.delete(polarFitSets).where(eq(polarFitSets.id, fitSetId));
+    }
+  });
+
+  it("launches a symmetric-only clMax campaign whose lane awaits its seed", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} clmax clamp`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-key-clamp`,
+        airfoilIds: [symId],
+        plan: planBody({
+          chordsM: [0.2],
+          speedsMps: [CLAMP_SPEED],
+          objectives: {
+            ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+            clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+            clMax: { enabled: true, toleranceDeg: 0.1, maxRounds: 4 },
+          },
+        }),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    campaignId = res.json().campaign.id;
+    cleanupCampaignIds.push(campaignId);
+    const [condition] = (await db.execute(sql`
+      SELECT id, simulation_preset_revision_id AS revision_id FROM sim_campaign_conditions WHERE campaign_id = ${campaignId}
+    `)) as unknown as Array<{ id: string; revision_id: string }>;
+    conditionId = condition.id;
+    revisionId = condition.revision_id;
+    const lanes = (await db.execute(sql`
+      SELECT objective, state FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}
+    `)) as unknown as Array<{ objective: string; state: string }>;
+    expect(lanes).toEqual([{ objective: "cl_max", state: "awaiting_seed" }]);
+  });
+
+  it("laneTick clamps a negative α(Cl_max) prediction to the α ≥ 0 search half", async () => {
+    // A current fit whose fine Cl_max target is NEGATIVE (mirror side). The
+    // real symmetric polar is mirror-symmetric, so −1.5° and +1.5° are the
+    // same physics — the lane must pursue the solvable +side representative.
+    const [fit] = await db
+      .insert(polarFitSets)
+      .values({
+        airfoilId: symId,
+        simulationPresetRevisionId: revisionId,
+        fitVersion: POLAR_FIT_VERSION,
+        evidenceSignature: `${PREFIX}-clamp-sig`,
+        status: "final",
+        confidence: 0.9,
+        acceptedPointCount: 5,
+        provisionalPointCount: 0,
+        rejectedPointCount: 0,
+        alphaClmaxFine: -1.5,
+        isCurrent: true,
+      })
+      .returning({ id: polarFitSets.id });
+    fitSetId = fit.id;
+
+    const result = await laneTick(db, { campaignId, airfoilId: symId, conditionId, objective: "cl_max" });
+    expect(result).not.toBeNull();
+    // Clamped prediction 0° collides with the base-sweep point at α = 0 →
+    // duplicate branch: lane iterates on that open point, nothing new enqueued.
+    expect(result!.state).toBe("iterating");
+    expect(result!.enqueuedAoaDeg).toBeNull();
+
+    const [lane] = (await db.execute(sql`
+      SELECT current_target_alpha FROM sim_campaign_lanes
+      WHERE campaign_id = ${campaignId} AND airfoil_id = ${symId} AND condition_id = ${conditionId} AND objective = 'cl_max'
+    `)) as unknown as Array<{ current_target_alpha: number | string }>;
+    expect(Number(lane.current_target_alpha)).toBe(0); // −1.5 unclamped would be the F-shape failure
+
+    // And the clamp kept the negative half derived-only: no solver-facing
+    // campaign point may exist at α < 0 for the symmetric airfoil.
+    const [negativeSolverPoints] = (await db.execute(sql`
+      SELECT count(*)::int AS n FROM sim_campaign_points
+      WHERE campaign_id = ${campaignId} AND aoa_deg < 0 AND NOT derived_by_symmetry
+    `)) as unknown as Array<{ n: number }>;
+    expect(Number(negativeSolverPoints.n)).toBe(0);
+  });
+
+  it("converges once the seed is terminal and accepted evidence lands within tolerance of the clamped target", async () => {
+    const [preset] = (await db.execute(sql`
+      SELECT p.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc JOIN simulation_presets p ON p.id = cc.preset_id
+      WHERE cc.id = ${conditionId}
+    `)) as unknown as Array<{ bc_id: string }>;
+    // Solve the whole symmetric seed (solver half α = 0, 1, 2) with accepted
+    // evidence — the ld_max laneTick flow: terminal-link via onResultIngested,
+    // then tick the lane against the unchanged witness fit.
+    for (const [aoa, cl] of [
+      [0, 0],
+      [1, 0.11],
+      [2, 0.22],
+    ] as Array<[number, number]>) {
+      const [row] = await db
+        .insert(results)
+        .values({
+          airfoilId: symId,
+          bcId: preset.bc_id,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: aoa,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          converged: true,
+          stalled: false,
+          cl,
+          cd: 0.01,
+          cm: -0.01,
+        })
+        .returning({ id: results.id });
+      cleanupResultIds.push(row.id);
+      await db.insert(resultClassifications).values({
+        resultId: row.id,
+        airfoilId: symId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: aoa,
+        regime: "rans",
+        classifierVersion: "test-fixture",
+        state: "accepted",
+        region: "attached",
+        confidence: 0.9,
+      });
+      await onResultIngested(db, { airfoilId: symId, revisionId, aoaDeg: aoa, resultId: row.id, status: "done" });
+    }
+
+    const result = await laneTick(db, { campaignId, airfoilId: symId, conditionId, objective: "cl_max" });
+    expect(result).not.toBeNull();
+    // No open lane points, accepted evidence at |α − 0| ≤ 0.10°, witness fit
+    // unmoved since the prediction → converged against the final-status fit.
+    expect(result!.state).toBe("converged_final");
+    expect(result!.enqueuedAoaDeg).toBeNull();
+    const [lane] = (await db.execute(sql`
+      SELECT state, current_target_alpha, witness_fit_set_id FROM sim_campaign_lanes
+      WHERE campaign_id = ${campaignId} AND airfoil_id = ${symId} AND condition_id = ${conditionId} AND objective = 'cl_max'
+    `)) as unknown as Array<{ state: string; current_target_alpha: number | string; witness_fit_set_id: string }>;
+    expect(lane.state).toBe("converged_final");
+    expect(Number(lane.current_target_alpha)).toBe(0);
+    expect(lane.witness_fit_set_id).toBe(fitSetId);
+  });
+
+  it("polar-cache refresh retires prior-version current rows (single-current invariant)", async () => {
+    // A POLAR_FIT_VERSION bump refreshes lazily: before the fix, storeFit only
+    // un-currented rows of the CURRENT version, so the stale prior-version row
+    // stayed co-current and the detail/catalog single-current readers picked
+    // between the two nondeterministically. Must-catch: stale v1 current row +
+    // one refresh → exactly one current row, the fresh-version one.
+    const [stale] = await db
+      .insert(polarFitSets)
+      .values({
+        airfoilId: symId,
+        simulationPresetRevisionId: revisionId,
+        fitVersion: "evidence-lowess-v1",
+        evidenceSignature: `${PREFIX}-stale-v1-sig`,
+        status: "final",
+        confidence: 0.9,
+        acceptedPointCount: 3,
+        provisionalPointCount: 0,
+        rejectedPointCount: 0,
+        alphaClmax: 2,
+        isCurrent: true,
+      })
+      .returning({ id: polarFitSets.id });
+
+    await refreshPolarCacheForRevision(db, symId, revisionId);
+
+    const rows = await db
+      .select({ id: polarFitSets.id, fitVersion: polarFitSets.fitVersion, isCurrent: polarFitSets.isCurrent })
+      .from(polarFitSets)
+      .where(and(eq(polarFitSets.airfoilId, symId), eq(polarFitSets.simulationPresetRevisionId, revisionId)));
+    const current = rows.filter((r) => r.isCurrent);
+    expect(current.length).toBe(1);
+    expect(current[0].fitVersion).toBe(POLAR_FIT_VERSION);
+    expect(rows.find((r) => r.id === stale.id)?.isCurrent).toBe(false);
+  });
+});
+
+// The running production campaign predates the clMax objective: its stored
+// plan revisions have NO objectives.clMax block at all. Enabling Cl_max on
+// such a campaign goes through preview → apply (§6.1) and must (a) classify
+// without crashing on the absent legacy block, (b) surface the enable in
+// objectiveDeltas, and (c) materialize the new cl_max lanes via the generic
+// ensureCampaignLanes loop — including awaiting_seed on the symmetric airfoil.
+describe("plan edit enables cl_max on a legacy (pre-clMax) campaign and materializes lanes", () => {
+  const EDIT_SPEED = 17; // unique speed → unique physics revision, isolated from the other campaigns
+  let campaignId = "";
+  let diffHash = "";
+
+  const legacyObjectives = {
+    ldMax: { enabled: true, toleranceDeg: 0.1, maxRounds: 4 },
+    clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+    // clMax intentionally ABSENT: pre-clMax clients never sent it — the zod
+    // default + normalizeCampaignPlan must treat absence as disabled.
+  };
+  const editedObjectives = {
+    ...legacyObjectives,
+    // Tolerance/rounds match the disabled-block defaults so the only delta is
+    // the enable itself (a rounds change would add "rounds_changed").
+    clMax: { enabled: true, toleranceDeg: 0.1, maxRounds: 8 },
+  };
+
+  it("launches without a clMax block → ld_max lanes only", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} clmax plan edit`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-key-planedit`,
+        airfoilIds: [asymId, symId],
+        plan: planBody({ chordsM: [0.2], speedsMps: [EDIT_SPEED], objectives: legacyObjectives }),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    campaignId = res.json().campaign.id;
+    cleanupCampaignIds.push(campaignId);
+    const lanes = (await db.execute(sql`
+      SELECT objective FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}
+    `)) as unknown as Array<{ objective: string }>;
+    expect(lanes.map((l) => l.objective).sort()).toEqual(["ld_max", "ld_max"]);
+
+    // Make the stored revision a true legacy artifact: strip the normalized
+    // clMax block so the jsonb matches what pre-clMax launches persisted.
+    await db.execute(sql`
+      UPDATE sim_campaign_plan_revisions
+      SET plan = jsonb_set(plan, '{objectives}', (plan->'objectives') - 'clMax')
+      WHERE campaign_id = ${campaignId}
+    `);
+    const [stored] = (await db.execute(sql`
+      SELECT plan->'objectives' ? 'clMax' AS has_clmax FROM sim_campaign_plan_revisions WHERE campaign_id = ${campaignId}
+    `)) as unknown as Array<{ has_clmax: boolean }>;
+    expect(stored.has_clmax).toBe(false);
+  });
+
+  it("preview classifies the legacy plan without crashing and reports the cl_max enable", async () => {
+    const preview = await app.inject({
+      method: "POST",
+      url: `/api/admin/campaigns/${campaignId}/plan/preview`,
+      payload: {
+        plan: planBody({ chordsM: [0.2], speedsMps: [EDIT_SPEED], objectives: editedObjectives }),
+        basePlanRevisionNumber: 1,
+      },
+    });
+    expect(preview.statusCode).toBe(200);
+    const diff = preview.json();
+    expect(diff.objectiveDeltas).toEqual([{ objective: "cl_max", changes: ["enabled"], toleranceDeg: "0.10" }]);
+    // Objective toggles alone release/add nothing.
+    expect(diff.releasedConditions.length).toBe(0);
+    expect(diff.addedConditions.length).toBe(0);
+    diffHash = diff.diffHash;
+  });
+
+  it("apply materializes the cl_max lanes (symmetric included, never symmetric_definition)", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/admin/campaigns/${campaignId}/plan/apply`,
+      payload: {
+        plan: planBody({ chordsM: [0.2], speedsMps: [EDIT_SPEED], objectives: editedObjectives }),
+        basePlanRevisionNumber: 1,
+        diffHash,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("applied");
+
+    const lanes = (await db.execute(sql`
+      SELECT airfoil_id, objective, state FROM sim_campaign_lanes WHERE campaign_id = ${campaignId} ORDER BY objective
+    `)) as unknown as Array<{ airfoil_id: string; objective: string; state: string }>;
+    expect(lanes.map((l) => l.objective)).toEqual(["cl_max", "cl_max", "ld_max", "ld_max"]);
+    const clMaxLanes = lanes.filter((l) => l.objective === "cl_max");
+    expect(clMaxLanes.map((l) => l.airfoil_id).sort()).toEqual([asymId, symId].sort());
+    for (const lane of clMaxLanes) expect(lane.state).toBe("awaiting_seed");
+
+    // The new stored revision carries the normalized clMax block.
+    const [rev2] = (await db.execute(sql`
+      SELECT plan->'objectives'->'clMax' AS clmax FROM sim_campaign_plan_revisions
+      WHERE campaign_id = ${campaignId} AND revision_number = 2
+    `)) as unknown as Array<{ clmax: { enabled: boolean; toleranceDeg: string; maxRounds: number } }>;
+    expect(rev2.clmax).toEqual({ enabled: true, toleranceDeg: "0.10", maxRounds: 8 });
   });
 });
 

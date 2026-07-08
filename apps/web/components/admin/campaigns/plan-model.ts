@@ -146,6 +146,7 @@ export interface WizardAnglePlan {
   listText: string;
   ldMax: { enabled: boolean; toleranceDeg: number; maxRounds: number };
   clZero: { enabled: boolean; toleranceDeg: number; maxRounds: number };
+  clMax: { enabled: boolean; toleranceDeg: number; maxRounds: number };
 }
 
 export function parseAngleListText(text: string): { values: number[]; invalidTokens: string[] } {
@@ -208,6 +209,7 @@ export function buildPlanInput(envelope: WizardEnvelope, angle: WizardAnglePlan,
     objectives: {
       ldMax: { enabled: angle.ldMax.enabled, toleranceDeg: angle.ldMax.toleranceDeg.toFixed(2), maxRounds: angle.ldMax.maxRounds },
       clZero: { enabled: angle.clZero.enabled, toleranceDeg: angle.clZero.toleranceDeg.toFixed(2), maxRounds: angle.clZero.maxRounds },
+      clMax: { enabled: angle.clMax.enabled, toleranceDeg: angle.clMax.toleranceDeg.toFixed(2), maxRounds: angle.clMax.maxRounds },
     },
     baseSweep,
     numerics,

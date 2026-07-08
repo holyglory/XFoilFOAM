@@ -88,12 +88,13 @@ export class CampaignError extends Error {
 // ---------------------------------------------------------------------------
 // Plan document (spec §3.1) — canonical, byte-stable jsonb shape.
 // ---------------------------------------------------------------------------
-export type CampaignObjectiveId = "ldMax" | "clZero";
-export type CampaignObjectiveKey = "ld_max" | "cl_zero";
+export type CampaignObjectiveId = "ldMax" | "clZero" | "clMax";
+export type CampaignObjectiveKey = "ld_max" | "cl_zero" | "cl_max";
 
 export const CAMPAIGN_OBJECTIVES: ReadonlyArray<{ id: CampaignObjectiveId; key: CampaignObjectiveKey }> = [
   { id: "ldMax", key: "ld_max" },
   { id: "clZero", key: "cl_zero" },
+  { id: "clMax", key: "cl_max" },
 ];
 
 export interface CampaignObjectivePlan {
@@ -119,7 +120,7 @@ export interface CampaignPlan {
   areaM2: string | null;
   excludedConditions: Array<[string, string, string, string]>; // [T, P, speed, chord]
   baseSweep: CampaignBaseSweep;
-  objectives: { ldMax: CampaignObjectivePlan; clZero: CampaignObjectivePlan };
+  objectives: { ldMax: CampaignObjectivePlan; clZero: CampaignObjectivePlan; clMax: CampaignObjectivePlan };
   numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
 }
 
@@ -138,6 +139,8 @@ export interface CampaignPlanInput {
   objectives: {
     ldMax: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number };
     clZero: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number };
+    /** Optional for pre-clMax callers/plans: absent means disabled (defaults). */
+    clMax?: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number };
   };
   numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
 }
@@ -241,8 +244,13 @@ export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
   const objectives = {
     ldMax: normalizeObjective(input.objectives?.ldMax, "objectives.ldMax", push),
     clZero: normalizeObjective(input.objectives?.clZero, "objectives.clZero", push),
+    // clMax joined the plan shape later: absence is a valid disabled block so
+    // pre-clMax clients and replayed payloads keep normalizing byte-stably.
+    clMax: input.objectives?.clMax
+      ? normalizeObjective(input.objectives.clMax, "objectives.clMax", push)
+      : DISABLED_CLMAX_OBJECTIVE,
   };
-  if ((objectives.ldMax.enabled || objectives.clZero.enabled) && angleCount < 3) {
+  if ((objectives.ldMax.enabled || objectives.clZero.enabled || objectives.clMax.enabled) && angleCount < 3) {
     push("objectives", "refinement objectives require a base sweep of at least 3 angles");
   }
 
@@ -276,6 +284,10 @@ export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
     },
   };
 }
+
+/** Canonical disabled Cl_max block (spec §3.1 defaults: ±0.10°, 8 rounds) —
+ *  substituted when a plan input predates the third objective. */
+const DISABLED_CLMAX_OBJECTIVE: CampaignObjectivePlan = { enabled: false, toleranceDeg: "0.10", maxRounds: 8 };
 
 function normalizeObjective(
   input: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number } | undefined,
@@ -1970,7 +1982,9 @@ export async function classifyPlanChange(
 
   const objectiveDeltas: PlanChangeObjectiveDelta[] = [];
   for (const objective of CAMPAIGN_OBJECTIVES) {
-    const oldObj = currentPlan.objectives[objective.id];
+    // Stored plan revisions that predate the clMax objective have no block for
+    // it — semantically identical to a disabled block with the defaults.
+    const oldObj = currentPlan.objectives[objective.id] ?? DISABLED_CLMAX_OBJECTIVE;
     const newObj = newPlan.objectives[objective.id];
     const changes: PlanChangeObjectiveDelta["changes"] = [];
     if (!oldObj.enabled && newObj.enabled) changes.push("enabled");

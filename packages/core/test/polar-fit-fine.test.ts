@@ -33,9 +33,34 @@ function syntheticEvidence(a: number): PolarEvidencePoint {
   };
 }
 
-function acceptedClassifications(angles: number[]): PolarEvidenceClassification[] {
-  return angles.map((a) => ({
-    evidence: syntheticEvidence(a),
+// Cl-peak fixture for the Cl_max fine target: quadratic lift peak at an
+// off-grid α* (cl = CLMAX_PEAK − KC·(α − α*)²) with a positive quadratic drag
+// bucket. The local-quadratic LOWESS reproduces a quadratic exactly, so the
+// golden-section argmax must land on α* to fine-target accuracy.
+const A_CLMAX = 8.3;
+const CLMAX_PEAK = 1.2;
+const KC = 0.005;
+
+function clPeakEvidence(a: number): PolarEvidencePoint {
+  const cl = CLMAX_PEAK - KC * (a - A_CLMAX) ** 2;
+  const cd = 0.02 + 0.0008 * (a - A_CLMAX) ** 2;
+  return {
+    a,
+    cl,
+    cd,
+    cm: -0.05,
+    ld: cl / cd,
+    status: "done",
+    source: "solved",
+    regime: "rans",
+    converged: true,
+    stalled: false,
+  };
+}
+
+function classify(evidence: PolarEvidencePoint[]): PolarEvidenceClassification[] {
+  return evidence.map((e) => ({
+    evidence: e,
     state: "accepted" as const,
     region: "attached" as const,
     confidence: 0.9,
@@ -43,9 +68,19 @@ function acceptedClassifications(angles: number[]): PolarEvidenceClassification[
   }));
 }
 
+function acceptedClassifications(angles: number[]): PolarEvidenceClassification[] {
+  return classify(angles.map(syntheticEvidence));
+}
+
+function clPeakClassifications(angles: number[]): PolarEvidenceClassification[] {
+  return classify(angles.map(clPeakEvidence));
+}
+
 describe("polar fit fine targets (spec §8)", () => {
   it("bumps POLAR_FIT_VERSION for the fine-target fields", () => {
-    expect(POLAR_FIT_VERSION).toBe("evidence-lowess-v2");
+    // v3 = alphaClmaxFine joined the metrics; existing fits refresh lazily on
+    // the next ingest per revision (version participates in the cache key).
+    expect(POLAR_FIT_VERSION).toBe("evidence-lowess-v3");
   });
 
   it("alphaLdmaxFine lands within 0.02° of the analytic L/D optimum", () => {
@@ -75,5 +110,30 @@ describe("polar fit fine targets (spec §8)", () => {
     const metrics = buildPolarFit(acceptedClassifications(angles)).metrics!;
     expect(metrics.alphaLdmaxFine).toBe(Number(metrics.alphaLdmaxFine.toFixed(2)));
     expect(metrics.alphaClZeroFine).toBe(Number(metrics.alphaClZeroFine!.toFixed(2)));
+  });
+
+  it("alphaClmaxFine lands within 0.02° of the analytic Cl peak", () => {
+    const angles = Array.from({ length: 21 }, (_, i) => i - 2); // -2..18 step 1, peak at 8.3 off-grid
+    const fit = buildPolarFit(clPeakClassifications(angles));
+    expect(fit.status).toBe("final");
+    expect(fit.metrics).not.toBeNull();
+    expect(fit.metrics!.alphaClmaxFine).not.toBeNull();
+    expect(Math.abs(fit.metrics!.alphaClmaxFine! - A_CLMAX)).toBeLessThanOrEqual(0.02);
+  });
+
+  it("alphaClmaxFine is rounded to 0.01°", () => {
+    const angles = Array.from({ length: 21 }, (_, i) => i - 2);
+    const metrics = buildPolarFit(clPeakClassifications(angles)).metrics!;
+    expect(metrics.alphaClmaxFine).toBe(Number(metrics.alphaClmaxFine!.toFixed(2)));
+  });
+
+  it("alphaClmaxFine is null when the Cl argmax sits on the evidence boundary (no interior max)", () => {
+    // The thin-airfoil fixture's cl is monotonic in α: the coarse argmax is the
+    // last evidence sample, so no interior maximum is bracketed — the fine
+    // target must be an honest null, not an extrapolated invention.
+    const angles = Array.from({ length: 26 }, (_, i) => i - 10);
+    const fit = buildPolarFit(acceptedClassifications(angles));
+    expect(fit.metrics).not.toBeNull();
+    expect(fit.metrics!.alphaClmaxFine).toBeNull();
   });
 });

@@ -2203,3 +2203,76 @@ leakage lock, noise-minted period, slope-dragged period) fail on the
 pre-fix code and pass post-fix; a near-band-edge low-St false-positive
 guard passes in both worlds. Engine suite: 271 passed (253 baseline + 18),
 6 deselected; node typecheck 6/6 with zero node-side diff.
+
+## 2026-07-08 — Cl_max refinement objective: third lane type (clMax / cl_max)
+
+Decision (user-approved plan parsed-painting-ocean): campaigns gain the third
+iterative refinement objective — the angle of maximum lift — alongside ld_max
+and cl_zero, reusing the objective-generic lane machinery end to end.
+
+1. IDENTITY: id `clMax`, key `cl_max`, label "Cl_max", chip `Cl_max ±0.10°`.
+   Added to `CAMPAIGN_OBJECTIVES`; the lane/step tables' plain text objective
+   columns needed no DDL.
+2. FINE TARGET `alphaClmaxFine`: computed exactly like `alphaLdmaxFine` —
+   golden-section argmax of the LOWESS-evaluated Cl bracketed ±1 sample step
+   around the coarse argmax, rounded to 0.01°. NULL when the coarse argmax
+   sits on the evidence-range boundary (lift curve still rising at the edge —
+   stall not bracketed; honest absence, never an extrapolated value, and the
+   API detail service does NOT substitute the coarse peak the way it does for
+   pre-v2 alphaLdmaxFine). `POLAR_FIT_VERSION` evidence-lowess-v2 → v3;
+   existing fits refresh lazily on next ingest per revision. Migration 0035
+   adds nullable `polar_fit_sets.alpha_cl_max_fine`.
+3. SYMMETRIC AIRFOILS: Cl_max is a real nonzero-α target — lanes take the
+   ld_max α ≥ 0 clamp branch in laneTick, NEVER the cl_zero
+   `symmetric_definition` shortcut (the ensureCampaignLanes CASE stays
+   cl_zero-only). Locked by launch-lane and laneTick-level tests (negative
+   fine target −1.5° must iterate at the clamped 0° representative).
+4. DEFAULTS: toleranceDeg 0.10, maxRounds 8 (same as ld_max — the Cl curve is
+   flat near its peak, so α(Cl_max) is ill-conditioned; tighter defaults would
+   burn rounds for negligible Cl gain). Wizard-adjustable per campaign.
+5. BACKWARD COMPATIBILITY (implementation decision surfaced during build):
+   plan revisions stored before clMax have no objectives.clMax block. Absence
+   = disabled-with-defaults everywhere — API zod defaults the block,
+   normalizeCampaignPlan substitutes DISABLED_CLMAX_OBJECTIVE,
+   classifyPlanChange falls back for the OLD plan side (this is the exact
+   path that lets the running production campaign gain the objective live via
+   Edit angle plan), and all web plan readers treat `clMax` as optional.
+6. STALL-REGION EVIDENCE: no new machinery — near-peak points classify
+   through the existing fidelity ladder; `insufficient_evidence` / `stalled`
+   / `awaiting_seed` already state the truth, same as ld_max.
+
+Verified: typecheck 6/6; core 85 (82+3: analytic 8.3° peak within 0.02°,
+0.01° rounding, boundary-argmax null), api 89 (12-lane 2×2×3 launch +
+symmetric cl_max awaiting_seed; laneTick clamp e2e; legacy plan-edit enable;
+single-current refresh invariant), web 196, sweeper 124 (both sweeper
+campaign fixtures now carry explicit clMax-disabled blocks).
+Migration 0035 applied to dev :5544 after a verified pg_dump backup.
+
+Independent verification pass (same day) confirmed the above and added:
+
+7. PLAN-EDIT PROOF: new api tests launch a campaign, strip the stored
+   revision's objectives.clMax jsonb block (true pre-clMax artifact), then
+   preview → apply enabling Cl_max: classifyPlanChange survives the absent
+   block, objectiveDeltas reports exactly [cl_max enabled ±0.10°], and
+   applyPlanEdit materializes the cl_max lanes for every airfoil×condition —
+   symmetric included, awaiting_seed, never symmetric_definition.
+8. DEFECT FOUND AND FIXED — single-current invariant on version bumps:
+   polar-cache storeFit un-currented only rows of the CURRENT fit version, so
+   every POLAR_FIT_VERSION bump (v1→v2 before, v2→v3 now) left the stale
+   prior-version row co-current with the freshly refreshed one; the airfoil
+   detail fitByRevision map and Browse catalog metrics pick among current
+   rows with no version tie-break → nondeterministic stale-fit serving.
+   Reproduced on dev with real evidence (v1+v3 both current after a lazy v3
+   refresh). Fix: storeFit now retires EVERY current row for the
+   (airfoil, revision) pair; migration 0035 gained an idempotent repair that
+   un-currents all but the newest current row per pair (applied to dev;
+   0 double-current pairs remain). Regression test proves recall: with the
+   old behavior the new api test fails "expected 2 to be 1".
+   laneTick was never exposed (ORDER BY createdAt DESC LIMIT 1).
+9. RECALL SPOT-CHECKS: reverting the laneTick fine-target ternary makes the
+   clamp tests fail (awaiting_seed / insufficient_evidence instead of
+   iterating / converged_final — which also demonstrates the null-tolerant
+   degradation path for pre-v3 fit rows: honest lane states, no crash).
+   Real-data probes: lazy v3 refresh persisted alpha_cl_max_fine 11.9 / 13.49
+   on interior-peak airfoils and an honest NULL where the coarse argmax sits
+   on the +20° sweep edge.

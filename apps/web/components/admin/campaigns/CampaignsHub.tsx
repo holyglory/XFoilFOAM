@@ -115,11 +115,14 @@ function statusLine(
 
 function kindChip(summary: AdminCampaignSummary | undefined): string | null {
   if (!summary) return null;
-  const { ldMax, clZero } = summary.campaign.plan.objectives;
-  if (ldMax.enabled && clZero.enabled) return "max L/D + zero-lift refine";
-  if (ldMax.enabled) return "max-L/D refine";
-  if (clZero.enabled) return "zero-lift refine";
-  return "polar sweep";
+  const { ldMax, clZero, clMax } = summary.campaign.plan.objectives;
+  // clMax is optional on pre-clMax plan revisions — absence means disabled.
+  const enabled = [ldMax.enabled ? "max L/D" : null, clZero.enabled ? "zero-lift" : null, clMax?.enabled ? "Cl_max" : null].filter(
+    (x): x is string => x != null,
+  );
+  if (enabled.length === 0) return "polar sweep";
+  if (enabled.length === 1) return enabled[0] === "max L/D" ? "max-L/D refine" : `${enabled[0]} refine`;
+  return `${enabled.join(" + ")} refine`;
 }
 
 export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver, onOpenPoints }: CampaignsHubProps) {

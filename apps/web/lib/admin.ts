@@ -963,7 +963,7 @@ export const bulkAirfoils = (body: {
 // wrap aj<T>() like every other admin client above.
 // ---------------------------------------------------------------------------
 
-export type CampaignObjectiveKey = "ld_max" | "cl_zero";
+export type CampaignObjectiveKey = "ld_max" | "cl_zero" | "cl_max";
 export type CampaignErrorClass = "mesh" | "diverged" | "timeout" | "engine" | "cancelled" | "solver" | "unknown";
 
 export interface CampaignProgressTotals {
@@ -1004,7 +1004,9 @@ export interface CampaignPlanInput {
     stepDeg: string | null;
     listDeg: string[] | null;
   };
-  objectives: { ldMax: CampaignObjectivePlanInput; clZero: CampaignObjectivePlanInput };
+  /** clMax is optional: plan revisions stored before the third objective have
+   *  no block for it — readers must treat absence as disabled. */
+  objectives: { ldMax: CampaignObjectivePlanInput; clZero: CampaignObjectivePlanInput; clMax?: CampaignObjectivePlanInput };
   numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
 }
 

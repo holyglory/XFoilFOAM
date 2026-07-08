@@ -151,6 +151,7 @@ beforeAll(async () => {
       objectives: {
         ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
         clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+        clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
       },
       numerics: {
         boundaryProfileId: profileIds.boundary,

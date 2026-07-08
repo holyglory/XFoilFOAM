@@ -49,6 +49,7 @@ export interface CampaignWizardDraft {
   sweepListText: string;
   ldMax: WizardObjectiveDraft;
   clZero: WizardObjectiveDraft;
+  clMax: WizardObjectiveDraft;
   // step 4 — numerics ("" = unresolved, surfaces as a validation issue)
   numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
 }
@@ -101,6 +102,9 @@ export function emptyDraft(kind: CampaignKind): CampaignWizardDraft {
     // (spec §11 hub CTAs); tolerance/rounds defaults follow spec §3.1.
     ldMax: { enabled: kind === "ld_refine", toleranceDeg: 0.1, maxRounds: 8 },
     clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 6 },
+    // Same defaults as ld_max: the Cl curve is flat near its peak, so a
+    // tighter tolerance would burn rounds for negligible Cl gain.
+    clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 8 },
     numerics: { boundaryProfileId: "", meshProfileId: "", solverProfileId: "", outputProfileId: "" },
   };
 }
@@ -132,6 +136,10 @@ export function draftFromPrefill(prefill: CampaignDuplicatePrefill): CampaignWiz
     sweepListText: plan.baseSweep.listDeg?.map((a) => String(Number(a))).join(", ") ?? "",
     ldMax: { enabled: plan.objectives.ldMax.enabled, toleranceDeg: Number(plan.objectives.ldMax.toleranceDeg), maxRounds: plan.objectives.ldMax.maxRounds },
     clZero: { enabled: plan.objectives.clZero.enabled, toleranceDeg: Number(plan.objectives.clZero.toleranceDeg), maxRounds: plan.objectives.clZero.maxRounds },
+    // Pre-clMax plans have no block — duplicate as disabled with defaults.
+    clMax: plan.objectives.clMax
+      ? { enabled: plan.objectives.clMax.enabled, toleranceDeg: Number(plan.objectives.clMax.toleranceDeg), maxRounds: plan.objectives.clMax.maxRounds }
+      : { ...base.clMax },
     numerics: { ...plan.numerics },
   };
 }

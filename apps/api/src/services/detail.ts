@@ -443,6 +443,9 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
                 // pre-v2 fit rows have no fine targets; the coarse peak stands in until refit
                 alphaLdmaxFine: row.alphaLdmaxFine ?? row.alphaLdmax,
                 alphaClZeroFine: row.alphaClZeroFine ?? null,
+                // pre-v3 fit rows: null until refit — no coarse stand-in, a
+                // boundary argmax must stay an honest absence (see 0035).
+                alphaClmaxFine: row.alphaClmaxFine ?? null,
                 cdmin: row.cdmin,
                 clCd: row.clAtCdmin,
                 cd0: row.cd0,

@@ -236,8 +236,9 @@ export function CampaignWizard({ initialKind, prefill, step, onStepChange, onLau
       listText: draft.sweepListText,
       ldMax: draft.ldMax,
       clZero: draft.clZero,
+      clMax: draft.clMax,
     }),
-    [draft.sweepMode, draft.sweepFromDeg, draft.sweepToDeg, draft.sweepStepDeg, draft.sweepListText, draft.ldMax, draft.clZero],
+    [draft.sweepMode, draft.sweepFromDeg, draft.sweepToDeg, draft.sweepStepDeg, draft.sweepListText, draft.ldMax, draft.clZero, draft.clMax],
   );
 
   const sweep = useMemo(() => sweepSetsOf(anglePlan), [anglePlan]);
@@ -302,7 +303,10 @@ export function CampaignWizard({ initialKind, prefill, step, onStepChange, onLau
           draft.clZero.enabled ? positiveIssue(draft.clZero.toleranceDeg, "Zero-lift tolerance ±°") : null,
           draft.clZero.enabled ? positiveIntegerIssue(draft.clZero.maxRounds, "Zero-lift rounds") : null,
           draft.clZero.enabled && draft.clZero.maxRounds > 50 ? { field: "Zero-lift rounds", message: "Zero-lift rounds must be 1..50" } : null,
-          (draft.ldMax.enabled || draft.clZero.enabled) && sweep.sets && sweep.sets.angles.length < 3
+          draft.clMax.enabled ? positiveIssue(draft.clMax.toleranceDeg, "Cl_max tolerance ±°") : null,
+          draft.clMax.enabled ? positiveIntegerIssue(draft.clMax.maxRounds, "Cl_max rounds") : null,
+          draft.clMax.enabled && draft.clMax.maxRounds > 50 ? { field: "Cl_max rounds", message: "Cl_max rounds must be 1..50" } : null,
+          (draft.ldMax.enabled || draft.clZero.enabled || draft.clMax.enabled) && sweep.sets && sweep.sets.angles.length < 3
             ? { field: draft.sweepMode === "list" ? "AoA list °" : "AoA step °", message: "Refinement objectives require a base sweep of at least 3 angles" }
             : null,
         ]);
@@ -459,6 +463,7 @@ export function CampaignWizard({ initialKind, prefill, step, onStepChange, onLau
               if (patch.listText !== undefined) translated.sweepListText = patch.listText;
               if (patch.ldMax !== undefined) translated.ldMax = patch.ldMax;
               if (patch.clZero !== undefined) translated.clZero = patch.clZero;
+              if (patch.clMax !== undefined) translated.clMax = patch.clMax;
               patchDraft(translated);
             }}
             resolvedAirfoils={resolvedScope.airfoils}

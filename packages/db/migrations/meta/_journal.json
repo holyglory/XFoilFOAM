@@ -246,6 +246,13 @@
       "when": 1783900800000,
       "tag": "0034_urans_fidelity_ladder",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1783987200000,
+      "tag": "0035_cl_max_refinement_objective",
+      "breakpoints": true
     }
   ]
 }

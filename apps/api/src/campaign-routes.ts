@@ -74,7 +74,14 @@ const planBody = z.object({
     stepDeg: numberLike.nullable().optional(),
     listDeg: z.array(numberLike).nullable().optional(),
   }),
-  objectives: z.object({ ldMax: objectiveBody, clZero: objectiveBody }),
+  // clMax joined the plan shape later — defaulted-disabled so pre-clMax
+  // payloads (idempotent replays, scripted launches) keep validating;
+  // normalizeCampaignPlan applies the same disabled default when absent.
+  objectives: z.object({
+    ldMax: objectiveBody,
+    clZero: objectiveBody,
+    clMax: objectiveBody.default({ enabled: false, toleranceDeg: 0.1, maxRounds: 8 }),
+  }),
   numerics: z.object({
     boundaryProfileId: z.string().uuid(),
     meshProfileId: z.string().uuid(),
@@ -93,7 +100,7 @@ const launchBody = z.object({
   markStaleAndResolve: z.boolean().default(false),
 });
 
-const objectiveKeyParam = z.enum(["ld_max", "cl_zero"]);
+const objectiveKeyParam = z.enum(["ld_max", "cl_zero", "cl_max"]);
 
 function sendCampaignError(reply: FastifyReply, e: unknown): FastifyReply {
   if (e instanceof CampaignError) {

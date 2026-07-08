@@ -441,6 +441,11 @@ export function CampaignDetail({
             α₀ ±{objectives.clZero.toleranceDeg}°
           </span>
         )}
+        {objectives.clMax?.enabled && (
+          <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "3px 9px" }}>
+            Cl_max ±{objectives.clMax.toleranceDeg}°
+          </span>
+        )}
         <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "3px 9px" }}>
           {PRIORITY_LABEL[campaign.priority] ?? `priority ${campaign.priority}`}
         </span>

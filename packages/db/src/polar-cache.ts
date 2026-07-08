@@ -378,6 +378,10 @@ async function storeFit(
   const acceptedPointCount = classifications.filter((c) => c.state === "accepted").length;
   const provisionalPointCount = classifications.filter((c) => c.state === "needs_urans").length;
   const rejectedPointCount = classifications.filter((c) => c.state === "rejected" || c.state === "superseded_by_urans").length;
+  // Retire EVERY current row for the pair, not just same-version rows: a
+  // POLAR_FIT_VERSION bump refreshes lazily, and leaving the prior-version
+  // row co-current makes single-current readers (detail fitByRevision map,
+  // catalog metrics) nondeterministic between the stale and fresh fit.
   await db
     .update(polarFitSets)
     .set({ isCurrent: false })
@@ -385,7 +389,7 @@ async function storeFit(
       and(
         eq(polarFitSets.airfoilId, airfoilId),
         eq(polarFitSets.simulationPresetRevisionId, simulationPresetRevisionId),
-        eq(polarFitSets.fitVersion, POLAR_FIT_VERSION),
+        eq(polarFitSets.isCurrent, true),
       ),
     );
   const [fitSet] = await db
@@ -406,6 +410,7 @@ async function storeFit(
       alphaLdmax: metrics?.aLd ?? null,
       alphaLdmaxFine: metrics?.alphaLdmaxFine ?? null,
       alphaClZeroFine: metrics?.alphaClZeroFine ?? null,
+      alphaClmaxFine: metrics?.alphaClmaxFine ?? null,
       clmax: metrics?.clmax ?? null,
       alphaClmax: metrics?.aStall ?? null,
       cdmin: metrics?.cdmin ?? null,
@@ -430,6 +435,7 @@ async function storeFit(
         alphaLdmax: metrics?.aLd ?? null,
         alphaLdmaxFine: metrics?.alphaLdmaxFine ?? null,
         alphaClZeroFine: metrics?.alphaClZeroFine ?? null,
+        alphaClmaxFine: metrics?.alphaClmaxFine ?? null,
         clmax: metrics?.clmax ?? null,
         alphaClmax: metrics?.aStall ?? null,
         cdmin: metrics?.cdmin ?? null,

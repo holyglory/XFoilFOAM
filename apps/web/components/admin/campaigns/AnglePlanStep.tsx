@@ -19,7 +19,7 @@ export interface AnglePlanStepProps {
 }
 
 const OBJECTIVE_CARDS: Array<{
-  key: "ldMax" | "clZero";
+  key: "ldMax" | "clZero" | "clMax";
   title: string;
   decision: string;
   detail: string;
@@ -41,6 +41,14 @@ const OBJECTIVE_CARDS: Array<{
     detail: "Same loop against the Cl = 0 crossing. Symmetric airfoils skip this — their zero-lift angle is 0° by definition.",
     toleranceField: "Zero-lift tolerance ±°",
     roundsField: "Zero-lift rounds",
+  },
+  {
+    key: "clMax",
+    title: "Find the Cl_max angle",
+    decision: "Keep solving single extra angles until the maximum-lift angle is pinned down.",
+    detail: "Same loop against the Cl peak: each round fits the polar, predicts α(Cl max), solves that one angle, and stops when the prediction is confirmed within tolerance.",
+    toleranceField: "Cl_max tolerance ±°",
+    roundsField: "Cl_max rounds",
   },
 ];
 
@@ -157,7 +165,7 @@ export function AnglePlanStep({ angle, onAngle, resolvedAirfoils, conditionCount
             </div>
           );
         })}
-        {(angle.ldMax.enabled || angle.clZero.enabled) && expansion.sets && expansion.sets.angles.length < 3 && (
+        {(angle.ldMax.enabled || angle.clZero.enabled || angle.clMax.enabled) && expansion.sets && expansion.sets.angles.length < 3 && (
           <InfoLine tone="red" text="Refinement objectives need a base sweep of at least 3 angles to seed the first fit." />
         )}
       </div>

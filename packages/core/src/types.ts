@@ -63,6 +63,10 @@ export interface PolarFitMetrics {
   /** Refinement fine target (spec §8): LOWESS-evaluated Cl root, 0.01°; null
    *  when Cl never crosses zero in the evidence range. */
   alphaClZeroFine: number | null;
+  /** Refinement fine target (spec §8): LOWESS-evaluated Cl argmax, 0.01°;
+   *  null when the coarse Cl argmax sits on the evidence-range boundary (no
+   *  interior maximum — stall not bracketed by the evidence). */
+  alphaClmaxFine: number | null;
 }
 
 export interface PolarFit {

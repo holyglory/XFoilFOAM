@@ -35,7 +35,7 @@ import type {
 // rejection-only — the oscillating-averaging note is surfaced through the
 // quality-warnings marker the ingest path persists, never through reasons.
 export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v4";
-export const POLAR_FIT_VERSION = "evidence-lowess-v2";
+export const POLAR_FIT_VERSION = "evidence-lowess-v3";
 
 /** Minimum retained shedding periods for FULL-fidelity URANS acceptance
  *  (frame-track gate). Cross-runtime parity pin: the engine's early-stop
@@ -502,6 +502,23 @@ function fitMetrics(points: PolarFitPoint[], fine: FineTargetContext): PolarFitM
       Math.min(fine.maxA, byLd.a + fine.stepDeg),
     ),
   );
+  // Cl_max fine target (third refinement objective): same golden-section
+  // argmax bracket as L/D, applied to the LOWESS-evaluated Cl around the
+  // coarse Cl argmax. Null when the coarse argmax sits on an evidence-range
+  // boundary — the lift curve is still rising (or falling) at the edge, so no
+  // interior maximum is bracketed and predicting one would be invention.
+  let alphaClmaxFine: number | null = null;
+  const clArgmaxIdx = finitePoints.reduce((best, p, i) => (p.cl > finitePoints[best].cl ? i : best), 0);
+  if (clArgmaxIdx > 0 && clArgmaxIdx < finitePoints.length - 1) {
+    alphaClmaxFine = roundCenti(
+      goldenSectionMax(
+        (a) => fine.evaluate(a, "cl"),
+        Math.max(fine.minA, byCl.a - fine.stepDeg),
+        Math.min(fine.maxA, byCl.a + fine.stepDeg),
+      ),
+    );
+  }
+
   let alphaClZeroFine: number | null = null;
   for (let i = 1; i < finitePoints.length; i++) {
     const a = finitePoints[i - 1];
@@ -531,6 +548,7 @@ function fitMetrics(points: PolarFitPoint[], fine: FineTargetContext): PolarFitM
     cm0: interpolateAtClZero(finitePoints, "cm"),
     alphaLdmaxFine,
     alphaClZeroFine,
+    alphaClmaxFine,
   };
 }
 

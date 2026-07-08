@@ -32,6 +32,7 @@ const PAGE_LIMIT = 100;
 const OBJECTIVE_LABEL: Record<string, string> = {
   ld_max: "max L/D",
   cl_zero: "α₀ (Cl = 0)",
+  cl_max: "Cl_max",
 };
 
 const STATE_META: Record<string, { label: string; color: string; border: string }> = {
