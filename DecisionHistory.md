@@ -2276,3 +2276,236 @@ Independent verification pass (same day) confirmed the above and added:
    Real-data probes: lazy v3 refresh persisted alpha_cl_max_fine 11.9 / 13.49
    on interior-peak airfoils and an honest NULL where the coarse argmax sits
    on the +20° sweep edge.
+
+## 2026-07-08 — Rejected-bucket semantic split, auto-retry-once, URANS continuation (node side; approved mockup c19fd74a)
+
+Decisions (node implementation of amendments A/B/C; web dashboard is a
+separate lane; engine continuation restart is the parallel python lane):
+
+1. SEMANTIC SPLIT (A) is DERIVED LIVE, never stored: one canonical SQL
+   predicate (packages/db/src/urans-ladder.ts) — awaiting_urans = terminal,
+   non-derived, done+rejected at fidelity 'rans' (NULL = 0034-backfill rans);
+   needs_review = terminal failed (derived symmetry mirrors EXCLUDED — see
+   the review-fix entry below: the red chip's count must equal its Points-tab
+   click-through, which lists source rows only; repairing the source repairs
+   the mirror) OR done+rejected urans_* with NOTHING FURTHER SCHEDULED (no open
+   verify item, no open request-URANS item covering the cell — exact angle or
+   whole-polar NULL aoa; an in-flight re-solve already left the done+rejected
+   shape, and a rejected wave-2 child never earns a second gated retry).
+   Rationale: the rule reads cross-table scheduling state (verify queue,
+   requests) that changes without ingest events — stored counters would go
+   stale; deriving keeps sim_campaign_progress untouched. needs_review counts
+   ALL surviving failed rows, not only marker-carrying ones: with auto-retry
+   once, any row still failed has consumed its retry or predates the feature,
+   and counting only marked rows would hide pre-feature failures from the only
+   surface that shows them. Payloads: campaignSummary (campaign + per
+   condition), listCampaigns items, campaignAirfoilRows per-cell (matrix
+   recolor), point-history filters awaiting_urans / needs_review (+ counts,
+   per-item reviewBucket), 'rejected' kept as a deprecated alias.
+2. AUTO-RETRY-ONCE (B) marker = results.auto_retried_at (migration 0036), on
+   the durable cell row — NOT a retry-job payload marker: the retry is not a
+   composed job (row returns to pending; ordinary gap finders re-claim), and
+   the ingest upsert never writes the column, so the marker survives re-ingest
+   of the same failed job (a replayed crash escalates instead of earning a
+   second silent retry; marker is never cleared on success — one automatic
+   retry per cell lifetime, bounded by construction). Runs in reconcile AFTER
+   every polar-cache refresh (at-ingest verdict preservation, prod row
+   741db07a class) and AFTER submitUransRetryForJob (wave-2-claimed angles are
+   queued, so the two retry mechanisms cannot double-schedule a cell). The
+   requeue also re-derives campaign status: the completion probe flips a
+   campaign to 'attention' the instant its last point terminal-fails, BEFORE
+   the retry reopens it — without the active flip the requeued points were
+   invisible to the gap finder (caught by the auto-retry must-catch suite).
+3. CONTINUATION (C) extends sim_urans_requests (migration 0037:
+   continue_from_result_id FK SET NULL + budget_override_s int) instead of a
+   sibling table: fidelity, idempotency (one open item per cell+fidelity) and
+   precalc scheduler rank carry over unchanged. POST /api/admin/urans-requests
+   accepts { continueFromResultId, budgetOverrideS } and derives cell + tier
+   from the SOURCE row (422 without engine_job_id/engine_case_slug — no saved
+   case state means no honest resume). The ladder tick composes
+   { continue_from: { engine_job_id, case_slug }, budget_override_s } into the
+   engine request (typed in engine-client PolarRequest) and pins both on the
+   sim_job requestPayload. Continuable detection for the UI: rejected urans_*
+   row + engine ids + quality warning containing the pinned budget-stop marker
+   "stopped by the wall-clock budget guard" (URANS_BUDGET_STOP_MARKER,
+   packages/core/src/urans-quality.ts — engine phrasing drift is a cross-side
+   test failure) → point-history page items + story ship `continuable`.
+
+Verification: pnpm typecheck green (6 workspaces); core 85, api 101
+(baseline 85: +10 review-bucket matrix incl. a recall must-catch that settles
+the verify item/request and asserts the buckets MOVE, +2 continuation
+endpoint), sweeper 129 (baseline 124: +3 auto-retry lifecycle must-catch,
++2 continuation payload pins). Migrations 0036/0037 applied to dev :5544
+after a verified pg_dump backup (test-restored, 50 tables). Behavior change
+pinned in updated legacy tests: a first genuine engine failure now requeues
+once (pending + marker + message kept) and only the second terminal-fails.
+
+## 2026-07-08 — Web dashboard lane (D/E) + adversarial-review fixes F1–F5
+
+Web lane (amendments D/E, approved mockup c19fd74a): campaign detail gets a
+pipeline hero (single stacked progress bar with a violet awaiting-urans
+segment + phase line) with technical detail behind a details disclosure;
+CampaignsHub cards carry the red "needs review · N" chip linking to the
+Points tab pre-filtered; Points tab renames the filter chips to the semantic
+split and adds repair actions on needs-review rows — Retry (requeue) for
+failed/crash rows, Continue +2h / +6h (continuation POST) for continuable
+budget-stopped URANS rows; the coverage matrix recolors awaiting-urans cells
+violet. RequeueDialog was removed in favor of in-panel actions.
+
+Adversarial review of the combined diff confirmed five defects; all fixed:
+
+1. F1 (recall gap, amendment C): only the between-chunks budget projection
+   guard emitted the continuable marker. A chunk killed by the ACTUAL solver
+   wall-clock timeout (returncode 124) graded "timed out … partial window"
+   without the marker, yet leaves the same restartable case — the UI offered
+   only a from-scratch requeue. Fix: pipeline.py now owns
+   URANS_BUDGET_STOP_MARKER (same literal as urans-quality.ts) and embeds it
+   in ALL wall-clock-stopped grades that leave restartable state: the
+   projection guard, the mid-chunk timeout partial grade, and a timed-out
+   continuation chunk (new TransientTimeoutError distinguishes timeout from
+   crash/divergence — crashed chunks must NEVER claim continuable, since
+   resuming a diverged case integrates garbage; false-positive guard test).
+2. F2 (one-sided contract pin): no engine test pinned the marker phrase —
+   rewording the sentence would silently zero node continuable detection.
+   Fix: tests/test_continuation.py pins the literal; the timed-out MUST-CATCH
+   and both frame-track budget/chunk tests assert the marker in the grade.
+3. F3 (doomed requests): API zod accepted budgetOverrideS up to 48 h while
+   the engine caps at URANS_BUDGET_OVERRIDE_MAX_S = 86 400 (24 h) — a 24–48 h
+   override queued, then 422-ed at engine submit and cancelled. Fix: zod max
+   aligned to 24 h; test pins 24 h accepted / 48 h rejected up front.
+4. F4 (fresh solve presented as resume): idempotency is per (cell, fidelity),
+   so a continuation POST could silently reuse an OPEN non-continuation
+   request — the admin believed a resume was queued while a from-scratch
+   solve ran. Fix: the API now 409s with an honest message when the reused
+   open item is not a continuation of the named result (matching replays
+   still reuse with created=false); the panel surfaces the 409 message.
+5. F5 (chip > click-through): needsReview counted terminal failed points
+   INCLUDING derived symmetry mirrors while the Points tab needs_review
+   filter lists source rows only — on symmetric airfoils the red chip
+   exceeded its own list. Fix: the failed arm of NEEDS_REVIEW_POINT_SQL now
+   excludes derived mirrors (both arms non-derived); MUST-CATCH test inserts
+   a terminal derived mirror of a failed source and asserts chip == list.
+   NOTE (pre-existing, unchanged): the legacy `failed` counter still counts
+   mirrors; its click-through has the same historic skew — out of scope here,
+   flagged for a follow-up.
+
+Verification of the review-fix pass (same day, no commit yet): pnpm typecheck
+6/6; core 85, api 104 (+3: derived-mirror needsReview must-catch, budget-cap
+bounds, continuation/fresh-request 409), sweeper 129, web 226; engine pytest
+286 (-m "not integration"; +4 marker pins incl. chunk-timeout continuable and
+chunk-crash false-positive guard). e2e (local-solve openfoam-* specs skipped,
+engine :8000 intentionally down in remote-solving mode): 23 passed / 2
+conditional skips after updating campaign-management.spec for the shipped
+D-design (plan-edit verbs behind the "⋯" overflow; objective chips behind the
+details disclosure). The details disclosure was made URL-owned (?cdetails=1,
+same replaceState contract as ?flog=1) — both to honor spec §11 and to give
+the formal UI verifier a direct render path; pinned in the refinement-board
+e2e (URL asserted + reload stays open). formal-web-ui-verification (dev web
+:3004 via coordinator; campaign detail hero, detail+details-open, Points tab;
+1440x900 + 390x844): 0 criticals on all 6 renders; document x-overflow false
+everywhere; only intentional inner x-scrollers (topbar tabs, section nav,
+condition strip, refinement lane-scroll) — the coverage matrix itself has no
+x-overflow.
+
+## 2026-07-08 — Precalc established-oscillation gate + wave-1 in-job escalation off (engine)
+
+User decision (verbatim): "the solution should converge to a stable
+oscillation" — for the PRECALC fidelity tier only, the stationarity verdict
+became an ESTABLISHED-OSCILLATION test instead of the strict 5% two-half
+mean-drift gate (prod: established modulated limit cycles with drift_frac
+~0.14 bounced forever at tier 1 even though the oscillation was honest).
+FULL fidelity keeps the strict gate byte-identical ("verified" = converged
+mean).
+
+1. Test definition (src/airfoilfoam/postprocess/unsteady.py): per-cycle Cl
+   means m_1..m_K over the K whole retained periods (integer-cycle
+   sub-windows of the stats window, same time-weighted trapezoidal mean as
+   the drift halves). stationary(precalc) = NO monotonic trend AND period
+   stable (the existing half-window PeriodEstimate.ambiguous check, passed in
+   by the pipeline) AND amplitude bounded (the oscillating-steady
+   OSCILLATING_AMPLITUDE_GROWTH_MAX=1.3 half-window peak-to-peak guard) AND
+   K >= 3. Trend test (_cycle_mean_trend): TRENDING iff |net| = |m_K - m_1|
+   >= 2% of the drift scale (same denominator as drift_frac; femto-noise
+   floor) AND (all successive diffs share one strict sign AND |net| >= 3.0 x
+   the dof-adjusted rms residual about the least-squares line, OR |net| >=
+   4.0 x that residual — the slow-drift guard for drifts whose noise flips
+   one cycle mean). The 3.0 monotone threshold is deliberately ABOVE the K=3
+   collinearity bound net/s_resid = 2.449 (monotone geometry pins d = interior
+   deviation from the endpoint chord < |net|/2, s_resid = d*sqrt(2/3)):
+   below 2.449 every monotone triple would trend and the significance clause
+   would be vacuous. At 3.0 a monotone-by-luck triple with d > 0.408|net| is
+   accepted; smooth relaxations (geometric decay ratio rho > 0.105) reject.
+   A slow smooth modulation (period >> 3 cycles) still rejects at K=3 — it is
+   genuinely indistinguishable from a relaxing drift; rejection escalates to
+   the full tier (conservative direction).
+2. Disclosure, no contract change: acceptance appends the quality warning
+   "cycle means scatter ±<std m_i> over K cycles (precalc)". The strict
+   cross-runtime frame_track parser rejects new keys, so cycle_means /
+   cycle_mean_std / stationary_reason live only on the engine-side
+   PeriodWindowStats; the verdict travels through the existing `stationary`
+   boolean + warning text.
+3. Wiring (src/airfoilfoam/pipeline.py): period_window_stats gained
+   keyword-only established_oscillation + period_stable; the frame-stats call
+   passes established_oscillation=(urans_fidelity == precalc) and
+   period_stable=(not frame_estimate.ambiguous). Default args keep every
+   existing caller/fixture byte-identical (full suite verdicts unchanged).
+4. Second fix — live incident (wave-1 sweep job 20b67295, s1223 -5 deg /
+   25 m/s / 1.0 m, 7+ failed and climbing): node wave-1 jobs already ship
+   transient_fallback=false (apps/sweeper/src/build-request.ts has sent
+   `transient_fallback: wave === 2` since 2026-06-30 — checked, no node
+   change needed), but the ENGINE ignored the flag in solve_polar_marched's
+   attached-range abort: a rejected RANS point inside 0-5 deg promoted the
+   WHOLE polar to in-job URANS (transient_fallback/force_transient forced
+   true) with no tier fidelity, no precalc mesh, no ladder budget — startup
+   divergence, watchdog kills, honest-failed points that the gated ladder
+   would have handled. The promotion is now gated on
+   solver_params.transient_fallback: campaign/sweep wave-1 ships the honest
+   rejected-RANS point (ladder tier-1 evidence) and the node ladder owns
+   escalation; direct-API requests (engine default transient_fallback=true)
+   keep the in-job promotion.
+5. Tests (tests/test_established_oscillation.py, 17): must-catch relaxing
+   startup (exp + collinear ramp) rejects; established modulated
+   (drift_frac ~0.10 unit / ~0.15 pipeline, old gate provably rejects)
+   accepts with the scatter warning; clean periodic passes both gates;
+   growing envelope with trendless means rejects (the drift gate MISSED this
+   class); K=3 edges both directions incl. the documented d = 0.408|net|
+   boundary and the femto floor; K=2 not certifiable; full-tier verdicts
+   pinned drift-only (period_stable must not leak). Wave-1 must-catch:
+   marched reject at aoa=2 with transient_fallback=false never calls
+   _run_full_urans_replacement (recall proven: test fails on reverted gate),
+   default-params promotion preserved (false-positive guard). Engine suite
+   286 -> 303, all green. Engine rebuild required for deploy.
+
+## 2026-07-08 — Failed counter excludes derived symmetry mirrors (canonical counter model amendment)
+
+- Defect (user-directed fix): the canonical `failed` counter
+  (sim_campaign_progress recompute, packages/db/src/campaign-execution.ts,
+  BOTH sites: recomputeProgressForKeys + recomputeProgressForCampaign) counted
+  every terminal point linked to a failed results row — INCLUDING derived
+  symmetry mirrors, which onResultIngested terminal-links to the SAME failed
+  +α source row. Two user-visible consequences on symmetric airfoils:
+  1. Chip > click-through: the failed chip counted source + mirror while the
+     Points tab failed filter lists source results rows only.
+  2. Arithmetic double-count: a failed source's mirror is terminal+derived
+     (already in `derived`) AND was in `failed`, so
+     remaining = requested − solved − derived − failed − rejected undershot
+     (hidden by the Math.max(0, …) clamp; per-cell settled sums could exceed
+     requested in coverage-matrix math).
+- Locked semantics: failed = terminal AND NOT derived_by_symmetry AND
+  r.status='failed' (consistent with solved/rejected, and with
+  NEEDS_REVIEW_POINT_SQL in urans-ladder.ts which already excluded mirrors
+  from both bucket arms). `derived` keeps counting ALL terminal mirrors
+  regardless of source disposition — a failed source's mirror sits in
+  derived, keeping the remaining identity exactly balanced.
+- Gate safety: probeCampaignCompletion's has_failed EXISTS still scans
+  mirrors (truth-equivalent — a mirror cannot be linked to a failed row
+  without its source being too), so mirror-exclusion in the counter can never
+  hide a failure from the attention gate; asserted in the new test.
+- MUST-CATCH (apps/api/test/campaigns.test.ts, "failed counter excludes
+  derived symmetry mirrors"): symmetric 5-point campaign, fail the +1 source →
+  mirror terminalizes; failed == 1 == Points-tab failed list length; unclamped
+  identity requested == solved+derived+failed+rejected+remaining holds with
+  the mirror present (pre-fix sum = 6 ≠ 5); campaign still flips attention;
+  keys-path and campaign-wide recompute agree row-for-row and re-ingest is
+  idempotent. Recall proven: suite run against the reverted filter fails with
+  failed=2.

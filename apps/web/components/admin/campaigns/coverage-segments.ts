@@ -1,17 +1,22 @@
 // Pure segment/bar math for the coverage matrix redesign (approved mockup
-// 1ed4374f): per-airfoil segmented bars replace the fixed-width
-// condition-column grid. One flex segment per condition; fill HEIGHT is the
-// fraction of that condition's angles that are terminal; rejected points tint
-// the fill amber; any failed point renders the segment solid red. Kept
-// React-free with relative imports (not @/ aliases): this module is covered
-// by node vitest, which resolves no tsconfig paths (same pattern as
-// campaign-status.ts).
+// 1ed4374f, recolored per amendment A / design c19fd74a): per-airfoil
+// segmented bars, one flex segment per condition; fill HEIGHT is the fraction
+// of that condition's angles that are terminal. Awaiting-URANS points tint
+// the fill VIOLET (calm stage-2 queue); needs-review/failed render the
+// segment solid RED; the legacy amber 'rejected' tint survives only for
+// payloads without the split counters. Kept React-free with relative imports
+// (not @/ aliases): this module is covered by node vitest, which resolves no
+// tsconfig paths (same pattern as campaign-status.ts).
 
 import type {
   AdminCampaignAirfoilRow,
   AdminCampaignConditionSummary,
   CampaignProgressTotals,
+  CampaignReviewBuckets,
 } from "../../../lib/admin";
+
+/** Matrix cell payload: real counters + the optional amendment-A split. */
+export type CoverageCell = CampaignProgressTotals & Partial<CampaignReviewBuckets>;
 
 // Local copies of ui.tsx's formatRe/fCount: importing ui.tsx here would drag
 // the React component tree into node vitest, defeating the point of this
@@ -37,7 +42,10 @@ export function syncPromisedCount(cell: CampaignProgressTotals): number {
 // Segment state + fill
 // ---------------------------------------------------------------------------
 
-export type SegmentState = "empty" | "progress" | "rejected" | "failed";
+/** 'rejected' is the LEGACY amber tint: it only appears for payloads without
+ *  the amendment-A split counters. With the split, red is strictly
+ *  needs-review/failed and violet is the calm awaiting-URANS queue. */
+export type SegmentState = "empty" | "progress" | "rejected" | "awaiting_urans" | "needs_review" | "failed";
 
 export interface SegmentView {
   state: SegmentState;
@@ -54,35 +62,48 @@ export function terminalCount(cell: CampaignProgressTotals): number {
   return cell.solved + cell.derived + cell.failed + cell.rejected;
 }
 
-/** Mockup encoding: failed wins over rejected wins over plain progress; a
- *  missing cell or requested === 0 renders as an empty (panel-background)
- *  segment. */
-export function segmentView(cell: CampaignProgressTotals | null | undefined): SegmentView {
+/** Encoding (design c19fd74a): failed wins, then needs-review (both solid
+ *  red), then awaiting-URANS (violet), then plain progress. A cell whose
+ *  rejected points ALL have their next solve scheduled (split present, both
+ *  buckets 0) renders as plain progress — it is back in the pipeline. The
+ *  legacy amber 'rejected' state survives only when the payload has no split
+ *  counters. A missing cell or requested === 0 renders empty. */
+export function segmentView(cell: CoverageCell | null | undefined): SegmentView {
   if (!cell || cell.requested <= 0) return { state: "empty", fillFraction: 0 };
   const fillFraction = Math.min(1, Math.max(0, terminalCount(cell) / cell.requested));
+  const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
   if (cell.failed > 0) return { state: "failed", fillFraction };
+  if (hasSplit) {
+    if ((cell.needsReview ?? 0) > 0) return { state: "needs_review", fillFraction };
+    if ((cell.awaitingUrans ?? 0) > 0) return { state: "awaiting_urans", fillFraction };
+    return { state: "progress", fillFraction };
+  }
   if (cell.rejected > 0) return { state: "rejected", fillFraction };
   return { state: "progress", fillFraction };
 }
 
-/** Rendered fill height (0..1). Failed segments render SOLID red at full
- *  height (mockup `.seg.fail`) so a failure stays visible at any progress;
- *  every other state fills to the terminal fraction. */
+/** Rendered fill height (0..1). Failed/needs-review segments render SOLID at
+ *  full height (mockup `.seg.fail`) so review work stays visible at any
+ *  progress; every other state fills to the terminal fraction. */
 export function segmentFillHeight(view: SegmentView): number {
-  return view.state === "failed" ? 1 : view.fillFraction;
+  return view.state === "failed" || view.state === "needs_review" ? 1 : view.fillFraction;
 }
 
 // ---------------------------------------------------------------------------
 // Tooltip label (identification moved off the removed column headers)
 // ---------------------------------------------------------------------------
 
-/** "Re 614k · #13 · 24/31 · 2 rejected" — condition label + index + real
- *  counts. `stateLabel` is the ConditionStrip display state; anything other
- *  than "active" is appended so kept/blocked/retired/released stay visible
- *  without column headers. */
+/** "Re 614k · #13 · 24/31 · 2 awaiting URANS" — condition label + index +
+ *  real counts. With the amendment-A split the raw 'rejected' count is
+ *  replaced by its refined buckets ('needs review' includes crash-failed
+ *  points, which stay listed separately so crashes remain distinguishable);
+ *  payloads without the split keep the legacy 'rejected' wording. `stateLabel`
+ *  is the ConditionStrip display state; anything other than "active" is
+ *  appended so kept/blocked/retired/released stay visible without column
+ *  headers. */
 export function segmentTitle(
   condition: Pick<AdminCampaignConditionSummary, "reynolds" | "ord">,
-  cell: CampaignProgressTotals | null | undefined,
+  cell: CoverageCell | null | undefined,
   stateLabel?: string,
 ): string {
   const parts = [`Re ${formatRe(condition.reynolds)}`, `#${condition.ord}`];
@@ -90,7 +111,13 @@ export function segmentTitle(
     parts.push("no points");
   } else {
     parts.push(`${fCount(terminalCount(cell))}/${fCount(cell.requested)}`);
-    if (cell.rejected > 0) parts.push(`${fCount(cell.rejected)} rejected`);
+    const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
+    if (hasSplit) {
+      if ((cell.awaitingUrans ?? 0) > 0) parts.push(`${fCount(cell.awaitingUrans ?? 0)} awaiting URANS`);
+      if ((cell.needsReview ?? 0) > 0) parts.push(`${fCount(cell.needsReview ?? 0)} needs review`);
+    } else if (cell.rejected > 0) {
+      parts.push(`${fCount(cell.rejected)} rejected`);
+    }
     if (cell.failed > 0) parts.push(`${fCount(cell.failed)} failed`);
     if (cell.running > 0) parts.push(`${fCount(cell.running)} running`);
     const sync = syncPromisedCount(cell);

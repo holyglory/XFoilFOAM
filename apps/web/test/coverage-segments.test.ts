@@ -1,13 +1,16 @@
-// Coverage-matrix segmented bars (approved mockup 1ed4374f): pure helper
-// coverage for segment state derivation from real sim_campaign_progress cell
-// counts, fill-fraction math, tooltip labels, the per-row DONE fraction, and
-// the chord-grouping threshold. Cells are shaped like the real
-// /campaigns/:id/airfoils perCondition payloads (all eight counters present).
+// Coverage-matrix segmented bars (approved mockup 1ed4374f, recolored per
+// amendment A / design c19fd74a): pure helper coverage for segment state
+// derivation from real sim_campaign_progress cell counts (+ the optional
+// awaitingUrans/needsReview split), fill-fraction math, tooltip labels, the
+// per-row DONE fraction, and the chord-grouping threshold. Cells are shaped
+// like the real /campaigns/:id/airfoils perCondition payloads (all eight
+// counters present).
 
 import { describe, expect, it } from "vitest";
 
 import type { AdminCampaignConditionSummary, CampaignProgressTotals } from "../lib/admin";
 import {
+  type CoverageCell,
   MIN_SEGMENT_PX,
   SEGMENT_GAP_PX,
   groupConditionsByChord,
@@ -72,7 +75,7 @@ describe("segmentView state derivation", () => {
     expect(v.fillFraction).toBe(1);
   });
 
-  it("rejected points tint the fill (state 'rejected'), and count as terminal", () => {
+  it("LEGACY payload (no split counters): rejected points tint the fill amber-state 'rejected'", () => {
     const v = segmentView(cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }));
     expect(v.state).toBe("rejected");
     expect(v.fillFraction).toBeCloseTo(24 / 31, 10);
@@ -86,6 +89,35 @@ describe("segmentView state derivation", () => {
 
   it("fill fraction clamps to [0,1] even on inconsistent counters", () => {
     expect(segmentView(cell({ solved: 40, remaining: 0 })).fillFraction).toBe(1);
+  });
+});
+
+describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
+  const split = (over: Partial<CoverageCell> = {}): CoverageCell => ({ ...cell(), awaitingUrans: 0, needsReview: 0, ...over });
+
+  it("awaiting-URANS cells go VIOLET-state, never red", () => {
+    const v = segmentView(split({ solved: 20, derived: 2, rejected: 2, remaining: 7, awaitingUrans: 2 }));
+    expect(v.state).toBe("awaiting_urans");
+    expect(v.fillFraction).toBeCloseTo(24 / 31, 10);
+    // violet is calm: renders at the terminal fraction, not solid
+    expect(segmentFillHeight(v)).toBeCloseTo(24 / 31, 10);
+  });
+
+  it("needs-review cells go RED-state solid, winning over awaiting", () => {
+    const v = segmentView(split({ solved: 20, rejected: 3, remaining: 8, awaitingUrans: 2, needsReview: 1 }));
+    expect(v.state).toBe("needs_review");
+    expect(segmentFillHeight(v)).toBe(1);
+  });
+
+  it("failed still wins over everything (crash salience)", () => {
+    const v = segmentView(split({ solved: 10, failed: 1, rejected: 2, remaining: 18, awaitingUrans: 2, needsReview: 1 }));
+    expect(v.state).toBe("failed");
+    expect(segmentFillHeight(v)).toBe(1);
+  });
+
+  it("rejected-but-rescheduled cells (split present, both buckets 0) are plain progress", () => {
+    const v = segmentView(split({ solved: 20, rejected: 2, remaining: 9 }));
+    expect(v.state).toBe("progress");
   });
 });
 
@@ -103,9 +135,21 @@ describe("segmentFillHeight rendering rule", () => {
 });
 
 describe("segmentTitle tooltip", () => {
-  it("matches the mockup example: 'Re 614k · #13 · 24/31 · 2 rejected'", () => {
+  it("LEGACY payload keeps the raw rejected wording: 'Re 614k · #13 · 24/31 · 2 rejected'", () => {
     const t = segmentTitle(condition(), cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }), "active");
     expect(t).toBe("Re 614k · #13 · 24/31 · 2 rejected");
+  });
+
+  it("split payload replaces 'rejected' with its refined buckets", () => {
+    const awaiting = { ...cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }), awaitingUrans: 2, needsReview: 0 };
+    expect(segmentTitle(condition(), awaiting, "active")).toBe("Re 614k · #13 · 24/31 · 2 awaiting URANS");
+    // needs review includes the crash; failed stays listed so crashes remain
+    // distinguishable from rejected-urans reviews.
+    const review = { ...cell({ solved: 12, failed: 1, rejected: 1, remaining: 17 }), awaitingUrans: 0, needsReview: 2 };
+    expect(segmentTitle(condition({ reynolds: 1_500_000, ord: 14 }), review)).toBe("Re 1.5M · #14 · 14/31 · 2 needs review · 1 failed");
+    // rescheduled rejects: neither bucket — no review wording at all
+    const rescheduled = { ...cell({ solved: 20, rejected: 2, remaining: 9 }), awaitingUrans: 0, needsReview: 0 };
+    expect(segmentTitle(condition(), rescheduled, "active")).toBe("Re 614k · #13 · 22/31");
   });
 
   it("failed condition includes the failed count (mockup row 3, Re 1.5M · #14)", () => {

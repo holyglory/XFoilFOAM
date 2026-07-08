@@ -107,6 +107,16 @@ export interface ResourceParams {
   policy?: ResourcePolicy;
 }
 
+/** Continuation source (amendment C, 2026-07-08): a prior URANS solve stopped
+ *  by the engine's wall-clock budget guard left its case directory saved on
+ *  the volume. The engine copies/links that case into the new job and RESUMES
+ *  the transient from latestTime (the existing chunk-restart mechanics across
+ *  jobs), merging coefficient history via the restart-segment machinery. */
+export interface ContinueFrom {
+  engine_job_id: string;
+  case_slug: string;
+}
+
 export interface PolarRequest {
   airfoil: AirfoilInput;
   chord_lengths?: number[];
@@ -117,6 +127,11 @@ export interface PolarRequest {
   mesh?: MeshParams;
   solver?: SolverParams;
   resources?: ResourceParams;
+  /** Amendment C: resume from a saved case state instead of a fresh solve. */
+  continue_from?: ContinueFrom | null;
+  /** Amendment C: increased wall-clock solver budget [s] for the continuation
+   *  (+2h/+6h UI choices); replaces the fidelity-derived tier budget. */
+  budget_override_s?: number | null;
 }
 
 export type JobState = "pending" | "running" | "completed" | "failed" | "cancelled";

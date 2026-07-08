@@ -152,6 +152,8 @@ function storyWith(verify: PointVerifyInfo | null): PointStoryPayload {
       solvedAt: "2026-07-07T09:00:00.000Z",
       updatedAt: "2026-07-07T09:00:00.000Z",
       fidelity: "urans_precalc",
+      reviewBucket: null,
+      continuable: false,
       verify,
     },
     attempts: [],

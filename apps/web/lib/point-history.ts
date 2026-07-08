@@ -6,8 +6,15 @@
 // ---------------------------------------------------------------------------
 // Shared API payload types (mirrors apps/api point-history endpoints).
 // ---------------------------------------------------------------------------
-export const POINT_STATUS_CHIPS = ["all", "failed", "rejected", "accepted", "needs_urans", "solving"] as const;
-export type PointStatusChip = (typeof POINT_STATUS_CHIPS)[number];
+/** Chip row order (approved design c19fd74a, amendment A): the raw 'rejected'
+ *  bucket is REPLACED in the UI by the semantic split — violet 'awaiting
+ *  URANS' (tier-1 rejects, stage-2 queue) and red 'needs review' (failed after
+ *  auto-retry + urans-rejected with nothing further scheduled). */
+export const POINT_STATUS_CHIPS = ["all", "failed", "awaiting_urans", "needs_review", "accepted", "needs_urans", "solving"] as const;
+/** 'rejected' stays a DEPRECATED alias: old links (?pstatus=rejected) keep
+ *  filtering server-side (the union bucket), but no chip renders for it. */
+export type PointStatusChip = (typeof POINT_STATUS_CHIPS)[number] | "rejected";
+const POINT_STATUS_VALUES: readonly string[] = [...POINT_STATUS_CHIPS, "rejected"];
 
 export const POINT_ERROR_CLASSES = ["mesh", "diverged", "timeout", "engine", "cancelled", "solver", "unknown"] as const;
 export type PointErrorClass = (typeof POINT_ERROR_CLASSES)[number];
@@ -56,13 +63,24 @@ export interface PointHistoryItem {
   /** Fidelity ladder echo (results.fidelity): 'rans' | 'urans_precalc' |
    *  'urans_full' | null (pre-ladder/unsolved). */
   fidelity: string | null;
+  /** Amendment-A refined review bucket: 'awaiting_urans' (violet stage-2
+   *  queue) | 'needs_review' (red, repair actions) | null (neither — includes
+   *  urans-rejected rows whose next step is already scheduled). */
+  reviewBucket: "awaiting_urans" | "needs_review" | null;
+  /** Amendment C: the rejected urans solve was stopped by the wall-clock
+   *  budget guard and its saved case state is resumable (Continue +2h/+6h). */
+  continuable: boolean;
   /** Latest verify-queue item covering this cell+angle; null = never queued. */
   verify: PointVerifyInfo | null;
 }
 
 export interface PointHistoryCounts {
   failed: number;
+  /** Deprecated union bucket (every done+physics-rejected row); kept for old
+   *  links only — the chips render the split counts below instead. */
   rejected: number;
+  awaiting_urans: number;
+  needs_review: number;
   accepted: number;
   needs_urans: number;
   solving: number;
@@ -137,6 +155,11 @@ export interface PointStoryPayload {
     updatedAt: string;
     /** Fidelity ladder echo (results.fidelity); null = pre-ladder/unsolved. */
     fidelity: string | null;
+    /** Amendment-A refined review bucket (see PointHistoryItem.reviewBucket). */
+    reviewBucket: "awaiting_urans" | "needs_review" | null;
+    /** Amendment C: budget-stopped rejected urans row with saved case state —
+     *  the story panel renders Continue +2h/+6h on exactly these. */
+    continuable: boolean;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;
   };
@@ -186,7 +209,7 @@ export function parsePointFilters(search: string): PointFilters {
   const reynolds = params.get("pre") ?? "";
   const verify = params.get("pverify") ?? "";
   return {
-    status: (POINT_STATUS_CHIPS as readonly string[]).includes(status) ? (status as PointStatusChip) : "all",
+    status: POINT_STATUS_VALUES.includes(status) ? (status as PointStatusChip) : "all",
     airfoil: params.get("pairfoil") ?? "",
     campaignId: params.get("pcampaign") ?? "",
     regime: regime === "rans" || regime === "urans" ? regime : "",
@@ -215,12 +238,18 @@ export function pointFiltersToSearch(search: string, filters: PointFilters): str
   return s ? `?${s}` : "";
 }
 
-/** Canonical explorer link target for a campaign's rejected/failed counts
+/** Buckets campaign surfaces link to (amendment A): the split buckets replace
+ *  the deprecated 'rejected' union in every gate badge / count link; 'failed'
+ *  stays for surfaces whose payload only carries a failed count (backlog
+ *  strip); 'rejected' is accepted for old callers only. */
+export type CampaignPointsBucket = "failed" | "rejected" | "awaiting_urans" | "needs_review";
+
+/** Canonical explorer link target for a campaign's review-bucket counts
  *  (hub cards, campaign detail header, backlog strip): the Solver ▸ Points
  *  tab pre-filtered to that campaign + bucket. Built through
  *  pointFiltersToSearch so the param names can never drift from the
  *  explorer's own URL round-trip. */
-export function campaignPointsSearch(campaignId: string, status: "failed" | "rejected"): string {
+export function campaignPointsSearch(campaignId: string, status: CampaignPointsBucket): string {
   return pointFiltersToSearch("?section=queue&tab=points", { ...DEFAULT_POINT_FILTERS, campaignId, status });
 }
 
@@ -302,6 +331,42 @@ export function bucketOfPoint(status: string, classificationState: string | null
   if (status === "done" && classificationState === "needs_urans") return "needs_urans";
   if (status === "done" && classificationState === "accepted") return "accepted";
   return "other";
+}
+
+// ---------------------------------------------------------------------------
+// Review-bucket display (amendment A recolor): the ONE presentation rule for
+// status chips wherever a raw bucket + refined reviewBucket pair is known
+// (Points rows, story header). Violet is CALM (stage-2 queue, no repair
+// verbs); red is strictly failed / needs-review.
+// ---------------------------------------------------------------------------
+export type StatusChipTone = "teal" | "amber" | "red" | "violet" | "muted";
+
+export interface StatusChipDisplay {
+  label: string;
+  tone: StatusChipTone;
+}
+
+/** Chip label + tone for a table/story status chip. `reviewBucket` refines
+ *  the deprecated 'rejected' bucket; a rejected row in NEITHER refined bucket
+ *  has its next solve already scheduled — labelled honestly, amber (in the
+ *  pipeline), never red. */
+export function statusChipDisplay(bucket: string, reviewBucket: "awaiting_urans" | "needs_review" | null): StatusChipDisplay {
+  switch (bucket) {
+    case "failed":
+      return { label: "failed", tone: "red" };
+    case "rejected":
+      if (reviewBucket === "awaiting_urans") return { label: "awaiting URANS", tone: "violet" };
+      if (reviewBucket === "needs_review") return { label: "needs review", tone: "red" };
+      return { label: "rejected · rescheduled", tone: "amber" };
+    case "accepted":
+      return { label: "accepted", tone: "teal" };
+    case "needs_urans":
+      return { label: "needs URANS", tone: "amber" };
+    case "solving":
+      return { label: "solving", tone: "amber" };
+    default:
+      return { label: bucket, tone: "muted" };
+  }
 }
 
 // ---------------------------------------------------------------------------

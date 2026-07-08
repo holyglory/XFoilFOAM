@@ -749,3 +749,134 @@ describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-
     await db.update(simJobs).set({ status: "done", ingestedAt: new Date(), finishedAt: new Date() }).where(eq(simJobs.id, child!.id));
   }, 180000);
 });
+
+describe("continuation work items (amendment C): budget-stopped URANS resumes from saved case state", () => {
+  const CONTINUE_AOA = 12;
+  let sourceResultId = "";
+
+  it("CONTINUATION PAYLOAD MUST-CATCH: the ladder tick composes continue_from + budget_override_s and pins them on the sim_job payload", async () => {
+    // Quiet slate for tier 2b: earlier tests settled their requests; make sure
+    // nothing pending remains scoped to this revision.
+    await db
+      .update(simUransRequests)
+      .set({ state: "cancelled" })
+      .where(and(eq(simUransRequests.revisionId, revisionId), inArray(simUransRequests.state, ["pending", "running"])));
+
+    // The budget-stopped source: a REJECTED precalc URANS row whose engine
+    // case ids address the saved case state on the volume, quality warning
+    // carrying the engine's wall-clock budget-guard sentence.
+    const [source] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: CONTINUE_AOA,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        reynolds: Math.round((SPEED * CHORD) / (1.789e-5 / 1.225)),
+        speed: SPEED,
+        chord: CHORD,
+        cl: 0.9,
+        cd: 0.08,
+        cm: -0.05,
+        unsteady: true,
+        converged: true,
+        engineJobId: `${PREFIX}-budget-stopped-job`,
+        engineCaseSlug: "aoa_12.00",
+        qualityWarnings: [
+          "URANS integration stopped by the wall-clock budget guard: retained 1.4 of 3 periods (budget); projected 3.2h continuation exceeds 80% of the 2.0h solver timeout",
+        ],
+        solvedAt: new Date(),
+      })
+      .returning();
+    sourceResultId = source.id;
+
+    const { request, created } = await createUransRequest(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg: CONTINUE_AOA,
+      fidelity: "precalc",
+      requestedBy: "test@airfoils.pro",
+      continueFromResultId: sourceResultId,
+      budgetOverrideS: 21600, // the +6h choice
+    });
+    expect(created).toBe(true);
+    expect(request.continueFromResultId).toBe(sourceResultId);
+    expect(request.budgetOverrideS).toBe(21600);
+
+    const captured: PolarRequest[] = [];
+    const submitted = await uransLadderTick(db, stubEngine(captured, `${PREFIX}-continuation-job`), 0, { campaignIds: [campaignId] });
+    expect(submitted).toBe(true);
+    expect(captured.length).toBe(1);
+    // ENGINE-REQUEST SHAPE PIN (amendment C contract): the engine copies/links
+    // the prior case dir and restarts the transient from latestTime, merging
+    // coefficient history — addressed EXACTLY by these two fields.
+    expect(captured[0].continue_from).toEqual({
+      engine_job_id: `${PREFIX}-budget-stopped-job`,
+      case_slug: "aoa_12.00",
+    });
+    expect(captured[0].budget_override_s).toBe(21600);
+    // Still URANS-by-definition (prod job e89be2bb class).
+    expect(captured[0].solver).toMatchObject({
+      force_transient: true,
+      transient_fallback: true,
+      urans_fidelity: "precalc",
+    });
+    expect(captured[0].aoa?.angles).toEqual([CONTINUE_AOA]);
+
+    const [afterRequest] = await db.select().from(simUransRequests).where(eq(simUransRequests.id, request.id));
+    expect(afterRequest.state).toBe("running");
+    expect(afterRequest.simJobId).toBeTruthy();
+    const [job] = await db.select().from(simJobs).where(eq(simJobs.id, afterRequest.simJobId!));
+    expect(job.wave).toBe(2);
+    expect(job.jobKind).toBe("targeted");
+    const payload = job.requestPayload as { uransRequestId?: string; continueFromResultId?: string; budgetOverrideS?: number };
+    expect(payload.uransRequestId).toBe(request.id);
+    expect(payload.continueFromResultId).toBe(sourceResultId);
+    expect(payload.budgetOverrideS).toBe(21600);
+
+    // Settle (continuation results ingest normally — same cell upsert; the
+    // ingest path itself is covered by the ladder ingest tests above).
+    await db.update(simJobs).set({ status: "done", ingestedAt: new Date(), finishedAt: new Date() }).where(eq(simJobs.id, job.id));
+    await db.update(simUransRequests).set({ state: "done" }).where(eq(simUransRequests.id, request.id));
+  }, 120000);
+
+  it("cancels a continuation whose source lost its saved case state instead of faking a fresh solve as a resume", async () => {
+    const [orphanSource] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: 13,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        cl: 0.8,
+        cd: 0.07,
+        unsteady: true,
+        converged: true,
+        // engineJobId / engineCaseSlug DELIBERATELY absent: no case state.
+        solvedAt: new Date(),
+      })
+      .returning();
+    const { request } = await createUransRequest(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg: 13,
+      fidelity: "precalc",
+      continueFromResultId: orphanSource.id,
+      budgetOverrideS: 7200,
+    });
+    const captured: PolarRequest[] = [];
+    const submitted = await uransLadderTick(db, stubEngine(captured, `${PREFIX}-orphan-continuation`), 0, { campaignIds: [campaignId] });
+    expect(submitted).toBe(false);
+    expect(captured.length).toBe(0);
+    const [afterRequest] = await db.select().from(simUransRequests).where(eq(simUransRequests.id, request.id));
+    expect(afterRequest.state).toBe("cancelled");
+  }, 120000);
+});

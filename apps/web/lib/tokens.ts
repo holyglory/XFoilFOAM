@@ -26,6 +26,11 @@ export const C = {
   amber: "var(--aero-amber)",
   red: "var(--aero-red)",
   redText: "var(--aero-red-text)",
+  // calm "awaiting URANS" stage-2 tint (approved design c19fd74a) — never an
+  // error color; rejected tier-1 evidence queued for the unsteady re-solve.
+  violet: "var(--aero-violet)",
+  violetBorder: "var(--aero-violet-border)",
+  violetFill: "var(--aero-violet-fill)",
   // chrome surfaces (were hardcoded literals)
   topbarBg: "var(--aero-topbar-bg)",
   navActive: "var(--aero-nav-active)",

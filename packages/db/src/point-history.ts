@@ -14,6 +14,7 @@
 // Status buckets are derived in ONE SQL expression shared by the chip counts
 // and the page filter so the numbers always describe exactly the rows listed.
 // ---------------------------------------------------------------------------
+import { URANS_BUDGET_STOP_MARKER } from "@aerodb/core";
 import { sql } from "drizzle-orm";
 
 import {
@@ -25,7 +26,11 @@ import {
 } from "./campaigns";
 import type { DB } from "./client";
 
-export const POINT_HISTORY_BUCKETS = ["failed", "rejected", "accepted", "needs_urans", "solving"] as const;
+/** Filterable status buckets. 'rejected' is a DEPRECATED alias kept for old
+ *  links/clients: it matches every done+physics-rejected row, i.e. the union
+ *  the amendment-A semantic split ('awaiting_urans' violet vs the rejected
+ *  part of 'needs_review' red) replaced in the UI. */
+export const POINT_HISTORY_BUCKETS = ["failed", "rejected", "awaiting_urans", "needs_review", "accepted", "needs_urans", "solving"] as const;
 export type PointHistoryBucket = (typeof POINT_HISTORY_BUCKETS)[number];
 
 /** Single source of truth for the status chips AND the bucket filter.
@@ -43,6 +48,62 @@ const BUCKET_SQL = sql`CASE
   WHEN r.status = 'done' AND rc.state = 'accepted' THEN 'accepted'
   ELSE 'other'
 END`;
+
+// ---------------------------------------------------------------------------
+// Amendment-A semantic split, applied to RAW results rows — the same rule the
+// campaign payloads derive from sim_campaign_points (see the canonical
+// definition + rationale in urans-ladder.ts campaignReviewBucketRows):
+//   awaiting_urans — done + rejected at fidelity 'rans' (or NULL = pre-ladder
+//     steady rows): the stage-2 queue, violet, no repair verbs.
+//   needs_review — failed rows (post-auto-retry survivors + pre-feature
+//     failures) PLUS done + rejected urans_* rows with nothing further
+//     scheduled (no open verify item, no open request-URANS item covering the
+//     cell; an in-flight re-solve already left the done+rejected shape).
+// ---------------------------------------------------------------------------
+const AWAITING_URANS_RESULT_SQL = sql`(
+  r.status = 'done' AND rc.state = 'rejected' AND (r.fidelity = 'rans' OR r.fidelity IS NULL)
+)`;
+
+const URANS_REJECTED_UNSCHEDULED_SQL = sql`(
+  r.status = 'done' AND rc.state = 'rejected' AND r.fidelity LIKE 'urans%'
+  AND NOT EXISTS (
+    SELECT 1 FROM sim_urans_verify_queue q
+    WHERE q.airfoil_id = r.airfoil_id AND q.revision_id = r.simulation_preset_revision_id
+      AND q.aoa_deg = r.aoa_deg AND q.state IN ('pending', 'running')
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM sim_urans_requests req
+    WHERE req.airfoil_id = r.airfoil_id AND req.revision_id = r.simulation_preset_revision_id
+      AND (req.aoa_deg = r.aoa_deg OR req.aoa_deg IS NULL)
+      AND req.state IN ('pending', 'running')
+  )
+)`;
+
+const NEEDS_REVIEW_RESULT_SQL = sql`(r.status = 'failed' OR ${URANS_REJECTED_UNSCHEDULED_SQL})`;
+
+/** Refined review bucket of a row (NULL for rows in neither): rides every page
+ *  row so the web recolors without re-deriving the rule client-side. A
+ *  urans-rejected row with an open verify/request item is neither — it is
+ *  still in the pipeline. */
+const REVIEW_BUCKET_SQL = sql`CASE
+  WHEN ${AWAITING_URANS_RESULT_SQL} THEN 'awaiting_urans'
+  WHEN ${NEEDS_REVIEW_RESULT_SQL} THEN 'needs_review'
+  ELSE NULL
+END`;
+
+/** Continuable (amendment C): a rejected urans_* row whose solve was stopped
+ *  by the engine's wall-clock budget guard (quality-warning marker) and whose
+ *  saved case state is addressable (engine ids present) can be RESUMED with an
+ *  increased budget. Substring match — the marker sits inside the engine's
+ *  measured-periods sentence. */
+const CONTINUABLE_SQL = sql`(
+  r.status = 'done' AND rc.state = 'rejected' AND r.fidelity LIKE 'urans%'
+  AND r.engine_job_id IS NOT NULL AND r.engine_case_slug IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM unnest(COALESCE(r.quality_warnings, ARRAY[]::text[])) w
+    WHERE w LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+  )
+)`;
 
 export interface PointHistoryCursor {
   /** Raw timestamp text carried losslessly back to Postgres. The sort key is
@@ -112,6 +173,13 @@ export interface PointHistoryItem {
   /** Fidelity ladder echo (results.fidelity). Derived mirrors carry their +α
    *  source row's fidelity. null = pre-ladder/unsolved row. */
   fidelity: string | null;
+  /** Amendment-A refined review bucket: 'awaiting_urans' (violet stage-2
+   *  queue) | 'needs_review' (red, repair actions) | null (neither — includes
+   *  urans-rejected rows whose next step is already scheduled). */
+  reviewBucket: "awaiting_urans" | "needs_review" | null;
+  /** Amendment C: the rejected urans solve was stopped by the wall-clock
+   *  budget guard and its saved case state is resumable (Continue +2h/+6h). */
+  continuable: boolean;
   /** Latest verify-queue item covering this point's cell+angle; null = never
    *  queued for full-fidelity verification. */
   verify: PointVerifyInfo | null;
@@ -127,7 +195,11 @@ export interface PointVerifyInfo {
 
 export interface PointHistoryCounts {
   failed: number;
+  /** Deprecated alias bucket: every done+physics-rejected row (the union the
+   *  awaiting_urans / needs_review split refines). */
   rejected: number;
+  awaiting_urans: number;
+  needs_review: number;
   accepted: number;
   needs_urans: number;
   solving: number;
@@ -201,7 +273,15 @@ function resultArmFilters(f: PointHistoryFilters, opts: { includeBucket: boolean
       ORDER BY q."createdAt" DESC LIMIT 1
     ) = 'disagreed'`);
   }
-  if (opts.includeBucket && f.bucket) parts.push(sql`${BUCKET_SQL} = ${f.bucket}`);
+  if (opts.includeBucket && f.bucket) {
+    // Amendment-A filters are dedicated expressions (they cut ACROSS the raw
+    // bucket CASE: needs_review unions failed + a rejected subset); every
+    // other value — including the deprecated 'rejected' alias — matches the
+    // raw bucket label as before.
+    if (f.bucket === "awaiting_urans") parts.push(AWAITING_URANS_RESULT_SQL);
+    else if (f.bucket === "needs_review") parts.push(NEEDS_REVIEW_RESULT_SQL);
+    else parts.push(sql`${BUCKET_SQL} = ${f.bucket}`);
+  }
   return sql.join(parts, sql` AND `);
 }
 
@@ -245,6 +325,8 @@ interface PageRow {
   campaign_name: string | null;
   condition_id: string | null;
   fidelity: string | null;
+  review_bucket: "awaiting_urans" | "needs_review" | null;
+  continuable: boolean | null;
   verify_state: string | null;
   verify_delta_cl: number | string | null;
   verify_delta_cd: number | string | null;
@@ -291,7 +373,10 @@ export async function pointHistoryPage(
         p."updatedAt" AS last_activity,
         p.campaign_id AS campaign_id,
         p.condition_id AS condition_id,
-        r.fidelity AS fidelity
+        r.fidelity AS fidelity,
+        -- Mirrors are never review-bucketed or continuable in their own right.
+        NULL AS review_bucket,
+        FALSE AS continuable
       FROM sim_campaign_points p
       JOIN results r ON r.id = p.result_id
       JOIN airfoils af ON af.id = p.airfoil_id
@@ -324,7 +409,9 @@ export async function pointHistoryPage(
         r."updatedAt" AS last_activity,
         NULL::uuid AS campaign_id,
         NULL::uuid AS condition_id,
-        r.fidelity AS fidelity
+        r.fidelity AS fidelity,
+        ${REVIEW_BUCKET_SQL} AS review_bucket,
+        ${CONTINUABLE_SQL} AS continuable
       FROM results r
       JOIN airfoils af ON af.id = r.airfoil_id
       LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -408,19 +495,30 @@ export async function pointHistoryPage(
     SELECT
       count(*) FILTER (WHERE b.bucket = 'failed')::int AS failed,
       count(*) FILTER (WHERE b.bucket = 'rejected')::int AS rejected,
+      count(*) FILTER (WHERE b.review_bucket = 'awaiting_urans')::int AS awaiting_urans,
+      count(*) FILTER (WHERE b.review_bucket = 'needs_review')::int AS needs_review,
       count(*) FILTER (WHERE b.bucket = 'accepted')::int AS accepted,
       count(*) FILTER (WHERE b.bucket = 'needs_urans')::int AS needs_urans,
       count(*) FILTER (WHERE b.bucket = 'solving')::int AS solving,
       count(*)::int AS all_results
     FROM (
-      SELECT ${BUCKET_SQL} AS bucket
+      SELECT ${BUCKET_SQL} AS bucket, ${REVIEW_BUCKET_SQL} AS review_bucket
       FROM results r
       JOIN airfoils af ON af.id = r.airfoil_id
       LEFT JOIN result_classifications rc ON rc.result_id = r.id
       WHERE ${resultArmFilters(filters, { includeBucket: false })}
     ) b
-  `)) as unknown as Array<{ failed: number; rejected: number; accepted: number; needs_urans: number; solving: number; all_results: number }>;
-  const c = countRows[0] ?? { failed: 0, rejected: 0, accepted: 0, needs_urans: 0, solving: 0, all_results: 0 };
+  `)) as unknown as Array<{
+    failed: number;
+    rejected: number;
+    awaiting_urans: number;
+    needs_review: number;
+    accepted: number;
+    needs_urans: number;
+    solving: number;
+    all_results: number;
+  }>;
+  const c = countRows[0] ?? { failed: 0, rejected: 0, awaiting_urans: 0, needs_review: 0, accepted: 0, needs_urans: 0, solving: 0, all_results: 0 };
 
   let derivedCount = 0;
   if (!filters.errorClass) {
@@ -475,6 +573,8 @@ export async function pointHistoryPage(
       revisionId: row.revision_id,
       lastActivityAt: isoOf(row.last_activity),
       fidelity: row.fidelity,
+      reviewBucket: row.review_bucket ?? null,
+      continuable: Boolean(row.continuable),
       verify:
         row.verify_state == null
           ? null
@@ -489,6 +589,8 @@ export async function pointHistoryPage(
     counts: {
       failed: Number(c.failed),
       rejected: Number(c.rejected),
+      awaiting_urans: Number(c.awaiting_urans),
+      needs_review: Number(c.needs_review),
       accepted: Number(c.accepted),
       needs_urans: Number(c.needs_urans),
       solving: Number(c.solving),
@@ -557,6 +659,11 @@ export interface PointStory {
     updatedAt: string;
     /** Fidelity ladder echo (results.fidelity); null = pre-ladder/unsolved. */
     fidelity: string | null;
+    /** Amendment-A refined review bucket (see PointHistoryItem.reviewBucket). */
+    reviewBucket: "awaiting_urans" | "needs_review" | null;
+    /** Amendment C: budget-stopped rejected urans row with saved case state —
+     *  the story panel renders Continue +2h/+6h on exactly these. */
+    continuable: boolean;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;
   };
@@ -574,6 +681,7 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
       r.aoa_deg::float8 AS aoa_deg, r.reynolds, r.mach, r.speed, r.regime, r.status::text AS status,
       r.error, r.quality_warnings, r.simulation_preset_revision_id AS revision_id,
       r."solvedAt" AS solved_at, r."updatedAt" AS updated_at, r.fidelity,
+      ${REVIEW_BUCKET_SQL} AS review_bucket, ${CONTINUABLE_SQL} AS continuable,
       rc.state::text AS cls_state, rc.reasons AS cls_reasons, rc.confidence AS cls_confidence,
       rc.classifier_version AS cls_version,
       cp.campaign_id, cp.condition_id, sc.name AS campaign_name,
@@ -625,6 +733,8 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
     condition_id: string | null;
     campaign_name: string | null;
     fidelity: string | null;
+    review_bucket: "awaiting_urans" | "needs_review" | null;
+    continuable: boolean | null;
     verify_state: string | null;
     verify_delta_cl: number | string | null;
     verify_delta_cd: number | string | null;
@@ -765,6 +875,8 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
       solvedAt: isoOrNull(p.solved_at),
       updatedAt: iso(p.updated_at),
       fidelity: p.fidelity,
+      reviewBucket: p.review_bucket ?? null,
+      continuable: Boolean(p.continuable),
       verify:
         p.verify_state == null
           ? null

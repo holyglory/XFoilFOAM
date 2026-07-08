@@ -28,6 +28,11 @@
   --aero-amber: #f5a524;
   --aero-red: #ef4444;
   --aero-red-text: #c0392b;
+  /* violet: the calm "awaiting URANS" stage-2 queue tint (approved design
+     c19fd74a) — never an error color. */
+  --aero-violet: #a78bfa;
+  --aero-violet-border: rgba(167, 139, 250, 0.45);
+  --aero-violet-fill: rgba(167, 139, 250, 0.1);
   --aero-topbar-bg: rgba(11, 16, 22, 0.85);
   --aero-nav-active: #16202b;
   --aero-row-active: #0f1620;
@@ -68,6 +73,9 @@
   --aero-amber: #bb7a0c;
   --aero-red: #dc2626;
   --aero-red-text: #b91c1c;
+  --aero-violet: #7c5cd6;
+  --aero-violet-border: rgba(124, 92, 214, 0.45);
+  --aero-violet-fill: rgba(124, 92, 214, 0.1);
   --aero-topbar-bg: rgba(255, 255, 255, 0.85);
   --aero-nav-active: #e3ebf3;
   --aero-row-active: #eef4f9;

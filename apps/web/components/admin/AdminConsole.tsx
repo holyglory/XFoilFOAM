@@ -87,7 +87,7 @@ import {
 import { C, MONO } from "@/lib/tokens";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import { isFinishedLogOpen, withFinishedLogParam } from "@/lib/finished-log-param";
-import { campaignPointsSearch } from "@/lib/point-history";
+import { campaignPointsSearch, type CampaignPointsBucket } from "@/lib/point-history";
 import { deriveSolverState, solverStateLabel } from "@/lib/solver-state";
 import { AddAirfoilsPanel } from "./AddAirfoilsPanel";
 import { momentumSchemeSelect } from "./solver-schemes";
@@ -286,7 +286,7 @@ export function AdminConsole() {
   // bucket. The search string comes from campaignPointsSearch (the explorer's
   // own filter round-trip) — never hand-built param names.
   const openCampaignPoints = useCallback(
-    (campaignId: string, status: "failed" | "rejected") => {
+    (campaignId: string, status: CampaignPointsBucket) => {
       const qs = campaignPointsSearch(campaignId, status);
       navigate(Object.fromEntries(new URLSearchParams(qs.slice(1))), "push");
     },
@@ -2585,7 +2585,7 @@ function QueueDashboard({
   onTabChange: (t: SolverTab) => void;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
-  onOpenPoints: (campaignId: string, status: "failed" | "rejected") => void;
+  onOpenPoints: (campaignId: string, status: CampaignPointsBucket) => void;
 }) {
   const [queue, setQueue] = useState<AdminQueue | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -3132,7 +3132,7 @@ function CampaignBacklogStrip({
   gate: CampaignGate | null;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
-  onOpenPoints: (campaignId: string, status: "failed" | "rejected") => void;
+  onOpenPoints: (campaignId: string, status: CampaignPointsBucket) => void;
 }) {
   const gap = strip.backgroundGapFill;
   return (

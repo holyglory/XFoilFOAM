@@ -15,6 +15,8 @@ import {
   pointFiltersToSearch,
   type PointStoryAttempt,
   type PointStoryPayload,
+  POINT_STATUS_CHIPS,
+  statusChipDisplay,
 } from "../lib/point-history";
 
 // ---------------------------------------------------------------------------
@@ -71,7 +73,10 @@ describe("point filter query-param round-trip", () => {
 
   it("campaignPointsSearch targets Solver ▸ Points filtered to campaign + bucket and parses back", () => {
     const id = "0f097f76-c1b9-4794-a8e7-8ba9ae27d565";
-    for (const status of ["failed", "rejected"] as const) {
+    // Includes the amendment-A split buckets the campaign gate badges /
+    // needs-review chip now link to, plus the deprecated 'rejected' alias
+    // old callers may still emit.
+    for (const status of ["failed", "rejected", "awaiting_urans", "needs_review"] as const) {
       const search = campaignPointsSearch(id, status);
       const params = new URLSearchParams(search.slice(1));
       expect(params.get("section")).toBe("queue");
@@ -84,9 +89,49 @@ describe("point filter query-param round-trip", () => {
     }
   });
 
+  it("chip row replaces raw 'rejected' with the semantic split (amendment A)", () => {
+    expect(POINT_STATUS_CHIPS).toContain("awaiting_urans");
+    expect(POINT_STATUS_CHIPS).toContain("needs_review");
+    expect(POINT_STATUS_CHIPS as readonly string[]).not.toContain("rejected");
+  });
+
+  it("still parses deprecated ?pstatus=rejected links (server keeps the alias bucket)", () => {
+    expect(parsePointFilters("?pstatus=rejected").status).toBe("rejected");
+    for (const status of ["awaiting_urans", "needs_review"] as const) {
+      expect(parsePointFilters(`?pstatus=${status}`).status).toBe(status);
+    }
+  });
+
   it("rejects malformed URL values (user-editable input) back to defaults", () => {
     const parsed = parsePointFilters("?pstatus=nonsense&pregime=laminar&perr=exploded&pre=12abc");
     expect(parsed).toEqual(DEFAULT_POINT_FILTERS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// statusChipDisplay — the ONE recolor rule for status chips (amendment A):
+// violet strictly for the calm awaiting-URANS queue, red strictly for
+// failed / needs-review, amber for a rejected row whose next solve is
+// already scheduled (reviewBucket null).
+// ---------------------------------------------------------------------------
+describe("statusChipDisplay", () => {
+  it("splits the rejected bucket by the server-derived reviewBucket", () => {
+    expect(statusChipDisplay("rejected", "awaiting_urans")).toEqual({ label: "awaiting URANS", tone: "violet" });
+    expect(statusChipDisplay("rejected", "needs_review")).toEqual({ label: "needs review", tone: "red" });
+    expect(statusChipDisplay("rejected", null)).toEqual({ label: "rejected · rescheduled", tone: "amber" });
+  });
+
+  it("red is strictly failed / needs-review — never the violet queue", () => {
+    expect(statusChipDisplay("failed", "needs_review").tone).toBe("red");
+    expect(statusChipDisplay("failed", null).tone).toBe("red");
+    expect(statusChipDisplay("rejected", "awaiting_urans").tone).not.toBe("red");
+  });
+
+  it("keeps the untouched buckets stable", () => {
+    expect(statusChipDisplay("accepted", null)).toEqual({ label: "accepted", tone: "teal" });
+    expect(statusChipDisplay("needs_urans", null)).toEqual({ label: "needs URANS", tone: "amber" });
+    expect(statusChipDisplay("solving", null)).toEqual({ label: "solving", tone: "amber" });
+    expect(statusChipDisplay("other", null)).toEqual({ label: "other", tone: "muted" });
   });
 });
 
@@ -217,6 +262,8 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
       solvedAt: "2026-07-06T12:00:00.000Z",
       updatedAt: "2026-07-06T12:00:00.000Z",
       fidelity: null,
+      reviewBucket: null,
+      continuable: false,
       verify: null,
       ...(over.point ?? {}),
     },

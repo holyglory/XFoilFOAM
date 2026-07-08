@@ -1,10 +1,12 @@
 "use client";
 
-// Campaign coverage matrix (spec §11, approved mockup 1ed4374f): virtualized
-// airfoil rows over the keyset /airfoils pages with per-airfoil SEGMENTED
-// BARS — one flex segment per condition (2px gap), fill height = fraction of
-// that condition's angles terminal, amber fill = has rejected, solid red =
-// has failed, empty = panel background. The per-condition column headers are
+// Campaign coverage matrix (spec §11, approved mockup 1ed4374f; recolored per
+// amendment A / design c19fd74a): virtualized airfoil rows over the keyset
+// /airfoils pages with per-airfoil SEGMENTED BARS — one flex segment per
+// condition (2px gap), fill height = fraction of that condition's angles
+// terminal, VIOLET fill = awaiting URANS (calm stage-2 queue), solid RED =
+// needs review / failed, empty = panel background (legacy payloads without
+// the split keep the amber rejected tint). The per-condition column headers are
 // gone: a slim AIRFOIL | DONE | CONDITIONS legend row sits above and the
 // hover tooltip + cell side panel carry the identification. Click on a
 // segment opens the existing cell side panel (same onCellClick contract).
@@ -50,8 +52,11 @@ interface PageState {
   rows: AdminCampaignAirfoilRow[];
 }
 
-function rowFailed(row: AdminCampaignAirfoilRow): number {
-  return row.perCondition.reduce((s, c) => s + c.failed, 0);
+/** Red-segment weight for the "needs review first" sort: crash-failed points
+ *  plus the amendment-A needsReview count when the payload ships it (the two
+ *  overlap — only the >0 comparison matters here). */
+function rowNeedsReview(row: AdminCampaignAirfoilRow): number {
+  return row.perCondition.reduce((s, c) => s + c.failed + (c.needsReview ?? 0), 0);
 }
 
 interface HoverTip {
@@ -193,7 +198,7 @@ export function CoverageMatrix({
     let out = loadedRows;
     if (q) out = out.filter((r) => r.slug.toLowerCase().includes(q) || r.name.toLowerCase().includes(q));
     if (failedFirst) {
-      out = [...out].sort((a, b) => Number(rowFailed(b) > 0) - Number(rowFailed(a) > 0) || a.slug.localeCompare(b.slug));
+      out = [...out].sort((a, b) => Number(rowNeedsReview(b) > 0) - Number(rowNeedsReview(a) > 0) || a.slug.localeCompare(b.slug));
     }
     return out;
   }, [loadedRows, search, failedFirst]);
@@ -267,7 +272,7 @@ export function CoverageMatrix({
           onClick={() => setFailedFirst((v) => !v)}
           style={{ ...ghostBtn, padding: "5px 10px", fontSize: 10, color: failedFirst ? C.teal : C.muted, borderColor: failedFirst ? C.tealBorder : C.stroke }}
         >
-          failed first
+          needs review first
         </button>
         {releasedConditions.length > 0 && (
           <button
@@ -321,7 +326,7 @@ export function CoverageMatrix({
         <span style={{ letterSpacing: "0.1em" }}>AIRFOIL</span>
         <span style={{ letterSpacing: "0.1em", textAlign: "right" }}>DONE</span>
         <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-          CONDITIONS → fill = angles done · <span style={{ color: C.amber }}>amber</span> = rejected · <span style={{ color: C.redText }}>red</span> = failed · hover for detail · click opens the cell panel
+          CONDITIONS → fill = angles done · <span style={{ color: C.violet }}>violet</span> = awaiting URANS · <span style={{ color: C.redText }}>red</span> = needs review · hover for detail · click opens the cell panel
         </span>
       </div>
 
@@ -361,7 +366,11 @@ export function CoverageMatrix({
                     const label = segmentTitle(c, cell, conditionDisplayState(c));
                     const hoverKey = `${row.slug}:${c.id}`;
                     const fillH = segmentFillHeight(view);
-                    const fillColor = view.state === "failed" ? C.red : view.state === "rejected" ? C.amber : C.teal;
+                    // Amendment-A recolor: red strictly for needs-review /
+                    // failed; violet = calm awaiting-URANS; amber only for
+                    // legacy payloads without the split counters.
+                    const red = view.state === "failed" || view.state === "needs_review";
+                    const fillColor = red ? C.red : view.state === "awaiting_urans" ? C.violet : view.state === "rejected" ? C.amber : C.teal;
                     return (
                       <button
                         key={c.id}
@@ -369,9 +378,9 @@ export function CoverageMatrix({
                         data-testid={`matrix-cell-${row.slug}-${c.ord}`}
                         aria-label={label}
                         onClick={() => onCellClick(row, c, cell)}
-                        onMouseEnter={(e) => showTip(e.currentTarget, hoverKey, label, view.state === "failed")}
+                        onMouseEnter={(e) => showTip(e.currentTarget, hoverKey, label, red)}
                         onMouseLeave={hideTip}
-                        onFocus={(e) => showTip(e.currentTarget, hoverKey, label, view.state === "failed")}
+                        onFocus={(e) => showTip(e.currentTarget, hoverKey, label, red)}
                         onBlur={hideTip}
                         style={{
                           flex: "1 1 0",

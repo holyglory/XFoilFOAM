@@ -169,6 +169,153 @@ export async function campaignOpenTierCounts(db: DB, campaignId: string): Promis
   };
 }
 
+// ---------------------------------------------------------------------------
+// Review buckets (approved design c19fd74a, amendment A): the SEMANTIC SPLIT
+// of the old "rejected" bucket, derived live from the rule — no stored
+// counter columns, one canonical SQL definition.
+//
+//   awaiting_urans — tier-1 rejects: terminal, non-derived, result DONE with a
+//     'rejected' classification at fidelity 'rans' (NULL fidelity = pre-ladder
+//     steady rows, graded 'rans' by the 0034 backfill — treated identically so
+//     the split always partitions the rans side of the rejected counter).
+//     These are the stage-2 queue: calm violet, never red, no repair verbs.
+//
+//   needs_review — points a human must look at:
+//     * terminal FAILED points (same shape as the canonical `failed` counter,
+//       derived mirrors included). With auto-retry-once (amendment B) any row
+//       still status='failed' has either consumed its one automatic retry or
+//       predates the feature — counting only marker-carrying rows would hide
+//       pre-feature failures from the only surface that shows them;
+//     * terminal, non-derived, DONE + 'rejected' rows at fidelity 'urans_*'
+//       with NOTHING FURTHER SCHEDULED for the cell: no open (pending/running)
+//       verify-queue item, and no open (pending/running) admin request-URANS
+//       item covering the cell (exact angle or whole-polar NULL-aoa). An
+//       in-flight ladder re-solve needs no third clause: re-claiming a cell
+//       flips its natural-key results row to pending/queued/running, which
+//       already drops it out of the DONE+rejected shape; and a rejected
+//       urans_* row always came from a wave-2 child, whose parent can never
+//       grow a second gated retry (the NOT-EXISTS child filter counts done
+//       children as settled).
+//
+// The point-history read model (point-history.ts) applies the SAME rule to
+// raw results rows for the Points tab filters; both sides are pinned by the
+// bucket-predicate matrix tests.
+// ---------------------------------------------------------------------------
+export interface CampaignReviewBuckets {
+  awaitingUrans: number;
+  needsReview: number;
+}
+
+export interface CampaignReviewBucketRow extends CampaignReviewBuckets {
+  conditionId: string;
+  airfoilId: string;
+}
+
+const AWAITING_URANS_POINT_SQL = sql`
+  p.state = 'terminal' AND p.derived_by_symmetry = false
+  AND r.status = 'done' AND rc.state = 'rejected'
+  AND (r.fidelity = 'rans' OR r.fidelity IS NULL)`;
+
+// Derived symmetry mirrors are excluded from BOTH arms: repairing the source
+// point repairs its mirror, the Points tab bucket filters list source rows
+// only, and the red chip's count must equal its click-through list.
+const NEEDS_REVIEW_POINT_SQL = sql`
+  p.state = 'terminal' AND p.derived_by_symmetry = false AND (
+    r.status = 'failed'
+    OR (
+      r.status = 'done' AND rc.state = 'rejected' AND r.fidelity LIKE 'urans%'
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_urans_verify_queue q
+        WHERE q.airfoil_id = p.airfoil_id AND q.revision_id = p.revision_id
+          AND q.aoa_deg = p.aoa_deg AND q.state IN ('pending', 'running')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_urans_requests req
+        WHERE req.airfoil_id = p.airfoil_id AND req.revision_id = p.revision_id
+          AND (req.aoa_deg = p.aoa_deg OR req.aoa_deg IS NULL)
+          AND req.state IN ('pending', 'running')
+      )
+    )
+  )`;
+
+interface ReviewBucketQueryRow {
+  condition_id: string;
+  airfoil_id: string;
+  awaiting_urans: number;
+  needs_review: number;
+}
+
+/** Per-(condition, airfoil) review buckets of one campaign — the coverage
+ *  matrix recolor reads these (optionally scoped to a page of airfoils); the
+ *  summary aggregates them. One query, the canonical predicate above. */
+export async function campaignReviewBucketRows(
+  db: DB,
+  campaignId: string,
+  opts: { airfoilIds?: string[] } = {},
+): Promise<CampaignReviewBucketRow[]> {
+  const airfoilFilter = opts.airfoilIds?.length
+    ? sql`AND p.airfoil_id = ANY(${sql`ARRAY[${sql.join(opts.airfoilIds.map((id) => sql`${id}::uuid`), sql`, `)}]`})`
+    : sql``;
+  const rows = (await db.execute(sql`
+    SELECT p.condition_id, p.airfoil_id,
+      COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
+      COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
+    FROM sim_campaign_points p
+    LEFT JOIN results r ON r.id = p.result_id
+    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    WHERE p.campaign_id = ${campaignId} ${airfoilFilter}
+    GROUP BY p.condition_id, p.airfoil_id
+    HAVING COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL}) > 0
+        OR COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL}) > 0
+  `)) as unknown as ReviewBucketQueryRow[];
+  return rows.map((row) => ({
+    conditionId: row.condition_id,
+    airfoilId: row.airfoil_id,
+    awaitingUrans: Number(row.awaiting_urans),
+    needsReview: Number(row.needs_review),
+  }));
+}
+
+/** Whole-campaign review-bucket totals (dashboard progress-bar violet segment
+ *  + the red "needs review · N" chip). */
+export async function campaignReviewBuckets(db: DB, campaignId: string): Promise<CampaignReviewBuckets> {
+  const [row] = (await db.execute(sql`
+    SELECT
+      COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
+      COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
+    FROM sim_campaign_points p
+    LEFT JOIN results r ON r.id = p.result_id
+    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    WHERE p.campaign_id = ${campaignId}
+  `)) as unknown as Array<{ awaiting_urans: number; needs_review: number }>;
+  return {
+    awaitingUrans: Number(row?.awaiting_urans ?? 0),
+    needsReview: Number(row?.needs_review ?? 0),
+  };
+}
+
+/** Batched review buckets for a page of campaigns (the campaign list payload).
+ *  Campaigns without any bucketed point are absent from the map. */
+export async function reviewBucketsByCampaign(db: DB, campaignIds: string[]): Promise<Map<string, CampaignReviewBuckets>> {
+  if (!campaignIds.length) return new Map();
+  const rows = (await db.execute(sql`
+    SELECT p.campaign_id,
+      COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
+      COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
+    FROM sim_campaign_points p
+    LEFT JOIN results r ON r.id = p.result_id
+    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    WHERE p.campaign_id = ANY(${sql`ARRAY[${sql.join(campaignIds.map((id) => sql`${id}::uuid`), sql`, `)}]`})
+    GROUP BY p.campaign_id
+  `)) as unknown as Array<{ campaign_id: string; awaiting_urans: number; needs_review: number }>;
+  return new Map(
+    rows.map((row) => [
+      row.campaign_id,
+      { awaitingUrans: Number(row.awaiting_urans), needsReview: Number(row.needs_review) },
+    ]),
+  );
+}
+
 export type CampaignPhase = "running_rans" | "running_precalc" | "running_refinement" | "completed" | null;
 
 /** Derived campaign phase (contract 7): running_rans → running_precalc →
@@ -246,14 +393,25 @@ export async function healOrphanedUransRequests(db: DB): Promise<number> {
 
 /** Idempotent admin request-URANS creation (contract 6): one open item per
  *  (cell, fidelity); NULL aoaDeg = whole polar. Returns the open/created row
- *  and whether this call created it. */
+ *  and whether this call created it. Continuation items (amendment C) carry
+ *  continueFromResultId + budgetOverrideS and share the same idempotency: a
+ *  cell with an already-open item of this fidelity returns THAT item — the
+ *  admin surface shows the open item instead of stacking a duplicate. */
 export async function createUransRequest(
   db: DB,
-  input: { airfoilId: string; revisionId: string; aoaDeg?: number | null; fidelity: "precalc" | "full"; requestedBy?: string | null },
+  input: {
+    airfoilId: string;
+    revisionId: string;
+    aoaDeg?: number | null;
+    fidelity: "precalc" | "full";
+    requestedBy?: string | null;
+    continueFromResultId?: string | null;
+    budgetOverrideS?: number | null;
+  },
 ): Promise<{ request: SimUransRequest; created: boolean }> {
   const inserted = (await db.execute(sql`
-    INSERT INTO sim_urans_requests (airfoil_id, revision_id, aoa_deg, fidelity, state, requested_by)
-    VALUES (${input.airfoilId}, ${input.revisionId}, ${input.aoaDeg ?? null}, ${input.fidelity}, 'pending', ${input.requestedBy ?? null})
+    INSERT INTO sim_urans_requests (airfoil_id, revision_id, aoa_deg, fidelity, state, requested_by, continue_from_result_id, budget_override_s)
+    VALUES (${input.airfoilId}, ${input.revisionId}, ${input.aoaDeg ?? null}, ${input.fidelity}, 'pending', ${input.requestedBy ?? null}, ${input.continueFromResultId ?? null}, ${input.budgetOverrideS ?? null})
     ON CONFLICT (airfoil_id, revision_id, COALESCE(aoa_deg, 'NaN'::float8), fidelity)
       WHERE state IN ('pending', 'running') DO NOTHING
     RETURNING *

@@ -17,6 +17,7 @@ import {
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
 import { deriveSolverState, solverChipText, type SolverStateName } from "@/lib/solver-state";
+import type { CampaignPointsBucket } from "@/lib/point-history";
 import { gateFromSolverState } from "./campaign-status";
 import { stashDuplicatePrefill } from "./wizard-draft";
 import { usePoll } from "./usePoll";
@@ -39,7 +40,7 @@ export interface CampaignsHubProps {
   /** Router-navigates to ?section=queue (the Solver page). */
   onOpenSolver: () => void;
   /** Opens Solver ▸ Points pre-filtered to a campaign + bucket. */
-  onOpenPoints: (campaignId: string, status: "failed" | "rejected") => void;
+  onOpenPoints: (campaignId: string, status: CampaignPointsBucket) => void;
 }
 
 function priorityLabel(priority: number): string {
@@ -76,6 +77,15 @@ function statusLine(
     return `Paused by you — no new points will be scheduled${running > 0 ? `; ${running} running job${running === 1 ? "" : "s"} will finish` : ""}.`;
   }
   if (item.status === "attention") {
+    // Amendment-A copy when the list payload carries the split; the legacy
+    // failed/rejected wording survives only for older payloads.
+    const rb = item.reviewBuckets;
+    if (rb && (rb.needsReview > 0 || rb.awaitingUrans > 0)) {
+      const needs: string[] = [];
+      if (rb.needsReview > 0) needs.push(`${fCount(rb.needsReview)} need${rb.needsReview === 1 ? "s" : ""} review`);
+      if (rb.awaitingUrans > 0) needs.push(`${fCount(rb.awaitingUrans)} awaiting URANS`);
+      return `All work settled — ${needs.join(" · ")}.`;
+    }
     const needs: string[] = [];
     if (totals.failed > 0) needs.push(`${fCount(totals.failed)} failed`);
     if (totals.rejected > 0) needs.push(`${fCount(totals.rejected)} rejected`);
@@ -108,8 +118,14 @@ function statusLine(
   }
   const parts = [`${fCount(totals.remaining)} points remaining`];
   if (totals.running > 0) parts.push(`${fCount(totals.running)} running`);
-  if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
-  if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);
+  const rbActive = item.reviewBuckets;
+  if (rbActive) {
+    if (rbActive.needsReview > 0) parts.push(`${fCount(rbActive.needsReview)} need${rbActive.needsReview === 1 ? "s" : ""} review`);
+    if (rbActive.awaitingUrans > 0) parts.push(`${fCount(rbActive.awaitingUrans)} awaiting URANS`);
+  } else {
+    if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
+    if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);
+  }
   return `Active — ${parts.join(" · ")}.`;
 }
 
@@ -354,39 +370,85 @@ export function CampaignsHub({ onOpenCampaign, onNewCampaign, onOpenSolver, onOp
 
                 <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "center" }}>
                   <div aria-label={`progress ${settled} of ${totals.requested}`} style={{ height: 6, borderRadius: 4, background: C.panel3, overflow: "hidden" }}>
-                    <div style={{ width: `${progress * 100}%`, height: "100%", background: totals.failed > 0 || totals.rejected > 0 ? C.amber : C.teal }} />
+                    {/* Amber only when a human is needed (needs review); the
+                        calm awaiting-URANS queue keeps the teal bar. Legacy
+                        payloads without the split keep the old rule. */}
+                    <div
+                      style={{
+                        width: `${progress * 100}%`,
+                        height: "100%",
+                        background: (item.reviewBuckets ? item.reviewBuckets.needsReview > 0 : totals.failed > 0 || totals.rejected > 0) ? C.amber : C.teal,
+                      }}
+                    />
                   </div>
                   <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, whiteSpace: "nowrap" }}>
                     {fCount(settled)} / {fCount(totals.requested)}
-                    {/* Non-zero failed/rejected counts link to the Points
-                        explorer pre-filtered to this campaign + bucket; zero
-                        counts never render (no link to an empty view). */}
-                    {totals.failed > 0 && (
+                    {/* Amendment-A links: red strictly for needs-review (the
+                        repair surface), calm violet for the awaiting-URANS
+                        stage-2 queue; zero counts never render (no link to an
+                        empty view). Older payloads without the split fall
+                        back to the legacy failed/rejected links. */}
+                    {item.reviewBuckets ? (
                       <>
-                        {" · "}
-                        <button
-                          type="button"
-                          data-testid={`campaign-failed-link-${item.slug}`}
-                          title="Open these failed points in the Points explorer"
-                          onClick={() => onOpenPoints(item.id, "failed")}
-                          style={{ fontFamily: MONO, fontSize: 10, color: C.red, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
-                        >
-                          {fCount(totals.failed)} failed
-                        </button>
+                        {item.reviewBuckets.needsReview > 0 && (
+                          <>
+                            {" · "}
+                            <button
+                              type="button"
+                              data-testid={`campaign-needs-review-link-${item.slug}`}
+                              title="Open these points in the Points explorer — Retry / Continue actions live there"
+                              onClick={() => onOpenPoints(item.id, "needs_review")}
+                              style={{ fontFamily: MONO, fontSize: 10, color: C.red, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                            >
+                              needs review · {fCount(item.reviewBuckets.needsReview)}
+                            </button>
+                          </>
+                        )}
+                        {item.reviewBuckets.awaitingUrans > 0 && (
+                          <>
+                            {" · "}
+                            <button
+                              type="button"
+                              data-testid={`campaign-awaiting-urans-link-${item.slug}`}
+                              title="Tier-1 rejects queued for the unsteady re-solve — open them in the Points explorer"
+                              onClick={() => onOpenPoints(item.id, "awaiting_urans")}
+                              style={{ fontFamily: MONO, fontSize: 10, color: C.violet, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                            >
+                              {fCount(item.reviewBuckets.awaitingUrans)} awaiting URANS
+                            </button>
+                          </>
+                        )}
                       </>
-                    )}
-                    {totals.rejected > 0 && (
+                    ) : (
                       <>
-                        {" · "}
-                        <button
-                          type="button"
-                          data-testid={`campaign-rejected-link-${item.slug}`}
-                          title="Open these rejected points in the Points explorer"
-                          onClick={() => onOpenPoints(item.id, "rejected")}
-                          style={{ fontFamily: MONO, fontSize: 10, color: C.red, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
-                        >
-                          {fCount(totals.rejected)} rejected
-                        </button>
+                        {totals.failed > 0 && (
+                          <>
+                            {" · "}
+                            <button
+                              type="button"
+                              data-testid={`campaign-failed-link-${item.slug}`}
+                              title="Open these failed points in the Points explorer"
+                              onClick={() => onOpenPoints(item.id, "failed")}
+                              style={{ fontFamily: MONO, fontSize: 10, color: C.red, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                            >
+                              {fCount(totals.failed)} failed
+                            </button>
+                          </>
+                        )}
+                        {totals.rejected > 0 && (
+                          <>
+                            {" · "}
+                            <button
+                              type="button"
+                              data-testid={`campaign-rejected-link-${item.slug}`}
+                              title="Open these rejected points in the Points explorer"
+                              onClick={() => onOpenPoints(item.id, "rejected")}
+                              style={{ fontFamily: MONO, fontSize: 10, color: C.red, background: "transparent", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                            >
+                              {fCount(totals.rejected)} rejected
+                            </button>
+                          </>
+                        )}
                       </>
                     )}
                   </span>

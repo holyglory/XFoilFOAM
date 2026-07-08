@@ -983,6 +983,175 @@ describe("counter/failures/requeue coherence (production drift regression)", () 
   });
 });
 
+// MUST-CATCH (chip == click-through + no double-count): a symmetric airfoil's
+// derived −α mirror goes terminal linked to the SAME results row as its +α
+// source. When that source FAILS, the mirror must be booked in `derived` ONLY —
+// counting it in `failed` too (the pre-fix behavior) double-books the cell in
+// remaining = requested − solved − derived − failed − rejected AND makes the
+// failed chip exceed its Points-tab click-through list, which lists source
+// results rows only. Same canonical rule as NEEDS_REVIEW_POINT_SQL
+// (urans-ladder.ts), which already excludes mirrors from both bucket arms.
+describe("failed counter excludes derived symmetry mirrors (counted in derived; chip == Points-tab list)", () => {
+  let campaignId = "";
+  let revisionId = "";
+  let bcId = "";
+  let mirrorAfId = "";
+  let failedResultId = "";
+  // Unique speed → unique physics hash → this campaign pins its own revision,
+  // so no evidence from the other suites can terminal-link these points.
+  const MIRROR_SPEED = 13.65;
+
+  beforeAll(async () => {
+    const [af] = await db
+      .insert(airfoils)
+      .values({ slug: `${PREFIX}-mirror-af`, name: `${PREFIX} mirror af`, categoryId: cleanupCategoryIds[0], points: symmetricPoints, isSymmetric: true })
+      .returning();
+    mirrorAfId = af.id;
+    cleanupAirfoilIds.push(af.id);
+  });
+
+  it("launches a 5-point symmetric campaign: solver half 0..2 + derived mirrors −1,−2", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} mirror`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-mirror-key`,
+        airfoilIds: [mirrorAfId],
+        plan: planBody({ chordsM: [0.2], speedsMps: [MIRROR_SPEED], objectives: { ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 }, clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 } } }),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    campaignId = res.json().campaign.id;
+    cleanupCampaignIds.push(campaignId);
+    expect(res.json().totals.requested).toBe(5);
+
+    const [cond] = (await db.execute(sql`
+      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id, p.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc
+      JOIN simulation_presets p ON p.id = cc.preset_id
+      WHERE cc.campaign_id = ${campaignId}
+    `)) as unknown as Array<{ id: string; revision_id: string; bc_id: string }>;
+    revisionId = cond.revision_id;
+    bcId = cond.bc_id;
+
+    const mirrors = (await db.execute(sql`
+      SELECT aoa_deg::float8 AS aoa FROM sim_campaign_points
+      WHERE campaign_id = ${campaignId} AND derived_by_symmetry ORDER BY aoa_deg
+    `)) as unknown as Array<{ aoa: number }>;
+    expect(mirrors.map((m) => Number(m.aoa))).toEqual([-2, -1]);
+  });
+
+  it("failing the +1 source terminalizes its −1 mirror into derived, NOT failed (chip == Points-tab failed list)", async () => {
+    // Real breakage shape: the engine reports the +α solve failed; ingest
+    // terminal-links the source AND its mirror to the same failed results row.
+    const [failRow] = await db
+      .insert(results)
+      .values({ airfoilId: mirrorAfId, bcId, simulationPresetRevisionId: revisionId, aoaDeg: 1, status: "failed", source: "solved", error: "OpenFOAMError: solver crashed: NaN residual" })
+      .returning({ id: results.id });
+    failedResultId = failRow.id;
+    cleanupResultIds.push(failRow.id);
+    await onResultIngested(db, { airfoilId: mirrorAfId, revisionId, aoaDeg: 1, resultId: failRow.id, status: "failed" });
+
+    // Ground truth: the mirror IS terminal, derived, and linked to the FAILED row.
+    const [mirror] = (await db.execute(sql`
+      SELECT p.state, p.result_id, r.status
+      FROM sim_campaign_points p JOIN results r ON r.id = p.result_id
+      WHERE p.campaign_id = ${campaignId} AND p.aoa_deg = -1 AND p.derived_by_symmetry
+    `)) as unknown as Array<{ state: string; result_id: string; status: string }>;
+    expect(mirror.state).toBe("terminal");
+    expect(mirror.result_id).toBe(failedResultId);
+    expect(mirror.status).toBe("failed");
+
+    // The counter books the mirror in `derived` only — failed counts the source.
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.failed).toBe(1); // NOT 2: the mirror is not a second failure
+    expect(totals.derived).toBe(1); // the failed source's mirror sits here
+    expect(totals.solved).toBe(0);
+    expect(totals.rejected).toBe(0);
+    // Exact identity — a double-counted mirror would make the sum overshoot.
+    expect(totals.solved + totals.derived + totals.failed + totals.rejected + totals.remaining).toBe(totals.requested);
+
+    // Chip == click-through: the Points tab failed filter lists source results
+    // rows only, so the failed counter must equal its list length.
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/admin/point-history?${new URLSearchParams({ campaignId, status: "failed" }).toString()}`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { items: Array<{ aoaDeg: number }>; counts: Record<string, number> };
+    expect(body.items.length).toBe(totals.failed);
+    expect(body.items.map((i) => i.aoaDeg)).toEqual([1]);
+    expect(body.counts.failed).toBe(totals.failed);
+  });
+
+  it("full settle balances exactly with the mirror present and still flips the campaign to attention (gate unaffected)", async () => {
+    // Solve the remaining solver-half points (0, +2); +2's mirror (−2) derives.
+    for (const aoa of [0, 2]) {
+      const [row] = await db
+        .insert(results)
+        .values({ airfoilId: mirrorAfId, bcId, simulationPresetRevisionId: revisionId, aoaDeg: aoa, status: "done", source: "solved", regime: "rans", fidelity: "rans", converged: true, stalled: false, cl: 0.3 * aoa, cd: 0.011, cm: -0.01 })
+        .returning({ id: results.id });
+      cleanupResultIds.push(row.id);
+      await db.insert(resultClassifications).values({
+        resultId: row.id,
+        airfoilId: mirrorAfId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: aoa,
+        regime: "rans",
+        classifierVersion: "test-v1",
+        state: "accepted",
+        reasons: [],
+        confidence: 0.9,
+      });
+      await onResultIngested(db, { airfoilId: mirrorAfId, revisionId, aoaDeg: aoa, resultId: row.id, status: "done" });
+    }
+
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals.requested).toBe(5);
+    expect(totals.solved).toBe(2); // 0, +2
+    expect(totals.derived).toBe(2); // −2 (mirror of done) AND −1 (mirror of FAILED)
+    expect(totals.failed).toBe(1); // the +1 source only
+    expect(totals.rejected).toBe(0);
+    expect(totals.remaining).toBe(0);
+    // The unclamped identity: 5 = 2 + 2 + 1 + 0 + 0. Pre-fix the sum was 6 —
+    // the mirror double-booked in derived AND failed, hidden by the Math.max clamp.
+    expect(totals.solved + totals.derived + totals.failed + totals.rejected + totals.remaining).toBe(totals.requested);
+
+    // Attention gate: a mirror can only fail alongside its source, so excluding
+    // mirrors from the failed COUNTER can never hide a failure from the gate.
+    expect(deriveCampaignCompletion(totals)).toBe("attention");
+    await probeCampaignCompletion(db, campaignId);
+    const [camp] = (await db.execute(sql`SELECT status FROM sim_campaigns WHERE id = ${campaignId}`)) as unknown as Array<{ status: string }>;
+    expect(camp.status).toBe("attention");
+  });
+
+  it("both recompute paths agree row-for-row (incremental keys vs whole-campaign) and re-ingest is idempotent", async () => {
+    const readCounters = async () =>
+      (await db.execute(sql`
+        SELECT condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected
+        FROM sim_campaign_progress WHERE campaign_id = ${campaignId}
+        ORDER BY condition_id, airfoil_id
+      `)) as unknown as Array<Record<string, unknown>>;
+
+    // Counters as last written by the incremental ingest path (keys).
+    const fromKeysPath = await readCounters();
+    expect(fromKeysPath.length).toBeGreaterThan(0);
+
+    // Whole-campaign recompute (launch/plan-edit path) must produce identical rows.
+    await db.transaction(async (tx) => {
+      await recomputeCampaignProgress(tx, campaignId);
+    });
+    expect(await readCounters()).toEqual(fromKeysPath);
+
+    // Idempotent re-ingest of the failed result routes back through the keys
+    // path (rows already linked) — counters must not move.
+    await onResultIngested(db, { airfoilId: mirrorAfId, revisionId, aoaDeg: 1, resultId: failedResultId, status: "failed" });
+    expect(await readCounters()).toEqual(fromKeysPath);
+  });
+});
+
 describe("rejected-classification honesty + premature-completion guard (D6)", () => {
   let campaignId = "";
   let revisionId = "";

@@ -1,3 +1,17 @@
+/** Budget-stop marker (pinned cross-runtime contract, 2026-07-08): the engine
+ *  (src/airfoilfoam/pipeline.py, URANS_BUDGET_STOP_MARKER — the identical
+ *  literal) embeds exactly this substring in the quality reason of EVERY
+ *  wall-clock-stopped URANS grade that leaves restartable saved case state:
+ *  the between-chunks budget projection guard, the mid-chunk solver-timeout
+ *  partial grade, and a timed-out continuation chunk. Crash/divergence grades
+ *  never carry it. A REJECTED urans row whose quality_warnings carry this
+ *  marker AND whose engine case ids are present is CONTINUABLE — the saved
+ *  case state can be resumed with an increased budget (amendment C). Matching
+ *  is substring-based so surrounding measurements never break detection;
+ *  drift in the phrasing is a test failure on both sides (engine:
+ *  tests/test_continuation.py marker pin; node: the fixtures embedding it). */
+export const URANS_BUDGET_STOP_MARKER = "stopped by the wall-clock budget guard";
+
 export const URANS_MIN_RETAINED_CYCLES = 7;
 export const URANS_MIN_ANIMATION_FRAMES_PER_CYCLE = 20;
 export const URANS_ANIMATION_FPS = 20;

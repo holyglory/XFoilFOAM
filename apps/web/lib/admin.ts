@@ -555,6 +555,16 @@ export const requestUrans = (body: { airfoilId: string; revisionId: string; aoaD
     body: JSON.stringify(body),
   });
 
+/** Continuation (amendment C): resume a budget-stopped URANS solve from its
+ *  saved engine case state with an increased wall-clock budget. The server
+ *  derives cell/angle/fidelity from the SOURCE results row; idempotent like
+ *  requestUrans (created=false replays the open item). */
+export const continueUransResult = (resultId: string, budgetOverrideS: number) =>
+  aj<{ request: AdminUransRequest; created: boolean }>("/api/admin/urans-requests", {
+    method: "POST",
+    body: JSON.stringify({ continueFromResultId: resultId, budgetOverrideS }),
+  });
+
 /** Open/settled request items + verify-queue items for one cell scope — the
  *  action surfaces read this to render idempotent-aware button state. */
 export const getUransRequests = (airfoilId: string, revisionId: string) =>
@@ -979,6 +989,17 @@ export interface CampaignProgressTotals {
   remaining: number;
 }
 
+/** Amendment-A semantic split of the review surface (approved design
+ *  c19fd74a): awaitingUrans = tier-1 rejects queued for stage 2 (calm violet,
+ *  no repair verbs); needsReview = failed-after-auto-retry + urans-rejected
+ *  with nothing further scheduled (red chip, repair actions on the Points
+ *  tab). Derived live server-side from the canonical predicate — optional on
+ *  every payload because older APIs omit it (render nothing, never zeros). */
+export interface CampaignReviewBuckets {
+  awaitingUrans: number;
+  needsReview: number;
+}
+
 export interface CampaignObjectivePlanInput {
   enabled: boolean;
   /** Canonical 2-decimal degree string, e.g. "0.10". */
@@ -1025,6 +1046,7 @@ export interface AdminCampaignListItem {
   conditionCount: number;
   airfoilCount: number;
   totals: CampaignProgressTotals;
+  reviewBuckets?: CampaignReviewBuckets;
 }
 
 export interface AdminCampaignConditionSummary {
@@ -1048,6 +1070,7 @@ export interface AdminCampaignConditionSummary {
   drift: boolean;
   gainedEvidenceAfterRelease: boolean;
   counters: CampaignProgressTotals;
+  reviewBuckets?: CampaignReviewBuckets;
 }
 
 /** Mirrors GET /api/admin/campaigns/:id (campaignSummary + scheduler + rate). */
@@ -1070,6 +1093,9 @@ export interface AdminCampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  /** Amendment-A review-bucket split (violet awaiting-URANS bar segment + the
+   *  red "needs review · N" chip). Optional: older APIs omit it. */
+  reviewBuckets?: CampaignReviewBuckets;
   /** Fidelity ladder per-tier open counts (contract 7). Optional: older API
    *  payloads omit it — render nothing, never invented zeros. */
   tierCounts?: { ransOpen: number; precalcOpen: number; verifyOpen: number };
@@ -1106,7 +1132,9 @@ export interface AdminCampaignAirfoilRow {
   slug: string;
   name: string;
   isSymmetric: boolean;
-  perCondition: Array<{ conditionId: string } & CampaignProgressTotals>;
+  /** Per-cell counters; awaitingUrans/needsReview ride along (amendment A)
+   *  when the API ships the split — optional for older payloads. */
+  perCondition: Array<{ conditionId: string } & CampaignProgressTotals & Partial<CampaignReviewBuckets>>;
 }
 
 export interface AdminCampaignFailureGroup {

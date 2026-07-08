@@ -1,0 +1,14 @@
+-- Auto-retry-once for crash-class failed points (approved design c19fd74a,
+-- amendment B, 2026-07-08): a results row that lands status='failed' gets ONE
+-- automatic requeue (result -> pending, campaign point -> requested) before it
+-- counts as needs_review. The marker lives on the RESULTS row — the durable
+-- cell identity — because:
+--   * it must survive re-ingest of the same failed job (the natural-key upsert
+--     never touches columns absent from the ingest SET list), so a re-ingested
+--     crash escalates instead of earning a second silent retry;
+--   * the retry itself is not a directly-composed job (the row goes back to
+--     'pending' and the ordinary gap finders re-claim it), so there is no
+--     retry-job requestPayload to stamp at requeue time;
+--   * the needs_review bucket predicate reads it in one indexed table.
+-- NULL = never auto-retried; a timestamp doubles as marker + evidence of when.
+ALTER TABLE "results" ADD COLUMN IF NOT EXISTS "auto_retried_at" timestamp with time zone;

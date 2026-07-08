@@ -23,6 +23,7 @@ import {
   nextPendingUransRequest,
   nextPendingVerifyItem,
   precalcSnapshotForVerifyItem,
+  results,
   simCampaigns,
   simJobs,
   simulationPresetRevisions,
@@ -175,6 +176,12 @@ async function submitLadderJob(
     campaignId?: string | null;
     payloadExtras: Record<string, unknown>;
     cpuSlots: number;
+    /** Continuation (amendment C): resume the transient of a saved engine case
+     *  instead of a fresh solve. Composed into the request as
+     *  { continue_from: { engine_job_id, case_slug } }. */
+    continueFrom?: { engineJobId: string; caseSlug: string } | null;
+    /** Continuation budget override [s] — replaces the tier-derived budget. */
+    budgetOverrideS?: number | null;
   },
 ): Promise<{ jobId: string; submitted: boolean; connectionFailure: boolean; error?: string }> {
   const { target, aoas, fidelity, jobKind, campaignId, payloadExtras, cpuSlots } = opts;
@@ -204,6 +211,14 @@ async function submitLadderJob(
     force_transient: true,
     urans_fidelity: fidelity,
   };
+  if (opts.continueFrom) {
+    // Amendment C: the engine copies/links the saved case dir into the new
+    // job and restarts the transient from latestTime, merging coefficient
+    // history (the existing restart-segment machinery, across jobs).
+    // MUST-CATCH payload-shape pin: urans-ladder-continuation test.
+    request.continue_from = { engine_job_id: opts.continueFrom.engineJobId, case_slug: opts.continueFrom.caseSlug };
+    if (opts.budgetOverrideS != null) request.budget_override_s = opts.budgetOverrideS;
+  }
   const [job] = await db
     .insert(simJobs)
     .values({
@@ -267,7 +282,31 @@ async function consumeUransRequest(db: DB, engine: EngineClient, cpuSlots: numbe
     await db.update(simUransRequests).set({ state: "cancelled" }).where(eq(simUransRequests.id, request.id));
     return false;
   }
-  const aoas = request.aoaDeg != null ? [request.aoaDeg] : snapshotAoas(target.snapshot);
+  // Continuation (amendment C): the request pins the SOURCE results row whose
+  // saved engine case the resumed transient restarts from. The source row must
+  // still carry its engine addressing (engine_job_id + engine_case_slug) —
+  // without it there is no case state to resume, so the item cancels loudly
+  // instead of pretending a fresh solve is a continuation.
+  let continueFrom: { engineJobId: string; caseSlug: string } | null = null;
+  let aoas: number[];
+  if (request.continueFromResultId) {
+    const [source] = await db
+      .select({ aoaDeg: results.aoaDeg, engineJobId: results.engineJobId, engineCaseSlug: results.engineCaseSlug })
+      .from(results)
+      .where(eq(results.id, request.continueFromResultId))
+      .limit(1);
+    if (!source || !source.engineJobId || !source.engineCaseSlug) {
+      console.error(
+        `[sweeper] URANS request ${request.id} cancelled: continuation source ${request.continueFromResultId} has no saved case state (row missing or engine ids absent)`,
+      );
+      await db.update(simUransRequests).set({ state: "cancelled" }).where(eq(simUransRequests.id, request.id));
+      return false;
+    }
+    continueFrom = { engineJobId: source.engineJobId, caseSlug: source.engineCaseSlug };
+    aoas = [request.aoaDeg ?? source.aoaDeg];
+  } else {
+    aoas = request.aoaDeg != null ? [request.aoaDeg] : snapshotAoas(target.snapshot);
+  }
   if (!aoas.length) {
     console.error(`[sweeper] URANS request ${request.id} cancelled: no angles derivable from the pinned revision sweep`);
     await db.update(simUransRequests).set({ state: "cancelled" }).where(eq(simUransRequests.id, request.id));
@@ -278,12 +317,25 @@ async function consumeUransRequest(db: DB, engine: EngineClient, cpuSlots: numbe
     aoas,
     fidelity,
     jobKind: "targeted",
-    payloadExtras: { uransRequestId: request.id },
+    payloadExtras: {
+      uransRequestId: request.id,
+      ...(request.continueFromResultId
+        ? { continueFromResultId: request.continueFromResultId, budgetOverrideS: request.budgetOverrideS ?? null }
+        : {}),
+    },
     cpuSlots,
+    continueFrom,
+    budgetOverrideS: request.budgetOverrideS ?? null,
   });
   if (outcome.submitted) {
     await db.update(simUransRequests).set({ state: "running", simJobId: outcome.jobId }).where(eq(simUransRequests.id, request.id));
-    console.log(`[sweeper] URANS request ${request.id} submitted (${fidelity}, ${aoas.length} angle(s), job ${outcome.jobId})`);
+    console.log(
+      `[sweeper] URANS request ${request.id} submitted (${fidelity}, ${aoas.length} angle(s), job ${outcome.jobId}${
+        continueFrom
+          ? `, CONTINUATION of engine ${continueFrom.engineJobId}/${continueFrom.caseSlug}${request.budgetOverrideS ? ` with budget override ${request.budgetOverrideS}s` : ""}`
+          : ""
+      })`,
+    );
     return true;
   }
   if (outcome.connectionFailure) return false; // stays pending; backoff recorded

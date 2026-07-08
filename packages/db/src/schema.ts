@@ -743,6 +743,13 @@ export const results = pgTable(
      *  classic pointwise convergence or legacy pre-contract evidence.
      *  result_attempts carry it inside evidence_payload (whole PolarPoint). */
     steadyHistory: jsonb("steady_history"),
+    /** Auto-retry-once marker (migration 0036): set when the sweeper's
+     *  crash-class auto-retry requeued this cell after a failed ingest. A row
+     *  that fails AGAIN with this set escalates to needs_review instead of a
+     *  second silent retry. Deliberately NEVER written by the ingest upsert
+     *  (absent from its SET list), so it survives re-ingest of the same
+     *  failed job. NULL = never auto-retried. */
+    autoRetriedAt: timestamp("auto_retried_at", { withTimezone: true }),
     // linkage to the engine run
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
     engineJobId: text("engine_job_id"),
@@ -1575,6 +1582,16 @@ export const simUransRequests = pgTable(
     // pending | running | done | cancelled
     state: text("state").notNull().default("pending"),
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
+    /** Continuation (migration 0037, amendment C): the rejected results row
+     *  whose SAVED engine case state (engine_job_id + engine_case_slug on that
+     *  row) this request resumes from. The ladder tick composes
+     *  { continue_from: { engine_job_id, case_slug } } into the engine request
+     *  and the engine restarts the transient from latestTime, merging
+     *  coefficient history. NULL = ordinary fresh-solve request. */
+    continueFromResultId: uuid("continue_from_result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    /** Continuation budget override [s]: replaces the fidelity-derived solver
+     *  budget for the resumed run (+2h / +6h UI choices). NULL = tier default. */
+    budgetOverrideS: integer("budget_override_s"),
     requestedBy: text("requested_by"),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()

@@ -1,5 +1,6 @@
 import {
   airfoils,
+  autoRetryCrashedResultsForJob,
   type CampaignLaneKey,
   campaignHasOpenRansGaps,
   type DB,
@@ -843,6 +844,32 @@ async function settleCampaignAfterRefresh(db: DB, job: SimJobRow): Promise<void>
   }
 }
 
+/** Auto-retry-once (amendment B): requeue this job's unmarked crash-class
+ *  failed rows exactly once and log BOTH directions loudly — the requeue and
+ *  the escalation. Runs AFTER every polar-cache refresh of the terminal ingest
+ *  path (flipping a row to pending before a refresh would overwrite its stored
+ *  at-ingest classification — prod row 741db07a) and AFTER the wave-2 retry
+ *  submit (angles the URANS ladder just claimed are queued, not failed, so the
+ *  two retry mechanisms can never double-schedule one cell). Never throws: a
+ *  bookkeeping hiccup must not fail an already-ingested job. */
+async function autoRetryFailedPointsForJob(db: DB, job: SimJobRow): Promise<void> {
+  try {
+    const outcome = await autoRetryCrashedResultsForJob(db, job.id);
+    for (const cell of outcome.retried) {
+      console.error(
+        `[sweeper] AUTO-RETRY: crash-class failed point requeued ONCE (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — a second crash escalates to needs review`,
+      );
+    }
+    for (const cell of outcome.escalated) {
+      console.error(
+        `[sweeper] AUTO-RETRY EXHAUSTED: point failed again after its automatic retry (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — stays failed, needs review`,
+      );
+    }
+  } catch (e) {
+    console.error(`[sweeper] auto-retry pass FAILED (sim_job ${job.id}): ${errorMessage(e)}`);
+  }
+}
+
 async function ingestCompletedJob(db: DB, engine: EngineClient, job: SimJobRow): Promise<void> {
   if (!job.engineJobId) return;
   const result = await engine.getResult(job.engineJobId);
@@ -869,6 +896,9 @@ async function ingestCompletedJob(db: DB, engine: EngineClient, job: SimJobRow):
     .set({ status: "done", engineState: "completed", error: null, ingestedAt: new Date(), finishedAt: new Date() })
     .where(reconcilableJobWhere(job.id));
   await submitUransRetryForJob(db, engine, job);
+  // Amendment B: a COMPLETED job can still ship individual crashed points
+  // (per-case solver error → failed rows) — same one-shot requeue.
+  await autoRetryFailedPointsForJob(db, job);
   await settleCampaignAfterRefresh(db, job);
 }
 
@@ -1010,6 +1040,7 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
     logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, "never submitted to the engine; rows failed");
     await failJob(db, job.id, failure);
     await settleUransLadderForJob(db, job);
+    await autoRetryFailedPointsForJob(db, job);
     return;
   }
   let result: JobResult;
@@ -1020,6 +1051,7 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
     logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, `result payload unreadable (${errorMessage(e)}); rows failed with the status message`);
     await failJob(db, job.id, failure);
     await settleUransLadderForJob(db, job);
+    await autoRetryFailedPointsForJob(db, job);
     return;
   }
   // The ENGINE's own failure message wins (gate incident 2026-07-07: the
@@ -1046,9 +1078,11 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       await failJob(db, job.id, failure);
       if (ingested.attempts === 0) {
         // True crash: the payload shipped no evidence at all — current
-        // terminal-fail behavior, now loud.
+        // terminal-fail behavior, now loud. The exact crash-class shape the
+        // auto-retry-once amendment covers.
         await settleUransLadderForJob(db, job);
         logEngineJobFailed(job, failure, ingested, "no shipped evidence; rows failed");
+        await autoRetryFailedPointsForJob(db, job);
         return;
       }
       // All-rejected job (gate incident 2026-07-07, job a2379532): points: []
@@ -1067,6 +1101,9 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       await settleUransLadderForJob(db, job);
       logEngineJobFailed(job, failure, ingested, "attempt evidence kept on the failed rows; gated URANS retry evaluated");
       await submitUransRetryForJob(db, engine, job);
+      // Amendment B: rows the wave-2 retry did NOT claim get their one
+      // automatic requeue (after the refresh — at-ingest verdicts preserved).
+      await autoRetryFailedPointsForJob(db, job);
       await settleCampaignAfterRefresh(db, job);
       return;
     }
@@ -1079,6 +1116,8 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       .where(reconcilableJobWhere(job.id));
     logEngineJobFailed(job, failure, ingested, "partial evidence ingested; failed rows carry the engine message");
     await submitUransRetryForJob(db, engine, job);
+    // Amendment B: crashed points of a partially-failed job requeue once.
+    await autoRetryFailedPointsForJob(db, job);
     await settleCampaignAfterRefresh(db, job);
   } catch (e) {
     // Loud, never silent (the old bare catch was exactly how a mid-ingest
@@ -1086,6 +1125,7 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
     logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, `failed-result ingest errored (${errorMessage(e)}); rows failed`);
     await failJob(db, job.id, failure);
     await settleUransLadderForJob(db, job);
+    await autoRetryFailedPointsForJob(db, job);
   }
 }
 

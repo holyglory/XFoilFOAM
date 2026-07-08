@@ -23,8 +23,11 @@ import type { DB } from "./client";
 import {
   campaignOpenTierCounts,
   type CampaignPhase,
+  campaignReviewBucketRows,
+  type CampaignReviewBuckets,
   type CampaignTierCounts,
   deriveCampaignPhase,
+  reviewBucketsByCampaign,
 } from "./urans-ladder";
 import {
   airfoils,
@@ -1089,10 +1092,17 @@ export interface CampaignProgressTotals {
  *                AND classification IS NOT 'rejected'
  *   - rejected:  state = 'terminal' AND NOT derived AND result.status = 'done'
  *                AND result_classifications.state = 'rejected'
- *   - failed:    state = 'terminal' AND result.status = 'failed'
+ *   - failed:    state = 'terminal' AND NOT derived AND result.status = 'failed'
+ *                (a failed source's mirror is counted in `derived`, NOT here —
+ *                counting it in both double-books the cell in the remaining
+ *                arithmetic and makes the failed chip exceed its Points-tab
+ *                click-through list, which lists source rows only)
  *   - running:   state = 'requested' AND live-cell result.status IN (queued, running)
  *   - superseded: result_classifications.state = 'superseded_by_urans'
- *   - derived:   state = 'terminal' AND derived
+ *   - derived:   state = 'terminal' AND derived — ALL terminal mirrors,
+ *                whatever their source's disposition (done OR failed), so
+ *                remaining = requested - solved - derived - failed - rejected
+ *                stays balanced
  *  (result joined ON r.id = p.result_id; live joined ON the cell key.)
  *
  *  This wrapper additionally DELETEs the campaign's progress rows first so that
@@ -2979,6 +2989,11 @@ export interface CampaignListItem {
   conditionCount: number;
   airfoilCount: number;
   totals: CampaignProgressTotals;
+  /** Semantic split of the rejected/failed review surface (amendment A):
+   *  awaitingUrans = tier-1 rejects queued for stage 2 (violet, calm);
+   *  needsReview = failed-after-auto-retry + urans-rejected with nothing
+   *  further scheduled (red chip only when > 0). */
+  reviewBuckets: CampaignReviewBuckets;
 }
 
 const isoOf = (v: Date | string | null): string | null => (v == null ? null : v instanceof Date ? v.toISOString() : v);
@@ -3015,6 +3030,10 @@ export async function listCampaigns(
     LIMIT ${limit} OFFSET ${offset}
   `)) as unknown as Array<Record<string, unknown>>;
   const total = Number(rows[0]?.total ?? 0);
+  const reviewBuckets = await reviewBucketsByCampaign(
+    db,
+    rows.map((r) => String(r.id)),
+  );
   return {
     total,
     items: rows.map((r) => ({
@@ -3041,6 +3060,7 @@ export async function listCampaigns(
         rejected: Number(r.rejected),
         remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed) - Number(r.rejected)),
       },
+      reviewBuckets: reviewBuckets.get(String(r.id)) ?? { awaitingUrans: 0, needsReview: 0 },
     })),
   };
 }
@@ -3066,6 +3086,8 @@ export interface CampaignConditionSummary {
   drift: boolean;
   gainedEvidenceAfterRelease: boolean;
   counters: CampaignProgressTotals;
+  /** Per-condition semantic split of the rejected/failed surface (amendment A). */
+  reviewBuckets: CampaignReviewBuckets;
 }
 
 export interface CampaignSummary {
@@ -3087,6 +3109,9 @@ export interface CampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  /** Semantic review-bucket split (amendment A): violet awaiting-URANS segment
+   *  + the red "needs review · N" chip (chip renders ONLY when N > 0). */
+  reviewBuckets: CampaignReviewBuckets;
   /** Fidelity ladder per-tier open counts (contract 7). */
   tierCounts: CampaignTierCounts;
   /** Derived ladder phase (contract 7): running_rans → running_precalc →
@@ -3102,6 +3127,19 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
   const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(db, campaignId);
   const totals = await campaignProgressTotals(db, campaignId);
   const tierCounts = await campaignOpenTierCounts(db, campaignId);
+  const reviewBucketRows = await campaignReviewBucketRows(db, campaignId);
+  const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
+    (acc, row) => ({ awaitingUrans: acc.awaitingUrans + row.awaitingUrans, needsReview: acc.needsReview + row.needsReview }),
+    { awaitingUrans: 0, needsReview: 0 },
+  );
+  const reviewByCondition = new Map<string, CampaignReviewBuckets>();
+  for (const row of reviewBucketRows) {
+    const prev = reviewByCondition.get(row.conditionId) ?? { awaitingUrans: 0, needsReview: 0 };
+    reviewByCondition.set(row.conditionId, {
+      awaitingUrans: prev.awaitingUrans + row.awaitingUrans,
+      needsReview: prev.needsReview + row.needsReview,
+    });
+  }
   const [airfoilCountRow] = (await db.execute(
     sql`SELECT count(*)::int AS n FROM sim_campaign_airfoils WHERE campaign_id = ${campaignId}`,
   )) as unknown as Array<{ n: number }>;
@@ -3171,6 +3209,7 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
       rateBaselineAt: typeof summaryRateBaseline === "string" ? summaryRateBaseline : isoOf(revision.createdAt),
     },
     totals,
+    reviewBuckets,
     tierCounts,
     phase: deriveCampaignPhase(campaign.status, tierCounts),
     airfoilCount: Number(airfoilCountRow?.n ?? 0),
@@ -3204,6 +3243,7 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
         rejected: Number(r.rejected),
         remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed) - Number(r.rejected)),
       },
+      reviewBuckets: reviewByCondition.get(String(r.id)) ?? { awaitingUrans: 0, needsReview: 0 },
     })),
     lanesSummary,
   };
@@ -3214,7 +3254,7 @@ export interface CampaignAirfoilRow {
   slug: string;
   name: string;
   isSymmetric: boolean;
-  perCondition: Array<{ conditionId: string } & CampaignProgressTotals>;
+  perCondition: Array<{ conditionId: string } & CampaignProgressTotals & CampaignReviewBuckets>;
 }
 
 /** Keyset matrix rows by airfoil slug (spec §10, cursor = last slug). */
@@ -3242,9 +3282,18 @@ export async function campaignAirfoilRows(
     .select()
     .from(simCampaignProgress)
     .where(and(eq(simCampaignProgress.campaignId, campaignId), inArray(simCampaignProgress.airfoilId, ids)));
+  // Per-cell review-bucket split (amendment A): the matrix recolors rejected
+  // cells violet (awaiting URANS) vs red (needs review) from the same
+  // canonical predicate the summary/dashboard use.
+  const reviewRows = await campaignReviewBucketRows(db, campaignId, { airfoilIds: ids });
+  const reviewByCell = new Map<string, CampaignReviewBuckets>();
+  for (const row of reviewRows) {
+    reviewByCell.set(`${row.airfoilId}:${row.conditionId}`, { awaitingUrans: row.awaitingUrans, needsReview: row.needsReview });
+  }
   const byAirfoil = new Map<string, CampaignAirfoilRow["perCondition"]>();
   for (const row of progressRows) {
     const bucket = byAirfoil.get(row.airfoilId) ?? [];
+    const review = reviewByCell.get(`${row.airfoilId}:${row.conditionId}`) ?? { awaitingUrans: 0, needsReview: 0 };
     bucket.push({
       conditionId: row.conditionId,
       requested: row.requested,
@@ -3255,6 +3304,8 @@ export async function campaignAirfoilRows(
       derived: row.derived,
       rejected: row.rejected,
       remaining: Math.max(0, row.requested - row.solved - row.derived - row.failed - row.rejected),
+      awaitingUrans: review.awaitingUrans,
+      needsReview: review.needsReview,
     });
     byAirfoil.set(row.airfoilId, bucket);
   }

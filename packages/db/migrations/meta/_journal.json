@@ -253,6 +253,20 @@
       "when": 1783987200000,
       "tag": "0035_cl_max_refinement_objective",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1784073600000,
+      "tag": "0036_auto_retry_marker",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1784073600001,
+      "tag": "0037_urans_continuation",
+      "breakpoints": true
     }
   ]
 }

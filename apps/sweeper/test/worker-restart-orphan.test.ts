@@ -325,24 +325,42 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
     genuineCampaignId = await launchCampaign(`${PREFIX} genuine campaign`, 20, `${PREFIX}-genuine-key`);
     const { jobId, entry } = await composeAndSubmit(genuineCampaignId, `${PREFIX}-genuine-engine-job`);
 
-    const genuineEngine = {
-      getQueue: async () => {
-        throw new Error("queue unavailable in test");
-      },
-      getJob: async (): Promise<JobStatus> => ({
-        job_id: `${PREFIX}-genuine-engine-job`,
-        state: "failed",
-        total_cases: ANGLES.length,
-        completed_cases: 0,
-        message: MSG,
-      }),
-      // tasks.py exception path: failed result with a message and no polars.
-      getResult: async (): Promise<JobResult> => ({ job_id: `${PREFIX}-genuine-engine-job`, state: "failed", message: MSG, polars: [] }),
-    } as unknown as EngineClient;
+    const genuineEngine = (engineJobId: string): EngineClient =>
+      ({
+        getQueue: async () => {
+          throw new Error("queue unavailable in test");
+        },
+        getJob: async (): Promise<JobStatus> => ({
+          job_id: engineJobId,
+          state: "failed",
+          total_cases: ANGLES.length,
+          completed_cases: 0,
+          message: MSG,
+        }),
+        // tasks.py exception path: failed result with a message and no polars.
+        getResult: async (): Promise<JobResult> => ({ job_id: engineJobId, state: "failed", message: MSG, polars: [] }),
+      }) as unknown as EngineClient;
 
-    await reconcile(db, genuineEngine, { jobIds: [jobId], skipFailedRecovery: true });
+    await reconcile(db, genuineEngine(`${PREFIX}-genuine-engine-job`), { jobIds: [jobId], skipFailedRecovery: true });
 
-    // Rows fail WITH the engine message — never empty.
+    // Amendment B (auto-retry-once): the FIRST genuine crash requeues the
+    // cells — pending with the marker and the engine message kept as evidence.
+    const firstRows = await db
+      .select({ status: results.status, error: results.error, autoRetriedAt: results.autoRetriedAt })
+      .from(results)
+      .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, entry.revisionId)));
+    expect(firstRows.length).toBe(ANGLES.length);
+    for (const row of firstRows) {
+      expect(row.status).toBe("pending");
+      expect(row.autoRetriedAt).not.toBeNull();
+      expect(row.error).toBe(MSG);
+    }
+
+    // The SECOND crash exhausts the automatic retry: rows terminal-fail WITH
+    // the engine message — never empty.
+    const { jobId: secondJobId } = await composeAndSubmit(genuineCampaignId, `${PREFIX}-genuine-engine-job-2`);
+    await reconcile(db, genuineEngine(`${PREFIX}-genuine-engine-job-2`), { jobIds: [secondJobId], skipFailedRecovery: true });
+
     const rows = await db
       .select({ status: results.status, error: results.error })
       .from(results)

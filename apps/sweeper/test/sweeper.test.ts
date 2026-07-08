@@ -2460,11 +2460,18 @@ describe("sweeper: gap → claim → ingest", () => {
 
     await reconcile(db, failedEngine, { jobIds: [job.id], skipFailedRecovery: true });
 
-    const rows = await db.select({ status: results.status, error: results.error }).from(results).where(inArray(results.id, rowIds));
+    const rows = await db
+      .select({ status: results.status, error: results.error, autoRetriedAt: results.autoRetriedAt })
+      .from(results)
+      .where(inArray(results.id, rowIds));
     expect(rows.length).toBe(aoas.length);
     for (const row of rows) {
-      expect(row.status).toBe("failed");
-      expect(row.error).toBe(MSG); // exact engine message — never empty, never 'unknown'-classed
+      // Amendment B (auto-retry-once): a first crash requeues the cell — the
+      // row returns to pending WITH the marker and the exact engine message
+      // kept as crash evidence (never empty, never 'unknown'-classed).
+      expect(row.status).toBe("pending");
+      expect(row.autoRetriedAt).not.toBeNull();
+      expect(row.error).toBe(MSG);
       expect((row.error ?? "").trim().length).toBeGreaterThan(0);
     }
     const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
@@ -2559,8 +2566,14 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(solvedRow.status).toBe("done"); // real partial evidence survives the failure
     expect(solvedRow.cl).toBeCloseTo(0.42, 8);
     expect(solvedRow.error).toBeNull();
-    const [failedRow] = await db.select({ status: results.status, error: results.error }).from(results).where(eq(results.id, rowIds[1]));
-    expect(failedRow.status).toBe("failed");
+    const [failedRow] = await db
+      .select({ status: results.status, error: results.error, autoRetriedAt: results.autoRetriedAt })
+      .from(results)
+      .where(eq(results.id, rowIds[1]));
+    // Amendment B: the crashed point requeues once — pending with the marker;
+    // the propagated job-level message stays on the row (never empty).
+    expect(failedRow.status).toBe("pending");
+    expect(failedRow.autoRetriedAt).not.toBeNull();
     expect(failedRow.error).toBe(MSG); // job-level message propagated — never empty
     const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
     expect(gotJob.status).toBe("failed");

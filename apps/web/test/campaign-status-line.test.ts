@@ -23,9 +23,11 @@ function summary(overrides: {
   rejected?: number;
   closedWithFailedCount?: number | null;
   closedWithRejectedCount?: number | null;
+  reviewBuckets?: { awaitingUrans: number; needsReview: number };
 }): AdminCampaignSummary {
   const now = new Date().toISOString();
   return {
+    ...(overrides.reviewBuckets ? { reviewBuckets: overrides.reviewBuckets } : {}),
     campaign: {
       status: overrides.status ?? "active",
       closedWithFailedCount: overrides.closedWithFailedCount ?? null,
@@ -220,7 +222,7 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
   });
 });
 
-describe("campaignStatusLine — attention covers rejected points", () => {
+describe("campaignStatusLine — attention covers rejected points (legacy payloads without the split)", () => {
   it("names rejected points in the attention copy", () => {
     const line = campaignStatusLine(summary({ status: "attention", rejected: 3, failed: 0 }));
     expect(line.tone).toBe("red");
@@ -231,5 +233,41 @@ describe("campaignStatusLine — attention covers rejected points", () => {
     const line = campaignStatusLine(summary({ status: "attention", rejected: 2, failed: 1 }));
     expect(line.text).toContain("1 failed");
     expect(line.text).toContain("2 rejected");
+  });
+});
+
+// Amendment-A split (approved design c19fd74a): red strictly for
+// needs-review evidence; an awaiting-URANS-only attention state is the calm
+// violet stage-2 queue — never a false red.
+describe("campaignStatusLine — attention with the reviewBuckets split", () => {
+  it("needs-review points drive the red copy (awaiting listed alongside)", () => {
+    const line = campaignStatusLine(
+      summary({ status: "attention", rejected: 5, failed: 1, reviewBuckets: { awaitingUrans: 3, needsReview: 2 } }),
+    );
+    expect(line.tone).toBe("red");
+    expect(line.text).toBe("All obligated work is terminal — 2 points need review · 3 awaiting URANS.");
+  });
+
+  it("MUST-CATCH: awaiting-URANS-only attention is VIOLET, never red, no 'review' wording", () => {
+    const line = campaignStatusLine(
+      summary({ status: "attention", rejected: 3, failed: 0, reviewBuckets: { awaitingUrans: 3, needsReview: 0 } }),
+    );
+    expect(line.tone).toBe("violet");
+    expect(line.text).toBe("All obligated work is terminal — 3 points awaiting URANS.");
+    expect(line.text).not.toContain("review");
+  });
+
+  it("singular copy for one needs-review point", () => {
+    const line = campaignStatusLine(
+      summary({ status: "attention", failed: 1, reviewBuckets: { awaitingUrans: 0, needsReview: 1 } }),
+    );
+    expect(line.text).toBe("All obligated work is terminal — 1 point needs review.");
+  });
+
+  it("empty split buckets fall back to the legacy failed/rejected copy", () => {
+    const line = campaignStatusLine(
+      summary({ status: "attention", failed: 2, reviewBuckets: { awaitingUrans: 0, needsReview: 0 } }),
+    );
+    expect(line.text).toContain("2 failed");
   });
 });

@@ -19,7 +19,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 
-import { type AdminUransRequest, getPointHistory, getPointStory, getUransRequests, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
+import { type AdminUransRequest, continueUransResult, getPointHistory, getPointStory, getUransRequests, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
 import { getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import {
@@ -38,6 +38,8 @@ import {
   type PointVerifyInfo,
   POINT_ERROR_CLASSES,
   POINT_STATUS_CHIPS,
+  statusChipDisplay,
+  type StatusChipTone,
   type TimelineTone,
 } from "@/lib/point-history";
 import { C, MONO } from "@/lib/tokens";
@@ -73,12 +75,14 @@ const selectStyle: CSSProperties = {
 const toneColor = (tone: TimelineTone): string =>
   tone === "teal" ? C.teal : tone === "amber" ? C.amber : tone === "red" ? C.redText : C.dim;
 
-function statusChipStyle(active: boolean, tone: "teal" | "amber" | "red" | "muted"): CSSProperties {
-  const color = tone === "teal" ? C.teal : tone === "amber" ? C.amber : tone === "red" ? C.redText : C.muted;
+const toneToColor = (tone: StatusChipTone): string =>
+  tone === "teal" ? C.teal : tone === "amber" ? C.amber : tone === "red" ? C.redText : tone === "violet" ? C.violet : C.muted;
+
+function statusChipStyle(active: boolean, tone: StatusChipTone): CSSProperties {
   return {
     fontFamily: MONO,
     fontSize: 10,
-    color: active ? color : C.muted,
+    color: active ? toneToColor(tone) : C.muted,
     background: active ? C.tealFill : C.panel3,
     border: `1px solid ${active ? C.tealBorder : C.stroke}`,
     borderRadius: 999,
@@ -88,10 +92,13 @@ function statusChipStyle(active: boolean, tone: "teal" | "amber" | "red" | "mute
   };
 }
 
-const CHIP_TONES: Record<string, "teal" | "amber" | "red" | "muted"> = {
+// Amendment-A chip row: the raw 'rejected' chip is replaced by the calm
+// violet 'awaiting URANS' + red 'needs review' split (design c19fd74a).
+const CHIP_TONES: Record<string, StatusChipTone> = {
   all: "muted",
   failed: "red",
-  rejected: "red",
+  awaiting_urans: "violet",
+  needs_review: "red",
   accepted: "teal",
   needs_urans: "amber",
   solving: "amber",
@@ -100,20 +107,34 @@ const CHIP_TONES: Record<string, "teal" | "amber" | "red" | "muted"> = {
 const CHIP_LABELS: Record<string, string> = {
   all: "all",
   failed: "failed",
-  rejected: "rejected",
+  awaiting_urans: "awaiting URANS",
+  needs_review: "needs review",
   accepted: "accepted",
   needs_urans: "needs URANS",
   solving: "solving",
 };
 
 function rowStatusChip(item: PointHistoryItem) {
-  const label =
-    item.kind === "derived" ? "derived" : item.bucket === "other" ? item.status : CHIP_LABELS[item.bucket] ?? item.status;
-  const tone =
-    item.kind === "derived" ? C.dim : item.bucket === "failed" || item.bucket === "rejected" ? C.redText : item.bucket === "accepted" ? C.teal : item.bucket === "solving" || item.bucket === "needs_urans" ? C.amber : C.muted;
+  if (item.kind === "derived") {
+    return (
+      <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+        derived
+      </span>
+    );
+  }
+  if (item.bucket === "other") {
+    return (
+      <span style={{ fontFamily: MONO, fontSize: 9, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+        {item.status}
+      </span>
+    );
+  }
+  // Amendment-A recolor: rejected rows split into violet awaiting-URANS /
+  // red needs-review / amber rescheduled by the server-derived reviewBucket.
+  const view = statusChipDisplay(item.bucket, item.reviewBucket ?? null);
   return (
-    <span style={{ fontFamily: MONO, fontSize: 9, color: tone, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
-      {label}
+    <span style={{ fontFamily: MONO, fontSize: 9, color: toneToColor(view.tone), border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+      {view.label}
     </span>
   );
 }
@@ -356,15 +377,33 @@ export function PointHistoryPanel() {
       });
   }, []);
 
-  const requeueEligible =
+  // ---- per-point repair actions (approved design D: repair verbs live HERE,
+  // not in the campaign header) ----
+  // Retry: crash-class failed points (any surviving failed row already
+  // consumed its automatic retry or predates the feature).
+  const retryEligible = story != null && story.point.status === "failed";
+  // Continue: budget-exhausted rejected urans rows with saved case state
+  // (server-derived `continuable` — never guessed client-side).
+  const continueEligible = story != null && story.point.continuable;
+  // Legacy requeue stays ONLY for red needs-review rejected rows that cannot
+  // be continued (no saved case state). Calm awaiting-URANS rows and
+  // rescheduled rejected rows get NO repair verbs — stage 2 handles them.
+  const requeueRejectedEligible =
     story != null &&
-    story.point.status !== "derived" &&
-    (story.point.status === "failed" || (story.point.status === "done" && story.point.classification?.state === "rejected"));
+    !continueEligible &&
+    story.point.status === "done" &&
+    story.point.classification?.state === "rejected" &&
+    story.point.reviewBucket === "needs_review";
+  const requeueEligible = retryEligible || requeueRejectedEligible;
 
   const doRequeue = useCallback(async () => {
     const item = openItemRef.current;
     if (!item || requeueBusy) return;
-    if (!window.confirm(`Requeue this point (${item.airfoilName} α ${item.aoaDeg}°)? Its failed/rejected evidence returns to the solve queue.`)) return;
+    const retry = openItemRef.current?.status === "failed" || story?.point.status === "failed";
+    const prompt = retry
+      ? `Retry this point (${item.airfoilName} α ${item.aoaDeg}°)? The crashed evidence returns to the solve queue for a fresh attempt.`
+      : `Requeue this point (${item.airfoilName} α ${item.aoaDeg}°)? Its rejected evidence returns to the solve queue.`;
+    if (!window.confirm(prompt)) return;
     setRequeueBusy(true);
     setRequeueNotice(null);
     try {
@@ -378,7 +417,40 @@ export function PointHistoryPanel() {
     } finally {
       setRequeueBusy(false);
     }
-  }, [requeueBusy, openStory, fetchFirstPage]);
+  }, [requeueBusy, story, openStory, fetchFirstPage]);
+
+  // Continuation (amendment C): resume the budget-stopped URANS solve from
+  // its saved engine case state with an increased wall-clock budget.
+  const [continueBusy, setContinueBusy] = useState(false);
+  const doContinue = useCallback(
+    async (extraHours: 2 | 6) => {
+      const item = openItemRef.current;
+      if (!item || continueBusy) return;
+      if (
+        !window.confirm(
+          `Continue this URANS solve (${item.airfoilName} α ${item.aoaDeg}°) from its saved case state with a +${extraHours} h wall-clock budget? It resumes from the last written time step (no work is redone) and re-enters the queue at precalc rank.`,
+        )
+      )
+        return;
+      setContinueBusy(true);
+      setRequeueNotice(null);
+      try {
+        const res = await continueUransResult(item.resultId, extraHours * 3600);
+        setRequeueNotice(
+          res.created
+            ? `continuation queued (+${extraHours} h) — resumes from the saved case state after all RANS gaps`
+            : `already queued — the open continuation request is reused (${res.request.state})`,
+        );
+        openStory(item);
+        void fetchFirstPage(filtersRef.current);
+      } catch (e) {
+        setRequeueNotice(isAdminApiError(e) ? e.message : (e as Error).message);
+      } finally {
+        setContinueBusy(false);
+      }
+    },
+    [continueBusy, openStory, fetchFirstPage],
+  );
 
   // ---- request-URANS (fidelity ladder contract 6) ----
   // Close any open row overflow menu on outside click.
@@ -468,6 +540,8 @@ export function PointHistoryPanel() {
             status: story.point.status,
             bucket: bucketOfPoint(story.point.status, story.point.classification?.state ?? null),
             classificationState: story.point.classification?.state ?? null,
+            reviewBucket: story.point.reviewBucket,
+            continuable: story.point.continuable,
           }
         : openItem;
   const headerChipsPending = openItem != null && openItem.kind === "result" && openItem.status === "derived" && !storyMatchesOpen;
@@ -772,22 +846,50 @@ export function PointHistoryPanel() {
                 )}
             </div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              <button
-                type="button"
-                data-testid="point-requeue"
-                disabled={!requeueEligible || requeueBusy}
-                title={requeueEligible ? "Reset this point's failed/rejected evidence back to the solve queue" : "Only failed or rejected points can be requeued"}
-                onClick={() => void doRequeue()}
-                style={{
-                  ...smallBtn,
-                  color: requeueEligible ? C.redText : C.dimmest,
-                  borderColor: requeueEligible ? "rgba(245, 101, 101, 0.4)" : C.stroke,
-                  opacity: requeueBusy ? 0.6 : 1,
-                  cursor: requeueEligible ? "pointer" : "not-allowed",
-                }}
-              >
-                {requeueBusy ? "requeueing…" : "requeue point"}
-              </button>
+              {/* Repair verbs (design D): Retry for crashes, Continue for
+                  budget-exhausted continuable solves, legacy requeue only for
+                  non-continuable needs-review rejects. Calm awaiting-URANS
+                  rows show none of these. */}
+              {requeueEligible && (
+                <button
+                  type="button"
+                  data-testid="point-requeue"
+                  disabled={requeueBusy}
+                  title={
+                    retryEligible
+                      ? "This crash survived its automatic retry — send it back to the solve queue for a fresh attempt"
+                      : "Reset this point's rejected evidence back to the solve queue"
+                  }
+                  onClick={() => void doRequeue()}
+                  style={{
+                    ...smallBtn,
+                    color: C.redText,
+                    borderColor: "rgba(245, 101, 101, 0.4)",
+                    opacity: requeueBusy ? 0.6 : 1,
+                  }}
+                >
+                  {requeueBusy ? "requeueing…" : retryEligible ? "Retry" : "requeue point"}
+                </button>
+              )}
+              {continueEligible &&
+                ([2, 6] as const).map((h) => (
+                  <button
+                    key={h}
+                    type="button"
+                    data-testid={`point-continue-${h}h`}
+                    disabled={continueBusy}
+                    title={`This URANS solve was stopped by the wall-clock budget guard with its case state saved — resume it from the last written time step with +${h} h of budget`}
+                    onClick={() => void doContinue(h)}
+                    style={{
+                      ...smallBtn,
+                      color: C.violet,
+                      borderColor: C.violetBorder,
+                      opacity: continueBusy ? 0.6 : 1,
+                    }}
+                  >
+                    {continueBusy ? "queueing…" : `Continue +${h}h`}
+                  </button>
+                ))}
               <button type="button" data-testid="point-solver-results" onClick={openSolverResults} style={{ ...smallBtn, color: C.teal, borderColor: C.tealBorder }}>
                 solver results ▸
               </button>

@@ -36,7 +36,9 @@ export interface CampaignStatusView {
    *  small secondary chip whenever `gate` is present. */
   lifecycle: string;
   text: string;
-  tone: "teal" | "amber" | "red" | "dim";
+  /** violet = the calm awaiting-URANS-only attention state (amendment A):
+   *  nothing needs a human, the stage-2 queue just has not run yet. */
+  tone: "teal" | "amber" | "red" | "dim" | "violet";
 }
 
 /** Gate badge from the GLOBAL solver derivation (lib/solver-state) — used by
@@ -149,6 +151,28 @@ export function campaignStatusLine(s: AdminCampaignSummary, nowMs: number = Date
       return { gate: null, lifecycle, text: "Completed — every obligated point is terminal.", tone: "teal" };
     }
     case "attention": {
+      // Amendment-A split when the payload carries it: red strictly for
+      // needs-review evidence; an awaiting-URANS-only attention state is the
+      // calm violet stage-2 queue, never a false red.
+      const rb = s.reviewBuckets;
+      if (rb && (rb.needsReview > 0 || rb.awaitingUrans > 0)) {
+        if (rb.needsReview > 0) {
+          const suffix = rb.awaitingUrans > 0 ? ` · ${fCount(rb.awaitingUrans)} awaiting URANS` : "";
+          return {
+            gate: null,
+            lifecycle,
+            text: `All obligated work is terminal — ${fCount(rb.needsReview)} point${rb.needsReview === 1 ? "" : "s"} need${rb.needsReview === 1 ? "s" : ""} review${suffix}.`,
+            tone: "red",
+          };
+        }
+        return {
+          gate: null,
+          lifecycle,
+          text: `All obligated work is terminal — ${fCount(rb.awaitingUrans)} point${rb.awaitingUrans === 1 ? "" : "s"} awaiting URANS.`,
+          tone: "violet",
+        };
+      }
+      // Older payloads (no reviewBuckets): the pre-split failed/rejected copy.
       const parts: string[] = [];
       if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
       if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);

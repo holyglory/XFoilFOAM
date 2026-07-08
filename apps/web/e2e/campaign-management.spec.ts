@@ -266,6 +266,9 @@ test.describe.serial("simulation campaigns: wizard, plan edits, routing, refinem
 
     await page.goto(`/admin?campaign=${id}`);
     await expect(page.getByTestId("campaign-detail")).toBeVisible();
+    // Plan-edit verbs live in the "⋯" overflow (approved design D: one
+    // visible primary lifecycle action, everything else behind the overflow).
+    await page.getByTestId("campaign-actions-overflow").click();
     await page.getByTestId("campaign-action-edit-conditions").click();
     const dialog = page.getByTestId("plan-edit-dialog-conditions");
     await expect(dialog).toBeVisible();
@@ -373,7 +376,15 @@ test.describe.serial("simulation campaigns: wizard, plan edits, routing, refinem
 
     await page.goto(`/admin?campaign=${id}`);
     await expect(page.getByTestId("campaign-detail")).toBeVisible();
-    await expect(page.getByText(/max L\/D ±0\.10°/)).toBeVisible(); // objective chip in the header
+    // Objective chips are technical plan detail — behind the details
+    // disclosure since the pipeline-hero redesign (approved design c19fd74a).
+    await page.getByTestId("campaign-details-toggle").click();
+    // The disclosure is URL-owned (?cdetails=1, same contract as ?flog=1):
+    // reload must land with the details still open.
+    await expect(page).toHaveURL(/[?&]cdetails=1/);
+    await expect(page.getByText(/max L\/D ±0\.10?°/)).toBeVisible(); // objective chip in plan details
+    await page.reload();
+    await expect(page.getByTestId("campaign-details")).toBeVisible();
 
     const board = page.getByTestId("refinement-board");
     await expect(board).toBeVisible();

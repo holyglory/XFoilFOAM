@@ -2815,29 +2815,100 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // sweeper schedules at PRECALC rank (after all RANS gaps, before the verify
   // queue). aoaDeg absent = whole polar. Idempotent per (cell, fidelity) —
   // replaying returns the existing open request with created=false.
+  //
+  // CONTINUATION mode (amendment C): { continueFromResultId, budgetOverrideS? }
+  // resumes a budget-stopped URANS solve from its saved engine case state with
+  // an increased wall-clock budget (+2h/+6h UI choices). The cell, angle and
+  // fidelity derive from the SOURCE results row — the client names only the
+  // row it is continuing.
   app.post("/api/admin/urans-requests", { preHandler: requireAdmin }, async (req, reply) => {
     const parsed = z
       .object({
-        airfoilId: z.string().uuid(),
-        revisionId: z.string().uuid(),
+        airfoilId: z.string().uuid().optional(),
+        revisionId: z.string().uuid().optional(),
         aoaDeg: z.number().finite().optional(),
-        fidelity: z.enum(["precalc", "full"]),
+        fidelity: z.enum(["precalc", "full"]).optional(),
+        continueFromResultId: z.string().uuid().optional(),
+        // 1 min .. 24 h — mirrors the engine's URANS_BUDGET_OVERRIDE_MAX_S
+        // (models.py, le=86400): a larger value would be accepted here, queued,
+        // then 422-rejected at engine submit and the request cancelled. Reject
+        // it up front instead.
+        budgetOverrideS: z.number().int().min(60).max(24 * 3600).optional(),
       })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "invalid request" });
-    const [airfoil] = await db.select({ id: airfoils.id }).from(airfoils).where(eq(airfoils.id, parsed.data.airfoilId)).limit(1);
+    const body = parsed.data;
+
+    if (body.continueFromResultId) {
+      const [source] = await db
+        .select({
+          id: results.id,
+          airfoilId: results.airfoilId,
+          revisionId: results.simulationPresetRevisionId,
+          aoaDeg: results.aoaDeg,
+          fidelity: results.fidelity,
+          regime: results.regime,
+          engineJobId: results.engineJobId,
+          engineCaseSlug: results.engineCaseSlug,
+        })
+        .from(results)
+        .where(eq(results.id, body.continueFromResultId))
+        .limit(1);
+      if (!source) return reply.code(404).send({ error: "continuation source result not found" });
+      if (source.regime !== "urans" && !(source.fidelity ?? "").startsWith("urans")) {
+        return reply.code(422).send({ error: "only URANS solves can be continued" });
+      }
+      if (!source.engineJobId || !source.engineCaseSlug) {
+        return reply.code(422).send({ error: "continuation source has no saved engine case state (engine ids missing)" });
+      }
+      if (!source.revisionId) {
+        return reply.code(422).send({ error: "continuation source has no pinned simulation revision" });
+      }
+      const { request, created } = await createUransRequest(db, {
+        airfoilId: source.airfoilId,
+        revisionId: source.revisionId,
+        aoaDeg: source.aoaDeg,
+        // The resumed run keeps the tier the evidence was solved at.
+        fidelity: body.fidelity ?? (source.fidelity === "urans_full" ? "full" : "precalc"),
+        requestedBy: sessionEmail(req),
+        continueFromResultId: source.id,
+        budgetOverrideS: body.budgetOverrideS ?? null,
+      });
+      // Idempotency is per (cell, fidelity): a reused open item that is NOT a
+      // continuation of this result would run a FRESH solve, silently
+      // discarding the saved case state the admin asked to resume. Refuse
+      // honestly instead of presenting a from-scratch job as a resume.
+      if (!created && request.continueFromResultId !== source.id) {
+        return reply.code(409).send({
+          error:
+            request.continueFromResultId == null
+              ? `an open ${request.state} URANS request already covers this cell and is NOT a continuation — it will solve from scratch; wait for it to settle (or cancel it) before queuing this resume`
+              : `an open ${request.state} URANS request already covers this cell but continues a different result; wait for it to settle before queuing this resume`,
+          request,
+        });
+      }
+      return reply.code(created ? 201 : 200).send({ request, created });
+    }
+
+    if (body.budgetOverrideS != null) {
+      return reply.code(400).send({ error: "budgetOverrideS is only valid with continueFromResultId (continuation mode)" });
+    }
+    if (!body.airfoilId || !body.revisionId || !body.fidelity) {
+      return reply.code(400).send({ error: "airfoilId, revisionId and fidelity are required (or pass continueFromResultId)" });
+    }
+    const [airfoil] = await db.select({ id: airfoils.id }).from(airfoils).where(eq(airfoils.id, body.airfoilId)).limit(1);
     if (!airfoil) return reply.code(404).send({ error: "airfoil not found" });
     const [revision] = await db
       .select({ id: simulationPresetRevisions.id })
       .from(simulationPresetRevisions)
-      .where(eq(simulationPresetRevisions.id, parsed.data.revisionId))
+      .where(eq(simulationPresetRevisions.id, body.revisionId))
       .limit(1);
     if (!revision) return reply.code(404).send({ error: "simulation preset revision not found" });
     const { request, created } = await createUransRequest(db, {
-      airfoilId: parsed.data.airfoilId,
-      revisionId: parsed.data.revisionId,
-      aoaDeg: parsed.data.aoaDeg ?? null,
-      fidelity: parsed.data.fidelity,
+      airfoilId: body.airfoilId,
+      revisionId: body.revisionId,
+      aoaDeg: body.aoaDeg ?? null,
+      fidelity: body.fidelity,
       requestedBy: sessionEmail(req),
     });
     return reply.code(created ? 201 : 200).send({ request, created });

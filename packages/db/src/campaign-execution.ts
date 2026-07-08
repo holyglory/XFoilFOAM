@@ -398,10 +398,19 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
  *                 physics-REJECTED point must never book as solved work)
  *   - rejected:   terminal, non-derived, result.status='done' AND
  *                 result_classifications.state='rejected'
- *   - failed:     terminal, result.status='failed'
+ *   - failed:     terminal, non-derived, result.status='failed' (mirrors are
+ *                 excluded like solved/rejected: a failed source's mirror is
+ *                 terminal-linked to the SAME failed results row, so counting
+ *                 it here double-books the cell — once in derived, once in
+ *                 failed — and the failed chip exceeds its Points-tab
+ *                 click-through list, which lists source rows only)
  *   - running:    requested AND live-cell result.status IN (queued, running)
  *   - superseded: result_classifications.state='superseded_by_urans'
- *   - derived:    terminal AND derived_by_symmetry
+ *   - derived:    terminal AND derived_by_symmetry — ALL terminal mirrors
+ *                 regardless of source disposition: a failed source's mirror
+ *                 sits in derived (not failed), keeping
+ *                 remaining = requested - solved - derived - failed - rejected
+ *                 exactly balanced
  *  Do not diverge these between the incremental and whole-campaign paths — the
  *  first production campaign drifted precisely because two paths disagreed. */
 /** Tuple lists are bounded per statement: beyond this, template flattening
@@ -426,7 +435,7 @@ async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IS DISTINCT FROM 'rejected')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND r.status = 'failed')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed')::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int,
@@ -458,7 +467,7 @@ export async function recomputeProgressForCampaign(db: DB, campaignId: string): 
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IS DISTINCT FROM 'rejected')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND r.status = 'failed')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed')::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int,
@@ -528,6 +537,11 @@ export async function probeCampaignCompletion(db: DB, campaignId: string): Promi
           AND NOT EXISTS (SELECT 1 FROM result_classifications rc2 WHERE rc2.result_id = r.id)
       ) AS awaiting_verdict,
       EXISTS (
+        -- Mirrors are NOT filtered out here (unlike the failed COUNTER, which
+        -- excludes them): an EXISTS is truth-equivalent either way because a
+        -- derived mirror can only be terminal-linked to a failed results row
+        -- alongside its +α source — mirror-exclusion in the counter can never
+        -- hide a failure from this attention gate.
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results r ON r.id = p.result_id
@@ -674,6 +688,95 @@ export async function onResultIngested(db: DB, signal: ResultIngestSignal): Prom
     await probeCampaignCompletion(db, campaignId);
   }
   return laneKeys;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-retry-once (approved design c19fd74a, amendment B): a crash-class
+// failed point (results.status = 'failed') gets ONE automatic requeue before
+// counting as needs_review. Marker = results.auto_retried_at (migration 0036):
+// it lives on the durable cell row so it survives re-ingest of the same failed
+// job (the ingest upsert never writes it), and the retry itself is not a
+// composed job (the row returns to 'pending' and the ordinary gap finders
+// re-claim it), so there is no retry-job payload to stamp at requeue time.
+// ---------------------------------------------------------------------------
+export interface AutoRetriedCell {
+  resultId: string;
+  airfoilId: string;
+  revisionId: string | null;
+  aoaDeg: number;
+  error: string | null;
+}
+
+export interface AutoRetryOutcome {
+  /** Cells flipped back to pending/requested — their ONE automatic retry. */
+  retried: AutoRetriedCell[];
+  /** Cells that failed AGAIN after their automatic retry (marker already
+   *  present): left failed = needs_review. The caller logs these loudly. */
+  escalated: AutoRetriedCell[];
+}
+
+/** Requeue every unmarked failed row of one sim job exactly once:
+ *  result → pending (claim links cleared, marker stamped, error text kept as
+ *  evidence of the crash), linked campaign points → requested, counters
+ *  recomputed. Rows already carrying the marker stay failed and are returned
+ *  as `escalated`. Callers MUST invoke this AFTER every polar-cache refresh of
+ *  the job's ingest path — flipping a row to pending and re-refreshing would
+ *  overwrite its stored at-ingest classification (prod row 741db07a). */
+export async function autoRetryCrashedResultsForJob(db: DB, simJobId: string): Promise<AutoRetryOutcome> {
+  const escalated = (await db.execute(sql`
+    SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+           r.aoa_deg::float8 AS aoa_deg, r.error
+    FROM results r
+    WHERE r.sim_job_id = ${simJobId} AND r.status = 'failed' AND r.auto_retried_at IS NOT NULL
+  `)) as unknown as Array<{ result_id: string; airfoil_id: string; revision_id: string | null; aoa_deg: number; error: string | null }>;
+
+  const retried = (await db.execute(sql`
+    UPDATE results r
+    SET status = 'pending', source = 'queued', sim_job_id = NULL, engine_job_id = NULL,
+        engine_case_slug = NULL, auto_retried_at = now(), "updatedAt" = now()
+    WHERE r.sim_job_id = ${simJobId} AND r.status = 'failed' AND r.auto_retried_at IS NULL
+    RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+              r.aoa_deg::float8 AS aoa_deg, r.error
+  `)) as unknown as Array<{ result_id: string; airfoil_id: string; revision_id: string | null; aoa_deg: number; error: string | null }>;
+
+  if (retried.length) {
+    // Terminal campaign points linked to the requeued rows reopen (the same
+    // reset semantics as requeueSinglePoint, bulk + non-derived only), and the
+    // affected counters recompute idempotently.
+    const keys = (await db.execute(sql`
+      UPDATE sim_campaign_points p
+      SET state = 'requested', "updatedAt" = now()
+      WHERE p.result_id = ANY(${sql`ARRAY[${sql.join(retried.map((r) => sql`${r.result_id}::uuid`), sql`, `)}]`})
+        AND p.state = 'terminal' AND NOT p.derived_by_symmetry
+      RETURNING p.campaign_id, p.condition_id, p.airfoil_id
+    `)) as unknown as ProgressKeyRow[];
+    await recomputeProgressForKeys(db, dedupeProgressKeys(keys));
+    // The completion probe may have flipped the campaign to 'attention' the
+    // instant its last point terminal-failed — BEFORE this retry reopened it.
+    // An attention/completed campaign is invisible to the gap finder
+    // (camp.status = 'active'), which would strand the requeued points
+    // forever. Same re-derivation refreshCampaignCompletion performs: open
+    // requested work ⇒ active.
+    const campaignIds = [...new Set(keys.map((k) => k.campaign_id))];
+    if (campaignIds.length) {
+      await db.execute(sql`
+        UPDATE sim_campaigns c
+        SET status = 'active'
+        WHERE c.id = ANY(${sql`ARRAY[${sql.join(campaignIds.map((id) => sql`${id}::uuid`), sql`, `)}]`})
+          AND c.status IN ('attention', 'completed')
+          AND EXISTS (SELECT 1 FROM sim_campaign_points p WHERE p.campaign_id = c.id AND p.state = 'requested')
+      `);
+    }
+  }
+
+  const toCell = (row: { result_id: string; airfoil_id: string; revision_id: string | null; aoa_deg: number; error: string | null }): AutoRetriedCell => ({
+    resultId: row.result_id,
+    airfoilId: row.airfoil_id,
+    revisionId: row.revision_id,
+    aoaDeg: Number(row.aoa_deg),
+    error: row.error,
+  });
+  return { retried: retried.map(toCell), escalated: escalated.map(toCell) };
 }
 
 // ---------------------------------------------------------------------------
