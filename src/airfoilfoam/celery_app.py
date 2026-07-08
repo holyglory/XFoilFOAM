@@ -5,8 +5,10 @@ import math
 
 from celery import Celery
 
+from typing import Optional
+
 from .config import Settings, get_settings
-from .models import URANS_FIDELITY_BUDGET_S
+from .models import URANS_BUDGET_OVERRIDE_MAX_S, URANS_FIDELITY_BUDGET_S
 
 #: Fixed per-case teardown/overhead margin on top of the solver + media budgets:
 #: meshing, potentialFoam/steady init, y+, foamToVTK conversion, reconstructPar
@@ -15,7 +17,9 @@ from .models import URANS_FIDELITY_BUDGET_S
 TASK_TIME_LIMIT_MARGIN_S = 900
 
 
-def task_hard_time_limit_s(settings: Settings, total_cases: int = 1) -> int:
+def task_hard_time_limit_s(
+    settings: Settings, total_cases: int = 1, budget_override_s: Optional[int] = None
+) -> int:
     """Hard celery wall ceiling for one ``run_polar`` task (LAST-RESORT backstop).
 
     Per-case unit, computed from the SAME config source the runtime budgets
@@ -52,6 +56,13 @@ def task_hard_time_limit_s(settings: Settings, total_cases: int = 1) -> int:
     ``tasks.run_polar`` (same class as boot reconcile / redelivery).
     """
     solver_ceiling = max(settings.solver_timeout, max(URANS_FIDELITY_BUDGET_S.values()))
+    if budget_override_s is not None:
+        # A continuation's per-job budget override (PolarRequest.budget_override_s)
+        # replaces the tier budget for its transient, so the hard ceiling must be
+        # computed from it too (clamped like urans_budget_seconds).
+        solver_ceiling = max(
+            solver_ceiling, min(int(budget_override_s), URANS_BUDGET_OVERRIDE_MAX_S)
+        )
     per_case = 2 * solver_ceiling + settings.media_budget_seconds() + TASK_TIME_LIMIT_MARGIN_S
     return int(math.ceil(per_case * max(1, int(total_cases))))
 

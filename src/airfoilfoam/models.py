@@ -177,6 +177,49 @@ URANS_FIDELITY_BUDGET_S: dict[UransFidelity, int] = {
 #: Mesh resolution scale of the derived precalc URANS mesh.
 URANS_PRECALC_MESH_SCALE = 0.5
 
+#: Sane hard cap on the per-job URANS wall-budget override [s] (24 h). A
+#: continuation submits the INCREASED budget through
+#: ``PolarRequest.budget_override_s``; anything above this cap is rejected at
+#: validation and clamped defensively at budget resolution.
+URANS_BUDGET_OVERRIDE_MAX_S = 86_400
+
+
+class ContinueFrom(BaseModel):
+    """Resume a saved URANS case from a prior engine job (cross-job continuation).
+
+    A URANS transient stopped by the wall-clock budget guard leaves its case
+    directory (mesh, fields at latestTime, coefficient history) intact on the
+    shared volume. A request carrying ``continue_from`` copies that saved case
+    state into the new job and restarts the transient from latestTime with the
+    (usually increased) budget, merging the coefficient history across the job
+    boundary — the same restart-segment mechanics the in-run continuation
+    chunks use. The source directory is validated at RUN time (the volume is
+    only visible to the worker); a missing/cleaned case fails the job honestly.
+    """
+
+    engine_job_id: str = Field(
+        pattern=r"^[0-9a-fA-F-]{8,64}$",
+        description="Engine job id that produced the saved case (uuid-ish hex).",
+    )
+    case_slug: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Case slug within the prior job's cases/ directory (may contain "
+        "one nesting level, e.g. 'c0p1_u25/urans_a3').",
+    )
+
+    @model_validator(mode="after")
+    def _safe_slug(self) -> "ContinueFrom":
+        parts = self.case_slug.split("/")
+        if len(parts) > 2:
+            raise ValueError("case_slug may contain at most one '/' nesting level.")
+        for part in parts:
+            if not part or part in {".", ".."}:
+                raise ValueError("case_slug contains an empty or traversal path component.")
+            if not all(c.isalnum() or c in "._-" for c in part):
+                raise ValueError("case_slug contains characters outside [A-Za-z0-9._-].")
+        return self
+
 
 class ImageField(str, Enum):
     velocity_magnitude = "velocity_magnitude"
@@ -292,8 +335,16 @@ class SolverParams(BaseModel):
     )
 
 
-def urans_budget_seconds(solver: "SolverParams") -> int:
-    """Wall-clock solver budget for the URANS transient of this request's tier."""
+def urans_budget_seconds(solver: "SolverParams", override_s: Optional[int] = None) -> int:
+    """Wall-clock solver budget for the URANS transient of this request's tier.
+
+    ``override_s`` (``PolarRequest.budget_override_s``) replaces the tier
+    budget for this job only — used by cross-job continuations that resume a
+    budget-stopped transient with more wall time. Clamped to the 24 h cap
+    defensively even though validation already rejects larger values.
+    """
+    if override_s is not None:
+        return max(60, min(int(override_s), URANS_BUDGET_OVERRIDE_MAX_S))
     return URANS_FIDELITY_BUDGET_S[solver.urans_fidelity]
 
 
@@ -426,6 +477,20 @@ class PolarRequest(BaseModel):
     mesh: MeshParams = Field(default_factory=MeshParams)
     solver: SolverParams = Field(default_factory=SolverParams)
     resources: ResourceParams = Field(default_factory=ResourceParams)
+    continue_from: Optional[ContinueFrom] = Field(
+        default=None,
+        description="Resume the saved URANS case of a prior engine job instead of "
+        "solving from scratch: the saved case dir is copied into this job, the "
+        "transient restarts from latestTime and the coefficient history is merged "
+        "across the job boundary. Requires a single-case force_transient request.",
+    )
+    budget_override_s: Optional[int] = Field(
+        default=None,
+        ge=60,
+        le=URANS_BUDGET_OVERRIDE_MAX_S,
+        description="Per-job URANS wall-clock budget [s] replacing the fidelity-tier "
+        "budget (continuations submit the increased budget here). Capped at 24 h.",
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> "PolarRequest":
@@ -433,6 +498,16 @@ class PolarRequest(BaseModel):
             raise ValueError("chord_lengths must be positive.")
         if any(s <= 0 for s in self.speeds):
             raise ValueError("speeds must be positive.")
+        if self.continue_from is not None:
+            if not self.solver.force_transient:
+                raise ValueError(
+                    "continue_from resumes a saved URANS transient; solver.force_transient must be true."
+                )
+            if len(self.cases()) != 1:
+                raise ValueError(
+                    "continue_from targets one saved case; the request must expand to exactly one "
+                    "(chord, speed, AoA) case."
+                )
         return self
 
     def cases(self) -> list["CaseSpec"]:

@@ -14,7 +14,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .forces import _data_rows
+from .forces import OSCILLATING_AMPLITUDE_GROWTH_MAX, _data_rows
 
 
 @dataclass
@@ -504,6 +504,55 @@ FRAME_EXPORT_SPAN_PERIODS = 3
 #: ... capped at 120 frames total.
 FRAME_EXPORT_MAX_FRAMES = 120
 
+# --------------------------------------------------------------------------- #
+# Precalc-tier ESTABLISHED-OSCILLATION stationarity (user decision 2026-07-08:
+# "the solution should converge to a stable oscillation"). The strict 5%
+# two-half mean-drift gate stays the FULL-tier "verified" bar; the precalc
+# tier instead asks whether the transient has SETTLED INTO a bounded limit
+# cycle: per-cycle means m_1..m_K must show no monotonic trend (a relaxing
+# startup approaches its attractor one-directionally; an established
+# modulated limit cycle scatters trendlessly), the shedding period must be
+# stable across the half-windows, and the oscillation amplitude must not be
+# growing (the oscillating-steady growth guard).
+# --------------------------------------------------------------------------- #
+
+#: Minimum whole cycles for the established-oscillation trend test. With
+#: fewer than 3 cycle means "trend" is undefined (2 points are always
+#: monotone), so shorter precalc windows are honestly non-stationary.
+ESTABLISHED_MIN_CYCLES = 3
+#: A monotone run of cycle means counts as a TREND only when the net change
+#: |m_K - m_1| is at least this multiple of the residual scatter of the m_i
+#: about their least-squares line. Rationale (worked for K=3, the precalc
+#: contract size): the raw std of MONOTONE cycle means is trend-dominated —
+#: net/std(m_i) is pinned to ~2.1-2.45 for any monotone triple — so raw
+#: scatter cannot separate trend from luck; the RESIDUAL about the fitted
+#: line can. K=3 geometry: with d = |m_2 - (m_1+m_3)/2| (interior deviation
+#: from the endpoint chord), s_resid = d*sqrt(2/3), and strict monotonicity
+#: bounds d < |net|/2, i.e. s_resid < 0.409|net|. The threshold must sit
+#: ABOVE the collinearity bound |net|/s_resid = 2.449 or every monotone
+#: triple would be "trending" and the significance clause would be vacuous.
+#: At 3.0, a monotone triple is ACCEPTED when d > 0.408|net| — the interior
+#: mean far off the endpoint chord, the signature of a modulated cycle that
+#: landed monotone by luck (chance 2/3! = 1/3) — and REJECTED for the smooth
+#: relaxation shapes: a geometric approach with per-cycle decay ratio rho has
+#: d/|net| = (1-rho)/(2(1+rho)) < 0.408 for every rho > 0.105, so anything
+#: short of a ~90%-in-one-cycle collapse trends. A slow smooth modulation
+#: (period >> K cycles) IS still rejected — at K=3 it is indistinguishable
+#: from a relaxing drift, and rejection escalates to the full tier, the
+#: conservative direction.
+TREND_MONOTONE_SIGNIFICANCE = 3.0
+#: Slow-drift guard: even WITHOUT monotone signs (noise can flip one cycle
+#: mean), a net change this many times the residual scatter is a drift with
+#: noise riding on it, not an established cycle. Larger than the monotone
+#: threshold because the residual already contains the sign-flipping wiggle.
+TREND_DOMINANT_SIGNIFICANCE = 4.0
+#: Absolute trend floor: net cycle-mean change below this fraction of the
+#: drift scale (max(|mean cl|, retained cl rms, DRIFT_ABS_FLOOR) — the same
+#: denominator as drift_frac) never counts as trending, so femto-scale
+#: monotone numerical wobble cannot reject an established oscillation
+#: (same rationale as DRIFT_ABS_FLOOR itself).
+TREND_NET_MIN_FRACTION = 0.02
+
 
 def _refined_lag_period(ac: np.ndarray, k: int, dt: float) -> float:
     """Parabolic interpolation of the autocorrelation maximum around lag k."""
@@ -727,7 +776,15 @@ class ChannelWindowStats:
 
 @dataclass(frozen=True)
 class PeriodWindowStats:
-    """Integer-period window stats backing the frame_track contract."""
+    """Integer-period window stats backing the frame_track contract.
+
+    ``cycle_means``/``cycle_mean_std``/``stationary_reason`` are ENGINE-SIDE
+    diagnostics for the precalc established-oscillation verdict and its
+    quality-warning text. They are deliberately NOT part of the serialized
+    frame_track contract (the cross-runtime parser rejects new keys); the
+    verdict travels through the existing ``stationary`` boolean and warning
+    strings only.
+    """
 
     period_s: float
     periods_retained: float  # fractional periods available in the series (M.x)
@@ -739,6 +796,9 @@ class PeriodWindowStats:
     cm: ChannelWindowStats
     drift_frac: float
     stationary: bool
+    cycle_means: tuple[float, ...] = ()
+    cycle_mean_std: float = 0.0
+    stationary_reason: str = ""
 
 
 def _windowed_mean(t: np.ndarray, v: np.ndarray, a: float, b: float) -> float:
@@ -750,6 +810,98 @@ def _windowed_mean(t: np.ndarray, v: np.ndarray, a: float, b: float) -> float:
     return mean
 
 
+def _cycle_mean_trend(cycle_means: "Sequence[float]", scale: float) -> tuple[bool, str]:
+    """Robust monotonic-trend test on per-cycle means (precalc established-
+    oscillation gate). Returns ``(trending, description)``.
+
+    Definition (K = len(cycle_means) >= ESTABLISHED_MIN_CYCLES, documented at
+    the TREND_* constants):
+
+    - net = m_K - m_1; monotone = all successive differences share one strict
+      sign (any tie/reversal breaks it — a Kendall-style sign statistic, which
+      at |S| = K(K-1)/2 is exactly this condition);
+    - s_resid = dof-adjusted rms residual of the m_i about their least-squares
+      line (sqrt(SS/(K-2))) — the scatter that is NOT explained by a linear
+      trend;
+    - TRENDING iff |net| >= TREND_NET_MIN_FRACTION * scale (absolute floor)
+      AND (monotone and |net| >= TREND_MONOTONE_SIGNIFICANCE * s_resid,
+      OR |net| >= TREND_DOMINANT_SIGNIFICANCE * s_resid — the slow-drift
+      guard for drifts whose noise flips one cycle mean).
+    """
+    ms = np.asarray(cycle_means, dtype=float)
+    k = ms.size
+    net = float(ms[-1] - ms[0])
+    if abs(net) < TREND_NET_MIN_FRACTION * scale:
+        return False, f"net cycle-mean change {net:+.3g} below the {TREND_NET_MIN_FRACTION:.0%} trend floor"
+    diffs = np.diff(ms)
+    monotone = bool(np.all(diffs > 0.0) or np.all(diffs < 0.0))
+    x = np.arange(k, dtype=float)
+    slope, intercept = np.polyfit(x, ms, 1)
+    resid = ms - (slope * x + intercept)
+    s_resid = float(math.sqrt(float(np.sum(resid**2)) / (k - 2))) if k > 2 else 0.0
+    direction = "upward" if net > 0 else "downward"
+    if monotone and abs(net) >= TREND_MONOTONE_SIGNIFICANCE * s_resid:
+        return True, (
+            f"cycle means trend {direction} monotonically: net {net:+.3g} over {k} cycles "
+            f"vs residual scatter {s_resid:.3g}"
+        )
+    if abs(net) >= TREND_DOMINANT_SIGNIFICANCE * s_resid:
+        return True, (
+            f"cycle means drift {direction}: net {net:+.3g} over {k} cycles dominates "
+            f"residual scatter {s_resid:.3g}"
+        )
+    return False, (
+        f"cycle means scatter trendlessly (net {net:+.3g} vs residual scatter {s_resid:.3g} "
+        f"over {k} cycles)"
+    )
+
+
+def _established_oscillation_verdict(
+    st: np.ndarray,
+    scl: np.ndarray,
+    start: float,
+    end: float,
+    period_s: float,
+    k: int,
+    cycle_means: tuple[float, ...],
+    drift_scale: float,
+    period_stable: bool,
+) -> tuple[bool, str]:
+    """Precalc-tier stationarity: has the transient CONVERGED TO A STABLE
+    OSCILLATION? Requires K >= ESTABLISHED_MIN_CYCLES whole cycles, a stable
+    period, no monotonic cycle-mean trend (:func:`_cycle_mean_trend`) and a
+    non-growing amplitude (the oscillating-steady growth guard
+    OSCILLATING_AMPLITUDE_GROWTH_MAX applied to the whole-period half-window
+    peak-to-peaks). Returns ``(established, reason)``."""
+    if k < ESTABLISHED_MIN_CYCLES:
+        return False, (
+            f"only {k} whole cycle{'s' if k != 1 else ''} retained; the established-oscillation "
+            f"test needs >= {ESTABLISHED_MIN_CYCLES}"
+        )
+    if not period_stable:
+        return False, "shedding period unstable between the analysis half-windows"
+    trending, trend_reason = _cycle_mean_trend(cycle_means, drift_scale)
+    if trending:
+        return False, trend_reason
+    # Bounded amplitude: same whole-period halves as the drift metric
+    # (floor(K/2) periods each, middle cycle skipped when K is odd).
+    half_span = (k // 2) * period_s
+    first = (st >= start) & (st <= start + half_span)
+    second = (st >= end - half_span) & (st <= end)
+    if np.count_nonzero(first) >= 2 and np.count_nonzero(second) >= 2:
+        ptp1 = float(np.max(scl[first]) - np.min(scl[first]))
+        ptp2 = float(np.max(scl[second]) - np.min(scl[second]))
+        # Additive floor as in the steady guard: machine-flat channels must
+        # not trip the ratio on a ~0 denominator.
+        if ptp2 > OSCILLATING_AMPLITUDE_GROWTH_MAX * ptp1 + 1e-4 * drift_scale:
+            growth = ptp2 / ptp1 if ptp1 > 0 else float("inf")
+            return False, (
+                f"oscillation amplitude growing (x{growth:.2f} second-half vs first-half "
+                f"peak-to-peak, > x{OSCILLATING_AMPLITUDE_GROWTH_MAX:g} guard)"
+            )
+    return True, trend_reason
+
+
 def period_window_stats(
     times: "np.ndarray | list[float]",
     cl: "np.ndarray | list[float]",
@@ -757,6 +909,9 @@ def period_window_stats(
     cm: "np.ndarray | list[float]",
     period_s: float,
     drift_tolerance: float = 0.05,
+    *,
+    established_oscillation: bool = False,
+    period_stable: bool = True,
 ) -> PeriodWindowStats | None:
     """Stats over exactly K = floor(available periods) whole periods ending at
     the last sample: time-weighted trapezoidal mean/std (non-uniform dt, so an
@@ -766,6 +921,13 @@ def period_window_stats(
     whole-period halves (floor(K/2) periods each, middle
     period skipped when K is odd) so the drift metric itself carries no
     half-period phase bias.
+
+    ``established_oscillation=True`` (precalc fidelity tier) replaces the
+    drift-tolerance verdict with the ESTABLISHED-OSCILLATION test
+    (:func:`_established_oscillation_verdict`): trendless per-cycle means +
+    stable period (``period_stable``, the caller's half-window period check) +
+    bounded amplitude. ``drift_frac`` is still computed and reported either
+    way; the default keeps the strict full-tier gate byte-identical.
 
     Pass the POST-DISCARD series; ``periods_retained`` is the fractional
     number of periods it spans. Returns None when less than one whole period
@@ -811,6 +973,23 @@ def period_window_stats(
     # near-zero signal still fails via the rms/absolute-floor scale.
     drift_scale = max(abs(cl_stats.mean), abs(cl_stats.std), DRIFT_ABS_FLOOR)
     drift = abs(m1 - m2) / drift_scale
+
+    # Per-cycle Cl means over the K whole periods (integer-cycle sub-windows
+    # of the stats window): the established-oscillation evidence, and the
+    # scatter disclosed by the precalc acceptance warning.
+    boundaries = [start + i * period_s for i in range(k)] + [end]
+    cycle_means = tuple(
+        _windowed_mean(st, scl, boundaries[i], boundaries[i + 1]) for i in range(k)
+    )
+    cycle_mean_std = float(np.std(np.asarray(cycle_means))) if k > 1 else 0.0
+
+    if established_oscillation:
+        stationary, reason = _established_oscillation_verdict(
+            st, scl, start, end, period_s, k, cycle_means, drift_scale, period_stable
+        )
+    else:
+        stationary, reason = bool(drift <= drift_tolerance), ""
+
     return PeriodWindowStats(
         period_s=float(period_s),
         periods_retained=float(available),
@@ -821,7 +1000,10 @@ def period_window_stats(
         cd=cd_stats,
         cm=cm_stats,
         drift_frac=float(drift),
-        stationary=bool(drift <= drift_tolerance),
+        stationary=bool(stationary),
+        cycle_means=cycle_means,
+        cycle_mean_std=cycle_mean_std,
+        stationary_reason=reason,
     )
 
 

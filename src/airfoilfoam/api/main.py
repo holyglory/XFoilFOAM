@@ -245,12 +245,15 @@ def create_app() -> FastAPI:
         from ..tasks import run_polar
 
         # Hard celery backstop scaled by THIS job's case count (one task runs
-        # the whole polar job; the app-level default only covers one case).
+        # the whole polar job; the app-level default only covers one case) and
+        # by a continuation's per-job budget override when present.
         total_cases = max(1, len(request.cases()))
         async_result = run_polar.apply_async(
             args=[job_id, request.model_dump_json()],
             task_id=job_id,
-            time_limit=task_hard_time_limit_s(get_settings(), total_cases),
+            time_limit=task_hard_time_limit_s(
+                get_settings(), total_cases, budget_override_s=request.budget_override_s
+            ),
         )
         status = store.read_status(job_id)
         assert status is not None

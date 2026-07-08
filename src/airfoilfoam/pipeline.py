@@ -43,6 +43,7 @@ from .models import (
     SolverParams,
     SteadyHistory,
     SteadyHistoryWindow,
+    UransFidelity,
     apply_urans_fidelity,
     effective_mesh_params,
     urans_budget_seconds,
@@ -208,6 +209,13 @@ def _last_log_delta_t(log_text: str) -> Optional[float]:
         except ValueError:
             continue
     return value
+
+
+class TransientTimeoutError(OpenFOAMError):
+    """A transient solver run killed by the wall-clock timeout that left no
+    gradable coefficient window in the CURRENT chunk. Distinct from a crash:
+    the case dir keeps its last written fields, so the saved state stays
+    restartable (continuation catch sites mark the grade continuable)."""
 
 
 def _transient_timeout_message(
@@ -509,6 +517,239 @@ def _write_early_stop_marker(
             sort_keys=True,
         )
         + "\n"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Cross-job URANS continuation (task: continue budget-stopped transients).
+#
+# A transient stopped by the wall-clock budget guard leaves its case dir
+# intact on the shared volume (the timeout path never deletes state; latestTime
+# fields stay written). A continuation job copies that saved case state into
+# the new job's case dir, restarts pimpleFoam from latestTime with a fresh
+# (usually increased) budget and merges the coefficient history across the job
+# boundary — the SAME restart-segment mechanics the in-run continuation chunks
+# already use (``_transient_coeff_selection`` keyed on the transient's start).
+# --------------------------------------------------------------------------- #
+
+#: Continuable-grade marker (pinned cross-runtime contract with
+#: packages/core/src/urans-quality.ts URANS_BUDGET_STOP_MARKER, matched by the
+#: node continuable predicate as a substring of quality warnings): every URANS
+#: grading path that stops on WALL-CLOCK grounds while leaving restartable
+#: saved case state — the between-chunks budget projection guard, the
+#: mid-chunk solver timeout partial grade, and a timed-out continuation chunk
+#: — must embed exactly this substring in its quality reason. Rewording it is
+#: a test failure on BOTH sides (tests/test_continuation.py pins the literal
+#: here; the node fixtures pin it there).
+URANS_BUDGET_STOP_MARKER = "stopped by the wall-clock budget guard"
+
+#: Marker persisted in a transient case dir recording the coefficient-history
+#: start time of the transient (the steady-init history written before it must
+#: never merge into the force signal). Written when a fresh transient starts;
+#: continuation jobs read it to keep merging across jobs.
+TRANSIENT_START_MARKER = "transient_start.json"
+
+#: Top-level directories of a saved case that a continuation never needs:
+#: derived media and evidence are rebuilt from scratch after the resumed
+#: solve, VTK frames are re-converted by foamToVTK, and stale decompositions
+#: are re-created by the runner's ``decomposePar -latestTime -force``.
+CONTINUATION_SKIP_DIRS = frozenset({"evidence", "images", "frames", "VTK", "custom_renders", "_seed_stage"})
+
+
+@dataclass
+class TransientResume:
+    """Resume a STAGED transient case across jobs: restart from latestTime and
+    merge the coefficient history from the transient's original start time."""
+
+    #: Original transient start (coefficient merge boundary across ALL segments).
+    transient_start: float
+    #: latestTime of the saved case at staging — this job's own integration
+    #: starts here, so wall-rate projections must measure from this origin.
+    resume_from: float
+
+
+@dataclass
+class ContinuationSource:
+    """A staged continuation case: where the restartable transient lives."""
+
+    transient_subdir: str
+    transient_start: float
+    resume_from: float
+
+
+def write_transient_start_marker(tcase: Path, transient_start: float) -> None:
+    tcase.mkdir(parents=True, exist_ok=True)
+    (tcase / TRANSIENT_START_MARKER).write_text(
+        json.dumps({"transient_start": float(transient_start)}, indent=2) + "\n"
+    )
+
+
+def read_transient_start_marker(tcase: Path) -> Optional[float]:
+    try:
+        payload = json.loads((tcase / TRANSIENT_START_MARKER).read_text())
+    except (OSError, ValueError):
+        return None
+    value = payload.get("transient_start") if isinstance(payload, dict) else None
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _infer_transient_start(tcase: Path) -> float:
+    """Recover the transient's start for saved cases predating the marker.
+
+    Mechanics-faithful heuristic: a steady-seeded transient (warm start from
+    the job's steady RANS field) starts at 0 with no in-case init log; an
+    init-seeded transient ran a short simpleFoam init in the case first
+    (``log.simpleFoam.init``), whose pseudo-time forceCoeffs segment sits at 0,
+    so the transient owns the first POSITIVE segment."""
+    seg_times = sorted({_time_of(f) for f in _coeff_files(tcase)})
+    if (tcase / "log.simpleFoam.init").exists():
+        positive = [t for t in seg_times if t > 0]
+        if positive:
+            return positive[0]
+    return seg_times[0] if seg_times else 0.0
+
+
+def _find_continuable_transient(src_case: Path) -> str:
+    """The transient subdir of a saved case, or a truthful OpenFOAMError."""
+    if (src_case / "transient").is_dir():
+        return "transient"
+    candidates = sorted(
+        d.name
+        for d in src_case.iterdir()
+        if d.is_dir() and d.name.startswith("transient") and not d.name.endswith("_refined")
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise OpenFOAMError(
+            f"saved case {src_case.name} has no transient directory to continue"
+        )
+    raise OpenFOAMError(
+        f"saved case {src_case.name} has multiple transient directories "
+        f"({', '.join(candidates)}); cannot disambiguate the continuation target"
+    )
+
+
+def _hardlinkable(rel: Path) -> bool:
+    """Files safe to hardlink instead of copy: bulk data the resumed run only
+    READS or supersedes with new directories — numeric time-dir fields and the
+    polyMesh. Everything modified in place (system/ dicts via write_text /
+    foamDictionary, log.* via write_text) or appended near-in-place
+    (postProcessing segment reuse edge) gets a REAL copy."""
+    parts = rel.parts
+    if "postProcessing" in parts:
+        # forceCoeffs/yPlus segment dirs are numeric-named; a restart landing
+        # on an identical startTime would rewrite the file through a hardlink
+        # and corrupt the source job's evidence. Always real-copy.
+        return False
+    if "polyMesh" in parts:
+        return True
+    for part in parts[:-1]:
+        try:
+            float(part)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _copy_case_tree(src_case: Path, dst_case: Path) -> None:
+    """Copy a saved case dir into the new job (hardlinking bulk data where
+    safe, falling back to a real copy across devices). Follows symlinks so a
+    shared-mesh polyMesh symlink materialises as real files; skips derived
+    media/evidence dirs and stale divergence verdicts."""
+    if dst_case.exists():
+        shutil.rmtree(dst_case)
+    dst_case.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(src_case, followlinks=True):
+        rel_root = Path(root).relative_to(src_case)
+        dirs[:] = sorted(
+            d
+            for d in dirs
+            if d not in CONTINUATION_SKIP_DIRS and not d.startswith("processor")
+        )
+        dst_root = dst_case / rel_root
+        dst_root.mkdir(parents=True, exist_ok=True)
+        for name in sorted(files):
+            if name == DIVERGENCE_MARKER_FILENAME:
+                continue
+            src = Path(root) / name
+            if not src.is_file():
+                continue  # dangling symlink etc.
+            dst = dst_root / name
+            if _hardlinkable(rel_root / name):
+                try:
+                    os.link(src, dst)
+                    continue
+                except OSError:
+                    pass  # cross-device or FS without hardlinks: real copy below
+            shutil.copy2(src, dst, follow_symlinks=True)
+
+
+def stage_continuation_case(src_case: Path, dst_case: Path) -> ContinuationSource:
+    """Validate + copy a prior job's saved case for continuation.
+
+    Raises a truthful ``OpenFOAMError`` when the source is missing, cleaned,
+    or not restartable (no latestTime fields / no mesh / no controlDict) —
+    the caller fails the job honestly instead of solving from nothing."""
+    if not src_case.is_dir():
+        raise OpenFOAMError(
+            f"continuation source case directory not found: {src_case} "
+            f"(job files cleaned from the engine volume, or wrong job id/slug)"
+        )
+    transient_subdir = _find_continuable_transient(src_case)
+    src_t = src_case / transient_subdir
+    latest = _latest_time_dir(src_t)
+    if latest is None:
+        raise OpenFOAMError(
+            f"saved transient {src_case.name}/{transient_subdir} has no time directories; "
+            f"nothing to restart from"
+        )
+    missing_fields = [name for name in ("U", "p") if not (latest / name).is_file()]
+    if missing_fields:
+        raise OpenFOAMError(
+            f"saved transient {src_case.name}/{transient_subdir} latestTime {latest.name} "
+            f"is missing fields {', '.join(missing_fields)}; not restartable"
+        )
+    if not (src_t / "system" / "controlDict").is_file():
+        raise OpenFOAMError(
+            f"saved transient {src_case.name}/{transient_subdir} has no system/controlDict; "
+            f"not restartable"
+        )
+    if not (src_t / "constant" / "polyMesh" / "points").exists():
+        raise OpenFOAMError(
+            f"saved transient {src_case.name}/{transient_subdir} mesh is missing "
+            f"(constant/polyMesh cleaned or its shared-mesh symlink dangles); not restartable"
+        )
+    _copy_case_tree(src_case, dst_case)
+    dst_t = dst_case / transient_subdir
+    transient_start = read_transient_start_marker(dst_t)
+    if transient_start is None:
+        transient_start = _infer_transient_start(dst_t)
+        write_transient_start_marker(dst_t, transient_start)
+        logger.warning(
+            "continuation: %s has no %s marker; inferred transient start t=%g from the "
+            "segment layout",
+            src_t,
+            TRANSIENT_START_MARKER,
+            transient_start,
+        )
+    resume_from = _latest_time(dst_t)
+    logger.warning(
+        "continuation: staged saved case %s -> %s (transient %s, start t=%g, resume from "
+        "latestTime t=%g)",
+        src_case,
+        dst_case,
+        transient_subdir,
+        transient_start,
+        resume_from,
+    )
+    return ContinuationSource(
+        transient_subdir=transient_subdir,
+        transient_start=transient_start,
+        resume_from=resume_from,
     )
 
 
@@ -881,7 +1122,7 @@ def _run_transient_attempt(
         reached = _coeff_last_time(files_now[-1]) if files_now else None
         if reached is None:
             reached = _latest_time(tcase) or None
-        return OpenFOAMError(
+        return TransientTimeoutError(
             _transient_timeout_message(timeout, reached, end_t, _last_log_delta_t(res.stdout))
         )
 
@@ -958,7 +1199,9 @@ def _run_transient_attempt(
             reason=(
                 f"{'refined' if refined else 'base'} transient timed out at t={reached:.6g}s "
                 f"of {end_t:.6g}s (solver timeout {timeout:g}s); graded partial window; "
-                f"{quality.reason}"
+                f"URANS integration {URANS_BUDGET_STOP_MARKER} mid-chunk — the saved "
+                f"case state resumes from the last written time step with a bigger "
+                f"budget; {quality.reason}"
             ),
             measured_period_s=quality.measured_period_s,
             retained_cycles=quality.retained_cycles,
@@ -1023,6 +1266,7 @@ def _extend_transient_until_periods(
     timeout,
     initial_delta_t: float,
     cancel_check: CancelCheck = None,
+    rate_origin: Optional[float] = None,
 ) -> TransientResult:
     """Integrate until ``urans_min_periods`` WHOLE shedding periods are retained
     after startup discard, extending the SAME transient case in continuation
@@ -1078,11 +1322,19 @@ def _extend_transient_until_periods(
             break
         chunk_sim = (target - retained) * period / max(1e-6, 1.0 - discard)
         if timeout and total_wall > 0.0:
-            rate = span / total_wall  # simulated seconds per wall second
+            # Rate = THIS job's simulated progress per wall second. For a
+            # cross-job continuation the retained window spans prior jobs'
+            # simulated time too, so the rate must measure from the resume
+            # point (rate_origin), never from the transient start.
+            rate_span = max(
+                0.0,
+                _latest_time(tcase) - (rate_origin if rate_origin is not None else transient_start),
+            )
+            rate = rate_span / total_wall  # simulated seconds per wall second
             projected_wall_s = chunk_sim / rate if rate > 0.0 else math.inf
             if total_wall + projected_wall_s > URANS_REFINE_BUDGET_FRACTION * timeout:
                 reason = (
-                    f"URANS integration stopped by the wall-clock budget guard: "
+                    f"URANS integration {URANS_BUDGET_STOP_MARKER}: "
                     f"retained {retained:.1f} of {target:g} periods (budget); "
                     f"projected {projected_wall_s / 3600.0:.1f}h continuation exceeds "
                     f"{URANS_REFINE_BUDGET_FRACTION:.0%} of the {timeout / 3600.0:.1f}h "
@@ -1112,13 +1364,22 @@ def _extend_transient_until_periods(
         except OpenFOAMError as exc:
             # A chunk that timed out without gradable data must not discard the
             # already-graded window; the point keeps its honest partial grade.
+            # A TIMEOUT (unlike a crash/divergence) leaves the previous chunk's
+            # fields saved and restartable, so the grade carries the pinned
+            # continuable marker.
+            budget_note = (
+                f" URANS integration {URANS_BUDGET_STOP_MARKER} mid-continuation — "
+                f"the saved case state resumes from the last written time step;"
+                if isinstance(exc, TransientTimeoutError)
+                else ""
+            )
             result.quality = _quality_with(
                 result.quality,
                 ok=False,
                 can_refine=False,
                 reason=(
                     f"URANS continuation chunk failed after retaining {retained:.1f} of "
-                    f"{target:g} periods: {exc}; {result.quality.reason}"
+                    f"{target:g} periods: {exc};{budget_note} {result.quality.reason}"
                 ),
             )
             break
@@ -1150,36 +1411,100 @@ def _run_transient(
     case_dir, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
     subdir="transient", shared_mesh_dir: Optional[Path] = None,
     steady_field_dir: Optional[Path] = None, cancel_check: CancelCheck = None,
+    resume: Optional[TransientResume] = None,
 ):
     """Run URANS, extend it until enough whole periods are retained, then
-    automatically refine sparse/short transient media once."""
+    automatically refine sparse/short transient media once.
+
+    With ``resume`` the case dir already holds STAGED saved state from a prior
+    job (cross-job continuation): mesh/steady/prepare stages are skipped, the
+    transient restarts from latestTime, and grading/media run over the history
+    merged from the transient's ORIGINAL start."""
     tcase = case_dir / subdir
-    try:
-        tmesh, patches = _prepare_transient_case(
-            tcase, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
-            shared_mesh_dir=shared_mesh_dir,
-            steady_field_dir=steady_field_dir,
+    initial_period = physics.shedding_period(spec.speed, spec.chord, strouhal=TRANSIENT_INITIAL_STROUHAL)
+    initial_delta_t = initial_period / 5000.0
+    if resume is not None:
+        # Staged continuation: the saved state IS the case — never wipe or
+        # re-prepare it. The shared mesh already sits in constant/polyMesh.
+        tmesh = resolved
+        patches = get_mesher(resolved.mesher).patches(tmesh)
+        transient_start = resume.transient_start
+        target = float(solver_params.urans_min_periods)
+        discard = min(max(solver_params.transient_discard_fraction, 0.0), 0.95)
+        # Size the first continuation chunk from the SAVED merged history
+        # (same math as the in-run extension loop); fall back to the Strouhal
+        # guess horizon when no period is measurable yet.
+        period: Optional[float] = None
+        span = max(0.0, resume.resume_from - transient_start)
+        try:
+            saved_paths = _transient_coeff_selection(tcase, transient_start)
+            if saved_paths:
+                t_all, cl_all, _cd_all, _cm_all = coefficient_series(saved_paths)
+                estimate = estimate_period(t_all, cl_all, speed=spec.speed, chord=spec.chord)
+                if estimate is not None:
+                    period = estimate.period_s
+        except Exception:  # noqa: BLE001 - chunk sizing must never block the resume
+            period = None
+        if period is not None and math.isfinite(period) and period > 0:
+            retained = span * (1.0 - discard) / period
+            chunk_sim = max(period, (target - retained) * period / max(1e-6, 1.0 - discard))
+            write_interval: Optional[float] = period / URANS_MIN_FRAMES_PER_CYCLE
+            delta_t = min(initial_delta_t, period / 5000.0)
+        else:
+            chunk_sim = max(
+                2.0 * initial_period, solver_params.transient_cycles * initial_period - span
+            )
+            write_interval = None
+            delta_t = initial_delta_t
+        logger.warning(
+            "continuation: resuming transient %s from t=%g (merged history start t=%g) "
+            "with wall budget %gs",
+            tcase, resume.resume_from, transient_start, timeout,
+        )
+        first = _run_transient_attempt(
+            tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params,
+            runner, n_proc, timeout,
+            run_time=chunk_sim, delta_t=delta_t,
+            write_interval=write_interval,
+            max_delta_t=write_interval,
+            coeff_start_time=transient_start,
             cancel_check=cancel_check,
         )
-    except OpenFOAMError:
-        return None
+    else:
+        try:
+            tmesh, patches = _prepare_transient_case(
+                tcase, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
+                shared_mesh_dir=shared_mesh_dir,
+                steady_field_dir=steady_field_dir,
+                cancel_check=cancel_check,
+            )
+        except OpenFOAMError:
+            return None
 
-    initial_period = physics.shedding_period(spec.speed, spec.chord, strouhal=TRANSIENT_INITIAL_STROUHAL)
-    initial_run_time = solver_params.transient_cycles * initial_period
-    initial_delta_t = initial_period / 5000.0
-    transient_start = _latest_time(tcase)
-    first = _run_transient_attempt(
-        tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
-        run_time=initial_run_time, delta_t=initial_delta_t,
-        coeff_start_time=transient_start,
-        cancel_check=cancel_check,
-    )
+        initial_run_time = solver_params.transient_cycles * initial_period
+        transient_start = _latest_time(tcase)
+        # Persist the merge boundary so a cross-job continuation can keep
+        # merging coefficient segments after this job is gone.
+        write_transient_start_marker(tcase, transient_start)
+        first = _run_transient_attempt(
+            tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
+            run_time=initial_run_time, delta_t=initial_delta_t,
+            coeff_start_time=transient_start,
+            cancel_check=cancel_check,
+        )
     if first is None:
         return None
+    rate_origin = resume.resume_from if resume is not None else None
     first = _extend_transient_until_periods(
         tcase, first, transient_start, airfoil, tmesh, patches, spec, fluid, roughness,
         solver_params, runner, n_proc, timeout, initial_delta_t, cancel_check=cancel_check,
+        rate_origin=rate_origin,
     )
+    if resume is not None:
+        # The result grades the WHOLE merged transient window across jobs.
+        first.start_time = transient_start
+        first.end_time = max(first.end_time, _latest_time(tcase))
+        first.run_time = max(0.0, first.end_time - transient_start)
     if (
         first.quality.ok
         or not solver_params.transient_auto_refine
@@ -1217,7 +1542,12 @@ def _run_transient(
     # measured base-pass solve rate (simulated seconds per wall second); if it
     # cannot fit the same per-attempt timeout budget, skip the refinement and
     # grade the base window honestly instead.
-    base_span = max(0.0, _latest_time(tcase) - first.start_time)
+    # Rate projection origin: for a resumed case, only THIS job's simulated
+    # span corresponds to first.wall_seconds (the merged window includes prior
+    # jobs' integration time).
+    base_span = max(
+        0.0, _latest_time(tcase) - (rate_origin if rate_origin is not None else first.start_time)
+    )
     if base_span <= 0.0:
         base_span = first.run_time
     if timeout and first.wall_seconds > 0.0 and base_span > 0.0:
@@ -1572,6 +1902,8 @@ def _finalize_outcome(
     cancel_check: CancelCheck = None,
     phase_progress=None, case_slug: Optional[str] = None,
     media_budget_s: Optional[float] = None,
+    resume: Optional[TransientResume] = None,
+    urans_budget_s: Optional[int] = None,
 ):
     """Parse forces, run the transient fallback if needed, compute y+ and images.
 
@@ -1663,12 +1995,15 @@ def _finalize_outcome(
         # transient wall-clock budget (precalc: 3 periods / 7200 s; full:
         # 7 periods / 43200 s) — contract item 1, pinned cross-runtime.
         urans_params = apply_urans_fidelity(solver_params)
-        urans_timeout = urans_budget_seconds(solver_params)
+        # A continuation's per-job override (PolarRequest.budget_override_s)
+        # replaces the tier budget for this job only (24 h cap).
+        urans_timeout = urans_budget_seconds(solver_params, urans_budget_s)
         transient = _run_transient(
             case_dir, airfoil, resolved, spec, fluid, roughness, urans_params,
             runner, n_proc, urans_timeout, subdir=transient_subdir, shared_mesh_dir=shared_mesh_dir,
             steady_field_dir=steady_field_dir,
             cancel_check=cancel_check,
+            resume=resume,
         )
         _check_cancel(cancel_check)
         if transient is not None:
@@ -1725,9 +2060,20 @@ def _finalize_outcome(
                     if frame_period is None and transient.force_history is not None:
                         frame_period = transient.force_history.period_s
                     if frame_period is not None and frame_period > 0:
+                        # PRECALC tier stationarity = established-oscillation
+                        # test (trendless per-cycle means + stable period +
+                        # bounded amplitude — user decision 2026-07-08: the
+                        # rung certifies "converged to a stable oscillation").
+                        # FULL tier keeps the strict 5% mean-drift gate
+                        # ("verified" = converged mean), byte-identical.
+                        precalc_tier = solver_params.urans_fidelity == UransFidelity.precalc
                         frame_stats = period_window_stats(
                             t_c, cl_c, cd_c, cm_c, frame_period,
                             drift_tolerance=solver_params.urans_drift_tolerance,
+                            established_oscillation=precalc_tier,
+                            period_stable=(
+                                frame_estimate is None or not frame_estimate.ambiguous
+                            ),
                         )
                         frame_series = (t_all, cl_all, cd_all, cm_all)
                 except Exception as exc:  # noqa: BLE001 - stats loss is loud degradation
@@ -1745,11 +2091,26 @@ def _finalize_outcome(
                 )
                 if spec.speed > 0 and frame_stats.period_s > 0:
                     outcome.strouhal = spec.chord / (frame_stats.period_s * spec.speed)
+                precalc_tier = solver_params.urans_fidelity == UransFidelity.precalc
                 if not frame_stats.stationary:
+                    if precalc_tier and frame_stats.stationary_reason:
+                        outcome.quality_warnings.append(
+                            "URANS window not stationary (precalc established-oscillation "
+                            f"test): {frame_stats.stationary_reason}"
+                        )
+                    else:
+                        outcome.quality_warnings.append(
+                            f"URANS window not stationary: Cl drift {frame_stats.drift_frac:.3f} "
+                            f"exceeds tolerance {solver_params.urans_drift_tolerance:g} over "
+                            f"{frame_stats.whole_periods} whole periods"
+                        )
+                elif precalc_tier:
+                    # Acceptance under the established-oscillation gate is a
+                    # looser bar than the full-tier converged mean: DISCLOSE
+                    # the cycle-mean uncertainty on the accepted point.
                     outcome.quality_warnings.append(
-                        f"URANS window not stationary: Cl drift {frame_stats.drift_frac:.3f} "
-                        f"exceeds tolerance {solver_params.urans_drift_tolerance:g} over "
-                        f"{frame_stats.whole_periods} whole periods"
+                        f"cycle means scatter ±{frame_stats.cycle_mean_std:.3g} over "
+                        f"{frame_stats.whole_periods} cycles (precalc)"
                     )
         elif solver_params.force_transient or not coeff_files:
             # A URANS-only case must never silently fall back to the steady
@@ -2003,16 +2364,49 @@ def run_case(
     phase_progress=None,
     case_slug: Optional[str] = None,
     media_budget_s: Optional[float] = None,
+    resume: Optional[TransientResume] = None,
+    urans_budget_s: Optional[int] = None,
 ) -> CaseOutcome:
     """Run one self-contained case. If ``mesh_dir`` is given, reuse that prebuilt
     mesh (skip blockMesh) instead of meshing in the case directory. With a
     ``cache``, the steady start seeds from the nearest previously solved angle
-    at the same mesh/fluid/speed, and accepted steady fields are published back."""
+    at the same mesh/fluid/speed, and accepted steady fields are published back.
+
+    With ``resume`` the case dir holds STAGED saved state from a prior job
+    (see ``stage_continuation_case``): meshing and the steady stage are
+    skipped entirely and the URANS transient restarts from latestTime with
+    ``urans_budget_s`` (when given) replacing the tier wall budget."""
     case_dir.mkdir(parents=True, exist_ok=True)
     re = physics.reynolds(spec.speed, spec.chord, fluid.nu)
     outcome = CaseOutcome(spec=spec, reynolds=re)
     steady_timeout = min(solver_timeout, rans_solver_timeout or solver_timeout)
     steady_solver_params = _steady_rans_params(solver_params, rans_max_iterations)
+
+    if resume is not None:
+        # Cross-job continuation: state exists — no mesh build, no steady
+        # stage; the transient path in _finalize_outcome resumes from
+        # latestTime and grades the merged history.
+        try:
+            _check_cancel(cancel_check)
+            resolved = resolve_mesh_params(
+                effective_mesh_params(mesh_params, solver_params), spec, fluid
+            )
+            outcome.n_cells = mesher.cell_count(resolved) if hasattr(mesher, "cell_count") else 0
+            _finalize_outcome(
+                case_dir, outcome, airfoil, resolved, spec, fluid, roughness, solver_params,
+                runner, n_proc, render_images, solver_timeout,
+                cancel_check=cancel_check,
+                phase_progress=phase_progress,
+                case_slug=case_slug,
+                media_budget_s=media_budget_s,
+                resume=resume,
+                urans_budget_s=urans_budget_s,
+            )
+        except JobCancelled:
+            raise
+        except (OpenFOAMError, Exception) as exc:  # noqa: BLE001 - report, don't crash the batch
+            outcome.error = f"{type(exc).__name__}: {exc}"
+        return outcome
 
     try:
         _check_cancel(cancel_check)
@@ -2561,7 +2955,20 @@ def solve_polar_marched(
         if progress:
             progress()
         _check_cancel(cancel_check)
-        if not solver_params.force_transient and should_abort_rans_sweep_for_urans(aoa, outcome):
+        # In-job whole-polar URANS promotion is an ENGINE-SIDE escalation and
+        # must honor transient_fallback (2026-07-08 incident, wave-1 sweep job
+        # 20b67295: campaign jobs ship transient_fallback=false because the
+        # node-side ladder owns escalation, yet a rejected RANS point inside
+        # the attached-range check promoted the WHOLE polar to URANS without
+        # tier fidelity/budget/precalc mesh and diverged at startup). With the
+        # fallback off, rejected points ship honestly below and the gated
+        # ladder escalates; direct-API requests (default fallback on) keep
+        # the in-job promotion.
+        if (
+            not solver_params.force_transient
+            and solver_params.transient_fallback
+            and should_abort_rans_sweep_for_urans(aoa, outcome)
+        ):
             reason = (
                 f"RANS rejected at {aoa:g} deg inside the {RANS_CORE_ABORT_AOA_MIN:g}-"
                 f"{RANS_CORE_ABORT_AOA_MAX:g} deg attached-range check; switching the whole polar to URANS."

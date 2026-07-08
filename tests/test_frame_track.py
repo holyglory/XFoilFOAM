@@ -34,6 +34,7 @@ from airfoilfoam.models import (
     RoughnessParams,
     SolverParams,
 )
+from airfoilfoam.openfoam.runner import OpenFOAMError
 from airfoilfoam.pipeline import (
     CaseOutcome,
     TransientResult,
@@ -473,6 +474,61 @@ def test_continuation_budget_stop_grades_retained_periods_honestly(tmp_path, mon
     assert not result.quality.ok
     assert not result.quality.can_refine  # a refined pass would blow the same budget
     assert "retained 1.2 of 7 periods (budget)" in result.quality.reason
+    # Cross-runtime recall pin: the budget-stop grade carries the continuable
+    # marker the node predicate matches by substring (urans-quality.ts).
+    assert pipeline.URANS_BUDGET_STOP_MARKER in result.quality.reason
+
+
+def test_continuation_chunk_timeout_keeps_grade_and_marks_continuable(tmp_path, monkeypatch):
+    # Real breakage shape (amendment C recall): the second chunk is killed by
+    # the wall clock with nothing gradable IN THAT CHUNK. The already-graded
+    # window must survive, and — because a timeout (unlike a crash) leaves the
+    # previous chunk's fields saved and restartable — the grade must carry the
+    # pinned continuable marker so the UI can offer CONTINUE.
+    period = 0.5
+    calls = _install_continuation_fakes(
+        monkeypatch, period=period, spans=[1.0], wall_seconds=1.0, quality_ok_at_end=False
+    )
+    fake = pipeline._run_transient_attempt
+
+    def timeout_on_chunk(*args, **kwargs):
+        if calls:
+            raise pipeline.TransientTimeoutError(
+                "URANS transient timed out after 7200s at t=1.6 of 4.8s (dt collapsed to 1e-06)"
+            )
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", timeout_on_chunk)
+    result = _run_transient_for_test(tmp_path / "case", SolverParams(), timeout=7200)
+
+    assert result is not None
+    assert not result.quality.ok and not result.quality.can_refine
+    assert "continuation chunk failed after retaining 1.2 of 7 periods" in result.quality.reason
+    assert pipeline.URANS_BUDGET_STOP_MARKER in result.quality.reason
+
+
+def test_continuation_chunk_crash_does_not_claim_continuable(tmp_path, monkeypatch):
+    # False-positive guard: a chunk that CRASHED (divergence/solver error, not
+    # a timeout) must keep the honest partial grade WITHOUT the continuable
+    # marker — resuming a diverged case would integrate garbage.
+    period = 0.5
+    calls = _install_continuation_fakes(
+        monkeypatch, period=period, spans=[1.0], wall_seconds=1.0, quality_ok_at_end=False
+    )
+    fake = pipeline._run_transient_attempt
+
+    def crash_on_chunk(*args, **kwargs):
+        if calls:
+            raise OpenFOAMError("pimpleFoam diverged: sigFpe in GAMG at t=1.31")
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", crash_on_chunk)
+    result = _run_transient_for_test(tmp_path / "case", SolverParams(), timeout=7200)
+
+    assert result is not None
+    assert not result.quality.ok and not result.quality.can_refine
+    assert "continuation chunk failed after retaining 1.2 of 7 periods" in result.quality.reason
+    assert pipeline.URANS_BUDGET_STOP_MARKER not in result.quality.reason
 
 
 def test_continuation_respects_no_shedding_early_exit(tmp_path, monkeypatch):

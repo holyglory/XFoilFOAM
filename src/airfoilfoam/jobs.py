@@ -1,6 +1,7 @@
 """Execute a polar job with one mesh per chord and CPU-budgeted AoA scheduling."""
 from __future__ import annotations
 
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
@@ -24,10 +25,22 @@ from .models import (
     ResourcePolicy,
     effective_mesh_params,
 )
-from .openfoam.runner import get_runner
-from .pipeline import CaseOutcome, PolarMarchResult, StoredCaseOutcome, prepare_mesh, resolve_mesh_params, run_case, solve_polar_marched
+from .openfoam.runner import OpenFOAMError, get_runner
+from .pipeline import (
+    CaseOutcome,
+    PolarMarchResult,
+    StoredCaseOutcome,
+    TransientResume,
+    prepare_mesh,
+    resolve_mesh_params,
+    run_case,
+    solve_polar_marched,
+    stage_continuation_case,
+)
 from .resources import CpuTokenPool, resolve_resources
 from .storage import JobStore
+
+logger = logging.getLogger(__name__)
 
 ProgressCb = Optional[Callable[[JobStatus], None]]
 
@@ -221,10 +234,12 @@ def execute_job(
     #    every speed/AoA of that chord). URANS precalc jobs build the DERIVED
     #    half-resolution mesh (contract item 1) — the mesh cache keys on the
     #    resolved params, so it caches separately from the full mesh.
+    #    Continuation jobs skip meshing entirely: the staged saved case already
+    #    contains the mesh it was solved on.
     job_mesh = effective_mesh_params(request.mesh, request.solver)
     max_speed = max(speeds)
     meshes: dict[float, tuple] = {}
-    for chord in chords:
+    for chord in chords if request.continue_from is None else []:
         ensure_not_cancelled()
         resolved = resolve_mesh_params(
             job_mesh, CaseSpec(chord=chord, speed=max_speed, aoa_deg=0.0), request.fluid
@@ -298,7 +313,113 @@ def execute_job(
 
     use_warm_start = request.solver.warm_start and plan.resolved_policy == ResourcePolicy.airfoil_parallel
 
-    if use_warm_start:
+    if request.continue_from is not None:
+        # 2c. CROSS-JOB CONTINUATION: resume the saved (budget-stopped) URANS
+        #     case of a prior job. Single force_transient case (validated on
+        #     the request); no meshing, no steady stage — the staged state
+        #     restarts from latestTime with the (overridden) budget and the
+        #     coefficient history merges across the job boundary. A missing/
+        #     cleaned source case fails the job HONESTLY before any solving.
+        cf = request.continue_from
+        spec = request.cases()[0]
+        src_case = store.cases_dir(cf.engine_job_id) / cf.case_slug
+        dst_case = store.case_dir(job_id, spec.slug)
+        logger.warning(
+            "continuation: job %s resumes job %s case %s (budget_override_s=%s)",
+            job_id, cf.engine_job_id, cf.case_slug, request.budget_override_s,
+        )
+        set_status(
+            JobState.running,
+            f"staging saved case {cf.case_slug} from job {cf.engine_job_id} for continuation",
+            phase=JobPhase.waiting_cpu,
+        )
+        try:
+            source = stage_continuation_case(src_case, dst_case)
+        except OpenFOAMError as exc:
+            message = f"continuation failed: {exc}"
+            logger.error(
+                "continuation: job %s cannot resume %s/%s — %s",
+                job_id, cf.engine_job_id, cf.case_slug, exc,
+            )
+            result = JobResult(
+                job_id=job_id,
+                state=JobState.failed,
+                polars=build_polars(),
+                message=message,
+                scheduling=scheduling_metadata(),
+            )
+            store.write_result(result)
+            set_status(
+                JobState.failed,
+                message,
+                phase=JobPhase.failed,
+                cpu_tokens_waiting=0,
+                cpu_tokens_held=0,
+            )
+            return result
+        resume = TransientResume(
+            transient_start=source.transient_start, resume_from=source.resume_from
+        )
+
+        def continuation_phase_progress(
+            phase: JobPhase,
+            aoa: Optional[float],
+            slug: Optional[str],
+            solver: Optional[str],
+            message: Optional[str] = None,
+        ) -> None:
+            set_status(
+                JobState.running,
+                message or f"{phase.value.replace('_', ' ')} AoA {spec.aoa_deg:g} (continuation)",
+                phase=phase,
+                active_solver=solver,
+                active_case_slug=slug,
+                active_aoa_deg=aoa,
+            )
+
+        wait_for_cpu(
+            plan.solver_processes,
+            f"waiting for CPU before continuation AoA {spec.aoa_deg:g}",
+            case=spec,
+        )
+        with cpu_tokens.acquire(
+            plan.solver_processes,
+            on_wait=lambda _snapshot: wait_for_cpu(
+                plan.solver_processes,
+                f"waiting for CPU before continuation AoA {spec.aoa_deg:g}",
+                case=spec,
+            ),
+            on_acquired=lambda _snapshot: cpu_acquired(
+                plan.solver_processes,
+                JobPhase.solving_urans,
+                f"URANS continuation AoA {spec.aoa_deg:g} (resume from t={source.resume_from:g})",
+                solver="pimpleFoam",
+                case=spec,
+            ),
+        ):
+            outcome = run_case(
+                dst_case, airfoil, spec, request.fluid, request.roughness,
+                request.mesh, request.solver, mesher, runner,
+                n_proc=plan.solver_processes,
+                render_images=render_images,
+                solver_timeout=settings.solver_timeout,
+                rans_solver_timeout=settings.rans_solver_timeout,
+                rans_max_iterations=settings.rans_max_iterations,
+                cancel_check=ensure_not_cancelled,
+                phase_progress=continuation_phase_progress,
+                case_slug=spec.slug,
+                media_budget_s=settings.media_budget_seconds(),
+                resume=resume,
+                urans_budget_s=request.budget_override_s,
+            )
+        bump()
+        record_outcome(
+            spec.chord,
+            spec.speed,
+            StoredCaseOutcome(slug=spec.slug, outcome=outcome),
+            accepted=outcome.error is None,
+        )
+    elif use_warm_start:
         # 2a. WARM-START: one polar per (chord, speed), marched serially over AoA,
         #     polars run concurrently. Image URLs are namespaced under the polar dir.
         def run_polar(chord: float, speed: float) -> tuple[float, float, PolarMarchResult]:
