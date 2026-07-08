@@ -433,7 +433,16 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     const submitted = await uransLadderTick(db, stubEngine(captured, `${PREFIX}-request-job`), 0, { campaignIds: [campaignId] });
     expect(submitted).toBe(true);
     expect(captured.length).toBe(1);
-    expect(captured[0].solver?.urans_fidelity).toBe("full");
+    // PAYLOAD-SHAPE PIN (prod job e89be2bb class): ladder-composed admin
+    // requests are URANS-by-definition — solver.force_transient MUST ship, or
+    // the engine treats the URANS stage as a steady fallback on the FULL mesh
+    // at the tier's budget (effective_mesh_params requires force_transient).
+    expect(captured[0].solver).toMatchObject({
+      force_transient: true,
+      transient_fallback: true,
+      warm_start: false,
+      urans_fidelity: "full",
+    });
     const [afterRequest] = await db.select().from(simUransRequests).where(eq(simUransRequests.id, request.id));
     expect(afterRequest.state).toBe("running");
     expect(afterRequest.simJobId).toBeTruthy();
@@ -442,6 +451,63 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     expect(item.state).toBe("pending");
 
     // Settle the request job so the verify tier can open up.
+    await db.update(simJobs).set({ status: "done", ingestedAt: new Date(), finishedAt: new Date() }).where(eq(simJobs.id, afterRequest.simJobId!));
+    await db.update(simUransRequests).set({ state: "done" }).where(eq(simUransRequests.id, request.id));
+  }, 60000);
+
+  it("LADDER PAYLOAD MUST-CATCH: an admin PRECALC request ships force_transient + precalc fidelity (full mesh requested; half-res derivation is engine-side)", async () => {
+    const { request, created } = await createUransRequest(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg: REJECTED_AOA,
+      fidelity: "precalc",
+      requestedBy: "test@airfoils.pro",
+    });
+    expect(created).toBe(true);
+
+    const captured: PolarRequest[] = [];
+    const submitted = await uransLadderTick(db, stubEngine(captured, `${PREFIX}-precalc-request-job`), 0, { campaignIds: [campaignId] });
+    expect(submitted).toBe(true);
+    expect(captured.length).toBe(1);
+    // PAYLOAD-SHAPE PIN (prod job e89be2bb, 2026-07-07): a ladder request that
+    // ships WITHOUT solver.force_transient runs URANS on the FULL mesh at
+    // precalc budgets — the engine's half-mesh derivation
+    // (src/airfoilfoam/models.py effective_mesh_params) engages only when
+    // force_transient && urans_fidelity == precalc — structurally guaranteeing
+    // insufficient-periods (budget) rejections. A regression here must fail
+    // loudly on the exact composed payload.
+    expect(captured[0].solver).toMatchObject({
+      force_transient: true,
+      transient_fallback: true,
+      warm_start: false,
+      urans_fidelity: "precalc",
+    });
+    expect(captured[0].aoa?.angles).toEqual([REJECTED_AOA]);
+    expect(captured[0].speeds).toEqual([SPEED]);
+    // The node NEVER downscales the mesh: the composed request carries the
+    // revision's FULL-resolution grid and the engine derives the half-res
+    // precalc mesh from the flags pinned above.
+    const [revision] = await db
+      .select()
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    const snapshotMesh = (revision!.snapshot as { mesh: { nSurface: number; nRadial: number; nWake: number } }).mesh;
+    expect(captured[0].mesh?.n_surface).toBe(snapshotMesh.nSurface);
+    expect(captured[0].mesh?.n_radial).toBe(snapshotMesh.nRadial);
+    expect(captured[0].mesh?.n_wake).toBe(snapshotMesh.nWake);
+
+    const [afterRequest] = await db.select().from(simUransRequests).where(eq(simUransRequests.id, request.id));
+    expect(afterRequest.state).toBe("running");
+    expect(afterRequest.simJobId).toBeTruthy();
+    const [job] = await db.select().from(simJobs).where(eq(simJobs.id, afterRequest.simJobId!));
+    expect(job.wave).toBe(2);
+    expect(job.jobKind).toBe("targeted");
+    const payload = job.requestPayload as { uransFidelity?: string; uransRequestId?: string };
+    expect(payload.uransFidelity).toBe("precalc");
+    expect(payload.uransRequestId).toBe(request.id);
+
+    // Settle so the later verify-tier tests see a quiet machine.
     await db.update(simJobs).set({ status: "done", ingestedAt: new Date(), finishedAt: new Date() }).where(eq(simJobs.id, afterRequest.simJobId!));
     await db.update(simUransRequests).set({ state: "done" }).where(eq(simUransRequests.id, request.id));
   }, 60000);
@@ -476,7 +542,15 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     const submitted = await uransLadderTick(db, stubEngine(captured, `${PREFIX}-verify-job`), 0, { campaignIds: [campaignId] });
     expect(submitted).toBe(true);
     expect(captured.length).toBe(1);
-    expect(captured[0].solver?.urans_fidelity).toBe("full");
+    // PAYLOAD-SHAPE PIN (prod job e89be2bb class): verify items re-solve at
+    // FULL fidelity and are URANS-by-definition — force_transient MUST ship
+    // or the full-tier budget wraps a steady-fallback solve.
+    expect(captured[0].solver).toMatchObject({
+      force_transient: true,
+      transient_fallback: true,
+      warm_start: false,
+      urans_fidelity: "full",
+    });
     expect(captured[0].aoa?.angles).toEqual([REJECTED_AOA]);
 
     const [item] = await db.select().from(simUransVerifyQueue).where(eq(simUransVerifyQueue.revisionId, revisionId));

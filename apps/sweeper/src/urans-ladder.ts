@@ -189,6 +189,21 @@ async function submitLadderJob(
     queuePressure: await dbQueuePressure(db),
     cpuSlots,
   });
+  // Ladder jobs are URANS-BY-DEFINITION: the in-job steady stage is only the
+  // designed warm-start init, never the reported result. Pin the transient
+  // flags locally instead of relying on buildPolarRequest's wave-2 inference —
+  // a ladder request shipped without solver.force_transient runs URANS on the
+  // FULL mesh at this tier's budget (the engine's half-mesh derivation,
+  // src/airfoilfoam/models.py effective_mesh_params, requires
+  // force_transient && precalc), which structurally guarantees
+  // insufficient-periods (budget) rejections (prod job e89be2bb).
+  // MUST-CATCH payload-shape pins: urans-ladder.test.ts.
+  request.solver = {
+    ...request.solver,
+    transient_fallback: true,
+    force_transient: true,
+    urans_fidelity: fidelity,
+  };
   const [job] = await db
     .insert(simJobs)
     .values({
