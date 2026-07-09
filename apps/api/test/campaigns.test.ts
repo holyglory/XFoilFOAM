@@ -71,6 +71,8 @@ let asymId = "";
 let symId = "";
 let mediumId = "";
 let numerics = { boundaryProfileId: "", meshProfileId: "", solverProfileId: "", outputProfileId: "" };
+let uransMeshProfileId = "";
+let uransPrecalcMeshProfileId = "";
 
 function planBody(overrides: Record<string, unknown> = {}) {
   return {
@@ -128,13 +130,23 @@ beforeAll(async () => {
   cleanupMediumIds.push(medium.id);
   const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` }).returning();
   const [mesh] = await db.insert(meshProfiles).values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` }).returning();
+  const [uransMesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${PREFIX}-urans-mesh`, name: `${PREFIX} URANS mesh`, nSurface: 260, nRadial: 140, nWake: 90, targetYPlus: 0.8 })
+    .returning();
+  const [uransPrecalcMesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${PREFIX}-urans-precalc-mesh`, name: `${PREFIX} URANS precalc mesh`, nSurface: 90, nRadial: 45, nWake: 35, targetYPlus: 40 })
+    .returning();
   const [solver] = await db.insert(solverProfiles).values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` }).returning();
   const [output] = await db.insert(outputProfiles).values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` }).returning();
   cleanupProfileIds.boundary.push(boundary.id);
-  cleanupProfileIds.mesh.push(mesh.id);
+  cleanupProfileIds.mesh.push(mesh.id, uransMesh.id, uransPrecalcMesh.id);
   cleanupProfileIds.solver.push(solver.id);
   cleanupProfileIds.output.push(output.id);
   numerics = { boundaryProfileId: boundary.id, meshProfileId: mesh.id, solverProfileId: solver.id, outputProfileId: output.id };
+  uransMeshProfileId = uransMesh.id;
+  uransPrecalcMeshProfileId = uransPrecalcMesh.id;
 });
 
 afterAll(async () => {
@@ -316,6 +328,57 @@ describe("campaign launch (§5)", () => {
     expect(secondRevisions.map((r) => r.simulation_preset_revision_id)).toEqual(firstRevisions.map((r) => r.simulation_preset_revision_id));
   });
 
+  it("accepts and round-trips per-tier URANS mesh numerics fields", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} tier mesh pins`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-key-tier-mesh`,
+        airfoilIds: [asymId],
+        plan: planBody({
+          chordsM: [0.2],
+          numerics: {
+            ...numerics,
+            uransMeshProfileId,
+            uransPrecalcMeshProfileId,
+          },
+        }),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const tierCampaignId = res.json().campaign.id as string;
+    cleanupCampaignIds.push(tierCampaignId);
+
+    const summary = await app.inject({ method: "GET", url: `/api/admin/campaigns/${tierCampaignId}` });
+    expect(summary.statusCode).toBe(200);
+    expect(summary.json().campaign.plan.numerics).toMatchObject({
+      uransMeshProfileId,
+      uransPrecalcMeshProfileId,
+    });
+
+    const [stored] = (await db.execute(sql`
+      SELECT sp.urans_mesh_profile_id, sp.urans_precalc_mesh_profile_id,
+             rev.snapshot->'uransMesh'->>'id' AS snapshot_urans_mesh_id,
+             rev.snapshot->'uransPrecalcMesh'->>'id' AS snapshot_urans_precalc_mesh_id
+      FROM sim_campaign_conditions cc
+      JOIN simulation_presets sp ON sp.id = cc.preset_id
+      JOIN simulation_preset_revisions rev ON rev.id = cc.simulation_preset_revision_id
+      WHERE cc.campaign_id = ${tierCampaignId}
+      LIMIT 1
+    `)) as unknown as Array<{
+      urans_mesh_profile_id: string;
+      urans_precalc_mesh_profile_id: string;
+      snapshot_urans_mesh_id: string;
+      snapshot_urans_precalc_mesh_id: string;
+    }>;
+    expect(stored.urans_mesh_profile_id).toBe(uransMeshProfileId);
+    expect(stored.urans_precalc_mesh_profile_id).toBe(uransPrecalcMeshProfileId);
+    expect(stored.snapshot_urans_mesh_id).toBe(uransMeshProfileId);
+    expect(stored.snapshot_urans_precalc_mesh_id).toBe(uransPrecalcMeshProfileId);
+  });
+
   it("previews reuse read-only with real counts", async () => {
     const res = await app.inject({
       method: "POST",
@@ -337,6 +400,8 @@ describe("campaign launch (§5)", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.campaign.status).toBe("active");
+    expect(body.campaign.plan.numerics.uransMeshProfileId).toBeNull();
+    expect(body.campaign.plan.numerics.uransPrecalcMeshProfileId).toBeNull();
     expect(body.conditions.length).toBe(2);
     expect(body.totals.requested).toBe(20);
     expect(body.scheduler).toHaveProperty("sweeperEnabled");

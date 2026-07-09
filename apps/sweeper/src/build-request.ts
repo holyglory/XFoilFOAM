@@ -4,6 +4,7 @@ import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
   ALL_IMAGE_FIELDS,
   type AirfoilFormat,
+  type MeshParams,
   type PolarRequest,
   type ResourcePolicy,
   type TurbulenceModelName,
@@ -39,6 +40,16 @@ export function buildPolarRequest(opts: {
   const nu = setup.flowState.kinematicViscosity;
   const speed = setup.flowState.speedMps;
   const points = (airfoil.points as Point[]).map((p) => [p.x, p.y] as [number, number]);
+  const meshBlock = (mesh: SimulationSetupSnapshot["mesh"]): MeshParams => ({
+    mesher: mesh.mesher,
+    farfield_radius_chords: mesh.farfieldRadiusChords,
+    wake_length_chords: mesh.wakeLengthChords,
+    n_surface: mesh.nSurface,
+    n_radial: mesh.nRadial,
+    n_wake: mesh.nWake,
+    target_y_plus: mesh.targetYPlus,
+    span_chords: mesh.spanChords,
+  });
   const request: PolarRequest = {
     airfoil: { name: airfoil.name, format: airfoil.pointFormat as AirfoilFormat, points },
     chord_lengths: [setup.referenceGeometry.referenceLengthM],
@@ -46,16 +57,9 @@ export function buildPolarRequest(opts: {
     aoa: { angles: aoaList },
     fluid: { density: setup.flowState.density, kinematic_viscosity: nu },
     roughness: { sand_grain_height: setup.boundary.sandGrainHeight, roughness_constant: setup.boundary.roughnessConstant },
-    mesh: {
-      mesher: setup.mesh.mesher,
-      farfield_radius_chords: setup.mesh.farfieldRadiusChords,
-      wake_length_chords: setup.mesh.wakeLengthChords,
-      n_surface: setup.mesh.nSurface,
-      n_radial: setup.mesh.nRadial,
-      n_wake: setup.mesh.nWake,
-      target_y_plus: setup.mesh.targetYPlus,
-      span_chords: setup.mesh.spanChords,
-    },
+    mesh: meshBlock(setup.mesh),
+    ...(setup.uransMesh ? { urans_mesh: meshBlock(setup.uransMesh) } : {}),
+    ...(setup.uransPrecalcMesh ? { urans_precalc_mesh: meshBlock(setup.uransPrecalcMesh) } : {}),
     solver: {
       turbulence: {
         model: setup.solver.turbulenceModel as TurbulenceModelName,

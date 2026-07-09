@@ -3,7 +3,8 @@
 // isDirty/serialize/restore so the integration layer can wire the actual
 // dirty-exit navigation guard.
 
-import type { CampaignDuplicatePrefill } from "@/lib/admin";
+import type { CampaignDuplicatePrefill, CampaignPlanInput } from "@/lib/admin";
+import { withUransMeshDefaults } from "./urans-mesh-selection";
 
 export type CampaignKind = "polar_sweep" | "ld_refine";
 
@@ -51,7 +52,7 @@ export interface CampaignWizardDraft {
   clZero: WizardObjectiveDraft;
   clMax: WizardObjectiveDraft;
   // step 4 — numerics ("" = unresolved, surfaces as a validation issue)
-  numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
+  numerics: Required<CampaignPlanInput["numerics"]>;
 }
 
 const DRAFT_KEY_PREFIX = "aerodb.campaign-wizard.draft.";
@@ -105,7 +106,14 @@ export function emptyDraft(kind: CampaignKind): CampaignWizardDraft {
     // Same defaults as ld_max: the Cl curve is flat near its peak, so a
     // tighter tolerance would burn rounds for negligible Cl gain.
     clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 8 },
-    numerics: { boundaryProfileId: "", meshProfileId: "", solverProfileId: "", outputProfileId: "" },
+    numerics: {
+      boundaryProfileId: "",
+      meshProfileId: "",
+      solverProfileId: "",
+      outputProfileId: "",
+      uransMeshProfileId: null,
+      uransPrecalcMeshProfileId: null,
+    },
   };
 }
 
@@ -140,7 +148,7 @@ export function draftFromPrefill(prefill: CampaignDuplicatePrefill): CampaignWiz
     clMax: plan.objectives.clMax
       ? { enabled: plan.objectives.clMax.enabled, toleranceDeg: Number(plan.objectives.clMax.toleranceDeg), maxRounds: plan.objectives.clMax.maxRounds }
       : { ...base.clMax },
-    numerics: { ...plan.numerics },
+    numerics: withUransMeshDefaults(plan.numerics),
   };
 }
 
@@ -152,7 +160,7 @@ export function restoreDraft(serialized: string): CampaignWizardDraft | null {
   try {
     const parsed = JSON.parse(serialized) as CampaignWizardDraft;
     if (parsed?.version !== 1 || typeof parsed.draftId !== "string") return null;
-    return { ...parsed, anglePlanTouched: Boolean(parsed.anglePlanTouched) };
+    return { ...parsed, anglePlanTouched: Boolean(parsed.anglePlanTouched), numerics: withUransMeshDefaults(parsed.numerics) };
   } catch {
     return null;
   }

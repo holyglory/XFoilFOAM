@@ -124,7 +124,14 @@ export interface CampaignPlan {
   excludedConditions: Array<[string, string, string, string]>; // [T, P, speed, chord]
   baseSweep: CampaignBaseSweep;
   objectives: { ldMax: CampaignObjectivePlan; clZero: CampaignObjectivePlan; clMax: CampaignObjectivePlan };
-  numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
+  numerics: {
+    boundaryProfileId: string;
+    meshProfileId: string;
+    uransMeshProfileId: string | null;
+    uransPrecalcMeshProfileId: string | null;
+    solverProfileId: string;
+    outputProfileId: string;
+  };
 }
 
 type NumberLike = number | string;
@@ -145,7 +152,14 @@ export interface CampaignPlanInput {
     /** Optional for pre-clMax callers/plans: absent means disabled (defaults). */
     clMax?: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number };
   };
-  numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
+  numerics: {
+    boundaryProfileId: string;
+    meshProfileId: string;
+    uransMeshProfileId?: string | null;
+    uransPrecalcMeshProfileId?: string | null;
+    solverProfileId: string;
+    outputProfileId: string;
+  };
 }
 
 export interface CampaignPlanIssue {
@@ -261,6 +275,17 @@ export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
   for (const slot of ["boundaryProfileId", "meshProfileId", "solverProfileId", "outputProfileId"] as const) {
     if (!numerics?.[slot]) push(`numerics.${slot}`, "numerics profile is required");
   }
+  const optionalNumericProfileId = (slot: "uransMeshProfileId" | "uransPrecalcMeshProfileId"): string | null => {
+    const value = numerics?.[slot];
+    if (value == null) return null;
+    if (typeof value !== "string" || value.trim().length === 0) {
+      push(`numerics.${slot}`, "optional numerics profile id must be a non-empty string when set");
+      return null;
+    }
+    return value;
+  };
+  const uransMeshProfileId = optionalNumericProfileId("uransMeshProfileId");
+  const uransPrecalcMeshProfileId = optionalNumericProfileId("uransPrecalcMeshProfileId");
 
   const comboCount = ambients.length * speeds.length * chords.length - countApplicableExclusions(ambients, speeds, chords, excluded);
   if (comboCount <= 0) push("excludedConditions", "every condition combination is excluded — nothing to run");
@@ -282,6 +307,8 @@ export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
     numerics: {
       boundaryProfileId: numerics.boundaryProfileId,
       meshProfileId: numerics.meshProfileId,
+      uransMeshProfileId,
+      uransPrecalcMeshProfileId,
       solverProfileId: numerics.solverProfileId,
       outputProfileId: numerics.outputProfileId,
     },
@@ -712,11 +739,13 @@ async function findOrCreateReferenceGeometry(
 interface NumericsRows {
   boundary: typeof boundaryProfiles.$inferSelect;
   mesh: typeof meshProfiles.$inferSelect;
+  uransMesh: typeof meshProfiles.$inferSelect | null;
+  uransPrecalcMesh: typeof meshProfiles.$inferSelect | null;
   solver: typeof solverProfiles.$inferSelect;
   output: typeof outputProfiles.$inferSelect;
 }
 
-async function loadNumericsRows(db: DbTx, numerics: CampaignPlan["numerics"]): Promise<NumericsRows> {
+export async function loadNumericsRows(db: DbTx, numerics: CampaignPlan["numerics"]): Promise<NumericsRows> {
   const [[boundary], [mesh], [solver], [output]] = await Promise.all([
     asDb(db).select().from(boundaryProfiles).where(eq(boundaryProfiles.id, numerics.boundaryProfileId)).limit(1),
     asDb(db).select().from(meshProfiles).where(eq(meshProfiles.id, numerics.meshProfileId)).limit(1),
@@ -727,7 +756,15 @@ async function loadNumericsRows(db: DbTx, numerics: CampaignPlan["numerics"]): P
   if (!mesh) throw new CampaignError("not_found", "mesh profile not found");
   if (!solver) throw new CampaignError("not_found", "solver profile not found");
   if (!output) throw new CampaignError("not_found", "output profile not found");
-  return { boundary, mesh, solver, output };
+  const uransMesh = numerics.uransMeshProfileId
+    ? (await asDb(db).select().from(meshProfiles).where(eq(meshProfiles.id, numerics.uransMeshProfileId)).limit(1))[0]
+    : null;
+  if (numerics.uransMeshProfileId && !uransMesh) throw new CampaignError("not_found", "URANS mesh profile not found");
+  const uransPrecalcMesh = numerics.uransPrecalcMeshProfileId
+    ? (await asDb(db).select().from(meshProfiles).where(eq(meshProfiles.id, numerics.uransPrecalcMeshProfileId)).limit(1))[0]
+    : null;
+  if (numerics.uransPrecalcMeshProfileId && !uransPrecalcMesh) throw new CampaignError("not_found", "URANS precalc mesh profile not found");
+  return { boundary, mesh, uransMesh, uransPrecalcMesh, solver, output };
 }
 
 function stripRowMeta<T extends { createdAt: Date; updatedAt: Date; isSeeded: boolean }>(row: T) {
@@ -735,9 +772,10 @@ function stripRowMeta<T extends { createdAt: Date; updatedAt: Date; isSeeded: bo
   return rest;
 }
 
-/** Build the physics-relevant snapshot subset for hashing. Only the blocks
- *  physicsHashForSnapshot reads are real; preset/scheduling/output/sweep are
- *  placeholders that the hash provably ignores (see simulation-setup.ts). */
+/** Build the physics-relevant snapshot subset for hashing. The mesh and
+ *  optional per-tier URANS mesh blocks are real when present; preset /
+ *  scheduling / output / sweep are placeholders that the hash provably ignores
+ *  (see simulation-setup.ts). */
 function buildPhysicsHashSnapshot(args: {
   flow: typeof flowConditions.$inferSelect;
   medium: Medium;
@@ -784,6 +822,8 @@ function buildPhysicsHashSnapshot(args: {
       roughnessConstant: numerics.boundary.roughnessConstant,
     },
     mesh: stripRowMeta(numerics.mesh),
+    uransMesh: numerics.uransMesh ? stripRowMeta(numerics.uransMesh) : null,
+    uransPrecalcMesh: numerics.uransPrecalcMesh ? stripRowMeta(numerics.uransPrecalcMesh) : null,
     solver: stripRowMeta(numerics.solver),
     scheduling: null,
     output: null,
@@ -910,6 +950,8 @@ async function resolveCampaignConditionRevision(
       referenceGeometryProfileId: args.geo.id,
       boundaryProfileId: args.numerics.boundary.id,
       meshProfileId: args.numerics.mesh.id,
+      uransMeshProfileId: args.numerics.uransMesh?.id ?? null,
+      uransPrecalcMeshProfileId: args.numerics.uransPrecalcMesh?.id ?? null,
       solverProfileId: args.numerics.solver.id,
       schedulingProfileId: support.schedulingProfileId,
       outputProfileId: args.numerics.output.id,

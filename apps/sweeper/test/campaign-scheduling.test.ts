@@ -182,6 +182,10 @@ function batchSnapshot(overrides: {
   chordM?: number;
   meshId?: string;
   nSurface?: number;
+  uransMeshId?: string;
+  uransMeshSurface?: number;
+  uransPrecalcMeshId?: string;
+  uransPrecalcMeshSurface?: number;
   solverId?: string;
   nIterations?: number;
   boundaryIntensity?: number;
@@ -212,6 +216,20 @@ function batchSnapshot(overrides: {
       roughnessConstant: 0.5,
     },
     mesh: { id: overrides.meshId ?? "mesh-a", slug: "mesh-a", name: "Mesh A", nSurface: overrides.nSurface ?? 220, nRadial: 90 },
+    uransMesh:
+      overrides.uransMeshSurface == null
+        ? null
+        : { id: overrides.uransMeshId ?? "urans-mesh-a", slug: "urans-mesh-a", name: "URANS Mesh A", nSurface: overrides.uransMeshSurface, nRadial: 120 },
+    uransPrecalcMesh:
+      overrides.uransPrecalcMeshSurface == null
+        ? null
+        : {
+            id: overrides.uransPrecalcMeshId ?? "urans-precalc-mesh-a",
+            slug: "urans-precalc-mesh-a",
+            name: "URANS Precalc Mesh A",
+            nSurface: overrides.uransPrecalcMeshSurface,
+            nRadial: 45,
+          },
     solver: { id: overrides.solverId ?? "solver-a", slug: "solver-a", name: "Solver A", turbulenceModel: "kOmegaSST", nIterations: overrides.nIterations ?? 3000 },
     output: { id: "output-a", slug: "output-a", name: "Output A", imageZoomChords: overrides.outputZoom ?? 2 },
   };
@@ -280,16 +298,32 @@ describe("batched campaign job grouping (binding rules 1–4)", () => {
   it("different mesh/solver/boundary/output VALUES never share a job", () => {
     const head = candidateFor("c10", 10, angles);
     const mesh = candidateFor("cMesh", 20, angles, { speedMps: 20, nSurface: 300 });
+    const uransMesh = candidateFor("cUransMesh", 20, angles, { speedMps: 20, uransMeshSurface: 300 });
+    const uransPrecalcMesh = candidateFor("cUransPrecalcMesh", 20, angles, { speedMps: 20, uransPrecalcMeshSurface: 80 });
     const solver = candidateFor("cSolver", 20, angles, { speedMps: 20, nIterations: 5000 });
     const boundary = candidateFor("cBc", 20, angles, { speedMps: 20, boundaryIntensity: 0.1 });
     const output = candidateFor("cOut", 20, angles, { speedMps: 20, outputZoom: 4 });
-    const grouped = groupCampaignBatchEntries(head, [head, mesh, solver, boundary, output]);
+    const grouped = groupCampaignBatchEntries(head, [head, mesh, uransMesh, uransPrecalcMesh, solver, boundary, output]);
     expect(grouped.entries.map((e) => e.conditionId)).toEqual(["c10"]);
   });
 
   it("false-positive guard: value-identical numerics with different profile row ids DO share (identity is excluded)", () => {
     const head = candidateFor("c10", 10, angles);
     const sameValuesOtherRows = candidateFor("c20", 20, angles, { speedMps: 20, meshId: "mesh-b", solverId: "solver-b" });
+    expect(campaignBatchGroupKey(head.snapshot)).toBe(campaignBatchGroupKey(sameValuesOtherRows.snapshot));
+    const grouped = groupCampaignBatchEntries(head, [head, sameValuesOtherRows]);
+    expect(grouped.entries.map((e) => e.conditionId)).toEqual(["c10", "c20"]);
+  });
+
+  it("false-positive guard: value-identical per-tier URANS mesh pins with different row ids DO share", () => {
+    const head = candidateFor("c10", 10, angles, { speedMps: 10, uransMeshSurface: 260, uransPrecalcMeshSurface: 90 });
+    const sameValuesOtherRows = candidateFor("c20", 20, angles, {
+      speedMps: 20,
+      uransMeshId: "urans-mesh-b",
+      uransMeshSurface: 260,
+      uransPrecalcMeshId: "urans-precalc-mesh-b",
+      uransPrecalcMeshSurface: 90,
+    });
     expect(campaignBatchGroupKey(head.snapshot)).toBe(campaignBatchGroupKey(sameValuesOtherRows.snapshot));
     const grouped = groupCampaignBatchEntries(head, [head, sameValuesOtherRows]);
     expect(grouped.entries.map((e) => e.conditionId)).toEqual(["c10", "c20"]);

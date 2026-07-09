@@ -5,6 +5,7 @@
 import { canonicalAoa, canonicalSiString, expandAngleGrid } from "@aerodb/core";
 
 import type { CampaignPlanInput } from "@/lib/admin";
+import { withUransMeshDefaults } from "./urans-mesh-selection";
 
 export const CAMPAIGN_MAX_VALUES_PER_AXIS = 25;
 export const CAMPAIGN_MAX_CONDITIONS = 2000;
@@ -212,6 +213,6 @@ export function buildPlanInput(envelope: WizardEnvelope, angle: WizardAnglePlan,
       clMax: { enabled: angle.clMax.enabled, toleranceDeg: angle.clMax.toleranceDeg.toFixed(2), maxRounds: angle.clMax.maxRounds },
     },
     baseSweep,
-    numerics,
+    numerics: withUransMeshDefaults(numerics),
   };
 }

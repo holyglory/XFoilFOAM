@@ -596,6 +596,8 @@ export const simulationPresets = pgTable(
     meshProfileId: uuid("mesh_profile_id")
       .notNull()
       .references(() => meshProfiles.id),
+    uransMeshProfileId: uuid("urans_mesh_profile_id").references(() => meshProfiles.id),
+    uransPrecalcMeshProfileId: uuid("urans_precalc_mesh_profile_id").references(() => meshProfiles.id),
     solverProfileId: uuid("solver_profile_id")
       .notNull()
       .references(() => solverProfiles.id),

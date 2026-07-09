@@ -144,8 +144,9 @@ class MeshParams(BaseModel):
 #              half-resolution URANS mesh halves n_surface/n_radial/n_wake; the
 #              mesh cache keys on the resolved params, so it caches separately
 #              from the full one.
-#   full    => urans_min_periods 7, solver budget 43200 s (12 h), full mesh
-#              (background trickle tier per the approved ladder design)
+#   full    => urans_min_periods 7, solver budget 43200 s (12 h), full-
+#              resolution wall-function mesh by default (background trickle
+#              tier per the approved ladder design)
 # Measured basis for the budgets (gate tier-2 quality_warnings): under the
 # original 3600 s precalc budget the guard stopped at "retained 1.4 of 3
 # periods; projected 0.6h continuation exceeds 80% of the 1.0h solver
@@ -179,7 +180,7 @@ URANS_FIDELITY_MIN_PERIODS: dict[UransFidelity, int] = {
 #: while the provably hopeless class (Re 3.4M: t=0.0094 s of 0.4 s in the
 #: full 2 h) is now stopped EARLY by the march-rate guard instead of burning
 #: the bigger budget blind. History: 3600 -> 7200 -> 14400.
-#: full 43200 s (~2 h/period full mesh => 7 periods, background trickle tier).
+#: full 43200 s (~2 h/period full-resolution mesh => 7 periods, background trickle tier).
 URANS_FIDELITY_BUDGET_S: dict[UransFidelity, int] = {
     UransFidelity.precalc: 14400,
     UransFidelity.full: 43200,
@@ -188,15 +189,17 @@ URANS_FIDELITY_BUDGET_S: dict[UransFidelity, int] = {
 #: Mesh resolution scale of the derived precalc URANS mesh.
 URANS_PRECALC_MESH_SCALE = 0.5
 
-#: Wall-function y+ of the derived precalc URANS mesh.
-#: Precalc is the rough screening tier — wall-function resolution trades
-#: boundary-layer detail for a ~40x taller first cell, which lifts the
-#: Courant-capped dt by the same factor and removes the high-aspect-ratio
-#: pressure stiffness; the full tier keeps the resolved y+=1 wall.
+#: Wall-function y+ of derived URANS meshes.
+#: Wall-function resolution trades boundary-layer detail for a ~40x taller
+#: first cell, which lifts the Courant-capped dt by the same factor and removes
+#: the high-aspect-ratio pressure stiffness. Precalc halves the mesh counts;
+#: the full tier keeps the requested counts/extents and changes only the wall
+#: spacing unless the concavity guard keeps the requested resolved-wall mesh.
 #: Deliberately equals ``pipeline.TRANSIENT_WALL_YPLUS`` (standalone-case
 #: fallback); do not import pipeline here because models must stay below the
 #: runtime layer.
 URANS_PRECALC_WALL_YPLUS = 40.0
+URANS_FULL_WALL_YPLUS = 40.0
 
 #: Geometry guard for the y+40 precalc wall-function mesh. Measured with the
 #: airfoil.max_concave_curvature 0.025c arc-length window on real seed files:
@@ -314,7 +317,8 @@ class SolverParams(BaseModel):
         default=UransFidelity.full,
         description="URANS fidelity tier (pinned cross-runtime): 'precalc' runs a fast 3-period "
         "transient on a derived half-resolution wall-function mesh with a 14400 s (4 h) solver budget; 'full' "
-        "runs 7 periods on the full mesh with a 43200 s (12 h) budget (background trickle tier). "
+        "runs 7 periods on a full-resolution wall-function mesh with a 43200 s (12 h) budget "
+        "(background trickle tier). "
         "Budgets sized to measured prod rates: ~14 min/period half-res, ~2 h/period full mesh at "
         "the worst campaign class (0.1 m chord, 25 m/s). Echoed on PolarPoint.fidelity.",
     )
@@ -417,6 +421,22 @@ def derive_precalc_mesh_params(mesh: MeshParams) -> MeshParams:
     )
 
 
+def derive_full_urans_mesh_params(mesh: MeshParams) -> MeshParams:
+    """Derived full-resolution wall-function URANS mesh for the full tier.
+
+    Keeps the request mesh counts/extents unchanged, switches the wall target
+    to y+=40, and clears explicit first-cell height so y+ is resolved per case.
+    The geometry-aware concavity guard lives in pipeline where airfoil geometry
+    is available.
+    """
+    return mesh.model_copy(
+        update={
+            "target_y_plus": URANS_FULL_WALL_YPLUS,
+            "first_cell_height_chords": None,
+        }
+    )
+
+
 def derive_precalc_resolved_wall_mesh_params(mesh: MeshParams) -> MeshParams:
     """Derived half-resolution URANS mesh that preserves the profile wall spacing.
 
@@ -434,11 +454,16 @@ def derive_precalc_resolved_wall_mesh_params(mesh: MeshParams) -> MeshParams:
 
 
 def effective_mesh_params(mesh: MeshParams, solver: "SolverParams") -> MeshParams:
-    """The mesh params a job/case must actually build for this request: URANS
-    precalc requests mesh the derived half-resolution grid; everything else
-    (RANS and full-tier URANS) meshes the requested full grid."""
-    if solver.force_transient and solver.urans_fidelity == UransFidelity.precalc:
-        return derive_precalc_mesh_params(mesh)
+    """The default mesh params a job/case must build without geometry context.
+
+    Geometry-aware resolution, explicit per-tier overrides, and concavity
+    guards are centralized in ``pipeline.effective_mesh_params_for_airfoil``.
+    """
+    if solver.force_transient:
+        if solver.urans_fidelity == UransFidelity.precalc:
+            return derive_precalc_mesh_params(mesh)
+        if solver.urans_fidelity == UransFidelity.full:
+            return derive_full_urans_mesh_params(mesh)
     return mesh
 
 
@@ -526,6 +551,14 @@ class PolarRequest(BaseModel):
     fluid: FluidProperties = Field(default_factory=FluidProperties)
     roughness: RoughnessParams = Field(default_factory=RoughnessParams)
     mesh: MeshParams = Field(default_factory=MeshParams)
+    urans_mesh: Optional[MeshParams] = Field(
+        default=None,
+        description="Explicit mesh for the full URANS tier. None means derive from mesh.",
+    )
+    urans_precalc_mesh: Optional[MeshParams] = Field(
+        default=None,
+        description="Explicit mesh for the precalc URANS tier. None means derive from mesh.",
+    )
     solver: SolverParams = Field(default_factory=SolverParams)
     resources: ResourceParams = Field(default_factory=ResourceParams)
     continue_from: Optional[ContinueFrom] = Field(

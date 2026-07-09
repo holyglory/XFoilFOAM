@@ -2,7 +2,7 @@
 
 Pins the tier constants the node build-request relies on (precalc: 3 periods /
 14400 s budget / half-resolution derived mesh; full: 7 periods / 43200 s /
-full mesh — budgets retuned 2026-07-07 to measured prod rates and again
+full-resolution wall-function mesh — budgets retuned 2026-07-07 to measured prod rates and again
 2026-07-09 after the first prod tier-2 wave budget-stopped 9/9 points at
 7200 s: the feasible class projected up to ~3.1 h of continuation, so 4 h
 absorbs it while the march-rate guard stops the hopeless class early), the PolarPoint.fidelity echo ("rans" | "urans_precalc" |
@@ -25,6 +25,7 @@ from airfoilfoam.models import (
     URANS_FIDELITY_BUDGET_S,
     URANS_FIDELITY_MIN_PERIODS,
     PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
+    URANS_FULL_WALL_YPLUS,
     URANS_PRECALC_MESH_SCALE,
     URANS_PRECALC_WALL_YPLUS,
     AirfoilFormat,
@@ -39,6 +40,7 @@ from airfoilfoam.models import (
     SolverParams,
     UransFidelity,
     apply_urans_fidelity,
+    derive_full_urans_mesh_params,
     derive_precalc_mesh_params,
     effective_mesh_params,
     urans_budget_seconds,
@@ -68,6 +70,7 @@ def test_fidelity_tier_contract_pin():
     assert URANS_FIDELITY_BUDGET_S == {UransFidelity.precalc: 14400, UransFidelity.full: 43200}
     assert URANS_PRECALC_MESH_SCALE == 0.5
     assert URANS_PRECALC_WALL_YPLUS == 40.0
+    assert URANS_FULL_WALL_YPLUS == 40.0
     assert PRECALC_WALLFN_MAX_CONCAVE_CURVATURE == 2.5
 
     # Effective per-tier resolution.
@@ -83,6 +86,18 @@ def test_fidelity_tier_contract_pin():
     assert json.loads(PolarPoint(aoa_deg=1.0).model_dump_json())["fidelity"] == "rans"
     with pytest.raises(ValueError):
         PolarPoint(aoa_deg=1.0, fidelity="urans_turbo")
+
+
+def test_polar_request_parses_old_payload_without_per_tier_mesh_keys():
+    request = PolarRequest.model_validate(
+        {
+            "airfoil": {"name": "unit", "points": [(1.0, 0.0), (0.0, 0.0), (1.0, 0.0)]},
+            "aoa": {"angles": [0.0]},
+        }
+    )
+
+    assert request.urans_mesh is None
+    assert request.urans_precalc_mesh is None
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +119,26 @@ def test_precalc_mesh_derivation_halves_counts_uses_wall_function_yplus():
     # Field minimums are respected (never an invalid MeshParams).
     tiny = derive_precalc_mesh_params(MeshParams(n_surface=25, n_radial=21, n_wake=11))
     assert (tiny.n_surface, tiny.n_radial, tiny.n_wake) == (20, 20, 10)
+
+
+def test_full_urans_mesh_derivation_keeps_counts_uses_wall_function_yplus():
+    full = MeshParams(
+        n_surface=180,
+        n_radial=120,
+        n_wake=90,
+        farfield_radius_chords=22.0,
+        wake_length_chords=18.0,
+        target_y_plus=1.0,
+        first_cell_height_chords=1e-5,
+    )
+    derived = derive_full_urans_mesh_params(full)
+
+    assert (derived.n_surface, derived.n_radial, derived.n_wake) == (180, 120, 90)
+    assert derived.farfield_radius_chords == full.farfield_radius_chords
+    assert derived.wake_length_chords == full.wake_length_chords
+    assert derived.span_chords == full.span_chords
+    assert derived.target_y_plus == URANS_FULL_WALL_YPLUS
+    assert derived.first_cell_height_chords is None
 
 
 def test_precalc_wall_function_height_scales_resolved_first_cell():
@@ -131,7 +166,7 @@ def test_effective_mesh_params_only_derives_for_precalc_urans():
     full_urans = SolverParams(force_transient=True)
     precalc_urans = SolverParams(force_transient=True, urans_fidelity="precalc")
     assert effective_mesh_params(mesh, rans) == mesh
-    assert effective_mesh_params(mesh, full_urans) == mesh
+    assert effective_mesh_params(mesh, full_urans) == derive_full_urans_mesh_params(mesh)
     assert effective_mesh_params(mesh, precalc_urans) == derive_precalc_mesh_params(mesh)
 
 
@@ -161,6 +196,76 @@ def test_geometry_aware_precalc_keeps_wall_function_for_sd8020():
     assert resolved.target_y_plus == URANS_PRECALC_WALL_YPLUS
     assert resolved.first_cell_height_chords is None
     assert warnings == []
+
+
+def test_geometry_aware_full_urans_uses_full_resolution_wall_function_for_sd8020():
+    mesh = MeshParams(target_y_plus=1.0, first_cell_height_chords=1e-6)
+    solver = SolverParams(force_transient=True, urans_fidelity="full")
+    resolved, warnings = pipeline.effective_mesh_params_for_airfoil(mesh, solver, _seed_airfoil("sd8020"))
+
+    assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (130, 80, 60)
+    assert resolved.target_y_plus == URANS_FULL_WALL_YPLUS
+    assert resolved.first_cell_height_chords is None
+    assert warnings == [
+        "full URANS tier uses a wall-function mesh (y+~40) derived from the RANS mesh profile"
+    ]
+
+
+def test_geometry_aware_full_urans_reverts_derived_wall_function_for_s1223():
+    mesh = MeshParams(target_y_plus=1.0, first_cell_height_chords=1e-6)
+    solver = SolverParams(force_transient=True, urans_fidelity="full")
+    resolved, warnings = pipeline.effective_mesh_params_for_airfoil(mesh, solver, _seed_airfoil("s1223"))
+
+    assert resolved == mesh
+    assert warnings
+    assert "full URANS tier ran the resolved-wall mesh: concave geometry" in warnings[0]
+    assert "folds the wall-function layer" in warnings[0]
+
+
+def test_explicit_full_urans_mesh_is_honored_verbatim_for_concave_airfoil():
+    mesh = MeshParams(target_y_plus=1.0, first_cell_height_chords=1e-6)
+    explicit = MeshParams(
+        n_surface=222,
+        n_radial=111,
+        n_wake=77,
+        target_y_plus=6.0,
+        first_cell_height_chords=2e-5,
+        farfield_radius_chords=19.0,
+        wake_length_chords=17.0,
+    )
+    solver = SolverParams(force_transient=True, urans_fidelity="full")
+    resolved, warnings = pipeline.effective_mesh_params_for_airfoil(
+        mesh,
+        solver,
+        _seed_airfoil("s1223"),
+        urans_mesh=explicit,
+    )
+
+    assert resolved == explicit
+    assert warnings == ["full URANS tier runs a user-defined mesh"]
+
+
+def test_explicit_precalc_urans_mesh_is_honored_verbatim_for_concave_airfoil():
+    mesh = MeshParams(target_y_plus=1.0, first_cell_height_chords=1e-6)
+    explicit = MeshParams(
+        n_surface=222,
+        n_radial=111,
+        n_wake=77,
+        target_y_plus=6.0,
+        first_cell_height_chords=2e-5,
+        farfield_radius_chords=19.0,
+        wake_length_chords=17.0,
+    )
+    solver = SolverParams(force_transient=True, urans_fidelity="precalc")
+    resolved, warnings = pipeline.effective_mesh_params_for_airfoil(
+        mesh,
+        solver,
+        _seed_airfoil("s1223"),
+        urans_precalc_mesh=explicit,
+    )
+
+    assert resolved == explicit
+    assert warnings == ["precalc URANS tier runs a user-defined precalc mesh"]
 
 
 def test_precalc_mesh_caches_under_its_own_key(naca2412_points):
@@ -270,7 +375,14 @@ def test_steady_rans_point_echoes_rans_fidelity():
 # --------------------------------------------------------------------------- #
 
 
-def _run_job_capturing_mesh(monkeypatch, naca0012_selig_text, solver: SolverParams):
+def _run_job_capturing_mesh(
+    monkeypatch,
+    naca0012_selig_text,
+    solver: SolverParams,
+    mesh: MeshParams | None = None,
+    urans_mesh: MeshParams | None = None,
+    urans_precalc_mesh: MeshParams | None = None,
+):
     captured = {}
 
     def fake_prepare_mesh(mesh_dir, airfoil, resolved, chord, mesher, runner, **_kwargs):
@@ -292,6 +404,9 @@ def _run_job_capturing_mesh(monkeypatch, naca0012_selig_text, solver: SolverPara
     request = PolarRequest(
         airfoil=AirfoilInput(name="n0012", coordinates=naca0012_selig_text),
         aoa=AoASpec(angles=[2.0]),
+        mesh=mesh or MeshParams(),
+        urans_mesh=urans_mesh,
+        urans_precalc_mesh=urans_precalc_mesh,
         solver=solver,
     )
     settings = get_settings()
@@ -314,14 +429,82 @@ def test_precalc_urans_job_builds_derived_half_mesh(monkeypatch, naca0012_selig_
     assert (captured["case_mesh"].n_surface, captured["case_mesh"].n_radial) == (65, 40)
 
 
-def test_full_urans_and_rans_jobs_build_the_full_mesh(monkeypatch, naca0012_selig_text):
-    for solver in (
+def test_full_urans_job_builds_full_resolution_wall_function_mesh(monkeypatch, naca0012_selig_text):
+    captured = _run_job_capturing_mesh(
+        monkeypatch,
+        naca0012_selig_text,
         SolverParams(force_transient=True, urans_fidelity="full", write_images=[]),
+    )
+    resolved = captured["resolved"]
+
+    assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (130, 80, 60)
+    assert resolved.target_y_plus == URANS_FULL_WALL_YPLUS
+    full_resolved = pipeline.resolve_mesh_params(MeshParams(), captured["spec"], captured["fluid"])
+    assert resolved.first_cell_height_chords == pytest.approx(
+        40.0 * full_resolved.first_cell_height_chords
+    )
+    assert captured["case_warnings"] == [
+        "full URANS tier uses a wall-function mesh (y+~40) derived from the RANS mesh profile"
+    ]
+
+
+def test_explicit_full_urans_job_builds_user_mesh_verbatim(monkeypatch, naca0012_selig_text):
+    explicit = MeshParams(
+        n_surface=222,
+        n_radial=111,
+        n_wake=77,
+        target_y_plus=6.0,
+        first_cell_height_chords=2e-5,
+        farfield_radius_chords=19.0,
+        wake_length_chords=17.0,
+    )
+    captured = _run_job_capturing_mesh(
+        monkeypatch,
+        naca0012_selig_text,
+        SolverParams(force_transient=True, urans_fidelity="full", write_images=[]),
+        urans_mesh=explicit,
+    )
+
+    assert captured["resolved"] == explicit
+    assert captured["case_mesh"] == explicit
+    assert captured["case_warnings"] == ["full URANS tier runs a user-defined mesh"]
+
+
+def test_explicit_precalc_urans_job_builds_user_mesh_verbatim(monkeypatch, naca0012_selig_text):
+    explicit = MeshParams(
+        n_surface=222,
+        n_radial=111,
+        n_wake=77,
+        target_y_plus=6.0,
+        first_cell_height_chords=2e-5,
+        farfield_radius_chords=19.0,
+        wake_length_chords=17.0,
+    )
+    captured = _run_job_capturing_mesh(
+        monkeypatch,
+        naca0012_selig_text,
+        SolverParams(force_transient=True, urans_fidelity="precalc", write_images=[]),
+        urans_precalc_mesh=explicit,
+    )
+
+    assert captured["resolved"] == explicit
+    assert captured["case_mesh"] == explicit
+    assert captured["case_warnings"] == ["precalc URANS tier runs a user-defined precalc mesh"]
+
+
+def test_rans_job_builds_the_request_mesh(monkeypatch, naca0012_selig_text):
+    captured = _run_job_capturing_mesh(
+        monkeypatch,
+        naca0012_selig_text,
         SolverParams(write_images=[]),
-    ):
-        captured = _run_job_capturing_mesh(monkeypatch, naca0012_selig_text, solver)
-        resolved = captured["resolved"]
-        assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (130, 80, 60)
+    )
+    resolved = captured["resolved"]
+
+    assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (130, 80, 60)
+    assert resolved.target_y_plus == 1.0
+    full_resolved = pipeline.resolve_mesh_params(MeshParams(), captured["spec"], captured["fluid"])
+    assert resolved.first_cell_height_chords == pytest.approx(full_resolved.first_cell_height_chords)
+    assert captured["case_warnings"] == []
 
 
 def test_concave_precalc_job_builds_resolved_wall_half_mesh(monkeypatch):

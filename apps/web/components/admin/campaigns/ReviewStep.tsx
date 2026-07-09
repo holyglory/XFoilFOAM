@@ -28,6 +28,7 @@ import { C, MONO } from "@/lib/tokens";
 import { PROCESS_NOT_RUNNING_DETAIL, isProcessDead } from "@/lib/solver-state";
 import { NumericsQuickCreate, type NumericsProfileKind, type NumericsProfileRow } from "./NumericsQuickCreate";
 import { resolveNumericsDefault } from "./numerics-resolution";
+import { formatUransMeshDisclosureValue, formatUransMeshReviewSummary } from "./urans-mesh-selection";
 import { usePoll } from "./usePoll";
 import {
   type AngleSets,
@@ -121,6 +122,7 @@ export function ReviewStep({
   const [queueError, setQueueError] = useState<string | null>(null);
   const [confirmText, setConfirmText] = useState("");
   const [expandedSlot, setExpandedSlot] = useState<NumericsSlot | null>(null);
+  const [uransMeshesExpanded, setUransMeshesExpanded] = useState(false);
   const [creatingSlot, setCreatingSlot] = useState<NumericsSlot | null>(null);
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
@@ -266,6 +268,7 @@ export function ReviewStep({
     ["Points", fCount(totalPoints)],
     ["Solver runs", `${fCount(totalSolverRuns)}${totalDerived ? ` — ${fCount(symmetricCount)} symmetric airfoils solve positive angles only; ${fCount(totalDerived)} points derived by symmetry` : ""}`],
     ["Span / area", `${Number(plan.spanM)} m span · ${plan.areaMode === "explicit" && plan.areaM2 ? `${Number(plan.areaM2)} m² explicit` : "area derived per condition"}`],
+    ["URANS meshes", formatUransMeshReviewSummary(plan.numerics, setup.meshProfiles)],
     ["Priority", PRIORITY_OPTIONS.find((o) => o.value === String(priority))?.label ?? String(priority)],
   ];
 
@@ -420,6 +423,66 @@ export function ReviewStep({
               />
             );
           })()}
+        <div style={{ border: `1px solid ${C.borderSoft}`, borderRadius: 6, padding: "7px 8px", display: "grid", gap: 7 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flexWrap: "wrap" }}>
+            <span style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest }}>URANS meshes</span>
+            <span
+              data-testid="urans-meshes-summary"
+              style={{
+                flex: "1 1 180px",
+                minWidth: 0,
+                fontFamily: MONO,
+                fontSize: 10,
+                color: C.text,
+                background: C.panel3,
+                border: `1px solid ${C.borderSoft}`,
+                borderRadius: 6,
+                padding: "5px 7px",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {formatUransMeshDisclosureValue(numerics, setup.meshProfiles)}
+            </span>
+            <button
+              type="button"
+              data-testid="urans-meshes-customize"
+              aria-expanded={uransMeshesExpanded}
+              onClick={() => setUransMeshesExpanded((open) => !open)}
+              style={{ ...ghostBtn, padding: "5px 9px", fontSize: 10, color: C.teal, whiteSpace: "nowrap" }}
+            >
+              {uransMeshesExpanded ? "hide" : "Customize"}
+            </button>
+          </div>
+          {uransMeshesExpanded && (
+            <div data-testid="urans-meshes-editor" style={{ display: "grid", gap: 7 }}>
+              <InfoLine text="Derived: full URANS uses full-resolution wall-function y+~40; precalc uses half-resolution wall-function." />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 8 }}>
+                <SelectField
+                  label="Full URANS mesh"
+                  value={numerics.uransMeshProfileId ?? ""}
+                  options={["", ...setup.meshProfiles.map((row) => row.id)]}
+                  optionLabels={Object.fromEntries([
+                    ["", "Derived — wall-function from RANS mesh (default)"],
+                    ...setup.meshProfiles.map((row) => [row.id, `${row.name}${row.isSeeded ? " · seeded" : ""}`]),
+                  ])}
+                  onChange={(id) => onNumerics({ uransMeshProfileId: id || null })}
+                />
+                <SelectField
+                  label="Precalc URANS mesh"
+                  value={numerics.uransPrecalcMeshProfileId ?? ""}
+                  options={["", ...setup.meshProfiles.map((row) => row.id)]}
+                  optionLabels={Object.fromEntries([
+                    ["", "Derived — half-resolution wall-function (default)"],
+                    ...setup.meshProfiles.map((row) => [row.id, `${row.name}${row.isSeeded ? " · seeded" : ""}`]),
+                  ])}
+                  onChange={(id) => onNumerics({ uransPrecalcMeshProfileId: id || null })}
+                />
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       <SelectField

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { canonicalSiString } from "@aerodb/core";
 import { desc, eq, type InferSelectModel } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 
 import type { DB } from "./client";
 import {
@@ -17,6 +18,11 @@ import {
   solverProfiles,
   sweepDefinitions,
 } from "./schema";
+
+type MeshSnapshot = Omit<InferSelectModel<typeof meshProfiles>, "createdAt" | "updatedAt" | "isSeeded">;
+
+const uransMeshProfiles = alias(meshProfiles, "urans_mesh_profiles");
+const uransPrecalcMeshProfiles = alias(meshProfiles, "urans_precalc_mesh_profiles");
 
 export interface SimulationSetupSnapshot {
   preset: {
@@ -64,7 +70,9 @@ export interface SimulationSetupSnapshot {
     sandGrainHeight: number;
     roughnessConstant: number;
   };
-  mesh: Omit<InferSelectModel<typeof meshProfiles>, "createdAt" | "updatedAt" | "isSeeded">;
+  mesh: MeshSnapshot;
+  uransMesh: SimulationSetupSnapshot["mesh"] | null;
+  uransPrecalcMesh: SimulationSetupSnapshot["mesh"] | null;
   solver: Omit<InferSelectModel<typeof solverProfiles>, "createdAt" | "updatedAt" | "isSeeded">;
   scheduling: Omit<InferSelectModel<typeof schedulingProfiles>, "createdAt" | "updatedAt" | "isSeeded">;
   output: Omit<InferSelectModel<typeof outputProfiles>, "createdAt" | "updatedAt" | "isSeeded">;
@@ -86,6 +94,9 @@ function stableStringify(value: unknown): string {
 }
 
 export function simulationSetupSignature(snapshot: SimulationSetupSnapshot): string {
+  // Signature intentionally covers the whole snapshot. Adding always-present
+  // uransMesh/uransPrecalcMesh null keys changes signatures; a DB reseed
+  // follows this deploy.
   return createHash("md5").update(stableStringify(snapshot)).digest("hex");
 }
 
@@ -101,14 +112,18 @@ export function simulationSetupSignature(snapshot: SimulationSetupSnapshot): str
  *  - boundary: turbulenceIntensity, viscosityRatio, sandGrainHeight,
  *    roughnessConstant
  *  - mesh / solver: full numeric payloads minus row identity (id/slug/name)
+ *  - uransMesh / uransPrecalcMesh: same mesh payload minus identity, included
+ *    only when pinned; NULL/absent preserves the historical hash byte-for-byte
  *  - derived: reynolds, mach
  * EXCLUDED: preset name/slug, sweep block, scheduling block, output block,
  * every registry-row id/slug/name, and timestamps — two profile rows with the
  * same values must produce the same hash.
  */
 export function physicsHashForSnapshot(snapshot: SimulationSetupSnapshot): string {
-  const { flowState, referenceGeometry, boundary, mesh, solver, derived } = snapshot;
+  const { flowState, referenceGeometry, boundary, mesh, uransMesh, uransPrecalcMesh, solver, derived } = snapshot;
   const { id: _meshId, slug: _meshSlug, name: _meshName, ...meshPhysics } = mesh;
+  const uransMeshPhysics = uransMesh ? meshPhysicsPayload(uransMesh) : null;
+  const uransPrecalcMeshPhysics = uransPrecalcMesh ? meshPhysicsPayload(uransPrecalcMesh) : null;
   const { id: _solverId, slug: _solverSlug, name: _solverName, ...solverPhysics } = solver;
   const subset = {
     flowState: {
@@ -135,10 +150,23 @@ export function physicsHashForSnapshot(snapshot: SimulationSetupSnapshot): strin
       roughnessConstant: boundary.roughnessConstant,
     },
     mesh: meshPhysics,
+    ...(uransMeshPhysics ? { uransMesh: uransMeshPhysics } : {}),
+    ...(uransPrecalcMeshPhysics ? { uransPrecalcMesh: uransPrecalcMeshPhysics } : {}),
     solver: solverPhysics,
     derived: { reynolds: derived.reynolds, mach: derived.mach },
   };
   return createHash("sha256").update(stableStringify(subset)).digest("hex");
+}
+
+function meshPhysicsPayload(mesh: MeshSnapshot): Omit<MeshSnapshot, "id" | "slug" | "name"> {
+  const { id: _id, slug: _slug, name: _name, ...payload } = mesh;
+  return payload;
+}
+
+function stripMeshProfileMeta(row: InferSelectModel<typeof meshProfiles> | null): MeshSnapshot | null {
+  if (!row) return null;
+  const { createdAt: _createdAt, updatedAt: _updatedAt, isSeeded: _isSeeded, ...payload } = row;
+  return payload;
 }
 
 export interface FlowConditionCanonicalInput {
@@ -202,6 +230,8 @@ export async function resolveSimulationPresetSnapshot(db: DB, presetId: string):
       referenceGeometry: referenceGeometryProfiles,
       boundary: boundaryProfiles,
       mesh: meshProfiles,
+      uransMesh: uransMeshProfiles,
+      uransPrecalcMesh: uransPrecalcMeshProfiles,
       solver: solverProfiles,
       scheduling: schedulingProfiles,
       output: outputProfiles,
@@ -213,6 +243,8 @@ export async function resolveSimulationPresetSnapshot(db: DB, presetId: string):
     .innerJoin(referenceGeometryProfiles, eq(referenceGeometryProfiles.id, simulationPresets.referenceGeometryProfileId))
     .innerJoin(boundaryProfiles, eq(boundaryProfiles.id, simulationPresets.boundaryProfileId))
     .innerJoin(meshProfiles, eq(meshProfiles.id, simulationPresets.meshProfileId))
+    .leftJoin(uransMeshProfiles, eq(uransMeshProfiles.id, simulationPresets.uransMeshProfileId))
+    .leftJoin(uransPrecalcMeshProfiles, eq(uransPrecalcMeshProfiles.id, simulationPresets.uransPrecalcMeshProfileId))
     .innerJoin(solverProfiles, eq(solverProfiles.id, simulationPresets.solverProfileId))
     .innerJoin(schedulingProfiles, eq(schedulingProfiles.id, simulationPresets.schedulingProfileId))
     .innerJoin(outputProfiles, eq(outputProfiles.id, simulationPresets.outputProfileId))
@@ -220,8 +252,10 @@ export async function resolveSimulationPresetSnapshot(db: DB, presetId: string):
     .where(eq(simulationPresets.id, presetId))
     .limit(1);
   if (!row) return null;
-  const { preset, flowState, medium, referenceGeometry, boundary, mesh, solver, scheduling, output, sweep } = row;
-  const { createdAt: _mCreated, updatedAt: _mUpdated, isSeeded: _mSeeded, ...meshPayload } = mesh;
+  const { preset, flowState, medium, referenceGeometry, boundary, mesh, uransMesh, uransPrecalcMesh, solver, scheduling, output, sweep } = row;
+  const meshPayload = stripMeshProfileMeta(mesh);
+  const uransMeshPayload = stripMeshProfileMeta(uransMesh);
+  const uransPrecalcMeshPayload = stripMeshProfileMeta(uransPrecalcMesh);
   const { createdAt: _solCreated, updatedAt: _solUpdated, isSeeded: _solSeeded, ...solverPayload } = solver;
   const { createdAt: _schedCreated, updatedAt: _schedUpdated, isSeeded: _schedSeeded, ...schedulingPayload } = scheduling;
   const { createdAt: _outCreated, updatedAt: _outUpdated, isSeeded: _outSeeded, ...outputPayload } = output;
@@ -272,7 +306,9 @@ export async function resolveSimulationPresetSnapshot(db: DB, presetId: string):
       sandGrainHeight: boundary.sandGrainHeight,
       roughnessConstant: boundary.roughnessConstant,
     },
-    mesh: meshPayload,
+    mesh: meshPayload!,
+    uransMesh: uransMeshPayload,
+    uransPrecalcMesh: uransPrecalcMeshPayload,
     solver: solverPayload,
     scheduling: schedulingPayload,
     output: outputPayload,

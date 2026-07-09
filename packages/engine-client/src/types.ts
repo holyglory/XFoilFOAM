@@ -125,6 +125,8 @@ export interface PolarRequest {
   fluid?: FluidProperties;
   roughness?: RoughnessParams;
   mesh?: MeshParams;
+  urans_mesh?: MeshParams;
+  urans_precalc_mesh?: MeshParams;
   solver?: SolverParams;
   resources?: ResourceParams;
   /** Amendment C: resume from a saved case state instead of a fresh solve. */

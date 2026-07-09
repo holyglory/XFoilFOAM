@@ -57,9 +57,10 @@ export function compareScheduleCandidates(a: ScheduleCandidate, b: ScheduleCandi
 // marches every speed×angle warm-started. Conditions may share a job ONLY if
 // their pinned revision snapshots have identical ambient fluid state
 // (temperature/pressure/density/dynamicViscosity — speed excluded) AND
-// identical boundary/mesh/solver/output blocks (value-compared, row identity
-// excluded), a single chord per job, and identical open-angle sets (ONE aoa
-// list per engine request; unioning would re-solve already-solved points).
+// identical boundary/mesh/solver/output blocks plus any pinned per-tier URANS
+// mesh blocks (value-compared, row identity excluded), a single chord per job,
+// and identical open-angle sets (ONE aoa list per engine request; unioning
+// would re-solve already-solved points).
 // ---------------------------------------------------------------------------
 
 /** Case budget per batched campaign job: speeds × angles ≤ this, min 1 speed. */
@@ -92,6 +93,8 @@ export interface CampaignBatchSnapshot {
     roughnessConstant: number;
   };
   mesh: Record<string, unknown>;
+  uransMesh?: Record<string, unknown> | null;
+  uransPrecalcMesh?: Record<string, unknown> | null;
   solver: Record<string, unknown>;
   output: Record<string, unknown>;
 }
@@ -157,9 +160,10 @@ function withoutRowIdentity(block: Record<string, unknown>): Record<string, unkn
  * Physics-group signature (binding batching rules 1–2): conditions may share a
  * job ONLY when this key matches — identical ambient fluid state (T, P,
  * density, dynamicViscosity; speed deliberately excluded), single chord, and
- * identical boundary/mesh/solver/output blocks compared by VALUES (row
- * id/slug/name excluded, mirroring physicsHashForSnapshot's discipline so
- * value-identical profiles group together across presets).
+ * identical boundary/mesh/solver/output blocks compared by VALUES. Optional
+ * per-tier URANS mesh pins join the key only when present. Row id/slug/name is
+ * excluded, mirroring physicsHashForSnapshot's discipline so value-identical
+ * profiles group together across presets.
  */
 export function campaignBatchGroupKey(snapshot: CampaignBatchSnapshot): string {
   const subset = {
@@ -184,6 +188,8 @@ export function campaignBatchGroupKey(snapshot: CampaignBatchSnapshot): string {
       roughnessConstant: snapshot.boundary.roughnessConstant,
     },
     mesh: withoutRowIdentity(snapshot.mesh),
+    ...(snapshot.uransMesh ? { uransMesh: withoutRowIdentity(snapshot.uransMesh) } : {}),
+    ...(snapshot.uransPrecalcMesh ? { uransPrecalcMesh: withoutRowIdentity(snapshot.uransPrecalcMesh) } : {}),
     solver: withoutRowIdentity(snapshot.solver),
     output: withoutRowIdentity(snapshot.output),
   };

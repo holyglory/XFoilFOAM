@@ -85,6 +85,8 @@ const planBody = z.object({
   numerics: z.object({
     boundaryProfileId: z.string().uuid(),
     meshProfileId: z.string().uuid(),
+    uransMeshProfileId: z.string().uuid().nullable().optional(),
+    uransPrecalcMeshProfileId: z.string().uuid().nullable().optional(),
     solverProfileId: z.string().uuid(),
     outputProfileId: z.string().uuid(),
   }),

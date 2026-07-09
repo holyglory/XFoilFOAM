@@ -2949,3 +2949,44 @@ mean).
   costs ~50 h/point at precalc (measured 2026-07-09) and would land as
   march-guard budget stops — the honest terminal label differs, the
   outcome (needs full tier or numerics work) does not.
+
+## 2026-07-10 — Per-tier URANS mesh definitions + wall-function full-tier default
+
+- Decision (user question: "final URANS mesh is still y+1 — does it make
+  sense? maybe define meshes separately for RANS, URANS, precalc?"):
+  per-tier mesh definitions with DERIVED DEFAULTS, and the full URANS
+  tier default changes from "request mesh verbatim (typically y+1)" to
+  a derived full-resolution wall-function mesh (y+~40, counts/extents
+  unchanged, first-cell cleared). Rationale: transient dt is Courant-
+  chained to the first wall cell — resolved-wall full tier measured
+  ~50 h/point at HALF resolution; shedding physics is governed by
+  separated shear layers, so wall-function URANS is standard practice.
+  y+1 remains available as an explicit per-tier user choice.
+- Contract: PolarRequest gains urans_mesh / urans_precalc_mesh
+  (optional; None = engine derives). Explicit meshes are honored
+  VERBATIM (no halving, no y+ override, no silent concavity revert) —
+  the checkMesh QA gate still protects; disclosure recorded either way.
+  Derived paths keep the concavity guard (now both tiers).
+- Node: simulation_presets gains nullable urans_mesh_profile_id /
+  urans_precalc_mesh_profile_id (migration 0038); snapshot embeds
+  uransMesh/uransPrecalcMesh (null = derived); physics hash includes
+  them ONLY when pinned (null preserves historical hashes byte-for-byte
+  — pinned by test); snapshot signature change from the new null keys
+  accepted (reseed follows). Job-batching signature value-compares the
+  per-tier mesh blocks so differing pins never share an engine job.
+  Wizard: numerics "URANS meshes" disclosure, Derived (default) /
+  Customize with two profile selects; ReviewStep summary line.
+- Verification: engine 356 passed (-m "not integration"); api 116;
+  web 242; core 103; db 4; workspace typecheck green. Codex gpt-5.5
+  xhigh lanes J/K/L (engine / node data path / web), contract pinned in
+  specs before parallel launch.
+- Incident during verification: OrbStack VM wedged (docker engine
+  unresponsive, psql handshake hung, port proxy still accepting) —
+  every DB-backed api/sweeper test timed out. Restarted OrbStack,
+  restarted aerodb-pg, applied migration 0038 to the :5544 test DB;
+  api suite went 0-green to 116/116 unchanged-code. Sweeper flakes
+  under whole-suite DB contention (ladder/auto-retry files) passed in
+  isolation. One PRE-EXISTING order-dependent hang found and filed
+  separately: sweeper.test.ts "retries only the rejected angles…"
+  times out with the full file, passes solo, reproduces at HEAD before
+  this change (task chip spawned).

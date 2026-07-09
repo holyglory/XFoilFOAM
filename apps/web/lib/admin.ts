@@ -1018,6 +1018,17 @@ export interface CampaignObjectivePlanInput {
   maxRounds: number;
 }
 
+export interface CampaignPlanNumericsInput {
+  boundaryProfileId: string;
+  meshProfileId: string;
+  solverProfileId: string;
+  outputProfileId: string;
+  /** null/absent = engine derives the full URANS mesh from the RANS mesh. */
+  uransMeshProfileId?: string | null;
+  /** null/absent = engine derives the precalc URANS mesh at half resolution. */
+  uransPrecalcMeshProfileId?: string | null;
+}
+
 /** Spec §3.1 plan jsonb shape — all values are canonical decimal strings. */
 export interface CampaignPlanInput {
   mediumId: string;
@@ -1039,7 +1050,7 @@ export interface CampaignPlanInput {
   /** clMax is optional: plan revisions stored before the third objective have
    *  no block for it — readers must treat absence as disabled. */
   objectives: { ldMax: CampaignObjectivePlanInput; clZero: CampaignObjectivePlanInput; clMax?: CampaignObjectivePlanInput };
-  numerics: { boundaryProfileId: string; meshProfileId: string; solverProfileId: string; outputProfileId: string };
+  numerics: CampaignPlanNumericsInput;
 }
 
 export interface AdminCampaignListItem {

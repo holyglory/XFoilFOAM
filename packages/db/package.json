@@ -21,6 +21,7 @@
     "backfill:airfoil-symmetry": "tsx src/backfill-airfoil-symmetry.ts",
     "reset": "tsx src/reset.ts && pnpm run migrate && pnpm run seed",
     "studio": "drizzle-kit studio",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

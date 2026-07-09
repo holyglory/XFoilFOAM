@@ -398,6 +398,16 @@ def _concavity_disclosure(prefix: str, curvature: float) -> str:
     )
 
 
+def _user_defined_mesh_disclosure(fidelity: UransFidelity) -> str:
+    if fidelity == UransFidelity.precalc:
+        return "precalc URANS tier runs a user-defined precalc mesh"
+    return "full URANS tier runs a user-defined mesh"
+
+
+def _full_wall_function_mesh_disclosure() -> str:
+    return "full URANS tier uses a wall-function mesh (y+~40) derived from the RANS mesh profile"
+
+
 def _airfoil_max_concave_curvature(airfoil) -> float:
     contour = getattr(airfoil, "contour", None)
     if contour is None:
@@ -410,22 +420,40 @@ def _airfoil_max_concave_curvature(airfoil) -> float:
 
 
 def effective_mesh_params_for_airfoil(
-    mesh: MeshParams, solver: SolverParams, airfoil
+    mesh: MeshParams,
+    solver: SolverParams,
+    airfoil,
+    urans_mesh: Optional[MeshParams] = None,
+    urans_precalc_mesh: Optional[MeshParams] = None,
 ) -> tuple[MeshParams, list[str]]:
     """Effective mesh params plus any disclosure warnings with geometry available."""
+    if not solver.force_transient:
+        return mesh, []
+
+    if solver.urans_fidelity == UransFidelity.precalc and urans_precalc_mesh is not None:
+        return urans_precalc_mesh, [_user_defined_mesh_disclosure(UransFidelity.precalc)]
+    if solver.urans_fidelity == UransFidelity.full and urans_mesh is not None:
+        return urans_mesh, [_user_defined_mesh_disclosure(UransFidelity.full)]
+
     derived = effective_mesh_params(mesh, solver)
-    if not (solver.force_transient and solver.urans_fidelity == UransFidelity.precalc):
-        return derived, []
     if abs(derived.target_y_plus - TRANSIENT_WALL_YPLUS) > 1e-9:
         return derived, []
     curvature = _airfoil_max_concave_curvature(airfoil)
     if curvature <= PRECALC_WALLFN_MAX_CONCAVE_CURVATURE:
+        if solver.urans_fidelity == UransFidelity.full:
+            return derived, [_full_wall_function_mesh_disclosure()]
         return derived, []
-    guarded = derive_precalc_resolved_wall_mesh_params(mesh)
-    warning = _concavity_disclosure("precalc", curvature)
+    if solver.urans_fidelity == UransFidelity.precalc:
+        guarded = derive_precalc_resolved_wall_mesh_params(mesh)
+        prefix = "precalc"
+    else:
+        guarded = mesh
+        prefix = "full URANS tier"
+    warning = _concavity_disclosure(prefix, curvature)
     logger.warning(
-        "precalc mesh uses resolved-wall spacing for concave airfoil %s: "
+        "%s mesh uses resolved-wall spacing for concave airfoil %s: "
         "max concave curvature %.2f/c > %.2f/c",
+        prefix,
         getattr(airfoil, "name", "<unknown>"),
         curvature,
         PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
@@ -434,8 +462,27 @@ def effective_mesh_params_for_airfoil(
 
 
 def _standalone_transient_mesh_params(
-    resolved: MeshParams, airfoil, spec: CaseSpec, fluid: FluidProperties
+    resolved: MeshParams,
+    airfoil,
+    spec: CaseSpec,
+    fluid: FluidProperties,
+    solver_params: SolverParams,
+    urans_mesh: Optional[MeshParams] = None,
+    urans_precalc_mesh: Optional[MeshParams] = None,
 ) -> tuple[MeshParams, list[str]]:
+    if solver_params.urans_fidelity == UransFidelity.precalc and urans_precalc_mesh is not None:
+        return (
+            resolve_mesh_params(urans_precalc_mesh, spec, fluid),
+            [_user_defined_mesh_disclosure(UransFidelity.precalc)],
+        )
+    if solver_params.urans_fidelity == UransFidelity.full and urans_mesh is not None:
+        return (
+            resolve_mesh_params(urans_mesh, spec, fluid),
+            [_user_defined_mesh_disclosure(UransFidelity.full)],
+        )
+    if solver_params.force_transient:
+        return resolved, []
+
     curvature = _airfoil_max_concave_curvature(airfoil)
     if curvature > PRECALC_WALLFN_MAX_CONCAVE_CURVATURE:
         warning = _concavity_disclosure("transient", curvature)
@@ -1286,6 +1333,8 @@ def _prepare_transient_case(
     freestream_fallback: bool = False,
     cancel_check: CancelCheck = None,
     quality_warnings: Optional[list[str]] = None,
+    urans_mesh: Optional[MeshParams] = None,
+    urans_precalc_mesh: Optional[MeshParams] = None,
 ) -> tuple[MeshParams, object]:
     _check_cancel(cancel_check)
     if tcase.exists():
@@ -1297,7 +1346,15 @@ def _prepare_transient_case(
         tmesh = resolved
     else:
         # Fallback for standalone single cases without a shared job mesh.
-        tmesh, mesh_warnings = _standalone_transient_mesh_params(resolved, airfoil, spec, fluid)
+        tmesh, mesh_warnings = _standalone_transient_mesh_params(
+            resolved,
+            airfoil,
+            spec,
+            fluid,
+            solver_params,
+            urans_mesh=urans_mesh,
+            urans_precalc_mesh=urans_precalc_mesh,
+        )
         if quality_warnings is not None:
             quality_warnings.extend(mesh_warnings)
     patches = mesher.patches(tmesh)
@@ -1789,6 +1846,8 @@ def _run_transient(
     cancel_check: CancelCheck = None,
     resume: Optional[TransientResume] = None,
     quality_warnings: Optional[list[str]] = None,
+    urans_mesh: Optional[MeshParams] = None,
+    urans_precalc_mesh: Optional[MeshParams] = None,
 ):
     """Run URANS, extend it until enough whole periods are retained, then
     automatically refine sparse/short transient media once.
@@ -1868,6 +1927,8 @@ def _run_transient(
             freestream_fallback=freestream_fallback,
             cancel_check=cancel_check,
             quality_warnings=quality_warnings,
+            urans_mesh=urans_mesh,
+            urans_precalc_mesh=urans_precalc_mesh,
         )
 
         initial_run_time = solver_params.transient_cycles * initial_period
@@ -2295,6 +2356,8 @@ def _finalize_outcome(
     media_budget_s: Optional[float] = None,
     resume: Optional[TransientResume] = None,
     urans_budget_s: Optional[int] = None,
+    urans_mesh: Optional[MeshParams] = None,
+    urans_precalc_mesh: Optional[MeshParams] = None,
 ):
     """Parse forces, run the transient fallback if needed, compute y+ and images.
 
@@ -2407,6 +2470,8 @@ def _finalize_outcome(
             cancel_check=cancel_check,
             resume=resume,
             quality_warnings=outcome.quality_warnings,
+            urans_mesh=urans_mesh,
+            urans_precalc_mesh=urans_precalc_mesh,
         )
         _check_cancel(cancel_check)
         if transient is not None:
@@ -2775,6 +2840,8 @@ def run_case(
     resume: Optional[TransientResume] = None,
     urans_budget_s: Optional[int] = None,
     mesh_quality_warnings: Optional[list[str]] = None,
+    urans_mesh: Optional[MeshParams] = None,
+    urans_precalc_mesh: Optional[MeshParams] = None,
 ) -> CaseOutcome:
     """Run one self-contained case. If ``mesh_dir`` is given, reuse that prebuilt
     mesh (skip blockMesh) instead of meshing in the case directory. With a
@@ -2799,9 +2866,15 @@ def run_case(
         # latestTime and grades the merged history.
         try:
             _check_cancel(cancel_check)
-            resolved = resolve_mesh_params(
-                effective_mesh_params(mesh_params, solver_params), spec, fluid
+            effective, derived_warnings = effective_mesh_params_for_airfoil(
+                mesh_params,
+                solver_params,
+                airfoil,
+                urans_mesh=urans_mesh,
+                urans_precalc_mesh=urans_precalc_mesh,
             )
+            outcome.quality_warnings.extend(derived_warnings)
+            resolved = resolve_mesh_params(effective, spec, fluid)
             outcome.n_cells = mesher.cell_count(resolved) if hasattr(mesher, "cell_count") else 0
             _finalize_outcome(
                 case_dir, outcome, airfoil, resolved, spec, fluid, roughness, solver_params,
@@ -2812,6 +2885,8 @@ def run_case(
                 media_budget_s=media_budget_s,
                 resume=resume,
                 urans_budget_s=urans_budget_s,
+                urans_mesh=urans_mesh,
+                urans_precalc_mesh=urans_precalc_mesh,
             )
         except JobCancelled:
             raise
@@ -2826,7 +2901,11 @@ def run_case(
             # meshes the derived half-resolution grid (contract item 1). With
             # a prebuilt mesh_dir the caller already derived before building.
             mesh_params, derived_warnings = effective_mesh_params_for_airfoil(
-                mesh_params, solver_params, airfoil
+                mesh_params,
+                solver_params,
+                airfoil,
+                urans_mesh=urans_mesh,
+                urans_precalc_mesh=urans_precalc_mesh,
             )
             outcome.quality_warnings.extend(derived_warnings)
         resolved = resolve_mesh_params(mesh_params, spec, fluid)
@@ -2913,6 +2992,8 @@ def run_case(
             phase_progress=phase_progress,
             case_slug=case_slug,
             media_budget_s=media_budget_s,
+            urans_mesh=urans_mesh,
+            urans_precalc_mesh=urans_precalc_mesh,
         )
 
         if (

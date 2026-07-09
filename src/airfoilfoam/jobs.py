@@ -237,7 +237,11 @@ def execute_job(
     #    Continuation jobs skip meshing entirely: the staged saved case already
     #    contains the mesh it was solved on.
     job_mesh, mesh_quality_warnings = effective_mesh_params_for_airfoil(
-        request.mesh, request.solver, airfoil
+        request.mesh,
+        request.solver,
+        airfoil,
+        urans_mesh=request.urans_mesh,
+        urans_precalc_mesh=request.urans_precalc_mesh,
     )
     max_speed = max(speeds)
     meshes: dict[float, tuple] = {}
@@ -413,6 +417,8 @@ def execute_job(
                 media_budget_s=settings.media_budget_seconds(),
                 resume=resume,
                 urans_budget_s=request.budget_override_s,
+                urans_mesh=request.urans_mesh,
+                urans_precalc_mesh=request.urans_precalc_mesh,
             )
         bump()
         record_outcome(
