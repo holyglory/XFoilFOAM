@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
 
 from .models import AirfoilFormat
+
+CURVATURE_ARC_WINDOW_CHORDS = 0.025
 
 
 def _numeric_pairs(text: str) -> list[tuple[float, float]]:
@@ -73,6 +76,89 @@ def parse_airfoil(text: str, fmt: AirfoilFormat = AirfoilFormat.auto) -> np.ndar
     if fmt == AirfoilFormat.lednicer:
         return _parse_lednicer(pairs)
     return _parse_selig(pairs)
+
+
+def _unit_chord_contour(points: Iterable[tuple[float, float]]) -> np.ndarray:
+    pts = np.asarray(list(points), dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        return np.empty((0, 2), dtype=float)
+    finite = np.isfinite(pts).all(axis=1)
+    pts = pts[finite]
+    if pts.shape[0] < 5:
+        return np.empty((0, 2), dtype=float)
+    chord = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
+    if chord <= 0 or not math.isfinite(chord):
+        return np.empty((0, 2), dtype=float)
+    pts = pts / chord
+    cleaned: list[np.ndarray] = []
+    for p in pts:
+        if not cleaned or float(np.linalg.norm(p - cleaned[-1])) > 1e-10:
+            cleaned.append(p)
+    pts = np.asarray(cleaned, dtype=float)
+    if pts.shape[0] > 1 and float(np.linalg.norm(pts[0] - pts[-1])) <= 1e-10:
+        pts = pts[:-1]
+    return pts if pts.shape[0] >= 5 else np.empty((0, 2), dtype=float)
+
+
+def _signed_area(points: np.ndarray) -> float:
+    """Polygon winding convention matching meshing.blockmesh._signed_area."""
+    return 0.5 * float(
+        np.sum(points[:, 0] * np.roll(points[:, 1], -1) - np.roll(points[:, 0], -1) * points[:, 1])
+    )
+
+
+def max_concave_curvature(
+    points: Iterable[tuple[float, float]],
+    *,
+    window_chords: float = CURVATURE_ARC_WINDOW_CHORDS,
+) -> float:
+    """Maximum smoothed concave curvature magnitude of a unit-chord contour.
+
+    Curvature is signed by the contour winding: convex turns follow the signed
+    area, and concave turns have the opposite sign. The finite arc-length window
+    suppresses point-spacing noise in real Selig/Lednicer coordinate files.
+    """
+    pts = _unit_chord_contour(points)
+    if pts.shape[0] < 5:
+        return 0.0
+    area = _signed_area(pts)
+    if abs(area) <= 1e-12:
+        return 0.0
+    seg = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)
+    total = float(np.sum(seg))
+    if total <= 0 or not math.isfinite(total):
+        return 0.0
+    window = min(max(float(window_chords), 1e-4), 0.2 * total)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    n = pts.shape[0]
+
+    def point_at(distance: float) -> np.ndarray:
+        s = distance % total
+        idx = int(np.searchsorted(cum, s, side="right") - 1)
+        if idx >= n:
+            idx = 0
+        length = float(seg[idx])
+        if length <= 1e-12:
+            return pts[idx]
+        t = (s - float(cum[idx])) / length
+        return (1.0 - t) * pts[idx] + t * pts[(idx + 1) % n]
+
+    concave_sign = -1.0 if area > 0 else 1.0
+    max_k = 0.0
+    for i, point in enumerate(pts):
+        s = float(cum[i])
+        prev = point_at(s - window)
+        nxt = point_at(s + window)
+        v1 = point - prev
+        v2 = nxt - point
+        if float(np.linalg.norm(v1)) <= 1e-12 or float(np.linalg.norm(v2)) <= 1e-12:
+            continue
+        cross = float(v1[0] * v2[1] - v1[1] * v2[0])
+        dot = float(np.dot(v1, v2))
+        curvature = math.atan2(cross, dot) / window
+        if curvature * concave_sign > 0:
+            max_k = max(max_k, abs(curvature))
+    return max_k
 
 
 @dataclass

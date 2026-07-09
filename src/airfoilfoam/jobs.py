@@ -23,7 +23,6 @@ from .models import (
     PolarPoint,
     PolarRequest,
     ResourcePolicy,
-    effective_mesh_params,
 )
 from .openfoam.runner import OpenFOAMError, get_runner
 from .pipeline import (
@@ -31,6 +30,7 @@ from .pipeline import (
     PolarMarchResult,
     StoredCaseOutcome,
     TransientResume,
+    effective_mesh_params_for_airfoil,
     prepare_mesh,
     resolve_mesh_params,
     run_case,
@@ -236,7 +236,9 @@ def execute_job(
     #    resolved params, so it caches separately from the full mesh.
     #    Continuation jobs skip meshing entirely: the staged saved case already
     #    contains the mesh it was solved on.
-    job_mesh = effective_mesh_params(request.mesh, request.solver)
+    job_mesh, mesh_quality_warnings = effective_mesh_params_for_airfoil(
+        request.mesh, request.solver, airfoil
+    )
     max_speed = max(speeds)
     meshes: dict[float, tuple] = {}
     for chord in chords if request.continue_from is None else []:
@@ -469,6 +471,7 @@ def execute_job(
                     cancel_check=ensure_not_cancelled,
                     cache=cache,
                     media_budget_s=settings.media_budget_seconds(),
+                    mesh_quality_warnings=mesh_quality_warnings,
                 )
             ensure_not_cancelled()
             set_status(JobState.running, "polar complete", phase=JobPhase.ingesting, cpu_tokens_waiting=0, cpu_tokens_held=0)
@@ -544,6 +547,7 @@ def execute_job(
                     phase_progress=phase_progress,
                     case_slug=spec.slug,
                     media_budget_s=settings.media_budget_seconds(),
+                    mesh_quality_warnings=mesh_quality_warnings,
                 )
             bump()
             return spec, outcome

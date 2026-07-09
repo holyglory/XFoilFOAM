@@ -1,8 +1,14 @@
+import math
+from pathlib import Path
+
 import numpy as np
 import pytest
 
-from airfoilfoam.airfoil import Airfoil, load_airfoil, parse_airfoil
-from airfoilfoam.models import AirfoilFormat
+from airfoilfoam.airfoil import Airfoil, load_airfoil, max_concave_curvature, parse_airfoil
+from airfoilfoam.models import AirfoilFormat, PRECALC_WALLFN_MAX_CONCAVE_CURVATURE
+
+
+SELIG_SEED_DIR = Path(__file__).resolve().parents[1] / "packages/db/seed/selig-database"
 
 
 def test_parse_selig_autodetect(naca0012_selig_text):
@@ -64,3 +70,38 @@ def test_points_input_rotated_airfoil():
 def test_too_few_points_raises():
     with pytest.raises(ValueError):
         parse_airfoil("airfoil\n0 0\n1 0\n", AirfoilFormat.selig)
+
+
+def _seed_airfoil(name: str):
+    return load_airfoil(name, (SELIG_SEED_DIR / f"{name}.dat").read_text(), None, AirfoilFormat.auto)
+
+
+def test_max_concave_curvature_classifies_real_seed_airfoils():
+    measured = {
+        name: max_concave_curvature(_seed_airfoil(name).contour)
+        for name in ("s1223", "sd8020", "naca4412", "n0012", "clarky")
+    }
+
+    assert measured["s1223"] == pytest.approx(4.89, abs=0.06)
+    assert measured["s1223"] > PRECALC_WALLFN_MAX_CONCAVE_CURVATURE
+    assert measured["sd8020"] == pytest.approx(0.17, abs=0.06)
+    assert measured["naca4412"] == pytest.approx(0.36, abs=0.06)
+    assert measured["n0012"] == pytest.approx(0.0, abs=0.01)
+    assert measured["clarky"] == pytest.approx(0.04, abs=0.04)
+    for name in ("sd8020", "naca4412", "n0012", "clarky"):
+        assert measured[name] < PRECALC_WALLFN_MAX_CONCAVE_CURVATURE
+
+
+def test_max_concave_curvature_matches_synthetic_circle_notch_and_orientation_flip():
+    radius = 0.2
+    arc = [
+        (0.5 + radius * math.cos(theta), 1.0 + radius * math.sin(theta))
+        for theta in np.linspace(0.0, -math.pi, 121)
+    ]
+    contour = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), *arc, (0.0, 1.0)]
+
+    metric = max_concave_curvature(contour)
+    flipped = max_concave_curvature(list(reversed(contour)))
+
+    assert metric == pytest.approx(1.0 / radius, rel=0.03)
+    assert flipped == pytest.approx(metric, rel=0.01)

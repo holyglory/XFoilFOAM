@@ -22,13 +22,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import physics
-from .airfoil import Airfoil
+from .airfoil import Airfoil, max_concave_curvature
 from .cache import EngineCache, SeedHit
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
 from .meshing.base import Mesher, MeshResult, get_mesher
 from .models import (
     FRAME_IMAGE_ARTIFACT_KIND,
+    PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
     CaseSpec,
     EvidenceArtifact,
     FluidProperties,
@@ -45,6 +46,7 @@ from .models import (
     SteadyHistoryWindow,
     UransFidelity,
     apply_urans_fidelity,
+    derive_precalc_resolved_wall_mesh_params,
     effective_mesh_params,
     urans_budget_seconds,
     urans_point_fidelity,
@@ -389,7 +391,164 @@ def resolve_mesh_params(
     return mesh_params.model_copy(update={"first_cell_height_chords": height_chords})
 
 
+def _concavity_disclosure(prefix: str, curvature: float) -> str:
+    return (
+        f"{prefix} ran the resolved-wall mesh: concave geometry "
+        f"(max concave curvature {curvature:.2f}/c) folds the wall-function layer"
+    )
+
+
+def _airfoil_max_concave_curvature(airfoil) -> float:
+    contour = getattr(airfoil, "contour", None)
+    if contour is None:
+        return 0.0
+    try:
+        return max_concave_curvature(contour)
+    except Exception as exc:  # noqa: BLE001 - geometry guard must never block meshing
+        logger.warning("failed to measure airfoil concavity for mesh guard: %s", exc)
+        return 0.0
+
+
+def effective_mesh_params_for_airfoil(
+    mesh: MeshParams, solver: SolverParams, airfoil
+) -> tuple[MeshParams, list[str]]:
+    """Effective mesh params plus any disclosure warnings with geometry available."""
+    derived = effective_mesh_params(mesh, solver)
+    if not (solver.force_transient and solver.urans_fidelity == UransFidelity.precalc):
+        return derived, []
+    if abs(derived.target_y_plus - TRANSIENT_WALL_YPLUS) > 1e-9:
+        return derived, []
+    curvature = _airfoil_max_concave_curvature(airfoil)
+    if curvature <= PRECALC_WALLFN_MAX_CONCAVE_CURVATURE:
+        return derived, []
+    guarded = derive_precalc_resolved_wall_mesh_params(mesh)
+    warning = _concavity_disclosure("precalc", curvature)
+    logger.warning(
+        "precalc mesh uses resolved-wall spacing for concave airfoil %s: "
+        "max concave curvature %.2f/c > %.2f/c",
+        getattr(airfoil, "name", "<unknown>"),
+        curvature,
+        PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
+    )
+    return guarded, [warning]
+
+
+def _standalone_transient_mesh_params(
+    resolved: MeshParams, airfoil, spec: CaseSpec, fluid: FluidProperties
+) -> tuple[MeshParams, list[str]]:
+    curvature = _airfoil_max_concave_curvature(airfoil)
+    if curvature > PRECALC_WALLFN_MAX_CONCAVE_CURVATURE:
+        warning = _concavity_disclosure("transient", curvature)
+        logger.warning(
+            "standalone transient mesh uses resolved-wall spacing for concave airfoil %s: "
+            "max concave curvature %.2f/c > %.2f/c",
+            getattr(airfoil, "name", "<unknown>"),
+            curvature,
+            PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
+        )
+        return resolved, [warning]
+    h = physics.first_cell_height_for_yplus(TRANSIENT_WALL_YPLUS, spec.speed, spec.chord, fluid.nu)
+    return (
+        resolved.model_copy(
+            update={
+                "first_cell_height_chords": h / spec.chord,
+                "n_surface": min(resolved.n_surface, 90),
+                "n_radial": min(resolved.n_radial, 56),
+                "n_wake": min(resolved.n_wake, 50),
+                "farfield_radius_chords": min(resolved.farfield_radius_chords, 12.0),
+                "wake_length_chords": min(resolved.wake_length_chords, 10.0),
+            }
+        ),
+        [],
+    )
+
+
+@dataclass(frozen=True)
+class MeshQaResult:
+    max_non_ortho_deg: Optional[float] = None
+    failed_checks: int = 0
+    negative_volume: bool = False
+
+
+_CHECKMESH_NON_ORTHO_RE = re.compile(
+    r"Mesh\s+non-orthogonality\s+Max:\s*([0-9.+\-eE]+)", re.IGNORECASE
+)
+_CHECKMESH_FAILED_RE = re.compile(r"Failed\s+([1-9]\d*)\s+mesh\s+checks?", re.IGNORECASE)
+
+
+def _parse_check_mesh_output(output: str) -> MeshQaResult:
+    max_non_ortho: Optional[float] = None
+    match = _CHECKMESH_NON_ORTHO_RE.search(output)
+    if match:
+        try:
+            max_non_ortho = float(match.group(1))
+        except ValueError:
+            max_non_ortho = None
+    failed_checks = 0
+    failed = _CHECKMESH_FAILED_RE.search(output)
+    if failed:
+        try:
+            failed_checks = int(failed.group(1))
+        except ValueError:
+            failed_checks = 0
+    lower = output.lower()
+    negative_volume = "negative volume" in lower or "negative cell volume" in lower
+    return MeshQaResult(
+        max_non_ortho_deg=max_non_ortho,
+        failed_checks=failed_checks,
+        negative_volume=negative_volume,
+    )
+
+
+def _run_transient_mesh_qa_gate(
+    case_dir: Path, runner: Runner, quality_warnings: Optional[list[str]] = None
+) -> None:
+    try:
+        result = runner.application(case_dir, "checkMesh -time 0", timeout=MESH_CHECK_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 - inability to run the advisory gate is non-fatal
+        logger.warning("checkMesh gate could not run for %s: %s", case_dir, exc)
+        return
+    output = getattr(result, "stdout", "") or ""
+    try:
+        (case_dir / "log.checkMesh").write_text(output)
+    except OSError:
+        logger.warning("could not write checkMesh log for %s", case_dir)
+    qa = _parse_check_mesh_output(output)
+    reasons: list[str] = []
+    if qa.max_non_ortho_deg is not None and qa.max_non_ortho_deg > MESH_MAX_NON_ORTHO_DEG:
+        reasons.append(
+            f"checkMesh max non-orthogonality exceeds {MESH_MAX_NON_ORTHO_DEG:.1f} deg"
+        )
+    if qa.failed_checks > 0:
+        reasons.append(f"checkMesh reported Failed {qa.failed_checks} mesh checks")
+    if qa.negative_volume:
+        reasons.append("checkMesh reported negative-volume cells")
+    if reasons:
+        if qa.max_non_ortho_deg is not None:
+            prefix = (
+                "mesh degenerate at this fidelity tier "
+                f"(max non-orthogonality {qa.max_non_ortho_deg:.1f} deg): "
+            )
+        else:
+            prefix = "mesh degenerate at this fidelity tier: "
+        raise OpenFOAMError(prefix + "; ".join(reasons) + "; see log.checkMesh")
+    if qa.max_non_ortho_deg is None:
+        logger.warning("checkMesh output for %s had no non-orthogonality summary; mesh QA gate skipped", case_dir)
+        return
+    if qa.max_non_ortho_deg > MESH_WARN_NON_ORTHO_DEG:
+        warning = (
+            f"mesh quality warning: max non-orthogonality {qa.max_non_ortho_deg:.1f} deg "
+            f"at this fidelity tier (limit {MESH_MAX_NON_ORTHO_DEG:.1f} deg)"
+        )
+        logger.warning("%s: %s", case_dir, warning)
+        if quality_warnings is not None:
+            quality_warnings.append(warning)
+
+
 TRANSIENT_WALL_YPLUS = 40.0  # wall-function y+ for transient mesh; mirrors models.URANS_PRECALC_WALL_YPLUS
+MESH_MAX_NON_ORTHO_DEG = 85.0
+MESH_WARN_NON_ORTHO_DEG = 75.0
+MESH_CHECK_TIMEOUT_S = 300
 TRANSIENT_INIT_ITERS = 600  # short steady init before the transient
 TRANSIENT_INITIAL_STROUHAL = 0.5
 # Prod s1223 jobs 7ff36caf/0cba5e9b on the y+40 precalc mesh showed the fresh
@@ -1126,6 +1285,7 @@ def _prepare_transient_case(
     steady_field_dir: Optional[Path] = None,
     freestream_fallback: bool = False,
     cancel_check: CancelCheck = None,
+    quality_warnings: Optional[list[str]] = None,
 ) -> tuple[MeshParams, object]:
     _check_cancel(cancel_check)
     if tcase.exists():
@@ -1137,17 +1297,9 @@ def _prepare_transient_case(
         tmesh = resolved
     else:
         # Fallback for standalone single cases without a shared job mesh.
-        h = physics.first_cell_height_for_yplus(TRANSIENT_WALL_YPLUS, spec.speed, spec.chord, fluid.nu)
-        tmesh = resolved.model_copy(
-            update={
-                "first_cell_height_chords": h / spec.chord,
-                "n_surface": min(resolved.n_surface, 90),
-                "n_radial": min(resolved.n_radial, 56),
-                "n_wake": min(resolved.n_wake, 50),
-                "farfield_radius_chords": min(resolved.farfield_radius_chords, 12.0),
-                "wake_length_chords": min(resolved.wake_length_chords, 10.0),
-            }
-        )
+        tmesh, mesh_warnings = _standalone_transient_mesh_params(resolved, airfoil, spec, fluid)
+        if quality_warnings is not None:
+            quality_warnings.extend(mesh_warnings)
     patches = mesher.patches(tmesh)
 
     # A short steady initialisation gives the transient a developed,
@@ -1161,6 +1313,8 @@ def _prepare_transient_case(
         mesher.run_mesh(tcase, tmesh, runner)
     else:
         _link_mesh(tcase, shared_mesh_dir, runner)
+    _check_cancel(cancel_check)
+    _run_transient_mesh_qa_gate(tcase, runner, quality_warnings)
     _check_cancel(cancel_check)
     # Preferred warm start: continue from an ACCEPTED in-job steady RANS field
     # solved on the SAME shared mesh (URANS-only jobs run that stage first).
@@ -1634,6 +1788,7 @@ def _run_transient(
     steady_field_dir: Optional[Path] = None, steady_field_accepted: bool = True,
     cancel_check: CancelCheck = None,
     resume: Optional[TransientResume] = None,
+    quality_warnings: Optional[list[str]] = None,
 ):
     """Run URANS, extend it until enough whole periods are retained, then
     automatically refine sparse/short transient media once.
@@ -1706,16 +1861,14 @@ def _run_transient(
             )
             effective_steady_field_dir = None
             freestream_fallback = True
-        try:
-            tmesh, patches = _prepare_transient_case(
-                tcase, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
-                shared_mesh_dir=shared_mesh_dir,
-                steady_field_dir=effective_steady_field_dir,
-                freestream_fallback=freestream_fallback,
-                cancel_check=cancel_check,
-            )
-        except OpenFOAMError:
-            return None
+        tmesh, patches = _prepare_transient_case(
+            tcase, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
+            shared_mesh_dir=shared_mesh_dir,
+            steady_field_dir=effective_steady_field_dir,
+            freestream_fallback=freestream_fallback,
+            cancel_check=cancel_check,
+            quality_warnings=quality_warnings,
+        )
 
         initial_run_time = solver_params.transient_cycles * initial_period
         transient_start = _latest_time(tcase)
@@ -2253,6 +2406,7 @@ def _finalize_outcome(
             steady_field_accepted=steady_field_accepted,
             cancel_check=cancel_check,
             resume=resume,
+            quality_warnings=outcome.quality_warnings,
         )
         _check_cancel(cancel_check)
         if transient is not None:
@@ -2620,6 +2774,7 @@ def run_case(
     media_budget_s: Optional[float] = None,
     resume: Optional[TransientResume] = None,
     urans_budget_s: Optional[int] = None,
+    mesh_quality_warnings: Optional[list[str]] = None,
 ) -> CaseOutcome:
     """Run one self-contained case. If ``mesh_dir`` is given, reuse that prebuilt
     mesh (skip blockMesh) instead of meshing in the case directory. With a
@@ -2633,6 +2788,8 @@ def run_case(
     case_dir.mkdir(parents=True, exist_ok=True)
     re = physics.reynolds(spec.speed, spec.chord, fluid.nu)
     outcome = CaseOutcome(spec=spec, reynolds=re)
+    if mesh_quality_warnings:
+        outcome.quality_warnings.extend(mesh_quality_warnings)
     steady_timeout = min(solver_timeout, rans_solver_timeout or solver_timeout)
     steady_solver_params = _steady_rans_params(solver_params, rans_max_iterations)
 
@@ -2668,7 +2825,10 @@ def run_case(
             # Standalone case builds its own mesh: a precalc URANS request
             # meshes the derived half-resolution grid (contract item 1). With
             # a prebuilt mesh_dir the caller already derived before building.
-            mesh_params = effective_mesh_params(mesh_params, solver_params)
+            mesh_params, derived_warnings = effective_mesh_params_for_airfoil(
+                mesh_params, solver_params, airfoil
+            )
+            outcome.quality_warnings.extend(derived_warnings)
         resolved = resolve_mesh_params(mesh_params, spec, fluid)
         patches = mesher.patches(resolved)
         if mesh_dir is None:
@@ -3084,6 +3244,7 @@ def _run_full_urans_replacement(
     progress_budget: Optional[int] = None,
     cancel_check: CancelCheck = None,
     media_budget_s: Optional[float] = None,
+    mesh_quality_warnings: Optional[list[str]] = None,
 ) -> list[StoredCaseOutcome]:
     urans_solver = solver_params.model_copy(
         update={"transient_fallback": True, "force_transient": True, "transient_auto_refine": True}
@@ -3096,6 +3257,9 @@ def _run_full_urans_replacement(
         case_dir = polar_dir / f"urans_a{j}"
         if phase_progress:
             phase_progress(JobPhase.solving_urans, aoa, case_slug, "pimpleFoam")
+        extra_run_case_kwargs = {}
+        if mesh_quality_warnings:
+            extra_run_case_kwargs["mesh_quality_warnings"] = mesh_quality_warnings
         outcome = run_case(
             case_dir,
             airfoil,
@@ -3114,6 +3278,7 @@ def _run_full_urans_replacement(
             phase_progress=phase_progress,
             case_slug=case_slug,
             media_budget_s=media_budget_s,
+            **extra_run_case_kwargs,
         )
         _check_cancel(cancel_check)
         outcome.n_cells = outcome.n_cells or n_cells
@@ -3133,6 +3298,7 @@ def solve_polar_marched(
     rans_max_iterations: Optional[int] = None, progress=None,
     phase_progress=None, outcome_progress=None, cancel_check: CancelCheck = None,
     cache: Optional[EngineCache] = None, media_budget_s: Optional[float] = None,
+    mesh_quality_warnings: Optional[list[str]] = None,
 ) -> PolarMarchResult:
     """Run one polar (fixed chord+speed) over the AoA sweep, reusing ``mesh_dir``
     and warm-starting each AoA from the previous converged field (marching).
@@ -3165,6 +3331,8 @@ def solve_polar_marched(
         outcome = CaseOutcome(
             spec=spec, reynolds=physics.reynolds(speed, chord, fluid.nu), n_cells=n_cells
         )
+        if mesh_quality_warnings:
+            outcome.quality_warnings.extend(mesh_quality_warnings)
         try:
             if i == 0:
                 res = _solve_cold_marched(
@@ -3251,6 +3419,7 @@ def solve_polar_marched(
                 progress_budget=remaining_progress,
                 cancel_check=cancel_check,
                 media_budget_s=media_budget_s,
+                mesh_quality_warnings=mesh_quality_warnings,
             )
             return PolarMarchResult(
                 points=urans_points,

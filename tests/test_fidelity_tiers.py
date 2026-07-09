@@ -11,6 +11,7 @@ transient stage must receive the tier budget + period target, and precalc
 URANS jobs must BUILD the derived mesh. No OpenFOAM needed.
 """
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from airfoilfoam.jobs import _outcome_to_point
 from airfoilfoam.models import (
     URANS_FIDELITY_BUDGET_S,
     URANS_FIDELITY_MIN_PERIODS,
+    PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
     URANS_PRECALC_MESH_SCALE,
     URANS_PRECALC_WALL_YPLUS,
     AirfoilFormat,
@@ -46,6 +48,9 @@ from airfoilfoam.pipeline import CaseOutcome, TransientResult, UransQuality, _fi
 from airfoilfoam.storage import JobStore
 
 
+SELIG_SEED_DIR = Path(__file__).resolve().parents[1] / "packages/db/seed/selig-database"
+
+
 # --------------------------------------------------------------------------- #
 # Contract pin: tier constants + request/point field shapes
 # --------------------------------------------------------------------------- #
@@ -63,6 +68,7 @@ def test_fidelity_tier_contract_pin():
     assert URANS_FIDELITY_BUDGET_S == {UransFidelity.precalc: 14400, UransFidelity.full: 43200}
     assert URANS_PRECALC_MESH_SCALE == 0.5
     assert URANS_PRECALC_WALL_YPLUS == 40.0
+    assert PRECALC_WALLFN_MAX_CONCAVE_CURVATURE == 2.5
 
     # Effective per-tier resolution.
     assert apply_urans_fidelity(SolverParams(urans_fidelity="precalc")).urans_min_periods == 3
@@ -127,6 +133,34 @@ def test_effective_mesh_params_only_derives_for_precalc_urans():
     assert effective_mesh_params(mesh, rans) == mesh
     assert effective_mesh_params(mesh, full_urans) == mesh
     assert effective_mesh_params(mesh, precalc_urans) == derive_precalc_mesh_params(mesh)
+
+
+def _seed_airfoil(name: str):
+    return load_airfoil(name, (SELIG_SEED_DIR / f"{name}.dat").read_text(), None, AirfoilFormat.auto)
+
+
+def test_geometry_aware_precalc_keeps_resolved_wall_for_s1223():
+    mesh = MeshParams(target_y_plus=1.0, first_cell_height_chords=1e-6)
+    solver = SolverParams(force_transient=True, urans_fidelity="precalc")
+    resolved, warnings = pipeline.effective_mesh_params_for_airfoil(mesh, solver, _seed_airfoil("s1223"))
+
+    assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (65, 40, 30)
+    assert resolved.target_y_plus == 1.0
+    assert resolved.first_cell_height_chords == pytest.approx(1e-6)
+    assert warnings
+    assert "precalc ran the resolved-wall mesh: concave geometry" in warnings[0]
+    assert "folds the wall-function layer" in warnings[0]
+
+
+def test_geometry_aware_precalc_keeps_wall_function_for_sd8020():
+    mesh = MeshParams(target_y_plus=1.0, first_cell_height_chords=1e-6)
+    solver = SolverParams(force_transient=True, urans_fidelity="precalc")
+    resolved, warnings = pipeline.effective_mesh_params_for_airfoil(mesh, solver, _seed_airfoil("sd8020"))
+
+    assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (65, 40, 30)
+    assert resolved.target_y_plus == URANS_PRECALC_WALL_YPLUS
+    assert resolved.first_cell_height_chords is None
+    assert warnings == []
 
 
 def test_precalc_mesh_caches_under_its_own_key(naca2412_points):
@@ -249,6 +283,7 @@ def _run_job_capturing_mesh(monkeypatch, naca0012_selig_text, solver: SolverPara
         captured.setdefault("case_mesh", mesh_params)
         captured.setdefault("spec", spec)
         captured.setdefault("fluid", fluid)
+        captured.setdefault("case_warnings", _kwargs.get("mesh_quality_warnings"))
         return CaseOutcome(spec=spec, reynolds=1e6, cl=0.5, cd=0.01, cm=0.0, converged=True)
 
     monkeypatch.setattr(jobs, "prepare_mesh", fake_prepare_mesh)
@@ -287,3 +322,18 @@ def test_full_urans_and_rans_jobs_build_the_full_mesh(monkeypatch, naca0012_seli
         captured = _run_job_capturing_mesh(monkeypatch, naca0012_selig_text, solver)
         resolved = captured["resolved"]
         assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (130, 80, 60)
+
+
+def test_concave_precalc_job_builds_resolved_wall_half_mesh(monkeypatch):
+    captured = _run_job_capturing_mesh(
+        monkeypatch,
+        (SELIG_SEED_DIR / "s1223.dat").read_text(),
+        SolverParams(force_transient=True, urans_fidelity="precalc", write_images=[]),
+    )
+    resolved = captured["resolved"]
+    assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (65, 40, 30)
+    assert resolved.target_y_plus == 1.0
+    full_resolved = pipeline.resolve_mesh_params(MeshParams(), captured["spec"], captured["fluid"])
+    assert resolved.first_cell_height_chords == pytest.approx(full_resolved.first_cell_height_chords)
+    assert captured["case_warnings"]
+    assert "precalc ran the resolved-wall mesh" in captured["case_warnings"][0]

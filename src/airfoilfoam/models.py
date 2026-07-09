@@ -198,6 +198,13 @@ URANS_PRECALC_MESH_SCALE = 0.5
 #: runtime layer.
 URANS_PRECALC_WALL_YPLUS = 40.0
 
+#: Geometry guard for the y+40 precalc wall-function mesh. Measured with the
+#: airfoil.max_concave_curvature 0.025c arc-length window on real seed files:
+#: s1223 4.89/c; sd8020 0.17/c; naca4412 0.36/c; n0012 0.00/c; clarky 0.04/c.
+#: Keep a wide gap so only the strongly concave cove class stays on the
+#: resolved-wall precalc mesh.
+PRECALC_WALLFN_MAX_CONCAVE_CURVATURE = 2.5
+
 #: Sane hard cap on the per-job URANS wall-budget override [s] (24 h). A
 #: continuation submits the INCREASED budget through
 #: ``PolarRequest.budget_override_s``; anything above this cap is rejected at
@@ -406,6 +413,22 @@ def derive_precalc_mesh_params(mesh: MeshParams) -> MeshParams:
             "n_wake": max(10, round(mesh.n_wake * URANS_PRECALC_MESH_SCALE)),
             "target_y_plus": URANS_PRECALC_WALL_YPLUS,
             "first_cell_height_chords": None,
+        }
+    )
+
+
+def derive_precalc_resolved_wall_mesh_params(mesh: MeshParams) -> MeshParams:
+    """Derived half-resolution URANS mesh that preserves the profile wall spacing.
+
+    This is the pre-wall-function derivation used for strongly concave airfoils:
+    precalc still reduces the stream/radial/wake counts, but it keeps the
+    requested target_y_plus and any explicit first-cell override.
+    """
+    return mesh.model_copy(
+        update={
+            "n_surface": max(20, round(mesh.n_surface * URANS_PRECALC_MESH_SCALE)),
+            "n_radial": max(20, round(mesh.n_radial * URANS_PRECALC_MESH_SCALE)),
+            "n_wake": max(10, round(mesh.n_wake * URANS_PRECALC_MESH_SCALE)),
         }
     )
 

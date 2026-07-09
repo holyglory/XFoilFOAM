@@ -2907,3 +2907,25 @@ mean).
   gate at mesh time that fails the case honestly ("mesh degenerate at
   this tier") before burning solver attempts; alternatively route
   concave-cove geometries to the resolved-wall mesh.
+
+## 2026-07-10 — Geometry-aware precalc meshing + checkMesh gate (S1223 family fix)
+
+- Fix A: max_concave_curvature(contour) (arc-length-windowed signed
+  curvature, orientation-robust) + PRECALC_WALLFN_MAX_CONCAVE_CURVATURE
+  = 2.5/c. Measured on real seed coordinates: s1223 4.889/c (OVER) vs
+  naca-4412 0.360, sd8020 0.172, clarky 0.035, naca-0012 0.000 — 13x
+  separation. Over-threshold airfoils keep the RESOLVED wall (y+1) at
+  the precalc tier with a truthful quality disclosure ("precalc ran the
+  resolved-wall mesh: concave geometry ... folds the wall-function
+  layer"); the standalone TRANSIENT_WALL_YPLUS fallback gets the same
+  guard. Expected S1223 heavy outcome: slow-but-structurally-sound
+  integration governed by the march guard/budget (continuable budget
+  stops), never detonation.
+- Fix B: _run_transient_mesh_qa_gate after transient mesh build/link:
+  checkMesh -time 0, fail honestly at MESH time over
+  MESH_MAX_NON_ORTHO_DEG=85 ("mesh degenerate at this fidelity tier
+  (max non-orthogonality X deg)") or on failed mesh checks; 75-85 deg =
+  disclosure warning; gate inability to run is non-fatal (advisory).
+- Codex (gpt-5.5 xhigh) lane, reviewed; engine suite 347 passed with
+  prod-shaped must-catches (real checkMesh output lines; real seed
+  coordinates; no-solver-call-after-gate assertion).

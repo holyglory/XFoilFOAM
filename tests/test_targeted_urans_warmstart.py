@@ -56,6 +56,12 @@ TIMEOUT_LOG = (
     "\nCommand timed out after 7200s"
 )
 
+PROD_DEGENERATE_CHECKMESH = (
+    "Mesh non-orthogonality Max: 88.229104 average: 29.642901\n"
+    "***High aspect ratio cells found, Max aspect ratio: 2559.0303, number of cells 42\n"
+    "Mesh OK.\n"
+)
+
 
 def _write_shedding_coeff(path: Path, f=5.0, n=500, dt=0.002, cl0=0.7, cd0=0.2):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -349,6 +355,8 @@ def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
     class FakeRunner:
         def application(self, _case_dir, cmd, *args, **kwargs):
             calls.append(cmd.split()[0])
+            if cmd.split()[0] == "checkMesh":
+                return SimpleNamespace(ok=True, returncode=0, timed_out=False, stdout="Mesh OK.\n")
             # potentialFoam IS wanted on the fallback path: prod s1223 c=1
             # u=50 detonated on the first 1-2 steps even from pure uniform
             # freestream — the smooth potential-flow field is the classic
@@ -415,7 +423,7 @@ def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
         strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
     )
     assert result is not None
-    assert calls == ["potentialFoam", "pimpleFoam"]
+    assert calls == ["checkMesh", "potentialFoam", "pimpleFoam"]
     assert latest_seen_by_pimple == [pytest.approx(0.0)]
     assert transient_writes[0]["start_time"] == pytest.approx(0.0)
     assert transient_writes[0]["end_time"] == pytest.approx(expected_horizon)
@@ -504,7 +512,7 @@ def test_prepare_transient_case_warm_starts_from_steady_field(tmp_path, monkeypa
     assert (tcase / "0" / "U").read_text() == "steady U"
     assert (tcase / "0" / "p").read_text() == "steady p"
     assert not (tcase / "0" / "uniform").exists()
-    assert calls == []  # no potentialFoam cold start, no extra init solve
+    assert calls == ["checkMesh"]  # no potentialFoam cold start, no extra init solve
 
 
 def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_init(tmp_path, monkeypatch):
@@ -590,8 +598,146 @@ def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_pa
         steady_field_dir=None,
     )
 
-    assert calls == ["write_inputs", "run_mesh", "potentialFoam", "simpleFoam"]
+    assert calls == ["write_inputs", "run_mesh", "checkMesh", "potentialFoam", "simpleFoam"]
     assert (tcase / "log.simpleFoam.init").read_text() == "standalone init ok"
+
+
+def _run_transient_with_checkmesh(tmp_path, monkeypatch, checkmesh_stdout: str):
+    calls: list[str] = []
+    quality_warnings: list[str] = []
+
+    class FakeRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            if cmd.startswith("checkMesh"):
+                return SimpleNamespace(ok=True, returncode=0, timed_out=False, stdout=checkmesh_stdout)
+            return SimpleNamespace(ok=True, returncode=0, timed_out=False, stdout=f"{cmd} ok\n")
+
+        def solver(self, case_dir, app, *_args, **_kwargs):
+            calls.append(app)
+            cdir = Path(case_dir)
+            if app == "pimpleFoam":
+                _write_flat_transient_coeff(
+                    cdir / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat",
+                    0.0,
+                    0.1,
+                )
+                (cdir / "0.1").mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(
+                ok=True,
+                returncode=0,
+                timed_out=False,
+                stdout=f"{app} ok\n",
+                check=lambda: SimpleNamespace(stdout=f"{app} ok\n"),
+            )
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
+
+    result = pipeline._run_transient(
+        tmp_path / "case",
+        airfoil=SimpleNamespace(name="s1223", contour=[]),
+        resolved=MeshParams(),
+        spec=CaseSpec(chord=1.0, speed=25.0, aoa_deg=18.0),
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(force_transient=True, transient_auto_refine=False),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=7200,
+        shared_mesh_dir=tmp_path / "mesh",
+        quality_warnings=quality_warnings,
+    )
+    return result, calls, quality_warnings
+
+
+def test_transient_mesh_qa_gate_fails_prod_degenerate_mesh_before_solver(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    class FakeRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            if cmd.startswith("checkMesh"):
+                return SimpleNamespace(ok=True, returncode=0, timed_out=False, stdout=PROD_DEGENERATE_CHECKMESH)
+            raise AssertionError(f"mesh gate should stop before {cmd}")
+
+        def solver(self, _case_dir, app, *_args, **_kwargs):
+            calls.append(app)
+            raise AssertionError(f"mesh gate should stop before {app}")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
+
+    with pytest.raises(OpenFOAMError) as err:
+        pipeline._run_transient(
+            tmp_path / "case",
+            airfoil=SimpleNamespace(name="s1223", contour=[]),
+            resolved=MeshParams(),
+            spec=CaseSpec(chord=1.0, speed=25.0, aoa_deg=18.0),
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(force_transient=True),
+            runner=FakeRunner(),
+            n_proc=1,
+            timeout=7200,
+            shared_mesh_dir=tmp_path / "mesh",
+        )
+
+    assert "mesh degenerate at this fidelity tier (max non-orthogonality 88.2 deg)" in str(err.value)
+    assert "checkMesh max non-orthogonality exceeds 85.0 deg" in str(err.value)
+    assert "pimpleFoam" not in calls
+    assert calls == ["checkMesh"]
+
+
+def test_transient_mesh_qa_gate_allows_healthy_mesh_and_solver_runs(tmp_path, monkeypatch):
+    result, calls, quality_warnings = _run_transient_with_checkmesh(
+        tmp_path,
+        monkeypatch,
+        "Mesh non-orthogonality Max: 65 average: 22\nMesh OK.\n",
+    )
+
+    assert result is not None
+    assert "pimpleFoam" in calls
+    assert not quality_warnings
+
+
+def test_transient_mesh_qa_gate_warns_near_limit_and_solver_runs(tmp_path, monkeypatch):
+    result, calls, quality_warnings = _run_transient_with_checkmesh(
+        tmp_path,
+        monkeypatch,
+        "Mesh non-orthogonality Max: 78 average: 25\nMesh OK.\n",
+    )
+
+    assert result is not None
+    assert "pimpleFoam" in calls
+    assert any("max non-orthogonality 78.0 deg" in warning for warning in quality_warnings)
+
+
+def test_transient_mesh_qa_gate_missing_non_ortho_line_is_nonfatal(tmp_path):
+    calls: list[str] = []
+
+    class FakeRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(ok=True, returncode=0, timed_out=False, stdout="Mesh OK.\n")
+
+    pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
+
+    assert calls == ["checkMesh -time 0"]
+
+
+def test_transient_mesh_qa_gate_failed_checks_are_degenerate(tmp_path):
+    class FakeRunner:
+        def application(self, _case_dir, _cmd, *args, **kwargs):
+            return SimpleNamespace(
+                ok=False,
+                returncode=1,
+                timed_out=False,
+                stdout="Mesh non-orthogonality Max: 20 average: 5\nFailed 1 mesh checks.\n",
+            )
+
+    with pytest.raises(OpenFOAMError, match="Failed 1 mesh checks"):
+        pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
 
 
 def test_seed_transient_from_steady_requires_essential_fields(tmp_path):
