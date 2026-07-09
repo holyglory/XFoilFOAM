@@ -22,7 +22,7 @@ import {
   solverProfiles,
   sweepDefinitions,
 } from "@aerodb/db";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -494,5 +494,188 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
     });
     expect(replay.statusCode).toBe(200);
     expect((replay.json() as { created: boolean }).created).toBe(false);
+  });
+});
+
+describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
+  // Hermetic on the shared dev DB: everything scoped to a fixture CAMPAIGN so
+  // the bulk sweep can never touch (or create requests for) foreign rows.
+  const BPREFIX = `${PREFIX}-bulk`;
+  let campaignId = "";
+  let campaignRevisionId = "";
+  const bulkResultIds: string[] = [];
+  const bulkCleanup: { presetIds: string[] } = { presetIds: [] };
+
+  afterAll(async () => {
+    if (bulkResultIds.length) {
+      await db.execute(sql`DELETE FROM sim_urans_requests WHERE continue_from_result_id = ANY(${`{${bulkResultIds.join(",")}}`}::uuid[])`);
+      await db.execute(sql`DELETE FROM result_classifications WHERE result_id = ANY(${`{${bulkResultIds.join(",")}}`}::uuid[])`);
+      await db.execute(sql`DELETE FROM results WHERE id = ANY(${`{${bulkResultIds.join(",")}}`}::uuid[])`);
+    }
+    if (campaignId) {
+      await db.execute(sql`DELETE FROM sim_campaigns WHERE id = ${campaignId}`);
+    }
+    for (const presetId of bulkCleanup.presetIds) {
+      await db.execute(sql`DELETE FROM simulation_preset_revisions WHERE preset_id = ${presetId}`);
+      await db.execute(sql`DELETE FROM simulation_presets WHERE id = ${presetId}`);
+    }
+  });
+
+  it("queues continuations for exactly the continuable needs-review rows of the campaign", async () => {
+    // Minimal plan fixtures (own medium + numerics profiles).
+    const [medium] = await db
+      .insert(mediums)
+      .values({
+        slug: `${BPREFIX}-air`,
+        name: `${BPREFIX} air`,
+        phase: "gas",
+        density: 1.225,
+        viscosityModel: "constant",
+        constantDynamicViscosity: 1.789e-5,
+        dynamicViscosity: 1.789e-5,
+        kinematicViscosity: 1.789e-5 / 1.225,
+        speedOfSound: 340.3,
+      })
+      .returning({ id: mediums.id });
+    const [bp] = await db.insert(boundaryProfiles).values({ slug: `${BPREFIX}-b`, name: `${BPREFIX} b` }).returning({ id: boundaryProfiles.id });
+    const [mp] = await db.insert(meshProfiles).values({ slug: `${BPREFIX}-m`, name: `${BPREFIX} m` }).returning({ id: meshProfiles.id });
+    const [sp] = await db.insert(solverProfiles).values({ slug: `${BPREFIX}-s`, name: `${BPREFIX} s` }).returning({ id: solverProfiles.id });
+    const [op] = await db.insert(outputProfiles).values({ slug: `${BPREFIX}-o`, name: `${BPREFIX} o` }).returning({ id: outputProfiles.id });
+
+    const launch = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      headers: { cookie: adminCookie },
+      payload: {
+        name: `${BPREFIX} campaign`,
+        priority: 5,
+        idempotencyKey: `${BPREFIX}-key`,
+        airfoilIds: [airfoilId],
+        plan: {
+          mediumId: medium.id,
+          ambients: [[288.15, 101325]],
+          speedsMps: [17],
+          chordsM: [0.2],
+          spanM: 1,
+          areaMode: "derived",
+          excludedConditions: [],
+          baseSweep: { fromDeg: 5, toDeg: 7, stepDeg: 1, listDeg: null },
+          objectives: {
+            ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+            clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+            clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+          },
+          numerics: { boundaryProfileId: bp.id, meshProfileId: mp.id, solverProfileId: sp.id, outputProfileId: op.id },
+        },
+      },
+    });
+    expect(launch.statusCode).toBe(201);
+    campaignId = launch.json().campaign.id;
+    const [condition] = (await db.execute(sql`
+      SELECT id, simulation_preset_revision_id AS revision_id, preset_id FROM sim_campaign_conditions WHERE campaign_id = ${campaignId}
+    `)) as unknown as Array<{ id: string; revision_id: string; preset_id: string }>;
+    campaignRevisionId = condition.revision_id;
+    bulkCleanup.presetIds.push(condition.preset_id);
+
+    // Three terminal-rejected precalc rows in the campaign: 5° and 7° are
+    // budget-stopped with saved state (continuable); 6° rejected for a
+    // NON-budget reason (no marker) — must be excluded from the bulk.
+    const mkRow = async (aoa: number, warnings: string[]) => {
+      const [row] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: campaignRevisionId,
+          aoaDeg: aoa,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          fidelity: "urans_precalc",
+          unsteady: true,
+          converged: true,
+          cl: 0.4 + aoa / 100,
+          cd: 0.02,
+          qualityWarnings: warnings,
+          engineJobId: `${BPREFIX}-engine-${aoa}`,
+          engineCaseSlug: `aoa_${aoa}.00`,
+          solvedAt: new Date(),
+        })
+        .returning({ id: results.id });
+      bulkResultIds.push(row.id);
+      await db.execute(sql`
+        INSERT INTO result_classifications (result_id, airfoil_id, simulation_preset_revision_id, aoa_deg, regime, classifier_version, state, region, confidence)
+        VALUES (${row.id}, ${airfoilId}, ${campaignRevisionId}, ${aoa}, 'urans', 'test-fixture', 'rejected', 'post_stall', 0.9)
+      `);
+      await db.execute(sql`
+        UPDATE sim_campaign_points SET state = 'terminal', result_id = ${row.id}
+        WHERE campaign_id = ${campaignId} AND aoa_deg = ${aoa} AND NOT derived_by_symmetry
+      `);
+      return row.id;
+    };
+    const budgetStopped = "URANS integration stopped by the wall-clock budget guard: retained 1.1 of 3 periods (budget)";
+    const idA = await mkRow(5, [budgetStopped]);
+    await mkRow(6, ["URANS quality could not be measured: missing or flat shedding history."]);
+    const idC = await mkRow(7, [budgetStopped]);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests/bulk-continue",
+      headers: { cookie: adminCookie },
+      payload: { campaignId, budgetOverrideS: 21600 },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toEqual({ continuable: 2, created: 2, reused: 0, conflicted: 0 });
+
+    const queued = await db.select().from(simUransRequests).where(eq(simUransRequests.revisionId, campaignRevisionId));
+    expect(queued.length).toBe(2);
+    for (const q of queued) {
+      expect(q.state).toBe("pending");
+      expect(q.fidelity).toBe("precalc");
+      expect(q.budgetOverrideS).toBe(21600);
+      expect([idA, idC]).toContain(q.continueFromResultId);
+    }
+
+    // Replay: the queued cells are now SCHEDULED, so they leave the
+    // needs-review bucket entirely — zeros across the board, and the request
+    // table is unchanged (idempotency at the bucket level, not just per-cell).
+    const replay = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests/bulk-continue",
+      headers: { cookie: adminCookie },
+      payload: { campaignId, budgetOverrideS: 21600 },
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toEqual({ continuable: 0, created: 0, reused: 0, conflicted: 0 });
+    expect((await db.select().from(simUransRequests).where(eq(simUransRequests.revisionId, campaignRevisionId))).length).toBe(2);
+
+    // Foreign-campaign scoping: a random campaign id sweeps nothing.
+    const foreign = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests/bulk-continue",
+      headers: { cookie: adminCookie },
+      payload: { campaignId: "00000000-0000-4000-8000-000000000000", budgetOverrideS: 21600 },
+    });
+    expect(foreign.statusCode).toBe(200);
+    expect(foreign.json().continuable).toBe(0);
+  });
+
+  it("requires admin auth and a budget", async () => {
+    const noAuth = await app.inject({ method: "POST", url: "/api/admin/urans-requests/bulk-continue", payload: { budgetOverrideS: 7200 } });
+    expect([401, 403]).toContain(noAuth.statusCode);
+    const noBudget = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests/bulk-continue",
+      headers: { cookie: adminCookie },
+      payload: {},
+    });
+    expect(noBudget.statusCode).toBe(400);
+    const overCap = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests/bulk-continue",
+      headers: { cookie: adminCookie },
+      payload: { budgetOverrideS: 48 * 3600 },
+    });
+    expect(overCap.statusCode).toBe(400);
   });
 });

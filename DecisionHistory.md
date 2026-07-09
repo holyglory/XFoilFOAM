@@ -2686,3 +2686,26 @@ mean).
 - Live verify (local dev, 1640 rows): desc first = FX 79-W-660A 66.39, all
   19 null rows contiguous at the tail as null; asc nulls also last; browse
   row for an artifact shows "—"/"—" in t/c and CAMB.
+
+## 2026-07-09 — Bulk resume from the needs-attention page
+
+- User report: the needs-review Points view showed only budget-stopped
+  rejections with no visible way to resume; the per-row Continue lives in
+  the story panel (click a row) and there was no bulk path at all.
+- Shipped: POST /api/admin/urans-requests/bulk-continue
+  {campaignId?, budgetOverrideS 60..86400} — queues a continuation for
+  EVERY continuable needs-review row (budget-stop marker + saved engine
+  case state; selection = NEEDS_REVIEW ∧ CONTINUABLE SQL reused from the
+  point-history payload), through the same idempotent per-(cell,fidelity)
+  request machinery as single-row Continue. Non-continuable rejections
+  (crashes, non-budget quality rejects) are excluded server-side — they
+  have no restartable state. Response {continuable, created, reused,
+  conflicted}. Web: RESUME ALL +2h/+6h/+24h control on the Points toolbar,
+  visible only under the needs_review filter, campaign-scoped via the
+  pcampaign filter, window.confirm + outcome notice
+  ("queued N · … — non-resumable rows are excluded").
+- Hermetic recall-proven test (urans-requests.test.ts): fixture campaign
+  via the real launch API; 2 budget-stopped + 1 non-budget rejected rows →
+  {continuable:2, created:2}; replay → zeros with request table unchanged
+  (queued cells leave needs_review — bucket-level idempotency); foreign
+  campaign sweeps nothing; dropping the marker filter fails the test.

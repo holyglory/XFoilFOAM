@@ -9,6 +9,7 @@ import {
   buildStoryDigest,
   campaignPointsSearch,
   DEFAULT_POINT_FILTERS,
+  formatBulkContinueOutcome,
   parsePointFilters,
   type PointAttemptDigestEvent,
   type PointFilters,
@@ -339,5 +340,35 @@ describe("assembleTimeline", () => {
     expect(events).toHaveLength(1);
     expect(events[0].kind).toBe("now");
     expect(events[0].detail).toContain("0 attempts");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatBulkContinueOutcome — the one honest line the needs-review toolbar
+// shows after a bulk resume (counts come straight from the server response).
+// ---------------------------------------------------------------------------
+describe("formatBulkContinueOutcome", () => {
+  it("empty scope says so instead of pretending zero-of-zero was queued", () => {
+    expect(formatBulkContinueOutcome({ continuable: 0, created: 0, reused: 0, conflicted: 0 })).toBe(
+      "nothing to resume — no needs-review point in this scope has saved case state",
+    );
+  });
+
+  it("reports queued + already-open counts and the exclusion rule", () => {
+    expect(formatBulkContinueOutcome({ continuable: 12, created: 12, reused: 0, conflicted: 0 })).toBe(
+      "queued 12 · already open 0 — non-resumable rows are excluded",
+    );
+  });
+
+  it("idempotent replay shows every row as already open", () => {
+    expect(formatBulkContinueOutcome({ continuable: 5, created: 0, reused: 5, conflicted: 0 })).toBe(
+      "queued 0 · already open 5 — non-resumable rows are excluded",
+    );
+  });
+
+  it("conflicting open requests are counted honestly, never folded into queued", () => {
+    expect(formatBulkContinueOutcome({ continuable: 7, created: 4, reused: 2, conflicted: 1 })).toBe(
+      "queued 4 · already open 2 · conflicting open request 1 — non-resumable rows are excluded",
+    );
   });
 });

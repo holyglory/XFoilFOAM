@@ -19,7 +19,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 
-import { type AdminUransRequest, continueUransResult, getPointHistory, getPointStory, getUransRequests, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
+import { type AdminUransRequest, bulkContinueUrans, continueUransResult, getPointHistory, getPointStory, getUransRequests, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
 import { getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import {
@@ -28,6 +28,7 @@ import {
   buildStoryDigest,
   DEFAULT_POINT_FILTERS,
   fidelityChipView,
+  formatBulkContinueOutcome,
   parsePointFilters,
   type PointFilters,
   type PointHistoryCounts,
@@ -452,6 +453,39 @@ export function PointHistoryPanel() {
     [continueBusy, openStory, fetchFirstPage],
   );
 
+  // Bulk resume (needs-review toolbar): one click queues a continuation for
+  // EVERY continuable needs-review row in the current campaign scope — the
+  // server recomputes membership (staleness-safe) and excludes non-resumable
+  // rows (crashes, non-budget rejections). Same window.confirm idiom as the
+  // per-row Continue buttons.
+  const [bulkContinueBusy, setBulkContinueBusy] = useState(false);
+  const [bulkContinueNotice, setBulkContinueNotice] = useState<string | null>(null);
+  const doBulkContinue = useCallback(
+    async (extraHours: 2 | 6 | 24) => {
+      if (bulkContinueBusy) return;
+      const campaignId = filtersRef.current.campaignId || null;
+      const scope = campaignId ? "in the selected campaign" : "across ALL campaigns and background work";
+      if (
+        !window.confirm(
+          `Resume every continuable needs-review URANS solve ${scope} with a +${extraHours} h wall-clock budget each? Each one resumes from its saved case state (no work is redone) and re-enters the queue at precalc rank. Crashes and other non-resumable rows are excluded automatically.`,
+        )
+      )
+        return;
+      setBulkContinueBusy(true);
+      setBulkContinueNotice(null);
+      try {
+        const res = await bulkContinueUrans(campaignId, extraHours * 3600);
+        setBulkContinueNotice(formatBulkContinueOutcome(res));
+        void fetchFirstPage(filtersRef.current);
+      } catch (e) {
+        setBulkContinueNotice(isAdminApiError(e) ? e.message : (e as Error).message);
+      } finally {
+        setBulkContinueBusy(false);
+      }
+    },
+    [bulkContinueBusy, fetchFirstPage],
+  );
+
   // ---- request-URANS (fidelity ladder contract 6) ----
   // Close any open row overflow menu on outside click.
   useEffect(() => {
@@ -564,6 +598,28 @@ export function PointHistoryPanel() {
               {chipCount(k) != null ? ` ${chipCount(k)!.toLocaleString()}` : ""}
             </button>
           ))}
+          {/* Bulk resume (amendment C, bulk form): acts on the WHOLE filtered
+              needs-review set — no row selection; the server recomputes
+              membership, so a stale table is safe. Rendered only while the
+              needs-review chip filter is active. */}
+          {filters.status === "needs_review" && (
+            <span data-testid="points-bulk-resume" style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.08em" }}>RESUME ALL</span>
+              {([2, 6, 24] as const).map((h) => (
+                <button
+                  key={h}
+                  type="button"
+                  data-testid={`points-bulk-resume-${h}h`}
+                  disabled={bulkContinueBusy}
+                  title={`Resume every continuable needs-review URANS solve ${filters.campaignId ? "in the selected campaign" : "in every campaign"} from its saved case state with +${h} h of wall-clock budget — crashes and other non-resumable rows are excluded`}
+                  onClick={() => void doBulkContinue(h)}
+                  style={{ ...smallBtn, color: C.violet, borderColor: C.violetBorder, opacity: bulkContinueBusy ? 0.6 : 1 }}
+                >
+                  {bulkContinueBusy ? "queueing…" : `+${h}h`}
+                </button>
+              ))}
+            </span>
+          )}
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <input
@@ -656,6 +712,11 @@ export function PointHistoryPanel() {
       {uransNotice && !openItem && (
         <div data-testid="points-urans-notice" style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>
           {uransNotice}
+        </div>
+      )}
+      {bulkContinueNotice && filters.status === "needs_review" && (
+        <div data-testid="points-bulk-resume-notice" style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>
+          {bulkContinueNotice}
         </div>
       )}
 

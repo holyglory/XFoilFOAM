@@ -261,6 +261,26 @@ export function verifyPointsSearch(airfoilSlug: string, verify: "pending" | "dis
 }
 
 // ---------------------------------------------------------------------------
+// Bulk resume (needs-review toolbar): one honest outcome line from the
+// bulk-continue response. Counts come straight from the server — created /
+// reused / conflicted always sum to continuable, and non-resumable rows
+// (crashes, non-budget rejections) were never in the set.
+// ---------------------------------------------------------------------------
+export interface BulkContinueOutcome {
+  continuable: number;
+  created: number;
+  reused: number;
+  conflicted: number;
+}
+
+export function formatBulkContinueOutcome(o: BulkContinueOutcome): string {
+  if (o.continuable === 0) return "nothing to resume — no needs-review point in this scope has saved case state";
+  const parts = [`queued ${o.created}`, `already open ${o.reused}`];
+  if (o.conflicted > 0) parts.push(`conflicting open request ${o.conflicted}`);
+  return `${parts.join(" · ")} — non-resumable rows are excluded`;
+}
+
+// ---------------------------------------------------------------------------
 // Fidelity chip (ladder contract): the ONE presentation rule for every surface
 // that renders a classification chip (Points rows, story header, cell panel,
 // solver-results modal). Pure so node vitest pins the truth table.

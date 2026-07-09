@@ -565,6 +565,17 @@ export const continueUransResult = (resultId: string, budgetOverrideS: number) =
     body: JSON.stringify({ continueFromResultId: resultId, budgetOverrideS }),
   });
 
+/** Bulk continuation: queue a resume for EVERY continuable needs-review row
+ *  (optionally scoped to one campaign) with the same budget override. The
+ *  server recomputes membership and excludes non-continuable rows (crashes,
+ *  non-budget rejections); idempotent — replays count as reused; conflicted =
+ *  cells whose open request is NOT this row's continuation. */
+export const bulkContinueUrans = (campaignId: string | null, budgetOverrideS: number) =>
+  aj<{ continuable: number; created: number; reused: number; conflicted: number }>("/api/admin/urans-requests/bulk-continue", {
+    method: "POST",
+    body: JSON.stringify({ ...(campaignId ? { campaignId } : {}), budgetOverrideS }),
+  });
+
 /** Open/settled request items + verify-queue items for one cell scope — the
  *  action surfaces read this to render idempotent-aware button state. */
 export const getUransRequests = (airfoilId: string, revisionId: string) =>

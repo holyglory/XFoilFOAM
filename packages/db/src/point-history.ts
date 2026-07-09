@@ -981,3 +981,47 @@ export async function requeueSinglePoint(
     return { requeued: 1 as const, scope, campaignIds };
   });
 }
+
+/** Bulk resume (needs-attention page): every needs-review row that is
+ *  CONTINUABLE — budget-stopped rejected urans evidence with saved engine
+ *  case state and nothing further scheduled. The bulk endpoint feeds each
+ *  row into createUransRequest (idempotent per cell+fidelity), so replays
+ *  and races with single-row Continue actions are safe. */
+export async function listContinuableNeedsReview(
+  db: DB,
+  opts: { campaignId?: string | null } = {},
+): Promise<Array<{ resultId: string; airfoilId: string; revisionId: string; aoaDeg: number; fidelity: string | null }>> {
+  const campaignCond = opts.campaignId
+    ? sql`AND EXISTS (
+        SELECT 1 FROM sim_campaign_points p
+        WHERE p.campaign_id = ${opts.campaignId} AND NOT p.derived_by_symmetry
+          AND ((p.result_id = r.id)
+            OR (p.state = 'requested' AND p.revision_id = r.simulation_preset_revision_id
+                AND p.airfoil_id = r.airfoil_id AND p.aoa_deg = r.aoa_deg))
+      )`
+    : sql``;
+  const rows = (await db.execute(sql`
+    SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+           r.aoa_deg::float8 AS aoa_deg, r.fidelity
+    FROM results r
+    LEFT JOIN result_classifications rc ON rc.result_id = r.id
+    WHERE ${NEEDS_REVIEW_RESULT_SQL}
+      AND ${CONTINUABLE_SQL}
+      AND r.simulation_preset_revision_id IS NOT NULL
+      ${campaignCond}
+    ORDER BY r."updatedAt" ASC
+  `)) as unknown as Array<{
+    result_id: string;
+    airfoil_id: string;
+    revision_id: string;
+    aoa_deg: number;
+    fidelity: string | null;
+  }>;
+  return rows.map((r) => ({
+    resultId: r.result_id,
+    airfoilId: r.airfoil_id,
+    revisionId: r.revision_id,
+    aoaDeg: Number(r.aoa_deg),
+    fidelity: r.fidelity,
+  }));
+}

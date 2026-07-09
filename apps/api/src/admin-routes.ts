@@ -25,6 +25,7 @@ import {
   sweepDefinitions,
   campaignBacklogStrip,
   createUransRequest,
+  listContinuableNeedsReview,
   simUransRequests,
   simUransVerifyQueue,
   syncLegacyBoundaryConditionForPreset as syncLegacyBoundaryConditionForPresetDb,
@@ -2912,6 +2913,49 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       requestedBy: sessionEmail(req),
     });
     return reply.code(created ? 201 : 200).send({ request, created });
+  });
+
+  // Bulk resume (needs-attention page): queue a continuation for EVERY
+  // continuable needs-review row (budget-stopped rejected urans evidence with
+  // saved case state), optionally scoped to one campaign. Reuses the same
+  // idempotent per-(cell, fidelity) request machinery as the single-row
+  // Continue action; rows whose cell already has an open request are counted
+  // as reused, never duplicated. Non-continuable needs-review rows (crashes,
+  // non-budget rejections) are intentionally excluded — resuming needs saved
+  // restartable state.
+  app.post("/api/admin/urans-requests/bulk-continue", { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = z
+      .object({
+        campaignId: z.string().uuid().optional(),
+        // mirrors the single-row continuation bounds (engine cap 24 h)
+        budgetOverrideS: z.number().int().min(60).max(24 * 3600),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "invalid request" });
+    const body = parsed.data;
+
+    const rows = await listContinuableNeedsReview(db, { campaignId: body.campaignId ?? null });
+    let created = 0;
+    let reused = 0;
+    let conflicted = 0;
+    for (const row of rows) {
+      const { request, created: isNew } = await createUransRequest(db, {
+        airfoilId: row.airfoilId,
+        revisionId: row.revisionId,
+        aoaDeg: row.aoaDeg,
+        fidelity: row.fidelity === "urans_full" ? "full" : "precalc",
+        requestedBy: sessionEmail(req),
+        continueFromResultId: row.resultId,
+        budgetOverrideS: body.budgetOverrideS,
+      });
+      if (isNew) created += 1;
+      else if (request.continueFromResultId === row.resultId) reused += 1;
+      // An open item covering the cell that is NOT this row's continuation
+      // would run from scratch (or resume a different result) — count it
+      // honestly instead of pretending this row was queued for resume.
+      else conflicted += 1;
+    }
+    return reply.code(created ? 201 : 200).send({ continuable: rows.length, created, reused, conflicted });
   });
 
   // Open/settled request-URANS items + verify-queue items for one cell scope —
