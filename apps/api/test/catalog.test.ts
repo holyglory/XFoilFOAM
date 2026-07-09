@@ -938,3 +938,71 @@ describe("simulation media evidence", () => {
     expect(sim?.evidenceArtifacts?.some((artifact) => artifact.kind === "frame_image")).toBe(false);
   });
 });
+
+describe("geometry-metric sorts keep NULL-metric rows last", () => {
+  // Prod repro 2026-07-09: GET /api/airfoils?sort=thickness&dir=desc returned
+  // 21 metric-less campaign-artifact rows (thicknessPct serialized as 0)
+  // BEFORE "FX 79-W-660A" (66.39%) — postgres DESC defaults to NULLS FIRST,
+  // and the DTO coalesced NULL metrics to a fake 0.
+  it("puts real metric values first in both directions and serializes missing metrics as null", async () => {
+    const unique = `nullsort-${Date.now().toString(36)}`;
+    const [cat] = await db
+      .insert(categories)
+      .values({ slug: unique, name: "Null Metric Sort Test", path: unique, depth: 0, sortOrder: 999 })
+      .returning({ id: categories.id });
+    cleanupCategoryIds.add(cat.id);
+
+    const mk = async (suffix: string, vals: Record<string, unknown>) => {
+      const [row] = await db
+        .insert(airfoils)
+        .values({
+          slug: `${unique}-${suffix}`,
+          name: `${unique} ${suffix}`,
+          categoryId: cat.id,
+          source: "test",
+          points,
+          refMetricsSource: "queued",
+          tags: [],
+          ...vals,
+        })
+        .returning({ id: airfoils.id });
+      cleanupAirfoilIds.add(row.id);
+    };
+    // the repro shape: an artifact airfoil with NO computed geometry metrics
+    await mk("artifact", { thicknessPct: null, camberPct: null, areaProfile: null });
+    await mk("thick", { thicknessPct: 66.39, camberPct: 1.2, areaProfile: 0.21 });
+    await mk("thin", { thicknessPct: 12, camberPct: 4.4, areaProfile: 0.07 });
+
+    const suffixes = (rows: Array<{ name: string }>) => rows.map((r) => r.name.split(" ")[1]);
+
+    const desc = await listAirfoils({ q: unique, sort: "thickness", dir: "desc" });
+    expect(suffixes(desc)).toEqual(["thick", "thin", "artifact"]);
+    // DTO honesty: a missing metric is null, never a fake 0 (camber 0.0 is a
+    // REAL value on symmetric airfoils and must stay distinguishable).
+    expect(desc[2].thicknessPct).toBeNull();
+    expect(desc[2].camberPct).toBeNull();
+    expect(desc[2].areaProfile).toBeNull();
+    expect(desc[0].thicknessPct).toBeCloseTo(66.39);
+
+    const ascOrder = await listAirfoils({ q: unique, sort: "thickness", dir: "asc" });
+    expect(suffixes(ascOrder)).toEqual(["thin", "thick", "artifact"]);
+
+    const camberDesc = await listAirfoils({ q: unique, sort: "camber", dir: "desc" });
+    expect(suffixes(camberDesc)).toEqual(["thin", "thick", "artifact"]);
+
+    const areaAsc = await listAirfoils({ q: unique, sort: "area", dir: "asc" });
+    expect(suffixes(areaAsc)).toEqual(["thin", "thick", "artifact"]);
+
+    // HTTP path — the exact reported repro URL shape.
+    const app = await buildServer();
+    try {
+      const res = await app.inject({ method: "GET", url: `/api/airfoils?q=${unique}&sort=thickness&dir=desc` });
+      expect(res.statusCode).toBe(200);
+      const items = res.json().items as Array<{ name: string; thicknessPct: number | null }>;
+      expect(suffixes(items)).toEqual(["thick", "thin", "artifact"]);
+      expect(items[2].thicknessPct).toBeNull();
+    } finally {
+      await app.close();
+    }
+  });
+});

@@ -60,9 +60,9 @@ const EMPTY_FILTERS: Filters = {
 
 const COLS: { key: SortKey; label: string; fmt: (a: AirfoilSummary) => string; num: boolean }[] = [
   { key: "name", label: "NAME", fmt: (a) => a.name, num: false },
-  { key: "thicknessPct", label: "t/c", fmt: (a) => a.thicknessPct.toFixed(1), num: true },
-  { key: "camberPct", label: "CAMB", fmt: (a) => a.camberPct.toFixed(1), num: true },
-  { key: "areaProfile", label: "AREA", fmt: (a) => a.areaProfile.toFixed(3), num: true },
+  { key: "thicknessPct", label: "t/c", fmt: (a) => solvedMetric(a.thicknessPct, 1), num: true },
+  { key: "camberPct", label: "CAMB", fmt: (a) => solvedMetric(a.camberPct, 1), num: true },
+  { key: "areaProfile", label: "AREA", fmt: (a) => solvedMetric(a.areaProfile, 3), num: true },
   { key: "ldmax", label: "L/D", fmt: (a) => solvedMetric(a.ldmax, 1), num: true },
   { key: "cdmin", label: "Cd", fmt: (a) => solvedMetric(a.cdmin, 4), num: true },
 ];
@@ -631,9 +631,9 @@ export function BrowseView({
                     )}
                   </span>
                 </span>
-                <span className="airfoil-cell airfoil-col-thicknessPct" style={{ textAlign: "right", color: C.text }}>{a.thicknessPct.toFixed(1)}</span>
-                <span className="airfoil-cell airfoil-col-camberPct" style={{ textAlign: "right", color: C.text }}>{a.camberPct.toFixed(1)}</span>
-                <span className="airfoil-cell airfoil-col-areaProfile" style={{ textAlign: "right", color: C.muted }}>{a.areaProfile.toFixed(3)}</span>
+                <span className="airfoil-cell airfoil-col-thicknessPct" style={{ textAlign: "right", color: a.thicknessPct == null ? C.dimmest : C.text }}>{solvedMetric(a.thicknessPct, 1)}</span>
+                <span className="airfoil-cell airfoil-col-camberPct" style={{ textAlign: "right", color: a.camberPct == null ? C.dimmest : C.text }}>{solvedMetric(a.camberPct, 1)}</span>
+                <span className="airfoil-cell airfoil-col-areaProfile" style={{ textAlign: "right", color: a.areaProfile == null ? C.dimmest : C.muted }}>{solvedMetric(a.areaProfile, 3)}</span>
                 <span
                   className="airfoil-cell airfoil-col-ldmax"
                   title={

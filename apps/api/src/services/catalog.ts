@@ -124,6 +124,11 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
   const sort = opts.sort ?? "name";
   const sortCol = SORT_COLS[sort as keyof typeof SORT_COLS] ?? airfoils.name;
   const solvedSort = sort === "ldmax" || sort === "clmax" || sort === "cdmin";
+  // Geometry-metric sorts must keep NULL-metric rows LAST in both directions
+  // (postgres defaults DESC to NULLS FIRST, which put metric-less rows above
+  // "FX 79-W-660A" at 66.39% t/c) — mirroring the solved-metric in-memory
+  // sort below, which already sends missing values to the tail.
+  const nullableMetricSort = sort === "thickness" || sort === "camber" || sort === "area";
   const rows = await db
     .select({
       id: airfoils.id,
@@ -153,7 +158,15 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
     .innerJoin(categories, eq(airfoils.categoryId, categories.id))
     .where(and(...conds))
     .orderBy(
-      solvedSort ? asc(airfoils.name) : opts.dir === "desc" ? desc(sortCol) : asc(sortCol),
+      solvedSort
+        ? asc(airfoils.name)
+        : nullableMetricSort
+          ? opts.dir === "desc"
+            ? sql`${sortCol} DESC NULLS LAST`
+            : sql`${sortCol} ASC NULLS LAST`
+          : opts.dir === "desc"
+            ? desc(sortCol)
+            : asc(sortCol),
       asc(airfoils.name),
     )
     .limit(opts.limit ?? DEFAULT_LIMIT)
@@ -234,8 +247,11 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
       tags: normalizedTags.length ? normalizedTags.map((h) => h.name) : r.tags,
       hashtags: normalizedTags,
       points: r.points as AirfoilSummary["points"],
-      thicknessPct: r.thicknessPct ?? 0,
-      areaProfile: r.areaProfile ?? 0,
+      // Missing geometry metrics stay NULL in the DTO — a zero here is a lie
+      // (and camber 0.0 is REAL for symmetric airfoils, so the UI must be
+      // able to tell "0.0" from "not computed").
+      thicknessPct: r.thicknessPct ?? null,
+      areaProfile: r.areaProfile ?? null,
       areaUpper: r.areaUpper ?? 0,
       areaLower: r.areaLower ?? 0,
       areaCamber: r.areaCamber ?? 0,
@@ -245,8 +261,8 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
       areaLowerNegative: r.areaLowerNegative ?? Math.min(0, r.areaLower ?? 0),
       areaCamberPositive: r.areaCamberPositive ?? Math.max(0, r.areaCamber ?? 0),
       areaCamberNegative: r.areaCamberNegative ?? Math.min(0, r.areaCamber ?? 0),
-      camberPct: r.camberPct ?? 0,
-      camberPosPct: r.camberPosPct ?? 0,
+      camberPct: r.camberPct ?? null,
+      camberPosPct: r.camberPosPct ?? null,
       reMin: RELIST[0],
       reMax: RELIST[RELIST.length - 1],
       polarCount,

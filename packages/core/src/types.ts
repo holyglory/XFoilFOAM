@@ -187,8 +187,10 @@ export interface AirfoilSummary {
   hashtags: HashtagDTO[];
   points: Point[]; // contour, for the row glyph
 
-  thicknessPct: number;
-  areaProfile: number;
+  /** null = geometry metric not computed (never coalesced to a fake 0;
+   *  camber 0.0 is a REAL value on symmetric airfoils) */
+  thicknessPct: number | null;
+  areaProfile: number | null;
   areaUpper: number;
   areaLower: number;
   areaCamber: number;
@@ -198,8 +200,8 @@ export interface AirfoilSummary {
   areaLowerNegative: number;
   areaCamberPositive: number;
   areaCamberNegative: number;
-  camberPct: number;
-  camberPosPct: number;
+  camberPct: number | null;
+  camberPosPct: number | null;
   reMin: number;
   reMax: number;
   polarCount: number;

@@ -73,7 +73,7 @@ export function rankSearchItems(items: AirfoilSummary[], objectiveKey: string, c
 function passesConstraints(airfoil: AirfoilSummary, constraints: SearchConstraints): boolean {
   if (constraints.clmaxOn && (!isFiniteMetric(airfoil.clmax) || airfoil.clmax < constraints.clmaxMin)) return false;
   if (constraints.cdminOn && (!isFiniteMetric(airfoil.cdmin) || airfoil.cdmin > constraints.cdminMax)) return false;
-  if (constraints.tcOn && airfoil.thicknessPct > constraints.tcMax) return false;
+  if (constraints.tcOn && (!isFiniteMetric(airfoil.thicknessPct) || airfoil.thicknessPct > constraints.tcMax)) return false;
   return true;
 }
 

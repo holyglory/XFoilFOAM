@@ -2661,3 +2661,28 @@ mean).
   prod-shaped) — reverting `advances` fails 3 of them; restored 42/42.
   Collapse helper pinned by apps/web/test/lane-steps.test.ts (prod 21-step
   fixture → 9 rows; never merges solved/distinct-α/non-superseded).
+
+## 2026-07-09 — Catalog metric sorts: NULLS LAST + honest null DTO
+
+- Repro: GET /api/airfoils?sort=thickness&dir=desc listed 21 metric-less
+  campaign/test-artifact rows (thicknessPct serialized as 0) before
+  FX 79-W-660A (66.39%). Two defects: postgres DESC defaults to NULLS FIRST
+  and the geometry sorts (thickness/camber/area) never overrode it; the
+  summary DTO coalesced NULL geometry metrics to a fake 0 (banned — and
+  camber 0.0 is REAL on symmetric airfoils, so 0-vs-missing must stay
+  distinguishable).
+- Fix: ORDER BY <metric> {ASC|DESC} NULLS LAST for the three geometry sorts
+  (solved-metric sorts ldmax/clmax/cdmin already sent missing values last
+  in their in-memory comparator); AirfoilSummary.thicknessPct/camberPct/
+  camberPosPct/areaProfile are now number|null end-to-end — Browse t/c,
+  CAMB, AREA cells render "—" via the existing solvedMetric idiom,
+  AirfoilSelector shows "—", search ranking excludes unknown t/c when the
+  constraint is on (same policy as clmax/cdmin), CompareView geometry rows
+  were already null-typed.
+- Must-catch (apps/api/test/catalog.test.ts): artifact-shaped NULL-metric
+  fixture + real rows → desc/asc thickness, desc camber, asc area all keep
+  the artifact LAST; DTO nulls asserted (not 0); HTTP leg uses the exact
+  reported URL shape. Recall-proven: reverting the ORDER BY fails the test.
+- Live verify (local dev, 1640 rows): desc first = FX 79-W-660A 66.39, all
+  19 null rows contiguous at the tail as null; asc nulls also last; browse
+  row for an artifact shows "—"/"—" in t/c and CAMB.

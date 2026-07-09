@@ -165,7 +165,7 @@ export function AirfoilSelector({
                     ) : (
                       showDetails && (
                         <div style={{ fontFamily: MONO, fontSize: 10, color: C.muted, textAlign: "right", flex: "none", lineHeight: 1.5 }}>
-                          t/c {a.thicknessPct.toFixed(1)}% · cam {a.camberPct.toFixed(1)}%
+                          t/c {a.thicknessPct != null ? `${a.thicknessPct.toFixed(1)}%` : "—"} · cam {a.camberPct != null ? `${a.camberPct.toFixed(1)}%` : "—"}
                           <br />
                           {a.ldmax == null || a.cdmin == null ? (
                             <span style={{ color: C.dim }}>no polar data</span>
