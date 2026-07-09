@@ -391,6 +391,12 @@ def resolve_mesh_params(
 TRANSIENT_WALL_YPLUS = 40.0  # wall-function y+ for transient mesh; mirrors models.URANS_PRECALC_WALL_YPLUS
 TRANSIENT_INIT_ITERS = 600  # short steady init before the transient
 TRANSIENT_INITIAL_STROUHAL = 0.5
+# Prod s1223 jobs 7ff36caf/0cba5e9b on the y+40 precalc mesh showed the fresh
+# startup dt ramp growing 1.2x/step toward the new Courant-4 ceiling before the
+# separated flow was developed, then blowing up. Keep only the FIRST fresh chunk
+# at roughly Co <= 1 (dt <= 2x the Strouhal period/5000 guess); resumed,
+# extension, and refined chunks use their measured-period cadence/caps.
+STARTUP_MAX_DELTA_T_FACTOR = 2.0
 URANS_REFINED_CADENCE_STROUHAL = 0.75
 URANS_MIN_RETAINED_CYCLES = 7.0
 #: Early-stop retention target. The two-period comparator only DETECTS a
@@ -1356,6 +1362,39 @@ def _quality_with(quality: UransQuality, **updates) -> UransQuality:
     return UransQuality(**base)
 
 
+def _quality_allows_more_integration(quality: UransQuality, target_cycles: float) -> bool:
+    if quality.ok or quality.no_shedding:
+        return False
+    period = quality.measured_period_s
+    if period is None or not math.isfinite(period) or period <= 0:
+        return False
+    if quality.can_refine:
+        return True
+    reason = quality.reason.lower()
+    if any(
+        marker in reason
+        for marker in (
+            URANS_BUDGET_STOP_MARKER,
+            "timed out",
+            "stopped early",
+            "failed",
+            "crashed",
+            "diverged",
+            "could not be measured",
+            "missing or flat",
+        )
+    ):
+        return False
+    eps = 1e-9
+    too_short = quality.retained_cycles + eps < target_cycles
+    too_sparse = (
+        quality.frames_per_cycle > 0.0
+        and quality.frames_per_cycle + eps < URANS_MIN_FRAMES_PER_CYCLE
+    )
+    not_stationary = "not stationary" in reason or "established-oscillation" in reason
+    return too_short or too_sparse or not_stationary
+
+
 def _extend_transient_until_periods(
     tcase: Path,
     first: TransientResult,
@@ -1398,10 +1437,11 @@ def _extend_transient_until_periods(
     chunks = 0
     while chunks < URANS_CONTINUATION_MAX_CHUNKS:
         history = result.force_history
+        can_continue = _quality_allows_more_integration(result.quality, target)
         if (
             result.early_stopped
             or result.quality.no_shedding
-            or not result.quality.can_refine
+            or not can_continue
             or history is None
             or len(history.t) < 8
         ):
@@ -1426,6 +1466,11 @@ def _extend_transient_until_periods(
         retained = span * (1.0 - discard) / period
         if retained + 1e-6 >= target:
             break
+        # Prod naca-4412 -15deg precalc retained 2.00/3.00 cycles at 19.5
+        # frames/cycle and was not yet stationary, but still had a measurable
+        # period and hours of budget. Those blockers are solved by more
+        # integration; the next chunk writes at period/20 while the budget guard
+        # below remains the honest stop condition.
         chunk_sim = (target - retained) * period / max(1e-6, 1.0 - discard)
         if timeout and total_wall > 0.0:
             # Rate = THIS job's simulated progress per wall second. For a
@@ -1595,6 +1640,7 @@ def _run_transient(
         first = _run_transient_attempt(
             tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
             run_time=initial_run_time, delta_t=initial_delta_t,
+            max_delta_t=STARTUP_MAX_DELTA_T_FACTOR * initial_delta_t,
             coeff_start_time=transient_start,
             cancel_check=cancel_check,
         )

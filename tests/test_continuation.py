@@ -373,6 +373,10 @@ def test_resume_restarts_from_latest_time_and_merges_both_segments(tmp_path):
     assert calls["timeout"] == 21600
     assert "latestTime" in calls["controlDict"]
     assert re.search(r"startTime\s+0\.1;", calls["controlDict"]), calls["controlDict"]
+    max_delta_t = float(re.search(r"maxDeltaT\s+([0-9.eE+-]+);", calls["controlDict"]).group(1))
+    write_interval = float(re.search(r"writeInterval\s+([0-9.eE+-]+);", calls["controlDict"]).group(1))
+    assert max_delta_t == pytest.approx(write_interval)
+    assert write_interval == pytest.approx(PERIOD_S / pipeline.URANS_MIN_FRAMES_PER_CYCLE, rel=0.05)
     # The saved state was NOT wiped or re-prepared.
     assert (tcase / "0.1" / "U").read_text() == "saved U at 0.1"
     # Merged history: coefficient segments of BOTH jobs feed the grade, and

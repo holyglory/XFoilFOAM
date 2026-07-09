@@ -388,9 +388,28 @@ def _install_continuation_fakes(monkeypatch, *, period, spans, wall_seconds, qua
         (tcase / "0").mkdir(exist_ok=True)
         return (None, {})
 
-    def fake_attempt(tcase, *_args, run_time=None, coeff_start_time=None, refined=False, **_kwargs):
+    def fake_attempt(
+        tcase,
+        *_args,
+        run_time=None,
+        delta_t=None,
+        write_interval=None,
+        max_delta_t=None,
+        coeff_start_time=None,
+        refined=False,
+        **_kwargs,
+    ):
         k = len(calls)
-        calls.append({"run_time": run_time, "coeff_start_time": coeff_start_time, "refined": refined})
+        calls.append(
+            {
+                "run_time": run_time,
+                "delta_t": delta_t,
+                "write_interval": write_interval,
+                "max_delta_t": max_delta_t,
+                "coeff_start_time": coeff_start_time,
+                "refined": refined,
+            }
+        )
         end = spans[min(k, len(spans) - 1)]
         (tcase / f"{end:.10g}").mkdir(exist_ok=True)
         last = k >= len(spans) - 1
@@ -415,6 +434,31 @@ def _install_continuation_fakes(monkeypatch, *, period, spans, wall_seconds, qua
     monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
     monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
     return calls
+
+
+def test_fresh_transient_startup_caps_first_chunk_max_delta_t(tmp_path, monkeypatch):
+    period = pipeline.physics.shedding_period(
+        10.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[2.0],
+        wall_seconds=1.0,
+    )
+
+    result = _run_transient_for_test(tmp_path / "case", SolverParams(urans_min_periods=3))
+
+    assert result is not None
+    assert pipeline.STARTUP_MAX_DELTA_T_FACTOR == 2.0
+    initial_delta_t = period / 5000.0
+    assert calls[0]["delta_t"] == pytest.approx(initial_delta_t)
+    assert calls[0]["max_delta_t"] == pytest.approx(
+        pipeline.STARTUP_MAX_DELTA_T_FACTOR * initial_delta_t
+    )
+    assert calls[0]["write_interval"] is None
 
 
 def _run_transient_for_test(tmp_path, solver_params, timeout=7200):
@@ -477,6 +521,94 @@ def test_continuation_budget_stop_grades_retained_periods_honestly(tmp_path, mon
     # Cross-runtime recall pin: the budget-stop grade carries the continuable
     # marker the node predicate matches by substring (urans-quality.ts).
     assert pipeline.URANS_BUDGET_STOP_MARKER in result.quality.reason
+
+
+def test_continuation_extends_underretained_sparse_nonstationary_window(tmp_path, monkeypatch):
+    """Prod shape: precalc retained 2.00/3.00 cycles at 19.5 frames/cycle and
+    then reported the established-oscillation window as not stationary. That is
+    still a measurable shedding window; another continuation chunk fixes both
+    retained cycles and the field-write cadence when budget allows."""
+
+    period = 0.5
+    spans = [1.0, 1.5]
+    calls: list[dict] = []
+
+    def fake_prepare(tcase, *_args, **_kwargs):
+        tcase.mkdir(parents=True, exist_ok=True)
+        (tcase / "0").mkdir(exist_ok=True)
+        return (None, {})
+
+    def fake_attempt(
+        tcase,
+        *_args,
+        run_time=None,
+        write_interval=None,
+        max_delta_t=None,
+        coeff_start_time=None,
+        refined=False,
+        **_kwargs,
+    ):
+        k = len(calls)
+        calls.append(
+            {
+                "run_time": run_time,
+                "write_interval": write_interval,
+                "max_delta_t": max_delta_t,
+                "coeff_start_time": coeff_start_time,
+                "refined": refined,
+            }
+        )
+        end = spans[min(k, len(spans) - 1)]
+        (tcase / f"{end:.10g}").mkdir(exist_ok=True)
+        ok = k >= 1
+        return TransientResult(
+            avg=SimpleNamespace(cl=0.7, cd=0.05, cm=-0.02, cl_cd=14.0, cl_std=0.07, cd_std=0.0, cm_std=0.0),
+            case_dir=tcase,
+            force_history=_history_over(0.0, end, period),
+            quality=UransQuality(
+                ok=ok,
+                can_refine=False,
+                reason=(
+                    "URANS quality target met."
+                    if ok
+                    else (
+                        "retained cycles 2.00 < 3.00; frames/cycle 19.50 < 20.00; "
+                        "URANS window not stationary (precalc established-oscillation test): "
+                        "only 2 whole cycles retained"
+                    )
+                ),
+                measured_period_s=period,
+                retained_cycles=end / period,
+                retained_frame_count=60 if ok else 39,
+                frames_per_cycle=20.0 if ok else 19.5,
+            ),
+            start_time=0.0 if k == 0 else spans[k - 1],
+            end_time=end,
+            run_time=end if k == 0 else end - spans[k - 1],
+            wall_seconds=10.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(urans_min_periods=3, transient_discard_fraction=0.0),
+        timeout=4 * 3600,
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["run_time"] == pytest.approx(period, rel=0.01)
+    assert calls[1]["write_interval"] == pytest.approx(
+        period / pipeline.URANS_MIN_FRAMES_PER_CYCLE,
+        rel=0.01,
+    )
+    assert calls[1]["max_delta_t"] == pytest.approx(
+        period / pipeline.URANS_MIN_FRAMES_PER_CYCLE,
+        rel=0.01,
+    )
+    assert result is not None
+    assert result.quality.ok
 
 
 def test_continuation_chunk_timeout_keeps_grade_and_marks_continuable(tmp_path, monkeypatch):

@@ -2760,3 +2760,33 @@ mean).
   unchanged guard). Engine suite 317 passed; sweeper contract pins 21/21.
 - Continuations resume SAVED meshes: in-flight +6h resumes stay on y+=1;
   fresh retries (incl. march-guard re-rejects) pick up the new mesh.
+
+## 2026-07-09 — Wall-function mesh follow-ups: startup dt cap + extension continue-gate
+
+- New-mesh validation surfaced two behaviors (both measured on prod):
+  1. Fresh-transient startup blowups at c=1 (s1223 25° and 7.49°, jobs
+     0cba5e9b/7ff36caf): calm start (Co 0.53) then the adaptive controller
+     grew dt 1.2x/step toward the NEW Courant-4 ceiling (~40x above the
+     initial dt guess) and outran the developing separated flow —
+     |Cl|→1e156..1e163 by ~step 10, dt collapse to 1e-85, honest watchdog
+     kill (auto-retry same). On the old y+1 mesh the ceiling sat BELOW the
+     initial dt so the growth dynamics never engaged. Fix:
+     STARTUP_MAX_DELTA_T_FACTOR=2.0 — the FIRST fresh chunk caps
+     maxDeltaT at 2x the period/5000 guess (Co ≲ 1 through startup);
+     resumed/extension/refined chunks keep their measured-period caps.
+  2. Extension loop exited with hours of budget left (naca-4412 −15° u=100:
+     retained 2.00/3.00 cycles, 19.5 frames/cycle, 26 min of a 4 h budget,
+     honest reject). Root cause: _extend_transient_until_periods treated
+     ANY can_refine=False as terminal. Fix: _quality_allows_more_integration
+     — measured-period windows blocked only by retention/frame-rate/
+     stationarity (all fixed by more integration; extension chunks write at
+     period/20) continue until the existing budget projection guard stops
+     them; no-shedding, missing/unmeasurable period, budget-stop, timeout,
+     crash, divergence still break immediately.
+- Codex CLI (gpt-5.5 xhigh) lane under forensic spec; reviewed here.
+  Engine suite 319 passed (must-catch: fresh first chunk receives the
+  capped maxDeltaT; under-retained/sparse/non-stationary window extends;
+  resume maxDeltaT==writeInterval pinned).
+- Validation tally to date (new mesh): s1223 30° Re 3.4M ACCEPTED in 6 min
+  (oscillating-steady; old projection 57–59 h); naca-4412 −15° u=100 ran
+  2.0 cycles in 26 min (old: 0.9 cycles in 2 h).
