@@ -1127,12 +1127,11 @@ def _prepare_transient_case(
     else:
         _link_mesh(tcase, shared_mesh_dir, runner)
     _check_cancel(cancel_check)
-    # Preferred warm start: continue from the in-job steady RANS field solved on
-    # the SAME shared mesh (URANS-only jobs run that stage first). A developed
-    # steady field is a vastly better initial condition than a uniform-flow cold
-    # start — prod evidence: cambered clarky at alpha=4 cold-started URANS,
-    # Courant control collapsed dt to ~1e-6 s and the run timed out at t=0.010
-    # of 0.333 s.
+    # Preferred warm start: continue from an ACCEPTED in-job steady RANS field
+    # solved on the SAME shared mesh (URANS-only jobs run that stage first).
+    # Non-converged/non-accepted full steady fields are filtered by
+    # _run_transient before this prep step; they can carry oscillating garbage
+    # that is worse than the fresh no-seed initialisation path.
     if (
         steady_field_dir is not None
         and shared_mesh_dir is not None
@@ -1577,7 +1576,8 @@ def _extend_transient_until_periods(
 def _run_transient(
     case_dir, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
     subdir="transient", shared_mesh_dir: Optional[Path] = None,
-    steady_field_dir: Optional[Path] = None, cancel_check: CancelCheck = None,
+    steady_field_dir: Optional[Path] = None, steady_field_accepted: bool = True,
+    cancel_check: CancelCheck = None,
     resume: Optional[TransientResume] = None,
 ):
     """Run URANS, extend it until enough whole periods are retained, then
@@ -1638,11 +1638,19 @@ def _run_transient(
             cancel_check=cancel_check,
         )
     else:
+        effective_steady_field_dir = steady_field_dir
+        if steady_field_dir is not None and not steady_field_accepted:
+            logger.warning(
+                "steady init not converged; transient starts from freestream instead "
+                "of the non-converged field (%s)",
+                steady_field_dir,
+            )
+            effective_steady_field_dir = None
         try:
             tmesh, patches = _prepare_transient_case(
                 tcase, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
                 shared_mesh_dir=shared_mesh_dir,
-                steady_field_dir=steady_field_dir,
+                steady_field_dir=effective_steady_field_dir,
                 cancel_check=cancel_check,
             )
         except OpenFOAMError:
@@ -2091,6 +2099,7 @@ def _finalize_outcome(
     """
     _check_cancel(cancel_check)
     coeff_files = _coeff_files(case_dir)
+    steady_field_accepted = bool(steady_field_dir is not None and outcome.converged)
     if coeff_files:
         steady_coeff = coeff_files[-1]
         coeffs = parse_force_coefficients(steady_coeff)
@@ -2098,6 +2107,7 @@ def _finalize_outcome(
         outcome.cl_cd = coeffs.cl_cd
         if not outcome.converged and force_is_steady(steady_coeff):
             outcome.converged = True
+        steady_field_accepted = bool(steady_field_dir is not None and outcome.converged)
         # Oscillating-steady averaging (R1): a steady solve that failed both
         # residual convergence and the pointwise force plateau, but oscillates
         # BOUNDEDLY with a stable windowed mean, is accepted with the window
@@ -2105,7 +2115,9 @@ def _finalize_outcome(
         # steady_history in BOTH the accepted and the still-failing case (the
         # failing history is analysis evidence on the escalation path);
         # classic converged solves ship steady_history=null.
-        if not outcome.converged and not solver_params.force_transient:
+        if not outcome.converged and (
+            not solver_params.force_transient or steady_field_dir is not None
+        ):
             try:
                 osc = analyze_steady_oscillation(
                     steady_coeff, window=solver_params.steady_oscillation_window
@@ -2113,7 +2125,7 @@ def _finalize_outcome(
             except Exception as exc:  # noqa: BLE001 - analysis loss must not fail the case
                 logger.warning("oscillating-steady analysis failed for %s: %s", case_dir, exc)
                 osc = None
-            if osc is not None:
+            if osc is not None and not solver_params.force_transient:
                 outcome.steady_history = SteadyHistory(
                     iterations=osc.iterations,
                     cl=osc.cl,
@@ -2130,6 +2142,12 @@ def _finalize_outcome(
                     outcome.cl_cd = osc.cl_mean / osc.cd_mean if osc.cd_mean else None
                     outcome.converged = True
                     outcome.quality_warnings.append(osc.note)
+                    steady_field_accepted = bool(steady_field_dir is not None)
+            elif osc is not None and osc.mean_stable:
+                # A force_transient request still reports the URANS result, but
+                # a bounded full-steady oscillation is an accepted developed
+                # field and remains a valid transient seed.
+                steady_field_accepted = bool(steady_field_dir is not None)
         if (
             not outcome.converged
             and not solver_params.force_transient
@@ -2170,6 +2188,7 @@ def _finalize_outcome(
             case_dir, airfoil, resolved, spec, fluid, roughness, urans_params,
             runner, n_proc, urans_timeout, subdir=transient_subdir, shared_mesh_dir=shared_mesh_dir,
             steady_field_dir=steady_field_dir,
+            steady_field_accepted=steady_field_accepted,
             cancel_check=cancel_check,
             resume=resume,
         )
@@ -2631,13 +2650,13 @@ def run_case(
         # (e.g. the delicate symmetric AoA=0 state) that diverge with 2nd-order
         # convection. The fallback is more dissipative but reliably stable.
         #
-        # URANS-only (force_transient) cases run this steady RANS stage too:
-        # even a non-converged steady field is a vastly better transient initial
-        # condition than a uniform-flow cold start (prod: cambered airfoil at
-        # alpha=4 cold-started URANS -> dt collapsed to ~1e-6 s -> timeout), and
-        # the steady log/coefficients are valuable attempt evidence. The only
-        # differences: a steady failure must not abort the URANS attempt, and
-        # the steady coefficients are never accepted as the reported result.
+        # URANS-only (force_transient) cases run this steady RANS stage too: an
+        # accepted developed steady field is a good transient seed, and the
+        # steady log/coefficients are valuable attempt evidence. A successful
+        # but non-converged/non-accepted steady stage is evidence only; the
+        # transient falls back to the no-seed freestream initialisation path.
+        # A steady failure must not abort the URANS attempt, and the steady
+        # coefficients are never accepted as the reported result.
         steady_field_dir: Optional[Path] = None
         res = solve_once(steady_solver_params)
         if not res.ok and steady_solver_params.momentum_scheme != "upwind":

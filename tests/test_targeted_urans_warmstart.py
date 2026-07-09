@@ -1,7 +1,8 @@
 """Targeted (URANS-only) job fixes, prod incident 2026-07-06 (clarky alpha=-2..4):
 
 F1  URANS-only cases must run a steady RANS stage FIRST and warm-start the
-    transient from that field (a cambered-airfoil uniform-flow cold start
+    transient from that field only when the steady verdict is accepted (a
+    cambered-airfoil uniform-flow cold start
     collapsed dt to ~1e-6 s and burned the whole 7200 s budget at t=0.010 of
     0.333 s).
 F2  A base-pass solver timeout with a gradable coefficient.dat window is graded
@@ -12,6 +13,7 @@ F3  "URANS transient produced no coefficient.dat" may only be raised when the
 
 No real OpenFOAM solves; runners are faked with prod-shaped logs/outputs.
 """
+import logging
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,8 @@ from airfoilfoam.models import (
 from airfoilfoam.openfoam.runner import OpenFOAMError, _run_subprocess
 from airfoilfoam.pipeline import (
     CaseOutcome,
+    TransientResult,
+    UransQuality,
     _finalize_outcome,
     _prepare_transient_case,
     _run_transient_attempt,
@@ -65,6 +69,17 @@ def _write_shedding_coeff(path: Path, f=5.0, n=500, dt=0.002, cl0=0.7, cd0=0.2):
     path.write_text("\n".join(lines) + "\n")
 
 
+def _write_drifting_steady_coeff(path: Path, n=600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"]
+    for i in range(n):
+        cl = 0.2 + 0.002 * i
+        cd = 0.03 + 0.00008 * i
+        row = [i + 1, cd, 0.0, 0.0, cl, 0.0, 0.0, -0.02, 0.0, 0.0, 0.0, 0.0, 0.0]
+        lines.append(" ".join(f"{v:.6g}" for v in row))
+    path.write_text("\n".join(lines) + "\n")
+
+
 class FakeCaseBuilder:
     def __init__(self, *_args, **_kwargs):
         pass
@@ -75,6 +90,98 @@ class FakeCaseBuilder:
 
     def write_transient(self, *_args, **_kwargs) -> None:
         pass
+
+
+def _successful_no_shedding_transient(tcase: Path) -> TransientResult:
+    tcase.mkdir(parents=True, exist_ok=True)
+    (tcase / "0.1").mkdir(exist_ok=True)
+    return TransientResult(
+        avg=SimpleNamespace(
+            cl=0.3,
+            cd=0.03,
+            cm=-0.02,
+            cl_cd=10.0,
+            cl_std=0.0,
+            cd_std=0.0,
+            cm_std=0.0,
+        ),
+        case_dir=tcase,
+        force_history=None,
+        quality=UransQuality(
+            ok=True,
+            can_refine=False,
+            reason="no shedding",
+            no_shedding=True,
+        ),
+        start_time=0.0,
+        end_time=0.1,
+        run_time=0.1,
+    )
+
+
+def _run_force_transient_seed_handoff(
+    tmp_path,
+    monkeypatch,
+    steady_stdout: str,
+    write_steady_coeff,
+) -> tuple[CaseOutcome, dict[str, object]]:
+    captured: dict[str, object] = {}
+    calls: list[str] = []
+
+    class FakeRunner:
+        external_paths_visible = True
+
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            return SimpleNamespace(ok=True, stdout="", check=lambda: None)
+
+        def solver(self, case_dir, app, *_args, **_kwargs):
+            calls.append(app)
+            assert app == "simpleFoam"
+            cdir = Path(case_dir)
+            latest = cdir / "600"
+            latest.mkdir(parents=True, exist_ok=True)
+            for name in ("U", "p", "k", "omega", "nut"):
+                (latest / name).write_text(f"full steady {name}")
+            write_steady_coeff(cdir / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat")
+            return SimpleNamespace(
+                ok=True,
+                returncode=0,
+                timed_out=False,
+                stdout=steady_stdout,
+                check=lambda: SimpleNamespace(stdout=steady_stdout),
+            )
+
+    def fake_prepare(tcase, *_args, **kwargs):
+        captured["prep_steady_field_dir"] = kwargs.get("steady_field_dir")
+        captured["calls_at_prep"] = list(calls)
+        Path(tcase).mkdir(parents=True, exist_ok=True)
+        return MeshParams(), {}
+
+    def fake_attempt(tcase, *_args, **_kwargs):
+        return _successful_no_shedding_transient(Path(tcase))
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    mesh_dir = tmp_path / "mesh"
+    mesh_dir.mkdir()
+    outcome = run_case(
+        tmp_path / "case",
+        airfoil=SimpleNamespace(name="s1223", contour=[]),
+        spec=CaseSpec(chord=0.5, speed=50.0, aoa_deg=10.0),
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        mesh_params=MeshParams(),
+        solver_params=SolverParams(force_transient=True, transient_fallback=True, write_images=[]),
+        mesher=SimpleNamespace(patches=lambda _resolved: {}),
+        runner=FakeRunner(),
+        mesh_dir=mesh_dir,
+        render_images=False,
+    )
+    return outcome, captured
 
 
 # --------------------------------------------------------------------------- #
@@ -95,7 +202,7 @@ def test_urans_only_run_case_runs_steady_rans_stage_before_transient(tmp_path, m
 
         def solver(self, case_dir, app, *_args, **_kwargs):
             calls.append(app)
-            # steady stage completes (non-converged is fine) and leaves a field
+            # steady stage converges and leaves a field
             lt = Path(case_dir) / "300"
             lt.mkdir(parents=True, exist_ok=True)
             for name in ("U", "p", "k", "omega", "nut"):
@@ -140,6 +247,65 @@ def test_urans_only_run_case_runs_steady_rans_stage_before_transient(tmp_path, m
     # Steady attempt evidence is recorded, not discarded.
     assert outcome.iterations == 300
     assert (tmp_path / "case" / "log.simpleFoam").exists()
+
+
+def test_nonconverged_full_steady_field_not_used_as_transient_seed(
+    tmp_path, monkeypatch, caplog
+):
+    """MUST-CATCH: prod-shaped URANS precalc failures had a root full-steady
+    stage that ran to the iteration cap without "SIMPLE solution converged";
+    that latestTime field must not seed pimpleFoam."""
+    caplog.set_level(logging.WARNING, logger="airfoilfoam.pipeline")
+
+    outcome, captured = _run_force_transient_seed_handoff(
+        tmp_path,
+        monkeypatch,
+        steady_stdout="Time = 600\nEnd\n",
+        write_steady_coeff=_write_drifting_steady_coeff,
+    )
+
+    assert outcome.error is None
+    assert "simpleFoam" in captured["calls_at_prep"]
+    assert captured["prep_steady_field_dir"] is None
+    assert any(
+        "steady init not converged; transient starts from freestream instead "
+        "of the non-converged field" in message
+        for message in caplog.messages
+    )
+
+
+def test_converged_full_steady_field_still_warm_starts_transient(tmp_path, monkeypatch):
+    """False-positive guard: a full steady stage with residual convergence is
+    still the preferred URANS initial field."""
+    outcome, captured = _run_force_transient_seed_handoff(
+        tmp_path,
+        monkeypatch,
+        steady_stdout="Time = 300\nSIMPLE solution converged in 300 iterations\nEnd\n",
+        write_steady_coeff=_write_drifting_steady_coeff,
+    )
+
+    assert outcome.error is None
+    seed = captured["prep_steady_field_dir"]
+    assert seed is not None
+    assert seed.name == "600"
+
+
+def test_accepted_oscillating_full_steady_field_still_warm_starts_transient(
+    tmp_path, monkeypatch
+):
+    """False-positive guard: a bounded accepted oscillating steady field is a
+    valid developed seed even without the literal SIMPLE convergence line."""
+    outcome, captured = _run_force_transient_seed_handoff(
+        tmp_path,
+        monkeypatch,
+        steady_stdout="Time = 600\nEnd\n",
+        write_steady_coeff=_write_shedding_coeff,
+    )
+
+    assert outcome.error is None
+    seed = captured["prep_steady_field_dir"]
+    assert seed is not None
+    assert seed.name == "600"
 
 
 def test_prepare_transient_case_warm_starts_from_steady_field(tmp_path, monkeypatch):
