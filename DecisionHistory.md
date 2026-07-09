@@ -2889,3 +2889,21 @@ mean).
   irrotational, no iterations, nothing to oscillate). The fallback now
   runs potentialFoam ONLY (SIMPLE init stays banned); tests updated
   (fallback calls == [potentialFoam, pimpleFoam]). Engine 337 passed.
+
+## 2026-07-10 — S1223 heavy-cell failures: mesh degeneracy, loop closed
+
+- After potentialFoam init ALSO detonated on step 1 (as did steady-seed,
+  short-init and pure freestream — init-independent), checkMesh on the
+  failing s1223 c=1 precalc mesh gave the final answer: max
+  non-orthogonality 88.2° (42 cells at AR 2559) — the 40x-thick
+  wall-function first layer folds against S1223's deeply concave lower
+  surface and the pressure Laplacian is near-singular; any solve diverges
+  immediately. Geometry-specific mesher limitation (sd8020/naca-4412 at
+  the same chord mesh cleanly and run fine); NOT solver numerics.
+- Decision: the ~8 S1223 heavy cells stay honest failures (they are
+  genuinely unsolvable on this mesh). No further engine iterations on
+  this family. Follow-up (separate work): curvature-aware first-layer
+  clamping in the C-grid mesher AND/OR a checkMesh non-orthogonality
+  gate at mesh time that fails the case honestly ("mesh degenerate at
+  this tier") before burning solver attempts; alternatively route
+  concave-cove geometries to the resolved-wall mesh.
