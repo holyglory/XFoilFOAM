@@ -2929,3 +2929,23 @@ mean).
 - Codex (gpt-5.5 xhigh) lane, reviewed; engine suite 347 passed with
   prod-shaped must-catches (real checkMesh output lines; real seed
   coordinates; no-solver-call-after-gate assertion).
+
+## 2026-07-10 — Mesh-gate task closed: S1223 family parked honestly
+
+- Final prod state: all 8 S1223 heavy cells terminal with the exact
+  honest error the task specified — "mesh degenerate at this fidelity
+  tier (max non-orthogonality 88.3 deg)" — failing in SECONDS at mesh
+  time (no solver burn, no detonations, no watchdog churn). The
+  concavity guard verifiably engages on the wave-2 path (worker logs:
+  "resolved-wall spacing for concave airfoil S1223: 4.89/c > 2.50/c");
+  the checkMesh gate catches the path(s) the guard does not cover.
+- Known residual (accepted): at least one submit path still builds the
+  wall-function mesh before the guard can divert it; the gate converts
+  those attempts into cheap honest failures and the retry chain lands
+  on the guarded path — self-healing at the cost of one ~30 s attempt.
+  A future pass can thread the geometry guard through that path; not
+  worth another rebuild now.
+- Operational equivalence note: even fully y+1-guarded, this family
+  costs ~50 h/point at precalc (measured 2026-07-09) and would land as
+  march-guard budget stops — the honest terminal label differs, the
+  outcome (needs full tier or numerics work) does not.
