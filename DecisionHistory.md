@@ -2800,3 +2800,20 @@ mean).
   span 2.9 grades as 2. Fix: RETENTION_SAFETY_CYCLES = 0.6 — the loop
   targets (and sizes chunks for) target + 0.6 cycles so the integer
   boundary is always crossed. Tests updated to pin the margin sizing.
+
+## 2026-07-09 — Performance arc closed: final validation state
+
+- Startup crash class ELIMINATED: both previously-diverging heavy cells
+  (s1223 25°/7.49°) re-ran complete jobs under the startup dt cap with
+  zero divergences; campaign failed-count 0 sustained.
+- Wall-function precalc validated at class level: 12 precalc results in
+  the first 4 h (2 accepted avg 11 min, 5 provisional avg 70 min, 5
+  honest quality rejects avg 28 min, 0 failures, 0 budget burns) — the
+  59-hour heavy class now solves or honestly rejects in minutes.
+- RETENTION_SAFETY_CYCLES margin: pinned by tests; the live sentinel
+  (naca-4412 −15° u=100) could not prove it end-to-end because its
+  period lock is run-to-run inconsistent at precalc resolution (second
+  run: "missing or flat shedding history") — an honest physics limit,
+  not a mechanism failure. Cells of this shape belong to the full tier
+  (request-URANS) or stand as documented steady values; no further
+  precalc tuning warranted on single-cell evidence.
