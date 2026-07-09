@@ -349,7 +349,13 @@ def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
     class FakeRunner:
         def application(self, _case_dir, cmd, *args, **kwargs):
             calls.append(cmd.split()[0])
-            raise AssertionError(f"freestream fallback must not run {cmd}")
+            # potentialFoam IS wanted on the fallback path: prod s1223 c=1
+            # u=50 detonated on the first 1-2 steps even from pure uniform
+            # freestream — the smooth potential-flow field is the classic
+            # impulsive-start cure. Only the SIMPLE init stays banned.
+            if cmd.split()[0] != "potentialFoam":
+                raise AssertionError(f"freestream fallback must not run {cmd}")
+            return SimpleNamespace(ok=True, returncode=0, timed_out=False, stdout="potentialFoam ok\n")
 
         def solver(self, case_dir, app, *_args, **_kwargs):
             calls.append(app)
@@ -409,7 +415,7 @@ def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
         strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
     )
     assert result is not None
-    assert calls == ["pimpleFoam"]
+    assert calls == ["potentialFoam", "pimpleFoam"]
     assert latest_seen_by_pimple == [pytest.approx(0.0)]
     assert transient_writes[0]["start_time"] == pytest.approx(0.0)
     assert transient_writes[0]["end_time"] == pytest.approx(expected_horizon)

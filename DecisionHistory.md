@@ -2877,3 +2877,15 @@ mean).
   follow automatically through the ladder. Every startup crash class
   found today (dt-ramp, garbage steady seed, zero-step restart, garbage
   short-init field) is closed with recall-proven guards.
+
+## 2026-07-09 — Correction: fallback keeps potentialFoam (cleanstart addendum)
+
+- The "failure surface zero" call was premature: the 5 tier-1-rejected
+  s1223 c=1 u=50 cells' wave-2 transients then detonated on steps 1-2
+  even from PURE freestream (t~4e-5, |Cl| 1e53..1e110) — the impulsive
+  no-slip start around the extreme-camber section is singular by itself.
+  Lane H had dropped potentialFoam together with the SIMPLE init; the
+  potential-flow field is the classic impulsive-start cure (smooth,
+  irrotational, no iterations, nothing to oscillate). The fallback now
+  runs potentialFoam ONLY (SIMPLE init stays banned); tests updated
+  (fallback calls == [potentialFoam, pimpleFoam]). Engine 337 passed.

@@ -1176,14 +1176,21 @@ def _prepare_transient_case(
         logger.info("transient %s warm-started from steady field %s", tcase, steady_field_dir)
         return tmesh, patches
     if freestream_fallback:
-        # A rejected full-steady field means this condition is hostile to SIMPLE
-        # initialisation. Keep the CaseBuilder's pristine 0/ freestream fields
-        # and let the transient startup dt cap control the impulse.
+        # A rejected full-steady field means this condition is hostile to
+        # SIMPLE initialisation — skip the in-case short simpleFoam init (its
+        # own field is garbage at exactly these cells). But PURE uniform
+        # freestream is singular too: prod s1223 c=1 u=50 detonated on the
+        # first 1-2 pimpleFoam steps (t~4e-5, |Cl| 1e53..1e110) from the
+        # impulsive no-slip start around the high-camber section. The classic
+        # cure is a smooth POTENTIAL-flow initial field: irrotational, no
+        # SIMPLE iterations, nothing to oscillate — keep exactly that stage.
         logger.warning(
-            "transient %s starts from pristine freestream fields; skipping "
-            "potentialFoam and in-case short simpleFoam init",
+            "transient %s starts from potential-flow initialised freestream; "
+            "skipping the in-case short simpleFoam init",
             tcase,
         )
+        runner.application(tcase, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+        _check_cancel(cancel_check)
         return tmesh, patches
     runner.application(tcase, "potentialFoam -writephi -initialiseUBCs", timeout=600)
     _check_cancel(cancel_check)
