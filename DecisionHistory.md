@@ -2634,3 +2634,30 @@ mean).
 - Verification: core 103/103, web 226/226, e2e 6/6, typechecks clean,
   formal-web-ui-verification desktop+mobile on the fixed route: 0 critical.
   After-fix coordinate probe: 0 escaped coords on all four tabs.
+
+## 2026-07-09 — Lane-step churn: append on target movement, not on fit refresh
+
+- User asked what "superseded" means on the refinement board (clarky ld_max
+  Re 3.4M showed rows 5-8 all predicting 7.67° with Δ +0.00°, all amber).
+  Semantics are correct — superseded = the best fit was re-derived from newer
+  evidence and the target α moved before that predicted point was solved —
+  but the DB held TWENTY-ONE steps for that lane, twelve of them identical
+  7.67° rows: laneTick's `advances` fired on `fitSetId` change alone, so
+  every tier-2 ingest (fit refresh) appended another identical step; all
+  twelve were swept to 'superseded' at once when the target finally moved.
+  Rounds accounting was NOT affected (iterationCount increments only on
+  enqueue), so no lane stalled from this — pure evidence-table noise.
+- Fix: `advances` = predicted α moved (canonical compare) — a refreshed fit
+  with an unmoved argmax appends nothing; `fitStable` becomes TARGET
+  stability (advances || last step at the same canonical α) because the old
+  fit-id equality test would deadlock convergence once same-α refreshes stop
+  appending witness steps. Convergence through a same-α refresh is asserted
+  in the new test.
+- Display: RefinementBoard collapses historical consecutive unsolved
+  same-α 'superseded' runs into one row ("5–16 … superseded ×12 fit
+  refreshes") via pure helper apps/web/lib/lane-steps.ts (append-only step
+  evidence stays untouched); tooltip on the outcome explains supersession.
+- Recall-proven: apps/api/test/campaigns.test.ts churn describe (4 tests,
+  prod-shaped) — reverting `advances` fails 3 of them; restored 42/42.
+  Collapse helper pinned by apps/web/test/lane-steps.test.ts (prod 21-step
+  fixture → 9 rows; never merges solved/distinct-α/non-superseded).

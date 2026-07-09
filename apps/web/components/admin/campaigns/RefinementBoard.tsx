@@ -20,6 +20,7 @@ import {
   getCampaignLanes,
   requeueCampaignFailed,
 } from "@/lib/admin";
+import { collapseLaneSteps } from "@/lib/lane-steps";
 import { C, MONO } from "@/lib/tokens";
 import { f, fCount, formatRe, ghostBtn, inputStyle } from "./ui";
 
@@ -413,13 +414,16 @@ export function RefinementBoard({
                               </tr>
                             </thead>
                             <tbody>
-                              {detail.steps.map((s, idx) => {
-                                const nextTarget = detail.steps[idx + 1]?.predictedAlpha ?? null;
+                              {collapseLaneSteps(detail.steps).map((row, idx, rows) => {
+                                const s = row.step;
+                                const nextTarget = rows[idx + 1]?.step.predictedAlpha ?? null;
                                 const delta = nextTarget != null ? nextTarget - s.predictedAlpha : null;
                                 const ld = s.solved && s.solved.cl != null && s.solved.cd ? s.solved.cl / s.solved.cd : null;
                                 return (
                                   <tr key={s.iteration} style={{ color: C.muted, borderTop: `1px solid ${C.borderRow}` }}>
-                                    <td style={{ padding: "4px 10px 4px 0", color: C.dimmest }}>{s.iteration}</td>
+                                    <td style={{ padding: "4px 10px 4px 0", color: C.dimmest }}>
+                                      {row.repeats > 1 ? `${row.firstIteration}–${s.iteration}` : s.iteration}
+                                    </td>
                                     <td style={{ padding: "4px 10px 4px 0", color: C.text }}>{f(s.predictedAlpha, 2)}°</td>
                                     <td style={{ padding: "4px 10px 4px 0" }}>
                                       {s.solvedResultId && s.solved ? (
@@ -439,7 +443,13 @@ export function RefinementBoard({
                                     <td style={{ padding: "4px 10px 4px 0", color: delta != null && Math.abs(delta) < 1e-9 ? C.teal : C.muted }}>
                                       {delta != null ? `${delta >= 0 ? "+" : ""}${f(delta, 2)}°` : "—"}
                                     </td>
-                                    <td style={{ padding: "4px 0", color: s.outcome === "superseded" ? C.amber : s.outcome === "released" ? C.dimmest : C.dim }}>{s.outcome}</td>
+                                    <td
+                                      style={{ padding: "4px 0", color: s.outcome === "superseded" ? C.amber : s.outcome === "released" ? C.dimmest : C.dim }}
+                                      title={s.outcome === "superseded" ? "the best fit was re-derived from newer evidence and the target angle moved before this point was solved" : undefined}
+                                    >
+                                      {s.outcome}
+                                      {row.repeats > 1 ? <span style={{ color: C.dimmest }}> ×{row.repeats} fit refreshes</span> : null}
+                                    </td>
                                   </tr>
                                 );
                               })}

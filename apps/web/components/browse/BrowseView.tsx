@@ -17,7 +17,7 @@ import { adminMe, bulkAirfoils } from "@/lib/admin";
 import { getAirfoilDetail, getCategoriesTree, getHashtags, listAirfoils } from "@/lib/api";
 import { C, MONO } from "@/lib/tokens";
 
-type SortKey = "name" | "family" | "thicknessPct" | "camberPct" | "areaProfile" | "ldmax" | "clmax" | "cdmin";
+type SortKey = "name" | "thicknessPct" | "camberPct" | "areaProfile" | "ldmax" | "clmax" | "cdmin";
 type MetricKey =
   | "thickness"
   | "area"
@@ -60,7 +60,6 @@ const EMPTY_FILTERS: Filters = {
 
 const COLS: { key: SortKey; label: string; fmt: (a: AirfoilSummary) => string; num: boolean }[] = [
   { key: "name", label: "NAME", fmt: (a) => a.name, num: false },
-  { key: "family", label: "CATEGORY", fmt: (a) => a.family, num: false },
   { key: "thicknessPct", label: "t/c", fmt: (a) => a.thicknessPct.toFixed(1), num: true },
   { key: "camberPct", label: "CAMB", fmt: (a) => a.camberPct.toFixed(1), num: true },
   { key: "areaProfile", label: "AREA", fmt: (a) => a.areaProfile.toFixed(3), num: true },
@@ -250,7 +249,7 @@ export function BrowseView({
     if (k === sortKey) setDir((d) => (d === "asc" ? "desc" : "asc"));
     else {
       setSortKey(k);
-      setDir(k === "name" || k === "family" ? "asc" : "desc");
+      setDir(k === "name" ? "asc" : "desc");
     }
   };
 
@@ -299,7 +298,7 @@ export function BrowseView({
         }
         .airfoil-row {
           display: grid;
-          grid-template-columns: 34px 1.45fr 1fr 0.62fr 0.62fr 0.7fr 0.72fr 0.82fr;
+          grid-template-columns: 34px 2.45fr 0.62fr 0.62fr 0.7fr 0.72fr 0.82fr;
           align-items: center;
           min-width: 0;
         }
@@ -411,7 +410,6 @@ export function BrowseView({
           .airfoil-row {
             grid-template-columns: 30px minmax(0, 1fr) 56px 56px 68px;
           }
-          .airfoil-col-family,
           .airfoil-col-areaProfile,
           .airfoil-col-cdmin {
             display: none;
@@ -604,7 +602,7 @@ export function BrowseView({
                     <AirfoilGlyph points={a.points} />
                   </span>
                   <span className="airfoil-name-wrap">
-                    <span style={{ color: C.text, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>
+                    <span style={{ color: C.text, fontWeight: 500, display: "block", overflowWrap: "break-word" }}>
                       {a.name}
                     </span>
                     {a.hashtags.length > 0 && (
@@ -633,7 +631,6 @@ export function BrowseView({
                     )}
                   </span>
                 </span>
-                <span className="airfoil-cell airfoil-col-family" style={{ color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.family}</span>
                 <span className="airfoil-cell airfoil-col-thicknessPct" style={{ textAlign: "right", color: C.text }}>{a.thicknessPct.toFixed(1)}</span>
                 <span className="airfoil-cell airfoil-col-camberPct" style={{ textAlign: "right", color: C.text }}>{a.camberPct.toFixed(1)}</span>
                 <span className="airfoil-cell airfoil-col-areaProfile" style={{ textAlign: "right", color: C.muted }}>{a.areaProfile.toFixed(3)}</span>

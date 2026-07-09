@@ -994,8 +994,13 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
     .orderBy(asc(simCampaignLaneSteps.iteration));
   const last = steps.length ? steps[steps.length - 1] : null;
 
-  // Step 2: append (iteration, predictedAlpha, fitSetId) when it advances the lane.
-  const advances = !last || last.fitSetId !== fit.id || canonicalAoa(last.predictedAlpha) !== predicted;
+  // Step 2: append (iteration, predictedAlpha, fitSetId) when it advances the
+  // lane — i.e. when the PREDICTED α actually moved. A fit refresh whose
+  // argmax lands on the same canonical α is NOT an advance: appending a step
+  // per refit flooded lanes with identical rows during tier-2 ingest (prod
+  // 2026-07-09: twelve duplicate 7.67° steps on one clarky ld_max lane, all
+  // swept to 'superseded' at once when the target finally moved).
+  const advances = !last || canonicalAoa(last.predictedAlpha) !== predicted;
   if (advances) {
     await db.execute(sql`
       UPDATE sim_campaign_lane_steps
@@ -1034,7 +1039,12 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
     LIMIT 1
   `)) as unknown as unknown[];
   const evidenceWithinTolerance = evidenceRows.length > 0;
-  const fitStable = advances ? true : last ? last.fitSetId === fit.id : false;
+  // Fit stability = TARGET stability: the current fit's prediction equals the
+  // last recorded step's α (advances just appended that witness), or the lane
+  // has a step at this very α from an earlier fit. A refreshed fit id whose
+  // argmax did not move must not block convergence — same-α refits no longer
+  // append witness steps, so the old fit-id equality test would deadlock.
+  const fitStable = advances || (last != null && canonicalAoa(last.predictedAlpha) === predicted);
 
   if (!openPoints && evidenceWithinTolerance && fitStable) {
     const state = fit.status === "final" ? "converged_final" : "converged_provisional";

@@ -1599,3 +1599,169 @@ describe("auth hardening (§10)", () => {
     }
   });
 });
+
+describe("same-α fit refreshes do not append duplicate lane steps (laneTick churn must-catch)", () => {
+  // Prod 2026-07-09 (clarky ld_max Re 3.4M): tier-2 ingest re-derived the
+  // best fit after every result, and although the predicted α never moved,
+  // every refresh appended ANOTHER identical step — twelve duplicate 7.67°
+  // rows later swept to 'superseded' in one go. The lane step table is
+  // append-only EVIDENCE of target movement, not a fit-refresh log.
+  const CHURN_SPEED = 14; // unique speed → isolated physics revision
+  let campaignId = "";
+  let conditionId = "";
+  let revisionId = "";
+  const fitIds: string[] = [];
+
+  const stepsQuery = async () =>
+    (await db.execute(sql`
+      SELECT iteration, predicted_alpha, outcome FROM sim_campaign_lane_steps
+      WHERE campaign_id = ${campaignId} AND airfoil_id = ${symId}
+        AND condition_id = ${conditionId} AND objective = 'ld_max'
+      ORDER BY iteration
+    `)) as unknown as Array<{ iteration: number; predicted_alpha: number | string; outcome: string }>;
+
+  const insertCurrentFit = async (alphaLdmaxFine: number, sig: string) => {
+    if (fitIds.length) {
+      await db.execute(sql`UPDATE polar_fit_sets SET is_current = false WHERE id = ANY(${`{${fitIds.join(",")}}`}::uuid[])`);
+    }
+    const [fit] = await db
+      .insert(polarFitSets)
+      .values({
+        airfoilId: symId,
+        simulationPresetRevisionId: revisionId,
+        fitVersion: POLAR_FIT_VERSION,
+        evidenceSignature: `${PREFIX}-${sig}`,
+        status: "final",
+        confidence: 0.9,
+        acceptedPointCount: 5,
+        provisionalPointCount: 0,
+        rejectedPointCount: 0,
+        alphaLdmaxFine,
+        isCurrent: true,
+      })
+      .returning({ id: polarFitSets.id });
+    fitIds.push(fit.id);
+    return fit.id;
+  };
+
+  afterAll(async () => {
+    if (fitIds.length) {
+      await db.execute(sql`DELETE FROM sim_campaign_lane_steps WHERE fit_set_id = ANY(${`{${fitIds.join(",")}}`}::uuid[])`);
+      await db.delete(polarFitSets).where(inArray(polarFitSets.id, fitIds));
+    }
+  });
+
+  it("appends the first prediction step and enqueues the point", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} step churn`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-key-churn`,
+        airfoilIds: [symId],
+        plan: planBody({
+          chordsM: [0.2],
+          speedsMps: [CHURN_SPEED],
+          objectives: {
+            ldMax: { enabled: true, toleranceDeg: 0.1, maxRounds: 4 },
+            clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+            clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+          },
+        }),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    campaignId = res.json().campaign.id;
+    cleanupCampaignIds.push(campaignId);
+    const [condition] = (await db.execute(sql`
+      SELECT id, simulation_preset_revision_id AS revision_id FROM sim_campaign_conditions WHERE campaign_id = ${campaignId}
+    `)) as unknown as Array<{ id: string; revision_id: string }>;
+    conditionId = condition.id;
+    revisionId = condition.revision_id;
+
+    await insertCurrentFit(3.42, "churn-a");
+    const result = await laneTick(db, { campaignId, airfoilId: symId, conditionId, objective: "ld_max" });
+    expect(result).not.toBeNull();
+    const steps = await stepsQuery();
+    expect(steps.map((s) => [Number(s.predicted_alpha), s.outcome])).toEqual([[3.42, "predicted"]]);
+  });
+
+  it("MUST-CATCH: a refreshed fit with an unmoved target appends nothing and supersedes nothing", async () => {
+    await insertCurrentFit(3.42, "churn-b"); // new fit id, same argmax
+    const result = await laneTick(db, { campaignId, airfoilId: symId, conditionId, objective: "ld_max" });
+    expect(result).not.toBeNull();
+    const steps = await stepsQuery();
+    // pre-fix behavior: a second identical 3.42° row appears here
+    expect(steps.map((s) => [Number(s.predicted_alpha), s.outcome])).toEqual([[3.42, "predicted"]]);
+  });
+
+  it("a genuinely moved target appends and supersedes the stale prediction", async () => {
+    await insertCurrentFit(4.1, "churn-c");
+    const result = await laneTick(db, { campaignId, airfoilId: symId, conditionId, objective: "ld_max" });
+    expect(result).not.toBeNull();
+    const steps = await stepsQuery();
+    expect(steps.map((s) => [Number(s.predicted_alpha), s.outcome])).toEqual([
+      [3.42, "superseded"],
+      [4.1, "predicted"],
+    ]);
+  });
+
+  it("converges through a same-α fit refresh (target stability, not fit-id identity)", async () => {
+    // Terminal-link every open lane point with accepted evidence (3.42 from
+    // the first prediction, 4.1 from the move), then refresh the fit AGAIN
+    // with the SAME 4.1 argmax — under the old fit-id equality test the lane
+    // could never converge once same-α refreshes stopped appending steps.
+    const [preset] = (await db.execute(sql`
+      SELECT p.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc JOIN simulation_presets p ON p.id = cc.preset_id
+      WHERE cc.id = ${conditionId}
+    `)) as unknown as Array<{ bc_id: string }>;
+    const openPoints = (await db.execute(sql`
+      SELECT aoa_deg FROM sim_campaign_points
+      WHERE campaign_id = ${campaignId} AND condition_id = ${conditionId} AND airfoil_id = ${symId}
+        AND state NOT IN ('terminal')
+    `)) as unknown as Array<{ aoa_deg: number | string }>;
+    for (const p of openPoints) {
+      const aoa = Number(p.aoa_deg);
+      const [row] = await db
+        .insert(results)
+        .values({
+          airfoilId: symId,
+          bcId: preset.bc_id,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: aoa,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          converged: true,
+          stalled: false,
+          cl: 0.1 * aoa,
+          cd: 0.01,
+          cm: -0.01,
+        })
+        .returning({ id: results.id });
+      cleanupResultIds.push(row.id);
+      await db.insert(resultClassifications).values({
+        resultId: row.id,
+        airfoilId: symId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: aoa,
+        regime: "rans",
+        classifierVersion: "test-fixture",
+        state: "accepted",
+        region: "attached",
+        confidence: 0.9,
+      });
+      await onResultIngested(db, { airfoilId: symId, revisionId, aoaDeg: aoa, resultId: row.id, status: "done" });
+    }
+
+    await insertCurrentFit(4.1, "churn-d"); // fourth fit id, unmoved argmax
+    const result = await laneTick(db, { campaignId, airfoilId: symId, conditionId, objective: "ld_max" });
+    expect(result).not.toBeNull();
+    expect(result!.state).toBe("converged_final");
+    // and the refresh still appended nothing
+    const steps = await stepsQuery();
+    expect(steps.length).toBe(2);
+  });
+});
