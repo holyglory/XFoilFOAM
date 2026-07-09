@@ -8,6 +8,7 @@
 
 import {
   type AirfoilDetailPayload,
+  type ChartDomain,
   type ChartPointVM,
   type ChartType,
   derivedBySymmetryInfo,
@@ -79,6 +80,12 @@ export function CellSidePanel({
   const [chartType, setChartType] = useState<ChartType>("cla");
   const [visibleRe, setVisibleRe] = useState<Record<number, boolean>>({});
   const [hover, setHover] = useState<HoverState | null>(null);
+  // zoom/pan window; null = zoom-to-fit (resets when the chart type switches)
+  const [chartDomain, setChartDomain] = useState<ChartDomain | null>(null);
+  const changeChartType = useCallback((t: ChartType) => {
+    setChartType(t);
+    setChartDomain(null);
+  }, []);
 
   const [failures, setFailures] = useState<{ total: number; groups: AdminCampaignFailureGroup[] } | null>(null);
   const [failuresError, setFailuresError] = useState<string | null>(null);
@@ -189,17 +196,22 @@ export function CellSidePanel({
     }
   };
 
+  const chartPolars = useMemo(
+    () => (detail ? detail.polars.map((p) => ({ re: p.re, color: p.color, points: p.points, fit: p.fit })) : []),
+    [detail],
+  );
   const projection = useMemo(
     () =>
       detail
         ? projectChart({
             chartType,
-            polars: detail.polars.map((p) => ({ re: p.re, color: p.color, points: p.points, fit: p.fit })),
+            polars: chartPolars,
             visibleRe,
             hoverKey: hover?.key ?? null,
+            domain: chartDomain,
           })
         : null,
-    [detail, chartType, visibleRe, hover?.key],
+    [detail, chartPolars, chartType, visibleRe, hover?.key, chartDomain],
   );
 
   const solvedPointCount = useMemo(
@@ -366,8 +378,11 @@ export function CellSidePanel({
         {detail && projection ? (
           <PolarViewer
             chartType={chartType}
-            onChartType={setChartType}
+            onChartType={changeChartType}
             projection={projection}
+            polars={chartPolars}
+            domain={chartDomain}
+            onDomainChange={setChartDomain}
             visibleRe={visibleRe}
             onToggleRe={(re) => setVisibleRe((v) => ({ ...v, [re]: !v[re] }))}
             reList={detail.reList}

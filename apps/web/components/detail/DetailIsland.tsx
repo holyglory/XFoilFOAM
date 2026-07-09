@@ -2,6 +2,7 @@
 
 import {
   type AirfoilDetailPayload,
+  type ChartDomain,
   type ChartPointVM,
   type ChartType,
   type FieldId,
@@ -61,6 +62,13 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
   const [chartType, setChartType] = useState<ChartType>("cla");
   const [visibleRe, setVisibleRe] = useState<Record<number, boolean>>(() => visibleDefaults(detail, !!pinnedRevisionId));
   const [hover, setHover] = useState<HoverState | null>(null);
+  // zoom/pan window; null = zoom-to-fit. Axes change meaning per chart type,
+  // so switching tabs resets the window.
+  const [chartDomain, setChartDomain] = useState<ChartDomain | null>(null);
+  const changeChartType = useCallback((t: ChartType) => {
+    setChartType(t);
+    setChartDomain(null);
+  }, []);
 
   const [simOpen, setSimOpen] = useState(false);
   const [simCtx, setSimCtx] = useState<{ re: number; aoa: number; resultId?: string | null; mirrored?: boolean; mirroredFromAoaDeg?: number | null } | null>(null);
@@ -118,15 +126,20 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     ];
   }, [solvedM]);
 
+  const chartPolars = useMemo(
+    () => detail.polars.map((p) => ({ re: p.re, color: p.color, points: p.points, fit: p.fit })),
+    [detail.polars],
+  );
   const projection = useMemo(
     () =>
       projectChart({
         chartType,
-        polars: detail.polars.map((p) => ({ re: p.re, color: p.color, points: p.points, fit: p.fit })),
+        polars: chartPolars,
         visibleRe,
         hoverKey: hover?.key ?? null,
+        domain: chartDomain,
       }),
-    [chartType, detail.polars, visibleRe, hover?.key],
+    [chartType, chartPolars, visibleRe, hover?.key, chartDomain],
   );
 
   const onPointClick = useCallback((vm: ChartPointVM) => {
@@ -267,8 +280,11 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
           )}
           <PolarViewer
             chartType={chartType}
-            onChartType={setChartType}
+            onChartType={changeChartType}
             projection={projection}
+            polars={chartPolars}
+            domain={chartDomain}
+            onDomainChange={setChartDomain}
             visibleRe={visibleRe}
             onToggleRe={(re) => setVisibleRe((v) => ({ ...v, [re]: !v[re] }))}
             reList={detail.reList}

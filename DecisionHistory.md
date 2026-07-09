@@ -2595,3 +2595,42 @@ mean).
   API-inclusive, verified); stale tier-budget copy fixed at six sites
   ("1 h"/"6 h" pre-7200 era → 4 h precalc / 12 h full; pipeline hero
   "~2 h each" → "~4 h each").
+
+## 2026-07-09 — Polar chart: fit-to-data domain, hard clipping, zoom/pan/hover navigation
+
+- User-reported (screenshot, campaign cell panel, CLARK Y Re 3.41M): the polar
+  drew OUTSIDE the chart canvas — curve and a solved point left of the y-axis
+  over the tick labels, running off both canvas edges.
+- Root cause (confirmed by pre-fix coordinate probe: 42 escaped coords per
+  α tab, x −93.5..880.4 against plot rect 58..664; Cl–Cd tab 0 escaped):
+  packages/core/src/chart.ts hard-coded the α domain to −8..20 (predates
+  campaign sweeps −15..30), the out-of-domain guard existed ONLY for clcd,
+  and PolarChart had no clipPath. CompareView duplicated the same hardcode
+  AND rendered overflow:visible. Detection failure: no core test fed α
+  outside −8..20 and no test asserted projected coords stay in the plot
+  rect; local UI verification had no CFD rows so charts rendered empty.
+- Fix (core-first, all consumers): projectChart α domain is now DATA-DERIVED
+  (zoom-to-fit is the default window; −8..20 survives only as the no-data
+  fallback); optional ChartDomain override; ALL chart types clip curves in
+  data space (Liang–Barsky segments, boundary crossings interpolated, curves
+  splitting into visible segments) and filter points; dynamic α ticks.
+  PolarChart adds an SVG clipPath (belt-and-braces), wheel zoom about the
+  cursor (native non-passive listener), drag pan (3-unit threshold, click
+  suppression), double-click fit; PolarViewer adds −/+/fit toolbar buttons,
+  a mouse-following badge: point-snap (full point data, 14-unit radius) or
+  interpolated per-series readout at cursor α (readoutAtX; hidden on Cl–Cd
+  where x is Cd and interpolation is ambiguous). Zoom state lives in hosts
+  (DetailIsland, CellSidePanel), resets on chart-type switch. CompareView got
+  the same domain/clip/ticks fix (no zoom — no interaction state there yet).
+- Guardrails first, recall-proven: packages/core/test/chart-clip.test.ts
+  (prod-shaped −15..30 polar, all four chart types, in-rect assertions +
+  fitted-window pins + clip/zoom/pan/readout units) — 16/18 fail against the
+  pre-fix file, exactly the 2 domain pins fail against a domain-only revert;
+  apps/web/e2e/polar-zoom.spec.ts (live-route, 6 tests: in-rect regression,
+  wheel zoom + fit restore, buttons, drag pan, snap/readout badges, badge
+  follows mouse) — compare fix separately recall-proven via stash run
+  (10 escaped vertices pre-fix). Local repro used REAL prod clarky rows
+  (insert script + capture script in session scratchpad; local dev DB only).
+- Verification: core 103/103, web 226/226, e2e 6/6, typechecks clean,
+  formal-web-ui-verification desktop+mobile on the fixed route: 0 critical.
+  After-fix coordinate probe: 0 escaped coords on all four tabs.

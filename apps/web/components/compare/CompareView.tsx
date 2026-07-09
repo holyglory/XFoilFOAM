@@ -4,6 +4,7 @@ import {
   type AirfoilDetailPayload,
   type AirfoilSummary,
   CHART_VIEW,
+  clipCurveToDomain,
   f1,
   f2,
   f4,
@@ -14,7 +15,7 @@ import {
   type PolarPointData,
   xyOf,
 } from "@aerodb/core";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 
 import { AirfoilSelector } from "@/components/AirfoilSelector";
 import { getAirfoilDetail } from "@/lib/api";
@@ -116,6 +117,7 @@ export function CompareView({ items: initialItems }: { items: AirfoilSummary[] }
 
 function CompareChart({ selected, chartType }: { selected: Sel[]; chartType: "clcd" | "cla" | "lda" }) {
   const { PX0, PX1, PY0, PY1, w, h } = CHART_VIEW;
+  const clipId = "compare-clip-" + useId().replace(/:/g, "");
   let xMin: number, xMax: number;
   if (chartType === "clcd") {
     let mx = 0;
@@ -123,14 +125,32 @@ function CompareChart({ selected, chartType }: { selected: Sel[]; chartType: "cl
     xMin = 0;
     xMax = Math.max(0.02, Math.min(0.06, mx * 1.18));
   } else {
-    xMin = -8;
-    xMax = 20;
+    // Data-derived α window (same fit rule as core projectChart) — the
+    // historical fixed −8..20 window predates campaign sweeps (−15..30) and
+    // drew wider polars outside the axes; it survives only as the no-data
+    // fallback.
+    let aMin = Infinity, aMax = -Infinity;
+    selected.forEach((s) =>
+      s.points.forEach((p) => {
+        if (!Number.isFinite(p.a)) return;
+        if (p.a < aMin) aMin = p.a;
+        if (p.a > aMax) aMax = p.a;
+      }),
+    );
+    if (aMin > aMax) {
+      xMin = -8;
+      xMax = 20;
+    } else {
+      const aPad = Math.max(0.5, (aMax - aMin) * 0.03);
+      xMin = aMin - aPad;
+      xMax = aMax + aPad;
+    }
   }
   let yMin = 1e9, yMax = -1e9;
   selected.forEach((s) =>
     s.points.forEach((p) => {
       const [xx, yy] = xyOf(p, chartType);
-      if (chartType === "clcd" && (xx > xMax || xx < xMin)) return;
+      if (xx > xMax || xx < xMin) return;
       if (yy < yMin) yMin = yy;
       if (yy > yMax) yMax = yy;
     }),
@@ -141,13 +161,18 @@ function CompareChart({ selected, chartType }: { selected: Sel[]; chartType: "cl
   yMax += pad;
   const mapX = (v: number) => PX0 + ((v - xMin) / (xMax - xMin)) * (PX1 - PX0);
   const mapY = (v: number) => PY1 - ((v - yMin) / (yMax - yMin)) * (PY1 - PY0);
-  const xt = chartType === "clcd" ? niceTicks(xMin, xMax, 5).out : [-8, -4, 0, 4, 8, 12, 16, 20].filter((v) => v >= xMin && v <= xMax);
+  const xt = chartType === "clcd" ? niceTicks(xMin, xMax, 5).out : niceTicks(xMin, xMax, 7).out;
   const yt = niceTicks(yMin, yMax, 6).out;
   const xTitle = chartType === "clcd" ? "drag coefficient  Cd" : "angle of attack α  [deg]";
   const yTitle = chartType === "lda" ? "L/D" : "Cl";
 
   return (
-    <svg width="100%" viewBox={`0 0 ${w} ${h}`} style={{ display: "block", overflow: "visible" }}>
+    <svg width="100%" viewBox={`0 0 ${w} ${h}`} style={{ display: "block", overflow: "hidden" }}>
+      <defs>
+        <clipPath id={clipId}>
+          <rect x={PX0} y={PY0} width={PX1 - PX0} height={PY1 - PY0} />
+        </clipPath>
+      </defs>
       {yt.map((v, i) => (
         <g key={`y${i}`}>
           <line x1={PX0} y1={mapY(v)} x2={PX1} y2={mapY(v)} stroke={VIZ.grid} strokeWidth="1" />
@@ -160,22 +185,30 @@ function CompareChart({ selected, chartType }: { selected: Sel[]; chartType: "cl
         <g key={`x${i}`}>
           <line x1={mapX(v)} y1={PY0} x2={mapX(v)} y2={PY1} stroke={VIZ.gridX} strokeWidth="1" />
           <text x={mapX(v)} y={362} textAnchor="middle" fontFamily="IBM Plex Mono" fontSize="10" fill={VIZ.dim}>
-            {chartType === "clcd" ? v.toFixed(3) : String(v)}
+            {chartType === "clcd" ? v.toFixed(3) : String(Math.round(v * 100) / 100)}
           </text>
         </g>
       ))}
       <line x1={PX0} y1={PY0} x2={PX0} y2={PY1} stroke={VIZ.axis} strokeWidth="1.4" />
       <line x1={PX0} y1={PY1} x2={PX1} y2={PY1} stroke={VIZ.axis} strokeWidth="1.4" />
-      {selected.map((s) => {
-        if (s.points.length === 0) return null;
-        let pts = "";
-        s.points.forEach((p) => {
-          const [xx, yy] = xyOf(p, chartType);
-          if (chartType === "clcd" && (xx > xMax || xx < xMin)) return;
-          pts += `${mapX(xx).toFixed(1)},${mapY(yy).toFixed(1)} `;
-        });
-        return <polyline key={s.a.slug} points={pts.trim()} fill="none" stroke={s.color} strokeWidth={1.8} strokeLinejoin="round" />;
-      })}
+      <g clipPath={`url(#${clipId})`}>
+        {selected.map((s) => {
+          if (s.points.length === 0) return null;
+          // Clip in DATA space (same core helper as the detail chart): a curve
+          // that exits and re-enters the window becomes separate segments, and
+          // no coordinate can leave the plot rect.
+          return clipCurveToDomain(s.points, chartType, { xMin, xMax, yMin, yMax }).map((seg, i) => (
+            <polyline
+              key={`${s.a.slug}-${i}`}
+              points={seg.map(([xx, yy]) => `${mapX(xx).toFixed(1)},${mapY(yy).toFixed(1)}`).join(" ")}
+              fill="none"
+              stroke={s.color}
+              strokeWidth={1.8}
+              strokeLinejoin="round"
+            />
+          ));
+        })}
+      </g>
       <text x={361} y={372} textAnchor="middle" fontFamily="IBM Plex Mono" fontSize="11" fill={VIZ.text}>
         {xTitle}
       </text>

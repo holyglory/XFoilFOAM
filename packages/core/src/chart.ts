@@ -88,12 +88,22 @@ export function niceTicks(min: number, max: number, count: number): { step: numb
   return { step, out };
 }
 
+/** A data-space window of the chart (zoom/pan state round-trips through it). */
+export interface ChartDomain {
+  xMin: number;
+  xMax: number;
+  yMin: number;
+  yMax: number;
+}
+
 export interface ProjectChartInput {
   chartType: ChartType;
   /** all per-Re polars available (used for the Cl–Cd domain scan regardless of visibility) */
   polars: { re: number; color: string; points: PolarPointData[]; fit?: PolarFit | null }[];
   visibleRe: Record<number, boolean>;
   hoverKey?: string | null;
+  /** Zoom/pan window override. Omitted/null → fit the visible data (auto). */
+  domain?: Partial<ChartDomain> | null;
 }
 
 interface VisCurve {
@@ -130,16 +140,7 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
           re: pl.re,
           color: pl.color,
           dash: "7 5",
-          data: pl.fit.points.map((p) => ({
-            a: p.a,
-            cl: p.cl,
-            cd: p.cd,
-            cm: p.cm,
-            ld: p.ld,
-            stalled: false,
-            source: "queued",
-            resultId: null,
-          })),
+          data: pl.fit.points.map(fitPointToPolarPoint),
           label: "fit Re " + fRe(pl.re),
           kind: "fit",
         });
@@ -148,6 +149,8 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
   }
 
   // ---- domain ----
+  // Auto domain = zoom-to-fit: derived from the visible data. A zoom/pan
+  // override (input.domain) replaces any subset of the fitted window.
   let xMin: number;
   let xMax: number;
   if (type === "clcd") {
@@ -164,8 +167,33 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
     xMax = Math.min(0.05, mx * 1.18);
     if (xMax < 0.02) xMax = 0.02;
   } else {
-    xMin = -8;
-    xMax = 20;
+    // Fit the α window to the visible data (measured + fit samples). The
+    // historical fixed −8..20 window predates campaign sweeps (prod: −15..30)
+    // and drew wider polars OUTSIDE the axes; it survives only as the
+    // no-data fallback.
+    let aMin = Infinity;
+    let aMax = -Infinity;
+    for (const c of visCurves) {
+      for (const p of c.data) {
+        if (!Number.isFinite(p.a)) continue;
+        if (p.a < aMin) aMin = p.a;
+        if (p.a > aMax) aMax = p.a;
+      }
+    }
+    if (aMin > aMax) {
+      xMin = -8;
+      xMax = 20;
+    } else {
+      const pad = Math.max(0.5, (aMax - aMin) * 0.03);
+      xMin = aMin - pad;
+      xMax = aMax + pad;
+    }
+  }
+  const override = input.domain;
+  if (override) {
+    if (Number.isFinite(override.xMin as number)) xMin = override.xMin as number;
+    if (Number.isFinite(override.xMax as number)) xMax = override.xMax as number;
+    if (xMax - xMin < 1e-9) xMax = xMin + 1e-9;
   }
   let yMin = 1e9;
   let yMax = -1e9;
@@ -173,7 +201,7 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
   for (const c of visCurves) {
     for (const p of c.data) {
       const [xx, yy] = xyOf(p, type);
-      if (type === "clcd" && (xx > xMax || xx < xMin)) continue;
+      if (xx > xMax || xx < xMin) continue;
       if (yy < yMin) yMin = yy;
       if (yy > yMax) yMax = yy;
       hasDomainData = true;
@@ -195,6 +223,11 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
     yMin -= pad;
     yMax += pad;
   }
+  if (override) {
+    if (Number.isFinite(override.yMin as number)) yMin = override.yMin as number;
+    if (Number.isFinite(override.yMax as number)) yMax = override.yMax as number;
+    if (yMax - yMin < 1e-12) yMax = yMin + 1e-12;
+  }
 
   const mapX = (v: number) => PX0 + ((v - xMin) / (xMax - xMin)) * (PX1 - PX0);
   const mapY = (v: number) => PY1 - ((v - yMin) / (yMax - yMin)) * (PY1 - PY0);
@@ -205,9 +238,13 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
     const nt = niceTicks(xMin, xMax, 5);
     xTicks = nt.out.map((v) => ({ pos: mapX(v), labelPos: mapX(v), label: v.toFixed(3) }));
   } else {
-    xTicks = [-8, -4, 0, 4, 8, 12, 16, 20]
-      .filter((v) => v >= xMin && v <= xMax)
-      .map((v) => ({ pos: mapX(v), labelPos: mapX(v), label: String(v) }));
+    // Dynamic α ticks: the window is data-fitted (and zoomable), so the old
+    // fixed −8..20 tick list no longer spans it.
+    const nt = niceTicks(xMin, xMax, 7);
+    xTicks = nt.out.map((v) => {
+      const r = Math.round(v * 100) / 100;
+      return { pos: mapX(v), labelPos: mapX(v), label: String(r) };
+    });
   }
   const ynt = niceTicks(yMin, yMax, 6);
   const ydp = type === "cma" ? 2 : type === "lda" ? 0 : 1;
@@ -218,25 +255,27 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
   }));
 
   // ---- curve polylines ----
-  const curves: ChartCurve[] = visCurves.map((c) => {
-    let pts = "";
-    for (const p of c.data) {
-      const [xx, yy] = xyOf(p, type);
-      if (type === "clcd" && (xx > xMax || xx < xMin)) continue;
-      if (!Number.isFinite(xx) || !Number.isFinite(yy)) continue;
-      pts += mapX(xx).toFixed(1) + "," + mapY(yy).toFixed(1) + " ";
+  // Every curve is clipped to the domain box in DATA space (segment
+  // intersections interpolated at the window edges), so no polyline
+  // coordinate can leave the plot rect — the pre-clip code drew campaign
+  // polars (α beyond the window) across the axes into the margins. A curve
+  // that exits and re-enters the window becomes multiple ChartCurve entries.
+  const curves: ChartCurve[] = [];
+  const domainBox: ChartDomain = { xMin, xMax, yMin, yMax };
+  for (const c of visCurves) {
+    for (const seg of clipCurveToDomain(c.data, type, domainBox)) {
+      curves.push({
+        re: c.re,
+        color: c.color,
+        dash: c.dash,
+        width: 1.6,
+        opacity: c.kind === "fit" ? 0.92 : 0.72,
+        points: seg.map(([xx, yy]) => mapX(xx).toFixed(1) + "," + mapY(yy).toFixed(1)).join(" "),
+        label: c.label,
+        kind: c.kind,
+      });
     }
-    return {
-      re: c.re,
-      color: c.color,
-      dash: c.dash,
-      width: 1.6,
-      opacity: c.kind === "fit" ? 0.92 : 0.72,
-      points: pts.trim(),
-      label: c.label,
-      kind: c.kind,
-    };
-  });
+  }
 
   // ---- clickable points ----
   const points: ChartPointVM[] = [];
@@ -244,7 +283,7 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
     for (const p of c.data) {
       if (p.source !== "solved" || !p.resultId) continue;
       const [xx, yy] = xyOf(p, type);
-      if (type === "clcd" && (xx > xMax || xx < xMin)) continue;
+      if (xx > xMax || xx < xMin || yy > yMax || yy < yMin) continue;
       if (!Number.isFinite(xx) || !Number.isFinite(yy)) continue;
       const cx = mapX(xx);
       const cy = mapY(yy);
@@ -283,4 +322,185 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
     yTitle: Y_TITLE[type],
     domain: { xMin, xMax, yMin, yMax },
   };
+}
+
+// ============================ domain clipping ============================
+
+/** Liang–Barsky clip of one segment against the domain box in DATA space.
+ *  Returns the clipped endpoints, or null when the segment misses the box. */
+function clipSegment(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  dom: ChartDomain,
+): [[number, number], [number, number]] | null {
+  let t0 = 0;
+  let t1 = 1;
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const edges: [number, number][] = [
+    [-dx, x0 - dom.xMin],
+    [dx, dom.xMax - x0],
+    [-dy, y0 - dom.yMin],
+    [dy, dom.yMax - y0],
+  ];
+  for (const [p, q] of edges) {
+    if (p === 0) {
+      if (q < 0) return null;
+      continue;
+    }
+    const r = q / p;
+    if (p < 0) {
+      if (r > t1) return null;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return null;
+      if (r < t1) t1 = r;
+    }
+  }
+  return [
+    [x0 + t0 * dx, y0 + t0 * dy],
+    [x0 + t1 * dx, y0 + t1 * dy],
+  ];
+}
+
+/** Clip a data series to the domain box. A curve that leaves and re-enters
+ *  the window splits into separate visible segments (each length ≥ 2), with
+ *  the boundary crossings interpolated — never clamped, never bled outside. */
+export function clipCurveToDomain(
+  data: PolarPointData[],
+  type: ChartType,
+  dom: ChartDomain,
+): [number, number][][] {
+  const epsX = (dom.xMax - dom.xMin) * 1e-9;
+  const epsY = (dom.yMax - dom.yMin) * 1e-9;
+  const segs: [number, number][][] = [];
+  let cur: [number, number][] = [];
+  let prev: [number, number] | null = null;
+  const flush = () => {
+    if (cur.length >= 2) segs.push(cur);
+    cur = [];
+  };
+  for (const p of data) {
+    const [xx, yy] = xyOf(p, type);
+    if (!Number.isFinite(xx) || !Number.isFinite(yy)) {
+      flush();
+      prev = null;
+      continue;
+    }
+    if (prev === null) {
+      prev = [xx, yy];
+      if (xx >= dom.xMin && xx <= dom.xMax && yy >= dom.yMin && yy <= dom.yMax) {
+        cur.push([xx, yy]);
+      }
+      continue;
+    }
+    const clipped = clipSegment(prev[0], prev[1], xx, yy, dom);
+    prev = [xx, yy];
+    if (!clipped) {
+      flush();
+      continue;
+    }
+    const [a, b] = clipped;
+    const last = cur[cur.length - 1];
+    if (!last || Math.abs(last[0] - a[0]) > epsX || Math.abs(last[1] - a[1]) > epsY) {
+      flush();
+      cur.push(a);
+    }
+    cur.push(b);
+  }
+  flush();
+  return segs;
+}
+
+// ============================ zoom / pan ============================
+
+/** New window after zooming by `factor` (<1 = in, >1 = out) about a data
+ *  point; the anchor keeps its screen position (map-style zoom). */
+export function zoomChartDomain(
+  dom: ChartDomain,
+  factor: number,
+  center: { x: number; y: number },
+): ChartDomain {
+  const f = Math.min(10, Math.max(0.05, factor));
+  const cx = Math.min(dom.xMax, Math.max(dom.xMin, center.x));
+  const cy = Math.min(dom.yMax, Math.max(dom.yMin, center.y));
+  return {
+    xMin: cx - (cx - dom.xMin) * f,
+    xMax: cx + (dom.xMax - cx) * f,
+    yMin: cy - (cy - dom.yMin) * f,
+    yMax: cy + (dom.yMax - cy) * f,
+  };
+}
+
+/** Translate the window by data-space deltas (drag pan). */
+export function panChartDomain(dom: ChartDomain, dx: number, dy: number): ChartDomain {
+  return {
+    xMin: dom.xMin + dx,
+    xMax: dom.xMax + dx,
+    yMin: dom.yMin + dy,
+    yMax: dom.yMax + dy,
+  };
+}
+
+// ============================ cursor readout ============================
+
+export interface ChartReadoutRow {
+  re: number;
+  color: string;
+  label: string;
+  kind: "measured" | "fit";
+  y: number;
+}
+
+function fitPointToPolarPoint(p: { a: number; cl: number; cd: number; cm: number; ld: number }): PolarPointData {
+  return { a: p.a, cl: p.cl, cd: p.cd, cm: p.cm, ld: p.ld, stalled: false, source: "queued", resultId: null };
+}
+
+/** Linear interpolation of a series' y at x; null outside the series' span. */
+function interpSeriesAtX(points: PolarPointData[], type: ChartType, x: number): number | null {
+  const xs: [number, number][] = [];
+  for (const p of points) {
+    const [xx, yy] = xyOf(p, type);
+    if (Number.isFinite(xx) && Number.isFinite(yy)) xs.push([xx, yy]);
+  }
+  xs.sort((a, b) => a[0] - b[0]);
+  if (!xs.length || x < xs[0][0] || x > xs[xs.length - 1][0]) return null;
+  for (let i = 1; i < xs.length; i++) {
+    if (x <= xs[i][0]) {
+      const [x0, y0] = xs[i - 1];
+      const [x1, y1] = xs[i];
+      if (x1 === x0) return y0;
+      return y0 + ((x - x0) / (x1 - x0)) * (y1 - y0);
+    }
+  }
+  return xs[xs.length - 1][1];
+}
+
+/** Every visible curve's interpolated value at cursor α (α-x charts only —
+ *  Cl–Cd has no single-valued x there; snap to the nearest point instead). */
+export function readoutAtX(input: {
+  chartType: ChartType;
+  polars: ProjectChartInput["polars"];
+  visibleRe: Record<number, boolean>;
+  x: number;
+}): ChartReadoutRow[] {
+  const { chartType: type, polars, visibleRe, x } = input;
+  if (type === "clcd") return [];
+  const rows: ChartReadoutRow[] = [];
+  for (const pl of polars) {
+    if (!visibleRe[pl.re]) continue;
+    const measured = interpSeriesAtX(pl.points, type, x);
+    if (measured !== null) {
+      rows.push({ re: pl.re, color: pl.color, label: "Re " + fRe(pl.re), kind: "measured", y: measured });
+    }
+    if (pl.fit?.points.length) {
+      const fy = interpSeriesAtX(pl.fit.points.map(fitPointToPolarPoint), type, x);
+      if (fy !== null) {
+        rows.push({ re: pl.re, color: pl.color, label: "fit Re " + fRe(pl.re), kind: "fit", y: fy });
+      }
+    }
+  }
+  return rows;
 }
