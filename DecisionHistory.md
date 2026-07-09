@@ -2733,3 +2733,30 @@ mean).
   (relTol/maxIter/GAMG tuning — ×3 on heavy even alone); (C) precalc
   maxCo 4→8 (×2, cheap, composable); (D) solver_processes 2-4 for
   single-case continuation/request jobs (cores idle at queue tail).
+
+## 2026-07-09 — Implemented A+B: precalc wall-function mesh + pressure-solver fix
+
+- A (approved): derive_precalc_mesh_params now sets target_y_plus = 40
+  (URANS_PRECALC_WALL_YPLUS, = pipeline.TRANSIENT_WALL_YPLUS) and CLEARS any
+  explicit first_cell_height_chords so the y+ target actually resolves per
+  case (an explicit low-Re height would short-circuit resolve_mesh_params).
+  Turbulence BCs needed no change — nutUSpaldingWallFunction +
+  omegaWallFunction are already all-y+. First-layer height is linear in y+
+  (pinned: height(40)/height(1) == 40 exactly), so the Courant-capped dt
+  lifts ~40x and the AR~2100 pressure stiffness disappears. Mesh cache keys
+  on resolved params → precalc meshes regenerate under new keys; full tier
+  and RANS untouched. Caveat noted: precalc + sand-grain roughness (Ks >
+  y+40 height) would need its own guard — smooth-wall campaigns unaffected.
+- B: transient fvSolution p/pFinal smoother GaussSeidel → DICGaussSeidel
+  (symmetric matrix, standard for stretched layers); pFinal tolerance
+  1e-7 → 1e-6 (measured cap-saturation sat at 2.7e-7..8.4e-7 after 1000
+  capped iters; 3 PIMPLE outers provide remaining contraction). Steady
+  solver dicts untouched (pinned by test). Helps the full tier too (still
+  y+=1 at chord 1 m).
+- Authored by two Codex CLI (gpt-5.5, xhigh) lanes under precise specs;
+  reviewed line-by-line here. Tests: tests/test_fidelity_tiers.py (y+40,
+  cleared explicit height, 40x ratio, resolve-level check, cache-key
+  separation), tests/test_transient_fvsolution.py (transient pins + steady
+  unchanged guard). Engine suite 317 passed; sweeper contract pins 21/21.
+- Continuations resume SAVED meshes: in-flight +6h resumes stay on y+=1;
+  fresh retries (incl. march-guard re-rejects) pick up the new mesh.

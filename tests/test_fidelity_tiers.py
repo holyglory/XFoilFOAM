@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from airfoilfoam import jobs, pipeline
+from airfoilfoam import jobs, physics, pipeline
 from airfoilfoam.airfoil import load_airfoil
 from airfoilfoam.cache import EngineCache
 from airfoilfoam.config import get_settings
@@ -24,6 +24,7 @@ from airfoilfoam.models import (
     URANS_FIDELITY_BUDGET_S,
     URANS_FIDELITY_MIN_PERIODS,
     URANS_PRECALC_MESH_SCALE,
+    URANS_PRECALC_WALL_YPLUS,
     AirfoilFormat,
     AirfoilInput,
     AoASpec,
@@ -61,6 +62,7 @@ def test_fidelity_tier_contract_pin():
     assert URANS_FIDELITY_MIN_PERIODS == {UransFidelity.precalc: 3, UransFidelity.full: 7}
     assert URANS_FIDELITY_BUDGET_S == {UransFidelity.precalc: 14400, UransFidelity.full: 43200}
     assert URANS_PRECALC_MESH_SCALE == 0.5
+    assert URANS_PRECALC_WALL_YPLUS == 40.0
 
     # Effective per-tier resolution.
     assert apply_urans_fidelity(SolverParams(urans_fidelity="precalc")).urans_min_periods == 3
@@ -78,17 +80,17 @@ def test_fidelity_tier_contract_pin():
 
 
 # --------------------------------------------------------------------------- #
-# Derived precalc mesh: halved counts, same y+, separate cache identity
+# Derived precalc mesh: halved counts, wall-function y+, separate cache identity
 # --------------------------------------------------------------------------- #
 
 
-def test_precalc_mesh_derivation_halves_counts_same_yplus():
-    full = MeshParams()  # 130 / 80 / 60
+def test_precalc_mesh_derivation_halves_counts_uses_wall_function_yplus():
+    full = MeshParams(first_cell_height_chords=1e-5)  # 130 / 80 / 60
     derived = derive_precalc_mesh_params(full)
     assert (derived.n_surface, derived.n_radial, derived.n_wake) == (65, 40, 30)
-    # Same wall treatment and domain extents — ONLY the resolution halves.
-    assert derived.target_y_plus == full.target_y_plus
-    assert derived.first_cell_height_chords == full.first_cell_height_chords
+    # Precalc owns the wall-function mesh; explicit low-Re overrides must not survive.
+    assert derived.target_y_plus == URANS_PRECALC_WALL_YPLUS
+    assert derived.first_cell_height_chords is None
     assert derived.farfield_radius_chords == full.farfield_radius_chords
     assert derived.wake_length_chords == full.wake_length_chords
     assert derived.span_chords == full.span_chords
@@ -96,6 +98,25 @@ def test_precalc_mesh_derivation_halves_counts_same_yplus():
     # Field minimums are respected (never an invalid MeshParams).
     tiny = derive_precalc_mesh_params(MeshParams(n_surface=25, n_radial=21, n_wake=11))
     assert (tiny.n_surface, tiny.n_radial, tiny.n_wake) == (20, 20, 10)
+
+
+def test_precalc_wall_function_height_scales_resolved_first_cell():
+    speed = 25.0
+    chord = 1.0
+    nu = 1.5e-5
+    h1 = physics.first_cell_height_for_yplus(1.0, speed, chord, nu)
+    h40 = physics.first_cell_height_for_yplus(URANS_PRECALC_WALL_YPLUS, speed, chord, nu)
+    assert h40 / h1 == 40.0
+
+    spec = CaseSpec(chord=chord, speed=speed, aoa_deg=8.0)
+    fluid = FluidProperties(kinematic_viscosity=nu)
+    full = MeshParams(target_y_plus=1.0)
+    precalc = derive_precalc_mesh_params(MeshParams(target_y_plus=1.0, first_cell_height_chords=1e-6))
+    resolved_full = pipeline.resolve_mesh_params(full, spec, fluid)
+    resolved_precalc = pipeline.resolve_mesh_params(precalc, spec, fluid)
+    assert resolved_precalc.first_cell_height_chords == pytest.approx(
+        40.0 * resolved_full.first_cell_height_chords
+    )
 
 
 def test_effective_mesh_params_only_derives_for_precalc_urans():
@@ -226,6 +247,8 @@ def _run_job_capturing_mesh(monkeypatch, naca0012_selig_text, solver: SolverPara
     def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
                       mesher, runner, **_kwargs):
         captured.setdefault("case_mesh", mesh_params)
+        captured.setdefault("spec", spec)
+        captured.setdefault("fluid", fluid)
         return CaseOutcome(spec=spec, reynolds=1e6, cl=0.5, cd=0.01, cm=0.0, converged=True)
 
     monkeypatch.setattr(jobs, "prepare_mesh", fake_prepare_mesh)
@@ -249,7 +272,9 @@ def test_precalc_urans_job_builds_derived_half_mesh(monkeypatch, naca0012_selig_
     )
     resolved = captured["resolved"]
     assert (resolved.n_surface, resolved.n_radial, resolved.n_wake) == (65, 40, 30)
-    assert resolved.target_y_plus == MeshParams().target_y_plus
+    assert resolved.target_y_plus == URANS_PRECALC_WALL_YPLUS
+    full_resolved = pipeline.resolve_mesh_params(MeshParams(), captured["spec"], captured["fluid"])
+    assert resolved.first_cell_height_chords == pytest.approx(40.0 * full_resolved.first_cell_height_chords)
     # run_case receives the derived params too (cache keys match the mesh built).
     assert (captured["case_mesh"].n_surface, captured["case_mesh"].n_radial) == (65, 40)
 

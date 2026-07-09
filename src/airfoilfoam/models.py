@@ -138,9 +138,12 @@ class MeshParams(BaseModel):
 # ``solver.urans_fidelity`` selects the tier; the node side builds requests
 # against EXACTLY these tier constants (contract pin tests on both runtimes):
 #   precalc => urans_min_periods 3, solver budget 14400 s (4 h), mesh scale 0.5
-#              (derived half-resolution URANS mesh: n_surface/n_radial/n_wake
-#              halved, same y+ target; the mesh cache keys on the resolved
-#              params, so the derived mesh caches separately from the full one)
+#              + wall-function y+ 40 (2026-07-09 retune, measured basis:
+#              first-layer height bound the timestep; see DecisionHistory
+#              2026-07-09 "Measured: why precalc URANS is slow"). The derived
+#              half-resolution URANS mesh halves n_surface/n_radial/n_wake; the
+#              mesh cache keys on the resolved params, so it caches separately
+#              from the full one.
 #   full    => urans_min_periods 7, solver budget 43200 s (12 h), full mesh
 #              (background trickle tier per the approved ladder design)
 # Measured basis for the budgets (gate tier-2 quality_warnings): under the
@@ -184,6 +187,16 @@ URANS_FIDELITY_BUDGET_S: dict[UransFidelity, int] = {
 
 #: Mesh resolution scale of the derived precalc URANS mesh.
 URANS_PRECALC_MESH_SCALE = 0.5
+
+#: Wall-function y+ of the derived precalc URANS mesh.
+#: Precalc is the rough screening tier — wall-function resolution trades
+#: boundary-layer detail for a ~40x taller first cell, which lifts the
+#: Courant-capped dt by the same factor and removes the high-aspect-ratio
+#: pressure stiffness; the full tier keeps the resolved y+=1 wall.
+#: Deliberately equals ``pipeline.TRANSIENT_WALL_YPLUS`` (standalone-case
+#: fallback); do not import pipeline here because models must stay below the
+#: runtime layer.
+URANS_PRECALC_WALL_YPLUS = 40.0
 
 #: Sane hard cap on the per-job URANS wall-budget override [s] (24 h). A
 #: continuation submits the INCREASED budget through
@@ -293,7 +306,7 @@ class SolverParams(BaseModel):
     urans_fidelity: UransFidelity = Field(
         default=UransFidelity.full,
         description="URANS fidelity tier (pinned cross-runtime): 'precalc' runs a fast 3-period "
-        "transient on a derived half-resolution mesh with a 7200 s (2 h) solver budget; 'full' "
+        "transient on a derived half-resolution wall-function mesh with a 14400 s (4 h) solver budget; 'full' "
         "runs 7 periods on the full mesh with a 43200 s (12 h) budget (background trickle tier). "
         "Budgets sized to measured prod rates: ~14 min/period half-res, ~2 h/period full mesh at "
         "the worst campaign class (0.1 m chord, 25 m/s). Echoed on PolarPoint.fidelity.",
@@ -374,18 +387,21 @@ def urans_point_fidelity(solver: "SolverParams") -> str:
 
 
 def derive_precalc_mesh_params(mesh: MeshParams) -> MeshParams:
-    """Derived half-resolution URANS mesh for the precalc tier.
+    """Derived wall-function, half-resolution URANS mesh for the precalc tier.
 
-    Halves n_surface/n_radial/n_wake (clamped to the field minimums) and keeps
-    the SAME y+ target / explicit first-cell height, farfield and wake extents.
-    The mesh cache keys on the resolved params, so this derived mesh caches
-    under its own key, separate from the full-resolution mesh.
+    Halves n_surface/n_radial/n_wake (clamped to the field minimums), switches
+    the wall target to y+=40, clears any explicit first-cell height so y+ is
+    actually resolved per case, and keeps farfield/wake extents. The mesh cache
+    keys on the resolved params, so this derived mesh caches under its own key,
+    separate from the full-resolution mesh.
     """
     return mesh.model_copy(
         update={
             "n_surface": max(20, round(mesh.n_surface * URANS_PRECALC_MESH_SCALE)),
             "n_radial": max(20, round(mesh.n_radial * URANS_PRECALC_MESH_SCALE)),
             "n_wake": max(10, round(mesh.n_wake * URANS_PRECALC_MESH_SCALE)),
+            "target_y_plus": URANS_PRECALC_WALL_YPLUS,
+            "first_cell_height_chords": None,
         }
     )
 

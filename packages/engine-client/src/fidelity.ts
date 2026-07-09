@@ -4,9 +4,10 @@
 // Contract 1 — request field solver.urans_fidelity: "precalc" | "full".
 //   The ENGINE derives everything from the literal (src/airfoilfoam/models.py):
 //     precalc → urans_min_periods 3, solver budget 14400 s (4 h), mesh scale
-//               0.5 (derived half-resolution URANS mesh: halve n_surface/
-//               n_radial/n_wake, same y+ target — engine-side derivation,
-//               cached separately in the mesh cache);
+//               0.5 + wall-function y+ 40 (derived half-resolution URANS mesh:
+//               halve n_surface/n_radial/n_wake, clear explicit low-Re
+//               first-cell overrides — engine-side derivation, cached
+//               separately in the mesh cache);
 //     full    → urans_min_periods 7, solver budget 43200 s (12 h), full mesh
 //               (background trickle tier).
 //   Budgets retuned 2026-07-07 to measured prod rates (ladder-gate campaign,

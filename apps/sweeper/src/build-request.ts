@@ -13,7 +13,7 @@ import {
 /** Map an immutable simulation setup revision + airfoil into a Python PolarRequest.
  *  wave 1 = steady (transient_fallback off); wave 2 = re-run post-stall as URANS.
  *  Wave-2 requests carry solver.urans_fidelity (ladder contract 1): 'precalc'
- *  by default (3 periods, 1 h budget, half-resolution mesh — engine-derived);
+ *  by default (3 periods, 4 h budget, half-resolution wall-function mesh — engine-derived);
  *  verify-queue / admin-full jobs pass 'full' explicitly. */
 export function buildPolarRequest(opts: {
   airfoil: Airfoil;

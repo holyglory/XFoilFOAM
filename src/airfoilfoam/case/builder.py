@@ -313,8 +313,17 @@ class CaseBuilder:
             "fvSolution",
             {
                 "solvers": {
-                    "p": {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.05},
-                    "pFinal": {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.0},
+                    # Prod 2026-07-09, s1223 c1 u50 Re 3.4M precalc:
+                    # pFinal GAMG cap-saturation was the entire 4.6x per-step
+                    # gap (DecisionHistory "Measured: why precalc URANS is slow").
+                    # The pressure matrix is symmetric; DICGaussSeidel is the
+                    # standard GAMG smoother for stretched/anisotropic near-wall
+                    # layers. The capped pFinal residual sat at 2.7e-7..8.4e-7;
+                    # a 1e-6 absolute floor is ample for incompressible force
+                    # coefficients, and 3 PIMPLE outer correctors provide the
+                    # remaining contraction.
+                    "p": {"solver": "GAMG", "smoother": "DICGaussSeidel", "tolerance": 1e-7, "relTol": 0.05},
+                    "pFinal": {"solver": "GAMG", "smoother": "DICGaussSeidel", "tolerance": 1e-6, "relTol": 0.0},
                     f'"({turb_vars}|U).*"': {
                         "solver": "smoothSolver",
                         "smoother": "symGaussSeidel",

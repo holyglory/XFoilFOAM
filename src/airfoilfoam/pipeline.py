@@ -388,7 +388,7 @@ def resolve_mesh_params(
     return mesh_params.model_copy(update={"first_cell_height_chords": height_chords})
 
 
-TRANSIENT_WALL_YPLUS = 40.0  # wall-function y+ for the transient mesh (affordable timestep)
+TRANSIENT_WALL_YPLUS = 40.0  # wall-function y+ for transient mesh; mirrors models.URANS_PRECALC_WALL_YPLUS
 TRANSIENT_INIT_ITERS = 600  # short steady init before the transient
 TRANSIENT_INITIAL_STROUHAL = 0.5
 URANS_REFINED_CADENCE_STROUHAL = 0.75
