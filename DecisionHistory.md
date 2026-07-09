@@ -2709,3 +2709,27 @@ mean).
   {continuable:2, created:2}; replay → zeros with request table unchanged
   (queued cells leave needs_review — bucket-level idempotency); foreign
   campaign sweeps nothing; dropping the marker filter fails the test.
+
+## 2026-07-09 — Measured: why precalc URANS is slow (evidence for the mesh-tier decision)
+
+- Measured on prod (S1223 c=1 u=50 Re 3.4M "heavy" vs NACA 4412 c=0.1 u=50
+  Re 341k "light", both precalc 7,600-cell meshes, both SERIAL 1-core):
+  heavy 1.9e-6 sim-s/wall-s (~59 h/point), light 6.8e-6 (~5.8 h) — ×9.9 =
+  ×2.81 (endTime ∝ chord via shedding period) × ×2.23 (steps) × ×4.45/2.8
+  (per-step cost). Per-step gap is ENTIRELY pFinal GAMG: heavy saturates
+  the 1000-iteration cap on all 3 PIMPLE outers every step (near-wall
+  aspect ratio ~2,100 at c=1) vs ~190 iters converged on light.
+- Root structural fact: derive_precalc_mesh_params halves n_surface/
+  n_radial/n_wake but keeps target_y_plus=1 → first-layer height ~1.4e-5 m
+  regardless of chord → Courant-capped dt ~2e-6 s (Courant MAX 4.0 pinned
+  at the wall cell while Courant MEAN is 4e-4 — the whole domain marches
+  10,000× slower than it needs except one cell). Precalc saves cells (×4)
+  but not the time step. TRANSIENT_WALL_YPLUS=40 wall-function remesh
+  exists in the engine but only on the no-shared-mesh fallback path.
+- Contention measured: ×1.45 per-step when 6 sibling cases share the box.
+- Proposals (pending user approval; ranked): (A) precalc tier goes
+  wall-function y+≈40 (dt ×~30, kills the GAMG stiffness; est. heavy point
+  59 h → <1 h; full tier keeps y+=1); (B) fix pFinal cap saturation
+  (relTol/maxIter/GAMG tuning — ×3 on heavy even alone); (C) precalc
+  maxCo 4→8 (×2, cheap, composable); (D) solver_processes 2-4 for
+  single-case continuation/request jobs (cores idle at queue tail).
