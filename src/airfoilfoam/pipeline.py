@@ -1124,6 +1124,7 @@ def _prepare_transient_case(
     timeout,
     shared_mesh_dir: Optional[Path] = None,
     steady_field_dir: Optional[Path] = None,
+    freestream_fallback: bool = False,
     cancel_check: CancelCheck = None,
 ) -> tuple[MeshParams, object]:
     _check_cancel(cancel_check)
@@ -1173,6 +1174,16 @@ def _prepare_transient_case(
         and _seed_transient_from_steady(steady_field_dir, tcase)
     ):
         logger.info("transient %s warm-started from steady field %s", tcase, steady_field_dir)
+        return tmesh, patches
+    if freestream_fallback:
+        # A rejected full-steady field means this condition is hostile to SIMPLE
+        # initialisation. Keep the CaseBuilder's pristine 0/ freestream fields
+        # and let the transient startup dt cap control the impulse.
+        logger.warning(
+            "transient %s starts from pristine freestream fields; skipping "
+            "potentialFoam and in-case short simpleFoam init",
+            tcase,
+        )
         return tmesh, patches
     runner.application(tcase, "potentialFoam -writephi -initialiseUBCs", timeout=600)
     _check_cancel(cancel_check)
@@ -1678,18 +1689,22 @@ def _run_transient(
         )
     else:
         effective_steady_field_dir = steady_field_dir
+        freestream_fallback = False
         if steady_field_dir is not None and not steady_field_accepted:
             logger.warning(
                 "steady init not converged; transient starts from freestream instead "
-                "of the non-converged field (%s)",
+                "of the non-converged field (%s); skipping in-case short "
+                "simpleFoam init",
                 steady_field_dir,
             )
             effective_steady_field_dir = None
+            freestream_fallback = True
         try:
             tmesh, patches = _prepare_transient_case(
                 tcase, airfoil, resolved, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
                 shared_mesh_dir=shared_mesh_dir,
                 steady_field_dir=effective_steady_field_dir,
+                freestream_fallback=freestream_fallback,
                 cancel_check=cancel_check,
             )
         except OpenFOAMError:

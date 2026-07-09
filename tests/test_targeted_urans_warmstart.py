@@ -69,6 +69,17 @@ def _write_shedding_coeff(path: Path, f=5.0, n=500, dt=0.002, cl0=0.7, cd0=0.2):
     path.write_text("\n".join(lines) + "\n")
 
 
+def _write_flat_transient_coeff(path: Path, start: float, end: float, n: int = 80):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    span = max(0.0, end - start)
+    lines = ["# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"]
+    for i in range(n):
+        t = start + span * i / max(1, n - 1)
+        row = [t, 0.035, 0.0, 0.0, 0.42, 0.0, 0.0, -0.015, 0.0, 0.0, 0.0, 0.0, 0.0]
+        lines.append(" ".join(f"{v:.6g}" for v in row))
+    path.write_text("\n".join(lines) + "\n")
+
+
 def _write_uniform_time_state(time_dir: Path, delta_t: float, delta_t0: float | None = None) -> Path:
     uniform = time_dir / "uniform"
     uniform.mkdir(parents=True, exist_ok=True)
@@ -181,6 +192,7 @@ def _run_force_transient_seed_handoff(
 
     def fake_prepare(tcase, *_args, **kwargs):
         captured["prep_steady_field_dir"] = kwargs.get("steady_field_dir")
+        captured["prep_freestream_fallback"] = kwargs.get("freestream_fallback")
         captured["calls_at_prep"] = list(calls)
         Path(tcase).mkdir(parents=True, exist_ok=True)
         return MeshParams(), {}
@@ -294,11 +306,119 @@ def test_nonconverged_full_steady_field_not_used_as_transient_seed(
     assert outcome.error is None
     assert "simpleFoam" in captured["calls_at_prep"]
     assert captured["prep_steady_field_dir"] is None
+    assert captured["prep_freestream_fallback"] is True
     assert any(
         "steady init not converged; transient starts from freestream instead "
         "of the non-converged field" in message
+        and "skipping in-case short simpleFoam init" in message
         for message in caplog.messages
     )
+
+
+def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
+    tmp_path, monkeypatch, caplog
+):
+    """Prod shape: a rejected full-steady field must not be followed by the
+    in-case short SIMPLE init. pimpleFoam starts from the transient case's
+    pristine 0/ freestream state, so the pseudo-time-600 axis cannot appear."""
+    caplog.set_level(logging.WARNING, logger="airfoilfoam.pipeline")
+    calls: list[str] = []
+    transient_writes: list[dict[str, float]] = []
+    latest_seen_by_pimple: list[float] = []
+
+    class TrackingCaseBuilder(FakeCaseBuilder):
+        def write_transient(
+            self,
+            case_dir: Path,
+            start_time: float,
+            end_time: float,
+            delta_t: float,
+            write_interval=None,
+            max_delta_t=None,
+        ) -> None:
+            transient_writes.append(
+                {"start_time": start_time, "end_time": end_time, "delta_t": delta_t}
+            )
+            system = Path(case_dir) / "system"
+            system.mkdir(parents=True, exist_ok=True)
+            (system / "controlDict").write_text(
+                f"application pimpleFoam;\nstartTime {start_time:.12g};\n"
+                f"endTime {end_time:.12g};\n"
+            )
+
+    class FakeRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            raise AssertionError(f"freestream fallback must not run {cmd}")
+
+        def solver(self, case_dir, app, *_args, **_kwargs):
+            calls.append(app)
+            if app == "simpleFoam":
+                (Path(case_dir) / "600").mkdir(parents=True, exist_ok=True)
+                raise AssertionError("freestream fallback must not run simpleFoam.init")
+            assert app == "pimpleFoam"
+            cdir = Path(case_dir)
+            latest_seen_by_pimple.append(pipeline._latest_time(cdir))
+            assert latest_seen_by_pimple[-1] == pytest.approx(0.0)
+            assert not (cdir / "600").exists()
+            assert not (cdir / "log.simpleFoam.init").exists()
+            assert transient_writes[-1]["start_time"] == pytest.approx(0.0)
+            _write_flat_transient_coeff(
+                cdir / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat",
+                transient_writes[-1]["start_time"],
+                transient_writes[-1]["end_time"],
+            )
+            (cdir / f"{transient_writes[-1]['end_time']:.12g}").mkdir(exist_ok=True)
+            return SimpleNamespace(
+                ok=True,
+                returncode=0,
+                timed_out=False,
+                stdout="Time = 0\nTime = end\n",
+                check=lambda: SimpleNamespace(stdout="Time = 0\nTime = end\n"),
+            )
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", TrackingCaseBuilder)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
+
+    params = SolverParams(force_transient=True, transient_auto_refine=False)
+    spec = CaseSpec(chord=1.0, speed=25.0, aoa_deg=18.0)
+    steady = tmp_path / "case" / "600"
+    steady.mkdir(parents=True)
+    mesh = tmp_path / "mesh"
+    mesh.mkdir()
+
+    result = pipeline._run_transient(
+        tmp_path / "case",
+        airfoil=SimpleNamespace(name="s1223", contour=[]),
+        resolved=MeshParams(),
+        spec=spec,
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=params,
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=7200,
+        shared_mesh_dir=mesh,
+        steady_field_dir=steady,
+        steady_field_accepted=False,
+    )
+
+    expected_horizon = params.transient_cycles * pipeline.physics.shedding_period(
+        spec.speed,
+        spec.chord,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    assert result is not None
+    assert calls == ["pimpleFoam"]
+    assert latest_seen_by_pimple == [pytest.approx(0.0)]
+    assert transient_writes[0]["start_time"] == pytest.approx(0.0)
+    assert transient_writes[0]["end_time"] == pytest.approx(expected_horizon)
+    assert result.start_time == pytest.approx(0.0)
+    assert result.run_time == pytest.approx(expected_horizon)
+    assert pipeline.read_transient_start_marker(tmp_path / "case" / "transient") == pytest.approx(0.0)
+    assert not (tmp_path / "case" / "transient" / "log.simpleFoam.init").exists()
+    assert "startTime 0;" in (tmp_path / "case" / "transient" / "system" / "controlDict").read_text()
+    assert any("skipping in-case short simpleFoam init" in message for message in caplog.messages)
 
 
 def test_converged_full_steady_field_still_warm_starts_transient(tmp_path, monkeypatch):
@@ -315,6 +435,7 @@ def test_converged_full_steady_field_still_warm_starts_transient(tmp_path, monke
     seed = captured["prep_steady_field_dir"]
     assert seed is not None
     assert seed.name == "600"
+    assert captured["prep_freestream_fallback"] is False
 
 
 def test_accepted_oscillating_full_steady_field_still_warm_starts_transient(
@@ -417,6 +538,54 @@ def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_in
     assert "potentialFoam" in calls
     assert "simpleFoam" in calls  # RANS-first fallback is unconditional
     assert (tcase / "log.simpleFoam.init").read_text() == "init ok"
+
+
+def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_path, monkeypatch):
+    """False-positive guard: a standalone transient with no shared mesh has no
+    rejected steady seed, so it keeps the potentialFoam + short SIMPLE init."""
+    calls: list[str] = []
+
+    class FakeMesher:
+        def patches(self, _mesh):
+            return {}
+
+        def write_inputs(self, *_args, **_kwargs):
+            calls.append("write_inputs")
+
+        def run_mesh(self, *_args, **_kwargs):
+            calls.append("run_mesh")
+            return SimpleNamespace(n_cells=123)
+
+    class FakeRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            return SimpleNamespace(ok=True, stdout="", check=lambda: None)
+
+        def solver(self, _case_dir, app, *_args, **_kwargs):
+            calls.append(app)
+            return SimpleNamespace(ok=True, stdout="standalone init ok")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "get_mesher", lambda _name: FakeMesher())
+
+    tcase = tmp_path / "case" / "transient"
+    _prepare_transient_case(
+        tcase,
+        airfoil=None,
+        resolved=MeshParams(),
+        spec=CaseSpec(chord=0.25, speed=15.0, aoa_deg=4.0),
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(force_transient=True),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=60,
+        shared_mesh_dir=None,
+        steady_field_dir=None,
+    )
+
+    assert calls == ["write_inputs", "run_mesh", "potentialFoam", "simpleFoam"]
+    assert (tcase / "log.simpleFoam.init").read_text() == "standalone init ok"
 
 
 def test_seed_transient_from_steady_requires_essential_fields(tmp_path):

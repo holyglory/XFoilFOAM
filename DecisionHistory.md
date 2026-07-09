@@ -2847,3 +2847,22 @@ mean).
   consumer. Must-catch: dt=1 uniform/time regression; chord-St-0.70
   fixture measures ~0.057 s (was None); α=2 preserves old band; noise
   still None; lottery fixtures still pass. Engine suite 335 passed.
+
+## 2026-07-09 — Freestream fallback skips the short init (final startup layer)
+
+- With the zero-step bug fixed, the s1223 c=1 fallback transients RAN and
+  detonated on their first steps (t=600.00x, |Cl| 1e131..1e162, 11 cells):
+  the 600-iter in-case simpleFoam init at steady-hostile conditions
+  produces its own violently oscillating field (init Cl amp 2..4) and the
+  transient inherits it — the zero-step bug had been shielding this. The
+  init is a warm-start optimization with no advance way to know when it
+  turns harmful.
+- Fix: freestream_fallback flag — when the full steady seed was refused,
+  _prepare_transient_case keeps the pristine 0/ freestream fields and
+  skips potentialFoam + simpleFoam.init entirely; transient starts at
+  t=0 (pseudo-time-600 axis and uniform/time hazard vanish on this path).
+  Standalone no-seed cases keep their init (pinned); warm seeds unchanged;
+  dt cap/march guard/watchdog unchanged. Engine suite 337 passed.
+- Wave tally before this fix (post-shedband re-solves): 13 accepted
+  (avg 8 min), 12 honest quality rejects — 24/25 graded cells with real
+  measured periods (was 0/25 before the band fix).
