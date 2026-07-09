@@ -492,8 +492,10 @@ def test_continuation_extends_until_min_whole_periods_retained(tmp_path, monkeyp
     assert not calls[1]["refined"]  # a continuation chunk, not a refined rerun
     assert calls[0]["coeff_start_time"] == pytest.approx(0.0)
     assert calls[1]["coeff_start_time"] == pytest.approx(0.0)  # merged history anchor
-    # chunk sized to close the deficit: (4 - 1.2) * 0.5 / 0.6
-    assert calls[1]["run_time"] == pytest.approx((4 - 1.2) * period / 0.6, rel=0.05)
+    # chunk sized to close the deficit PLUS the whole-cycle safety margin:
+    # quality counts INTEGER cycles, so exact-target sizing graded prod
+    # naca-4412 −15° span ~2.8 as "2.00 < 3.00" twice.
+    assert calls[1]["run_time"] == pytest.approx((4 + 0.6 - 1.2) * period / 0.6, rel=0.05)
     assert result is not None
     assert result.quality.ok
     # the returned result grades the WHOLE merged window
@@ -598,7 +600,10 @@ def test_continuation_extends_underretained_sparse_nonstationary_window(tmp_path
     )
 
     assert len(calls) == 2
-    assert calls[1]["run_time"] == pytest.approx(period, rel=0.01)
+    # deficit (3 − 2 cycles) plus the whole-cycle safety margin
+    assert calls[1]["run_time"] == pytest.approx(
+        (1.0 + pipeline.RETENTION_SAFETY_CYCLES) * period, rel=0.01
+    )
     assert calls[1]["write_interval"] == pytest.approx(
         period / pipeline.URANS_MIN_FRAMES_PER_CYCLE,
         rel=0.01,

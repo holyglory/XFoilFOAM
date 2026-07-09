@@ -397,6 +397,11 @@ TRANSIENT_INITIAL_STROUHAL = 0.5
 # at roughly Co <= 1 (dt <= 2x the Strouhal period/5000 guess); resumed,
 # extension, and refined chunks use their measured-period cadence/caps.
 STARTUP_MAX_DELTA_T_FACTOR = 2.0
+#: Extra span-retention (cycles) the extension loop targets past the whole-
+#: cycle requirement: the quality gate counts INTEGER cycles, so breaking at a
+#: fractional span-retention of exactly `target` leaves the gate one whole
+#: cycle short (prod naca-4412 −15° u=100: span ~2.8 graded as 2.00 < 3.00).
+RETENTION_SAFETY_CYCLES = 0.6
 URANS_REFINED_CADENCE_STROUHAL = 0.75
 URANS_MIN_RETAINED_CYCLES = 7.0
 #: Early-stop retention target. The two-period comparator only DETECTS a
@@ -1464,14 +1469,20 @@ def _extend_transient_until_periods(
         if span <= 0.0:
             break
         retained = span * (1.0 - discard) / period
-        if retained + 1e-6 >= target:
+        # Quality counts WHOLE retained cycles (integer sub-windows), so a
+        # span-retention of ~2.9 still grades as 2 whole cycles — prod
+        # naca-4412 −15° u=100 was rejected at exactly "retained cycles
+        # 2.00 < 3.00" twice (span ~2.8) because this break fired at the
+        # fractional target. Overshoot past the integer boundary so the
+        # loop and the gate agree.
+        if retained + 1e-6 >= target + RETENTION_SAFETY_CYCLES:
             break
         # Prod naca-4412 -15deg precalc retained 2.00/3.00 cycles at 19.5
         # frames/cycle and was not yet stationary, but still had a measurable
         # period and hours of budget. Those blockers are solved by more
         # integration; the next chunk writes at period/20 while the budget guard
         # below remains the honest stop condition.
-        chunk_sim = (target - retained) * period / max(1e-6, 1.0 - discard)
+        chunk_sim = (target + RETENTION_SAFETY_CYCLES - retained) * period / max(1e-6, 1.0 - discard)
         if timeout and total_wall > 0.0:
             # Rate = THIS job's simulated progress per wall second. For a
             # cross-job continuation the retained window spans prior jobs'

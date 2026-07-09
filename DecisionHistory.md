@@ -2790,3 +2790,13 @@ mean).
 - Validation tally to date (new mesh): s1223 30° Re 3.4M ACCEPTED in 6 min
   (oscillating-steady; old projection 57–59 h); naca-4412 −15° u=100 ran
   2.0 cycles in 26 min (old: 0.9 cycles in 2 h).
+
+## 2026-07-09 — RETENTION_SAFETY_CYCLES: loop/gate whole-cycle alignment
+
+- Post-startupramp validation: naca-4412 −15° u=100 rejected at exactly
+  "retained cycles 2.00 < 3.00" a SECOND time (span-retention ~2.8, new
+  engine). Root cause: the extension loop breaks on FRACTIONAL span
+  retention ≥ target while the quality gate counts INTEGER whole cycles —
+  span 2.9 grades as 2. Fix: RETENTION_SAFETY_CYCLES = 0.6 — the loop
+  targets (and sizes chunks for) target + 0.6 cycles so the integer
+  boundary is always crossed. Tests updated to pin the margin sizing.
