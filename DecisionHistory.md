@@ -2817,3 +2817,33 @@ mean).
   not a mechanism failure. Cells of this shape belong to the full tier
   (request-URANS) or stand as documented steady values; no further
   precalc tuning warranted on single-cell evidence.
+
+## 2026-07-09 — Forensics round: two stacked bugs behind the heavy-chord "missing or flat" pile
+
+- VPS forensics (3 cells + code cross-check) EXONERATED the wall-function
+  mesh and both physics hypotheses. Real causes:
+  1. ZERO-STEP RESTART: the in-case 600-iter simpleFoam init leaves
+     uniform/time deltaT=1 s (pseudo-time); latestTime restart restores it
+     (controlDict overridden, setInitialDeltaT skipped at timeIndex!=0) and
+     Time::run()'s `value < endTime - 0.5*deltaT` is false for any target
+     span <= 0.5 s → pimpleFoam exits with ZERO steps ("Starting time
+     loop"→"End", Courant mean 167/max 31446 fingerprint) and the grader
+     consumes the init's pseudo-time segment → "missing or flat" in
+     minutes. Hit every freestream-fallback cell with span 20c/u <= 0.5 s.
+  2. STROUHAL BAND CLAMP: the surviving class (c=1 u=25, span 0.8 s)
+     integrated 4 nominal periods and shed a constant-amplitude ±0.1 Cl
+     limit cycle at 17.6 Hz = chord-St 0.70 — post-stall shedding scales
+     with PROJECTED HEIGHT c·sinα (St_h≈0.18, textbook) — but the
+     chord-based band (0.05,0.5) capped at 12.5 Hz → real peak discarded →
+     "missing or flat" → extension forbidden. A correct measurement graded
+     unmeasurable.
+- Fixes (Codex gpt-5.5 xhigh, reviewed): init-only uniform/time sanitize
+  (rewrites deltaT/deltaT0 to the transient initial dt after
+  log.simpleFoam.init, before the first fresh attempt; chunk restarts and
+  continuations untouched — pinned by tests); α-aware shedding band via
+  projected height h = c·max(sin|α|, 0.15) widening the HIGH-frequency
+  ceiling only (low side stays chord-based; sub-harmonic 80% rule,
+  credibility and undercut gates intact); α threaded through every band
+  consumer. Must-catch: dt=1 uniform/time regression; chord-St-0.70
+  fixture measures ~0.057 s (was None); α=2 preserves old band; noise
+  still None; lottery fixtures still pass. Engine suite 335 passed.

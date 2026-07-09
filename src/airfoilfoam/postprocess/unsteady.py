@@ -75,6 +75,12 @@ class StablePeriodResult:
 #: it is harmonics or numerical noise — neither is the shedding fundamental.
 SHEDDING_STROUHAL_BAND: tuple[float, float] = (0.05, 0.5)
 
+#: Above this projected-height ratio, separated/post-stall shedding is measured
+#: against the airfoil's projected frontal height ``c*sin(|alpha|)``. Below it,
+#: keep the chord-based band: attached low-alpha cases retain the existing
+#: acceptance/rejection behavior instead of widening the high-frequency side.
+SHEDDING_PROJECTED_HEIGHT_FLOOR = 0.15
+
 #: Sub-harmonic preference tolerance: within the physical band the HIGHEST-
 #: frequency peak whose autocorrelation (or in-band FFT magnitude) is at least
 #: this fraction of the strongest in-band peak wins. 0.8 because a genuine
@@ -121,13 +127,31 @@ IN_BAND_CREDIBILITY_FRACTION = 0.05
 AC_FFT_UNDERCUT_TOLERANCE = 0.25
 
 
+def _shedding_reference_length(chord: float, alpha_deg: "float | None") -> float:
+    if alpha_deg is None:
+        return chord
+    try:
+        sin_alpha = abs(math.sin(math.radians(float(alpha_deg))))
+    except (TypeError, ValueError):
+        return chord
+    if not math.isfinite(sin_alpha) or sin_alpha <= SHEDDING_PROJECTED_HEIGHT_FLOOR:
+        return chord
+    return chord * sin_alpha
+
+
 def shedding_period_band(
     speed: "float | None",
     chord: "float | None",
     st_band: tuple[float, float] = SHEDDING_STROUHAL_BAND,
+    *,
+    alpha_deg: "float | None" = None,
 ) -> "tuple[float, float] | None":
     """Physically plausible shedding-period window [s] for the flow context:
-    St in ``st_band`` => period in [c/(St_max U), c/(St_min U)].
+    St in ``st_band`` => period in [H/(St_max U), c/(St_min U)] where ``H`` is
+    chord for attached/low-alpha cases and projected height for separated
+    high-alpha cases. The low-frequency side remains chord-based so the
+    sub-harmonic/undercut guards keep their previous safety boundary; high alpha
+    only widens the high-frequency ceiling.
 
     Returns None (no constraint — explicit legacy behavior) when the flow
     context is missing or unusable.
@@ -142,17 +166,20 @@ def shedding_period_band(
     lo, hi = float(st_band[0]), float(st_band[1])
     if not (0 < lo < hi):
         return None
-    return (c / (hi * u), c / (lo * u))
+    length = _shedding_reference_length(c, alpha_deg)
+    return (length / (hi * u), c / (lo * u))
 
 
 def shedding_frequency_band(
     speed: "float | None",
     chord: "float | None",
     st_band: tuple[float, float] = SHEDDING_STROUHAL_BAND,
+    *,
+    alpha_deg: "float | None" = None,
 ) -> "tuple[float, float] | None":
     """Frequency-domain twin of :func:`shedding_period_band`: [St_min U / c,
-    St_max U / c] in Hz, or None without flow context."""
-    band = shedding_period_band(speed, chord, st_band)
+    St_max U / H] in Hz, or None without flow context."""
+    band = shedding_period_band(speed, chord, st_band, alpha_deg=alpha_deg)
     if band is None:
         return None
     p_lo, p_hi = band
@@ -395,6 +422,7 @@ def stable_two_period_window(
     phase_samples: int = 96,
     similarity_tolerance: float = 0.12,
     mean_drift_tolerance: float = 0.12,
+    alpha_deg: float | None = None,
 ) -> StablePeriodResult:
     """Return an early-stop candidate when the final two periods are repeatable.
 
@@ -419,7 +447,9 @@ def stable_two_period_window(
     if t.size < max(16, min_samples_per_cycle * 2):
         return StablePeriodResult(ok=False, reason="not enough retained coefficient samples")
 
-    freq = dominant_frequency(t, cl, freq_band=shedding_frequency_band(speed, chord))
+    freq = dominant_frequency(
+        t, cl, freq_band=shedding_frequency_band(speed, chord, alpha_deg=alpha_deg)
+    )
     st = strouhal(freq, chord, speed)
     period = chord / (st * speed) if st > 0 else None
     if period is None or not math.isfinite(period) or period <= 0:
@@ -719,13 +749,14 @@ def estimate_period(
     min_cycles: float = 2.0,
     corr_threshold: float = 0.2,
     ambiguity_tolerance: float = PERIOD_AMBIGUITY_TOLERANCE,
+    alpha_deg: "float | None" = None,
 ) -> "PeriodEstimate | None":
     """Flow-context-aware shedding period with a stability check.
 
     Wraps :func:`measure_period` with the physical Strouhal band derived from
-    ``speed``/``chord`` (legacy unconstrained search when either is missing),
-    then estimates the period independently on the two halves of the analysis
-    window. Half-window estimates differing by more than
+    ``speed``/``chord`` plus optional ``alpha_deg`` (legacy unconstrained search
+    when speed/chord is missing), then estimates the period independently on the
+    two halves of the analysis window. Half-window estimates differing by more than
     ``ambiguity_tolerance`` mark the period AMBIGUOUS: both values are
     disclosed and the conservative SHORTER estimate becomes ``period_s``, so
     retained-cycle counting and budget projection can never be starved by an
@@ -733,7 +764,7 @@ def estimate_period(
     the projection math, with the ambiguity reported as a quality warning by
     the callers.
     """
-    band = shedding_period_band(speed, chord)
+    band = shedding_period_band(speed, chord, alpha_deg=alpha_deg)
     t, v = _normalise_series(times, values)
     if t.size == 0:
         return None
@@ -1133,6 +1164,7 @@ def force_history(
     discard_fraction: float = 0.4,
     max_points: int = 400,
     target_cycles: int = 7,
+    alpha_deg: float | None = None,
 ) -> ForceHistory:
     """Extract the windowed Cl/Cd/Cm time series from a transient coefficient.dat,
     plus the measured shedding frequency and Strouhal number.
@@ -1156,7 +1188,9 @@ def force_history(
     # so history.strouhal / period_s — the quality-evaluation period chain —
     # can never lock onto a low-frequency sub-harmonic of a broadband
     # post-stall signal. Without speed/chord the band is None (legacy search).
-    freq = dominant_frequency(t_a, cl_a, freq_band=shedding_frequency_band(speed, chord))
+    freq = dominant_frequency(
+        t_a, cl_a, freq_band=shedding_frequency_band(speed, chord, alpha_deg=alpha_deg)
+    )
     st = strouhal(freq, chord, speed)
     period = chord / (st * speed) if st > 0 and speed > 0 and chord > 0 else None
     window = integer_period_window(t_a, period, discard_fraction=0.0, target_cycles=target_cycles) if period else None

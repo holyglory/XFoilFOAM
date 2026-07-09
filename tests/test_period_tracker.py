@@ -51,6 +51,7 @@ from airfoilfoam.postprocess.unsteady import (
     measure_period,
     shedding_frequency_band,
     shedding_period_band,
+    stable_two_period_window,
 )
 
 # Prod flow context: naca-0012, U=25 m/s, c=0.1 m.
@@ -58,6 +59,12 @@ PROD_U = 25.0
 PROD_C = 0.1
 PROD_T0 = 0.0338  # measured run-1 shedding period (St 0.118)
 PROD_TSUB = 4 * PROD_T0  # ~0.135 s modulation the run-2 tracker locked onto
+
+POSTSTALL_U = 25.0
+POSTSTALL_C = 1.0
+POSTSTALL_ALPHA = 15.0
+POSTSTALL_FREQ = 17.6
+POSTSTALL_PERIOD = 1.0 / POSTSTALL_FREQ
 
 
 # --------------------------------------------------------------------------- #
@@ -82,6 +89,105 @@ def test_band_requires_flow_context_explicit_legacy_otherwise():
     assert shedding_period_band(PROD_U, 0.0) is None
     assert shedding_period_band(math.nan, PROD_C) is None
     assert shedding_frequency_band(None, None) is None
+
+
+def test_projected_height_band_widens_high_alpha_only():
+    old_freq = shedding_frequency_band(POSTSTALL_U, POSTSTALL_C)
+    low_alpha = shedding_frequency_band(POSTSTALL_U, POSTSTALL_C, alpha_deg=2.0)
+    high_alpha = shedding_frequency_band(POSTSTALL_U, POSTSTALL_C, alpha_deg=POSTSTALL_ALPHA)
+
+    assert low_alpha == pytest.approx(old_freq)
+    assert old_freq == pytest.approx((1.25, 12.5))
+    assert high_alpha[0] == pytest.approx(old_freq[0])
+    assert high_alpha[1] == pytest.approx(
+        SHEDDING_STROUHAL_BAND[1]
+        * POSTSTALL_U
+        / (POSTSTALL_C * math.sin(math.radians(POSTSTALL_ALPHA)))
+    )
+    assert high_alpha[0] < POSTSTALL_FREQ < high_alpha[1]
+
+
+def _chord_st_070_poststall(seed: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0.0, 0.8, 5113)
+    cl = (
+        0.7
+        + 0.1 * np.sin(2 * np.pi * POSTSTALL_FREQ * t + 0.3)
+        + rng.normal(0.0, 0.006, t.size)
+    )
+    return t, cl
+
+
+def test_projected_height_band_measures_chord_st_070_poststall_signal(tmp_path):
+    """MUST-CATCH: c=1, U=25, alpha=15 sheds at 17.6 Hz. Chord St=0.70 is
+    outside the old high-frequency ceiling, but projected-height St_h is valid."""
+    t, cl = _chord_st_070_poststall()
+    old_band = shedding_period_band(POSTSTALL_U, POSTSTALL_C, alpha_deg=2.0)
+    high_alpha_band = shedding_period_band(
+        POSTSTALL_U,
+        POSTSTALL_C,
+        alpha_deg=POSTSTALL_ALPHA,
+    )
+
+    assert measure_period(t, cl, period_band=old_band) is None
+    assert estimate_period(t, cl, speed=POSTSTALL_U, chord=POSTSTALL_C, alpha_deg=2.0) is None
+
+    measured = measure_period(t, cl, period_band=high_alpha_band)
+    estimate = estimate_period(
+        t,
+        cl,
+        speed=POSTSTALL_U,
+        chord=POSTSTALL_C,
+        alpha_deg=POSTSTALL_ALPHA,
+    )
+
+    assert measured == pytest.approx(POSTSTALL_PERIOD, rel=0.03)
+    assert estimate is not None and not estimate.ambiguous
+    assert estimate.period_s == pytest.approx(POSTSTALL_PERIOD, rel=0.03)
+
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    _write_coeff_rows(coeff, t, cl)
+    hist = force_history(
+        coeff,
+        POSTSTALL_U,
+        POSTSTALL_C,
+        discard_fraction=0.0,
+        alpha_deg=POSTSTALL_ALPHA,
+    )
+    assert hist.period_s == pytest.approx(POSTSTALL_PERIOD, rel=0.03)
+    assert hist.shedding_freq_hz == pytest.approx(POSTSTALL_FREQ, rel=0.03)
+
+    frame_start = float(t[-1]) - 2.0 * POSTSTALL_PERIOD
+    frame_times = [frame_start + i * (2.0 * POSTSTALL_PERIOD / 60.0) for i in range(61)]
+    stable = stable_two_period_window(
+        coeff,
+        speed=POSTSTALL_U,
+        chord=POSTSTALL_C,
+        alpha_deg=POSTSTALL_ALPHA,
+        frame_times=frame_times,
+        min_frames_per_cycle=20,
+    )
+    assert stable.ok
+    assert stable.period_s == pytest.approx(POSTSTALL_PERIOD, rel=0.03)
+
+
+def test_projected_height_band_noise_only_still_has_no_period():
+    rng = np.random.default_rng(11)
+    t = np.linspace(0.0, 0.8, 5113)
+    cl = 0.7 + rng.normal(0.0, 0.05, t.size)
+    band = shedding_period_band(POSTSTALL_U, POSTSTALL_C, alpha_deg=POSTSTALL_ALPHA)
+
+    assert measure_period(t, cl, period_band=band) is None
+    assert (
+        estimate_period(
+            t,
+            cl,
+            speed=POSTSTALL_U,
+            chord=POSTSTALL_C,
+            alpha_deg=POSTSTALL_ALPHA,
+        )
+        is None
+    )
 
 
 # --------------------------------------------------------------------------- #

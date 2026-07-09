@@ -530,10 +530,10 @@ def _foam_value(value: object) -> str:
     return str(value)
 
 
-def _set_control_dict_entries(control_dict: Path, entries: dict[str, object]) -> None:
-    if not control_dict.exists():
+def _set_foam_dict_entries(dict_path: Path, entries: dict[str, object]) -> None:
+    if not dict_path.exists():
         return
-    text = control_dict.read_text()
+    text = dict_path.read_text()
     for key, value in entries.items():
         value_text = _foam_value(value)
         pattern = re.compile(rf"(^\s*{re.escape(key)}\s+)([^;]*)(;)", re.MULTILINE)
@@ -542,7 +542,40 @@ def _set_control_dict_entries(control_dict: Path, entries: dict[str, object]) ->
             text = pattern.sub(replacement, text, count=1)
         else:
             text += f"\n{key:<16} {value_text};\n"
-    control_dict.write_text(text)
+    dict_path.write_text(text)
+
+
+def _set_control_dict_entries(control_dict: Path, entries: dict[str, object]) -> None:
+    _set_foam_dict_entries(control_dict, entries)
+
+
+def _sanitize_freestream_init_time_state(case_dir: Path, initial_delta_t: float) -> bool:
+    """Reset a SIMPLE-init pseudo-time restart to the intended transient dt.
+
+    OpenFOAM v2406 restores ``deltaT`` from ``latestTime/uniform/time`` before
+    the first pimpleFoam step. A 600-iteration simpleFoam init writes pseudo-time
+    ``deltaT 1``/``deltaT0 1``; for a 0.4 s startup span, Time::run sees
+    ``600 < 600.4 - 0.5*1`` as false and exits after zero steps. The forensic
+    fingerprint is the first Courant line exploding (mean 167 / max 31446) from
+    an inherited 1 s step.
+    """
+    if not (case_dir / "log.simpleFoam.init").is_file():
+        return False
+    try:
+        dt = float(initial_delta_t)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(dt) or dt <= 0:
+        return False
+    latest = _latest_time_dir(case_dir)
+    if latest is None:
+        return False
+    time_state = latest / "uniform" / "time"
+    if not time_state.is_file():
+        return False
+    before = time_state.read_text()
+    _set_foam_dict_entries(time_state, {"deltaT": dt, "deltaT0": dt})
+    return time_state.read_text() != before
 
 
 def _read_early_stop_marker(case_dir: Path) -> dict[str, object] | None:
@@ -868,6 +901,7 @@ def _make_urans_monitor(
             coeff_files,
             speed=spec.speed,
             chord=spec.chord,
+            alpha_deg=spec.aoa_deg,
             frame_times=_numeric_time_dirs(tcase),
             discard_fraction=0.0,
             min_frames_per_cycle=URANS_MIN_FRAMES_PER_CYCLE,
@@ -1260,6 +1294,7 @@ def _run_transient_attempt(
             spec.chord,
             history_discard,
             target_cycles=target_cycles,
+            alpha_deg=spec.aoa_deg,
         )
     except Exception:  # noqa: BLE001 - quality/history is non-fatal
         history = None
@@ -1455,7 +1490,9 @@ def _extend_transient_until_periods(
             or len(history.t) < 8
         ):
             break
-        estimate = estimate_period(history.t, history.cl, speed=spec.speed, chord=spec.chord)
+        estimate = estimate_period(
+            history.t, history.cl, speed=spec.speed, chord=spec.chord, alpha_deg=spec.aoa_deg
+        )
         period = estimate.period_s if estimate is not None else None
         period_note = ""
         if estimate is not None and estimate.ambiguous:
@@ -1607,7 +1644,9 @@ def _run_transient(
             saved_paths = _transient_coeff_selection(tcase, transient_start)
             if saved_paths:
                 t_all, cl_all, _cd_all, _cm_all = coefficient_series(saved_paths)
-                estimate = estimate_period(t_all, cl_all, speed=spec.speed, chord=spec.chord)
+                estimate = estimate_period(
+                    t_all, cl_all, speed=spec.speed, chord=spec.chord, alpha_deg=spec.aoa_deg
+                )
                 if estimate is not None:
                     period = estimate.period_s
         except Exception:  # noqa: BLE001 - chunk sizing must never block the resume
@@ -1658,6 +1697,7 @@ def _run_transient(
 
         initial_run_time = solver_params.transient_cycles * initial_period
         transient_start = _latest_time(tcase)
+        _sanitize_freestream_init_time_state(tcase, initial_delta_t)
         # Persist the merge boundary so a cross-job continuation can keep
         # merging coefficient segments after this job is gone.
         write_transient_start_marker(tcase, transient_start)
@@ -2233,7 +2273,7 @@ def _finalize_outcome(
                             fraction=solver_params.transient_discard_fraction,
                         )
                     frame_estimate: Optional[PeriodEstimate] = estimate_period(
-                        t_c, cl_c, speed=spec.speed, chord=spec.chord
+                        t_c, cl_c, speed=spec.speed, chord=spec.chord, alpha_deg=spec.aoa_deg
                     )
                     frame_period = frame_estimate.period_s if frame_estimate is not None else None
                     if frame_estimate is not None and frame_estimate.ambiguous:

@@ -69,6 +69,33 @@ def _write_shedding_coeff(path: Path, f=5.0, n=500, dt=0.002, cl0=0.7, cd0=0.2):
     path.write_text("\n".join(lines) + "\n")
 
 
+def _write_uniform_time_state(time_dir: Path, delta_t: float, delta_t0: float | None = None) -> Path:
+    uniform = time_dir / "uniform"
+    uniform.mkdir(parents=True, exist_ok=True)
+    value = float(time_dir.name)
+    path = uniform / "time"
+    path.write_text(
+        "FoamFile\n"
+        "{\n"
+        "    class       dictionary;\n"
+        "    object      time;\n"
+        "}\n"
+        f"deltaT          {delta_t:.12g};\n"
+        f"deltaT0         {(delta_t if delta_t0 is None else delta_t0):.12g};\n"
+        f"index           {int(value)};\n"
+        f"value           {value:.12g};\n"
+    )
+    return path
+
+
+def _foam_entry(text: str, key: str) -> str | None:
+    for raw in text.splitlines():
+        parts = raw.strip().split()
+        if len(parts) >= 2 and parts[0] == key:
+            return parts[1].rstrip(";")
+    return None
+
+
 def _write_drifting_steady_coeff(path: Path, n=600):
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"]
@@ -400,6 +427,119 @@ def test_seed_transient_from_steady_requires_essential_fields(tmp_path):
     (tcase / "0").mkdir(parents=True)
     assert pipeline._seed_transient_from_steady(steady, tcase) is False
     assert not (tcase / "0" / "k").exists()
+
+
+def test_freestream_init_rewrites_pseudo_time_delta_t_before_transient(tmp_path):
+    """MUST-CATCH: simpleFoam init writes pseudo-time deltaT=1 at latestTime.
+    pimpleFoam latestTime restart must enter with the transient initial dt, not
+    exit zero-step on the inherited SIMPLE time state."""
+    tcase = tmp_path / "transient"
+    latest = tcase / "600"
+    time_state = _write_uniform_time_state(latest, delta_t=1.0, delta_t0=1.0)
+    (tcase / "log.simpleFoam.init").write_text("Time = 600\nEnd\n")
+    initial_delta_t = pipeline.physics.shedding_period(
+        50.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    ) / 5000.0
+
+    start = 600.0
+    run_span = 20.0 * 1.0 / 50.0
+    assert not (start < start + run_span - 0.5 * 1.0)
+
+    assert pipeline._sanitize_freestream_init_time_state(tcase, initial_delta_t)
+
+    text = time_state.read_text()
+    assert float(_foam_entry(text, "deltaT")) == pytest.approx(initial_delta_t)
+    assert float(_foam_entry(text, "deltaT0")) == pytest.approx(initial_delta_t)
+    assert _foam_entry(text, "index") == "600"
+    assert _foam_entry(text, "value") == "600"
+    assert start < start + run_span - 0.5 * initial_delta_t
+
+
+def test_freestream_init_sanitize_is_not_a_warm_seed_rewrite(tmp_path):
+    tcase = tmp_path / "transient"
+    time_state = _write_uniform_time_state(tcase / "0", delta_t=0.002, delta_t0=0.002)
+    before = time_state.read_text()
+
+    assert not pipeline._sanitize_freestream_init_time_state(tcase, 8e-6)
+    assert time_state.read_text() == before
+
+
+def test_chunk_restart_attempt_keeps_real_transient_uniform_time(tmp_path, monkeypatch):
+    """False-positive guard: in-run restart chunks carry a real transient dt in
+    latestTime/uniform/time. _run_transient_attempt must not sanitize it just
+    because the original case still has log.simpleFoam.init."""
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    time_state = _write_uniform_time_state(tcase / "12", delta_t=0.002, delta_t0=0.002)
+    (tcase / "log.simpleFoam.init").write_text("Time = 600\nEnd\n")
+    before = time_state.read_text()
+
+    class FakeRunner:
+        def solver(self, case_dir, *_args, **_kwargs):
+            assert (Path(case_dir) / "12" / "uniform" / "time").read_text() == before
+            return SimpleNamespace(ok=False, returncode=1, timed_out=False, stdout="crash")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+
+    assert _run_transient_attempt(
+        tcase,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=CaseSpec(chord=1.0, speed=50.0, aoa_deg=25.0),
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=60,
+        run_time=0.4,
+        delta_t=8e-6,
+    ) is None
+    assert time_state.read_text() == before
+
+
+def test_cross_job_continuation_keeps_real_transient_uniform_time(tmp_path, monkeypatch):
+    tcase = tmp_path / "case" / "transient"
+    (tcase / "0").mkdir(parents=True)
+    time_state = _write_uniform_time_state(tcase / "12", delta_t=0.002, delta_t0=0.002)
+    (tcase / "log.simpleFoam.init").write_text("original init evidence")
+    before = time_state.read_text()
+
+    monkeypatch.setattr(pipeline, "get_mesher", lambda _name: SimpleNamespace(patches=lambda _mesh: {}))
+
+    def fake_attempt(tcase_arg, *_args, **_kwargs):
+        assert (Path(tcase_arg) / "12" / "uniform" / "time").read_text() == before
+        return TransientResult(
+            avg=SimpleNamespace(cl=0.3, cd=0.03, cm=-0.02, cl_cd=10.0, cl_std=0.0, cd_std=0.0, cm_std=0.0),
+            case_dir=Path(tcase_arg),
+            force_history=None,
+            quality=UransQuality(ok=True, can_refine=False, reason="continued"),
+            start_time=0.0,
+            end_time=12.1,
+            run_time=0.1,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    result = pipeline._run_transient(
+        tmp_path / "case",
+        airfoil=None,
+        resolved=MeshParams(),
+        spec=CaseSpec(chord=1.0, speed=50.0, aoa_deg=25.0),
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(),
+        runner=None,
+        n_proc=1,
+        timeout=60,
+        resume=pipeline.TransientResume(transient_start=0.0, resume_from=12.0),
+    )
+
+    assert result is not None
+    assert time_state.read_text() == before
 
 
 # --------------------------------------------------------------------------- #
