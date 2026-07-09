@@ -1,7 +1,7 @@
 "use client";
 
-import { f1, f2, f4, type FieldId, type FieldTrackPoint, fRe, type Point, type SimulationDetail } from "@aerodb/core";
-import { type CSSProperties, type MouseEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { f1, f2, type FieldId, type FieldTrackPoint, fRe, type Point, type SimulationDetail } from "@aerodb/core";
+import { type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { browserUrl, renderResultField } from "@/lib/api";
 import {
@@ -13,19 +13,18 @@ import {
   frameForChartX,
   frameImageUrl,
   frameIndexForTime,
-  historyFracForTime,
   PLAYER_CHART_GEOMETRY,
   periodOrdinal,
+  periodTickFractions,
   type FramePlayerModel,
   type PlaybackSpeed,
   timeForFrameIndex,
   windowPeriodCount,
 } from "@/lib/frame-player";
 import { fidelityChipView } from "@/lib/point-history";
-import { buildSteadyHistoryModel, type SteadyHistoryModel } from "@/lib/steady-history";
+import { buildSteadyHistoryModel, summarizeSteadyWindow, type SteadyHistoryModel } from "@/lib/steady-history";
 import { C, MONO, VIZ } from "@/lib/tokens";
 
-const PERIOD = 4;
 const FIELDS: FieldId[] = [
   "velocity_magnitude",
   "velocity_x",
@@ -36,6 +35,7 @@ const FIELDS: FieldId[] = [
   "turbulent_kinetic_energy",
   "turbulent_viscosity",
 ];
+const FIELD_ID_SET = new Set<string>(FIELDS);
 const FIELD_LABELS: Record<FieldId, string> = {
   velocity_magnitude: "velocity |U|",
   velocity_x: "velocity Ux",
@@ -48,14 +48,16 @@ const FIELD_LABELS: Record<FieldId, string> = {
 };
 const COLORMAPS = ["viridis", "coolwarm", "magma", "plasma", "cividis", "turbo"];
 
-const statCard: CSSProperties = {
-  flex: 1,
-  minWidth: 104,
-  border: `1px solid ${C.stroke2}`,
-  borderRadius: 9,
-  background: C.panel2,
-  padding: "8px 11px",
-};
+function asFieldId(value: string | null | undefined): FieldId | null {
+  return value && FIELD_ID_SET.has(value) ? (value as FieldId) : null;
+}
+
+function labelForField(value: string | null | undefined): string {
+  if (!value) return "field";
+  const fid = asFieldId(value);
+  return fid ? FIELD_LABELS[fid] : value.replace(/_/g, " ");
+}
+
 const dlBtn: CSSProperties = {
   fontFamily: MONO,
   fontSize: 11,
@@ -108,12 +110,6 @@ export function SimModal(props: {
   const clMonRef = useRef<HTMLCanvasElement>(null);
   const cdMonRef = useRef<HTMLCanvasElement>(null);
   const ldMonRef = useRef<HTMLCanvasElement>(null);
-  const fillRef = useRef<HTMLDivElement>(null);
-  const knobRef = useRef<HTMLDivElement>(null);
-  const trackRef = useRef<HTMLDivElement>(null);
-  const animTimeRef = useRef(0);
-  const lastUiRef = useRef(0);
-  const [scrubFrac, setScrubFrac] = useState(0);
   const [renderBusy, setRenderBusy] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [customRender, setCustomRender] = useState<{ field: FieldId; role: "instantaneous" | "mean"; url: string; cached: boolean } | null>(null);
@@ -137,71 +133,50 @@ export function SimModal(props: {
   const [frameField, setFrameField] = useState<string | null>(null);
   const [preload, setPreload] = useState<{ field: string; loaded: number; failed: number; total: number } | null>(null);
   const playerSimTimeRef = useRef(0);
-  const playerChartRef = useRef<HTMLCanvasElement>(null);
   const chartDragRef = useRef(false);
   const preloadImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
 
   const stalled = sim?.regime === "stalled";
-  // Engine-recorded frame track → player model; null = legacy evidence (steady,
-  // no-shedding, pre-contract, or drifted payload) → the stored mp4 stays.
+  // Engine-recorded frame track → player model; null = steady, no-shedding,
+  // pre-contract, or drifted payload, which stays in the static media layout.
   const playerModel = useMemo(() => buildFramePlayerModel(sim?.frameTrack ?? null), [sim?.frameTrack]);
   // Oscillating-steady iteration history (fidelity ladder contract 2): null =
   // classic pointwise convergence — the section renders nothing new.
   const steadyModel = useMemo(() => buildSteadyHistoryModel(sim?.steadyHistory ?? null), [sim?.steadyHistory]);
-  const steadyClRef = useRef<HTMLCanvasElement>(null);
-  const steadyCdRef = useRef<HTMLCanvasElement>(null);
-  const steadyCmRef = useRef<HTMLCanvasElement>(null);
   const framesMode = Boolean(playerModel && stalled);
   const frameIdx = playerModel ? clampFrameIndex(playerModel.frames.length, frameIndex) : -1;
   const currentFrame = playerModel && frameIdx >= 0 ? playerModel.frames[frameIdx] : null;
-  const realField = (f: FieldId) => (sim?.status === "solved" ? sim.media?.[f] : undefined);
+  const activeField = frameField ?? field;
+  const activeFieldId = asFieldId(activeField);
+  const fieldLabel = labelForField(activeField);
+  const realField = (f: FieldId | null) => (f && sim?.status === "solved" ? sim.media?.[f] : undefined);
+  const activeStoredMedia = realField(activeFieldId);
+  const fieldChoices = useMemo(() => {
+    const out: string[] = [];
+    const add = (value: string | null | undefined) => {
+      if (!value || out.includes(value)) return;
+      out.push(value);
+    };
+    playerModel?.fields.forEach(add);
+    sim?.availableFields.forEach(add);
+    add(field);
+    return out;
+  }, [field, playerModel, sim?.availableFields]);
+  const isAnimatedField = Boolean(playerModel && activeField && (playerModel.frameImageCounts[activeField] ?? 0) > 0);
+  const transportActive = Boolean(framesMode && playerModel && currentFrame && isAnimatedField);
+  const sortedTrack = useMemo(() => track.slice().sort((a, b) => a.aoa - b.aoa), [track]);
   const selectedTrackIndex = useMemo(() => {
-    if (!track.length) return -1;
-    const byId = ctx?.resultId ? track.findIndex((p) => p.resultId === ctx.resultId) : -1;
+    if (!sortedTrack.length) return -1;
+    const byId = ctx?.resultId ? sortedTrack.findIndex((p) => p.resultId === ctx.resultId) : -1;
     if (byId >= 0) return byId;
-    return track.findIndex((p) => Math.abs(p.aoa - (sim?.alpha ?? ctx?.aoa ?? 0)) < 1e-6);
-  }, [ctx?.aoa, ctx?.resultId, sim?.alpha, track]);
+    return sortedTrack.findIndex((p) => Math.abs(p.aoa - (sim?.alpha ?? ctx?.aoa ?? 0)) < 1e-6);
+  }, [ctx?.aoa, ctx?.resultId, sim?.alpha, sortedTrack]);
   const evidenceBundle = sim?.evidenceArtifacts?.find((artifact) => artifact.kind === "openfoam_bundle") ?? null;
   const fieldDataArtifact = sim?.evidenceArtifacts?.find((artifact) => artifact.kind === "vtk_window" || artifact.kind === "field_data") ?? null;
-  const historySeries = useMemo(() => {
-    if (!sim?.history) return null;
-    const len = Math.min(sim.history.cl.length, sim.history.cd.length);
-    const cl = sim.history.cl.slice(0, len);
-    const cd = sim.history.cd.slice(0, len);
-    const ld = cl.map((v, i) => (Math.abs(cd[i]) > 1e-9 ? v / cd[i] : 0));
-    const t = sim.history.t.slice(0, len);
-    return { t, cl, cd, ld };
-  }, [sim?.history]);
-  const currentHistory = useMemo(() => {
-    if (!historySeries || historySeries.cl.length === 0) return null;
-    const idx = Math.max(0, Math.min(historySeries.cl.length - 1, Math.round(scrubFrac * (historySeries.cl.length - 1))));
-    return {
-      idx,
-      t: historySeries.t[idx] ?? idx,
-      cl: historySeries.cl[idx],
-      cd: historySeries.cd[idx],
-      ld: historySeries.ld[idx],
-    };
-  }, [historySeries, scrubFrac]);
-  // Frames mode: the monitors' "exact at cursor" readout follows the frame
-  // clock (nearest full-history sample to frames[frameIndex].t).
-  const historyCursor = useMemo(() => {
-    if (!framesMode || !playerModel || !historySeries || historySeries.cl.length === 0) return null;
-    const t = timeForFrameIndex(playerModel, frameIdx);
-    const idx = Math.max(0, Math.min(historySeries.cl.length - 1, frameIndexForTime(historySeries.t, t)));
-    return {
-      idx,
-      t: historySeries.t[idx] ?? t,
-      cl: historySeries.cl[idx],
-      cd: historySeries.cd[idx],
-      ld: historySeries.ld[idx],
-    };
-  }, [framesMode, playerModel, historySeries, frameIdx]);
+  const steadySummary = useMemo(() => summarizeSteadyWindow(steadyModel), [steadyModel]);
 
   // reset the animation clock when a new point is opened
   useEffect(() => {
-    animTimeRef.current = 0;
-    setScrubFrac(0);
     setCustomRender(null);
     setRenderError(null);
     setRenderToolsOpen(false);
@@ -213,8 +188,13 @@ export function SimModal(props: {
   useEffect(() => {
     setFrameIndex(0);
     playerSimTimeRef.current = playerModel?.tStart ?? 0;
-    setFrameField(playerModel ? defaultFrameField(playerModel) : null);
-  }, [playerModel]);
+    setFrameField((current) => current ?? (playerModel ? defaultFrameField(playerModel) : field));
+  }, [field, playerModel]);
+
+  useEffect(() => {
+    if (!open || !fieldChoices.length) return;
+    setFrameField((current) => (current && fieldChoices.includes(current) ? current : fieldChoices[0]));
+  }, [fieldChoices, open]);
 
   // Lazily preload every frame PNG of the selected field so scrubbing and
   // playback don't flash. Absent URLs (unregistered evidence) are never
@@ -260,7 +240,7 @@ export function SimModal(props: {
   // Playback: rAF advances the sim clock at real-time-scaled speed (one
   // shedding period per wall second at 1×) and snaps to the nearest frame.
   useEffect(() => {
-    if (!open || !framesMode || !playerModel || !playing) return;
+    if (!open || !transportActive || !playerModel || !playing) return;
     let raf = 0;
     let last = performance.now();
     const loop = (now: number) => {
@@ -273,54 +253,69 @@ export function SimModal(props: {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [open, framesMode, playerModel, playing, playSpeed]);
+  }, [open, transportActive, playerModel, playing, playSpeed]);
 
-  // Frames mode drawing: the window Cl(t) chart cursor sits at
-  // frames[frameIndex].t and the secondary full-history monitors sync to the
-  // same instant (nearest history sample).
+  // Hero chart column: one geometry for URANS frame windows and RANS steady
+  // convergence. Empty states stay in the same slots instead of reshuffling.
   useEffect(() => {
-    if (!open || !framesMode || !playerModel) return;
-    const chart = playerChartRef.current;
-    if (chart) {
-      const g = chart.getContext("2d");
-      if (g) drawWindowChart(g, { width: chart.width, height: chart.height, model: playerModel, frameIndex: frameIdx });
+    if (!open) return;
+    if (framesMode && playerModel) {
+      const charts: Array<[HTMLCanvasElement | null, "cl" | "cd" | "ld", string]> = [
+        [clMonRef.current, "cl", "#2dd4bf"],
+        [cdMonRef.current, "cd", "#f59e0b"],
+        [ldMonRef.current, "ld", "#e6edf3"],
+      ];
+      for (const [canvas, series, color] of charts) {
+        if (!canvas) continue;
+        const g = canvas.getContext("2d");
+        if (!g) continue;
+        drawFrameWindowChart(g, { width: canvas.width, height: canvas.height, model: playerModel, frameIndex: frameIdx, series, color });
+      }
+      return;
     }
-    const frac = historySeries ? historyFracForTime(historySeries.t, timeForFrameIndex(playerModel, frameIdx)) : 0;
-    const monitors: Array<[HTMLCanvasElement | null, number[] | undefined, string]> = [
-      [clMonRef.current, historySeries?.cl, "#2dd4bf"],
-      [cdMonRef.current, historySeries?.cd, "#f59e0b"],
-      [ldMonRef.current, historySeries?.ld, "#e6edf3"],
-    ];
-    for (const [canvas, values, color] of monitors) {
+    if (steadyModel) {
+      const charts: Array<[HTMLCanvasElement | null, number[], string]> = [
+        [clMonRef.current, steadyModel.cl, "#2dd4bf"],
+        [cdMonRef.current, steadyModel.cd, "#f59e0b"],
+        [ldMonRef.current, steadyModel.cm, "#e6edf3"],
+      ];
+      for (const [canvas, values, color] of charts) {
+        if (!canvas) continue;
+        const g = canvas.getContext("2d");
+        if (!g) continue;
+        drawSteadyHistoryChart(g, { width: canvas.width, height: canvas.height, values, color, model: steadyModel });
+      }
+      return;
+    }
+    for (const canvas of [clMonRef.current, cdMonRef.current, ldMonRef.current]) {
       if (!canvas) continue;
       const g = canvas.getContext("2d");
       if (!g) continue;
-      if (values && values.length) drawForceChart(g, { width: canvas.width, height: canvas.height, values, color, frac });
-      else drawEmptyChart(g, { width: canvas.width, height: canvas.height });
+      drawEmptyChart(g, { width: canvas.width, height: canvas.height });
     }
-  }, [open, framesMode, playerModel, frameIdx, historySeries]);
+  }, [open, framesMode, playerModel, frameIdx, steadyModel]);
 
   const seekFrame = useCallback(
     (idx: number) => {
-      if (!playerModel) return;
+      if (!transportActive || !playerModel) return;
       const k = clampFrameIndex(playerModel.frames.length, idx);
       if (k < 0) return;
       setFrameIndex(k);
       playerSimTimeRef.current = timeForFrameIndex(playerModel, k);
       if (playing) onTogglePlay();
     },
-    [playerModel, playing, onTogglePlay],
+    [transportActive, playerModel, playing, onTogglePlay],
   );
 
   const chartPointerToFrame = useCallback(
     (e: ReactPointerEvent<HTMLCanvasElement>) => {
-      const canvas = playerChartRef.current;
-      if (!canvas || !playerModel) return;
+      if (!transportActive || !playerModel) return;
+      const canvas = e.currentTarget;
       const rect = canvas.getBoundingClientRect();
       const x = ((e.clientX - rect.left) / Math.max(1, rect.width)) * canvas.width;
       seekFrame(frameForChartX(x, playerModel, { width: canvas.width, ...PLAYER_CHART_GEOMETRY }));
     },
-    [playerModel, seekFrame],
+    [transportActive, playerModel, seekFrame],
   );
 
   useEffect(() => {
@@ -328,107 +323,31 @@ export function SimModal(props: {
     if (!sim.availableFields.includes(field)) onField(sim.availableFields[0]);
   }, [open, sim?.status, sim?.availableFields, field, onField]);
 
-  // Static oscillating-steady iteration charts (real recorded samples, shaded
-  // averaging window). Drawn once per model — no animation clock.
-  useEffect(() => {
-    if (!open || !steadyModel) return;
-    const charts: Array<[HTMLCanvasElement | null, number[], string]> = [
-      [steadyClRef.current, steadyModel.cl, "#2dd4bf"],
-      [steadyCdRef.current, steadyModel.cd, "#f59e0b"],
-      [steadyCmRef.current, steadyModel.cm, "#e6edf3"],
-    ];
-    for (const [canvas, values, color] of charts) {
-      if (!canvas) continue;
-      const g = canvas.getContext("2d");
-      if (!g) continue;
-      drawSteadyHistoryChart(g, { width: canvas.width, height: canvas.height, values, color, model: steadyModel });
-    }
-  }, [open, steadyModel]);
-
-  // Legacy loop (no frame track): keep the scrubber and real force-history
-  // charts moving without inventing CFD fields. Frames mode drives the same
-  // canvases from the frame index instead.
-  useEffect(() => {
-    if (!open || !sim || framesMode) return;
-    let raf = 0;
-    let last = performance.now();
-    const loop = (now: number) => {
-      raf = requestAnimationFrame(loop);
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
-      if (playing) animTimeRef.current += dt;
-      const frac = (((animTimeRef.current % PERIOD) + PERIOD) % PERIOD) / PERIOD;
-      const clc = clMonRef.current;
-      if (clc) {
-        const c2 = clc.getContext("2d");
-        if (c2) {
-          if (historySeries) drawForceChart(c2, { width: clc.width, height: clc.height, values: historySeries.cl, color: C.teal, frac });
-          else drawEmptyChart(c2, { width: clc.width, height: clc.height });
-        }
-      }
-      const cdc = cdMonRef.current;
-      if (cdc) {
-        const c2 = cdc.getContext("2d");
-        if (c2) {
-          if (historySeries) drawForceChart(c2, { width: cdc.width, height: cdc.height, values: historySeries.cd, color: C.amber, frac });
-          else drawEmptyChart(c2, { width: cdc.width, height: cdc.height });
-        }
-      }
-      const ldc = ldMonRef.current;
-      if (ldc) {
-        const c2 = ldc.getContext("2d");
-        if (c2) {
-          if (historySeries) drawForceChart(c2, { width: ldc.width, height: ldc.height, values: historySeries.ld, color: C.text, frac });
-          else drawEmptyChart(c2, { width: ldc.width, height: ldc.height });
-        }
-      }
-      if (fillRef.current) fillRef.current.style.width = `${frac * 100}%`;
-      if (knobRef.current) knobRef.current.style.left = `${frac * 100}%`;
-      if (now - lastUiRef.current > 100) {
-        lastUiRef.current = now;
-        setScrubFrac(frac);
-      }
-    };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
-  }, [open, sim, playing, historySeries, framesMode]);
-
   if (!open) return null;
 
   const reStr = fRe(sim?.re ?? ctx?.re ?? 0);
   // Mirrored view: the header keeps the derived −α the user opened; the badge
   // on the media states the +α source (spec §9.3).
   const alphaStr = ctx?.mirrored ? f1(ctx.aoa) : f1(sim?.alpha ?? ctx?.aoa ?? 0);
-  const modeTag = sim ? (stalled ? "URANS · POST-STALL" : "RANS · STEADY") : unavailableMessage ? "OPENFOAM RESULT" : "LOADING";
   const shownMach = sim ? f2(sim.mach) : machStr;
-  const fieldLabel = FIELD_LABELS[field];
-  const onScrub = (e: MouseEvent<HTMLDivElement>) => {
-    const t = trackRef.current;
-    if (!t) return;
-    const r = t.getBoundingClientRect();
-    const frac = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-    animTimeRef.current = frac * PERIOD;
-    setScrubFrac(frac);
-    if (playing) onTogglePlay();
-  };
 
   const currentStoredMediaUrl = () => {
-    const media = realField(field);
+    const media = activeStoredMedia;
     if (!media) return null;
-    if (customRender?.field === field && customRender.role === "instantaneous") return customRender.url;
+    if (activeFieldId && customRender?.field === activeFieldId && customRender.role === "instantaneous") return customRender.url;
     return media.imageUrl ?? (media.kind === "image" ? media.url : null);
   };
-  const currentDownloadUrl = () => (customRender?.field === field ? customRender.url : currentStoredMediaUrl());
+  const currentDownloadUrl = () => (activeFieldId && customRender?.field === activeFieldId ? customRender.url : currentStoredMediaUrl());
   const customRenderFor = (which: "live" | "mean") =>
-    customRender?.field === field && customRender.role === (which === "mean" ? "mean" : "instantaneous") ? customRender.url : null;
+    activeFieldId && customRender?.field === activeFieldId && customRender.role === (which === "mean" ? "mean" : "instantaneous") ? customRender.url : null;
 
   const requestCustomRender = async () => {
-    if (!ctx?.resultId) return;
+    if (!ctx?.resultId || !activeFieldId) return;
     setRenderBusy(true);
     setRenderError(null);
     try {
       const rendered = await renderResultField(ctx.resultId, {
-        field,
+        field: activeFieldId,
         role: customRole,
         scaleMode,
         zoomChords,
@@ -436,7 +355,7 @@ export function SimModal(props: {
         levels,
         vmin: scaleMode === "manual" && vmin.trim() ? Number(vmin) : null,
         vmax: scaleMode === "manual" && vmax.trim() ? Number(vmax) : null,
-        frameIndex: customRole === "instantaneous" && historySeries ? Math.round(scrubFrac * Math.max(0, historySeries.t.length - 1)) : null,
+        frameIndex: customRole === "instantaneous" && playerModel ? frameIdx : null,
         widthPx,
         heightPx,
       });
@@ -460,7 +379,7 @@ export function SimModal(props: {
     setHeightPx(next);
     if (lockAspect) setWidthPx(Math.max(320, Math.min(2400, Math.round(next * ratio))));
   };
-  const selectedScale = realField(field)?.scale ?? null;
+  const selectedScale = activeStoredMedia?.scale ?? null;
   const scaleLabel = scaleMode === "track"
     ? selectedScale ? `track ${fmtCompact(selectedScale.vmin)}…${fmtCompact(selectedScale.vmax)}` : "track unavailable"
     : scaleMode === "auto"
@@ -569,7 +488,7 @@ export function SimModal(props: {
     );
   };
   const activeScaleChip = () => {
-    const scale = realField(field)?.scale;
+    const scale = activeStoredMedia?.scale;
     if (!scale) return null;
     return (
       <div style={{ display: "flex", justifyContent: "flex-end", margin: "-2px 0 8px" }}>
@@ -582,7 +501,7 @@ export function SimModal(props: {
   const renderTools = () => {
     if (sim?.status !== "solved") return null;
     return (
-      <div style={{ display: "grid", gap: 8, margin: "0 0 10px" }}>
+      <div style={{ display: "grid", gap: 8 }}>
         {!renderToolsOpen ? (
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
             <button type="button" onClick={() => setRenderToolsOpen(true)} style={{ ...dlBtn, color: C.teal }}>
@@ -598,7 +517,13 @@ export function SimModal(props: {
               {renderControlButton("levels", "levels", String(levels))}
               {renderControlButton("scale", "scale", scaleLabel)}
               {renderControlButton("resolution", "size", `${widthPx}x${heightPx}`)}
-              <button type="button" disabled={renderBusy || !ctx?.resultId} title={!ctx?.resultId ? "No solved result is selected for custom rendering" : undefined} onClick={requestCustomRender} style={{ ...dlBtn, color: C.teal, marginLeft: "auto" }}>
+              <button
+                type="button"
+                disabled={renderBusy || !ctx?.resultId || !activeFieldId}
+                title={!ctx?.resultId ? "No solved result is selected for custom rendering" : !activeFieldId ? "Custom rendering is available only for stored OpenFOAM fields." : undefined}
+                onClick={requestCustomRender}
+                style={{ ...dlBtn, color: C.teal, marginLeft: "auto" }}
+              >
                 {renderBusy ? "rendering..." : "re-render"}
               </button>
               <button type="button" onClick={() => { setRenderToolsOpen(false); setExpandedRenderControl(null); }} style={dlBtn}>
@@ -617,18 +542,25 @@ export function SimModal(props: {
     );
   };
   const fieldTabsRow = () => (
-    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 13 }}>
-      {FIELDS.map((fid) => {
-        const on = field === fid;
-        const available = !sim || sim.availableFields.length === 0 || sim.availableFields.includes(fid);
-        const storedFields = sim?.availableFields.map((stored) => FIELD_LABELS[stored]).join(", ") || "none";
+    <div data-testid="sim-frame-fields" style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+      {fieldChoices.map((fid) => {
+        const on = activeField === fid;
+        const frameCount = playerModel?.frameImageCounts[fid] ?? 0;
+        const stored = asFieldId(fid) ? realField(asFieldId(fid)) : undefined;
+        const available = frameCount > 0 || Boolean(stored);
+        const mode = frameCount > 0 ? `${frameCount} frame images` : stored?.meanUrl || stored?.imageUrl || stored?.url ? "stored static media" : "no media registered";
         return (
           <button
             key={fid}
+            data-testid={`sim-frame-field-${fid}`}
             type="button"
             disabled={!available}
-            onClick={() => onField(fid)}
-            title={available ? FIELD_LABELS[fid] : `No stored ${FIELD_LABELS[fid]} media for this result. Stored fields: ${storedFields}.`}
+            onClick={() => {
+              setFrameField(fid);
+              const typed = asFieldId(fid);
+              if (typed) onField(typed);
+            }}
+            title={mode}
             style={{
               fontFamily: MONO,
               fontSize: 11,
@@ -642,118 +574,39 @@ export function SimModal(props: {
               opacity: available ? 1 : 0.45,
             }}
           >
-            {FIELD_LABELS[fid]}
+            {labelForField(fid)}
           </button>
         );
       })}
-      <div style={{ marginLeft: "auto", display: "flex", gap: 7 }}>
-        {currentDownloadUrl() ? (
-          <a href={browserUrl(currentDownloadUrl()!)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ render .png</a>
-        ) : (
-          <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ render .png</button>
-        )}
-        {evidenceBundle ? (
-          <a href={browserUrl(evidenceBundle.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ evidence</a>
-        ) : (
-          <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ evidence</button>
-        )}
-        {fieldDataArtifact ? (
-          <a href={browserUrl(fieldDataArtifact.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ field data</a>
-        ) : (
-          <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ field data</button>
-        )}
-      </div>
     </div>
   );
 
-  // live + mean stored-media pair (URANS). Frames mode shows the same pair as
-  // a secondary evidence surface below the player — unchanged, just demoted.
-  const mediaPairGrid = () => (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-      <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: "#070b10" }}>
-        {fieldViewport("live")}
-        <span style={{ position: "absolute", top: 9, left: 10, display: "flex", alignItems: "center", gap: 5, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.red }}>
-          <span style={{ width: 7, height: 7, borderRadius: "50%", background: C.red, animation: "recpulse 1.2s infinite" }} />
-          LIVE · UNSTEADY
-        </span>
-        <span style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.muted, background: "rgba(7,11,16,0.7)", borderRadius: 5, padding: "2px 6px" }}>
-          {fieldLabel}
-        </span>
-      </div>
-      <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: "#070b10" }}>
-        {fieldViewport("mean")}
-        <span style={{ position: "absolute", top: 9, left: 10, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.muted }}>TIME-AVERAGED  x̄</span>
-        <span style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.muted, background: "rgba(7,11,16,0.7)", borderRadius: 5, padding: "2px 6px" }}>
-          {fieldLabel}
-        </span>
-      </div>
+  const downloadChips = () => (
+    <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
+      {currentDownloadUrl() ? (
+        <a href={browserUrl(currentDownloadUrl()!)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ render .png</a>
+      ) : (
+        <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ render .png</button>
+      )}
+      {evidenceBundle ? (
+        <a href={browserUrl(evidenceBundle.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ evidence</a>
+      ) : (
+        <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ evidence</button>
+      )}
+      {fieldDataArtifact ? (
+        <a href={browserUrl(fieldDataArtifact.downloadUrl)} download style={{ ...dlBtn, textDecoration: "none" }}>↓ field data</a>
+      ) : (
+        <button type="button" disabled style={{ ...dlBtn, cursor: "not-allowed", opacity: 0.45 }}>↓ field data</button>
+      )}
     </div>
   );
-
-  const forceMonitorsGrid = () => {
-    const cursor = framesMode ? historyCursor : currentHistory;
-    return (
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginTop: 13 }}>
-        <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
-          <ChartHeader title="Cl(t)" color={C.teal} values={historySeries?.cl} current={cursor?.cl} />
-          <canvas ref={clMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
-        </div>
-        <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
-          <ChartHeader title="Cd(t)" color={C.amber} values={historySeries?.cd} current={cursor?.cd} digits={5} />
-          <canvas ref={cdMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
-        </div>
-        <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
-          <ChartHeader title="L/D(t)" color={C.text} values={historySeries?.ld} current={cursor?.ld} digits={3} />
-          <canvas ref={ldMonRef} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
-        </div>
-      </div>
-    );
-  };
-
-  // Oscillating-steady iteration history (fidelity ladder contract 2): the
-  // REAL recorded Cl/Cd/Cm(iteration) samples with the averaging window
-  // shaded, plus the honest "averaged over last N iterations" note. Absent
-  // steady_history renders nothing.
-  const steadyHistorySection = () => {
-    if (!steadyModel) return null;
-    return (
-      <div data-testid="sim-steady-history" style={{ marginTop: 13, display: "grid", gap: 8 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.12em", whiteSpace: "nowrap" }}>
-            STEADY SOLVE · ITERATION HISTORY
-          </span>
-          <div style={{ flex: 1, height: 1, background: C.stroke2 }} />
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
-          {(
-            [
-              ["Cl(iter)", steadyClRef, steadyModel.cl, C.teal],
-              ["Cd(iter)", steadyCdRef, steadyModel.cd, C.amber],
-              ["Cm(iter)", steadyCmRef, steadyModel.cm, C.text],
-            ] as const
-          ).map(([title, ref, values, color]) => (
-            <div key={title} style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2 }}>
-              <ChartHeader title={title} color={color} values={[...values]} current={values[values.length - 1]} />
-              <canvas ref={ref} width={380} height={104} style={{ display: "block", width: "100%", height: "auto", borderRadius: 5 }} />
-            </div>
-          ))}
-        </div>
-        <div data-testid="sim-steady-history-note" style={{ fontFamily: MONO, fontSize: 10, color: steadyModel.meanStable ? C.dimmest : C.amber, lineHeight: 1.5 }}>
-          Oscillating steady solve — coefficients averaged over the last {steadyModel.windowIterCount.toLocaleString()} iterations
-          (iter {steadyModel.windowStartIter.toLocaleString()}–{steadyModel.windowEndIter.toLocaleString()}, shaded window
-          {steadyModel.meanStable ? ", mean stable" : ", MEAN NOT STABLE"}).
-          {steadyModel.note ? ` Engine: ${steadyModel.note}` : ""}
-        </div>
-      </div>
-    );
-  };
 
   const setupDetails = () => {
     if (!sim?.condition) return null;
     return (
-      <div style={{ marginTop: 13 }}>
+      <div>
         <button type="button" onClick={() => setSetupDetailsOpen((v) => !v)} style={{ ...dlBtn, color: setupDetailsOpen ? C.teal : C.muted }}>
-          {setupDetailsOpen ? "hide setup details" : "setup details"}
+          {setupDetailsOpen ? "▾ setup details" : "▸ setup details"}
         </button>
         {setupDetailsOpen && (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 8, marginTop: 9 }}>
@@ -846,41 +699,282 @@ export function SimModal(props: {
     </span>
   ) : null;
 
-  const fieldViewport = (which: "live" | "mean") => {
-    const media = realField(field);
-    const customUrl = customRenderFor(which);
-    if (customUrl) {
+  const qualityChips = () => {
+    if (!sim) return null;
+    if (stalled) {
+      const frequency = playerModel?.periodS ? 1 / playerModel.periodS : null;
       return (
         <>
-          <img src={browserUrl(customUrl)} alt={`${fieldLabel} custom`} style={mediaStyle} />
-          {mirroredBadge}
+          <HeaderChip
+            testId="sim-chip-stationary"
+            color={playerModel?.stationary ? C.teal : playerModel ? C.red : C.amber}
+            border={playerModel?.stationary ? C.tealBorder : C.stroke}
+            text={
+              playerModel
+                ? `${playerModel.stationary ? "stationary ✓" : "stationary ✗"} · drift ${fmt(playerModel.driftFrac * 100, 1)}%`
+                : "frame track unavailable"
+            }
+          />
+          <HeaderChip
+            color={C.muted}
+            border={C.stroke}
+            text={`${playerModel ? `${playerModel.periodsRetained} periods` : "periods unavailable"} · St ${sim.strouhal == null ? "—" : f2(sim.strouhal)} · f ${frequency == null ? "—" : `${fmt(frequency, 2)} Hz`}`}
+          />
         </>
       );
     }
-    if (media && which === "live") {
+    const iterText = sim.condition?.mesh?.iterations == null ? "" : ` · ${sim.condition.mesh.iterations.toLocaleString()} iters`;
+    if (steadyModel && steadySummary) {
       return (
-        <>
-          {media.kind === "video" ? (
-            <video src={browserUrl(media.url)} autoPlay loop muted playsInline style={mediaStyle} />
-          ) : (
-            <img src={browserUrl(media.url)} alt={fieldLabel} style={mediaStyle} />
-          )}
-          {mirroredBadge}
-        </>
+        <HeaderChip
+          color={steadyModel.meanStable ? C.teal : C.amber}
+          border={steadyModel.meanStable ? C.tealBorder : "rgba(245,158,11,0.45)"}
+          text={`oscillating steady · ±${fmt(steadySummary.clHalfAmplitude, 3)} Cl over ${steadySummary.iterCount.toLocaleString()} iters`}
+        />
       );
     }
-    if (media?.meanUrl && which === "mean") {
+    return <HeaderChip color={C.teal} border={C.tealBorder} text={`converged${iterText}`} />;
+  };
+
+  const alphaTrackBar = () => {
+    const hasSiblings = sortedTrack.length > 0 && selectedTrackIndex >= 0;
+    const value = hasSiblings ? selectedTrackIndex : 0;
+    const total = hasSiblings ? sortedTrack.length : 1;
+    const shown = hasSiblings ? sortedTrack[value]?.aoa : sim?.alpha ?? ctx?.aoa ?? 0;
+    return (
+      <div data-testid="sim-alpha-track" style={{ display: "grid", gap: 6, margin: "0 0 13px", padding: "8px 10px", border: `1px solid ${C.stroke2}`, borderRadius: 9, background: C.panel2 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontFamily: MONO, fontSize: 10, color: C.dim }}>
+          <span>AoA evidence</span>
+          <span data-testid="sim-alpha-label">α {f1(shown ?? 0)}° · {value + 1}/{total}</span>
+        </div>
+        <input
+          data-testid="sim-alpha-slider"
+          aria-label="AoA evidence"
+          type="range"
+          min={0}
+          max={Math.max(0, total - 1)}
+          step={1}
+          value={value}
+          disabled={!hasSiblings || total < 2}
+          onChange={(e) => {
+            const next = sortedTrack[Number(e.currentTarget.value)];
+            if (next) onTrackPoint(next);
+          }}
+          style={{ width: "100%", opacity: hasSiblings && total > 1 ? 1 : 0.55 }}
+        />
+      </div>
+    );
+  };
+
+  const meansRow = () => {
+    if (!sim) return null;
+    if (stalled && playerModel) {
       return (
-        <>
-          <img src={browserUrl(media.meanUrl)} alt={`${fieldLabel} mean`} style={mediaStyle} />
-          {mirroredBadge}
-        </>
+        <div data-testid="sim-accent-stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(142px, 1fr))", gap: 10, margin: "0 0 12px" }}>
+          <AccentStat label="Cl" color={C.teal} value={fmt(playerModel.stats.cl.mean, 3)} sub={`± ${fmt(playerModel.stats.cl.std, 3)} · time-weighted, ${playerModel.periodsRetained} whole periods`} />
+          <AccentStat label="Cd" color={C.amber} value={fmt(playerModel.stats.cd.mean, 4)} sub={`± ${fmt(playerModel.stats.cd.std, 4)} · time-weighted, ${playerModel.periodsRetained} whole periods`} />
+          <AccentStat label="Cm" color={C.text} value={fmt(playerModel.stats.cm.mean, 3)} sub={`± ${fmt(playerModel.stats.cm.std, 3)} · time-weighted, ${playerModel.periodsRetained} whole periods`} />
+          <AccentStat
+            label="L/D"
+            color={C.teal}
+            value={Math.abs(playerModel.stats.cd.mean) > 1e-9 ? fmt(playerModel.stats.cl.mean / playerModel.stats.cd.mean, 2) : "—"}
+            sub={`time-weighted, ${playerModel.periodsRetained} whole periods`}
+          />
+          <AccentStat
+            label="Period"
+            color={C.muted}
+            value={playerModel.periodS != null ? `${fmt(playerModel.periodS, 3)} s` : "—"}
+            sub={`${playerModel.periodS != null ? `f ${fmt(1 / playerModel.periodS, 2)} Hz` : "f —"} · window ${fmt(playerModel.tStart, 2)}–${fmt(playerModel.tEnd, 2)} s · ${playerModel.frames.length} frames`}
+          />
+        </div>
       );
     }
+    const convergence = steadyModel && steadySummary
+      ? {
+          value: steadyModel.meanStable ? "oscillating steady" : "oscillating",
+          sub: `±${fmt(steadySummary.clHalfAmplitude, 3)} Cl over ${steadySummary.iterCount.toLocaleString()} iters`,
+        }
+      : {
+          value: "✓ steady",
+          sub: [
+            sim.condition?.mesh?.finalResidual == null ? null : `residuals ${fmtCompact(sim.condition.mesh.finalResidual)}`,
+            sim.condition?.mesh?.iterations == null ? null : `${sim.condition.mesh.iterations.toLocaleString()} iters`,
+          ].filter(Boolean).join(" · ") || "convergence history unavailable",
+        };
+    return (
+      <div data-testid="sim-accent-stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(142px, 1fr))", gap: 10, margin: "0 0 12px" }}>
+        <AccentStat label="Cl" color={C.teal} value={fmt(sim.cl, 4)} sub="converged coefficient" />
+        <AccentStat label="Cd" color={C.amber} value={fmt(sim.cd, 5)} sub="converged coefficient" />
+        <AccentStat label="Cm" color={C.text} value={fmt(sim.cm, 4)} sub="converged coefficient" />
+        <AccentStat label="L/D" color={C.teal} value={fmt(sim.ld, 2)} sub="Cl / Cd" />
+        <AccentStat label="Convergence" color={steadyModel ? C.amber : C.teal} value={convergence.value} sub={convergence.sub} />
+      </div>
+    );
+  };
+
+  const selectedStaticUrl = () => {
+    if (customRender?.field === activeFieldId) return customRender.url;
+    if (!activeStoredMedia) return null;
+    if (stalled) return activeStoredMedia.meanUrl ?? activeStoredMedia.imageUrl ?? (activeStoredMedia.kind === "image" ? activeStoredMedia.url : null);
+    return activeStoredMedia.imageUrl ?? (activeStoredMedia.kind === "image" ? activeStoredMedia.url : null) ?? activeStoredMedia.meanUrl ?? null;
+  };
+
+  const heroImage = () => {
+    if (transportActive && playerModel && currentFrame) {
+      const frameUrl = frameImageUrl(playerModel, frameIdx, activeField);
+      if (frameUrl) {
+        return <img data-testid="sim-frame-image" src={browserUrl(frameUrl)} alt={`${activeField ?? "frame"} f${String(currentFrame.i).padStart(4, "0")}`} style={mediaStyle} />;
+      }
+    }
+    const staticUrl = selectedStaticUrl();
+    if (staticUrl) return <img data-testid="sim-frame-image" src={browserUrl(staticUrl)} alt={`${fieldLabel} static`} style={mediaStyle} />;
     if (sim?.status === "solved") {
-      return <MediaEmpty text={which === "mean" ? "No time-averaged field stored for this solver output." : "No stored OpenFOAM media for this field."} />;
+      return <MediaEmpty text={transportActive ? "This frame's image evidence is not registered — the gap is shown, never interpolated." : "No stored media is available for this field on this result."} />;
     }
     return <MediaEmpty text="No solved OpenFOAM media is available for this point." />;
+  };
+
+  const imageTag = () => {
+    if (transportActive) return "RECORDED FRAMES · URANS";
+    if (stalled) return "x̄ static";
+    return "RANS · steady static";
+  };
+
+  const overlayReadout = () => {
+    if (transportActive && playerModel && currentFrame) {
+      const po = periodOrdinal(playerModel, frameIdx);
+      return `Cl ${fmt(currentFrame.cl, 3)} · Cd ${fmt(currentFrame.cd, 4)} · Cm ${fmt(currentFrame.cm, 3)} · t ${fmt(currentFrame.t, 3)} s${po ? ` · period ${po.ordinal}/${po.total}` : ""}`;
+    }
+    if (!sim) return "loading";
+    return `Cl ${fmt(sim.cl, 3)} · Cd ${fmt(sim.cd, 4)} · Cm ${fmt(sim.cm, 3)} · α ${alphaStr}°`;
+  };
+
+  const transportBar = () => {
+    const max = Math.max(0, (playerModel?.frames.length ?? 1) - 1);
+    const ticks = playerModel ? periodTickFractions(playerModel) : [];
+    return (
+      <div data-testid="sim-transport" style={{ display: "flex", alignItems: "center", gap: 12, opacity: transportActive ? 1 : 0.45 }}>
+        <button
+          data-testid="sim-frame-play"
+          type="button"
+          disabled={!transportActive}
+          onClick={transportActive ? onTogglePlay : undefined}
+          style={{ width: 34, height: 34, borderRadius: 9, background: transportActive ? C.teal : C.panel3, border: transportActive ? "none" : `1px solid ${C.stroke}`, color: transportActive ? C.tealInk : C.dim, cursor: transportActive ? "pointer" : "not-allowed", fontSize: 13, flex: "none" }}
+        >
+          {playing && transportActive ? "❚❚" : "▶"}
+        </button>
+        <div style={{ position: "relative", flex: 1, minWidth: 0, height: 24, display: "grid", alignItems: "center" }}>
+          <input
+            data-testid="sim-frame-scrub"
+            aria-label="Frame scrubber"
+            type="range"
+            min={0}
+            max={max}
+            step={1}
+            value={transportActive ? frameIdx : 0}
+            disabled={!transportActive}
+            onChange={(e) => seekFrame(Number(e.currentTarget.value))}
+            style={{ width: "100%", margin: 0 }}
+          />
+          {ticks.map((tick) => (
+            <span key={tick} aria-hidden="true" style={{ position: "absolute", left: `${tick * 100}%`, top: 4, bottom: 4, width: 1, background: "rgba(230,237,243,0.32)", pointerEvents: "none" }} />
+          ))}
+        </div>
+        <button data-testid="sim-frame-speed" type="button" disabled={!transportActive} onClick={() => setPlaySpeed((s) => (s === 1 ? 0.5 : 1))} style={{ ...dlBtn, color: transportActive ? C.teal : C.dim, cursor: transportActive ? "pointer" : "not-allowed" }}>
+          {playSpeed === 1 ? "1.0×" : "0.5×"}
+        </button>
+        <span style={{ fontFamily: MONO, fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>
+          {transportActive && playerModel ? `frame ${frameIdx + 1}/${playerModel.frames.length}` : "static"}
+        </span>
+      </div>
+    );
+  };
+
+  const chartCanvas = (ref: RefObject<HTMLCanvasElement | null>, testId: string, height: number) => (
+    <canvas
+      data-testid={testId}
+      ref={ref}
+      width={520}
+      height={height}
+      onPointerDown={(e) => {
+        if (!transportActive) return;
+        chartDragRef.current = true;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        chartPointerToFrame(e);
+      }}
+      onPointerMove={(e) => {
+        if (chartDragRef.current) chartPointerToFrame(e);
+      }}
+      onPointerUp={() => { chartDragRef.current = false; }}
+      onPointerCancel={() => { chartDragRef.current = false; }}
+      style={{ display: "block", width: "100%", height: "auto", borderRadius: 5, touchAction: "none", cursor: transportActive ? "crosshair" : "default" }}
+    />
+  );
+
+  const chartsColumn = () => {
+    const labels = framesMode
+      ? [
+          ["Cl(t)", C.teal, clMonRef, "sim-frame-chart", 136],
+          ["Cd(t)", C.amber, cdMonRef, "sim-frame-chart-cd", 116],
+          ["L/D(t)", C.text, ldMonRef, "sim-frame-chart-ld", 116],
+        ] as const
+      : [
+          ["Cl history", C.teal, clMonRef, "sim-frame-chart", 136],
+          ["Cd history", C.amber, cdMonRef, "sim-frame-chart-cd", 116],
+          ["Cm history", C.text, ldMonRef, "sim-frame-chart-ld", 116],
+        ] as const;
+    return (
+      <div data-testid="sim-chart-column" style={{ display: "grid", gap: 8 }}>
+        {labels.map(([title, color, ref, testId, height]) => (
+          <div key={title} style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2, minWidth: 0 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", fontFamily: MONO, marginBottom: 5 }}>
+              <span style={{ fontSize: 10, color }}>{title}</span>
+              <span style={{ fontSize: 9, color: C.dim, whiteSpace: "nowrap" }}>
+                {transportActive ? "click / drag to seek" : steadyModel ? "recorded iterations" : "no history"}
+              </span>
+            </div>
+            {chartCanvas(ref, testId, height)}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const heroSection = () => (
+    <div data-testid="sim-frame-player" className="sim-hero-grid">
+      <div style={{ display: "grid", gap: 10, minWidth: 0 }}>
+        {fieldTabsRow()}
+        <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: VIZ.bg, minHeight: 300 }}>
+          {heroImage()}
+          <span style={{ position: "absolute", top: 9, left: 10, display: "flex", alignItems: "center", gap: 5, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: transportActive ? C.teal : C.muted, background: "rgba(7,11,16,0.62)", borderRadius: 5, padding: "2px 6px" }}>
+            {transportActive && <span style={{ width: 7, height: 7, borderRadius: "50%", background: C.teal }} />}
+            {imageTag()}
+          </span>
+          {mirroredBadge}
+          {preload && transportActive && preload.total > 0 && preload.loaded + preload.failed < preload.total && (
+            <span data-testid="sim-frame-loading" style={{ position: "absolute", top: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.amber, background: "rgba(7,11,16,0.78)", borderRadius: 5, padding: "2px 6px" }}>
+              loading frames {preload.loaded + preload.failed}/{preload.total}
+            </span>
+          )}
+          <span
+            data-testid="sim-frame-readout"
+            style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: "#e6edf3", background: "rgba(7,11,16,0.78)", border: "1px solid rgba(148,163,184,0.25)", borderRadius: 5, padding: "3px 7px", maxWidth: "calc(100% - 18px)", whiteSpace: "normal", textAlign: "right" }}
+          >
+            {overlayReadout()}
+          </span>
+        </div>
+        {transportBar()}
+      </div>
+      {chartsColumn()}
+    </div>
+  );
+
+  const provenanceText = () => {
+    if (!sim) return "";
+    if (stalled) {
+      return `URANS k-ω SST · frames = ${playerModel ? "engine-recorded period-locked window" : "unavailable"} · stored media/evidence only`;
+    }
+    return `RANS ${sim.condition?.turbulenceModel ?? "solver"} · steady result evidence · stored media/evidence only`;
   };
 
   return (
@@ -899,6 +993,19 @@ export function SimModal(props: {
       }}
       onClick={onClose}
     >
+      <style jsx>{`
+        .sim-hero-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr);
+          gap: 12px;
+          align-items: start;
+        }
+        @media (max-width: 760px) {
+          .sim-hero-grid {
+            grid-template-columns: minmax(0, 1fr);
+          }
+        }
+      `}</style>
       <div
         style={{
           width: "min(900px,94vw)",
@@ -913,9 +1020,11 @@ export function SimModal(props: {
       >
         {/* header */}
         <div
+          data-testid="sim-frame-chips"
           style={{
             display: "flex",
             alignItems: "center",
+            flexWrap: "wrap",
             gap: 12,
             padding: "14px 18px",
             borderBottom: `1px solid ${C.border}`,
@@ -925,9 +1034,13 @@ export function SimModal(props: {
             zIndex: 2,
           }}
         >
-          <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.1em", color: C.teal, border: `1px solid ${C.tealBorder}`, borderRadius: 5, padding: "3px 8px" }}>
-            {modeTag}
-          </span>
+          <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
+            <HeaderChip
+              color={sim?.regime === "stalled" ? C.violet : C.teal}
+              border={sim?.regime === "stalled" ? C.violetBorder : C.tealBorder}
+              text={sim ? (stalled ? "URANS · vortex shedding" : "RANS · steady") : unavailableMessage ? "OpenFOAM result" : "loading"}
+            />
+          </div>
           {(() => {
             // Fidelity ladder chip (same truth table as every classification
             // surface): plain for RANS/pre-ladder rows.
@@ -943,8 +1056,11 @@ export function SimModal(props: {
           })()}
           <span style={{ fontWeight: 600, fontSize: 15 }}>{name}</span>
           <span style={{ fontFamily: MONO, fontSize: 12, color: C.muted }}>
-            α {alphaStr}°&nbsp;&nbsp;·&nbsp;&nbsp;Re {reStr}&nbsp;&nbsp;·&nbsp;&nbsp;M {shownMach}
+            Re {reStr}&nbsp;&nbsp;·&nbsp;&nbsp;M {shownMach}
           </span>
+          <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
+            {qualityChips()}
+          </div>
           <button
             type="button"
             onClick={onClose}
@@ -955,277 +1071,27 @@ export function SimModal(props: {
         </div>
 
         <div style={{ padding: "16px 18px 20px" }}>
-          {framesMode ? null : fieldTabsRow()}
-          {track.length > 1 && selectedTrackIndex >= 0 && (
-            <div style={{ display: "grid", gap: 6, margin: "0 0 13px", padding: "8px 10px", border: `1px solid ${C.stroke2}`, borderRadius: 9, background: C.panel2 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontFamily: MONO, fontSize: 10, color: C.dim }}>
-                <span>AoA evidence</span>
-                <span>α {f1(track[selectedTrackIndex]?.aoa ?? 0)}° · {selectedTrackIndex + 1}/{track.length}</span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={track.length - 1}
-                step={1}
-                value={selectedTrackIndex}
-                onChange={(e) => onTrackPoint(track[Number(e.currentTarget.value)])}
-                style={{ width: "100%" }}
-              />
-            </div>
-          )}
+          {alphaTrackBar()}
 
           {!sim ? (
             <div style={{ fontFamily: MONO, fontSize: 12, color: unavailableMessage ? C.amber : C.muted, padding: "60px 0", textAlign: "center", lineHeight: 1.6 }}>
               {unavailableMessage ?? "loading OpenFOAM result..."}
             </div>
-          ) : framesMode && playerModel && currentFrame ? (
-            <>
-              {/* header chips: regime / classification / periods / stationarity / St */}
-              <div data-testid="sim-frame-chips" style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
-                <HeaderChip color={C.teal} border={C.tealBorder} text={sim.strouhal != null ? "URANS · vortex shedding" : "URANS · post-stall"} />
-                <HeaderChip color={C.muted} border={C.stroke} text={`${playerModel.periodsRetained} periods retained`} />
-                <HeaderChip
-                  testId="sim-chip-stationary"
-                  color={playerModel.stationary ? C.teal : C.red}
-                  border={playerModel.stationary ? C.tealBorder : C.stroke}
-                  text={`${playerModel.stationary ? "stationary ✓" : "non-stationary ✗"} · drift ${fmt(playerModel.driftFrac * 100, 1)}%`}
-                />
-                {sim.strouhal != null && <HeaderChip color={C.muted} border={C.stroke} text={`St ${f2(sim.strouhal)}`} />}
-                <HeaderChip color={C.dim} border={C.stroke} text={`${playerModel.frames.length} frames · ${windowPeriodCount(playerModel) ?? "?"} periods recorded`} />
-              </div>
-
-              {/* accent stats: time-weighted means over the integer-period window */}
-              <div data-testid="sim-accent-stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(148px, 1fr))", gap: 10, margin: "0 0 12px" }}>
-                <AccentStat label="Cl mean" color={C.teal} value={fmt(playerModel.stats.cl.mean, 3)} sub={`± ${fmt(playerModel.stats.cl.std, 3)} std`} />
-                <AccentStat label="Cd mean" color={C.amber} value={fmt(playerModel.stats.cd.mean, 4)} sub={`± ${fmt(playerModel.stats.cd.std, 4)} std`} />
-                <AccentStat label="Cm mean" color={C.text} value={fmt(playerModel.stats.cm.mean, 3)} sub={`± ${fmt(playerModel.stats.cm.std, 3)} std`} />
-                <AccentStat
-                  label="L/D"
-                  color={C.teal}
-                  value={Math.abs(playerModel.stats.cd.mean) > 1e-9 ? fmt(playerModel.stats.cl.mean / playerModel.stats.cd.mean, 2) : "—"}
-                  sub="time-weighted means"
-                />
-                <AccentStat
-                  label="Period"
-                  color={C.muted}
-                  value={playerModel.periodS != null ? `${fmt(playerModel.periodS, 3)} s` : "—"}
-                  sub={playerModel.periodS != null ? `f ${fmt(1 / playerModel.periodS, 2)} Hz` : "no measured period"}
-                />
-              </div>
-
-              {/* frame player: image + window chart, both driven by frameIndex */}
-              <div data-testid="sim-frame-player" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.15fr) minmax(0, 1fr)", gap: 12, alignItems: "stretch" }}>
-                <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: VIZ.bg, minHeight: 240 }}>
-                  {(() => {
-                    const frameUrl = frameImageUrl(playerModel, frameIdx, frameField);
-                    if (frameUrl) return <img data-testid="sim-frame-image" src={browserUrl(frameUrl)} alt={`${frameField ?? "frame"} f${String(currentFrame.i).padStart(4, "0")}`} style={mediaStyle} />;
-                    const fieldHasImages = frameField ? (playerModel.frameImageCounts[frameField] ?? 0) > 0 : false;
-                    return (
-                      <MediaEmpty
-                        text={
-                          fieldHasImages
-                            ? "This frame's image evidence is not registered — the gap is shown, never interpolated."
-                            : "No frame images are registered for this field yet — engine evidence files pending."
-                        }
-                      />
-                    );
-                  })()}
-                  <span style={{ position: "absolute", top: 9, left: 10, display: "flex", alignItems: "center", gap: 5, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.teal }}>
-                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: C.teal }} />
-                    RECORDED FRAMES · URANS
-                  </span>
-                  {mirroredBadge}
-                  {preload && preload.total > 0 && preload.loaded + preload.failed < preload.total && (
-                    <span data-testid="sim-frame-loading" style={{ position: "absolute", top: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.amber, background: "rgba(7,11,16,0.78)", borderRadius: 5, padding: "2px 6px" }}>
-                      loading frames {preload.loaded + preload.failed}/{preload.total}
-                    </span>
-                  )}
-                  {preload && preload.failed > 0 && preload.loaded + preload.failed >= preload.total && (
-                    <span style={{ position: "absolute", top: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.red, background: "rgba(7,11,16,0.78)", borderRadius: 5, padding: "2px 6px" }}>
-                      {preload.failed}/{preload.total} frames failed to load
-                    </span>
-                  )}
-                  <span
-                    data-testid="sim-frame-readout"
-                    style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: "#e6edf3", background: "rgba(7,11,16,0.78)", border: "1px solid rgba(148,163,184,0.25)", borderRadius: 5, padding: "3px 7px" }}
-                  >
-                    Cl {fmt(currentFrame.cl, 3)} · Cd {fmt(currentFrame.cd, 4)} · Cm {fmt(currentFrame.cm, 3)} · t {fmt(currentFrame.t, 3)} s
-                    {(() => {
-                      const po = periodOrdinal(playerModel, frameIdx);
-                      return po ? ` · period ${po.ordinal}/${po.total}` : "";
-                    })()}
-                  </span>
-                </div>
-                <div style={{ border: `1px solid ${C.stroke2}`, borderRadius: 10, padding: "8px 10px", background: C.panel2, display: "grid", gap: 5, alignContent: "start" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", fontFamily: MONO }}>
-                    <span style={{ fontSize: 10, color: C.teal }}>Cl(t) · recorded window</span>
-                    <span style={{ fontSize: 9, color: C.dim }}>click / drag to seek</span>
-                  </div>
-                  <canvas
-                    data-testid="sim-frame-chart"
-                    ref={playerChartRef}
-                    width={520}
-                    height={236}
-                    onPointerDown={(e) => {
-                      chartDragRef.current = true;
-                      e.currentTarget.setPointerCapture(e.pointerId);
-                      chartPointerToFrame(e);
-                    }}
-                    onPointerMove={(e) => {
-                      if (chartDragRef.current) chartPointerToFrame(e);
-                    }}
-                    onPointerUp={() => { chartDragRef.current = false; }}
-                    onPointerCancel={() => { chartDragRef.current = false; }}
-                    style={{ display: "block", width: "100%", height: "auto", borderRadius: 5, touchAction: "none", cursor: "crosshair" }}
-                  />
-                </div>
-              </div>
-
-              {/* single transport: scrub + play/pause + speed */}
-              <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
-                <button
-                  data-testid="sim-frame-play"
-                  type="button"
-                  onClick={onTogglePlay}
-                  style={{ width: 34, height: 34, borderRadius: 9, background: C.teal, border: "none", color: C.tealInk, cursor: "pointer", fontSize: 13, flex: "none" }}
-                >
-                  {playing ? "❚❚" : "▶"}
-                </button>
-                <input
-                  data-testid="sim-frame-scrub"
-                  type="range"
-                  min={0}
-                  max={Math.max(0, playerModel.frames.length - 1)}
-                  step={1}
-                  value={frameIdx}
-                  onChange={(e) => seekFrame(Number(e.currentTarget.value))}
-                  style={{ flex: 1 }}
-                />
-                <button data-testid="sim-frame-speed" type="button" onClick={() => setPlaySpeed((s) => (s === 1 ? 0.5 : 1))} style={{ ...dlBtn, color: C.teal }}>
-                  {playSpeed === 1 ? "1.0×" : "0.5×"}
-                </button>
-                <span style={{ fontFamily: MONO, fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>
-                  frame {frameIdx + 1}/{playerModel.frames.length}
-                </span>
-              </div>
-
-              {/* frame field selector (contract fields; disabled = no evidence) */}
-              <div data-testid="sim-frame-fields" style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 12 }}>
-                <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.1em" }}>FRAME FIELD</span>
-                {playerModel.fields.map((f) => {
-                  const count = playerModel.frameImageCounts[f] ?? 0;
-                  const on = frameField === f;
-                  return (
-                    <button
-                      key={f}
-                      data-testid={`sim-frame-field-${f}`}
-                      type="button"
-                      disabled={count === 0}
-                      onClick={() => setFrameField(f)}
-                      title={count === 0 ? "No frame images registered for this field." : `${count}/${playerModel.frames.length} frame images registered`}
-                      style={{
-                        fontFamily: MONO,
-                        fontSize: 11,
-                        borderRadius: 7,
-                        padding: "6px 12px",
-                        cursor: count === 0 ? "not-allowed" : "pointer",
-                        border: `1px solid ${on ? C.tealBorder : C.stroke}`,
-                        background: on ? C.tealFill : C.panel3,
-                        color: on ? C.teal : C.muted,
-                        fontWeight: on ? 600 : 400,
-                        opacity: count === 0 ? 0.45 : 1,
-                      }}
-                    >
-                      {FIELD_LABELS[f as FieldId] ?? f}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* secondary: stored field media + evidence, unchanged */}
-              <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "18px 0 10px" }}>
-                <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.12em", whiteSpace: "nowrap" }}>STORED FIELD MEDIA &amp; EVIDENCE</span>
-                <div style={{ flex: 1, height: 1, background: C.stroke2 }} />
-              </div>
-              {fieldTabsRow()}
-              {renderTools()}
-              {activeScaleChip()}
-              {mediaPairGrid()}
-              {forceMonitorsGrid()}
-              <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, lineHeight: 1.5 }}>
-                URANS, k-ω SST · player frames are the engine-recorded period-locked window; means are time-weighted over an integer number of periods. Full force histories above are synced to the same frame clock.
-              </div>
-              {setupDetails()}
-            </>
-          ) : stalled ? (
-            <>
-              {renderTools()}
-              {activeScaleChip()}
-              {/* legacy pre-contract URANS evidence: no frame track recorded */}
-              <div data-testid="sim-legacy-note" style={{ fontFamily: MONO, fontSize: 10, color: C.amber, border: `1px solid ${C.stroke2}`, background: C.panel2, borderRadius: 8, padding: "7px 10px", margin: "0 0 10px", lineHeight: 1.5 }}>
-                legacy evidence — no frame track. This result predates the URANS recording contract, so the stored mp4 loop is shown instead of frame-synced playback. Re-solving the point records frames.
-              </div>
-              {mediaPairGrid()}
-
-              {/* mean force readout */}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 10, marginTop: 12 }}>
-                <Stat label="Cl exact" color={C.teal} value={currentHistory ? fmt(currentHistory.cl, 4) : fmt(sim.cl, 4)} sub={`at cursor · mean ${fmt(sim.cl, 4)} · rms ${fmt(sim.clStd ?? 0, 4)}`} />
-                <Stat label="Cd exact" color={C.amber} value={currentHistory ? fmt(currentHistory.cd, 5) : fmt(sim.cd, 5)} sub={`at cursor · mean ${fmt(sim.cd, 5)} · rms ${fmt(sim.cdStd ?? 0, 5)}`} />
-                <Stat label="L/D exact" color={C.text} value={currentHistory ? fmt(currentHistory.ld, 3) : fmt(sim.ld, 3)} sub={`at cursor · mean ${fmt(sim.ld, 3)}`} />
-                <Stat label="St" color={C.muted} value={f2(sim.strouhal ?? 0)} sub={currentHistory ? `t ${fmt(currentHistory.t, 3)} s` : "shedding"} />
-              </div>
-
-              {/* transport */}
-              <div style={{ display: "flex", alignItems: "center", gap: 13, marginTop: 13 }}>
-                <button
-                  type="button"
-                  onClick={onTogglePlay}
-                  style={{ width: 34, height: 34, borderRadius: 9, background: C.teal, border: "none", color: C.tealInk, cursor: "pointer", fontSize: 13, flex: "none" }}
-                >
-                  {playing ? "❚❚" : "▶"}
-                </button>
-                <div ref={trackRef} onClick={onScrub} style={{ flex: 1, height: 8, background: C.stroke, borderRadius: 6, position: "relative", cursor: "pointer" }}>
-                  <div ref={fillRef} style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: "0%", background: "rgba(45,212,191,0.35)", borderRadius: 6 }} />
-                  <div ref={knobRef} style={{ position: "absolute", left: "0%", top: "50%", transform: "translate(-50%,-50%)", width: 14, height: 14, borderRadius: "50%", background: C.teal, border: `2px solid ${C.tealInk}` }} />
-                </div>
-                <span style={{ fontFamily: MONO, fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>St {f2(sim.strouhal ?? 0)} · 1.0×</span>
-              </div>
-
-              {/* force monitors */}
-              {forceMonitorsGrid()}
-              {steadyHistorySection()}
-              <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, lineHeight: 1.5 }}>
-                URANS, k-ω SST · vortex shedding past stall. Scrubber cursor is synced to the force histories. Mean field is the time-average over the sampling window.
-              </div>
-              {setupDetails()}
-            </>
           ) : (
             <>
-              {renderTools()}
+              {meansRow()}
               {activeScaleChip()}
-              {/* attached: single steady RANS */}
-              <div style={{ position: "relative", border: `1px solid ${C.stroke2}`, borderRadius: 10, overflow: "hidden", background: "#070b10", maxWidth: 640, margin: "0 auto" }}>
-                {fieldViewport("live")}
-                <span style={{ position: "absolute", top: 9, left: 10, fontFamily: MONO, fontSize: 9, fontWeight: 600, color: C.teal }}>STEADY · RANS</span>
-                <span style={{ position: "absolute", bottom: 9, right: 10, fontFamily: MONO, fontSize: 9, color: C.muted, background: "rgba(7,11,16,0.7)", borderRadius: 5, padding: "2px 6px" }}>
-                  {fieldLabel}
-                </span>
-              </div>
-              {/* accent stats block (steady: single converged values, no player) */}
-              <div data-testid="sim-accent-stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(148px, 1fr))", gap: 10, marginTop: 13 }}>
-                <AccentStat label="Cl" color={C.teal} value={f2(sim.cl)} sub="converged steady value" />
-                <AccentStat label="Cd" color={C.amber} value={f4(sim.cd)} sub="converged steady value" />
-                <AccentStat label="Cm" color={C.text} value={f2(sim.cm)} sub="converged steady value" />
-                <AccentStat label="L/D" color={C.teal} value={f1(sim.ld)} sub="Cl / Cd" />
-              </div>
-              {steadyModel ? (
-                steadyHistorySection()
-              ) : (
-                <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, marginTop: 11, textAlign: "center" }}>
-                  Attached flow — steady RANS converges to a single field, so no animation or force history.
+              {heroSection()}
+              <div data-testid="sim-footer" style={{ display: "grid", gap: 10, marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.stroke2}` }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+                  {setupDetails()}
+                  <div style={{ marginLeft: "auto" }}>{downloadChips()}</div>
+                  {renderTools()}
                 </div>
-              )}
-              {setupDetails()}
+                <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, lineHeight: 1.5 }}>
+                  {provenanceText()}
+                </div>
+              </div>
             </>
           )}
         </div>
@@ -1260,18 +1126,23 @@ function AccentStat({ label, color, value, sub }: { label: string; color: string
  *  boundaries, and a cursor line + marker at frames[frameIndex].t. Pointer
  *  mapping shares PLAYER_CHART_GEOMETRY with frameForChartX so a click lands
  *  exactly on the frame under the cursor. */
-function drawWindowChart(
+function drawFrameWindowChart(
   g: CanvasRenderingContext2D,
-  opts: { width: number; height: number; model: FramePlayerModel; frameIndex: number },
+  opts: { width: number; height: number; model: FramePlayerModel; frameIndex: number; series: "cl" | "cd" | "ld"; color: string },
 ) {
-  const { width: W, height: H, model, frameIndex } = opts;
+  const { width: W, height: H, model, frameIndex, series, color } = opts;
   const geom = { width: W, ...PLAYER_CHART_GEOMETRY };
   const padT = 12;
   const padB = 24;
   const plotH = H - padT - padB;
   g.fillStyle = VIZ.panel;
   g.fillRect(0, 0, W, H);
-  const values = model.frames.map((f) => f.cl).filter(Number.isFinite);
+  const valueOf = (f: FramePlayerModel["frames"][number]) => {
+    if (series === "cl") return f.cl;
+    if (series === "cd") return f.cd;
+    return Math.abs(f.cd) > 1e-9 ? f.cl / f.cd : Number.NaN;
+  };
+  const values = model.frames.map(valueOf).filter(Number.isFinite);
   if (values.length === 0) return;
   let lo = Math.min(...values);
   let hi = Math.max(...values);
@@ -1318,14 +1189,21 @@ function drawWindowChart(
   g.fillStyle = "rgba(148,163,184,0.75)";
   g.font = "9px ui-monospace, SFMono-Regular, Menlo, monospace";
   g.textAlign = "right";
-  g.fillText(fmt(hi, 3), geom.padLeft - 6, padT + 4);
-  g.fillText(fmt(lo, 3), geom.padLeft - 6, H - padB + 3);
+  const digits = series === "cd" ? 4 : 3;
+  g.fillText(fmt(hi, digits), geom.padLeft - 6, padT + 4);
+  g.fillText(fmt(lo, digits), geom.padLeft - 6, H - padB + 3);
   g.textAlign = "left";
   g.fillText(`${fmt(model.tStart, 2)}s`, geom.padLeft, H - padB + 13);
   g.textAlign = "right";
   g.fillText(`${fmt(model.tEnd, 2)}s`, W - geom.padRight, H - padB + 13);
-  // time-weighted mean (the pinned point-level Cl)
-  const mean = model.stats.cl.mean;
+  // time-weighted mean (the pinned point-level coefficient)
+  const mean = series === "cl"
+    ? model.stats.cl.mean
+    : series === "cd"
+      ? model.stats.cd.mean
+      : Math.abs(model.stats.cd.mean) > 1e-9
+        ? model.stats.cl.mean / model.stats.cd.mean
+        : Number.NaN;
   if (Number.isFinite(mean) && mean >= lo && mean <= hi) {
     g.strokeStyle = "rgba(230,237,243,0.25)";
     g.setLineDash([4, 4]);
@@ -1336,12 +1214,12 @@ function drawWindowChart(
     g.setLineDash([]);
   }
   // trace through the frame samples
-  g.strokeStyle = "#2dd4bf";
+  g.strokeStyle = color;
   g.lineWidth = 1.6;
   g.beginPath();
   model.frames.forEach((f, k) => {
     const x = xv(f.t);
-    const y = yv(f.cl);
+    const y = yv(valueOf(f));
     if (k === 0) g.moveTo(x, y);
     else g.lineTo(x, y);
   });
@@ -1358,18 +1236,8 @@ function drawWindowChart(
   g.stroke();
   g.fillStyle = "#e6edf3";
   g.beginPath();
-  g.arc(cx, yv(cur.cl), 3.4, 0, Math.PI * 2);
+  g.arc(cx, yv(valueOf(cur)), 3.4, 0, Math.PI * 2);
   g.fill();
-}
-
-function Stat({ label, color, value, sub }: { label: string; color: string; value: string; sub: string }) {
-  return (
-    <div style={statCard}>
-      <div style={{ fontFamily: MONO, fontSize: 9, color }}>{label}</div>
-      <div style={{ fontFamily: MONO, fontSize: 17, color: C.text, fontWeight: 500, lineHeight: 1.2 }}>{value}</div>
-      <div style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>{sub}</div>
-    </div>
-  );
 }
 
 function ConditionGroup({ title, rows }: { title: string; rows: [string, string][] }) {
@@ -1390,18 +1258,6 @@ function MediaEmpty({ text }: { text: string }) {
   return (
     <div style={{ minHeight: 260, display: "grid", placeItems: "center", background: "#070b10", color: C.dim, fontFamily: MONO, fontSize: 11, textAlign: "center", padding: 20 }}>
       {text}
-    </div>
-  );
-}
-
-function ChartHeader({ title, color, values, current, digits = 4 }: { title: string; color: string; values?: number[]; current?: number; digits?: number }) {
-  const stats = values?.length ? summarize(values) : null;
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", fontFamily: MONO, marginBottom: 5 }}>
-      <span style={{ fontSize: 10, color }}>{title}</span>
-      <span style={{ fontSize: 9, color: C.dim, whiteSpace: "nowrap" }}>
-        {current == null ? "no history" : `exact ${fmt(current, digits)} · min ${fmt(stats?.min ?? current, digits)} · max ${fmt(stats?.max ?? current, digits)}`}
-      </span>
     </div>
   );
 }
@@ -1429,98 +1285,6 @@ function fmtCompact(n: number) {
   if (abs >= 100) return n.toFixed(0);
   if (abs >= 10) return n.toFixed(1);
   return n.toFixed(2);
-}
-
-function summarize(values: number[]) {
-  let min = Infinity;
-  let max = -Infinity;
-  let sum = 0;
-  for (const value of values) {
-    if (!Number.isFinite(value)) continue;
-    min = Math.min(min, value);
-    max = Math.max(max, value);
-    sum += value;
-  }
-  return { min, max, mean: sum / values.length };
-}
-
-function drawForceChart(
-  ctx: CanvasRenderingContext2D,
-  opts: { width: number; height: number; values: number[]; color: string; frac: number },
-) {
-  const { width: W, height: H, values, color, frac } = opts;
-  ctx.fillStyle = "#0a0f15";
-  ctx.fillRect(0, 0, W, H);
-  if (values.length < 2) return;
-
-  const finite = values.filter(Number.isFinite);
-  if (finite.length === 0) return;
-  const lo = Math.min(...finite);
-  const hi = Math.max(...finite);
-  const span = hi - lo || 1;
-  const padL = 44;
-  const padR = 10;
-  const padT = 10;
-  const padB = 22;
-  const plotW = W - padL - padR;
-  const plotH = H - padT - padB;
-  const yv = (v: number) => padT + (1 - (v - lo) / span) * plotH;
-  const xv = (i: number) => padL + (i / (values.length - 1)) * plotW;
-
-  ctx.strokeStyle = "rgba(148,163,184,0.16)";
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 3; i++) {
-    const y = padT + (i / 3) * plotH;
-    ctx.beginPath();
-    ctx.moveTo(padL, y);
-    ctx.lineTo(W - padR, y);
-    ctx.stroke();
-  }
-  ctx.strokeStyle = "rgba(148,163,184,0.3)";
-  ctx.beginPath();
-  ctx.moveTo(padL, padT);
-  ctx.lineTo(padL, H - padB);
-  ctx.lineTo(W - padR, H - padB);
-  ctx.stroke();
-
-  ctx.fillStyle = "rgba(148,163,184,0.75)";
-  ctx.font = "9px ui-monospace, SFMono-Regular, Menlo, monospace";
-  ctx.textAlign = "right";
-  ctx.fillText(fmt(hi, 3), padL - 6, padT + 4);
-  ctx.fillText(fmt(lo, 3), padL - 6, H - padB + 3);
-
-  const mean = finite.reduce((sum, value) => sum + value, 0) / finite.length;
-  ctx.strokeStyle = "rgba(230,237,243,0.22)";
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(padL, yv(mean));
-  ctx.lineTo(W - padR, yv(mean));
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.6;
-  ctx.beginPath();
-  values.forEach((v, i) => {
-    const x = xv(i);
-    const y = yv(v);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-
-  const idx = Math.max(0, Math.min(values.length - 1, Math.round(Math.max(0, Math.min(1, frac)) * (values.length - 1))));
-  const cx = xv(idx);
-  const cy = yv(values[idx]);
-  ctx.strokeStyle = "rgba(230,237,243,0.48)";
-  ctx.beginPath();
-  ctx.moveTo(cx, padT);
-  ctx.lineTo(cx, H - padB);
-  ctx.stroke();
-  ctx.fillStyle = "#e6edf3";
-  ctx.beginPath();
-  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
-  ctx.fill();
 }
 
 /** Oscillating-steady iteration trace: same visual language as the force

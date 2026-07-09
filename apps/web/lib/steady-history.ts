@@ -27,9 +27,22 @@ export interface SteadyHistoryModel {
   windowIterCount: number;
   /** Recorded samples that fall inside the window. */
   windowSampleCount: number;
+  windowStartIndex: number;
+  windowEndIndex: number;
   meanStable: boolean;
   /** Engine's honest note, rendered verbatim. */
   note: string;
+}
+
+export interface SteadyWindowSummary {
+  clMean: number;
+  cdMean: number;
+  cmMean: number;
+  clHalfAmplitude: number;
+  cdHalfAmplitude: number;
+  cmHalfAmplitude: number;
+  sampleCount: number;
+  iterCount: number;
 }
 
 /** null = nothing to chart (absent payload or fewer than 2 usable samples). */
@@ -65,7 +78,39 @@ export function buildSteadyHistoryModel(sh: SteadyHistoryDetail | null | undefin
     windowEndFrac: endIdx / (len - 1),
     windowIterCount: Math.max(0, endIter - startIter),
     windowSampleCount: endIdx - startIdx + 1,
+    windowStartIndex: startIdx,
+    windowEndIndex: endIdx,
     meanStable: sh.meanStable,
     note: sh.note,
+  };
+}
+
+export function summarizeSteadyWindow(model: SteadyHistoryModel | null | undefined): SteadyWindowSummary | null {
+  if (!model) return null;
+  const start = Math.max(0, Math.min(model.cl.length - 1, model.windowStartIndex));
+  const end = Math.max(start, Math.min(model.cl.length - 1, model.windowEndIndex));
+  const slice = <T>(values: T[]) => values.slice(start, end + 1);
+  const stats = (values: number[]) => {
+    const finite = values.filter(Number.isFinite);
+    if (!finite.length) return { mean: Number.NaN, halfAmplitude: Number.NaN };
+    const min = Math.min(...finite);
+    const max = Math.max(...finite);
+    return {
+      mean: finite.reduce((sum, value) => sum + value, 0) / finite.length,
+      halfAmplitude: (max - min) / 2,
+    };
+  };
+  const cl = stats(slice(model.cl));
+  const cd = stats(slice(model.cd));
+  const cm = stats(slice(model.cm));
+  return {
+    clMean: cl.mean,
+    cdMean: cd.mean,
+    cmMean: cm.mean,
+    clHalfAmplitude: cl.halfAmplitude,
+    cdHalfAmplitude: cd.halfAmplitude,
+    cmHalfAmplitude: cm.halfAmplitude,
+    sampleCount: end - start + 1,
+    iterCount: model.windowIterCount,
   };
 }

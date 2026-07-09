@@ -17,6 +17,7 @@ import {
   frameIndexForTime,
   historyFracForTime,
   PLAYER_CHART_GEOMETRY,
+  periodTickFractions,
   periodOrdinal,
   playbackSimRate,
   scrubFracForFrame,
@@ -314,6 +315,19 @@ describe("period ordinal overlay", () => {
   it("no measured period → no ordinal (shown as absent, not invented)", () => {
     expect(periodOrdinal(model({ periodS: null }), 10)).toBeNull();
     expect(windowPeriodCount(model({ periodS: null }))).toBeNull();
+  });
+});
+
+describe("period tick fractions", () => {
+  it("returns interior whole-period boundaries for the scrubber", () => {
+    const m = model(); // tStart 3.0, tEnd 4.0, period 0.5 → one interior boundary
+    expect(periodTickFractions(m)).toEqual([0.5]);
+  });
+
+  it("returns no visual ticks when no measured period/window exists", () => {
+    expect(periodTickFractions(model({ periodS: null }))).toEqual([]);
+    const single = buildFramePlayerModel({ ...realTrack(), frames: [realTrack().frames[0]], window: { tStart: 3, tEnd: 3 } })!;
+    expect(periodTickFractions(single)).toEqual([]);
   });
 });
 

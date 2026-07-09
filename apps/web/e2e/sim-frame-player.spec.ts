@@ -4,7 +4,8 @@
 // contract, task #23, is not deployed), so this spec exercises the player
 // against a FIXTURE sim payload injected at the network boundary: the real
 // detail page renders from the real DB, the modal opens from a real solved
-// polar point, and only the /sim response + frame PNG bytes are intercepted.
+// polar point, and only the /sim response, sibling field-track list, and
+// fixture media bytes are intercepted.
 // This is a test-only interception (Playwright route), never product code —
 // no fake data touches the DB or the runtime API. Once a frame-track point
 // exists in the dev DB the same assertions hold without the route (swap the
@@ -19,7 +20,7 @@ const API = process.env.PLAYWRIGHT_API_URL ?? "http://127.0.0.1:4000";
 // 40 frames, t = 3.00 + 0.02k (3.00..3.78), window 3.0..3.8 s, period 0.4 s
 // → exactly 2 recorded periods, 20 frames/period, matching the engine cadence.
 const FRAME_COUNT = 40;
-const FIELDS = ["vorticity", "velocity_magnitude"];
+const FIELDS = ["vorticity", "velocity_magnitude", "pressure"];
 const frames = Array.from({ length: FRAME_COUNT }, (_, k) => ({
   i: k,
   t: Number((3 + 0.02 * k).toFixed(4)),
@@ -45,8 +46,18 @@ const fixtureSim = {
   clStd: 0.11,
   cdStd: 0.004,
   strouhal: 0.21,
-  media: null,
-  availableFields: [],
+  media: Object.fromEntries(
+    FIELDS.map((f) => [
+      f,
+      {
+        kind: "image",
+        url: `/api/media/e2e-static/urans-${f}.png`,
+        imageUrl: `/api/media/e2e-static/urans-${f}.png`,
+        meanUrl: `/api/media/e2e-static/urans-${f}-mean.png`,
+      },
+    ]),
+  ),
+  availableFields: FIELDS,
   evidenceArtifacts: [],
   history: {
     t: Array.from({ length: 200 }, (_, k) => Number((k * 0.02).toFixed(3))),
@@ -70,6 +81,82 @@ const fixtureSim = {
   condition: null,
 };
 
+const ransSim = {
+  status: "solved",
+  regime: "attached",
+  airfoilName: "fixture",
+  alpha: 4,
+  re: 200000,
+  mach: 0.06,
+  cl: 0.4812,
+  cd: 0.01842,
+  cm: -0.0221,
+  ld: 26.12,
+  clStd: null,
+  cdStd: null,
+  strouhal: null,
+  media: {
+    velocity_magnitude: {
+      kind: "image",
+      url: "/api/media/e2e-static/rans-velocity_magnitude.png",
+      imageUrl: "/api/media/e2e-static/rans-velocity_magnitude.png",
+    },
+    pressure: {
+      kind: "image",
+      url: "/api/media/e2e-static/rans-pressure.png",
+      imageUrl: "/api/media/e2e-static/rans-pressure.png",
+    },
+  },
+  availableFields: ["velocity_magnitude", "pressure"],
+  evidenceArtifacts: [],
+  history: null,
+  frameTrack: null,
+  fidelity: "rans",
+  steadyHistory: {
+    iterations: [100, 200, 300, 400, 500],
+    cl: [0.46, 0.49, 0.475, 0.484, 0.481],
+    cd: [0.019, 0.0182, 0.0186, 0.0184, 0.01842],
+    cm: [-0.023, -0.0215, -0.0224, -0.022, -0.0221],
+    window: { startIter: 300, endIter: 500 },
+    meanStable: true,
+    note: "steady oscillating mean over trailing window",
+  },
+  condition: {
+    boundaryConditionName: "fixture setup",
+    mediumName: "air",
+    speedMps: 12,
+    referenceChordM: 1,
+    temperatureK: 288.15,
+    pressurePa: 101325,
+    density: 1.225,
+    kinematicViscosity: 0.0000146,
+    turbulenceModel: "k-ω SST",
+    turbulenceIntensity: 0.01,
+    viscosityRatio: 10,
+    mesh: {
+      nCells: 120000,
+      mesher: "blockmesh-cgrid",
+      nSurface: 160,
+      nRadial: 96,
+      nWake: 80,
+      farfieldRadiusChords: 20,
+      wakeLengthChords: 15,
+      targetYPlus: 1,
+      yPlusAvg: 0.8,
+      yPlusMax: 1.4,
+      iterations: 500,
+      finalResidual: 0.000003,
+    },
+  },
+};
+
+const fieldTrackFixture = {
+  items: [
+    { resultId: "fixture-rans-a4", aoa: 4, re: 200000, mach: 0.06, regime: "rans", fields: ["velocity_magnitude", "pressure"] },
+    { resultId: "fixture-urans-a16", aoa: 16, re: 200000, mach: 0.06, regime: "urans", fields: FIELDS },
+  ],
+};
+
 // 1×1 transparent PNG
 const PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
@@ -77,10 +164,19 @@ const PNG = Buffer.from(
 );
 
 async function interceptSim(page: Page) {
-  await page.route("**/api/airfoils/*/sim*", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fixtureSim) }),
+  await page.route("**/api/airfoils/*/field-track*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fieldTrackFixture) }),
   );
+  await page.route("**/api/airfoils/*/sim*", (route) => {
+    const url = new URL(route.request().url());
+    const resultId = url.searchParams.get("resultId");
+    const body = resultId === "fixture-rans-a4" ? ransSim : fixtureSim;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
   await page.route("**/api/media/e2e-frames/**", (route) =>
+    route.fulfill({ status: 200, contentType: "image/png", body: PNG }),
+  );
+  await page.route("**/api/media/e2e-static/**", (route) =>
     route.fulfill({ status: 200, contentType: "image/png", body: PNG }),
   );
 }
@@ -142,17 +238,21 @@ test.describe("URANS frame-synced player (fixture-intercepted sim payload)", () 
     const opened = await openSimModal(page);
     expect(opened, "a solved polar point should open the sim modal").toBe(true);
 
-    // Header chips: regime/classification, periods, stationarity, St.
+    // Header chips: regime/classification, stationarity, St/frequency.
     const chips = page.getByTestId("sim-frame-chips");
     await expect(chips).toContainText("URANS · vortex shedding");
-    await expect(chips).toContainText("6 periods retained");
     await expect(page.getByTestId("sim-chip-stationary")).toContainText("stationary ✓");
+    await expect(chips).toContainText("6 periods");
     await expect(chips).toContainText("St 0.21");
+    await expect(chips).toContainText("f 2.50 Hz");
+
+    // Primary alpha track bar is the sibling-result navigation, sorted by α.
+    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 16.0° · 2/2");
 
     // Accent stats: time-weighted means ± std, L/D, period + frequency.
     const stats = page.getByTestId("sim-accent-stats");
     await expect(stats).toContainText("0.912");
-    await expect(stats).toContainText("± 0.148 std");
+    await expect(stats).toContainText("± 0.148");
     await expect(stats).toContainText("0.0421");
     await expect(stats).toContainText("21.66"); // 0.912 / 0.0421 time-weighted L/D
     await expect(stats).toContainText("0.400 s");
@@ -211,7 +311,20 @@ test.describe("URANS frame-synced player (fixture-intercepted sim payload)", () 
     const after = await scrub.inputValue();
     expect(after).not.toBe(before);
 
-    // Secondary surfaces (stored media/evidence) are still present below.
-    await expect(page.getByText("STORED FIELD MEDIA & EVIDENCE")).toBeVisible();
+    // New default frame field is generic over the engine contract and includes pressure.
+    await expect(page.getByTestId("sim-frame-field-pressure")).toBeVisible();
+
+    // Alpha slider navigation loads the sibling RANS result into the SAME layout.
+    const alphaSlider = page.getByTestId("sim-alpha-slider");
+    await alphaSlider.focus();
+    await page.keyboard.press("ArrowLeft");
+    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 4.0° · 1/2");
+    await expect(page.getByTestId("sim-frame-chips")).toContainText("RANS · steady");
+    await expect(page.getByTestId("sim-accent-stats")).toContainText("oscillating steady");
+    await expect(page.getByTestId("sim-frame-player")).toBeVisible();
+    await expect(page.getByTestId("sim-frame-image")).toHaveAttribute("src", /\/rans-velocity_magnitude\.png$/);
+    await expect(page.getByTestId("sim-frame-play")).toBeDisabled();
+    await expect(page.getByTestId("sim-frame-scrub")).toBeDisabled();
+    await expect(page.getByTestId("sim-transport")).toContainText("static");
   });
 });

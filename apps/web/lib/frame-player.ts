@@ -4,11 +4,11 @@
 //
 // The player has ONE piece of truth: the current frame index into the
 // engine-recorded frame track (results.frame_track → SimulationDetail.frameTrack).
-// Every surface — scrub bar, Cl(t) window chart cursor, frame image, overlay
+// Every surface — scrub bar, window-chart cursor, frame image, overlay
 // readout — derives from that index through these helpers. Legacy points
 // (frameTrack null/absent: steady, no-shedding, or pre-contract evidence)
-// yield a null model and the modal falls back to the stored mp4 loop with an
-// explicit "legacy evidence" note — frames are never invented.
+// yield a null model and the modal stays in its static stored-media state —
+// frames are never invented.
 
 import type { FrameTrackDetail, FrameTrackFrameDetail } from "@aerodb/core";
 
@@ -201,6 +201,19 @@ export function advancePlayback(simTime: number, wallDtSeconds: number, speed: P
 export function windowPeriodCount(model: FramePlayerModel): number | null {
   if (model.periodS == null || model.durationS <= 0) return null;
   return Math.max(1, Math.round(model.durationS / model.periodS));
+}
+
+/** Whole-period boundaries as scrub fractions, excluding the 0/1 edges. These
+ *  drive visual tick marks only; the scrubber itself still snaps to frames. */
+export function periodTickFractions(model: FramePlayerModel): number[] {
+  const total = windowPeriodCount(model);
+  if (total == null || model.periodS == null || model.durationS <= 0) return [];
+  const ticks: number[] = [];
+  for (let k = 1; k < total; k++) {
+    const frac = (model.tStart + k * model.periodS - model.tStart) / model.durationS;
+    if (frac > 0 && frac < 1) ticks.push(frac);
+  }
+  return ticks;
 }
 
 /** 1-based period ordinal of a frame within the recording window, for the

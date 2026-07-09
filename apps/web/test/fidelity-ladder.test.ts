@@ -27,7 +27,7 @@ import {
   URANS_VERIFY_DELTA_CL_LIMIT,
   verifyPointsSearch,
 } from "../lib/point-history";
-import { buildSteadyHistoryModel } from "../lib/steady-history";
+import { buildSteadyHistoryModel, summarizeSteadyWindow } from "../lib/steady-history";
 
 // ---------------------------------------------------------------------------
 // contract pins (values must match engine-client fidelity.ts / migration 0034)
@@ -222,6 +222,16 @@ describe("buildSteadyHistoryModel", () => {
     expect(m.iterations).toHaveLength(3);
     expect(m.cl).toHaveLength(3);
     expect(m.windowEndFrac).toBe(1); // clamped to the last available sample
+  });
+
+  it("summarizes the real averaging window for convergence copy", () => {
+    const m = buildSteadyHistoryModel(steadyHistory())!;
+    const summary = summarizeSteadyWindow(m)!;
+    expect(summary.sampleCount).toBe(3);
+    expect(summary.iterCount).toBe(200);
+    expect(summary.clMean).toBeCloseTo((0.85 + 0.87 + 0.86) / 3);
+    expect(summary.clHalfAmplitude).toBeCloseTo(0.01);
+    expect(summary.cdHalfAmplitude).toBeCloseTo(0.0005);
   });
 });
 
