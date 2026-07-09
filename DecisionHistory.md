@@ -2866,3 +2866,14 @@ mean).
 - Wave tally before this fix (post-shedband re-solves): 13 accepted
   (avg 8 min), 12 honest quality rejects — 24/25 graded cells with real
   measured periods (was 0/25 before the band fix).
+
+## 2026-07-09 — cleanstart wave outcome: failure surface zero
+
+- The 12 requeued s1223 c=1 cells re-ran under prod-20260709-cleanstart:
+  ZERO failures (global failed count 0 — cells that detonated within
+  seconds now integrate normally from pristine freestream). Grades:
+  3 accepted (2.34°, 2.45°, 20° oscillating-steady); 5 honest tier-1
+  "steady did not converge" rejects whose wave-2 freestream transients
+  follow automatically through the ladder. Every startup crash class
+  found today (dt-ramp, garbage steady seed, zero-step restart, garbage
+  short-init field) is closed with recall-proven guards.
