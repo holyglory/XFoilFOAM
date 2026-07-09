@@ -124,7 +124,7 @@ def test_solver_profile_frame_track_fields():
     sp = SolverParams()
     assert sp.urans_min_periods == 7
     assert sp.urans_drift_tolerance == pytest.approx(0.05)
-    assert [f.value for f in sp.frame_fields] == ["vorticity", "velocity_magnitude"]
+    assert [f.value for f in sp.frame_fields] == ["vorticity", "velocity_magnitude", "pressure"]
     custom = SolverParams(urans_min_periods=3, urans_drift_tolerance=0.1, frame_fields=["pressure"])
     assert custom.urans_min_periods == 3
     assert custom.frame_fields == [ImageField.pressure]
@@ -461,6 +461,35 @@ def test_fresh_transient_startup_caps_first_chunk_max_delta_t(tmp_path, monkeypa
     assert calls[0]["write_interval"] is None
 
 
+def test_fresh_chunk_monitor_switches_to_frame_write_cadence(tmp_path, monkeypatch):
+    tcase = tmp_path / "transient"
+    (tcase / "system").mkdir(parents=True)
+    (tcase / "system" / "controlDict").write_text(
+        "writeInterval 0.1;\nmaxDeltaT 0.1;\nrunTimeModifiable false;\n"
+    )
+    period = 0.6
+
+    monkeypatch.setattr(pipeline, "_transient_coeff_selection", lambda *_args, **_kwargs: [tmp_path / "coefficient.dat"])
+    monkeypatch.setattr(
+        pipeline,
+        "stable_two_period_window",
+        lambda *_args, **_kwargs: pipeline.StablePeriodResult(
+            ok=False,
+            reason="period locked",
+            period_s=period,
+        ),
+    )
+
+    monitor = pipeline._make_urans_monitor(tcase, CaseSpec(chord=1.0, speed=10.0, aoa_deg=8.0))
+    monitor()
+
+    control = (tcase / "system" / "controlDict").read_text()
+    assert pipeline.URANS_FRAME_WRITE_PER_CYCLE == pytest.approx(30.0)
+    assert pipeline.URANS_MIN_FRAMES_PER_CYCLE == pytest.approx(20.0)
+    assert f"writeInterval {period / pipeline.URANS_FRAME_WRITE_PER_CYCLE:.12g};" in control
+    assert f"maxDeltaT {period / pipeline.URANS_FRAME_WRITE_PER_CYCLE:.12g};" in control
+
+
 def _run_transient_for_test(tmp_path, solver_params, timeout=7200):
     return pipeline._run_transient(
         tmp_path,
@@ -605,11 +634,11 @@ def test_continuation_extends_underretained_sparse_nonstationary_window(tmp_path
         (1.0 + pipeline.RETENTION_SAFETY_CYCLES) * period, rel=0.01
     )
     assert calls[1]["write_interval"] == pytest.approx(
-        period / pipeline.URANS_MIN_FRAMES_PER_CYCLE,
+        period / pipeline.URANS_FRAME_WRITE_PER_CYCLE,
         rel=0.01,
     )
     assert calls[1]["max_delta_t"] == pytest.approx(
-        period / pipeline.URANS_MIN_FRAMES_PER_CYCLE,
+        period / pipeline.URANS_FRAME_WRITE_PER_CYCLE,
         rel=0.01,
     )
     assert result is not None
@@ -701,27 +730,54 @@ def test_continuation_respects_no_shedding_early_exit(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Frame targeting: ~24/period over last min(3, K) periods, cap, alignment
+# Frame targeting: all written states in the retained player window up to cap
 # --------------------------------------------------------------------------- #
 
 
-def test_frame_target_times_cover_last_three_periods_at_24_per_period():
+def test_frame_target_times_cover_last_three_periods_at_frame_write_cadence():
     targets = frame_target_times(window_end=10.0, period_s=0.5, whole_periods=7)
 
-    assert len(targets) == 72  # 24 * min(3, 7)
+    assert len(targets) == 90  # 30 * min(3, 7)
     assert targets[-1] == pytest.approx(10.0)
     assert min(targets) > 10.0 - 3 * 0.5  # start phase excluded (no duplicate)
     steps = np.diff(targets)
     assert np.allclose(steps, steps[0])
-    assert steps[0] == pytest.approx(0.5 / 24)
+    assert steps[0] == pytest.approx(0.5 / 30)
 
 
 def test_frame_target_times_cap_and_short_run_behaviour():
-    assert len(frame_target_times(1.0, 0.01, 7, span_periods=7)) == 120  # 24*7 -> capped
-    assert len(frame_target_times(1.0, 0.4, 2)) == 48  # K=2 -> 2 periods
-    assert len(frame_target_times(1.0, 0.4, 1)) == 24  # K=1 -> 1 period
+    assert len(frame_target_times(1.0, 0.01, 7, span_periods=7)) == 120  # 30*7 -> capped
+    assert len(frame_target_times(1.0, 0.4, 2)) == 60  # K=2 -> 2 periods
+    assert len(frame_target_times(1.0, 0.4, 1)) == 30  # K=1 -> 1 period
     assert frame_target_times(1.0, 0.0, 3) == []
     assert frame_target_times(1.0, 0.4, 0) == []
+
+
+def test_frame_target_times_use_every_written_state_up_to_cap():
+    period = 0.5
+    window_end = 10.0
+    start = window_end - 3 * period
+    written = [start + (i + 1) * period / pipeline.URANS_FRAME_WRITE_PER_CYCLE for i in range(90)]
+
+    targets = frame_target_times(window_end, period, 7, written_times=written)
+
+    assert len(targets) == 90
+    assert targets == pytest.approx(written)
+    assert nearest_vtu_indices(written, targets) == list(range(90))
+
+
+def test_frame_target_times_evenly_caps_dense_written_states():
+    period = 0.5
+    window_end = 10.0
+    start = window_end - 3 * period
+    written = [start + (i + 1) * (3 * period) / 150 for i in range(150)]
+
+    targets = frame_target_times(window_end, period, 7, written_times=written)
+
+    assert len(targets) == FRAME_TRACK_MAX_FRAMES
+    assert targets[0] == pytest.approx(written[0])
+    assert targets[-1] == pytest.approx(written[-1])
+    assert nearest_vtu_indices(written, targets) == sorted(set(nearest_vtu_indices(written, targets)))
 
 
 def test_nearest_vtu_indices_align_and_deduplicate():

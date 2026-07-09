@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from airfoilfoam import pipeline
 from airfoilfoam.cancellation import JobCancelled
 from airfoilfoam.postprocess.unsteady import (
     ForceHistory,
@@ -192,6 +193,11 @@ def test_urans_quality_passes_after_dense_refined_frames(tmp_path):
     assert quality.frames_per_cycle >= 20
 
 
+def test_urans_frame_write_cadence_is_separate_from_quality_gate():
+    assert pipeline.URANS_MIN_FRAMES_PER_CYCLE == pytest.approx(20.0)
+    assert pipeline.URANS_FRAME_WRITE_PER_CYCLE == pytest.approx(30.0)
+
+
 def test_refined_transient_timing_uses_measured_period():
     period = 0.2063864970944712
     timing = refined_transient_timing(
@@ -201,7 +207,7 @@ def test_refined_transient_timing_uses_measured_period():
         discard_fraction=0.25,
     )
 
-    assert timing.write_interval == pytest.approx(period / 20)
+    assert timing.write_interval == pytest.approx(period / pipeline.URANS_FRAME_WRITE_PER_CYCLE)
     assert timing.delta_t == pytest.approx(min(0.00013692523615699336, period / 5000))
     assert timing.run_time_s >= (7 * period) / 0.75
     assert timing.max_delta_t <= timing.write_interval
@@ -218,7 +224,9 @@ def test_refined_transient_timing_can_use_safer_write_cadence():
         cadence_period_s=cadence_period,
     )
 
-    assert timing.write_interval == pytest.approx(measured_period / 20)
+    assert timing.write_interval == pytest.approx(
+        measured_period / pipeline.URANS_FRAME_WRITE_PER_CYCLE
+    )
     assert timing.run_time_s >= (7 * measured_period) / 0.6
     assert (timing.run_time_s / timing.write_interval) == pytest.approx(
         round(timing.run_time_s / timing.write_interval)

@@ -337,7 +337,11 @@ class SolverParams(BaseModel):
         "Cl mean between the first and second half of the integer-period window.",
     )
     frame_fields: list[ImageField] = Field(
-        default_factory=lambda: [ImageField.vorticity, ImageField.velocity_magnitude],
+        default_factory=lambda: [
+            ImageField.vorticity,
+            ImageField.velocity_magnitude,
+            ImageField.pressure,
+        ],
         description="Fields rendered as per-frame 640px PNGs for the frame-synced URANS player "
         "(frame_track contract). Output-profile configurable.",
     )
@@ -631,10 +635,11 @@ class FrameTrack(BaseModel):
     drift_frac: float
     window: FrameTrackWindow
     stats: FrameTrackStats
-    # Frame-image fields (output-profile configurable; default vorticity +
-    # velocity_magnitude). Only fields whose PNGs actually rendered are listed.
+    # Frame-image fields (output-profile configurable; defaults include
+    # vorticity, velocity magnitude, and pressure). Only fields whose PNGs
+    # actually rendered are listed.
     fields: list[str] = Field(default_factory=list)
-    # <=120 frames, ~24/period over the last 2-3 periods.
+    # <=120 frames, all written states up to cap over the last 2-3 periods.
     frames: list[FrameSample] = Field(default_factory=list)
     # 640px-wide PNGs under the case dir, shipped as evidence files.
     image_pattern: str = "frames/{field}/f{i04}.png"

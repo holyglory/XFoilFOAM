@@ -59,6 +59,7 @@ from .postprocess.forces import (
     time_averaged_coefficients,
 )
 from .postprocess.images import (
+    available_vtu_times,
     find_all_vtus,
     render_animations,
     render_contours,
@@ -417,6 +418,10 @@ URANS_STABLE_RETAINED_CYCLES = 5.0
 #: tail) can never floor the whole-period count below the retention target.
 URANS_STABLE_STOP_MARGIN_CYCLES = 0.5
 URANS_MIN_FRAMES_PER_CYCLE = 20.0
+#: Field-write cadence for URANS frame/media evidence. This is deliberately
+#: denser than ``URANS_MIN_FRAMES_PER_CYCLE``: the latter is the cross-runtime
+#: quality gate, while this controls how many real states the player can export.
+URANS_FRAME_WRITE_PER_CYCLE = 30.0
 URANS_ANIMATION_FRAMES = 141
 URANS_MAX_ANIMATION_FRAMES = 220
 URANS_EARLY_STOP_MARKER = "urans_early_stop.json"
@@ -871,7 +876,7 @@ def _make_urans_monitor(
         if period is not None and period > 0 and math.isfinite(period):
             previous = state.get("cadence_period")
             if previous is None or abs(float(previous) - period) / max(period, 1e-12) > 0.15:
-                write_interval = period / URANS_MIN_FRAMES_PER_CYCLE
+                write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
                 _set_control_dict_entries(
                     tcase / "system" / "controlDict",
                     {
@@ -1008,18 +1013,18 @@ def refined_transient_timing(
     discard_fraction: float,
     cadence_period_s: float | None = None,
     min_cycles: float = URANS_MIN_RETAINED_CYCLES,
-    min_frames_per_cycle: float = URANS_MIN_FRAMES_PER_CYCLE,
+    frame_write_per_cycle: float = URANS_FRAME_WRITE_PER_CYCLE,
 ) -> RefinedTransientTiming:
     retained_cycles = max(1, math.ceil(min_cycles))
     retained_fraction = max(1e-6, 1.0 - discard_fraction)
-    write_interval = measured_period_s / min_frames_per_cycle
+    write_interval = measured_period_s / frame_write_per_cycle
     min_total_cycles = retained_cycles / retained_fraction
     original_cycles = original_run_time_s / measured_period_s
     requested_total_cycles = max(original_cycles, min_total_cycles)
     # Align endTime to the field-write cadence so the final retained window has
     # exactly N whole periods with start/end on saved phases.
-    write_steps = max(1, math.ceil(requested_total_cycles * min_frames_per_cycle - 1e-9))
-    run_time = (write_steps / min_frames_per_cycle) * measured_period_s
+    write_steps = max(1, math.ceil(requested_total_cycles * frame_write_per_cycle - 1e-9))
+    run_time = (write_steps / frame_write_per_cycle) * measured_period_s
     delta_t = min(original_delta_t, measured_period_s / 5000.0)
     max_delta_t = min(write_interval, run_time / 50.0)
     return RefinedTransientTiming(
@@ -1480,8 +1485,8 @@ def _extend_transient_until_periods(
         # Prod naca-4412 -15deg precalc retained 2.00/3.00 cycles at 19.5
         # frames/cycle and was not yet stationary, but still had a measurable
         # period and hours of budget. Those blockers are solved by more
-        # integration; the next chunk writes at period/20 while the budget guard
-        # below remains the honest stop condition.
+        # integration; the next chunk writes at the dedicated frame cadence
+        # while the budget guard below remains the honest stop condition.
         chunk_sim = (target + RETENTION_SAFETY_CYCLES - retained) * period / max(1e-6, 1.0 - discard)
         if timeout and total_wall > 0.0:
             # Rate = THIS job's simulated progress per wall second. For a
@@ -1511,7 +1516,7 @@ def _extend_transient_until_periods(
                     measured_period_s=result.quality.measured_period_s or period,
                 )
                 break
-        write_interval = period / URANS_MIN_FRAMES_PER_CYCLE
+        write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
         try:
             nxt = _run_transient_attempt(
                 tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params,
@@ -1610,7 +1615,7 @@ def _run_transient(
         if period is not None and math.isfinite(period) and period > 0:
             retained = span * (1.0 - discard) / period
             chunk_sim = max(period, (target - retained) * period / max(1e-6, 1.0 - discard))
-            write_interval: Optional[float] = period / URANS_MIN_FRAMES_PER_CYCLE
+            write_interval: Optional[float] = period / URANS_FRAME_WRITE_PER_CYCLE
             delta_t = min(initial_delta_t, period / 5000.0)
         else:
             chunk_sim = max(
@@ -2406,18 +2411,23 @@ def _finalize_outcome(
                         outcome.quality_warnings.append(f"animation render failed ({field_name}): {err}")
                     vids = {k: f"{prefix}images/{v}" for k, v in batch.videos.items()}
             outcome.video = vids
-            # Frame-track PNG export: ~24 frames/period over the last
-            # min(3, K) periods (cap 120), rendered from the VTU frames nearest
-            # each target time at the contract's 640px width.
+            # Frame-track PNG export: every written state in the last
+            # min(3, K) periods up to the 120-frame cap, rendered at the
+            # contract's 640px width.
             if frame_stats is not None and solver_params.frame_fields:
                 frames_out = (
                     (case_dir / image_subdir / "frames") if image_subdir else (case_dir / "frames")
                 )
                 if not budget.exceeded():
                     try:
+                        try:
+                            written_times = available_vtu_times(post_dir)
+                        except (FileNotFoundError, OSError):
+                            written_times = None
                         targets = frame_target_times(
                             frame_stats.window_end, frame_stats.period_s, frame_stats.whole_periods,
                             span_periods=URANS_FRAME_SPAN_PERIODS,
+                            written_times=written_times,
                         )
                         frame_times, frame_fields_rendered = render_frame_track_images(
                             post_dir, frames_out, airfoil.contour, spec.chord,

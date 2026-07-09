@@ -9,7 +9,13 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from airfoilfoam.models import ImageField  # noqa: E402
-from airfoilfoam.postprocess.images import compute_field_extents, compute_vorticity, render_contours, write_animation_mp4  # noqa: E402
+from airfoilfoam.postprocess.images import (  # noqa: E402
+    _robust_frame_track_scale,
+    compute_field_extents,
+    compute_vorticity,
+    render_contours,
+    write_animation_mp4,
+)
 
 
 def test_compute_vorticity_solid_body_rotation():
@@ -22,6 +28,27 @@ def test_compute_vorticity_solid_body_rotation():
     wz = compute_vorticity(triang, -y, x)
     assert abs(float(np.median(wz)) - 2.0) < 1e-3
     assert float(np.percentile(np.abs(wz - 2.0), 90)) < 0.05
+
+
+def test_robust_frame_track_scale_excludes_unsigned_outlier():
+    frames = [np.linspace(0.0, 10.0, 1000), np.r_[np.linspace(0.0, 10.0, 999), 5000.0]]
+
+    vmin, vmax = _robust_frame_track_scale(ImageField.velocity_magnitude, frames)
+
+    assert vmin == pytest.approx(0.2, abs=0.2)
+    assert 9.0 < vmax < 20.0
+
+
+def test_robust_frame_track_scale_is_symmetric_for_signed_vorticity():
+    frames = [
+        np.r_[np.linspace(-8.0, 6.0, 1000), 3000.0],
+        np.linspace(-4.0, 7.0, 1000),
+    ]
+
+    vmin, vmax = _robust_frame_track_scale(ImageField.vorticity, frames)
+
+    assert vmin == pytest.approx(-vmax)
+    assert 7.0 < vmax < 20.0
 
 
 def test_write_animation_mp4(tmp_path):

@@ -497,12 +497,27 @@ def stable_two_period_window(
 #: signal still fails: its half-window delta is judged against the rms/absolute
 #: floor scale instead of an accidentally tiny mean.
 DRIFT_ABS_FLOOR = 0.05
-#: Frame-export cadence pinned by the contract: ~24 frames/period ...
-FRAME_EXPORT_FRAMES_PER_PERIOD = 24.0
+#: Fallback synthetic target cadence when the caller cannot provide actual
+#: written VTU times. Normal frame export uses all written states up to cap.
+FRAME_EXPORT_FRAMES_PER_PERIOD = 30.0
 #: ... over the last min(3, K) whole periods ...
 FRAME_EXPORT_SPAN_PERIODS = 3
 #: ... capped at 120 frames total.
 FRAME_EXPORT_MAX_FRAMES = 120
+
+
+def _evenly_capped_times(times: Sequence[float], max_frames: int) -> list[float]:
+    if len(times) <= max_frames:
+        return [float(t) for t in times]
+    n = len(times)
+    m = max(2, int(max_frames))
+    selected: list[int] = []
+    for pos, raw in enumerate(np.linspace(0, n - 1, m)):
+        k = int(round(float(raw)))
+        lower = selected[-1] + 1 if selected else 0
+        upper = n - (m - pos)
+        selected.append(min(max(k, lower), upper))
+    return [float(times[i]) for i in selected]
 
 # --------------------------------------------------------------------------- #
 # Precalc-tier ESTABLISHED-OSCILLATION stationarity (user decision 2026-07-08:
@@ -1014,17 +1029,36 @@ def frame_target_times(
     frames_per_period: float = FRAME_EXPORT_FRAMES_PER_PERIOD,
     max_frames: int = FRAME_EXPORT_MAX_FRAMES,
     span_periods: int = FRAME_EXPORT_SPAN_PERIODS,
+    written_times: Sequence[float] | None = None,
 ) -> list[float]:
-    """Target frame times: ~``frames_per_period`` per period over the LAST
-    min(``span_periods``, K) whole periods, ending exactly at ``window_end``,
-    capped at ``max_frames``. The window start itself is excluded so the phase
-    coverage is uniform (no duplicated endpoint phase)."""
+    """Target frame times for the frame player.
+
+    When real written VTU times are supplied, every written state inside the
+    LAST min(``span_periods``, K) whole-period window is exported up to
+    ``max_frames``. Dense written windows are capped evenly. Without written
+    times, fall back to a synthetic ``frames_per_period`` cadence. The window
+    start itself is excluded so the phase coverage is uniform (no duplicated
+    endpoint phase)."""
     if not math.isfinite(period_s) or period_s <= 0 or whole_periods < 1:
         return []
     p = max(1, min(int(span_periods), int(whole_periods)))
+    span = p * period_s
+    start = window_end - span
+    if written_times is not None:
+        eps = max(abs(window_end), abs(period_s), 1.0) * 1e-9
+        written: list[float] = []
+        for raw in written_times:
+            try:
+                t = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(t) and t > start + eps and t <= window_end + eps:
+                written.append(t)
+        written.sort()
+        if written:
+            return _evenly_capped_times(written, int(max_frames))
     n = int(round(frames_per_period * p))
     n = max(2, min(int(max_frames), n))
-    span = p * period_s
     step = span / n
     return [window_end - span + (j + 1) * step for j in range(n)]
 

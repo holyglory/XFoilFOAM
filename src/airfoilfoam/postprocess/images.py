@@ -26,7 +26,7 @@ from matplotlib.path import Path as MplPath  # noqa: E402
 
 import meshio  # noqa: E402
 
-from ..models import ImageField  # noqa: E402
+from ..models import FRAME_TRACK_MAX_FRAMES, ImageField  # noqa: E402
 
 # field -> (label, matplotlib colormap)
 _FIELD_STYLE = {
@@ -39,6 +39,18 @@ _FIELD_STYLE = {
     ImageField.turbulent_kinetic_energy: ("Turbulent kinetic energy k [m^2/s^2]", "magma"),
     ImageField.turbulent_viscosity: ("Turbulent viscosity nut [m^2/s]", "magma"),
 }
+
+FRAME_TRACK_RENDER_LEVELS = 40
+FRAME_TRACK_SCALE_SAMPLE_FRAMES = 32
+_SIGNED_FRAME_FIELDS = frozenset(
+    {
+        ImageField.velocity_x,
+        ImageField.velocity_y,
+        ImageField.pressure,
+        ImageField.pressure_coefficient,
+        ImageField.vorticity,
+    }
+)
 
 
 def find_internal_vtu(case_dir: Path) -> Path:
@@ -56,6 +68,11 @@ def find_all_vtus(case_dir: Path) -> list[Path]:
     if not candidates:
         raise FileNotFoundError(f"No internal.vtu found under {case_dir / 'VTK'}")
     return candidates
+
+
+def available_vtu_times(case_dir: Path) -> list[float]:
+    """Physical times of stored VTU frames, in render order."""
+    return [_vtu_time(vtu) for vtu in find_all_vtus(case_dir)]
 
 
 def _vtu_time(p: Path) -> float:
@@ -454,6 +471,46 @@ def _scale_for(field_scales: dict[ImageField, tuple[float, float]] | None, field
     return scale
 
 
+def _sample_track_frames(frames: Sequence[np.ndarray], max_frames: int = FRAME_TRACK_SCALE_SAMPLE_FRAMES) -> list[np.ndarray]:
+    if len(frames) <= max_frames:
+        return [np.asarray(frame, dtype=float) for frame in frames]
+    idx = np.linspace(0, len(frames) - 1, max_frames).round().astype(int)
+    return [np.asarray(frames[int(i)], dtype=float) for i in idx]
+
+
+def _robust_frame_track_scale(field: ImageField, frames: Sequence[np.ndarray]) -> tuple[float, float]:
+    """Robust constant color scale for one frame-player track.
+
+    The frame player needs a single scale per field to avoid flicker, but raw
+    min/max lets startup transients or near-wall vorticity spikes collapse the
+    visible wake into a few color bands. Pool a bounded sample of real frames,
+    use 2nd..98th percentiles, and keep signed diverging fields symmetric.
+    """
+    chunks: list[np.ndarray] = []
+    for frame in _sample_track_frames(frames):
+        values = np.asarray(frame, dtype=float).ravel()
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            chunks.append(finite)
+    if not chunks:
+        return 0.0, 1.0e-9
+    pooled = np.concatenate(chunks)
+    if field in _SIGNED_FRAME_FIELDS:
+        vmax = float(np.percentile(np.abs(pooled), 98))
+        if not np.isfinite(vmax) or vmax <= 0.0:
+            vmax = float(np.max(np.abs(pooled)))
+        if not np.isfinite(vmax) or vmax <= 0.0:
+            vmax = 1.0e-9
+        return -vmax, vmax
+    vmin, vmax = (float(x) for x in np.percentile(pooled, [2, 98]))
+    if not (np.isfinite(vmin) and np.isfinite(vmax)) or vmax <= vmin:
+        vmin = float(np.min(pooled))
+        vmax = float(np.max(pooled))
+    if not (np.isfinite(vmin) and np.isfinite(vmax)) or vmax <= vmin:
+        vmax = vmin + 1.0e-9
+    return vmin, vmax
+
+
 def render_contours(
     case_dir: Path,
     out_dir: Path,
@@ -734,10 +791,13 @@ def render_frame_track_images(
     frames nearest each target time.
 
     Writes ``out_root/{field}/f{i:04d}.png`` per rendered field with a
-    consistent per-field color scale across the sequence (2nd..98th percentile
-    over all frames). Returns ``(actual_frame_times, rendered_field_names)``;
-    a field whose source data is missing in the VTUs is skipped (reported by
-    omission, never invented).
+    consistent robust per-field color scale across the sequence. Returns
+    ``(actual_frame_times, rendered_field_names)``; a field whose source data is
+    missing in the VTUs is skipped (reported by omission, never invented).
+
+    Budget sanity: the default precalc player can render 3 fields x up to 120
+    frames = 360 PNGs per case; the media wall-budget guard remains the
+    enforcement point for unexpectedly expensive meshes or filesystems.
 
     ``deadline`` (``time.monotonic`` clock) enforces the media wall budget:
     when it passes mid-field, that field's PARTIAL PNG directory is removed
@@ -748,6 +808,8 @@ def render_frame_track_images(
     vtus = find_all_vtus(case_dir)
     times = [_vtu_time(v) for v in vtus]
     picks = nearest_vtu_indices(times, target_times)
+    if len(picks) > FRAME_TRACK_MAX_FRAMES:
+        picks = _subsample(picks, FRAME_TRACK_MAX_FRAMES)
     if len(picks) < 2:
         return [], []
     chosen = [vtus[k] for k in picks]
@@ -781,10 +843,7 @@ def render_frame_track_images(
         if deadline is not None and time.monotonic() >= deadline:
             break
         frames_vals = per_field[field]
-        allv = np.concatenate(frames_vals)
-        vmin, vmax = float(np.percentile(allv, 2)), float(np.percentile(allv, 98))
-        if vmax <= vmin:
-            vmax = vmin + 1e-9
+        vmin, vmax = _robust_frame_track_scale(field, frames_vals)
         _label, cmap = _FIELD_STYLE[field]
         field_dir = out_root / field.value
         field_dir.mkdir(parents=True, exist_ok=True)
@@ -800,7 +859,13 @@ def render_frame_track_images(
             ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
             ax.set_axis_off()
             ax.tricontourf(
-                f2d.triang, values, levels=40, cmap=cmap, extend="both", vmin=vmin, vmax=vmax
+                f2d.triang,
+                values,
+                levels=FRAME_TRACK_RENDER_LEVELS,
+                cmap=cmap,
+                extend="both",
+                vmin=vmin,
+                vmax=vmax,
             )
             ax.fill(airfoil_xy[:, 0], airfoil_xy[:, 1], color="white", zorder=3)
             ax.plot(airfoil_xy[:, 0], airfoil_xy[:, 1], color="black", lw=1.0, zorder=4)
