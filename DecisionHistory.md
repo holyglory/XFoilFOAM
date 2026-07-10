@@ -2990,3 +2990,31 @@ mean).
   separately: sweeper.test.ts "retries only the rejected angles…"
   times out with the full file, passes solo, reproduces at HEAD before
   this change (task chip spawned).
+
+## 2026-07-10 — DB reseed + clean campaign relaunch (uniform provenance)
+
+- Rationale (user-approved plan): the shakedown dataset mixed evidence
+  from eight engine generations in two days; with the engine stable
+  (prod-20260710-tiermesh) a clean re-run yields uniform provenance at
+  ~10x the original solve speed.
+- Backup FIRST (policy): aerodb-preseed-20260710T000022Z.dump (43 MB,
+  sha256 05133cec…), STRONG-verified by full restore into a scratch DB
+  (49 tables, 577 results, 1621 airfoils) + local copy pulled off-box.
+- Wipe via packages/db reset (drops public AND drizzle schemas — the
+  known migration-ledger gotcha), migrate (incl. 0038), seed (64
+  mediums, 1621 airfoils), symmetry backfill (119 symmetric — matches
+  2026-07-07 exactly).
+- Numerics profiles recreated from values captured pre-wipe (SQL,
+  slugs prod-default-*); plan JSON captured pre-wipe and re-posted by
+  slug-resolved ids. New campaign production-campaign-20260710
+  (b96594a6-e0bf-40ce-b3c6-5dee77b35116): 450 points, 9 conditions,
+  135 lanes — all THREE objectives enabled this time (ld_max 0.10/4,
+  cl_zero 0.05/4, cl_max 0.10/8; the 07-07 run predated cl_max).
+  Per-tier URANS meshes: derived defaults (null pins) — full tier will
+  run the new wall-function derivation when the ladder reaches it.
+- Gotchas hit and handled: sweeper seed default enabled=false (flipped
+  after launch); mint-admin-token.sh writes /tmp/adm.token itself —
+  capturing its stdout message as the token breaks auth (401).
+- S1223 heavy-chord precalc cells are EXPECTED to park again as honest
+  mesh-time failures (documented geometry limit).
+- Monitor re-armed on the new campaign id (state-change-only stream).
