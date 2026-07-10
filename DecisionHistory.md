@@ -3049,3 +3049,23 @@ mean).
   (engine-side retention: strip solver state after terminal ingest,
   keep continuable saved state + media, periodic orphan sweep) filed as
   a spawned task chip with full design constraints.
+
+## 2026-07-10 — Sweeper "order-dependent hang": diagnosis corrected, no code bug
+
+- The suspected hang in sweeper.test.ts ("retries only the rejected
+  angles…", 120 s timeout with the full file, pass solo) does NOT
+  reproduce: 7 consecutive solo-file passes and 3 consecutive FULL
+  sweeper suite runs (16 files / 139 tests) all green in ~80 s each,
+  with a pg_stat_activity/pg_locks sampler armed the whole time — no
+  idle-in-transaction connections, no lock waits beyond sub-5 s
+  sim_campaign_progress insert contention between parallel workers.
+- Corrected root cause: every failure-era run fell in the cold-I/O
+  window right after the OrbStack VM restart (per-FILE durations
+  137–249 s vs seconds at baseline); tests timed out at 120 s while
+  fixture queries crawled. The "-t filter passes" observation was load
+  reduction, not order-dependence; the "reproduces at HEAD" observation
+  was the same degraded window, not a pre-existing code bug.
+- Guardrail: AGENTS.md now instructs comparing file duration against
+  the healthy baseline and sampling pg activity before diagnosing
+  DB-backed test "hangs" after a VM restart. Probe harness pattern
+  (activity/lock sampler alongside vitest) recorded via this incident.

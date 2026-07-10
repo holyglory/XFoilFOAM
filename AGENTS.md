@@ -347,3 +347,13 @@
 - When hardening one test file's cleanup against a shared-DB flake, sweep every
   sibling suite for the same pattern in the same change (the 2026-07-07
   worker-restart-orphan flake was the batching guard fix not being generalized).
+- DB-backed suite timeouts right after a local Docker-VM restart (OrbStack on
+  this machine; test postgres `aerodb-pg` on 127.0.0.1:5544) are usually COLD
+  I/O, not code: in the ~30 min after a VM restart, per-file durations can
+  inflate 10-50x and individual tests hit their 120 s limits with zero log
+  output (fixture queries crawling, not deadlocked). Before diagnosing a
+  "hang" or order-dependence, compare the FILE duration against its healthy
+  baseline (seconds, not minutes) and sample pg_stat_activity for
+  idle-in-transaction / Lock waits during a re-run; only a caught blocker
+  justifies a code-level fix. Incident: 2026-07-10 — 5 "failing" sweeper
+  tests, all environmental (3x full-suite green after warm-up, sampler clean).
