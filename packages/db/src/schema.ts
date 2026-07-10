@@ -36,7 +36,11 @@ export const resultStatusEnum = pgEnum("result_status", [
 ]);
 export const regimeEnum = pgEnum("regime", ["rans", "urans"]);
 export const mediaKindEnum = pgEnum("media_kind", ["image", "video"]);
-export const mediaRoleEnum = pgEnum("media_role", ["instantaneous", "mean", "history"]);
+export const mediaRoleEnum = pgEnum("media_role", [
+  "instantaneous",
+  "mean",
+  "history",
+]);
 export const evidenceArtifactKindEnum = pgEnum("evidence_artifact_kind", [
   "manifest",
   "openfoam_bundle",
@@ -51,7 +55,10 @@ export const evidenceArtifactKindEnum = pgEnum("evidence_artifact_kind", [
   // pinned cross-runtime as FRAME_IMAGE_ARTIFACT_KIND in @aerodb/engine-client.
   "frame_image",
 ]);
-export const presetTargetScopeEnum = pgEnum("preset_target_scope", ["all", "airfoils"]);
+export const presetTargetScopeEnum = pgEnum("preset_target_scope", [
+  "all",
+  "airfoils",
+]);
 export const simJobStatusEnum = pgEnum("sim_job_status", [
   "pending",
   "submitted",
@@ -61,20 +68,24 @@ export const simJobStatusEnum = pgEnum("sim_job_status", [
   "failed",
   "cancelled",
 ]);
-export const resultClassificationStateEnum = pgEnum("result_classification_state", [
-  "accepted",
-  "needs_urans",
-  "superseded_by_urans",
-  "rejected",
+export const resultClassificationStateEnum = pgEnum(
+  "result_classification_state",
+  ["accepted", "needs_urans", "superseded_by_urans", "rejected"],
+);
+export const resultClassificationRegionEnum = pgEnum(
+  "result_classification_region",
+  ["attached", "near_stall", "post_stall", "unknown"],
+);
+export const polarFitStatusEnum = pgEnum("polar_fit_status", [
+  "final",
+  "provisional",
+  "insufficient",
 ]);
-export const resultClassificationRegionEnum = pgEnum("result_classification_region", [
-  "attached",
-  "near_stall",
-  "post_stall",
-  "unknown",
+export const colorScaleStatusEnum = pgEnum("color_scale_status", [
+  "active",
+  "rebalancing",
+  "failed",
 ]);
-export const polarFitStatusEnum = pgEnum("polar_fit_status", ["final", "provisional", "insufficient"]);
-export const colorScaleStatusEnum = pgEnum("color_scale_status", ["active", "rebalancing", "failed"]);
 export const syncDataTypeEnum = pgEnum("sync_data_type", [
   "sweeps",
   "airfoils",
@@ -85,9 +96,20 @@ export const syncDataTypeEnum = pgEnum("sync_data_type", [
   "evidence_artifacts",
   "result_media",
 ]);
-export const syncPromiseStatusEnum = pgEnum("sync_promise_status", ["active", "fulfilled", "expired", "cancelled"]);
-export const syncImportConflictStatusEnum = pgEnum("sync_import_conflict_status", ["pending", "promoted", "archived"]);
-export const syncModeEnum = pgEnum("sync_mode", ["full", "db_only_remote_assets"]);
+export const syncPromiseStatusEnum = pgEnum("sync_promise_status", [
+  "active",
+  "fulfilled",
+  "expired",
+  "cancelled",
+]);
+export const syncImportConflictStatusEnum = pgEnum(
+  "sync_import_conflict_status",
+  ["pending", "promoted", "archived"],
+);
+export const syncModeEnum = pgEnum("sync_mode", [
+  "full",
+  "db_only_remote_assets",
+]);
 export const remoteSolverStatusEnum = pgEnum("remote_solver_status", [
   "disabled",
   "idle",
@@ -98,7 +120,12 @@ export const remoteSolverStatusEnum = pgEnum("remote_solver_status", [
   "error",
   "offline",
 ]);
-export const remoteAssetAvailabilityEnum = pgEnum("remote_asset_availability", ["remote_only", "cached", "missing", "failed"]);
+export const remoteAssetAvailabilityEnum = pgEnum("remote_asset_availability", [
+  "remote_only",
+  "cached",
+  "missing",
+  "failed",
+]);
 
 const ts = () => timestamp({ withTimezone: true });
 export const ALL_IMAGE_FIELDS = [
@@ -178,7 +205,9 @@ export const airfoils = pgTable(
     refLdmax: doublePrecision("ref_ldmax"),
     refClmax: doublePrecision("ref_clmax"),
     refCdmin: doublePrecision("ref_cdmin"),
-    refMetricsSource: dataSourceEnum("ref_metrics_source").notNull().default("queued"),
+    refMetricsSource: dataSourceEnum("ref_metrics_source")
+      .notNull()
+      .default("queued"),
     // Computed geometric property (see @aerodb/core isAirfoilSymmetric); campaigns
     // solve only α ≥ 0 for symmetric airfoils and derive the negative side.
     isSymmetric: boolean("is_symmetric").notNull().default(false),
@@ -249,7 +278,9 @@ export const mediums = pgTable("mediums", {
   name: text("name").notNull(),
   phase: phaseEnum("phase").notNull(),
   density: doublePrecision("density").notNull(),
-  refTemperatureK: doublePrecision("ref_temperature_k").notNull().default(288.15),
+  refTemperatureK: doublePrecision("ref_temperature_k")
+    .notNull()
+    .default(288.15),
   refPressurePa: doublePrecision("ref_pressure_pa").notNull().default(101325),
   viscosityModel: text("viscosity_model").notNull(), // constant | sutherland | table
   constantDynamicViscosity: doublePrecision("constant_dynamic_viscosity"),
@@ -278,7 +309,9 @@ export const mediumViscosityTablePoints = pgTable(
     temperatureK: doublePrecision("temperature_k").notNull(),
     dynamicViscosity: doublePrecision("dynamic_viscosity").notNull(),
     sortOrder: integer("sort_order").notNull().default(0),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .defaultNow()
@@ -286,7 +319,10 @@ export const mediumViscosityTablePoints = pgTable(
   },
   (t) => ({
     mediumIdx: index("medium_viscosity_points_medium_idx").on(t.mediumId),
-    orderUq: uniqueIndex("medium_viscosity_points_order_uq").on(t.mediumId, t.sortOrder),
+    orderUq: uniqueIndex("medium_viscosity_points_order_uq").on(
+      t.mediumId,
+      t.sortOrder,
+    ),
   }),
 );
 
@@ -308,14 +344,21 @@ export const flowConditions = pgTable(
     pressurePa: doublePrecision("pressure_pa").notNull().default(101325),
     speedMps: doublePrecision("speed_mps").notNull().default(50),
     density: doublePrecision("density").notNull().default(1.225),
-    dynamicViscosity: doublePrecision("dynamic_viscosity").notNull().default(1.789e-5),
-    kinematicViscosity: doublePrecision("kinematic_viscosity").notNull().default(1.46e-5),
+    dynamicViscosity: doublePrecision("dynamic_viscosity")
+      .notNull()
+      .default(1.789e-5),
+    kinematicViscosity: doublePrecision("kinematic_viscosity")
+      .notNull()
+      .default(1.46e-5),
     mach: doublePrecision("mach"),
     isSeeded: boolean("is_seeded").notNull().default(false),
     origin: text("origin").notNull().default("user"), // seeded | user | campaign — set once at INSERT
-    createdByCampaignId: uuid("created_by_campaign_id").references((): AnyPgColumn => simCampaigns.id, {
-      onDelete: "set null",
-    }),
+    createdByCampaignId: uuid("created_by_campaign_id").references(
+      (): AnyPgColumn => simCampaigns.id,
+      {
+        onDelete: "set null",
+      },
+    ),
     // mediumId|T|P|speed at canonical SI precision, INPUT values only (see
     // flowConditionCanonicalKey in simulation-setup.ts). Nullable until backfilled.
     canonicalKey: text("canonical_key"),
@@ -327,7 +370,9 @@ export const flowConditions = pgTable(
   },
   (t) => ({
     mediumIdx: index("flow_conditions_medium_idx").on(t.mediumId),
-    canonicalKeyUq: uniqueIndex("flow_conditions_canonical_key_uq").on(t.canonicalKey),
+    canonicalKeyUq: uniqueIndex("flow_conditions_canonical_key_uq").on(
+      t.canonicalKey,
+    ),
   }),
 );
 
@@ -338,15 +383,22 @@ export const referenceGeometryProfiles = pgTable(
     slug: text("slug").notNull().unique(),
     name: text("name").notNull(),
     geometryType: text("geometry_type").notNull().default("airfoil_2d"),
-    referenceLengthKind: text("reference_length_kind").notNull().default("chord"),
-    referenceLengthM: doublePrecision("reference_length_m").notNull().default(1.0),
+    referenceLengthKind: text("reference_length_kind")
+      .notNull()
+      .default("chord"),
+    referenceLengthM: doublePrecision("reference_length_m")
+      .notNull()
+      .default(1.0),
     spanM: doublePrecision("span_m"),
     referenceAreaM2: doublePrecision("reference_area_m2"),
     isSeeded: boolean("is_seeded").notNull().default(false),
     origin: text("origin").notNull().default("user"), // seeded | user | campaign — set once at INSERT
-    createdByCampaignId: uuid("created_by_campaign_id").references((): AnyPgColumn => simCampaigns.id, {
-      onDelete: "set null",
-    }),
+    createdByCampaignId: uuid("created_by_campaign_id").references(
+      (): AnyPgColumn => simCampaigns.id,
+      {
+        onDelete: "set null",
+      },
+    ),
     // type|kind|chord|span|area at canonical SI precision, INPUT values only (see
     // referenceGeometryCanonicalKey in simulation-setup.ts). Nullable until backfilled.
     canonicalKey: text("canonical_key"),
@@ -357,8 +409,12 @@ export const referenceGeometryProfiles = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    geometryTypeIdx: index("reference_geometry_profiles_type_idx").on(t.geometryType),
-    canonicalKeyUq: uniqueIndex("reference_geometry_profiles_canonical_key_uq").on(t.canonicalKey),
+    geometryTypeIdx: index("reference_geometry_profiles_type_idx").on(
+      t.geometryType,
+    ),
+    canonicalKeyUq: uniqueIndex(
+      "reference_geometry_profiles_canonical_key_uq",
+    ).on(t.canonicalKey),
   }),
 );
 
@@ -374,13 +430,19 @@ export const operatingConditions = pgTable(
     mediumId: uuid("medium_id")
       .notNull()
       .references(() => mediums.id),
-    referenceChordM: doublePrecision("reference_chord_m").notNull().default(1.0),
+    referenceChordM: doublePrecision("reference_chord_m")
+      .notNull()
+      .default(1.0),
     temperatureK: doublePrecision("temperature_k").notNull().default(288.15),
     pressurePa: doublePrecision("pressure_pa").notNull().default(101325),
     speedMps: doublePrecision("speed_mps").notNull().default(50),
     density: doublePrecision("density").notNull().default(1.225),
-    dynamicViscosity: doublePrecision("dynamic_viscosity").notNull().default(1.789e-5),
-    kinematicViscosity: doublePrecision("kinematic_viscosity").notNull().default(1.46e-5),
+    dynamicViscosity: doublePrecision("dynamic_viscosity")
+      .notNull()
+      .default(1.789e-5),
+    kinematicViscosity: doublePrecision("kinematic_viscosity")
+      .notNull()
+      .default(1.46e-5),
     reynolds: bigint("reynolds", { mode: "number" }).notNull(),
     mach: doublePrecision("mach"),
     isSeeded: boolean("is_seeded").notNull().default(false),
@@ -400,10 +462,14 @@ export const boundaryProfiles = pgTable("boundary_profiles", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
-  turbulenceIntensity: doublePrecision("turbulence_intensity").notNull().default(0.001),
+  turbulenceIntensity: doublePrecision("turbulence_intensity")
+    .notNull()
+    .default(0.001),
   viscosityRatio: doublePrecision("viscosity_ratio").notNull().default(10),
   sandGrainHeight: doublePrecision("sand_grain_height").notNull().default(0),
-  roughnessConstant: doublePrecision("roughness_constant").notNull().default(0.5),
+  roughnessConstant: doublePrecision("roughness_constant")
+    .notNull()
+    .default(0.5),
   isSeeded: boolean("is_seeded").notNull().default(false),
   createdAt: ts().notNull().defaultNow(),
   updatedAt: ts()
@@ -417,7 +483,9 @@ export const meshProfiles = pgTable("mesh_profiles", {
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
   mesher: text("mesher").notNull().default("blockmesh-cgrid"),
-  farfieldRadiusChords: doublePrecision("farfield_radius_chords").notNull().default(15),
+  farfieldRadiusChords: doublePrecision("farfield_radius_chords")
+    .notNull()
+    .default(15),
   wakeLengthChords: doublePrecision("wake_length_chords").notNull().default(12),
   nSurface: integer("n_surface").notNull().default(130),
   nRadial: integer("n_radial").notNull().default(80),
@@ -438,11 +506,17 @@ export const solverProfiles = pgTable("solver_profiles", {
   name: text("name").notNull(),
   turbulenceModel: text("turbulence_model").notNull().default("kOmegaSST"),
   nIterations: integer("n_iterations").notNull().default(3000),
-  convergenceTolerance: doublePrecision("convergence_tolerance").notNull().default(1e-5),
+  convergenceTolerance: doublePrecision("convergence_tolerance")
+    .notNull()
+    .default(1e-5),
   momentumScheme: text("momentum_scheme").notNull().default("linearUpwind"),
   transientCycles: doublePrecision("transient_cycles").notNull().default(10),
-  transientDiscardFraction: doublePrecision("transient_discard_fraction").notNull().default(0.4),
-  transientMaxCourant: doublePrecision("transient_max_courant").notNull().default(15),
+  transientDiscardFraction: doublePrecision("transient_discard_fraction")
+    .notNull()
+    .default(0.4),
+  transientMaxCourant: doublePrecision("transient_max_courant")
+    .notNull()
+    .default(15),
   isSeeded: boolean("is_seeded").notNull().default(false),
   createdAt: ts().notNull().defaultNow(),
   updatedAt: ts()
@@ -516,25 +590,39 @@ export const boundaryConditions = pgTable(
       .notNull()
       .references(() => mediums.id),
     reynolds: bigint("reynolds", { mode: "number" }).notNull(),
-    referenceChordM: doublePrecision("reference_chord_m").notNull().default(1.0),
+    referenceChordM: doublePrecision("reference_chord_m")
+      .notNull()
+      .default(1.0),
     temperatureK: doublePrecision("temperature_k").notNull().default(288.15),
     pressurePa: doublePrecision("pressure_pa").notNull().default(101325),
     speedMps: doublePrecision("speed_mps").notNull().default(50),
     density: doublePrecision("density").notNull().default(1.225),
-    dynamicViscosity: doublePrecision("dynamic_viscosity").notNull().default(1.789e-5),
-    kinematicViscosity: doublePrecision("kinematic_viscosity").notNull().default(1.46e-5),
+    dynamicViscosity: doublePrecision("dynamic_viscosity")
+      .notNull()
+      .default(1.789e-5),
+    kinematicViscosity: doublePrecision("kinematic_viscosity")
+      .notNull()
+      .default(1.46e-5),
     mach: doublePrecision("mach"),
     // turbulence
     turbulenceModel: text("turbulence_model").notNull().default("kOmegaSST"),
-    turbulenceIntensity: doublePrecision("turbulence_intensity").notNull().default(0.001),
+    turbulenceIntensity: doublePrecision("turbulence_intensity")
+      .notNull()
+      .default(0.001),
     viscosityRatio: doublePrecision("viscosity_ratio").notNull().default(10),
     // roughness
     sandGrainHeight: doublePrecision("sand_grain_height").notNull().default(0),
-    roughnessConstant: doublePrecision("roughness_constant").notNull().default(0.5),
+    roughnessConstant: doublePrecision("roughness_constant")
+      .notNull()
+      .default(0.5),
     // mesh
     mesher: text("mesher").notNull().default("blockmesh-cgrid"),
-    farfieldRadiusChords: doublePrecision("farfield_radius_chords").notNull().default(15),
-    wakeLengthChords: doublePrecision("wake_length_chords").notNull().default(12),
+    farfieldRadiusChords: doublePrecision("farfield_radius_chords")
+      .notNull()
+      .default(15),
+    wakeLengthChords: doublePrecision("wake_length_chords")
+      .notNull()
+      .default(12),
     nSurface: integer("n_surface").notNull().default(130),
     nRadial: integer("n_radial").notNull().default(80),
     nWake: integer("n_wake").notNull().default(60),
@@ -542,11 +630,17 @@ export const boundaryConditions = pgTable(
     spanChords: doublePrecision("span_chords").notNull().default(0.1),
     // solver
     nIterations: integer("n_iterations").notNull().default(3000),
-    convergenceTolerance: doublePrecision("convergence_tolerance").notNull().default(1e-5),
+    convergenceTolerance: doublePrecision("convergence_tolerance")
+      .notNull()
+      .default(1e-5),
     momentumScheme: text("momentum_scheme").notNull().default("linearUpwind"),
     transientCycles: doublePrecision("transient_cycles").notNull().default(10),
-    transientDiscardFraction: doublePrecision("transient_discard_fraction").notNull().default(0.4),
-    transientMaxCourant: doublePrecision("transient_max_courant").notNull().default(15),
+    transientDiscardFraction: doublePrecision("transient_discard_fraction")
+      .notNull()
+      .default(0.4),
+    transientMaxCourant: doublePrecision("transient_max_courant")
+      .notNull()
+      .default(15),
     writeImages: jsonb("write_images")
       .$type<string[]>()
       .notNull()
@@ -583,7 +677,9 @@ export const simulationPresets = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     slug: text("slug").notNull().unique(),
     name: text("name").notNull(),
-    operatingConditionId: uuid("operating_condition_id").references(() => operatingConditions.id),
+    operatingConditionId: uuid("operating_condition_id").references(
+      () => operatingConditions.id,
+    ),
     flowConditionId: uuid("flow_condition_id")
       .notNull()
       .references(() => flowConditions.id),
@@ -596,8 +692,12 @@ export const simulationPresets = pgTable(
     meshProfileId: uuid("mesh_profile_id")
       .notNull()
       .references(() => meshProfiles.id),
-    uransMeshProfileId: uuid("urans_mesh_profile_id").references(() => meshProfiles.id),
-    uransPrecalcMeshProfileId: uuid("urans_precalc_mesh_profile_id").references(() => meshProfiles.id),
+    uransMeshProfileId: uuid("urans_mesh_profile_id").references(
+      () => meshProfiles.id,
+    ),
+    uransPrecalcMeshProfileId: uuid("urans_precalc_mesh_profile_id").references(
+      () => meshProfiles.id,
+    ),
     solverProfileId: uuid("solver_profile_id")
       .notNull()
       .references(() => solverProfiles.id),
@@ -610,7 +710,9 @@ export const simulationPresets = pgTable(
     sweepDefinitionId: uuid("sweep_definition_id")
       .notNull()
       .references(() => sweepDefinitions.id),
-    legacyBoundaryConditionId: uuid("legacy_boundary_condition_id").references(() => boundaryConditions.id),
+    legacyBoundaryConditionId: uuid("legacy_boundary_condition_id").references(
+      () => boundaryConditions.id,
+    ),
     targetScope: presetTargetScopeEnum("target_scope").notNull().default("all"),
     // library | campaign — set ONCE at INSERT, never reassigned. No campaignId
     // column: campaign linkage is many-to-many via sim_campaign_conditions.
@@ -625,7 +727,9 @@ export const simulationPresets = pgTable(
   },
   (t) => ({
     enabledIdx: index("simulation_presets_enabled_idx").on(t.enabled),
-    legacyBcIdx: index("simulation_presets_legacy_bc_idx").on(t.legacyBoundaryConditionId),
+    legacyBcIdx: index("simulation_presets_legacy_bc_idx").on(
+      t.legacyBoundaryConditionId,
+    ),
   }),
 );
 
@@ -666,16 +770,30 @@ export const simulationPresetRevisions = pgTable(
     // Deterministic canonical-revision election per physicsHash: the campaign
     // launch materializer reuses the canonical row (prefer enabled-preset
     // revision, else oldest createdAt, tie-break lowest id).
-    isCanonicalPhysics: boolean("is_canonical_physics").notNull().default(false),
+    isCanonicalPhysics: boolean("is_canonical_physics")
+      .notNull()
+      .default(false),
     createdAt: ts().notNull().defaultNow(),
   },
   (t) => ({
     presetIdx: index("simulation_preset_revisions_preset_idx").on(t.presetId),
-    reynoldsIdx: index("simulation_preset_revisions_reynolds_idx").on(t.reynolds),
-    signatureUq: uniqueIndex("simulation_preset_revisions_signature_uq").on(t.presetId, t.signatureHash),
-    revisionUq: uniqueIndex("simulation_preset_revisions_revision_uq").on(t.presetId, t.revisionNumber),
-    physicsHashIdx: index("simulation_preset_revisions_physics_hash_idx").on(t.physicsHash),
-    canonicalPhysicsUq: uniqueIndex("simulation_preset_revisions_canonical_physics_uq")
+    reynoldsIdx: index("simulation_preset_revisions_reynolds_idx").on(
+      t.reynolds,
+    ),
+    signatureUq: uniqueIndex("simulation_preset_revisions_signature_uq").on(
+      t.presetId,
+      t.signatureHash,
+    ),
+    revisionUq: uniqueIndex("simulation_preset_revisions_revision_uq").on(
+      t.presetId,
+      t.revisionNumber,
+    ),
+    physicsHashIdx: index("simulation_preset_revisions_physics_hash_idx").on(
+      t.physicsHash,
+    ),
+    canonicalPhysicsUq: uniqueIndex(
+      "simulation_preset_revisions_canonical_physics_uq",
+    )
       .on(t.physicsHash)
       .where(sql`${t.isCanonicalPhysics}`),
   }),
@@ -695,7 +813,9 @@ export const results = pgTable(
     bcId: uuid("bc_id")
       .notNull()
       .references(() => boundaryConditions.id, { onDelete: "cascade" }),
-    simulationPresetRevisionId: uuid("simulation_preset_revision_id").references(() => simulationPresetRevisions.id),
+    simulationPresetRevisionId: uuid(
+      "simulation_preset_revision_id",
+    ).references(() => simulationPresetRevisions.id),
     aoaDeg: doublePrecision("aoa_deg").notNull(),
     status: resultStatusEnum("status").notNull().default("pending"),
     source: dataSourceEnum("source").notNull().default("queued"),
@@ -721,7 +841,9 @@ export const results = pgTable(
     yPlusAvg: doublePrecision("y_plus_avg"),
     yPlusMax: doublePrecision("y_plus_max"),
     nCells: integer("n_cells"),
-    firstOrderFallback: boolean("first_order_fallback").notNull().default(false),
+    firstOrderFallback: boolean("first_order_fallback")
+      .notNull()
+      .default(false),
     strouhal: doublePrecision("strouhal"),
     error: text("error"),
     /** Engine per-point non-fatal quality warnings (PolarPoint.quality_warnings),
@@ -753,7 +875,9 @@ export const results = pgTable(
      *  failed job. NULL = never auto-retried. */
     autoRetriedAt: timestamp("auto_retried_at", { withTimezone: true }),
     // linkage to the engine run
-    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
+      onDelete: "set null",
+    }),
     engineJobId: text("engine_job_id"),
     engineCaseSlug: text("engine_case_slug"),
     priority: integer("priority").notNull().default(0),
@@ -765,10 +889,16 @@ export const results = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    naturalUq: uniqueIndex("results_revision_natural_uq").on(t.airfoilId, t.simulationPresetRevisionId, t.aoaDeg),
+    naturalUq: uniqueIndex("results_revision_natural_uq").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.aoaDeg,
+    ),
     airfoilBcIdx: index("results_airfoil_bc_idx").on(t.airfoilId, t.bcId),
     bcIdx: index("results_bc_idx").on(t.bcId),
-    presetRevisionIdx: index("results_preset_revision_idx").on(t.simulationPresetRevisionId),
+    presetRevisionIdx: index("results_preset_revision_idx").on(
+      t.simulationPresetRevisionId,
+    ),
     statusIdx: index("results_status_idx").on(t.status),
     simJobIdx: index("results_sim_job_idx").on(t.simJobId),
     catalogMetricsIdx: index("results_catalog_metrics_idx").on(
@@ -791,16 +921,22 @@ export const resultAttempts = pgTable(
   "result_attempts",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    resultId: uuid("result_id").references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "cascade",
+    }),
     airfoilId: uuid("airfoil_id")
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
     bcId: uuid("bc_id")
       .notNull()
       .references(() => boundaryConditions.id, { onDelete: "cascade" }),
-    simulationPresetRevisionId: uuid("simulation_preset_revision_id").references(() => simulationPresetRevisions.id),
+    simulationPresetRevisionId: uuid(
+      "simulation_preset_revision_id",
+    ).references(() => simulationPresetRevisions.id),
     aoaDeg: doublePrecision("aoa_deg").notNull(),
-    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
+      onDelete: "set null",
+    }),
     engineJobId: text("engine_job_id"),
     engineCaseSlug: text("engine_case_slug"),
     status: resultStatusEnum("status").notNull().default("done"),
@@ -822,7 +958,9 @@ export const resultAttempts = pgTable(
     yPlusAvg: doublePrecision("y_plus_avg"),
     yPlusMax: doublePrecision("y_plus_max"),
     nCells: integer("n_cells"),
-    firstOrderFallback: boolean("first_order_fallback").notNull().default(false),
+    firstOrderFallback: boolean("first_order_fallback")
+      .notNull()
+      .default(false),
     strouhal: doublePrecision("strouhal"),
     error: text("error"),
     /** Engine per-attempt non-fatal quality warnings (PolarPoint.quality_warnings)
@@ -835,8 +973,13 @@ export const resultAttempts = pgTable(
   },
   (t) => ({
     resultIdx: index("result_attempts_result_idx").on(t.resultId),
-    airfoilBcIdx: index("result_attempts_airfoil_bc_idx").on(t.airfoilId, t.bcId),
-    presetRevisionIdx: index("result_attempts_preset_revision_idx").on(t.simulationPresetRevisionId),
+    airfoilBcIdx: index("result_attempts_airfoil_bc_idx").on(
+      t.airfoilId,
+      t.bcId,
+    ),
+    presetRevisionIdx: index("result_attempts_preset_revision_idx").on(
+      t.simulationPresetRevisionId,
+    ),
     simJobIdx: index("result_attempts_sim_job_idx").on(t.simJobId),
     validIdx: index("result_attempts_valid_idx").on(t.validForPolar),
     catalogRejectedIdx: index("result_attempts_catalog_rejected_idx").on(
@@ -848,7 +991,12 @@ export const resultAttempts = pgTable(
       t.validForPolar,
       t.aoaDeg,
     ),
-    attemptUq: uniqueIndex("result_attempts_job_aoa_regime_uq").on(t.simJobId, t.engineJobId, t.aoaDeg, t.regime),
+    attemptUq: uniqueIndex("result_attempts_job_aoa_regime_uq").on(
+      t.simJobId,
+      t.engineJobId,
+      t.aoaDeg,
+      t.regime,
+    ),
   }),
 );
 
@@ -866,7 +1014,9 @@ export const fieldColorScales = pgTable(
       .notNull()
       .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
     field: text("field").notNull(),
-    renderProfileKey: text("render_profile_key").notNull().default("default:v1:zoom2"),
+    renderProfileKey: text("render_profile_key")
+      .notNull()
+      .default("default:v1:zoom2"),
     scalePolicy: text("scale_policy").notNull(),
     vmin: doublePrecision("vmin").notNull(),
     vmax: doublePrecision("vmax").notNull(),
@@ -882,9 +1032,19 @@ export const fieldColorScales = pgTable(
     activatedAt: ts(),
   },
   (t) => ({
-    scopeIdx: index("field_color_scales_scope_idx").on(t.airfoilId, t.simulationPresetRevisionId, t.field, t.renderProfileKey),
+    scopeIdx: index("field_color_scales_scope_idx").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.field,
+      t.renderProfileKey,
+    ),
     activeUq: uniqueIndex("field_color_scales_active_uq")
-      .on(t.airfoilId, t.simulationPresetRevisionId, t.field, t.renderProfileKey)
+      .on(
+        t.airfoilId,
+        t.simulationPresetRevisionId,
+        t.field,
+        t.renderProfileKey,
+      )
       .where(sql`${t.active}`),
     versionUq: uniqueIndex("field_color_scales_version_uq").on(
       t.airfoilId,
@@ -910,7 +1070,9 @@ export const resultFieldExtents = pgTable(
       .notNull()
       .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
     field: text("field").notNull(),
-    renderProfileKey: text("render_profile_key").notNull().default("default:v1:zoom2"),
+    renderProfileKey: text("render_profile_key")
+      .notNull()
+      .default("default:v1:zoom2"),
     vmin: doublePrecision("vmin").notNull(),
     vmax: doublePrecision("vmax").notNull(),
     finiteCount: integer("finite_count").notNull(),
@@ -925,8 +1087,17 @@ export const resultFieldExtents = pgTable(
   },
   (t) => ({
     resultIdx: index("result_field_extents_result_idx").on(t.resultId),
-    scopeIdx: index("result_field_extents_scope_idx").on(t.airfoilId, t.simulationPresetRevisionId, t.field, t.renderProfileKey),
-    uq: uniqueIndex("result_field_extents_result_field_uq").on(t.resultId, t.field, t.renderProfileKey),
+    scopeIdx: index("result_field_extents_scope_idx").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.field,
+      t.renderProfileKey,
+    ),
+    uq: uniqueIndex("result_field_extents_result_field_uq").on(
+      t.resultId,
+      t.field,
+      t.renderProfileKey,
+    ),
   }),
 );
 
@@ -946,12 +1117,16 @@ export const resultMedia = pgTable(
     height: integer("height"),
     frameCount: integer("frame_count"),
     durationS: doublePrecision("duration_s"),
-    colorScaleId: uuid("color_scale_id").references(() => fieldColorScales.id, { onDelete: "set null" }),
+    colorScaleId: uuid("color_scale_id").references(() => fieldColorScales.id, {
+      onDelete: "set null",
+    }),
     colorScaleVersion: integer("color_scale_version"),
     scaleVmin: doublePrecision("scale_vmin"),
     scaleVmax: doublePrecision("scale_vmax"),
     scalePolicy: text("scale_policy"),
-    renderProfileKey: text("render_profile_key").notNull().default("default:v1:zoom2"),
+    renderProfileKey: text("render_profile_key")
+      .notNull()
+      .default("default:v1:zoom2"),
     engineUrl: text("engine_url"),
     createdAt: ts().notNull().defaultNow(),
   },
@@ -968,12 +1143,19 @@ export const solverEvidenceArtifacts = pgTable(
   "solver_evidence_artifacts",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    resultId: uuid("result_id").references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
-    resultAttemptId: uuid("result_attempt_id").references((): AnyPgColumn => resultAttempts.id, { onDelete: "cascade" }),
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "cascade",
+    }),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "cascade" },
+    ),
     airfoilId: uuid("airfoil_id")
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
-    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
+      onDelete: "set null",
+    }),
     engineJobId: text("engine_job_id"),
     engineCaseSlug: text("engine_case_slug"),
     aoaDeg: doublePrecision("aoa_deg"),
@@ -993,9 +1175,17 @@ export const solverEvidenceArtifacts = pgTable(
   },
   (t) => ({
     resultIdx: index("solver_evidence_artifacts_result_idx").on(t.resultId),
-    attemptIdx: index("solver_evidence_artifacts_attempt_idx").on(t.resultAttemptId),
-    airfoilIdx: index("solver_evidence_artifacts_airfoil_idx").on(t.airfoilId, t.aoaDeg),
-    storageUq: uniqueIndex("solver_evidence_artifacts_storage_uq").on(t.storageKey, t.sha256),
+    attemptIdx: index("solver_evidence_artifacts_attempt_idx").on(
+      t.resultAttemptId,
+    ),
+    airfoilIdx: index("solver_evidence_artifacts_airfoil_idx").on(
+      t.airfoilId,
+      t.aoaDeg,
+    ),
+    storageUq: uniqueIndex("solver_evidence_artifacts_storage_uq").on(
+      t.storageKey,
+      t.sha256,
+    ),
   }),
 );
 
@@ -1024,7 +1214,12 @@ export const fieldRenderCache = pgTable(
   },
   (t) => ({
     resultIdx: index("field_render_cache_result_idx").on(t.resultId),
-    renderUq: uniqueIndex("field_render_cache_result_params_uq").on(t.resultId, t.field, t.role, t.paramsHash),
+    renderUq: uniqueIndex("field_render_cache_result_params_uq").on(
+      t.resultId,
+      t.field,
+      t.role,
+      t.paramsHash,
+    ),
   }),
 );
 
@@ -1060,8 +1255,13 @@ export const resultClassifications = pgTable(
   "result_classifications",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    resultId: uuid("result_id").references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
-    resultAttemptId: uuid("result_attempt_id").references((): AnyPgColumn => resultAttempts.id, { onDelete: "cascade" }),
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "cascade",
+    }),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "cascade" },
+    ),
     airfoilId: uuid("airfoil_id")
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
@@ -1072,15 +1272,20 @@ export const resultClassifications = pgTable(
     regime: regimeEnum("regime"),
     classifierVersion: text("classifier_version").notNull(),
     state: resultClassificationStateEnum("state").notNull(),
-    region: resultClassificationRegionEnum("region").notNull().default("unknown"),
+    region: resultClassificationRegionEnum("region")
+      .notNull()
+      .default("unknown"),
     confidence: doublePrecision("confidence").notNull().default(1),
     reasons: text("reasons")
       .array()
       .notNull()
       .default(sql`'{}'::text[]`),
-    supersededByResultId: uuid("superseded_by_result_id").references((): AnyPgColumn => results.id, {
-      onDelete: "set null",
-    }),
+    supersededByResultId: uuid("superseded_by_result_id").references(
+      (): AnyPgColumn => results.id,
+      {
+        onDelete: "set null",
+      },
+    ),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -1089,8 +1294,44 @@ export const resultClassifications = pgTable(
   },
   (t) => ({
     resultUq: uniqueIndex("result_classifications_result_uq").on(t.resultId),
-    attemptUq: uniqueIndex("result_classifications_attempt_uq").on(t.resultAttemptId),
-    polarIdx: index("result_classifications_polar_idx").on(t.airfoilId, t.simulationPresetRevisionId, t.state, t.aoaDeg),
+    attemptUq: uniqueIndex("result_classifications_attempt_uq").on(
+      t.resultAttemptId,
+    ),
+    polarIdx: index("result_classifications_polar_idx").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.state,
+      t.aoaDeg,
+    ),
+  }),
+);
+
+export const resultReviewVerdicts = pgTable(
+  "result_review_verdicts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
+    verdict: text("verdict").notNull(),
+    note: text("note"),
+    reviewer: text("reviewer").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+    revokedAt: ts(),
+    revokedBy: text("revoked_by"),
+  },
+  (t) => ({
+    verdictCheck: check(
+      "result_review_verdicts_verdict_check",
+      sql`${t.verdict} IN ('waive', 'exclude', 'defer')`,
+    ),
+    activeResultIdx: index("result_review_verdicts_active_result_idx")
+      .on(t.resultId)
+      .where(sql`${t.revokedAt} IS NULL`),
+    resultHistoryIdx: index("result_review_verdicts_result_history_idx").on(
+      t.resultId,
+      t.createdAt,
+    ),
   }),
 );
 
@@ -1109,7 +1350,9 @@ export const polarFitSets = pgTable(
     status: polarFitStatusEnum("status").notNull(),
     confidence: doublePrecision("confidence").notNull().default(0),
     acceptedPointCount: integer("accepted_point_count").notNull().default(0),
-    provisionalPointCount: integer("provisional_point_count").notNull().default(0),
+    provisionalPointCount: integer("provisional_point_count")
+      .notNull()
+      .default(0),
     rejectedPointCount: integer("rejected_point_count").notNull().default(0),
     reynolds: bigint("reynolds", { mode: "number" }),
     mach: doublePrecision("mach"),
@@ -1136,9 +1379,20 @@ export const polarFitSets = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    fitUq: uniqueIndex("polar_fit_sets_signature_uq").on(t.airfoilId, t.simulationPresetRevisionId, t.fitVersion, t.evidenceSignature),
-    airfoilIdx: index("polar_fit_sets_airfoil_idx").on(t.airfoilId, t.isCurrent, t.status),
-    revisionIdx: index("polar_fit_sets_revision_idx").on(t.simulationPresetRevisionId),
+    fitUq: uniqueIndex("polar_fit_sets_signature_uq").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.fitVersion,
+      t.evidenceSignature,
+    ),
+    airfoilIdx: index("polar_fit_sets_airfoil_idx").on(
+      t.airfoilId,
+      t.isCurrent,
+      t.status,
+    ),
+    revisionIdx: index("polar_fit_sets_revision_idx").on(
+      t.simulationPresetRevisionId,
+    ),
   }),
 );
 
@@ -1170,13 +1424,21 @@ export const simJobs = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     engineJobId: text("engine_job_id"),
-    parentJobId: uuid("parent_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
+    parentJobId: uuid("parent_job_id").references(
+      (): AnyPgColumn => simJobs.id,
+      { onDelete: "set null" },
+    ),
     airfoilId: uuid("airfoil_id")
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
     bcIds: jsonb("bc_ids").$type<string[]>().notNull(),
-    simulationPresetRevisionId: uuid("simulation_preset_revision_id").references(() => simulationPresetRevisions.id),
-    campaignId: uuid("campaign_id").references((): AnyPgColumn => simCampaigns.id, { onDelete: "set null" }),
+    simulationPresetRevisionId: uuid(
+      "simulation_preset_revision_id",
+    ).references(() => simulationPresetRevisions.id),
+    campaignId: uuid("campaign_id").references(
+      (): AnyPgColumn => simCampaigns.id,
+      { onDelete: "set null" },
+    ),
     jobKind: text("job_kind").notNull().default("sweep"), // sweep | targeted
     referenceChordM: doublePrecision("reference_chord_m").notNull(),
     wave: integer("wave").notNull().default(1),
@@ -1207,7 +1469,9 @@ export const simJobs = pgTable(
     statusIdx: index("sim_jobs_status_idx").on(t.status),
     engineJobIdx: index("sim_jobs_engine_job_idx").on(t.engineJobId),
     airfoilIdx: index("sim_jobs_airfoil_idx").on(t.airfoilId),
-    presetRevisionIdx: index("sim_jobs_preset_revision_idx").on(t.simulationPresetRevisionId),
+    presetRevisionIdx: index("sim_jobs_preset_revision_idx").on(
+      t.simulationPresetRevisionId,
+    ),
     campaignIdx: index("sim_jobs_campaign_idx").on(t.campaignId),
   }),
 );
@@ -1280,9 +1544,14 @@ export const simCampaigns = pgTable(
   },
   (t) => ({
     slugUq: uniqueIndex("sim_campaigns_slug_uq").on(t.slug),
-    idempotencyKeyUq: uniqueIndex("sim_campaigns_idempotency_key_uq").on(t.idempotencyKey),
+    idempotencyKeyUq: uniqueIndex("sim_campaigns_idempotency_key_uq").on(
+      t.idempotencyKey,
+    ),
     statusIdx: index("sim_campaigns_status_idx").on(t.status),
-    priorityCheck: check("sim_campaigns_priority_check", sql`${t.priority} >= 0 AND ${t.priority} <= 9`),
+    priorityCheck: check(
+      "sim_campaigns_priority_check",
+      sql`${t.priority} >= 0 AND ${t.priority} <= 9`,
+    ),
   }),
 );
 
@@ -1322,8 +1591,13 @@ export const simCampaignPlanRevisions = pgTable(
     createdAt: ts().notNull().defaultNow(),
   },
   (t) => ({
-    revisionUq: uniqueIndex("sim_campaign_plan_revisions_revision_uq").on(t.campaignId, t.revisionNumber),
-    campaignIdx: index("sim_campaign_plan_revisions_campaign_idx").on(t.campaignId),
+    revisionUq: uniqueIndex("sim_campaign_plan_revisions_revision_uq").on(
+      t.campaignId,
+      t.revisionNumber,
+    ),
+    campaignIdx: index("sim_campaign_plan_revisions_campaign_idx").on(
+      t.campaignId,
+    ),
   }),
 );
 
@@ -1357,9 +1631,9 @@ export const simCampaignConditions = pgTable(
     introducedInPlanRevisionId: uuid("introduced_in_plan_revision_id")
       .notNull()
       .references(() => simCampaignPlanRevisions.id),
-    statusChangedInPlanRevisionId: uuid("status_changed_in_plan_revision_id").references(
-      () => simCampaignPlanRevisions.id,
-    ),
+    statusChangedInPlanRevisionId: uuid(
+      "status_changed_in_plan_revision_id",
+    ).references(() => simCampaignPlanRevisions.id),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -1374,8 +1648,13 @@ export const simCampaignConditions = pgTable(
       t.flowConditionId,
       t.referenceGeometryProfileId,
     ),
-    campaignStatusIdx: index("sim_campaign_conditions_campaign_status_idx").on(t.campaignId, t.status),
-    revisionIdx: index("sim_campaign_conditions_revision_idx").on(t.simulationPresetRevisionId),
+    campaignStatusIdx: index("sim_campaign_conditions_campaign_status_idx").on(
+      t.campaignId,
+      t.status,
+    ),
+    revisionIdx: index("sim_campaign_conditions_revision_idx").on(
+      t.simulationPresetRevisionId,
+    ),
   }),
 );
 
@@ -1397,7 +1676,9 @@ export const simCampaignPoints = pgTable(
     revisionId: uuid("revision_id").notNull(), // denormalized pin (join key with results)
     planRevisionNumber: integer("plan_revision_number").notNull(),
     state: text("state").notNull().default("requested"), // requested | released | terminal
-    resultId: uuid("result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "set null",
+    }),
     // Negative-α cells of symmetric airfoils; terminal immediately when the +α
     // source is terminal (spec §9).
     derivedBySymmetry: boolean("derived_by_symmetry").notNull().default(false),
@@ -1408,7 +1689,9 @@ export const simCampaignPoints = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    pk: primaryKey({ columns: [t.campaignId, t.conditionId, t.airfoilId, t.aoaDeg] }),
+    pk: primaryKey({
+      columns: [t.campaignId, t.conditionId, t.airfoilId, t.aoaDeg],
+    }),
     requestedIdx: index("sim_campaign_points_requested_idx")
       .on(t.campaignId)
       .where(sql`${t.state} = 'requested'`),
@@ -1452,7 +1735,9 @@ export const simCampaignProgress = pgTable(
   },
   (t) => ({
     pk: primaryKey({ columns: [t.campaignId, t.conditionId, t.airfoilId] }),
-    conditionIdx: index("sim_campaign_progress_condition_idx").on(t.conditionId),
+    conditionIdx: index("sim_campaign_progress_condition_idx").on(
+      t.conditionId,
+    ),
   }),
 );
 
@@ -1477,7 +1762,10 @@ export const simCampaignLanes = pgTable(
     currentTargetAlpha: doublePrecision("current_target_alpha"),
     iterationCount: integer("iteration_count").notNull().default(0),
     // The fit convergence was judged against.
-    witnessFitSetId: uuid("witness_fit_set_id").references(() => polarFitSets.id, { onDelete: "set null" }),
+    witnessFitSetId: uuid("witness_fit_set_id").references(
+      () => polarFitSets.id,
+      { onDelete: "set null" },
+    ),
     extraRoundsGranted: integer("extra_rounds_granted").notNull().default(0), // "Continue +N iterations"
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
@@ -1486,8 +1774,14 @@ export const simCampaignLanes = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    pk: primaryKey({ columns: [t.campaignId, t.airfoilId, t.conditionId, t.objective] }),
-    stateIdx: index("sim_campaign_lanes_state_idx").on(t.campaignId, t.objective, t.state),
+    pk: primaryKey({
+      columns: [t.campaignId, t.airfoilId, t.conditionId, t.objective],
+    }),
+    stateIdx: index("sim_campaign_lanes_state_idx").on(
+      t.campaignId,
+      t.objective,
+      t.state,
+    ),
   }),
 );
 
@@ -1505,7 +1799,10 @@ export const simCampaignLaneSteps = pgTable(
     fitSetId: uuid("fit_set_id")
       .notNull()
       .references(() => polarFitSets.id),
-    solvedResultId: uuid("solved_result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    solvedResultId: uuid("solved_result_id").references(
+      (): AnyPgColumn => results.id,
+      { onDelete: "set null" },
+    ),
     outcome: text("outcome").notNull().default("predicted"), // predicted | solved | superseded | released
     createdAt: ts().notNull().defaultNow(),
   },
@@ -1548,13 +1845,19 @@ export const simUransVerifyQueue = pgTable(
       .notNull()
       .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
     aoaDeg: doublePrecision("aoa_deg").notNull(),
-    campaignId: uuid("campaign_id").references((): AnyPgColumn => simCampaigns.id, { onDelete: "set null" }),
+    campaignId: uuid("campaign_id").references(
+      (): AnyPgColumn => simCampaigns.id,
+      { onDelete: "set null" },
+    ),
     // pending | running | done | disagreed | cancelled
     state: text("state").notNull().default("pending"),
     precalcResultId: uuid("precalc_result_id")
       .notNull()
       .references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
-    verifyResultId: uuid("verify_result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    verifyResultId: uuid("verify_result_id").references(
+      (): AnyPgColumn => results.id,
+      { onDelete: "set null" },
+    ),
     deltaCl: doublePrecision("delta_cl"),
     deltaCd: doublePrecision("delta_cd"),
     deltaCm: doublePrecision("delta_cm"),
@@ -1570,7 +1873,10 @@ export const simUransVerifyQueue = pgTable(
       .on(t.airfoilId, t.revisionId, t.aoaDeg)
       .where(sql`${t.state} IN ('pending', 'running')`),
     stateIdx: index("sim_urans_verify_queue_state_idx").on(t.state),
-    campaignIdx: index("sim_urans_verify_queue_campaign_idx").on(t.campaignId, t.state),
+    campaignIdx: index("sim_urans_verify_queue_campaign_idx").on(
+      t.campaignId,
+      t.state,
+    ),
   }),
 );
 
@@ -1590,14 +1896,19 @@ export const simUransRequests = pgTable(
     fidelity: text("fidelity").notNull(),
     // pending | running | done | cancelled
     state: text("state").notNull().default("pending"),
-    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, { onDelete: "set null" }),
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
+      onDelete: "set null",
+    }),
     /** Continuation (migration 0037, amendment C): the rejected results row
      *  whose SAVED engine case state (engine_job_id + engine_case_slug on that
      *  row) this request resumes from. The ladder tick composes
      *  { continue_from: { engine_job_id, case_slug } } into the engine request
      *  and the engine restarts the transient from latestTime, merging
      *  coefficient history. NULL = ordinary fresh-solve request. */
-    continueFromResultId: uuid("continue_from_result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    continueFromResultId: uuid("continue_from_result_id").references(
+      (): AnyPgColumn => results.id,
+      { onDelete: "set null" },
+    ),
     /** Continuation budget override [s]: replaces the fidelity-derived solver
      *  budget for the resumed run (+2h / +6h UI choices). NULL = tier default. */
     budgetOverrideS: integer("budget_override_s"),
@@ -1627,19 +1938,39 @@ export const syncApiSettings = pgTable("sync_api_settings", {
   instanceName: text("instance_name").notNull().default("XFoilFOAM instance"),
   publicEndpointOverride: text("public_endpoint_override"),
   secret: text("secret").notNull().default(""),
-  defaultPromiseTtlHours: integer("default_promise_ttl_hours").notNull().default(24),
+  defaultPromiseTtlHours: integer("default_promise_ttl_hours")
+    .notNull()
+    .default(24),
   upstreamBaseUrl: text("upstream_base_url"),
   upstreamSecret: text("upstream_secret").notNull().default(""),
   syncMode: syncModeEnum("sync_mode").notNull().default("full"),
-  remoteSolverEnabled: boolean("remote_solver_enabled").notNull().default(false),
-  remoteSolverCpuBudget: integer("remote_solver_cpu_budget").notNull().default(1),
-  remoteSolverClaimSize: integer("remote_solver_claim_size").notNull().default(36),
-  remoteSolverHeartbeatIntervalSeconds: integer("remote_solver_heartbeat_interval_seconds").notNull().default(60),
+  remoteSolverEnabled: boolean("remote_solver_enabled")
+    .notNull()
+    .default(false),
+  remoteSolverCpuBudget: integer("remote_solver_cpu_budget")
+    .notNull()
+    .default(1),
+  remoteSolverClaimSize: integer("remote_solver_claim_size")
+    .notNull()
+    .default(36),
+  remoteSolverHeartbeatIntervalSeconds: integer(
+    "remote_solver_heartbeat_interval_seconds",
+  )
+    .notNull()
+    .default(60),
   remoteSolverRegisteredId: uuid("remote_solver_registered_id"),
-  remoteSolverLastSyncAt: timestamp("remote_solver_last_sync_at", { withTimezone: true }),
-  remoteSolverLastPromiseAt: timestamp("remote_solver_last_promise_at", { withTimezone: true }),
-  remoteSolverLastPushAt: timestamp("remote_solver_last_push_at", { withTimezone: true }),
-  remoteSolverLastStatus: remoteSolverStatusEnum("remote_solver_last_status").notNull().default("disabled"),
+  remoteSolverLastSyncAt: timestamp("remote_solver_last_sync_at", {
+    withTimezone: true,
+  }),
+  remoteSolverLastPromiseAt: timestamp("remote_solver_last_promise_at", {
+    withTimezone: true,
+  }),
+  remoteSolverLastPushAt: timestamp("remote_solver_last_push_at", {
+    withTimezone: true,
+  }),
+  remoteSolverLastStatus: remoteSolverStatusEnum("remote_solver_last_status")
+    .notNull()
+    .default("disabled"),
   remoteSolverLastError: text("remote_solver_last_error"),
   createdAt: ts().notNull().defaultNow(),
   updatedAt: ts()
@@ -1689,7 +2020,10 @@ export const syncSweepPromises = pgTable(
   (t) => ({
     statusIdx: index("sync_sweep_promises_status_idx").on(t.status),
     expiresIdx: index("sync_sweep_promises_expires_idx").on(t.expiresAt),
-    scopeIdx: index("sync_sweep_promises_scope_idx").on(t.airfoilId, t.simulationPresetRevisionId),
+    scopeIdx: index("sync_sweep_promises_scope_idx").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+    ),
   }),
 );
 
@@ -1708,7 +2042,9 @@ export const syncSweepPromisePoints = pgTable(
       .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
     aoaDeg: doublePrecision("aoa_deg").notNull(),
     status: syncPromiseStatusEnum("status").notNull().default("active"),
-    resultId: uuid("result_id").references((): AnyPgColumn => results.id, { onDelete: "set null" }),
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "set null",
+    }),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -1718,7 +2054,11 @@ export const syncSweepPromisePoints = pgTable(
   (t) => ({
     promiseIdx: index("sync_sweep_promise_points_promise_idx").on(t.promiseId),
     statusIdx: index("sync_sweep_promise_points_status_idx").on(t.status),
-    scopeIdx: index("sync_sweep_promise_points_scope_idx").on(t.airfoilId, t.simulationPresetRevisionId, t.aoaDeg),
+    scopeIdx: index("sync_sweep_promise_points_scope_idx").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.aoaDeg,
+    ),
     activePointUq: uniqueIndex("sync_sweep_promise_points_active_uq")
       .on(t.airfoilId, t.simulationPresetRevisionId, t.aoaDeg)
       .where(sql`${t.status} = 'active'`),
@@ -1734,9 +2074,12 @@ export const syncImportConflicts = pgTable(
     sourceInstanceId: text("source_instance_id"),
     sourceInstanceName: text("source_instance_name"),
     status: syncImportConflictStatusEnum("status").notNull().default("pending"),
-    incomingPayload: jsonb("incoming_payload").$type<Record<string, unknown>>().notNull(),
+    incomingPayload: jsonb("incoming_payload")
+      .$type<Record<string, unknown>>()
+      .notNull(),
     localSnapshot: jsonb("local_snapshot").$type<Record<string, unknown>>(),
-    artifactManifest: jsonb("artifact_manifest").$type<Record<string, unknown>>(),
+    artifactManifest:
+      jsonb("artifact_manifest").$type<Record<string, unknown>>(),
     resolutionNote: text("resolution_note"),
     resolvedAt: ts(),
     createdAt: ts().notNull().defaultNow(),
@@ -1747,7 +2090,10 @@ export const syncImportConflicts = pgTable(
   },
   (t) => ({
     statusIdx: index("sync_import_conflicts_status_idx").on(t.status),
-    naturalKeyIdx: index("sync_import_conflicts_natural_key_idx").on(t.dataType, t.naturalKey),
+    naturalKeyIdx: index("sync_import_conflicts_natural_key_idx").on(
+      t.dataType,
+      t.naturalKey,
+    ),
   }),
 );
 
@@ -1780,9 +2126,13 @@ export const registeredRemoteSolvers = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    instanceUq: uniqueIndex("registered_remote_solvers_instance_uq").on(t.instanceId),
+    instanceUq: uniqueIndex("registered_remote_solvers_instance_uq").on(
+      t.instanceId,
+    ),
     statusIdx: index("registered_remote_solvers_status_idx").on(t.status),
-    heartbeatIdx: index("registered_remote_solvers_heartbeat_idx").on(t.lastHeartbeatAt),
+    heartbeatIdx: index("registered_remote_solvers_heartbeat_idx").on(
+      t.lastHeartbeatAt,
+    ),
   }),
 );
 
@@ -1793,8 +2143,13 @@ export const remoteAssetReferences = pgTable(
     localKind: text("local_kind").notNull(),
     localRowId: uuid("local_row_id"),
     localStorageKey: text("local_storage_key").notNull(),
-    resultId: uuid("result_id").references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
-    resultAttemptId: uuid("result_attempt_id").references((): AnyPgColumn => resultAttempts.id, { onDelete: "set null" }),
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "cascade",
+    }),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "set null" },
+    ),
     sourceInstanceId: text("source_instance_id"),
     sourceInstanceName: text("source_instance_name"),
     remoteResultId: text("remote_result_id"),
@@ -1806,7 +2161,9 @@ export const remoteAssetReferences = pgTable(
     sha256: text("sha256"),
     byteSize: bigint("byte_size", { mode: "number" }),
     mimeType: text("mime_type").notNull(),
-    availability: remoteAssetAvailabilityEnum("availability").notNull().default("remote_only"),
+    availability: remoteAssetAvailabilityEnum("availability")
+      .notNull()
+      .default("remote_only"),
     cachedStorageKey: text("cached_storage_key"),
     lastFetchedAt: timestamp("last_fetched_at", { withTimezone: true }),
     lastError: text("last_error"),
@@ -1821,11 +2178,22 @@ export const remoteAssetReferences = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    storageUq: uniqueIndex("remote_asset_references_storage_uq").on(t.localStorageKey),
-    localRowIdx: index("remote_asset_references_local_row_idx").on(t.localKind, t.localRowId),
+    storageUq: uniqueIndex("remote_asset_references_storage_uq").on(
+      t.localStorageKey,
+    ),
+    localRowIdx: index("remote_asset_references_local_row_idx").on(
+      t.localKind,
+      t.localRowId,
+    ),
     resultIdx: index("remote_asset_references_result_idx").on(t.resultId),
-    remoteArtifactIdx: index("remote_asset_references_remote_artifact_idx").on(t.sourceInstanceId, t.remoteArtifactId),
-    remoteMediaIdx: index("remote_asset_references_remote_media_idx").on(t.sourceInstanceId, t.remoteMediaId),
+    remoteArtifactIdx: index("remote_asset_references_remote_artifact_idx").on(
+      t.sourceInstanceId,
+      t.remoteArtifactId,
+    ),
+    remoteMediaIdx: index("remote_asset_references_remote_media_idx").on(
+      t.sourceInstanceId,
+      t.remoteMediaId,
+    ),
   }),
 );
 
@@ -1838,9 +2206,11 @@ export type AirfoilInsert = typeof airfoils.$inferInsert;
 export type Hashtag = typeof hashtags.$inferSelect;
 export type AirfoilHashtag = typeof airfoilHashtags.$inferSelect;
 export type Medium = typeof mediums.$inferSelect;
-export type MediumViscosityTablePoint = typeof mediumViscosityTablePoints.$inferSelect;
+export type MediumViscosityTablePoint =
+  typeof mediumViscosityTablePoints.$inferSelect;
 export type FlowCondition = typeof flowConditions.$inferSelect;
-export type ReferenceGeometryProfile = typeof referenceGeometryProfiles.$inferSelect;
+export type ReferenceGeometryProfile =
+  typeof referenceGeometryProfiles.$inferSelect;
 export type OperatingCondition = typeof operatingConditions.$inferSelect;
 export type BoundaryProfile = typeof boundaryProfiles.$inferSelect;
 export type MeshProfile = typeof meshProfiles.$inferSelect;
@@ -1850,21 +2220,26 @@ export type OutputProfile = typeof outputProfiles.$inferSelect;
 export type SweepDefinition = typeof sweepDefinitions.$inferSelect;
 export type BoundaryCondition = typeof boundaryConditions.$inferSelect;
 export type SimulationPreset = typeof simulationPresets.$inferSelect;
-export type SimulationPresetAirfoilTarget = typeof simulationPresetAirfoilTargets.$inferSelect;
+export type SimulationPresetAirfoilTarget =
+  typeof simulationPresetAirfoilTargets.$inferSelect;
+export type ResultReviewVerdict = typeof resultReviewVerdicts.$inferSelect;
 export type SyncApiSetting = typeof syncApiSettings.$inferSelect;
 export type SyncApiPermission = typeof syncApiPermissions.$inferSelect;
 export type SyncSweepPromise = typeof syncSweepPromises.$inferSelect;
 export type SyncSweepPromisePoint = typeof syncSweepPromisePoints.$inferSelect;
 export type SyncImportConflict = typeof syncImportConflicts.$inferSelect;
-export type RegisteredRemoteSolver = typeof registeredRemoteSolvers.$inferSelect;
+export type RegisteredRemoteSolver =
+  typeof registeredRemoteSolvers.$inferSelect;
 export type RemoteAssetReference = typeof remoteAssetReferences.$inferSelect;
-export type SimulationPresetRevision = typeof simulationPresetRevisions.$inferSelect;
+export type SimulationPresetRevision =
+  typeof simulationPresetRevisions.$inferSelect;
 export type Result = typeof results.$inferSelect;
 export type ResultInsert = typeof results.$inferInsert;
 export type ResultAttempt = typeof resultAttempts.$inferSelect;
 export type ResultAttemptInsert = typeof resultAttempts.$inferInsert;
 export type ResultMedia = typeof resultMedia.$inferSelect;
-export type SolverEvidenceArtifact = typeof solverEvidenceArtifacts.$inferSelect;
+export type SolverEvidenceArtifact =
+  typeof solverEvidenceArtifacts.$inferSelect;
 export type FieldRenderCache = typeof fieldRenderCache.$inferSelect;
 export type ForceHistoryRow = typeof forceHistory.$inferSelect;
 export type ResultClassification = typeof resultClassifications.$inferSelect;
@@ -1875,10 +2250,13 @@ export type SweeperState = typeof sweeperState.$inferSelect;
 export type SimCampaign = typeof simCampaigns.$inferSelect;
 export type SimCampaignInsert = typeof simCampaigns.$inferInsert;
 export type SimCampaignAirfoil = typeof simCampaignAirfoils.$inferSelect;
-export type SimCampaignPlanRevision = typeof simCampaignPlanRevisions.$inferSelect;
-export type SimCampaignPlanRevisionInsert = typeof simCampaignPlanRevisions.$inferInsert;
+export type SimCampaignPlanRevision =
+  typeof simCampaignPlanRevisions.$inferSelect;
+export type SimCampaignPlanRevisionInsert =
+  typeof simCampaignPlanRevisions.$inferInsert;
 export type SimCampaignCondition = typeof simCampaignConditions.$inferSelect;
-export type SimCampaignConditionInsert = typeof simCampaignConditions.$inferInsert;
+export type SimCampaignConditionInsert =
+  typeof simCampaignConditions.$inferInsert;
 export type SimCampaignPoint = typeof simCampaignPoints.$inferSelect;
 export type SimCampaignPointInsert = typeof simCampaignPoints.$inferInsert;
 export type SimCampaignProgressRow = typeof simCampaignProgress.$inferSelect;

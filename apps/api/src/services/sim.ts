@@ -7,7 +7,12 @@ import {
   type SteadyHistoryDetail,
   type UransVerifyDetail,
 } from "@aerodb/core";
-import { FRAME_IMAGE_ARTIFACT_KIND, parseFrameTrack, parsePointFidelity, parseSteadyHistory } from "@aerodb/engine-client";
+import {
+  FRAME_IMAGE_ARTIFACT_KIND,
+  parseFrameTrack,
+  parsePointFidelity,
+  parseSteadyHistory,
+} from "@aerodb/engine-client";
 import {
   airfoils,
   boundaryConditions,
@@ -22,12 +27,23 @@ import {
   simulationPresets,
   simUransVerifyQueue,
   solverEvidenceArtifacts,
+  activeReviewVerdict,
 } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 
 import { db } from "../db";
 import { mediaStore } from "../media-store";
+
+type ReviewDisclosure = {
+  verdict: "waive" | "exclude";
+  note: string | null;
+  reviewer: string;
+  at: string;
+};
+type SimulationDetailWithReview = SimulationDetail & {
+  review?: ReviewDisclosure;
+};
 
 const ENGINE_TO_FIELD: Record<string, FieldId> = {
   velocity_magnitude: "velocity_magnitude",
@@ -68,12 +84,19 @@ function snapshotParts(snapshot: SimulationSetupSnapshot | undefined) {
   return {
     mediumName: snapshot.flowState?.mediumName ?? legacy.operating?.mediumName,
     speedMps: snapshot.flowState?.speedMps ?? legacy.operating?.speedMps,
-    referenceChordM: snapshot.referenceGeometry?.referenceLengthM ?? legacy.operating?.referenceChordM,
-    temperatureK: snapshot.flowState?.temperatureK ?? legacy.operating?.temperatureK,
+    referenceChordM:
+      snapshot.referenceGeometry?.referenceLengthM ??
+      legacy.operating?.referenceChordM,
+    temperatureK:
+      snapshot.flowState?.temperatureK ?? legacy.operating?.temperatureK,
     pressurePa: snapshot.flowState?.pressurePa ?? legacy.operating?.pressurePa,
     density: snapshot.flowState?.density ?? legacy.operating?.density,
-    dynamicViscosity: snapshot.flowState?.dynamicViscosity ?? legacy.operating?.dynamicViscosity,
-    kinematicViscosity: snapshot.flowState?.kinematicViscosity ?? legacy.operating?.kinematicViscosity,
+    dynamicViscosity:
+      snapshot.flowState?.dynamicViscosity ??
+      legacy.operating?.dynamicViscosity,
+    kinematicViscosity:
+      snapshot.flowState?.kinematicViscosity ??
+      legacy.operating?.kinematicViscosity,
     mesh: snapshot.mesh ?? legacy.mesh,
   };
 }
@@ -82,7 +105,8 @@ type EvidenceRow = typeof solverEvidenceArtifacts.$inferSelect;
 
 function frameIndexOf(row: EvidenceRow): number | null {
   const meta = (row.metadata ?? {}) as Record<string, unknown>;
-  if (typeof meta.frameIndex === "number" && Number.isInteger(meta.frameIndex)) return meta.frameIndex;
+  if (typeof meta.frameIndex === "number" && Number.isInteger(meta.frameIndex))
+    return meta.frameIndex;
   const match = /f(\d{4})\.(?:png|jpg|jpeg)$/i.exec(row.storageKey);
   return match ? Number(match[1]) : null;
 }
@@ -93,7 +117,10 @@ function frameIndexOf(row: EvidenceRow): number | null {
  *  registered ship WITHOUT that field's URL — absence stays absence. A
  *  contract-drifted payload resolves to null (the classifier already rejects
  *  such points; the raw jsonb stays on the row as evidence). */
-function frameTrackDetailOf(r: Result, frameArtifacts: EvidenceRow[]): FrameTrackDetail | null {
+function frameTrackDetailOf(
+  r: Result,
+  frameArtifacts: EvidenceRow[],
+): FrameTrackDetail | null {
   if (r.frameTrack === null || r.frameTrack === undefined) return null;
   const parsed = parseFrameTrack(r.frameTrack);
   if (!parsed.ok) return null;
@@ -101,7 +128,10 @@ function frameTrackDetailOf(r: Result, frameArtifacts: EvidenceRow[]): FrameTrac
   const urlByFieldFrame = new Map<string, string>();
   for (const row of frameArtifacts) {
     const index = frameIndexOf(row);
-    const field = row.field ?? ft.fields.find((f) => row.storageKey.includes(`/${f}/`)) ?? null;
+    const field =
+      row.field ??
+      ft.fields.find((f) => row.storageKey.includes(`/${f}/`)) ??
+      null;
     if (index === null || !field) continue;
     urlByFieldFrame.set(`${field}:${index}`, mediaStore.url(row.storageKey));
   }
@@ -151,7 +181,9 @@ function steadyHistoryDetailOf(r: Result): SteadyHistoryDetail | null {
 /** Latest verify-queue item covering this point's cell+angle (contract 4) —
  *  the modal header renders "verify pending"/"disagreed" from the REAL queue
  *  row, never inferred from fidelity alone. */
-async function uransVerifyDetailOf(r: Result): Promise<UransVerifyDetail | null> {
+async function uransVerifyDetailOf(
+  r: Result,
+): Promise<UransVerifyDetail | null> {
   if (!r.simulationPresetRevisionId) return null;
   const [item] = await db
     .select({
@@ -173,14 +205,31 @@ async function uransVerifyDetailOf(r: Result): Promise<UransVerifyDetail | null>
   return item ?? null;
 }
 
-async function solvedDetail(name: string, re: number, r: Result): Promise<SimulationDetail | null> {
+async function solvedDetail(
+  name: string,
+  re: number,
+  r: Result,
+): Promise<SimulationDetailWithReview | null> {
   const cl = r.cl ?? 0;
   const cd = r.cd ?? 0;
+  const review = await activeReviewVerdict(db, r.id);
   const media: Partial<Record<FieldId, FieldMedia>> = {};
-  const rows = await db.select().from(resultMedia).where(eq(resultMedia.resultId, r.id));
-  const scaleIds = Array.from(new Set(rows.map((row) => row.colorScaleId).filter((id): id is string => Boolean(id))));
+  const rows = await db
+    .select()
+    .from(resultMedia)
+    .where(eq(resultMedia.resultId, r.id));
+  const scaleIds = Array.from(
+    new Set(
+      rows
+        .map((row) => row.colorScaleId)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  );
   const scales = scaleIds.length
-    ? await db.select().from(fieldColorScales).where(inArray(fieldColorScales.id, scaleIds))
+    ? await db
+        .select()
+        .from(fieldColorScales)
+        .where(inArray(fieldColorScales.id, scaleIds))
     : [];
   const scaleById = new Map(scales.map((scale) => [scale.id, scale]));
   for (const mrow of rows) {
@@ -222,13 +271,27 @@ async function solvedDetail(name: string, re: number, r: Result): Promise<Simula
   // Per-frame URANS PNGs feed frameTrack.frames[].imageUrls; keeping their
   // <=240 rows out of the generic evidenceArtifacts list keeps the payload
   // bounded and the evidence panel readable.
-  const frameArtifacts = allEvidenceRows.filter((row) => row.kind === FRAME_IMAGE_ARTIFACT_KIND);
-  const evidenceRows = allEvidenceRows.filter((row) => row.kind !== FRAME_IMAGE_ARTIFACT_KIND);
-  const [hist] = await db.select().from(forceHistory).where(eq(forceHistory.resultId, r.id)).limit(1);
+  const frameArtifacts = allEvidenceRows.filter(
+    (row) => row.kind === FRAME_IMAGE_ARTIFACT_KIND,
+  );
+  const evidenceRows = allEvidenceRows.filter(
+    (row) => row.kind !== FRAME_IMAGE_ARTIFACT_KIND,
+  );
+  const [hist] = await db
+    .select()
+    .from(forceHistory)
+    .where(eq(forceHistory.resultId, r.id))
+    .limit(1);
   const [revision] = r.simulationPresetRevisionId
-    ? await db.select().from(simulationPresetRevisions).where(eq(simulationPresetRevisions.id, r.simulationPresetRevisionId)).limit(1)
+    ? await db
+        .select()
+        .from(simulationPresetRevisions)
+        .where(eq(simulationPresetRevisions.id, r.simulationPresetRevisionId))
+        .limit(1)
     : [];
-  const snapshot = revision?.snapshot as unknown as SimulationSetupSnapshot | undefined;
+  const snapshot = revision?.snapshot as unknown as
+    | SimulationSetupSnapshot
+    | undefined;
   const [legacyCondition] = snapshot
     ? []
     : await db
@@ -271,69 +334,78 @@ async function solvedDetail(name: string, re: number, r: Result): Promise<Simula
     fidelity: parsePointFidelity(r.fidelity),
     steadyHistory: steadyHistoryDetailOf(r),
     uransVerify: await uransVerifyDetailOf(r),
-    condition: snapshot && setup
+    review: review
       ? {
-          boundaryConditionName: snapshot.preset.name,
-          mediumName: setup.mediumName ?? "medium",
-          speedMps: setup.speedMps ?? 0,
-          referenceChordM: setup.referenceChordM ?? 1,
-          temperatureK: setup.temperatureK ?? 288.15,
-          pressurePa: setup.pressurePa ?? 101325,
-          density: setup.density,
-          dynamicViscosity: setup.dynamicViscosity,
-          kinematicViscosity: setup.kinematicViscosity,
-          turbulenceModel: snapshot.solver.turbulenceModel,
-          turbulenceIntensity: snapshot.boundary.turbulenceIntensity,
-          viscosityRatio: snapshot.boundary.viscosityRatio,
-          mesh: setup.mesh
-            ? {
-                mesher: setup.mesh.mesher,
-                farfieldRadiusChords: setup.mesh.farfieldRadiusChords,
-                wakeLengthChords: setup.mesh.wakeLengthChords,
-                nSurface: setup.mesh.nSurface,
-                nRadial: setup.mesh.nRadial,
-                nWake: setup.mesh.nWake,
-                targetYPlus: setup.mesh.targetYPlus,
-                spanChords: setup.mesh.spanChords,
+          verdict: review.verdict,
+          note: review.note,
+          reviewer: review.reviewer,
+          at: review.createdAt.toISOString(),
+        }
+      : undefined,
+    condition:
+      snapshot && setup
+        ? {
+            boundaryConditionName: snapshot.preset.name,
+            mediumName: setup.mediumName ?? "medium",
+            speedMps: setup.speedMps ?? 0,
+            referenceChordM: setup.referenceChordM ?? 1,
+            temperatureK: setup.temperatureK ?? 288.15,
+            pressurePa: setup.pressurePa ?? 101325,
+            density: setup.density,
+            dynamicViscosity: setup.dynamicViscosity,
+            kinematicViscosity: setup.kinematicViscosity,
+            turbulenceModel: snapshot.solver.turbulenceModel,
+            turbulenceIntensity: snapshot.boundary.turbulenceIntensity,
+            viscosityRatio: snapshot.boundary.viscosityRatio,
+            mesh: setup.mesh
+              ? {
+                  mesher: setup.mesh.mesher,
+                  farfieldRadiusChords: setup.mesh.farfieldRadiusChords,
+                  wakeLengthChords: setup.mesh.wakeLengthChords,
+                  nSurface: setup.mesh.nSurface,
+                  nRadial: setup.mesh.nRadial,
+                  nWake: setup.mesh.nWake,
+                  targetYPlus: setup.mesh.targetYPlus,
+                  spanChords: setup.mesh.spanChords,
+                  nCells: r.nCells,
+                  yPlusAvg: r.yPlusAvg,
+                  yPlusMax: r.yPlusMax,
+                  iterations: r.iterations,
+                  finalResidual: r.finalResidual,
+                }
+              : null,
+          }
+        : legacyCondition
+          ? {
+              boundaryConditionName: legacyCondition.bc.name,
+              mediumName: legacyCondition.mediumName,
+              speedMps: legacyCondition.bc.speedMps,
+              referenceChordM: legacyCondition.bc.referenceChordM,
+              temperatureK: legacyCondition.bc.temperatureK,
+              pressurePa: legacyCondition.bc.pressurePa,
+              density: legacyCondition.bc.density,
+              dynamicViscosity: legacyCondition.bc.dynamicViscosity,
+              kinematicViscosity: legacyCondition.bc.kinematicViscosity,
+              turbulenceModel: legacyCondition.bc.turbulenceModel,
+              turbulenceIntensity: legacyCondition.bc.turbulenceIntensity,
+              viscosityRatio: legacyCondition.bc.viscosityRatio,
+              mesh: {
+                mesher: legacyCondition.bc.mesher,
+                farfieldRadiusChords: legacyCondition.bc.farfieldRadiusChords,
+                wakeLengthChords: legacyCondition.bc.wakeLengthChords,
+                nSurface: legacyCondition.bc.nSurface,
+                nRadial: legacyCondition.bc.nRadial,
+                nWake: legacyCondition.bc.nWake,
+                targetYPlus: legacyCondition.bc.targetYPlus,
+                spanChords: legacyCondition.bc.spanChords,
                 nCells: r.nCells,
                 yPlusAvg: r.yPlusAvg,
                 yPlusMax: r.yPlusMax,
                 iterations: r.iterations,
                 finalResidual: r.finalResidual,
-              }
-            : null,
-        }
-      : legacyCondition
-      ? {
-          boundaryConditionName: legacyCondition.bc.name,
-          mediumName: legacyCondition.mediumName,
-          speedMps: legacyCondition.bc.speedMps,
-          referenceChordM: legacyCondition.bc.referenceChordM,
-          temperatureK: legacyCondition.bc.temperatureK,
-          pressurePa: legacyCondition.bc.pressurePa,
-          density: legacyCondition.bc.density,
-          dynamicViscosity: legacyCondition.bc.dynamicViscosity,
-          kinematicViscosity: legacyCondition.bc.kinematicViscosity,
-          turbulenceModel: legacyCondition.bc.turbulenceModel,
-          turbulenceIntensity: legacyCondition.bc.turbulenceIntensity,
-          viscosityRatio: legacyCondition.bc.viscosityRatio,
-          mesh: {
-            mesher: legacyCondition.bc.mesher,
-            farfieldRadiusChords: legacyCondition.bc.farfieldRadiusChords,
-            wakeLengthChords: legacyCondition.bc.wakeLengthChords,
-            nSurface: legacyCondition.bc.nSurface,
-            nRadial: legacyCondition.bc.nRadial,
-            nWake: legacyCondition.bc.nWake,
-            targetYPlus: legacyCondition.bc.targetYPlus,
-            spanChords: legacyCondition.bc.spanChords,
-            nCells: r.nCells,
-            yPlusAvg: r.yPlusAvg,
-            yPlusMax: r.yPlusMax,
-            iterations: r.iterations,
-            finalResidual: r.finalResidual,
-          },
-        }
-      : null,
+              },
+            }
+          : null,
   };
 }
 
@@ -346,7 +418,13 @@ export async function assembleSim(
   const [a] = await db
     .select()
     .from(airfoils)
-    .where(and(eq(airfoils.slug, slug), isNull(airfoils.archivedAt), isNull(airfoils.deletedAt)))
+    .where(
+      and(
+        eq(airfoils.slug, slug),
+        isNull(airfoils.archivedAt),
+        isNull(airfoils.deletedAt),
+      ),
+    )
     .limit(1);
   if (!a) return null;
 
@@ -370,17 +448,40 @@ export async function assembleSim(
 
   if (re === undefined || aoa === undefined) return null;
 
-  const [air] = await db.select({ id: mediums.id }).from(mediums).where(eq(mediums.slug, "air")).limit(1);
+  const [air] = await db
+    .select({ id: mediums.id })
+    .from(mediums)
+    .where(eq(mediums.slug, "air"))
+    .limit(1);
   if (air) {
     const presets = await db
-      .select({ revisionId: simulationPresetRevisions.id, reynolds: simulationPresetRevisions.reynolds })
+      .select({
+        revisionId: simulationPresetRevisions.id,
+        reynolds: simulationPresetRevisions.reynolds,
+      })
       .from(simulationPresets)
-      .innerJoin(flowConditions, eq(flowConditions.id, simulationPresets.flowConditionId))
-      .innerJoin(simulationPresetRevisions, eq(simulationPresetRevisions.presetId, simulationPresets.id))
-      .where(and(eq(flowConditions.mediumId, air.id), eq(simulationPresets.enabled, true)))
-      .orderBy(desc(simulationPresetRevisions.createdAt), desc(simulationPresetRevisions.revisionNumber));
+      .innerJoin(
+        flowConditions,
+        eq(flowConditions.id, simulationPresets.flowConditionId),
+      )
+      .innerJoin(
+        simulationPresetRevisions,
+        eq(simulationPresetRevisions.presetId, simulationPresets.id),
+      )
+      .where(
+        and(
+          eq(flowConditions.mediumId, air.id),
+          eq(simulationPresets.enabled, true),
+        ),
+      )
+      .orderBy(
+        desc(simulationPresetRevisions.createdAt),
+        desc(simulationPresetRevisions.revisionNumber),
+      );
     const revisionIds = presets.map((preset) => preset.revisionId);
-    const reByRevision = new Map(presets.map((preset) => [preset.revisionId, preset.reynolds]));
+    const reByRevision = new Map(
+      presets.map((preset) => [preset.revisionId, preset.reynolds]),
+    );
     if (revisionIds.length) {
       const rows = await db
         .select()
@@ -401,13 +502,26 @@ export async function assembleSim(
         );
       const candidates = rows
         .map((row) => {
-          const effectiveRe = row.reynolds ?? (row.simulationPresetRevisionId ? reByRevision.get(row.simulationPresetRevisionId) : null);
+          const effectiveRe =
+            row.reynolds ??
+            (row.simulationPresetRevisionId
+              ? reByRevision.get(row.simulationPresetRevisionId)
+              : null);
           return effectiveRe ? { row, effectiveRe } : null;
         })
-        .filter((candidate): candidate is { row: Result; effectiveRe: number } => candidate !== null)
-        .sort((left, right) => Math.abs(left.effectiveRe - re) - Math.abs(right.effectiveRe - re));
+        .filter(
+          (candidate): candidate is { row: Result; effectiveRe: number } =>
+            candidate !== null,
+        )
+        .sort(
+          (left, right) =>
+            Math.abs(left.effectiveRe - re) - Math.abs(right.effectiveRe - re),
+        );
       const match = candidates[0];
-      if (match && Math.abs(match.effectiveRe - re) <= Math.max(1000, Math.abs(re) * 0.02)) {
+      if (
+        match &&
+        Math.abs(match.effectiveRe - re) <= Math.max(1000, Math.abs(re) * 0.02)
+      ) {
         return solvedDetail(a.name, match.effectiveRe, match.row);
       }
     }

@@ -16,6 +16,7 @@ import {
   mediums,
   type Result,
   resultClassifications,
+  resultReviewVerdicts,
   polarFitPoints,
   polarFitSets,
   resultAttempts,
@@ -30,6 +31,13 @@ import { db } from "../db";
 import { geometryFor } from "./geometry";
 import { hashtagsByAirfoilIds } from "./hashtags";
 
+type ReviewDisclosure = {
+  verdict: "waive" | "exclude";
+  note: string | null;
+  reviewer: string;
+  at: string;
+};
+
 function solvedToPoint(
   r: Result,
   classification?: {
@@ -37,11 +45,12 @@ function solvedToPoint(
     region: ResultClassificationRegion | null;
     reasons: string[] | null;
     confidence: number | null;
+    review?: ReviewDisclosure | null;
   },
-): PolarPointData {
+): PolarPointData & { review?: ReviewDisclosure } {
   const cl = r.cl ?? 0;
   const cd = r.cd ?? 0;
-  return {
+  const point: PolarPointData & { review?: ReviewDisclosure } = {
     a: r.aoaDeg,
     cl,
     cd,
@@ -60,6 +69,8 @@ function solvedToPoint(
     classificationReasons: classification?.reasons ?? [],
     classificationConfidence: classification?.confidence ?? null,
   };
+  if (classification?.review) point.review = classification.review;
+  return point;
 }
 
 /** Display-only mirrored polar point for a symmetric airfoil (spec §9.2–§9.3).
@@ -77,6 +88,7 @@ type SolvedClassification = {
   region: ResultClassificationRegion | null;
   reasons: string[] | null;
   confidence: number | null;
+  review?: ReviewDisclosure | null;
 };
 
 /** Odd-function negation that never emits -0. */
@@ -421,12 +433,7 @@ export async function assembleDetail(
     string,
     {
       result: Result;
-      classification: {
-        state: ResultClassificationState | null;
-        region: ResultClassificationRegion | null;
-        reasons: string[] | null;
-        confidence: number | null;
-      };
+      classification: SolvedClassification;
     }[]
   >();
   if (revisionIds.length) {
@@ -437,11 +444,23 @@ export async function assembleDetail(
         region: resultClassifications.region,
         reasons: resultClassifications.reasons,
         confidence: resultClassifications.confidence,
+        reviewVerdict: resultReviewVerdicts.verdict,
+        reviewNote: resultReviewVerdicts.note,
+        reviewReviewer: resultReviewVerdicts.reviewer,
+        reviewCreatedAt: resultReviewVerdicts.createdAt,
       })
       .from(results)
       .leftJoin(
         resultClassifications,
         eq(resultClassifications.resultId, results.id),
+      )
+      .leftJoin(
+        resultReviewVerdicts,
+        and(
+          eq(resultReviewVerdicts.resultId, results.id),
+          isNull(resultReviewVerdicts.revokedAt),
+          inArray(resultReviewVerdicts.verdict, ["waive", "exclude"]),
+        ),
       )
       .where(
         and(
@@ -450,8 +469,16 @@ export async function assembleDetail(
           eq(results.source, "solved"),
           eq(results.status, "done"),
           or(
-            inArray(resultClassifications.state, ["accepted", "needs_urans"]),
-            and(isNull(resultClassifications.id), validPolarPoint),
+            eq(resultReviewVerdicts.verdict, "waive"),
+            and(
+              isNull(resultReviewVerdicts.id),
+              inArray(resultClassifications.state, ["accepted", "needs_urans"]),
+            ),
+            and(
+              isNull(resultReviewVerdicts.id),
+              isNull(resultClassifications.id),
+              validPolarPoint,
+            ),
           ),
         ),
       );
@@ -470,10 +497,21 @@ export async function assembleDetail(
       ).push({
         result: r,
         classification: {
-          state: row.state,
-          region: row.region,
-          reasons: row.reasons,
+          state: row.reviewVerdict === "waive" ? "accepted" : row.state,
+          region: row.reviewVerdict === "waive" ? "attached" : row.region,
+          reasons: row.reviewVerdict === "waive" ? [] : row.reasons,
           confidence: row.confidence,
+          review:
+            row.reviewVerdict === "waive" &&
+            row.reviewCreatedAt &&
+            row.reviewReviewer
+              ? {
+                  verdict: "waive",
+                  note: row.reviewNote,
+                  reviewer: row.reviewReviewer,
+                  at: row.reviewCreatedAt.toISOString(),
+                }
+              : null,
         },
       });
     }

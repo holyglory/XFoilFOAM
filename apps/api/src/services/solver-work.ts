@@ -1,6 +1,7 @@
 import {
   URANS_BUDGET_STOP_MARKER,
   canonicalAoa,
+  frameTrackMinPeriodsFor,
   type SimulationWorkItem,
 } from "@aerodb/core";
 import {
@@ -21,6 +22,7 @@ export const SOLVER_WORK_STATES = [
   "ladder",
   "needs_time",
   "needs_review",
+  "excluded",
   "blocked",
   "superseded",
 ] as const;
@@ -47,6 +49,17 @@ export interface SolverWorkGate {
   detail: string;
 }
 
+export interface SolverWorkGateCheck extends SolverWorkGate {
+  pass: boolean;
+}
+
+export interface SolverWorkReview {
+  verdict: "waive" | "exclude";
+  note: string | null;
+  reviewer: string;
+  at: string;
+}
+
 export interface SolverWorkPointStateRow {
   resultId?: string | null;
   status?: string | null;
@@ -57,6 +70,7 @@ export interface SolverWorkPointStateRow {
   continuable?: boolean | null;
   openVerify?: boolean | null;
   openRequest?: boolean | null;
+  reviewVerdict?: "waive" | "exclude" | string | null;
   autoRetriedAt?: Date | string | null;
   error?: string | null;
 }
@@ -71,6 +85,9 @@ export interface SolverWorkPoint {
   cm: number | null;
   plain: string;
   gate: SolverWorkGate | null;
+  gates: SolverWorkGateCheck[];
+  reviewed: boolean;
+  review: SolverWorkReview | null;
   chain: Array<{ label: string; tone: SolverWorkTone }>;
   continuable: boolean;
   actions: SolverWorkAction[];
@@ -96,6 +113,8 @@ export interface SolverWorkPayload {
 export function solverWorkStateForPoint(
   row: SolverWorkPointStateRow,
 ): SolverWorkState {
+  if (row.reviewVerdict === "exclude") return "excluded";
+  if (row.reviewVerdict === "waive") return "verified";
   if (row.classificationState === "superseded_by_urans") return "superseded";
 
   if (row.status === "queued" || row.status === "running") return "solving";
@@ -152,10 +171,16 @@ type ResultPointRow = {
   updated_at: Date | string;
   classification_state: string | null;
   classification_reasons: string[] | null;
+  frame_track: unknown;
   superseded_by_result_id: string | null;
   continuable: boolean | null;
   open_verify: boolean | null;
   open_request: boolean | null;
+  review_id: string | null;
+  review_verdict: "waive" | "exclude" | string | null;
+  review_note: string | null;
+  review_reviewer: string | null;
+  review_created_at: Date | string | null;
 };
 
 type CampaignPointRow = ResultPointRow & {
@@ -285,13 +310,7 @@ function normalizedGateDetail(line: string): string {
   return parts.length ? parts.join(" · ") : line;
 }
 
-function gateFromPoint(row: {
-  qualityWarnings?: string[] | null;
-  classificationReasons?: string[] | null;
-  error?: string | null;
-}): SolverWorkGate | null {
-  const line = firstDetailLine(row);
-  if (!line) return null;
+function gateFromLine(line: string): SolverWorkGate {
   const detail = normalizedGateDetail(line);
   const lower = line.toLowerCase();
   if (
@@ -326,6 +345,89 @@ function gateFromPoint(row: {
   return { name: "quality gate", detail };
 }
 
+function gateFromPoint(row: {
+  qualityWarnings?: string[] | null;
+  classificationReasons?: string[] | null;
+  error?: string | null;
+}): SolverWorkGate | null {
+  const line = firstDetailLine(row);
+  if (!line) return null;
+  return gateFromLine(line);
+}
+
+function frameTrackObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function gateChecksFromPoint(row: {
+  status?: string | null;
+  regime?: string | null;
+  fidelity?: string | null;
+  classificationState?: string | null;
+  qualityWarnings?: string[] | null;
+  classificationReasons?: string[] | null;
+  error?: string | null;
+  frameTrack?: unknown;
+}): SolverWorkGateCheck[] {
+  const checks = new Map<SolverWorkGate["name"], SolverWorkGateCheck>();
+  const put = (check: SolverWorkGateCheck) => {
+    const existing = checks.get(check.name);
+    if (!existing || existing.pass) checks.set(check.name, check);
+  };
+  for (const line of [
+    ...(row.qualityWarnings ?? []),
+    ...(row.classificationReasons ?? []),
+    row.error ?? "",
+  ]) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    put({ ...gateFromLine(trimmed), pass: false });
+  }
+
+  if (row.status === "done") {
+    if (!checks.has("RANS validity gate")) {
+      put({
+        name: "RANS validity gate",
+        detail: "pointwise solver validity checks passed",
+        pass: true,
+      });
+    }
+    if (row.regime === "urans" && !checks.has("mesh QA gate")) {
+      put({
+        name: "mesh QA gate",
+        detail: "no mesh QA warning recorded",
+        pass: true,
+      });
+    }
+  }
+
+  const frameTrack = frameTrackObject(row.frameTrack);
+  if (row.regime === "urans" && frameTrack) {
+    const stationary = frameTrack.stationary === true;
+    put({
+      name: "stationarity gate",
+      detail: stationary
+        ? "stationarity target met"
+        : "stationarity target failed",
+      pass: stationary,
+    });
+    const periods = Number(frameTrack.periods_retained);
+    const minPeriods = frameTrackMinPeriodsFor(row.fidelity);
+    const periodPass = Number.isFinite(periods) && periods >= minPeriods;
+    put({
+      name: "period detector",
+      detail: Number.isFinite(periods)
+        ? `retained ${periods} / ${minPeriods} periods`
+        : `retained periods unavailable; required ${minPeriods}`,
+      pass: periodPass,
+    });
+  }
+
+  return [...checks.values()];
+}
+
 function plainForPoint(
   state: SolverWorkState,
   gate: SolverWorkGate | null,
@@ -349,6 +451,10 @@ function plainForPoint(
       return gate
         ? `The solver produced evidence, but the ${gate.name} needs review before this point can be used.`
         : "The solver produced evidence, but a quality gate needs review before this point can be used.";
+    case "excluded":
+      return gate
+        ? `This point was excluded after review of the ${gate.name}.`
+        : "This point was excluded after review and is not used in the stored polar.";
     case "blocked":
       return gate
         ? `The point is blocked by the ${gate.name}; change the setup or repair the blocker before trying again.`
@@ -418,11 +524,13 @@ function chainForPoint(
         tone:
           state === "blocked"
             ? "blocked"
-            : state === "needs_review"
-              ? "review"
-              : state === "ladder"
-                ? "ladder"
-                : "ok",
+            : state === "excluded"
+              ? "blocked"
+              : state === "needs_review"
+                ? "review"
+                : state === "ladder"
+                  ? "ladder"
+                  : "ok",
       },
     ];
   }
@@ -452,6 +560,7 @@ function makePoint(
     continuable: row.continuable,
     openVerify: row.open_verify,
     openRequest: row.open_request,
+    reviewVerdict: row.review_verdict,
     autoRetriedAt: row.auto_retried_at,
     error: row.error,
   };
@@ -459,13 +568,29 @@ function makePoint(
   // A "deciding gate" only exists for states a gate actually decided; benign
   // disclosures on verified rows (e.g. "converged (oscillating steady…)")
   // must not render as a gate verdict in the popover.
-  const gate = ["ladder", "needs_time", "needs_review", "blocked"].includes(state)
+  const gate = [
+    "ladder",
+    "needs_time",
+    "needs_review",
+    "excluded",
+    "blocked",
+  ].includes(state)
     ? gateFromPoint({
         qualityWarnings: row.quality_warnings,
         classificationReasons: row.classification_reasons,
         error: row.error,
       })
     : null;
+  const gates = gateChecksFromPoint({
+    status: row.status,
+    regime: row.regime,
+    fidelity: row.fidelity,
+    classificationState: row.classification_state,
+    qualityWarnings: row.quality_warnings,
+    classificationReasons: row.classification_reasons,
+    error: row.error,
+    frameTrack: row.frame_track,
+  });
   const cl = numberOrNull(row.cl);
   const cd = numberOrNull(row.cd);
   const cm = numberOrNull(row.cm);
@@ -479,6 +604,20 @@ function makePoint(
     cm: opts.derivedBySymmetry ? negated(cm) : cm,
     plain: plainForPoint(state, gate),
     gate,
+    gates,
+    reviewed:
+      row.review_verdict === "waive" || row.review_verdict === "exclude",
+    review:
+      (row.review_verdict === "waive" || row.review_verdict === "exclude") &&
+      row.review_created_at &&
+      row.review_reviewer
+        ? {
+            verdict: row.review_verdict,
+            note: row.review_note,
+            reviewer: row.review_reviewer,
+            at: isoOf(row.review_created_at),
+          }
+        : null,
     chain: chainForPoint(stateRow, attempts, state),
     continuable: Boolean(row.continuable),
     actions: actionsForPoint(stateRow, state),
@@ -502,6 +641,9 @@ function queuedPoint(aoaDeg: number): SolverWorkPoint {
     cm: null,
     plain: plainForPoint(state, null),
     gate: null,
+    gates: [],
+    reviewed: false,
+    review: null,
     chain: chainForPoint(stateRow, [], state),
     continuable: false,
     actions: [],
@@ -563,6 +705,7 @@ async function loadResultRows(
       r."updatedAt" AS updated_at,
       rc.state::text AS classification_state,
       rc.reasons AS classification_reasons,
+      r.frame_track,
       rc.superseded_by_result_id,
       ${CONTINUABLE_SQL} AS continuable,
       EXISTS (
@@ -579,8 +722,17 @@ async function loadResultRows(
           AND (req.aoa_deg = r.aoa_deg OR req.aoa_deg IS NULL OR req.continue_from_result_id = r.id)
           AND req.state IN ('pending', 'running')
       ) AS open_request
+      ,
+      rrv.id AS review_id,
+      rrv.verdict AS review_verdict,
+      rrv.note AS review_note,
+      rrv.reviewer AS review_reviewer,
+      rrv."createdAt" AS review_created_at
     FROM results r
     LEFT JOIN result_classifications rc ON rc.result_id = r.id
+    LEFT JOIN result_review_verdicts rrv ON rrv.result_id = r.id
+      AND rrv."revokedAt" IS NULL
+      AND rrv.verdict IN ('waive', 'exclude')
     WHERE r.airfoil_id = ${airfoilId}
       AND r.simulation_preset_revision_id IS NOT NULL
       ${revisionId ? sql`AND r.simulation_preset_revision_id = ${revisionId}` : sql``}
@@ -613,6 +765,7 @@ async function loadCampaignPointRows(
       COALESCE(r."updatedAt", p."updatedAt") AS updated_at,
       rc.state::text AS classification_state,
       rc.reasons AS classification_reasons,
+      r.frame_track,
       rc.superseded_by_result_id,
       ${CONTINUABLE_SQL} AS continuable,
       EXISTS (
@@ -629,9 +782,18 @@ async function loadCampaignPointRows(
           AND (req.aoa_deg = p.aoa_deg OR req.aoa_deg IS NULL OR req.continue_from_result_id = r.id)
           AND req.state IN ('pending', 'running')
       ) AS open_request
+      ,
+      rrv.id AS review_id,
+      rrv.verdict AS review_verdict,
+      rrv.note AS review_note,
+      rrv.reviewer AS review_reviewer,
+      rrv."createdAt" AS review_created_at
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN result_classifications rc ON rc.result_id = r.id
+    LEFT JOIN result_review_verdicts rrv ON rrv.result_id = r.id
+      AND rrv."revokedAt" IS NULL
+      AND rrv.verdict IN ('waive', 'exclude')
     WHERE p.airfoil_id = ${airfoilId}
       ${revisionId ? sql`AND p.revision_id = ${revisionId}` : sql``}
   `)) as unknown as CampaignPointRow[];

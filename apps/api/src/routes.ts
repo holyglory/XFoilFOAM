@@ -14,6 +14,11 @@ import {
   referenceGeometryProfiles,
   remoteAssetReferences,
   resultMedia,
+  recordReviewVerdict,
+  revokeActiveReviewVerdict,
+  reviewVerdictHistory,
+  activeReviewVerdict,
+  CONTINUABLE_SQL,
   results,
   schedulingProfiles,
   simJobs,
@@ -25,6 +30,7 @@ import {
   sweeperState,
   sweepDefinitions,
 } from "@aerodb/db";
+import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { EngineClient, type ImageFieldName } from "@aerodb/engine-client";
 import {
@@ -43,7 +49,7 @@ import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { z } from "zod";
 
-import { requireAdmin } from "./admin-auth";
+import { requireAdmin, sessionEmail } from "./admin-auth";
 import { db } from "./db";
 import { env } from "./env";
 import { mediaStore } from "./media-store";
@@ -59,7 +65,10 @@ import {
   toMediumDTO,
 } from "./services/mediums";
 import { assembleSim } from "./services/sim";
-import { assembleSolverWork } from "./services/solver-work";
+import {
+  assembleSolverWork,
+  solverWorkStateForPoint,
+} from "./services/solver-work";
 import { readSweeperState, writeSweeperState } from "./services/sweeper-state";
 
 const nacaSchema = z.object({
@@ -77,6 +86,115 @@ const imageFieldSchema = z.enum([
   "turbulent_kinetic_energy",
   "turbulent_viscosity",
 ]);
+const reviewVerdictBody = z.object({
+  verdict: z.enum(["waive", "exclude", "defer"]),
+  note: z.string().optional(),
+});
+
+type ReviewableResultContext = {
+  id: string;
+  airfoilId: string;
+  revisionId: string | null;
+  status: string | null;
+  source: string | null;
+  regime: string | null;
+  fidelity: string | null;
+  classificationState: string | null;
+  continuable: boolean | null;
+  openVerify: boolean | null;
+  openRequest: boolean | null;
+  autoRetriedAt: Date | string | null;
+  error: string | null;
+};
+
+function reviewDTO(row: {
+  id: string;
+  resultId: string;
+  verdict: "waive" | "exclude" | "defer";
+  note: string | null;
+  reviewer: string;
+  createdAt: Date;
+  revokedAt: Date | null;
+  revokedBy: string | null;
+}) {
+  return {
+    id: row.id,
+    resultId: row.resultId,
+    verdict: row.verdict,
+    note: row.note,
+    reviewer: row.reviewer,
+    at: row.createdAt.toISOString(),
+    revokedAt: row.revokedAt?.toISOString() ?? null,
+    revokedBy: row.revokedBy,
+  };
+}
+
+async function loadReviewableResultContext(
+  resultId: string,
+): Promise<ReviewableResultContext | null> {
+  const rows = (await db.execute(sql`
+    SELECT
+      r.id,
+      r.airfoil_id AS "airfoilId",
+      r.simulation_preset_revision_id AS "revisionId",
+      r.status::text AS status,
+      r.source::text AS source,
+      r.regime::text AS regime,
+      r.fidelity AS fidelity,
+      rc.state::text AS "classificationState",
+      ${CONTINUABLE_SQL} AS continuable,
+      EXISTS (
+        SELECT 1 FROM sim_urans_verify_queue q
+        WHERE q.airfoil_id = r.airfoil_id
+          AND q.revision_id = r.simulation_preset_revision_id
+          AND q.aoa_deg = r.aoa_deg
+          AND q.state IN ('pending', 'running')
+      ) AS "openVerify",
+      EXISTS (
+        SELECT 1 FROM sim_urans_requests req
+        WHERE req.airfoil_id = r.airfoil_id
+          AND req.revision_id = r.simulation_preset_revision_id
+          AND (req.aoa_deg = r.aoa_deg OR req.aoa_deg IS NULL OR req.continue_from_result_id = r.id)
+          AND req.state IN ('pending', 'running')
+      ) AS "openRequest",
+      r.auto_retried_at AS "autoRetriedAt",
+      r.error
+    FROM results r
+    LEFT JOIN result_classifications rc ON rc.result_id = r.id
+    WHERE r.id = ${resultId}
+    LIMIT 1
+  `)) as unknown as ReviewableResultContext[];
+  return rows[0] ?? null;
+}
+
+async function refreshReviewResultCache(
+  ctx: ReviewableResultContext,
+): Promise<void> {
+  if (!ctx.revisionId) return;
+  await refreshPolarCacheForRevision(db, ctx.airfoilId, ctx.revisionId);
+}
+
+async function isReviewableResult(
+  ctx: ReviewableResultContext,
+): Promise<boolean> {
+  const active = await activeReviewVerdict(db, ctx.id);
+  if (active) return true;
+  return (
+    solverWorkStateForPoint({
+      resultId: ctx.id,
+      status: ctx.status,
+      source: ctx.source,
+      regime: ctx.regime,
+      fidelity: ctx.fidelity,
+      classificationState: ctx.classificationState,
+      continuable: ctx.continuable,
+      openVerify: ctx.openVerify,
+      openRequest: ctx.openRequest,
+      autoRetriedAt: ctx.autoRetriedAt,
+      error: ctx.error,
+    }) === "needs_review"
+  );
+}
 
 function stableHash(value: unknown): string {
   const stable = (v: unknown): unknown => {
@@ -599,6 +717,63 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     if (!payload) return reply.code(404).send({ error: "airfoil not found" });
     return payload;
   });
+
+  app.post(
+    "/api/admin/results/:id/review",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+      const body = reviewVerdictBody.parse(req.body);
+      const note = body.note?.trim() ?? "";
+      if ((body.verdict === "waive" || body.verdict === "exclude") && !note) {
+        return reply
+          .code(422)
+          .send({ error: "note is required for waive/exclude reviews" });
+      }
+      const ctx = await loadReviewableResultContext(id);
+      if (!ctx) return reply.code(404).send({ error: "result not found" });
+      if (!(await isReviewableResult(ctx))) {
+        return reply
+          .code(409)
+          .send({ error: "result is not in a reviewable solver-work state" });
+      }
+      const reviewer = sessionEmail(req) ?? "dev-admin@local";
+      const review = await recordReviewVerdict(db, {
+        resultId: id,
+        verdict: body.verdict,
+        note,
+        reviewer,
+      });
+      await refreshReviewResultCache(ctx);
+      return reply.code(201).send({ review: reviewDTO(review) });
+    },
+  );
+
+  app.delete(
+    "/api/admin/results/:id/review",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+      const ctx = await loadReviewableResultContext(id);
+      if (!ctx) return reply.code(404).send({ error: "result not found" });
+      const reviewer = sessionEmail(req) ?? "dev-admin@local";
+      await revokeActiveReviewVerdict(db, id, reviewer);
+      await refreshReviewResultCache(ctx);
+      return reply.code(204).send();
+    },
+  );
+
+  app.get(
+    "/api/admin/results/:id/reviews",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+      const ctx = await loadReviewableResultContext(id);
+      if (!ctx) return reply.code(404).send({ error: "result not found" });
+      const history = await reviewVerdictHistory(db, id);
+      return { items: history.map(reviewDTO) };
+    },
+  );
 
   app.get("/api/airfoils/:slug/field-track", async (req, reply) => {
     const { slug } = req.params as { slug: string };

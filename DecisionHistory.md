@@ -3120,3 +3120,40 @@ mean).
 - The disk-full failure class is now guarded three ways: continuous
   strip of terminal job dirs, hourly orphan sweep + disk log/warning
   in the sweeper, and the session monitor's DISK-WARN at 80%.
+
+## 2026-07-10 — Detail-page arc: honest statuses, hybrid solver work, review journey
+
+- User-reported gaps: phantom Cl-Cd fit lobe (LOWESS drawn across a 15°
+  pending-URANS hole + extrapolated tails — fixed by interval-support
+  gating: fit draws only across measured-α gaps ≤ max(2× median gap,
+  6°), never extrapolates; readout + axis window equally gated; the
+  incident shape and a uniform-sweep false-positive guard are pinned);
+  dead polar point clicks (pointer capture on pointer-down retargeted
+  clicks to the svg — capture now only on real pan start); and the
+  unreadable flat solver-work job dump.
+- Approved redesign shipped (mockups → user approval → Codex lanes):
+  status taxonomy with NO "rejected"/"failed" anywhere — verified /
+  provisional / solving / queued / ladder (→ URANS, normal operation,
+  never attention) / needs time (budget stop, resumable) / needs
+  review / blocked (terminal without different conditions) /
+  superseded / excluded; GET /api/airfoils/:slug/solver-work groups
+  points per condition with plain-language sentences + deciding-gate
+  lines + attempt chains; web hybrid: condition groups, α-strips,
+  rollups, attention filters, P1 anchored popover (mobile bottom
+  sheet) with admin-gated Continue +2h/+6h/+24h.
+- Review journey (approved Part 4): result_review_verdicts audit table
+  (migration 0040) — waive / exclude / defer as a REVERSIBLE overlay
+  that never mutates machine verdicts; waive counts as accepted in
+  polar/fits/browse with a permanent disclosure, exclude drops from
+  fits but stays listed; auto-revoke on re-verdict, full history;
+  SimModal review mode: gate checklist (all gates, pass+fail),
+  required-note verdicts, remediation buttons, review-next stepper,
+  reviewed ✓ badges, anonymous users see disclosures never controls.
+- Fixed in review: migration/schema column-casing mismatch (repo ts()
+  convention = camelCase columns; migration + raw rrv SQL said
+  snake_case — every DTO suite failed on it); "did not converge" gap
+  in gate patterns vs real prod strings; benign convergence
+  disclosures no longer render as gate verdicts on verified points.
+- Verified: api 126, web 257, core 108, typecheck; prod smoke of
+  solver-work on live S1223 (9 conditions; 39 former "rejected" rows
+  now read as ladder progression).

@@ -14,6 +14,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
+import { activeReviewVerdicts } from "./review-verdicts";
 import {
   airfoils,
   forceHistory,
@@ -105,7 +106,11 @@ function toEvidence(row: {
   };
 }
 
-async function loadResultEvidence(db: DB, airfoilId: string, simulationPresetRevisionId: string): Promise<EvidenceWithDbIds[]> {
+async function loadResultEvidence(
+  db: DB,
+  airfoilId: string,
+  simulationPresetRevisionId: string,
+): Promise<EvidenceWithDbIds[]> {
   const rows = await db
     .select({
       id: results.id,
@@ -137,11 +142,20 @@ async function loadResultEvidence(db: DB, airfoilId: string, simulationPresetRev
       steadyHistory: results.steadyHistory,
     })
     .from(results)
-    .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, simulationPresetRevisionId)));
+    .where(
+      and(
+        eq(results.airfoilId, airfoilId),
+        eq(results.simulationPresetRevisionId, simulationPresetRevisionId),
+      ),
+    );
   return rows.map(toEvidence);
 }
 
-async function loadAttemptEvidence(db: DB, airfoilId: string, simulationPresetRevisionId: string): Promise<EvidenceWithDbIds[]> {
+async function loadAttemptEvidence(
+  db: DB,
+  airfoilId: string,
+  simulationPresetRevisionId: string,
+): Promise<EvidenceWithDbIds[]> {
   const rows = await db
     .select({
       id: resultAttempts.resultId,
@@ -175,11 +189,21 @@ async function loadAttemptEvidence(db: DB, airfoilId: string, simulationPresetRe
       // and key-absent both surface as SQL NULL → legacy gate.
       frameTrack: sql<unknown>`"result_attempts"."evidence_payload" -> 'frame_track'`,
       // Ladder evidence lives inside the same verbatim engine PolarPoint.
-      fidelity: sql<string | null>`"result_attempts"."evidence_payload" ->> 'fidelity'`,
+      fidelity: sql<
+        string | null
+      >`"result_attempts"."evidence_payload" ->> 'fidelity'`,
       steadyHistory: sql<unknown>`"result_attempts"."evidence_payload" -> 'steady_history'`,
     })
     .from(resultAttempts)
-    .where(and(eq(resultAttempts.airfoilId, airfoilId), eq(resultAttempts.simulationPresetRevisionId, simulationPresetRevisionId)));
+    .where(
+      and(
+        eq(resultAttempts.airfoilId, airfoilId),
+        eq(
+          resultAttempts.simulationPresetRevisionId,
+          simulationPresetRevisionId,
+        ),
+      ),
+    );
   return rows.map(toEvidence);
 }
 
@@ -245,7 +269,10 @@ async function upsertClassification(
     });
 }
 
-function signatureFor(classifications: PolarEvidenceClassification[], symmetryMirrored: boolean): string {
+function signatureFor(
+  classifications: PolarEvidenceClassification[],
+  symmetryMirrored: boolean,
+): string {
   const payload = classifications
     .filter((c) => {
       const e = c.evidence as EvidenceWithDbIds;
@@ -273,14 +300,24 @@ function signatureFor(classifications: PolarEvidenceClassification[], symmetryMi
     .digest("hex");
 }
 
-async function supersedeRansWithAcceptedUrans(db: DB, airfoilId: string, simulationPresetRevisionId: string): Promise<void> {
+async function supersedeRansWithAcceptedUrans(
+  db: DB,
+  airfoilId: string,
+  simulationPresetRevisionId: string,
+): Promise<void> {
   const uransRows = await db
-    .select({ resultId: resultClassifications.resultId, aoaDeg: resultClassifications.aoaDeg })
+    .select({
+      resultId: resultClassifications.resultId,
+      aoaDeg: resultClassifications.aoaDeg,
+    })
     .from(resultClassifications)
     .where(
       and(
         eq(resultClassifications.airfoilId, airfoilId),
-        eq(resultClassifications.simulationPresetRevisionId, simulationPresetRevisionId),
+        eq(
+          resultClassifications.simulationPresetRevisionId,
+          simulationPresetRevisionId,
+        ),
         eq(resultClassifications.regime, "urans"),
         eq(resultClassifications.state, "accepted"),
       ),
@@ -299,7 +336,10 @@ async function supersedeRansWithAcceptedUrans(db: DB, airfoilId: string, simulat
       .where(
         and(
           eq(resultClassifications.airfoilId, airfoilId),
-          eq(resultClassifications.simulationPresetRevisionId, simulationPresetRevisionId),
+          eq(
+            resultClassifications.simulationPresetRevisionId,
+            simulationPresetRevisionId,
+          ),
           eq(resultClassifications.aoaDeg, row.aoaDeg),
           eq(resultClassifications.regime, "rans"),
           inArray(resultClassifications.state, ["accepted", "needs_urans"]),
@@ -314,7 +354,11 @@ async function supersedeRansWithAcceptedUrans(db: DB, airfoilId: string, simulat
  *  Runs after every classification upsert pass (same re-assert discipline as
  *  supersedeRansWithAcceptedUrans — the upsert rewrites attempt verdicts each
  *  refresh, so the supersession must be re-derived each refresh too). */
-async function supersedePrecalcWithVerifiedUrans(db: DB, airfoilId: string, simulationPresetRevisionId: string): Promise<void> {
+async function supersedePrecalcWithVerifiedUrans(
+  db: DB,
+  airfoilId: string,
+  simulationPresetRevisionId: string,
+): Promise<void> {
   await db.execute(sql`
     UPDATE result_classifications rc
     SET state = 'superseded_by_urans',
@@ -350,7 +394,10 @@ async function storeFit(
   symmetric: boolean,
 ): Promise<{ fitSetId: string | null; status: string }> {
   const [revision] = await db
-    .select({ reynolds: simulationPresetRevisions.reynolds, mach: simulationPresetRevisions.mach })
+    .select({
+      reynolds: simulationPresetRevisions.reynolds,
+      mach: simulationPresetRevisions.mach,
+    })
     .from(simulationPresetRevisions)
     .where(eq(simulationPresetRevisions.id, simulationPresetRevisionId))
     .limit(1);
@@ -375,9 +422,15 @@ async function storeFit(
   const evidenceSignature = signatureFor(classifications, symmetric);
   // Stored point counts stay real-solve-only (they feed Browse polarCount and
   // ranking tie-breaks); mirrored copies only widen fit points/metrics.
-  const acceptedPointCount = classifications.filter((c) => c.state === "accepted").length;
-  const provisionalPointCount = classifications.filter((c) => c.state === "needs_urans").length;
-  const rejectedPointCount = classifications.filter((c) => c.state === "rejected" || c.state === "superseded_by_urans").length;
+  const acceptedPointCount = classifications.filter(
+    (c) => c.state === "accepted",
+  ).length;
+  const provisionalPointCount = classifications.filter(
+    (c) => c.state === "needs_urans",
+  ).length;
+  const rejectedPointCount = classifications.filter(
+    (c) => c.state === "rejected" || c.state === "superseded_by_urans",
+  ).length;
   // Retire EVERY current row for the pair, not just same-version rows: a
   // POLAR_FIT_VERSION bump refreshes lazily, and leaving the prior-version
   // row co-current makes single-current readers (detail fitByRevision map,
@@ -422,7 +475,12 @@ async function storeFit(
       isCurrent: true,
     })
     .onConflictDoUpdate({
-      target: [polarFitSets.airfoilId, polarFitSets.simulationPresetRevisionId, polarFitSets.fitVersion, polarFitSets.evidenceSignature],
+      target: [
+        polarFitSets.airfoilId,
+        polarFitSets.simulationPresetRevisionId,
+        polarFitSets.fitVersion,
+        polarFitSets.evidenceSignature,
+      ],
       set: {
         status: fit.status,
         confidence: fit.confidence,
@@ -477,8 +535,16 @@ export async function refreshPolarCacheForRevision(
     .where(eq(airfoils.id, airfoilId))
     .limit(1);
   const symmetric = airfoilRow?.isSymmetric ?? false;
-  const resultEvidence = await loadResultEvidence(db, airfoilId, simulationPresetRevisionId);
-  const attemptEvidence = await loadAttemptEvidence(db, airfoilId, simulationPresetRevisionId);
+  const resultEvidence = await loadResultEvidence(
+    db,
+    airfoilId,
+    simulationPresetRevisionId,
+  );
+  const attemptEvidence = await loadAttemptEvidence(
+    db,
+    airfoilId,
+    simulationPresetRevisionId,
+  );
   const resultClassified = classifyPolarEvidence(resultEvidence);
   const attemptEvidenceByJob = new Map<string, EvidenceWithDbIds[]>();
   for (const evidence of attemptEvidence) {
@@ -490,14 +556,29 @@ export async function refreshPolarCacheForRevision(
       attemptEvidenceByJob.set(key, [evidence]);
     }
   }
-  const attemptClassifiedGroups = [...attemptEvidenceByJob.values()].map((group) => classifyPolarEvidence(group));
-  const attemptClassifications = attemptClassifiedGroups.flatMap((group) => group.classifications);
+  const attemptClassifiedGroups = [...attemptEvidenceByJob.values()].map(
+    (group) => classifyPolarEvidence(group),
+  );
+  const attemptClassifications = attemptClassifiedGroups.flatMap(
+    (group) => group.classifications,
+  );
 
-  for (const c of [...resultClassified.classifications, ...attemptClassifications]) {
+  for (const c of [
+    ...resultClassified.classifications,
+    ...attemptClassifications,
+  ]) {
     await upsertClassification(db, c, airfoilId, simulationPresetRevisionId);
   }
-  await supersedeRansWithAcceptedUrans(db, airfoilId, simulationPresetRevisionId);
-  await supersedePrecalcWithVerifiedUrans(db, airfoilId, simulationPresetRevisionId);
+  await supersedeRansWithAcceptedUrans(
+    db,
+    airfoilId,
+    simulationPresetRevisionId,
+  );
+  await supersedePrecalcWithVerifiedUrans(
+    db,
+    airfoilId,
+    simulationPresetRevisionId,
+  );
 
   const freshResultClassifications = await db
     .select({
@@ -528,28 +609,69 @@ export async function refreshPolarCacheForRevision(
     .where(
       and(
         eq(resultClassifications.airfoilId, airfoilId),
-        eq(resultClassifications.simulationPresetRevisionId, simulationPresetRevisionId),
+        eq(
+          resultClassifications.simulationPresetRevisionId,
+          simulationPresetRevisionId,
+        ),
       ),
     );
-  const fitClassifications: PolarEvidenceClassification[] = freshResultClassifications.map((row) => ({
-    evidence: toEvidence({ id: row.resultId, ...row, hasForceHistory: true, hasVideo: true }),
-    state: row.state,
-    region: row.region,
-    confidence: row.confidence,
-    reasons: row.reasons,
-  }));
-  const storedFit = await storeFit(db, airfoilId, simulationPresetRevisionId, fitClassifications, symmetric);
-  const attemptNeeds = attemptClassifiedGroups.flatMap((group) => group.needsUransAoas);
+  const activeVerdicts = await activeReviewVerdicts(
+    db,
+    freshResultClassifications
+      .map((row) => row.resultId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const fitClassifications: PolarEvidenceClassification[] =
+    freshResultClassifications
+      .map((row) => ({
+        evidence: toEvidence({
+          id: row.resultId,
+          ...row,
+          hasForceHistory: true,
+          hasVideo: true,
+        }),
+        state:
+          activeVerdicts.get(row.resultId ?? "")?.verdict === "waive"
+            ? "accepted"
+            : row.state,
+        region: row.region,
+        confidence: row.confidence,
+        reasons: row.reasons,
+      }))
+      .filter((classification) => {
+        const evidence = classification.evidence as EvidenceWithDbIds;
+        return (
+          activeVerdicts.get(evidence.resultId ?? "")?.verdict !== "exclude"
+        );
+      });
+  const storedFit = await storeFit(
+    db,
+    airfoilId,
+    simulationPresetRevisionId,
+    fitClassifications,
+    symmetric,
+  );
+  const attemptNeeds = attemptClassifiedGroups.flatMap(
+    (group) => group.needsUransAoas,
+  );
   const resultNeeds = resultClassified.needsUransAoas;
-  const attemptRejected = attemptClassifiedGroups.flatMap((group) => group.hardRejectedAoas);
+  const attemptRejected = attemptClassifiedGroups.flatMap(
+    (group) => group.hardRejectedAoas,
+  );
   const resultRejected = resultClassified.hardRejectedAoas;
 
   return {
     airfoilId,
     simulationPresetRevisionId,
-    needsUransAoas: [...new Set([...attemptNeeds, ...resultNeeds])].sort((a, b) => a - b),
-    hardRejectedAoas: [...new Set([...attemptRejected, ...resultRejected])].sort((a, b) => a - b),
-    lowAoaFailure: attemptClassifiedGroups.some((group) => group.lowAoaFailure) || resultClassified.lowAoaFailure,
+    needsUransAoas: [...new Set([...attemptNeeds, ...resultNeeds])].sort(
+      (a, b) => a - b,
+    ),
+    hardRejectedAoas: [
+      ...new Set([...attemptRejected, ...resultRejected]),
+    ].sort((a, b) => a - b),
+    lowAoaFailure:
+      attemptClassifiedGroups.some((group) => group.lowAoaFailure) ||
+      resultClassified.lowAoaFailure,
     fitSetId: storedFit.fitSetId,
     fitStatus: storedFit.status,
   };

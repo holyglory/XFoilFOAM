@@ -4,6 +4,7 @@ export * from "./campaigns";
 export * from "./campaign-execution";
 export * from "./urans-ladder";
 export * from "./point-history";
+export * from "./review-verdicts";
 export { createClient, type DB, type Sql } from "./client";
 export { databaseUrl, DEFAULT_DATABASE_URL } from "./env";
 import * as schema from "./schema";

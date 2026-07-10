@@ -7,6 +7,7 @@ export const SOLVER_WORK_STATES = [
   "needs_time",
   "needs_review",
   "blocked",
+  "excluded",
   "superseded",
 ] as const;
 
@@ -20,6 +21,15 @@ export interface SolverWorkGate {
 export interface SolverWorkChainItem {
   label: string;
   tone: string;
+}
+
+export type SolverWorkReviewVerdict = "waive" | "exclude" | "defer";
+
+export interface SolverWorkReviewed {
+  verdict: SolverWorkReviewVerdict;
+  note: string | null;
+  reviewer: string | null;
+  at: string;
 }
 
 export interface SolverWorkPoint {
@@ -36,6 +46,7 @@ export interface SolverWorkPoint {
   continuable: boolean;
   actions: string[];
   supersededBy: string | null;
+  reviewed?: SolverWorkReviewed | null;
 }
 
 export interface SolverWorkJob {
@@ -150,6 +161,13 @@ export const SOLVER_WORK_STATE_STYLES: Record<SolverWorkPointState, SolverWorkSt
     background: "#260d0d",
     border: "#7f1d1d",
   },
+  excluded: {
+    label: "excluded",
+    className: "solver-work-state--excluded",
+    color: "#fca5a5",
+    background: "#260d0d",
+    border: "#7f1d1d",
+  },
   superseded: {
     label: "superseded",
     className: "solver-work-state--superseded",
@@ -185,14 +203,22 @@ export interface SolverWorkResultContext {
 }
 
 export interface SolverWorkPopoverAction {
-  kind: "open-results" | "continue-2h" | "continue-6h" | "continue-24h" | "retry" | "request-full-tier";
+  kind: "open-results" | "continue-2h" | "continue-6h" | "continue-24h" | "retry" | "request-full-tier" | "revoke-review";
   label: string;
   adminOnly: boolean;
+}
+
+export interface SolverWorkPointPresentation {
+  visualState: SolverWorkPointState;
+  stateLabel: string;
+  badgeMark: string | null;
+  reviewedDisclosure: string | null;
 }
 
 export interface SolverWorkPopoverView {
   title: string;
   state: SolverWorkPointState;
+  visualState: SolverWorkPointState;
   stateLabel: string;
   plain: string;
   gate: SolverWorkGate | null;
@@ -200,10 +226,37 @@ export interface SolverWorkPopoverView {
   provisionalNote: boolean;
   chain: { label: string; tone: string; style: SolverWorkStateStyle }[];
   actions: SolverWorkPopoverAction[];
+  reviewedDisclosure: string | null;
 }
 
 export function solverWorkStateClass(state: SolverWorkPointState): string {
   return `solver-work-state ${SOLVER_WORK_STATE_STYLES[state].className}`;
+}
+
+export function solverWorkPointPresentation(point: SolverWorkPoint): SolverWorkPointPresentation {
+  const reviewed = point.reviewed ?? null;
+  if (reviewed?.verdict === "waive") {
+    return {
+      visualState: "verified",
+      stateLabel: "verified · reviewed ✓",
+      badgeMark: "✓",
+      reviewedDisclosure: solverWorkReviewDisclosure(reviewed),
+    };
+  }
+  if (point.state === "excluded" || reviewed?.verdict === "exclude") {
+    return {
+      visualState: "excluded",
+      stateLabel: reviewed ? "excluded · reviewed" : SOLVER_WORK_STATE_STYLES.excluded.label,
+      badgeMark: null,
+      reviewedDisclosure: reviewed ? solverWorkReviewDisclosure(reviewed) : null,
+    };
+  }
+  return {
+    visualState: point.state,
+    stateLabel: SOLVER_WORK_STATE_STYLES[point.state].label,
+    badgeMark: null,
+    reviewedDisclosure: reviewed ? solverWorkReviewDisclosure(reviewed) : null,
+  };
 }
 
 export function solverWorkPointKey(condition: SolverWorkCondition, point: SolverWorkPoint): string {
@@ -328,6 +381,7 @@ export function buildContinueUransPayload(resultId: string, hours: 2 | 6 | 24): 
 }
 
 export function buildSolverWorkPopoverView(condition: SolverWorkCondition, point: SolverWorkPoint, admin: boolean): SolverWorkPopoverView {
+  const presentation = solverWorkPointPresentation(point);
   const actions: SolverWorkPopoverAction[] = [];
   if (point.resultId) actions.push({ kind: "open-results", label: "full results ▸", adminOnly: false });
   if (admin && point.state === "needs_time" && point.continuable && point.resultId) {
@@ -343,11 +397,15 @@ export function buildSolverWorkPopoverView(condition: SolverWorkCondition, point
   if (admin && (point.state === "needs_review" || point.state === "blocked") && hasFullTierAction(point) && condition.presetRevisionId) {
     actions.push({ kind: "request-full-tier", label: "Request full tier", adminOnly: true });
   }
+  if (admin && point.reviewed && point.resultId) {
+    actions.push({ kind: "revoke-review", label: "revoke review", adminOnly: true });
+  }
 
   return {
     title: `α ${formatAoa(point.aoaDeg)}`,
     state: point.state,
-    stateLabel: SOLVER_WORK_STATE_STYLES[point.state].label,
+    visualState: presentation.visualState,
+    stateLabel: presentation.stateLabel,
     plain: point.plain,
     gate: point.gate,
     coefficients: [
@@ -362,7 +420,18 @@ export function buildSolverWorkPopoverView(condition: SolverWorkCondition, point
       style: styleForTone(item.tone),
     })),
     actions,
+    reviewedDisclosure: presentation.reviewedDisclosure,
   };
+}
+
+function solverWorkReviewDisclosure(reviewed: SolverWorkReviewed): string {
+  const verb = reviewed.verdict === "waive" ? "waived" : reviewed.verdict === "exclude" ? "excluded" : "deferred";
+  const note = reviewed.note?.trim();
+  return `${verb} by ${reviewed.reviewer || "unknown"} ${formatReviewDate(reviewed.at)}${note ? `: ${note}` : ""}`;
+}
+
+function formatReviewDate(iso: string): string {
+  return iso ? iso.slice(0, 10) : "unknown date";
 }
 
 function normalizedAction(action: string): string {
@@ -418,6 +487,7 @@ function isUransRelated(point: SolverWorkPoint): boolean {
     point.state === "ladder" ||
     point.state === "needs_time" ||
     point.state === "needs_review" ||
-    point.state === "blocked"
+    point.state === "blocked" ||
+    point.state === "excluded"
   );
 }

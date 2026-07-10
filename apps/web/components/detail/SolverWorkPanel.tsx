@@ -2,8 +2,9 @@
 
 import { type CSSProperties, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { adminMe, continueUransResult, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
+import { adminMe, continueUransResult, deleteResultReview, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
 import { getSolverWork } from "@/lib/api";
+import { buildReviewQueue, type ReviewQueueItem, type SimModalReviewContext } from "@/lib/result-review";
 import {
   buildSolverWorkConditionSummary,
   buildSolverWorkPopoverView,
@@ -15,6 +16,7 @@ import {
   SOLVER_WORK_STATE_STYLES,
   solverWorkLegendStates,
   solverWorkPointKey,
+  solverWorkPointPresentation,
   solverWorkResultContext,
   solverWorkRollup,
   solverWorkStateClass,
@@ -73,7 +75,7 @@ export function SolverWorkPanel({
   slug: string;
   airfoilId: string;
   revisionId?: string | null;
-  onOpenResult: (ctx: SolverWorkResultContext) => void;
+  onOpenResult: (ctx: SolverWorkResultContext, review?: SimModalReviewContext | null) => void;
 }) {
   const [conditions, setConditions] = useState<SolverWorkCondition[]>([]);
   const [loading, setLoading] = useState(true);
@@ -90,6 +92,7 @@ export function SolverWorkPanel({
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [optimisticStates, setOptimisticStates] = useState<Record<string, SolverWorkPointState>>({});
   const popoverRef = useRef<HTMLDivElement>(null);
+  const latestConditionsRef = useRef<SolverWorkCondition[]>([]);
 
   const refresh = useCallback(
     async (opts?: { quiet?: boolean }) => {
@@ -97,6 +100,7 @@ export function SolverWorkPanel({
       setError(null);
       try {
         const payload = await getSolverWork(slug, revisionId);
+        latestConditionsRef.current = payload.conditions;
         setConditions(payload.conditions);
       } catch (e) {
         setError((e as Error).message);
@@ -176,6 +180,10 @@ export function SolverWorkPanel({
     [conditions, optimisticStates],
   );
 
+  useEffect(() => {
+    latestConditionsRef.current = optimisticConditions;
+  }, [optimisticConditions]);
+
   const filteredConditions = useMemo(
     () => filterSortSolverWorkConditions(optimisticConditions, filter, sort),
     [optimisticConditions, filter, sort],
@@ -210,13 +218,13 @@ export function SolverWorkPanel({
 
   const runContinue = useCallback(
     async (condition: SolverWorkCondition, point: SolverWorkPoint, hours: 2 | 6 | 24) => {
-      if (!point.resultId || busyAction) return;
+      if (!point.resultId || busyAction) return false;
       if (
         !window.confirm(
           `Continue this URANS solve (α ${formatAoa(point.aoaDeg)}) from its saved case state with a +${hours} h wall-clock budget? It resumes from the last written time step (no work is redone) and re-enters the queue at precalc rank.`,
         )
       )
-        return;
+        return false;
       setBusyAction(`continue-${hours}h`);
       setActionNotice(null);
       try {
@@ -228,8 +236,10 @@ export function SolverWorkPanel({
             : `already queued — the open continuation request is reused (${res.request.state})`,
         );
         void refresh({ quiet: true });
+        return true;
       } catch (e) {
         setActionNotice(isAdminApiError(e) ? e.message : (e as Error).message);
+        return false;
       } finally {
         setBusyAction(null);
       }
@@ -259,13 +269,13 @@ export function SolverWorkPanel({
 
   const runRequestFull = useCallback(
     async (condition: SolverWorkCondition, point: SolverWorkPoint) => {
-      if (busyAction) return;
+      if (busyAction) return false;
       if (
         !window.confirm(
           `Queue a full-fidelity URANS solve for α ${formatAoa(point.aoaDeg)}? Full mesh, 7 shedding periods, 12 h budget. It runs after all RANS gaps, at precalc rank.`,
         )
       )
-        return;
+        return false;
       setBusyAction("request-full-tier");
       setActionNotice(null);
       try {
@@ -282,13 +292,56 @@ export function SolverWorkPanel({
             : `already requested — the open full request is reused (${res.request.state})`,
         );
         void refresh({ quiet: true });
+        return true;
+      } catch (e) {
+        setActionNotice(isAdminApiError(e) ? e.message : (e as Error).message);
+        return false;
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [airfoilId, busyAction, optimisticFlip, refresh],
+  );
+
+  const runRevokeReview = useCallback(
+    async (condition: SolverWorkCondition, point: SolverWorkPoint) => {
+      if (!point.resultId || busyAction) return;
+      setBusyAction("revoke-review");
+      setActionNotice(null);
+      try {
+        await deleteResultReview(point.resultId);
+        setActionNotice("review revoked — solver work refreshed");
+        void refresh({ quiet: true });
       } catch (e) {
         setActionNotice(isAdminApiError(e) ? e.message : (e as Error).message);
       } finally {
         setBusyAction(null);
       }
     },
-    [airfoilId, busyAction, optimisticFlip, refresh],
+    [busyAction, refresh],
+  );
+
+  const openResultWithReview = useCallback(
+    (condition: SolverWorkCondition, point: SolverWorkPoint) => {
+      const ctx = solverWorkResultContext(condition, point);
+      if (!ctx) return;
+      const makeReviewContext = (reviewCondition: SolverWorkCondition, reviewPoint: SolverWorkPoint): SimModalReviewContext => ({
+        admin: adminAuthed,
+        condition: reviewCondition,
+        point: reviewPoint,
+        queue: buildReviewQueue(latestConditionsRef.current),
+        onOpenQueueItem: (item: ReviewQueueItem) => {
+          const latestItem = buildReviewQueue(latestConditionsRef.current).find((candidate) => candidate.resultId === item.resultId) ?? item;
+          const nextCtx = solverWorkResultContext(latestItem.condition, latestItem.point);
+          if (nextCtx) onOpenResult(nextCtx, makeReviewContext(latestItem.condition, latestItem.point));
+        },
+        onRefresh: () => refresh({ quiet: true }),
+        onContinue6h: () => runContinue(reviewCondition, reviewPoint, 6),
+        onRequestFull: () => runRequestFull(reviewCondition, reviewPoint),
+      });
+      onOpenResult(ctx, makeReviewContext(condition, point));
+    },
+    [adminAuthed, onOpenResult, refresh, runContinue, runRequestFull],
   );
 
   return (
@@ -406,12 +459,12 @@ export function SolverWorkPanel({
             busyAction={busyAction}
             actionNotice={actionNotice}
             onOpenResults={() => {
-              const ctx = solverWorkResultContext(openContext.condition, openContext.point);
-              if (ctx) onOpenResult(ctx);
+              openResultWithReview(openContext.condition, openContext.point);
             }}
             onContinue={(hours) => void runContinue(openContext.condition, openContext.point, hours)}
             onRetry={() => void runRetry(openContext.condition, openContext.point)}
             onRequestFull={() => void runRequestFull(openContext.condition, openContext.point)}
+            onRevokeReview={() => void runRevokeReview(openContext.condition, openContext.point)}
           />
         </div>
       )}
@@ -533,16 +586,19 @@ function PointBadge({
   point: SolverWorkPoint;
   onClick: (e: MouseEvent<HTMLButtonElement>, condition: SolverWorkCondition, point: SolverWorkPoint) => void;
 }) {
-  const style = SOLVER_WORK_STATE_STYLES[point.state];
+  const presentation = solverWorkPointPresentation(point);
+  const style = SOLVER_WORK_STATE_STYLES[presentation.visualState];
   return (
     <button
       type="button"
       data-testid="solver-work-point-badge"
       data-solver-point-badge
-      data-state={point.state}
-      className={solverWorkStateClass(point.state)}
+      data-state={presentation.visualState}
+      data-reviewed={presentation.badgeMark ? "true" : undefined}
+      className={solverWorkStateClass(presentation.visualState)}
       onClick={(e) => onClick(e, condition, point)}
       style={{
+        position: "relative",
         fontFamily: MONO,
         fontSize: 10,
         color: style.color,
@@ -556,6 +612,28 @@ function PointBadge({
       }}
     >
       {formatAoa(point.aoaDeg)}
+      {presentation.badgeMark && (
+        <span
+          aria-label="reviewed"
+          style={{
+            position: "absolute",
+            top: -5,
+            right: -3,
+            minWidth: 14,
+            height: 14,
+            borderRadius: 999,
+            display: "grid",
+            placeItems: "center",
+            fontSize: 9,
+            lineHeight: 1,
+            color: C.tealInk,
+            background: C.teal,
+            border: `1px solid ${C.tealBorder}`,
+          }}
+        >
+          {presentation.badgeMark}
+        </span>
+      )}
     </button>
   );
 }
@@ -575,7 +653,7 @@ function RollupBar({ segments }: { segments: ReturnType<typeof solverWorkRollup>
   );
 }
 
-function StatePill({ state, compact = false }: { state: SolverWorkPointState; compact?: boolean }) {
+function StatePill({ state, compact = false, label }: { state: SolverWorkPointState; compact?: boolean; label?: string }) {
   const style = SOLVER_WORK_STATE_STYLES[state];
   return (
     <span
@@ -591,7 +669,7 @@ function StatePill({ state, compact = false }: { state: SolverWorkPointState; co
         whiteSpace: "nowrap",
       }}
     >
-      {style.label}
+      {label ?? style.label}
     </span>
   );
 }
@@ -604,6 +682,7 @@ export function PointPopoverBody({
   onContinue,
   onRetry,
   onRequestFull,
+  onRevokeReview,
 }: {
   view: SolverWorkPopoverView;
   busyAction?: string | null;
@@ -612,15 +691,23 @@ export function PointPopoverBody({
   onContinue: (hours: 2 | 6 | 24) => void;
   onRetry: () => void;
   onRequestFull: () => void;
+  onRevokeReview: () => void;
 }) {
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
   const resultAction = view.actions.find((action) => action.kind === "open-results");
-  const adminActions = view.actions.filter((action) => action.adminOnly);
+  const adminActions = view.actions.filter((action) => action.adminOnly && action.kind !== "revoke-review");
+  const revokeAction = view.actions.find((action) => action.kind === "revoke-review");
   return (
     <div style={{ width: "min(360px, calc(100vw - 24px))", display: "grid", gap: 10, color: C.text }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <strong style={{ fontFamily: MONO, fontSize: 13, color: C.text }}>{view.title}</strong>
-        <StatePill state={view.state} />
+        <StatePill state={view.visualState} label={view.stateLabel} />
       </div>
+      {view.reviewedDisclosure && (
+        <div data-testid="solver-work-reviewed-disclosure" style={{ fontFamily: MONO, fontSize: 10.5, color: C.muted, lineHeight: 1.45, border: `1px solid ${C.stroke}`, background: C.panel2, borderRadius: 8, padding: "7px 8px" }}>
+          {view.reviewedDisclosure}
+        </div>
+      )}
       {view.plain && <div style={{ fontSize: 12, color: C.text2, lineHeight: 1.45 }}>{view.plain}</div>}
       {view.gate && (
         <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.muted, lineHeight: 1.45, border: `1px solid ${C.stroke}`, background: C.panel3, borderRadius: 8, padding: "7px 8px" }}>
@@ -676,6 +763,32 @@ export function PointPopoverBody({
               }}
             />
           ))}
+          {revokeAction && (
+            <PopoverActionButton
+              action={revokeAction}
+              busyAction={busyAction}
+              onClick={() => setConfirmRevoke(true)}
+            />
+          )}
+        </div>
+      )}
+      {confirmRevoke && revokeAction && (
+        <div data-testid="solver-work-revoke-confirm" style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", fontFamily: MONO, fontSize: 10, color: C.amber }}>
+          confirm revoke?
+          <button
+            type="button"
+            disabled={!!busyAction}
+            onClick={() => {
+              setConfirmRevoke(false);
+              onRevokeReview();
+            }}
+            style={{ ...smallBtn, color: C.redText, borderColor: "rgba(245,101,101,0.5)" }}
+          >
+            revoke
+          </button>
+          <button type="button" disabled={!!busyAction} onClick={() => setConfirmRevoke(false)} style={smallBtn}>
+            cancel
+          </button>
         </div>
       )}
       {actionNotice && <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber, lineHeight: 1.4 }}>{actionNotice}</div>}
@@ -685,8 +798,8 @@ export function PointPopoverBody({
 
 function PopoverActionButton({ action, busyAction, onClick }: { action: SolverWorkPopoverAction; busyAction?: string | null; onClick: () => void }) {
   const busy = busyAction === action.kind;
-  const color = action.kind === "retry" ? C.redText : action.kind === "request-full-tier" || action.kind.startsWith("continue") ? C.violet : C.teal;
-  const borderColor = action.kind === "retry" ? "rgba(245,101,101,0.5)" : action.kind === "request-full-tier" || action.kind.startsWith("continue") ? C.violetBorder : C.tealBorder;
+  const color = action.kind === "retry" || action.kind === "revoke-review" ? C.redText : action.kind === "request-full-tier" || action.kind.startsWith("continue") ? C.violet : C.teal;
+  const borderColor = action.kind === "retry" || action.kind === "revoke-review" ? "rgba(245,101,101,0.5)" : action.kind === "request-full-tier" || action.kind.startsWith("continue") ? C.violetBorder : C.tealBorder;
   return (
     <button
       type="button"

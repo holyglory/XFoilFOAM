@@ -8,6 +8,7 @@ import {
   SOLVER_WORK_STATE_STYLES,
   SOLVER_WORK_STATES,
   solverWorkLegendStates,
+  solverWorkPointPresentation,
   solverWorkResultContext,
   solverWorkRollup,
   solverWorkStateClass,
@@ -50,7 +51,7 @@ function condition(overrides: Partial<SolverWorkCondition>): SolverWorkCondition
 }
 
 describe("solver-work state taxonomy", () => {
-  it("pins the style/class mapping for all nine states", () => {
+  it("pins the style/class mapping for all ten states", () => {
     expect(SOLVER_WORK_STATES).toEqual([
       "verified",
       "provisional",
@@ -60,6 +61,7 @@ describe("solver-work state taxonomy", () => {
       "needs_time",
       "needs_review",
       "blocked",
+      "excluded",
       "superseded",
     ]);
     expect(SOLVER_WORK_STATE_STYLES.verified).toMatchObject({
@@ -74,9 +76,67 @@ describe("solver-work state taxonomy", () => {
       border: "#7c2d12",
       className: "solver-work-state--needs-review",
     });
+    expect(SOLVER_WORK_STATE_STYLES.excluded).toMatchObject({
+      label: "excluded",
+      background: "#260d0d",
+      border: "#7f1d1d",
+      className: "solver-work-state--excluded",
+    });
     for (const state of SOLVER_WORK_STATES) {
       expect(solverWorkStateClass(state)).toBe(`solver-work-state ${SOLVER_WORK_STATE_STYLES[state].className}`);
     }
+  });
+});
+
+describe("solver-work reviewed presentation", () => {
+  const group = condition({ points: [] });
+
+  it("renders waived points as verified with a reviewed mark and disclosure for every user", () => {
+    const waived = point({
+      state: "verified",
+      resultId: "res-waived",
+      reviewed: {
+        verdict: "waive",
+        note: "periodic shedding accepted",
+        reviewer: "ja@vr.ae",
+        at: "2026-07-10T08:15:00.000Z",
+      },
+    });
+    const presentation = solverWorkPointPresentation(waived);
+    const anonView = buildSolverWorkPopoverView(group, waived, false);
+    const adminView = buildSolverWorkPopoverView(group, waived, true);
+
+    expect(presentation.visualState).toBe("verified");
+    expect(presentation.badgeMark).toBe("✓");
+    expect(anonView.stateLabel).toBe("verified · reviewed ✓");
+    expect(anonView.reviewedDisclosure).toBe("waived by ja@vr.ae 2026-07-10: periodic shedding accepted");
+    expect(anonView.actions.map((action) => action.kind)).toEqual(["open-results"]);
+    expect(adminView.actions.map((action) => action.kind)).toContain("revoke-review");
+  });
+
+  it("renders excluded points in the blocked-family palette and hides revoke for anonymous users", () => {
+    const excluded = point({
+      state: "excluded",
+      resultId: "res-excluded",
+      reviewed: {
+        verdict: "exclude",
+        note: "bad mesh evidence",
+        reviewer: "ja@vr.ae",
+        at: "2026-07-10T09:00:00.000Z",
+      },
+    });
+    const presentation = solverWorkPointPresentation(excluded);
+    const anonView = buildSolverWorkPopoverView(group, excluded, false);
+
+    expect(presentation.visualState).toBe("excluded");
+    expect(SOLVER_WORK_STATE_STYLES[presentation.visualState]).toMatchObject({
+      label: "excluded",
+      background: "#260d0d",
+      border: "#7f1d1d",
+    });
+    expect(anonView.stateLabel).toBe("excluded · reviewed");
+    expect(anonView.reviewedDisclosure).toBe("excluded by ja@vr.ae 2026-07-10: bad mesh evidence");
+    expect(anonView.actions.some((action) => action.kind === "revoke-review")).toBe(false);
   });
 });
 

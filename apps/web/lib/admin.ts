@@ -6,6 +6,7 @@ import type {
   ViscosityModelName,
   ViscosityTablePointDTO,
 } from "@aerodb/core";
+import { buildResultReviewPayload, type ResultReviewRecord, type ResultReviewVerdict } from "./result-review";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 
@@ -37,6 +38,7 @@ async function aj<T>(path: string, init?: RequestInit): Promise<T> {
       body: e as Record<string, unknown>,
     });
   }
+  if (res.status === 204) return undefined as T;
   return res.json();
 }
 
@@ -564,6 +566,18 @@ export const continueUransResult = (resultId: string, budgetOverrideS: number) =
     method: "POST",
     body: JSON.stringify({ continueFromResultId: resultId, budgetOverrideS }),
   });
+
+export const reviewResult = (resultId: string, verdict: ResultReviewVerdict, note: string) =>
+  aj<{ review: ResultReviewRecord }>(`/api/admin/results/${encodeURIComponent(resultId)}/review`, {
+    method: "POST",
+    body: JSON.stringify(buildResultReviewPayload(verdict, note)),
+  });
+
+export const deleteResultReview = (resultId: string) =>
+  aj<void>(`/api/admin/results/${encodeURIComponent(resultId)}/review`, { method: "DELETE" });
+
+export const getResultReviews = (resultId: string) =>
+  aj<{ items: ResultReviewRecord[] }>(`/api/admin/results/${encodeURIComponent(resultId)}/reviews`);
 
 /** Bulk continuation: queue a resume for EVERY continuable needs-review row
  *  (optionally scoped to one campaign) with the same budget override. The

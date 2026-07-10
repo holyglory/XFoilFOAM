@@ -3,6 +3,7 @@
 import { f1, f2, type FieldId, type FieldTrackPoint, fRe, type Point, type SimulationDetail } from "@aerodb/core";
 import { type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { getResultReviews, isAdminApiError, reviewResult } from "@/lib/admin";
 import { browserUrl, renderResultField } from "@/lib/api";
 import {
   advancePlayback,
@@ -22,7 +23,20 @@ import {
   windowPeriodCount,
 } from "@/lib/frame-player";
 import { fidelityChipView } from "@/lib/point-history";
+import {
+  canSubmitResultReview,
+  formatResultReviewLine,
+  gateChecklistView,
+  latestResultReviewLine,
+  resultReviewGates,
+  reviewStepperView,
+  shouldShowReviewLayer,
+  type ResultReviewRecord,
+  type ResultReviewVerdict,
+  type SimModalReviewContext,
+} from "@/lib/result-review";
 import { buildSteadyHistoryModel, summarizeSteadyWindow, type SteadyHistoryModel } from "@/lib/steady-history";
+import { buildSolverWorkPopoverView } from "@/lib/solver-work";
 import { C, MONO, VIZ } from "@/lib/tokens";
 
 const FIELDS: FieldId[] = [
@@ -104,8 +118,9 @@ export function SimModal(props: {
   onTogglePlay: () => void;
   onClose: () => void;
   unavailableMessage?: string | null;
+  review?: SimModalReviewContext | null;
 }) {
-  const { open, ctx, sim, name, machStr, field, onField, track, onTrackPoint, playing, onTogglePlay, onClose, unavailableMessage } = props;
+  const { open, ctx, sim, name, machStr, field, onField, track, onTrackPoint, playing, onTogglePlay, onClose, unavailableMessage, review } = props;
 
   const clMonRef = useRef<HTMLCanvasElement>(null);
   const cdMonRef = useRef<HTMLCanvasElement>(null);
@@ -126,6 +141,12 @@ export function SimModal(props: {
   const [expandedRenderControl, setExpandedRenderControl] = useState<"role" | "zoom" | "map" | "levels" | "scale" | "resolution" | null>(null);
   const [lockAspect, setLockAspect] = useState(true);
   const [setupDetailsOpen, setSetupDetailsOpen] = useState(false);
+  const [reviewNote, setReviewNote] = useState("");
+  const [reviewBusy, setReviewBusy] = useState<ResultReviewVerdict | "continue-6h" | "request-full-tier" | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [reviewNotice, setReviewNotice] = useState<string | null>(null);
+  const [reviewHistory, setReviewHistory] = useState<ResultReviewRecord[]>([]);
+  const [reviewDismissed, setReviewDismissed] = useState(false);
 
   // ---- URANS frame player (task #25): ONE state drives every surface. ----
   const [frameIndex, setFrameIndex] = useState(0);
@@ -174,6 +195,15 @@ export function SimModal(props: {
   const evidenceBundle = sim?.evidenceArtifacts?.find((artifact) => artifact.kind === "openfoam_bundle") ?? null;
   const fieldDataArtifact = sim?.evidenceArtifacts?.find((artifact) => artifact.kind === "vtk_window" || artifact.kind === "field_data") ?? null;
   const steadySummary = useMemo(() => summarizeSteadyWindow(steadyModel), [steadyModel]);
+  const reviewLayerEligible = Boolean(ctx?.resultId && shouldShowReviewLayer(!!review?.admin, review?.point));
+  const reviewLayerVisible = reviewLayerEligible && !reviewDismissed;
+  const reviewGates = useMemo(() => resultReviewGates(sim), [sim]);
+  const reviewChecklist = useMemo(() => gateChecklistView(reviewGates), [reviewGates]);
+  const reviewStepper = useMemo(() => reviewStepperView(review?.queue ?? [], ctx?.resultId), [ctx?.resultId, review?.queue]);
+  const reviewActions = useMemo(() => (review ? buildSolverWorkPopoverView(review.condition, review.point, true).actions : []), [review]);
+  const canContinue6h = Boolean(review?.point.continuable && ctx?.resultId && review?.onContinue6h);
+  const canRequestFullTier = Boolean(review?.onRequestFull && reviewActions.some((action) => action.kind === "request-full-tier"));
+  const latestHistory = useMemo(() => latestResultReviewLine(reviewHistory), [reviewHistory]);
 
   // reset the animation clock when a new point is opened
   useEffect(() => {
@@ -182,7 +212,27 @@ export function SimModal(props: {
     setRenderToolsOpen(false);
     setExpandedRenderControl(null);
     setPlaySpeed(1);
+    setReviewNote("");
+    setReviewError(null);
+    setReviewNotice(null);
+    setReviewHistory([]);
+    setReviewDismissed(false);
   }, [ctx?.re, ctx?.aoa, ctx?.resultId]);
+
+  useEffect(() => {
+    if (!open || !reviewLayerEligible || !ctx?.resultId) return;
+    let cancelled = false;
+    getResultReviews(ctx.resultId)
+      .then((payload) => {
+        if (!cancelled) setReviewHistory(payload.items);
+      })
+      .catch((e) => {
+        if (!cancelled) setReviewError(isAdminApiError(e) ? e.message : (e as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ctx?.resultId, open, reviewLayerEligible]);
 
   // new frame track loaded → rewind the player and pick the default field
   useEffect(() => {
@@ -364,6 +414,46 @@ export function SimModal(props: {
       setRenderError((e as Error).message);
     } finally {
       setRenderBusy(false);
+    }
+  };
+
+  const submitReview = async (verdict: ResultReviewVerdict) => {
+    if (!ctx?.resultId || !review || reviewBusy || !canSubmitResultReview(verdict, reviewNote)) return;
+    const stepperBeforeSubmit = reviewStepper;
+    setReviewBusy(verdict);
+    setReviewError(null);
+    setReviewNotice(null);
+    try {
+      const res = await reviewResult(ctx.resultId, verdict, reviewNote);
+      setReviewHistory((items) => [res.review, ...items]);
+      setReviewNote("");
+      setReviewNotice(formatResultReviewLine(res.review));
+      await review.onRefresh();
+      if (stepperBeforeSubmit) review.onOpenQueueItem(stepperBeforeSubmit.next);
+    } catch (e) {
+      setReviewError(isAdminApiError(e) ? e.message : (e as Error).message);
+    } finally {
+      setReviewBusy(null);
+    }
+  };
+
+  const runReviewRemediation = async (kind: "continue-6h" | "request-full-tier") => {
+    if (!review || reviewBusy) return;
+    const run = kind === "continue-6h" ? review.onContinue6h : review.onRequestFull;
+    if (!run) return;
+    setReviewBusy(kind);
+    setReviewError(null);
+    setReviewNotice(null);
+    try {
+      const ok = await run();
+      if (ok !== false) {
+        await review.onRefresh();
+        setReviewDismissed(true);
+      }
+    } catch (e) {
+      setReviewError(isAdminApiError(e) ? e.message : (e as Error).message);
+    } finally {
+      setReviewBusy(null);
     }
   };
 
@@ -670,6 +760,142 @@ export function SimModal(props: {
       </div>
     );
   };
+
+  const reviewButtonStyle = (tone: "teal" | "amber" | "red" | "ghost", disabled = false): CSSProperties => {
+    const color = tone === "teal" ? C.teal : tone === "amber" ? C.amber : tone === "red" ? C.redText : C.muted;
+    const border = tone === "teal" ? C.tealBorder : tone === "amber" ? "rgba(245,158,11,0.55)" : tone === "red" ? "rgba(245,101,101,0.58)" : C.stroke;
+    const background = tone === "teal" ? C.tealFill : tone === "amber" ? "rgba(245,158,11,0.08)" : tone === "red" ? "transparent" : "transparent";
+    return {
+      fontFamily: MONO,
+      fontSize: 10,
+      color,
+      background,
+      border: `1px solid ${border}`,
+      borderRadius: 7,
+      padding: "7px 10px",
+      cursor: disabled ? "not-allowed" : "pointer",
+      opacity: disabled ? 0.48 : 1,
+      textAlign: "center",
+    };
+  };
+
+  const reviewLayer = () => {
+    if (!reviewLayerVisible || !review || !ctx?.resultId) return null;
+    const waiveDisabled = reviewBusy != null || !canSubmitResultReview("waive", reviewNote);
+    const excludeDisabled = reviewBusy != null || !canSubmitResultReview("exclude", reviewNote);
+    const deferDisabled = reviewBusy != null;
+    const continueDisabled = reviewBusy != null || !canContinue6h;
+    const requestFullDisabled = reviewBusy != null || !canRequestFullTier;
+    return (
+      <aside data-testid="sim-review-layer" style={{ display: "grid", gap: 12, alignSelf: "start", border: `1px solid ${C.stroke2}`, borderRadius: 10, background: C.panel2, padding: 12, minWidth: 0 }}>
+        <div style={{ display: "grid", gap: 3 }}>
+          <div style={{ fontFamily: MONO, fontSize: 10, color: C.dim, letterSpacing: "0.08em" }}>REVIEW</div>
+          <div style={{ fontFamily: MONO, fontSize: 12, color: C.text }}>α {f1(review.point.aoaDeg)}° · Re {fRe(review.condition.reynolds)}</div>
+        </div>
+        {reviewChecklist.length > 0 && (
+          <div data-testid="sim-review-gates" style={{ display: "grid", gap: 6 }}>
+            {reviewChecklist.map((line) => (
+              <div
+                key={line.key}
+                data-testid="sim-review-gate-line"
+                data-pass={line.pass ? "true" : "false"}
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  lineHeight: 1.45,
+                  color: line.pass ? C.teal : C.redText,
+                  border: `1px solid ${line.pass ? C.tealBorder : "rgba(245,101,101,0.5)"}`,
+                  background: C.panel3,
+                  borderRadius: 7,
+                  padding: "6px 8px",
+                  overflowWrap: "anywhere",
+                }}
+              >
+                {line.text}
+              </div>
+            ))}
+          </div>
+        )}
+        {latestHistory && (
+          <div data-testid="sim-review-audit-line" style={{ fontFamily: MONO, fontSize: 10, color: C.muted, lineHeight: 1.45, border: `1px solid ${C.stroke}`, borderRadius: 7, background: C.panel3, padding: "6px 8px", overflowWrap: "anywhere" }}>
+            {latestHistory}
+          </div>
+        )}
+        <textarea
+          data-testid="sim-review-note"
+          value={reviewNote}
+          onChange={(e) => setReviewNote(e.currentTarget.value)}
+          placeholder="review note (required for waiver/exclude)…"
+          rows={4}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            minHeight: 86,
+            fontFamily: MONO,
+            fontSize: 11,
+            lineHeight: 1.45,
+            color: C.text,
+            background: C.panel3,
+            border: `1px solid ${C.stroke}`,
+            borderRadius: 8,
+            padding: 9,
+          }}
+        />
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 7 }}>
+          <button type="button" data-testid="sim-review-waive" disabled={waiveDisabled} onClick={() => void submitReview("waive")} style={reviewButtonStyle("teal", waiveDisabled)}>
+            {reviewBusy === "waive" ? "saving…" : "Accept with waiver"}
+          </button>
+          {canContinue6h && (
+            <button type="button" data-testid="sim-review-continue-6h" disabled={continueDisabled} onClick={() => void runReviewRemediation("continue-6h")} style={reviewButtonStyle("amber", continueDisabled)}>
+              {reviewBusy === "continue-6h" ? "queueing…" : "Continue +6h"}
+            </button>
+          )}
+          {canRequestFullTier && (
+            <button type="button" data-testid="sim-review-request-full" disabled={requestFullDisabled} onClick={() => void runReviewRemediation("request-full-tier")} style={reviewButtonStyle("amber", requestFullDisabled)}>
+              {reviewBusy === "request-full-tier" ? "queueing…" : "Request full tier"}
+            </button>
+          )}
+          <button type="button" data-testid="sim-review-exclude" disabled={excludeDisabled} onClick={() => void submitReview("exclude")} style={reviewButtonStyle("red", excludeDisabled)}>
+            {reviewBusy === "exclude" ? "saving…" : "Exclude"}
+          </button>
+          <button type="button" data-testid="sim-review-defer" disabled={deferDisabled} onClick={() => void submitReview("defer")} style={reviewButtonStyle("ghost", deferDisabled)}>
+            {reviewBusy === "defer" ? "saving…" : "Defer with note"}
+          </button>
+        </div>
+        {(reviewError || reviewNotice) && (
+          <div data-testid="sim-review-inline-message" style={{ fontFamily: MONO, fontSize: 10, color: reviewError ? C.redText : C.teal, lineHeight: 1.45, overflowWrap: "anywhere" }}>
+            {reviewError ?? reviewNotice}
+          </div>
+        )}
+        {reviewStepper && (
+          <div data-testid="sim-review-stepper" style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between", borderTop: `1px solid ${C.stroke2}`, paddingTop: 9, minWidth: 0 }}>
+            <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, minWidth: 0 }}>{reviewStepper.label}</span>
+            <button type="button" data-testid="sim-review-next" onClick={() => review.onOpenQueueItem(reviewStepper.next)} style={{ ...reviewButtonStyle("ghost"), whiteSpace: "nowrap", padding: "5px 8px" }}>
+              {reviewStepper.nextLabel}
+            </button>
+          </div>
+        )}
+      </aside>
+    );
+  };
+
+  const resultContent = () => (
+    <>
+      {meansRow()}
+      {activeScaleChip()}
+      {heroSection()}
+      <div data-testid="sim-footer" style={{ display: "grid", gap: 10, marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.stroke2}` }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+          {setupDetails()}
+          <div style={{ marginLeft: "auto" }}>{downloadChips()}</div>
+          {renderTools()}
+        </div>
+        <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, lineHeight: 1.5 }}>
+          {provenanceText()}
+        </div>
+      </div>
+    </>
+  );
 
   // Derived-by-symmetry view (spec §9.3): the media element itself is flipped
   // vertically — overlays, labels and charts are never mirrored.
@@ -1005,10 +1231,21 @@ export function SimModal(props: {
             grid-template-columns: minmax(0, 1fr);
           }
         }
+        .sim-review-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(280px, 320px);
+          gap: 14px;
+          align-items: start;
+        }
+        @media (max-width: 900px) {
+          .sim-review-grid {
+            grid-template-columns: minmax(0, 1fr);
+          }
+        }
       `}</style>
       <div
         style={{
-          width: "min(900px,94vw)",
+          width: reviewLayerVisible ? "min(1160px,94vw)" : "min(900px,94vw)",
           maxHeight: "92vh",
           overflow: "auto",
           background: C.modalBg,
@@ -1078,21 +1315,14 @@ export function SimModal(props: {
               {unavailableMessage ?? "loading OpenFOAM result..."}
             </div>
           ) : (
-            <>
-              {meansRow()}
-              {activeScaleChip()}
-              {heroSection()}
-              <div data-testid="sim-footer" style={{ display: "grid", gap: 10, marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.stroke2}` }}>
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
-                  {setupDetails()}
-                  <div style={{ marginLeft: "auto" }}>{downloadChips()}</div>
-                  {renderTools()}
-                </div>
-                <div style={{ fontFamily: MONO, fontSize: 10, color: C.dimmest, lineHeight: 1.5 }}>
-                  {provenanceText()}
-                </div>
+            reviewLayerVisible ? (
+              <div className="sim-review-grid">
+                <div style={{ minWidth: 0 }}>{resultContent()}</div>
+                {reviewLayer()}
               </div>
-            </>
+            ) : (
+              resultContent()
+            )
           )}
         </div>
       </div>

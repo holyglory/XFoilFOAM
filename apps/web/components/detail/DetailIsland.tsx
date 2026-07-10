@@ -19,6 +19,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { getFieldTrack, getSim } from "@/lib/api";
+import type { SimModalReviewContext } from "@/lib/result-review";
 import { C, MONO } from "@/lib/tokens";
 import { PolarViewer } from "./PolarViewer";
 import { SolverWorkPanel } from "./SolverWorkPanel";
@@ -77,6 +78,7 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
   const [simMessage, setSimMessage] = useState<string | null>(null);
   const [simField, setSimField] = useState<FieldId>("vorticity");
   const [simTrack, setSimTrack] = useState<FieldTrackPoint[]>([]);
+  const [simReview, setSimReview] = useState<SimModalReviewContext | null>(null);
   const [playing, setPlaying] = useState(true);
 
   useEffect(() => {
@@ -157,14 +159,16 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     });
     setSimDetail(null);
     setSimMessage(null);
+    setSimReview(null);
     setPlaying(true);
     setSimOpen(true);
   }, []);
 
-  const openSolverWorkResult = useCallback((ctx: { re: number; aoa: number; resultId: string }) => {
+  const openSolverWorkResult = useCallback((ctx: { re: number; aoa: number; resultId: string }, review?: SimModalReviewContext | null) => {
     setSimCtx({ re: ctx.re, aoa: ctx.aoa, resultId: ctx.resultId });
     setSimDetail(null);
     setSimMessage(null);
+    setSimReview(review ?? null);
     setPlaying(true);
     setSimOpen(true);
   }, []);
@@ -221,6 +225,7 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     setSimCtx({ re: point.re, aoa: point.aoa, resultId: point.resultId });
     setSimDetail(null);
     setSimMessage(null);
+    setSimReview(null);
     setPlaying(true);
   }, []);
 
@@ -323,6 +328,7 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
         onTogglePlay={() => setPlaying((p) => !p)}
         onClose={() => setSimOpen(false)}
         unavailableMessage={simMessage}
+        review={simReview}
       />
     </>
   );
