@@ -101,7 +101,10 @@ export function PolarChart({
     if (!inPlot(vx, vy)) return;
     drag.current = { vx, vy, dom: projection.domain, panning: false };
     didPan.current = false;
-    e.currentTarget.setPointerCapture?.(e.pointerId);
+    // NO pointer capture yet: capturing on pointer-down retargets the whole
+    // click to the svg, so the point circles' onClick can never fire (prod
+    // regression: clicking a solved point stopped opening its results).
+    // Capture is taken only when a real pan starts (see handlePointerMove).
   };
 
   const handlePointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
@@ -111,6 +114,7 @@ export function PolarChart({
       if (!d.panning && Math.hypot(vx - d.vx, vy - d.vy) > DRAG_THRESHOLD) {
         d.panning = true;
         didPan.current = true;
+        e.currentTarget.setPointerCapture?.(e.pointerId);
       }
       if (d.panning) {
         // pan against the domain captured at pointer-down: no drift accumulation
@@ -132,7 +136,9 @@ export function PolarChart({
 
   const handlePointerUp = (e: ReactPointerEvent<SVGSVGElement>) => {
     drag.current = null;
-    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
   };
 
   // A drag must not fire the point click it happened to start on.

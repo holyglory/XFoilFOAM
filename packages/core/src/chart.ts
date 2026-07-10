@@ -136,14 +136,21 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
         kind: "measured",
       });
       if (pl.fit?.points.length) {
-        visCurves.push({
-          re: pl.re,
-          color: pl.color,
-          dash: "7 5",
-          data: pl.fit.points.map(fitPointToPolarPoint),
-          label: "fit Re " + fRe(pl.re),
-          kind: "fit",
-        });
+        // Support-gated: fit samples are drawn only where measured data
+        // backs them. LOWESS interpolation across large solved-α gaps (and
+        // extrapolation past the coverage ends) invents physically impossible
+        // polar shapes — prod incident: an S1223 drag polar with 7 solved
+        // points drew a second Cl-Cd lobe below the measured Cd minimum.
+        for (const seg of supportedFitSegments(pl.fit.points, measuredAlphas(pl.points))) {
+          visCurves.push({
+            re: pl.re,
+            color: pl.color,
+            dash: "7 5",
+            data: seg.map(fitPointToPolarPoint),
+            label: "fit Re " + fRe(pl.re),
+            kind: "fit",
+          });
+        }
       }
     }
   }
@@ -159,7 +166,13 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
       for (const p of pl.points) {
         if (!p.stalled && p.cd > mx) mx = p.cd;
       }
-      for (const p of pl.fit?.points ?? []) {
+    }
+    // Fit contribution to the Cd window comes from the SUPPORT-GATED curves
+    // (visCurves), never raw fit samples — unsupported LOWESS lobes must not
+    // stretch the axis any more than they may draw.
+    for (const c of visCurves) {
+      if (c.kind !== "fit") continue;
+      for (const p of c.data) {
         if (p.cd > mx) mx = p.cd;
       }
     }
@@ -458,6 +471,55 @@ function fitPointToPolarPoint(p: { a: number; cl: number; cd: number; cm: number
   return { a: p.a, cl: p.cl, cd: p.cd, cm: p.cm, ld: p.ld, stalled: false, source: "queued", resultId: null };
 }
 
+// ---- fit support gating ----
+// A fit sample is drawn only where measured data backs it. The rule works on
+// the INTERVALS between consecutive measured α: an interval is bridgeable iff
+// it is no wider than max(2× the median measured gap, 6°); fit samples inside
+// non-bridgeable holes are dropped, and nothing draws beyond the measured α
+// range at all (a LOWESS fit has no business extrapolating). A −15…30° sweep
+// solved every 5° keeps one continuous fit; a polar with a 15° pending-URANS
+// hole gets the hole left visibly open instead of bridged by invented values.
+const FIT_BRIDGE_FLOOR_DEG = 6;
+const FIT_BRIDGE_GAP_FACTOR = 2;
+
+export function measuredAlphas(points: PolarPointData[]): number[] {
+  return points.map((p) => p.a).filter((a) => Number.isFinite(a));
+}
+
+export function fitBridgeThresholdDeg(alphas: number[]): number {
+  const sorted = [...alphas].sort((a, b) => a - b);
+  const gaps: number[] = [];
+  for (let i = 1; i < sorted.length; i++) gaps.push(sorted[i] - sorted[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const median = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+  return Math.max(FIT_BRIDGE_FLOOR_DEG, median * FIT_BRIDGE_GAP_FACTOR);
+}
+
+/** Merge bridgeable measured intervals into supported α spans, then group fit
+ *  samples by span. Spans yielding fewer than 2 samples are dropped (a lone
+ *  sample cannot draw a curve). */
+export function supportedFitSegments<T extends { a: number }>(fitPoints: T[], alphas: number[]): T[][] {
+  const sorted = [...new Set(alphas)].sort((a, b) => a - b);
+  if (!fitPoints.length || sorted.length < 2) return [];
+  const bridge = fitBridgeThresholdDeg(sorted);
+  const spans: [number, number][] = [];
+  let start = sorted[0];
+  let end = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] - end <= bridge) {
+      end = sorted[i];
+    } else {
+      spans.push([start, end]);
+      start = sorted[i];
+      end = sorted[i];
+    }
+  }
+  spans.push([start, end]);
+  return spans
+    .map(([lo, hi]) => fitPoints.filter((p) => p.a >= lo - 1e-9 && p.a <= hi + 1e-9))
+    .filter((s) => s.length >= 2);
+}
+
 /** Linear interpolation of a series' y at x; null outside the series' span. */
 function interpSeriesAtX(points: PolarPointData[], type: ChartType, x: number): number | null {
   const xs: [number, number][] = [];
@@ -496,9 +558,14 @@ export function readoutAtX(input: {
       rows.push({ re: pl.re, color: pl.color, label: "Re " + fRe(pl.re), kind: "measured", y: measured });
     }
     if (pl.fit?.points.length) {
-      const fy = interpSeriesAtX(pl.fit.points.map(fitPointToPolarPoint), type, x);
-      if (fy !== null) {
-        rows.push({ re: pl.re, color: pl.color, label: "fit Re " + fRe(pl.re), kind: "fit", y: fy });
+      // Same support gating as the drawn curve: never read out a fit value
+      // the chart refuses to draw (unsupported span or extrapolated tail).
+      for (const seg of supportedFitSegments(pl.fit.points, measuredAlphas(pl.points))) {
+        const fy = interpSeriesAtX(seg.map(fitPointToPolarPoint), type, x);
+        if (fy !== null) {
+          rows.push({ re: pl.re, color: pl.color, label: "fit Re " + fRe(pl.re), kind: "fit", y: fy });
+          break;
+        }
       }
     }
   }
