@@ -8,6 +8,7 @@ import type {
   HashtagDTO,
   SimulationDetail,
 } from "@aerodb/core";
+import type { SolverWorkPayload } from "./solver-work";
 
 const SERVER_BASE = process.env.API_URL ?? "http://localhost:4000";
 const CLIENT_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
@@ -126,6 +127,15 @@ export async function getFieldTrack(slug: string, revisionId?: string | null): P
   const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}/field-track?${qs.toString()}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`GET field-track → ${res.status}`);
   return (await res.json()).items as FieldTrackPoint[];
+}
+
+export async function getSolverWork(slug: string, revisionId?: string | null): Promise<SolverWorkPayload> {
+  const qs = new URLSearchParams();
+  if (revisionId) qs.set("revision", revisionId);
+  const suffix = qs.toString();
+  const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}/solver-work${suffix ? `?${suffix}` : ""}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`GET solver-work → ${res.status}`);
+  return res.json();
 }
 
 export async function getResultEvidence(resultId: string): Promise<{ artifacts: EvidenceArtifactDTO[] }> {

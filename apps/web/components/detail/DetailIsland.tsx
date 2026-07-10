@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { getFieldTrack, getSim } from "@/lib/api";
 import { C, MONO } from "@/lib/tokens";
 import { PolarViewer } from "./PolarViewer";
+import { SolverWorkPanel } from "./SolverWorkPanel";
 import { SimModal } from "./SimModal";
 import { SpecSheet } from "./SpecSheet";
 
@@ -154,6 +155,14 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
       mirrored: derived.derived,
       mirroredFromAoaDeg: derived.derivedFromAoaDeg,
     });
+    setSimDetail(null);
+    setSimMessage(null);
+    setPlaying(true);
+    setSimOpen(true);
+  }, []);
+
+  const openSolverWorkResult = useCallback((ctx: { re: number; aoa: number; resultId: string }) => {
+    setSimCtx({ re: ctx.re, aoa: ctx.aoa, resultId: ctx.resultId });
     setSimDetail(null);
     setSimMessage(null);
     setPlaying(true);
@@ -295,7 +304,7 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
             onHover={setHover}
             onPointClick={onPointClick}
           />
-          <SolverWorkPanel works={detail.simulationWorks} />
+          <SolverWorkPanel slug={detail.slug} airfoilId={detail.id} revisionId={pinnedRevisionId} onOpenResult={openSolverWorkResult} />
         </div>
       </div>
 
@@ -317,103 +326,4 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
       />
     </>
   );
-}
-
-function SolverWorkPanel({ works }: { works: AirfoilDetailPayload["simulationWorks"] }) {
-  if (!works.length) return null;
-  return (
-    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          gap: 12,
-          padding: "12px 16px",
-          borderBottom: `1px solid ${C.borderSoft}`,
-          alignItems: "baseline",
-        }}
-      >
-        <span style={{ fontFamily: MONO, fontSize: 11, color: C.dim, letterSpacing: "0.12em" }}>SOLVER WORK</span>
-        <span style={{ fontFamily: MONO, fontSize: 11, color: C.muted }}>{works.length} job{works.length === 1 ? "" : "s"}</span>
-      </div>
-      <div style={{ display: "grid" }}>
-        {works.map((work) => (
-          <div
-            key={work.id}
-            style={{
-              display: "grid",
-              gridTemplateColumns: "minmax(0, 1fr) auto",
-              gap: 12,
-              padding: "12px 16px",
-              borderBottom: `1px solid ${C.borderRow}`,
-            }}
-          >
-            <div style={{ minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
-                <span style={{ fontFamily: MONO, fontSize: 10, color: statusColor(work.status), border: `1px solid ${statusBorder(work.status)}`, borderRadius: 999, padding: "3px 8px" }}>
-                  {work.status}
-                </span>
-                <span style={{ fontWeight: 650, color: C.text }}>{work.kind === "urans-retry" ? "URANS retry" : "RANS sweep"}</span>
-                {work.retryMode && <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>{work.retryMode.replaceAll("-", " ")}</span>}
-              </div>
-              <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, lineHeight: 1.55 }}>
-                α {formatAoas(work)} · {work.completedCases}/{work.totalCases} cases
-                {work.reynolds ? ` · Re ${fRe(work.reynolds)}` : ""}
-                {work.mach != null ? ` · M ${work.mach.toFixed(3)}` : ""}
-              </div>
-              <div style={{ fontFamily: MONO, fontSize: 10, color: C.dim, lineHeight: 1.55 }}>
-                solved {work.solvedCount} · pending {work.pendingCount} · failed {work.failedCount}
-                {work.acceptedRansCount || work.rejectedRansCount
-                  ? ` · RANS accepted ${work.acceptedRansCount}, rejected ${work.rejectedRansCount}`
-                  : ""}
-                {work.uransAttemptCount ? ` · URANS attempts ${work.uransAttemptCount}` : ""}
-              </div>
-              {work.error && <div style={{ fontFamily: MONO, fontSize: 10, color: C.redText, marginTop: 5 }}>{work.error}</div>}
-            </div>
-            <div style={{ textAlign: "right", fontFamily: MONO, fontSize: 10, color: C.dimmest, whiteSpace: "nowrap" }}>
-              wave {work.wave}
-              <br />
-              {work.engineState ?? "not submitted"}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function formatAoas(work: AirfoilDetailPayload["simulationWorks"][number]) {
-  if (work.aoas.length) return compactRanges(work.aoas);
-  if (work.aoaMin != null && work.aoaMax != null) {
-    return work.aoaMin === work.aoaMax ? `${work.aoaMin}°` : `${work.aoaMin}°…${work.aoaMax}°`;
-  }
-  return "—";
-}
-
-function compactRanges(values: number[]) {
-  const sorted = [...new Set(values)].sort((a, b) => a - b);
-  const ranges: string[] = [];
-  for (let i = 0; i < sorted.length; i++) {
-    const start = sorted[i];
-    let end = start;
-    while (i + 1 < sorted.length && Math.abs(sorted[i + 1] - end - 1) < 1e-9) {
-      end = sorted[++i];
-    }
-    ranges.push(start === end ? `${start}°` : `${start}°…${end}°`);
-  }
-  return ranges.join(", ");
-}
-
-function statusColor(status: string) {
-  if (status === "failed" || status === "cancelled") return C.redText;
-  if (status === "running" || status === "submitted" || status === "ingesting") return C.teal;
-  if (status === "done") return C.muted;
-  return C.amber;
-}
-
-function statusBorder(status: string) {
-  if (status === "failed" || status === "cancelled") return "rgba(239,68,68,0.45)";
-  if (status === "running" || status === "submitted" || status === "ingesting") return C.tealBorder;
-  if (status === "done") return C.stroke;
-  return "rgba(245,158,11,0.45)";
 }

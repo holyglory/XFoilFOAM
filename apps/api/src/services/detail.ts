@@ -88,7 +88,9 @@ function negated(v: number): number {
  *  display (Cl/Cm/L/D negated, Cd kept). Mirrors are evidence-navigation
  *  entries only — never counted as solver runs — and a real solve at the
  *  mirrored α suppresses the mirror. */
-function mirroredSolvedPoints(rows: { result: Result; classification: SolvedClassification }[]): DerivedPolarPointData[] {
+function mirroredSolvedPoints(
+  rows: { result: Result; classification: SolvedClassification }[],
+): DerivedPolarPointData[] {
   const realAoas = new Set(rows.map((row) => canonicalAoa(row.result.aoaDeg)));
   const mirrored: DerivedPolarPointData[] = [];
   for (const row of rows) {
@@ -115,7 +117,10 @@ function mirroredSolvedPoints(rows: { result: Result; classification: SolvedClas
 
 function numericAoas(value: unknown): number[] {
   if (!Array.isArray(value)) return [];
-  return value.map(Number).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+  return value
+    .map(Number)
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
 }
 
 type WorkPayload = {
@@ -129,13 +134,22 @@ type WorkPayload = {
   speedMap?: { mach?: number | null }[];
 };
 
-async function loadSimulationWorks(airfoilId: string): Promise<SimulationWorkItem[]> {
+export async function loadSimulationWorks(
+  airfoilId: string,
+  opts: { revisionId?: string | null; limit?: number } = {},
+): Promise<SimulationWorkItem[]> {
+  const where = opts.revisionId
+    ? and(
+        eq(simJobs.airfoilId, airfoilId),
+        eq(simJobs.simulationPresetRevisionId, opts.revisionId),
+      )
+    : eq(simJobs.airfoilId, airfoilId);
   const jobs = await db
     .select()
     .from(simJobs)
-    .where(eq(simJobs.airfoilId, airfoilId))
+    .where(where)
     .orderBy(desc(simJobs.createdAt))
-    .limit(16);
+    .limit(opts.limit ?? 16);
   if (jobs.length === 0) return [];
 
   const jobIds = jobs.map((job) => job.id);
@@ -152,7 +166,11 @@ async function loadSimulationWorks(airfoilId: string): Promise<SimulationWorkIte
     .from(results)
     .where(inArray(results.simJobId, jobIds))
     .groupBy(results.simJobId);
-  const resultStats = new Map(resultStatsRows.filter((row) => row.simJobId).map((row) => [row.simJobId!, row]));
+  const resultStats = new Map(
+    resultStatsRows
+      .filter((row) => row.simJobId)
+      .map((row) => [row.simJobId!, row]),
+  );
 
   const attemptStatsRows = await db
     .select({
@@ -164,7 +182,11 @@ async function loadSimulationWorks(airfoilId: string): Promise<SimulationWorkIte
     .from(resultAttempts)
     .where(inArray(resultAttempts.simJobId, jobIds))
     .groupBy(resultAttempts.simJobId);
-  const attemptStats = new Map(attemptStatsRows.filter((row) => row.simJobId).map((row) => [row.simJobId!, row]));
+  const attemptStats = new Map(
+    attemptStatsRows
+      .filter((row) => row.simJobId)
+      .map((row) => [row.simJobId!, row]),
+  );
 
   return jobs.map((job) => {
     const payload = (job.requestPayload ?? {}) as WorkPayload;
@@ -172,7 +194,9 @@ async function loadSimulationWorks(airfoilId: string): Promise<SimulationWorkIte
     const rstats = resultStats.get(job.id);
     const astats = attemptStats.get(job.id);
     const aoaMin = aoas.length ? aoas[0] : (rstats?.aoaMin ?? null);
-    const aoaMax = aoas.length ? aoas[aoas.length - 1] : (rstats?.aoaMax ?? null);
+    const aoaMax = aoas.length
+      ? aoas[aoas.length - 1]
+      : (rstats?.aoaMax ?? null);
     return {
       id: job.id,
       kind: job.wave === 2 ? "urans-retry" : "rans-sweep",
@@ -194,7 +218,10 @@ async function loadSimulationWorks(airfoilId: string): Promise<SimulationWorkIte
       rejectedRansCount: astats?.rejectedRansCount ?? 0,
       uransAttemptCount: astats?.uransAttemptCount ?? 0,
       reynolds: payload.setupSnapshot?.derived?.reynolds ?? null,
-      mach: payload.setupSnapshot?.flowState?.mach ?? payload.speedMap?.[0]?.mach ?? null,
+      mach:
+        payload.setupSnapshot?.flowState?.mach ??
+        payload.speedMap?.[0]?.mach ??
+        null,
       createdAt: job.createdAt.toISOString(),
       submittedAt: job.submittedAt?.toISOString() ?? null,
       finishedAt: job.finishedAt?.toISOString() ?? null,
@@ -270,22 +297,47 @@ const validPolarPoint = sql<boolean>`(
  *  Scoped mode always emits that revision's Re entry (possibly with zero
  *  points) so "no solved points yet" renders honestly instead of hiding the
  *  curve. Default (no revisionId) behaviour is unchanged. */
-export async function assembleDetail(slug: string, opts: { revisionId?: string | null } = {}): Promise<AirfoilDetailPayload | null> {
+export async function assembleDetail(
+  slug: string,
+  opts: { revisionId?: string | null } = {},
+): Promise<AirfoilDetailPayload | null> {
   const [a] = await db
     .select()
     .from(airfoils)
-    .where(and(eq(airfoils.slug, slug), isNull(airfoils.archivedAt), isNull(airfoils.deletedAt)))
+    .where(
+      and(
+        eq(airfoils.slug, slug),
+        isNull(airfoils.archivedAt),
+        isNull(airfoils.deletedAt),
+      ),
+    )
     .limit(1);
   if (!a) return null;
-  const [cat] = await db.select().from(categories).where(eq(categories.id, a.categoryId)).limit(1);
+  const [cat] = await db
+    .select()
+    .from(categories)
+    .where(eq(categories.id, a.categoryId))
+    .limit(1);
   const normalizedTags = (await hashtagsByAirfoilIds([a.id])).get(a.id) ?? [];
 
   const geo = geometryFor(a);
 
   // The Detail-page curves are accepted stored solver evidence only. Scheduled
   // work is exposed separately so empty queue placeholders never look like polars.
-  const [air] = await db.select({ id: mediums.id }).from(mediums).where(eq(mediums.slug, "air")).limit(1);
-  const revisionsByRe = new Map<number, { id: string; createdAt: Date; revisionNumber: number; mach: number | null }[]>();
+  const [air] = await db
+    .select({ id: mediums.id })
+    .from(mediums)
+    .where(eq(mediums.slug, "air"))
+    .limit(1);
+  const revisionsByRe = new Map<
+    number,
+    {
+      id: string;
+      createdAt: Date;
+      revisionNumber: number;
+      mach: number | null;
+    }[]
+  >();
   const reByRevision = new Map<string, number>();
   const machByRevision = new Map<string, number | null>();
   let scopedRe: number | null = null;
@@ -310,7 +362,12 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
         reByRevision.set(rev.revisionId, roundedRe);
         machByRevision.set(rev.revisionId, rev.mach);
         revisionsByRe.set(roundedRe, [
-          { id: rev.revisionId, createdAt: rev.createdAt, revisionNumber: rev.revisionNumber, mach: rev.mach },
+          {
+            id: rev.revisionId,
+            createdAt: rev.createdAt,
+            revisionNumber: rev.revisionNumber,
+            mach: rev.mach,
+          },
         ]);
       }
     }
@@ -324,17 +381,36 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
         revisionNumber: simulationPresetRevisions.revisionNumber,
       })
       .from(simulationPresets)
-      .innerJoin(flowConditions, eq(flowConditions.id, simulationPresets.flowConditionId))
-      .innerJoin(simulationPresetRevisions, eq(simulationPresetRevisions.presetId, simulationPresets.id))
-      .where(and(eq(flowConditions.mediumId, air.id), eq(simulationPresets.enabled, true)))
-      .orderBy(desc(simulationPresetRevisions.createdAt), desc(simulationPresetRevisions.revisionNumber));
+      .innerJoin(
+        flowConditions,
+        eq(flowConditions.id, simulationPresets.flowConditionId),
+      )
+      .innerJoin(
+        simulationPresetRevisions,
+        eq(simulationPresetRevisions.presetId, simulationPresets.id),
+      )
+      .where(
+        and(
+          eq(flowConditions.mediumId, air.id),
+          eq(simulationPresets.enabled, true),
+        ),
+      )
+      .orderBy(
+        desc(simulationPresetRevisions.createdAt),
+        desc(simulationPresetRevisions.revisionNumber),
+      );
     for (const row of rows) {
       const roundedRe = Math.round(row.reynolds);
       if (roundedRe <= 0) continue;
       reByRevision.set(row.revisionId, roundedRe);
       machByRevision.set(row.revisionId, row.mach);
       const list = revisionsByRe.get(roundedRe) ?? [];
-      list.push({ id: row.revisionId, createdAt: row.createdAt, revisionNumber: row.revisionNumber, mach: row.mach });
+      list.push({
+        id: row.revisionId,
+        createdAt: row.createdAt,
+        revisionNumber: row.revisionNumber,
+        mach: row.mach,
+      });
       revisionsByRe.set(roundedRe, list);
     }
   }
@@ -363,7 +439,10 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
         confidence: resultClassifications.confidence,
       })
       .from(results)
-      .leftJoin(resultClassifications, eq(resultClassifications.resultId, results.id))
+      .leftJoin(
+        resultClassifications,
+        eq(resultClassifications.resultId, results.id),
+      )
       .where(
         and(
           eq(results.airfoilId, a.id),
@@ -378,9 +457,17 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
       );
     for (const row of rows) {
       const r = row.result;
-      if (!r.simulationPresetRevisionId || !reByRevision.has(r.simulationPresetRevisionId)) continue;
-      (solvedByRevision.get(r.simulationPresetRevisionId) ??
-        solvedByRevision.set(r.simulationPresetRevisionId, []).get(r.simulationPresetRevisionId)!).push({
+      if (
+        !r.simulationPresetRevisionId ||
+        !reByRevision.has(r.simulationPresetRevisionId)
+      )
+        continue;
+      (
+        solvedByRevision.get(r.simulationPresetRevisionId) ??
+        solvedByRevision
+          .set(r.simulationPresetRevisionId, [])
+          .get(r.simulationPresetRevisionId)!
+      ).push({
         result: r,
         classification: {
           state: row.state,
@@ -413,12 +500,21 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
       : [];
     const fitPointsBySet = new Map<string, typeof fitPointRows>();
     for (const row of fitPointRows) {
-      (fitPointsBySet.get(row.fitSetId) ?? fitPointsBySet.set(row.fitSetId, []).get(row.fitSetId)!).push(row);
+      (
+        fitPointsBySet.get(row.fitSetId) ??
+        fitPointsBySet.set(row.fitSetId, []).get(row.fitSetId)!
+      ).push(row);
     }
     for (const row of fitRows) {
       const points = (fitPointsBySet.get(row.id) ?? [])
         .sort((x, y) => x.aoaDeg - y.aoaDeg)
-        .map((p) => ({ a: p.aoaDeg, cl: p.cl, cd: p.cd, cm: p.cm, ld: p.clCd }));
+        .map((p) => ({
+          a: p.aoaDeg,
+          cl: p.cl,
+          cd: p.cd,
+          cm: p.cm,
+          ld: p.clCd,
+        }));
       fitByRevision.set(row.simulationPresetRevisionId, {
         status: row.status,
         confidence: row.confidence,
@@ -477,7 +573,9 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
   const polars: Polar[] = reList.map((re) => {
     const revision =
       (revisionsByRe.get(re) ?? []).find(
-        (candidate) => (solvedByRevision.get(candidate.id)?.length ?? 0) > 0 || Boolean(fitByRevision.get(candidate.id)?.points.length),
+        (candidate) =>
+          (solvedByRevision.get(candidate.id)?.length ?? 0) > 0 ||
+          Boolean(fitByRevision.get(candidate.id)?.points.length),
       ) ?? (scopedRe != null ? (revisionsByRe.get(re) ?? [])[0] : undefined);
     const rows = revision ? solvedByRevision.get(revision.id) : undefined;
     const fit = revision ? fitByRevision.get(revision.id) : undefined;
@@ -491,12 +589,22 @@ export async function assembleDetail(slug: string, opts: { revisionId?: string |
         points.push(...mirroredSolvedPoints(rows));
         points.sort((x, y) => x.a - y.a);
       }
-      return { re, mach: machByRevision.get(revision.id) ?? undefined, color: colorForRe(re), source: "solved", points, fit };
+      return {
+        re,
+        mach: machByRevision.get(revision.id) ?? undefined,
+        color: colorForRe(re),
+        source: "solved",
+        points,
+        fit,
+      };
     }
     return { re, color: colorForRe(re), source: "queued", points: [], fit };
   });
   const simulationWorks = await loadSimulationWorks(a.id);
-  const displayedMach = polars.find((polar) => polar.points.length > 0)?.mach ?? simulationWorks.find((work) => work.mach !== null)?.mach ?? 0;
+  const displayedMach =
+    polars.find((polar) => polar.points.length > 0)?.mach ??
+    simulationWorks.find((work) => work.mach !== null)?.mach ??
+    0;
 
   const family = cat?.name ?? "—";
   const subtitle = `${geo.camberPct > 0.5 ? "Cambered" : "Symmetric"} · ${geo.thicknessPct.toFixed(0)}% thick · low-to-mid Re`;
