@@ -214,6 +214,36 @@ export interface EngineCacheStats {
   oldest_last_used: string | null;
 }
 
+export interface EngineStripJobRequest {
+  keep_case_state?: boolean;
+}
+
+export interface EngineStripJobResponse {
+  bytes_freed: number;
+  files_removed: number;
+  kept_case_state: boolean;
+}
+
+export interface EngineDeleteJobResponse {
+  bytes_freed: number;
+}
+
+export interface EngineMaintenanceJobItem {
+  job_id: string;
+  mtime_epoch: number;
+  bytes: number | null;
+}
+
+export interface EngineMaintenanceJobsResponse {
+  items: EngineMaintenanceJobItem[];
+}
+
+export interface EngineMaintenanceDiskResponse {
+  total_bytes: number;
+  free_bytes: number;
+  used_pct: number;
+}
+
 export interface EngineTaskSummary {
   worker: string;
   task_id: string | null;

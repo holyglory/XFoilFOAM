@@ -31,6 +31,7 @@ import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
 import { markTickCompleted, markTickStarted, touchHeartbeat } from "./heartbeat";
 import { reconcile, resetOrphans } from "./reconcile";
 import { remoteSolverTick } from "./remote-solver";
+import { retentionTick } from "./retention";
 
 interface SweeperConfig {
   enabled: boolean;
@@ -395,6 +396,7 @@ export async function tick(
   await markTickStarted(db);
   await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
   await remoteSolverTick(db, engine);
+  await retentionTick(db, engine);
   if (state.enabled && (await inFlight(db)) < state.maxConcurrentJobs) {
     // Engine-down backoff (§7): check the cached engine probe before composing.
     if (!engineBackoffActive()) {

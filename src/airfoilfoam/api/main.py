@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ from ..models import (
     TurbulenceModel,
 )
 from ..postprocess.images import compute_field_extents, render_animations, render_contours, render_custom_field, render_mean_contours
+from ..retention import JobRetentionRefused, delete_job_dir, strip_job_dir
 from ..storage import JobStore
 
 
@@ -84,6 +86,10 @@ class RenderDefaultMediaRequest(BaseModel):
     zoom_chords: float = Field(default=2.0, gt=0)
     scale_version: int = Field(default=1, ge=1)
     render_profile_key: str = Field(default="default:v1:zoom2")
+
+
+class StripJobRequest(BaseModel):
+    keep_case_state: bool = False
 
 
 def _sha256_file(path: Path) -> str:
@@ -184,6 +190,13 @@ def create_app() -> FastAPI:
     )
     settings = get_settings()
     store = JobStore(settings)
+
+    def safe_job_root(job_id: str) -> Path:
+        jobs_root = (settings.data_dir / "jobs").resolve()
+        job_root = store.job_dir(job_id).resolve()
+        if job_root.parent != jobs_root:
+            raise HTTPException(status_code=400, detail="Invalid job id")
+        return job_root
 
     # ------------------------------------------------------------------ #
     @app.get("/health")
@@ -291,6 +304,24 @@ def create_app() -> FastAPI:
             "redelivered": [row for row in active + reserved + scheduled if row.get("redelivered")],
         }
 
+    @app.get("/maintenance/jobs")
+    def maintenance_jobs() -> list[dict]:
+        jobs_root = settings.data_dir / "jobs"
+        rows = []
+        if jobs_root.is_dir():
+            for path in sorted(p for p in jobs_root.iterdir() if p.is_dir()):
+                rows.append({"job_id": path.name, "mtime_epoch": path.stat().st_mtime, "bytes": None})
+        return rows
+
+    @app.get("/maintenance/disk")
+    def maintenance_disk() -> dict:
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        stat = os.statvfs(settings.data_dir)
+        total = int(stat.f_blocks * stat.f_frsize)
+        free = int(stat.f_bavail * stat.f_frsize)
+        used_pct = 0.0 if total <= 0 else 100.0 * (1.0 - (free / total))
+        return {"total_bytes": total, "free_bytes": free, "used_pct": used_pct}
+
     @app.post("/jobs/runtime")
     def jobs_runtime(request: RuntimeRequest) -> dict:
         rows: list[dict] = []
@@ -395,6 +426,26 @@ def create_app() -> FastAPI:
         status.message = "cancelled"
         store.write_status(status)
         return {"job_id": job_id, "cancelled": True, "reaper": reaper_results}
+
+    @app.post("/jobs/{job_id}/strip")
+    def strip_job(job_id: str, request: StripJobRequest) -> dict:
+        job_root = safe_job_root(job_id)
+        if not job_root.is_dir():
+            raise HTTPException(status_code=404, detail="Job not found")
+        try:
+            return strip_job_dir(job_root, keep_case_state=request.keep_case_state).to_dict()
+        except JobRetentionRefused as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.delete("/jobs/{job_id}")
+    def delete_job(job_id: str) -> dict:
+        job_root = safe_job_root(job_id)
+        if not job_root.is_dir():
+            raise HTTPException(status_code=404, detail="Job not found")
+        try:
+            return delete_job_dir(job_root).to_dict()
+        except JobRetentionRefused as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     @app.get("/jobs/{job_id}/result", response_model=JobResult)
     def job_result(job_id: str) -> JobResult:

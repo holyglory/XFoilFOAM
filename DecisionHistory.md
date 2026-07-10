@@ -3069,3 +3069,34 @@ mean).
   the healthy baseline and sampling pg activity before diagnosing
   DB-backed test "hangs" after a VM restart. Probe harness pattern
   (activity/lock sampler alongside vitest) recorded via this incident.
+
+## 2026-07-10 — Job-dir retention: engine strip API + sweeper reaper (incident guardrail)
+
+- Engine (retention.py + api): POST /jobs/{id}/strip {keep_case_state},
+  DELETE /jobs/{id}, GET /maintenance/jobs, GET /maintenance/disk.
+  Keep set derived from real consumers and pinned by test: root API
+  JSONs; a*/images, frames, evidence/{manifest, scaled_media,
+  custom_renders, openfoam_evidence.tar.gz}; evidence/VTK is the
+  re-render source (render endpoints prefer it) — redundant
+  evidence/openfoam/ and evidence/time_directories/ strip (measured
+  ~19 MB/angle of triplicated solver state vs <400 KB referenced
+  media). keep_case_state=True preserves case solver dirs AND job-root
+  meshes/ — prod cases SYMLINK constant/polyMesh into meshes/
+  (jobs.py mesh_reuse_mode) and a dangling link is "not restartable";
+  caught in review, pinned by a symlink must-catch with toggle-revert
+  recall proof. Running guard: fresh .execute.lock → 409. Unknown
+  files are kept and counted, never swept blindly.
+- Node (migration 0039 sim_jobs.stripped_at/strip_report): sweeper
+  retentionTick — strips terminal jobs after 30 min; continuable
+  budget-stop rows keep case state until superseded or 14 d
+  (RETENTION_CONTINUABLE_DAYS), then full-strip revisit; live
+  continuation requests protect their source job; 409 retries, 404
+  stamps no-op; ≤5 strips/tick. Hourly orphan sweep deletes only dirs
+  UNKNOWN to sim_jobs older than 48 h; logs disk usage each sweep and
+  warns ≥80%. Verify-tier checked in code: full-tier verify re-meshes
+  (no continue_from) — no precalc-state protection needed.
+- Fixes made during review: Date param under ::timestamptz cast broke
+  postgres.js Bind (→ toISOString); retention tests scoped to own
+  fixture jobs (shared test DB has legitimate foreign candidates).
+- Verified: engine 363 (incl. 7 retention tests + symlink recall
+  proof); sweeper 147/147 full suite; db + typecheck green.

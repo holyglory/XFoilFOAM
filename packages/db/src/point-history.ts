@@ -96,7 +96,7 @@ END`;
  *  saved case state is addressable (engine ids present) can be RESUMED with an
  *  increased budget. Substring match — the marker sits inside the engine's
  *  measured-periods sentence. */
-const CONTINUABLE_SQL = sql`(
+export const CONTINUABLE_SQL = sql`(
   r.status = 'done' AND rc.state = 'rejected' AND r.fidelity LIKE 'urans%'
   AND r.engine_job_id IS NOT NULL AND r.engine_case_slug IS NOT NULL
   AND EXISTS (

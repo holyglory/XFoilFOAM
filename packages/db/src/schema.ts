@@ -1190,6 +1190,13 @@ export const simJobs = pgTable(
     polledAt: ts(),
     ingestedAt: ts(),
     finishedAt: ts(),
+    strippedAt: timestamp("stripped_at", { withTimezone: true }),
+    stripReport: jsonb("strip_report").$type<{
+      bytes_freed?: number;
+      files_removed?: number;
+      kept_case_state?: boolean;
+      note?: string;
+    }>(),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()

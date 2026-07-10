@@ -1,9 +1,14 @@
 import type {
   EngineCacheStats,
   EngineHealth,
+  EngineMaintenanceDiskResponse,
+  EngineMaintenanceJobsResponse,
   EngineQueueState,
+  EngineStripJobRequest,
+  EngineStripJobResponse,
   FieldExtentsRequest,
   FieldExtentsResponse,
+  EngineDeleteJobResponse,
   JobResult,
   JobRuntimeResponse,
   JobStatus,
@@ -127,6 +132,28 @@ export class EngineClient {
   /** Mesh/seed cache stats scanned from the engine's cache volume. */
   cacheStats(opts?: EngineCallOptions): Promise<EngineCacheStats> {
     return this.json<EngineCacheStats>("/cache/stats", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+  }
+
+  stripJob(jobId: string, request: EngineStripJobRequest = {}, opts?: EngineCallOptions): Promise<EngineStripJobResponse> {
+    return this.json<EngineStripJobResponse>(
+      `/jobs/${encodeURIComponent(jobId)}/strip`,
+      opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+      { method: "POST", body: JSON.stringify(request) },
+    );
+  }
+
+  deleteJob(jobId: string, opts?: EngineCallOptions): Promise<EngineDeleteJobResponse> {
+    return this.json<EngineDeleteJobResponse>(`/jobs/${encodeURIComponent(jobId)}`, opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS, {
+      method: "DELETE",
+    });
+  }
+
+  maintenanceJobs(opts?: EngineCallOptions): Promise<EngineMaintenanceJobsResponse> {
+    return this.json<EngineMaintenanceJobsResponse>("/maintenance/jobs", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+  }
+
+  maintenanceDisk(opts?: EngineCallOptions): Promise<EngineMaintenanceDiskResponse> {
+    return this.json<EngineMaintenanceDiskResponse>("/maintenance/disk", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
   }
 
   getJobRuntimes(jobIds: string[], opts?: EngineCallOptions): Promise<JobRuntimeResponse> {
