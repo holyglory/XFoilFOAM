@@ -3018,3 +3018,34 @@ mean).
 - S1223 heavy-chord precalc cells are EXPECTED to park again as honest
   mesh-time failures (documented geometry limit).
 - Monitor re-armed on the new campaign id (state-change-only stream).
+
+## 2026-07-10 — Prod incident: VPS disk full → postgres crash-loop (recovered, zero loss)
+
+- Symptom: monitor surfaced "Container … is restarting"; postgres in a
+  crash loop (11 restarts, exit 1: "could not write lock file
+  postmaster.pid: No space left on device"); sweeper died with it. Root
+  disk 296 GB at 100%.
+- Root cause: engine OpenFOAM job case directories under the
+  app_results docker volume are NEVER cleaned after ingest — 523 dirs,
+  ~240 GB in 3 days (RANS batch dirs 50–360 MB; URANS dirs multi-GB
+  with saved continuation state). 464 dirs predated the 2026-07-10
+  reseed: pure orphans of the wiped DB (their media/result rows no
+  longer exist). NOT the new campaign's fault — it had added ~12 GB.
+- Recovery (evidence captured before acting): deleted the 464
+  pre-reseed job dirs (mtime split at reseed timestamp 00:05 UTC;
+  current 59 dirs kept), disk 100% → 26% (211 GB free); postgres
+  self-recovered healthy via restart policy; sweeper needed a
+  compose force-recreate (its crash-loop lost the embedded-DNS alias —
+  "getaddrinfo ENOTFOUND postgres" on boot; also noted: sweeper boot
+  heartbeat write is an uncaught exception, no retry — restart policy
+  masks it). Campaign verified intact: 634 requested / 268 solved /
+  0 failed; interrupted jobs resumed.
+- Note on the shakedown archive: the pre-reseed DB dump remains
+  restorable (rows), but the old campaign's media FILES were part of
+  the deleted case dirs — the archive is data-complete, media-orphaned.
+  Accepted: user approved the wipe; media is re-derivable by re-solving.
+- Guardrails: monitor script now emits DISK-WARN at ≥80% root usage and
+  flags restarting/unhealthy/exited containers every cycle; durable fix
+  (engine-side retention: strip solver state after terminal ingest,
+  keep continuable saved state + media, periodic orphan sweep) filed as
+  a spawned task chip with full design constraints.
