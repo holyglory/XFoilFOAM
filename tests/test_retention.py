@@ -214,7 +214,11 @@ def test_api_strip_preserves_served_media_and_reports_maintenance():
     assert media.content.startswith(b"\x89PNG")
 
     jobs = client.get("/maintenance/jobs").json()
-    assert any(row["job_id"] == job_id and row["mtime_epoch"] > 0 and row["bytes"] is None for row in jobs)
+    # Cross-runtime contract pin: wrapped {"items": [...]}, never a bare list
+    # (the node orphan sweep iterates response.items — incident 2026-07-10:
+    # a bare list shipped and every prod orphan sweep failed "not iterable").
+    assert isinstance(jobs, dict)
+    assert any(row["job_id"] == job_id and row["mtime_epoch"] > 0 and row["bytes"] is None for row in jobs["items"])
 
     disk = client.get("/maintenance/disk").json()
     assert disk["total_bytes"] > 0

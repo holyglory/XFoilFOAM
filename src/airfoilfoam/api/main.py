@@ -305,13 +305,15 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/maintenance/jobs")
-    def maintenance_jobs() -> list[dict]:
+    def maintenance_jobs() -> dict:
         jobs_root = settings.data_dir / "jobs"
         rows = []
         if jobs_root.is_dir():
             for path in sorted(p for p in jobs_root.iterdir() if p.is_dir()):
                 rows.append({"job_id": path.name, "mtime_epoch": path.stat().st_mtime, "bytes": None})
-        return rows
+        # Cross-runtime contract (node engine-client maintenanceJobs): the
+        # payload is wrapped — {"items": [...]} — never a bare list.
+        return {"items": rows}
 
     @app.get("/maintenance/disk")
     def maintenance_disk() -> dict:
