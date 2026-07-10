@@ -114,3 +114,17 @@ export function summarizeSteadyWindow(model: SteadyHistoryModel | null | undefin
     iterCount: model.windowIterCount,
   };
 }
+
+/** Caption for static field images rendered from an OSCILLATING steady solve.
+ *  The stored image is a single pseudo-time snapshot of an oscillation the
+ *  steady solver cannot time-resolve, so transient wake structures in it are
+ *  not time-accurate (prod misread 2026-07-10: S1223 α20 frozen shed vortices
+ *  along the wake read as a mesh defect). Null when real URANS frames are
+ *  playing (transport active) or when the solve did not oscillate. */
+export function oscillatingSnapshotCaption(
+  summary: SteadyWindowSummary | null | undefined,
+  transportActive: boolean,
+): string | null {
+  if (!summary || transportActive) return null;
+  return "Oscillating steady solve — this image is a single solver snapshot; transient wake structures are not time-accurate.";
+}

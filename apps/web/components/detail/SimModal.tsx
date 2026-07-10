@@ -35,7 +35,7 @@ import {
   type ResultReviewVerdict,
   type SimModalReviewContext,
 } from "@/lib/result-review";
-import { buildSteadyHistoryModel, summarizeSteadyWindow, type SteadyHistoryModel } from "@/lib/steady-history";
+import { buildSteadyHistoryModel, oscillatingSnapshotCaption, summarizeSteadyWindow, type SteadyHistoryModel } from "@/lib/steady-history";
 import { buildSolverWorkPopoverView } from "@/lib/solver-work";
 import { C, MONO, VIZ } from "@/lib/tokens";
 
@@ -1189,6 +1189,14 @@ export function SimModal(props: {
             {overlayReadout()}
           </span>
         </div>
+        {(() => {
+          const caption = oscillatingSnapshotCaption(steadySummary, transportActive);
+          return caption ? (
+            <div data-testid="sim-snapshot-caption" style={{ fontFamily: MONO, fontSize: 10, color: C.amber, opacity: 0.85, lineHeight: 1.5 }}>
+              {caption}
+            </div>
+          ) : null;
+        })()}
         {transportBar()}
       </div>
       {chartsColumn()}
