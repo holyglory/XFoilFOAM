@@ -3100,3 +3100,23 @@ mean).
   fixture jobs (shared test DB has legitimate foreign candidates).
 - Verified: engine 363 (incl. 7 retention tests + symlink recall
   proof); sweeper 147/147 full suite; db + typecheck green.
+
+## 2026-07-10 — Retention validated on prod (builds prod-20260710-retention/-retention2)
+
+- Live evidence: reaper stripped the terminal backlog within minutes of
+  deploy (17+ jobs, 7+ GB in the first pass; single URANS-era test jobs
+  freed 1.5–1.6 GB each). Stripped job 4f7f30ea…: .stripped.json marker
+  (mode full, 131 MB / 310 files), per-angle media dirs intact, and its
+  scaled-media PNG served HTTP 200 (36 KB) through /api/media — media
+  survival proven live, not just in tests. Ticks kept completing
+  (started/completed stamps) and the campaign never paused.
+- One cross-runtime contract slip caught in prod validation: engine
+  GET /maintenance/jobs shipped a bare list; node client expects
+  {"items": […]} → orphan sweep failed "not iterable". Fixed engine-
+  side to the pinned contract, shape now pinned in test_retention.py
+  (a bare list fails the suite). After -retention2: orphan sweep runs
+  clean — "deleted 0 job(s) (known=69, young=0)" — with DISK telemetry
+  (28.9% used, 209.8 GB free).
+- The disk-full failure class is now guarded three ways: continuous
+  strip of terminal job dirs, hourly orphan sweep + disk log/warning
+  in the sweeper, and the session monitor's DISK-WARN at 80%.
