@@ -23,7 +23,11 @@ import {
   syncSweepPromises,
   sweepDefinitions,
 } from "@aerodb/db";
-import { simulationSetupSignature, type SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
+import {
+  physicsHashForSnapshot,
+  simulationSetupSignature,
+  type SimulationSetupSnapshot,
+} from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { readFile } from "node:fs/promises";
@@ -324,6 +328,7 @@ async function ensureRemoteRevision(db: DB, claim: NonNullable<RemoteClaimRespon
     flowState: { ...snapshot.flowState, mediumId: medium.id },
     scheduling: { ...snapshot.scheduling, cpuBudget: settings.remoteSolverCpuBudget || snapshot.scheduling.cpuBudget },
   };
+  const physicsHash = physicsHashForSnapshot(localSnapshot);
   const [revision] = await db
     .insert(simulationPresetRevisions)
     .values({
@@ -334,10 +339,11 @@ async function ensureRemoteRevision(db: DB, claim: NonNullable<RemoteClaimRespon
       mach: snapshot.derived.mach,
       referenceLengthM: snapshot.referenceGeometry.referenceLengthM,
       snapshot: localSnapshot as unknown as Record<string, unknown>,
+      physicsHash,
     })
     .onConflictDoNothing({ target: [simulationPresetRevisions.presetId, simulationPresetRevisions.signatureHash] })
     .returning();
-  const row =
+  let row =
     revision ??
     (
       await db
@@ -346,6 +352,18 @@ async function ensureRemoteRevision(db: DB, claim: NonNullable<RemoteClaimRespon
         .where(and(eq(simulationPresetRevisions.presetId, preset.id), eq(simulationPresetRevisions.signatureHash, signatureHash)))
         .limit(1)
     )[0];
+  if (row && !row.physicsHash) {
+    const [withPhysicsHash] = await db
+      .update(simulationPresetRevisions)
+      .set({
+        physicsHash: physicsHashForSnapshot(
+          row.snapshot as unknown as SimulationSetupSnapshot,
+        ),
+      })
+      .where(eq(simulationPresetRevisions.id, row.id))
+      .returning();
+    row = withPhysicsHash ?? row;
+  }
   return { revision: row, snapshot: localSnapshot, bcId: legacy.id };
 }
 

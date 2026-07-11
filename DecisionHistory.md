@@ -3238,3 +3238,48 @@ mean).
   enabled=false unless the box should also run its own public sweeps;
   claim size bounds α per promise. The hub needs enabled presets with
   gaps for remote solvers to have work.
+
+## 2026-07-11 — Public polars span compatible runs, never internal batches
+
+- User-reported production defect: E387 had seven accepted points at one
+  physical/numerical condition, split across two immutable sweep revisions
+  (`-8,-2,2,6` and `-4,0,4`). Solver Work truthfully exposed both sets, but
+  public Detail grouped by rounded Reynolds and selected only one revision,
+  so the chart silently omitted three verified points. Public users were also
+  being forced to reason about an internal validation/batch name to find them.
+- Owner context and alternatives presented: (1) merge/refit raw results on
+  every Detail request — quick, but slow at catalog scale and inconsistent
+  with cached Browse/Compare metrics; (2) keep exact revision caches and add a
+  durable aggregate compatibility cache — additive schema/work, but one
+  consistent evidence-derived read model; (3) move results onto one canonical
+  revision — simpler reads, but destroys immutable provenance. Recommendation
+  was option 2. The owner asked to fix the public experience and explicitly
+  required users to see all polars without knowing calculation batches, so
+  option 2 was implemented.
+- Decision: public series identity is `polar-compat-v1` plus the existing
+  value-level `physicsHashForSnapshot` identity. It includes flow/material,
+  reference geometry, boundary, mesh (including pinned URANS tiers), and
+  solver values; it excludes preset names, sweep angles, scheduling, output,
+  and provenance. Equal-Re evidence with different physical or numerical
+  values remains separate. Pinned admin/campaign views remain revision-exact.
+- Decision: migration 0041 adds compatibility fit sets, fit points, and audited
+  evidence members; revision-scoped `polar_fit_sets` remain unchanged for
+  campaign/refinement decisions. Refreshes are transactionally serialized per
+  airfoil+compatibility hash and run after exact revision refreshes. Accepted
+  outranks provisional; full URANS outranks precalc URANS, which outranks RANS.
+  Exact-equal duplicate AoAs shadow deterministically. Equal-ranked differing
+  coefficients stay visible as conflict evidence but are excluded from the
+  aggregate fit rather than silently choosing or averaging them.
+- Public presentation uses stable opaque series ids with only aerodynamic
+  labels (Re, Mach, and a neutral condition ordinal when needed). Every solved
+  series starts visible; chart state, readouts, Compare selection, and colors
+  key by series id rather than Reynolds. Internal preset/revision/batch names
+  never label public curves. Compare uses cached aggregate fit metrics.
+- Rollout order: additive migration, physics-hash backfill, then polar-cache
+  backfill (which now also builds compatibility caches). New library, sync, and
+  remote-solver revision writers populate/repair the hash. Malformed legacy
+  snapshots fail closed as isolated revision series instead of merging or
+  taking Detail down. Regression coverage pins the E387 4+3→7 merge, stable
+  result-id conservation against Solver Work, same-Re different-physics
+  separation, conflict handling, cache-absent rollout fallback, and public
+  terminology.

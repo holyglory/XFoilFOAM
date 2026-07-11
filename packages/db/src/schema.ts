@@ -1417,6 +1417,172 @@ export const polarFitPoints = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Public polar compatibility cache — evidence-derived read model spanning
+// value-identical immutable setup revisions. Revision-scoped polar_fit_sets
+// remain authoritative for campaign/refinement work; these tables exist so a
+// public series can combine evidence split only by sweep/batch revisions
+// without relabelling that evidence as belonging to one canonical revision.
+// ---------------------------------------------------------------------------
+export const polarCompatibilityFitSets = pgTable(
+  "polar_compatibility_fit_sets",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    compatibilityVersion: text("compatibility_version").notNull(),
+    compatibilityHash: text("compatibility_hash").notNull(),
+    fitVersion: text("fit_version").notNull(),
+    evidenceSignature: text("evidence_signature").notNull(),
+    status: polarFitStatusEnum("status").notNull(),
+    confidence: doublePrecision("confidence").notNull().default(0),
+    acceptedPointCount: integer("accepted_point_count").notNull().default(0),
+    provisionalPointCount: integer("provisional_point_count")
+      .notNull()
+      .default(0),
+    rejectedPointCount: integer("rejected_point_count").notNull().default(0),
+    conflictPointCount: integer("conflict_point_count").notNull().default(0),
+    reynolds: bigint("reynolds", { mode: "number" }),
+    mach: doublePrecision("mach"),
+    ldmax: doublePrecision("ldmax"),
+    alphaLdmax: doublePrecision("alpha_ldmax"),
+    alphaLdmaxFine: doublePrecision("alpha_ldmax_fine"),
+    alphaClZeroFine: doublePrecision("alpha_cl_zero_fine"),
+    alphaClmaxFine: doublePrecision("alpha_cl_max_fine"),
+    clmax: doublePrecision("clmax"),
+    alphaClmax: doublePrecision("alpha_clmax"),
+    cdmin: doublePrecision("cdmin"),
+    clAtCdmin: doublePrecision("cl_at_cdmin"),
+    cd0: doublePrecision("cd0"),
+    cm0: doublePrecision("cm0"),
+    aoaMin: doublePrecision("aoa_min"),
+    aoaMax: doublePrecision("aoa_max"),
+    isCurrent: boolean("is_current").notNull().default(true),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    signatureUq: uniqueIndex("polar_compatibility_fit_sets_signature_uq").on(
+      t.airfoilId,
+      t.compatibilityVersion,
+      t.compatibilityHash,
+      t.fitVersion,
+      t.evidenceSignature,
+    ),
+    currentUq: uniqueIndex("polar_compatibility_fit_sets_current_uq")
+      .on(t.airfoilId, t.compatibilityVersion, t.compatibilityHash)
+      .where(sql`${t.isCurrent}`),
+    airfoilIdx: index("polar_compatibility_fit_sets_airfoil_idx").on(
+      t.airfoilId,
+      t.isCurrent,
+      t.status,
+    ),
+    compatibilityIdx: index(
+      "polar_compatibility_fit_sets_compatibility_idx",
+    ).on(t.compatibilityVersion, t.compatibilityHash),
+  }),
+);
+
+export const polarCompatibilityFitPoints = pgTable(
+  "polar_compatibility_fit_points",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    fitSetId: uuid("fit_set_id")
+      .notNull()
+      .references(() => polarCompatibilityFitSets.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    cl: doublePrecision("cl").notNull(),
+    cd: doublePrecision("cd").notNull(),
+    cm: doublePrecision("cm").notNull(),
+    clCd: doublePrecision("cl_cd").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    fitSetIdx: index("polar_compatibility_fit_points_fit_set_idx").on(
+      t.fitSetId,
+    ),
+    fitAoaUq: uniqueIndex("polar_compatibility_fit_points_aoa_uq").on(
+      t.fitSetId,
+      t.aoaDeg,
+    ),
+  }),
+);
+
+export const polarCompatibilityFitMembers = pgTable(
+  "polar_compatibility_fit_members",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    fitSetId: uuid("fit_set_id")
+      .notNull()
+      .references(() => polarCompatibilityFitSets.id, { onDelete: "cascade" }),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    simulationPresetRevisionId: uuid("simulation_preset_revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    role: text("role").notNull(),
+    selectionRank: integer("selection_rank").notNull(),
+    selectionReason: text("selection_reason").notNull(),
+    classificationState: resultClassificationStateEnum(
+      "classification_state",
+    ).notNull(),
+    classificationRegion: resultClassificationRegionEnum(
+      "classification_region",
+    ).notNull(),
+    classificationReasons: text("classification_reasons")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    classificationConfidence: doublePrecision(
+      "classification_confidence",
+    ).notNull(),
+    reviewVerdict: text("review_verdict"),
+    fidelity: text("fidelity"),
+    regime: regimeEnum("regime"),
+    cl: doublePrecision("cl").notNull(),
+    cd: doublePrecision("cd").notNull(),
+    cm: doublePrecision("cm"),
+    clCd: doublePrecision("cl_cd"),
+    clStd: doublePrecision("cl_std"),
+    cdStd: doublePrecision("cd_std"),
+    cmStd: doublePrecision("cm_std"),
+    stalled: boolean("stalled").notNull(),
+    unsteady: boolean("unsteady").notNull(),
+    converged: boolean("converged").notNull(),
+    resultUpdatedAt: timestamp("result_updated_at", {
+      withTimezone: true,
+    }).notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    roleCheck: check(
+      "polar_compatibility_fit_members_role_check",
+      sql`${t.role} IN ('selected', 'shadowed', 'conflict')`,
+    ),
+    fitResultUq: uniqueIndex("polar_compatibility_fit_members_result_uq").on(
+      t.fitSetId,
+      t.resultId,
+    ),
+    fitRoleIdx: index("polar_compatibility_fit_members_fit_role_idx").on(
+      t.fitSetId,
+      t.role,
+      t.aoaDeg,
+    ),
+    resultIdx: index("polar_compatibility_fit_members_result_idx").on(
+      t.resultId,
+    ),
+    revisionIdx: index("polar_compatibility_fit_members_revision_idx").on(
+      t.simulationPresetRevisionId,
+    ),
+  }),
+);
+
+// ---------------------------------------------------------------------------
 // 11. Sim jobs — maps Postgres intent to a Python engine job_id (two-wave).
 // ---------------------------------------------------------------------------
 export const simJobs = pgTable(

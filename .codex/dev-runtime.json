@@ -5,28 +5,56 @@
       "name": "api",
       "role": "api",
       "port": 4000,
-      "cmd": "API_HOST=127.0.0.1 API_PORT={port} ENGINE_URL=http://127.0.0.1:8000 MEDIA_DIR=data/airfoilfoam ENGINE_EXPECTED_BUILD_ID=dev-20260704-batch-cache pnpm --filter @aerodb/api dev",
+      "argv": [
+        "corepack",
+        "pnpm",
+        "--filter",
+        "@aerodb/api",
+        "dev"
+      ],
       "health_url": "http://127.0.0.1:{port}/health",
       "env": [
-        "CI=true"
+        "CI=true",
+        "DATABASE_URL=postgres://aerodb:aerodb@127.0.0.1:5544/aerodb",
+        "API_HOST=127.0.0.1",
+        "API_PORT=4000",
+        "ENGINE_URL=http://127.0.0.1:8000",
+        "MEDIA_DIR=data/airfoilfoam",
+        "ENGINE_EXPECTED_BUILD_ID=dev-20260704-batch-cache"
       ]
     },
     {
       "name": "web",
       "role": "web",
       "port": 3004,
-      "cmd": "rm -rf apps/web/.next && API_URL=http://127.0.0.1:4000 NEXT_PUBLIC_API_URL=http://127.0.0.1:4000 NEXT_TELEMETRY_DISABLED=1 pnpm --filter @aerodb/web exec next dev -H 127.0.0.1 -p {port}",
+      "argv": [
+        "/bin/sh",
+        "-lc",
+        "rm -rf apps/web/.next && exec corepack pnpm --filter @aerodb/web exec next dev -H 127.0.0.1 -p {port}"
+      ],
       "health_url": "http://127.0.0.1:{port}/health",
       "env": [
-        "CI=true"
+        "CI=true",
+        "API_URL=http://127.0.0.1:4000",
+        "NEXT_PUBLIC_API_URL=http://127.0.0.1:4000",
+        "NEXT_TELEMETRY_DISABLED=1"
       ]
     },
     {
       "name": "sweeper",
       "role": "worker",
-      "cmd": "ENGINE_URL=http://127.0.0.1:8000 MEDIA_DIR=data/airfoilfoam pnpm --filter @aerodb/sweeper dev",
+      "argv": [
+        "corepack",
+        "pnpm",
+        "--filter",
+        "@aerodb/sweeper",
+        "dev"
+      ],
       "env": [
-        "CI=true"
+        "CI=true",
+        "DATABASE_URL=postgres://aerodb:aerodb@127.0.0.1:5544/aerodb",
+        "ENGINE_URL=http://127.0.0.1:8000",
+        "MEDIA_DIR=data/airfoilfoam"
       ]
     }
   ],

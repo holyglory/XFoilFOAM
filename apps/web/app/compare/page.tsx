@@ -12,7 +12,7 @@ export default async function ComparePage() {
       <div style={{ maxWidth: 1280, margin: "0 auto", padding: "24px 22px 56px" }}>
         <h1 style={{ margin: "0 0 4px", fontSize: 26, fontWeight: 700, letterSpacing: "-0.01em" }}>Compare</h1>
         <div style={{ fontFamily: MONO, fontSize: 12, color: C.muted, marginBottom: 18 }}>
-          Overlay polars and diff metrics for up to four airfoils at a chosen Reynolds number.
+          Overlay polars and cached fit metrics for up to four airfoils at one operating condition.
         </div>
         <CompareView items={items} />
       </div>

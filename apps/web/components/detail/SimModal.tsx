@@ -1031,7 +1031,12 @@ export function SimModal(props: {
       <div data-testid="sim-accent-stats" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(142px, 1fr))", gap: 10, margin: "0 0 12px" }}>
         <AccentStat label="Cl" color={C.teal} value={fmt(sim.cl, 4)} sub="converged coefficient" />
         <AccentStat label="Cd" color={C.amber} value={fmt(sim.cd, 5)} sub="converged coefficient" />
-        <AccentStat label="Cm" color={C.text} value={fmt(sim.cm, 4)} sub="converged coefficient" />
+        <AccentStat
+          label="Cm"
+          color={C.text}
+          value={fmtOptional(sim.cm, 4)}
+          sub={sim.cm == null ? "coefficient unavailable" : "converged coefficient"}
+        />
         <AccentStat label="L/D" color={C.teal} value={fmt(sim.ld, 2)} sub="Cl / Cd" />
         <AccentStat label="Convergence" color={steadyModel ? C.amber : C.teal} value={convergence.value} sub={convergence.sub} />
       </div>
@@ -1072,7 +1077,7 @@ export function SimModal(props: {
       return `Cl ${fmt(currentFrame.cl, 3)} · Cd ${fmt(currentFrame.cd, 4)} · Cm ${fmt(currentFrame.cm, 3)} · t ${fmt(currentFrame.t, 3)} s${po ? ` · period ${po.ordinal}/${po.total}` : ""}`;
     }
     if (!sim) return "loading";
-    return `Cl ${fmt(sim.cl, 3)} · Cd ${fmt(sim.cd, 4)} · Cm ${fmt(sim.cm, 3)} · α ${alphaStr}°`;
+    return `Cl ${fmt(sim.cl, 3)} · Cd ${fmt(sim.cd, 4)} · Cm ${fmtOptional(sim.cm, 3)} · α ${alphaStr}°`;
   };
 
   const transportBar = () => {

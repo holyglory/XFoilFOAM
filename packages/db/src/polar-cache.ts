@@ -26,6 +26,11 @@ import {
   results,
   simulationPresetRevisions,
 } from "./schema";
+import {
+  ensureRevisionPhysicsHash,
+  refreshPolarCompatibilityCache,
+} from "./polar-compatibility-cache";
+export * from "./polar-compatibility-cache";
 
 type EvidenceWithDbIds = PolarEvidencePoint & {
   resultId?: string | null;
@@ -529,6 +534,10 @@ export async function refreshPolarCacheForRevision(
   airfoilId: string,
   simulationPresetRevisionId: string,
 ): Promise<PolarCacheRefreshResult> {
+  const compatibilityHash = await ensureRevisionPhysicsHash(
+    db,
+    simulationPresetRevisionId,
+  );
   const [airfoilRow] = await db
     .select({ isSymmetric: airfoils.isSymmetric })
     .from(airfoils)
@@ -651,6 +660,9 @@ export async function refreshPolarCacheForRevision(
     fitClassifications,
     symmetric,
   );
+  if (compatibilityHash) {
+    await refreshPolarCompatibilityCache(db, airfoilId, compatibilityHash);
+  }
   const attemptNeeds = attemptClassifiedGroups.flatMap(
     (group) => group.needsUransAoas,
   );

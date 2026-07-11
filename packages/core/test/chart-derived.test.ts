@@ -28,8 +28,8 @@ describe("derived-by-symmetry chart styling (spec §9.3)", () => {
 
   const projection = projectChart({
     chartType: "cla",
-    polars: [{ re: 100000, color: "#f5a524", points: [derived, source], fit: null }],
-    visibleRe: { 100000: true },
+    polars: [{ seriesId: "series-a", label: "Re 100k", re: 100000, color: "#f5a524", points: [derived, source], fit: null }],
+    visibleSeries: { "series-a": true },
   });
 
   it("reads the payload marker fields structurally", () => {
@@ -61,8 +61,8 @@ describe("derived-by-symmetry chart styling (spec §9.3)", () => {
     const unmarked = solvedPoint(-4, -0.5, "res-1");
     const plain = projectChart({
       chartType: "cla",
-      polars: [{ re: 100000, color: "#f5a524", points: [unmarked, source], fit: null }],
-      visibleRe: { 100000: true },
+      polars: [{ seriesId: "series-a", label: "Re 100k", re: 100000, color: "#f5a524", points: [unmarked, source], fit: null }],
+      visibleSeries: { "series-a": true },
     });
     const vm = plain.points.find((p) => p.point.a === -4)!;
     expect(vm.fill).toBe("#f5a524");

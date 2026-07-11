@@ -12,6 +12,7 @@ import {
   exportCoordinates,
   fRe,
   makePath,
+  metrics,
   nacaGeometry,
   niceTicks,
   parseCoordinates,
@@ -76,6 +77,30 @@ describe("geometry port matches airfoil-db.js", () => {
 });
 
 describe("polar chart evidence gating", () => {
+  it("does not relabel another angle's measured moment as cm0", () => {
+    const base = {
+      cl: 0.1,
+      cd: 0.01,
+      ld: 10,
+      stalled: false,
+      source: "solved" as const,
+      resultId: "result-0",
+    };
+
+    expect(
+      metrics([
+        { ...base, a: -2, cm: null },
+        { ...base, a: 0, cm: -0.03, resultId: "result-1" },
+      ]).cm0,
+    ).toBeNull();
+    expect(
+      metrics([
+        { ...base, a: -4, cm: -0.05 },
+        { ...base, a: 0, cm: -0.03, resultId: "result-1" },
+      ]).cm0,
+    ).toBe(-0.05);
+  });
+
   it("exposes clickable points only for solved result rows", () => {
     const solved = {
       a: 0,
@@ -100,8 +125,8 @@ describe("polar chart evidence gating", () => {
 
     const projection = projectChart({
       chartType: "cla",
-      polars: [{ re: 100000, color: "#f5a524", points: [solved, queued] }],
-      visibleRe: { 100000: true },
+      polars: [{ seriesId: "series-a", label: "Re 100k", re: 100000, color: "#f5a524", points: [solved, queued] }],
+      visibleSeries: { "series-a": true },
     });
 
     expect(projection.points).toHaveLength(1);
@@ -111,8 +136,8 @@ describe("polar chart evidence gating", () => {
   it("keeps an empty solved-only chart finite while sweeps are still queued", () => {
     const projection = projectChart({
       chartType: "cla",
-      polars: [{ re: 100000, color: "#f5a524", points: [] }],
-      visibleRe: { 100000: true },
+      polars: [{ seriesId: "series-a", label: "Re 100k", re: 100000, color: "#f5a524", points: [] }],
+      visibleSeries: { "series-a": true },
     });
 
     expect(projection.points).toHaveLength(0);

@@ -33,7 +33,7 @@ import {
   sweepDefinitions,
 } from "@aerodb/db";
 import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
-import { ensureEnabledSimulationPresetRevisions, simulationSetupSignature, type SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
+import { ensureEnabledSimulationPresetRevisions, physicsHashForSnapshot, simulationSetupSignature, type SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, asc, count, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createHash, randomUUID } from "node:crypto";
@@ -1271,6 +1271,7 @@ async function importSimulationSetupRevision(
     })
     .returning({ id: simulationPresets.id });
   localSnapshot.preset.id = preset.id;
+  const physicsHash = physicsHashForSnapshot(localSnapshot);
   const revisionNumber = Math.max(1, Math.round(numberWithFallback(data.revisionNumber ?? data.revision_number, 1)));
   const [revision] = await db
     .insert(simulationPresetRevisions)
@@ -1282,18 +1283,32 @@ async function importSimulationSetupRevision(
       mach: nullableNumber(data.mach) ?? snapshot.derived.mach,
       referenceLengthM: numberWithFallback(data.referenceLengthM ?? data.reference_length_m, snapshot.referenceGeometry.referenceLengthM),
       snapshot: localSnapshot as unknown as Record<string, unknown>,
+      physicsHash,
     })
     .onConflictDoNothing({ target: [simulationPresetRevisions.presetId, simulationPresetRevisions.signatureHash] })
     .returning({ id: simulationPresetRevisions.id });
-  const revisionId =
-    revision?.id ??
-    (
-      await db
-        .select({ id: simulationPresetRevisions.id })
-        .from(simulationPresetRevisions)
-        .where(and(eq(simulationPresetRevisions.presetId, preset.id), eq(simulationPresetRevisions.signatureHash, signatureHash)))
-        .limit(1)
-    )[0]?.id;
+  const existingRevision = revision?.id
+    ? null
+    : (
+        await db
+          .select({
+            id: simulationPresetRevisions.id,
+            physicsHash: simulationPresetRevisions.physicsHash,
+            snapshot: simulationPresetRevisions.snapshot,
+          })
+          .from(simulationPresetRevisions)
+          .where(and(eq(simulationPresetRevisions.presetId, preset.id), eq(simulationPresetRevisions.signatureHash, signatureHash)))
+          .limit(1)
+      )[0];
+  const revisionId = revision?.id ?? existingRevision?.id;
+  // Older sync-imported rows can predate physicsHash. Derive the rollout
+  // repair from their immutable stored snapshot, never the incoming payload.
+  if (existingRevision && !existingRevision.physicsHash) {
+    await db
+      .update(simulationPresetRevisions)
+      .set({ physicsHash: physicsHashForSnapshot(existingRevision.snapshot as unknown as SimulationSetupSnapshot) })
+      .where(eq(simulationPresetRevisions.id, existingRevision.id));
+  }
   return { imported: Boolean(revision?.id), revisionId };
 }
 

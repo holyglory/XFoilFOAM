@@ -2,6 +2,7 @@ import {
   type AirfoilDetailPayload,
   canonicalAoa,
   colorForRe,
+  fRe,
   type PolarFit,
   type Polar,
   type PolarPointData,
@@ -14,6 +15,9 @@ import {
   categories,
   flowConditions,
   mediums,
+  polarCompatibilityFitMembers,
+  polarCompatibilityFitPoints,
+  polarCompatibilityFitSets,
   type Result,
   resultClassifications,
   resultReviewVerdicts,
@@ -25,6 +29,14 @@ import {
   simulationPresetRevisions,
   simulationPresets,
 } from "@aerodb/db";
+import {
+  POLAR_COMPATIBILITY_VERSION,
+  polarCompatibilitySeriesId,
+} from "@aerodb/db/polar-cache";
+import {
+  physicsHashForSnapshot,
+  type SimulationSetupSnapshot,
+} from "@aerodb/db/simulation-setup";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import { db } from "../db";
@@ -37,6 +49,8 @@ type ReviewDisclosure = {
   reviewer: string;
   at: string;
 };
+
+type PublicEvidenceRole = NonNullable<PolarPointData["evidenceRole"]>;
 
 function solvedToPoint(
   r: Result,
@@ -54,7 +68,7 @@ function solvedToPoint(
     a: r.aoaDeg,
     cl,
     cd,
-    cm: r.cm ?? 0,
+    cm: r.cm,
     ld: r.clCd ?? (cd !== 0 ? cl / cd : 0),
     stalled: r.stalled,
     source: "solved",
@@ -91,8 +105,164 @@ type SolvedClassification = {
   review?: ReviewDisclosure | null;
 };
 
+type SolvedRow = {
+  result: Result;
+  classification: SolvedClassification;
+};
+
+type DetailRevision = {
+  id: string;
+  reynolds: number;
+  mach: number | null;
+  createdAt: Date;
+  revisionNumber: number;
+  physicsHash: string | null;
+  snapshot: Record<string, unknown>;
+};
+
+function effectivePhysicsHash(revision: DetailRevision): string {
+  if (revision.physicsHash?.trim()) return revision.physicsHash;
+  try {
+    return physicsHashForSnapshot(
+      revision.snapshot as unknown as SimulationSetupSnapshot,
+    );
+  } catch {
+    // A malformed historical snapshot must not take down the public Detail
+    // route or be guessed compatible with another setup. Isolate it under its
+    // immutable revision identity until the backfill can repair the row.
+    return `legacy-revision:${revision.id}`;
+  }
+}
+
+function classificationRank(row: SolvedRow): number {
+  return (row.classification.state ?? "accepted") === "accepted" ? 2 : 1;
+}
+
+function fidelityRank(row: SolvedRow): number {
+  if (row.result.fidelity === "urans_full") return 3;
+  if (row.result.fidelity === "urans_precalc") return 2;
+  return row.result.regime === "urans" ? 2 : 1;
+}
+
+function sameCoefficients(a: SolvedRow, b: SolvedRow): boolean {
+  return (
+    a.result.cl === b.result.cl &&
+    a.result.cd === b.result.cd &&
+    a.result.cm === b.result.cm
+  );
+}
+
+/** Rollout fallback used only while a compatibility cache is absent. It
+ * mirrors the cache's conservative selector: accepted before provisional,
+ * full URANS before precalc before RANS, exact-equal ties shadow
+ * deterministically, and contradictory equal-rank evidence remains visible
+ * as point-only conflict evidence. */
+function resolveFallbackCompatibilityRows(
+  rows: SolvedRow[],
+): Array<{ row: SolvedRow; role: PublicEvidenceRole }> {
+  const byAoa = new Map<number, SolvedRow[]>();
+  for (const row of rows) {
+    const aoa = canonicalAoa(row.result.aoaDeg);
+    const list = byAoa.get(aoa) ?? [];
+    list.push(row);
+    byAoa.set(aoa, list);
+  }
+  const resolved: Array<{ row: SolvedRow; role: PublicEvidenceRole }> = [];
+  for (const candidates of byAoa.values()) {
+    const topClassification = Math.max(...candidates.map(classificationRank));
+    const classified = candidates.filter(
+      (row) => classificationRank(row) === topClassification,
+    );
+    const topFidelity = Math.max(...classified.map(fidelityRank));
+    const top = classified
+      .filter((row) => fidelityRank(row) === topFidelity)
+      .sort((x, y) => {
+        const solved =
+          (y.result.solvedAt?.getTime() ?? 0) -
+          (x.result.solvedAt?.getTime() ?? 0);
+        if (solved !== 0) return solved;
+        const updated =
+          y.result.updatedAt.getTime() - x.result.updatedAt.getTime();
+        return updated || x.result.id.localeCompare(y.result.id);
+      });
+    const lower = candidates.filter((row) => !top.includes(row));
+    if (top.length === 1 || top.every((row) => sameCoefficients(row, top[0]))) {
+      resolved.push({ row: top[0], role: "primary" });
+      for (const row of top.slice(1)) resolved.push({ row, role: "alternate" });
+    } else {
+      for (const row of top) resolved.push({ row, role: "conflict" });
+    }
+    for (const row of lower) resolved.push({ row, role: "alternate" });
+  }
+  const roleRank = (role: PublicEvidenceRole) =>
+    role === "primary" ? 0 : role === "conflict" ? 1 : 2;
+  return resolved.sort(
+    (x, y) =>
+      x.row.result.aoaDeg - y.row.result.aoaDeg ||
+      roleRank(x.role) - roleRank(y.role) ||
+      x.row.result.id.localeCompare(y.row.result.id),
+  );
+}
+
+function seriesHue(seriesId: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < seriesId.length; i += 1) {
+    hash ^= seriesId.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % 360;
+}
+
+/** Public labels describe operating conditions, never internal batches or
+ * revisions. Same-Re series get identity-derived colors; residual identical
+ * Re+Mach collisions receive a neutral deterministic condition ordinal. */
+export function decoratePublicPolars(input: Polar[]): Polar[] {
+  const polars = [...input].sort(
+    (x, y) =>
+      x.re - y.re ||
+      (x.mach ?? Number.NEGATIVE_INFINITY) -
+        (y.mach ?? Number.NEGATIVE_INFINITY) ||
+      x.seriesId.localeCompare(y.seriesId),
+  );
+  const baseLabelBySeries = new Map<string, string>();
+  const byBaseLabel = new Map<string, Polar[]>();
+  for (const polar of polars) {
+    const machLabel = polar.mach == null ? "" : polar.mach.toFixed(2);
+    const baseLabel = `Re ${fRe(polar.re)}${machLabel ? ` · M ${machLabel}` : ""}`;
+    baseLabelBySeries.set(polar.seriesId, baseLabel);
+    const list = byBaseLabel.get(baseLabel) ?? [];
+    list.push(polar);
+    byBaseLabel.set(baseLabel, list);
+  }
+  const usedHues = new Set<number>();
+  for (const polar of polars) {
+    const baseLabel = baseLabelBySeries.get(polar.seriesId)!;
+    const collisions = byBaseLabel.get(baseLabel) ?? [];
+    const ordinal = collisions.findIndex(
+      (candidate) => candidate.seriesId === polar.seriesId,
+    );
+    polar.label =
+      collisions.length > 1
+        ? `${baseLabel} · condition ${ordinal + 1}`
+        : baseLabel;
+    if (polars.length === 1) {
+      polar.color = colorForRe(polar.re);
+    } else {
+      let hue = seriesHue(polar.seriesId);
+      while (usedHues.has(hue)) hue = (hue + 47) % 360;
+      usedHues.add(hue);
+      polar.color = `hsl(${hue} 72% 62%)`;
+    }
+  }
+  return polars;
+}
+
 /** Odd-function negation that never emits -0. */
-function negated(v: number): number {
+function negated(v: number): number;
+function negated(v: null): null;
+function negated(v: number | null): number | null;
+function negated(v: number | null): number | null {
+  if (v == null) return null;
   return v === 0 ? 0 : -v;
 }
 
@@ -102,6 +272,7 @@ function negated(v: number): number {
  *  mirrored α suppresses the mirror. */
 function mirroredSolvedPoints(
   rows: { result: Result; classification: SolvedClassification }[],
+  evidenceRoles?: Map<string, PublicEvidenceRole>,
 ): DerivedPolarPointData[] {
   const realAoas = new Set(rows.map((row) => canonicalAoa(row.result.aoaDeg)));
   const mirrored: DerivedPolarPointData[] = [];
@@ -115,6 +286,7 @@ function mirroredSolvedPoints(
     const source = solvedToPoint(row.result, row.classification);
     mirrored.push({
       ...source,
+      evidenceRole: evidenceRoles?.get(row.result.id),
       a: mirroredAoa,
       cl: negated(source.cl),
       cm: negated(source.cm),
@@ -217,7 +389,9 @@ export async function loadSimulationWorks(
       engineState: job.engineState,
       engineJobId: job.engineJobId,
       retryMode: payload.retryMode ?? null,
-      setupName: payload.setupSnapshot?.preset?.name ?? null,
+      // Public solver-work summaries describe physical conditions and status;
+      // internal preset/batch names are deliberately not exposed.
+      setupName: null,
       aoas,
       aoaMin,
       aoaMax,
@@ -301,6 +475,292 @@ const validPolarPoint = sql<boolean>`(
   )
 )`;
 
+async function loadSolvedRows(
+  airfoilId: string,
+  revisionIds: string[],
+): Promise<Map<string, SolvedRow[]>> {
+  const solvedByRevision = new Map<string, SolvedRow[]>();
+  if (revisionIds.length === 0) return solvedByRevision;
+  const rows = await db
+    .select({
+      result: results,
+      state: resultClassifications.state,
+      region: resultClassifications.region,
+      reasons: resultClassifications.reasons,
+      confidence: resultClassifications.confidence,
+      reviewVerdict: resultReviewVerdicts.verdict,
+      reviewNote: resultReviewVerdicts.note,
+      reviewReviewer: resultReviewVerdicts.reviewer,
+      reviewCreatedAt: resultReviewVerdicts.createdAt,
+    })
+    .from(results)
+    .leftJoin(
+      resultClassifications,
+      eq(resultClassifications.resultId, results.id),
+    )
+    .leftJoin(
+      resultReviewVerdicts,
+      and(
+        eq(resultReviewVerdicts.resultId, results.id),
+        isNull(resultReviewVerdicts.revokedAt),
+        inArray(resultReviewVerdicts.verdict, ["waive", "exclude"]),
+      ),
+    )
+    .where(
+      and(
+        eq(results.airfoilId, airfoilId),
+        inArray(results.simulationPresetRevisionId, revisionIds),
+        eq(results.source, "solved"),
+        eq(results.status, "done"),
+        or(
+          eq(resultReviewVerdicts.verdict, "waive"),
+          and(
+            isNull(resultReviewVerdicts.id),
+            inArray(resultClassifications.state, ["accepted", "needs_urans"]),
+          ),
+          and(
+            isNull(resultReviewVerdicts.id),
+            isNull(resultClassifications.id),
+            validPolarPoint,
+          ),
+        ),
+      ),
+    );
+  for (const row of rows) {
+    const revisionId = row.result.simulationPresetRevisionId;
+    if (!revisionId) continue;
+    const list = solvedByRevision.get(revisionId) ?? [];
+    list.push({
+      result: row.result,
+      classification: {
+        state: row.reviewVerdict === "waive" ? "accepted" : row.state,
+        region: row.reviewVerdict === "waive" ? "attached" : row.region,
+        reasons: row.reviewVerdict === "waive" ? [] : row.reasons,
+        confidence: row.confidence,
+        review:
+          row.reviewVerdict === "waive" &&
+          row.reviewCreatedAt &&
+          row.reviewReviewer
+            ? {
+                verdict: "waive",
+                note: row.reviewNote,
+                reviewer: row.reviewReviewer,
+                at: row.reviewCreatedAt.toISOString(),
+              }
+            : null,
+      },
+    });
+    solvedByRevision.set(revisionId, list);
+  }
+  return solvedByRevision;
+}
+
+type FitRowShape = {
+  status: PolarFit["status"];
+  confidence: number;
+  acceptedPointCount: number;
+  provisionalPointCount: number;
+  rejectedPointCount: number;
+  evidenceSignature: string;
+  ldmax: number | null;
+  alphaLdmax: number | null;
+  alphaLdmaxFine: number | null;
+  alphaClZeroFine: number | null;
+  alphaClmaxFine: number | null;
+  cdmin: number | null;
+  clAtCdmin: number | null;
+  cd0: number | null;
+  clmax: number | null;
+  alphaClmax: number | null;
+  cm0: number | null;
+};
+
+function polarFitFromRows(
+  row: FitRowShape,
+  points: Array<{ a: number; cl: number; cd: number; cm: number; ld: number }>,
+): PolarFit {
+  return {
+    status: row.status,
+    confidence: row.confidence,
+    acceptedPointCount: row.acceptedPointCount,
+    provisionalPointCount: row.provisionalPointCount,
+    rejectedPointCount: row.rejectedPointCount,
+    evidenceSignature: row.evidenceSignature,
+    points,
+    metrics:
+      row.ldmax == null ||
+      row.alphaLdmax == null ||
+      row.cdmin == null ||
+      row.clAtCdmin == null ||
+      row.cd0 == null ||
+      row.clmax == null ||
+      row.alphaClmax == null ||
+      row.cm0 == null
+        ? null
+        : {
+            ldmax: row.ldmax,
+            aLd: row.alphaLdmax,
+            alphaLdmaxFine: row.alphaLdmaxFine ?? row.alphaLdmax,
+            alphaClZeroFine: row.alphaClZeroFine ?? null,
+            alphaClmaxFine: row.alphaClmaxFine ?? null,
+            cdmin: row.cdmin,
+            clCd: row.clAtCdmin,
+            cd0: row.cd0,
+            clmax: row.clmax,
+            aStall: row.alphaClmax,
+            cm0: row.cm0,
+          },
+  };
+}
+
+async function loadRevisionFits(
+  airfoilId: string,
+  revisionIds: string[],
+): Promise<Map<string, PolarFit>> {
+  const fitByRevision = new Map<string, PolarFit>();
+  if (revisionIds.length === 0) return fitByRevision;
+  const fitRows = await db
+    .select()
+    .from(polarFitSets)
+    .where(
+      and(
+        inArray(polarFitSets.simulationPresetRevisionId, revisionIds),
+        eq(polarFitSets.airfoilId, airfoilId),
+        eq(polarFitSets.isCurrent, true),
+      ),
+    );
+  const fitIds = fitRows.map((row) => row.id);
+  const pointRows = fitIds.length
+    ? await db
+        .select()
+        .from(polarFitPoints)
+        .where(inArray(polarFitPoints.fitSetId, fitIds))
+    : [];
+  const pointsBySet = new Map<string, typeof pointRows>();
+  for (const point of pointRows) {
+    const list = pointsBySet.get(point.fitSetId) ?? [];
+    list.push(point);
+    pointsBySet.set(point.fitSetId, list);
+  }
+  for (const fit of fitRows) {
+    const points = (pointsBySet.get(fit.id) ?? [])
+      .sort((x, y) => x.aoaDeg - y.aoaDeg)
+      .map((point) => ({
+        a: point.aoaDeg,
+        cl: point.cl,
+        cd: point.cd,
+        cm: point.cm,
+        ld: point.clCd,
+      }));
+    fitByRevision.set(
+      fit.simulationPresetRevisionId,
+      polarFitFromRows(fit, points),
+    );
+  }
+  return fitByRevision;
+}
+
+type CompatibilityCache = {
+  fitByHash: Map<string, PolarFit>;
+  measuredResultIdsByHash: Map<string, Set<string>>;
+  memberRolesByHash: Map<string, Map<string, PublicEvidenceRole>>;
+  cachedHashes: Set<string>;
+};
+
+async function loadCompatibilityCache(
+  airfoilId: string,
+  hashes: string[],
+): Promise<CompatibilityCache> {
+  const fitByHash = new Map<string, PolarFit>();
+  const measuredResultIdsByHash = new Map<string, Set<string>>();
+  const memberRolesByHash = new Map<string, Map<string, PublicEvidenceRole>>();
+  const cachedHashes = new Set<string>();
+  if (hashes.length === 0) {
+    return {
+      fitByHash,
+      measuredResultIdsByHash,
+      memberRolesByHash,
+      cachedHashes,
+    };
+  }
+  const fitRows = await db
+    .select()
+    .from(polarCompatibilityFitSets)
+    .where(
+      and(
+        eq(polarCompatibilityFitSets.airfoilId, airfoilId),
+        eq(
+          polarCompatibilityFitSets.compatibilityVersion,
+          POLAR_COMPATIBILITY_VERSION,
+        ),
+        inArray(polarCompatibilityFitSets.compatibilityHash, hashes),
+        eq(polarCompatibilityFitSets.isCurrent, true),
+      ),
+    );
+  const fitIds = fitRows.map((row) => row.id);
+  const [pointRows, memberRows] = fitIds.length
+    ? await Promise.all([
+        db
+          .select()
+          .from(polarCompatibilityFitPoints)
+          .where(inArray(polarCompatibilityFitPoints.fitSetId, fitIds)),
+        db
+          .select({
+            fitSetId: polarCompatibilityFitMembers.fitSetId,
+            resultId: polarCompatibilityFitMembers.resultId,
+            role: polarCompatibilityFitMembers.role,
+          })
+          .from(polarCompatibilityFitMembers)
+          .where(inArray(polarCompatibilityFitMembers.fitSetId, fitIds)),
+      ])
+    : [[], []];
+  const pointsBySet = new Map<string, typeof pointRows>();
+  for (const point of pointRows) {
+    const list = pointsBySet.get(point.fitSetId) ?? [];
+    list.push(point);
+    pointsBySet.set(point.fitSetId, list);
+  }
+  const hashBySetId = new Map(
+    fitRows.map((row) => [row.id, row.compatibilityHash]),
+  );
+  for (const member of memberRows) {
+    const hash = hashBySetId.get(member.fitSetId);
+    if (!hash) continue;
+    const measuredIds = measuredResultIdsByHash.get(hash) ?? new Set<string>();
+    measuredIds.add(member.resultId);
+    measuredResultIdsByHash.set(hash, measuredIds);
+    const publicRole: PublicEvidenceRole =
+      member.role === "selected"
+        ? "primary"
+        : member.role === "conflict"
+          ? "conflict"
+          : "alternate";
+    const roles =
+      memberRolesByHash.get(hash) ?? new Map<string, PublicEvidenceRole>();
+    roles.set(member.resultId, publicRole);
+    memberRolesByHash.set(hash, roles);
+  }
+  for (const fit of fitRows) {
+    cachedHashes.add(fit.compatibilityHash);
+    const points = (pointsBySet.get(fit.id) ?? [])
+      .sort((x, y) => x.aoaDeg - y.aoaDeg)
+      .map((point) => ({
+        a: point.aoaDeg,
+        cl: point.cl,
+        cd: point.cd,
+        cm: point.cm,
+        ld: point.clCd,
+      }));
+    fitByHash.set(fit.compatibilityHash, polarFitFromRows(fit, points));
+  }
+  return {
+    fitByHash,
+    measuredResultIdsByHash,
+    memberRolesByHash,
+    cachedHashes,
+  };
+}
+
 /** Assemble the public airfoil detail payload.
  *
  *  `opts.revisionId` (campaign spec §11 surgical exception): scope the polar
@@ -308,7 +768,8 @@ const validPolarPoint = sql<boolean>`(
  *  cell side panel can reuse this payload for its pinned-revision PolarViewer.
  *  Scoped mode always emits that revision's Re entry (possibly with zero
  *  points) so "no solved points yet" renders honestly instead of hiding the
- *  curve. Default (no revisionId) behaviour is unchanged. */
+ *  curve. Public mode groups all evidence under enabled, physics-compatible
+ *  setup anchors; internal batch/revision names never define a curve. */
 export async function assembleDetail(
   slug: string,
   opts: { revisionId?: string | null } = {},
@@ -334,310 +795,209 @@ export async function assembleDetail(
 
   const geo = geometryFor(a);
 
-  // The Detail-page curves are accepted stored solver evidence only. Scheduled
-  // work is exposed separately so empty queue placeholders never look like polars.
-  const [air] = await db
-    .select({ id: mediums.id })
-    .from(mediums)
-    .where(eq(mediums.slug, "air"))
-    .limit(1);
-  const revisionsByRe = new Map<
-    number,
-    {
-      id: string;
-      createdAt: Date;
-      revisionNumber: number;
-      mach: number | null;
-    }[]
-  >();
-  const reByRevision = new Map<string, number>();
-  const machByRevision = new Map<string, number | null>();
-  let scopedRe: number | null = null;
+  // Public curves are grouped by physics/numerics compatibility, never by a
+  // batch/revision name and never by rounded Reynolds alone. Enabled air
+  // revisions anchor which compatibility hashes are public; once anchored,
+  // accepted evidence from every equivalent immutable revision participates.
+  // A pinned admin journey remains scoped to exactly the requested revision.
+  const revisionSelection = {
+    id: simulationPresetRevisions.id,
+    reynolds: simulationPresetRevisions.reynolds,
+    mach: simulationPresetRevisions.mach,
+    createdAt: simulationPresetRevisions.createdAt,
+    revisionNumber: simulationPresetRevisions.revisionNumber,
+    physicsHash: simulationPresetRevisions.physicsHash,
+    snapshot: simulationPresetRevisions.snapshot,
+  };
+  let pinnedRevision: DetailRevision | null = null;
+  const anchorsByHash = new Map<string, DetailRevision[]>();
+  const revisionById = new Map<string, DetailRevision>();
+
   if (opts.revisionId) {
-    // Pinned-revision scope: exactly this revision, regardless of preset
-    // enabled state or medium (campaign presets are disabled by design).
-    const [rev] = await db
-      .select({
-        revisionId: simulationPresetRevisions.id,
-        reynolds: simulationPresetRevisions.reynolds,
-        mach: simulationPresetRevisions.mach,
-        createdAt: simulationPresetRevisions.createdAt,
-        revisionNumber: simulationPresetRevisions.revisionNumber,
-      })
+    const [row] = await db
+      .select(revisionSelection)
       .from(simulationPresetRevisions)
       .where(eq(simulationPresetRevisions.id, opts.revisionId))
       .limit(1);
-    if (rev) {
-      const roundedRe = Math.round(rev.reynolds);
-      if (roundedRe > 0) {
-        scopedRe = roundedRe;
-        reByRevision.set(rev.revisionId, roundedRe);
-        machByRevision.set(rev.revisionId, rev.mach);
-        revisionsByRe.set(roundedRe, [
-          {
-            id: rev.revisionId,
-            createdAt: rev.createdAt,
-            revisionNumber: rev.revisionNumber,
-            mach: rev.mach,
-          },
-        ]);
-      }
+    if (row && Math.round(row.reynolds) > 0) {
+      pinnedRevision = row;
+      revisionById.set(row.id, row);
     }
-  } else if (air) {
-    const rows = await db
-      .select({
-        revisionId: simulationPresetRevisions.id,
-        reynolds: simulationPresetRevisions.reynolds,
-        mach: simulationPresetRevisions.mach,
-        createdAt: simulationPresetRevisions.createdAt,
-        revisionNumber: simulationPresetRevisions.revisionNumber,
-      })
-      .from(simulationPresets)
-      .innerJoin(
-        flowConditions,
-        eq(flowConditions.id, simulationPresets.flowConditionId),
-      )
-      .innerJoin(
-        simulationPresetRevisions,
-        eq(simulationPresetRevisions.presetId, simulationPresets.id),
-      )
-      .where(
-        and(
-          eq(flowConditions.mediumId, air.id),
-          eq(simulationPresets.enabled, true),
-        ),
-      )
-      .orderBy(
-        desc(simulationPresetRevisions.createdAt),
-        desc(simulationPresetRevisions.revisionNumber),
-      );
-    for (const row of rows) {
-      const roundedRe = Math.round(row.reynolds);
-      if (roundedRe <= 0) continue;
-      reByRevision.set(row.revisionId, roundedRe);
-      machByRevision.set(row.revisionId, row.mach);
-      const list = revisionsByRe.get(roundedRe) ?? [];
-      list.push({
-        id: row.revisionId,
-        createdAt: row.createdAt,
-        revisionNumber: row.revisionNumber,
-        mach: row.mach,
-      });
-      revisionsByRe.set(roundedRe, list);
-    }
-  }
-
-  // Any solved results across enabled setup revisions upgrade the corresponding curve in place.
-  const revisionIds = [...reByRevision.keys()];
-  const solvedByRevision = new Map<
-    string,
-    {
-      result: Result;
-      classification: SolvedClassification;
-    }[]
-  >();
-  if (revisionIds.length) {
-    const rows = await db
-      .select({
-        result: results,
-        state: resultClassifications.state,
-        region: resultClassifications.region,
-        reasons: resultClassifications.reasons,
-        confidence: resultClassifications.confidence,
-        reviewVerdict: resultReviewVerdicts.verdict,
-        reviewNote: resultReviewVerdicts.note,
-        reviewReviewer: resultReviewVerdicts.reviewer,
-        reviewCreatedAt: resultReviewVerdicts.createdAt,
-      })
-      .from(results)
-      .leftJoin(
-        resultClassifications,
-        eq(resultClassifications.resultId, results.id),
-      )
-      .leftJoin(
-        resultReviewVerdicts,
-        and(
-          eq(resultReviewVerdicts.resultId, results.id),
-          isNull(resultReviewVerdicts.revokedAt),
-          inArray(resultReviewVerdicts.verdict, ["waive", "exclude"]),
-        ),
-      )
-      .where(
-        and(
-          eq(results.airfoilId, a.id),
-          inArray(results.simulationPresetRevisionId, revisionIds),
-          eq(results.source, "solved"),
-          eq(results.status, "done"),
-          or(
-            eq(resultReviewVerdicts.verdict, "waive"),
-            and(
-              isNull(resultReviewVerdicts.id),
-              inArray(resultClassifications.state, ["accepted", "needs_urans"]),
-            ),
-            and(
-              isNull(resultReviewVerdicts.id),
-              isNull(resultClassifications.id),
-              validPolarPoint,
-            ),
+  } else {
+    const [air] = await db
+      .select({ id: mediums.id })
+      .from(mediums)
+      .where(eq(mediums.slug, "air"))
+      .limit(1);
+    if (air) {
+      const anchorRows = await db
+        .select(revisionSelection)
+        .from(simulationPresets)
+        .innerJoin(
+          flowConditions,
+          eq(flowConditions.id, simulationPresets.flowConditionId),
+        )
+        .innerJoin(
+          simulationPresetRevisions,
+          eq(simulationPresetRevisions.presetId, simulationPresets.id),
+        )
+        .where(
+          and(
+            eq(flowConditions.mediumId, air.id),
+            eq(simulationPresets.enabled, true),
           ),
-        ),
-      );
-    for (const row of rows) {
-      const r = row.result;
-      if (
-        !r.simulationPresetRevisionId ||
-        !reByRevision.has(r.simulationPresetRevisionId)
-      )
-        continue;
-      (
-        solvedByRevision.get(r.simulationPresetRevisionId) ??
-        solvedByRevision
-          .set(r.simulationPresetRevisionId, [])
-          .get(r.simulationPresetRevisionId)!
-      ).push({
-        result: r,
-        classification: {
-          state: row.reviewVerdict === "waive" ? "accepted" : row.state,
-          region: row.reviewVerdict === "waive" ? "attached" : row.region,
-          reasons: row.reviewVerdict === "waive" ? [] : row.reasons,
-          confidence: row.confidence,
-          review:
-            row.reviewVerdict === "waive" &&
-            row.reviewCreatedAt &&
-            row.reviewReviewer
-              ? {
-                  verdict: "waive",
-                  note: row.reviewNote,
-                  reviewer: row.reviewReviewer,
-                  at: row.reviewCreatedAt.toISOString(),
-                }
-              : null,
-        },
-      });
-    }
-  }
-
-  const fitByRevision = new Map<string, PolarFit>();
-  if (revisionIds.length) {
-    const fitRows = await db
-      .select()
-      .from(polarFitSets)
-      .where(
-        and(
-          inArray(polarFitSets.simulationPresetRevisionId, revisionIds),
-          eq(polarFitSets.airfoilId, a.id),
-          eq(polarFitSets.isCurrent, true),
-        ),
-      );
-    const fitIds = fitRows.map((row) => row.id);
-    const fitPointRows = fitIds.length
-      ? await db
-          .select()
-          .from(polarFitPoints)
-          .where(inArray(polarFitPoints.fitSetId, fitIds))
-      : [];
-    const fitPointsBySet = new Map<string, typeof fitPointRows>();
-    for (const row of fitPointRows) {
-      (
-        fitPointsBySet.get(row.fitSetId) ??
-        fitPointsBySet.set(row.fitSetId, []).get(row.fitSetId)!
-      ).push(row);
-    }
-    for (const row of fitRows) {
-      const points = (fitPointsBySet.get(row.id) ?? [])
-        .sort((x, y) => x.aoaDeg - y.aoaDeg)
-        .map((p) => ({
-          a: p.aoaDeg,
-          cl: p.cl,
-          cd: p.cd,
-          cm: p.cm,
-          ld: p.clCd,
-        }));
-      fitByRevision.set(row.simulationPresetRevisionId, {
-        status: row.status,
-        confidence: row.confidence,
-        acceptedPointCount: row.acceptedPointCount,
-        provisionalPointCount: row.provisionalPointCount,
-        rejectedPointCount: row.rejectedPointCount,
-        evidenceSignature: row.evidenceSignature,
-        points,
-        metrics:
-          row.ldmax == null ||
-          row.alphaLdmax == null ||
-          row.cdmin == null ||
-          row.clAtCdmin == null ||
-          row.cd0 == null ||
-          row.clmax == null ||
-          row.alphaClmax == null ||
-          row.cm0 == null
-            ? null
-            : {
-                ldmax: row.ldmax,
-                aLd: row.alphaLdmax,
-                // pre-v2 fit rows have no fine targets; the coarse peak stands in until refit
-                alphaLdmaxFine: row.alphaLdmaxFine ?? row.alphaLdmax,
-                alphaClZeroFine: row.alphaClZeroFine ?? null,
-                // pre-v3 fit rows: null until refit — no coarse stand-in, a
-                // boundary argmax must stay an honest absence (see 0035).
-                alphaClmaxFine: row.alphaClmaxFine ?? null,
-                cdmin: row.cdmin,
-                clCd: row.clAtCdmin,
-                cd0: row.cd0,
-                clmax: row.clmax,
-                aStall: row.alphaClmax,
-                cm0: row.cm0,
-              },
-      });
-    }
-  }
-
-  const solvedReValues = new Set<number>();
-  for (const [revisionId, rows] of solvedByRevision) {
-    if (rows.length) {
-      const re = reByRevision.get(revisionId);
-      if (re !== undefined) solvedReValues.add(re);
-    }
-  }
-  for (const [revisionId, fit] of fitByRevision) {
-    if (fit.points.length || fit.metrics) {
-      const re = reByRevision.get(revisionId);
-      if (re !== undefined) solvedReValues.add(re);
-    }
-  }
-  // Pinned-revision scope: always surface the revision's Re so an empty
-  // polar renders as explicitly-empty evidence, never as a missing curve.
-  if (scopedRe != null) solvedReValues.add(scopedRe);
-  const reList = [...solvedReValues].sort((a, b) => a - b);
-  const polars: Polar[] = reList.map((re) => {
-    const revision =
-      (revisionsByRe.get(re) ?? []).find(
-        (candidate) =>
-          (solvedByRevision.get(candidate.id)?.length ?? 0) > 0 ||
-          Boolean(fitByRevision.get(candidate.id)?.points.length),
-      ) ?? (scopedRe != null ? (revisionsByRe.get(re) ?? [])[0] : undefined);
-    const rows = revision ? solvedByRevision.get(revision.id) : undefined;
-    const fit = revision ? fitByRevision.get(revision.id) : undefined;
-    if (revision && rows && rows.length) {
-      const points: PolarPointData[] = rows
-        .sort((x, y) => x.result.aoaDeg - y.result.aoaDeg)
-        .map((row) => solvedToPoint(row.result, row.classification));
-      if (a.isSymmetric) {
-        // Spec §9.2–§9.3: append display-only mirrored points; results rows and
-        // solver-run counts stay real solves only.
-        points.push(...mirroredSolvedPoints(rows));
-        points.sort((x, y) => x.a - y.a);
+        );
+      for (const row of anchorRows) {
+        if (Math.round(row.reynolds) <= 0) continue;
+        const hash = effectivePhysicsHash(row);
+        const anchors = anchorsByHash.get(hash) ?? [];
+        anchors.push(row);
+        anchorsByHash.set(hash, anchors);
+        revisionById.set(row.id, row);
       }
-      return {
+    }
+
+    if (anchorsByHash.size > 0) {
+      // Result-bearing revisions are the bounded rollout fallback for legacy
+      // NULL physics_hash rows. Compatibility cache members cover this same
+      // set after the production backfill, but the public page must not lose
+      // real evidence while that additive cache is being populated.
+      const evidenceRevisionRows = await db
+        .selectDistinct(revisionSelection)
+        .from(simulationPresetRevisions)
+        .innerJoin(
+          results,
+          eq(results.simulationPresetRevisionId, simulationPresetRevisions.id),
+        )
+        .where(eq(results.airfoilId, a.id));
+      for (const row of evidenceRevisionRows) {
+        const hash = effectivePhysicsHash(row);
+        if (anchorsByHash.has(hash)) revisionById.set(row.id, row);
+      }
+    }
+  }
+
+  const revisionIds = [...revisionById.keys()];
+  const solvedByRevision = await loadSolvedRows(a.id, revisionIds);
+  let polars: Polar[];
+  if (pinnedRevision) {
+    const rows = (solvedByRevision.get(pinnedRevision.id) ?? []).sort(
+      (x, y) => x.result.aoaDeg - y.result.aoaDeg,
+    );
+    const fit = (await loadRevisionFits(a.id, [pinnedRevision.id])).get(
+      pinnedRevision.id,
+    );
+    const points = rows.map((row) =>
+      solvedToPoint(row.result, row.classification),
+    );
+    if (a.isSymmetric) {
+      points.push(...mirroredSolvedPoints(rows));
+      points.sort((x, y) => x.a - y.a);
+    }
+    const re = Math.round(pinnedRevision.reynolds);
+    const mach = pinnedRevision.mach ?? undefined;
+    polars = [
+      {
+        seriesId: `revision:${pinnedRevision.id}`,
+        label: `Re ${fRe(re)}${mach == null ? "" : ` · M ${mach.toFixed(2)}`}`,
         re,
-        mach: machByRevision.get(revision.id) ?? undefined,
+        mach,
         color: colorForRe(re),
-        source: "solved",
+        source: rows.length > 0 ? "solved" : "queued",
         points,
         fit,
-      };
+      },
+    ];
+  } else if (opts.revisionId) {
+    polars = [];
+  } else {
+    const hashes = [...anchorsByHash.keys()];
+    const compatibility = await loadCompatibilityCache(a.id, hashes);
+    const hashByRevision = new Map<string, string>();
+    for (const revision of revisionById.values()) {
+      const hash = effectivePhysicsHash(revision);
+      if (anchorsByHash.has(hash)) hashByRevision.set(revision.id, hash);
     }
-    return { re, color: colorForRe(re), source: "queued", points: [], fit };
-  });
+    const rowsByHash = new Map<string, SolvedRow[]>();
+    for (const [revisionId, rows] of solvedByRevision) {
+      const hash = hashByRevision.get(revisionId);
+      if (!hash) continue;
+      const list = rowsByHash.get(hash) ?? [];
+      list.push(...rows);
+      rowsByHash.set(hash, list);
+    }
+
+    const drafts: Polar[] = [];
+    for (const [hash, anchors] of anchorsByHash) {
+      const allRows = rowsByHash.get(hash) ?? [];
+      const measuredIds = compatibility.measuredResultIdsByHash.get(hash);
+      const cachedRoles = compatibility.memberRolesByHash.get(hash);
+      const resolvedRows = compatibility.cachedHashes.has(hash)
+        ? allRows
+            .filter((row) => measuredIds?.has(row.result.id))
+            .map((row) => ({
+              row,
+              role: cachedRoles?.get(row.result.id) ?? ("alternate" as const),
+            }))
+            .sort(
+              (x, y) =>
+                x.row.result.aoaDeg - y.row.result.aoaDeg ||
+                x.row.result.id.localeCompare(y.row.result.id),
+            )
+        : resolveFallbackCompatibilityRows(allRows);
+      const rows = resolvedRows.map(({ row }) => row);
+      if (rows.length === 0) continue;
+      const anchor = [...anchors].sort(
+        (x, y) =>
+          x.createdAt.getTime() - y.createdAt.getTime() ||
+          x.revisionNumber - y.revisionNumber ||
+          x.id.localeCompare(y.id),
+      )[0];
+      const evidenceRoles = new Map(
+        resolvedRows.map(({ row, role }) => [row.result.id, role]),
+      );
+      const displayRows = resolvedRows.map(({ row, role }) => ({
+        result: row.result,
+        classification:
+          role === "conflict"
+            ? {
+                ...row.classification,
+                reasons: [
+                  ...(row.classification.reasons ?? []),
+                  "compatibility_conflict",
+                ],
+              }
+            : row.classification,
+      }));
+      const points: PolarPointData[] = displayRows.map((row) => ({
+        ...solvedToPoint(row.result, row.classification),
+        evidenceRole: evidenceRoles.get(row.result.id),
+      }));
+      if (a.isSymmetric) {
+        points.push(...mirroredSolvedPoints(displayRows, evidenceRoles));
+        points.sort((x, y) => x.a - y.a);
+      }
+      const cacheComplete =
+        !measuredIds ||
+        [...measuredIds].every((resultId) =>
+          rows.some((row) => row.result.id === resultId),
+        );
+      drafts.push({
+        seriesId: polarCompatibilitySeriesId(hash),
+        label: "",
+        re: Math.round(anchor.reynolds),
+        mach: anchor.mach ?? undefined,
+        color: "",
+        source: "solved",
+        points,
+        fit: cacheComplete ? compatibility.fitByHash.get(hash) : undefined,
+      });
+    }
+    polars = decoratePublicPolars(drafts);
+  }
+  const reList = [...new Set(polars.map((polar) => polar.re))].sort(
+    (x, y) => x - y,
+  );
   const simulationWorks = await loadSimulationWorks(a.id);
   const displayedMach =
     polars.find((polar) => polar.points.length > 0)?.mach ??

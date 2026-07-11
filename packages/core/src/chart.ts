@@ -1,4 +1,3 @@
-import { fRe } from "./format";
 import type {
   ChartCurve,
   ChartPointVM,
@@ -43,13 +42,25 @@ export interface DerivedBySymmetryInfo {
 }
 
 /** Read the derived-by-symmetry marker off a polar point (absent → not derived). */
-export function derivedBySymmetryInfo(p: PolarPointData): DerivedBySymmetryInfo {
-  const d = p as PolarPointData & { derived?: boolean; derivedFromResultId?: string | null; derivedFromAoaDeg?: number | null };
-  if (d.derived !== true) return { derived: false, derivedFromResultId: null, derivedFromAoaDeg: null };
+export function derivedBySymmetryInfo(
+  p: PolarPointData,
+): DerivedBySymmetryInfo {
+  const d = p as PolarPointData & {
+    derived?: boolean;
+    derivedFromResultId?: string | null;
+    derivedFromAoaDeg?: number | null;
+  };
+  if (d.derived !== true)
+    return {
+      derived: false,
+      derivedFromResultId: null,
+      derivedFromAoaDeg: null,
+    };
   return {
     derived: true,
     derivedFromResultId: d.derivedFromResultId ?? p.resultId ?? null,
-    derivedFromAoaDeg: typeof d.derivedFromAoaDeg === "number" ? d.derivedFromAoaDeg : null,
+    derivedFromAoaDeg:
+      typeof d.derivedFromAoaDeg === "number" ? d.derivedFromAoaDeg : null,
   };
 }
 
@@ -70,11 +81,15 @@ export function xyOf(p: PolarPointData, type: ChartType): [number, number] {
   if (type === "cla") return [p.a, p.cl];
   if (type === "clcd") return [p.cd, p.cl];
   if (type === "lda") return [p.a, p.ld];
-  return [p.a, p.cm];
+  return [p.a, p.cm ?? Number.NaN];
 }
 
 /** "Nice" axis tick steps — verbatim from the prototype. */
-export function niceTicks(min: number, max: number, count: number): { step: number; out: number[] } {
+export function niceTicks(
+  min: number,
+  max: number,
+  count: number,
+): { step: number; out: number[] } {
   const span = max - min || 1;
   const raw = span / count;
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
@@ -98,15 +113,24 @@ export interface ChartDomain {
 
 export interface ProjectChartInput {
   chartType: ChartType;
-  /** all per-Re polars available (used for the Cl–Cd domain scan regardless of visibility) */
-  polars: { re: number; color: string; points: PolarPointData[]; fit?: PolarFit | null }[];
-  visibleRe: Record<number, boolean>;
+  /** All public polar series available (used for the Cl–Cd domain scan
+   *  regardless of visibility). Reynolds is display metadata, not identity. */
+  polars: {
+    seriesId: string;
+    label: string;
+    re: number;
+    color: string;
+    points: PolarPointData[];
+    fit?: PolarFit | null;
+  }[];
+  visibleSeries: Record<string, boolean>;
   hoverKey?: string | null;
   /** Zoom/pan window override. Omitted/null → fit the visible data (auto). */
   domain?: Partial<ChartDomain> | null;
 }
 
 interface VisCurve {
+  seriesId: string;
   re: number;
   color: string;
   dash: string;
@@ -115,41 +139,119 @@ interface VisCurve {
   kind: "measured" | "fit";
 }
 
+interface VisPointSeries {
+  seriesId: string;
+  re: number;
+  color: string;
+  data: PolarPointData[];
+  label: string;
+}
+
+function isPrimaryEvidence(point: PolarPointData): boolean {
+  return point.evidenceRole == null || point.evidenceRole === "primary";
+}
+
+/** Build measured-line segments from primary evidence only. A conflict-only
+ * angle is an explicit break: the chart keeps every contradictory result as a
+ * clickable marker without drawing a line through an unresolved measurement. */
+export function measuredEvidenceSegments(
+  points: PolarPointData[],
+): PolarPointData[][] {
+  const byAoa = new Map<number, PolarPointData[]>();
+  for (const point of [...points].sort((a, b) => a.a - b.a)) {
+    const bucket = byAoa.get(point.a) ?? [];
+    bucket.push(point);
+    byAoa.set(point.a, bucket);
+  }
+  const segments: PolarPointData[][] = [];
+  let current: PolarPointData[] = [];
+  for (const bucket of byAoa.values()) {
+    const primary = bucket.filter(isPrimaryEvidence);
+    if (primary.length === 0) {
+      if (current.length) segments.push(current);
+      current = [];
+      continue;
+    }
+    current.push(...primary);
+  }
+  if (current.length) segments.push(current);
+  return segments;
+}
+
+function finiteChartSegments(
+  points: PolarPointData[],
+  type: ChartType,
+): PolarPointData[][] {
+  const segments: PolarPointData[][] = [];
+  let current: PolarPointData[] = [];
+  for (const point of points) {
+    const [x, y] = xyOf(point, type);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      if (current.length) segments.push(current);
+      current = [];
+      continue;
+    }
+    current.push(point);
+  }
+  if (current.length) segments.push(current);
+  return segments;
+}
+
 /**
  * Project polars into SVG-ready curves/points/ticks. Pure port of the chart
  * section of renderVals() in Airfoil Detail.dc.html — same coordinate math,
  * colors, point radii and post-stall styling.
  */
 export function projectChart(input: ProjectChartInput): ChartProjection {
-  const { chartType: type, polars, visibleRe, hoverKey } = input;
+  const { chartType: type, polars, visibleSeries, hoverKey } = input;
   const { PX0, PX1, PY0, PY1 } = CHART_VIEW;
 
   const visCurves: VisCurve[] = [];
+  const visPointSeries: VisPointSeries[] = [];
   for (const pl of polars) {
-    if (visibleRe[pl.re]) {
-      visCurves.push({
+    if (visibleSeries[pl.seriesId]) {
+      visPointSeries.push({
+        seriesId: pl.seriesId,
         re: pl.re,
         color: pl.color,
-        dash: "0",
         data: pl.points,
-        label: "Re " + fRe(pl.re),
-        kind: "measured",
+        label: pl.label,
       });
+      const measuredSegments = measuredEvidenceSegments(pl.points).flatMap(
+        (segment) => finiteChartSegments(segment, type),
+      );
+      for (const segment of measuredSegments) {
+        visCurves.push({
+          seriesId: pl.seriesId,
+          re: pl.re,
+          color: pl.color,
+          dash: "0",
+          data: segment,
+          label: pl.label,
+          kind: "measured",
+        });
+      }
       if (pl.fit?.points.length) {
         // Support-gated: fit samples are drawn only where measured data
         // backs them. LOWESS interpolation across large solved-α gaps (and
         // extrapolation past the coverage ends) invents physically impossible
         // polar shapes — prod incident: an S1223 drag polar with 7 solved
         // points drew a second Cl-Cd lobe below the measured Cd minimum.
-        for (const seg of supportedFitSegments(pl.fit.points, measuredAlphas(pl.points))) {
-          visCurves.push({
-            re: pl.re,
-            color: pl.color,
-            dash: "7 5",
-            data: seg.map(fitPointToPolarPoint),
-            label: "fit Re " + fRe(pl.re),
-            kind: "fit",
-          });
+        for (const measuredSegment of measuredSegments) {
+          for (const seg of supportedFitSegments(
+            pl.fit.points,
+            measuredSegment.map((point) => point.a),
+          )) {
+            visCurves.push({
+              seriesId: pl.seriesId,
+              re: pl.re,
+              color: pl.color,
+              dash: "7 5",
+              data: seg.map(fitPointToPolarPoint),
+              label: pl.label,
+              kind: "fit",
+            });
+          }
         }
       }
     }
@@ -186,11 +288,12 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
     // no-data fallback.
     let aMin = Infinity;
     let aMax = -Infinity;
-    for (const c of visCurves) {
+    for (const c of [...visCurves, ...visPointSeries]) {
       for (const p of c.data) {
-        if (!Number.isFinite(p.a)) continue;
-        if (p.a < aMin) aMin = p.a;
-        if (p.a > aMax) aMax = p.a;
+        const [xx, yy] = xyOf(p, type);
+        if (!Number.isFinite(xx) || !Number.isFinite(yy)) continue;
+        if (xx < aMin) aMin = xx;
+        if (xx > aMax) aMax = xx;
       }
     }
     if (aMin > aMax) {
@@ -204,16 +307,19 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
   }
   const override = input.domain;
   if (override) {
-    if (Number.isFinite(override.xMin as number)) xMin = override.xMin as number;
-    if (Number.isFinite(override.xMax as number)) xMax = override.xMax as number;
+    if (Number.isFinite(override.xMin as number))
+      xMin = override.xMin as number;
+    if (Number.isFinite(override.xMax as number))
+      xMax = override.xMax as number;
     if (xMax - xMin < 1e-9) xMax = xMin + 1e-9;
   }
   let yMin = 1e9;
   let yMax = -1e9;
   let hasDomainData = false;
-  for (const c of visCurves) {
+  for (const c of [...visCurves, ...visPointSeries]) {
     for (const p of c.data) {
       const [xx, yy] = xyOf(p, type);
+      if (!Number.isFinite(xx) || !Number.isFinite(yy)) continue;
       if (xx > xMax || xx < xMin) continue;
       if (yy < yMin) yMin = yy;
       if (yy > yMax) yMax = yy;
@@ -237,8 +343,10 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
     yMax += pad;
   }
   if (override) {
-    if (Number.isFinite(override.yMin as number)) yMin = override.yMin as number;
-    if (Number.isFinite(override.yMax as number)) yMax = override.yMax as number;
+    if (Number.isFinite(override.yMin as number))
+      yMin = override.yMin as number;
+    if (Number.isFinite(override.yMax as number))
+      yMax = override.yMax as number;
     if (yMax - yMin < 1e-12) yMax = yMin + 1e-12;
   }
 
@@ -249,7 +357,11 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
   let xTicks: ChartTick[];
   if (type === "clcd") {
     const nt = niceTicks(xMin, xMax, 5);
-    xTicks = nt.out.map((v) => ({ pos: mapX(v), labelPos: mapX(v), label: v.toFixed(3) }));
+    xTicks = nt.out.map((v) => ({
+      pos: mapX(v),
+      labelPos: mapX(v),
+      label: v.toFixed(3),
+    }));
   } else {
     // Dynamic α ticks: the window is data-fitted (and zoomable), so the old
     // fixed −8..20 tick list no longer spans it.
@@ -275,15 +387,22 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
   // that exits and re-enters the window becomes multiple ChartCurve entries.
   const curves: ChartCurve[] = [];
   const domainBox: ChartDomain = { xMin, xMax, yMin, yMax };
-  for (const c of visCurves) {
-    for (const seg of clipCurveToDomain(c.data, type, domainBox)) {
+  for (let curveIndex = 0; curveIndex < visCurves.length; curveIndex++) {
+    const c = visCurves[curveIndex];
+    const segments = clipCurveToDomain(c.data, type, domainBox);
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+      const seg = segments[segmentIndex];
       curves.push({
+        key: `${c.seriesId}:${c.kind}:${curveIndex}:${segmentIndex}`,
+        seriesId: c.seriesId,
         re: c.re,
         color: c.color,
         dash: c.dash,
         width: 1.6,
         opacity: c.kind === "fit" ? 0.92 : 0.72,
-        points: seg.map(([xx, yy]) => mapX(xx).toFixed(1) + "," + mapY(yy).toFixed(1)).join(" "),
+        points: seg
+          .map(([xx, yy]) => mapX(xx).toFixed(1) + "," + mapY(yy).toFixed(1))
+          .join(" "),
         label: c.label,
         kind: c.kind,
       });
@@ -292,7 +411,16 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
 
   // ---- clickable points ----
   const points: ChartPointVM[] = [];
-  for (const c of visCurves) {
+  const pointGroups = new Map<
+    string,
+    {
+      series: VisPointSeries;
+      cx: number;
+      cy: number;
+      choices: PolarPointData[];
+    }
+  >();
+  for (const c of visPointSeries) {
     for (const p of c.data) {
       if (p.source !== "solved" || !p.resultId) continue;
       const [xx, yy] = xyOf(p, type);
@@ -300,30 +428,103 @@ export function projectChart(input: ProjectChartInput): ChartProjection {
       if (!Number.isFinite(xx) || !Number.isFinite(yy)) continue;
       const cx = mapX(xx);
       const cy = mapY(yy);
-      // Derived-by-symmetry mirrors share the source resultId, so their key
-      // (and hover identity) must also carry the mirrored angle (spec §9.3).
-      const derivedNote = derivedBySymmetryNote(p);
-      const key = c.label + ":" + (p.resultId ?? p.a) + (derivedNote ? ":d" + p.a : "");
-      const hovered = key === hoverKey;
-      const provisional = p.classificationState === "needs_urans";
-      // Derived points render hollow in the curve colour — visually distinct
-      // from provisional (amber) and post-stall (red) outlines.
-      const fill = derivedNote ? "#0a0f15" : p.stalled ? "#0a0f15" : provisional ? "#0a0f15" : c.color;
-      const stroke = p.stalled ? "#ef4444" : provisional ? "#f59e0b" : derivedNote ? c.color : "rgba(7,11,16,0.6)";
-      points.push({
-        cx,
-        cy,
-        r: hovered ? 5.5 : 3,
-        fill,
-        stroke,
-        sw: p.stalled || provisional ? 1.8 : derivedNote ? 1.6 : 1,
-        re: c.re,
-        label: derivedNote ? c.label + " · " + derivedNote : c.label,
-        stalled: p.stalled,
-        key,
-        point: p,
-      });
+      const stackKey = `${c.seriesId}:${xx}:${yy}`;
+      const group = pointGroups.get(stackKey);
+      if (group) group.choices.push(p);
+      else pointGroups.set(stackKey, { series: c, cx, cy, choices: [p] });
     }
+  }
+  const roleRank = (point: PolarPointData) =>
+    point.evidenceRole === "primary"
+      ? 0
+      : point.evidenceRole === "conflict"
+        ? 1
+        : point.evidenceRole === "alternate"
+          ? 2
+          : 0;
+  for (const group of pointGroups.values()) {
+    const choices = group.choices.sort(
+      (a, b) =>
+        roleRank(a) - roleRank(b) ||
+        (a.resultId ?? "").localeCompare(b.resultId ?? ""),
+    );
+    const p = choices[0];
+    const c = group.series;
+    const derivedNote = derivedBySymmetryNote(p);
+    const choiceIds = choices
+      .map((choice) => choice.resultId)
+      .sort()
+      .join(":");
+    const key = c.seriesId + ":" + choiceIds + (derivedNote ? ":d" + p.a : "");
+    const hovered = key === hoverKey;
+    const provisional = p.classificationState === "needs_urans";
+    const alternate = p.evidenceRole === "alternate";
+    const conflict = p.evidenceRole === "conflict";
+    const stacked = choices.length > 1;
+    const anyConflict = choices.some(
+      (choice) => choice.evidenceRole === "conflict",
+    );
+    const anyAlternate = choices.some(
+      (choice) => choice.evidenceRole === "alternate",
+    );
+    const baseRadius = stacked ? 5.2 : alternate ? 4.8 : conflict ? 4.2 : 3;
+    // Derived points render hollow in the curve colour — visually distinct
+    // from provisional (amber) and post-stall (red) outlines.
+    const fill =
+      stacked || alternate || conflict
+        ? "#0a0f15"
+        : derivedNote
+          ? "#0a0f15"
+          : p.stalled
+            ? "#0a0f15"
+            : provisional
+              ? "#0a0f15"
+              : c.color;
+    const stroke = anyConflict
+      ? "#d946ef"
+      : stacked || anyAlternate
+        ? "#94a3b8"
+        : p.stalled
+          ? "#ef4444"
+          : provisional
+            ? "#f59e0b"
+            : derivedNote
+              ? c.color
+              : "rgba(7,11,16,0.6)";
+    const roleNote = anyConflict
+      ? " · repeated measurements disagree · excluded from best-fit"
+      : stacked
+        ? ` · ${choices.length} stored results`
+        : alternate
+          ? " · alternate stored result · excluded from best-fit"
+          : "";
+    points.push({
+      cx: group.cx,
+      cy: group.cy,
+      r: hovered ? baseRadius + 2.5 : baseRadius,
+      fill,
+      stroke,
+      sw: anyConflict
+        ? 2.4
+        : stacked
+          ? 2.2
+          : conflict
+            ? 2.2
+            : alternate
+              ? 1.8
+              : p.stalled || provisional
+                ? 1.8
+                : derivedNote
+                  ? 1.6
+                  : 1,
+      seriesId: c.seriesId,
+      re: c.re,
+      label: (derivedNote ? c.label + " · " + derivedNote : c.label) + roleNote,
+      stalled: choices.some((choice) => choice.stalled),
+      key,
+      point: p,
+      resultChoices: stacked ? choices : undefined,
+    });
   }
 
   return {
@@ -404,7 +605,12 @@ export function clipCurveToDomain(
     }
     if (prev === null) {
       prev = [xx, yy];
-      if (xx >= dom.xMin && xx <= dom.xMax && yy >= dom.yMin && yy <= dom.yMax) {
+      if (
+        xx >= dom.xMin &&
+        xx <= dom.xMax &&
+        yy >= dom.yMin &&
+        yy <= dom.yMax
+      ) {
         cur.push([xx, yy]);
       }
       continue;
@@ -417,7 +623,11 @@ export function clipCurveToDomain(
     }
     const [a, b] = clipped;
     const last = cur[cur.length - 1];
-    if (!last || Math.abs(last[0] - a[0]) > epsX || Math.abs(last[1] - a[1]) > epsY) {
+    if (
+      !last ||
+      Math.abs(last[0] - a[0]) > epsX ||
+      Math.abs(last[1] - a[1]) > epsY
+    ) {
       flush();
       cur.push(a);
     }
@@ -448,7 +658,11 @@ export function zoomChartDomain(
 }
 
 /** Translate the window by data-space deltas (drag pan). */
-export function panChartDomain(dom: ChartDomain, dx: number, dy: number): ChartDomain {
+export function panChartDomain(
+  dom: ChartDomain,
+  dx: number,
+  dy: number,
+): ChartDomain {
   return {
     xMin: dom.xMin + dx,
     xMax: dom.xMax + dx,
@@ -460,6 +674,7 @@ export function panChartDomain(dom: ChartDomain, dx: number, dy: number): ChartD
 // ============================ cursor readout ============================
 
 export interface ChartReadoutRow {
+  seriesId: string;
   re: number;
   color: string;
   label: string;
@@ -467,8 +682,23 @@ export interface ChartReadoutRow {
   y: number;
 }
 
-function fitPointToPolarPoint(p: { a: number; cl: number; cd: number; cm: number; ld: number }): PolarPointData {
-  return { a: p.a, cl: p.cl, cd: p.cd, cm: p.cm, ld: p.ld, stalled: false, source: "queued", resultId: null };
+function fitPointToPolarPoint(p: {
+  a: number;
+  cl: number;
+  cd: number;
+  cm: number;
+  ld: number;
+}): PolarPointData {
+  return {
+    a: p.a,
+    cl: p.cl,
+    cd: p.cd,
+    cm: p.cm,
+    ld: p.ld,
+    stalled: false,
+    source: "queued",
+    resultId: null,
+  };
 }
 
 // ---- fit support gating ----
@@ -483,7 +713,10 @@ const FIT_BRIDGE_FLOOR_DEG = 6;
 const FIT_BRIDGE_GAP_FACTOR = 2;
 
 export function measuredAlphas(points: PolarPointData[]): number[] {
-  return points.map((p) => p.a).filter((a) => Number.isFinite(a));
+  return points
+    .filter(isPrimaryEvidence)
+    .map((p) => p.a)
+    .filter((a) => Number.isFinite(a));
 }
 
 export function fitBridgeThresholdDeg(alphas: number[]): number {
@@ -498,7 +731,10 @@ export function fitBridgeThresholdDeg(alphas: number[]): number {
 /** Merge bridgeable measured intervals into supported α spans, then group fit
  *  samples by span. Spans yielding fewer than 2 samples are dropped (a lone
  *  sample cannot draw a curve). */
-export function supportedFitSegments<T extends { a: number }>(fitPoints: T[], alphas: number[]): T[][] {
+export function supportedFitSegments<T extends { a: number }>(
+  fitPoints: T[],
+  alphas: number[],
+): T[][] {
   const sorted = [...new Set(alphas)].sort((a, b) => a - b);
   if (!fitPoints.length || sorted.length < 2) return [];
   const bridge = fitBridgeThresholdDeg(sorted);
@@ -516,28 +752,35 @@ export function supportedFitSegments<T extends { a: number }>(fitPoints: T[], al
   }
   spans.push([start, end]);
   return spans
-    .map(([lo, hi]) => fitPoints.filter((p) => p.a >= lo - 1e-9 && p.a <= hi + 1e-9))
+    .map(([lo, hi]) =>
+      fitPoints.filter((p) => p.a >= lo - 1e-9 && p.a <= hi + 1e-9),
+    )
     .filter((s) => s.length >= 2);
 }
 
 /** Linear interpolation of a series' y at x; null outside the series' span. */
-function interpSeriesAtX(points: PolarPointData[], type: ChartType, x: number): number | null {
-  const xs: [number, number][] = [];
-  for (const p of points) {
-    const [xx, yy] = xyOf(p, type);
-    if (Number.isFinite(xx) && Number.isFinite(yy)) xs.push([xx, yy]);
-  }
-  xs.sort((a, b) => a[0] - b[0]);
-  if (!xs.length || x < xs[0][0] || x > xs[xs.length - 1][0]) return null;
-  for (let i = 1; i < xs.length; i++) {
-    if (x <= xs[i][0]) {
-      const [x0, y0] = xs[i - 1];
-      const [x1, y1] = xs[i];
-      if (x1 === x0) return y0;
-      return y0 + ((x - x0) / (x1 - x0)) * (y1 - y0);
+function interpSeriesAtX(
+  points: PolarPointData[],
+  type: ChartType,
+  x: number,
+): number | null {
+  for (const segment of finiteChartSegments(points, type)) {
+    const xs = segment
+      .map((point) => xyOf(point, type))
+      .sort((a, b) => a[0] - b[0]);
+    if (!xs.length || x < xs[0][0] || x > xs[xs.length - 1][0]) continue;
+    if (xs.length === 1) return x === xs[0][0] ? xs[0][1] : null;
+    for (let i = 1; i < xs.length; i++) {
+      if (x <= xs[i][0]) {
+        const [x0, y0] = xs[i - 1];
+        const [x1, y1] = xs[i];
+        if (x1 === x0) return y0;
+        return y0 + ((x - x0) / (x1 - x0)) * (y1 - y0);
+      }
     }
+    return xs[xs.length - 1][1];
   }
-  return xs[xs.length - 1][1];
+  return null;
 }
 
 /** Every visible curve's interpolated value at cursor α (α-x charts only —
@@ -545,27 +788,55 @@ function interpSeriesAtX(points: PolarPointData[], type: ChartType, x: number): 
 export function readoutAtX(input: {
   chartType: ChartType;
   polars: ProjectChartInput["polars"];
-  visibleRe: Record<number, boolean>;
+  visibleSeries: Record<string, boolean>;
   x: number;
 }): ChartReadoutRow[] {
-  const { chartType: type, polars, visibleRe, x } = input;
+  const { chartType: type, polars, visibleSeries, x } = input;
   if (type === "clcd") return [];
   const rows: ChartReadoutRow[] = [];
   for (const pl of polars) {
-    if (!visibleRe[pl.re]) continue;
-    const measured = interpSeriesAtX(pl.points, type, x);
+    if (!visibleSeries[pl.seriesId]) continue;
+    const measuredSegments = measuredEvidenceSegments(pl.points).flatMap(
+      (segment) => finiteChartSegments(segment, type),
+    );
+    const measured =
+      measuredSegments
+        .map((segment) => interpSeriesAtX(segment, type, x))
+        .find((value) => value !== null) ?? null;
     if (measured !== null) {
-      rows.push({ re: pl.re, color: pl.color, label: "Re " + fRe(pl.re), kind: "measured", y: measured });
+      rows.push({
+        seriesId: pl.seriesId,
+        re: pl.re,
+        color: pl.color,
+        label: pl.label,
+        kind: "measured",
+        y: measured,
+      });
     }
     if (pl.fit?.points.length) {
       // Same support gating as the drawn curve: never read out a fit value
       // the chart refuses to draw (unsupported span or extrapolated tail).
-      for (const seg of supportedFitSegments(pl.fit.points, measuredAlphas(pl.points))) {
-        const fy = interpSeriesAtX(seg.map(fitPointToPolarPoint), type, x);
-        if (fy !== null) {
-          rows.push({ re: pl.re, color: pl.color, label: "fit Re " + fRe(pl.re), kind: "fit", y: fy });
-          break;
+      let fitMatched = false;
+      for (const measuredSegment of measuredSegments) {
+        for (const seg of supportedFitSegments(
+          pl.fit.points,
+          measuredSegment.map((point) => point.a),
+        )) {
+          const fy = interpSeriesAtX(seg.map(fitPointToPolarPoint), type, x);
+          if (fy !== null) {
+            rows.push({
+              seriesId: pl.seriesId,
+              re: pl.re,
+              color: pl.color,
+              label: `${pl.label} · best-fit`,
+              kind: "fit",
+              y: fy,
+            });
+            fitMatched = true;
+            break;
+          }
         }
+        if (fitMatched) break;
       }
     }
   }

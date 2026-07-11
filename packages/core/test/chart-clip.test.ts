@@ -65,8 +65,8 @@ function prodShapedFit(): PolarFit {
 function prodInput(chartType: ChartType, domain?: Partial<ChartDomain> | null) {
   return {
     chartType,
-    polars: [{ re: 3_410_000, color: "#38bdf8", points: prodShapedPoints(), fit: prodShapedFit() }],
-    visibleRe: { 3_410_000: true },
+    polars: [{ seriesId: "series-wide", label: "Re 3.41M", re: 3_410_000, color: "#38bdf8", points: prodShapedPoints(), fit: prodShapedFit() }],
+    visibleSeries: { "series-wide": true },
     domain,
   };
 }
@@ -110,7 +110,7 @@ describe("must-catch: prod-shaped wide polar stays inside the plot rect", () => 
   });
 
   it("empty data keeps the legacy fallback window", () => {
-    const proj = projectChart({ chartType: "cla", polars: [], visibleRe: {} });
+    const proj = projectChart({ chartType: "cla", polars: [], visibleSeries: {} });
     expect(proj.domain.xMin).toBe(-8);
     expect(proj.domain.xMax).toBe(20);
   });
@@ -231,7 +231,7 @@ describe("readoutAtX", () => {
   const input = prodInput("cla");
 
   it("interpolates measured + fit values at the cursor α", () => {
-    const rows = readoutAtX({ chartType: "cla", polars: input.polars, visibleRe: input.visibleRe, x: 2.5 });
+    const rows = readoutAtX({ chartType: "cla", polars: input.polars, visibleSeries: input.visibleSeries, x: 2.5 });
     const measured = rows.find((r) => r.kind === "measured");
     const fit = rows.find((r) => r.kind === "fit");
     expect(measured).toBeDefined();
@@ -239,17 +239,18 @@ describe("readoutAtX", () => {
     expect(measured!.y).toBeCloseTo(0.84, 9);
     expect(fit).toBeDefined();
     expect(fit!.y).toBeCloseTo(0.63 + 0.085 * 2.5, 6);
+    expect(fit!.label).toBe("Re 3.41M · best-fit");
   });
 
   it("returns nothing outside the series span, for hidden series, and for Cl–Cd", () => {
-    expect(readoutAtX({ chartType: "cla", polars: input.polars, visibleRe: input.visibleRe, x: 45 })).toEqual([]);
-    expect(readoutAtX({ chartType: "cla", polars: input.polars, visibleRe: {}, x: 0 })).toEqual([]);
-    expect(readoutAtX({ chartType: "clcd", polars: input.polars, visibleRe: input.visibleRe, x: 0.02 })).toEqual([]);
+    expect(readoutAtX({ chartType: "cla", polars: input.polars, visibleSeries: input.visibleSeries, x: 45 })).toEqual([]);
+    expect(readoutAtX({ chartType: "cla", polars: input.polars, visibleSeries: {}, x: 0 })).toEqual([]);
+    expect(readoutAtX({ chartType: "clcd", polars: input.polars, visibleSeries: input.visibleSeries, x: 0.02 })).toEqual([]);
   });
 
   it("L/D and Cm readouts use the right accessor", () => {
-    const ld = readoutAtX({ chartType: "lda", polars: input.polars, visibleRe: input.visibleRe, x: 0 });
-    const cm = readoutAtX({ chartType: "cma", polars: input.polars, visibleRe: input.visibleRe, x: 0 });
+    const ld = readoutAtX({ chartType: "lda", polars: input.polars, visibleSeries: input.visibleSeries, x: 0 });
+    const cm = readoutAtX({ chartType: "cma", polars: input.polars, visibleSeries: input.visibleSeries, x: 0 });
     expect(ld.find((r) => r.kind === "measured")!.y).toBeCloseTo(0.63 / 0.013, 6);
     expect(cm.find((r) => r.kind === "measured")!.y).toBeCloseTo(-0.071, 9);
   });

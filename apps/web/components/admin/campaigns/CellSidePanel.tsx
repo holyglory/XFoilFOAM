@@ -35,6 +35,7 @@ import {
 import { getAirfoilDetail, getFieldTrack, getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import { disagreedDeltaLabel, verifyPointsSearch } from "@/lib/point-history";
+import { initialSeriesVisibility, toggleSeriesVisibility } from "@/lib/polar-series";
 import { C, MONO } from "@/lib/tokens";
 import type { HoverState } from "../../detail/DetailIsland";
 import { PolarViewer } from "../../detail/PolarViewer";
@@ -78,7 +79,7 @@ export function CellSidePanel({
   const [detail, setDetail] = useState<AirfoilDetailPayload | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [chartType, setChartType] = useState<ChartType>("cla");
-  const [visibleRe, setVisibleRe] = useState<Record<number, boolean>>({});
+  const [visibleSeries, setVisibleSeries] = useState<Record<string, boolean>>({});
   const [hover, setHover] = useState<HoverState | null>(null);
   // zoom/pan window; null = zoom-to-fit (resets when the chart type switches)
   const [chartDomain, setChartDomain] = useState<ChartDomain | null>(null);
@@ -136,7 +137,7 @@ export function CellSidePanel({
           return;
         }
         setDetail(d);
-        setVisibleRe(Object.fromEntries(d.polars.map((p) => [p.re, true])));
+        setVisibleSeries(initialSeriesVisibility(d.polars));
       })
       .catch((e) => {
         if (!cancelled) setDetailError((e as Error).message);
@@ -197,7 +198,17 @@ export function CellSidePanel({
   };
 
   const chartPolars = useMemo(
-    () => (detail ? detail.polars.map((p) => ({ re: p.re, color: p.color, points: p.points, fit: p.fit })) : []),
+    () =>
+      detail
+        ? detail.polars.map((p) => ({
+            seriesId: p.seriesId,
+            label: p.label,
+            re: p.re,
+            color: p.color,
+            points: p.points,
+            fit: p.fit,
+          }))
+        : [],
     [detail],
   );
   const projection = useMemo(
@@ -206,12 +217,12 @@ export function CellSidePanel({
         ? projectChart({
             chartType,
             polars: chartPolars,
-            visibleRe,
+            visibleSeries,
             hoverKey: hover?.key ?? null,
             domain: chartDomain,
           })
         : null,
-    [detail, chartPolars, chartType, visibleRe, hover?.key, chartDomain],
+    [detail, chartPolars, chartType, visibleSeries, hover?.key, chartDomain],
   );
 
   const solvedPointCount = useMemo(
@@ -383,10 +394,10 @@ export function CellSidePanel({
             polars={chartPolars}
             domain={chartDomain}
             onDomainChange={setChartDomain}
-            visibleRe={visibleRe}
-            onToggleRe={(re) => setVisibleRe((v) => ({ ...v, [re]: !v[re] }))}
-            reList={detail.reList}
-            rePointCounts={Object.fromEntries(detail.polars.map((p) => [p.re, p.points.length]))}
+            visibleSeries={visibleSeries}
+            onToggleSeries={(seriesId) =>
+              setVisibleSeries((visibility) => toggleSeriesVisibility(visibility, seriesId))
+            }
             solvedPointCount={solvedPointCount}
             machStr={condition.mach != null ? condition.mach.toFixed(2) : detail.mach.toFixed(2)}
             hover={hover}

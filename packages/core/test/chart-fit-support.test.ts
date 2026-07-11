@@ -65,8 +65,8 @@ describe("fit support gating (S1223 phantom-lobe incident 2026-07-10)", () => {
     const alphas = [-15, -10, -5, 0, 5, 10, 25, 30];
     // unsupported bridge carries an absurd Cd spike that must not stretch xMax
     const fitPoints = fitGrid(-15, 30).map((p) => (p.a > 13 && p.a < 22 ? { ...p, cd: 0.049 } : { ...p, cd: 0.01 }));
-    const polars = [{ re: 850_000, color: "#a78bfa", points: alphas.map((a) => pt(a, { cd: 0.01 })), fit: asFit(fitPoints) }];
-    const proj = projectChart({ chartType: "clcd", polars, visibleRe: { 850_000: true } });
+    const polars = [{ seriesId: "series-fit", label: "Re 850k", re: 850_000, color: "#a78bfa", points: alphas.map((a) => pt(a, { cd: 0.01 })), fit: asFit(fitPoints) }];
+    const proj = projectChart({ chartType: "clcd", polars, visibleSeries: { "series-fit": true } });
     expect(proj.curves.filter((c) => c.kind === "fit").length).toBeGreaterThanOrEqual(2);
     // 0.049 spike lives only in the unsupported bridge → window stays near the data
     expect(proj.domain.xMax).toBeLessThan(0.045);
@@ -74,8 +74,8 @@ describe("fit support gating (S1223 phantom-lobe incident 2026-07-10)", () => {
 
   it("readoutAtX refuses fit values inside the unsupported hole but serves supported spans", () => {
     const alphas = [-15, -10, -5, 0, 5, 10, 25, 30];
-    const polars = [{ re: 850_000, color: "#a78bfa", points: alphas.map((a) => pt(a)), fit: asFit(fitGrid(-15, 30)) }];
-    const base = { chartType: "cla" as const, polars, visibleRe: { 850_000: true } };
+    const polars = [{ seriesId: "series-fit", label: "Re 850k", re: 850_000, color: "#a78bfa", points: alphas.map((a) => pt(a)), fit: asFit(fitGrid(-15, 30)) }];
+    const base = { chartType: "cla" as const, polars, visibleSeries: { "series-fit": true } };
     const inHole = readoutAtX({ ...base, x: 17.5 });
     expect(inHole.some((r) => r.kind === "fit")).toBe(false);
     const supported = readoutAtX({ ...base, x: 2.5 });

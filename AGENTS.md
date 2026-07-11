@@ -199,6 +199,17 @@
   follow-up actions must use the stable evidence id (`resultId`, attempt id, or
   preset revision id) instead of rediscovering the row from rounded display
   values such as Re, Mach, or AoA. Display values are not lookup keys.
+- Public polar series identity must come from the value-level physical and
+  numerical setup compatibility identity, never rounded Reynolds, Mach,
+  display labels, preset names, revision numbers, jobs, or batches. Revisions
+  that differ only in sweep, scheduling, output, or provenance may contribute
+  to one public polar; same-Re evidence with different flow, geometry,
+  boundary, mesh, or solver values must remain separate series.
+- Public-detail tests must conserve eligible stored evidence across the
+  Solver Work and polar-chart read models: every verified/provisional result
+  exposed for a public-compatible setup must remain reachable by its stable
+  result id from the corresponding public polar, with deterministic handling
+  for repeated solves at the same AoA.
 - Tests for solved-point interactions must assert that opening/clicking the
   point fetches its stored evidence, including dynamic non-canonical Reynolds
   values from simulation preset revisions.

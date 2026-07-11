@@ -310,7 +310,7 @@ async function solvedDetail(
     mach: r.mach ?? 0.1,
     cl,
     cd,
-    cm: r.cm ?? 0,
+    cm: r.cm,
     ld: r.clCd ?? (cd !== 0 ? cl / cd : 0),
     clStd: r.clStd,
     cdStd: r.cdStd,

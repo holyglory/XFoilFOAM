@@ -36,6 +36,7 @@ export function metrics(arr: PolarPointData[]): PolarMetrics {
       break;
     }
   }
-  const cmp = arr.find((p) => p.a === -4);
-  return { ldmax, aLd, cdmin, clCd, cd0, clmax, aStall, cm0: cmp ? cmp.cm : arr[0].cm };
+  const cmp = arr.find((p) => p.a === -4 && p.cm != null);
+  const cm0 = cmp?.cm ?? null;
+  return { ldmax, aLd, cdmin, clCd, cd0, clmax, aStall, cm0 };
 }

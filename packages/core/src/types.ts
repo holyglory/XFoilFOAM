@@ -37,8 +37,16 @@ export interface AirfoilGeometry {
 // ============================ polars ============================
 export type DataSource = "queued" | "solved";
 export type ResultRegime = "rans" | "urans";
-export type ResultClassificationState = "accepted" | "needs_urans" | "superseded_by_urans" | "rejected";
-export type ResultClassificationRegion = "attached" | "near_stall" | "post_stall" | "unknown";
+export type ResultClassificationState =
+  | "accepted"
+  | "needs_urans"
+  | "superseded_by_urans"
+  | "rejected";
+export type ResultClassificationRegion =
+  | "attached"
+  | "near_stall"
+  | "post_stall"
+  | "unknown";
 export type PolarFitStatus = "final" | "provisional" | "insufficient";
 
 export interface PolarFitPoint {
@@ -86,7 +94,9 @@ export interface PolarPointData {
   a: number; // angle of attack [deg]
   cl: number;
   cd: number;
-  cm: number;
+  /** Missing solver evidence stays null. In particular, the Cm chart must not
+   *  turn an unavailable moment coefficient into a measured zero. */
+  cm: number | null;
   ld: number; // cl/cd
   stalled: boolean; // post-stall → URANS (drives the red point outline)
   source?: DataSource;
@@ -100,9 +110,18 @@ export interface PolarPointData {
   classificationRegion?: ResultClassificationRegion;
   classificationReasons?: string[];
   classificationConfidence?: number | null;
+  /** Public presentation role inside a compatibility-merged series. Primary
+   *  evidence defines the measured curve; alternate/conflict evidence remains
+   *  a clickable point at its true coordinates but is excluded from the curve
+   *  and best-fit. Omitted on exact-revision/admin views. */
+  evidenceRole?: "primary" | "alternate" | "conflict";
 }
 
 export interface Polar {
+  /** Stable public identity for one compatible operating/numerical series.
+   *  Opaque to users: labels carry the human-readable condition. */
+  seriesId: string;
+  label: string;
   re: number;
   mach?: number;
   color: string;
@@ -119,7 +138,7 @@ export interface PolarMetrics {
   cd0: number;
   clmax: number;
   aStall: number;
-  cm0: number;
+  cm0: number | null;
 }
 
 // ============================ chart projection ============================
@@ -134,6 +153,8 @@ export interface ChartTick {
 }
 
 export interface ChartCurve {
+  key: string;
+  seriesId: string;
   re: number;
   color: string;
   dash: string;
@@ -151,11 +172,15 @@ export interface ChartPointVM {
   fill: string;
   stroke: string;
   sw: number;
+  seriesId: string;
   re: number;
   label: string;
   stalled: boolean;
   key: string;
   point: PolarPointData;
+  /** Coincident stored results represented by this one marker. Each choice
+   *  retains its stable resultId for the public result chooser. */
+  resultChoices?: PolarPointData[];
 }
 
 export interface ChartProjection {
@@ -227,8 +252,10 @@ export interface AirfoilDetailPayload {
   breadcrumb: Breadcrumb;
   geometry: AirfoilGeometry;
   mach: number;
+  /** @deprecated Public chart identity is `polars[].seriesId`; Reynolds is
+   *  display metadata and is not unique across series. */
   reList: number[];
-  polars: Polar[]; // one per Re in reList; Detail carries solved CFD points only
+  polars: Polar[]; // one per public series; Detail carries solved CFD points only
   simulationWorks: SimulationWorkItem[];
   downloads: Record<string, string | null>;
 }
@@ -277,7 +304,11 @@ export interface MediumDTO {
   isSeeded: boolean;
 }
 
-export type CpuSchedulingPolicy = "auto" | "airfoil_parallel" | "case_parallel" | "exclusive";
+export type CpuSchedulingPolicy =
+  | "auto"
+  | "airfoil_parallel"
+  | "case_parallel"
+  | "exclusive";
 
 export interface BoundaryConditionDTO {
   id: string;
@@ -417,7 +448,10 @@ export interface FrameTrackDetail {
   stationary: boolean;
   driftFrac: number;
   window: { tStart: number; tEnd: number };
-  stats: Record<"cl" | "cd" | "cm", { mean: number; std: number; min: number; max: number }>;
+  stats: Record<
+    "cl" | "cd" | "cm",
+    { mean: number; std: number; min: number; max: number }
+  >;
   fields: string[];
   frames: FrameTrackFrameDetail[];
 }
@@ -456,7 +490,7 @@ export interface SimulationDetail {
   mach: number;
   cl: number;
   cd: number;
-  cm: number;
+  cm: number | null;
   ld: number;
   clStd?: number | null;
   cdStd?: number | null;

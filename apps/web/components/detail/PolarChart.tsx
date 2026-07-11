@@ -9,7 +9,10 @@ import {
   zoomChartDomain,
 } from "@aerodb/core";
 import { useCallback, useEffect, useId, useRef } from "react";
-import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
+import type {
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 
 import { VIZ } from "@/lib/tokens";
 
@@ -49,7 +52,12 @@ export function PolarChart({
   projRef.current = projection;
   const onDomainRef = useRef(onDomainChange);
   onDomainRef.current = onDomainChange;
-  const drag = useRef<{ vx: number; vy: number; dom: ChartDomain; panning: boolean } | null>(null);
+  const drag = useRef<{
+    vx: number;
+    vy: number;
+    dom: ChartDomain;
+    panning: boolean;
+  } | null>(null);
   const didPan = useRef(false);
 
   const toViewBox = useCallback(
@@ -65,7 +73,8 @@ export function PolarChart({
     [w, h],
   );
   const inPlot = useCallback(
-    (vx: number, vy: number) => vx >= PX0 && vx <= PX1 && vy >= PY0 && vy <= PY1,
+    (vx: number, vy: number) =>
+      vx >= PX0 && vx <= PX1 && vy >= PY0 && vy <= PY1,
     [PX0, PX1, PY0, PY1],
   );
   const toData = useCallback(
@@ -180,8 +189,22 @@ export function PolarChart({
       {/* y grid + labels */}
       {projection.yTicks.map((t, i) => (
         <g key={`y${i}`}>
-          <line x1={PX0} y1={t.pos} x2={PX1} y2={t.pos} stroke={VIZ.grid} strokeWidth="1" />
-          <text x={PX0 - 8} y={t.labelPos} textAnchor="end" fontFamily="IBM Plex Mono" fontSize="10" fill={VIZ.dim}>
+          <line
+            x1={PX0}
+            y1={t.pos}
+            x2={PX1}
+            y2={t.pos}
+            stroke={VIZ.grid}
+            strokeWidth="1"
+          />
+          <text
+            x={PX0 - 8}
+            y={t.labelPos}
+            textAnchor="end"
+            fontFamily="IBM Plex Mono"
+            fontSize="10"
+            fill={VIZ.dim}
+          >
             {t.label}
           </text>
         </g>
@@ -189,21 +212,49 @@ export function PolarChart({
       {/* x grid + labels */}
       {projection.xTicks.map((t, i) => (
         <g key={`x${i}`}>
-          <line x1={t.pos} y1={PY0} x2={t.pos} y2={PY1} stroke={VIZ.gridX} strokeWidth="1" />
-          <text x={t.pos} y={354} textAnchor="middle" fontFamily="IBM Plex Mono" fontSize="10" fill={VIZ.dim}>
+          <line
+            x1={t.pos}
+            y1={PY0}
+            x2={t.pos}
+            y2={PY1}
+            stroke={VIZ.gridX}
+            strokeWidth="1"
+          />
+          <text
+            x={t.pos}
+            y={354}
+            textAnchor="middle"
+            fontFamily="IBM Plex Mono"
+            fontSize="10"
+            fill={VIZ.dim}
+          >
             {t.label}
           </text>
         </g>
       ))}
       {/* axes */}
-      <line x1={PX0} y1={PY0} x2={PX0} y2={PY1} stroke={VIZ.axis} strokeWidth="1.4" />
-      <line x1={PX0} y1={PY1} x2={PX1} y2={PY1} stroke={VIZ.axis} strokeWidth="1.4" />
+      <line
+        x1={PX0}
+        y1={PY0}
+        x2={PX0}
+        y2={PY1}
+        stroke={VIZ.axis}
+        strokeWidth="1.4"
+      />
+      <line
+        x1={PX0}
+        y1={PY1}
+        x2={PX1}
+        y2={PY1}
+        stroke={VIZ.axis}
+        strokeWidth="1.4"
+      />
       {/* curves + points, hard-clipped to the plot rect (belt-and-braces with
           the core's data-space clipping: nothing ever draws over the axes) */}
       <g clipPath={`url(#${clipId})`}>
-        {projection.curves.map((c, i) => (
+        {projection.curves.map((c) => (
           <polyline
-            key={`c${i}`}
+            key={c.key}
             points={c.points}
             fill="none"
             stroke={c.color}
@@ -213,22 +264,56 @@ export function PolarChart({
             strokeLinejoin="round"
           />
         ))}
-        {projection.points.map((p) => (
-          <circle
-            key={p.key}
-            cx={p.cx}
-            cy={p.cy}
-            r={p.r}
-            fill={p.fill}
-            stroke={p.stroke}
-            strokeWidth={p.sw}
-            style={{ cursor: "pointer" }}
-            onClick={() => onPointClick(p)}
-          />
-        ))}
+        {projection.points.map((p) => {
+          const choiceCount = p.resultChoices?.length ?? 1;
+          const activate = () => onPointClick(p);
+          return (
+            <g key={p.key}>
+              <circle
+                cx={p.cx}
+                cy={p.cy}
+                r={p.r}
+                fill={p.fill}
+                stroke={p.stroke}
+                strokeWidth={p.sw}
+                style={{ cursor: "pointer" }}
+                tabIndex={0}
+                role="button"
+                aria-label={`${p.label}; ${choiceCount} stored result${choiceCount === 1 ? "" : "s"}`}
+                onClick={activate}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    activate();
+                  }
+                }}
+              />
+              {choiceCount > 1 && (
+                <text
+                  x={p.cx + p.r + 2}
+                  y={p.cy - p.r - 1}
+                  fontFamily="IBM Plex Mono"
+                  fontSize="8"
+                  fontWeight="700"
+                  fill={VIZ.text}
+                  pointerEvents="none"
+                >
+                  {choiceCount}
+                </text>
+              )}
+            </g>
+          );
+        })}
       </g>
       {/* x axis title */}
-      <text x={361} y={366} textAnchor="middle" fontFamily="IBM Plex Mono" fontSize="11" fill={VIZ.text}>
+      <text
+        x={361}
+        y={366}
+        textAnchor="middle"
+        fontFamily="IBM Plex Mono"
+        fontSize="11"
+        fill={VIZ.text}
+      >
         {projection.xTitle}
       </text>
     </svg>

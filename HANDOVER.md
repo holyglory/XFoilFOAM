@@ -211,8 +211,9 @@ ssh ... 'docker exec app-postgres-1 psql -U aerodb -d aerodb -At -F" | " -c "<sq
 - **Engine tests MUST be** `.venv/bin/pytest tests/ -m "not integration"` — bare
   `pytest` runs real OpenFOAM docker solves (banned; battery).
 - Node suites: `pnpm --filter @aerodb/{api,sweeper,web,core,db} test`. `pnpm typecheck`.
-- **No local browser launches** (sandbox Chrome SIGABRTs; user rejected Playwright).
-  Verify UI via unit tests; the user eyeballs live.
+- **Browser automation is allowed** for local and live-route verification.
+  Production mutations remain governed by the active task's authorization;
+  browser access itself is not restricted by this handover.
 
 **Monitor**: a persistent background Monitor (`continuation-watch.sh`, IP-pinned)
 streams campaign totals / needs-review / march-guard / disk / container health on

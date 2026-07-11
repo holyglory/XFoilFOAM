@@ -32,14 +32,14 @@ export interface PolarMetricRow {
 export function SpecSheet({
   detail,
   polarRows,
-  solvedReStr,
+  solvedSeriesLabel,
   solvedPointCount,
   machStr,
   fitStatus,
 }: {
   detail: AirfoilDetailPayload;
   polarRows: PolarMetricRow[];
-  solvedReStr: string | null;
+  solvedSeriesLabel: string | null;
   solvedPointCount: number;
   machStr: string;
   fitStatus: string | null;
@@ -96,8 +96,8 @@ export function SpecSheet({
       <div style={card}>
         <div style={cardHead}>
           <span style={cardLabel}>BEST-FIT POLAR</span>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: solvedReStr ? C.teal : C.dim }}>
-            {solvedReStr ? `Re ${solvedReStr}${fitStatus ? ` · ${fitStatus}` : ""}` : "queued"}
+          <span style={{ fontFamily: MONO, fontSize: 10, color: solvedSeriesLabel ? C.teal : C.dim }}>
+            {solvedSeriesLabel ? `${solvedSeriesLabel}${fitStatus ? ` · ${fitStatus}` : ""}` : "queued"}
           </span>
         </div>
         <div style={{ padding: "6px 14px 12px" }}>
@@ -126,7 +126,7 @@ export function SpecSheet({
             ))
           ) : (
             <div style={{ fontFamily: MONO, fontSize: 10, color: C.muted, lineHeight: 1.55, padding: "12px 0 4px" }}>
-              Best-fit metrics appear after at least three solved AoA points are stored for one Reynolds condition.
+              Best-fit metrics appear after at least three solved AoA points are stored for one operating condition.
             </div>
           )}
           <div style={{ fontFamily: MONO, fontSize: 9, color: C.dimmest, marginTop: 8, lineHeight: 1.5 }}>

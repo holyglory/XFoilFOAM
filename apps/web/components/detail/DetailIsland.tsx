@@ -11,7 +11,6 @@ import {
   f1,
   f2,
   f4,
-  fRe,
   projectChart,
   type SimulationDetail,
 } from "@aerodb/core";
@@ -19,6 +18,12 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { getFieldTrack, getSim } from "@/lib/api";
+import {
+  initialSeriesVisibility,
+  publicSolvedPointCount,
+  toggleSeriesVisibility,
+  visibleMachDisplay,
+} from "@/lib/polar-series";
 import type { SimModalReviewContext } from "@/lib/result-review";
 import { C, MONO } from "@/lib/tokens";
 import { PolarViewer } from "./PolarViewer";
@@ -37,32 +42,15 @@ export interface HoverState {
   ld: string;
 }
 
-const DEFAULT_VISIBLE: Record<number, boolean> = {
-  100000: true,
-  200000: false,
-  500000: true,
-  1000000: false,
-};
-
-function visibleDefaults(detail: AirfoilDetailPayload, pinned: boolean): Record<number, boolean> {
-  // Pinned-revision scope carries exactly one curve — it must start visible
-  // (the catalog defaults would hide e.g. a pinned Re 200k curve entirely).
-  if (pinned) return Object.fromEntries(detail.polars.map((polar) => [polar.re, true]));
-  return Object.fromEntries(
-    detail.polars.map((polar) => [
-      polar.re,
-      Object.prototype.hasOwnProperty.call(DEFAULT_VISIBLE, polar.re) ? DEFAULT_VISIBLE[polar.re] : polar.points.length > 0,
-    ]),
-  );
-}
-
 /** `pinnedRevisionId` (campaign spec §11 pinned-detail admin journey): the
  *  page was opened from an admin evidence link with ?revision=<uuid>, so the
  *  payload is scoped to that one setup revision (enabled or not). A compact
  *  context chip above the charts says so and links back to the public view. */
 export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: AirfoilDetailPayload; pinnedRevisionId?: string | null }) {
   const [chartType, setChartType] = useState<ChartType>("cla");
-  const [visibleRe, setVisibleRe] = useState<Record<number, boolean>>(() => visibleDefaults(detail, !!pinnedRevisionId));
+  const [visibleSeries, setVisibleSeries] = useState<Record<string, boolean>>(() =>
+    initialSeriesVisibility(detail.polars),
+  );
   const [hover, setHover] = useState<HoverState | null>(null);
   // zoom/pan window; null = zoom-to-fit. Axes change meaning per chart type,
   // so switching tabs resets the window.
@@ -86,34 +74,30 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
   }, [detail.slug]);
 
   useEffect(() => {
-    setVisibleRe(visibleDefaults(detail, !!pinnedRevisionId));
+    setVisibleSeries(initialSeriesVisibility(detail.polars));
   }, [detail, pinnedRevisionId]);
 
   // Real solver evidence only — derived-by-symmetry mirrors are display points,
   // never counted as solved runs (spec §9.3 "solver runs vs points").
   const solvedPointCount = useMemo(
-    () => detail.polars.reduce((sum, p) => sum + p.points.filter((pt) => !derivedBySymmetryInfo(pt).derived).length, 0),
+    () =>
+      detail.polars.reduce(
+        (sum, polar) => sum + publicSolvedPointCount(polar.points),
+        0,
+      ),
     [detail.polars],
   );
-  const solvedPointKeys = useMemo(() => {
-    const keys = new Set<string>();
-    for (const polar of detail.polars) {
-      for (const point of polar.points) {
-        if (point.source === "solved" && point.resultId) keys.add(`${polar.re}:${point.a}`);
-      }
-    }
-    return keys;
-  }, [detail.polars]);
   const metricPolar = useMemo(
     () =>
-      detail.polars.find((p) => visibleRe[p.re] && p.fit?.metrics) ??
+      detail.polars.find((p) => visibleSeries[p.seriesId] && p.fit?.metrics) ??
       detail.polars.find((p) => p.fit?.metrics) ??
-      detail.polars.find((p) => visibleRe[p.re] && p.points.length >= 3) ??
+      detail.polars.find((p) => visibleSeries[p.seriesId] && p.points.length >= 3) ??
       detail.polars.find((p) => p.points.length >= 3) ??
       null,
-    [detail.polars, visibleRe],
+    [detail.polars, visibleSeries],
   );
   const solvedM = metricPolar?.fit?.metrics ?? null;
+  const chartMachStr = visibleMachDisplay(detail.polars, visibleSeries);
 
   const polarRows = useMemo(() => {
     if (!solvedM) return [];
@@ -130,7 +114,15 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
   }, [solvedM]);
 
   const chartPolars = useMemo(
-    () => detail.polars.map((p) => ({ re: p.re, color: p.color, points: p.points, fit: p.fit })),
+    () =>
+      detail.polars.map((p) => ({
+        seriesId: p.seriesId,
+        label: p.label,
+        re: p.re,
+        color: p.color,
+        points: p.points,
+        fit: p.fit,
+      })),
     [detail.polars],
   );
   const projection = useMemo(
@@ -138,11 +130,11 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
       projectChart({
         chartType,
         polars: chartPolars,
-        visibleRe,
+        visibleSeries,
         hoverKey: hover?.key ?? null,
         domain: chartDomain,
       }),
-    [chartType, chartPolars, visibleRe, hover?.key, chartDomain],
+    [chartType, chartPolars, visibleSeries, hover?.key, chartDomain],
   );
 
   const onPointClick = useCallback((vm: ChartPointVM) => {
@@ -176,7 +168,7 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
   // fetch the simulation detail whenever the modal opens for a new point
   useEffect(() => {
     if (!simOpen || !simCtx) return;
-    if (!simCtx.resultId && !solvedPointKeys.has(`${simCtx.re}:${simCtx.aoa}`)) {
+    if (!simCtx.resultId) {
       setSimDetail(null);
       setSimMessage("No solved OpenFOAM result is stored for this point yet. Queue or rerun the sweep to inspect real CFD media here.");
       setPlaying(false);
@@ -204,7 +196,7 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     return () => {
       cancelled = true;
     };
-  }, [simOpen, simCtx, detail.slug, solvedPointKeys]);
+  }, [simOpen, simCtx, detail.slug]);
 
   useEffect(() => {
     if (!simOpen) return;
@@ -250,9 +242,9 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
         <SpecSheet
           detail={detail}
           polarRows={polarRows}
-          solvedReStr={metricPolar ? fRe(metricPolar.re) : null}
+          solvedSeriesLabel={metricPolar?.label ?? null}
           solvedPointCount={solvedPointCount}
-          machStr={detail.mach.toFixed(2)}
+          machStr={(metricPolar?.mach ?? detail.mach).toFixed(2)}
           fitStatus={metricPolar?.fit?.status ?? null}
         />
         {/* minWidth 0 so the pinned chip's text cannot widen the 1fr track past the viewport */}
@@ -281,7 +273,7 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
               }}
             >
               Pinned to setup revision {pinnedRevisionId.slice(0, 8)}
-              {detail.reList.length === 1 ? ` · Re ${fRe(detail.reList[0])}` : ""}
+              {detail.polars.length === 1 ? ` · ${detail.polars[0].label}` : ""}
               <Link
                 href={`/airfoils/${encodeURIComponent(detail.slug)}`}
                 title="View public data (enabled setups only)"
@@ -299,12 +291,12 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
             polars={chartPolars}
             domain={chartDomain}
             onDomainChange={setChartDomain}
-            visibleRe={visibleRe}
-            onToggleRe={(re) => setVisibleRe((v) => ({ ...v, [re]: !v[re] }))}
-            reList={detail.reList}
-            rePointCounts={Object.fromEntries(detail.polars.map((p) => [p.re, p.points.length]))}
+            visibleSeries={visibleSeries}
+            onToggleSeries={(seriesId) =>
+              setVisibleSeries((visibility) => toggleSeriesVisibility(visibility, seriesId))
+            }
             solvedPointCount={solvedPointCount}
-            machStr={detail.mach.toFixed(2)}
+            machStr={chartMachStr}
             hover={hover}
             onHover={setHover}
             onPointClick={onPointClick}

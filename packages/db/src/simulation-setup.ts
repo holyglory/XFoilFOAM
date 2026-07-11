@@ -320,6 +320,7 @@ export async function ensureSimulationPresetRevision(db: DB, presetId: string): 
   const snapshot = await resolveSimulationPresetSnapshot(db, presetId);
   if (!snapshot) return null;
   const signatureHash = simulationSetupSignature(snapshot);
+  const physicsHash = physicsHashForSnapshot(snapshot);
   const [latest] = await db
     .select()
     .from(simulationPresetRevisions)
@@ -331,6 +332,17 @@ export async function ensureSimulationPresetRevision(db: DB, presetId: string): 
     (latest.signatureHash === signatureHash ||
       stableStringify(latest.snapshot) === stableStringify(snapshot))
   ) {
+    if (!latest.physicsHash) {
+      const [withPhysicsHash] = await db
+        .update(simulationPresetRevisions)
+        .set({ physicsHash, isCanonicalPhysics: false })
+        .where(eq(simulationPresetRevisions.id, latest.id))
+        .returning();
+      return {
+        revision: withPhysicsHash ?? { ...latest, physicsHash },
+        snapshot: latest.snapshot as unknown as SimulationSetupSnapshot,
+      };
+    }
     return { revision: latest, snapshot: latest.snapshot as unknown as SimulationSetupSnapshot };
   }
   await db
@@ -343,6 +355,7 @@ export async function ensureSimulationPresetRevision(db: DB, presetId: string): 
       mach: snapshot.derived.mach,
       referenceLengthM: snapshot.referenceGeometry.referenceLengthM,
       snapshot: snapshot as unknown as Record<string, unknown>,
+      physicsHash,
     })
     .onConflictDoNothing({ target: [simulationPresetRevisions.presetId, simulationPresetRevisions.signatureHash] });
   const [revision] = await db
