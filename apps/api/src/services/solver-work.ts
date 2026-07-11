@@ -299,7 +299,15 @@ function firstDetailLine(row: {
   ]
     .map((line) => line.trim())
     .filter(Boolean);
-  return lines[0] ?? null;
+  // Disclosure-class warnings (e.g. the 75-85 deg mesh quality band, the
+  // aspect-ratio waiver) describe context, not the DECIDING verdict — a point
+  // rejected for non-stationarity was showing "mesh QA gate · 78.7 deg" in
+  // review because the disclosure sat first in the array. Prefer the first
+  // non-disclosure line; fall back to the disclosure only if nothing else
+  // explains the state.
+  const isDisclosure = (line: string) =>
+    /^mesh quality warning:/i.test(line) || /heuristic waived/i.test(line) || /^converged \(oscillating steady/i.test(line) || /^steady-oscillating-mean:/i.test(line);
+  return lines.find((line) => !isDisclosure(line)) ?? lines[0] ?? null;
 }
 
 function normalizedGateDetail(line: string): string {
