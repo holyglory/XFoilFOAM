@@ -475,10 +475,17 @@ async function pushCompletedJob(db: DB, settings: Settings, job: typeof simJobs.
   const payload = (job.requestPayload as { syncPromiseId?: string; remotePushedAt?: string } | null) ?? {};
   if (!payload.syncPromiseId || payload.remotePushedAt || job.status !== "done" || !job.simulationPresetRevisionId) return false;
   if (job.wave === 1) {
+    // Block the parent's push only while a ladder child is STILL WORKING —
+    // the child owns the escalated α, and pushing early would ship a value
+    // the ladder is about to supersede. A TERMINAL child must not block:
+    // the escalated α's row moved to the child (it pushes separately), and
+    // blocking forever orphans the parent's accepted siblings (validation
+    // incident 2026-07-11: e387 −2/2 never shipped; the hub re-promised and
+    // re-solved them from scratch).
     const [replacement] = await db
       .select({ id: simJobs.id })
       .from(simJobs)
-      .where(eq(simJobs.parentJobId, job.id))
+      .where(and(eq(simJobs.parentJobId, job.id), inArray(simJobs.status, ["pending", "submitted", "running", "ingesting"])))
       .limit(1);
     if (replacement) return false;
   }
