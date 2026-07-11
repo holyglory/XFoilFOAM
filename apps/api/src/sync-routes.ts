@@ -340,6 +340,27 @@ function permissionSummary(permissions: Awaited<ReturnType<typeof getSettings>>[
   return Object.fromEntries(permissions.map((p) => [p.dataType, { fetch: p.canFetch, push: p.canPush }]));
 }
 
+/** Conflict payloads must stay INSPECTABLE, not exhaustive: pushed points
+ *  carry media/evidence as inline base64 (tens-to-hundreds of MB) and storing
+ *  them verbatim blew Postgres's 256 MB jsonb ceiling — the conflict INSERT
+ *  itself 500'd and the remote push retried forever (validation incident
+ *  2026-07-11). Strip every contentBase64 to a size stamp; sha256 + metadata
+ *  survive for diagnosis. */
+function stripBase64Content(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripBase64Content);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] =
+        k === "contentBase64" && typeof v === "string"
+          ? `[stripped ${v.length} base64 chars]`
+          : stripBase64Content(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 async function createConflict(opts: {
   dataType: SyncDataType;
   naturalKey: string;
@@ -354,7 +375,7 @@ async function createConflict(opts: {
     .values({
       dataType: opts.dataType,
       naturalKey: opts.naturalKey,
-      incomingPayload: opts.incomingPayload,
+      incomingPayload: stripBase64Content(opts.incomingPayload) as Record<string, unknown>,
       localSnapshot: opts.localSnapshot ?? null,
       artifactManifest: opts.artifactManifest ?? null,
       sourceInstanceId: opts.sourceInstanceId ?? null,
