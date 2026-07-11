@@ -86,5 +86,15 @@
       "expect_status": 200,
       "expect_text": "ok"
     }
-  ]
+  ],
+  "docker": {
+    "compose_files": [
+      "docker-compose.yml"
+    ],
+    "services": [
+      "redis",
+      "api",
+      "worker"
+    ]
+  }
 }

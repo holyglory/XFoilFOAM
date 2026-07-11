@@ -3182,3 +3182,59 @@ mean).
 - Bundled: solver-work gate naming — "frames/cycle" warnings now map
   to a named "frame recorder" gate instead of generic "quality gate"
   (first live needs-review point: naca-0012 a30, 10.67 frames/cycle).
+
+## 2026-07-11 — Remote solver API validated end-to-end (Mac as live remote solver)
+
+- Purpose: prove the remote-solver path before deploying the repo on the
+  user's Windows server. The Mac ran the full remote stack (engine trio
+  in docker rebuilt from current source, host sweeper, dev DB) against
+  the PROD hub with a dedicated tiny validation preset (e387, chord
+  0.1 m / 25 m/s, small α list; sync API enabled with a fresh secret +
+  least-privilege grants: sweeps.fetch, polars/evidence/media push).
+- Architecture confirmed: PULL model — the remote instance registers
+  (/solvers/register), heartbeats, CLAIMS sweep-gap promises from
+  enabled presets, mirrors airfoil+numerics locally (find-or-create by
+  deterministic slugs), solves through its own full quality
+  pipeline (incl. the fidelity ladder), and PUSHES results with media
+  and evidence inline to /api/sync/v1/polars. Campaign presets are
+  disabled by design → remote solvers boost the PUBLIC sweep pool,
+  not a running campaign directly.
+- The validation deliberately crossed the whole pipeline: e387 α−8
+  was honestly rejected by the local RANS validity gate, laddered to a
+  local URANS precalc, and shipped as the corrected value.
+- SIX defects found live and fixed (each pinned by a lane-S test):
+  1. 413 on first real push — Fastify default 1 MiB bodyLimit; scoped
+     512 MiB limit on the polars route only.
+  2. Push shipped a whole job in one POST — now one result per request
+     (idempotent re-push on mid-sequence failure).
+  3. Hub ingested the REMOTE database's bcId verbatim → results FK
+     500s; foreign ids now count only if they exist locally, else the
+     hub's own legacy bc from the revision snapshot.
+  4. result_attempts.evidence_payload stored the whole pushed point
+     (base64 media incl.) → Postgres 256 MB jsonb ceiling; sanitized
+     (structure + hashes survive, files land on disk).
+  5. sync_import_conflicts.incoming_payload had the same hazard;
+     sanitized at createConflict.
+  6. Ladder-vs-promise deadlock: the child's /complete fulfilled the
+     whole promise after shipping 1 of 3 α AND the parent's push guard
+     blocked on ANY child — the accepted sibling points were orphaned
+     while the hub re-promised (and a re-claim of locally-solved α
+     dead-ends in "no locally claimable AoAs"). Fixed both sides:
+     fulfilled/expired promises accept idempotent late chunks (only
+     cancelled/unknown reject); the guard blocks only while a child is
+     actively pending/submitted/running/ingesting.
+  Plus a deploy gap: node-api mounts engine data :ro — sync imports
+  now get a dedicated writable volume nested at
+  /data/airfoilfoam/sync-imports (mountpoint pre-created in the
+  results volume; nested mounts cannot create dirs under ro parents).
+- Final prod evidence: e387 carries all 7 α as verified (mixed VPS +
+  Mac provenance), pushed media serves via /api/media (sync-imports
+  key, HTTP 200), promise fulfilled, solver registered/heartbeating.
+- Windows deployment notes: run the full compose (its own postgres —
+  NOT port 5544 if colocated); configure sync_api_settings id=1 with
+  upstream_base_url https://airfoils.pro/api/sync/v1 + the hub secret
+  (stored in prod sync_api_settings) + remote_solver_enabled=true +
+  remote_solver_cpu_budget sized to the box; keep sweeper_state
+  enabled=false unless the box should also run its own public sweeps;
+  claim size bounds α per promise. The hub needs enabled presets with
+  gaps for remote solvers to have work.
