@@ -99,6 +99,11 @@ services:
       - "127.0.0.1:4000:4000"
     volumes:
       - results:/data/airfoilfoam:ro
+      # Sync imports (remote-solver pushes) are the ONE path node-api must
+      # WRITE under the media root; a dedicated volume nested at that path
+      # keeps engine data read-only (validation incident 2026-07-11: pushed
+      # media failed EROFS/ENOENT on the ro mount).
+      - sync_imports:/data/airfoilfoam/sync-imports
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,4 +151,5 @@ services:
 
 volumes:
   results:
+  sync_imports:
   pgdata:
