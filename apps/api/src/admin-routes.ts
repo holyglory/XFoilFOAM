@@ -73,6 +73,7 @@ import {
   tablePointsDTO,
   toMediumDTO,
 } from "./services/mediums";
+import { startSystemHealthSampler, systemHealthSnapshot } from "./services/system-health";
 import { readSweeperState, SWEEPER_STATE_DEFAULTS, type SweeperStateRow, writeSweeperState } from "./services/sweeper-state";
 
 const activeSimJobStatuses: Array<"submitted" | "running" | "ingesting"> = ["submitted", "running", "ingesting"];
@@ -1291,6 +1292,11 @@ async function replacePresetTargets(presetId: string, targetScope: "all" | "airf
 }
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
+  const stopSystemHealthSampler = startSystemHealthSampler();
+  app.addHook("onClose", async () => {
+    stopSystemHealthSampler();
+  });
+
   // ---- auth ----
   app.get("/api/admin/me", async (req) => {
     const mode = authMode();
@@ -1366,6 +1372,8 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     reply.clearCookie(COOKIE_NAME, { path: "/" });
     return { ok: true };
   });
+
+  app.get("/api/admin/health", { preHandler: requireAdmin }, async () => systemHealthSnapshot());
 
   // ---- mediums + setup state (protected writes) ----
   app.get("/api/admin/mediums", { preHandler: requireAdmin }, async () => {

@@ -95,6 +95,7 @@ import { CategoriesAdminPanel, HashtagsAdminPanel } from "./CatalogAdminPanels";
 import { UnitNumberField } from "./UnitNumberField";
 import { PointHistoryPanel } from "./PointHistoryPanel";
 import { SolvedPointsPopover, type SolvedPopoverAnchor } from "./SolvedPointsPopover";
+import { HealthPanel } from "./HealthPanel";
 import { CampaignDetail } from "./campaigns/CampaignDetail";
 import { gateFromSolverState, type CampaignGate } from "./campaigns/campaign-status";
 import { CampaignsHub } from "./campaigns/CampaignsHub";
@@ -102,12 +103,13 @@ import { CampaignWizard } from "./campaigns/CampaignWizard";
 import { usePoll } from "./campaigns/usePoll";
 import { stashDuplicatePrefill } from "./campaigns/wizard-draft";
 
-type Section = "simulations" | "queue" | "setup" | "catalog" | "sync";
+type Section = "simulations" | "queue" | "health" | "setup" | "catalog" | "sync";
 const SECTIONS: { k: Section; label: string; icon: string }[] = [
   { k: "simulations", label: "Simulations", icon: "∿" },
   // Label "Solver" (approved redesign); the URL key stays ?section=queue so
   // links, tests, and bookmarks keep working (§11 routing contract).
   { k: "queue", label: "Solver", icon: "◷" },
+  { k: "health", label: "Health", icon: "▥" },
   { k: "setup", label: "Setup library", icon: "β" },
   { k: "catalog", label: "Catalog", icon: "▸" },
   { k: "sync", label: "Sync API", icon: "⇄" },
@@ -620,6 +622,7 @@ export function AdminConsole() {
               onOpenPoints={openCampaignPoints}
             />
           )}
+          {section === "health" && <HealthPanel />}
           {section === "setup" && (
             <SimulationSetupPanel
               tab={parseSetupTab(tabParam)}

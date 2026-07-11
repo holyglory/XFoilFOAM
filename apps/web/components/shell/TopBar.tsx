@@ -60,11 +60,27 @@ export function TopBar({ active }: { active: string }) {
           }
         }
         @media (max-width: 640px) {
+          .topbar-shell {
+            height: auto !important;
+            min-height: 52px;
+            flex-wrap: wrap;
+            row-gap: 6px !important;
+            padding-top: 8px !important;
+            padding-bottom: 8px !important;
+          }
           .topbar-brand-text {
             display: none;
           }
           .topbar-jump {
             display: none;
+          }
+          .topbar-tabs {
+            order: 3;
+            flex: 1 0 100%;
+            width: 100%;
+          }
+          .topbar-tabs > * {
+            padding: 5px 10px !important;
           }
         }
       `}</style>

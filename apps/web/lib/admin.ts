@@ -57,6 +57,45 @@ export interface AdminMe {
     loginUrl: string;
   };
 }
+export interface AdminHealthSample {
+  at: string;
+  cpu: {
+    load1: number;
+    load5: number;
+    load15: number;
+    availableCpus: number;
+    loadPct: number;
+  };
+  memory: {
+    totalBytes: number;
+    freeBytes: number;
+    usedBytes: number;
+    usedPct: number;
+  };
+  storage: {
+    path: string;
+    totalBytes: number;
+    freeBytes: number;
+    usedBytes: number;
+    usedPct: number;
+  } | null;
+  storageError: string | null;
+}
+export interface AdminHealth {
+  asOf: string;
+  sampleIntervalSeconds: number;
+  windowHours: number;
+  current: AdminHealthSample;
+  averages24h: {
+    sampleCount: number;
+    coverageSeconds: number;
+    firstSampleAt: string | null;
+    cpuLoad1: number | null;
+    cpuLoadPct: number | null;
+    memoryUsedPct: number | null;
+  };
+  history: AdminHealthSample[];
+}
 export interface SweeperState {
   enabled: boolean;
   maxConcurrentJobs: number;
@@ -447,6 +486,7 @@ export const adminLogin = (email: string, password: string) =>
 export const adminGoogleLoginUrl = (returnTo = "/admin") =>
   `${BASE}/api/admin/oauth/google?returnTo=${encodeURIComponent(returnTo)}`;
 export const adminLogout = () => aj<{ ok: boolean }>("/api/admin/logout", { method: "POST" });
+export const getAdminHealth = () => aj<AdminHealth>("/api/admin/health");
 export const getAdminQueue = (scope: AdminQueueScope = "all") =>
   aj<AdminQueue>(`/api/admin/queue${scope === "all" ? "" : `?scope=${scope}`}`);
 
