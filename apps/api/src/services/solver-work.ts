@@ -45,6 +45,7 @@ export interface SolverWorkGate {
     | "period detector"
     | "mesh QA gate"
     | "RANS validity gate"
+    | "frame recorder"
     | "quality gate";
   detail: string;
 }

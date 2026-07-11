@@ -308,6 +308,8 @@ function syncSecret(req: FastifyRequest): string | null {
   return null;
 }
 
+const SYNC_POLAR_PUSH_BODY_LIMIT_BYTES = 512 * 1024 * 1024;
+
 async function requireSync(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -2475,7 +2477,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     return { imported, conflicts: conflictIds };
   });
 
-  app.post("/api/sync/v1/polars", async (req, reply) => {
+  // Remote solvers push results with media + evidence bundles inline as
+  // base64 (a single URANS point can carry tens of MB); Fastify's default
+  // 1 MiB bodyLimit rejected the very first real push with 413 (validation
+  // incident 2026-07-11). Scoped here — public routes keep the default.
+  app.post("/api/sync/v1/polars", { bodyLimit: SYNC_POLAR_PUSH_BODY_LIMIT_BYTES }, async (req, reply) => {
     const ctx = await requireSync(req, reply, "polars", "push");
     if (!ctx) return;
     const { payload, files } = await parsePolarRequest(req);

@@ -550,21 +550,28 @@ async function pushCompletedJob(db: DB, settings: Settings, job: typeof simJobs.
       }))),
     });
   }
-  const res = await fetch(`${syncBase(settings)}/polars`, {
-    method: "POST",
-    signal: AbortSignal.timeout(REMOTE_PUSH_TIMEOUT_MS),
-    headers: headers(settings),
-    body: JSON.stringify({
-      promiseId: payload.syncPromiseId,
-      sourceInstanceId: settings.instanceId,
-      sourceInstanceName: settings.instanceName,
-      airfoilSlug: airfoil.slug,
-      simulationPresetSignatureHash: revision.signatureHash,
-      bcId: job.bcIds[0],
-      results: payloadResults,
-    }),
-  });
-  if (!res.ok) throw new Error(`remote polar push failed (${res.status})`);
+  // One result per request: a job's combined media/evidence payload (base64
+  // inline) can reach tens of MB per point — the single-POST form tripped the
+  // hub's body limit on the first real push (413, 2026-07-11). Server-side
+  // ingest is idempotent, so a mid-sequence failure simply re-pushes all
+  // chunks on the next tick.
+  for (const one of payloadResults) {
+    const res = await fetch(`${syncBase(settings)}/polars`, {
+      method: "POST",
+      signal: AbortSignal.timeout(REMOTE_PUSH_TIMEOUT_MS),
+      headers: headers(settings),
+      body: JSON.stringify({
+        promiseId: payload.syncPromiseId,
+        sourceInstanceId: settings.instanceId,
+        sourceInstanceName: settings.instanceName,
+        airfoilSlug: airfoil.slug,
+        simulationPresetSignatureHash: revision.signatureHash,
+        bcId: job.bcIds[0],
+        results: [one],
+      }),
+    });
+    if (!res.ok) throw new Error(`remote polar push failed (${res.status})`);
+  }
   await fetch(`${syncBase(settings)}/sweeps/${payload.syncPromiseId}/complete`, {
     method: "POST",
     signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
