@@ -1397,6 +1397,19 @@ async function importPolarPush(payload: PolarPushPayload, files: Map<string, Upl
   const [revision] = await db.select().from(simulationPresetRevisions).where(eq(simulationPresetRevisions.id, revisionId)).limit(1);
   const snapshot = jsonObject(revision?.snapshot);
   const snapshotPreset = jsonObject(snapshot.preset);
+  // Never trust a pushing instance's bc id blindly: remote solvers send THEIR
+  // database's uuid (validation incident 2026-07-11 — the Mac's local bc id
+  // hit results_bc_id fk on the hub with a 500 on every chunk). Accept the
+  // pushed id only if it exists HERE (same-instance/legacy pushes); otherwise
+  // resolve the hub's own legacy bc from the revision snapshot.
+  if (bcId) {
+    const [localBc] = await db
+      .select({ id: boundaryConditions.id })
+      .from(boundaryConditions)
+      .where(eq(boundaryConditions.id, bcId))
+      .limit(1);
+    if (!localBc) bcId = null;
+  }
   bcId = bcId ?? nullableText(snapshotPreset.legacyBoundaryConditionId);
   if (!bcId) {
     conflictIds.push(
