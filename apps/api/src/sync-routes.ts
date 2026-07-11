@@ -1384,7 +1384,13 @@ async function importPolarPush(payload: PolarPushPayload, files: Map<string, Upl
 
   if (payload.promiseId) {
     [promise] = await db.select().from(syncSweepPromises).where(eq(syncSweepPromises.id, payload.promiseId)).limit(1);
-    if (!promise || promise.status !== "active" || promise.expiresAt <= new Date()) {
+    // Fulfilled/expired promises still identify their scope and the ingest is
+    // idempotent — LATE chunks must land (validation incident 2026-07-11: a
+    // ladder child's /complete fulfilled the promise after shipping 1 of 3
+    // alphas; the parent's remaining chunks were then rejected forever and
+    // the hub re-promised work the solver had already finished). Only a
+    // cancelled or unknown promise rejects.
+    if (!promise || promise.status === "cancelled") {
       throw new Error("promise is not active");
     }
     airfoilId = promise.airfoilId;
