@@ -515,12 +515,28 @@ class MeshQaResult:
     max_non_ortho_deg: Optional[float] = None
     failed_checks: int = 0
     negative_volume: bool = False
+    #: Every failed check is benign wall-layer anisotropy (checkMesh's
+    #: "***High aspect ratio cells found" heuristic). High-AR cells are the
+    #: NORMAL shape of a boundary-layer mesh at high Re (prod false positive
+    #: 2026-07-11: sd8020 c1.0 u100, AR 4871, non-ortho only 72.4 deg — the
+    #: transient p/pFinal smoother was hardened for exactly this anisotropy),
+    #: so an aspect-ratio-ONLY failure is a disclosure, not a fatal verdict.
+    aspect_ratio_only_failure: bool = False
+    max_aspect_ratio: Optional[float] = None
+    high_aspect_cells: Optional[int] = None
 
 
 _CHECKMESH_NON_ORTHO_RE = re.compile(
     r"Mesh\s+non-orthogonality\s+Max:\s*([0-9.+\-eE]+)", re.IGNORECASE
 )
 _CHECKMESH_FAILED_RE = re.compile(r"Failed\s+([1-9]\d*)\s+mesh\s+checks?", re.IGNORECASE)
+# checkMesh marks each FAILED check with a leading "***" line; single-star
+# lines are advisories that did not fail the check.
+_CHECKMESH_FAILLINE_RE = re.compile(r"^\s*\*\*\*(.+)$", re.MULTILINE)
+_CHECKMESH_ASPECT_RE = re.compile(
+    r"High aspect ratio cells found,\s*Max aspect ratio:\s*([0-9.+\-eE]+),\s*number of cells\s+(\d+)",
+    re.IGNORECASE,
+)
 
 
 def _parse_check_mesh_output(output: str) -> MeshQaResult:
@@ -540,10 +556,26 @@ def _parse_check_mesh_output(output: str) -> MeshQaResult:
             failed_checks = 0
     lower = output.lower()
     negative_volume = "negative volume" in lower or "negative cell volume" in lower
+    fail_lines = _CHECKMESH_FAILLINE_RE.findall(output)
+    aspect_lines = [line for line in fail_lines if "high aspect ratio" in line.lower()]
+    aspect_only = bool(failed_checks) and bool(fail_lines) and len(aspect_lines) == len(fail_lines)
+    max_aspect: Optional[float] = None
+    high_cells: Optional[int] = None
+    aspect_match = _CHECKMESH_ASPECT_RE.search(output)
+    if aspect_match:
+        try:
+            max_aspect = float(aspect_match.group(1))
+            high_cells = int(aspect_match.group(2))
+        except ValueError:
+            max_aspect = None
+            high_cells = None
     return MeshQaResult(
         max_non_ortho_deg=max_non_ortho,
         failed_checks=failed_checks,
         negative_volume=negative_volume,
+        aspect_ratio_only_failure=aspect_only,
+        max_aspect_ratio=max_aspect,
+        high_aspect_cells=high_cells,
     )
 
 
@@ -566,7 +598,7 @@ def _run_transient_mesh_qa_gate(
         reasons.append(
             f"checkMesh max non-orthogonality exceeds {MESH_MAX_NON_ORTHO_DEG:.1f} deg"
         )
-    if qa.failed_checks > 0:
+    if qa.failed_checks > 0 and not qa.aspect_ratio_only_failure:
         reasons.append(f"checkMesh reported Failed {qa.failed_checks} mesh checks")
     if qa.negative_volume:
         reasons.append("checkMesh reported negative-volume cells")
@@ -582,6 +614,18 @@ def _run_transient_mesh_qa_gate(
     if qa.max_non_ortho_deg is None:
         logger.warning("checkMesh output for %s had no non-orthogonality summary; mesh QA gate skipped", case_dir)
         return
+    if qa.failed_checks > 0 and qa.aspect_ratio_only_failure:
+        ar = f"{qa.max_aspect_ratio:.0f}" if qa.max_aspect_ratio is not None else "unknown"
+        cells = qa.high_aspect_cells if qa.high_aspect_cells is not None else "some"
+        warning = (
+            f"mesh quality warning: {cells} high-aspect-ratio wall cells (max aspect ratio {ar}) — "
+            "checkMesh aspect-ratio heuristic waived: this is the normal anisotropy of a "
+            "wall-function boundary layer at high Re, and the transient pressure solver is "
+            "configured for it"
+        )
+        logger.warning("%s: %s", case_dir, warning)
+        if quality_warnings is not None:
+            quality_warnings.append(warning)
     if qa.max_non_ortho_deg > MESH_WARN_NON_ORTHO_DEG:
         warning = (
             f"mesh quality warning: max non-orthogonality {qa.max_non_ortho_deg:.1f} deg "

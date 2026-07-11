@@ -740,6 +740,58 @@ def test_transient_mesh_qa_gate_failed_checks_are_degenerate(tmp_path):
         pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
 
 
+# Verbatim shape of the prod false positive (2026-07-11, sd8020 c1.0 u100):
+# checkMesh failed ONLY its aspect-ratio heuristic — the normal anisotropy of
+# a wall-function boundary layer at high Re — with non-ortho at a healthy 72.4.
+_ASPECT_ONLY_CHECKMESH = (
+    " ***High aspect ratio cells found, Max aspect ratio: 4870.8257, number of cells 96\n"
+    "  <<Writing 96 cells with high aspect ratio to set highAspectRatioCells\n"
+    "    Min volume = 9.5656255e-08. Max volume = 0.52245327.  Total volume = 74.329612.  Cell volumes OK.\n"
+    "    Mesh non-orthogonality Max: 72.364462 average: 29.704061\n"
+    "   *Number of severely non-orthogonal (> 70 degrees) faces: 419.\n"
+    "    Max skewness = 1.0856355 OK.\n"
+    "Failed 1 mesh checks.\n"
+)
+
+
+def test_transient_mesh_qa_gate_waives_aspect_ratio_only_failure(tmp_path):
+    # MUST-CATCH: aspect-ratio-only checkMesh failure is a disclosure, never a
+    # fatal mesh-degenerate verdict.
+    class FakeRunner:
+        def application(self, _case_dir, _cmd, *args, **kwargs):
+            return SimpleNamespace(ok=False, returncode=1, timed_out=False, stdout=_ASPECT_ONLY_CHECKMESH)
+
+    warnings: list[str] = []
+    pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), warnings)
+
+    assert any("high-aspect-ratio wall cells" in w and "4871" in w for w in warnings)
+
+
+def test_transient_mesh_qa_gate_aspect_plus_other_failure_stays_fatal(tmp_path):
+    # FALSE-POSITIVE GUARD for the waiver itself: aspect ratio plus ANY other
+    # failed check (or degenerate non-ortho) must still kill the case.
+    output = _ASPECT_ONLY_CHECKMESH.replace(
+        "Failed 1 mesh checks.",
+        " ***Max skewness = 6.2, 12 highly skew faces detected\nFailed 2 mesh checks.",
+    )
+
+    class FakeRunner:
+        def application(self, _case_dir, _cmd, *args, **kwargs):
+            return SimpleNamespace(ok=False, returncode=1, timed_out=False, stdout=output)
+
+    with pytest.raises(OpenFOAMError, match="Failed 2 mesh checks"):
+        pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
+
+    degenerate = _ASPECT_ONLY_CHECKMESH.replace("Max: 72.364462", "Max: 88.3")
+
+    class DegenerateRunner:
+        def application(self, _case_dir, _cmd, *args, **kwargs):
+            return SimpleNamespace(ok=False, returncode=1, timed_out=False, stdout=degenerate)
+
+    with pytest.raises(OpenFOAMError, match="non-orthogonality"):
+        pipeline._run_transient_mesh_qa_gate(tmp_path, DegenerateRunner(), [])
+
+
 def test_seed_transient_from_steady_requires_essential_fields(tmp_path):
     steady = tmp_path / "700"
     steady.mkdir()

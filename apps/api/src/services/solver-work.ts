@@ -335,6 +335,9 @@ function gateFromLine(line: string): SolverWorkGate {
   ) {
     return { name: "mesh QA gate", detail };
   }
+  if (/frames?\s*\/\s*cycle|frames? per cycle|frame track|frame recorder/.test(lower)) {
+    return { name: "frame recorder", detail };
+  }
   if (
     /rans|stalled|did not converge|not[- ]converged|solver[- ]stalled|non[- ]physical|low[- ]aoa|positive[- ]drag|missing[- ]coefficients|out_of_family/.test(
       lower,

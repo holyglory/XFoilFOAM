@@ -3157,3 +3157,28 @@ mean).
 - Verified: api 126, web 257, core 108, typecheck; prod smoke of
   solver-work on live S1223 (9 conditions; 39 former "rejected" rows
   now read as ladder progression).
+
+## 2026-07-11 — Mesh gate false positive: aspect-ratio-only checkMesh failures waived
+
+- First wave-2 casualty of the clean campaign was NOT a real defect:
+  sd8020 c1.0 u100 (Re 6.8M, heaviest condition) failed at mesh time
+  because checkMesh failed exactly ONE check — its aspect-ratio
+  heuristic (96 wall cells, AR 4871) — while non-orthogonality was a
+  healthy 72.4 deg and skewness/volumes passed. High-AR wall cells are
+  the NORMAL anisotropy of a wall-function boundary layer at high Re
+  (y+40 first cell is physically thin, half-res streamwise cells are
+  long), and the transient p/pFinal smoother was hardened for exactly
+  this. Left unfixed the gate would have falsely parked heavy
+  conditions across every airfoil as wave-2 progressed.
+- Fix: the gate now parses WHICH checks failed (checkMesh's ***
+  fail-lines); an aspect-ratio-ONLY failure becomes a quality
+  disclosure ("N high-aspect-ratio wall cells (max AR X) — checkMesh
+  aspect-ratio heuristic waived") instead of a fatal mesh-degenerate
+  verdict. Fatal verdicts unchanged for: non-ortho > 85 deg, negative
+  volumes, any failed check other than aspect ratio, and failed checks
+  with no ***-line detail (fail-safe). Pinned with the verbatim prod
+  checkMesh output as must-catch + two false-positive guards for the
+  waiver itself; toggle-revert recall proof run. Engine suite 365.
+- Bundled: solver-work gate naming — "frames/cycle" warnings now map
+  to a named "frame recorder" gate instead of generic "quality gate"
+  (first live needs-review point: naca-0012 a30, 10.67 frames/cycle).
