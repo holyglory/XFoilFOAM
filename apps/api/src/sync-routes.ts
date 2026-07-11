@@ -1550,7 +1550,13 @@ async function importPolarPush(payload: PolarPushPayload, files: Map<string, Upl
         firstOrderFallback: point.firstOrderFallback,
         strouhal: point.strouhal ?? null,
         error: point.error ?? null,
-        evidencePayload: point.evidencePayload ?? point,
+        // The fallback stores the whole pushed point — whose media/evidence
+        // arrays carry inline base64 (a URANS point's frame track alone can
+        // exceed Postgres's 256 MB jsonb ceiling; the insert 500'd every
+        // remote push retry, validation incident 2026-07-11). Files land on
+        // disk via the artifact/media import; the attempt record keeps
+        // structure + hashes only.
+        evidencePayload: stripBase64Content(point.evidencePayload ?? point) as Record<string, unknown>,
         solvedAt: point.status === "done" ? new Date() : null,
       })
       .returning({ id: resultAttempts.id });
