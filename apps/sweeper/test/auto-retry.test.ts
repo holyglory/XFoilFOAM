@@ -31,9 +31,15 @@ import {
   mediums,
   meshProfiles,
   outputProfiles,
+  resultAttempts,
+  resultClassifications,
   results,
   simCampaignPoints,
   simJobs,
+  simPrecalcObligationCampaigns,
+  simPrecalcObligations,
+  simRansPolarPromotionPoints,
+  simRansPolarPromotions,
   simResultSubmitRetries,
   solverProfiles,
   sweeperState,
@@ -51,7 +57,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ConditionMapEntry } from "../src/ingest";
 import { ingestResult } from "../src/ingest";
 import { submitCampaignBatch } from "../src/loop";
-import { reconcile } from "../src/reconcile";
+import { reconcile, submitUransRetryForJob } from "../src/reconcile";
+import { resetUransLadderMemory, uransLadderTick } from "../src/urans-ladder";
 
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `sw-autoretry-${process.pid}-${Date.now().toString(36)}`;
@@ -422,5 +429,759 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     const outcome = await autoRetryCrashedResultsForJob(db, secondJobId);
     expect(outcome.retried).toEqual([]);
     expect(outcome.escalated.length).toBe(ANGLES.length);
+  }, 240000);
+
+  it("MUST-CATCH: a typed hard-solver partial failure stays with promotion routing while infrastructure and mesh failures keep the ordinary one-shot route", async () => {
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        campaignId,
+        jobKind: "sweep",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "running",
+        totalCases: 3,
+        requestPayload: {
+          aoas: [0.25, 0.5, 0.75],
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: [0.25, 0.5, 0.75],
+          },
+        },
+      })
+      .returning();
+
+    const cases = [
+      {
+        aoaDeg: 0.25,
+        disposition: "hard_solver",
+        error: "simpleFoam diverged after residual growth",
+      },
+      {
+        aoaDeg: 0.5,
+        disposition: "infrastructure",
+        error: "OpenMPI reported insufficient slots",
+      },
+      {
+        aoaDeg: 0.75,
+        disposition: "deterministic_mesh",
+        error: "blockMesh rejected deterministic topology",
+      },
+    ] as const;
+    const seeded: Array<{
+      resultId: string;
+      aoaDeg: number;
+      disposition: (typeof cases)[number]["disposition"];
+    }> = [];
+    for (const fixture of cases) {
+      const [result] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: fixture.aoaDeg,
+          status: "failed",
+          source: "queued",
+          regime: "rans",
+          converged: false,
+          error: fixture.error,
+          simJobId: job.id,
+          engineJobId: `${PREFIX}-typed-partial`,
+        })
+        .returning();
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: result.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: fixture.aoaDeg,
+          simJobId: job.id,
+          engineJobId: `${PREFIX}-typed-partial`,
+          status: "failed",
+          source: "queued",
+          regime: "rans",
+          validForPolar: false,
+          converged: false,
+          error: fixture.error,
+          evidencePayload: {
+            failure_disposition: fixture.disposition,
+          },
+          solvedAt: new Date(),
+        })
+        .returning();
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: attempt.id })
+        .where(eq(results.id, result.id));
+      await db.insert(resultClassifications).values({
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: fixture.aoaDeg,
+        regime: "rans",
+        classifierVersion: "typed-auto-retry-guard:v1",
+        state: "rejected",
+        reasons: [fixture.error],
+      });
+      seeded.push({
+        resultId: result.id,
+        aoaDeg: fixture.aoaDeg,
+        disposition: fixture.disposition,
+      });
+    }
+
+    // Real partial ingestion refreshes classifications before generic retry;
+    // rejected hard evidence is intentionally not a selected public pointer.
+    // The promotion guard must use exact job-local attempt history, not this
+    // mutable projection.
+    const pointerNullHard = seeded.find(
+      (row) => row.disposition === "hard_solver",
+    )!;
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: null })
+      .where(eq(results.id, pointerNullHard.resultId));
+
+    const outcome = await autoRetryCrashedResultsForJob(db, job.id);
+    const after = await db
+      .select({
+        id: results.id,
+        status: results.status,
+        simJobId: results.simJobId,
+        autoRetriedAt: results.autoRetriedAt,
+      })
+      .from(results)
+      .where(
+        inArray(
+          results.id,
+          seeded.map((row) => row.resultId),
+        ),
+      );
+    const byId = new Map(after.map((row) => [row.id, row]));
+    const hard = seeded.find((row) => row.disposition === "hard_solver")!;
+    expect(byId.get(hard.resultId)).toMatchObject({
+      status: "failed",
+      simJobId: job.id,
+      autoRetriedAt: null,
+    });
+    expect(outcome.retried.map((row) => row.resultId).sort()).toEqual(
+      seeded
+        .filter((row) => row.disposition !== "hard_solver")
+        .map((row) => row.resultId)
+        .sort(),
+    );
+    for (const routed of seeded.filter(
+      (row) => row.disposition !== "hard_solver",
+    )) {
+      expect(byId.get(routed.resultId)?.status).toBe("pending");
+      expect(byId.get(routed.resultId)?.simJobId).toBeNull();
+      expect(byId.get(routed.resultId)?.autoRetriedAt).not.toBeNull();
+    }
+  }, 240000);
+
+  it("MUST-CATCH: durable whole-polar promotion events recover campaign and background parents after a crash before child composition", async () => {
+    resetUransLadderMemory();
+    const seedRecovery = async (opts: {
+      requestedAoas: number[];
+      campaignOwned: boolean;
+      suffix: string;
+      parentState: "done" | "cancelled" | "stale-ingest" | "live-ingest";
+      conditionMapEntry?: ConditionMapEntry;
+    }): Promise<{
+      promotionId: string;
+      parentJobId: string;
+      triggerAttemptId: string;
+      obligationIds: string[];
+      ingestLeaseToken: string | null;
+    }> => {
+      const triggerAoa = opts.requestedAoas[0];
+      const ingesting =
+        opts.parentState === "stale-ingest" ||
+        opts.parentState === "live-ingest";
+      const [parent] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          campaignId: opts.campaignOwned ? campaignId : null,
+          engineJobId: `${PREFIX}-promotion-parent-${opts.suffix}`,
+          jobKind: "sweep",
+          referenceChordM: CHORD,
+          wave: 1,
+          status: ingesting
+            ? "ingesting"
+            : opts.parentState === "cancelled"
+              ? "cancelled"
+              : "done",
+          totalCases: opts.requestedAoas.length,
+          completedCases: 1,
+          ...(ingesting
+            ? {
+                ingestLeaseToken: `${PREFIX}-dead-owner-${opts.suffix}`,
+                ingestLeaseClaimedAt: new Date(Date.now() - 120_000),
+                ingestLeaseExpiresAt: new Date(
+                  Date.now() +
+                    (opts.parentState === "live-ingest" ? 120_000 : -60_000),
+                ),
+              }
+            : { ingestedAt: new Date(), finishedAt: new Date() }),
+          requestPayload: {
+            speedMap: [
+              {
+                speed: SPEED,
+                bcId,
+                presetRevisionId: revisionId,
+                mach: SPEED / 340.3,
+              },
+            ],
+            aoas: opts.requestedAoas,
+            ransRetryScope: {
+              origin: "continuous-polar",
+              requestedAoas: opts.requestedAoas,
+            },
+            ...(opts.conditionMapEntry
+              ? { conditionMap: [opts.conditionMapEntry] }
+              : {}),
+          },
+        })
+        .returning();
+      const [triggerResult] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: triggerAoa,
+          status: "failed",
+          source: "queued",
+          regime: "rans",
+          converged: false,
+          error: "simpleFoam diverged after residual growth",
+          simJobId: parent.id,
+          engineJobId: parent.engineJobId,
+        })
+        .returning();
+      const [triggerAttempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: triggerResult.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: triggerAoa,
+          simJobId: parent.id,
+          engineJobId: parent.engineJobId,
+          status: "failed",
+          source: "queued",
+          regime: "rans",
+          validForPolar: false,
+          converged: false,
+          error: "simpleFoam diverged after residual growth",
+          evidencePayload: { failure_disposition: "hard_solver" },
+          solvedAt: new Date(),
+        })
+        .returning();
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: triggerAttempt.id })
+        .where(eq(results.id, triggerResult.id));
+      await db.insert(resultClassifications).values({
+        resultId: triggerResult.id,
+        resultAttemptId: triggerAttempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: triggerAoa,
+        regime: "rans",
+        classifierVersion: "promotion-recovery:v1",
+        state: "rejected",
+        reasons: ["typed hard solver failure"],
+      });
+      const obligations = await db
+        .insert(simPrecalcObligations)
+        .values(
+          opts.requestedAoas.map((aoaDeg) => ({
+            airfoilId,
+            revisionId,
+            aoaDeg,
+            sourceResultId: aoaDeg === triggerAoa ? triggerResult.id : null,
+            sourceResultAttemptId:
+              aoaDeg === triggerAoa ? triggerAttempt.id : null,
+            state: "pending",
+            backgroundOwner: !opts.campaignOwned,
+          })),
+        )
+        .returning();
+      if (opts.campaignOwned) {
+        await db.insert(simPrecalcObligationCampaigns).values(
+          obligations.map((obligation) => ({
+            obligationId: obligation.id,
+            campaignId,
+            state: "active",
+          })),
+        );
+      }
+      const [promotion] = await db
+        .insert(simRansPolarPromotions)
+        .values({
+          parentJobId: parent.id,
+          airfoilId,
+          revisionId,
+          conditionId: opts.conditionMapEntry?.conditionId ?? null,
+          ownerKind: opts.campaignOwned ? "campaign" : "background",
+          campaignId: opts.campaignOwned ? campaignId : null,
+          triggerResultAttemptId: triggerAttempt.id,
+          triggerAoaDeg: triggerAoa,
+          failureDisposition: "hard_solver",
+          requestOrigin: "continuous-polar",
+        })
+        .returning();
+      await db.insert(simRansPolarPromotionPoints).values(
+        obligations.map((obligation) => ({
+          promotionId: promotion.id,
+          aoaDeg: obligation.aoaDeg,
+          obligationId: obligation.id,
+          intentionallyOmittedByRans: obligation.aoaDeg !== triggerAoa,
+        })),
+      );
+      return {
+        promotionId: promotion.id,
+        parentJobId: parent.id,
+        triggerAttemptId: triggerAttempt.id,
+        obligationIds: obligations.map((obligation) => obligation.id),
+        ingestLeaseToken: ingesting
+          ? `${PREFIX}-dead-owner-${opts.suffix}`
+          : null,
+      };
+    };
+
+    const [campaignCondition] = await db
+      .select({ conditionId: simCampaignPoints.conditionId })
+      .from(simCampaignPoints)
+      .where(eq(simCampaignPoints.campaignId, campaignId))
+      .limit(1);
+    expect(campaignCondition?.conditionId).toBeTruthy();
+    const conditionMapEntryFor = (
+      requestedAoas: number[],
+    ): ConditionMapEntry => ({
+      conditionId: campaignCondition!.conditionId,
+      revisionId,
+      presetId: revisionId,
+      speed: SPEED,
+      reynolds: 1,
+      bcId,
+      ransRetryScope: {
+        origin: "continuous-polar",
+        requestedAoas,
+      },
+    });
+
+    const campaignPromotion = await seedRecovery({
+      requestedAoas: [1, 1.25],
+      campaignOwned: true,
+      suffix: "campaign",
+      parentState: "stale-ingest",
+    });
+    const backgroundPromotion = await seedRecovery({
+      requestedAoas: [2, 2.25],
+      campaignOwned: false,
+      suffix: "background",
+      parentState: "done",
+    });
+    const liveLeasePromotion = await seedRecovery({
+      requestedAoas: [2.5, 2.75],
+      campaignOwned: false,
+      suffix: "live-lease",
+      parentState: "live-ingest",
+    });
+    const meshBlockedPromotion = await seedRecovery({
+      requestedAoas: [4.25, 4.5],
+      campaignOwned: true,
+      suffix: "mesh-blocked",
+      parentState: "done",
+      conditionMapEntry: conditionMapEntryFor([4.25, 4.5]),
+    });
+    const cancelledBackgroundPromotion = await seedRecovery({
+      requestedAoas: [4.75, 5.25],
+      campaignOwned: false,
+      suffix: "cancelled-background",
+      parentState: "cancelled",
+    });
+    const cancelledParentCampaignOwnedWithBackgroundCoowner =
+      await seedRecovery({
+        requestedAoas: [3.75, 4],
+        campaignOwned: true,
+        suffix: "cancelled-parent-campaign-owned-background-coowner",
+        parentState: "cancelled",
+      });
+    // Shared physical ownership is mutable. While the original campaign stays
+    // active, this later beneficiary must not change the event's immutable
+    // campaign origin into an autonomous background event (which would
+    // incorrectly suppress recovery solely because the RANS parent job is
+    // cancelled).
+    await db
+      .update(simPrecalcObligations)
+      .set({ backgroundOwner: true })
+      .where(
+        inArray(
+          simPrecalcObligations.id,
+          cancelledParentCampaignOwnedWithBackgroundCoowner.obligationIds,
+        ),
+      );
+    const cancelDuringSubmitPromotion = await seedRecovery({
+      requestedAoas: [3.25, 3.5],
+      campaignOwned: false,
+      suffix: "cancel-during-submit",
+      parentState: "done",
+    });
+    const conditionMapEntry = conditionMapEntryFor([3.6, 3.7]);
+    const conditionMapPromotion = await seedRecovery({
+      requestedAoas: [3.6, 3.7],
+      campaignOwned: false,
+      suffix: "condition-map-terminal-replay",
+      parentState: "live-ingest",
+      conditionMapEntry,
+    });
+    await db
+      .update(simPrecalcObligations)
+      .set({ lastOutcome: "deterministic_failure" })
+      .where(
+        eq(simPrecalcObligations.id, meshBlockedPromotion.obligationIds[0]),
+      );
+    // The normalized event and its exact point→obligation coverage are the
+    // recovery authority. A later mutation of mutable parent transport JSON
+    // or derived classification must neither shrink nor erase that scope.
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          aoas: [2],
+          ransRetryScope: {
+            origin: "explicit-targeted",
+            requestedAoas: [2],
+          },
+        },
+      })
+      .where(eq(simJobs.id, backgroundPromotion.parentJobId));
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          aoas: [4.25],
+          ransRetryScope: {
+            origin: "explicit-targeted",
+            requestedAoas: [4.25],
+          },
+        },
+      })
+      .where(eq(simJobs.id, meshBlockedPromotion.parentJobId));
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          aoas: [3.6],
+          ransRetryScope: {
+            origin: "explicit-targeted",
+            requestedAoas: [3.6],
+          },
+        },
+      })
+      .where(eq(simJobs.id, conditionMapPromotion.parentJobId));
+    await db
+      .update(resultClassifications)
+      .set({ state: "superseded_by_urans" })
+      .where(
+        eq(
+          resultClassifications.resultAttemptId,
+          backgroundPromotion.triggerAttemptId,
+        ),
+      );
+    await db
+      .update(resultClassifications)
+      .set({ state: "needs_urans" })
+      .where(
+        eq(
+          resultClassifications.resultAttemptId,
+          conditionMapPromotion.triggerAttemptId,
+        ),
+      );
+    const [classificationBeforeRecovery] = await db
+      .select({ state: resultClassifications.state })
+      .from(resultClassifications)
+      .where(
+        eq(
+          resultClassifications.resultAttemptId,
+          backgroundPromotion.triggerAttemptId,
+        ),
+      );
+    expect(classificationBeforeRecovery?.state).toBe("superseded_by_urans");
+    const submitted: PolarRequest[] = [];
+    let engineSequence = 0;
+    const engine = {
+      submitPolar: async (request: PolarRequest): Promise<JobStatus> => {
+        submitted.push(request);
+        engineSequence += 1;
+        return {
+          job_id: `${PREFIX}-promotion-child-${engineSequence}`,
+          state: "pending",
+          total_cases: request.aoa?.angles?.length ?? 0,
+          completed_cases: 0,
+        };
+      },
+    } as unknown as EngineClient;
+    const [conditionMapParent] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, conditionMapPromotion.parentJobId));
+    await submitUransRetryForJob(db, engine, conditionMapParent, {
+      ingestLeaseToken: conditionMapPromotion.ingestLeaseToken!,
+    });
+    expect(submitted).toHaveLength(0);
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(
+          and(
+            eq(simJobs.parentJobId, conditionMapPromotion.parentJobId),
+            eq(simJobs.wave, 2),
+          ),
+        ),
+    ).toHaveLength(0);
+    // Mirror the terminal ingester after the event-first replay returned: the
+    // normalized event remains the only authority and finalization can clear
+    // the lease without composing an unbound targeted child.
+    const finalizedConditionMapParent = await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeaseExpiresAt: null,
+      })
+      .where(
+        and(
+          eq(simJobs.id, conditionMapPromotion.parentJobId),
+          eq(simJobs.status, "ingesting"),
+          eq(simJobs.ingestLeaseToken, conditionMapPromotion.ingestLeaseToken!),
+        ),
+      )
+      .returning({ id: simJobs.id });
+    expect(finalizedConditionMapParent).toEqual([
+      { id: conditionMapPromotion.parentJobId },
+    ]);
+    const parentJobIds = [
+      campaignPromotion.parentJobId,
+      backgroundPromotion.parentJobId,
+      liveLeasePromotion.parentJobId,
+      meshBlockedPromotion.parentJobId,
+      cancelledBackgroundPromotion.parentJobId,
+      cancelledParentCampaignOwnedWithBackgroundCoowner.parentJobId,
+      cancelDuringSubmitPromotion.parentJobId,
+    ];
+    const recoveryScope = (promotionIds: string[]) => ({
+      campaignIds: [campaignId],
+      parentJobIds,
+      promotionIds,
+      requestIds: [] as string[],
+      verifyIds: [] as string[],
+    });
+    // A live ingest owner must not be raced by recovery even though its event
+    // and obligations are already durable.
+    expect(
+      await uransLadderTick(
+        db,
+        engine,
+        0,
+        recoveryScope([liveLeasePromotion.promotionId]),
+      ),
+    ).toBe(false);
+    expect(submitted).toHaveLength(0);
+    const compensatingCancels: string[] = [];
+    const cancelDuringSubmitEngine = {
+      submitPolar: async (request: PolarRequest): Promise<JobStatus> => {
+        await db
+          .update(simJobs)
+          .set({ status: "cancelled", finishedAt: new Date() })
+          .where(eq(simJobs.id, cancelDuringSubmitPromotion.parentJobId));
+        return {
+          job_id: `${PREFIX}-cancel-during-promotion-submit`,
+          state: "pending",
+          total_cases: request.aoa?.angles?.length ?? 0,
+          completed_cases: 0,
+        };
+      },
+      cancelJob: async (engineJobId: string): Promise<JobStatus> => {
+        compensatingCancels.push(engineJobId);
+        return {
+          job_id: engineJobId,
+          state: "cancelled",
+          total_cases: 2,
+          completed_cases: 0,
+        };
+      },
+    } as unknown as EngineClient;
+    expect(
+      await uransLadderTick(
+        db,
+        cancelDuringSubmitEngine,
+        0,
+        recoveryScope([cancelDuringSubmitPromotion.promotionId]),
+      ),
+    ).toBe(false);
+    expect(compensatingCancels).toEqual([
+      `${PREFIX}-cancel-during-promotion-submit`,
+    ]);
+    expect(
+      await uransLadderTick(
+        db,
+        engine,
+        0,
+        recoveryScope([cancelledBackgroundPromotion.promotionId]),
+      ),
+    ).toBe(false);
+    expect(submitted).toHaveLength(0);
+    expect(
+      await uransLadderTick(
+        db,
+        engine,
+        0,
+        recoveryScope([meshBlockedPromotion.promotionId]),
+      ),
+    ).toBe(false);
+    // MUST-CATCH: the authoritative event is temporarily ineligible because
+    // of immutable deterministic mesh evidence. The same ladder tick must not
+    // fall through to the generic gated-parent path, reinterpret the drifted
+    // parent scope as a targeted retry, and compose an unbound wave-2 child.
+    expect(submitted).toHaveLength(0);
+    await db
+      .update(simJobs)
+      .set({ ingestLeaseExpiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(simJobs.id, liveLeasePromotion.parentJobId));
+
+    const promotionIds = [
+      campaignPromotion.promotionId,
+      backgroundPromotion.promotionId,
+      liveLeasePromotion.promotionId,
+      meshBlockedPromotion.promotionId,
+      cancelledBackgroundPromotion.promotionId,
+      cancelledParentCampaignOwnedWithBackgroundCoowner.promotionId,
+      cancelDuringSubmitPromotion.promotionId,
+    ];
+
+    expect(
+      await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
+    ).toBe(true);
+    expect(
+      await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
+    ).toBe(true);
+    expect(
+      await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
+    ).toBe(true);
+    expect(
+      await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
+    ).toBe(true);
+    expect(submitted).toHaveLength(4);
+    expect(
+      submitted
+        .map((request) => request.aoa?.angles)
+        .sort((a, b) => (a?.[0] ?? 0) - (b?.[0] ?? 0)),
+    ).toEqual([
+      [1, 1.25],
+      [2, 2.25],
+      [2.5, 2.75],
+      [3.75, 4],
+    ]);
+    expect(
+      submitted.every(
+        (request) =>
+          request.solver?.force_transient === true &&
+          request.solver?.urans_fidelity === "precalc",
+      ),
+    ).toBe(true);
+    const children = await db
+      .select({
+        parentJobId: simJobs.parentJobId,
+        payload: simJobs.requestPayload,
+        status: simJobs.status,
+      })
+      .from(simJobs)
+      .where(
+        and(
+          inArray(simJobs.parentJobId, [
+            campaignPromotion.parentJobId,
+            backgroundPromotion.parentJobId,
+            liveLeasePromotion.parentJobId,
+            meshBlockedPromotion.parentJobId,
+            cancelledBackgroundPromotion.parentJobId,
+            cancelledParentCampaignOwnedWithBackgroundCoowner.parentJobId,
+            cancelDuringSubmitPromotion.parentJobId,
+          ]),
+          eq(simJobs.wave, 2),
+        ),
+      );
+    const submittedChildren = children.filter(
+      (child) => child.status === "submitted",
+    );
+    expect(submittedChildren).toHaveLength(4);
+    expect(
+      children.some(
+        (child) => child.parentJobId === meshBlockedPromotion.parentJobId,
+      ),
+    ).toBe(false);
+    expect(
+      children.some(
+        (child) =>
+          child.parentJobId === cancelledBackgroundPromotion.parentJobId,
+      ),
+    ).toBe(false);
+    expect(
+      children.some(
+        (child) =>
+          child.parentJobId === cancelDuringSubmitPromotion.parentJobId &&
+          child.status === "cancelled",
+      ),
+    ).toBe(true);
+    expect(
+      submittedChildren.every(
+        (child) =>
+          child.status === "submitted" &&
+          Array.isArray(
+            (child.payload as { precalcObligationIds?: unknown })
+              .precalcObligationIds,
+          ),
+      ),
+    ).toBe(true);
+    const promotionByParent = new Map([
+      [campaignPromotion.parentJobId, campaignPromotion.promotionId],
+      [backgroundPromotion.parentJobId, backgroundPromotion.promotionId],
+      [liveLeasePromotion.parentJobId, liveLeasePromotion.promotionId],
+      [
+        cancelledParentCampaignOwnedWithBackgroundCoowner.parentJobId,
+        cancelledParentCampaignOwnedWithBackgroundCoowner.promotionId,
+      ],
+    ]);
+    for (const child of submittedChildren) {
+      expect(
+        (child.payload as { conditionalPromotionId?: string })
+          .conditionalPromotionId,
+      ).toBe(promotionByParent.get(child.parentJobId!));
+    }
+
+    // Live children are the durable duplicate barrier: replaying the recovery
+    // scan must neither submit nor compose a second child.
+    expect(
+      await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
+    ).toBe(false);
+    expect(submitted).toHaveLength(4);
   }, 240000);
 });

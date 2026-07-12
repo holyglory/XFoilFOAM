@@ -56,6 +56,7 @@ const {
   meshProfiles,
   outputProfiles,
   polarFitSets,
+  recordRansPolarPromotion,
   referenceGeometryProfiles,
   resultAttempts,
   resultClassifications,
@@ -66,6 +67,8 @@ const {
   simJobs,
   simPrecalcObligationAttempts,
   simPrecalcObligations,
+  simRansPolarPromotionPoints,
+  simRansPolarPromotions,
   simResultSubmitRetries,
   simulationPresets,
   solverEvidenceArtifacts,
@@ -780,6 +783,7 @@ async function seedRemoteRejectedParent(label: string, aoaDeg: number) {
       stalled: true,
       unsteady: false,
       error: "RANS did not converge",
+      evidencePayload: { failure_disposition: "hard_solver" },
       solvedAt: new Date(),
     })
     .returning();
@@ -794,6 +798,202 @@ async function seedRemoteRejectedParent(label: string, aoaDeg: number) {
     reasons: ["RANS did not converge"],
   });
   return { promise, parent, result, attempt };
+}
+
+async function seedRemoteWholePolarParent(label: string) {
+  const aoas = [0, 2, 8];
+  const promise = await seedMirroredPromise(label, aoas);
+  const ingestLeaseToken = randomUUID();
+  const engineJobId = `${PREFIX}-${label}-rans`;
+  const [parent] = await db
+    .insert(simJobs)
+    .values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      referenceChordM: CHORD,
+      wave: 1,
+      jobKind: "sweep",
+      status: "ingesting",
+      engineJobId,
+      totalCases: aoas.length,
+      completedCases: 2,
+      ingestLeaseToken,
+      ingestLeaseExpiresAt: new Date(Date.now() + 60_000),
+      requestPayload: {
+        syncPromiseId: promise.id,
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
+        speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+        aoas,
+        ransRetryScope: { origin: "continuous-polar", requestedAoas: aoas },
+      },
+    })
+    .returning();
+
+  const [acceptedResult] = await db
+    .insert(results)
+    .values({
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: 0,
+      status: "done",
+      source: "solved",
+      regime: "rans",
+      fidelity: "rans",
+      simJobId: parent.id,
+      engineJobId,
+      engineCaseSlug: "aoa_0",
+      converged: true,
+      cl: 0.12,
+      cd: 0.01,
+      cm: -0.01,
+      solvedAt: new Date(),
+    })
+    .returning();
+  const [acceptedAttempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId: acceptedResult.id,
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: 0,
+      simJobId: parent.id,
+      engineJobId,
+      engineCaseSlug: "aoa_0",
+      status: "done",
+      source: "solved",
+      regime: "rans",
+      validForPolar: true,
+      converged: true,
+      cl: 0.12,
+      cd: 0.01,
+      cm: -0.01,
+      evidencePayload: { failure_disposition: "none" },
+      solvedAt: new Date(),
+    })
+    .returning();
+  await db
+    .update(results)
+    .set({ currentResultAttemptId: acceptedAttempt.id })
+    .where(eq(results.id, acceptedResult.id));
+  await db.insert(resultClassifications).values({
+    resultId: acceptedResult.id,
+    resultAttemptId: acceptedAttempt.id,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg: 0,
+    regime: "rans",
+    classifierVersion: "remote-whole-polar-test-v1",
+    state: "accepted",
+    reasons: [],
+  });
+  const acceptedManifest = writeMedia(
+    `jobs/${engineJobId}/cases/aoa_0/manifest.json`,
+    `${label}:accepted-rans-manifest`,
+  );
+  await db.insert(solverEvidenceArtifacts).values({
+    resultId: acceptedResult.id,
+    resultAttemptId: acceptedAttempt.id,
+    airfoilId,
+    simJobId: parent.id,
+    engineJobId,
+    engineCaseSlug: "aoa_0",
+    aoaDeg: 0,
+    kind: "manifest",
+    role: "raw",
+    storageKey: acceptedManifest.storageKey,
+    mimeType: "application/json",
+    sha256: acceptedManifest.sha256,
+    byteSize: acceptedManifest.byteSize,
+    metadata: { fixture: label, promotionRace: true },
+  });
+
+  const [triggerResult] = await db
+    .insert(results)
+    .values({
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: 2,
+      status: "failed",
+      source: "queued",
+      regime: "rans",
+      fidelity: "rans",
+      simJobId: parent.id,
+      engineJobId,
+      engineCaseSlug: "aoa_2",
+      converged: false,
+      error: "steady solver diverged after residual growth",
+      solvedAt: new Date(),
+    })
+    .returning();
+  const [triggerAttempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId: triggerResult.id,
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: 2,
+      simJobId: parent.id,
+      engineJobId,
+      engineCaseSlug: "aoa_2",
+      status: "failed",
+      source: "queued",
+      regime: "rans",
+      validForPolar: false,
+      converged: false,
+      error: "steady solver diverged after residual growth",
+      evidencePayload: { failure_disposition: "hard_solver" },
+      solvedAt: new Date(),
+    })
+    .returning();
+  await db.insert(resultClassifications).values({
+    resultId: triggerResult.id,
+    resultAttemptId: triggerAttempt.id,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg: 2,
+    regime: "rans",
+    classifierVersion: "remote-whole-polar-test-v1",
+    state: "rejected",
+    reasons: ["steady solver diverged after residual growth"],
+  });
+  await db.insert(results).values({
+    airfoilId,
+    bcId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg: 8,
+    status: "queued",
+    source: "queued",
+    simJobId: parent.id,
+  });
+  await db
+    .update(syncSweepPromisePoints)
+    .set({
+      status: "fulfilled",
+      resultId: acceptedResult.id,
+      resultAttemptId: acceptedAttempt.id,
+    })
+    .where(
+      and(
+        eq(syncSweepPromisePoints.promiseId, promise.id),
+        eq(syncSweepPromisePoints.aoaDeg, 0),
+      ),
+    );
+  return {
+    aoas,
+    promise,
+    parent,
+    ingestLeaseToken,
+    acceptedResult,
+    acceptedAttempt,
+    triggerResult,
+    triggerAttempt,
+  };
 }
 
 async function jobsForPromise(promiseId: string) {
@@ -1193,6 +1393,51 @@ describe("remote solver submit lifecycle", () => {
     });
   });
 
+  it("pins a new marched job to every exact promise point after an earlier sibling was fulfilled", async () => {
+    const promise = await seedMirroredPromise("pinned-full-scope", [0, 2, 8]);
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "fulfilled", updatedAt: new Date() })
+      .where(
+        and(
+          eq(syncSweepPromisePoints.promiseId, promise.id),
+          eq(syncSweepPromisePoints.aoaDeg, 0),
+        ),
+      );
+    stubFetch();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("pinned-full-scope", 2),
+    );
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    const [remoteStatus] = await db
+      .select({ error: syncApiSettings.remoteSolverLastError })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(remoteStatus?.error).toBeNull();
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    const request = submitPolar.mock.calls[0]?.[0] as PolarRequest;
+    expect(request.aoa.angles).toEqual([2, 8]);
+    expect(request.solver?.rans_failure_policy).toBe("abort_for_precalc");
+    const [job] = await jobsForPromise(promise.id);
+    expect(job.requestPayload).toMatchObject({
+      aoas: [2, 8],
+      ransRetryScope: {
+        origin: "continuous-polar",
+        requestedAoas: [0, 2, 8],
+      },
+    });
+    expect((await readPromise(promise.id)).points).toMatchObject([
+      { aoaDeg: 0, status: "fulfilled" },
+      { aoaDeg: 2, status: "active" },
+      { aoaDeg: 8, status: "active" },
+    ]);
+  });
+
   it.each([
     ["cancelled", 906.001],
     ["expired", 907.001],
@@ -1350,6 +1595,495 @@ describe("remote solver submit lifecycle", () => {
       simJobId: null,
     });
   });
+});
+
+describe("remote-owned whole-polar promotion scope", () => {
+  it("atomically reopens a fulfilled sibling and preserves its evidence link while recording full preliminary coverage", async () => {
+    const seeded = await seedRemoteWholePolarParent("promote-fulfilled");
+
+    const first = await recordRansPolarPromotion(db, {
+      parentJobId: seeded.parent.id,
+      ingestLeaseToken: seeded.ingestLeaseToken,
+      airfoilId,
+      revisionId,
+      triggerResultAttemptId: seeded.triggerAttempt.id,
+      triggerAoaDeg: 2,
+      requestedAoas: seeded.aoas,
+      intentionallyOmittedAoas: [8],
+      ownership: { syncPromiseIds: [seeded.promise.id] },
+    });
+    await db
+      .update(resultClassifications)
+      .set({
+        state: "superseded_by_urans",
+        supersededByResultId: seeded.triggerResult.id,
+        updatedAt: new Date(),
+      })
+      .where(
+        eq(resultClassifications.resultAttemptId, seeded.triggerAttempt.id),
+      );
+    await db
+      .update(syncSweepPromises)
+      .set({
+        status: "expired",
+        expiredAt: new Date(),
+        expiresAt: new Date(Date.now() - 1_000),
+        updatedAt: new Date(),
+      })
+      .where(eq(syncSweepPromises.id, seeded.promise.id));
+    const second = await recordRansPolarPromotion(db, {
+      parentJobId: seeded.parent.id,
+      ingestLeaseToken: seeded.ingestLeaseToken,
+      airfoilId,
+      revisionId,
+      triggerResultAttemptId: seeded.triggerAttempt.id,
+      triggerAoaDeg: 2,
+      requestedAoas: seeded.aoas,
+      intentionallyOmittedAoas: [8],
+      ownership: { syncPromiseIds: [seeded.promise.id] },
+    });
+    const driftedReplay = await recordRansPolarPromotion(db, {
+      parentJobId: seeded.parent.id,
+      ingestLeaseToken: seeded.ingestLeaseToken,
+      airfoilId,
+      revisionId,
+      triggerResultAttemptId: randomUUID(),
+      triggerAoaDeg: 4,
+      requestedAoas: [2],
+      intentionallyOmittedAoas: [2],
+      ownership: { backgroundOwner: true },
+    });
+
+    expect(first).not.toBeNull();
+    expect(second).toEqual(first);
+    // An already-normalized event is authoritative. Replay derives omitted
+    // coverage from its point ledger rather than accepting or rejecting a
+    // caller's later trigger, scope, omission, or owner drift.
+    expect(driftedReplay).toEqual(first);
+    const promise = await readPromise(seeded.promise.id);
+    expect(promise.points).toMatchObject([
+      {
+        aoaDeg: 0,
+        status: "active",
+        resultId: seeded.acceptedResult.id,
+        resultAttemptId: seeded.acceptedAttempt.id,
+      },
+      { aoaDeg: 2, status: "active" },
+      { aoaDeg: 8, status: "active" },
+    ]);
+    const promotions = await db
+      .select()
+      .from(simRansPolarPromotions)
+      .where(eq(simRansPolarPromotions.parentJobId, seeded.parent.id));
+    expect(promotions).toHaveLength(1);
+    expect(promotions[0]).toMatchObject({
+      triggerResultAttemptId: seeded.triggerAttempt.id,
+      triggerAoaDeg: 2,
+      failureDisposition: "hard_solver",
+      requestOrigin: "continuous-polar",
+      ownerKind: "sync_promise",
+      campaignId: null,
+      syncPromiseId: seeded.promise.id,
+    });
+    const promotionPoints = await db
+      .select()
+      .from(simRansPolarPromotionPoints)
+      .where(eq(simRansPolarPromotionPoints.promotionId, promotions[0]!.id))
+      .orderBy(simRansPolarPromotionPoints.aoaDeg);
+    expect(promotionPoints).toMatchObject([
+      { aoaDeg: 0, intentionallyOmittedByRans: false },
+      { aoaDeg: 2, intentionallyOmittedByRans: false },
+      { aoaDeg: 8, intentionallyOmittedByRans: true },
+    ]);
+    const obligations = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.revisionId, revisionId))
+      .orderBy(simPrecalcObligations.aoaDeg);
+    expect(obligations).toMatchObject([
+      { aoaDeg: 0, backgroundOwner: false, state: "pending" },
+      { aoaDeg: 2, backgroundOwner: false, state: "pending" },
+      { aoaDeg: 8, backgroundOwner: false, state: "pending" },
+    ]);
+    expect(new Set(first?.obligationIds)).toEqual(
+      new Set(obligations.map((obligation) => obligation.id)),
+    );
+    expect(await resultForAoa(8)).toMatchObject({
+      status: "queued",
+      simJobId: null,
+    });
+  });
+
+  it("MUST-CATCH: terminal replay ignores a replacement remote owner, targeted scope, and changed classification", async () => {
+    const seeded = await seedRemoteWholePolarParent("terminal-event-first");
+    const recorded = await recordRansPolarPromotion(db, {
+      parentJobId: seeded.parent.id,
+      ingestLeaseToken: seeded.ingestLeaseToken,
+      airfoilId,
+      revisionId,
+      triggerResultAttemptId: seeded.triggerAttempt.id,
+      triggerAoaDeg: 2,
+      requestedAoas: seeded.aoas,
+      intentionallyOmittedAoas: [8],
+      ownership: { syncPromiseIds: [seeded.promise.id] },
+    });
+    expect(recorded?.owner).toEqual({
+      kind: "sync_promise",
+      syncPromiseId: seeded.promise.id,
+    });
+
+    // The original promise has ended and another valid promise now owns the
+    // same cells. Mutable parent transport is deliberately retargeted to that
+    // replacement and narrowed to one explicit angle. Without event-first
+    // replay the generic path would compose a non-event targeted child.
+    await db
+      .update(syncSweepPromises)
+      .set({
+        status: "expired",
+        expiredAt: new Date(),
+        expiresAt: new Date(Date.now() - 1_000),
+        updatedAt: new Date(),
+      })
+      .where(eq(syncSweepPromises.id, seeded.promise.id));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "expired", updatedAt: new Date() })
+      .where(eq(syncSweepPromisePoints.promiseId, seeded.promise.id));
+    const replacement = await seedMirroredPromise(
+      "terminal-event-first-replacement",
+      seeded.aoas,
+    );
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          syncPromiseId: replacement.id,
+          remoteSolver: true,
+          upstreamBaseUrl: UPSTREAM,
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas: [2],
+          ransRetryScope: {
+            origin: "explicit-targeted",
+            requestedAoas: [2],
+          },
+        },
+      })
+      .where(eq(simJobs.id, seeded.parent.id));
+    await db
+      .update(resultClassifications)
+      .set({ state: "needs_urans", updatedAt: new Date() })
+      .where(
+        eq(resultClassifications.resultAttemptId, seeded.triggerAttempt.id),
+      );
+    const [driftedParent] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, seeded.parent.id));
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("terminal-event-first-unbound"),
+    );
+
+    await submitUransRetryForJob(
+      db,
+      { submitPolar } as unknown as EngineClient,
+      driftedParent,
+      { ingestLeaseToken: seeded.ingestLeaseToken },
+    );
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(
+          and(eq(simJobs.parentJobId, seeded.parent.id), eq(simJobs.wave, 2)),
+        ),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select({ syncPromiseId: simRansPolarPromotions.syncPromiseId })
+        .from(simRansPolarPromotions)
+        .where(eq(simRansPolarPromotions.parentJobId, seeded.parent.id)),
+    ).toEqual([{ syncPromiseId: seeded.promise.id }]);
+
+    const finalized = await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeaseExpiresAt: null,
+      })
+      .where(
+        and(
+          eq(simJobs.id, seeded.parent.id),
+          eq(simJobs.status, "ingesting"),
+          eq(simJobs.ingestLeaseToken, seeded.ingestLeaseToken),
+        ),
+      )
+      .returning({ id: simJobs.id });
+    expect(finalized).toEqual([{ id: seeded.parent.id }]);
+  });
+
+  it("keeps the exact original promise active when an already-streaming parent RANS delivery answers after promotion", async () => {
+    const seeded = await seedRemoteWholePolarParent("late-rans-delivery");
+    let uploadStartedResolve!: () => void;
+    let releaseUploadResolve!: () => void;
+    const uploadStarted = new Promise<void>((resolve) => {
+      uploadStartedResolve = resolve;
+    });
+    const releaseUpload = new Promise<void>((resolve) => {
+      releaseUploadResolve = resolve;
+    });
+    const fetchMock = vi.fn(
+      async (input: string | URL, _init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/polars")) {
+          uploadStartedResolve();
+          await releaseUpload;
+          return new Response(
+            JSON.stringify({
+              imported: 1,
+              conflictIds: [],
+              fulfilledAoas: [0],
+              unfulfilledAoas: [],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tick = remoteSolverTick(db, {} as EngineClient);
+    await uploadStarted;
+    const [inFlight] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(
+        and(
+          eq(syncRemoteResultDeliveries.promiseId, seeded.promise.id),
+          eq(syncRemoteResultDeliveries.simJobId, seeded.parent.id),
+        ),
+      );
+    expect(inFlight).toMatchObject({
+      resultId: seeded.acceptedResult.id,
+      resultAttemptId: seeded.acceptedAttempt.id,
+      state: "pushing",
+    });
+
+    const recorded = await recordRansPolarPromotion(db, {
+      parentJobId: seeded.parent.id,
+      ingestLeaseToken: seeded.ingestLeaseToken,
+      airfoilId,
+      revisionId,
+      triggerResultAttemptId: seeded.triggerAttempt.id,
+      triggerAoaDeg: 2,
+      requestedAoas: seeded.aoas,
+      intentionallyOmittedAoas: [8],
+      ownership: { syncPromiseIds: [seeded.promise.id] },
+    });
+    expect(recorded?.owner).toEqual({
+      kind: "sync_promise",
+      syncPromiseId: seeded.promise.id,
+    });
+    const [supersededBeforeResponse] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, inFlight.id));
+    expect(supersededBeforeResponse).toMatchObject({
+      state: "superseded",
+      claimToken: null,
+      claimExpiresAt: null,
+    });
+    expect((await readPromise(seeded.promise.id)).points).toMatchObject([
+      { aoaDeg: 0, status: "active" },
+      { aoaDeg: 2, status: "active" },
+      { aoaDeg: 8, status: "active" },
+    ]);
+
+    releaseUploadResolve();
+    await tick;
+
+    expect(requests(fetchMock, "/polars")).toHaveLength(1);
+    expect((await readPromise(seeded.promise.id)).points).toMatchObject([
+      { aoaDeg: 0, status: "active" },
+      { aoaDeg: 2, status: "active" },
+      { aoaDeg: 8, status: "active" },
+    ]);
+    const [settled] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, inFlight.id));
+    expect(settled).toMatchObject({
+      state: "superseded",
+      resultAttemptId: seeded.acceptedAttempt.id,
+    });
+    expect((await readPromise(seeded.promise.id)).promise.status).toBe(
+      "active",
+    );
+  });
+
+  it.each(["cancelled", "expired"] as const)(
+    "does not resurrect fulfilled siblings when the exact remote promise is %s",
+    async (terminalStatus) => {
+      const seeded = await seedRemoteWholePolarParent(
+        `promote-${terminalStatus}`,
+      );
+      await db
+        .update(syncSweepPromises)
+        .set({
+          status: terminalStatus,
+          ...(terminalStatus === "cancelled"
+            ? { cancelledAt: new Date() }
+            : {
+                expiredAt: new Date(),
+                expiresAt: new Date(Date.now() - 1_000),
+              }),
+          updatedAt: new Date(),
+        })
+        .where(eq(syncSweepPromises.id, seeded.promise.id));
+      const before = await readPromise(seeded.promise.id);
+
+      const recorded = await recordRansPolarPromotion(db, {
+        parentJobId: seeded.parent.id,
+        ingestLeaseToken: seeded.ingestLeaseToken,
+        airfoilId,
+        revisionId,
+        triggerResultAttemptId: seeded.triggerAttempt.id,
+        triggerAoaDeg: 2,
+        requestedAoas: seeded.aoas,
+        intentionallyOmittedAoas: [8],
+        ownership: { syncPromiseIds: [seeded.promise.id] },
+      });
+
+      expect(recorded).toBeNull();
+      expect(await readPromise(seeded.promise.id)).toEqual(before);
+      expect(
+        await db
+          .select()
+          .from(simRansPolarPromotions)
+          .where(eq(simRansPolarPromotions.parentJobId, seeded.parent.id)),
+      ).toHaveLength(0);
+      expect(
+        await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.revisionId, revisionId)),
+      ).toHaveLength(0);
+    },
+  );
+
+  it("does not steal a fulfilled sibling that a different active promise now owns", async () => {
+    const seeded = await seedRemoteWholePolarParent("promote-competing-owner");
+    const competing = await seedMirroredPromise("competing-owner", [0]);
+
+    const recorded = await recordRansPolarPromotion(db, {
+      parentJobId: seeded.parent.id,
+      ingestLeaseToken: seeded.ingestLeaseToken,
+      airfoilId,
+      revisionId,
+      triggerResultAttemptId: seeded.triggerAttempt.id,
+      triggerAoaDeg: 2,
+      requestedAoas: seeded.aoas,
+      intentionallyOmittedAoas: [8],
+      ownership: { syncPromiseIds: [seeded.promise.id] },
+    });
+
+    expect(recorded).toBeNull();
+    expect((await readPromise(seeded.promise.id)).points).toMatchObject([
+      { aoaDeg: 0, status: "fulfilled" },
+      { aoaDeg: 2, status: "active" },
+      { aoaDeg: 8, status: "active" },
+    ]);
+    expect((await readPromise(competing.id)).points).toMatchObject([
+      { aoaDeg: 0, status: "active" },
+    ]);
+    expect(
+      await db
+        .select()
+        .from(simRansPolarPromotions)
+        .where(eq(simRansPolarPromotions.parentJobId, seeded.parent.id)),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select()
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.revisionId, revisionId)),
+    ).toHaveLength(0);
+  });
+
+  it("acquires competing promise owners before the shared cell lock under two-transaction contention", async () => {
+    const seeded = await seedRemoteWholePolarParent("promotion-lock-order");
+    const competing = await seedMirroredPromise(
+      "promotion-lock-competitor",
+      [0],
+    );
+    let ownerLockedResolve!: () => void;
+    let proceedResolve!: () => void;
+    const ownerLocked = new Promise<void>((resolve) => {
+      ownerLockedResolve = resolve;
+    });
+    const proceed = new Promise<void>((resolve) => {
+      proceedResolve = resolve;
+    });
+    const competitorTransaction = db.transaction(async (tx) => {
+      await tx.execute(dsql`
+        SELECT promise.id
+        FROM sync_sweep_promises promise
+        JOIN sync_sweep_promise_points point
+          ON point.promise_id = promise.id
+        WHERE promise.id = ${competing.id}
+        FOR UPDATE OF promise, point
+      `);
+      ownerLockedResolve();
+      await proceed;
+      await tx.execute(dsql`
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(
+            ${`precalc-cell:${airfoilId}:${revisionId}:0`},
+            0
+          )
+        )
+      `);
+    });
+    await ownerLocked;
+
+    const promotion = recordRansPolarPromotion(db, {
+      parentJobId: seeded.parent.id,
+      ingestLeaseToken: seeded.ingestLeaseToken,
+      airfoilId,
+      revisionId,
+      triggerResultAttemptId: seeded.triggerAttempt.id,
+      triggerAoaDeg: 2,
+      requestedAoas: seeded.aoas,
+      intentionallyOmittedAoas: [8],
+      ownership: { syncPromiseIds: [seeded.promise.id] },
+    });
+    // Give the promotion transaction time to reach the owner row held above.
+    // Correct owner->cell order means it cannot hold the shared cell yet.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    proceedResolve();
+
+    const [, recorded] = await Promise.all([competitorTransaction, promotion]);
+    expect(recorded).toBeNull();
+    expect((await readPromise(seeded.promise.id)).points[0]).toMatchObject({
+      aoaDeg: 0,
+      status: "fulfilled",
+    });
+    expect((await readPromise(competing.id)).points[0]).toMatchObject({
+      aoaDeg: 0,
+      status: "active",
+    });
+  }, 10_000);
 });
 
 describe("remote-owned derived PRECALC lifecycle", () => {

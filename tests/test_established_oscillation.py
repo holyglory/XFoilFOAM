@@ -415,7 +415,9 @@ def test_precalc_tier_still_rejects_relaxing_startup(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def _run_marched(tmp_path, monkeypatch, solver_params, promotion_fake):
+def _run_marched(
+    tmp_path, monkeypatch, solver_params, promotion_fake, *, aoas=None, seen_aoas=None
+):
     """Marched polar where the aoa=2 warm point is rejected INSIDE the 0-5 deg
     attached-range check window (the promotion trigger)."""
 
@@ -432,11 +434,19 @@ def _run_marched(tmp_path, monkeypatch, solver_params, promotion_fake):
         def check(self):
             return self
 
-    def fake_cold(*_args, **_kwargs):
+    def fake_cold(*args, **_kwargs):
+        if seen_aoas is not None:
+            seen_aoas.append(args[5].aoa_deg)
         return FakeRunResult("Time = 1\nSIMPLE solution converged in 1 iterations\n")
 
-    def fake_warm(*_args, **_kwargs):
-        return FakeRunResult("Time = 2\n")  # no convergence line -> rejected
+    def fake_warm(_polar_dir, spec, *_args, **_kwargs):
+        if seen_aoas is not None:
+            seen_aoas.append(spec.aoa_deg)
+        return FakeRunResult(
+            "Time = 2\n"
+            if spec.aoa_deg == 2.0
+            else "Time = 2\nSIMPLE solution converged in 1 iterations\n"
+        )
 
     def fake_finalize(_case_dir, outcome, *_args, **_kwargs):
         outcome.cl = 0.1 * outcome.spec.aoa_deg + 0.01
@@ -462,7 +472,7 @@ def _run_marched(tmp_path, monkeypatch, solver_params, promotion_fake):
         solver_params=solver_params,
         mesher=FakeMesher(),
         runner=None,
-        aoas=[0.0, 2.0],
+        aoas=aoas or [0.0, 2.0],
         render_images=False,
     )
 
@@ -489,6 +499,170 @@ def test_wave1_rans_tier_never_runs_in_job_urans_promotion(tmp_path, monkeypatch
     assert [p.outcome.spec.aoa_deg for p in result.points] == [0.0, 2.0]
     assert result.points[0].outcome.converged
     assert not result.points[1].outcome.converged
+
+
+def test_wave1_conditional_policy_aborts_remaining_rans_for_external_precalc(
+    tmp_path, monkeypatch
+):
+    """A node-owned promotion stops the marched RANS loop immediately, emits a
+    durable per-polar signal, and never starts an ungated in-job transient."""
+
+    def never_promote(*_args, **_kwargs):
+        pytest.fail("external PRECALC policy must not run in-job URANS")
+
+    seen = []
+    result = _run_marched(
+        tmp_path,
+        monkeypatch,
+        SolverParams(
+            transient_fallback=False,
+            force_transient=False,
+            rans_failure_policy="abort_for_precalc",
+            write_images=[],
+        ),
+        never_promote,
+        aoas=[0.0, 2.0, 4.0],
+        seen_aoas=seen,
+    )
+
+    assert seen == [0.0, 2.0]
+    assert not result.promoted_to_urans
+    assert result.precalc_promotion is not None
+    assert result.precalc_promotion.trigger_aoa_deg == 2.0
+    assert result.precalc_promotion.intentionally_omitted_aoas == [4.0]
+    assert [item.outcome.spec.aoa_deg for item in result.attempts] == [0.0, 2.0]
+
+
+def test_engine_publishes_condition_promotion_before_sibling_speed_finishes(
+    tmp_path, monkeypatch, naca0012_selig_text
+):
+    """MUST-CATCH: a batched condition can abort while another speed is still
+    running. Its typed promotion must reach partial result.json immediately so
+    Node cannot generically requeue the hard failure before terminal ingest."""
+    import threading
+
+    from airfoilfoam import jobs
+    from airfoilfoam.config import Settings
+    from airfoilfoam.models import (
+        AirfoilInput,
+        AoASpec,
+        FailureDisposition,
+        PolarRequest,
+        RansPrecalcPromotion,
+        ResourceParams,
+    )
+    from airfoilfoam.pipeline import PolarMarchResult, StoredCaseOutcome
+    from airfoilfoam.storage import JobStore
+
+    promotion_published = threading.Event()
+    slow_saw_promotion = []
+
+    class ObservingStore(JobStore):
+        def write_result(self, result):
+            super().write_result(result)
+            if result.state.value == "running" and any(
+                polar.rans_precalc_promotion is not None
+                for polar in result.polars
+            ):
+                promotion_published.set()
+
+    monkeypatch.setattr(
+        jobs,
+        "prepare_mesh",
+        lambda mesh_dir, *_args, **_kwargs: (
+            mesh_dir.mkdir(parents=True, exist_ok=True)
+            or SimpleNamespace(n_cells=100, patches=[], span_chords=0.1)
+        ),
+    )
+
+    def fake_march(_polar_dir, _mesh_dir, _airfoil, chord, speed, *_args, **_kwargs):
+        if speed == 20.0:
+            slow_saw_promotion.append(promotion_published.wait(timeout=2.0))
+            point = CaseOutcome(
+                spec=CaseSpec(chord=chord, speed=speed, aoa_deg=0.0),
+                reynolds=1e6,
+                cl=0.1,
+                cd=0.02,
+                cm=0.0,
+                cl_cd=5.0,
+                converged=True,
+            )
+            return PolarMarchResult(
+                points=[StoredCaseOutcome(slug="slow/a0", outcome=point)],
+                attempts=[StoredCaseOutcome(slug="slow/a0", outcome=point)],
+            )
+        accepted = CaseOutcome(
+            spec=CaseSpec(chord=chord, speed=speed, aoa_deg=0.0),
+            reynolds=1e6,
+            cl=0.0,
+            cd=0.02,
+            cm=0.0,
+            cl_cd=0.0,
+            converged=True,
+        )
+        failed = CaseOutcome(
+            spec=CaseSpec(chord=chord, speed=speed, aoa_deg=2.0),
+            reynolds=1e6,
+            converged=False,
+            failure_disposition=FailureDisposition.hard_solver,
+            error="HardSolverError: divergence watchdog condemned RANS",
+        )
+        return PolarMarchResult(
+            points=[StoredCaseOutcome(slug="fast/a0", outcome=accepted)],
+            attempts=[
+                StoredCaseOutcome(slug="fast/a0", outcome=accepted),
+                StoredCaseOutcome(slug="fast/a2", outcome=failed),
+            ],
+            precalc_promotion=RansPrecalcPromotion(
+                trigger_aoa_deg=2.0,
+                attempted_aoas=[0.0, 2.0],
+                intentionally_omitted_aoas=[4.0],
+            ),
+        )
+
+    monkeypatch.setattr(jobs, "solve_polar_marched", fake_march)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        cpu_token_state_path=tmp_path / "cpu-tokens.json",
+        worker_cpu_budget=2,
+        case_concurrency=2,
+        solver_processes=1,
+    )
+    store = ObservingStore(settings)
+    request = PolarRequest(
+        airfoil=AirfoilInput(name="naca0012", coordinates=naca0012_selig_text),
+        speeds=[10.0, 20.0],
+        aoa=AoASpec(angles=[0.0, 2.0, 4.0]),
+        solver=SolverParams(
+            warm_start=True,
+            transient_fallback=False,
+            rans_failure_policy="abort_for_precalc",
+            write_images=[],
+        ),
+        resources=ResourceParams(
+            policy="case_parallel",
+            cpu_budget=2,
+            case_concurrency=2,
+            solver_processes=1,
+        ),
+    )
+
+    result = jobs.execute_job(
+        "partial-promotion-publication",
+        request,
+        store=store,
+        settings=settings,
+    )
+
+    assert slow_saw_promotion == [True]
+    assert any(
+        polar.rans_precalc_promotion is not None for polar in result.polars
+    )
+    status = store.read_status("partial-promotion-publication")
+    assert status is not None
+    assert status.state.value == "completed"
+    assert status.phase.value == "completed"
 
 
 def test_default_transient_fallback_keeps_in_job_promotion(tmp_path, monkeypatch):

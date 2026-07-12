@@ -13,6 +13,7 @@ import {
 import {
   ensureEnabledSimulationPresetRevisions,
   ensureSimulationPresetRevision,
+  snapshotAoas,
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
@@ -35,6 +36,7 @@ import {
 import { reconcile, resetOrphans } from "./reconcile";
 import { remoteSolverTick } from "./remote-solver";
 import { retentionTick } from "./retention";
+import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
 interface SweeperConfig {
@@ -148,12 +150,20 @@ async function submitContinuousBatch(
   const setup = await ensureSimulationPresetRevision(db, batch.presetId);
   if (!a || !setup) return false;
   const bcId = setup.snapshot.preset.legacyBoundaryConditionId ?? batch.bcId;
+  const retryScope = retryScopeForRequestedPolar(
+    batch.effectivePriority >= 10 ? batch.aoas : snapshotAoas(setup.snapshot),
+    { explicitTargeted: batch.effectivePriority >= 10 },
+  );
 
   const { request, speed } = buildPolarRequest({
     airfoil: a,
     setup: setup.snapshot,
     aoaList: batch.aoas,
     wave: 1,
+    ransFailurePolicy:
+      retryScope.origin === "continuous-polar"
+        ? "abort_for_precalc"
+        : "continue",
     queuePressure,
     cpuSlots,
   });
@@ -182,6 +192,7 @@ async function submitContinuousBatch(
             },
           ],
           aoas: batch.aoas,
+          ransRetryScope: retryScope,
           resources: request.resources,
           setupSnapshot: setup.snapshot,
         },
@@ -225,6 +236,7 @@ interface ResolvedCampaignEntry {
   presetId: string;
   speed: number;
   reynolds: number;
+  requestedPolarAoas: number[];
   bcId: string;
   snapshot: SimulationSetupSnapshot;
 }
@@ -303,6 +315,7 @@ function campaignJobPayload(
       speed: e.speed,
       reynolds: e.reynolds,
       bcId: e.bcId,
+      ransRetryScope: retryScopeForRequestedPolar(e.requestedPolarAoas),
     })),
     resources,
     setupSnapshot: anchorSnapshot,
@@ -334,12 +347,17 @@ export async function submitCampaignBatch(
   // Min-Re entry = compat anchor: job revision, physics snapshot, chord.
   const anchor = entries[0];
   const snapshot = anchor.snapshot;
+  const retryScope = retryScopeForRequestedPolar(anchor.requestedPolarAoas);
 
   const { request } = buildPolarRequest({
     airfoil: a,
     setup: snapshot,
     aoaList: batch.angles,
     wave: 1,
+    ransFailurePolicy:
+      retryScope.origin === "continuous-polar"
+        ? "abort_for_precalc"
+        : "continue",
     queuePressure,
     cpuSlots,
     speeds: entries.map((e) => e.speed),

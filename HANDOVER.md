@@ -144,6 +144,15 @@ repeated S1223 work was deterministic waste, not transient solver recovery.
 
 ## Verification and production rollout status
 
+- Conditional whole-polar promotion is release-ready locally. A fresh database
+  applied migrations 0000 through 0058 and seeded the production-shaped
+  catalog. The final tree passed Python 426 (1 skipped, 6 integration tests
+  deselected), core 122, web 272, DB 53, API 221, and sweeper 303 tests; every
+  TypeScript workspace typechecked and `git diff --check` passed. The
+  must-catch recovery test reproduced an unbound 3.6° child when a batched
+  parent's mutable `conditionMap` disappeared, then proved the normalized
+  event-first correction prevents any child and finalizes only under the exact
+  ingest lease. A separate final audit found no remaining release blocker.
 - Python on the final MPI/deploy-safety tree: 411 passed, 1 skipped, 6
   integration tests deselected. The focused launcher/resource/deploy harness
   passed 20/20, including realistic stopped/running sweeper restoration,
@@ -219,6 +228,15 @@ repeated S1223 work was deterministic waste, not transient solver recovery.
 
 Fresh verified post-0057/post-backfill backup retained on the VPS and copied to
 `/tmp/airfoils-prod-backups` locally:
+
+- Container: `a7136886aaae13b40972c2c72395b2902238f8d759f29140e9688cd597a653e5`
+- Dump: `/opt/airfoils-pro/.codex-db-backups/app-postgres-1-aerodb-20260712T222012Z-d2a8ce1c.dump`
+- Bytes: `62,554,561`
+- SHA-256: `c11380aab30047255d530ba03ad53b6ce70a13a0198c3ef83daec4b0b5af58c9`
+- Strong verification restored all 66 tables into disposable database
+  `codex_verify_4a1c17085e2b`. The temporary VPS backup helper was removed.
+
+The earlier verified post-0057/post-backfill backup is also retained:
 
 - Container: `a7136886aaae13b40972c2c72395b2902238f8d759f29140e9688cd597a653e5`
 - Dump: `/opt/airfoils-pro/.codex-db-backups/app-postgres-1-aerodb-20260712T143755Z-b488723c.dump`
@@ -297,15 +315,21 @@ from the VPS after rollout. Do not recreate a persistent admin-token file.
   including same-case continuation and complete evidence/media. That is a
   release canary, not statistical performance proof across airfoils, Reynolds
   numbers, mesh profiles, or attached-flow conditions.
-- **Scheduler-policy conflict must be resolved before a new campaign.** The
-  2026-07-07 decision record says the background fidelity ladder retries only
-  the rejected/provisional angles, which is faster and cheaper but can leave
-  surviving RANS points provisional after a low-angle failure. The current
-  project guardrail says any rejected RANS point from 0° through 5° must abort
-  the remaining RANS sweep and replace the whole requested polar with URANS,
-  which costs more solver time but produces one physically coherent transient
-  polar. Recommendation: follow the current whole-polar guardrail for new
-  production campaigns unless the owner explicitly re-approves targeted-only
-  escalation after weighing that cost/correctness tradeoff. The 0057 evidence
-  correction is valid under either scheduling policy and does not silently
-  change scheduler breadth.
+- **The scheduler-policy conflict is resolved, but this does not authorize a
+  campaign.** On 2026-07-12 the owner approved conditional whole-polar
+  preliminary URANS: in a continuous multi-angle sweep, only a job-local exact
+  RANS attempt with structured `hard_solver` provenance at inclusive 0° through
+  5° stops that condition's remaining RANS march and promotes its original
+  requested angle list. Failures below 0° or above 5°, `needs_urans`, and
+  explicit single-angle work remain targeted. Infrastructure and deterministic
+  mesh failures stay on their existing retry/block paths and never trigger the
+  promotion. Scope is exact to parent job, condition, and immutable revision;
+  batch siblings and revision history cannot widen it. This costs about
+  `requested AoAs / targeted bad AoAs` more transient cases than targeted
+  repair, while shared-mesh reuse avoids per-angle remeshing. Implementation,
+  migration 0058, event-first recovery, remote replacement ownership, and the
+  destructive-metadata-drift regression are complete and release-ready. This
+  still does not authorize solver work: the campaign remains cancelled,
+  scheduling remains disabled, and the owner has not authorized a new
+  campaign. The 0057 exact-evidence correction remains valid under the resolved
+  scheduling policy.

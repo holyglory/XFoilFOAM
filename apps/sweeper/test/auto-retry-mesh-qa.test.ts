@@ -380,6 +380,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           stalled: true,
           unsteady: false,
           error: "RANS did not converge; precalc escalation required",
+          evidencePayload: { failure_disposition: "hard_solver" },
           solvedAt: new Date(),
         })),
       )

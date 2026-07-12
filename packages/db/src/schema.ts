@@ -2742,6 +2742,120 @@ export const simPrecalcObligationRequests = pgTable(
   }),
 );
 
+/** Immutable, idempotent provenance for a conditional whole-polar promotion.
+ * Mutable execution state remains in the shared physical obligations; this row
+ * records why one exact RANS job/condition widened to its pinned polar scope. */
+export const simRansPolarPromotions = pgTable(
+  "sim_rans_polar_promotions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    parentJobId: uuid("parent_job_id")
+      .notNull()
+      .references((): AnyPgColumn => simJobs.id, { onDelete: "cascade" }),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    revisionId: uuid("revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    conditionId: uuid("condition_id").references(
+      (): AnyPgColumn => simCampaignConditions.id,
+      { onDelete: "set null" },
+    ),
+    ownerKind: text("owner_kind").notNull(),
+    campaignId: uuid("campaign_id").references(
+      (): AnyPgColumn => simCampaigns.id,
+      { onDelete: "cascade" },
+    ),
+    syncPromiseId: uuid("sync_promise_id").references(
+      (): AnyPgColumn => syncSweepPromises.id,
+      { onDelete: "cascade" },
+    ),
+    triggerResultAttemptId: uuid("trigger_result_attempt_id")
+      .notNull()
+      .references((): AnyPgColumn => resultAttempts.id, {
+        onDelete: "cascade",
+      }),
+    triggerAoaDeg: doublePrecision("trigger_aoa_deg").notNull(),
+    failureDisposition: text("failure_disposition").notNull(),
+    requestOrigin: text("request_origin").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    triggerUq: unique("sim_rans_polar_promotions_trigger_uq").on(
+      t.triggerResultAttemptId,
+    ),
+    parentRevisionUq: unique("sim_rans_polar_promotions_parent_revision_uq").on(
+      t.parentJobId,
+      t.revisionId,
+    ),
+    triggerRangeCheck: check(
+      "sim_rans_polar_promotions_trigger_range_check",
+      sql`${t.triggerAoaDeg} >= 0 AND ${t.triggerAoaDeg} <= 5`,
+    ),
+    dispositionCheck: check(
+      "sim_rans_polar_promotions_disposition_check",
+      sql`${t.failureDisposition} = 'hard_solver'`,
+    ),
+    originCheck: check(
+      "sim_rans_polar_promotions_origin_check",
+      sql`${t.requestOrigin} = 'continuous-polar'`,
+    ),
+    ownerKindCheck: check(
+      "sim_rans_polar_promotions_owner_kind_check",
+      sql`${t.ownerKind} IN ('campaign', 'background', 'sync_promise')`,
+    ),
+    ownerShapeCheck: check(
+      "sim_rans_polar_promotions_owner_shape_check",
+      sql`(
+        (${t.ownerKind} = 'campaign' AND ${t.campaignId} IS NOT NULL AND ${t.syncPromiseId} IS NULL)
+        OR (${t.ownerKind} = 'background' AND ${t.campaignId} IS NULL AND ${t.syncPromiseId} IS NULL)
+        OR (${t.ownerKind} = 'sync_promise' AND ${t.campaignId} IS NULL AND ${t.syncPromiseId} IS NOT NULL)
+      )`,
+    ),
+    parentIdx: index("sim_rans_polar_promotions_parent_idx").on(t.parentJobId),
+    revisionIdx: index("sim_rans_polar_promotions_revision_idx").on(
+      t.airfoilId,
+      t.revisionId,
+    ),
+    campaignIdx: index("sim_rans_polar_promotions_campaign_idx").on(
+      t.campaignId,
+    ),
+    syncPromiseIdx: index("sim_rans_polar_promotions_sync_promise_idx").on(
+      t.syncPromiseId,
+    ),
+  }),
+);
+
+/** Exact full-polar coverage of one promotion. The obligation link makes the
+ * recovery path independent of in-memory retry planning and safe across a
+ * process death between promotion commit and child composition. */
+export const simRansPolarPromotionPoints = pgTable(
+  "sim_rans_polar_promotion_points",
+  {
+    promotionId: uuid("promotion_id")
+      .notNull()
+      .references(() => simRansPolarPromotions.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    obligationId: uuid("obligation_id")
+      .notNull()
+      .references(() => simPrecalcObligations.id, { onDelete: "cascade" }),
+    intentionallyOmittedByRans: boolean("intentionally_omitted_by_rans")
+      .notNull()
+      .default(false),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.promotionId, t.aoaDeg] }),
+    promotionObligationUq: unique(
+      "sim_rans_polar_promotion_points_promotion_obligation_uq",
+    ).on(t.promotionId, t.obligationId),
+    obligationIdx: index("sim_rans_polar_promotion_points_obligation_idx").on(
+      t.obligationId,
+    ),
+  }),
+);
+
 // ---------------------------------------------------------------------------
 // 13. Cross-instance sync — settings, permissions, external scheduling leases,
 //     and reviewable import conflicts. Promises are scheduling metadata only;
@@ -3279,3 +3393,6 @@ export type SimPrecalcObligationCampaign =
   typeof simPrecalcObligationCampaigns.$inferSelect;
 export type SimPrecalcObligationRequest =
   typeof simPrecalcObligationRequests.$inferSelect;
+export type SimRansPolarPromotion = typeof simRansPolarPromotions.$inferSelect;
+export type SimRansPolarPromotionPoint =
+  typeof simRansPolarPromotionPoints.$inferSelect;

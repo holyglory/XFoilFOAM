@@ -18,6 +18,15 @@ import { databaseUrl } from "../src/env";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrations = resolve(here, "../migrations");
+const latestMigrationTimestamp = String(
+  Math.max(
+    ...(
+      JSON.parse(
+        readFileSync(join(migrations, "meta/_journal.json"), "utf8"),
+      ) as { entries: Array<{ when: number }> }
+    ).entries.map((entry) => entry.when),
+  ),
+);
 const runId = `${process.pid}_${Date.now()}`;
 const dbName = `aerodb_rd0052_${runId}`;
 const baseUrl = new URL(databaseUrl());
@@ -373,7 +382,7 @@ describe("0051→0052 remote delivery and evidence-association upgrade", () => {
         delivery_table: "sync_remote_result_deliveries",
         point_attempt_column: true,
         conflict_fingerprint_column: true,
-        latest_migration: "1785801600000",
+        latest_migration: latestMigrationTimestamp,
       },
     ]);
   });

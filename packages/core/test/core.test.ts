@@ -294,15 +294,16 @@ describe("RANS stall classification and fitted polar", () => {
   it("detects low-AoA failure for whole-polar URANS promotion", () => {
     const classified = classifyPolarEvidence([
       {
-        a: 0,
-        cl: null,
-        cd: null,
-        cm: null,
-        status: "failed",
-        source: "queued",
+        a: 2,
+        cl: 0.31,
+        cd: 0.018,
+        cm: -0.01,
+        status: "done",
+        source: "solved",
         regime: "rans",
         converged: false,
         stalled: true,
+        failureDisposition: "hard_solver",
       },
       {
         a: 1,
@@ -316,7 +317,7 @@ describe("RANS stall classification and fitted polar", () => {
         stalled: false,
       },
       {
-        a: 2,
+        a: 3,
         cl: 0.3,
         cd: 0.011,
         cm: 0,
@@ -329,7 +330,68 @@ describe("RANS stall classification and fitted polar", () => {
     ]);
 
     expect(classified.lowAoaFailure).toBe(true);
-    expect(classified.hardRejectedAoas).toEqual([0]);
+    expect(classified.hardRejectedAoas).toEqual([2]);
+    expect(
+      classified.classifications
+        .filter((row) => row.evidence.a !== 2)
+        .map((row) => row.state),
+    ).toEqual(["needs_urans", "needs_urans"]);
+  });
+
+  it.each(["infrastructure", "deterministic_mesh"] as const)(
+    "does not turn a low-AoA %s rejection into a polar-wide physics verdict",
+    (failureDisposition) => {
+      const classified = classifyPolarEvidence([
+        {
+          a: 2,
+          cl: null,
+          cd: null,
+          cm: null,
+          status: "failed",
+          source: "queued",
+          regime: "rans",
+          converged: false,
+          stalled: true,
+          error: `${failureDisposition} fixture`,
+          failureDisposition,
+        },
+        {
+          a: 4,
+          cl: 0.4,
+          cd: 0.02,
+          cm: -0.01,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          converged: true,
+          stalled: false,
+          failureDisposition: "none",
+        },
+      ]);
+      expect(classified.lowAoaFailure).toBe(false);
+      expect(classified.classifications.map((row) => row.state)).toEqual([
+        "rejected",
+        "accepted",
+      ]);
+    },
+  );
+
+  it("does not treat an unattempted queued shell as a hard low-AoA failure", () => {
+    const classified = classifyPolarEvidence([
+      {
+        a: 2,
+        cl: null,
+        cd: null,
+        cm: null,
+        status: "pending",
+        source: "queued",
+        regime: "rans",
+        converged: false,
+        stalled: false,
+      },
+    ]);
+    expect(classified.hardRejectedAoas).toEqual([2]);
+    expect(classified.lowAoaFailure).toBe(false);
   });
 });
 

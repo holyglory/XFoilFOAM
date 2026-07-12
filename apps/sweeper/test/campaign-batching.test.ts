@@ -375,6 +375,7 @@ describe("batched campaign jobs: one mesh per airfoil-chord, all speeds warm-sta
                     converged: false,
                     first_order_fallback: false,
                     images: {},
+                    failure_disposition: "hard_solver",
                     error: "RANS did not converge",
                     evidence_artifacts: [
                       {

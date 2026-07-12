@@ -568,6 +568,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       stalled: true,
       unsteady: false,
       error: "RANS did not converge",
+      evidencePayload: { failure_disposition: "hard_solver" },
       solvedAt: new Date(),
     });
     await db
@@ -760,6 +761,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       stalled: true,
       unsteady: false,
       error: "RANS did not converge",
+      evidencePayload: { failure_disposition: "hard_solver" },
       solvedAt: new Date(),
     });
     await db

@@ -145,6 +145,105 @@ function pendingSubmitWhere(jobId: string, campaignId: string | null) {
                      )
                    )
               )
+              AND (
+                NOT (${simJobs.requestPayload} ? 'conditionalPromotionId')
+                OR EXISTS (
+                  SELECT 1
+                  FROM sim_rans_polar_promotions promotion
+                  JOIN sim_jobs promotion_parent
+                    ON promotion_parent.id = promotion.parent_job_id
+                  WHERE promotion.id::text = ${simJobs.requestPayload} ->> 'conditionalPromotionId'
+                    AND promotion_parent.id::text = ${simJobs.requestPayload} ->> 'parentJobId'
+                    AND promotion.airfoil_id = ${simJobs.airfoilId}
+                    AND promotion.revision_id = ${simJobs.simulationPresetRevisionId}
+                    AND promotion.condition_id IS NOT DISTINCT FROM CASE
+                      WHEN ${simJobs.requestPayload} ->> 'conditionId' IS NULL THEN NULL
+                      ELSE (${simJobs.requestPayload} ->> 'conditionId')::uuid
+                    END
+                    AND (
+                      (
+                        promotion.owner_kind = 'sync_promise'
+                        AND promotion.sync_promise_id::text = ${simJobs.requestPayload} ->> 'syncPromiseId'
+                      )
+                      OR (
+                        promotion.owner_kind IN ('campaign', 'background')
+                        AND NOT (${simJobs.requestPayload} ? 'syncPromiseId')
+                      )
+                    )
+                    AND (
+                      promotion_parent.status IN ('done', 'failed', 'cancelled')
+                      OR (
+                        promotion_parent.status = 'ingesting'
+                        AND (
+                          promotion_parent.ingest_lease_expires_at IS NULL
+                          OR promotion_parent.ingest_lease_expires_at <= now()
+                        )
+                      )
+                    )
+                    AND NOT (
+                      promotion_parent.status = 'cancelled'
+                      AND promotion.owner_kind = 'background'
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements_text(
+                        CASE
+                          WHEN jsonb_typeof(${simJobs.requestPayload} -> 'precalcObligationIds') = 'array'
+                          THEN ${simJobs.requestPayload} -> 'precalcObligationIds'
+                          ELSE '[]'::jsonb
+                        END
+                      ) payload_event_obligation(id)
+                      LEFT JOIN sim_precalc_obligations event_obligation
+                        ON event_obligation.id::text = payload_event_obligation.id
+                      WHERE event_obligation.id IS NULL
+                         OR NOT EXISTS (
+                           SELECT 1
+                           FROM sim_rans_polar_promotion_points event_point
+                           WHERE event_point.promotion_id = promotion.id
+                             AND event_point.obligation_id = event_obligation.id
+                             AND event_point.aoa_deg = event_obligation.aoa_deg
+                             AND event_obligation.airfoil_id = promotion.airfoil_id
+                             AND event_obligation.revision_id = promotion.revision_id
+                         )
+                         OR NOT (
+                           (
+                             promotion.owner_kind = 'background'
+                             AND event_obligation.background_owner
+                           )
+                           OR (
+                             promotion.owner_kind = 'campaign'
+                             AND EXISTS (
+                               SELECT 1
+                               FROM sim_precalc_obligation_campaigns exact_ownership
+                               JOIN sim_campaigns exact_campaign
+                                 ON exact_campaign.id = exact_ownership.campaign_id
+                                AND exact_campaign.status IN ('active', 'attention')
+                               WHERE exact_ownership.obligation_id = event_obligation.id
+                                 AND exact_ownership.campaign_id = promotion.campaign_id
+                                 AND exact_ownership.state = 'active'
+                             )
+                           )
+                           OR (
+                             promotion.owner_kind = 'sync_promise'
+                             AND EXISTS (
+                               SELECT 1
+                               FROM sync_sweep_promise_points exact_point
+                               JOIN sync_sweep_promises exact_promise
+                                 ON exact_promise.id = exact_point.promise_id
+                                AND exact_promise.status = 'active'
+                                AND exact_promise."expiresAt" > now()
+                                AND exact_promise.request_payload ->> 'remoteSolver' = 'true'
+                               WHERE exact_promise.id = promotion.sync_promise_id
+                                 AND exact_point.status = 'active'
+                                 AND exact_point.airfoil_id = event_obligation.airfoil_id
+                                 AND exact_point.simulation_preset_revision_id = event_obligation.revision_id
+                                 AND exact_point.aoa_deg = event_obligation.aoa_deg
+                             )
+                           )
+                         )
+                    )
+                )
+              )
             )
             WHEN ${simJobs.requestPayload} ? 'verifyQueueItemId' THEN EXISTS (
               SELECT 1
@@ -389,6 +488,19 @@ async function withSubmitLifecycleLocks<T>(
           ON remote_promise.id::text = job.request_payload ->> 'syncPromiseId'
         WHERE job.id = ${jobId}
         FOR SHARE OF remote_promise
+      `);
+      // A recorded-promotion child also depends on its exact parent lifecycle.
+      // Owner rows (campaign/remote promise) are locked first, then the parent,
+      // matching the physical composer and avoiding parent↔remote inversion.
+      await tx.execute(sql`
+        SELECT promotion_parent.id
+        FROM sim_jobs job
+        JOIN sim_rans_polar_promotions promotion
+          ON promotion.id::text = job.request_payload ->> 'conditionalPromotionId'
+        JOIN sim_jobs promotion_parent
+          ON promotion_parent.id = promotion.parent_job_id
+        WHERE job.id = ${jobId}
+        FOR SHARE OF promotion_parent
       `);
       // Lock the other shared association shapes defensively; a job contains
       // at most one request/verify id.

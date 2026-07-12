@@ -315,8 +315,10 @@ conditions nothing has been solved at yet."*
   requestPayload carries a conditionMap [{conditionId, revisionId, presetId,
   speed, reynolds, bcId}]; ingest maps each returned polar to its entry by
   canonical speed (exact equality, never nearest-guess); wave-2 URANS plans are
-  computed per entry and submitted as per-condition single-revision targeted
-  children. Jobs without a conditionMap keep the legacy single-revision path.
+  computed per entry and submitted as per-condition single-revision preliminary
+  children whose angle list follows the RANS-failure policy below. One entry's
+  promotion must never widen a sibling entry. Jobs without a conditionMap keep
+  the legacy single-revision path.
   Campaign jobs never bundle foreign gaps; refinement iterations are
   single-angle `targeted` jobs; sim_jobs.campaignId set.
 - **Engine-side reuse** (2026-07-04, supersedes §15's "no engine changes"):
@@ -330,11 +332,25 @@ conditions nothing has been solved at yet."*
   mechanism as the in-job march) instead of potentialFoam. Verified on real
   OpenFOAM: second job logged "mesh cache hit" and "seeded … from cached
   solution at aoa 2". Engine build id: dev-20260704-batch-cache.
-- **RANS→URANS retry scoping**: the "<5 valid points / longest run <5 → whole polar"
-  heuristics are evaluated against the REVISION-WIDE evidence set for the airfoil,
-  not the job's own points; `targeted` jobs escalate only their own rejected/
-  needs_urans point (targeted mode). The 0..5° whole-polar rule still applies at
-  revision scope.
+- **RANS→URANS retry scoping** (2026-07-12 owner decision, superseding the
+  earlier revision-wide heuristic and the 2026-07-07 categorical targeted-only
+  rule): only an exact job-local RANS attempt with structured `hard_solver`
+  provenance at inclusive 0..5° promotes a continuous multi-angle production
+  sweep. Stop the remaining RANS march and create preliminary URANS obligations
+  for the original requested AoA list of that exact parent job, condition, and
+  immutable revision. Do not use the currently open subset, revision history,
+  rounded values, batch labels, `<5 valid points`, or longest-run length to
+  derive scope. Hard failures below 0° or above 5°, `needs_urans`, and explicit
+  single-angle/refinement/admin work remain targeted. Infrastructure and
+  deterministic mesh failures never promote and stay on their existing
+  retry/block paths. The failed attempt stays immutable evidence; angles omitted
+  by the abort are scheduling obligations, not invented failed attempts. The
+  normalized promotion event and per-angle obligations are the restart-safe,
+  idempotent execution authority. For a remote-solver promise, a fulfilled
+  exact accepted RANS pointer may advance only to the newly accepted canonical
+  URANS generation for that same promise and cell; the RANS attempt remains
+  immutable. Changed RANS, competing URANS, and expired/cancelled promise
+  generations remain conflicts.
 - **Engine-down backoff**: before composing a job, check the cached engine probe; on
   submit connection failure do NOT mark the job failed — release the composed row,
   set engineUnreachableSince in sweeper state, back off exponentially (5 s → 5 min
@@ -566,11 +582,16 @@ airfoils. Keep the engine request untouched otherwise.
   restore, no-resurrection), legacy bcId path, auth on every new route + the
   hardened /api/sweeper + /api/sim-jobs, purge endpoint cascades campaign tables.
 - Sweeper: campaign branch ordering vs public priority 10, campaign job isolation
-  (no foreign gap bundling), targeted retry scoping (single-angle job does NOT
-  trigger whole-polar URANS when revision-wide evidence is healthy — must-catch
-  regression test), engine-down backoff (no failed-job spam), counters/completion
-  transitions, lane convergence state machine (iteration-1 convergence, oscillation
-  window, supersession reopen, tolerance tighten/loosen, symmetric_definition).
+  (no foreign gap bundling), and conditional retry scoping. Must-catch coverage
+  includes hard-solver failures at both inclusive 0°/5° boundaries promoting
+  only the exact condition's original requested polar, plus durable recovery and
+  truthful intentionally omitted angles. False-positive guards cover negative
+  and above-5° failures, `needs_urans`, explicit single-angle work,
+  infrastructure and deterministic mesh failures, sparse evidence, and
+  unrelated job/revision history. Also cover engine-down backoff (no failed-job
+  spam), counters/completion transitions, and the lane convergence state
+  machine (iteration-1 convergence, oscillation window, supersession reopen,
+  tolerance tighten/loosen, symmetric_definition).
 - Playwright e2e (pw- stamp + extended purge): wizard launch happy path with
   multi-value chips + preview; edit-conditions diff with a kept-to-finish condition;
   refinement board states; hub/URL routing (back button returns hub with state).

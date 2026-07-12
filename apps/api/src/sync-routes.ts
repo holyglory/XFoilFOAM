@@ -3477,11 +3477,21 @@ async function importPolarPush(
             .limit(1)
         : [];
 
-      const [ownedContinuation] =
+      const [ownedGeneration] =
         existing && payload.promiseId
           ? await tx
-              .select({ id: syncSweepPromisePoints.id })
+              .select({
+                id: syncSweepPromisePoints.id,
+                regime: resultAttempts.regime,
+              })
               .from(syncSweepPromisePoints)
+              .innerJoin(
+                resultAttempts,
+                and(
+                  eq(resultAttempts.id, syncSweepPromisePoints.resultAttemptId),
+                  eq(resultAttempts.resultId, existing.id),
+                ),
+              )
               .where(
                 and(
                   eq(syncSweepPromisePoints.promiseId, payload.promiseId),
@@ -3502,6 +3512,8 @@ async function importPolarPush(
               )
               .limit(1)
           : [];
+      const ownedContinuation =
+        ownedGeneration?.regime === "rans" && attemptRegime === "urans";
       const [exactReplayAttempt] = existing
         ? await tx
             .select({ id: resultAttempts.id })
@@ -3563,7 +3575,9 @@ async function importPolarPush(
         if (ownedContinuation) {
           // The same authoritative promise may legitimately continue from an
           // already-delivered RANS generation to changed-value URANS/full
-          // evidence. Unrelated/direct imports still conflict below.
+          // evidence. Once a URANS generation owns the point, a different
+          // generation is not another continuation; exact replay is handled
+          // separately above. Unrelated/direct imports still conflict below.
           kind = "equivalent";
         }
         const scheduledPlaceholder =
@@ -4091,6 +4105,22 @@ async function importPolarPush(
         ) {
           return false;
         }
+        // A marched remote RANS job can publish early siblings before a typed
+        // low-angle hard failure promotes its exact polar to preliminary
+        // URANS. The point remains owned by this promise, and the immutable
+        // RANS generation remains stored, but the fulfilled pointer must be
+        // allowed to advance to the newly accepted canonical URANS attempt.
+        // Arbitrary changed RANS replays still fail the exact-attempt guard.
+        const acceptedUransUpgrade =
+          committed.regime === "urans"
+            ? sql`EXISTS (
+                SELECT 1
+                FROM result_attempts prior_attempt
+                WHERE prior_attempt.id = ${syncSweepPromisePoints.resultAttemptId}
+                  AND prior_attempt.result_id = ${committed.resultId}
+                  AND prior_attempt.regime = 'rans'
+              )`
+            : sql`false`;
         const settled = await tx
           .update(syncSweepPromisePoints)
           .set({
@@ -4110,9 +4140,12 @@ async function importPolarPush(
                 and(
                   eq(syncSweepPromisePoints.status, "fulfilled"),
                   eq(syncSweepPromisePoints.resultId, committed.resultId),
-                  eq(
-                    syncSweepPromisePoints.resultAttemptId,
-                    committed.attemptId,
+                  or(
+                    eq(
+                      syncSweepPromisePoints.resultAttemptId,
+                      committed.attemptId,
+                    ),
+                    acceptedUransUpgrade,
                   ),
                 ),
               ),

@@ -6,6 +6,7 @@ import {
   type AirfoilFormat,
   type MeshParams,
   type PolarRequest,
+  type RansFailurePolicy,
   type ResourcePolicy,
   type TurbulenceModelName,
   type UransFidelity,
@@ -24,6 +25,9 @@ export function buildPolarRequest(opts: {
   /** URANS fidelity tier for wave-2 requests. Default 'precalc'. Ignored on
    *  wave 1 (steady solves have no URANS tier). */
   uransFidelity?: UransFidelity;
+  /** Wave-1 low-AoA policy. Continuous production polars use
+   * abort_for_precalc; explicit targeted work uses continue. */
+  ransFailurePolicy?: RansFailurePolicy;
   queuePressure?: number;
   /** Global solver capacity (sweeper_state.cpuSlots). >0 → cpu_budget cap;
    *  0 → auto: omit cpu_budget so the engine resolves its own worker budget;
@@ -34,12 +38,28 @@ export function buildPolarRequest(opts: {
    *  Omitted → the snapshot's single speed (legacy behavior). */
   speeds?: number[];
 }): { request: PolarRequest; speed: number; nu: number } {
-  const { airfoil, setup, aoaList, wave, uransFidelity, queuePressure, cpuSlots, speeds } = opts;
+  const {
+    airfoil,
+    setup,
+    aoaList,
+    wave,
+    uransFidelity,
+    ransFailurePolicy,
+    queuePressure,
+    cpuSlots,
+    speeds,
+  } = opts;
   const cpuBudget =
-    cpuSlots == null ? (setup.scheduling.cpuBudget ?? undefined) : cpuSlots > 0 ? cpuSlots : undefined;
+    cpuSlots == null
+      ? (setup.scheduling.cpuBudget ?? undefined)
+      : cpuSlots > 0
+        ? cpuSlots
+        : undefined;
   const nu = setup.flowState.kinematicViscosity;
   const speed = setup.flowState.speedMps;
-  const points = (airfoil.points as Point[]).map((p) => [p.x, p.y] as [number, number]);
+  const points = (airfoil.points as Point[]).map(
+    (p) => [p.x, p.y] as [number, number],
+  );
   const meshBlock = (mesh: SimulationSetupSnapshot["mesh"]): MeshParams => ({
     mesher: mesh.mesher,
     farfield_radius_chords: mesh.farfieldRadiusChords,
@@ -51,15 +71,24 @@ export function buildPolarRequest(opts: {
     span_chords: mesh.spanChords,
   });
   const request: PolarRequest = {
-    airfoil: { name: airfoil.name, format: airfoil.pointFormat as AirfoilFormat, points },
+    airfoil: {
+      name: airfoil.name,
+      format: airfoil.pointFormat as AirfoilFormat,
+      points,
+    },
     chord_lengths: [setup.referenceGeometry.referenceLengthM],
     speeds: speeds && speeds.length ? speeds : [speed],
     aoa: { angles: aoaList },
     fluid: { density: setup.flowState.density, kinematic_viscosity: nu },
-    roughness: { sand_grain_height: setup.boundary.sandGrainHeight, roughness_constant: setup.boundary.roughnessConstant },
+    roughness: {
+      sand_grain_height: setup.boundary.sandGrainHeight,
+      roughness_constant: setup.boundary.roughnessConstant,
+    },
     mesh: meshBlock(setup.mesh),
     ...(setup.uransMesh ? { urans_mesh: meshBlock(setup.uransMesh) } : {}),
-    ...(setup.uransPrecalcMesh ? { urans_precalc_mesh: meshBlock(setup.uransPrecalcMesh) } : {}),
+    ...(setup.uransPrecalcMesh
+      ? { urans_precalc_mesh: meshBlock(setup.uransPrecalcMesh) }
+      : {}),
     solver: {
       turbulence: {
         model: setup.solver.turbulenceModel as TurbulenceModelName,
@@ -73,14 +102,16 @@ export function buildPolarRequest(opts: {
       // ship transient_fallback:false EXPLICITLY — the engine defaults it to
       // TRUE when the key is absent (models.py SolverParams), which re-runs
       // every non-converged steady as an ungated in-job URANS with no tier
-      // fidelity/budget. Rejected wave-1 points reach URANS ONLY through the
-      // gated ladder (targeted wave-2 'precalc' retries in reconcile.ts).
+      // fidelity/budget. Wave-1 escalation is explicit: continuous multi-angle
+      // work uses abort_for_precalc so a structured low-angle hard_solver
+      // failure stops the RANS march and lets the Node ladder durably compose
+      // the exact preliminary scope; explicit targeted work uses continue.
       // Incident pin: prod wave-1 sweep job 20b67295 (s1223 -5deg) diverged in
       // an engine-side in-job escalation. MUST-CATCH payload-shape pins:
-      // build-request-transient-pin.test.ts. NOTE the engine's marched-sweep
-      // whole-polar abort (pipeline.py should_abort_rans_sweep_for_urans) is
-      // NOT gated on these flags — that gate is engine-side work.
+      // build-request-transient-pin.test.ts.
       transient_fallback: wave === 2,
+      rans_failure_policy:
+        wave === 1 ? (ransFailurePolicy ?? "continue") : "continue",
       force_transient: wave === 2,
       // Ladder contract 1: the node sends ONLY the fidelity literal; the
       // engine derives min periods / budget / mesh scale from it.

@@ -31,6 +31,8 @@ import {
   simPrecalcObligationAttempts,
   simPrecalcObligationCampaigns,
   simPrecalcObligations,
+  simRansPolarPromotionPoints,
+  simRansPolarPromotions,
   simUransVerifyQueue,
   simulationPresetAirfoilTargets,
   simulationPresets,
@@ -395,6 +397,7 @@ async function evidenceBackedWave2Fixture(
       stalled: true,
       unsteady: false,
       error: "RANS did not converge",
+      evidencePayload: { failure_disposition: "hard_solver" },
       solvedAt: new Date(),
     })
     .returning();
@@ -2431,6 +2434,10 @@ describe("sweeper: gap → claim → ingest", () => {
             },
           ],
           aoas,
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: aoas,
+          },
         },
       })
       .returning({ id: simJobs.id });
@@ -2614,6 +2621,10 @@ describe("sweeper: gap → claim → ingest", () => {
             },
           ],
           aoas,
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: aoas,
+          },
         },
       })
       .returning({ id: simJobs.id });
@@ -2793,6 +2804,10 @@ describe("sweeper: gap → claim → ingest", () => {
             },
           ],
           aoas: allAoas,
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: allAoas,
+          },
         },
       })
       .returning({ id: simJobs.id });
@@ -2868,6 +2883,7 @@ describe("sweeper: gap → claim → ingest", () => {
             converged: false,
             first_order_fallback: false,
             images: {},
+            failure_disposition: "hard_solver",
             error: "RANS did not converge",
           })),
         },
@@ -3862,6 +3878,236 @@ describe("sweeper: gap → claim → ingest", () => {
       );
     attempts.forEach((attempt) => cleanupAttemptIds.add(attempt.id));
     expect(attempts.length).toBe(1);
+  }, 60000);
+
+  it("MUST-CATCH: running partial ingest durably records a typed whole-polar promotion before terminal sibling work", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoas = [0.125, 2.125, 4.125];
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
+    const engineJobId = "running-partial-rans-promotion";
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        submittedAt: new Date(Date.now() - 60 * 60 * 1000),
+        totalCases: aoas.length,
+        completedCases: 0,
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+          aoas,
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: aoas,
+          },
+        },
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const seededResults = await db
+      .insert(results)
+      .values(
+        aoas.map((aoaDeg) => ({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg,
+          status: "running" as const,
+          source: "queued" as const,
+          regime: "rans" as const,
+          simJobId: job.id,
+          engineJobId,
+        })),
+      )
+      .returning({ id: results.id, aoaDeg: results.aoaDeg });
+    seededResults.forEach((row) => cleanupResultIds.add(row.id));
+
+    const accepted = {
+      aoa_deg: aoas[0],
+      cl: 0.02,
+      cd: 0.014,
+      cm: -0.01,
+      cl_cd: 0.02 / 0.014,
+      unsteady: false,
+      converged: true,
+      first_order_fallback: false,
+      failure_disposition: "none" as const,
+      images: {},
+    };
+    const hardFailure = {
+      aoa_deg: aoas[1],
+      cl: null,
+      cd: null,
+      cm: null,
+      cl_cd: null,
+      unsteady: false,
+      converged: false,
+      first_order_fallback: false,
+      failure_disposition: "hard_solver" as const,
+      error: "HardSolverError: divergence watchdog condemned RANS",
+      images: {},
+    };
+    const partialResult: JobResult = {
+      job_id: engineJobId,
+      state: "running",
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: bc.mach,
+          points: [accepted],
+          attempts: [accepted, hardFailure],
+          rans_precalc_promotion: {
+            trigger_aoa_deg: aoas[1],
+            failure_disposition: "hard_solver",
+            attempted_aoas: aoas.slice(0, 2),
+            intentionally_omitted_aoas: [aoas[2]],
+          },
+        },
+      ],
+    };
+    const partialEngine = {
+      getQueue: async () => emptyQueue([engineJobId]),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: true,
+            cancelled: false,
+            process_count: 1,
+            status_readable: true,
+            status_state: "running",
+            status_total_cases: aoas.length,
+            status_completed_cases: 2,
+            result_readable: true,
+            has_result: true,
+            result_state: "running",
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: "running",
+        total_cases: aoas.length,
+        completed_cases: 2,
+      }),
+      getResult: async () => partialResult,
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
+    } as unknown as EngineClient;
+
+    await reconcile(db, partialEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+
+    const [promotion] = await db
+      .select()
+      .from(simRansPolarPromotions)
+      .where(eq(simRansPolarPromotions.parentJobId, job.id));
+    expect(promotion).toMatchObject({
+      revisionId: presetRevisionId,
+      triggerAoaDeg: aoas[1],
+      failureDisposition: "hard_solver",
+      requestOrigin: "continuous-polar",
+    });
+    const promotionPoints = await db
+      .select({
+        aoaDeg: simRansPolarPromotionPoints.aoaDeg,
+        omitted: simRansPolarPromotionPoints.intentionallyOmittedByRans,
+      })
+      .from(simRansPolarPromotionPoints)
+      .where(eq(simRansPolarPromotionPoints.promotionId, promotion.id));
+    expect(
+      promotionPoints.sort((left, right) => left.aoaDeg - right.aoaDeg),
+    ).toEqual([
+      { aoaDeg: aoas[0], omitted: false },
+      { aoaDeg: aoas[1], omitted: false },
+      { aoaDeg: aoas[2], omitted: true },
+    ]);
+    expect(
+      await db
+        .select({ id: simPrecalcObligations.id })
+        .from(simPrecalcObligations)
+        .where(
+          and(
+            eq(simPrecalcObligations.airfoilId, a.id),
+            eq(simPrecalcObligations.revisionId, presetRevisionId),
+            inArray(simPrecalcObligations.aoaDeg, aoas),
+          ),
+        ),
+    ).toHaveLength(3);
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(and(eq(simJobs.parentJobId, job.id), eq(simJobs.wave, 2))),
+    ).toHaveLength(0);
+    const [parentAfter] = await db
+      .select({ status: simJobs.status })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    expect(parentAfter.status).toBe("running");
+    const hardAfter = (
+      await db
+        .select({
+          status: results.status,
+          simJobId: results.simJobId,
+          currentAttemptId: results.currentResultAttemptId,
+        })
+        .from(results)
+        .where(
+          and(
+            eq(results.airfoilId, a.id),
+            eq(results.simulationPresetRevisionId, presetRevisionId),
+            eq(results.aoaDeg, aoas[1]),
+          ),
+        )
+    )[0];
+    expect(hardAfter).toMatchObject({ status: "failed", simJobId: job.id });
+    expect(hardAfter.currentAttemptId).toBeNull();
+    const omittedAfter = (
+      await db
+        .select({
+          status: results.status,
+          simJobId: results.simJobId,
+          currentAttemptId: results.currentResultAttemptId,
+        })
+        .from(results)
+        .where(
+          and(
+            eq(results.airfoilId, a.id),
+            eq(results.simulationPresetRevisionId, presetRevisionId),
+            eq(results.aoaDeg, aoas[2]),
+          ),
+        )
+    )[0];
+    expect(omittedAfter).toEqual({
+      status: "queued",
+      simJobId: null,
+      currentAttemptId: null,
+    });
   }, 60000);
 
   it("re-ingests a completed engine result after a prior ingest failure", async () => {
@@ -5043,6 +5289,7 @@ describe("sweeper: gap → claim → ingest", () => {
               iterations: 600,
               first_order_fallback: false,
               images: {},
+              failure_disposition: "hard_solver",
               steady_history: steadyHistory,
               evidence_artifacts: [
                 {

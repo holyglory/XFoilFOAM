@@ -141,6 +141,14 @@ export interface PolarEvidencePoint {
   stalled: boolean;
   unsteady?: boolean;
   error?: string | null;
+  /** Structured engine cause for a rejected solve. Legacy evidence may omit it;
+   * only a solved/error-free legacy RANS row can then count as a hard failure. */
+  failureDisposition?:
+    | "none"
+    | "hard_solver"
+    | "deterministic_mesh"
+    | "infrastructure"
+    | null;
   finalResidual?: number | null;
   iterations?: number | null;
   firstOrderFallback?: boolean | null;
@@ -315,6 +323,23 @@ function acceptedForShape(c: PolarEvidenceClassification): boolean {
   );
 }
 
+export function isHardRansFailureEvidence(
+  evidence: PolarEvidencePoint,
+): boolean {
+  if (evidence.regime !== "rans") return false;
+  if (evidence.failureDisposition === "hard_solver") return true;
+  if (evidence.failureDisposition != null) return false;
+  // Pre-contract compatibility: a finite/error-free RANS point that actually
+  // reached solved evidence but failed convergence/physics gates is a genuine
+  // numerical rejection. Queued/failed shells and errored attempts are
+  // ambiguous infrastructure and fail closed.
+  return (
+    evidence.status === "done" &&
+    evidence.source === "solved" &&
+    !evidence.error
+  );
+}
+
 export function classifyPolarEvidence(
   points: PolarEvidencePoint[],
 ): ClassifiedPolar {
@@ -344,7 +369,8 @@ export function classifyPolarEvidence(
       c.evidence.regime === "rans" &&
       c.evidence.a >= 0 &&
       c.evidence.a <= 5 &&
-      c.state === "rejected",
+      c.state === "rejected" &&
+      isHardRansFailureEvidence(c.evidence),
   );
   if (lowAoaFailure) {
     for (const c of classifications) {

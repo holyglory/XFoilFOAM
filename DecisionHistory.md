@@ -1,5 +1,98 @@
 # Decision History
 
+## 2026-07-12 — Owner approves conditional whole-polar URANS after low-angle RANS failure
+
+- Decision context presented to the owner: the 2026-07-07 background fidelity
+  ladder deliberately retries only rejected/provisional angles. That minimizes
+  transient case count and previously prevented broad heuristics such as “fewer
+  than five valid points” from burning hours of URANS on accepted angles, but
+  it can leave one requested polar assembled from different numerical methods
+  after a failure in the normally attached-flow range. That is a consistency
+  risk, not proof that every surviving RANS value is physically wrong. The
+  alternative presented was to treat a hard RANS solver failure from 0° through
+  5° as the narrow signal to stop that continuous RANS march and replace its
+  original requested angles with preliminary URANS. Its transient-case cost is
+  roughly `requested AoAs / targeted bad AoAs` relative to targeted repair;
+  shared-mesh reuse avoids paying for one new mesh per angle. It makes the
+  replacement internally consistent and avoids routine human adjudication. The
+  recommendation was this conditional rule, not restoration of sparse-polar,
+  small-valid-set, or revision-history heuristics.
+- Owner decision, after that cost/risk explanation: “Approve conditional
+  whole-polar URANS: a hard RANS failure from 0° through 5° replaces the full
+  requested polar with preliminary URANS; failures above 5° and explicit
+  single-angle work remain targeted. Infrastructure and deterministic mesh
+  failures must not trigger this promotion.”
+- Authoritative policy: for a continuous multi-angle production sweep, an exact
+  attempt classified with the structured `hard_solver` RANS failure disposition
+  at inclusive AoA `[0°, 5°]` stops the remaining RANS march and promotes exactly
+  the original requested angle list for that job, physical condition, and
+  immutable setup revision to preliminary URANS. It does not promote every
+  angle ever associated with the revision, nor only the subset still open when
+  the job was claimed. In a multi-condition engine batch, one condition's
+  trigger cannot widen any sibling condition. The failed RANS attempt and the
+  intentionally unattempted remainder remain truthful immutable history/state;
+  accepted preliminary URANS generations become canonical only through the
+  normal exact-evidence gate. The replacement reuses the existing shared mesh
+  and remains durable and idempotent across retries/restarts.
+- Non-promoting boundaries: `needs_urans` without a hard rejection remains a
+  targeted confirmation; hard rejection below 0° or above 5° remains targeted;
+  an explicit single-angle/admin request remains targeted; cancellation,
+  connection/HTTP, worker/process, queue, or other infrastructure failure
+  follows its existing machine retry/block path; deterministic mesh-QA failure
+  follows its existing immutable-setup blocker path until the mesh changes.
+  The owner approved which failures promote; this did not create those existing
+  infrastructure or deterministic-mesh handling policies. Unrelated jobs,
+  revisions, campaigns, conditions, and historical classifications cannot
+  widen the promoted scope.
+- The old waste controls remain: `<5 valid points`, sparse early evidence, lack
+  of a long contiguous run, and revision-wide low-angle history are not
+  promotion triggers. Full-fidelity verification remains lower-priority
+  background work after preliminary evidence. This decision does not approve a
+  new campaign, change retry counts, alter exact result ownership, or resolve
+  the separately recorded orchestration, retention, idempotency-key, or
+  federation-credential decisions.
+- Implementation state at approval: the Python engine had a shared-mesh
+  whole-polar replacement mechanism for explicitly marched requests, but its
+  trigger was over-broad and its direct marched mode replaced in-job at full
+  cost. Campaign wave-1 requests
+  disabled in-job transient fallback because the Node fidelity ladder owned
+  escalation, while that ladder still pinned targeted-only retry plans. Both
+  sides therefore required explicit failure provenance, an abort-only engine
+  signal for externally scheduled preliminary work, exact scope pinning, and
+  aligned tests before this policy could run.
+- Agent implementation decision (not an additional owner policy choice): store
+  each authorized promotion and its per-angle preliminary obligations in
+  normalized orchestration tables, fenced to the exact trigger attempt, parent
+  job, condition, and revision. Keeping this only in process memory or mutable
+  request JSON would be cheaper to implement but could lose or duplicate work
+  across a crash. The normalized model costs two small tables, transactional
+  locking, migration and recovery code, but makes the replacement scope
+  auditable, idempotent, and restart-safe without mixing scheduling state into
+  immutable solver evidence. Scheduling remains disabled and no new campaign
+  is authorized by this decision alone.
+- Cross-instance implementation boundary: when a remote-solver promise already
+  delivered an accepted exact RANS generation, whole-polar replacement reopens
+  that same promise point and may advance its delivered pointer only to a newly
+  accepted canonical URANS generation for the same physical cell. The original
+  RANS attempt remains immutable evidence. A changed RANS replay, a competing
+  URANS generation, an expired/cancelled promise, or unrelated promise history
+  remains a conflict and cannot retarget the fulfilled point. This narrow
+  monotonic rule lets the approved replacement reach the upstream catalog
+  without weakening cross-instance evidence identity.
+- Release implementation: migration 0058 normalizes the exact promotion event
+  and its per-angle preliminary obligations. Engine failures now carry a
+  structured disposition; only exact `hard_solver` evidence can authorize the
+  low-angle policy, while deterministic mesh and infrastructure failures fail
+  closed on their existing paths. Partial ingest publishes the event before
+  terminal sibling work, and terminal/restart recovery discovers persisted
+  parent events before consulting mutable request JSON. A must-catch test first
+  reproduced an unbound 3.6° child after deleting a batched `conditionMap`, then
+  proved event-first recovery creates no generic child and finalizes only under
+  the exact ingest lease. The final clean-0058 gates passed core 122, web 272,
+  DB 53, API 221, sweeper 303, Python 426 (1 skipped), and all workspace
+  typechecks; an independent post-fix audit found no release blocker. This
+  verification does not enable scheduling or authorize a campaign.
+
 ## 2026-07-12 — Production precalc canary validates logical-CPU MPI and exact evidence
 
 - Production reproduction: isolated Clark Y AoA 15° forced-precalc job
@@ -74,12 +167,12 @@
 - The failed and successful canary directories are terminal and process-free,
   but the engine retention API correctly refused deletion during its six-hour
   fresh-lock window. Their locks were not removed or bypassed. The production
-  campaign remains cancelled and scheduling remains disabled. A new campaign
-  remains blocked on the separately recorded owner choice between targeted
-  angle-only URANS escalation (less compute, mixed/provisional polar risk) and
-  the current whole-polar URANS rule after a 0–5° RANS failure (more compute,
-  one coherent transient polar); recommendation remains the current
-  whole-polar rule unless the owner explicitly chooses otherwise.
+  campaign remains cancelled and scheduling remains disabled. The owner later
+  resolved the scheduler-policy choice in the 2026-07-12 entry above: only a
+  job-local structured hard RANS solver failure at inclusive 0° through 5° in a
+  continuous multi-angle sweep replaces that exact requested polar with
+  preliminary URANS. This canary did not exercise that promotion path and does
+  not authorize a new campaign.
 
 ## 2026-07-12 — Migration 0057 reasserts exact selected-result truth after every writer
 
@@ -913,13 +1006,17 @@
   solver-stalled; reasons stay rejection-only — the honest note surfaces via
   the `steady-oscillating-mean:` quality-warning marker appended at ingest,
   which the existing point-story UI already reads).
-- R2 whole-polar kill: `decideRansRetry` is TARGETED-ONLY (job's own
-  rejected/needs_urans angles; `whole-polar-urans` mode, `fullUrans`, the
-  tiny-polar `<5 valid` and 0..5° revision heuristics all removed, including
-  the dead legacy copies in packages/db/polar-cache.ts). Whole-polar URANS is
-  now exclusively an admin request (`aoa_deg NULL`). Must-catch tests pin the
-  old promotion inputs producing targeted plans
-  (campaign-scheduling.test.ts, sweeper.test.ts).
+- R2 retry scope as shipped on 2026-07-07: `decideRansRetry` was
+  TARGETED-ONLY (the job's own rejected/needs_urans angles); the old
+  tiny-polar `<5 valid` and revision-wide 0..5° heuristics were removed, and a
+  whole-polar retry required an explicit admin request (`aoa_deg NULL`). The
+  2026-07-12 owner decision partially supersedes only the categorical
+  targeted-only rule: a structured job-local `hard_solver` failure at
+  inclusive 0..5° in a continuous multi-angle sweep now promotes that exact
+  job/condition/revision's original requested angle list to preliminary URANS.
+  Targeted scope remains authoritative for `needs_urans`, failures below 0° or
+  above 5°, and explicit single-angle work. The removed sparse/tiny-polar and
+  revision-wide heuristics remain removed.
 - Scheduler ladder (ONE priority scale): RANS branch (`submitOneBatch`)
   always wins the tick; `uransLadderTick` (apps/sweeper/src/urans-ladder.ts)
   runs only when it submitted nothing and capacity remains — tier 2 = gated
@@ -2342,6 +2439,10 @@ fragments (`"results"."id"`).
   as 'rejected' until re-solved — deciding now could escalate interrupted
   points to whole-polar URANS. The follow-up re-solve job runs the same
   revision-wide retry pass on real evidence.
+  Retrospective update (2026-07-12): retry scope no longer reads result shells
+  or revision-wide classifications; it requires an exact job-local attempt with
+  structured failure provenance. The orphan remains an infrastructure event and
+  therefore still cannot trigger either targeted or whole-polar URANS.
 - Genuine failed jobs keep failing rows, but results.error must NEVER be
   empty: failJob now stamps the engine job message on every row it fails,
   and ingestResult gained failedPointErrorFallback so a failed point whose
@@ -2411,6 +2512,11 @@ fragments (`"results"."id"`).
   whole-polar promotion heuristics read REVISION-WIDE classifications, so
   leaked evidence shifts later suites' decisions (caught: the new scale-retry
   test's α=87 accepted point flipped whole-polar-urans → invalid-rans-points).
+  Retrospective update (2026-07-12): this records the historical detector that
+  exposed the fixture leak. Conditional promotion now reads exact attempts from
+  the parent job and its pinned requested scope, so unrelated revision evidence
+  cannot change scheduler breadth; shared-DB fixture cleanup remains mandatory
+  for isolation and foreign-key safety.
 
 ## 2026-07-06 — Targeted URANS: steady-RANS-first warm start + timeout honesty (prod clarky -2..4 timeouts)
 

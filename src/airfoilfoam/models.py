@@ -17,6 +17,30 @@ class AirfoilFormat(str, Enum):
     lednicer = "lednicer"
 
 
+class FailureDisposition(str, Enum):
+    """Machine-readable reason a solver point was rejected.
+
+    Promotion policy must consume this field, never parse the user-facing
+    ``error`` string.  ``hard_solver`` is reserved for aerodynamic/numerical
+    RANS evidence (non-convergence, divergence, or invalid coefficients).
+    Deterministic mesh and execution/infrastructure failures remain distinct
+    repair/retry classes and cannot justify a whole-polar URANS replacement.
+    """
+
+    none = "none"
+    hard_solver = "hard_solver"
+    deterministic_mesh = "deterministic_mesh"
+    infrastructure = "infrastructure"
+
+
+class RansFailurePolicy(str, Enum):
+    """Action after a qualifying low-AoA hard RANS failure in a marched polar."""
+
+    continue_rans = "continue"
+    abort_for_precalc = "abort_for_precalc"
+    replace_precalc = "replace_precalc"
+
+
 class AirfoilInput(BaseModel):
     """An airfoil supplied either as raw coordinate text or as an explicit point list."""
 
@@ -282,6 +306,11 @@ class SolverParams(BaseModel):
         description="If the steady solve does not converge (e.g. post-stall, unsteady separation), "
         "automatically re-run the case transient (pimpleFoam/URANS) and report time-averaged "
         "force coefficients with their fluctuation.",
+    )
+    rans_failure_policy: RansFailurePolicy = Field(
+        default=RansFailurePolicy.replace_precalc,
+        description="Low-AoA hard-RANS policy for a marched polar: continue, emit an "
+        "external preliminary-URANS promotion signal, or replace in-job at preliminary fidelity.",
     )
     force_transient: bool = Field(
         default=False,
@@ -819,7 +848,21 @@ class PolarPoint(BaseModel):
         default_factory=list,
         description="Raw immutable OpenFOAM evidence artifacts for this solver point.",
     )
+    failure_disposition: FailureDisposition = Field(
+        default=FailureDisposition.none,
+        description="Structured rejection provenance. Promotion logic may use 'hard_solver'; "
+        "deterministic_mesh and infrastructure are repair/retry failures and never aerodynamic evidence.",
+    )
     error: Optional[str] = None
+
+
+class RansPrecalcPromotion(BaseModel):
+    trigger_aoa_deg: float
+    failure_disposition: Literal[FailureDisposition.hard_solver] = (
+        FailureDisposition.hard_solver
+    )
+    attempted_aoas: list[float]
+    intentionally_omitted_aoas: list[float]
 
 
 class Polar(BaseModel):
@@ -831,6 +874,10 @@ class Polar(BaseModel):
     attempts: list[PolarPoint] = Field(
         default_factory=list,
         description="Rejected or superseded solver attempts retained as evidence; not valid polar points.",
+    )
+    rans_precalc_promotion: Optional[RansPrecalcPromotion] = Field(
+        default=None,
+        description="Typed normal-control-flow signal that this polar stopped RANS and owes external preliminary URANS.",
     )
 
 

@@ -16,7 +16,12 @@ from airfoilfoam.postprocess.unsteady import (
     strouhal,
 )
 from airfoilfoam.postprocess.images import find_all_vtus, select_vtus
-from airfoilfoam.models import CaseSpec
+from airfoilfoam.models import CaseSpec, FailureDisposition
+from airfoilfoam.openfoam.runner import (
+    DeterministicMeshError,
+    InsufficientMpiSlotsError,
+    RunResult,
+)
 from airfoilfoam.pipeline import (
     CaseOutcome,
     TransientResult,
@@ -283,7 +288,15 @@ def test_vtu_selector_uses_physical_time_for_foam_index_dirs(tmp_path):
     assert [p.parent.name for p in selected] == ["case_2001", "case_2002"]
 
 
-def _rans_outcome(aoa, *, converged=True, error=None, cl=0.4, cd=0.02):
+def _rans_outcome(
+    aoa,
+    *,
+    converged=True,
+    error=None,
+    cl=0.4,
+    cd=0.02,
+    failure_disposition=FailureDisposition.none,
+):
     return CaseOutcome(
         spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=aoa),
         reynolds=666_666,
@@ -291,19 +304,70 @@ def _rans_outcome(aoa, *, converged=True, error=None, cl=0.4, cd=0.02):
         cd=cd,
         converged=converged,
         error=error,
+        failure_disposition=failure_disposition,
     )
 
 
 def test_core_rans_failure_aborts_whole_sweep_for_urans():
-    assert should_abort_rans_sweep_for_urans(3.0, _rans_outcome(3.0, converged=False))
-    assert should_abort_rans_sweep_for_urans(0.0, _rans_outcome(0.0, error="solver diverged"))
-    assert should_abort_rans_sweep_for_urans(5.0, _rans_outcome(5.0, cd=-0.01))
+    hard = FailureDisposition.hard_solver
+    assert should_abort_rans_sweep_for_urans(
+        3.0, _rans_outcome(3.0, converged=False, failure_disposition=hard)
+    )
+    assert should_abort_rans_sweep_for_urans(
+        0.0, _rans_outcome(0.0, error="solver diverged", failure_disposition=hard)
+    )
+    assert should_abort_rans_sweep_for_urans(
+        5.0, _rans_outcome(5.0, cd=-0.01, failure_disposition=hard)
+    )
+    assert should_abort_rans_sweep_for_urans(
+        2.0, _rans_outcome(2.0, cl=math.nan, failure_disposition=hard)
+    )
 
 
 def test_rans_abort_rule_is_limited_to_attached_core_range():
-    assert not should_abort_rans_sweep_for_urans(-1.0, _rans_outcome(-1.0, converged=False))
-    assert not should_abort_rans_sweep_for_urans(6.0, _rans_outcome(6.0, converged=False))
+    hard = FailureDisposition.hard_solver
+    assert not should_abort_rans_sweep_for_urans(
+        -1.0, _rans_outcome(-1.0, converged=False, failure_disposition=hard)
+    )
+    assert not should_abort_rans_sweep_for_urans(
+        6.0, _rans_outcome(6.0, converged=False, failure_disposition=hard)
+    )
     assert not should_abort_rans_sweep_for_urans(3.0, _rans_outcome(3.0, converged=True))
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    [FailureDisposition.deterministic_mesh, FailureDisposition.infrastructure],
+)
+def test_core_non_solver_failure_does_not_abort_whole_sweep(disposition):
+    """FALSE-POSITIVE GUARD: rejected evidence in the attached range is not
+    itself permission to spend a whole polar of URANS. Mesh and execution
+    failures remain repair/retry work even when the point has no coefficients."""
+    outcome = _rans_outcome(
+        2.0,
+        converged=False,
+        # Deliberately solver-looking text: policy must use the typed field,
+        # not accidentally promote because a launcher/mesh message contains
+        # words such as "solver" or "diverged".
+        error="simpleFoam solver diverged before force evidence",
+        cl=None,
+        cd=None,
+        failure_disposition=disposition,
+    )
+    assert not should_abort_rans_sweep_for_urans(2.0, outcome)
+
+
+def test_failure_disposition_serializes_on_engine_polar_point():
+    from airfoilfoam.jobs import _outcome_to_point
+
+    outcome = _rans_outcome(
+        2.0,
+        converged=False,
+        failure_disposition=FailureDisposition.hard_solver,
+    )
+    payload = _outcome_to_point("engine-job", "polar/a0", outcome).model_dump(mode="json")
+
+    assert payload["failure_disposition"] == "hard_solver"
 
 
 def test_whole_polar_urans_replacement_reuses_shared_mesh(tmp_path, monkeypatch):
@@ -336,6 +400,7 @@ def test_whole_polar_urans_replacement_reuses_shared_mesh(tmp_path, monkeypatch)
         seen_meshes.append(mesh_dir)
         assert solver_params.force_transient
         assert solver_params.transient_auto_refine
+        assert solver_params.urans_fidelity.value == "precalc"
         return CaseOutcome(
             spec=spec,
             reynolds=physics.reynolds(spec.speed, spec.chord, fluid.nu),
@@ -344,6 +409,7 @@ def test_whole_polar_urans_replacement_reuses_shared_mesh(tmp_path, monkeypatch)
             cl_cd=(0.1 * spec.aoa_deg) / 0.02,
             unsteady=True,
             converged=True,
+            fidelity=f"urans_{solver_params.urans_fidelity.value}",
         )
 
     monkeypatch.setattr(pipeline, "run_case", fake_run_case)
@@ -366,6 +432,124 @@ def test_whole_polar_urans_replacement_reuses_shared_mesh(tmp_path, monkeypatch)
     assert len(points) == 3
     assert seen_meshes == [shared_mesh, shared_mesh, shared_mesh]
     assert all(p.outcome.unsteady for p in points)
+    assert all(p.outcome.fidelity == "urans_precalc" for p in points)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RunResult(
+            command="mpirun --use-hwthread-cpus -np 8 simpleFoam -parallel",
+            returncode=124,
+            stdout="Command timed out after 1200s",
+            timed_out=True,
+        ),
+        RunResult(
+            command="mpirun --use-hwthread-cpus -np 8 simpleFoam -parallel",
+            returncode=1,
+            stdout=(
+                "There are not enough slots available in the system to satisfy "
+                "the 8 slots that were requested"
+            ),
+        ),
+        InsufficientMpiSlotsError(requested=8, available=4),
+        DeterministicMeshError("checkMesh deterministic gate: negative-volume cells"),
+    ],
+    ids=[
+        "solver-command-timeout",
+        "openmpi-runtime-slot-refusal",
+        "declared-capacity-refusal",
+        "deterministic-mesh",
+    ],
+)
+def test_marched_execution_or_mesh_failure_is_retained_but_never_promoted(
+    tmp_path, monkeypatch, failure
+):
+    """MUST-CATCH: production-shaped timeout, MPI-capacity and deterministic
+    mesh failures at 2 degrees stay evidence-only and cannot trigger the
+    expensive whole-polar fallback."""
+    from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
+
+    def fake_cold(*_args, **_kwargs):
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(pipeline, "_solve_cold_marched", fake_cold)
+    monkeypatch.setattr(
+        pipeline,
+        "_run_full_urans_replacement",
+        lambda *_args, **_kwargs: pytest.fail("non-solver failure must not promote"),
+    )
+
+    result = solve_polar_marched(
+        tmp_path / "polar",
+        tmp_path / "shared-mesh",
+        airfoil=None,
+        chord=1.0,
+        speed=10.0,
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        resolved=MeshParams(),
+        solver_params=SolverParams(),
+        mesher=SimpleNamespace(patches=lambda _resolved: {}),
+        runner=None,
+        aoas=[2.0, 6.0],
+        render_images=False,
+    )
+
+    assert not result.promoted_to_urans
+    assert result.points == []
+    assert len(result.attempts) == 2
+    first = result.attempts[0].outcome
+    expected = (
+        FailureDisposition.deterministic_mesh
+        if isinstance(failure, DeterministicMeshError)
+        else FailureDisposition.infrastructure
+    )
+    assert first.failure_disposition == expected
+
+
+def test_marched_watchdog_divergence_is_hard_solver_failure_and_promotes(tmp_path, monkeypatch):
+    """MUST-CATCH: a numerical divergence condemnation is aerodynamic/numerical
+    solver evidence, unlike a timeout or launcher failure, so it promotes when
+    it occurs in the inclusive 0..5 degree range."""
+    from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
+
+    def fake_cold(polar_dir, *_args, **_kwargs):
+        pipeline.write_divergence_condemnation(
+            polar_dir,
+            "simpleFoam residuals and force coefficients diverged monotonically",
+        )
+        return RunResult(
+            command="simpleFoam",
+            returncode=143,
+            stdout="watchdog terminated divergent solver",
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(pipeline, "_solve_cold_marched", fake_cold)
+    monkeypatch.setattr(pipeline, "_run_full_urans_replacement", lambda *_a, **_k: [])
+
+    result = solve_polar_marched(
+        tmp_path / "polar",
+        tmp_path / "shared-mesh",
+        airfoil=None,
+        chord=1.0,
+        speed=10.0,
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        resolved=MeshParams(),
+        solver_params=SolverParams(),
+        mesher=SimpleNamespace(patches=lambda _resolved: {}),
+        runner=None,
+        aoas=[2.0, 6.0],
+        render_images=False,
+    )
+
+    assert result.promoted_to_urans
+    assert len(result.attempts) == 1
+    assert result.attempts[0].outcome.failure_disposition == FailureDisposition.hard_solver
 
 
 def test_marched_sweep_cancellation_is_not_promoted_to_urans(tmp_path, monkeypatch):
@@ -821,7 +1005,9 @@ def test_rejected_non_core_rans_with_force_data_ships_honest_points(tmp_path, mo
     assert accepted_flags == [False, True, False, True]
 
 
-def test_true_crash_rans_stays_evidence_only_attempt(tmp_path, monkeypatch):
+def test_missing_coefficient_evidence_is_infrastructure_and_never_promotes(
+    tmp_path, monkeypatch
+):
     """MUST-CATCH: a true crash (no coefficient data at all — _finalize_outcome
     raises) keeps the pre-existing behavior: evidence-only attempt with a
     truthful error, honestly ABSENT from the polar points."""
@@ -860,10 +1046,15 @@ def test_true_crash_rans_stays_evidence_only_attempt(tmp_path, monkeypatch):
         solver_params=SolverParams(),
         mesher=FakeMesher(),
         runner=None,
-        aoas=[6.0],
+        aoas=[2.0, 6.0],
         render_images=False,
     )
 
+    assert not result.promoted_to_urans
     assert result.points == []
-    assert len(result.attempts) == 1
-    assert "no coefficient.dat" in result.attempts[0].outcome.error
+    assert len(result.attempts) == 2
+    assert all(
+        item.outcome.failure_disposition == FailureDisposition.infrastructure
+        for item in result.attempts
+    )
+    assert all("no coefficient.dat" in item.outcome.error for item in result.attempts)

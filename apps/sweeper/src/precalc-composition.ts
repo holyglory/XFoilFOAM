@@ -10,6 +10,10 @@ export interface PhysicalPrecalcComposition {
     parentJobId: string;
     revisionId: string;
     conditionId?: string;
+    /** Exact normalized whole-polar event authorizing crash recovery. When
+     * present, the parent lifecycle and promotion→obligation coverage are
+     * rechecked under the same transaction that inserts the child. */
+    recordedPromotionId?: string;
   };
 }
 
@@ -44,6 +48,33 @@ export async function composePhysicalPrecalcJob(
   ) {
     throw new Error(
       "physical precalc job payload must carry the exact claimed obligation ids",
+    );
+  }
+  if (
+    spec.directParent?.recordedPromotionId &&
+    (spec.job.requestPayload as { conditionalPromotionId?: unknown } | null)
+      ?.conditionalPromotionId !== spec.directParent.recordedPromotionId
+  ) {
+    throw new Error(
+      "recorded promotion composition must pin its exact event id in the payload",
+    );
+  }
+  const rawPayloadAoas = (spec.job.requestPayload as { aoas?: unknown } | null)
+    ?.aoas;
+  const payloadAoas = Array.isArray(rawPayloadAoas)
+    ? rawPayloadAoas.filter(
+        (aoa): aoa is number => typeof aoa === "number" && Number.isFinite(aoa),
+      )
+    : [];
+  if (
+    spec.directParent?.recordedPromotionId &&
+    (!Array.isArray(rawPayloadAoas) ||
+      rawPayloadAoas.length !== ids.length ||
+      payloadAoas.length !== ids.length ||
+      new Set(payloadAoas).size !== payloadAoas.length)
+  ) {
+    throw new Error(
+      "recorded promotion composition must pair every obligation with one exact AoA",
     );
   }
   const payload = (spec.job.requestPayload ?? {}) as {
@@ -172,11 +203,139 @@ export async function composePhysicalPrecalcJob(
       // before insertion, matching lifecycle order and preventing two
       // sweepers from composing the same condition child.
       const [parent] = (await tx.execute(sql`
-        SELECT id FROM sim_jobs
+        SELECT id, status, ingest_lease_expires_at
+        FROM sim_jobs
         WHERE id = ${spec.directParent.parentJobId}
         FOR UPDATE
-      `)) as unknown as Array<{ id: string }>;
+      `)) as unknown as Array<{
+        id: string;
+        status: string;
+        ingest_lease_expires_at: Date | string | null;
+      }>;
       if (!parent) return null;
+      if (spec.directParent.recordedPromotionId) {
+        const leaseExpiry = parent.ingest_lease_expires_at
+          ? new Date(parent.ingest_lease_expires_at).getTime()
+          : null;
+        const recoverableParent =
+          ["done", "failed", "cancelled"].includes(parent.status) ||
+          (parent.status === "ingesting" &&
+            (leaseExpiry == null || leaseExpiry <= Date.now()));
+        if (!recoverableParent) return null;
+        const [promotion] = (await tx.execute(sql`
+          SELECT promotion.id, promotion.owner_kind
+          FROM sim_rans_polar_promotions promotion
+          WHERE promotion.id = ${spec.directParent.recordedPromotionId}
+            AND promotion.parent_job_id = ${spec.directParent.parentJobId}
+            AND promotion.airfoil_id = ${spec.job.airfoilId}
+            AND promotion.revision_id = ${spec.directParent.revisionId}
+            AND promotion.condition_id IS NOT DISTINCT FROM ${spec.directParent.conditionId ?? null}::uuid
+            AND (
+              (
+                promotion.owner_kind = 'sync_promise'
+                AND promotion.sync_promise_id = ${remoteProvenance?.promiseId ?? null}::uuid
+              )
+              OR (
+                promotion.owner_kind IN ('campaign', 'background')
+                AND promotion.sync_promise_id IS NULL
+                AND ${remoteProvenance?.promiseId ?? null}::uuid IS NULL
+              )
+            )
+            AND (
+              SELECT count(*)::int
+              FROM sim_rans_polar_promotion_points point
+              JOIN sim_precalc_obligations covered_obligation
+                ON covered_obligation.id = point.obligation_id
+               AND covered_obligation.airfoil_id = promotion.airfoil_id
+               AND covered_obligation.revision_id = promotion.revision_id
+               AND covered_obligation.aoa_deg = point.aoa_deg
+              WHERE point.promotion_id = promotion.id
+                AND point.obligation_id = ANY(${sql`ARRAY[${sql.join(
+                  ids.map((id) => sql`${id}::uuid`),
+                  sql`, `,
+                )}]`})
+            ) = ${ids.length}
+            AND (
+              SELECT array_agg(point.aoa_deg ORDER BY point.aoa_deg)
+              FROM sim_rans_polar_promotion_points point
+              JOIN sim_precalc_obligations covered_obligation
+                ON covered_obligation.id = point.obligation_id
+               AND covered_obligation.airfoil_id = promotion.airfoil_id
+               AND covered_obligation.revision_id = promotion.revision_id
+               AND covered_obligation.aoa_deg = point.aoa_deg
+              WHERE point.promotion_id = promotion.id
+                AND point.obligation_id = ANY(${sql`ARRAY[${sql.join(
+                  ids.map((id) => sql`${id}::uuid`),
+                  sql`, `,
+                )}]`})
+            ) = ${sql`ARRAY[${sql.join(
+              [...payloadAoas]
+                .sort((a, b) => a - b)
+                .map((aoa) => sql`${aoa}::float8`),
+              sql`, `,
+            )}]`}
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_rans_polar_promotion_points owner_point
+              JOIN sim_precalc_obligations owner_obligation
+                ON owner_obligation.id = owner_point.obligation_id
+               AND owner_obligation.airfoil_id = promotion.airfoil_id
+               AND owner_obligation.revision_id = promotion.revision_id
+               AND owner_obligation.aoa_deg = owner_point.aoa_deg
+              WHERE owner_point.promotion_id = promotion.id
+                AND owner_point.obligation_id = ANY(${sql`ARRAY[${sql.join(
+                  ids.map((id) => sql`${id}::uuid`),
+                  sql`, `,
+                )}]`})
+                AND NOT (
+                  (
+                    promotion.owner_kind = 'background'
+                    AND owner_obligation.background_owner
+                  )
+                  OR (
+                    promotion.owner_kind = 'campaign'
+                    AND EXISTS (
+                      SELECT 1
+                      FROM sim_precalc_obligation_campaigns exact_ownership
+                      JOIN sim_campaigns exact_campaign
+                        ON exact_campaign.id = exact_ownership.campaign_id
+                       AND exact_campaign.status IN ('active', 'attention')
+                      WHERE exact_ownership.obligation_id = owner_obligation.id
+                        AND exact_ownership.campaign_id = promotion.campaign_id
+                        AND exact_ownership.state = 'active'
+                    )
+                  )
+                  OR (
+                    promotion.owner_kind = 'sync_promise'
+                    AND EXISTS (
+                      SELECT 1
+                      FROM sync_sweep_promise_points exact_point
+                      JOIN sync_sweep_promises exact_promise
+                        ON exact_promise.id = exact_point.promise_id
+                       AND exact_promise.status = 'active'
+                       AND exact_promise."expiresAt" > now()
+                       AND exact_promise.request_payload ->> 'remoteSolver' = 'true'
+                      WHERE exact_promise.id = promotion.sync_promise_id
+                        AND exact_point.status = 'active'
+                        AND exact_point.airfoil_id = owner_obligation.airfoil_id
+                        AND exact_point.simulation_preset_revision_id = owner_obligation.revision_id
+                        AND exact_point.aoa_deg = owner_obligation.aoa_deg
+                    )
+                  )
+                )
+            )
+          FOR SHARE OF promotion
+        `)) as unknown as Array<{
+          id: string;
+          owner_kind: "campaign" | "background" | "sync_promise";
+        }>;
+        if (
+          !promotion ||
+          (parent.status === "cancelled" &&
+            promotion.owner_kind === "background")
+        )
+          return null;
+      }
       const conditionSql = spec.directParent.conditionId
         ? sql`request_payload ->> 'conditionId' = ${spec.directParent.conditionId}`
         : sql`request_payload ->> 'conditionId' IS NULL`;

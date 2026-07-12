@@ -146,7 +146,11 @@ export function firstBatch(gaps: Gap[]): ContinuousBatch | null {
     .filter(
       (g) =>
         g.airfoilId === head.airfoilId &&
-        g.presetRevisionId === head.presetRevisionId,
+        g.presetRevisionId === head.presetRevisionId &&
+        // An explicit public request (priority 10) is its own targeted intent;
+        // never silently pull the revision's priority-0 background gaps into
+        // that job and later mistake it for a continuous whole-polar sweep.
+        (head.priority >= 10 ? g.priority >= 10 : g.priority < 10),
     )
     .map((g) => g.aoaDeg)
     .sort((x, y) => x - y);

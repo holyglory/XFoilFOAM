@@ -1,6 +1,15 @@
 from pathlib import Path
 
-from airfoilfoam.openfoam.runner import RunResult, Runner
+import pytest
+
+from airfoilfoam.config import Settings
+from airfoilfoam.openfoam.runner import (
+    CommandLaunchError,
+    CommandTimeoutError,
+    InsufficientMpiSlotsError,
+    RunResult,
+    Runner,
+)
 
 
 class RecordingRunner(Runner):
@@ -46,3 +55,39 @@ def test_serial_solver_does_not_invoke_mpi_or_decomposition(tmp_path):
     runner.solver(tmp_path, "simpleFoam", n_proc=1, timeout=42, restart=True)
 
     assert runner.commands == [(tmp_path, "simpleFoam", 42, None)]
+
+
+def test_parallel_solver_rejects_rank_count_above_declared_worker_capacity(tmp_path):
+    runner = RecordingRunner()
+    runner.settings = Settings(worker_cpu_budget=4)
+
+    with pytest.raises(InsufficientMpiSlotsError) as err:
+        runner.solver(tmp_path, "simpleFoam", n_proc=8)
+
+    assert err.value.requested == 8
+    assert err.value.available == 4
+    assert runner.commands == []
+
+
+def test_run_result_timeout_flag_raises_typed_infrastructure_error():
+    result = RunResult(
+        command="mpirun -np 8 simpleFoam -parallel",
+        returncode=124,
+        stdout="solver process exceeded the command budget",
+        timed_out=True,
+    )
+
+    with pytest.raises(CommandTimeoutError):
+        result.check()
+
+
+@pytest.mark.parametrize("returncode", [125, 126, 127])
+def test_standard_launch_exit_codes_raise_typed_infrastructure_error(returncode):
+    result = RunResult(
+        command="blockMesh",
+        returncode=returncode,
+        stdout="runtime could not invoke requested command",
+    )
+
+    with pytest.raises(CommandLaunchError):
+        result.check()

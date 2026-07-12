@@ -6,6 +6,7 @@ import {
   type DB,
   enqueuePrecalcVerifications,
   ensurePrecalcObligations,
+  inspectParentRansPolarPromotions,
   laneKeyId,
   laneTick,
   onResultIngested,
@@ -13,6 +14,7 @@ import {
   precalcContinuationsForObligations,
   reconcileCampaigns,
   recomputeProgressForCampaign,
+  recordRansPolarPromotion,
   recordPrecalcObligationSubmission,
   refreshPrecalcSettlementCampaigns,
   refreshPolarCacheForRevision,
@@ -68,6 +70,7 @@ import { composePhysicalPrecalcJob } from "./precalc-composition";
 import {
   type ConditionMapEntry,
   failedForPoint,
+  type IngestedRansPrecalcPromotion,
   ingestResult,
   type SpeedBc,
 } from "./ingest";
@@ -82,6 +85,7 @@ import {
 } from "./ingest-lease";
 import { resultMediaRepairTick } from "./media-repair";
 import {
+  parseRansRetryScope,
   ransRetryPlanForJobScoped,
   type RansRetryDecision,
 } from "./retry-plan";
@@ -1032,13 +1036,12 @@ async function markPollMiss(
     .where(activeJobWhere(job.id));
 }
 
-/** Remove only immutable, exact deterministic mesh-QA cells from a repeated
- * campaign precalc plan. A partially-ingested cancelled child can contain one
- * such blocker alongside an unattempted or transient sibling; child-level
- * dedupe must not either replay the blocker or hide the retryable sibling.
- * Attempt evidence is authoritative, with the canonical failed row as a
- * compatibility fallback for older ingests. */
-async function withoutDeterministicPrecalcBlockers(
+/** Remove cells that already have terminal preliminary coverage or another
+ * active preliminary owner from a TARGETED composition plan. This function
+ * must never trim a whole-polar promotion event: its immutable coverage is the
+ * original pinned request, while schedulability is decided from obligations
+ * only after that full event is durable. */
+async function withoutExistingPrecalcCoverage(
   db: DB,
   opts: {
     parentJobId: string;
@@ -1092,8 +1095,8 @@ async function withoutDeterministicPrecalcBlockers(
   const blocked = new Set(rows.map((row) => Number(row.aoa_deg)));
   if (!blocked.size) return opts.retry;
   const aoas = opts.retry.aoas.filter((aoa) => !blocked.has(aoa));
-  console.error(
-    `[sweeper] PRECALC RETRY BLOCKED for deterministic mesh QA (parent ${opts.parentJobId}, revision ${opts.revisionId}, angles [${[...blocked].sort((a, b) => a - b).join(", ")}]) — immutable attempt evidence retained; unchanged mesh will not be submitted again`,
+  console.log(
+    `[sweeper] targeted PRECALC composition skips already covered/owned cells (parent ${opts.parentJobId}, revision ${opts.revisionId}, angles [${[...blocked].sort((a, b) => a - b).join(", ")}])`,
   );
   if (!aoas.length) return null;
   return {
@@ -1349,32 +1352,108 @@ export async function submitUransRetryForJob(
   db: DB,
   engine: EngineClient,
   parent: typeof simJobs.$inferSelect,
+  opts: {
+    ingestLeaseToken?: string;
+    ransPrecalcPromotions?: IngestedRansPrecalcPromotion[];
+    /** Partial ingest persists only typed promotion events/obligations. Child
+     * composition waits for terminal parent state or stale-lease recovery, so
+     * sibling RANS work keeps its resource priority. */
+    recordPromotionsOnly?: boolean;
+  } = {},
 ): Promise<void> {
-  if (
-    parent.wave !== 1 ||
-    parent.bcIds.length === 0 ||
-    !parent.simulationPresetRevisionId
-  )
+  if (parent.wave !== 1 || parent.bcIds.length === 0) return;
+  const recordedPromotions = await inspectParentRansPolarPromotions(db, {
+    parentJobId: parent.id,
+    ...(opts.ingestLeaseToken
+      ? { ingestLeaseToken: opts.ingestLeaseToken }
+      : {}),
+  });
+  let conditionMap = conditionMapForJob(parent);
+  if (recordedPromotions.length) {
+    // Persisted event identities are authoritative. Mutable batch transport is
+    // usable only when it still represents every recorded condition exactly;
+    // otherwise fail closed and let ledger recovery own the physical work.
+    if (!conditionMap) {
+      const hasBatchedEvent = recordedPromotions.some(
+        (event) => event.conditionId !== null,
+      );
+      if (hasBatchedEvent) {
+        console.error(
+          `[sweeper] conditional whole-polar parent ${parent.id} has ${recordedPromotions.length} persisted batched event(s) but no usable condition map; generic retry planning skipped`,
+        );
+      } else {
+        console.log(
+          `[sweeper] conditional whole-polar event ${recordedPromotions[0]!.promotionId} remains authoritative for scalar parent ${parent.id}; generic retry planning skipped`,
+        );
+      }
+      return;
+    }
+    const mapHasValidIdentities = conditionMap.every(
+      (entry) =>
+        entry !== null &&
+        typeof entry === "object" &&
+        typeof entry.revisionId === "string" &&
+        entry.revisionId.length > 0 &&
+        typeof entry.conditionId === "string" &&
+        entry.conditionId.length > 0,
+    );
+    const conditionKey = (revisionId: string, conditionId: string | null) =>
+      `${revisionId}:${conditionId ?? "-"}`;
+    const mapKeys = new Set(
+      mapHasValidIdentities
+        ? conditionMap.map((entry) =>
+            conditionKey(entry.revisionId, entry.conditionId),
+          )
+        : [],
+    );
+    const everyEventRepresented = recordedPromotions.every((event) =>
+      mapKeys.has(conditionKey(event.revisionId, event.conditionId)),
+    );
+    if (!mapHasValidIdentities || !everyEventRepresented) {
+      console.error(
+        `[sweeper] conditional whole-polar parent ${parent.id} has a missing or corrupt condition map relative to ${recordedPromotions.length} persisted event(s); generic retry planning skipped`,
+      );
+      return;
+    }
+    const recordedKeys = new Set(
+      recordedPromotions.map((event) =>
+        conditionKey(event.revisionId, event.conditionId),
+      ),
+    );
+    conditionMap = conditionMap.filter(
+      (entry) =>
+        !recordedKeys.has(conditionKey(entry.revisionId, entry.conditionId)),
+    );
+    if (!conditionMap.length) return;
+  } else if (!conditionMap && !parent.simulationPresetRevisionId) {
     return;
+  }
   // Fidelity ladder gate (contract 5): within a campaign, URANS (precalc)
   // work is gated until the campaign has ZERO open RANS gaps. Gated parents
   // are re-attempted by the sweeper's ladder tick once the gaps close.
-  if (
-    parent.campaignId &&
-    (await campaignHasOpenRansGaps(db, parent.campaignId))
-  ) {
+  const campaignGated = Boolean(
+    parent.campaignId && (await campaignHasOpenRansGaps(db, parent.campaignId)),
+  );
+  if (campaignGated) {
     console.log(
-      `[sweeper] URANS retry for job ${parent.id} deferred: campaign ${parent.campaignId} still has open RANS gaps (ladder gate)`,
+      `[sweeper] URANS submission for job ${parent.id} is gated: campaign ${parent.campaignId} still has open RANS gaps; durable retry routing is recorded before deferral`,
     );
-    return;
   }
-  const conditionMap = conditionMapForJob(parent);
   if (conditionMap) {
     // Batched campaign parent: the retry plan is computed PER conditionMap
     // entry and each retrying condition gets its own single-revision child.
-    await submitCampaignUransRetries(db, engine, parent, conditionMap);
+    await submitCampaignUransRetries(
+      db,
+      engine,
+      parent,
+      conditionMap,
+      campaignGated,
+      opts,
+    );
     return;
   }
+  const revisionId = parent.simulationPresetRevisionId;
+  if (!revisionId) return;
   const parentPayload = requestPayload(parent);
   const remotePromiseHint =
     typeof (parentPayload as { syncPromiseId?: unknown }).syncPromiseId ===
@@ -1399,29 +1478,85 @@ export async function submitUransRetryForJob(
     .limit(1);
   if (existing) return;
 
-  await refreshPolarCacheForRevision(
-    db,
-    parent.airfoilId,
-    parent.simulationPresetRevisionId,
-  );
-  // Retry scoping (ladder R2): TARGETED-ONLY — every retry re-solves only the
-  // job's own rejected/needs_urans angles at 'precalc' fidelity; whole-polar
-  // URANS is an explicit admin action, never an automatic escalation.
+  await refreshPolarCacheForRevision(db, parent.airfoilId, revisionId);
+  // Retry scoping is exact-attempt/job-local. Only a typed hard RANS rejection
+  // in 0..5° may widen a continuous request to its pinned full polar.
   const plannedRetry = await ransRetryPlanForJobScoped(db, {
     parentJobId: parent.id,
     airfoilId: parent.airfoilId,
-    revisionId: parent.simulationPresetRevisionId,
-    jobKind: parent.jobKind,
+    revisionId,
+    scope: parseRansRetryScope(
+      (parentPayload as { ransRetryScope?: unknown }).ransRetryScope,
+      anglesForJob(parent),
+    ),
   });
-  const retry = plannedRetry
-    ? await withoutDeterministicPrecalcBlockers(db, {
-        parentJobId: parent.id,
-        airfoilId: parent.airfoilId,
-        revisionId: parent.simulationPresetRevisionId,
-        retry: plannedRetry,
-      })
-    : null;
+  const retry =
+    plannedRetry?.retryMode === "whole-polar-urans"
+      ? plannedRetry
+      : plannedRetry
+        ? await withoutExistingPrecalcCoverage(db, {
+            parentJobId: parent.id,
+            airfoilId: parent.airfoilId,
+            revisionId,
+            retry: plannedRetry,
+          })
+        : null;
   if (!retry || retry.aoas.length === 0) return;
+  const enginePromotion = opts.ransPrecalcPromotions?.find(
+    (promotion) =>
+      promotion.revisionId === parent.simulationPresetRevisionId &&
+      promotion.conditionId == null,
+  );
+  if (opts.recordPromotionsOnly && !enginePromotion) return;
+  if (enginePromotion && retry.retryMode !== "whole-polar-urans") {
+    throw new Error(
+      `engine aborted RANS for preliminary promotion but exact Node policy did not authorize whole-polar scope (job ${parent.id}, revision ${parent.simulationPresetRevisionId})`,
+    );
+  }
+  if (retry.retryMode === "whole-polar-urans") {
+    const triggerResultAttemptId =
+      enginePromotion?.triggerResultAttemptId ??
+      retry.wholePolarTriggerResultAttemptId;
+    const triggerAoaDeg =
+      enginePromotion?.triggerAoaDeg ?? retry.wholePolarTriggerAoaDeg;
+    // Whole-polar work is authorized only by its normalized immutable event.
+    // Without the live ingest lease we cannot create that event, so fail
+    // closed instead of composing an ordinary unbound child from derived
+    // classification/request state.
+    if (
+      !opts.ingestLeaseToken ||
+      !triggerResultAttemptId ||
+      triggerAoaDeg == null
+    )
+      return;
+    const recorded = await recordRansPolarPromotion(db, {
+      parentJobId: parent.id,
+      ingestLeaseToken: opts.ingestLeaseToken,
+      airfoilId: parent.airfoilId,
+      revisionId,
+      conditionId: null,
+      triggerResultAttemptId,
+      triggerAoaDeg,
+      requestedAoas: retry.aoas,
+      intentionallyOmittedAoas: enginePromotion?.intentionallyOmittedAoas ?? [],
+      ownership: {
+        campaignIds: parent.campaignId ? [parent.campaignId] : [],
+        backgroundOwner: parent.campaignId == null && !remoteProvenance,
+        syncPromiseIds: remoteProvenance
+          ? [remoteProvenance.syncPromiseId]
+          : [],
+      },
+    });
+    if (!recorded) {
+      throw new Error(
+        `conditional whole-polar promotion failed its atomic evidence/ownership preconditions (job ${parent.id}, revision ${parent.simulationPresetRevisionId})`,
+      );
+    }
+    // The next ladder tick composes directly from the recorded event under
+    // parent lifecycle and exact-owner locks. Never fall through to the
+    // ordinary retry composer, even during terminal ingest.
+    return;
+  }
   // Resolve every immutable input before creating a durable physical
   // obligation. A missing/deleted setup cannot leave an open ledger row with
   // no child payload for the parent scan to recover.
@@ -1447,6 +1582,7 @@ export async function submitUransRetryForJob(
       syncPromiseIds: remoteProvenance ? [remoteProvenance.syncPromiseId] : [],
     },
   );
+  if (campaignGated) return;
   const schedulableByAoa = new Map(
     obligations
       .filter(
@@ -1592,8 +1728,8 @@ export async function submitUransRetryForJob(
 }
 
 /** RANS→URANS wave-2 for batched campaign parents: retry plans are computed
- *  per conditionMap entry against that entry's revision-wide evidence (exactly
- *  the scoped rules of submitUransRetryForJob), and each retrying condition
+ *  per conditionMap entry against that entry's exact job-local attempt evidence
+ *  and pinned full-polar scope, and each retrying condition
  *  submits its own single-revision child job through the existing machinery.
  *  Children are deduped per (parent, conditionId). */
 async function submitCampaignUransRetries(
@@ -1601,6 +1737,12 @@ async function submitCampaignUransRetries(
   engine: EngineClient,
   parent: SimJobRow,
   conditionMap: ConditionMapEntry[],
+  campaignGated: boolean,
+  opts: {
+    ingestLeaseToken?: string;
+    ransPrecalcPromotions?: IngestedRansPrecalcPromotion[];
+    recordPromotionsOnly?: boolean;
+  },
 ): Promise<void> {
   const parentPayload = requestPayload(parent);
   const remotePromiseHint =
@@ -1667,18 +1809,70 @@ async function submitCampaignUransRetries(
       parentJobId: parent.id,
       airfoilId: parent.airfoilId,
       revisionId: entry.revisionId,
-      jobKind: parent.jobKind,
+      scope: parseRansRetryScope(entry.ransRetryScope, anglesForJob(parent)),
       attemptRevisionId: entry.revisionId,
     });
-    const retry = plannedRetry
-      ? await withoutDeterministicPrecalcBlockers(db, {
-          parentJobId: parent.id,
-          airfoilId: parent.airfoilId,
-          revisionId: entry.revisionId,
-          retry: plannedRetry,
-        })
-      : null;
+    const retry =
+      plannedRetry?.retryMode === "whole-polar-urans"
+        ? plannedRetry
+        : plannedRetry
+          ? await withoutExistingPrecalcCoverage(db, {
+              parentJobId: parent.id,
+              airfoilId: parent.airfoilId,
+              revisionId: entry.revisionId,
+              retry: plannedRetry,
+            })
+          : null;
     if (!retry || retry.aoas.length === 0) continue;
+    const enginePromotion = opts.ransPrecalcPromotions?.find(
+      (promotion) =>
+        promotion.revisionId === entry.revisionId &&
+        promotion.conditionId === entry.conditionId,
+    );
+    if (opts.recordPromotionsOnly && !enginePromotion) continue;
+    if (enginePromotion && retry.retryMode !== "whole-polar-urans") {
+      throw new Error(
+        `engine aborted RANS for preliminary promotion but exact Node policy did not authorize condition scope (job ${parent.id}, condition ${entry.conditionId})`,
+      );
+    }
+    if (retry.retryMode === "whole-polar-urans") {
+      const triggerResultAttemptId =
+        enginePromotion?.triggerResultAttemptId ??
+        retry.wholePolarTriggerResultAttemptId;
+      const triggerAoaDeg =
+        enginePromotion?.triggerAoaDeg ?? retry.wholePolarTriggerAoaDeg;
+      if (
+        !opts.ingestLeaseToken ||
+        !triggerResultAttemptId ||
+        triggerAoaDeg == null
+      )
+        continue;
+      const recorded = await recordRansPolarPromotion(db, {
+        parentJobId: parent.id,
+        ingestLeaseToken: opts.ingestLeaseToken,
+        airfoilId: parent.airfoilId,
+        revisionId: entry.revisionId,
+        conditionId: entry.conditionId,
+        triggerResultAttemptId,
+        triggerAoaDeg,
+        requestedAoas: retry.aoas,
+        intentionallyOmittedAoas:
+          enginePromotion?.intentionallyOmittedAoas ?? [],
+        ownership: {
+          campaignIds: parent.campaignId ? [parent.campaignId] : [],
+          backgroundOwner: parent.campaignId == null && !remoteProvenance,
+          syncPromiseIds: remoteProvenance
+            ? [remoteProvenance.syncPromiseId]
+            : [],
+        },
+      });
+      if (!recorded) {
+        throw new Error(
+          `conditional whole-polar promotion failed atomic preconditions (job ${parent.id}, condition ${entry.conditionId})`,
+        );
+      }
+      continue;
+    }
     const obligations = await ensurePrecalcObligations(
       db,
       retry.aoas.map((aoaDeg) => ({
@@ -1694,6 +1888,7 @@ async function submitCampaignUransRetries(
           : [],
       },
     );
+    if (campaignGated) continue;
     const schedulableByAoa = new Map(
       obligations
         .filter(
@@ -1982,6 +2177,7 @@ async function ingestCompletedJob(
       airfoilId: job.airfoilId,
       speedMap,
       conditionMap: conditionMapForJob(job) ?? undefined,
+      jobAoas: anglesForJob(job),
       uransFidelity: uransFidelityForJob(job),
       result,
       ingestLeaseToken: lease.token,
@@ -1998,7 +2194,10 @@ async function ingestCompletedJob(
     await enqueueVerificationsForJob(db, job);
     await settleUransLadderForJob(db, job);
     await renewIngestLeaseOrThrow(db, lease);
-    await submitUransRetryForJob(db, engine, job);
+    await submitUransRetryForJob(db, engine, job, {
+      ingestLeaseToken: lease.token,
+      ransPrecalcPromotions: ingested.ransPrecalcPromotions,
+    });
     // Amendment B: a COMPLETED job can still ship individual crashed points
     // (per-case solver error → failed rows) — same one-shot requeue.
     await autoRetryFailedPointsForJob(db, job);
@@ -2008,11 +2207,15 @@ async function ingestCompletedJob(
       .set({
         status: "done",
         engineState: "completed",
-        // A completed engine result means every composed case reached a
-        // terminal outcome, including honestly rejected/failed cases.  The
-        // runtime-result fast path can ingest before a readable status poll,
-        // so leaving this stale made completed jobs appear one case behind.
-        completedCases: job.totalCases,
+        // A normal completed result terminalizes every composed case. A typed
+        // conditional RANS abort intentionally omits later angles; count only
+        // attempted cases and let normalized promotion obligations own the rest.
+        completedCases:
+          job.totalCases -
+          ingested.ransPrecalcPromotions.reduce(
+            (sum, promotion) => sum + promotion.intentionallyOmittedAoas.length,
+            0,
+          ),
         error: null,
         ingestedAt: new Date(),
         finishedAt: new Date(),
@@ -2058,23 +2261,37 @@ async function ingestRunningPartialJob(
       airfoilId: job.airfoilId,
       speedMap: speedMapForJob(job),
       conditionMap: conditionMapForJob(job) ?? undefined,
+      jobAoas: anglesForJob(job),
       uransFidelity: uransFidelityForJob(job),
       result,
       ingestLeaseToken: lease.token,
       heartbeat: () => renewIngestAndHeartbeat(db, lease),
     });
     collectDirtyLanes(ingested.dirtyLanes);
-    if (ingested.points > 0) {
+    if (ingested.points > 0 || ingested.ransPrecalcPromotions.length > 0) {
       await renewIngestLeaseOrThrow(db, lease);
       await refreshPolarCachesForJob(db, job, () =>
         renewIngestAndHeartbeat(db, lease),
       );
+    }
+    if (ingested.ransPrecalcPromotions.length > 0) {
+      await renewIngestLeaseOrThrow(db, lease);
+      await submitUransRetryForJob(db, engine, job, {
+        ingestLeaseToken: lease.token,
+        ransPrecalcPromotions: ingested.ransPrecalcPromotions,
+        recordPromotionsOnly: true,
+      });
+    }
+    if (ingested.points > 0) {
       // Amendment B, live gap 2026-07-08 (campaign 495d78e0, s1223 −5°): a
       // divergence-condemned case terminalizes its point MID-RUN. The
       // one-shot retry runs after the at-ingest classification refresh.
       await autoRetryFailedPointsForJob(db, job);
     }
-    const changed = ingested.points > 0 || ingested.media > 0;
+    const changed =
+      ingested.points > 0 ||
+      ingested.media > 0 ||
+      ingested.ransPrecalcPromotions.length > 0;
     if (!(await releaseIngestLeaseToRunning(db, lease))) {
       throw new IngestLeaseLostError(job.id);
     }
@@ -2133,11 +2350,11 @@ function solvedPointsOnly(result: JobResult): JobResult {
  *  back to pending (the cancelJobAndReleaseClaims claim-release semantics, so
  *  the gap finders re-claim the points next tick) and the sim_job terminates
  *  'cancelled'. NOTHING is marked failed, so campaign points never
- *  terminal-fail on a restart. No URANS retry is submitted here: retry plans
- *  read revision-wide classifications, where just-released unsolved rows
- *  snapshot as 'rejected' until re-solved — deciding now could escalate
- *  interrupted points to whole-polar URANS; the follow-up re-solve job runs
- *  the same revision-wide retry pass on real evidence instead. */
+ *  terminal-fail on a restart. No URANS retry is submitted here: policy reads
+ *  only exact job-local attempts with structured failure provenance, and the
+ *  released unsolved rows have no solver attempt at all. Infrastructure loss
+ *  can therefore neither target nor widen URANS; the follow-up RANS job owns
+ *  those released cells. */
 async function releaseWorkerRestartOrphan(
   db: DB,
   engine: EngineClient,
@@ -2156,6 +2373,7 @@ async function releaseWorkerRestartOrphan(
         airfoilId: job.airfoilId,
         speedMap: speedMapForJob(job),
         conditionMap: conditionMapForJob(job) ?? undefined,
+        jobAoas: anglesForJob(job),
         uransFidelity: uransFidelityForJob(job),
         result: solvedPointsOnly(result),
         ingestLeaseToken: lease.token,
@@ -2298,6 +2516,7 @@ async function ingestFailedEngineJob(
       airfoilId: job.airfoilId,
       speedMap: speedMapForJob(job),
       conditionMap: conditionMapForJob(job) ?? undefined,
+      jobAoas: anglesForJob(job),
       uransFidelity: uransFidelityForJob(job),
       result,
       failedPointErrorFallback: failure,
@@ -2344,7 +2563,10 @@ async function ingestFailedEngineJob(
         ingested,
         "attempt evidence kept on the failed rows; gated URANS retry evaluated",
       );
-      await submitUransRetryForJob(db, engine, job);
+      await submitUransRetryForJob(db, engine, job, {
+        ingestLeaseToken: lease.token,
+        ransPrecalcPromotions: ingested.ransPrecalcPromotions,
+      });
       // Amendment B: rows the wave-2 retry did NOT claim get their one
       // automatic requeue (after the refresh — at-ingest verdicts preserved).
       await autoRetryFailedPointsForJob(db, job);
@@ -2378,7 +2600,10 @@ async function ingestFailedEngineJob(
       "partial evidence ingested; failed rows carry the engine message",
     );
     await renewIngestLeaseOrThrow(db, lease);
-    await submitUransRetryForJob(db, engine, job);
+    await submitUransRetryForJob(db, engine, job, {
+      ingestLeaseToken: lease.token,
+      ransPrecalcPromotions: ingested.ransPrecalcPromotions,
+    });
     // Amendment B: crashed points of a partially-failed job requeue once.
     await autoRetryFailedPointsForJob(db, job);
     await settleCampaignAfterRefresh(db, job);

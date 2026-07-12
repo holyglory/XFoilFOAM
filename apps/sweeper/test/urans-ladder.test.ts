@@ -452,6 +452,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       stalled: true,
       unsteady: false,
       error: "RANS did not converge",
+      evidencePayload: { failure_disposition: "hard_solver" },
       solvedAt: new Date(),
     });
 
@@ -1657,6 +1658,7 @@ describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-
       stalled: true,
       unsteady: false,
       error: "RANS did not converge",
+      evidencePayload: { failure_disposition: "hard_solver" },
       solvedAt: new Date(),
     });
     expect(await campaignHasOpenRansGaps(db, campaignId)).toBe(false);
@@ -1750,6 +1752,7 @@ describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-
       stalled: true,
       unsteady: false,
       error: "RANS did not converge before the remaining sweep was cancelled",
+      evidencePayload: { failure_disposition: "hard_solver" },
       solvedAt: new Date(),
     });
     expect(await campaignHasOpenRansGaps(db, campaignId)).toBe(false);

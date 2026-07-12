@@ -224,6 +224,9 @@ export interface CampaignBatchEntry {
    *  the ingest speed→condition mapping both use this exact value. */
   speed: number;
   reynolds: number;
+  /** Immutable complete non-derived AoA request for this campaign condition and
+   * airfoil, including cells already solved before this gap batch. */
+  requestedPolarAoas: number[];
 }
 
 /** Open (condition, angle-set) aggregate used by the pure grouping rules. */
@@ -234,6 +237,8 @@ export interface CampaignConditionCandidate {
   reynolds: number;
   /** Open aoas of this (campaign, condition, airfoil), ascending canonical. */
   aoas: number[];
+  /** Complete non-derived requested polar, not merely the currently open gaps. */
+  requestedPolarAoas: number[];
   snapshot: CampaignBatchSnapshot;
 }
 
@@ -337,11 +342,13 @@ export function groupCampaignBatchEntries(
 ): { chord: number; angles: number[]; entries: CampaignBatchEntry[] } {
   const headGroup = campaignBatchGroupKey(head.snapshot);
   const headAngles = angleSetKey(head.aoas);
+  const headRequestedPolar = angleSetKey(head.requestedPolarAoas);
   const entries = candidates
     .filter(
       (c) =>
         campaignBatchGroupKey(c.snapshot) === headGroup &&
-        angleSetKey(c.aoas) === headAngles,
+        angleSetKey(c.aoas) === headAngles &&
+        angleSetKey(c.requestedPolarAoas) === headRequestedPolar,
     )
     .map((c) => ({
       conditionId: c.conditionId,
@@ -349,6 +356,9 @@ export function groupCampaignBatchEntries(
       presetId: c.presetId,
       speed: canonicalSi("speedMps", c.snapshot.flowState.speedMps),
       reynolds: Number(c.reynolds),
+      requestedPolarAoas: [
+        ...new Set(c.requestedPolarAoas.map(canonicalAoa)),
+      ].sort((x, y) => x - y),
     }))
     .sort((x, y) =>
       x.reynolds !== y.reynolds
@@ -400,6 +410,7 @@ interface CampaignConditionAggregateRow {
   reynolds: number;
   snapshot: CampaignBatchSnapshot;
   aoas: number[];
+  requested_aoas: number[];
 }
 
 export async function findCampaignGapBatch(
@@ -477,6 +488,15 @@ export async function findCampaignGapBatch(
   const aggregates = (await db.execute(sql`
     SELECT p.condition_id, p.revision_id, cond.preset_id, cond.reynolds,
            rev.snapshot AS snapshot,
+           ARRAY(
+             SELECT DISTINCT full_point.aoa_deg::float8
+             FROM sim_campaign_points full_point
+             WHERE full_point.campaign_id = ${head.campaign_id}
+               AND full_point.airfoil_id = ${head.airfoil_id}
+               AND full_point.condition_id = p.condition_id
+               AND full_point.derived_by_symmetry = false
+             ORDER BY full_point.aoa_deg::float8
+           ) AS requested_aoas,
            array_agg(p.aoa_deg::float8 ORDER BY p.aoa_deg) AS aoas
     FROM sim_campaign_points p
     JOIN sim_campaign_conditions cond ON cond.id = p.condition_id AND cond.status IN ('active', 'kept')
@@ -496,6 +516,7 @@ export async function findCampaignGapBatch(
     presetId: r.preset_id,
     reynolds: Number(r.reynolds),
     aoas: (r.aoas ?? []).map(Number),
+    requestedPolarAoas: (r.requested_aoas ?? []).map(Number),
     snapshot: r.snapshot,
   }));
   const headCandidate = candidates.find(
@@ -1282,13 +1303,43 @@ const DETERMINISTIC_PRECALC_MESH_QA_SQL = sql`
   AND position('max non-orthogonality' in lower(COALESCE(r.error, ''))) > 0
 `;
 
-/** Route every unmarked failed row of one sim job exactly once:
+/** A typed hard RANS failure is owned by the conditional promotion policy,
+ * not by the generic crash retry. Read the latest exact attempt from this job,
+ * independently of the public selected pointer: rejected attempts are
+ * deliberately pointer-null after cache refresh, and partial ingest runs this
+ * guard after that refresh. */
+const CURRENT_HARD_SOLVER_ATTEMPT_SQL = sql`EXISTS (
+  SELECT 1
+  FROM result_attempts current_attempt
+  WHERE current_attempt.result_id = r.id
+    AND current_attempt.sim_job_id = r.sim_job_id
+    AND current_attempt.regime = 'rans'
+    AND current_attempt.evidence_payload ->> 'failure_disposition' = 'hard_solver'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM result_attempts newer_attempt
+      WHERE newer_attempt.result_id = current_attempt.result_id
+        AND newer_attempt.sim_job_id = current_attempt.sim_job_id
+        AND (
+          newer_attempt."createdAt" > current_attempt."createdAt"
+          OR (
+            newer_attempt."createdAt" = current_attempt."createdAt"
+            AND newer_attempt.id > current_attempt.id
+          )
+        )
+    )
+)`;
+
+/** Route every generic crash-class unmarked failed row of one sim job exactly once:
  *  result → pending for wave-1 or queued-without-owner for campaign
  *  precalc (claim links cleared, marker stamped, error text kept as evidence
  *  of the crash), linked campaign points → requested, counters
  *  recomputed. Deterministic identical precalc mesh-QA failures stay failed
  *  and are returned as `suppressed`; rows already carrying the marker stay
- *  failed and are returned as `escalated`. Callers MUST invoke this AFTER
+ *  failed and are returned as `escalated`. Exact current `hard_solver` RANS
+ *  attempts stay attached to their parent for targeted/whole-polar URANS
+ *  routing and are never silently downgraded to another generic RANS try.
+ *  Callers MUST invoke this AFTER
  *  every polar-cache refresh of the job's ingest path — flipping a row to
  *  pending and re-refreshing would overwrite its stored at-ingest
  *  classification (prod row 741db07a). */
@@ -1417,6 +1468,7 @@ export async function autoRetryCrashedResultsForJob(
       AND NOT (${LADDER_SCOPED_PRECALC_SQL})
       AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
       AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+      AND NOT (${CURRENT_HARD_SOLVER_ATTEMPT_SQL})
     RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
               r.aoa_deg::float8 AS aoa_deg, r.error
   `)) as unknown as Array<{

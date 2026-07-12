@@ -76,6 +76,7 @@ export interface SolverParams {
   convergence_tolerance?: number;
   momentum_scheme?: string;
   transient_fallback?: boolean;
+  rans_failure_policy?: RansFailurePolicy;
   force_transient?: boolean;
   warm_start?: boolean;
   transient_cycles?: number;
@@ -90,6 +91,11 @@ export interface SolverParams {
   image_zoom_chords?: number;
 }
 
+export type RansFailurePolicy =
+  | "continue"
+  | "abort_for_precalc"
+  | "replace_precalc";
+
 export interface AoASpec {
   angles?: number[];
   start?: number;
@@ -97,7 +103,11 @@ export interface AoASpec {
   step?: number;
 }
 
-export type ResourcePolicy = "auto" | "airfoil_parallel" | "case_parallel" | "exclusive";
+export type ResourcePolicy =
+  | "auto"
+  | "airfoil_parallel"
+  | "case_parallel"
+  | "exclusive";
 
 export interface ResourceParams {
   cpu_budget?: number | null;
@@ -136,7 +146,12 @@ export interface PolarRequest {
   budget_override_s?: number | null;
 }
 
-export type JobState = "pending" | "running" | "completed" | "failed" | "cancelled";
+export type JobState =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 /** Engine worker-boot orphan reconciliation message — pinned byte-for-byte to
  *  `ORPHAN_MESSAGE` in src/airfoilfoam/storage.py. A failed job status/result
@@ -149,7 +164,8 @@ export type JobState = "pending" | "running" | "completed" | "failed" | "cancell
  *  Drift is a test failure on BOTH sides:
  *  - node:   apps/sweeper/test/orphan-message-pin.test.ts
  *  - python: tests/test_orphan_reconcile.py::test_orphan_message_is_pinned_for_node_clients */
-export const WORKER_RESTART_ORPHAN_MESSAGE = "worker restarted mid-solve; task lost";
+export const WORKER_RESTART_ORPHAN_MESSAGE =
+  "worker restarted mid-solve; task lost";
 
 export type JobPhase =
   | "pending"
@@ -359,8 +375,19 @@ export interface PolarPoint {
   steady_history?: SteadyHistory | null;
   quality_warnings?: string[];
   evidence_artifacts?: EngineEvidenceArtifact[];
+  /** Machine-readable rejection provenance. Only `hard_solver` represents
+   * aerodynamic/numerical evidence eligible for conditional whole-polar URANS;
+   * mesh and infrastructure failures remain repair/retry work. Optional for
+   * compatibility with stored results from pre-contract engine builds. */
+  failure_disposition?: FailureDisposition;
   error?: string | null;
 }
+
+export type FailureDisposition =
+  | "none"
+  | "hard_solver"
+  | "deterministic_mesh"
+  | "infrastructure";
 
 export interface EngineEvidenceArtifact {
   kind: string;
@@ -488,6 +515,14 @@ export interface Polar {
   mach?: number | null;
   points: PolarPoint[];
   attempts?: PolarPoint[];
+  rans_precalc_promotion?: RansPrecalcPromotion | null;
+}
+
+export interface RansPrecalcPromotion {
+  trigger_aoa_deg: number;
+  failure_disposition: "hard_solver";
+  attempted_aoas: number[];
+  intentionally_omitted_aoas: number[];
 }
 
 export interface JobResult {

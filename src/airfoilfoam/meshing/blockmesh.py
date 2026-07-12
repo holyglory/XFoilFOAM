@@ -22,7 +22,12 @@ import numpy as np
 
 from ..airfoil import Airfoil
 from ..models import MeshParams
-from ..openfoam.runner import Runner
+from ..openfoam.runner import (
+    DeterministicMeshError,
+    InfrastructureError,
+    OpenFOAMError,
+    Runner,
+)
 from .base import BoundaryPatch, MeshResult, Mesher, register_mesher
 
 # Streamwise clustering / wake growth (fixed, sensible defaults).
@@ -91,7 +96,12 @@ class BlockMeshCGrid(Mesher):
         path.write_text(text)
 
     def run_mesh(self, case_dir: Path, params: MeshParams, runner: Runner) -> MeshResult:
-        res = runner.application(case_dir, "blockMesh").check()
+        try:
+            res = runner.application(case_dir, "blockMesh").check()
+        except InfrastructureError:
+            raise
+        except OpenFOAMError as exc:
+            raise DeterministicMeshError(f"blockMesh rejected the requested geometry: {exc}") from exc
         n_cells = self.cell_count(params)
         m = re.search(r"nCells:\s*(\d+)", res.stdout)
         if m:

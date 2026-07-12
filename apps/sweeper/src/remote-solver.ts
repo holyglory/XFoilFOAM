@@ -16,6 +16,7 @@ import {
   results,
   schedulingProfiles,
   simJobs,
+  simRansPolarPromotions,
   simResultSubmitRetries,
   simulationPresetRevisions,
   simulationPresets,
@@ -48,6 +49,7 @@ import {
   recordEngineUnreachable,
 } from "./engine-backoff";
 import { touchHeartbeat } from "./heartbeat";
+import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
 const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
@@ -94,6 +96,7 @@ interface RemoteClaimResponse {
 
 interface RemotePromiseWorkState {
   dueAoas: number[];
+  requestedAoas: number[];
   waitingUntil: Date | null;
   busy: boolean;
   completed: boolean;
@@ -631,6 +634,7 @@ async function remotePromiseWorkState(
   const rows = await db
     .select({
       aoaDeg: syncSweepPromisePoints.aoaDeg,
+      pointStatus: syncSweepPromisePoints.status,
       resultId: results.id,
       resultStatus: results.status,
       retryState: simResultSubmitRetries.state,
@@ -652,20 +656,16 @@ async function remotePromiseWorkState(
       simResultSubmitRetries,
       eq(simResultSubmitRetries.resultId, results.id),
     )
-    .where(
-      and(
-        eq(syncSweepPromisePoints.promiseId, promiseId),
-        eq(syncSweepPromisePoints.status, "active"),
-      ),
-    );
+    .where(eq(syncSweepPromisePoints.promiseId, promiseId));
 
   const now = Date.now();
+  const activeRows = rows.filter((row) => row.pointStatus === "active");
   const dueAoas: number[] = [];
   let waitingUntil: Date | null = null;
   let busy = false;
   let completed = false;
   let terminal = false;
-  for (const row of rows) {
+  for (const row of activeRows) {
     if (!row.resultId) {
       dueAoas.push(Number(row.aoaDeg));
       continue;
@@ -699,11 +699,14 @@ async function remotePromiseWorkState(
   }
   return {
     dueAoas: [...new Set(dueAoas)].sort((a, b) => a - b),
+    requestedAoas: [...new Set(rows.map((row) => Number(row.aoaDeg)))].sort(
+      (a, b) => a - b,
+    ),
     waitingUntil,
     busy,
     completed,
     terminal,
-    activePointCount: rows.length,
+    activePointCount: activeRows.length,
   };
 }
 
@@ -1215,6 +1218,8 @@ async function composeRemotePromiseJob(
       setup,
       aoaList: state.dueAoas,
       wave: 1,
+      ransFailurePolicy:
+        state.requestedAoas.length > 1 ? "abort_for_precalc" : "continue",
       queuePressure: 0,
     });
     request.resources = {
@@ -1235,6 +1240,7 @@ async function composeRemotePromiseJob(
         },
       ],
       aoas: state.dueAoas,
+      ransRetryScope: retryScopeForRequestedPolar(state.requestedAoas),
       resources: request.resources,
       setupSnapshot: setup,
     };
@@ -1545,6 +1551,23 @@ export async function claimResultDelivery(
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`remote-delivery:${promiseId}:${result.id}`}, 0))`,
     );
+    if (job.wave === 1 && job.simulationPresetRevisionId) {
+      const [promotion] = await tx
+        .select({ id: simRansPolarPromotions.id })
+        .from(simRansPolarPromotions)
+        .where(
+          and(
+            eq(simRansPolarPromotions.parentJobId, job.id),
+            eq(
+              simRansPolarPromotions.revisionId,
+              job.simulationPresetRevisionId,
+            ),
+            eq(simRansPolarPromotions.syncPromiseId, promiseId),
+          ),
+        )
+        .limit(1);
+      if (promotion) return null;
+    }
     let [delivery] = await tx
       .select()
       .from(syncRemoteResultDeliveries)
@@ -1771,45 +1794,121 @@ async function markRemoteJobDeliveryTerminal(
     });
 }
 
-async function markMirroredPointPushed(
+async function settleSuccessfulRemoteResultDelivery(
   db: DB,
+  claim: DeliveryClaim,
   promiseId: string,
   job: typeof simJobs.$inferSelect,
   result: typeof results.$inferSelect,
   resultAttemptId: string,
-): Promise<void> {
-  if (!job.simulationPresetRevisionId)
+): Promise<"delivered" | "superseded"> {
+  const revisionId = job.simulationPresetRevisionId;
+  if (!revisionId)
     throw new Error(`remote job ${job.id} has no immutable setup revision`);
-  const marked = await db
-    .update(syncSweepPromisePoints)
-    .set({
-      status: "fulfilled",
-      resultId: result.id,
-      resultAttemptId,
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(syncSweepPromisePoints.promiseId, promiseId),
-        eq(syncSweepPromisePoints.airfoilId, job.airfoilId),
-        eq(
-          syncSweepPromisePoints.simulationPresetRevisionId,
-          job.simulationPresetRevisionId,
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const pointRows = (await tx.execute(sql`
+      SELECT promise_point.id
+      FROM sync_sweep_promises promise
+      JOIN sync_sweep_promise_points promise_point
+        ON promise_point.promise_id = promise.id
+      WHERE promise.id = ${promiseId}
+        AND promise_point.airfoil_id = ${job.airfoilId}
+        AND promise_point.simulation_preset_revision_id = ${revisionId}
+        AND promise_point.aoa_deg = ${result.aoaDeg}
+        AND promise_point.status IN ('active', 'expired', 'fulfilled')
+      ORDER BY promise.id, promise_point.id
+      FOR UPDATE OF promise, promise_point
+    `)) as unknown as Array<{ id: string }>;
+    if (pointRows.length !== 1) {
+      throw new Error(
+        `remote result ${result.id} at ${result.aoaDeg}° is outside mirrored promise ${promiseId}`,
+      );
+    }
+    const [promotion] = await tx
+      .select({ id: simRansPolarPromotions.id })
+      .from(simRansPolarPromotions)
+      .where(
+        and(
+          eq(simRansPolarPromotions.parentJobId, job.id),
+          eq(simRansPolarPromotions.revisionId, revisionId),
+          eq(simRansPolarPromotions.syncPromiseId, promiseId),
         ),
-        eq(syncSweepPromisePoints.aoaDeg, result.aoaDeg),
-        inArray(syncSweepPromisePoints.status, [
-          "active",
-          "expired",
-          "fulfilled",
-        ]),
-      ),
-    )
-    .returning({ id: syncSweepPromisePoints.id });
-  if (!marked.length) {
-    throw new Error(
-      `remote result ${result.id} at ${result.aoaDeg}° is outside mirrored promise ${promiseId}`,
-    );
-  }
+      )
+      .limit(1);
+    const now = new Date();
+    const [delivery] = await tx
+      .select({
+        id: syncRemoteResultDeliveries.id,
+        state: syncRemoteResultDeliveries.state,
+      })
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, claim.id))
+      .for("update")
+      .limit(1);
+    if (promotion) {
+      if (delivery?.state === "superseded") return "superseded";
+      const superseded = await tx
+        .update(syncRemoteResultDeliveries)
+        .set({
+          state: "superseded",
+          nextAttemptAt: now,
+          claimToken: null,
+          claimedAt: null,
+          claimExpiresAt: null,
+          lastHttpStatus: 200,
+          lastError:
+            "late RANS delivery superseded by conditional whole-polar preliminary URANS promotion",
+          remoteConflictIds: [],
+          deliveredAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(syncRemoteResultDeliveries.id, claim.id),
+            eq(syncRemoteResultDeliveries.state, "pushing"),
+            eq(syncRemoteResultDeliveries.claimToken, claim.token),
+            gt(syncRemoteResultDeliveries.claimExpiresAt, now),
+          ),
+        )
+        .returning({ id: syncRemoteResultDeliveries.id });
+      await assertSingleDeliverySettlement(superseded, claim);
+      return "superseded";
+    }
+    await tx
+      .update(syncSweepPromisePoints)
+      .set({
+        status: "fulfilled",
+        resultId: result.id,
+        resultAttemptId,
+        updatedAt: now,
+      })
+      .where(eq(syncSweepPromisePoints.id, pointRows[0]!.id));
+    const delivered = await tx
+      .update(syncRemoteResultDeliveries)
+      .set({
+        state: "delivered",
+        claimToken: null,
+        claimedAt: null,
+        claimExpiresAt: null,
+        lastHttpStatus: 200,
+        lastError: null,
+        remoteConflictIds: [],
+        deliveredAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(syncRemoteResultDeliveries.id, claim.id),
+          eq(syncRemoteResultDeliveries.state, "pushing"),
+          eq(syncRemoteResultDeliveries.claimToken, claim.token),
+          gt(syncRemoteResultDeliveries.claimExpiresAt, now),
+        ),
+      )
+      .returning({ id: syncRemoteResultDeliveries.id });
+    await assertSingleDeliverySettlement(delivered, claim);
+    return "delivered";
+  });
 }
 
 /** Complete an upstream promise only after the local durable mirror proves
@@ -2271,9 +2370,17 @@ async function pushOneRemoteResult(
       }
       throw new Error(error);
     }
-    await settleResultDelivery(db, claim, { kind: "delivered" });
-    await markMirroredPointPushed(db, promiseId, job, result, attempt.id);
-    await completeMirroredPromiseIfReady(db, settings, promiseId, job.id);
+    const settlement = await settleSuccessfulRemoteResultDelivery(
+      db,
+      claim,
+      promiseId,
+      job,
+      result,
+      attempt.id,
+    );
+    if (settlement === "delivered") {
+      await completeMirroredPromiseIfReady(db, settings, promiseId, job.id);
+    }
     await setStatus(db, "idle", null, { remoteSolverLastPushAt: new Date() });
     return true;
   } catch (error) {
@@ -2293,6 +2400,18 @@ async function pushOneRemoteResult(
         kind: "retry",
         error: error instanceof Error ? error.message : String(error),
       });
+    } else {
+      const [superseded] = await db
+        .select({ id: syncRemoteResultDeliveries.id })
+        .from(syncRemoteResultDeliveries)
+        .where(
+          and(
+            eq(syncRemoteResultDeliveries.id, claim.id),
+            eq(syncRemoteResultDeliveries.state, "superseded"),
+          ),
+        )
+        .limit(1);
+      if (superseded) return true;
     }
     throw error;
   }
@@ -2370,6 +2489,13 @@ async function processReusablePromiseEvidence(
           WHERE active_child.parent_job_id = solved_job.id
             AND active_child.status IN ('pending', 'submitted', 'running', 'ingesting')
         )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotions promotion
+        WHERE promotion.parent_job_id = solved_job.id
+          AND promotion.revision_id = solved_result.simulation_preset_revision_id
+          AND promotion.sync_promise_id = remote_promise.id
       )
       AND EXISTS (
         SELECT 1
@@ -2471,6 +2597,13 @@ async function processRemoteResultDeliveries(
             WHERE active_child.parent_job_id = ${simJobs.id}
               AND active_child.status IN ('pending', 'submitted', 'running', 'ingesting')
           )
+        )`,
+        sql`NOT EXISTS (
+          SELECT 1
+          FROM sim_rans_polar_promotions promotion
+          WHERE promotion.parent_job_id = ${simJobs.id}
+            AND promotion.revision_id = ${simJobs.simulationPresetRevisionId}
+            AND promotion.sync_promise_id::text = ${simJobs.requestPayload} ->> 'syncPromiseId'
         )`,
         sql`NOT EXISTS (
           SELECT 1

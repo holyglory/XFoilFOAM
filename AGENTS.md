@@ -319,20 +319,43 @@
 - Batch polars should be submitted as continuous marched sweeps whenever the
   goal is to build a production polar, so the engine can observe whether the
   attached low-AoA range is physically reliable.
-- If a marched RANS sweep produces a failed, non-converged, or rejected RANS
-  point anywhere from 0 through 5 degrees AoA, stop the remaining RANS points
-  for that polar and switch the whole requested polar to forced URANS.
+- For a continuous multi-angle production sweep, only an exact RANS attempt
+  with the structured `hard_solver` failure disposition at inclusive 0 through
+  5 degrees AoA triggers whole-polar promotion. Stop that condition's remaining
+  RANS march and route the original requested angle list for that exact parent
+  job, physical condition, and immutable setup revision to preliminary URANS.
+- Do not reconstruct promotion scope from the still-open subset, revision-wide
+  history, rounded setup values, batch labels, or a small valid-point count. In
+  a multi-condition engine batch, one condition's trigger must not widen any
+  sibling condition.
+- A hard RANS failure below 0 or above 5 degrees, `needs_urans` evidence without
+  that hard failure, and explicit single-angle/admin work remain targeted to
+  their own angles. Infrastructure failures and deterministic mesh failures
+  must never trigger whole-polar promotion; keep them on their existing
+  retry/block paths.
 - The failed RANS attempt must still be stored as attempt evidence, but the
-  canonical solved polar for that request should come from the URANS sweep.
+  unattempted remainder must not be represented as fake failed attempts. The
+  canonical solved polar for the promoted request should come from accepted
+  preliminary URANS evidence through the normal exact-evidence gate.
 - The URANS replacement sweep must reuse the already-built airfoil mesh just
   like the RANS sweep; do not rebuild one mesh per AoA.
+- For remote-solver promises, a promoted point that already delivered an exact
+  accepted RANS generation may advance only to a newly accepted canonical
+  URANS generation for that same promise and physical cell. Keep the RANS
+  attempt immutable. Changed RANS replays, competing URANS generations, and
+  expired/cancelled promises must remain conflicts and must not retarget the
+  fulfilled pointer.
 - URANS does not have to run until a fixed configured duration or timeout. It
   may stop early only after measured shedding has two phase-repeatable periods
   and each period has at least 20 real saved field frames; postprocessing must
   average exactly that integer-period window.
-- Tests for sweep scheduling must assert the early-abort path, full-polar URANS
-  promotion, attempt evidence retention, mesh reuse, and the stable-period
-  early-stop rule.
+- Tests for sweep scheduling must assert inclusive 0/5-degree early abort,
+  exact original-scope promotion, condition isolation, durable restart-safe
+  obligations, attempt evidence retention, truthful omitted angles, mesh reuse,
+  and the stable-period early-stop rule. False-positive guards must cover
+  negative and above-5-degree failures, explicit single-angle work,
+  `needs_urans`, infrastructure failures, deterministic mesh failures, sparse
+  evidence, and unrelated job/revision history.
 
 ## Live-DB Test Fixture Cleanup
 

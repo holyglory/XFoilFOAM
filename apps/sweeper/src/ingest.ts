@@ -35,6 +35,7 @@ import {
   parseSteadyHistory,
   type PointFidelity,
   type PolarPoint,
+  type RansPrecalcPromotion,
   type RenderedDefaultMedia,
   type UransFidelity,
 } from "@aerodb/engine-client";
@@ -47,6 +48,7 @@ import { resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 import { touchHeartbeat } from "./heartbeat";
+import type { RansRetryScope } from "./retry-plan";
 
 const execFileAsync = promisify(execFile);
 export const DEFAULT_RENDER_PROFILE_KEY = "default:v1:zoom2";
@@ -103,6 +105,65 @@ export interface ConditionMapEntry {
   speed: number;
   reynolds: number;
   bcId: string;
+  /** Pinned semantic intent and complete condition-local polar request. */
+  ransRetryScope?: RansRetryScope;
+}
+
+export interface IngestedRansPrecalcPromotion {
+  revisionId: string;
+  conditionId: string | null;
+  triggerResultAttemptId: string;
+  triggerAoaDeg: number;
+  attemptedAoas: number[];
+  intentionallyOmittedAoas: number[];
+}
+
+function uniqueFiniteAoas(values: number[]): number[] {
+  return [...new Set(values.filter(Number.isFinite))].sort((a, b) => a - b);
+}
+
+function sameAoas(left: number[], right: number[]): boolean {
+  return (
+    left.length === right.length && left.every((value, i) => value === right[i])
+  );
+}
+
+/** Validate the engine's early-abort accounting against both exact staged
+ * attempts and the immutable angle list actually sent to this engine job.
+ * Invalid metadata is a contract error: silently accepting it could mark
+ * unattempted cases complete or release the wrong parent claims. */
+export function validateRansPrecalcPromotionSignal(opts: {
+  promotion: RansPrecalcPromotion;
+  stagedAttemptAoas: number[];
+  triggerFailureDisposition: PolarPoint["failure_disposition"] | null;
+  jobAoas: number[];
+}): { attemptedAoas: number[]; intentionallyOmittedAoas: number[] } | null {
+  const attemptedAoas = uniqueFiniteAoas(opts.promotion.attempted_aoas);
+  const intentionallyOmittedAoas = uniqueFiniteAoas(
+    opts.promotion.intentionally_omitted_aoas,
+  );
+  const stagedAttemptAoas = uniqueFiniteAoas(opts.stagedAttemptAoas);
+  const jobAoas = uniqueFiniteAoas(opts.jobAoas);
+  const triggerIndex = jobAoas.indexOf(opts.promotion.trigger_aoa_deg);
+  const expectedAttemptedAoas =
+    triggerIndex >= 0 ? jobAoas.slice(0, triggerIndex + 1) : [];
+  const expectedOmittedAoas =
+    triggerIndex >= 0 ? jobAoas.slice(triggerIndex + 1) : [];
+  if (
+    opts.promotion.failure_disposition !== "hard_solver" ||
+    opts.triggerFailureDisposition !== "hard_solver" ||
+    !Number.isFinite(opts.promotion.trigger_aoa_deg) ||
+    opts.promotion.trigger_aoa_deg < 0 ||
+    opts.promotion.trigger_aoa_deg > 5 ||
+    triggerIndex < 0 ||
+    !sameAoas(attemptedAoas, expectedAttemptedAoas) ||
+    !sameAoas(intentionallyOmittedAoas, expectedOmittedAoas) ||
+    !sameAoas(attemptedAoas, stagedAttemptAoas) ||
+    attemptedAoas.at(-1) !== opts.promotion.trigger_aoa_deg
+  ) {
+    return null;
+  }
+  return { attemptedAoas, intentionallyOmittedAoas };
 }
 
 /** Pure speed→condition mapping for batched jobs: canonical float equality.
@@ -701,6 +762,7 @@ export function incomingPointEvidence(
     stalled: stalledForPoint(p),
     unsteady: p.unsteady,
     error: derived.error,
+    failureDisposition: p.failure_disposition ?? null,
     finalResidual: p.final_residual ?? null,
     iterations: p.iterations ?? null,
     firstOrderFallback: p.first_order_fallback,
@@ -3750,6 +3812,9 @@ export async function ingestResult(opts: {
    *  revision, bc) by exact canonical speed. Jobs without a conditionMap keep
    *  the single-revision nearest-speed path unchanged. */
   conditionMap?: ConditionMapEntry[];
+  /** Exact AoAs sent to this engine job. Required when the engine returns a
+   * typed early-abort promotion signal. */
+  jobAoas?: number[];
   /** URANS fidelity tier the JOB requested (wave-2 requestPayload
    *  uransFidelity) — the honest fallback when a point's fidelity echo is
    *  missing (with a loud drift log). Absent on wave-1/legacy jobs. */
@@ -3780,6 +3845,7 @@ export async function ingestResult(opts: {
   media: number;
   attempts: number;
   dirtyLanes: CampaignLaneKey[];
+  ransPrecalcPromotions: IngestedRansPrecalcPromotion[];
 }> {
   const {
     db,
@@ -3805,6 +3871,7 @@ export async function ingestResult(opts: {
   const dirtyLanes = new Map<string, CampaignLaneKey>();
   const candidatesByRevision = new Map<string, StagedPoint[]>();
   const legacyCandidates: StagedPoint[] = [];
+  const ransPrecalcPromotions: IngestedRansPrecalcPromotion[] = [];
 
   const stagePoint = async (input: {
     point: PolarPoint;
@@ -3941,6 +4008,7 @@ export async function ingestResult(opts: {
     let bcId: string;
     let presetRevisionId: string | null;
     let mappedMach: number | null;
+    let conditionId: string | null = null;
     if (conditionMap?.length) {
       // Batched campaign job: exact canonical speed → condition entry. A polar
       // with no matching entry is skipped — never misattributed to a revision.
@@ -3952,6 +4020,7 @@ export async function ingestResult(opts: {
         continue;
       }
       bcId = entry.bcId;
+      conditionId = entry.conditionId;
       presetRevisionId = entry.revisionId;
       mappedMach =
         speedMap.find((s) => canonicalSi("speedMps", s.speed) === entry.speed)
@@ -3984,6 +4053,7 @@ export async function ingestResult(opts: {
       points++;
     }
     const attemptOnlyByAoa = new Map<number, StagedPoint>();
+    const stagedAttemptByAoa = new Map<number, StagedPoint>();
     for (const p of polar.attempts ?? []) {
       await heartbeat();
       attempts++;
@@ -3996,8 +4066,33 @@ export async function ingestResult(opts: {
         speed: polar.speed,
         chord: polar.chord,
       });
+      stagedAttemptByAoa.set(p.aoa_deg, staged);
       if (!canonicalAoas.has(p.aoa_deg))
         attemptOnlyByAoa.set(p.aoa_deg, staged);
+    }
+    const promotion = polar.rans_precalc_promotion;
+    if (promotion && presetRevisionId) {
+      const trigger = stagedAttemptByAoa.get(promotion.trigger_aoa_deg);
+      const validated = validateRansPrecalcPromotionSignal({
+        promotion,
+        stagedAttemptAoas: [...stagedAttemptByAoa.keys()],
+        triggerFailureDisposition: trigger?.point.failure_disposition ?? null,
+        jobAoas: opts.jobAoas ?? [],
+      });
+      if (trigger && validated) {
+        ransPrecalcPromotions.push({
+          revisionId: presetRevisionId,
+          conditionId,
+          triggerResultAttemptId: trigger.resultAttemptId,
+          triggerAoaDeg: promotion.trigger_aoa_deg,
+          attemptedAoas: validated.attemptedAoas,
+          intentionallyOmittedAoas: validated.intentionallyOmittedAoas,
+        });
+      } else {
+        throw new Error(
+          `RANS PRECALC promotion signal failed exact attempt/omission accounting (engine job ${engineJobId}, revision ${presetRevisionId}, trigger ${promotion.trigger_aoa_deg})`,
+        );
+      }
     }
     for (const candidate of [
       ...pointCandidates,
@@ -4085,5 +4180,11 @@ export async function ingestResult(opts: {
     });
     for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
   }
-  return { points, media, attempts, dirtyLanes: [...dirtyLanes.values()] };
+  return {
+    points,
+    media,
+    attempts,
+    dirtyLanes: [...dirtyLanes.values()],
+    ransPrecalcPromotions,
+  };
 }

@@ -8,6 +8,7 @@ export * from "./review-verdicts";
 export * from "./job-lifecycle";
 export * from "./media-repair";
 export * from "./precalc-obligations";
+export * from "./rans-polar-promotions";
 export * from "./precalc-cell-lock";
 export * from "./result-evidence-lock";
 export * from "./sync-promise-purge";

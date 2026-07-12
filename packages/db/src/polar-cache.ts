@@ -103,6 +103,7 @@ function toEvidence(row: {
   stalled: boolean;
   unsteady?: boolean | null;
   error: string | null;
+  failureDisposition?: string | null;
   finalResidual: number | null;
   iterations: number | null;
   firstOrderFallback: boolean | null;
@@ -135,6 +136,13 @@ function toEvidence(row: {
     stalled: row.stalled,
     unsteady: row.unsteady ?? false,
     error: row.error,
+    failureDisposition:
+      row.failureDisposition === "none" ||
+      row.failureDisposition === "hard_solver" ||
+      row.failureDisposition === "deterministic_mesh" ||
+      row.failureDisposition === "infrastructure"
+        ? row.failureDisposition
+        : null,
     finalResidual: row.finalResidual,
     iterations: row.iterations,
     firstOrderFallback: row.firstOrderFallback,
@@ -198,6 +206,10 @@ async function loadResultEvidence(
       error: sql<
         string | null
       >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.error} ELSE NULL END`,
+      failureDisposition: sql<string | null>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.evidencePayload} ->> 'failure_disposition'
+        ELSE NULL
+      END`,
       finalResidual: sql<
         number | null
       >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.finalResidual} ELSE NULL END`,
@@ -307,6 +319,9 @@ async function loadAttemptEvidence(
       stalled: resultAttempts.stalled,
       unsteady: resultAttempts.unsteady,
       error: resultAttempts.error,
+      failureDisposition: sql<
+        string | null
+      >`${resultAttempts.evidencePayload} ->> 'failure_disposition'`,
       finalResidual: resultAttempts.finalResidual,
       iterations: resultAttempts.iterations,
       firstOrderFallback: resultAttempts.firstOrderFallback,
@@ -1110,9 +1125,8 @@ export async function refreshPolarCacheForRevision(
   return refreshed.result;
 }
 
-// Whole-polar URANS promotion was KILLED by the fidelity ladder (R2,
-// 2026-07-07): background retries are targeted-only (apps/sweeper/src/
-// retry-plan.ts decideRansRetry); whole-polar URANS is an explicit admin
-// request (sim_urans_requests, aoa_deg NULL). The old shouldPromoteWholePolar
-// heuristics and ransRetryPlanForJob were removed so no future caller can
-// silently revive the escalation.
+// This cache reports evidence-derived classification facts; it is not retry
+// scope authority. Conditional whole-polar preliminary URANS (2026-07-12) is
+// decided only from exact job-local attempt provenance plus the immutable
+// requested sweep scope in apps/sweeper/src/retry-plan.ts. Do not revive the
+// removed sparse/tiny-polar or revision-wide promotion heuristics here.

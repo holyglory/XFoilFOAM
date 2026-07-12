@@ -32,6 +32,7 @@ from .models import (
     PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
     CaseSpec,
     EvidenceArtifact,
+    FailureDisposition,
     FluidProperties,
     FrameChannelStats,
     FrameSample,
@@ -40,6 +41,8 @@ from .models import (
     FrameTrackWindow,
     JobPhase,
     MeshParams,
+    RansFailurePolicy,
+    RansPrecalcPromotion,
     RoughnessParams,
     SolverParams,
     SteadyHistory,
@@ -51,7 +54,15 @@ from .models import (
     urans_budget_seconds,
     urans_point_fidelity,
 )
-from .openfoam.runner import OpenFOAMError, RunResult, Runner
+from .openfoam.runner import (
+    CommandTimeoutError,
+    DeterministicMeshError,
+    HardSolverError,
+    InfrastructureError,
+    OpenFOAMError,
+    RunResult,
+    Runner,
+)
 from .postprocess.forces import (
     AveragedCoefficients,
     analyze_steady_oscillation,
@@ -138,6 +149,7 @@ class CaseOutcome:
     #: None for classic pointwise convergence.
     steady_history: Optional[SteadyHistory] = None
     quality_warnings: list[str] = field(default_factory=list)
+    failure_disposition: FailureDisposition = FailureDisposition.none
     error: Optional[str] = None
 
 
@@ -157,6 +169,7 @@ class PolarMarchResult:
     attempts: list[StoredCaseOutcome] = field(default_factory=list)
     promoted_to_urans: bool = False
     abort_reason: Optional[str] = None
+    precalc_promotion: Optional[RansPrecalcPromotion] = None
 
 
 def _time_of(coeff_path) -> float:
@@ -216,7 +229,7 @@ def _last_log_delta_t(log_text: str) -> Optional[float]:
     return value
 
 
-class TransientTimeoutError(OpenFOAMError):
+class TransientTimeoutError(CommandTimeoutError):
     """A transient solver run killed by the wall-clock timeout that left no
     gradable coefficient window in the CURRENT chunk. Distinct from a crash:
     the case dir keeps its last written fields, so the saved state stays
@@ -278,7 +291,63 @@ def clear_divergence_condemnation(case_dir: Path) -> None:
 def _raise_if_condemned(case_dir: Path) -> None:
     reason = read_divergence_condemnation(case_dir)
     if reason:
-        raise OpenFOAMError(reason)
+        raise HardSolverError(reason)
+
+
+def _checked_solver_result(case_dir: Path, result: RunResult) -> RunResult:
+    """Check one solver result while preserving machine-readable provenance.
+
+    ``RunResult.timed_out`` is authoritative execution evidence and is checked
+    before a possibly stale divergence marker.  A non-timeout solver exit is a
+    hard numerical failure only after the watchdog marker (when present) has
+    supplied its precise reason.  No display-string parsing participates in
+    this classification.
+    """
+    if getattr(result, "timed_out", False):
+        # RunResult.check raises CommandTimeoutError from the typed flag.
+        result.check()
+    if not result.ok:
+        _raise_if_condemned(case_dir)
+        try:
+            result.check()
+        except InfrastructureError:
+            raise
+        except OpenFOAMError as exc:
+            # A generic non-zero launcher/solver exit does not prove an
+            # aerodynamic failure. OpenMPI admission, container/runtime,
+            # filesystem and executable failures commonly return the same
+            # code as an OpenFOAM numerical abort. Only the typed watchdog
+            # condemnation above may widen a polar; ambiguous exits fail
+            # closed into the infrastructure retry path.
+            raise InfrastructureError(str(exc)) from exc
+    return result.check()
+
+
+def _record_outcome_failure(outcome: CaseOutcome, exc: BaseException) -> None:
+    """Persist error text and structured provenance on a case outcome."""
+    if isinstance(exc, DeterministicMeshError):
+        disposition = FailureDisposition.deterministic_mesh
+    elif isinstance(exc, InfrastructureError) or isinstance(exc, (TimeoutError, OSError)):
+        disposition = FailureDisposition.infrastructure
+    elif isinstance(exc, HardSolverError):
+        disposition = FailureDisposition.hard_solver
+    else:
+        # Unknown application/runtime exceptions are not aerodynamic evidence.
+        # They remain infrastructure until a narrower typed source proves
+        # otherwise; this is intentionally fail-closed for URANS promotion.
+        disposition = FailureDisposition.infrastructure
+    outcome.failure_disposition = disposition
+    outcome.error = f"{type(exc).__name__}: {exc}"
+
+
+def _record_unexceptional_rans_rejection(outcome: CaseOutcome) -> None:
+    """Classify data-backed RANS rejection that did not throw an exception."""
+    if (
+        outcome.failure_disposition == FailureDisposition.none
+        and outcome.error is None
+        and rans_outcome_rejected_for_polar(outcome)
+    ):
+        outcome.failure_disposition = FailureDisposition.hard_solver
 
 
 # --------------------------------------------------------------------------- #
@@ -637,7 +706,7 @@ def _run_transient_mesh_qa_gate(
             )
         else:
             prefix = "mesh degenerate at this fidelity tier: "
-        raise OpenFOAMError(prefix + "; ".join(reasons) + "; see log.checkMesh")
+        raise DeterministicMeshError(prefix + "; ".join(reasons) + "; see log.checkMesh")
     if qa.max_non_ortho_deg is None:
         logger.warning("checkMesh output for %s had no non-orthogonality summary; mesh QA gate skipped", case_dir)
         return
@@ -3139,7 +3208,17 @@ def _finalize_outcome(
     steady_field_accepted = bool(steady_field_dir is not None and outcome.converged)
     if coeff_files:
         steady_coeff = coeff_files[-1]
-        coeffs = parse_force_coefficients(steady_coeff)
+        try:
+            coeffs = parse_force_coefficients(steady_coeff)
+        except (ValueError, IndexError, ZeroDivisionError) as exc:
+            # A malformed/truncated coefficient artifact proves only that
+            # evidence transport or parsing failed. It does not prove an
+            # aerodynamic instability and therefore must not widen a polar.
+            # Parsed finite-but-nonphysical coefficients are classified below
+            # through the ordinary hard RANS verdict.
+            raise InfrastructureError(
+                f"steady RANS produced unreadable force coefficients in {steady_coeff}: {exc}"
+            ) from exc
         outcome.cl, outcome.cd, outcome.cm = coeffs.cl, coeffs.cd, coeffs.cm
         outcome.cl_cd = coeffs.cl_cd
         if not outcome.converged and force_is_steady(steady_coeff):
@@ -3207,7 +3286,7 @@ def _finalize_outcome(
                 note += f" — {outcome.steady_history.note}"
             outcome.quality_warnings.append(note)
     elif not solver_params.force_transient:
-        raise OpenFOAMError("forceCoeffs produced no coefficient.dat")
+        raise InfrastructureError("forceCoeffs produced no coefficient.dat")
 
     # transient (URANS) fallback for unsteady (e.g. post-stall) conditions
     post_dir = case_dir
@@ -3350,11 +3429,11 @@ def _finalize_outcome(
                 # after partial output.
                 reached = _coeff_last_time(transient_coeffs[-1])
                 reached_s = f"{reached:.6g}" if reached is not None else "unknown"
-                raise OpenFOAMError(
+                raise HardSolverError(
                     f"URANS transient failed before grading (coefficient.dat has data up to "
                     f"t={reached_s}s); see {transient_subdir}/log.pimpleFoam"
                 )
-            raise OpenFOAMError("URANS transient produced no coefficient.dat")
+            raise HardSolverError("URANS transient produced no coefficient.dat")
 
     # Truthful stage transition: everything below (y+ / foamToVTK / renders /
     # frame export) is post-processing, not solving. The phase change also
@@ -3648,7 +3727,7 @@ def run_case(
         except JobCancelled:
             raise
         except (OpenFOAMError, Exception) as exc:  # noqa: BLE001 - report, don't crash the batch
-            outcome.error = f"{type(exc).__name__}: {exc}"
+            _record_outcome_failure(outcome, exc)
         return outcome
 
     try:
@@ -3726,11 +3805,7 @@ def run_case(
                 "steady RANS initialisation stage failed; URANS falls back to a short steady init"
             )
         else:
-            # Prefer the watchdog's truthful divergence message over the
-            # generic "Command failed" tail when the solver was condemned.
-            if not res.ok:
-                _raise_if_condemned(case_dir)
-            log = res.check().stdout
+            log = _checked_solver_result(case_dir, res).stdout
             (case_dir / "log.simpleFoam").write_text(log)
             conv = parse_convergence(log)
             outcome.converged = conv.converged
@@ -3766,7 +3841,10 @@ def run_case(
     except JobCancelled:
         raise
     except (OpenFOAMError, Exception) as exc:  # noqa: BLE001 - report, don't crash the batch
-        outcome.error = f"{type(exc).__name__}: {exc}"
+        _record_outcome_failure(outcome, exc)
+
+    if not solver_params.force_transient:
+        _record_unexceptional_rans_rejection(outcome)
 
     return outcome
 
@@ -4055,6 +4133,7 @@ def steady_outcome_shippable(outcome: CaseOutcome) -> bool:
 def should_abort_rans_sweep_for_urans(aoa_deg: float, outcome: CaseOutcome) -> bool:
     return (
         RANS_CORE_ABORT_AOA_MIN <= aoa_deg <= RANS_CORE_ABORT_AOA_MAX
+        and outcome.failure_disposition == FailureDisposition.hard_solver
         and rans_outcome_rejected_for_polar(outcome)
     )
 
@@ -4084,9 +4163,14 @@ def _run_full_urans_replacement(
     media_budget_s: Optional[float] = None,
     mesh_quality_warnings: Optional[list[str]] = None,
 ) -> list[StoredCaseOutcome]:
-    urans_solver = solver_params.model_copy(
-        update={"transient_fallback": True, "force_transient": True, "transient_auto_refine": True}
-    )
+    urans_solver = apply_urans_fidelity(solver_params.model_copy(
+        update={
+            "transient_fallback": True,
+            "force_transient": True,
+            "transient_auto_refine": True,
+            "urans_fidelity": UransFidelity.precalc,
+        }
+    ))
     points: list[StoredCaseOutcome] = []
     for j, aoa in enumerate(sorted(aoas)):
         _check_cancel(cancel_check)
@@ -4184,10 +4268,7 @@ def solve_polar_marched(
                     cancel_check=cancel_check,
                 )
             _check_cancel(cancel_check)
-            if not res.ok:
-                # Truthful divergence message beats the generic command tail.
-                _raise_if_condemned(polar_dir)
-            log = res.check().stdout
+            log = _checked_solver_result(polar_dir, res).stdout
             (polar_dir / f"log.a{i}").write_text(log)
             conv = parse_convergence(log)
             outcome.converged = conv.converged
@@ -4207,7 +4288,8 @@ def solve_polar_marched(
         except JobCancelled:
             raise
         except (OpenFOAMError, Exception) as exc:  # noqa: BLE001
-            outcome.error = f"{type(exc).__name__}: {exc}"
+            _record_outcome_failure(outcome, exc)
+        _record_unexceptional_rans_rejection(outcome)
         stored = StoredCaseOutcome(slug=polar_dir.name, outcome=outcome)
         attempts.append(stored)
         if outcome_progress:
@@ -4215,19 +4297,41 @@ def solve_polar_marched(
         if progress:
             progress()
         _check_cancel(cancel_check)
-        # In-job whole-polar URANS promotion is an ENGINE-SIDE escalation and
-        # must honor transient_fallback (2026-07-08 incident, wave-1 sweep job
-        # 20b67295: campaign jobs ship transient_fallback=false because the
-        # node-side ladder owns escalation, yet a rejected RANS point inside
-        # the attached-range check promoted the WHOLE polar to URANS without
-        # tier fidelity/budget/precalc mesh and diverged at startup). With the
-        # fallback off, rejected points ship honestly below and the gated
-        # ladder escalates; direct-API requests (default fallback on) keep
-        # the in-job promotion.
-        if (
+        # The policy separates the numerical decision from execution ownership:
+        # Node-managed production sweeps stop immediately and emit a typed
+        # external-PRECALC signal; direct multi-angle API sweeps may replace
+        # in-job, but only at preliminary fidelity. Explicit targeted work uses
+        # `continue` and never widens. Infrastructure/mesh errors cannot reach
+        # this block because the predicate requires hard_solver provenance.
+        qualifying_core_failure = (
             not solver_params.force_transient
-            and solver_params.transient_fallback
             and should_abort_rans_sweep_for_urans(aoa, outcome)
+        )
+        if (
+            qualifying_core_failure
+            and solver_params.rans_failure_policy == RansFailurePolicy.abort_for_precalc
+        ):
+            reason = (
+                f"RANS rejected at {aoa:g} deg inside the {RANS_CORE_ABORT_AOA_MIN:g}-"
+                f"{RANS_CORE_ABORT_AOA_MAX:g} deg attached-range check; remaining RANS stopped "
+                "for external preliminary URANS."
+            )
+            return PolarMarchResult(
+                points=final_points,
+                attempts=attempts,
+                promoted_to_urans=False,
+                abort_reason=reason,
+                precalc_promotion=RansPrecalcPromotion(
+                    trigger_aoa_deg=aoa,
+                    attempted_aoas=[item.outcome.spec.aoa_deg for item in attempts],
+                    intentionally_omitted_aoas=sorted_aoas[i + 1 :],
+                ),
+            )
+        if (
+            qualifying_core_failure
+            and solver_params.rans_failure_policy == RansFailurePolicy.replace_precalc
+            and solver_params.transient_fallback
+            and len(sorted_aoas) > 1
         ):
             reason = (
                 f"RANS rejected at {aoa:g} deg inside the {RANS_CORE_ABORT_AOA_MIN:g}-"

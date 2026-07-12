@@ -1866,6 +1866,199 @@ describe("remote solver sync validation regressions", () => {
     ]);
   });
 
+  it("retargets a fulfilled RANS sibling to its accepted preliminary URANS generation while the exact promise remains active", async () => {
+    const aoas = [711.101, 711.201];
+    const promiseId = await createPromise("active", aoas);
+    const ransPush = await postPolars(
+      polarPayload([makePoint(aoas[0])], {
+        promiseId,
+        bcId: undefined,
+      }),
+    );
+    expect(ransPush.statusCode).toBe(200);
+    expect(ransPush.json()).toMatchObject({
+      fulfilledAoas: [aoas[0]],
+      unfulfilledAoas: [],
+    });
+    const afterRans = await readPromise(promiseId);
+    const ransPoint = afterRans.points[0]!;
+    expect(ransPoint).toMatchObject({
+      aoaDeg: aoas[0],
+      status: "fulfilled",
+    });
+    expect(ransPoint.resultId).toBeTruthy();
+    expect(ransPoint.resultAttemptId).toBeTruthy();
+    expect(afterRans.points[1]).toMatchObject({
+      aoaDeg: aoas[1],
+      status: "active",
+    });
+
+    const uransPush = await postPolars(
+      polarPayload(
+        [
+          makePoint(aoas[0], {
+            ...uransEvidencePatch("fulfilled-rans-to-precalc"),
+            engineJobId: `${PREFIX}-fulfilled-rans-to-precalc-urans`,
+          }),
+        ],
+        { promiseId, bcId: undefined },
+      ),
+    );
+
+    expect(uransPush.statusCode).toBe(200);
+    expect(uransPush.json()).toMatchObject({
+      conflictIds: [],
+      fulfilledAoas: [aoas[0]],
+      unfulfilledAoas: [],
+    });
+    const afterUrans = await readPromise(promiseId);
+    expect(afterUrans.promise.status).toBe("active");
+    expect(afterUrans.points[0]).toMatchObject({
+      aoaDeg: aoas[0],
+      status: "fulfilled",
+      resultId: ransPoint.resultId,
+    });
+    expect(afterUrans.points[0]!.resultAttemptId).not.toBe(
+      ransPoint.resultAttemptId,
+    );
+    expect(afterUrans.points[1]).toMatchObject({
+      aoaDeg: aoas[1],
+      status: "active",
+    });
+    expect(
+      await db
+        .select({ id: resultAttempts.id, regime: resultAttempts.regime })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.resultId, ransPoint.resultId!))
+        .orderBy(resultAttempts.createdAt),
+    ).toMatchObject([{ regime: "rans" }, { regime: "urans" }]);
+  });
+
+  it("does not retarget a fulfilled point to an unrelated changed RANS generation", async () => {
+    const aoas = [711.301, 711.401];
+    const promiseId = await createPromise("active", aoas);
+    const first = await postPolars(
+      polarPayload([makePoint(aoas[0])], {
+        promiseId,
+        bcId: undefined,
+      }),
+    );
+    expect(first.statusCode).toBe(200);
+    const originalPoint = (await readPromise(promiseId)).points[0]!;
+    expect(originalPoint).toMatchObject({
+      status: "fulfilled",
+      aoaDeg: aoas[0],
+    });
+
+    const changedRans = await postPolars(
+      polarPayload(
+        [
+          makePoint(aoas[0], {
+            engineJobId: `${PREFIX}-unrelated-second-rans-generation`,
+          }),
+        ],
+        { promiseId, bcId: undefined },
+      ),
+    );
+
+    expect(changedRans.statusCode).toBe(200);
+    expect(changedRans.json()).toMatchObject({
+      fulfilledAoas: [],
+      unfulfilledAoas: [aoas[0]],
+    });
+    expect((await readPromise(promiseId)).points[0]).toMatchObject({
+      status: "fulfilled",
+      resultId: originalPoint.resultId,
+      resultAttemptId: originalPoint.resultAttemptId,
+    });
+  });
+
+  it("serializes concurrent preliminary URANS replacements so one fulfilled RANS sibling advances exactly once", async () => {
+    const aoas = [711.601, 711.701];
+    const promiseId = await createPromise("active", aoas);
+    const ransPush = await postPolars(
+      polarPayload([makePoint(aoas[0])], {
+        promiseId,
+        bcId: undefined,
+      }),
+    );
+    expect(ransPush.statusCode).toBe(200);
+    const ransPoint = (await readPromise(promiseId)).points[0]!;
+    const evidenceA = uransEvidencePatch("concurrent-rans-upgrade-a");
+    const evidenceB = {
+      ...uransEvidencePatch("concurrent-rans-upgrade-b"),
+      forceHistory: {
+        ...uransEvidencePatch("concurrent-rans-upgrade-b").forceHistory,
+        cl: [0.4, 0.72, 0.4, 0.72, 0.4],
+        clMean: 0.56,
+      },
+    };
+
+    const [responseA, responseB] = await Promise.all([
+      postPolars(
+        polarPayload(
+          [
+            makePoint(aoas[0], {
+              ...evidenceA,
+              engineJobId: `${PREFIX}-concurrent-rans-upgrade-a`,
+            }),
+          ],
+          { promiseId, bcId: undefined },
+        ),
+      ),
+      postPolars(
+        polarPayload(
+          [
+            makePoint(aoas[0], {
+              ...evidenceB,
+              engineJobId: `${PREFIX}-concurrent-rans-upgrade-b`,
+            }),
+          ],
+          { promiseId, bcId: undefined },
+        ),
+      ),
+    ]);
+
+    const bodies = [responseA.json(), responseB.json()] as Array<{
+      conflictIds: string[];
+      fulfilledAoas: number[];
+      unfulfilledAoas: number[];
+    }>;
+    const accepted = bodies.filter((body) => body.conflictIds.length === 0);
+    const conflicted = bodies.filter((body) => body.conflictIds.length === 1);
+    expect(accepted).toHaveLength(1);
+    expect(conflicted).toHaveLength(1);
+    expect(accepted[0]).toMatchObject({
+      fulfilledAoas: [aoas[0]],
+      unfulfilledAoas: [],
+    });
+    expect(conflicted[0]).toMatchObject({
+      fulfilledAoas: [],
+      unfulfilledAoas: [aoas[0]],
+    });
+    cleanupConflictIds.add(conflicted[0]!.conflictIds[0]!);
+    const final = await readPromise(promiseId);
+    expect(final.promise.status).toBe("active");
+    expect(final.points[0]).toMatchObject({
+      status: "fulfilled",
+      resultId: ransPoint.resultId,
+    });
+    expect(final.points[0]!.resultAttemptId).not.toBe(
+      ransPoint.resultAttemptId,
+    );
+    expect(final.points[1]).toMatchObject({ status: "active" });
+    const canonical = await resultAt(aoas[0]);
+    expect(canonical?.currentResultAttemptId).toBe(
+      final.points[0]!.resultAttemptId,
+    );
+    expect(
+      await db
+        .select({ regime: resultAttempts.regime })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.resultId, ransPoint.resultId!)),
+    ).toHaveLength(2);
+  });
+
   it.each([
     ["pending", 709.001],
     ["stale", 710.001],

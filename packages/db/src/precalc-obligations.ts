@@ -86,10 +86,11 @@ const liveOwnerSql = (obligationId: string) => sql`(
 
 /** Ensure one physical obligation per value-compatible cell and attach every
  * beneficiary. Terminal satisfied/blocked work is never silently reopened. */
-export async function ensurePrecalcObligations(
-  db: DB,
+export async function ensurePrecalcObligationsInTransaction(
+  tx: DB,
   cells: PrecalcObligationCell[],
   ownership: PrecalcObligationOwnership = {},
+  opts: { transferFromJobId?: string } = {},
 ): Promise<SimPrecalcObligation[]> {
   if (!cells.length) return [];
   const requestedCampaignIds = [...new Set(ownership.campaignIds ?? [])].sort();
@@ -97,9 +98,8 @@ export async function ensurePrecalcObligations(
   const requestedSyncPromiseIds = [
     ...new Set(ownership.syncPromiseIds ?? []),
   ].sort();
-  return db.transaction(async (tx) => {
-    const liveCampaignRows = requestedCampaignIds.length
-      ? ((await tx.execute(sql`
+  const liveCampaignRows = requestedCampaignIds.length
+    ? ((await tx.execute(sql`
           SELECT campaign.id
           FROM sim_campaigns campaign
           WHERE campaign.id = ANY(${sql`ARRAY[${sql.join(
@@ -110,10 +110,10 @@ export async function ensurePrecalcObligations(
           ORDER BY campaign.id
           FOR SHARE OF campaign
         `)) as unknown as Array<{ id: string }>)
-      : [];
-    const campaignIds = liveCampaignRows.map((row) => row.id);
-    const liveRemoteCells = requestedSyncPromiseIds.length
-      ? ((await tx.execute(sql`
+    : [];
+  const campaignIds = liveCampaignRows.map((row) => row.id);
+  const liveRemoteCells = requestedSyncPromiseIds.length
+    ? ((await tx.execute(sql`
           SELECT promise.id, promise_point.airfoil_id,
                  promise_point.simulation_preset_revision_id AS revision_id,
                  promise_point.aoa_deg::float8 AS aoa_deg
@@ -131,19 +131,19 @@ export async function ensurePrecalcObligations(
           ORDER BY promise.id, promise_point.id
           FOR SHARE OF promise, promise_point
         `)) as unknown as Array<{
-          id: string;
-          airfoil_id: string;
-          revision_id: string;
-          aoa_deg: number;
-        }>)
-      : [];
-    const remoteCellKeys = new Set(
-      liveRemoteCells.map(
-        (row) => `${row.airfoil_id}:${row.revision_id}:${Number(row.aoa_deg)}`,
-      ),
-    );
-    const liveRequestRows = requestedRequestIds.length
-      ? ((await tx.execute(sql`
+        id: string;
+        airfoil_id: string;
+        revision_id: string;
+        aoa_deg: number;
+      }>)
+    : [];
+  const remoteCellKeys = new Set(
+    liveRemoteCells.map(
+      (row) => `${row.airfoil_id}:${row.revision_id}:${Number(row.aoa_deg)}`,
+    ),
+  );
+  const liveRequestRows = requestedRequestIds.length
+    ? ((await tx.execute(sql`
           SELECT request.id, request.background_owner
           FROM sim_urans_requests request
           WHERE request.id = ANY(${sql`ARRAY[${sql.join(
@@ -154,162 +154,179 @@ export async function ensurePrecalcObligations(
           ORDER BY request.id
           FOR SHARE OF request
         `)) as unknown as Array<{ id: string; background_owner: boolean }>)
-      : [];
-    const requestIds = liveRequestRows.map((row) => row.id);
-    // Global ownership transition lock order:
-    // campaign/request/promise owner rows -> sorted natural-cell advisory
-    // locks -> result/obligation rows. Campaign claim/requeue follows the same
-    // order, preventing campaign↔cell inversion under concurrent routing.
-    await lockPrecalcCells(tx, cells);
-    const independentlyOwnedRequest = liveRequestRows.some(
-      (row) => row.background_owner,
-    );
-    const hasSharedLiveOwner = Boolean(
-      ownership.backgroundOwner ||
-      campaignIds.length ||
-      independentlyOwnedRequest,
-    );
-    if (!hasSharedLiveOwner && !remoteCellKeys.size) return [];
-    const rows: SimPrecalcObligation[] = [];
-    for (const cell of cells) {
-      const hasLiveOwner =
-        hasSharedLiveOwner ||
-        remoteCellKeys.has(
-          `${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`,
-        );
-      if (!hasLiveOwner) continue;
-      const [existingObligation] = await tx
-        .select({ id: simPrecalcObligations.id })
-        .from(simPrecalcObligations)
+    : [];
+  const requestIds = liveRequestRows.map((row) => row.id);
+  // Global ownership transition lock order:
+  // campaign/request/promise owner rows -> sorted natural-cell advisory
+  // locks -> result/obligation rows. Campaign claim/requeue follows the same
+  // order, preventing campaign↔cell inversion under concurrent routing.
+  await lockPrecalcCells(tx, cells);
+  const independentlyOwnedRequest = liveRequestRows.some(
+    (row) => row.background_owner,
+  );
+  const hasSharedLiveOwner = Boolean(
+    ownership.backgroundOwner ||
+    campaignIds.length ||
+    independentlyOwnedRequest,
+  );
+  if (!hasSharedLiveOwner && !remoteCellKeys.size) return [];
+  const rows: SimPrecalcObligation[] = [];
+  for (const cell of cells) {
+    const hasLiveOwner =
+      hasSharedLiveOwner ||
+      remoteCellKeys.has(
+        `${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`,
+      );
+    if (!hasLiveOwner) continue;
+    const [existingObligation] = await tx
+      .select({ id: simPrecalcObligations.id })
+      .from(simPrecalcObligations)
+      .where(
+        and(
+          eq(simPrecalcObligations.airfoilId, cell.airfoilId),
+          eq(simPrecalcObligations.revisionId, cell.revisionId),
+          eq(simPrecalcObligations.aoaDeg, cell.aoaDeg),
+        ),
+      )
+      .limit(1);
+    if (!existingObligation) {
+      const [canonical] = await tx
+        .select({ status: results.status, simJobId: results.simJobId })
+        .from(results)
         .where(
           and(
-            eq(simPrecalcObligations.airfoilId, cell.airfoilId),
-            eq(simPrecalcObligations.revisionId, cell.revisionId),
-            eq(simPrecalcObligations.aoaDeg, cell.aoaDeg),
+            eq(results.airfoilId, cell.airfoilId),
+            eq(results.simulationPresetRevisionId, cell.revisionId),
+            eq(results.aoaDeg, cell.aoaDeg),
           ),
         )
         .limit(1);
-      if (!existingObligation) {
-        const [canonical] = await tx
-          .select({ status: results.status })
-          .from(results)
-          .where(
-            and(
-              eq(results.airfoilId, cell.airfoilId),
-              eq(results.simulationPresetRevisionId, cell.revisionId),
-              eq(results.aoaDeg, cell.aoaDeg),
-            ),
-          )
-          .limit(1);
-        // A generic queue mutation that won the natural-cell lock remains the
-        // sole owner for this cycle. Creating a new obligation behind its
-        // pending/queued/stale row would strand ordinary work in a ladder-
-        // owned state. No canonical row is fine for explicit/background
-        // PRECALC requests; terminal evidence is also eligible for routing.
-        if (canonical && !["done", "failed"].includes(canonical.status))
-          continue;
-      }
-      if (cell.sourceResultId) {
-        const [source] = await tx
-          .select({ status: results.status })
-          .from(results)
-          .where(eq(results.id, cell.sourceResultId))
-          .limit(1);
-        // A concurrent generic retry which acquired the cell lock first has
-        // already returned this source to pending. Do not create a ladder
-        // owner behind that committed retry; the next terminal verdict may
-        // route it again through the normal bounded path.
-        if (!source || !["done", "failed"].includes(source.status)) continue;
-      }
-      let sourceResultAttemptId = cell.sourceResultAttemptId ?? null;
-      if (!cell.sourceResultId && !sourceResultAttemptId) {
-        const [sourceAttempt] = await tx
-          .select({ id: resultAttempts.id })
-          .from(resultAttempts)
-          .where(
-            and(
-              eq(resultAttempts.airfoilId, cell.airfoilId),
-              eq(resultAttempts.simulationPresetRevisionId, cell.revisionId),
-              eq(resultAttempts.aoaDeg, cell.aoaDeg),
-              eq(resultAttempts.regime, "rans"),
-            ),
-          )
-          .orderBy(sql`${resultAttempts.createdAt} DESC`)
-          .limit(1);
-        sourceResultAttemptId = sourceAttempt?.id ?? null;
-      }
-      const [row] = await tx
-        .insert(simPrecalcObligations)
-        .values({
-          airfoilId: cell.airfoilId,
-          revisionId: cell.revisionId,
-          aoaDeg: cell.aoaDeg,
-          sourceResultId: cell.sourceResultId ?? null,
-          sourceResultAttemptId,
-          state: "pending",
-          backgroundOwner: ownership.backgroundOwner ?? false,
-        })
-        .onConflictDoUpdate({
-          target: [
-            simPrecalcObligations.airfoilId,
-            simPrecalcObligations.revisionId,
-            simPrecalcObligations.aoaDeg,
-          ],
-          set: {
-            sourceResultId: sql`COALESCE(${simPrecalcObligations.sourceResultId}, EXCLUDED.source_result_id)`,
-            sourceResultAttemptId: sql`COALESCE(${simPrecalcObligations.sourceResultAttemptId}, EXCLUDED.source_result_attempt_id)`,
-            backgroundOwner: sql`${simPrecalcObligations.backgroundOwner} OR EXCLUDED.background_owner`,
-            state: sql`CASE
+      // A generic queue mutation that won the natural-cell lock remains the
+      // sole owner for this cycle. Creating a new obligation behind its
+      // pending/queued/stale row would strand ordinary work in a ladder-
+      // owned state. No canonical row is fine for explicit/background
+      // PRECALC requests; terminal evidence is also eligible for routing.
+      if (
+        canonical &&
+        !["done", "failed"].includes(canonical.status) &&
+        canonical.simJobId !== opts.transferFromJobId
+      )
+        continue;
+    }
+    if (cell.sourceResultId) {
+      const [source] = await tx
+        .select({ status: results.status })
+        .from(results)
+        .where(eq(results.id, cell.sourceResultId))
+        .limit(1);
+      // A concurrent generic retry which acquired the cell lock first has
+      // already returned this source to pending. Do not create a ladder
+      // owner behind that committed retry; the next terminal verdict may
+      // route it again through the normal bounded path.
+      if (!source || !["done", "failed"].includes(source.status)) continue;
+    }
+    let sourceResultAttemptId = cell.sourceResultAttemptId ?? null;
+    if (!cell.sourceResultId && !sourceResultAttemptId) {
+      const [sourceAttempt] = await tx
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(
+          and(
+            eq(resultAttempts.airfoilId, cell.airfoilId),
+            eq(resultAttempts.simulationPresetRevisionId, cell.revisionId),
+            eq(resultAttempts.aoaDeg, cell.aoaDeg),
+            eq(resultAttempts.regime, "rans"),
+          ),
+        )
+        .orderBy(sql`${resultAttempts.createdAt} DESC`)
+        .limit(1);
+      sourceResultAttemptId = sourceAttempt?.id ?? null;
+    }
+    const [row] = await tx
+      .insert(simPrecalcObligations)
+      .values({
+        airfoilId: cell.airfoilId,
+        revisionId: cell.revisionId,
+        aoaDeg: cell.aoaDeg,
+        sourceResultId: cell.sourceResultId ?? null,
+        sourceResultAttemptId,
+        state: "pending",
+        backgroundOwner: ownership.backgroundOwner ?? false,
+      })
+      .onConflictDoUpdate({
+        target: [
+          simPrecalcObligations.airfoilId,
+          simPrecalcObligations.revisionId,
+          simPrecalcObligations.aoaDeg,
+        ],
+        set: {
+          sourceResultId: sql`COALESCE(${simPrecalcObligations.sourceResultId}, EXCLUDED.source_result_id)`,
+          sourceResultAttemptId: sql`COALESCE(${simPrecalcObligations.sourceResultAttemptId}, EXCLUDED.source_result_attempt_id)`,
+          backgroundOwner: sql`${simPrecalcObligations.backgroundOwner} OR EXCLUDED.background_owner`,
+          state: sql`CASE
               WHEN ${simPrecalcObligations.state} = 'cancelled'
                 AND ${hasLiveOwner}
               THEN 'pending'
               ELSE ${simPrecalcObligations.state}
             END`,
-            completedAt: sql`CASE
+          completedAt: sql`CASE
               WHEN ${simPrecalcObligations.state} = 'cancelled'
                 AND ${hasLiveOwner}
               THEN NULL
               ELSE ${simPrecalcObligations.completedAt}
             END`,
-            updatedAt: new Date(),
-          },
-        })
-        .returning();
-      if (!row) continue;
-      rows.push(row);
-      if (campaignIds.length) {
-        await tx
-          .insert(simPrecalcObligationCampaigns)
-          .values(
-            campaignIds.map((campaignId) => ({
-              obligationId: row.id,
-              campaignId,
-              state: "active",
-              cancelledAt: null,
-            })),
-          )
-          .onConflictDoUpdate({
-            target: [
-              simPrecalcObligationCampaigns.obligationId,
-              simPrecalcObligationCampaigns.campaignId,
-            ],
-            set: { state: "active", cancelledAt: null, updatedAt: new Date() },
-          });
-      }
-      if (requestIds.length) {
-        await tx
-          .insert(simPrecalcObligationRequests)
-          .values(
-            requestIds.map((requestId) => ({
-              obligationId: row.id,
-              requestId,
-            })),
-          )
-          .onConflictDoNothing();
-      }
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
+    if (!row) continue;
+    rows.push(row);
+    if (campaignIds.length) {
+      await tx
+        .insert(simPrecalcObligationCampaigns)
+        .values(
+          campaignIds.map((campaignId) => ({
+            obligationId: row.id,
+            campaignId,
+            state: "active",
+            cancelledAt: null,
+          })),
+        )
+        .onConflictDoUpdate({
+          target: [
+            simPrecalcObligationCampaigns.obligationId,
+            simPrecalcObligationCampaigns.campaignId,
+          ],
+          set: { state: "active", cancelledAt: null, updatedAt: new Date() },
+        });
     }
-    return rows;
-  });
+    if (requestIds.length) {
+      await tx
+        .insert(simPrecalcObligationRequests)
+        .values(
+          requestIds.map((requestId) => ({
+            obligationId: row.id,
+            requestId,
+          })),
+        )
+        .onConflictDoNothing();
+    }
+  }
+  return rows;
+}
+
+export async function ensurePrecalcObligations(
+  db: DB,
+  cells: PrecalcObligationCell[],
+  ownership: PrecalcObligationOwnership = {},
+): Promise<SimPrecalcObligation[]> {
+  return db.transaction((rawTx) =>
+    ensurePrecalcObligationsInTransaction(
+      rawTx as unknown as DB,
+      cells,
+      ownership,
+    ),
+  );
 }
 
 /** Record only an engine-accepted submission. A cancelled composition or

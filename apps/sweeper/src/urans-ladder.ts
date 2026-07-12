@@ -75,6 +75,564 @@ export function resetUransLadderMemory(): void {
 }
 
 const GATED_PARENTS_PER_TICK = 3;
+const PROMOTION_RECOVERIES_PER_TICK = 16;
+
+function promotionRecoveryScopeSql(opts: {
+  campaignIds?: string[];
+  parentJobIds?: string[];
+  promotionIds?: string[];
+}) {
+  // An exact promotion scope is the strongest test/recovery fence. Otherwise
+  // reuse the existing parent/campaign closed-world scopes. Production passes
+  // none and therefore scans the complete durable promotion ledger.
+  if (opts.promotionIds !== undefined) {
+    return opts.promotionIds.length
+      ? sql`promotion.id = ANY(${sql`ARRAY[${sql.join(
+          opts.promotionIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})`
+      : sql`false`;
+  }
+  if (opts.parentJobIds !== undefined) {
+    return opts.parentJobIds.length
+      ? sql`parent.id = ANY(${sql`ARRAY[${sql.join(
+          opts.parentJobIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})`
+      : sql`false`;
+  }
+  if (opts.campaignIds !== undefined) {
+    return opts.campaignIds.length
+      ? sql`promotion.campaign_id = ANY(${sql`ARRAY[${sql.join(
+          opts.campaignIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})`
+      : sql`false`;
+  }
+  return sql`true`;
+}
+
+interface RecordedPromotionPoint {
+  promotionId: string;
+  parentJobId: string;
+  airfoilId: string;
+  revisionId: string;
+  conditionId: string | null;
+  ownerKind: "campaign" | "background" | "sync_promise";
+  ownerCampaignId: string | null;
+  syncPromiseId: string | null;
+  aoaDeg: number;
+  obligationId: string;
+  state: string;
+  attemptCount: number;
+  maxAttempts: number;
+  nextSubmitAt: Date | string | null;
+}
+
+async function recordedPromotionPoints(
+  db: DB,
+  promotionId: string,
+  parentJobId: string,
+): Promise<RecordedPromotionPoint[]> {
+  const rows = (await db.execute(sql`
+    SELECT promotion.id AS promotion_id,
+           promotion.parent_job_id,
+           promotion.airfoil_id,
+           promotion.revision_id,
+           promotion.condition_id,
+           promotion.owner_kind,
+           promotion.campaign_id AS owner_campaign_id,
+           promotion.sync_promise_id,
+           point.aoa_deg::float8 AS aoa_deg,
+           point.obligation_id,
+           obligation.state,
+           obligation.attempt_count,
+           obligation.max_attempts,
+           obligation.next_submit_at
+    FROM sim_rans_polar_promotions promotion
+    JOIN sim_jobs parent ON parent.id = promotion.parent_job_id
+    JOIN sim_rans_polar_promotion_points point
+      ON point.promotion_id = promotion.id
+    JOIN sim_precalc_obligations obligation
+      ON obligation.id = point.obligation_id
+     AND obligation.airfoil_id = promotion.airfoil_id
+     AND obligation.revision_id = promotion.revision_id
+     AND obligation.aoa_deg = point.aoa_deg
+    WHERE promotion.id = ${promotionId}
+      AND promotion.parent_job_id = ${parentJobId}
+    ORDER BY point.aoa_deg, point.obligation_id
+  `)) as unknown as Array<{
+    promotion_id: string;
+    parent_job_id: string;
+    airfoil_id: string;
+    revision_id: string;
+    condition_id: string | null;
+    owner_kind: "campaign" | "background" | "sync_promise";
+    owner_campaign_id: string | null;
+    sync_promise_id: string | null;
+    aoa_deg: number;
+    obligation_id: string;
+    state: string;
+    attempt_count: number;
+    max_attempts: number;
+    next_submit_at: Date | string | null;
+  }>;
+  return rows.map((row) => ({
+    promotionId: row.promotion_id,
+    parentJobId: row.parent_job_id,
+    airfoilId: row.airfoil_id,
+    revisionId: row.revision_id,
+    conditionId: row.condition_id,
+    ownerKind: row.owner_kind,
+    ownerCampaignId: row.owner_campaign_id,
+    syncPromiseId: row.sync_promise_id,
+    aoaDeg: Number(row.aoa_deg),
+    obligationId: row.obligation_id,
+    state: row.state,
+    attemptCount: Number(row.attempt_count),
+    maxAttempts: Number(row.max_attempts),
+    nextSubmitAt: row.next_submit_at,
+  }));
+}
+
+async function recordedPromotionHasDeterministicMeshBlocker(
+  db: DB,
+  event: Pick<
+    RecordedPromotionPoint,
+    "promotionId" | "parentJobId" | "revisionId" | "conditionId"
+  >,
+): Promise<boolean> {
+  const conditionSql = event.conditionId
+    ? sql`child.request_payload ->> 'conditionId' = ${event.conditionId}`
+    : sql`child.request_payload ->> 'conditionId' IS NULL`;
+  const rows = (await db.execute(sql`
+    SELECT 1
+    WHERE EXISTS (
+      SELECT 1
+      FROM sim_rans_polar_promotion_points point
+      JOIN sim_precalc_obligations obligation
+        ON obligation.id = point.obligation_id
+      WHERE point.promotion_id = ${event.promotionId}
+        AND obligation.last_outcome = 'deterministic_failure'
+    ) OR EXISTS (
+      SELECT 1
+      FROM sim_jobs child
+      CROSS JOIN LATERAL (
+        SELECT attempt.error
+        FROM result_attempts attempt
+        WHERE attempt.sim_job_id = child.id
+        UNION ALL
+        SELECT canonical.error
+        FROM results canonical
+        WHERE canonical.sim_job_id = child.id
+      ) evidence
+      WHERE child.parent_job_id = ${event.parentJobId}
+        AND child.wave = 2
+        AND child.simulation_preset_revision_id = ${event.revisionId}
+        AND (${conditionSql})
+        AND child.request_payload ->> 'uransFidelity' = 'precalc'
+        AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(evidence.error, ''))) > 0
+        AND position('max non-orthogonality' in lower(COALESCE(evidence.error, ''))) > 0
+    )
+    LIMIT 1
+  `)) as unknown as unknown[];
+  if (!rows.length) return false;
+  console.error(
+    `[sweeper] recorded whole-polar promotion ${event.promotionId} remains blocked by deterministic shared-mesh evidence; exact obligation coverage is retained and unchanged mesh is not resubmitted`,
+  );
+  return true;
+}
+
+type PromotionRemoteProvenance =
+  | { required: false }
+  | {
+      required: true;
+      syncPromiseId: string;
+      remoteSolver: true;
+      upstreamBaseUrl: string;
+    }
+  | { required: true; unavailable: true };
+
+/** Resolve execution ownership from the exact physical obligations, never
+ * from mutable parent request JSON. A remote recovery must use one still-live
+ * promise covering every selected obligation because the guarded submit
+ * boundary validates the same complete payload scope. */
+async function remoteProvenanceForPromotionObligations(
+  db: DB,
+  obligationIds: string[],
+  event: Pick<RecordedPromotionPoint, "ownerKind" | "syncPromiseId">,
+): Promise<PromotionRemoteProvenance> {
+  const idArray = sql`ARRAY[${sql.join(
+    obligationIds.map((id) => sql`${id}::uuid`),
+    sql`, `,
+  )}]`;
+  // Owner kind and remote promise id are immutable event provenance. Never
+  // infer either from mutable shared-obligation owners: a later campaign or a
+  // replacement promise may benefit from the same physical solve, but cannot
+  // adopt this event's submit authority.
+  if (event.ownerKind !== "sync_promise") return { required: false };
+  if (!event.syncPromiseId) return { required: true, unavailable: true };
+  const [promise] = (await db.execute(sql`
+    SELECT remote_promise.id, remote_promise.source_base_url
+    FROM sync_sweep_promises remote_promise
+    WHERE remote_promise.id = ${event.syncPromiseId}
+      AND remote_promise.status = 'active'
+      AND remote_promise."expiresAt" > now()
+      AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND remote_promise.source_base_url IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_precalc_obligations obligation
+        WHERE obligation.id = ANY(${idArray})
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sync_sweep_promise_points promise_point
+            WHERE promise_point.promise_id = remote_promise.id
+              AND promise_point.status = 'active'
+              AND promise_point.airfoil_id = obligation.airfoil_id
+              AND promise_point.simulation_preset_revision_id = obligation.revision_id
+              AND promise_point.aoa_deg = obligation.aoa_deg
+          )
+      )
+    LIMIT 1
+  `)) as unknown as Array<{ id: string; source_base_url: string }>;
+  if (!promise) return { required: true, unavailable: true };
+  return {
+    required: true,
+    syncPromiseId: promise.id,
+    remoteSolver: true,
+    upstreamBaseUrl: promise.source_base_url,
+  };
+}
+
+/** Recover a normalized conditional-promotion event whose transaction
+ * committed before its wave-2 child was composed. The immutable event points
+ * and their exact physical-obligation ids are the sole scope authority; this
+ * path does not re-read mutable parent transport JSON or re-run classification.
+ *
+ * A still-live ingest lease is deliberately excluded: the ingest owner that
+ * recorded the event gets the first chance to compose. A crashed owner becomes
+ * eligible after lease expiry, while a terminal parent is immediately safe to
+ * recover. Campaign events retain the normal zero-open-RANS gate; background
+ * and remote parents are recovered independently of campaign enumeration. */
+async function submitRecordedPromotionRecovery(
+  db: DB,
+  engine: EngineClient,
+  cpuSlots: number,
+  opts: {
+    campaignIds?: string[];
+    parentJobIds?: string[];
+    promotionIds?: string[];
+  },
+): Promise<boolean> {
+  const scope = promotionRecoveryScopeSql(opts);
+  const campaignRows = (await db.execute(sql`
+    SELECT DISTINCT promotion.campaign_id
+    FROM sim_rans_polar_promotions promotion
+    JOIN sim_jobs parent ON parent.id = promotion.parent_job_id
+    JOIN sim_campaigns campaign ON campaign.id = promotion.campaign_id
+    WHERE (${scope})
+      AND promotion.owner_kind = 'campaign'
+      AND campaign.status IN ('active', 'attention')
+      AND EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points point
+        JOIN sim_precalc_obligations obligation
+          ON obligation.id = point.obligation_id
+        WHERE point.promotion_id = promotion.id
+          AND obligation.state = 'pending'
+          AND obligation.attempt_count < obligation.max_attempts
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs live_child
+        WHERE live_child.parent_job_id = parent.id
+          AND live_child.wave = 2
+          AND live_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+    ORDER BY promotion.campaign_id
+  `)) as unknown as Array<{ campaign_id: string }>;
+  const readyCampaignIds: string[] = [];
+  for (const row of campaignRows) {
+    if (!(await campaignHasOpenRansGaps(db, row.campaign_id)))
+      readyCampaignIds.push(row.campaign_id);
+  }
+  const readyCampaignSql = readyCampaignIds.length
+    ? sql`promotion.campaign_id = ANY(${sql`ARRAY[${sql.join(
+        readyCampaignIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`})`
+    : sql`false`;
+
+  const candidates = (await db.execute(sql`
+    SELECT promotion.id AS promotion_id, parent.id AS parent_job_id
+    FROM sim_rans_polar_promotions promotion
+    JOIN sim_jobs parent ON parent.id = promotion.parent_job_id
+    WHERE (${scope})
+      AND (
+        promotion.owner_kind <> 'campaign'
+        OR (${readyCampaignSql})
+      )
+      AND (
+        parent.status IN ('done', 'failed', 'cancelled')
+        OR (
+          parent.status = 'ingesting'
+          AND (
+            parent.ingest_lease_expires_at IS NULL
+            OR parent.ingest_lease_expires_at <= now()
+          )
+        )
+      )
+      AND NOT (
+        parent.status = 'cancelled'
+        AND promotion.owner_kind = 'background'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points blocked_point
+        JOIN sim_precalc_obligations blocked_obligation
+          ON blocked_obligation.id = blocked_point.obligation_id
+        WHERE blocked_point.promotion_id = promotion.id
+          AND blocked_obligation.last_outcome = 'deterministic_failure'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs blocked_child
+        CROSS JOIN LATERAL (
+          SELECT attempt.error
+          FROM result_attempts attempt
+          WHERE attempt.sim_job_id = blocked_child.id
+          UNION ALL
+          SELECT canonical.error
+          FROM results canonical
+          WHERE canonical.sim_job_id = blocked_child.id
+        ) blocked_evidence
+        WHERE blocked_child.parent_job_id = parent.id
+          AND blocked_child.wave = 2
+          AND blocked_child.simulation_preset_revision_id = promotion.revision_id
+          AND (
+            (promotion.condition_id IS NULL AND blocked_child.request_payload ->> 'conditionId' IS NULL)
+            OR blocked_child.request_payload ->> 'conditionId' = promotion.condition_id::text
+          )
+          AND blocked_child.request_payload ->> 'uransFidelity' = 'precalc'
+          AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(blocked_evidence.error, ''))) > 0
+          AND position('max non-orthogonality' in lower(COALESCE(blocked_evidence.error, ''))) > 0
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points point
+        JOIN sim_precalc_obligations obligation
+          ON obligation.id = point.obligation_id
+        WHERE point.promotion_id = promotion.id
+          AND obligation.state = 'pending'
+          AND obligation.attempt_count < obligation.max_attempts
+          AND (
+            obligation.next_submit_at IS NULL
+            OR obligation.next_submit_at <= now()
+          )
+          AND (
+            (
+              promotion.owner_kind = 'background'
+              AND obligation.background_owner
+            )
+            OR (
+              promotion.owner_kind = 'campaign'
+              AND EXISTS (
+              SELECT 1
+              FROM sim_precalc_obligation_campaigns ownership
+              JOIN sim_campaigns owner_campaign
+                ON owner_campaign.id = ownership.campaign_id
+               AND owner_campaign.status IN ('active', 'attention')
+              WHERE ownership.obligation_id = obligation.id
+                AND ownership.state = 'active'
+                AND ownership.campaign_id = promotion.campaign_id
+              )
+            )
+            OR (
+              promotion.owner_kind = 'sync_promise'
+              AND EXISTS (
+              SELECT 1
+              FROM sync_sweep_promise_points promise_point
+              JOIN sync_sweep_promises promise
+                ON promise.id = promise_point.promise_id
+               AND promise.status = 'active'
+               AND promise."expiresAt" > now()
+               AND promise.request_payload ->> 'remoteSolver' = 'true'
+              WHERE promise_point.airfoil_id = obligation.airfoil_id
+                AND promise_point.simulation_preset_revision_id = obligation.revision_id
+                AND promise_point.aoa_deg = obligation.aoa_deg
+                AND promise_point.status = 'active'
+                AND promise.id = promotion.sync_promise_id
+              )
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points unowned_point
+        JOIN sim_precalc_obligations unowned_obligation
+          ON unowned_obligation.id = unowned_point.obligation_id
+        WHERE unowned_point.promotion_id = promotion.id
+          AND unowned_obligation.state = 'pending'
+          AND unowned_obligation.attempt_count < unowned_obligation.max_attempts
+          AND (
+            unowned_obligation.next_submit_at IS NULL
+            OR unowned_obligation.next_submit_at <= now()
+          )
+          AND NOT (
+            (
+              promotion.owner_kind = 'background'
+              AND unowned_obligation.background_owner
+            )
+            OR (
+              promotion.owner_kind = 'campaign'
+              AND EXISTS (
+              SELECT 1
+              FROM sim_precalc_obligation_campaigns ownership
+              JOIN sim_campaigns owner_campaign
+                ON owner_campaign.id = ownership.campaign_id
+               AND owner_campaign.status IN ('active', 'attention')
+              WHERE ownership.obligation_id = unowned_obligation.id
+                AND ownership.state = 'active'
+                AND ownership.campaign_id = promotion.campaign_id
+              )
+            )
+            OR (
+              promotion.owner_kind = 'sync_promise'
+              AND EXISTS (
+              SELECT 1
+              FROM sync_sweep_promise_points promise_point
+              JOIN sync_sweep_promises promise
+                ON promise.id = promise_point.promise_id
+               AND promise.status = 'active'
+               AND promise."expiresAt" > now()
+               AND promise.request_payload ->> 'remoteSolver' = 'true'
+              WHERE promise_point.airfoil_id = unowned_obligation.airfoil_id
+                AND promise_point.simulation_preset_revision_id = unowned_obligation.revision_id
+                AND promise_point.aoa_deg = unowned_obligation.aoa_deg
+                AND promise_point.status = 'active'
+                AND promise.id = promotion.sync_promise_id
+              )
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs live_child
+        WHERE live_child.parent_job_id = parent.id
+          AND live_child.wave = 2
+          AND live_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+    ORDER BY promotion."createdAt", promotion.id
+    LIMIT ${PROMOTION_RECOVERIES_PER_TICK}
+  `)) as unknown as Array<{
+    promotion_id: string;
+    parent_job_id: string;
+  }>;
+
+  for (const candidate of candidates) {
+    await touchHeartbeat(db);
+    const points = await recordedPromotionPoints(
+      db,
+      candidate.promotion_id,
+      candidate.parent_job_id,
+    );
+    const event = points[0];
+    if (!event || points.length <= 1) continue;
+    if (
+      await recordedPromotionHasDeterministicMeshBlocker(db, {
+        promotionId: event.promotionId,
+        parentJobId: event.parentJobId,
+        revisionId: event.revisionId,
+        conditionId: event.conditionId,
+      })
+    )
+      continue;
+    const now = Date.now();
+    let schedulable = points.filter(
+      (point) =>
+        point.state === "pending" &&
+        point.attemptCount < point.maxAttempts &&
+        (!point.nextSubmitAt || new Date(point.nextSubmitAt).getTime() <= now),
+    );
+    if (!schedulable.length) continue;
+    let obligationIds = schedulable.map((point) => point.obligationId);
+    const [continuation] = await precalcContinuationsForObligations(
+      db,
+      obligationIds,
+    );
+    let continueFrom: { engineJobId: string; caseSlug: string } | null = null;
+    let budgetOverrideS: number | null = null;
+    let continuationResultAttemptId: string | null = null;
+    if (continuation) {
+      schedulable = schedulable.filter(
+        (point) => point.obligationId === continuation.obligationId,
+      );
+      obligationIds = [continuation.obligationId];
+      continueFrom = {
+        engineJobId: continuation.engineJobId,
+        caseSlug: continuation.engineCaseSlug,
+      };
+      budgetOverrideS = continuation.budgetOverrideS;
+      continuationResultAttemptId = continuation.resultAttemptId;
+    }
+    const remote = await remoteProvenanceForPromotionObligations(
+      db,
+      obligationIds,
+      event,
+    );
+    if (remote.required && "unavailable" in remote) continue;
+    const target = await resolveTarget(db, event.airfoilId, event.revisionId);
+    if (!target) continue;
+    const aoas = schedulable.map((point) => point.aoaDeg);
+    const outcome = await submitLadderJob(db, engine, {
+      target,
+      aoas,
+      fidelity: "precalc",
+      jobKind: "targeted",
+      campaignId: null,
+      payloadExtras: {
+        ...(remote.required
+          ? {
+              syncPromiseId: remote.syncPromiseId,
+              remoteSolver: remote.remoteSolver,
+              upstreamBaseUrl: remote.upstreamBaseUrl,
+            }
+          : {}),
+        conditionalPromotionId: event.promotionId,
+        parentJobId: event.parentJobId,
+        conditionId: event.conditionId,
+        precalcObligationIds: obligationIds,
+        retryMode: "whole-polar-urans",
+        promotionRequestedAoas: points.map((point) => point.aoaDeg),
+        ...(continuationResultAttemptId
+          ? {
+              continueFromResultAttemptId: continuationResultAttemptId,
+              budgetOverrideS,
+            }
+          : {}),
+      },
+      cpuSlots,
+      continueFrom,
+      budgetOverrideS,
+      recordedPromotion: {
+        promotionId: event.promotionId,
+        parentJobId: event.parentJobId,
+        conditionId: event.conditionId,
+        obligationIds,
+      },
+    });
+    if (outcome.submitted) {
+      await recordPrecalcObligationSubmission(db, outcome.jobId, obligationIds);
+      console.log(
+        `[sweeper] recovered conditional whole-polar promotion ${event.promotionId} directly from its durable ledger through wave-2 child ${outcome.jobId} (parent ${event.parentJobId}, angles [${aoas.join(", ")}])`,
+      );
+      return true;
+    }
+    if (outcome.submissionInProgress) return true;
+  }
+  return false;
+}
 
 /** Tier-2a: re-attempt gated campaign wave-2 retries for campaigns whose RANS
  *  gaps have hit zero. Returns true when a submission happened. */
@@ -343,6 +901,15 @@ async function submitLadderJob(
     uransRequestId?: string;
     /** Claimed automatic full-verification item. */
     verifyQueueId?: string;
+    /** Crash recovery for one normalized whole-polar event. The exact event
+     * and selected obligation ids are revalidated by the child composer in
+     * the same transaction as insertion. */
+    recordedPromotion?: {
+      promotionId: string;
+      parentJobId: string;
+      conditionId: string | null;
+      obligationIds: string[];
+    };
   },
 ): Promise<{
   jobId: string;
@@ -415,6 +982,7 @@ async function submitLadderJob(
       request.budget_override_s = opts.budgetOverrideS;
   }
   const jobValues: typeof simJobs.$inferInsert = {
+    parentJobId: opts.recordedPromotion?.parentJobId ?? null,
     airfoilId: a.id,
     bcIds: [target.bcId],
     simulationPresetRevisionId: target.revisionId,
@@ -449,10 +1017,31 @@ async function submitLadderJob(
         (id): id is string => typeof id === "string",
       )
     : [];
+  if (
+    opts.recordedPromotion &&
+    ([...payloadObligationIds].sort().join(",") !==
+      [...opts.recordedPromotion.obligationIds].sort().join(",") ||
+      payloadObligationIds.length !==
+        opts.recordedPromotion.obligationIds.length)
+  ) {
+    throw new Error(
+      "recorded promotion recovery payload does not match its selected obligation ids",
+    );
+  }
   const job = payloadObligationIds.length
     ? await composePhysicalPrecalcJob(db, {
         obligationIds: payloadObligationIds,
         job: jobValues,
+        ...(opts.recordedPromotion
+          ? {
+              directParent: {
+                parentJobId: opts.recordedPromotion.parentJobId,
+                revisionId: target.revisionId,
+                conditionId: opts.recordedPromotion.conditionId ?? undefined,
+                recordedPromotionId: opts.recordedPromotion.promotionId,
+              },
+            }
+          : {}),
       })
     : (
         await db.insert(simJobs).values(jobValues).returning({ id: simJobs.id })
@@ -912,6 +1501,8 @@ export async function uransLadderTick(
     campaignIds?: string[];
     /** Test-only closed world for tier-2a's finished-parent window. */
     parentJobIds?: string[];
+    /** Test-only closed world for normalized conditional-promotion recovery. */
+    promotionIds?: string[];
     requestIds?: string[];
     verifyIds?: string[];
   } = {},
@@ -932,6 +1523,8 @@ export async function uransLadderTick(
       `[sweeper] URANS requests: ${healedRequests} orphaned running request(s) returned to pending`,
     );
 
+  if (await submitRecordedPromotionRecovery(db, engine, cpuSlots, opts))
+    return true;
   if (
     await submitGatedCampaignRetries(
       db,

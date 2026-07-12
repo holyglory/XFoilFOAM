@@ -28,7 +28,11 @@ from airfoilfoam.models import (
     RoughnessParams,
     SolverParams,
 )
-from airfoilfoam.openfoam.runner import OpenFOAMError, _run_subprocess
+from airfoilfoam.openfoam.runner import (
+    DeterministicMeshError,
+    OpenFOAMError,
+    _run_subprocess,
+)
 from airfoilfoam.pipeline import (
     CaseOutcome,
     TransientResult,
@@ -686,7 +690,7 @@ def test_transient_mesh_qa_gate_fails_prod_degenerate_mesh_before_solver(tmp_pat
     monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
     monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
 
-    with pytest.raises(OpenFOAMError) as err:
+    with pytest.raises(DeterministicMeshError) as err:
         pipeline._run_transient(
             tmp_path / "case",
             airfoil=SimpleNamespace(name="s1223", contour=[]),
@@ -797,7 +801,7 @@ def test_transient_mesh_qa_gate_aspect_plus_other_failure_stays_fatal(tmp_path):
         def application(self, _case_dir, _cmd, *args, **kwargs):
             return SimpleNamespace(ok=False, returncode=1, timed_out=False, stdout=output)
 
-    with pytest.raises(OpenFOAMError, match="Failed 2 mesh checks"):
+    with pytest.raises(DeterministicMeshError, match="Failed 2 mesh checks"):
         pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
 
     degenerate = _ASPECT_ONLY_CHECKMESH.replace("Max: 72.364462", "Max: 88.3")
@@ -806,7 +810,7 @@ def test_transient_mesh_qa_gate_aspect_plus_other_failure_stays_fatal(tmp_path):
         def application(self, _case_dir, _cmd, *args, **kwargs):
             return SimpleNamespace(ok=False, returncode=1, timed_out=False, stdout=degenerate)
 
-    with pytest.raises(OpenFOAMError, match="non-orthogonality"):
+    with pytest.raises(DeterministicMeshError, match="non-orthogonality"):
         pipeline._run_transient_mesh_qa_gate(tmp_path, DegenerateRunner(), [])
 
 

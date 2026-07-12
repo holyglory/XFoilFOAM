@@ -22,7 +22,6 @@ from .models import (
     Polar,
     PolarPoint,
     PolarRequest,
-    ResourcePolicy,
 )
 from .openfoam.runner import OpenFOAMError, get_runner
 from .pipeline import (
@@ -97,6 +96,7 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
             artifact.model_copy(update={"url": url(artifact.path)})
             for artifact in outcome.evidence_artifacts
         ],
+        failure_disposition=outcome.failure_disposition,
         error=outcome.error,
     )
 
@@ -268,6 +268,7 @@ def execute_job(
     render_images = bool(request.solver.write_images)
     results: dict[tuple, dict[float, tuple[str, CaseOutcome]]] = {}
     attempts: dict[tuple, list[tuple[str, CaseOutcome]]] = {}
+    rans_precalc_promotions: dict[tuple, object] = {}
 
     def scheduling_metadata():
         return plan.metadata(
@@ -294,7 +295,16 @@ def execute_job(
                     _outcome_to_point(job_id, slug, outcome)
                     for slug, outcome in attempts.get((chord, speed), [])
                 ]
-                polars.append(Polar(speed=speed, chord=chord, reynolds=re, points=points, attempts=attempt_points))
+                polars.append(
+                    Polar(
+                        speed=speed,
+                        chord=chord,
+                        reynolds=re,
+                        points=points,
+                        attempts=attempt_points,
+                        rans_precalc_promotion=rans_precalc_promotions.get((chord, speed)),
+                    )
+                )
         return polars
 
     def write_partial_result_locked() -> None:
@@ -317,7 +327,13 @@ def execute_job(
                 attempts.setdefault(key, []).append((item.slug, item.outcome))
             write_partial_result_locked()
 
-    use_warm_start = request.solver.warm_start and plan.resolved_policy == ResourcePolicy.airfoil_parallel
+    # Numerical marching is solver intent, not a resource-policy suggestion.
+    # Resource planning may parallelize independent speed polars, but it must
+    # not switch an explicitly marched production polar back to case-parallel
+    # execution and bypass the low-AoA early-abort contract. The internal
+    # direct engine API retains its established cold/case-parallel default;
+    # the Node production builders explicitly set warm_start for polar work.
+    use_warm_start = request.solver.warm_start
 
     if request.continue_from is not None:
         # 2c. CROSS-JOB CONTINUATION: resume the saved (budget-stopped) URANS
@@ -488,14 +504,24 @@ def execute_job(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for fut in as_completed([pool.submit(run_polar, c, s) for c, s in units]):
                 chord, speed, march = fut.result()
-                results[(chord, speed)] = {
-                    item.outcome.spec.aoa_deg: (item.slug, item.outcome)
-                    for item in march.points
-                }
-                attempts[(chord, speed)] = [
-                    (item.slug, item.outcome)
-                    for item in march.attempts
-                ]
+                with lock:
+                    results[(chord, speed)] = {
+                        item.outcome.spec.aoa_deg: (item.slug, item.outcome)
+                        for item in march.points
+                    }
+                    attempts[(chord, speed)] = [
+                        (item.slug, item.outcome)
+                        for item in march.attempts
+                    ]
+                    if march.precalc_promotion is not None:
+                        rans_precalc_promotions[(chord, speed)] = (
+                            march.precalc_promotion
+                        )
+                    # Promotion metadata is execution progress. Publish it as
+                    # soon as this one condition aborts instead of waiting for
+                    # every sibling speed future; Node partial ingest can then
+                    # persist the full obligation event before generic retry.
+                    write_partial_result_locked()
     else:
         # 2b. DEFAULT: every (chord, speed, AoA) is an independent cold case that
         #     reuses the prebuilt mesh; all cases run concurrently (best throughput).
@@ -571,7 +597,10 @@ def execute_job(
     polars = build_polars()
 
     any_ok = any(p.error is None for pol in polars for p in pol.points)
-    state = JobState.completed if any_ok else JobState.failed
+    has_precalc_promotion = any(
+        pol.rans_precalc_promotion is not None for pol in polars
+    )
+    state = JobState.completed if any_ok or has_precalc_promotion else JobState.failed
     result = JobResult(
         job_id=job_id,
         state=state,
@@ -581,8 +610,16 @@ def execute_job(
     store.write_result(result)
     set_status(
         state,
-        message=None if any_ok else "All cases failed",
-        phase=JobPhase.completed if any_ok else JobPhase.failed,
+        message=(
+            "RANS stopped for external preliminary URANS promotion"
+            if has_precalc_promotion
+            else None if any_ok else "All cases failed"
+        ),
+        phase=(
+            JobPhase.completed
+            if any_ok or has_precalc_promotion
+            else JobPhase.failed
+        ),
         active_solver=None,
         active_case_slug=None,
         active_aoa_deg=None,

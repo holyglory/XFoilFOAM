@@ -18,6 +18,41 @@ from typing import Callable
 from ..config import Settings, get_settings
 
 
+class OpenFOAMError(RuntimeError):
+    pass
+
+
+class HardSolverError(OpenFOAMError):
+    """Numerical/aerodynamic solver failure backed by solver evidence."""
+
+
+class DeterministicMeshError(OpenFOAMError):
+    """A repeatable mesh construction or mesh-quality failure."""
+
+
+class InfrastructureError(OpenFOAMError):
+    """Execution environment failure, not aerodynamic solver evidence."""
+
+
+class CommandTimeoutError(InfrastructureError):
+    """An OpenFOAM command exhausted its wall-clock execution budget."""
+
+
+class CommandLaunchError(InfrastructureError):
+    """Shell/container could not launch the requested OpenFOAM command."""
+
+
+class InsufficientMpiSlotsError(InfrastructureError):
+    """The requested MPI rank count exceeds the worker's declared capacity."""
+
+    def __init__(self, *, requested: int, available: int):
+        self.requested = int(requested)
+        self.available = int(available)
+        super().__init__(
+            f"MPI requested {self.requested} process slots but the worker exposes {self.available}"
+        )
+
+
 @dataclass
 class RunResult:
     command: str
@@ -35,12 +70,19 @@ class RunResult:
     def check(self) -> "RunResult":
         if not self.ok:
             tail = "\n".join(self.stdout.splitlines()[-40:])
+            if self.timed_out:
+                raise CommandTimeoutError(
+                    f"Command timed out ({self.returncode}): {self.command}\n{tail}"
+                )
+            # POSIX shell 126/127 and Docker 125 are launch/runtime plumbing
+            # failures, not solver numerics.  The exit code is structured
+            # process evidence; no user-facing log text is parsed.
+            if self.returncode in {125, 126, 127}:
+                raise CommandLaunchError(
+                    f"Command could not be launched ({self.returncode}): {self.command}\n{tail}"
+                )
             raise OpenFOAMError(f"Command failed ({self.returncode}): {self.command}\n{tail}")
         return self
-
-
-class OpenFOAMError(RuntimeError):
-    pass
 
 
 _ACTIVE_PROCESS_GROUPS: set[int] = set()
@@ -217,6 +259,11 @@ class Runner:
         """
         if n_proc <= 1:
             return self.run(case_dir, app, timeout=timeout, monitor=monitor)
+        settings = getattr(self, "settings", None)
+        if settings is not None:
+            available = int(settings.resolved_worker_cpu_budget())
+            if n_proc > available:
+                raise InsufficientMpiSlotsError(requested=n_proc, available=available)
         decompose = "decomposePar -latestTime -force" if restart else "decomposePar -force"
         steps = (
             f"{decompose} && "
