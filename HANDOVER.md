@@ -8,27 +8,39 @@ snapshot in Git history. Read the 2026-07-12 and 2026-07-11 entries at the top o
 
 - Campaign `b96594a6-e0bf-40ce-b3c6-5dee77b35116`
   (`production-campaign-20260710`) is **cancelled and must not be resumed**.
-- `sweeper_state.enabled` is `false`, and the `app-sweeper-1` container is
-  deliberately stopped. Setting the database flag alone does not stop media
-  repair/reconciliation, so keep the process stopped through migration 0057,
-  the full cache backfill, and invariant audit. The latest check found zero
-  active `sim_jobs` and no OpenFOAM, meshing, decomposition, or reconstruction
-  processes in the worker container.
+- `sweeper_state.enabled` is `false`. The `app-sweeper-1` container is now
+  intentionally running only for reconciliation, retention, and exact-media
+  repair; it must not be enabled for scheduling. Nine observed post-start
+  samples kept active `sim_jobs` and the engine queue at zero. Exact selected
+  pointers remained 575 (558 accepted, 17 provisional) with zero invalid
+  selections, selected URANS missing exact video, pointer-null usable
+  projections, dual-owned usable classifications, or invalid repair owners.
+  At the 19:36 UTC audit, repair state had moved from 6 done / 608 pending to
+  12 done / 609 pending after discovery of seven additional real obligations;
+  no repair retried or blocked.
 - Forty-two verification rows remain as cancelled audit history.
 - There are no active, attention, or paused campaigns. The cancelled campaign
   is the only campaign row.
-- Current engine build at the last verified production snapshot was
-  `prod-20260711-argate`. Commit `725cdf5` deployed the Node control plane and
-  migrated production through 0056; GitHub Actions run `29192996322` / job
-  `86650864629` succeeded. The Python controller is committed but has not
-  replaced the engine image, and no production solver canary is recorded.
-- Post-0056 media repair exposed a selected-generation race: 44 selected URANS
-  attempts lacked video owned by that exact attempt, and six had already been
-  reclassified rejected while remaining selected. The sweeper was stopped
-  before more scopes could be exposed. Migration/runtime correction 0057 is
-  implemented and verified locally but is not yet deployed at this handover
-  snapshot.
-- Root disk was 43% used (121 GiB of 296 GiB) at the latest check.
+- Production is migrated through 0057 and its full 47/47 polar-cache backfill
+  completed with zero failures. Commit `3cb679b` is deployed. The resulting
+  selected-generation audit has zero violations and remains clean while media
+  repair runs.
+- Current engine build is `prod-20260712-mpi-9d3de67`. Commits `d7c78ac`
+  (logical-CPU MPI slots) and `9d3de67` (deploy-time sweeper-state preservation)
+  were pushed to `master`; GitHub Actions run `29205593733` / job `86684371758`
+  succeeded. The guarded engine rebuild completed with all three idle checks,
+  matching build IDs in API/worker/Node, and preserved the sweeper's
+  then-stopped canary state.
+- The production Clark Y AoA 15° forced-precalc canary completed in 3 minutes
+  22 seconds. It used eight bounded MPI ranks, one automatic same-case
+  continuation, and no external retry. The accepted `urans_precalc` point was
+  stationary with 7.97 periods in its statistics window. Its final three-cycle
+  force/media window published 71 real frame samples (23.7 per cycle) and 568
+  stored field-frame images, plus all eight requested instantaneous/mean/video
+  products, a 1,647-file checksummed evidence manifest, and a 107,030,967-byte
+  OpenFOAM bundle. Strict result and manifest contracts both passed; there was
+  no budget, continuation-required, or media-failure marker.
+- Root disk was 46.1% used with 158.9 GB free at the latest sweeper check.
 - The admin server-health page/API shipped separately in commit `bffc25c`
   (`Add admin server health monitoring`). Use `/admin?section=health` to read
   live host/build state; do not infer deployment from this worktree.
@@ -130,9 +142,12 @@ repeated S1223 work was deterministic waste, not transient solver recovery.
   active solver jobs, deletes only target-exclusive physical work, and
   preserves every shared or historical outside owner.
 
-## Verification status before the 0057 production rollout
+## Verification and production rollout status
 
-- Python: 400 passed, 1 skipped, 6 integration tests deselected.
+- Python on the final MPI/deploy-safety tree: 411 passed, 1 skipped, 6
+  integration tests deselected. The focused launcher/resource/deploy harness
+  passed 20/20, including realistic stopped/running sweeper restoration,
+  unknown-state refusal, and the post-stop queue-arrival race.
 - Full package suites recorded green before the correction: core 119 and web 272. The final clean-0057 API run passed 18/18 files and 218/218 tests; the
   final clean-0057 DB run passed 9/9 files and 51/51 tests.
 - Full sweeper on a freshly migrated/seeded 0057 database passed 25/25 files
@@ -170,9 +185,14 @@ repeated S1223 work was deterministic waste, not transient solver recovery.
   with zero critical findings. Its only overlap allowance is attached to the
   polar toolbar itself: the fixed top navigation intentionally covers ordinary
   document content after that content has scrolled underneath it.
-- Commit/push status for 0057 is owned by the root task. The 0057 production
-  migration/backfill, live-production invariant audit, engine rebuild, and
-  isolated OpenFOAM canary are **not** claimed here.
+- Production 0057 migration, 47/47 cache backfill, exact-pointer audit, guarded
+  engine rebuild, and isolated OpenFOAM canary are complete. The first canary
+  (`558386ae9e6245bab9778b71ef68bc5c`) is retained failed evidence of the
+  original MPI-slot defect; the successful canary
+  (`4c51f97efc474264b1eafbf9a96b70a1`) is also retained temporarily. Both are
+  engine-only, terminal, and process-free. The retention API correctly refused
+  deletion until its six-hour fresh-lock window expires; do not remove their
+  lock files to bypass that safety guard.
 - The default local `aerodb` database contains an obsolete, never-committed
   intermediate 0047 shape. Do not treat it as migration evidence and do not add
   compatibility SQL for it. Use a new scratch database migrated from 0000.
@@ -190,9 +210,22 @@ repeated S1223 work was deterministic waste, not transient solver recovery.
 - Engine rollout must use `scripts/deploy/rebuild-engine.sh <build-id>` only,
   after an explicit idle-process check and a fresh verified PostgreSQL
   backup/test restore. Never run raw `docker compose ... --force-recreate api
-worker`.
-- Keep the sweeper disabled after deployment. Do not launch or resume the old
-  campaign. A solver proof must be a deliberately isolated canary.
+  worker`.
+- Both deploy scripts preserve whether the sweeper was running or stopped. A
+  stopped sweeper is recreated with `--no-start`; an unreadable state aborts
+  before build/mutation. Keep database scheduling disabled and do not launch or
+  resume the old campaign. The running sweeper process is currently limited to
+  repair/reconciliation by `sweeper_state.enabled=false`.
+
+Fresh verified post-0057/post-backfill backup retained on the VPS and copied to
+`/tmp/airfoils-prod-backups` locally:
+
+- Container: `a7136886aaae13b40972c2c72395b2902238f8d759f29140e9688cd597a653e5`
+- Dump: `/opt/airfoils-pro/.codex-db-backups/app-postgres-1-aerodb-20260712T143755Z-b488723c.dump`
+- Bytes: `62,351,400`
+- SHA-256: `e0ac9bd53bb5627806fe8fc70ff45c4a11ffd2c9b9be5364dfca7dc59964d6ef`
+- File mode is `0600`; strong verification restored all 66 tables into
+  disposable database `codex_verify_f2e3e8ceef9c`.
 
 Fresh verified post-0056/pre-0057 backup retained on the VPS and copied to
 `/tmp/airfoils-prod-backups` locally:
@@ -220,8 +253,8 @@ The earlier verified pre-remediation backup is also retained:
 - SHA-256: `5a810d3bc2e853223fe0c748f529a8a55dc67a716bb9893582c0636732c3a0b0`
 - A test restore succeeded.
 
-After rollout, remove temporary `/tmp/postgres_docker_backup.py` and
-`/tmp/adm.token` from the VPS.
+Temporary `/tmp/postgres_docker_backup.py` and `/tmp/adm.token` were removed
+from the VPS after rollout. Do not recreate a persistent admin-token file.
 
 ## Open decisions and residual risk
 
@@ -260,8 +293,10 @@ After rollout, remove temporary `/tmp/postgres_docker_backup.py` and
   Per-solver revocable credentials add provisioning and rotation work but give
   isolated attribution and revocation; they are recommended before federation
   expands and require an owner decision.
-- The new controller remains unproven on real production OpenFOAM until the
-  isolated post-deploy canary succeeds.
+- The controller is proven for one isolated production AoA 15° precalc case,
+  including same-case continuation and complete evidence/media. That is a
+  release canary, not statistical performance proof across airfoils, Reynolds
+  numbers, mesh profiles, or attached-flow conditions.
 - **Scheduler-policy conflict must be resolved before a new campaign.** The
   2026-07-07 decision record says the background fidelity ladder retries only
   the rejected/provisional angles, which is faster and cheaper but can leave

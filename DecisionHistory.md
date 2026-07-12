@@ -1,5 +1,86 @@
 # Decision History
 
+## 2026-07-12 — Production precalc canary validates logical-CPU MPI and exact evidence
+
+- Production reproduction: isolated Clark Y AoA 15° forced-precalc job
+  `558386ae9e6245bab9778b71ef68bc5c` failed in about four seconds with
+  `URANS transient produced no coefficient.dat`. Its OpenFOAM logs showed the
+  real preceding failure on every parallel SIMPLE/PIMPLE launch: Open MPI
+  refused `-np 8` because it auto-discovered four physical-core slots. The
+  worker cgroup, `nproc`, resource planner, CPU-token lease, and request all
+  correctly exposed/budgeted eight logical CPUs (four cores with two hardware
+  threads each). This was a launcher/topology-unit mismatch, not a URANS
+  stationarity, Courant, or convergence failure.
+- Decision: the one centralized parallel solver command uses Open MPI's
+  `--use-hwthread-cpus`, so its auto-discovered slots use the same real logical
+  CPU unit as scheduling and token accounting. It still requests exactly the
+  bounded `n_proc` value and deliberately does not enable oversubscription.
+  Reducing every eight-CPU request to four ranks would hide the unit mismatch
+  and leave schedulable hardware unused; permitting oversubscription would let
+  future requests exceed the worker's CPU budget. Counting the eight real
+  hardware threads is the recommended correctness fix. Separate performance
+  measurement may still choose fewer ranks for a particular 2D mesh because
+  launch correctness does not prove eight ranks is the fastest configuration.
+- Same-environment proof before rebuild: the old command returned code 1 with
+  “not enough slots”; the corrected command launched exactly eight ranks in the
+  idle production worker. Repository-wide audit found no second MPI launcher:
+  transient initialization, URANS, cold RANS, and marched RANS all use
+  `Runner.solver`, with matching decomposition and CPU-token leases.
+- Deployment guardrail discovered during the rollout: both control-plane and
+  engine deploy scripts stopped the sweeper for migration/idle proof and then
+  started it unconditionally. That could silently undo an intentionally
+  stopped incident/canary state. Both scripts now capture the pre-deploy state,
+  fail closed if it cannot be read, restore a previously running sweeper, and
+  recreate a previously stopped sweeper with `--no-start`. Engine idle-refusal
+  paths restore that exact prior state before exiting and leave both build IDs
+  unchanged. This is operational correctness, not a new scheduling-policy
+  choice.
+- Recall/false-positive proof: executable deploy harnesses cover running and
+  stopped success paths, an unreadable state probe, and the original race shape
+  where engine work arrives only after image build and sweeper stop. The latter
+  exits 12, never recreates API/worker/Node, never starts an initially stopped
+  sweeper, restores an initially running one, and byte-preserves both old build
+  IDs. Launcher tests assert the exact eight-rank command, reject
+  oversubscription, preserve latest-time restart decomposition, and keep serial
+  solves MPI-free. Final Python gate: 411 passed, 1 skipped, 6 integration tests
+  deselected; focused launcher/resource/deploy tests: 20/20.
+- Release: commits `d7c78ac` and `9d3de67` were pushed to `master`. GitHub
+  Actions run `29205593733` / job `86684371758` deployed the control plane in
+  23 seconds and proved the stopped sweeper remained `Created`, not running.
+  `scripts/deploy/rebuild-engine.sh prod-20260712-mpi-9d3de67` then passed all
+  idle samples, updated API/worker/Node build expectations together, verified
+  engine and Node health, and again preserved the stopped sweeper. Source
+  hashes and installed generated MPI command matched the committed tree.
+- Exact production canary `4c51f97efc474264b1eafbf9a96b70a1` reused the
+  failed job's stored request byte-for-byte. It completed in 3 minutes 22
+  seconds with eight bounded ranks and one automatic continuation of the same
+  restartable trajectory; no external retry or copied rerun occurred. The
+  result was machine-accepted `urans_precalc`; its stationary statistics window
+  reported 7.97 periods. The final three-cycle force/media window contained 71
+  real frame samples (23.7 per cycle) and consistent force history. It stored
+  all eight requested instantaneous, mean, and video fields, 568 field-frame
+  images, a 1,647-file checksummed manifest, and a 107,030,967-byte OpenFOAM
+  bundle. Strict result and manifest contracts passed with no budget-stop,
+  further-continuation, or media-failure marker. This proves a fast reliable
+  preliminary result for this production case without human review; it is not
+  statistical proof for every airfoil/setup.
+- Post-canary reconciliation ran with `sweeper_state.enabled=false`. Nine
+  observed samples kept active control-plane jobs and engine queue work at
+  zero. Exact public selections stayed 575 (558 accepted, 17 provisional) with
+  zero invalid selections, selected URANS missing video, pointer-null usable
+  projections, dual-owned usable classifications, or invalid repair owners.
+  Media repair discovered seven real additional obligations and advanced from
+  6 to 12 done without retry/block while public truth remained stable.
+- The failed and successful canary directories are terminal and process-free,
+  but the engine retention API correctly refused deletion during its six-hour
+  fresh-lock window. Their locks were not removed or bypassed. The production
+  campaign remains cancelled and scheduling remains disabled. A new campaign
+  remains blocked on the separately recorded owner choice between targeted
+  angle-only URANS escalation (less compute, mixed/provisional polar risk) and
+  the current whole-polar URANS rule after a 0–5° RANS failure (more compute,
+  one coherent transient polar); recommendation remains the current
+  whole-polar rule unless the owner explicitly chooses otherwise.
+
 ## 2026-07-12 — Migration 0057 reasserts exact selected-result truth after every writer
 
 - Production trigger: the 0056 rollout exposed a repeatable selected-generation
