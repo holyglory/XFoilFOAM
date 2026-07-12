@@ -29,5 +29,22 @@ describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
       expect(serviceBlock(source, "worker")).not.toContain(mount);
       expect(source).toMatch(/^  sync_imports:\s*$/m);
     });
+
+    it("initializes the nested mountpoint before a read-only results mount can hide it", () => {
+      const source = readFileSync(resolve(repoRoot, filename), "utf8");
+
+      expect(serviceBlock(source, "storage-init")).toContain(
+        "results:/data/airfoilfoam",
+      );
+      expect(serviceBlock(source, "storage-init")).toContain(
+        "install -d -m 0755 /data/airfoilfoam/sync-imports",
+      );
+      expect(serviceBlock(source, "node-api")).toMatch(
+        /storage-init:\n\s+condition: service_completed_successfully/,
+      );
+      expect(serviceBlock(source, "sweeper")).toMatch(
+        /storage-init:\n\s+condition: service_completed_successfully/,
+      );
+    });
   },
 );

@@ -79,6 +79,15 @@ services:
       timeout: 3s
       retries: 10
 
+  # The nested writable import volume needs this mountpoint in the parent
+  # results volume before node-api mounts that parent read-only after a reset.
+  storage-init:
+    image: alpine:3.20
+    restart: "no"
+    command: ["sh", "-ec", "install -d -m 0755 /data/airfoilfoam/sync-imports"]
+    volumes:
+      - results:/data/airfoilfoam
+
   node-api:
     build:
       context: .
@@ -100,6 +109,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
     healthcheck:
       test:
         [
@@ -144,6 +155,8 @@ services:
         condition: service_healthy
       node-api:
         condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
 
 volumes:
   results:
