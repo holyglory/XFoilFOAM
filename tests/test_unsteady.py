@@ -1,5 +1,6 @@
 """Unit tests for URANS force-history + Strouhal extraction (no OpenFOAM needed)."""
 import math
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,8 @@ from airfoilfoam.postprocess.images import find_all_vtus, select_vtus
 from airfoilfoam.models import CaseSpec, FailureDisposition
 from airfoilfoam.openfoam.runner import (
     DeterministicMeshError,
+    HardSolverError,
+    InfrastructureError,
     InsufficientMpiSlotsError,
     RunResult,
 )
@@ -550,6 +553,30 @@ def test_marched_watchdog_divergence_is_hard_solver_failure_and_promotes(tmp_pat
     assert result.promoted_to_urans
     assert len(result.attempts) == 1
     assert result.attempts[0].outcome.failure_disposition == FailureDisposition.hard_solver
+
+
+def test_sigfpe_is_hard_solver_evidence_but_other_signals_remain_infrastructure(tmp_path):
+    """MUST-CATCH: the production-shaped simpleFoam SIGFPE is numerical
+    evidence; a generic process signal with the same log wording is not."""
+    with pytest.raises(HardSolverError, match="SIGFPE"):
+        pipeline._checked_solver_result(
+            tmp_path,
+            RunResult(
+                command="simpleFoam",
+                returncode=-signal.SIGFPE,
+                stdout="FOAM FATAL ERROR: Floating point exception",
+            ),
+        )
+
+    with pytest.raises(InfrastructureError):
+        pipeline._checked_solver_result(
+            tmp_path,
+            RunResult(
+                command="simpleFoam",
+                returncode=-signal.SIGTERM,
+                stdout="FOAM FATAL ERROR: Floating point exception",
+            ),
+        )
 
 
 def test_marched_sweep_cancellation_is_not_promoted_to_urans(tmp_path, monkeypatch):

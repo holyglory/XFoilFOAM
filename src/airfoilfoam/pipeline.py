@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import tarfile
 import time
@@ -298,16 +299,22 @@ def _checked_solver_result(case_dir: Path, result: RunResult) -> RunResult:
     """Check one solver result while preserving machine-readable provenance.
 
     ``RunResult.timed_out`` is authoritative execution evidence and is checked
-    before a possibly stale divergence marker.  A non-timeout solver exit is a
-    hard numerical failure only after the watchdog marker (when present) has
-    supplied its precise reason.  No display-string parsing participates in
-    this classification.
+    before a possibly stale divergence marker. A solver process killed by the
+    operating system's SIGFPE is also structured numerical evidence: this
+    function is called only for the RANS/URANS solver process, and SIGFPE is
+    distinct from shell launch, timeout, or worker failures. Other non-zero
+    exits remain fail-closed infrastructure errors. No display-string parsing
+    participates in this classification.
     """
     if getattr(result, "timed_out", False):
         # RunResult.check raises CommandTimeoutError from the typed flag.
         result.check()
     if not result.ok:
         _raise_if_condemned(case_dir)
+        if result.returncode == -signal.SIGFPE:
+            raise HardSolverError(
+                f"OpenFOAM solver terminated with SIGFPE: {result.command}"
+            )
         try:
             result.check()
         except InfrastructureError:
