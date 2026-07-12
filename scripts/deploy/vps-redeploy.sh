@@ -25,6 +25,32 @@ compose() {
   "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
 }
 
+capture_sweeper_state() {
+  local running_ids
+  if ! running_ids="$(compose ps --status running -q sweeper)"; then
+    echo "Could not determine whether the sweeper is running; refusing deploy." >&2
+    return 12
+  fi
+  if [[ -n "$running_ids" ]]; then
+    printf 'running\n'
+  else
+    printf 'stopped\n'
+  fi
+}
+
+restore_sweeper_state() {
+  local initial_state="$1"
+  if [[ "$initial_state" == "running" ]]; then
+    echo "Restoring the previously running sweeper..."
+    compose up -d --no-deps sweeper
+  else
+    echo "Preserving the intentionally stopped sweeper..."
+    # Recreate the stopped container so its image/config are current without
+    # opening even a brief scheduling or reconciliation window.
+    compose up --no-start --no-deps --force-recreate sweeper
+  fi
+}
+
 openfoam_processes() {
   compose exec -T worker sh -lc 'pgrep -af "[s]impleFoam|[p]impleFoam|[s]nappyHexMesh|[b]lockMesh|[d]ecomposePar|[r]econstructPar|[f]oamRun|[f]oamJob" || true' 2>/dev/null || true
 }
@@ -55,6 +81,10 @@ main() {
   echo "Airfoils.Pro deploy starting in $APP_DIR"
   echo "Compose project: $COMPOSE_PROJECT_NAME"
 
+  local sweeper_initial_state
+  sweeper_initial_state="$(capture_sweeper_state)"
+  echo "Sweeper state before deploy: $sweeper_initial_state"
+
   if [[ "${DEPLOY_OPENFOAM_SERVICES:-0}" == "1" ]]; then
     echo "Refusing DEPLOY_OPENFOAM_SERVICES=1 in the control-plane deploy." >&2
     echo "Use scripts/deploy/rebuild-engine.sh <build-id>; it owns the queue/process idle guards and coordinated build-id cutover." >&2
@@ -78,9 +108,10 @@ main() {
 
   # The node-api runs database migrations during startup.  Stop the old
   # sweeper before that cutover so an older writer cannot ingest evidence into
-  # a newly migrated schema between the migration commit and the new sweeper
-  # starting.  This stops only control-plane scheduling/ingest; api, worker,
-  # and any live OpenFOAM child processes remain untouched.
+  # a newly migrated schema between the migration commit and restoring the
+  # sweeper's prior running/stopped state. This stops only control-plane
+  # scheduling/ingest; api, worker, and any live OpenFOAM child processes
+  # remain untouched.
   echo "Quiescing the old sweeper before database migration..."
   compose stop sweeper
 
@@ -88,8 +119,9 @@ main() {
   compose up -d --no-deps node-api
   wait_http "node-api" "http://127.0.0.1:4000/health" 90
 
-  echo "Restarting web and sweeper only..."
-  compose up -d --no-deps web sweeper
+  echo "Restarting web..."
+  compose up -d --no-deps web
+  restore_sweeper_state "$sweeper_initial_state"
   wait_http "web" "http://127.0.0.1:3100/health" 90
 
   echo "Skipping api/worker redeploy. Engine maintenance is available only through scripts/deploy/rebuild-engine.sh."

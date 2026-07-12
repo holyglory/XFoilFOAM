@@ -57,6 +57,42 @@ compose() {
   "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
 }
 
+capture_sweeper_state() {
+  local running_ids
+  if ! running_ids="$(compose ps --status running -q sweeper)"; then
+    echo "Could not determine whether the sweeper is running; refusing engine rebuild." >&2
+    return 12
+  fi
+  if [[ -n "$running_ids" ]]; then
+    printf 'running\n'
+  else
+    printf 'stopped\n'
+  fi
+}
+
+restore_sweeper_after_refusal() {
+  local initial_state="$1"
+  if [[ "$initial_state" == "running" ]]; then
+    compose up -d --no-deps sweeper || true
+  else
+    compose stop sweeper || true
+  fi
+}
+
+restore_sweeper_after_rebuild() {
+  local initial_state="$1"
+  if [[ "$initial_state" == "running" ]]; then
+    echo "Restoring the previously running sweeper..."
+    compose up -d --no-deps --force-recreate sweeper
+  else
+    echo "Preserving the intentionally stopped sweeper..."
+    # Bake the new build-id environment into a replacement container, but do
+    # not start it. A later intentional `compose up -d sweeper` then uses the
+    # same verified engine generation without a stale-id transition.
+    compose up --no-start --no-deps --force-recreate sweeper
+  fi
+}
+
 openfoam_processes() {
   compose exec -T worker sh -lc \
     'pgrep -af "[s]impleFoam|[p]impleFoam|[p]otentialFoam|[s]nappyHexMesh|[s]urfaceFeatureExtract|[b]lockMesh|[c]heckMesh|[d]ecomposePar|[r]econstructPar|[r]enumberMesh|[m]apFields|[p]ostProcess|[f]oamToVTK|[f]oamRun|[f]oamJob" || true'
@@ -142,6 +178,10 @@ main() {
 
   echo "Engine rebuild starting: BUILD_ID=$BUILD_ID"
 
+  local sweeper_initial_state
+  sweeper_initial_state="$(capture_sweeper_state)"
+  echo "Sweeper state before engine rebuild: $sweeper_initial_state"
+
   # 1. Refuse maintenance while a solve is active. The check is repeated
   #    after the potentially long image build so a solve that started during
   #    that window cannot be terminated by the recreate below.
@@ -156,11 +196,11 @@ main() {
   # Freeze scheduling before the final idle proof. Leaving the old sweeper
   # live between that proof and force-recreate would let it submit a new solve
   # which the worker recreate then kills. A refused maintenance action occurs
-  # before either build-id setting changes, so it is safe to restart the old
-  # sweeper in that one path.
+  # before either build-id setting changes, so it is safe to restore the old
+  # sweeper's prior running/stopped state in that one path.
   compose stop sweeper
   if ! require_idle_worker "before service recreate"; then
-    compose up -d --no-deps sweeper || true
+    restore_sweeper_after_refusal "$sweeper_initial_state"
     exit 12
   fi
   # A submit HTTP request sent just before the sweeper stopped can finish in
@@ -168,7 +208,7 @@ main() {
   # before mutating env or recreating either engine service.
   sleep 2
   if ! require_idle_worker "stabilized before service recreate"; then
-    compose up -d --no-deps sweeper || true
+    restore_sweeper_after_refusal "$sweeper_initial_state"
     exit 12
   fi
 
@@ -206,7 +246,7 @@ main() {
   echo "Engine serves build_id=$BUILD_ID"
 
   wait_http "node-api" "http://127.0.0.1:4000/health" 90
-  compose up -d --no-deps --force-recreate sweeper
+  restore_sweeper_after_rebuild "$sweeper_initial_state"
 
   # 6. Requeue jobs orphaned by the worker restart. Requires an admin session
   #    cookie (aero_admin=<token>) in ADMIN_COOKIE. Manual fallback: log into
