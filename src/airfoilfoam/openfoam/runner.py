@@ -220,7 +220,14 @@ class Runner:
         decompose = "decomposePar -latestTime -force" if restart else "decomposePar -force"
         steps = (
             f"{decompose} && "
-            f"mpirun --allow-run-as-root -np {n_proc} {app} -parallel && "
+            # Resource planning counts the logical CPUs exposed by the worker
+            # cgroup (the same units reported by os.cpu_count/nproc). OpenMPI
+            # defaults its local slot count to physical cores, so an 8-vCPU
+            # SMT worker otherwise refuses `-np 8` despite having exactly
+            # eight schedulable hardware threads. Use those real threads as
+            # slots; do not use --oversubscribe, which could launch more solver
+            # ranks than the worker's bounded CPU budget.
+            f"mpirun --allow-run-as-root --use-hwthread-cpus -np {n_proc} {app} -parallel && "
             f"reconstructPar -latestTime"
         )
         return self.run(case_dir, steps, timeout=timeout, monitor=monitor)
