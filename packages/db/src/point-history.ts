@@ -14,7 +14,11 @@
 // Status buckets are derived in ONE SQL expression shared by the chip counts
 // and the page filter so the numbers always describe exactly the rows listed.
 // ---------------------------------------------------------------------------
-import { URANS_BUDGET_STOP_MARKER } from "@aerodb/core";
+import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+  isDeterministicMeshBlockerError,
+} from "@aerodb/core";
 import { sql } from "drizzle-orm";
 
 import {
@@ -25,12 +29,21 @@ import {
   type CampaignErrorClass,
 } from "./campaigns";
 import type { DB } from "./client";
+import { lockPrecalcCells } from "./precalc-cell-lock";
 
 /** Filterable status buckets. 'rejected' is a DEPRECATED alias kept for old
  *  links/clients: it matches every done+physics-rejected row, i.e. the union
  *  the amendment-A semantic split ('awaiting_urans' violet vs the rejected
  *  part of 'needs_review' red) replaced in the UI. */
-export const POINT_HISTORY_BUCKETS = ["failed", "rejected", "awaiting_urans", "needs_review", "accepted", "needs_urans", "solving"] as const;
+export const POINT_HISTORY_BUCKETS = [
+  "failed",
+  "rejected",
+  "awaiting_urans",
+  "needs_review",
+  "accepted",
+  "needs_urans",
+  "solving",
+] as const;
 export type PointHistoryBucket = (typeof POINT_HISTORY_BUCKETS)[number];
 
 /** Single source of truth for the status chips AND the bucket filter.
@@ -53,57 +66,94 @@ END`;
 // Amendment-A semantic split, applied to RAW results rows — the same rule the
 // campaign payloads derive from sim_campaign_points (see the canonical
 // definition + rationale in urans-ladder.ts campaignReviewBucketRows):
-//   awaiting_urans — done + rejected at fidelity 'rans' (or NULL = pre-ladder
-//     steady rows): the stage-2 queue, violet, no repair verbs.
-//   needs_review — failed rows (post-auto-retry survivors + pre-feature
-//     failures) PLUS done + rejected urans_* rows with nothing further
-//     scheduled (no open verify item, no open request-URANS item covering the
-//     cell; an in-flight re-solve already left the done+rejected shape).
+//   awaiting_urans — done + rejected at fidelity 'rans' (or NULL on a row not
+//     explicitly marked URANS): the stage-2 queue, violet, no repair verbs.
+//   needs_review — reserved for an explicit future evidence-adjudication
+//     workflow. Solver crashes, setup/mesh defects, exhausted period
+//     acquisition and missing media are machine failures: they stay visible
+//     under failed/rejected/all and Solver Work's blocked state, but never ask
+//     a human to repair them by reviewing coefficients.
 // ---------------------------------------------------------------------------
-const AWAITING_URANS_RESULT_SQL = sql`(
-  r.status = 'done' AND rc.state = 'rejected' AND (r.fidelity = 'rans' OR r.fidelity IS NULL)
-)`;
-
-const URANS_REJECTED_UNSCHEDULED_SQL = sql`(
-  r.status = 'done' AND rc.state = 'rejected' AND r.fidelity LIKE 'urans%'
-  AND NOT EXISTS (
-    SELECT 1 FROM sim_urans_verify_queue q
-    WHERE q.airfoil_id = r.airfoil_id AND q.revision_id = r.simulation_preset_revision_id
-      AND q.aoa_deg = r.aoa_deg AND q.state IN ('pending', 'running')
+const BLOCKED_WORK_SQL = sql`(
+  EXISTS (
+    SELECT 1 FROM sim_precalc_obligations blocked_obligation
+    WHERE blocked_obligation.airfoil_id = r.airfoil_id
+      AND blocked_obligation.revision_id = r.simulation_preset_revision_id
+      AND blocked_obligation.aoa_deg = r.aoa_deg
+      AND blocked_obligation.state = 'blocked'
   )
-  AND NOT EXISTS (
-    SELECT 1 FROM sim_urans_requests req
-    WHERE req.airfoil_id = r.airfoil_id AND req.revision_id = r.simulation_preset_revision_id
-      AND (req.aoa_deg = r.aoa_deg OR req.aoa_deg IS NULL)
-      AND req.state IN ('pending', 'running')
+  OR EXISTS (
+    SELECT 1 FROM sim_urans_verify_queue blocked_verify
+    WHERE blocked_verify.airfoil_id = r.airfoil_id
+      AND blocked_verify.revision_id = r.simulation_preset_revision_id
+      AND blocked_verify.aoa_deg = r.aoa_deg
+      AND blocked_verify.state = 'blocked'
   )
 )`;
 
-const NEEDS_REVIEW_RESULT_SQL = sql`(r.status = 'failed' OR ${URANS_REJECTED_UNSCHEDULED_SQL})`;
+const SCHEDULED_WORK_SQL = sql`(
+  EXISTS (
+    SELECT 1 FROM sim_precalc_obligations open_obligation
+    WHERE open_obligation.airfoil_id = r.airfoil_id
+      AND open_obligation.revision_id = r.simulation_preset_revision_id
+      AND open_obligation.aoa_deg = r.aoa_deg
+      AND open_obligation.state IN ('pending', 'running')
+  )
+  OR EXISTS (
+    SELECT 1 FROM sim_urans_requests open_request
+    WHERE open_request.airfoil_id = r.airfoil_id
+      AND open_request.revision_id = r.simulation_preset_revision_id
+      AND (open_request.aoa_deg = r.aoa_deg OR open_request.aoa_deg IS NULL)
+      AND open_request.state IN ('pending', 'running')
+  )
+  OR EXISTS (
+    SELECT 1 FROM sim_urans_verify_queue open_verify
+    WHERE open_verify.airfoil_id = r.airfoil_id
+      AND open_verify.revision_id = r.simulation_preset_revision_id
+      AND open_verify.aoa_deg = r.aoa_deg
+      AND open_verify.state IN ('pending', 'running')
+  )
+)`;
 
-/** Refined review bucket of a row (NULL for rows in neither): rides every page
- *  row so the web recolors without re-deriving the rule client-side. A
- *  urans-rejected row with an open verify/request item is neither — it is
- *  still in the pipeline. */
-const REVIEW_BUCKET_SQL = sql`CASE
-  WHEN ${AWAITING_URANS_RESULT_SQL} THEN 'awaiting_urans'
-  WHEN ${NEEDS_REVIEW_RESULT_SQL} THEN 'needs_review'
+const WORK_DISPOSITION_SQL = sql`CASE
+  WHEN ${BLOCKED_WORK_SQL} THEN 'blocked'
+  WHEN ${SCHEDULED_WORK_SQL} THEN 'scheduled'
   ELSE NULL
 END`;
 
-/** Continuable (amendment C): a rejected urans_* row whose solve was stopped
- *  by the engine's wall-clock budget guard (quality-warning marker) and whose
- *  saved case state is addressable (engine ids present) can be RESUMED with an
- *  increased budget. Substring match — the marker sits inside the engine's
- *  measured-periods sentence. */
+const AWAITING_URANS_RESULT_SQL = sql`(
+  r.status = 'done' AND rc.state = 'rejected'
+  AND (
+    r.fidelity = 'rans'
+    OR (r.fidelity IS NULL AND r.regime IS DISTINCT FROM 'urans')
+  )
+  AND ${SCHEDULED_WORK_SQL}
+)`;
+
+/** Continuable (amendment C): a rejected urans_* row whose engine warning says
+ * either (a) wall-clock budget stopped a restartable solve or (b) the bounded
+ * in-run controller still requires same-case integration, and whose saved case
+ * state is addressable. This is machine/action time, never human review. */
 export const CONTINUABLE_SQL = sql`(
   r.status = 'done' AND rc.state = 'rejected' AND r.fidelity LIKE 'urans%'
   AND r.engine_job_id IS NOT NULL AND r.engine_case_slug IS NOT NULL
   AND EXISTS (
     SELECT 1 FROM unnest(COALESCE(r.quality_warnings, ARRAY[]::text[])) w
     WHERE w LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+       OR w LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
   )
 )`;
+
+const NEEDS_REVIEW_RESULT_SQL = sql`FALSE`;
+
+/** Rolling-compatibility ladder bucket of a row (NULL for rows in neither).
+ *  `needs_review` has an empty canonical predicate; machine failures are
+ *  reported through status and workDisposition. */
+const REVIEW_BUCKET_SQL = sql`CASE
+  WHEN ${AWAITING_URANS_RESULT_SQL} THEN 'awaiting_urans'
+  WHEN ${NEEDS_REVIEW_RESULT_SQL} THEN 'needs_review'
+  ELSE NULL
+END`;
 
 export interface PointHistoryCursor {
   /** Raw timestamp text carried losslessly back to Postgres. The sort key is
@@ -116,7 +166,11 @@ export interface PointHistoryCursor {
   rowKey: string;
 }
 
-export const POINT_VERIFY_FILTERS = ["pending", "disagreed"] as const;
+export const POINT_VERIFY_FILTERS = [
+  "pending",
+  "disagreed",
+  "blocked",
+] as const;
 export type PointVerifyFilter = (typeof POINT_VERIFY_FILTERS)[number];
 
 export interface PointHistoryFilters {
@@ -173,12 +227,15 @@ export interface PointHistoryItem {
   /** Fidelity ladder echo (results.fidelity). Derived mirrors carry their +α
    *  source row's fidelity. null = pre-ladder/unsolved row. */
   fidelity: string | null;
-  /** Amendment-A refined review bucket: 'awaiting_urans' (violet stage-2
-   *  queue) | 'needs_review' (red, repair actions) | null (neither — includes
-   *  urans-rejected rows whose next step is already scheduled). */
+  /** Rolling-compatibility ladder bucket. `needs_review` is a legacy wire value
+   *  with an empty canonical predicate; new unavailable work uses status and
+   *  workDisposition instead. */
   reviewBucket: "awaiting_urans" | "needs_review" | null;
-  /** Amendment C: the rejected urans solve was stopped by the wall-clock
-   *  budget guard and its saved case state is resumable (Continue +2h/+6h). */
+  /** Explicit machine disposition for rejected/failed evidence. Scheduling is
+   *  claimed only when an open obligation/request/verify row actually exists. */
+  workDisposition: "scheduled" | "blocked" | null;
+  /** Amendment C: the rejected urans solve has restartable saved case state
+   *  after either a wall-budget stop or the bounded same-case chunk cap. */
   continuable: boolean;
   /** Latest verify-queue item covering this point's cell+angle; null = never
    *  queued for full-fidelity verification. */
@@ -191,6 +248,8 @@ export interface PointVerifyInfo {
   deltaCl: number | null;
   deltaCd: number | null;
   deltaCm: number | null;
+  submitError: string | null;
+  submitHttpStatus: number | null;
 }
 
 export interface PointHistoryCounts {
@@ -218,25 +277,34 @@ export interface PointHistoryPage {
   facets?: PointHistoryFacets;
 }
 
-export function encodePointHistoryCursor(lastActivityIso: string, rowKey: string): string {
+export function encodePointHistoryCursor(
+  lastActivityIso: string,
+  rowKey: string,
+): string {
   return `${lastActivityIso}|${rowKey}`;
 }
 
 /** Cursor format: `<lastActivity ISO>|<row key>` — row keys never contain `|`.
  *  Returns null for malformed values (the API layer maps that to 400). */
-export function parsePointHistoryCursor(raw: string): PointHistoryCursor | null {
+export function parsePointHistoryCursor(
+  raw: string,
+): PointHistoryCursor | null {
   const sep = raw.indexOf("|");
   if (sep <= 0) return null;
   const ts = raw.slice(0, sep);
   const rowKey = raw.slice(sep + 1);
   // Validate parseability only (V8 accepts µs ISO, truncating for the check);
   // the ORIGINAL string is kept so Postgres sees the full µs precision.
-  if (Number.isNaN(new Date(ts).getTime()) || !/^(r:|d:)/.test(rowKey)) return null;
+  if (Number.isNaN(new Date(ts).getTime()) || !/^(r:|d:)/.test(rowKey))
+    return null;
   return { lastActivity: ts, rowKey };
 }
 
 /** Shared non-status filters for the results arm (page + counts coherence). */
-function resultArmFilters(f: PointHistoryFilters, opts: { includeBucket: boolean }) {
+function resultArmFilters(
+  f: PointHistoryFilters,
+  opts: { includeBucket: boolean },
+) {
   const parts = [sql`TRUE`];
   if (f.airfoilQuery?.trim()) {
     const like = `%${f.airfoilQuery.trim()}%`;
@@ -256,7 +324,10 @@ function resultArmFilters(f: PointHistoryFilters, opts: { includeBucket: boolean
   }
   if (f.regime) parts.push(sql`r.regime = ${f.regime}`);
   if (f.reynolds != null) parts.push(sql`r.reynolds = ${f.reynolds}`);
-  if (f.errorClass) parts.push(sql`r.status = 'failed' AND ${ERROR_CLASS_SQL} = ${f.errorClass}`);
+  if (f.errorClass)
+    parts.push(
+      sql`r.status = 'failed' AND ${ERROR_CLASS_SQL} = ${f.errorClass}`,
+    );
   if (f.verify === "pending") {
     parts.push(sql`EXISTS (
       SELECT 1 FROM sim_urans_verify_queue q
@@ -272,6 +343,13 @@ function resultArmFilters(f: PointHistoryFilters, opts: { includeBucket: boolean
         AND q.aoa_deg = r.aoa_deg
       ORDER BY q."createdAt" DESC LIMIT 1
     ) = 'disagreed'`);
+  } else if (f.verify === "blocked") {
+    parts.push(sql`(
+      SELECT q.state FROM sim_urans_verify_queue q
+      WHERE q.airfoil_id = r.airfoil_id AND q.revision_id = r.simulation_preset_revision_id
+        AND q.aoa_deg = r.aoa_deg
+      ORDER BY q."createdAt" DESC LIMIT 1
+    ) = 'blocked'`);
   }
   if (opts.includeBucket && f.bucket) {
     // Amendment-A filters are dedicated expressions (they cut ACROSS the raw
@@ -290,7 +368,9 @@ function resultArmFilters(f: PointHistoryFilters, opts: { includeBucket: boolean
  *  error-class filter excludes the whole derived arm — mirrors are neither
  *  failed nor solving nor classified in their own right. */
 function derivedArmFilters(f: PointHistoryFilters) {
-  const parts = [sql`p.derived_by_symmetry AND p.state = 'terminal' AND p.result_id IS NOT NULL`];
+  const parts = [
+    sql`p.derived_by_symmetry AND p.state = 'terminal' AND p.result_id IS NOT NULL`,
+  ];
   if (f.airfoilQuery?.trim()) {
     const like = `%${f.airfoilQuery.trim()}%`;
     parts.push(sql`(af.name ILIKE ${like} OR af.slug ILIKE ${like})`);
@@ -326,27 +406,39 @@ interface PageRow {
   condition_id: string | null;
   fidelity: string | null;
   review_bucket: "awaiting_urans" | "needs_review" | null;
+  work_disposition: "scheduled" | "blocked" | null;
   continuable: boolean | null;
   verify_state: string | null;
   verify_delta_cl: number | string | null;
   verify_delta_cd: number | string | null;
   verify_delta_cm: number | string | null;
+  verify_submit_error: string | null;
+  verify_submit_http_status: number | null;
 }
 
-const isoOf = (v: Date | string): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
+const isoOf = (v: Date | string): string =>
+  v instanceof Date ? v.toISOString() : new Date(v).toISOString();
 
 export async function pointHistoryPage(
   db: DB,
   filters: PointHistoryFilters,
-  page: { cursor?: PointHistoryCursor | null; limit: number; includeFacets?: boolean },
+  page: {
+    cursor?: PointHistoryCursor | null;
+    limit: number;
+    includeFacets?: boolean;
+  },
 ): Promise<PointHistoryPage> {
   const limit = Math.max(1, Math.min(50, page.limit));
-  const cursorSql = (activityCol: ReturnType<typeof sql>, keyExpr: ReturnType<typeof sql>) =>
+  const cursorSql = (
+    activityCol: ReturnType<typeof sql>,
+    keyExpr: ReturnType<typeof sql>,
+  ) =>
     page.cursor
       ? sql`AND (${activityCol}, ${keyExpr}) < (${page.cursor.lastActivity}::timestamptz, ${page.cursor.rowKey})`
       : sql``;
 
-  const includeDerived = !filters.bucket && !filters.errorClass && !filters.verify;
+  const includeDerived =
+    !filters.bucket && !filters.errorClass && !filters.verify;
   const resultKey = sql`('r:' || r.id::text)`;
   const derivedKey = sql`('d:' || p.campaign_id::text || ':' || p.condition_id::text || ':' || p.airfoil_id::text || ':' || p.aoa_deg::text)`;
 
@@ -376,7 +468,8 @@ export async function pointHistoryPage(
         r.fidelity AS fidelity,
         -- Mirrors are never review-bucketed or continuable in their own right.
         NULL AS review_bucket,
-        FALSE AS continuable
+        FALSE AS continuable,
+        NULL AS work_disposition
       FROM sim_campaign_points p
       JOIN results r ON r.id = p.result_id
       JOIN airfoils af ON af.id = p.airfoil_id
@@ -411,7 +504,8 @@ export async function pointHistoryPage(
         NULL::uuid AS condition_id,
         r.fidelity AS fidelity,
         ${REVIEW_BUCKET_SQL} AS review_bucket,
-        ${CONTINUABLE_SQL} AS continuable
+        ${CONTINUABLE_SQL} AS continuable,
+        ${WORK_DISPOSITION_SQL} AS work_disposition
       FROM results r
       JOIN airfoils af ON af.id = r.airfoil_id
       LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -435,6 +529,8 @@ export async function pointHistoryPage(
       vq.verify_delta_cl,
       vq.verify_delta_cd,
       vq.verify_delta_cm,
+      vq.verify_submit_error,
+      vq.verify_submit_http_status,
       COALESCE(page.campaign_id, cp.campaign_id) AS campaign_id_final,
       COALESCE(page.condition_id, cp.condition_id) AS condition_id_final,
       sc.name AS campaign_name
@@ -478,14 +574,24 @@ export async function pointHistoryPage(
     -- Derived mirrors are never verified in their own right (kind gate).
     LEFT JOIN LATERAL (
       SELECT q.state AS verify_state, q.delta_cl AS verify_delta_cl,
-             q.delta_cd AS verify_delta_cd, q.delta_cm AS verify_delta_cm
+             q.delta_cd AS verify_delta_cd, q.delta_cm AS verify_delta_cm,
+             submit_retry.last_error AS verify_submit_error,
+             submit_retry.last_http_status AS verify_submit_http_status
       FROM sim_urans_verify_queue q
+      LEFT JOIN sim_ladder_submit_retries submit_retry
+        ON submit_retry.verify_queue_id = q.id
       WHERE q.airfoil_id = page.airfoil_id AND q.revision_id = page.revision_id AND q.aoa_deg = page.aoa_deg
       ORDER BY q."createdAt" DESC LIMIT 1
     ) vq ON page.kind = 'result'
     LEFT JOIN sim_campaigns sc ON sc.id = COALESCE(page.campaign_id, cp.campaign_id)
     ORDER BY page.last_activity DESC, page.row_key DESC
-  `)) as unknown as Array<PageRow & { last_activity_us: string; campaign_id_final: string | null; condition_id_final: string | null }>;
+  `)) as unknown as Array<
+    PageRow & {
+      last_activity_us: string;
+      campaign_id_final: string | null;
+      condition_id_final: string | null;
+    }
+  >;
 
   const hasMore = rows.length > limit;
   const pageRows = rows.slice(0, limit);
@@ -518,7 +624,16 @@ export async function pointHistoryPage(
     solving: number;
     all_results: number;
   }>;
-  const c = countRows[0] ?? { failed: 0, rejected: 0, awaiting_urans: 0, needs_review: 0, accepted: 0, needs_urans: 0, solving: 0, all_results: 0 };
+  const c = countRows[0] ?? {
+    failed: 0,
+    rejected: 0,
+    awaiting_urans: 0,
+    needs_review: 0,
+    accepted: 0,
+    needs_urans: 0,
+    solving: 0,
+    all_results: 0,
+  };
 
   let derivedCount = 0;
   if (!filters.errorClass) {
@@ -535,15 +650,21 @@ export async function pointHistoryPage(
   let facets: PointHistoryFacets | undefined;
   if (page.includeFacets) {
     const [campaignRows, reynoldsRows] = await Promise.all([
-      db.execute(sql`SELECT id, name, status FROM sim_campaigns ORDER BY "createdAt" DESC LIMIT 50`) as unknown as Promise<
+      db.execute(
+        sql`SELECT id, name, status FROM sim_campaigns ORDER BY "createdAt" DESC LIMIT 50`,
+      ) as unknown as Promise<
         Array<{ id: string; name: string; status: string }>
       >,
-      db.execute(sql`SELECT DISTINCT reynolds FROM results WHERE reynolds IS NOT NULL ORDER BY reynolds ASC LIMIT 40`) as unknown as Promise<
-        Array<{ reynolds: number | string }>
-      >,
+      db.execute(
+        sql`SELECT DISTINCT reynolds FROM results WHERE reynolds IS NOT NULL ORDER BY reynolds ASC LIMIT 40`,
+      ) as unknown as Promise<Array<{ reynolds: number | string }>>,
     ]);
     facets = {
-      campaigns: campaignRows.map((row) => ({ id: row.id, name: row.name, status: row.status })),
+      campaigns: campaignRows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        status: row.status,
+      })),
       reynolds: reynoldsRows.map((row) => Number(row.reynolds)),
     };
   }
@@ -557,7 +678,8 @@ export async function pointHistoryPage(
       airfoilSlug: row.airfoil_slug,
       airfoilName: row.airfoil_name,
       aoaDeg: Number(row.aoa_deg),
-      sourceAoaDeg: row.source_aoa_deg == null ? null : Number(row.source_aoa_deg),
+      sourceAoaDeg:
+        row.source_aoa_deg == null ? null : Number(row.source_aoa_deg),
       reynolds: row.reynolds == null ? null : Number(row.reynolds),
       regime: row.regime,
       status: row.status,
@@ -574,18 +696,33 @@ export async function pointHistoryPage(
       lastActivityAt: isoOf(row.last_activity),
       fidelity: row.fidelity,
       reviewBucket: row.review_bucket ?? null,
+      workDisposition: row.work_disposition ?? null,
       continuable: Boolean(row.continuable),
       verify:
         row.verify_state == null
           ? null
           : {
               state: row.verify_state,
-              deltaCl: row.verify_delta_cl == null ? null : Number(row.verify_delta_cl),
-              deltaCd: row.verify_delta_cd == null ? null : Number(row.verify_delta_cd),
-              deltaCm: row.verify_delta_cm == null ? null : Number(row.verify_delta_cm),
+              deltaCl:
+                row.verify_delta_cl == null
+                  ? null
+                  : Number(row.verify_delta_cl),
+              deltaCd:
+                row.verify_delta_cd == null
+                  ? null
+                  : Number(row.verify_delta_cd),
+              deltaCm:
+                row.verify_delta_cm == null
+                  ? null
+                  : Number(row.verify_delta_cm),
+              submitError: row.verify_submit_error,
+              submitHttpStatus: row.verify_submit_http_status,
             },
     })),
-    nextCursor: hasMore && last ? encodePointHistoryCursor(last.last_activity_us, last.row_key) : null,
+    nextCursor:
+      hasMore && last
+        ? encodePointHistoryCursor(last.last_activity_us, last.row_key)
+        : null,
     counts: {
       failed: Number(c.failed),
       rejected: Number(c.rejected),
@@ -619,8 +756,19 @@ export interface PointStoryAttempt {
   error: string | null;
   qualityWarnings: string[];
   engineCaseSlug: string | null;
-  simJob: { id: string; wave: number; jobKind: string; status: string; campaignId: string | null; engineJobId: string | null } | null;
-  classification: { state: string; reasons: string[]; confidence: number } | null;
+  simJob: {
+    id: string;
+    wave: number;
+    jobKind: string;
+    status: string;
+    campaignId: string | null;
+    engineJobId: string | null;
+  } | null;
+  classification: {
+    state: string;
+    reasons: string[];
+    confidence: number;
+  } | null;
   createdAt: string;
   solvedAt: string | null;
 }
@@ -650,7 +798,12 @@ export interface PointStory {
     status: string;
     error: string | null;
     qualityWarnings: string[];
-    classification: { state: string; reasons: string[]; confidence: number; classifierVersion: string } | null;
+    classification: {
+      state: string;
+      reasons: string[];
+      confidence: number;
+      classifierVersion: string;
+    } | null;
     revisionId: string | null;
     campaignId: string | null;
     campaignName: string | null;
@@ -659,10 +812,11 @@ export interface PointStory {
     updatedAt: string;
     /** Fidelity ladder echo (results.fidelity); null = pre-ladder/unsolved. */
     fidelity: string | null;
-    /** Amendment-A refined review bucket (see PointHistoryItem.reviewBucket). */
+    /** Rolling-compatibility ladder bucket (see PointHistoryItem.reviewBucket). */
     reviewBucket: "awaiting_urans" | "needs_review" | null;
-    /** Amendment C: budget-stopped rejected urans row with saved case state —
-     *  the story panel renders Continue +2h/+6h on exactly these. */
+    workDisposition: "scheduled" | "blocked" | null;
+    /** Amendment C: rejected urans row with restartable saved case state — the
+     *  story panel renders Continue +2h/+6h on exactly these. */
     continuable: boolean;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;
@@ -671,10 +825,19 @@ export interface PointStory {
   interruptions: PointStoryInterruption[];
   /** Campaign closure context: how many airfoils still have this angle open
    *  in the same condition. null for non-campaign points. */
-  closure: { campaignId: string; campaignName: string | null; conditionId: string; openAirfoils: number; totalAirfoils: number } | null;
+  closure: {
+    campaignId: string;
+    campaignName: string | null;
+    conditionId: string;
+    openAirfoils: number;
+    totalAirfoils: number;
+  } | null;
 }
 
-export async function pointStory(db: DB, resultId: string): Promise<PointStory> {
+export async function pointStory(
+  db: DB,
+  resultId: string,
+): Promise<PointStory> {
   const pointRows = (await db.execute(sql`
     SELECT
       r.id AS result_id, r.airfoil_id, af.slug AS airfoil_slug, af.name AS airfoil_name,
@@ -682,10 +845,12 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
       r.error, r.quality_warnings, r.simulation_preset_revision_id AS revision_id,
       r."solvedAt" AS solved_at, r."updatedAt" AS updated_at, r.fidelity,
       ${REVIEW_BUCKET_SQL} AS review_bucket, ${CONTINUABLE_SQL} AS continuable,
+      ${WORK_DISPOSITION_SQL} AS work_disposition,
       rc.state::text AS cls_state, rc.reasons AS cls_reasons, rc.confidence AS cls_confidence,
       rc.classifier_version AS cls_version,
       cp.campaign_id, cp.condition_id, sc.name AS campaign_name,
-      vq.verify_state, vq.verify_delta_cl, vq.verify_delta_cd, vq.verify_delta_cm
+      vq.verify_state, vq.verify_delta_cl, vq.verify_delta_cd, vq.verify_delta_cm,
+      vq.verify_submit_error, vq.verify_submit_http_status
     FROM results r
     JOIN airfoils af ON af.id = r.airfoil_id
     LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -702,8 +867,12 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
     LEFT JOIN sim_campaigns sc ON sc.id = cp.campaign_id
     LEFT JOIN LATERAL (
       SELECT q.state AS verify_state, q.delta_cl AS verify_delta_cl,
-             q.delta_cd AS verify_delta_cd, q.delta_cm AS verify_delta_cm
+             q.delta_cd AS verify_delta_cd, q.delta_cm AS verify_delta_cm,
+             submit_retry.last_error AS verify_submit_error,
+             submit_retry.last_http_status AS verify_submit_http_status
       FROM sim_urans_verify_queue q
+      LEFT JOIN sim_ladder_submit_retries submit_retry
+        ON submit_retry.verify_queue_id = q.id
       WHERE q.airfoil_id = r.airfoil_id AND q.revision_id = r.simulation_preset_revision_id AND q.aoa_deg = r.aoa_deg
       ORDER BY q."createdAt" DESC LIMIT 1
     ) vq ON TRUE
@@ -734,11 +903,14 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
     campaign_name: string | null;
     fidelity: string | null;
     review_bucket: "awaiting_urans" | "needs_review" | null;
+    work_disposition: "scheduled" | "blocked" | null;
     continuable: boolean | null;
     verify_state: string | null;
     verify_delta_cl: number | string | null;
     verify_delta_cd: number | string | null;
     verify_delta_cm: number | string | null;
+    verify_submit_error: string | null;
+    verify_submit_http_status: number | null;
   }>;
   const p = pointRows[0];
   if (!p) throw new CampaignError("not_found", "point not found");
@@ -842,8 +1014,10 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
     };
   }
 
-  const iso = (v: Date | string): string => (v instanceof Date ? v.toISOString() : new Date(v).toISOString());
-  const isoOrNull = (v: Date | string | null): string | null => (v == null ? null : iso(v));
+  const iso = (v: Date | string): string =>
+    v instanceof Date ? v.toISOString() : new Date(v).toISOString();
+  const isoOrNull = (v: Date | string | null): string | null =>
+    v == null ? null : iso(v);
 
   return {
     point: {
@@ -876,15 +1050,21 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
       updatedAt: iso(p.updated_at),
       fidelity: p.fidelity,
       reviewBucket: p.review_bucket ?? null,
+      workDisposition: p.work_disposition ?? null,
       continuable: Boolean(p.continuable),
       verify:
         p.verify_state == null
           ? null
           : {
               state: p.verify_state,
-              deltaCl: p.verify_delta_cl == null ? null : Number(p.verify_delta_cl),
-              deltaCd: p.verify_delta_cd == null ? null : Number(p.verify_delta_cd),
-              deltaCm: p.verify_delta_cm == null ? null : Number(p.verify_delta_cm),
+              deltaCl:
+                p.verify_delta_cl == null ? null : Number(p.verify_delta_cl),
+              deltaCd:
+                p.verify_delta_cd == null ? null : Number(p.verify_delta_cd),
+              deltaCm:
+                p.verify_delta_cm == null ? null : Number(p.verify_delta_cm),
+              submitError: p.verify_submit_error,
+              submitHttpStatus: p.verify_submit_http_status,
             },
     },
     attempts: attemptRows.map((a) => ({
@@ -915,7 +1095,13 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
               engineJobId: a.job_engine_id,
             },
       classification:
-        a.cls_state == null ? null : { state: a.cls_state, reasons: a.cls_reasons ?? [], confidence: Number(a.cls_confidence ?? 1) },
+        a.cls_state == null
+          ? null
+          : {
+              state: a.cls_state,
+              reasons: a.cls_reasons ?? [],
+              confidence: Number(a.cls_confidence ?? 1),
+            },
       createdAt: iso(a.created_at),
       solvedAt: isoOrNull(a.solved_at),
     })),
@@ -944,20 +1130,106 @@ export async function pointStory(db: DB, resultId: string): Promise<PointStory> 
 export async function requeueSinglePoint(
   db: DB,
   resultId: string,
-): Promise<{ requeued: 1; scope: "failed" | "rejected"; campaignIds: string[] }> {
+): Promise<{
+  requeued: 1;
+  scope: "failed" | "rejected";
+  campaignIds: string[];
+}> {
   return db.transaction(async (rawTx) => {
     // Same DB/Tx narrowing campaigns.ts uses (asDb): the tx client executes
     // the identical SQL surface.
     const tx = rawTx as unknown as DB;
+    const initialRows = (await tx.execute(sql`
+      SELECT r.id, r.status::text AS status, r.error, r.airfoil_id,
+        r.simulation_preset_revision_id AS revision_id,
+        r.aoa_deg::float8 AS aoa_deg, r.regime, r.fidelity,
+        EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected') AS rejected
+      FROM results r WHERE r.id = ${resultId}
+    `)) as unknown as Array<{
+      id: string;
+      status: string;
+      error: string | null;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      regime: string | null;
+      fidelity: string | null;
+      rejected: boolean;
+    }>;
+    const initial = initialRows[0];
+    if (!initial) throw new CampaignError("not_found", "point not found");
+    await tx.execute(sql`
+      SELECT campaign.id
+      FROM sim_campaigns campaign
+      WHERE EXISTS (
+        SELECT 1 FROM sim_campaign_points point
+        WHERE point.campaign_id = campaign.id
+          AND (
+            point.result_id = ${resultId}
+            OR (
+              point.airfoil_id = ${initial.airfoil_id}
+              AND point.revision_id = ${initial.revision_id}
+              AND point.aoa_deg = ${initial.aoa_deg}
+            )
+          )
+      )
+      ORDER BY campaign.id
+      FOR UPDATE OF campaign
+    `);
+    if (initial.revision_id) {
+      await lockPrecalcCells(tx, [
+        {
+          airfoilId: initial.airfoil_id,
+          revisionId: initial.revision_id,
+          aoaDeg: initial.aoa_deg,
+        },
+      ]);
+    }
+    // Re-read and lock only after the cell lock. Obligation creation follows
+    // the same order and therefore cannot appear between this check and reset.
     const rows = (await tx.execute(sql`
-      SELECT r.id, r.status::text AS status,
+      SELECT r.id, r.status::text AS status, r.error, r.airfoil_id,
+        r.simulation_preset_revision_id AS revision_id,
+        r.aoa_deg::float8 AS aoa_deg, r.regime, r.fidelity,
         EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected') AS rejected
       FROM results r WHERE r.id = ${resultId} FOR UPDATE OF r
-    `)) as unknown as Array<{ id: string; status: string; rejected: boolean }>;
+    `)) as unknown as typeof initialRows;
     const row = rows[0];
     if (!row) throw new CampaignError("not_found", "point not found");
+    if (row.regime === "urans" || (row.fidelity ?? "").startsWith("urans")) {
+      throw new CampaignError(
+        "invalid_state",
+        "URANS evidence is owned by the bounded fidelity ladder and cannot be sent to the ordinary RANS retry queue",
+      );
+    }
+    const obligations = row.revision_id
+      ? ((await tx.execute(sql`
+          SELECT id, state
+          FROM sim_precalc_obligations
+          WHERE airfoil_id = ${row.airfoil_id}
+            AND revision_id = ${row.revision_id}
+            AND aoa_deg = ${row.aoa_deg}
+          FOR UPDATE
+        `)) as unknown as Array<{ id: string; state: string }>)
+      : [];
+    if (obligations.length > 0) {
+      throw new CampaignError(
+        "invalid_state",
+        `this physical cell is owned by the bounded PRECALC ledger (${obligations[0].state}); ordinary RANS retry is unavailable`,
+      );
+    }
+    if (row.status === "failed" && isDeterministicMeshBlockerError(row.error)) {
+      throw new CampaignError(
+        "invalid_state",
+        "this point is blocked by deterministic mesh QA; repair or change the mesh setup before requeueing",
+      );
+    }
     const scope: "failed" | "rejected" | null =
-      row.status === "failed" ? "failed" : row.status === "done" && row.rejected ? "rejected" : null;
+      row.status === "failed"
+        ? "failed"
+        : row.status === "done" && row.rejected
+          ? "rejected"
+          : null;
     if (!scope) {
       throw new CampaignError(
         "invalid_state",
@@ -966,6 +1238,12 @@ export async function requeueSinglePoint(
     }
     await tx.execute(sql`
       UPDATE results SET status = 'pending', sim_job_id = NULL, "updatedAt" = now() WHERE id = ${resultId}
+    `);
+    // An explicit retry starts a fresh submit lifecycle. A stale answered-HTTP
+    // delay/block row would otherwise make the API report success while the
+    // gap/claim gates silently keep this cell unschedulable.
+    await tx.execute(sql`
+      DELETE FROM sim_result_submit_retries WHERE result_id = ${resultId}
     `);
     const flipped = (await tx.execute(sql`
       UPDATE sim_campaign_points
@@ -982,15 +1260,24 @@ export async function requeueSinglePoint(
   });
 }
 
-/** Bulk resume (needs-attention page): every needs-review row that is
- *  CONTINUABLE — budget-stopped rejected urans evidence with saved engine
- *  case state and nothing further scheduled. The bulk endpoint feeds each
+/** Bulk resume compatibility helper: every CONTINUABLE row — rejected URANS
+ * evidence with restartable saved engine case state and nothing further
+ * scheduled. Continuable rows are machine-time/availability, never human
+ * adjudication. The bulk endpoint feeds each
  *  row into createUransRequest (idempotent per cell+fidelity), so replays
  *  and races with single-row Continue actions are safe. */
 export async function listContinuableNeedsReview(
   db: DB,
   opts: { campaignId?: string | null } = {},
-): Promise<Array<{ resultId: string; airfoilId: string; revisionId: string; aoaDeg: number; fidelity: string | null }>> {
+): Promise<
+  Array<{
+    resultId: string;
+    airfoilId: string;
+    revisionId: string;
+    aoaDeg: number;
+    fidelity: string | null;
+  }>
+> {
   const campaignCond = opts.campaignId
     ? sql`AND EXISTS (
         SELECT 1 FROM sim_campaign_points p
@@ -1005,8 +1292,14 @@ export async function listContinuableNeedsReview(
            r.aoa_deg::float8 AS aoa_deg, r.fidelity
     FROM results r
     LEFT JOIN result_classifications rc ON rc.result_id = r.id
-    WHERE ${NEEDS_REVIEW_RESULT_SQL}
-      AND ${CONTINUABLE_SQL}
+    WHERE ${CONTINUABLE_SQL}
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_urans_requests req
+        WHERE req.airfoil_id = r.airfoil_id
+          AND req.revision_id = r.simulation_preset_revision_id
+          AND (req.aoa_deg = r.aoa_deg OR req.aoa_deg IS NULL)
+          AND req.state IN ('pending', 'running')
+      )
       AND r.simulation_preset_revision_id IS NOT NULL
       ${campaignCond}
     ORDER BY r."updatedAt" ASC

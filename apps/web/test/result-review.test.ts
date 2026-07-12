@@ -5,11 +5,16 @@ import {
   buildResultReviewPayload,
   buildReviewQueue,
   canSubmitResultReview,
+  formatResultReviewLine,
   gateChecklistView,
   reviewStepperView,
   shouldShowReviewLayer,
 } from "../lib/result-review";
-import { buildSolverWorkPopoverView, type SolverWorkCondition, type SolverWorkPoint } from "../lib/solver-work";
+import {
+  buildSolverWorkPopoverView,
+  type SolverWorkCondition,
+  type SolverWorkPoint,
+} from "../lib/solver-work";
 
 function point(overrides: Partial<SolverWorkPoint>): SolverWorkPoint {
   return {
@@ -26,11 +31,15 @@ function point(overrides: Partial<SolverWorkPoint>): SolverWorkPoint {
     continuable: false,
     actions: [],
     supersededBy: null,
+    reviewed: false,
+    review: null,
     ...overrides,
   };
 }
 
-function condition(overrides: Partial<SolverWorkCondition>): SolverWorkCondition {
+function condition(
+  overrides: Partial<SolverWorkCondition>,
+): SolverWorkCondition {
   return {
     presetRevisionId: "rev-1",
     reynolds: 400000,
@@ -58,48 +67,73 @@ describe("result review gates and verdict payloads", () => {
         { name: "drift", detail: "Cl drift 9.2%", pass: false },
       ]),
     ).toEqual([
-      { key: "periods:0", text: "✓ periods — 2 repeatable periods saved", pass: true },
+      {
+        key: "periods:0",
+        text: "✓ periods — 2 repeatable periods saved",
+        pass: true,
+      },
       { key: "drift:1", text: "✗ drift — Cl drift 9.2%", pass: false },
     ]);
   });
 
-  it("disables waiver/exclude without a note and pins the POST payload", async () => {
-    expect(canSubmitResultReview("waive", "")).toBe(false);
+  it("requires an exclusion note and pins the conservative POST payload", async () => {
     expect(canSubmitResultReview("exclude", "   ")).toBe(false);
-    expect(canSubmitResultReview("waive", "accepted after visual check")).toBe(true);
+    expect(
+      canSubmitResultReview("exclude", "bad retained-period evidence"),
+    ).toBe(true);
     expect(canSubmitResultReview("defer", "")).toBe(true);
-    expect(buildResultReviewPayload("waive", " accepted after visual check ")).toEqual({
-      verdict: "waive",
-      note: "accepted after visual check",
+    expect(
+      buildResultReviewPayload("exclude", " bad retained-period evidence "),
+    ).toEqual({
+      verdict: "exclude",
+      note: "bad retained-period evidence",
     });
 
-    const fetchMock = vi.fn(async () =>
-      new Response(
-        JSON.stringify({
-          review: {
-            id: "review-1",
-            verdict: "waive",
-            note: "accepted after visual check",
-            reviewer: "ja@vr.ae",
-            createdAt: "2026-07-10T08:15:00.000Z",
-          },
-        }),
-        { status: 201, headers: { "content-type": "application/json" } },
-      ),
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            review: {
+              id: "review-1",
+              verdict: "exclude",
+              note: "bad retained-period evidence",
+              reviewer: "ja@vr.ae",
+              createdAt: "2026-07-10T08:15:00.000Z",
+            },
+          }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        ),
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await reviewResult("result-1", "waive", " accepted after visual check ");
+    await reviewResult("result-1", "exclude", " bad retained-period evidence ");
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
     expect(url).toBe("http://localhost:4000/api/admin/results/result-1/review");
     expect(init.method).toBe("POST");
     expect(init.credentials).toBe("include");
     expect(JSON.parse(String(init.body))).toEqual({
-      verdict: "waive",
-      note: "accepted after visual check",
+      verdict: "exclude",
+      note: "bad retained-period evidence",
     });
+  });
+
+  it("keeps retired waiver rows readable as immutable history", () => {
+    expect(
+      formatResultReviewLine({
+        verdict: "waive",
+        note: "accepted after visual check",
+        reviewer: "ja@vr.ae",
+        createdAt: "2026-07-10T08:15:00.000Z",
+        revokedAt: "2026-07-11T00:00:00.000Z",
+      }),
+    ).toBe(
+      "waived by ja@vr.ae · 2026-07-10 · revoked: accepted after visual check",
+    );
   });
 });
 
@@ -122,7 +156,12 @@ describe("result review queue and anonymous guard", () => {
     });
     const queue = buildReviewQueue([first, second]);
 
-    expect(queue.map((item) => item.resultId)).toEqual(["a-neg2", "a-6", "b-1", "b-3"]);
+    expect(queue.map((item) => item.resultId)).toEqual([
+      "a-neg2",
+      "a-6",
+      "b-1",
+      "b-3",
+    ]);
     const stepper = reviewStepperView(queue, "a-6");
     expect(stepper?.label).toBe("2 of 4 in queue");
     expect(stepper?.nextLabel).toBe("review next ▸");
@@ -130,21 +169,23 @@ describe("result review queue and anonymous guard", () => {
     expect(reviewStepperView(queue.slice(0, 1), "a-neg2")).toBeNull();
   });
 
-  it("anonymous users get reviewed disclosure but no review layer or admin actions", () => {
+  it("a revoked legacy waiver cannot expose an accept/review path or alter blocked state", () => {
     const waived = point({
-      state: "verified",
+      state: "blocked",
       resultId: "res-waived",
-      reviewed: {
-        verdict: "waive",
-        note: "accepted after visual check",
-        reviewer: "ja@vr.ae",
-        at: "2026-07-10T08:15:00.000Z",
-      },
+      reviewed: false,
+      review: null,
     });
-    const view = buildSolverWorkPopoverView(condition({ points: [waived] }), waived, false);
+    const view = buildSolverWorkPopoverView(
+      condition({ points: [waived] }),
+      waived,
+      false,
+    );
 
     expect(shouldShowReviewLayer(false, waived)).toBe(false);
+    expect(shouldShowReviewLayer(true, waived)).toBe(false);
+    expect(view.visualState).toBe("blocked");
     expect(view.actions.filter((action) => action.adminOnly)).toEqual([]);
-    expect(view.reviewedDisclosure).toBe("waived by ja@vr.ae 2026-07-10: accepted after visual check");
+    expect(view.reviewedDisclosure).toBeNull();
   });
 });

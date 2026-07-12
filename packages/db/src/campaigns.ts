@@ -9,6 +9,13 @@
 import { createHash } from "node:crypto";
 
 import {
+  AUTO_PRECALC_CONTINUATION_BUDGET_S,
+  AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
+  DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER,
+  DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER,
+  MISSING_URANS_VIDEO_REASON,
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
   canonicalAoa,
   canonicalSiString,
   deriveFlowConditionState,
@@ -20,6 +27,7 @@ import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 
 import { recomputeProgressForCampaign } from "./campaign-execution";
 import type { DB } from "./client";
+import { lockPrecalcCells } from "./precalc-cell-lock";
 import {
   campaignOpenTierCounts,
   type CampaignPhase,
@@ -49,6 +57,13 @@ import {
   simCampaignPoints,
   simCampaignProgress,
   simCampaigns,
+  simJobs,
+  simPrecalcObligationCampaigns,
+  simPrecalcObligations,
+  simUransRequestCampaigns,
+  simUransRequests,
+  simUransVerifyQueue,
+  simUransVerifyQueueCampaigns,
   simulationPresetRevisions,
   simulationPresets,
   solverProfiles,
@@ -75,7 +90,12 @@ const asDb = (db: DbTx): DB => db as DB;
 // ---------------------------------------------------------------------------
 // Errors — typed so the API layer can map to proper HTTP codes.
 // ---------------------------------------------------------------------------
-export type CampaignErrorCode = "validation" | "not_found" | "conflict" | "invalid_state" | "drift";
+export type CampaignErrorCode =
+  | "validation"
+  | "not_found"
+  | "conflict"
+  | "invalid_state"
+  | "drift";
 
 export class CampaignError extends Error {
   readonly code: CampaignErrorCode;
@@ -94,7 +114,10 @@ export class CampaignError extends Error {
 export type CampaignObjectiveId = "ldMax" | "clZero" | "clMax";
 export type CampaignObjectiveKey = "ld_max" | "cl_zero" | "cl_max";
 
-export const CAMPAIGN_OBJECTIVES: ReadonlyArray<{ id: CampaignObjectiveId; key: CampaignObjectiveKey }> = [
+export const CAMPAIGN_OBJECTIVES: ReadonlyArray<{
+  id: CampaignObjectiveId;
+  key: CampaignObjectiveKey;
+}> = [
   { id: "ldMax", key: "ld_max" },
   { id: "clZero", key: "cl_zero" },
   { id: "clMax", key: "cl_max" },
@@ -123,7 +146,11 @@ export interface CampaignPlan {
   areaM2: string | null;
   excludedConditions: Array<[string, string, string, string]>; // [T, P, speed, chord]
   baseSweep: CampaignBaseSweep;
-  objectives: { ldMax: CampaignObjectivePlan; clZero: CampaignObjectivePlan; clMax: CampaignObjectivePlan };
+  objectives: {
+    ldMax: CampaignObjectivePlan;
+    clZero: CampaignObjectivePlan;
+    clMax: CampaignObjectivePlan;
+  };
   numerics: {
     boundaryProfileId: string;
     meshProfileId: string;
@@ -145,7 +172,12 @@ export interface CampaignPlanInput {
   areaMode?: "derived" | "explicit";
   areaM2?: NumberLike | null;
   excludedConditions?: Array<[NumberLike, NumberLike, NumberLike, NumberLike]>;
-  baseSweep: { fromDeg?: NumberLike | null; toDeg?: NumberLike | null; stepDeg?: NumberLike | null; listDeg?: NumberLike[] | null };
+  baseSweep: {
+    fromDeg?: NumberLike | null;
+    toDeg?: NumberLike | null;
+    stepDeg?: NumberLike | null;
+    listDeg?: NumberLike[] | null;
+  };
   objectives: {
     ldMax: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number };
     clZero: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number };
@@ -178,7 +210,11 @@ function canonicalAoaString(v: NumberLike): string {
 
 function toleranceString(v: NumberLike): string {
   const n = num(v);
-  if (!Number.isFinite(n) || n <= 0) throw new CampaignError("validation", `objective tolerance must be > 0 (got ${v})`);
+  if (!Number.isFinite(n) || n <= 0)
+    throw new CampaignError(
+      "validation",
+      `objective tolerance must be > 0 (got ${v})`,
+    );
   return n.toFixed(2);
 }
 
@@ -186,34 +222,60 @@ function toleranceString(v: NumberLike): string {
  *  CampaignError("validation") with an issue list on any failure. */
 export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
   const issues: CampaignPlanIssue[] = [];
-  const push = (path: string, message: string) => issues.push({ path, message });
+  const push = (path: string, message: string) =>
+    issues.push({ path, message });
 
-  if (!input.mediumId || typeof input.mediumId !== "string") push("mediumId", "medium is required");
+  if (!input.mediumId || typeof input.mediumId !== "string")
+    push("mediumId", "medium is required");
 
   const ambientPairs = (input.ambients ?? []).map(([t, p]) => {
     const tN = num(t);
     const pN = num(p);
-    if (!(Number.isFinite(tN) && tN > 0)) push("ambients", `temperature must be > 0 K (got ${t})`);
-    if (!(Number.isFinite(pN) && pN > 0)) push("ambients", `pressure must be > 0 Pa (got ${p})`);
-    return [canonicalSiString("temperatureK", tN), canonicalSiString("pressurePa", pN)] as [string, string];
+    if (!(Number.isFinite(tN) && tN > 0))
+      push("ambients", `temperature must be > 0 K (got ${t})`);
+    if (!(Number.isFinite(pN) && pN > 0))
+      push("ambients", `pressure must be > 0 Pa (got ${p})`);
+    return [
+      canonicalSiString("temperatureK", tN),
+      canonicalSiString("pressurePa", pN),
+    ] as [string, string];
   });
-  const ambients = dedupeSorted(ambientPairs, (a) => `${a[0]}|${a[1]}`, (a, b) => Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1]));
-  if (ambients.length === 0) push("ambients", "at least one ambient (T, P) is required");
-  if (ambients.length > CAMPAIGN_MAX_VALUES_PER_AXIS) push("ambients", `at most ${CAMPAIGN_MAX_VALUES_PER_AXIS} ambients`);
+  const ambients = dedupeSorted(
+    ambientPairs,
+    (a) => `${a[0]}|${a[1]}`,
+    (a, b) => Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1]),
+  );
+  if (ambients.length === 0)
+    push("ambients", "at least one ambient (T, P) is required");
+  if (ambients.length > CAMPAIGN_MAX_VALUES_PER_AXIS)
+    push("ambients", `at most ${CAMPAIGN_MAX_VALUES_PER_AXIS} ambients`);
 
-  const speeds = canonicalAxis(input.speedsMps ?? [], "speedMps", (m) => push("speedsMps", m));
-  const chords = canonicalAxis(input.chordsM ?? [], "chordM", (m) => push("chordsM", m));
+  const speeds = canonicalAxis(input.speedsMps ?? [], "speedMps", (m) =>
+    push("speedsMps", m),
+  );
+  const chords = canonicalAxis(input.chordsM ?? [], "chordM", (m) =>
+    push("chordsM", m),
+  );
 
   const spanN = num(input.spanM);
-  if (!(Number.isFinite(spanN) && spanN > 0)) push("spanM", "span must be > 0 m");
-  const spanM = canonicalSiString("spanM", Number.isFinite(spanN) && spanN > 0 ? spanN : 1);
+  if (!(Number.isFinite(spanN) && spanN > 0))
+    push("spanM", "span must be > 0 m");
+  const spanM = canonicalSiString(
+    "spanM",
+    Number.isFinite(spanN) && spanN > 0 ? spanN : 1,
+  );
 
   const areaMode = input.areaMode ?? "derived";
   let areaM2: string | null = null;
   if (areaMode === "explicit") {
-    if (chords.length > 1) push("areaMode", 'explicit reference area is only allowed while a single chord is selected');
+    if (chords.length > 1)
+      push(
+        "areaMode",
+        "explicit reference area is only allowed while a single chord is selected",
+      );
     const areaN = num(input.areaM2 ?? NaN);
-    if (!(Number.isFinite(areaN) && areaN > 0)) push("areaM2", "explicit area mode requires areaM2 > 0");
+    if (!(Number.isFinite(areaN) && areaN > 0))
+      push("areaM2", "explicit area mode requires areaM2 > 0");
     else areaM2 = canonicalSiString("areaM2", areaN);
   } else if (input.areaM2 != null) {
     push("areaM2", 'areaM2 must be null while areaMode is "derived"');
@@ -239,12 +301,23 @@ export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
   try {
     if (rawSweep.listDeg != null) {
       const list = expandAngleGrid({ listDeg: rawSweep.listDeg.map(num) });
-      if (list.length === 0) push("baseSweep.listDeg", "angle list must contain at least one angle");
+      if (list.length === 0)
+        push("baseSweep.listDeg", "angle list must contain at least one angle");
       angleCount = list.length;
-      baseSweep = { fromDeg: null, toDeg: null, stepDeg: null, listDeg: list.map((a) => a.toFixed(4)) };
+      baseSweep = {
+        fromDeg: null,
+        toDeg: null,
+        stepDeg: null,
+        listDeg: list.map((a) => a.toFixed(4)),
+      };
     } else {
-      const grid = expandAngleGrid({ fromDeg: num(rawSweep.fromDeg ?? NaN), toDeg: num(rawSweep.toDeg ?? NaN), stepDeg: num(rawSweep.stepDeg ?? NaN) });
-      if (grid.length === 0) push("baseSweep", "base sweep expands to zero angles");
+      const grid = expandAngleGrid({
+        fromDeg: num(rawSweep.fromDeg ?? NaN),
+        toDeg: num(rawSweep.toDeg ?? NaN),
+        stepDeg: num(rawSweep.stepDeg ?? NaN),
+      });
+      if (grid.length === 0)
+        push("baseSweep", "base sweep expands to zero angles");
       angleCount = grid.length;
       baseSweep = {
         fromDeg: canonicalAoaString(rawSweep.fromDeg ?? 0),
@@ -259,39 +332,81 @@ export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
   }
 
   const objectives = {
-    ldMax: normalizeObjective(input.objectives?.ldMax, "objectives.ldMax", push),
-    clZero: normalizeObjective(input.objectives?.clZero, "objectives.clZero", push),
+    ldMax: normalizeObjective(
+      input.objectives?.ldMax,
+      "objectives.ldMax",
+      push,
+    ),
+    clZero: normalizeObjective(
+      input.objectives?.clZero,
+      "objectives.clZero",
+      push,
+    ),
     // clMax joined the plan shape later: absence is a valid disabled block so
     // pre-clMax clients and replayed payloads keep normalizing byte-stably.
     clMax: input.objectives?.clMax
       ? normalizeObjective(input.objectives.clMax, "objectives.clMax", push)
       : DISABLED_CLMAX_OBJECTIVE,
   };
-  if ((objectives.ldMax.enabled || objectives.clZero.enabled || objectives.clMax.enabled) && angleCount < 3) {
-    push("objectives", "refinement objectives require a base sweep of at least 3 angles");
+  if (
+    (objectives.ldMax.enabled ||
+      objectives.clZero.enabled ||
+      objectives.clMax.enabled) &&
+    angleCount < 3
+  ) {
+    push(
+      "objectives",
+      "refinement objectives require a base sweep of at least 3 angles",
+    );
   }
 
   const numerics = input.numerics ?? ({} as CampaignPlanInput["numerics"]);
-  for (const slot of ["boundaryProfileId", "meshProfileId", "solverProfileId", "outputProfileId"] as const) {
-    if (!numerics?.[slot]) push(`numerics.${slot}`, "numerics profile is required");
+  for (const slot of [
+    "boundaryProfileId",
+    "meshProfileId",
+    "solverProfileId",
+    "outputProfileId",
+  ] as const) {
+    if (!numerics?.[slot])
+      push(`numerics.${slot}`, "numerics profile is required");
   }
-  const optionalNumericProfileId = (slot: "uransMeshProfileId" | "uransPrecalcMeshProfileId"): string | null => {
+  const optionalNumericProfileId = (
+    slot: "uransMeshProfileId" | "uransPrecalcMeshProfileId",
+  ): string | null => {
     const value = numerics?.[slot];
     if (value == null) return null;
     if (typeof value !== "string" || value.trim().length === 0) {
-      push(`numerics.${slot}`, "optional numerics profile id must be a non-empty string when set");
+      push(
+        `numerics.${slot}`,
+        "optional numerics profile id must be a non-empty string when set",
+      );
       return null;
     }
     return value;
   };
   const uransMeshProfileId = optionalNumericProfileId("uransMeshProfileId");
-  const uransPrecalcMeshProfileId = optionalNumericProfileId("uransPrecalcMeshProfileId");
+  const uransPrecalcMeshProfileId = optionalNumericProfileId(
+    "uransPrecalcMeshProfileId",
+  );
 
-  const comboCount = ambients.length * speeds.length * chords.length - countApplicableExclusions(ambients, speeds, chords, excluded);
-  if (comboCount <= 0) push("excludedConditions", "every condition combination is excluded — nothing to run");
-  if (comboCount > CAMPAIGN_MAX_CONDITIONS) push("conditions", `plan expands to ${comboCount} conditions (max ${CAMPAIGN_MAX_CONDITIONS})`);
+  const comboCount =
+    ambients.length * speeds.length * chords.length -
+    countApplicableExclusions(ambients, speeds, chords, excluded);
+  if (comboCount <= 0)
+    push(
+      "excludedConditions",
+      "every condition combination is excluded — nothing to run",
+    );
+  if (comboCount > CAMPAIGN_MAX_CONDITIONS)
+    push(
+      "conditions",
+      `plan expands to ${comboCount} conditions (max ${CAMPAIGN_MAX_CONDITIONS})`,
+    );
 
-  if (issues.length > 0) throw new CampaignError("validation", "campaign plan is invalid", { issues });
+  if (issues.length > 0)
+    throw new CampaignError("validation", "campaign plan is invalid", {
+      issues,
+    });
 
   return {
     mediumId: input.mediumId,
@@ -317,10 +432,16 @@ export function normalizeCampaignPlan(input: CampaignPlanInput): CampaignPlan {
 
 /** Canonical disabled Cl_max block (spec §3.1 defaults: ±0.10°, 8 rounds) —
  *  substituted when a plan input predates the third objective. */
-const DISABLED_CLMAX_OBJECTIVE: CampaignObjectivePlan = { enabled: false, toleranceDeg: "0.10", maxRounds: 8 };
+const DISABLED_CLMAX_OBJECTIVE: CampaignObjectivePlan = {
+  enabled: false,
+  toleranceDeg: "0.10",
+  maxRounds: 8,
+};
 
 function normalizeObjective(
-  input: { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number } | undefined,
+  input:
+    | { enabled: boolean; toleranceDeg: NumberLike; maxRounds: number }
+    | undefined,
   path: string,
   push: (path: string, message: string) => void,
 ): CampaignObjectivePlan {
@@ -335,23 +456,42 @@ function normalizeObjective(
     push(`${path}.toleranceDeg`, (e as Error).message);
   }
   const maxRounds = Number(input.maxRounds);
-  if (!(Number.isInteger(maxRounds) && maxRounds >= 1 && maxRounds <= 50)) push(`${path}.maxRounds`, "maxRounds must be an integer 1..50");
-  return { enabled: Boolean(input.enabled), toleranceDeg, maxRounds: Number.isInteger(maxRounds) ? maxRounds : 8 };
+  if (!(Number.isInteger(maxRounds) && maxRounds >= 1 && maxRounds <= 50))
+    push(`${path}.maxRounds`, "maxRounds must be an integer 1..50");
+  return {
+    enabled: Boolean(input.enabled),
+    toleranceDeg,
+    maxRounds: Number.isInteger(maxRounds) ? maxRounds : 8,
+  };
 }
 
-function canonicalAxis(values: NumberLike[], kind: "speedMps" | "chordM", push: (message: string) => void): string[] {
+function canonicalAxis(
+  values: NumberLike[],
+  kind: "speedMps" | "chordM",
+  push: (message: string) => void,
+): string[] {
   const canon = values.map((v) => {
     const n = num(v);
-    if (!(Number.isFinite(n) && n > 0)) push(`values must be finite and > 0 (got ${v})`);
+    if (!(Number.isFinite(n) && n > 0))
+      push(`values must be finite and > 0 (got ${v})`);
     return canonicalSiString(kind, Number.isFinite(n) && n > 0 ? n : 1);
   });
-  const out = dedupeSorted(canon, (x) => x, (a, b) => Number(a) - Number(b));
+  const out = dedupeSorted(
+    canon,
+    (x) => x,
+    (a, b) => Number(a) - Number(b),
+  );
   if (out.length === 0) push("at least one value is required");
-  if (out.length > CAMPAIGN_MAX_VALUES_PER_AXIS) push(`at most ${CAMPAIGN_MAX_VALUES_PER_AXIS} values per axis`);
+  if (out.length > CAMPAIGN_MAX_VALUES_PER_AXIS)
+    push(`at most ${CAMPAIGN_MAX_VALUES_PER_AXIS} values per axis`);
   return out;
 }
 
-function dedupeSorted<T>(items: T[], key: (t: T) => string, cmp: (a: T, b: T) => number): T[] {
+function dedupeSorted<T>(
+  items: T[],
+  key: (t: T) => string,
+  cmp: (a: T, b: T) => number,
+): T[] {
   const seen = new Set<string>();
   const out: T[] = [];
   for (const item of items) {
@@ -393,12 +533,19 @@ export interface CampaignConditionCombo {
   comboKey: string; // T|P|speed|chord canonical strings
 }
 
-export function campaignComboKey(temperatureK: string, pressurePa: string, speedMps: string, chordM: string): string {
+export function campaignComboKey(
+  temperatureK: string,
+  pressurePa: string,
+  speedMps: string,
+  chordM: string,
+): string {
   return `${temperatureK}|${pressurePa}|${speedMps}|${chordM}`;
 }
 
 /** Ordered (ambient × speed × chord) minus exclusions (spec §3.1/§5). */
-export function conditionCombosFromPlan(plan: CampaignPlan): CampaignConditionCombo[] {
+export function conditionCombosFromPlan(
+  plan: CampaignPlan,
+): CampaignConditionCombo[] {
   const excluded = new Set(plan.excludedConditions.map((x) => x.join("|")));
   const combos: CampaignConditionCombo[] = [];
   let ord = 0;
@@ -434,30 +581,54 @@ export interface CampaignAngleSets {
 
 export function campaignAngleSets(plan: CampaignPlan): CampaignAngleSets {
   const angles = expandAngleGrid({
-    fromDeg: plan.baseSweep.fromDeg == null ? undefined : Number(plan.baseSweep.fromDeg),
-    toDeg: plan.baseSweep.toDeg == null ? undefined : Number(plan.baseSweep.toDeg),
-    stepDeg: plan.baseSweep.stepDeg == null ? undefined : Number(plan.baseSweep.stepDeg),
-    listDeg: plan.baseSweep.listDeg == null ? null : plan.baseSweep.listDeg.map(Number),
+    fromDeg:
+      plan.baseSweep.fromDeg == null
+        ? undefined
+        : Number(plan.baseSweep.fromDeg),
+    toDeg:
+      plan.baseSweep.toDeg == null ? undefined : Number(plan.baseSweep.toDeg),
+    stepDeg:
+      plan.baseSweep.stepDeg == null
+        ? undefined
+        : Number(plan.baseSweep.stepDeg),
+    listDeg:
+      plan.baseSweep.listDeg == null
+        ? null
+        : plan.baseSweep.listDeg.map(Number),
   });
   return angleSetsFromAngles(angles);
 }
 
 export function angleSetsFromAngles(angles: number[]): CampaignAngleSets {
-  const canonical = [...new Set(angles.map(canonicalAoa))].sort((a, b) => a - b);
+  const canonical = [...new Set(angles.map(canonicalAoa))].sort(
+    (a, b) => a - b,
+  );
   const negativeAngles = canonical.filter((a) => a < 0);
-  const symmetricSolverAngles = [...new Set(canonical.map((a) => canonicalAoa(Math.abs(a))))].sort((a, b) => a - b);
+  const symmetricSolverAngles = [
+    ...new Set(canonical.map((a) => canonicalAoa(Math.abs(a)))),
+  ].sort((a, b) => a - b);
   return { angles: canonical, negativeAngles, symmetricSolverAngles };
 }
 
 /** Per-airfoil obligation sizes for one condition given the angle sets. */
-export function campaignPointArithmetic(sets: CampaignAngleSets, asymmetricCount: number, symmetricCount: number) {
+export function campaignPointArithmetic(
+  sets: CampaignAngleSets,
+  asymmetricCount: number,
+  symmetricCount: number,
+) {
   // Every requested angle is a point for every airfoil. Symmetric airfoils
   // additionally need mirrored solver cells for negative angles whose |α| is
   // not already in the grid (the derived cell needs a real +α source).
   const gridSet = new Set(sets.angles);
-  const extraMirrored = sets.symmetricSolverAngles.filter((a) => !gridSet.has(a)).length;
-  const points = (asymmetricCount + symmetricCount) * sets.angles.length + symmetricCount * extraMirrored;
-  const solverRuns = asymmetricCount * sets.angles.length + symmetricCount * sets.symmetricSolverAngles.length;
+  const extraMirrored = sets.symmetricSolverAngles.filter(
+    (a) => !gridSet.has(a),
+  ).length;
+  const points =
+    (asymmetricCount + symmetricCount) * sets.angles.length +
+    symmetricCount * extraMirrored;
+  const solverRuns =
+    asymmetricCount * sets.angles.length +
+    symmetricCount * sets.symmetricSolverAngles.length;
   const derivedPoints = symmetricCount * sets.negativeAngles.length;
   return { points, solverRuns, derivedPoints };
 }
@@ -555,11 +726,18 @@ function legacyBoundaryValuesFromSnapshot(snapshot: SimulationSetupSnapshot) {
   };
 }
 
-async function uniqueLegacyBoundarySlug(db: DbTx, base: string): Promise<string> {
+async function uniqueLegacyBoundarySlug(
+  db: DbTx,
+  base: string,
+): Promise<string> {
   let slug = base;
   let n = 2;
   for (let i = 0; i < 1000; i++) {
-    const [exists] = await asDb(db).select({ id: boundaryConditions.id }).from(boundaryConditions).where(eq(boundaryConditions.slug, slug)).limit(1);
+    const [exists] = await asDb(db)
+      .select({ id: boundaryConditions.id })
+      .from(boundaryConditions)
+      .where(eq(boundaryConditions.slug, slug))
+      .limit(1);
     if (!exists) return slug;
     slug = `${base}-${n++}`;
   }
@@ -569,7 +747,10 @@ async function uniqueLegacyBoundarySlug(db: DbTx, base: string): Promise<string>
 /** Sync (create/update) the deprecated boundary_conditions bridge row for a
  *  preset so results.bcId (NOT NULL) always has a target. Identical behavior
  *  to the pre-campaign admin-routes implementation, parameterized on db. */
-export async function syncLegacyBoundaryConditionForPreset(db: DbTx, presetId: string): Promise<string | null> {
+export async function syncLegacyBoundaryConditionForPreset(
+  db: DbTx,
+  presetId: string,
+): Promise<string | null> {
   const snapshot = await resolveSimulationPresetSnapshot(asDb(db), presetId);
   if (!snapshot) return null;
   const values = legacyBoundaryValuesFromSnapshot(snapshot);
@@ -577,12 +758,23 @@ export async function syncLegacyBoundaryConditionForPreset(db: DbTx, presetId: s
     await asDb(db)
       .update(boundaryConditions)
       .set(values)
-      .where(eq(boundaryConditions.id, snapshot.preset.legacyBoundaryConditionId));
+      .where(
+        eq(boundaryConditions.id, snapshot.preset.legacyBoundaryConditionId),
+      );
     return snapshot.preset.legacyBoundaryConditionId;
   }
-  const slug = await uniqueLegacyBoundarySlug(db, slugifyCampaign(snapshot.preset.slug || snapshot.preset.name));
-  const [legacy] = await asDb(db).insert(boundaryConditions).values({ ...values, slug }).returning({ id: boundaryConditions.id });
-  await asDb(db).update(simulationPresets).set({ legacyBoundaryConditionId: legacy.id }).where(eq(simulationPresets.id, presetId));
+  const slug = await uniqueLegacyBoundarySlug(
+    db,
+    slugifyCampaign(snapshot.preset.slug || snapshot.preset.name),
+  );
+  const [legacy] = await asDb(db)
+    .insert(boundaryConditions)
+    .values({ ...values, slug })
+    .returning({ id: boundaryConditions.id });
+  await asDb(db)
+    .update(simulationPresets)
+    .set({ legacyBoundaryConditionId: legacy.id })
+    .where(eq(simulationPresets.id, presetId));
   return legacy.id;
 }
 
@@ -594,26 +786,59 @@ interface MediumState {
   stateInput: MediumStateInput;
 }
 
-async function loadMediumState(db: DbTx, mediumId: string): Promise<MediumState> {
-  const [medium] = await asDb(db).select().from(mediums).where(eq(mediums.id, mediumId)).limit(1);
+async function loadMediumState(
+  db: DbTx,
+  mediumId: string,
+): Promise<MediumState> {
+  const [medium] = await asDb(db)
+    .select()
+    .from(mediums)
+    .where(eq(mediums.id, mediumId))
+    .limit(1);
   if (!medium) throw new CampaignError("not_found", "medium not found");
   let viscosity: ViscositySpec;
   if (medium.viscosityModel === "sutherland") {
-    if (!(medium.sutherlandMuRef && medium.sutherlandTRef && medium.sutherlandS)) {
-      throw new CampaignError("validation", `medium ${medium.slug} is missing Sutherland coefficients`);
+    if (
+      !(medium.sutherlandMuRef && medium.sutherlandTRef && medium.sutherlandS)
+    ) {
+      throw new CampaignError(
+        "validation",
+        `medium ${medium.slug} is missing Sutherland coefficients`,
+      );
     }
-    viscosity = { model: "sutherland", muRef: medium.sutherlandMuRef, tRef: medium.sutherlandTRef, s: medium.sutherlandS };
+    viscosity = {
+      model: "sutherland",
+      muRef: medium.sutherlandMuRef,
+      tRef: medium.sutherlandTRef,
+      s: medium.sutherlandS,
+    };
   } else if (medium.viscosityModel === "table") {
     const rows = await asDb(db)
       .select()
       .from(mediumViscosityTablePoints)
       .where(eq(mediumViscosityTablePoints.mediumId, medium.id))
-      .orderBy(asc(mediumViscosityTablePoints.sortOrder), asc(mediumViscosityTablePoints.temperatureK));
-    if (rows.length === 0) throw new CampaignError("validation", `medium ${medium.slug} has an empty viscosity table`);
-    viscosity = { model: "table", tempsK: rows.map((r) => r.temperatureK), mu: rows.map((r) => r.dynamicViscosity) };
+      .orderBy(
+        asc(mediumViscosityTablePoints.sortOrder),
+        asc(mediumViscosityTablePoints.temperatureK),
+      );
+    if (rows.length === 0)
+      throw new CampaignError(
+        "validation",
+        `medium ${medium.slug} has an empty viscosity table`,
+      );
+    viscosity = {
+      model: "table",
+      tempsK: rows.map((r) => r.temperatureK),
+      mu: rows.map((r) => r.dynamicViscosity),
+    };
   } else {
-    if (!(medium.constantDynamicViscosity && medium.constantDynamicViscosity > 0)) {
-      throw new CampaignError("validation", `medium ${medium.slug} is missing a constant dynamic viscosity`);
+    if (
+      !(medium.constantDynamicViscosity && medium.constantDynamicViscosity > 0)
+    ) {
+      throw new CampaignError(
+        "validation",
+        `medium ${medium.slug} is missing a constant dynamic viscosity`,
+      );
     }
     viscosity = { model: "constant", mu: medium.constantDynamicViscosity };
   }
@@ -630,11 +855,23 @@ async function loadMediumState(db: DbTx, mediumId: string): Promise<MediumState>
   };
 }
 
-async function uniqueSlug(db: DbTx, table: "flow_conditions" | "reference_geometry_profiles" | "simulation_presets" | "sweep_definitions" | "scheduling_profiles" | "sim_campaigns", base: string): Promise<string> {
+async function uniqueSlug(
+  db: DbTx,
+  table:
+    | "flow_conditions"
+    | "reference_geometry_profiles"
+    | "simulation_presets"
+    | "sweep_definitions"
+    | "scheduling_profiles"
+    | "sim_campaigns",
+  base: string,
+): Promise<string> {
   let slug = base || "item";
   let n = 2;
   for (let i = 0; i < 1000; i++) {
-    const rows = (await asDb(db).execute(sql`SELECT id FROM ${sql.raw(table)} WHERE slug = ${slug} LIMIT 1`)) as unknown as unknown[];
+    const rows = (await asDb(db).execute(
+      sql`SELECT id FROM ${sql.raw(table)} WHERE slug = ${slug} LIMIT 1`,
+    )) as unknown as unknown[];
     if (rows.length === 0) return slug;
     slug = `${base}-${n++}`;
   }
@@ -655,14 +892,29 @@ async function findOrCreateFlowCondition(
   const temperatureK = Number(combo.temperatureK);
   const pressurePa = Number(combo.pressurePa);
   const speedMps = Number(combo.speedMps);
-  const canonicalKey = flowConditionCanonicalKey({ mediumId: mediumState.medium.id, temperatureK, pressurePa, speedMps });
-  const [existing] = await asDb(tx).select().from(flowConditions).where(eq(flowConditions.canonicalKey, canonicalKey)).limit(1);
+  const canonicalKey = flowConditionCanonicalKey({
+    mediumId: mediumState.medium.id,
+    temperatureK,
+    pressurePa,
+    speedMps,
+  });
+  const [existing] = await asDb(tx)
+    .select()
+    .from(flowConditions)
+    .where(eq(flowConditions.canonicalKey, canonicalKey))
+    .limit(1);
   if (existing) return { row: existing, created: false };
-  const derived = deriveFlowConditionState(mediumState.stateInput, { temperatureK, pressurePa, speedMps });
+  const derived = deriveFlowConditionState(mediumState.stateInput, {
+    temperatureK,
+    pressurePa,
+    speedMps,
+  });
   const slug = await uniqueSlug(
     tx,
     "flow_conditions",
-    slugifyCampaign(`${mediumState.medium.slug}-t${combo.temperatureK}k-p${combo.pressurePa}pa-v${combo.speedMps}ms`),
+    slugifyCampaign(
+      `${mediumState.medium.slug}-t${combo.temperatureK}k-p${combo.pressurePa}pa-v${combo.speedMps}ms`,
+    ),
   );
   const [inserted] = await asDb(tx)
     .insert(flowConditions)
@@ -684,8 +936,16 @@ async function findOrCreateFlowCondition(
     .onConflictDoNothing({ target: flowConditions.canonicalKey })
     .returning();
   if (inserted) return { row: inserted, created: true };
-  const [row] = await asDb(tx).select().from(flowConditions).where(eq(flowConditions.canonicalKey, canonicalKey)).limit(1);
-  if (!row) throw new CampaignError("conflict", "flow condition insert race could not be resolved");
+  const [row] = await asDb(tx)
+    .select()
+    .from(flowConditions)
+    .where(eq(flowConditions.canonicalKey, canonicalKey))
+    .limit(1);
+  if (!row)
+    throw new CampaignError(
+      "conflict",
+      "flow condition insert race could not be resolved",
+    );
   return { row, created: false };
 }
 
@@ -704,12 +964,18 @@ async function findOrCreateReferenceGeometry(
     spanM,
     referenceAreaM2,
   });
-  const [existing] = await asDb(tx).select().from(referenceGeometryProfiles).where(eq(referenceGeometryProfiles.canonicalKey, canonicalKey)).limit(1);
+  const [existing] = await asDb(tx)
+    .select()
+    .from(referenceGeometryProfiles)
+    .where(eq(referenceGeometryProfiles.canonicalKey, canonicalKey))
+    .limit(1);
   if (existing) return { row: existing, created: false };
   const slug = await uniqueSlug(
     tx,
     "reference_geometry_profiles",
-    slugifyCampaign(`chord-${combo.chordM}m-span-${combo.spanM}m${combo.areaM2 ? `-area-${combo.areaM2}m2` : ""}`),
+    slugifyCampaign(
+      `chord-${combo.chordM}m-span-${combo.spanM}m${combo.areaM2 ? `-area-${combo.areaM2}m2` : ""}`,
+    ),
   );
   const [inserted] = await asDb(tx)
     .insert(referenceGeometryProfiles)
@@ -728,8 +994,16 @@ async function findOrCreateReferenceGeometry(
     .onConflictDoNothing({ target: referenceGeometryProfiles.canonicalKey })
     .returning();
   if (inserted) return { row: inserted, created: true };
-  const [row] = await asDb(tx).select().from(referenceGeometryProfiles).where(eq(referenceGeometryProfiles.canonicalKey, canonicalKey)).limit(1);
-  if (!row) throw new CampaignError("conflict", "reference geometry insert race could not be resolved");
+  const [row] = await asDb(tx)
+    .select()
+    .from(referenceGeometryProfiles)
+    .where(eq(referenceGeometryProfiles.canonicalKey, canonicalKey))
+    .limit(1);
+  if (!row)
+    throw new CampaignError(
+      "conflict",
+      "reference geometry insert race could not be resolved",
+    );
   return { row, created: false };
 }
 
@@ -745,29 +1019,68 @@ interface NumericsRows {
   output: typeof outputProfiles.$inferSelect;
 }
 
-export async function loadNumericsRows(db: DbTx, numerics: CampaignPlan["numerics"]): Promise<NumericsRows> {
+export async function loadNumericsRows(
+  db: DbTx,
+  numerics: CampaignPlan["numerics"],
+): Promise<NumericsRows> {
   const [[boundary], [mesh], [solver], [output]] = await Promise.all([
-    asDb(db).select().from(boundaryProfiles).where(eq(boundaryProfiles.id, numerics.boundaryProfileId)).limit(1),
-    asDb(db).select().from(meshProfiles).where(eq(meshProfiles.id, numerics.meshProfileId)).limit(1),
-    asDb(db).select().from(solverProfiles).where(eq(solverProfiles.id, numerics.solverProfileId)).limit(1),
-    asDb(db).select().from(outputProfiles).where(eq(outputProfiles.id, numerics.outputProfileId)).limit(1),
+    asDb(db)
+      .select()
+      .from(boundaryProfiles)
+      .where(eq(boundaryProfiles.id, numerics.boundaryProfileId))
+      .limit(1),
+    asDb(db)
+      .select()
+      .from(meshProfiles)
+      .where(eq(meshProfiles.id, numerics.meshProfileId))
+      .limit(1),
+    asDb(db)
+      .select()
+      .from(solverProfiles)
+      .where(eq(solverProfiles.id, numerics.solverProfileId))
+      .limit(1),
+    asDb(db)
+      .select()
+      .from(outputProfiles)
+      .where(eq(outputProfiles.id, numerics.outputProfileId))
+      .limit(1),
   ]);
-  if (!boundary) throw new CampaignError("not_found", "boundary profile not found");
+  if (!boundary)
+    throw new CampaignError("not_found", "boundary profile not found");
   if (!mesh) throw new CampaignError("not_found", "mesh profile not found");
   if (!solver) throw new CampaignError("not_found", "solver profile not found");
   if (!output) throw new CampaignError("not_found", "output profile not found");
   const uransMesh = numerics.uransMeshProfileId
-    ? (await asDb(db).select().from(meshProfiles).where(eq(meshProfiles.id, numerics.uransMeshProfileId)).limit(1))[0]
+    ? (
+        await asDb(db)
+          .select()
+          .from(meshProfiles)
+          .where(eq(meshProfiles.id, numerics.uransMeshProfileId))
+          .limit(1)
+      )[0]
     : null;
-  if (numerics.uransMeshProfileId && !uransMesh) throw new CampaignError("not_found", "URANS mesh profile not found");
+  if (numerics.uransMeshProfileId && !uransMesh)
+    throw new CampaignError("not_found", "URANS mesh profile not found");
   const uransPrecalcMesh = numerics.uransPrecalcMeshProfileId
-    ? (await asDb(db).select().from(meshProfiles).where(eq(meshProfiles.id, numerics.uransPrecalcMeshProfileId)).limit(1))[0]
+    ? (
+        await asDb(db)
+          .select()
+          .from(meshProfiles)
+          .where(eq(meshProfiles.id, numerics.uransPrecalcMeshProfileId))
+          .limit(1)
+      )[0]
     : null;
-  if (numerics.uransPrecalcMeshProfileId && !uransPrecalcMesh) throw new CampaignError("not_found", "URANS precalc mesh profile not found");
+  if (numerics.uransPrecalcMeshProfileId && !uransPrecalcMesh)
+    throw new CampaignError(
+      "not_found",
+      "URANS precalc mesh profile not found",
+    );
   return { boundary, mesh, uransMesh, uransPrecalcMesh, solver, output };
 }
 
-function stripRowMeta<T extends { createdAt: Date; updatedAt: Date; isSeeded: boolean }>(row: T) {
+function stripRowMeta<
+  T extends { createdAt: Date; updatedAt: Date; isSeeded: boolean },
+>(row: T) {
   const { createdAt: _c, updatedAt: _u, isSeeded: _s, ...rest } = row;
   return rest;
 }
@@ -781,11 +1094,23 @@ function buildPhysicsHashSnapshot(args: {
   medium: Medium;
   geo: typeof referenceGeometryProfiles.$inferSelect;
   numerics: NumericsRows;
-}): { snapshot: SimulationSetupSnapshot; reynolds: number; mach: number | null } {
+}): {
+  snapshot: SimulationSetupSnapshot;
+  reynolds: number;
+  mach: number | null;
+} {
   const { flow, medium, geo, numerics } = args;
-  const reynolds = Math.round((flow.speedMps * geo.referenceLengthM) / flow.kinematicViscosity);
+  const reynolds = Math.round(
+    (flow.speedMps * geo.referenceLengthM) / flow.kinematicViscosity,
+  );
   const snapshot = {
-    preset: { id: "", slug: "", name: "", enabled: false, legacyBoundaryConditionId: null },
+    preset: {
+      id: "",
+      slug: "",
+      name: "",
+      enabled: false,
+      legacyBoundaryConditionId: null,
+    },
     flowState: {
       id: flow.id,
       slug: flow.slug,
@@ -823,7 +1148,9 @@ function buildPhysicsHashSnapshot(args: {
     },
     mesh: stripRowMeta(numerics.mesh),
     uransMesh: numerics.uransMesh ? stripRowMeta(numerics.uransMesh) : null,
-    uransPrecalcMesh: numerics.uransPrecalcMesh ? stripRowMeta(numerics.uransPrecalcMesh) : null,
+    uransPrecalcMesh: numerics.uransPrecalcMesh
+      ? stripRowMeta(numerics.uransPrecalcMesh)
+      : null,
     solver: stripRowMeta(numerics.solver),
     scheduling: null,
     output: null,
@@ -850,46 +1177,99 @@ interface CampaignPresetSupport {
  *  presets reuse the seeded/oldest auto scheduling profile (NULL budgets =
  *  engine auto, matching global cpuSlots semantics) and get one inert sweep
  *  definition per campaign carrying the base sweep for snapshot honesty. */
-async function ensureCampaignPresetSupport(tx: CampaignTx, campaignSlug: string, plan: CampaignPlan): Promise<CampaignPresetSupport> {
-  let [sched] = await asDb(tx)
-    .select({ id: schedulingProfiles.id })
-    .from(schedulingProfiles)
-    .where(eq(schedulingProfiles.isSeeded, true))
-    .orderBy(asc(schedulingProfiles.createdAt))
-    .limit(1);
-  if (!sched) {
-    [sched] = await asDb(tx).select({ id: schedulingProfiles.id }).from(schedulingProfiles).orderBy(asc(schedulingProfiles.createdAt)).limit(1);
-  }
-  if (!sched) {
-    const slug = await uniqueSlug(tx, "scheduling_profiles", "campaign-auto");
+async function ensureCampaignPresetSupport(
+  tx: CampaignTx,
+  campaignSlug: string,
+  plan: CampaignPlan,
+  schedulingProfileId?: string,
+): Promise<CampaignPresetSupport> {
+  let sched: { id: string } | undefined;
+  if (schedulingProfileId) {
     [sched] = await asDb(tx)
-      .insert(schedulingProfiles)
-      .values({ slug, name: "Campaign auto scheduling", schedulingPolicy: "auto" })
-      .returning({ id: schedulingProfiles.id });
+      .select({ id: schedulingProfiles.id })
+      .from(schedulingProfiles)
+      .where(eq(schedulingProfiles.id, schedulingProfileId))
+      .for("share")
+      .limit(1);
+    if (!sched)
+      throw new CampaignError(
+        "validation",
+        `scheduling profile ${schedulingProfileId} is unavailable`,
+      );
+  } else {
+    [sched] = await asDb(tx)
+      .select({ id: schedulingProfiles.id })
+      .from(schedulingProfiles)
+      .where(eq(schedulingProfiles.isSeeded, true))
+      .orderBy(asc(schedulingProfiles.createdAt))
+      .limit(1);
+    if (!sched) {
+      [sched] = await asDb(tx)
+        .select({ id: schedulingProfiles.id })
+        .from(schedulingProfiles)
+        .orderBy(asc(schedulingProfiles.createdAt))
+        .limit(1);
+    }
+    if (!sched) {
+      const slug = await uniqueSlug(tx, "scheduling_profiles", "campaign-auto");
+      [sched] = await asDb(tx)
+        .insert(schedulingProfiles)
+        .values({
+          slug,
+          name: "Campaign auto scheduling",
+          schedulingPolicy: "auto",
+        })
+        .returning({ id: schedulingProfiles.id });
+    }
   }
   const sweepSlugBase = slugifyCampaign(`campaign-${campaignSlug}-sweep`);
-  const [existingSweep] = await asDb(tx).select({ id: sweepDefinitions.id }).from(sweepDefinitions).where(eq(sweepDefinitions.slug, sweepSlugBase)).limit(1);
-  if (existingSweep) return { schedulingProfileId: sched.id, sweepDefinitionId: existingSweep.id };
+  const [existingSweep] = await asDb(tx)
+    .select({ id: sweepDefinitions.id })
+    .from(sweepDefinitions)
+    .where(eq(sweepDefinitions.slug, sweepSlugBase))
+    .limit(1);
+  if (existingSweep)
+    return {
+      schedulingProfileId: sched.id,
+      sweepDefinitionId: existingSweep.id,
+    };
   const list = plan.baseSweep.listDeg?.map(Number) ?? null;
   const [sweep] = await asDb(tx)
     .insert(sweepDefinitions)
     .values({
       slug: sweepSlugBase,
       name: `Campaign ${campaignSlug} base sweep`,
-      aoaStart: plan.baseSweep.fromDeg != null ? Number(plan.baseSweep.fromDeg) : list && list.length ? Math.min(...list) : -8,
-      aoaStop: plan.baseSweep.toDeg != null ? Number(plan.baseSweep.toDeg) : list && list.length ? Math.max(...list) : 20,
-      aoaStep: plan.baseSweep.stepDeg != null ? Number(plan.baseSweep.stepDeg) : 1,
+      aoaStart:
+        plan.baseSweep.fromDeg != null
+          ? Number(plan.baseSweep.fromDeg)
+          : list && list.length
+            ? Math.min(...list)
+            : -8,
+      aoaStop:
+        plan.baseSweep.toDeg != null
+          ? Number(plan.baseSweep.toDeg)
+          : list && list.length
+            ? Math.max(...list)
+            : 20,
+      aoaStep:
+        plan.baseSweep.stepDeg != null ? Number(plan.baseSweep.stepDeg) : 1,
       aoaList: list,
     })
     .returning({ id: sweepDefinitions.id });
   return { schedulingProfileId: sched.id, sweepDefinitionId: sweep.id };
 }
 
-async function lookupRevisionByPhysicsHash(tx: CampaignTx, physicsHash: string) {
+async function lookupRevisionByPhysicsHash(
+  tx: CampaignTx,
+  physicsHash: string,
+) {
   const [found] = await asDb(tx)
     .select({ revision: simulationPresetRevisions, preset: simulationPresets })
     .from(simulationPresetRevisions)
-    .innerJoin(simulationPresets, eq(simulationPresets.id, simulationPresetRevisions.presetId))
+    .innerJoin(
+      simulationPresets,
+      eq(simulationPresets.id, simulationPresetRevisions.presetId),
+    )
     .where(eq(simulationPresetRevisions.physicsHash, physicsHash))
     .orderBy(
       desc(simulationPresetRevisions.isCanonicalPhysics),
@@ -916,14 +1296,21 @@ async function resolveCampaignConditionRevision(
     cache: Map<string, ResolvedCampaignRevision>;
   },
 ): Promise<ResolvedCampaignRevision> {
-  const { snapshot, reynolds, mach } = buildPhysicsHashSnapshot({ flow: args.flow, medium: args.medium, geo: args.geo, numerics: args.numerics });
+  const { snapshot, reynolds, mach } = buildPhysicsHashSnapshot({
+    flow: args.flow,
+    medium: args.medium,
+    geo: args.geo,
+    numerics: args.numerics,
+  });
   const physicsHash = physicsHashForSnapshot(snapshot);
   const cached = args.cache.get(physicsHash);
   if (cached) return cached;
 
   // Advisory lock on the hash: races between concurrent materializers on the
   // same physics collapse to one canonical revision (spec §5.3c).
-  await asDb(tx).execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"campaign-physics:" + physicsHash}, 0))`);
+  await asDb(tx).execute(
+    sql`SELECT pg_advisory_xact_lock(hashtextextended(${"campaign-physics:" + physicsHash}, 0))`,
+  );
 
   const found = await lookupRevisionByPhysicsHash(tx, physicsHash);
   if (found) {
@@ -940,7 +1327,11 @@ async function resolveCampaignConditionRevision(
   }
 
   const support = await args.support();
-  const presetSlug = await uniqueSlug(tx, "simulation_presets", slugifyCampaign(`campaign-${args.campaignSlug}-re${reynolds}`));
+  const presetSlug = await uniqueSlug(
+    tx,
+    "simulation_presets",
+    slugifyCampaign(`campaign-${args.campaignSlug}-re${reynolds}`),
+  );
   const [preset] = await asDb(tx)
     .insert(simulationPresets)
     .values({
@@ -961,8 +1352,15 @@ async function resolveCampaignConditionRevision(
       enabled: false,
     })
     .returning();
-  const resolvedPreset = await ensureSimulationPresetRevision(asDb(tx), preset.id);
-  if (!resolvedPreset) throw new CampaignError("conflict", "failed to materialize a preset revision for a campaign condition");
+  const resolvedPreset = await ensureSimulationPresetRevision(
+    asDb(tx),
+    preset.id,
+  );
+  if (!resolvedPreset)
+    throw new CampaignError(
+      "conflict",
+      "failed to materialize a preset revision for a campaign condition",
+    );
   // Hash the authoritative resolved snapshot (identical inputs → identical
   // hash; recomputing guards against any drift between builders).
   const actualHash = physicsHashForSnapshot(resolvedPreset.snapshot);
@@ -1000,8 +1398,14 @@ async function insertCampaignPoints(
   const conditionFilter = opts.conditionIds
     ? sql`AND cc.id = ANY(${pgUuidArray(opts.conditionIds)}::uuid[])`
     : sql`AND cc.status = 'active'`;
-  const airfoilFilter = opts.airfoilIds ? sql`AND ca.airfoil_id = ANY(${pgUuidArray(opts.airfoilIds)}::uuid[])` : sql``;
-  const insertFor = async (angles: number[], symmetric: boolean, derived: boolean) => {
+  const airfoilFilter = opts.airfoilIds
+    ? sql`AND ca.airfoil_id = ANY(${pgUuidArray(opts.airfoilIds)}::uuid[])`
+    : sql``;
+  const insertFor = async (
+    angles: number[],
+    symmetric: boolean,
+    derived: boolean,
+  ) => {
     if (angles.length === 0) return;
     await asDb(tx).execute(sql`
       INSERT INTO sim_campaign_points
@@ -1057,7 +1461,10 @@ async function reactivateReleasedPoints(
 
 /** Link pre-solved evidence: solver cells first, then symmetric derived cells
  *  whose +α source is terminal (spec §5.3e / §9.2). */
-async function linkPresolvedEvidence(tx: CampaignTx, campaignId: string): Promise<{ linkedSolver: number; linkedDerived: number }> {
+async function linkPresolvedEvidence(
+  tx: CampaignTx,
+  campaignId: string,
+): Promise<{ linkedSolver: number; linkedDerived: number }> {
   const solverRows = (await asDb(tx).execute(sql`
     UPDATE sim_campaign_points p
     SET state = 'terminal', result_id = r.id, "updatedAt" = now()
@@ -1089,9 +1496,332 @@ async function linkPresolvedEvidence(tx: CampaignTx, campaignId: string): Promis
   return { linkedSolver: solverRows.length, linkedDerived: derivedRows.length };
 }
 
+/** Reconcile fidelity-ladder ownership after launch/plan growth links existing
+ * evidence into a campaign. Reused RANS evidence can originate from a
+ * background or different campaign job, so it has no campaign parent for the
+ * ordinary wave-2 retry scan. Attach any already-open physical work first,
+ * then create exact fresh precalc requests for the remaining physical cells.
+ *
+ * The advisory lock key is identical to createUransRequest: whole-vs-exact
+ * overlap and concurrent campaign launches are serialized per physical setup.
+ * All writes are set-based and idempotent inside the launch transaction. */
+async function reconcileLinkedCampaignLadderWork(
+  tx: CampaignTx,
+  campaignId: string,
+): Promise<void> {
+  const db = asDb(tx);
+  const candidateSql = sql`
+    SELECT p.airfoil_id, p.revision_id, p.aoa_deg::float8 AS aoa_deg, p.result_id
+    FROM sim_campaign_points p
+    JOIN results r ON r.id = p.result_id
+    JOIN result_classifications rc ON rc.result_id = r.id
+    WHERE p.campaign_id = ${campaignId}
+      AND p.state = 'terminal'
+      AND p.derived_by_symmetry = false
+      AND r.status = 'done'
+      AND (
+        rc.state = 'needs_urans'
+        OR (
+          rc.state = 'rejected'
+          AND (
+            r.fidelity = 'rans'
+            OR (r.fidelity IS NULL AND r.regime IS DISTINCT FROM 'urans')
+          )
+        )
+      )
+  `;
+  const continuationCandidateSql = sql`
+    SELECT p.airfoil_id, p.revision_id, p.aoa_deg::float8 AS aoa_deg,
+           r.id AS result_id
+    FROM sim_campaign_points p
+    JOIN results r ON r.id = p.result_id
+    JOIN result_classifications rc ON rc.result_id = r.id
+    WHERE p.campaign_id = ${campaignId}
+      AND p.state = 'terminal'
+      AND p.derived_by_symmetry = false
+      AND r.status = 'done'
+      AND r.fidelity = 'urans_precalc'
+      AND rc.state = 'rejected'
+      AND COALESCE(rc.reasons, ARRAY[]::text[])
+            <> ARRAY[${MISSING_URANS_VIDEO_REASON}]::text[]
+      AND r.engine_job_id IS NOT NULL
+      AND r.engine_case_slug IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM unnest(COALESCE(r.quality_warnings, ARRAY[]::text[])) warning
+        WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+           OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_urans_requests prior
+        LEFT JOIN sim_jobs prior_job ON prior_job.id = prior.sim_job_id
+        WHERE prior.continue_from_result_id = r.id
+          AND prior.state NOT IN ('pending', 'running')
+          AND (
+            prior.state = 'done'
+            OR prior_job.engine_job_id IS NOT NULL
+            OR prior_job."submittedAt" IS NOT NULL
+          )
+      )
+  `;
+
+  await db.execute(sql`
+    SELECT pg_advisory_xact_lock(hashtextextended(lock_target.lock_key, 0))
+    FROM (
+      SELECT DISTINCT
+        'urans-request:' || candidate.airfoil_id::text || ':' || candidate.revision_id::text || ':precalc' AS lock_key
+      FROM (
+        ${candidateSql}
+        UNION ALL
+        ${continuationCandidateSql}
+      ) candidate
+      ORDER BY lock_key
+    ) lock_target
+  `);
+
+  await db.execute(sql`
+    INSERT INTO sim_precalc_obligations (
+      airfoil_id, revision_id, aoa_deg, source_result_id, state
+    )
+    SELECT DISTINCT candidate.airfoil_id, candidate.revision_id,
+           candidate.aoa_deg, candidate.result_id, 'pending'
+    FROM (${candidateSql}) candidate
+    ON CONFLICT (airfoil_id, revision_id, aoa_deg) DO UPDATE
+      SET source_result_id = COALESCE(sim_precalc_obligations.source_result_id, EXCLUDED.source_result_id),
+          "updatedAt" = now()
+  `);
+  await db.execute(sql`
+    INSERT INTO sim_precalc_obligation_campaigns (
+      obligation_id, campaign_id, state, cancelled_at
+    )
+    SELECT DISTINCT obligation.id, ${campaignId}::uuid, 'active', NULL::timestamptz
+    FROM (${candidateSql}) candidate
+    JOIN sim_precalc_obligations obligation
+      ON obligation.airfoil_id = candidate.airfoil_id
+     AND obligation.revision_id = candidate.revision_id
+     AND obligation.aoa_deg = candidate.aoa_deg
+    ON CONFLICT (obligation_id, campaign_id) DO UPDATE
+      SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
+  `);
+
+  // Verification ownership and the pending-owner healer serialize on the
+  // accepted preliminary result. enqueuePrecalcVerifications already takes
+  // this same result lock; keep launch/plan-growth reconciliation on the same
+  // boundary so a healer can never cancel a queue row between its discovery
+  // here and the owner-association insert below.
+  await db.execute(sql`
+    SELECT r.id
+    FROM sim_campaign_points p
+    JOIN results r ON r.id = p.result_id
+    JOIN result_classifications rc ON rc.result_id = r.id
+    WHERE p.campaign_id = ${campaignId}
+      AND p.state = 'terminal'
+      AND p.derived_by_symmetry = false
+      AND r.status = 'done'
+      AND r.fidelity = 'urans_precalc'
+      AND rc.state = 'accepted'
+    ORDER BY r.id
+    FOR UPDATE OF r
+  `);
+
+  // Contract 4 survives campaign churn: historical done/cancelled queue rows
+  // do not satisfy a future campaign that newly links accepted preliminary
+  // evidence. Create a fresh campaign-owned physical obligation whenever no
+  // open row exists; the partial unique index is the final race guard.
+  await db.execute(sql`
+    INSERT INTO sim_urans_verify_queue (
+      airfoil_id, revision_id, aoa_deg, background_owner, state,
+      precalc_result_id
+    )
+    SELECT DISTINCT p.airfoil_id, p.revision_id, p.aoa_deg,
+           false, 'pending', r.id
+    FROM sim_campaign_points p
+    JOIN results r ON r.id = p.result_id
+    JOIN result_classifications rc ON rc.result_id = r.id
+    WHERE p.campaign_id = ${campaignId}
+      AND p.state = 'terminal'
+      AND p.derived_by_symmetry = false
+      AND r.status = 'done'
+      AND r.fidelity = 'urans_precalc'
+      AND rc.state = 'accepted'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_urans_verify_queue open_queue
+        WHERE open_queue.airfoil_id = p.airfoil_id
+          AND open_queue.revision_id = p.revision_id
+          AND open_queue.aoa_deg = p.aoa_deg
+          AND open_queue.state IN ('pending', 'running')
+      )
+    ON CONFLICT (airfoil_id, revision_id, aoa_deg)
+      WHERE state IN ('pending', 'running') DO NOTHING
+  `);
+
+  // A verification may already exist for a preliminary result linked during
+  // plan growth. Attach the campaign instead of creating a duplicate owner.
+  await db.execute(sql`
+    INSERT INTO sim_urans_verify_queue_campaigns (queue_id, campaign_id, state, cancelled_at)
+    SELECT DISTINCT q.id, owner_campaign.id, 'active', NULL::timestamptz
+    FROM sim_urans_verify_queue q
+    JOIN sim_campaign_points trigger_point
+      ON trigger_point.campaign_id = ${campaignId}
+     AND trigger_point.airfoil_id = q.airfoil_id
+     AND trigger_point.revision_id = q.revision_id
+     AND trigger_point.aoa_deg = q.aoa_deg
+     AND trigger_point.derived_by_symmetry = false
+    JOIN sim_campaign_points owner_point
+      ON owner_point.airfoil_id = q.airfoil_id
+     AND owner_point.revision_id = q.revision_id
+     AND owner_point.aoa_deg = q.aoa_deg
+     AND owner_point.state = 'terminal'
+     AND owner_point.derived_by_symmetry = false
+    JOIN sim_campaigns owner_campaign
+      ON owner_campaign.id = owner_point.campaign_id
+     AND (
+       owner_campaign.status IN ('active', 'attention', 'paused')
+       OR (
+         owner_campaign.id = ${campaignId}
+         AND owner_campaign.status = 'completed'
+       )
+     )
+    WHERE q.state IN ('pending', 'running')
+    ON CONFLICT (queue_id, campaign_id) DO UPDATE
+      SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
+  `);
+
+  // Reused RANS rows with their own campaign wave-1 parent stay on the normal
+  // retry path. Only parentless reused evidence needs a fresh exact request.
+  await db.execute(sql`
+    INSERT INTO sim_urans_requests (
+      airfoil_id, revision_id, aoa_deg, fidelity, state, requested_by
+    )
+    SELECT DISTINCT candidate.airfoil_id, candidate.revision_id,
+           candidate.aoa_deg, 'precalc', 'pending',
+           ${AUTO_PRECALC_CONTINUATION_REQUESTED_BY}
+    FROM (${candidateSql}) candidate
+    JOIN sim_precalc_obligations obligation
+      ON obligation.airfoil_id = candidate.airfoil_id
+     AND obligation.revision_id = candidate.revision_id
+     AND obligation.aoa_deg = candidate.aoa_deg
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM sim_jobs campaign_parent
+      WHERE campaign_parent.campaign_id = ${campaignId}
+        AND campaign_parent.id = (
+          SELECT source_result.sim_job_id
+          FROM results source_result
+          WHERE source_result.id = candidate.result_id
+        )
+        AND campaign_parent.wave = 1
+    )
+      AND obligation.state = 'pending'
+      AND obligation.attempt_count < obligation.max_attempts
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_urans_requests open_request
+        WHERE open_request.airfoil_id = candidate.airfoil_id
+          AND open_request.revision_id = candidate.revision_id
+          AND open_request.fidelity = 'precalc'
+          AND open_request.state IN ('pending', 'running')
+          AND (open_request.aoa_deg IS NULL OR open_request.aoa_deg = candidate.aoa_deg)
+      )
+    ON CONFLICT DO NOTHING
+  `);
+
+  // Reused preliminary evidence may owe the same one bounded continuation as
+  // an in-place campaign result. A cancelled pre-submit composition did not
+  // spend it; a completed or engine-submitted attempt did, globally.
+  await db.execute(sql`
+    INSERT INTO sim_urans_requests (
+      airfoil_id, revision_id, aoa_deg, fidelity, state, requested_by,
+      continue_from_result_id, budget_override_s
+    )
+    SELECT DISTINCT candidate.airfoil_id, candidate.revision_id,
+           candidate.aoa_deg, 'precalc', 'pending',
+           ${AUTO_PRECALC_CONTINUATION_REQUESTED_BY}, candidate.result_id,
+           ${AUTO_PRECALC_CONTINUATION_BUDGET_S}::int
+    FROM (${continuationCandidateSql}) candidate
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM sim_urans_requests open_request
+      WHERE open_request.airfoil_id = candidate.airfoil_id
+        AND open_request.revision_id = candidate.revision_id
+        AND open_request.fidelity = 'precalc'
+        AND open_request.state IN ('pending', 'running')
+        AND (open_request.aoa_deg IS NULL OR open_request.aoa_deg = candidate.aoa_deg)
+    )
+    ON CONFLICT DO NOTHING
+  `);
+
+  // Both reused and newly-created covering requests become campaign-owned.
+  // A pre-existing manual whole request remains independently runnable; its
+  // association only records that this campaign is waiting on its coverage.
+  await db.execute(sql`
+    INSERT INTO sim_urans_request_campaigns (request_id, campaign_id, state, cancelled_at)
+    SELECT DISTINCT open_request.id, owner_campaign.id, 'active', NULL::timestamptz
+    FROM (${candidateSql}) candidate
+    JOIN sim_urans_requests open_request
+      ON open_request.airfoil_id = candidate.airfoil_id
+     AND open_request.revision_id = candidate.revision_id
+     AND open_request.fidelity = 'precalc'
+     AND open_request.state IN ('pending', 'running')
+     AND (open_request.aoa_deg IS NULL OR open_request.aoa_deg = candidate.aoa_deg)
+    JOIN sim_campaign_points owner_point
+      ON owner_point.airfoil_id = candidate.airfoil_id
+     AND owner_point.revision_id = candidate.revision_id
+     AND owner_point.aoa_deg = candidate.aoa_deg
+     AND owner_point.state = 'terminal'
+     AND owner_point.derived_by_symmetry = false
+    JOIN sim_campaigns owner_campaign
+      ON owner_campaign.id = owner_point.campaign_id
+     AND (
+       owner_campaign.status IN ('active', 'attention', 'paused')
+       OR (
+         owner_campaign.id = ${campaignId}
+         AND owner_campaign.status = 'completed'
+       )
+     )
+    ON CONFLICT (request_id, campaign_id) DO UPDATE
+      SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
+  `);
+
+  // A campaign launched while a bounded same-result continuation is already
+  // open must join that physical request even though its source fidelity is
+  // preliminary URANS rather than RANS.
+  await db.execute(sql`
+    INSERT INTO sim_urans_request_campaigns (request_id, campaign_id, state, cancelled_at)
+    SELECT DISTINCT open_request.id, owner_campaign.id, 'active', NULL::timestamptz
+    FROM (${continuationCandidateSql}) candidate
+    JOIN sim_urans_requests open_request
+      ON open_request.airfoil_id = candidate.airfoil_id
+     AND open_request.revision_id = candidate.revision_id
+     AND open_request.fidelity = 'precalc'
+     AND open_request.state IN ('pending', 'running')
+     AND (open_request.aoa_deg IS NULL OR open_request.aoa_deg = candidate.aoa_deg)
+    JOIN sim_campaign_points owner_point
+      ON owner_point.result_id = candidate.result_id
+     AND owner_point.state = 'terminal'
+     AND owner_point.derived_by_symmetry = false
+    JOIN sim_campaigns owner_campaign
+      ON owner_campaign.id = owner_point.campaign_id
+     AND (
+       owner_campaign.status IN ('active', 'attention', 'paused')
+       OR (
+         owner_campaign.id = ${campaignId}
+         AND owner_campaign.status = 'completed'
+       )
+     )
+    ON CONFLICT (request_id, campaign_id) DO UPDATE
+      SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
+  `);
+}
+
 /** §5.4 "mark reused points stale & re-solve": flip matching solved results to
  *  stale so the campaign branch treats them as gaps. */
-async function markReusedResultsStale(tx: CampaignTx, campaignId: string): Promise<number> {
+async function markReusedResultsStale(
+  tx: CampaignTx,
+  campaignId: string,
+): Promise<number> {
   const rows = (await asDb(tx).execute(sql`
     UPDATE results r
     SET status = 'stale'
@@ -1117,6 +1847,9 @@ export interface CampaignProgressTotals {
   /** Terminal-done points whose classification is 'rejected' — settled but
    *  NOT solved (physics-invalid evidence, surfaced like failed). */
   rejected: number;
+  /** Terminal machine-owned PRECALC obligations whose bounded attempts are
+   *  exhausted or deterministically blocked. Disjoint from failed/rejected. */
+  blocked: number;
   remaining: number;
 }
 
@@ -1131,7 +1864,8 @@ export interface CampaignProgressTotals {
  *  superseded" mean:
  *   - requested: state <> 'released' (TOTAL obligation, the UI denominator)
  *   - solved:    state = 'terminal' AND NOT derived AND result.status = 'done'
- *                AND classification IS NOT 'rejected'
+ *                AND classification is explicitly accepted/needs_urans/
+ *                superseded_by_urans
  *   - rejected:  state = 'terminal' AND NOT derived AND result.status = 'done'
  *                AND result_classifications.state = 'rejected'
  *   - failed:    state = 'terminal' AND NOT derived AND result.status = 'failed'
@@ -1141,9 +1875,13 @@ export interface CampaignProgressTotals {
  *                click-through list, which lists source rows only)
  *   - running:   state = 'requested' AND live-cell result.status IN (queued, running)
  *   - superseded: result_classifications.state = 'superseded_by_urans'
- *   - derived:   state = 'terminal' AND derived — ALL terminal mirrors,
- *                whatever their source's disposition (done OR failed), so
+ *   - derived:   terminal mirror only when its linked source classification
+ *                is explicitly usable and its source obligation is not blocked
+ *   - blocked:   blocked PRECALC cells and their mirrors, plus terminal
+ *                unclassified/unrecognized evidence and unavailable mirrors;
+ *                takes precedence over failed/rejected
  *                remaining = requested - solved - derived - failed - rejected
+ *                            - blocked
  *                stays balanced
  *  (result joined ON r.id = p.result_id; live joined ON the cell key.)
  *
@@ -1153,12 +1891,20 @@ export interface CampaignProgressTotals {
  *  DELETE-then-recompute cleanup (the reconciler prunes vanished rows out of
  *  band; here we must prune synchronously). The delegate's INSERT...ON CONFLICT
  *  then repopulates every surviving key from scratch. */
-export async function recomputeCampaignProgress(tx: CampaignTx, campaignId: string): Promise<void> {
-  await asDb(tx).execute(sql`DELETE FROM sim_campaign_progress WHERE campaign_id = ${campaignId}`);
+export async function recomputeCampaignProgress(
+  tx: CampaignTx,
+  campaignId: string,
+): Promise<void> {
+  await asDb(tx).execute(
+    sql`DELETE FROM sim_campaign_progress WHERE campaign_id = ${campaignId}`,
+  );
   await recomputeProgressForCampaign(asDb(tx), campaignId);
 }
 
-export async function campaignProgressTotals(db: DbTx, campaignId: string): Promise<CampaignProgressTotals> {
+export async function campaignProgressTotals(
+  db: DbTx,
+  campaignId: string,
+): Promise<CampaignProgressTotals> {
   const [row] = (await asDb(db).execute(sql`
     SELECT
       COALESCE(sum(requested), 0)::int AS requested,
@@ -1167,11 +1913,21 @@ export async function campaignProgressTotals(db: DbTx, campaignId: string): Prom
       COALESCE(sum(running), 0)::int AS running,
       COALESCE(sum(superseded), 0)::int AS superseded,
       COALESCE(sum(derived), 0)::int AS derived,
-      COALESCE(sum(rejected), 0)::int AS rejected
+      COALESCE(sum(rejected), 0)::int AS rejected,
+      COALESCE(sum(blocked), 0)::int AS blocked
     FROM sim_campaign_progress
     WHERE campaign_id = ${campaignId}
   `)) as unknown as Array<Omit<CampaignProgressTotals, "remaining">>;
-  const totals = row ?? { requested: 0, solved: 0, failed: 0, running: 0, superseded: 0, derived: 0, rejected: 0 };
+  const totals = row ?? {
+    requested: 0,
+    solved: 0,
+    failed: 0,
+    running: 0,
+    superseded: 0,
+    derived: 0,
+    rejected: 0,
+    blocked: 0,
+  };
   return {
     requested: Number(totals.requested),
     solved: Number(totals.solved),
@@ -1180,29 +1936,49 @@ export async function campaignProgressTotals(db: DbTx, campaignId: string): Prom
     superseded: Number(totals.superseded),
     derived: Number(totals.derived),
     rejected: Number(totals.rejected),
+    blocked: Number(totals.blocked),
     remaining: Math.max(
       0,
-      Number(totals.requested) - Number(totals.solved) - Number(totals.derived) - Number(totals.failed) - Number(totals.rejected),
+      Number(totals.requested) -
+        Number(totals.solved) -
+        Number(totals.derived) -
+        Number(totals.failed) -
+        Number(totals.rejected) -
+        Number(totals.blocked),
     ),
   };
 }
 
 /** Completion-state derivation (spec §6.4): every obligated cell settled and
- *  zero failed/rejected → completed; settled with failures OR physics-rejected
+ *  zero failed/rejected/blocked → completed; settled with failures,
+ *  physics-rejected evidence, or machine-blocked PRECALC work
  *  points → attention (a rejected point is settled but NOT solved work); else
  *  active. */
-export function deriveCampaignCompletion(totals: CampaignProgressTotals): "active" | "attention" | "completed" {
-  if (totals.requested > 0 && totals.remaining <= 0) return totals.failed > 0 || totals.rejected > 0 ? "attention" : "completed";
+export function deriveCampaignCompletion(
+  totals: CampaignProgressTotals,
+): "active" | "attention" | "completed" {
+  if (totals.requested > 0 && totals.remaining <= 0)
+    return totals.failed > 0 || totals.rejected > 0 || totals.blocked > 0
+      ? "attention"
+      : "completed";
   return "active";
 }
 
 /** Re-derive campaign status from counters. Only transitions between
  *  active/attention/completed; paused/cancelled/archived are verb-owned. */
-export async function refreshCampaignCompletion(tx: CampaignTx, campaignId: string): Promise<CampaignProgressTotals> {
+export async function refreshCampaignCompletion(
+  tx: CampaignTx,
+  campaignId: string,
+): Promise<CampaignProgressTotals> {
   const totals = await campaignProgressTotals(tx, campaignId);
-  const [campaign] = await asDb(tx).select().from(simCampaigns).where(eq(simCampaigns.id, campaignId)).limit(1);
+  const [campaign] = await asDb(tx)
+    .select()
+    .from(simCampaigns)
+    .where(eq(simCampaigns.id, campaignId))
+    .limit(1);
   if (!campaign) return totals;
-  if (!["active", "attention", "completed"].includes(campaign.status)) return totals;
+  if (!["active", "attention", "completed"].includes(campaign.status))
+    return totals;
   let next = deriveCampaignCompletion(totals);
   if (next !== "active") {
     // Fidelity ladder (contract 7): completion flips only when ALL THREE tiers
@@ -1212,12 +1988,16 @@ export async function refreshCampaignCompletion(tx: CampaignTx, campaignId: stri
     const tiers = await campaignOpenTierCounts(asDb(tx), campaignId);
     if (tiers.precalcOpen > 0 || tiers.verifyOpen > 0) next = "active";
   }
-  if (next !== campaign.status || (next === "completed") !== Boolean(campaign.completedAt)) {
+  if (
+    next !== campaign.status ||
+    (next === "completed") !== Boolean(campaign.completedAt)
+  ) {
     await asDb(tx)
       .update(simCampaigns)
       .set({
         status: next,
-        completedAt: next === "completed" ? campaign.completedAt ?? new Date() : null,
+        completedAt:
+          next === "completed" ? (campaign.completedAt ?? new Date()) : null,
       })
       .where(eq(simCampaigns.id, campaignId));
   }
@@ -1233,8 +2013,12 @@ async function ensureCampaignLanes(
   plan: CampaignPlan,
   opts: { conditionIds?: string[]; airfoilIds?: string[] } = {},
 ): Promise<void> {
-  const conditionFilter = opts.conditionIds ? sql`AND cc.id = ANY(${pgUuidArray(opts.conditionIds)}::uuid[])` : sql`AND cc.status = 'active'`;
-  const airfoilFilter = opts.airfoilIds ? sql`AND ca.airfoil_id = ANY(${pgUuidArray(opts.airfoilIds)}::uuid[])` : sql``;
+  const conditionFilter = opts.conditionIds
+    ? sql`AND cc.id = ANY(${pgUuidArray(opts.conditionIds)}::uuid[])`
+    : sql`AND cc.status = 'active'`;
+  const airfoilFilter = opts.airfoilIds
+    ? sql`AND ca.airfoil_id = ANY(${pgUuidArray(opts.airfoilIds)}::uuid[])`
+    : sql``;
   for (const objective of CAMPAIGN_OBJECTIVES) {
     if (!plan.objectives[objective.id].enabled) continue;
     await asDb(tx).execute(sql`
@@ -1257,7 +2041,10 @@ async function ensureCampaignLanes(
  *  "Campaign-claimed" = pending, unowned by a submitted job (sim_job_id NULL
  *  or a job still composing), at a released campaign cell. Running rows are
  *  never touched. */
-async function deleteReleasedPendingResults(tx: CampaignTx, campaignId: string): Promise<{ deleted: number; staled: number }> {
+async function deleteReleasedPendingResults(
+  tx: CampaignTx,
+  campaignId: string,
+): Promise<{ deleted: number; staled: number }> {
   const claimable = sql`
     p.campaign_id = ${campaignId}
     AND p.state = 'released'
@@ -1268,6 +2055,21 @@ async function deleteReleasedPendingResults(tx: CampaignTx, campaignId: string):
       OR (r.status IN ('pending', 'queued') AND r.sim_job_id IS NOT NULL AND EXISTS (
         SELECT 1 FROM sim_jobs j WHERE j.id = r.sim_job_id AND j.status = 'pending'
       ))
+      OR (
+        r.status = 'queued'
+        AND r.sim_job_id IS NULL
+        AND (
+          (r.fidelity = 'urans_precalc' AND r.auto_retried_at IS NOT NULL)
+          OR (
+            r.fidelity = 'rans'
+            AND EXISTS (
+              SELECT 1 FROM result_classifications routed_rc
+              WHERE routed_rc.result_id = r.id
+                AND routed_rc.state IN ('needs_urans', 'rejected')
+            )
+          )
+        )
+      )
     )
   `;
   const staledRows = (await asDb(tx).execute(sql`
@@ -1300,6 +2102,8 @@ export interface CampaignLaunchInput {
   plan: CampaignPlanInput;
   markStaleAndResolve?: boolean;
   createdBy?: string | null;
+  /** Explicit execution-support row; excluded from the physical plan. */
+  schedulingProfileId?: string;
 }
 
 export interface CampaignLaunchResult {
@@ -1335,6 +2139,7 @@ async function resolveConditionSetups(
     campaignSlug: string;
     plan: CampaignPlan;
     combos: CampaignConditionCombo[];
+    schedulingProfileId?: string;
   },
 ): Promise<ResolvedConditionSetup[]> {
   const mediumState = await loadMediumState(tx, args.plan.mediumId);
@@ -1342,12 +2147,23 @@ async function resolveConditionSetups(
   const cache = new Map<string, ResolvedCampaignRevision>();
   let support: CampaignPresetSupport | null = null;
   const supportLoader = async () => {
-    if (!support) support = await ensureCampaignPresetSupport(tx, args.campaignSlug, args.plan);
+    if (!support)
+      support = await ensureCampaignPresetSupport(
+        tx,
+        args.campaignSlug,
+        args.plan,
+        args.schedulingProfileId,
+      );
     return support;
   };
   const out: ResolvedConditionSetup[] = [];
   for (const combo of args.combos) {
-    const flow = await findOrCreateFlowCondition(tx, args.campaignId, mediumState, combo);
+    const flow = await findOrCreateFlowCondition(
+      tx,
+      args.campaignId,
+      mediumState,
+      combo,
+    );
     const geo = await findOrCreateReferenceGeometry(tx, args.campaignId, combo);
     const resolved = await resolveCampaignConditionRevision(tx, {
       campaignName: args.campaignName,
@@ -1375,38 +2191,66 @@ async function resolveConditionSetups(
   return out;
 }
 
-async function validateCampaignAirfoils(db: DbTx, airfoilIds: string[]): Promise<Array<{ id: string; isSymmetric: boolean }>> {
+async function validateCampaignAirfoils(
+  db: DbTx,
+  airfoilIds: string[],
+): Promise<Array<{ id: string; isSymmetric: boolean }>> {
   const unique = [...new Set(airfoilIds)];
-  if (unique.length === 0) throw new CampaignError("validation", "at least one airfoil is required");
+  if (unique.length === 0)
+    throw new CampaignError("validation", "at least one airfoil is required");
   const rows = await asDb(db)
     .select({ id: airfoils.id, isSymmetric: airfoils.isSymmetric })
     .from(airfoils)
-    .where(and(inArray(airfoils.id, unique), sql`${airfoils.deletedAt} IS NULL`));
+    .where(
+      and(inArray(airfoils.id, unique), sql`${airfoils.deletedAt} IS NULL`),
+    );
   if (rows.length !== unique.length) {
-    throw new CampaignError("validation", `one or more airfoils are unavailable (${rows.length}/${unique.length} found)`);
+    throw new CampaignError(
+      "validation",
+      `one or more airfoils are unavailable (${rows.length}/${unique.length} found)`,
+    );
   }
   return rows;
 }
 
 /** The §5 launch transaction. Idempotent by idempotencyKey (replay returns the
  *  existing campaign). */
-export async function materializeCampaignLaunch(db: DB, input: CampaignLaunchInput): Promise<CampaignLaunchResult> {
+export async function materializeCampaignLaunch(
+  db: DB,
+  input: CampaignLaunchInput,
+): Promise<CampaignLaunchResult> {
   const plan = normalizeCampaignPlan(input.plan);
   if (!input.idempotencyKey || input.idempotencyKey.length < 8) {
-    throw new CampaignError("validation", "idempotencyKey is required (min 8 chars)");
+    throw new CampaignError(
+      "validation",
+      "idempotencyKey is required (min 8 chars)",
+    );
   }
-  if (!(Number.isInteger(input.priority) && input.priority >= 0 && input.priority <= 9)) {
+  if (
+    !(
+      Number.isInteger(input.priority) &&
+      input.priority >= 0 &&
+      input.priority <= 9
+    )
+  ) {
     throw new CampaignError("validation", "priority must be an integer 0..9");
   }
-  if (!input.name?.trim()) throw new CampaignError("validation", "name is required");
+  if (!input.name?.trim())
+    throw new CampaignError("validation", "name is required");
 
   return db.transaction(async (tx) => {
     // Serialize launches: replay-safe idempotency, slug allocation, and
     // canonical-physics election all become race-free (launches are rare
     // admin operations; one lock is cheaper than per-row conflict recovery).
-    await asDb(tx).execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('sim-campaign-launch', 0))`);
+    await asDb(tx).execute(
+      sql`SELECT pg_advisory_xact_lock(hashtextextended('sim-campaign-launch', 0))`,
+    );
 
-    const [existing] = await asDb(tx).select().from(simCampaigns).where(eq(simCampaigns.idempotencyKey, input.idempotencyKey)).limit(1);
+    const [existing] = await asDb(tx)
+      .select()
+      .from(simCampaigns)
+      .where(eq(simCampaigns.idempotencyKey, input.idempotencyKey))
+      .limit(1);
     if (existing) {
       const totals = await campaignProgressTotals(tx, existing.id);
       const [conditionCount] = (await asDb(tx).execute(
@@ -1436,7 +2280,11 @@ export async function materializeCampaignLaunch(db: DB, input: CampaignLaunchInp
       airfoilRows.filter((a) => a.isSymmetric).length,
     );
     const totalPoints = arithmetic.points * combos.length;
-    const slug = await uniqueSlug(tx, "sim_campaigns", slugifyCampaign(input.name));
+    const slug = await uniqueSlug(
+      tx,
+      "sim_campaigns",
+      slugifyCampaign(input.name),
+    );
     const [campaign] = await asDb(tx)
       .insert(simCampaigns)
       .values({
@@ -1455,6 +2303,7 @@ export async function materializeCampaignLaunch(db: DB, input: CampaignLaunchInp
       campaignSlug: campaign.slug,
       plan,
       combos,
+      schedulingProfileId: input.schedulingProfileId,
     });
 
     // §3.3: legacy bcId bridge for every found-or-created preset BEFORE points.
@@ -1482,9 +2331,17 @@ export async function materializeCampaignLaunch(db: DB, input: CampaignLaunchInp
         createdBy: input.createdBy ?? null,
       })
       .returning();
-    await asDb(tx).update(simCampaigns).set({ currentPlanRevisionId: planRevision.id }).where(eq(simCampaigns.id, campaign.id));
+    await asDb(tx)
+      .update(simCampaigns)
+      .set({ currentPlanRevisionId: planRevision.id })
+      .where(eq(simCampaigns.id, campaign.id));
 
-    await asDb(tx).insert(simCampaignAirfoils).values(airfoilRows.map((a) => ({ campaignId: campaign.id, airfoilId: a.id }))).onConflictDoNothing();
+    await asDb(tx)
+      .insert(simCampaignAirfoils)
+      .values(
+        airfoilRows.map((a) => ({ campaignId: campaign.id, airfoilId: a.id })),
+      )
+      .onConflictDoNothing();
 
     if (setups.length > 0) {
       await asDb(tx)
@@ -1517,19 +2374,27 @@ export async function materializeCampaignLaunch(db: DB, input: CampaignLaunchInp
       linkedSolver = linked.linkedSolver;
       linkedDerived = linked.linkedDerived;
     }
+    await reconcileLinkedCampaignLadderWork(tx, campaign.id);
 
     await recomputeCampaignProgress(tx, campaign.id);
     await ensureCampaignLanes(tx, campaign.id, plan);
     const totals = await refreshCampaignCompletion(tx, campaign.id);
 
-    const [finalCampaign] = await asDb(tx).select().from(simCampaigns).where(eq(simCampaigns.id, campaign.id)).limit(1);
+    const [finalCampaign] = await asDb(tx)
+      .select()
+      .from(simCampaigns)
+      .where(eq(simCampaigns.id, campaign.id))
+      .limit(1);
     return {
       campaign: finalCampaign,
       replayed: false,
       totals,
       conditionCount: setups.length,
       presetsCreated: setups.filter((s) => s.presetCreated).length,
-      presetsReused: presetIds.length - new Set(setups.filter((s) => s.presetCreated).map((s) => s.presetId)).size,
+      presetsReused:
+        presetIds.length -
+        new Set(setups.filter((s) => s.presetCreated).map((s) => s.presetId))
+          .size,
       linkedSolver,
       linkedDerived,
       staleMarked,
@@ -1572,7 +2437,10 @@ export type CampaignReusePreview =
 /** READ-ONLY §5.4 preview: in-memory physics hashes, canonical revision
  *  lookup, solved counts. Bounded by statement_timeout ≈ 5 s and degrades to
  *  {status:"timeout"} honestly. Never creates rows. */
-export async function previewCampaignReuse(db: DB, input: CampaignReusePreviewInput): Promise<CampaignReusePreview> {
+export async function previewCampaignReuse(
+  db: DB,
+  input: CampaignReusePreviewInput,
+): Promise<CampaignReusePreview> {
   const plan = normalizeCampaignPlan(input.plan);
   try {
     return await db.transaction(async (tx) => {
@@ -1589,13 +2457,21 @@ export async function previewCampaignReuse(db: DB, input: CampaignReusePreviewIn
       const numerics = await loadNumericsRows(tx, plan.numerics);
 
       const conditions: CampaignReusePreviewCondition[] = [];
-      const combosByRevision = new Map<string, CampaignReusePreviewCondition[]>();
+      const combosByRevision = new Map<
+        string,
+        CampaignReusePreviewCondition[]
+      >();
       for (const combo of combos) {
         const temperatureK = Number(combo.temperatureK);
         const pressurePa = Number(combo.pressurePa);
         const speedMps = Number(combo.speedMps);
         const chordM = Number(combo.chordM);
-        const flowKey = flowConditionCanonicalKey({ mediumId: plan.mediumId, temperatureK, pressurePa, speedMps });
+        const flowKey = flowConditionCanonicalKey({
+          mediumId: plan.mediumId,
+          temperatureK,
+          pressurePa,
+          speedMps,
+        });
         const geoKey = referenceGeometryCanonicalKey({
           geometryType: "airfoil_2d",
           referenceLengthKind: "chord",
@@ -1603,9 +2479,21 @@ export async function previewCampaignReuse(db: DB, input: CampaignReusePreviewIn
           spanM: Number(combo.spanM),
           referenceAreaM2: combo.areaM2 == null ? null : Number(combo.areaM2),
         });
-        const [flowRow] = await asDb(tx).select().from(flowConditions).where(eq(flowConditions.canonicalKey, flowKey)).limit(1);
-        const [geoRow] = await asDb(tx).select().from(referenceGeometryProfiles).where(eq(referenceGeometryProfiles.canonicalKey, geoKey)).limit(1);
-        const derived = deriveFlowConditionState(mediumState.stateInput, { temperatureK, pressurePa, speedMps });
+        const [flowRow] = await asDb(tx)
+          .select()
+          .from(flowConditions)
+          .where(eq(flowConditions.canonicalKey, flowKey))
+          .limit(1);
+        const [geoRow] = await asDb(tx)
+          .select()
+          .from(referenceGeometryProfiles)
+          .where(eq(referenceGeometryProfiles.canonicalKey, geoKey))
+          .limit(1);
+        const derived = deriveFlowConditionState(mediumState.stateInput, {
+          temperatureK,
+          pressurePa,
+          speedMps,
+        });
         const flow = flowRow ?? {
           ...({} as typeof flowConditions.$inferSelect),
           id: "",
@@ -1631,7 +2519,12 @@ export async function previewCampaignReuse(db: DB, input: CampaignReusePreviewIn
           spanM: Number(combo.spanM),
           referenceAreaM2: combo.areaM2 == null ? null : Number(combo.areaM2),
         };
-        const { snapshot, reynolds } = buildPhysicsHashSnapshot({ flow, medium: mediumState.medium, geo, numerics });
+        const { snapshot, reynolds } = buildPhysicsHashSnapshot({
+          flow,
+          medium: mediumState.medium,
+          geo,
+          numerics,
+        });
         const hash = physicsHashForSnapshot(snapshot);
         const found = await lookupRevisionByPhysicsHash(tx, hash);
         const row: CampaignReusePreviewCondition = {
@@ -1675,8 +2568,10 @@ export async function previewCampaignReuse(db: DB, input: CampaignReusePreviewIn
           const solved = solvedByAirfoil.get(airfoil.id);
           if (!solved) continue;
           if (airfoil.isSymmetric) {
-            for (const a of sets.symmetricSolverAngles) if (solved.has(a)) solvedForRevision++;
-            for (const a of sets.negativeAngles) if (solved.has(canonicalAoa(-a))) solvedForRevision++;
+            for (const a of sets.symmetricSolverAngles)
+              if (solved.has(a)) solvedForRevision++;
+            for (const a of sets.negativeAngles)
+              if (solved.has(canonicalAoa(-a))) solvedForRevision++;
           } else {
             for (const a of sets.angles) if (solved.has(a)) solvedForRevision++;
           }
@@ -1699,7 +2594,10 @@ export async function previewCampaignReuse(db: DB, input: CampaignReusePreviewIn
       };
     });
   } catch (e) {
-    if ((e as { code?: string }).code === "57014" || /statement timeout/i.test((e as Error).message ?? "")) {
+    if (
+      (e as { code?: string }).code === "57014" ||
+      /statement timeout/i.test((e as Error).message ?? "")
+    ) {
       return { status: "timeout" };
     }
     throw e;
@@ -1711,7 +2609,13 @@ export async function previewCampaignReuse(db: DB, input: CampaignReusePreviewIn
 // ---------------------------------------------------------------------------
 export interface PlanChangeObjectiveDelta {
   objective: CampaignObjectiveKey;
-  changes: Array<"enabled" | "disabled" | "tolerance_tightened" | "tolerance_loosened" | "rounds_changed">;
+  changes: Array<
+    | "enabled"
+    | "disabled"
+    | "tolerance_tightened"
+    | "tolerance_loosened"
+    | "rounds_changed"
+  >;
   toleranceDeg: string;
 }
 
@@ -1719,10 +2623,30 @@ export interface PlanChangeClassification {
   basePlanRevisionNumber: number;
   newPlan: CampaignPlan;
   diffHash: string;
-  addedConditions: Array<{ comboKey: string; temperatureK: string; pressurePa: string; speedMps: string; chordM: string }>;
-  reactivatedConditions: Array<{ conditionId: string; comboKey: string; previousStatus: string }>;
-  keptConditions: Array<{ conditionId: string; comboKey: string; solvedAngles: number[]; releasedPoints: number; keptOpenPoints: number }>;
-  releasedConditions: Array<{ conditionId: string; comboKey: string; releasedPoints: number }>;
+  addedConditions: Array<{
+    comboKey: string;
+    temperatureK: string;
+    pressurePa: string;
+    speedMps: string;
+    chordM: string;
+  }>;
+  reactivatedConditions: Array<{
+    conditionId: string;
+    comboKey: string;
+    previousStatus: string;
+  }>;
+  keptConditions: Array<{
+    conditionId: string;
+    comboKey: string;
+    solvedAngles: number[];
+    releasedPoints: number;
+    keptOpenPoints: number;
+  }>;
+  releasedConditions: Array<{
+    conditionId: string;
+    comboKey: string;
+    releasedPoints: number;
+  }>;
   addedAngles: number[];
   removedAngles: number[];
   removedAngleKeptCells: number;
@@ -1760,10 +2684,23 @@ interface RequestedCellGroup {
 
 async function loadCampaignConditionCombos(db: DbTx, campaignId: string) {
   const rows = await asDb(db)
-    .select({ cc: simCampaignConditions, flow: flowConditions, geo: referenceGeometryProfiles })
+    .select({
+      cc: simCampaignConditions,
+      flow: flowConditions,
+      geo: referenceGeometryProfiles,
+    })
     .from(simCampaignConditions)
-    .innerJoin(flowConditions, eq(flowConditions.id, simCampaignConditions.flowConditionId))
-    .innerJoin(referenceGeometryProfiles, eq(referenceGeometryProfiles.id, simCampaignConditions.referenceGeometryProfileId))
+    .innerJoin(
+      flowConditions,
+      eq(flowConditions.id, simCampaignConditions.flowConditionId),
+    )
+    .innerJoin(
+      referenceGeometryProfiles,
+      eq(
+        referenceGeometryProfiles.id,
+        simCampaignConditions.referenceGeometryProfileId,
+      ),
+    )
     .where(eq(simCampaignConditions.campaignId, campaignId))
     .orderBy(asc(simCampaignConditions.ord));
   return rows.map((row) => ({
@@ -1777,21 +2714,39 @@ async function loadCampaignConditionCombos(db: DbTx, campaignId: string) {
   }));
 }
 
-async function loadCampaignWithCurrentPlan(db: DbTx, campaignId: string, opts: { forUpdate?: boolean } = {}) {
-  const campaignQuery = asDb(db).select().from(simCampaigns).where(eq(simCampaigns.id, campaignId)).limit(1);
-  const [campaign] = opts.forUpdate ? await campaignQuery.for("update") : await campaignQuery;
+async function loadCampaignWithCurrentPlan(
+  db: DbTx,
+  campaignId: string,
+  opts: { forUpdate?: boolean } = {},
+) {
+  const campaignQuery = asDb(db)
+    .select()
+    .from(simCampaigns)
+    .where(eq(simCampaigns.id, campaignId))
+    .limit(1);
+  const [campaign] = opts.forUpdate
+    ? await campaignQuery.for("update")
+    : await campaignQuery;
   if (!campaign) throw new CampaignError("not_found", "campaign not found");
-  if (!campaign.currentPlanRevisionId) throw new CampaignError("invalid_state", "campaign has no plan revision");
+  if (!campaign.currentPlanRevisionId)
+    throw new CampaignError("invalid_state", "campaign has no plan revision");
   const [revision] = await asDb(db)
     .select()
     .from(simCampaignPlanRevisions)
     .where(eq(simCampaignPlanRevisions.id, campaign.currentPlanRevisionId))
     .limit(1);
-  if (!revision) throw new CampaignError("invalid_state", "campaign plan revision is missing");
+  if (!revision)
+    throw new CampaignError(
+      "invalid_state",
+      "campaign plan revision is missing",
+    );
   return { campaign, revision, plan: revision.plan as unknown as CampaignPlan };
 }
 
-function axisDiff(oldValues: string[], newValues: string[]): { added: string[]; removed: string[] } {
+function axisDiff(
+  oldValues: string[],
+  newValues: string[],
+): { added: string[]; removed: string[] } {
   const oldSet = new Set(oldValues);
   const newSet = new Set(newValues);
   return {
@@ -1806,11 +2761,23 @@ export async function classifyPlanChange(
   db: DbTx,
   campaignId: string,
   newPlanInput: CampaignPlanInput,
-): Promise<{ campaign: typeof simCampaigns.$inferSelect; currentPlan: CampaignPlan; currentRevisionNumber: number; classification: PlanChangeClassification }> {
-  const { campaign, revision, plan: currentPlan } = await loadCampaignWithCurrentPlan(db, campaignId);
+): Promise<{
+  campaign: typeof simCampaigns.$inferSelect;
+  currentPlan: CampaignPlan;
+  currentRevisionNumber: number;
+  classification: PlanChangeClassification;
+}> {
+  const {
+    campaign,
+    revision,
+    plan: currentPlan,
+  } = await loadCampaignWithCurrentPlan(db, campaignId);
   const newPlan = normalizeCampaignPlan(newPlanInput);
   if (newPlan.mediumId !== currentPlan.mediumId) {
-    throw new CampaignError("validation", "the medium is fixed once launched — duplicate this campaign to change it");
+    throw new CampaignError(
+      "validation",
+      "the medium is fixed once launched — duplicate this campaign to change it",
+    );
   }
 
   const condRows = await loadCampaignConditionCombos(db, campaignId);
@@ -1819,9 +2786,15 @@ export async function classifyPlanChange(
   const newKeys = new Set(newCombos.map((c) => c.comboKey));
 
   const addedCombos = newCombos.filter((c) => !byKey.has(c.comboKey));
-  const reactivated = condRows.filter((r) => r.condition.status !== "active" && newKeys.has(r.comboKey));
-  const stayActive = condRows.filter((r) => r.condition.status === "active" && newKeys.has(r.comboKey));
-  const removedActive = condRows.filter((r) => r.condition.status === "active" && !newKeys.has(r.comboKey));
+  const reactivated = condRows.filter(
+    (r) => r.condition.status !== "active" && newKeys.has(r.comboKey),
+  );
+  const stayActive = condRows.filter(
+    (r) => r.condition.status === "active" && newKeys.has(r.comboKey),
+  );
+  const removedActive = condRows.filter(
+    (r) => r.condition.status === "active" && !newKeys.has(r.comboKey),
+  );
 
   const oldSets = campaignAngleSets(currentPlan);
   const newSets = campaignAngleSets(newPlan);
@@ -1831,8 +2804,12 @@ export async function classifyPlanChange(
   const removedAngles = oldSets.angles.filter((a) => !newAngleSet.has(a));
   const deltaSets: CampaignAngleSets = {
     angles: addedAngles,
-    negativeAngles: newSets.negativeAngles.filter((a) => !new Set(oldSets.negativeAngles).has(a)),
-    symmetricSolverAngles: newSets.symmetricSolverAngles.filter((a) => !new Set(oldSets.symmetricSolverAngles).has(a)),
+    negativeAngles: newSets.negativeAngles.filter(
+      (a) => !new Set(oldSets.negativeAngles).has(a),
+    ),
+    symmetricSolverAngles: newSets.symmetricSolverAngles.filter(
+      (a) => !new Set(oldSets.symmetricSolverAngles).has(a),
+    ),
   };
 
   // Evidence per (condition, solver angle): a solved results row for ANY
@@ -1868,7 +2845,11 @@ export async function classifyPlanChange(
     bucket.push({ ...g, aoa: canonicalAoa(Number(g.aoa)), n: Number(g.n) });
     requestedByCondition.set(g.condition_id, bucket);
   }
-  const cellCovered = (solved: Set<number> | undefined, aoa: number, derived: boolean): boolean => {
+  const cellCovered = (
+    solved: Set<number> | undefined,
+    aoa: number,
+    derived: boolean,
+  ): boolean => {
     if (!solved) return false;
     return derived ? solved.has(canonicalAoa(-aoa)) : solved.has(aoa);
   };
@@ -1878,7 +2859,11 @@ export async function classifyPlanChange(
   const releasedCellConditionIds: string[] = [];
   const releasedCellAoas: number[] = [];
   const releasedCellDerived: boolean[] = [];
-  const pushReleasedCell = (conditionId: string, aoa: number, derived: boolean) => {
+  const pushReleasedCell = (
+    conditionId: string,
+    aoa: number,
+    derived: boolean,
+  ) => {
     releasedCellConditionIds.push(conditionId);
     releasedCellAoas.push(aoa);
     releasedCellDerived.push(derived);
@@ -1893,7 +2878,11 @@ export async function classifyPlanChange(
         releasedPoints += g.n;
         pushReleasedCell(row.condition.id, g.aoa, g.derived);
       }
-      releasedConditions.push({ conditionId: row.condition.id, comboKey: row.comboKey, releasedPoints });
+      releasedConditions.push({
+        conditionId: row.condition.id,
+        comboKey: row.comboKey,
+        releasedPoints,
+      });
     } else {
       let releasedPoints = 0;
       let keptOpenPoints = 0;
@@ -1963,14 +2952,22 @@ export async function classifyPlanChange(
     const nonReleasedByCondition = new Map<string, number>();
     const releasedByCondition = new Map<string, number>();
     for (const row of existingRows) {
-      if (row.state === "released") releasedByCondition.set(row.condition_id, Number(row.n));
-      else nonReleasedByCondition.set(row.condition_id, (nonReleasedByCondition.get(row.condition_id) ?? 0) + Number(row.n));
+      if (row.state === "released")
+        releasedByCondition.set(row.condition_id, Number(row.n));
+      else
+        nonReleasedByCondition.set(
+          row.condition_id,
+          (nonReleasedByCondition.get(row.condition_id) ?? 0) + Number(row.n),
+        );
     }
     for (const id of reactivatedIds) {
       const target = fullPerCondition.points;
       const nonReleased = nonReleasedByCondition.get(id) ?? 0;
       const released = releasedByCondition.get(id) ?? 0;
-      reactivatedPoints += Math.min(released, Math.max(0, target - nonReleased));
+      reactivatedPoints += Math.min(
+        released,
+        Math.max(0, target - nonReleased),
+      );
       addedPoints += Math.max(0, target - nonReleased - released);
       addedSolverRuns += Math.max(0, fullPerCondition.solverRuns - nonReleased);
     }
@@ -1982,7 +2979,13 @@ export async function classifyPlanChange(
   if (deltaPerCondition.points > 0 && stayActiveIds.length > 0) {
     addedPoints += deltaPerCondition.points * stayActiveIds.length;
     addedSolverRuns += deltaPerCondition.solverRuns * stayActiveIds.length;
-    const allAdded = [...new Set([...deltaSets.angles, ...deltaSets.symmetricSolverAngles, ...deltaSets.negativeAngles])];
+    const allAdded = [
+      ...new Set([
+        ...deltaSets.angles,
+        ...deltaSets.symmetricSolverAngles,
+        ...deltaSets.negativeAngles,
+      ]),
+    ];
     const existingAtAdded = (await asDb(db).execute(sql`
       SELECT state, count(*)::int AS n
       FROM sim_campaign_points
@@ -2036,19 +3039,30 @@ export async function classifyPlanChange(
   for (const objective of CAMPAIGN_OBJECTIVES) {
     // Stored plan revisions that predate the clMax objective have no block for
     // it — semantically identical to a disabled block with the defaults.
-    const oldObj = currentPlan.objectives[objective.id] ?? DISABLED_CLMAX_OBJECTIVE;
+    const oldObj =
+      currentPlan.objectives[objective.id] ?? DISABLED_CLMAX_OBJECTIVE;
     const newObj = newPlan.objectives[objective.id];
     const changes: PlanChangeObjectiveDelta["changes"] = [];
     if (!oldObj.enabled && newObj.enabled) changes.push("enabled");
     if (oldObj.enabled && !newObj.enabled) changes.push("disabled");
-    if (Number(newObj.toleranceDeg) < Number(oldObj.toleranceDeg)) changes.push("tolerance_tightened");
-    if (Number(newObj.toleranceDeg) > Number(oldObj.toleranceDeg)) changes.push("tolerance_loosened");
+    if (Number(newObj.toleranceDeg) < Number(oldObj.toleranceDeg))
+      changes.push("tolerance_tightened");
+    if (Number(newObj.toleranceDeg) > Number(oldObj.toleranceDeg))
+      changes.push("tolerance_loosened");
     if (newObj.maxRounds !== oldObj.maxRounds) changes.push("rounds_changed");
-    if (changes.length > 0) objectiveDeltas.push({ objective: objective.key, changes, toleranceDeg: newObj.toleranceDeg });
+    if (changes.length > 0)
+      objectiveDeltas.push({
+        objective: objective.key,
+        changes,
+        toleranceDeg: newObj.toleranceDeg,
+      });
   }
 
   const valueDiffs = {
-    ambients: axisDiff(currentPlan.ambients.map((a) => a.join("|")), newPlan.ambients.map((a) => a.join("|"))),
+    ambients: axisDiff(
+      currentPlan.ambients.map((a) => a.join("|")),
+      newPlan.ambients.map((a) => a.join("|")),
+    ),
     speedsMps: axisDiff(currentPlan.speedsMps, newPlan.speedsMps),
     chordsM: axisDiff(currentPlan.chordsM, newPlan.chordsM),
     excludedConditions: axisDiff(
@@ -2067,8 +3081,15 @@ export async function classifyPlanChange(
     plan: newPlan,
     addedConditions: addedCombos.map((c) => c.comboKey),
     reactivated: reactivated.map((r) => r.comboKey).sort(),
-    kept: keptConditions.map((c) => ({ key: c.comboKey, solvedAngles: c.solvedAngles, releasedPoints: c.releasedPoints })),
-    released: releasedConditions.map((c) => ({ key: c.comboKey, releasedPoints: c.releasedPoints })),
+    kept: keptConditions.map((c) => ({
+      key: c.comboKey,
+      solvedAngles: c.solvedAngles,
+      releasedPoints: c.releasedPoints,
+    })),
+    released: releasedConditions.map((c) => ({
+      key: c.comboKey,
+      releasedPoints: c.releasedPoints,
+    })),
     addedAngles,
     removedAngles,
     removedAngleKeptCells,
@@ -2091,7 +3112,11 @@ export async function classifyPlanChange(
       speedMps: c.speedMps,
       chordM: c.chordM,
     })),
-    reactivatedConditions: reactivated.map((r) => ({ conditionId: r.condition.id, comboKey: r.comboKey, previousStatus: r.condition.status })),
+    reactivatedConditions: reactivated.map((r) => ({
+      conditionId: r.condition.id,
+      comboKey: r.comboKey,
+      previousStatus: r.condition.status,
+    })),
     keptConditions,
     releasedConditions,
     addedAngles,
@@ -2120,7 +3145,12 @@ export async function classifyPlanChange(
       maxOrd: condRows.reduce((max, r) => Math.max(max, r.condition.ord), -1),
     },
   };
-  return { campaign, currentPlan, currentRevisionNumber: revision.revisionNumber, classification };
+  return {
+    campaign,
+    currentPlan,
+    currentRevisionNumber: revision.revisionNumber,
+    classification,
+  };
 }
 
 export type PlanEditResult =
@@ -2154,7 +3184,8 @@ async function applyPlanEditCore(
       kind,
       plan: cls.newPlan as unknown as Record<string, unknown>,
       summary: {
-        addedConditions: cls.addedConditions.length + cls.reactivatedConditions.length,
+        addedConditions:
+          cls.addedConditions.length + cls.reactivatedConditions.length,
         keptConditions: cls.keptConditions.length,
         releasedConditions: cls.releasedConditions.length,
         addedPoints: cls.addedPoints,
@@ -2169,11 +3200,17 @@ async function applyPlanEditCore(
       createdBy: createdBy ?? null,
     })
     .returning();
-  await asDb(tx).update(simCampaigns).set({ currentPlanRevisionId: planRevision.id }).where(eq(simCampaigns.id, campaign.id));
+  await asDb(tx)
+    .update(simCampaigns)
+    .set({ currentPlanRevisionId: planRevision.id })
+    .where(eq(simCampaigns.id, campaign.id));
 
   // New conditions (value-level find-or-create + physics pinning, §5 machinery).
   if (cls.internal.addedCombos.length > 0) {
-    const combos = cls.internal.addedCombos.map((combo, i) => ({ ...combo, ord: cls.internal.maxOrd + 1 + i }));
+    const combos = cls.internal.addedCombos.map((combo, i) => ({
+      ...combo,
+      ord: cls.internal.maxOrd + 1 + i,
+    }));
     const setups = await resolveConditionSetups(tx, {
       campaignId: campaign.id,
       campaignName: campaign.name,
@@ -2182,7 +3219,8 @@ async function applyPlanEditCore(
       combos,
     });
     const presetIds = [...new Set(setups.map((s) => s.presetId))];
-    for (const presetId of presetIds) await syncLegacyBoundaryConditionForPreset(tx, presetId);
+    for (const presetId of presetIds)
+      await syncLegacyBoundaryConditionForPreset(tx, presetId);
     await asDb(tx)
       .insert(simCampaignConditions)
       .values(
@@ -2207,7 +3245,9 @@ async function applyPlanEditCore(
     await asDb(tx)
       .update(simCampaignConditions)
       .set({ status: "active", statusChangedInPlanRevisionId: planRevision.id })
-      .where(inArray(simCampaignConditions.id, cls.internal.reactivatedConditionIds));
+      .where(
+        inArray(simCampaignConditions.id, cls.internal.reactivatedConditionIds),
+      );
   }
   if (cls.internal.keptConditionIds.length > 0) {
     await asDb(tx)
@@ -2218,8 +3258,13 @@ async function applyPlanEditCore(
   if (cls.internal.releasedConditionIds.length > 0) {
     await asDb(tx)
       .update(simCampaignConditions)
-      .set({ status: "released", statusChangedInPlanRevisionId: planRevision.id })
-      .where(inArray(simCampaignConditions.id, cls.internal.releasedConditionIds));
+      .set({
+        status: "released",
+        statusChangedInPlanRevisionId: planRevision.id,
+      })
+      .where(
+        inArray(simCampaignConditions.id, cls.internal.releasedConditionIds),
+      );
   }
 
   // Release the classified cells, then drop campaign-claimed pending rows of
@@ -2244,27 +3289,57 @@ async function applyPlanEditCore(
   const fullTargets = [...new Set([...cls.internal.reactivatedConditionIds])];
   const newConditionIds =
     cls.internal.addedCombos.length > 0
-      ? ((await asDb(tx)
-          .select({ id: simCampaignConditions.id })
-          .from(simCampaignConditions)
-          .where(and(eq(simCampaignConditions.campaignId, campaign.id), eq(simCampaignConditions.introducedInPlanRevisionId, planRevision.id)))) as Array<{ id: string }>)
-          .map((r) => r.id)
+      ? (
+          (await asDb(tx)
+            .select({ id: simCampaignConditions.id })
+            .from(simCampaignConditions)
+            .where(
+              and(
+                eq(simCampaignConditions.campaignId, campaign.id),
+                eq(
+                  simCampaignConditions.introducedInPlanRevisionId,
+                  planRevision.id,
+                ),
+              ),
+            )) as Array<{ id: string }>
+        ).map((r) => r.id)
       : [];
-  await reactivateReleasedPoints(tx, campaign.id, nextRevisionNumber, cls.internal.newSets, [
-    ...fullTargets,
-    ...cls.internal.stayActiveConditionIds,
-  ]);
+  await reactivateReleasedPoints(
+    tx,
+    campaign.id,
+    nextRevisionNumber,
+    cls.internal.newSets,
+    [...fullTargets, ...cls.internal.stayActiveConditionIds],
+  );
   if (fullTargets.length + newConditionIds.length > 0) {
-    await insertCampaignPoints(tx, campaign.id, nextRevisionNumber, cls.internal.newSets, {
-      conditionIds: [...fullTargets, ...newConditionIds],
-    });
+    await insertCampaignPoints(
+      tx,
+      campaign.id,
+      nextRevisionNumber,
+      cls.internal.newSets,
+      {
+        conditionIds: [...fullTargets, ...newConditionIds],
+      },
+    );
   }
-  if (cls.internal.stayActiveConditionIds.length > 0 && cls.internal.deltaSets.angles.length + cls.internal.deltaSets.symmetricSolverAngles.length > 0) {
-    await insertCampaignPoints(tx, campaign.id, nextRevisionNumber, cls.internal.deltaSets, {
-      conditionIds: cls.internal.stayActiveConditionIds,
-    });
+  if (
+    cls.internal.stayActiveConditionIds.length > 0 &&
+    cls.internal.deltaSets.angles.length +
+      cls.internal.deltaSets.symmetricSolverAngles.length >
+      0
+  ) {
+    await insertCampaignPoints(
+      tx,
+      campaign.id,
+      nextRevisionNumber,
+      cls.internal.deltaSets,
+      {
+        conditionIds: cls.internal.stayActiveConditionIds,
+      },
+    );
   }
   await linkPresolvedEvidence(tx, campaign.id);
+  await reconcileLinkedCampaignLadderWork(tx, campaign.id);
 
   // Lane updates for objective toggles / tolerance edits (spec §6.1/§8.7).
   await ensureCampaignLanes(tx, campaign.id, cls.newPlan);
@@ -2307,21 +3382,50 @@ async function applyPlanEditCore(
  *  rollback with the refreshed diff on material drift, else apply atomically. */
 export async function applyPlanEdit(
   db: DB,
-  args: { campaignId: string; basePlanRevisionNumber: number; diffHash: string; newPlan: CampaignPlanInput; createdBy?: string | null },
+  args: {
+    campaignId: string;
+    basePlanRevisionNumber: number;
+    diffHash: string;
+    newPlan: CampaignPlanInput;
+    createdBy?: string | null;
+  },
 ): Promise<PlanEditResult> {
   return db.transaction(async (tx) => {
-    const { campaign, revision } = await loadCampaignWithCurrentPlan(tx, args.campaignId, { forUpdate: true });
-    if (!["active", "paused", "attention", "completed"].includes(campaign.status)) {
-      throw new CampaignError("invalid_state", `campaign is ${campaign.status} — plan edits are not allowed`);
+    const { campaign, revision } = await loadCampaignWithCurrentPlan(
+      tx,
+      args.campaignId,
+      { forUpdate: true },
+    );
+    if (
+      !["active", "paused", "attention", "completed"].includes(campaign.status)
+    ) {
+      throw new CampaignError(
+        "invalid_state",
+        `campaign is ${campaign.status} — plan edits are not allowed`,
+      );
     }
     if (revision.revisionNumber !== args.basePlanRevisionNumber) {
-      return { status: "conflict" as const, currentPlanRevisionNumber: revision.revisionNumber };
+      return {
+        status: "conflict" as const,
+        currentPlanRevisionNumber: revision.revisionNumber,
+      };
     }
-    const { classification } = await classifyPlanChange(tx, args.campaignId, args.newPlan);
+    const { classification } = await classifyPlanChange(
+      tx,
+      args.campaignId,
+      args.newPlan,
+    );
     if (classification.diffHash !== args.diffHash) {
       return { status: "stale_diff" as const, diff: classification };
     }
-    return applyPlanEditCore(tx, campaign, revision.revisionNumber, classification, "edit", args.createdBy);
+    return applyPlanEditCore(
+      tx,
+      campaign,
+      revision.revisionNumber,
+      classification,
+      "edit",
+      args.createdBy,
+    );
   });
 }
 
@@ -2334,14 +3438,27 @@ export interface AddAirfoilsPreview {
   alreadyIncluded: string[];
   addedPoints: number;
   addedSolverRuns: number;
-  perCondition: Array<{ conditionId: string; status: string; cellCount: number }>;
+  perCondition: Array<{
+    conditionId: string;
+    status: string;
+    cellCount: number;
+  }>;
 }
 
 export type AddAirfoilsResult =
-  | { status: "applied"; addedAirfoils: number; addedPoints: number; totals: CampaignProgressTotals }
+  | {
+      status: "applied";
+      addedAirfoils: number;
+      addedPoints: number;
+      totals: CampaignProgressTotals;
+    }
   | { status: "stale_diff"; preview: AddAirfoilsPreview };
 
-async function buildAddAirfoilsPreview(db: DbTx, campaignId: string, airfoilIds: string[]): Promise<AddAirfoilsPreview> {
+async function buildAddAirfoilsPreview(
+  db: DbTx,
+  campaignId: string,
+  airfoilIds: string[],
+): Promise<AddAirfoilsPreview> {
   await loadCampaignWithCurrentPlan(db, campaignId);
   const candidates = await validateCampaignAirfoils(db, airfoilIds);
   const existing = await asDb(db)
@@ -2350,7 +3467,9 @@ async function buildAddAirfoilsPreview(db: DbTx, campaignId: string, airfoilIds:
     .where(eq(simCampaignAirfoils.campaignId, campaignId));
   const existingSet = new Set(existing.map((r) => r.airfoilId));
   const newAirfoils = candidates.filter((a) => !existingSet.has(a.id));
-  const alreadyIncluded = candidates.filter((a) => existingSet.has(a.id)).map((a) => a.id);
+  const alreadyIncluded = candidates
+    .filter((a) => existingSet.has(a.id))
+    .map((a) => a.id);
 
   // Inherited work = the campaign's obligated cell set: active conditions'
   // full requested cells AND kept conditions' remaining (solved-angle) cells.
@@ -2360,10 +3479,20 @@ async function buildAddAirfoilsPreview(db: DbTx, campaignId: string, airfoilIds:
     JOIN sim_campaign_conditions cc ON cc.id = p.condition_id
     WHERE p.campaign_id = ${campaignId} AND p.state <> 'released' AND cc.status IN ('active', 'kept')
     GROUP BY p.condition_id, cc.status, p.aoa_deg
-  `)) as unknown as Array<{ condition_id: string; status: string; aoa: number }>;
-  const cellsByCondition = new Map<string, { status: string; angles: number[] }>();
+  `)) as unknown as Array<{
+    condition_id: string;
+    status: string;
+    aoa: number;
+  }>;
+  const cellsByCondition = new Map<
+    string,
+    { status: string; angles: number[] }
+  >();
   for (const row of cellRows) {
-    const bucket = cellsByCondition.get(row.condition_id) ?? { status: row.status, angles: [] };
+    const bucket = cellsByCondition.get(row.condition_id) ?? {
+      status: row.status,
+      angles: [],
+    };
     bucket.angles.push(canonicalAoa(Number(row.aoa)));
     cellsByCondition.set(row.condition_id, bucket);
   }
@@ -2378,7 +3507,11 @@ async function buildAddAirfoilsPreview(db: DbTx, campaignId: string, airfoilIds:
     const arithmetic = campaignPointArithmetic(sets, nAsym, nSym);
     addedPoints += arithmetic.points;
     addedSolverRuns += arithmetic.solverRuns;
-    perCondition.push({ conditionId, status: bucket.status, cellCount: bucket.angles.length });
+    perCondition.push({
+      conditionId,
+      status: bucket.status,
+      cellCount: bucket.angles.length,
+    });
   }
   perCondition.sort((a, b) => a.conditionId.localeCompare(b.conditionId));
 
@@ -2398,28 +3531,54 @@ async function buildAddAirfoilsPreview(db: DbTx, campaignId: string, airfoilIds:
   };
 }
 
-export async function previewAddCampaignAirfoils(db: DB, campaignId: string, airfoilIds: string[]): Promise<AddAirfoilsPreview> {
+export async function previewAddCampaignAirfoils(
+  db: DB,
+  campaignId: string,
+  airfoilIds: string[],
+): Promise<AddAirfoilsPreview> {
   return buildAddAirfoilsPreview(db, campaignId, airfoilIds);
 }
 
 /** Junction inserts + points for active AND kept work (kept = only its
  *  remaining solved-angle set) + counters + reopen completed → active. */
-export async function addCampaignAirfoils(db: DB, campaignId: string, airfoilIds: string[], diffHash: string): Promise<AddAirfoilsResult> {
+export async function addCampaignAirfoils(
+  db: DB,
+  campaignId: string,
+  airfoilIds: string[],
+  diffHash: string,
+): Promise<AddAirfoilsResult> {
   return db.transaction(async (tx) => {
-    const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(tx, campaignId, { forUpdate: true });
-    if (!["active", "paused", "attention", "completed"].includes(campaign.status)) {
-      throw new CampaignError("invalid_state", `campaign is ${campaign.status} — airfoils cannot be added`);
+    const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(
+      tx,
+      campaignId,
+      { forUpdate: true },
+    );
+    if (
+      !["active", "paused", "attention", "completed"].includes(campaign.status)
+    ) {
+      throw new CampaignError(
+        "invalid_state",
+        `campaign is ${campaign.status} — airfoils cannot be added`,
+      );
     }
     const preview = await buildAddAirfoilsPreview(tx, campaignId, airfoilIds);
-    if (preview.diffHash !== diffHash) return { status: "stale_diff" as const, preview };
+    if (preview.diffHash !== diffHash)
+      return { status: "stale_diff" as const, preview };
     if (preview.newAirfoilIds.length === 0) {
       const totals = await campaignProgressTotals(tx, campaignId);
-      return { status: "applied" as const, addedAirfoils: 0, addedPoints: 0, totals };
+      return {
+        status: "applied" as const,
+        addedAirfoils: 0,
+        addedPoints: 0,
+        totals,
+      };
     }
 
     await asDb(tx)
       .insert(simCampaignAirfoils)
-      .values(preview.newAirfoilIds.map((airfoilId) => ({ campaignId, airfoilId })))
+      .values(
+        preview.newAirfoilIds.map((airfoilId) => ({ campaignId, airfoilId })),
+      )
       .onConflictDoNothing();
 
     // Inherit the campaign's obligated cells; symmetric airfoils get solver
@@ -2428,7 +3587,7 @@ export async function addCampaignAirfoils(db: DB, campaignId: string, airfoilIds
     await asDb(tx).execute(sql`
       INSERT INTO sim_campaign_points
         (campaign_id, condition_id, airfoil_id, aoa_deg, revision_id, plan_revision_number, state, derived_by_symmetry)
-      SELECT DISTINCT p.campaign_id, p.condition_id, af.id, p.aoa_deg, p.revision_id, ${revision.revisionNumber},
+      SELECT DISTINCT p.campaign_id, p.condition_id, af.id, p.aoa_deg, p.revision_id, ${revision.revisionNumber}::int,
         'requested', (af.is_symmetric AND p.aoa_deg < 0)
       FROM sim_campaign_points p
       JOIN sim_campaign_conditions cc ON cc.id = p.condition_id AND cc.status IN ('active', 'kept')
@@ -2441,7 +3600,7 @@ export async function addCampaignAirfoils(db: DB, campaignId: string, airfoilIds
     await asDb(tx).execute(sql`
       INSERT INTO sim_campaign_points
         (campaign_id, condition_id, airfoil_id, aoa_deg, revision_id, plan_revision_number, state, derived_by_symmetry)
-      SELECT DISTINCT p.campaign_id, p.condition_id, af.id, abs(p.aoa_deg), p.revision_id, ${revision.revisionNumber}, 'requested', false
+      SELECT DISTINCT p.campaign_id, p.condition_id, af.id, abs(p.aoa_deg), p.revision_id, ${revision.revisionNumber}::int, 'requested', false
       FROM sim_campaign_points p
       JOIN sim_campaign_conditions cc ON cc.id = p.condition_id AND cc.status IN ('active', 'kept')
       CROSS JOIN airfoils af
@@ -2454,11 +3613,17 @@ export async function addCampaignAirfoils(db: DB, campaignId: string, airfoilIds
     `);
 
     await linkPresolvedEvidence(tx, campaignId);
+    await reconcileLinkedCampaignLadderWork(tx, campaignId);
     await ensureCampaignLanes(tx, campaignId, plan, { airfoilIds: newIds });
     await recomputeCampaignProgress(tx, campaignId);
     // Growth on a completed campaign reopens it (spec §6.2).
     const totals = await refreshCampaignCompletion(tx, campaignId);
-    return { status: "applied" as const, addedAirfoils: newIds.length, addedPoints: preview.addedPoints, totals };
+    return {
+      status: "applied" as const,
+      addedAirfoils: newIds.length,
+      addedPoints: preview.addedPoints,
+      totals,
+    };
   });
 }
 
@@ -2466,32 +3631,441 @@ export async function addCampaignAirfoils(db: DB, campaignId: string, airfoilIds
 // §6.4 — Lifecycle verbs
 // ---------------------------------------------------------------------------
 async function requireCampaign(db: DbTx, campaignId: string) {
-  const [campaign] = await asDb(db).select().from(simCampaigns).where(eq(simCampaigns.id, campaignId)).limit(1);
+  const [campaign] = await asDb(db)
+    .select()
+    .from(simCampaigns)
+    .where(eq(simCampaigns.id, campaignId))
+    .limit(1);
   if (!campaign) throw new CampaignError("not_found", "campaign not found");
   return campaign;
 }
 
+/** Serialize lifecycle changes by the shared physical ladder rows they own.
+ * Locking only each campaign row is insufficient: two concurrent final-owner
+ * cancellations can each observe the other's association as still active and
+ * both leave one pending request/verify/job ownerless. Physical-row locks make
+ * the second transaction re-evaluate after the first commits. All callers use
+ * verify-then-request and UUID order, preventing cross-item lock inversion. */
+async function lockCampaignSharedLadderItems(
+  tx: CampaignTx,
+  campaignId: string,
+): Promise<void> {
+  await asDb(tx).execute(sql`
+    SELECT q.id
+    FROM sim_urans_verify_queue q
+    JOIN sim_urans_verify_queue_campaigns ownership ON ownership.queue_id = q.id
+    WHERE ownership.campaign_id = ${campaignId}
+      AND ownership.state = 'active'
+      AND q.state IN ('pending', 'running')
+    ORDER BY q.id
+    FOR UPDATE OF q
+  `);
+  await asDb(tx).execute(sql`
+    SELECT req.id
+    FROM sim_urans_requests req
+    JOIN sim_urans_request_campaigns ownership ON ownership.request_id = req.id
+    WHERE ownership.campaign_id = ${campaignId}
+      AND ownership.state = 'active'
+      AND req.state IN ('pending', 'running')
+    ORDER BY req.id
+    FOR UPDATE OF req
+  `);
+  await asDb(tx).execute(sql`
+    SELECT obligation.id
+    FROM sim_precalc_obligations obligation
+    JOIN sim_precalc_obligation_campaigns ownership
+      ON ownership.obligation_id = obligation.id
+    WHERE ownership.campaign_id = ${campaignId}
+      AND ownership.state = 'active'
+      AND obligation.state IN ('pending', 'running')
+    ORDER BY obligation.id
+    FOR UPDATE OF obligation
+  `);
+}
+
+/** Cancel compositions that have not crossed the durable engine-submission
+ * boundary, then release only the claims owned by the rows whose pending→
+ * cancelled transition this transaction won. Submitted/in-flight jobs are
+ * deliberately untouched and retain the documented finish-and-ingest rule. */
+async function cancelPendingCampaignCompositions(
+  tx: CampaignTx,
+  campaignId: string,
+  reason: string,
+  releaseMode: "pause" | "cancel",
+): Promise<number> {
+  const stopped = await asDb(tx)
+    .update(simJobs)
+    .set({
+      status: "cancelled",
+      engineState: "cancelled",
+      error: reason,
+      finishedAt: new Date(),
+    })
+    .where(
+      and(eq(simJobs.campaignId, campaignId), eq(simJobs.status, "pending")),
+    )
+    .returning({ id: simJobs.id });
+  if (!stopped.length) return 0;
+  await asDb(tx)
+    .update(results)
+    .set({
+      // Paused wave-2 precalc work stays a wave-2 obligation. `queued` with
+      // no owner is the existing durable ladder route; converting it to
+      // pending would let the generic campaign gap finder redo wave-1 RANS.
+      // Terminal cancellation cleaned these rows above while their pending
+      // job link was still present, so its remaining ordinary claims reopen.
+      status:
+        releaseMode === "pause"
+          ? sql`CASE WHEN EXISTS (
+              SELECT 1 FROM sim_jobs stopped_job
+              WHERE stopped_job.id = ${results.simJobId}
+                AND stopped_job.wave = 2
+                AND stopped_job.request_payload ->> 'uransFidelity' = 'precalc'
+            ) THEN 'queued'::result_status ELSE 'pending'::result_status END`
+          : "pending",
+      source: "queued",
+      simJobId: null,
+      engineJobId: null,
+      engineCaseSlug: null,
+    })
+    .where(
+      and(
+        inArray(
+          results.simJobId,
+          stopped.map((job) => job.id),
+        ),
+        inArray(results.status, ["queued", "running"]),
+      ),
+    );
+  return stopped.length;
+}
+
+/** Cancel a global ladder composition only when this lifecycle change removed
+ * its last currently-runnable owner. A paused survivor freezes the physical
+ * item back to pending; an active/attention survivor keeps the already-built
+ * composition, and a background/manual owner remains fully independent. */
+async function cancelStoppedSharedLadderCompositions(
+  tx: CampaignTx,
+  verifyQueueIds: string[],
+  requestIds: string[],
+  precalcObligationIds: string[],
+  reason: string,
+): Promise<number> {
+  if (
+    !verifyQueueIds.length &&
+    !requestIds.length &&
+    !precalcObligationIds.length
+  )
+    return 0;
+  const verifyFilter = verifyQueueIds.length
+    ? sql`(
+        j.request_payload ->> 'verifyQueueItemId' = ANY(${pgUuidArray(verifyQueueIds)}::text[])
+        AND EXISTS (
+          SELECT 1 FROM sim_urans_verify_queue q
+          WHERE q.id::text = j.request_payload ->> 'verifyQueueItemId'
+            AND q.background_owner = false
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_campaigns ownership
+              JOIN sim_campaigns owner_campaign ON owner_campaign.id = ownership.campaign_id
+              WHERE ownership.queue_id = q.id
+                AND ownership.state = 'active'
+                AND owner_campaign.status IN ('active', 'attention')
+            )
+        )
+      )`
+    : sql`false`;
+  const requestFilter = requestIds.length
+    ? sql`(
+        j.request_payload ->> 'uransRequestId' = ANY(${pgUuidArray(requestIds)}::text[])
+        AND EXISTS (
+          SELECT 1 FROM sim_urans_requests req
+          WHERE req.id::text = j.request_payload ->> 'uransRequestId'
+            AND req.background_owner = false
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_urans_request_campaigns ownership
+              JOIN sim_campaigns owner_campaign ON owner_campaign.id = ownership.campaign_id
+              WHERE ownership.request_id = req.id
+                AND ownership.state = 'active'
+                AND owner_campaign.status IN ('active', 'attention')
+            )
+        )
+      )`
+    : sql`false`;
+  const precalcFilter = precalcObligationIds.length
+    ? sql`(
+        EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(j.request_payload -> 'precalcObligationIds') = 'array'
+              THEN j.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) payload_obligation(id)
+          WHERE payload_obligation.id::uuid = ANY(${pgUuidArray(precalcObligationIds)}::uuid[])
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(j.request_payload -> 'precalcObligationIds') = 'array'
+              THEN j.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) payload_obligation(id)
+          JOIN sim_precalc_obligations obligation
+            ON obligation.id = payload_obligation.id::uuid
+          WHERE obligation.state <> 'pending'
+             OR NOT (
+               obligation.background_owner
+               OR EXISTS (
+                 SELECT 1
+                 FROM sim_precalc_obligation_campaigns ownership
+                 JOIN sim_campaigns owner_campaign
+                   ON owner_campaign.id = ownership.campaign_id
+                 WHERE ownership.obligation_id = obligation.id
+                   AND ownership.state = 'active'
+                   AND owner_campaign.status IN ('active', 'attention')
+               )
+               OR EXISTS (
+                 SELECT 1
+                 FROM sim_precalc_obligation_requests coverage
+                 JOIN sim_urans_requests request_owner
+                   ON request_owner.id = coverage.request_id
+                 WHERE coverage.obligation_id = obligation.id
+                   AND request_owner.background_owner
+                   AND request_owner.state IN ('pending', 'running')
+               )
+             )
+        )
+      )`
+    : sql`false`;
+  const stopped = (await asDb(tx).execute(sql`
+    UPDATE sim_jobs j
+    SET status = 'cancelled', engine_state = 'cancelled', error = ${reason},
+        "finishedAt" = now(), "updatedAt" = now()
+    WHERE j.campaign_id IS NULL
+      AND j.status = 'pending'
+      AND (${verifyFilter} OR ${requestFilter} OR ${precalcFilter})
+    RETURNING j.id,
+      j.request_payload ->> 'verifyQueueItemId' AS verify_queue_id,
+      j.request_payload ->> 'uransRequestId' AS request_id
+  `)) as unknown as Array<{
+    id: string;
+    verify_queue_id: string | null;
+    request_id: string | null;
+  }>;
+  if (!stopped.length) return 0;
+
+  const stoppedJobIds = stopped.map((row) => row.id);
+  await asDb(tx)
+    .update(results)
+    .set({
+      status: sql`CASE WHEN EXISTS (
+        SELECT 1 FROM sim_jobs stopped_job
+        WHERE stopped_job.id = ${results.simJobId}
+          AND stopped_job.wave = 2
+          AND stopped_job.request_payload ->> 'uransFidelity' = 'precalc'
+      ) THEN 'queued'::result_status ELSE 'pending'::result_status END`,
+      source: "queued",
+      simJobId: null,
+      engineJobId: null,
+      engineCaseSlug: null,
+    })
+    .where(
+      and(
+        inArray(results.simJobId, stoppedJobIds),
+        inArray(results.status, ["queued", "running"]),
+      ),
+    );
+
+  const stoppedVerifyIds = stopped
+    .map((row) => row.verify_queue_id)
+    .filter((id): id is string => Boolean(id));
+  if (stoppedVerifyIds.length) {
+    await asDb(tx).execute(sql`
+      UPDATE sim_urans_verify_queue q
+      SET state = CASE
+            WHEN q.background_owner OR EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_campaigns ownership
+              JOIN sim_campaigns owner_campaign ON owner_campaign.id = ownership.campaign_id
+              WHERE ownership.queue_id = q.id
+                AND ownership.state = 'active'
+                AND owner_campaign.status IN ('active', 'attention', 'paused')
+            ) THEN 'pending'
+            ELSE 'cancelled'
+          END,
+          sim_job_id = NULL,
+          "updatedAt" = now()
+      WHERE q.id::text = ANY(${sql`ARRAY[${sql.join(
+        stoppedVerifyIds.map((id) => sql`${id}`),
+        sql`, `,
+      )}]`}::text[])
+        AND q.state = 'running'
+    `);
+  }
+
+  const stoppedRequestIds = stopped
+    .map((row) => row.request_id)
+    .filter((id): id is string => Boolean(id));
+  if (stoppedRequestIds.length) {
+    await asDb(tx).execute(sql`
+      UPDATE sim_urans_requests req
+      SET state = CASE WHEN req.background_owner OR EXISTS (
+            SELECT 1
+            FROM sim_urans_request_campaigns ownership
+            JOIN sim_campaigns owner_campaign ON owner_campaign.id = ownership.campaign_id
+            WHERE ownership.request_id = req.id
+              AND ownership.state = 'active'
+              AND owner_campaign.status IN ('active', 'attention', 'paused')
+          ) THEN 'pending' ELSE 'cancelled' END,
+          sim_job_id = NULL,
+          "updatedAt" = now()
+      WHERE req.id::text = ANY(${sql`ARRAY[${sql.join(
+        stoppedRequestIds.map((id) => sql`${id}`),
+        sql`, `,
+      )}]`}::text[])
+        AND req.state = 'running'
+    `);
+  }
+  return stopped.length;
+}
+
 export async function pauseCampaign(db: DB, campaignId: string) {
   return db.transaction(async (tx) => {
+    // Lifecycle changes and scheduler composition serialize on this row. The
+    // scheduler inserts its sim_job and claims in one transaction while
+    // holding the same lock, so pause can never miss a half-composed job.
+    await asDb(tx).execute(sql`
+      SELECT id FROM sim_campaigns WHERE id = ${campaignId} FOR UPDATE
+    `);
     const campaign = await requireCampaign(tx, campaignId);
     if (!["active", "attention"].includes(campaign.status)) {
-      throw new CampaignError("invalid_state", `only active/attention campaigns can be paused (status: ${campaign.status})`);
+      throw new CampaignError(
+        "invalid_state",
+        `only active/attention campaigns can be paused (status: ${campaign.status})`,
+      );
     }
-    const [row] = await asDb(tx).update(simCampaigns).set({ status: "paused" }).where(eq(simCampaigns.id, campaignId)).returning();
+    await lockCampaignSharedLadderItems(tx, campaignId);
+    const [row] = await asDb(tx)
+      .update(simCampaigns)
+      .set({ status: "paused" })
+      .where(eq(simCampaigns.id, campaignId))
+      .returning();
+    const verifyOwners = await asDb(tx)
+      .select({ id: simUransVerifyQueueCampaigns.queueId })
+      .from(simUransVerifyQueueCampaigns)
+      .where(
+        and(
+          eq(simUransVerifyQueueCampaigns.campaignId, campaignId),
+          eq(simUransVerifyQueueCampaigns.state, "active"),
+        ),
+      );
+    const requestOwners = await asDb(tx)
+      .select({ id: simUransRequestCampaigns.requestId })
+      .from(simUransRequestCampaigns)
+      .where(
+        and(
+          eq(simUransRequestCampaigns.campaignId, campaignId),
+          eq(simUransRequestCampaigns.state, "active"),
+        ),
+      );
+    const precalcOwners = await asDb(tx)
+      .select({ id: simPrecalcObligationCampaigns.obligationId })
+      .from(simPrecalcObligationCampaigns)
+      .where(
+        and(
+          eq(simPrecalcObligationCampaigns.campaignId, campaignId),
+          eq(simPrecalcObligationCampaigns.state, "active"),
+        ),
+      );
+    const cancelledSharedPendingJobs =
+      await cancelStoppedSharedLadderCompositions(
+        tx,
+        verifyOwners.map((owner) => owner.id),
+        requestOwners.map((owner) => owner.id),
+        precalcOwners.map((owner) => owner.id),
+        "all runnable campaign owners paused before engine submission",
+      );
+    const cancelledCampaignPendingJobs =
+      await cancelPendingCampaignCompositions(
+        tx,
+        campaignId,
+        "campaign paused before engine submission",
+        "pause",
+      );
+    const cancelledPendingJobs =
+      cancelledSharedPendingJobs + cancelledCampaignPendingJobs;
     const [running] = (await asDb(tx).execute(sql`
-      SELECT count(*)::int AS n FROM sim_jobs WHERE campaign_id = ${campaignId} AND status IN ('submitted', 'running', 'ingesting')
+      SELECT count(*)::int AS n
+      FROM sim_jobs job
+      WHERE job.status IN ('submitted', 'running', 'ingesting')
+        AND (
+          job.campaign_id = ${campaignId}
+          OR EXISTS (
+            SELECT 1 FROM sim_urans_request_campaigns ownership
+            WHERE ownership.campaign_id = ${campaignId}
+              AND ownership.request_id::text = job.request_payload ->> 'uransRequestId'
+          )
+          OR EXISTS (
+            SELECT 1 FROM sim_urans_verify_queue_campaigns ownership
+            WHERE ownership.campaign_id = ${campaignId}
+              AND ownership.queue_id::text = job.request_payload ->> 'verifyQueueItemId'
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(
+              CASE
+                WHEN jsonb_typeof(job.request_payload -> 'precalcObligationIds') = 'array'
+                THEN job.request_payload -> 'precalcObligationIds'
+                ELSE '[]'::jsonb
+              END
+            ) payload_obligation(id)
+            JOIN sim_precalc_obligation_campaigns ownership
+              ON ownership.obligation_id = payload_obligation.id::uuid
+            WHERE ownership.campaign_id = ${campaignId}
+          )
+        )
     `)) as unknown as Array<{ n: number }>;
-    return { campaign: row, runningJobs: Number(running?.n ?? 0) };
+    return {
+      campaign: row,
+      runningJobs: Number(running?.n ?? 0),
+      cancelledPendingJobs,
+    };
   });
 }
 
 export async function resumeCampaign(db: DB, campaignId: string) {
   return db.transaction(async (tx) => {
+    // Match pause/cancel's lifecycle boundary: a concurrent terminal action
+    // must commit before this read, not between a stale validation and an
+    // unconditional status write that could resurrect a cancelled campaign.
+    await asDb(tx).execute(sql`
+      SELECT id FROM sim_campaigns WHERE id = ${campaignId} FOR UPDATE
+    `);
     const campaign = await requireCampaign(tx, campaignId);
     if (campaign.status !== "paused") {
-      throw new CampaignError("invalid_state", `only paused campaigns can be resumed (status: ${campaign.status})`);
+      throw new CampaignError(
+        "invalid_state",
+        `only paused campaigns can be resumed (status: ${campaign.status})`,
+      );
     }
-    await asDb(tx).update(simCampaigns).set({ status: "active" }).where(eq(simCampaigns.id, campaignId));
+    const [resumed] = await asDb(tx)
+      .update(simCampaigns)
+      .set({ status: "active" })
+      .where(
+        and(eq(simCampaigns.id, campaignId), eq(simCampaigns.status, "paused")),
+      )
+      .returning({ id: simCampaigns.id });
+    if (!resumed) {
+      throw new CampaignError(
+        "invalid_state",
+        "campaign changed state while resume was being applied",
+      );
+    }
     await refreshCampaignCompletion(tx, campaignId);
     return requireCampaign(tx, campaignId);
   });
@@ -2503,10 +4077,20 @@ export async function resumeCampaign(db: DB, campaignId: string) {
  *  presets with zero references are GC'd. */
 export async function cancelCampaign(db: DB, campaignId: string) {
   return db.transaction(async (tx) => {
+    // Acquire the lifecycle lock before released-point and pending-job cleanup.
+    // Without this early lock a composer could insert after cleanup but before
+    // the final cancelled status update, escaping terminal settlement.
+    await asDb(tx).execute(sql`
+      SELECT id FROM sim_campaigns WHERE id = ${campaignId} FOR UPDATE
+    `);
     const campaign = await requireCampaign(tx, campaignId);
     if (!["active", "paused", "attention"].includes(campaign.status)) {
-      throw new CampaignError("invalid_state", `campaign is already ${campaign.status}`);
+      throw new CampaignError(
+        "invalid_state",
+        `campaign is already ${campaign.status}`,
+      );
     }
+    await lockCampaignSharedLadderItems(tx, campaignId);
     // Release all open work first, then reuse the shared claimed-row cleanup.
     const releasedRows = (await asDb(tx).execute(sql`
       UPDATE sim_campaign_points SET state = 'released', "updatedAt" = now()
@@ -2514,10 +4098,213 @@ export async function cancelCampaign(db: DB, campaignId: string) {
       RETURNING aoa_deg
     `)) as unknown as unknown[];
     const cleanup = await deleteReleasedPendingResults(tx, campaignId);
+    // Cancel only this campaign's ownership. A shared/background physical
+    // item survives; an ownerless pending item terminates, while submitted
+    // work retains the spec's finish-and-ingest semantics.
+    const cancelledVerifyRows = await asDb(tx)
+      .update(simUransVerifyQueueCampaigns)
+      .set({ state: "cancelled", cancelledAt: new Date() })
+      .where(
+        and(
+          eq(simUransVerifyQueueCampaigns.campaignId, campaignId),
+          eq(simUransVerifyQueueCampaigns.state, "active"),
+        ),
+      )
+      .returning({ id: simUransVerifyQueueCampaigns.queueId });
+    if (cancelledVerifyRows.length) {
+      await asDb(tx).execute(sql`
+        UPDATE sim_urans_verify_queue q
+        SET state = 'cancelled', "updatedAt" = now()
+        WHERE q.id = ANY(${sql`ARRAY[${sql.join(
+          cancelledVerifyRows.map((row) => sql`${row.id}::uuid`),
+          sql`, `,
+        )}]`})
+          AND q.state = 'pending'
+          AND q.background_owner = false
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_campaigns owner
+            JOIN sim_campaigns owner_campaign
+              ON owner_campaign.id = owner.campaign_id
+            WHERE owner.queue_id = q.id
+              AND owner.state = 'active'
+              AND owner_campaign.status IN ('active', 'attention', 'paused')
+          )
+      `);
+      await asDb(tx).execute(sql`
+        DELETE FROM sim_ladder_submit_retries retry
+        USING sim_urans_verify_queue q
+        WHERE retry.verify_queue_id = q.id
+          AND q.id = ANY(${sql`ARRAY[${sql.join(
+            cancelledVerifyRows.map((row) => sql`${row.id}::uuid`),
+            sql`, `,
+          )}]`})
+          AND q.state = 'cancelled'
+      `);
+    }
+    const cancelledRequestRows = await asDb(tx)
+      .update(simUransRequestCampaigns)
+      .set({ state: "cancelled", cancelledAt: new Date() })
+      .where(
+        and(
+          eq(simUransRequestCampaigns.campaignId, campaignId),
+          eq(simUransRequestCampaigns.state, "active"),
+        ),
+      )
+      .returning({ id: simUransRequestCampaigns.requestId });
+    if (cancelledRequestRows.length) {
+      await asDb(tx).execute(sql`
+        UPDATE sim_urans_requests req
+        SET state = 'cancelled', sim_job_id = NULL, "updatedAt" = now()
+        WHERE req.id = ANY(${sql`ARRAY[${sql.join(
+          cancelledRequestRows.map((row) => sql`${row.id}::uuid`),
+          sql`, `,
+        )}]`})
+          AND req.state = 'pending'
+          AND req.background_owner = false
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_request_campaigns owner
+            JOIN sim_campaigns owner_campaign
+              ON owner_campaign.id = owner.campaign_id
+            WHERE owner.request_id = req.id
+              AND owner.state = 'active'
+              AND owner_campaign.status IN ('active', 'attention', 'paused')
+          )
+      `);
+      await asDb(tx).execute(sql`
+        DELETE FROM sim_ladder_submit_retries retry
+        USING sim_urans_requests req
+        WHERE retry.urans_request_id = req.id
+          AND req.id = ANY(${sql`ARRAY[${sql.join(
+            cancelledRequestRows.map((row) => sql`${row.id}::uuid`),
+            sql`, `,
+          )}]`})
+          AND req.state = 'cancelled'
+      `);
+    }
+    const cancelledPrecalcRows = await asDb(tx)
+      .update(simPrecalcObligationCampaigns)
+      .set({ state: "cancelled", cancelledAt: new Date() })
+      .where(
+        and(
+          eq(simPrecalcObligationCampaigns.campaignId, campaignId),
+          eq(simPrecalcObligationCampaigns.state, "active"),
+        ),
+      )
+      .returning({ id: simPrecalcObligationCampaigns.obligationId });
+    if (cancelledPrecalcRows.length) {
+      await asDb(tx).execute(sql`
+        UPDATE sim_precalc_obligations obligation
+        SET state = 'cancelled', completed_at = now(), "updatedAt" = now()
+        WHERE obligation.id = ANY(${sql`ARRAY[${sql.join(
+          cancelledPrecalcRows.map((row) => sql`${row.id}::uuid`),
+          sql`, `,
+        )}]`})
+          AND obligation.state = 'pending'
+          AND obligation.background_owner = false
+          AND NOT EXISTS (
+            SELECT 1 FROM sim_jobs accepted_job
+            WHERE accepted_job.id = obligation.latest_sim_job_id
+              AND (
+                accepted_job.engine_job_id IS NOT NULL
+                OR accepted_job."submittedAt" IS NOT NULL
+                OR accepted_job.status IN ('submitted', 'running', 'ingesting')
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligation_campaigns owner
+            JOIN sim_campaigns owner_campaign
+              ON owner_campaign.id = owner.campaign_id
+            WHERE owner.obligation_id = obligation.id
+              AND owner.state = 'active'
+              AND owner_campaign.status IN ('active', 'attention', 'paused')
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligation_requests coverage
+            JOIN sim_urans_requests request_owner
+              ON request_owner.id = coverage.request_id
+            WHERE coverage.obligation_id = obligation.id
+              AND request_owner.background_owner
+              AND request_owner.state IN ('pending', 'running')
+          )
+      `);
+    }
+    const cancelledSharedPendingJobs =
+      await cancelStoppedSharedLadderCompositions(
+        tx,
+        cancelledVerifyRows.map((row) => row.id),
+        cancelledRequestRows.map((row) => row.id),
+        cancelledPrecalcRows.map((row) => row.id),
+        "last runnable campaign owner cancelled before engine submission",
+      );
+    const cancelledCampaignPendingJobs =
+      await cancelPendingCampaignCompositions(
+        tx,
+        campaignId,
+        "campaign cancelled before engine submission",
+        "cancel",
+      );
+    // A running retry owner can become physically cancelled only after its
+    // pending composition is stopped above. Remove scheduling-only retry state
+    // then; shared/background survivors remain pending/running and retain it.
+    await asDb(tx).execute(sql`
+      DELETE FROM sim_ladder_submit_retries retry
+      USING sim_urans_verify_queue verify_item,
+            sim_urans_verify_queue_campaigns ownership
+      WHERE retry.verify_queue_id = verify_item.id
+        AND ownership.queue_id = verify_item.id
+        AND ownership.campaign_id = ${campaignId}
+        AND verify_item.state = 'cancelled'
+    `);
+    await asDb(tx).execute(sql`
+      DELETE FROM sim_ladder_submit_retries retry
+      USING sim_urans_requests request_item,
+            sim_urans_request_campaigns ownership
+      WHERE retry.urans_request_id = request_item.id
+        AND ownership.request_id = request_item.id
+        AND ownership.campaign_id = ${campaignId}
+        AND request_item.state = 'cancelled'
+    `);
+    const cancelledPendingJobs =
+      cancelledSharedPendingJobs + cancelledCampaignPendingJobs;
     const [running] = (await asDb(tx).execute(sql`
-      SELECT count(*)::int AS n FROM sim_jobs WHERE campaign_id = ${campaignId} AND status IN ('submitted', 'running', 'ingesting')
+      SELECT count(*)::int AS n
+      FROM sim_jobs job
+      WHERE job.status IN ('submitted', 'running', 'ingesting')
+        AND (
+          job.campaign_id = ${campaignId}
+          OR EXISTS (
+            SELECT 1 FROM sim_urans_request_campaigns ownership
+            WHERE ownership.campaign_id = ${campaignId}
+              AND ownership.request_id::text = job.request_payload ->> 'uransRequestId'
+          )
+          OR EXISTS (
+            SELECT 1 FROM sim_urans_verify_queue_campaigns ownership
+            WHERE ownership.campaign_id = ${campaignId}
+              AND ownership.queue_id::text = job.request_payload ->> 'verifyQueueItemId'
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(
+              CASE
+                WHEN jsonb_typeof(job.request_payload -> 'precalcObligationIds') = 'array'
+                THEN job.request_payload -> 'precalcObligationIds'
+                ELSE '[]'::jsonb
+              END
+            ) payload_obligation(id)
+            JOIN sim_precalc_obligation_campaigns ownership
+              ON ownership.obligation_id = payload_obligation.id::uuid
+            WHERE ownership.campaign_id = ${campaignId}
+          )
+        )
     `)) as unknown as Array<{ n: number }>;
-    await asDb(tx).update(simCampaigns).set({ status: "cancelled", completedAt: null }).where(eq(simCampaigns.id, campaignId));
+    await asDb(tx)
+      .update(simCampaigns)
+      .set({ status: "cancelled", completedAt: null })
+      .where(eq(simCampaigns.id, campaignId));
     await recomputeCampaignProgress(tx, campaignId);
     const gcCount = await gcOrphanedCampaignPresets(tx);
     return {
@@ -2525,6 +4312,10 @@ export async function cancelCampaign(db: DB, campaignId: string) {
       releasedPoints: releasedRows.length,
       deletedPendingResults: cleanup.deleted,
       staledPendingResults: cleanup.staled,
+      cancelledPendingVerifications: cancelledVerifyRows.length,
+      cancelledPendingUransRequests: cancelledRequestRows.length,
+      cancelledPendingPrecalcObligations: cancelledPrecalcRows.length,
+      cancelledPendingJobs,
       runningJobsFinishing: Number(running?.n ?? 0),
       gcedPresets: gcCount,
     };
@@ -2556,62 +4347,155 @@ async function gcOrphanedCampaignPresets(tx: CampaignTx): Promise<number> {
 
 export async function closeCampaignWithFailures(db: DB, campaignId: string) {
   return db.transaction(async (tx) => {
+    await asDb(tx).execute(sql`
+      SELECT id FROM sim_campaigns WHERE id = ${campaignId} FOR UPDATE
+    `);
     const campaign = await requireCampaign(tx, campaignId);
     if (campaign.status !== "attention") {
-      throw new CampaignError("invalid_state", `only attention campaigns can be closed with failures (status: ${campaign.status})`);
+      throw new CampaignError(
+        "invalid_state",
+        `only attention campaigns can be closed with failures (status: ${campaign.status})`,
+      );
     }
     const totals = await campaignProgressTotals(tx, campaignId);
-    // Record BOTH review buckets: attention fires on failed>0 OR rejected>0,
-    // so a rejected-only close must not book "closed with 0 failed points".
+    // Historical close columns retain failed/rejected snapshots. Blocked is
+    // kept as an explicit current counter in the read model (there is no
+    // human-review close bucket for machine-owned unavailable work).
     const [row] = await asDb(tx)
       .update(simCampaigns)
-      .set({ status: "completed", closedWithFailedCount: totals.failed, closedWithRejectedCount: totals.rejected, completedAt: new Date() })
-      .where(eq(simCampaigns.id, campaignId))
+      .set({
+        status: "completed",
+        closedWithFailedCount: totals.failed,
+        closedWithRejectedCount: totals.rejected,
+        completedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(simCampaigns.id, campaignId),
+          eq(simCampaigns.status, "attention"),
+        ),
+      )
       .returning();
-    return { campaign: row, closedWithFailedCount: totals.failed, closedWithRejectedCount: totals.rejected };
+    if (!row) {
+      throw new CampaignError(
+        "invalid_state",
+        "campaign changed state while close was being applied",
+      );
+    }
+    return {
+      campaign: row,
+      closedWithFailedCount: totals.failed,
+      closedWithRejectedCount: totals.rejected,
+      blockedCount: totals.blocked,
+    };
   });
 }
 
-export async function archiveCampaign(db: DB, campaignId: string, unarchive = false) {
+export async function archiveCampaign(
+  db: DB,
+  campaignId: string,
+  unarchive = false,
+) {
   return db.transaction(async (tx) => {
+    await asDb(tx).execute(sql`
+      SELECT id FROM sim_campaigns WHERE id = ${campaignId} FOR UPDATE
+    `);
     const campaign = await requireCampaign(tx, campaignId);
     if (unarchive) {
-      if (campaign.status !== "archived") throw new CampaignError("invalid_state", "campaign is not archived");
+      if (campaign.status !== "archived")
+        throw new CampaignError("invalid_state", "campaign is not archived");
       const restored = campaign.completedAt ? "completed" : "cancelled";
-      const [row] = await asDb(tx).update(simCampaigns).set({ status: restored }).where(eq(simCampaigns.id, campaignId)).returning();
+      const [row] = await asDb(tx)
+        .update(simCampaigns)
+        .set({ status: restored })
+        .where(
+          and(
+            eq(simCampaigns.id, campaignId),
+            eq(simCampaigns.status, "archived"),
+          ),
+        )
+        .returning();
+      if (!row) {
+        throw new CampaignError(
+          "invalid_state",
+          "campaign changed state while unarchive was being applied",
+        );
+      }
       return { campaign: row };
     }
     if (!["completed", "cancelled"].includes(campaign.status)) {
-      throw new CampaignError("invalid_state", `only completed/cancelled campaigns can be archived (status: ${campaign.status})`);
+      throw new CampaignError(
+        "invalid_state",
+        `only completed/cancelled campaigns can be archived (status: ${campaign.status})`,
+      );
     }
-    const [row] = await asDb(tx).update(simCampaigns).set({ status: "archived" }).where(eq(simCampaigns.id, campaignId)).returning();
+    const [row] = await asDb(tx)
+      .update(simCampaigns)
+      .set({ status: "archived" })
+      .where(
+        and(
+          eq(simCampaigns.id, campaignId),
+          inArray(simCampaigns.status, ["completed", "cancelled"]),
+        ),
+      )
+      .returning();
+    if (!row) {
+      throw new CampaignError(
+        "invalid_state",
+        "campaign changed state while archive was being applied",
+      );
+    }
     return { campaign: row };
   });
 }
 
 /** Force-release a blocked `kept` condition (spec §6.3): explicit, recorded as
  *  a force_release plan revision; solved evidence kept; pending deleted. */
-export async function forceReleaseCondition(db: DB, campaignId: string, conditionId: string, expectedCancelledPoints?: number) {
+export async function forceReleaseCondition(
+  db: DB,
+  campaignId: string,
+  conditionId: string,
+  expectedCancelledPoints?: number,
+) {
   return db.transaction(async (tx) => {
-    const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(tx, campaignId, { forUpdate: true });
+    const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(
+      tx,
+      campaignId,
+      { forUpdate: true },
+    );
     const [condition] = await asDb(tx)
       .select()
       .from(simCampaignConditions)
-      .where(and(eq(simCampaignConditions.id, conditionId), eq(simCampaignConditions.campaignId, campaignId)))
+      .where(
+        and(
+          eq(simCampaignConditions.id, conditionId),
+          eq(simCampaignConditions.campaignId, campaignId),
+        ),
+      )
       .limit(1);
     if (!condition) throw new CampaignError("not_found", "condition not found");
     if (condition.status !== "kept") {
-      throw new CampaignError("invalid_state", `only kept conditions can be force-released (status: ${condition.status})`);
+      throw new CampaignError(
+        "invalid_state",
+        `only kept conditions can be force-released (status: ${condition.status})`,
+      );
     }
     const [openRow] = (await asDb(tx).execute(sql`
       SELECT count(*)::int AS n FROM sim_campaign_points WHERE campaign_id = ${campaignId} AND condition_id = ${conditionId} AND state = 'requested'
     `)) as unknown as Array<{ n: number }>;
     const cancelledPoints = Number(openRow?.n ?? 0);
-    if (expectedCancelledPoints != null && expectedCancelledPoints !== cancelledPoints) {
-      throw new CampaignError("drift", `expected ${expectedCancelledPoints} cancellable points but found ${cancelledPoints} — refresh and confirm again`, {
-        expected: expectedCancelledPoints,
-        actual: cancelledPoints,
-      });
+    if (
+      expectedCancelledPoints != null &&
+      expectedCancelledPoints !== cancelledPoints
+    ) {
+      throw new CampaignError(
+        "drift",
+        `expected ${expectedCancelledPoints} cancellable points but found ${cancelledPoints} — refresh and confirm again`,
+        {
+          expected: expectedCancelledPoints,
+          actual: cancelledPoints,
+        },
+      );
     }
     const [planRevision] = await asDb(tx)
       .insert(simCampaignPlanRevisions)
@@ -2632,10 +4516,16 @@ export async function forceReleaseCondition(db: DB, campaignId: string, conditio
         },
       })
       .returning();
-    await asDb(tx).update(simCampaigns).set({ currentPlanRevisionId: planRevision.id }).where(eq(simCampaigns.id, campaign.id));
+    await asDb(tx)
+      .update(simCampaigns)
+      .set({ currentPlanRevisionId: planRevision.id })
+      .where(eq(simCampaigns.id, campaign.id));
     await asDb(tx)
       .update(simCampaignConditions)
-      .set({ status: "released", statusChangedInPlanRevisionId: planRevision.id })
+      .set({
+        status: "released",
+        statusChangedInPlanRevisionId: planRevision.id,
+      })
       .where(eq(simCampaignConditions.id, conditionId));
     await asDb(tx).execute(sql`
       UPDATE sim_campaign_points SET state = 'released', "updatedAt" = now()
@@ -2644,23 +4534,46 @@ export async function forceReleaseCondition(db: DB, campaignId: string, conditio
     await deleteReleasedPendingResults(tx, campaignId);
     await recomputeCampaignProgress(tx, campaignId);
     const totals = await refreshCampaignCompletion(tx, campaignId);
-    return { planRevisionNumber: planRevision.revisionNumber, cancelledPoints, totals };
+    return {
+      planRevisionNumber: planRevision.revisionNumber,
+      cancelledPoints,
+      totals,
+    };
   });
 }
 
 /** Restore a released condition through the normal plan-edit path: the combo's
  *  values are ensured in the envelope and every OTHER combo that would newly
  *  appear is excluded, so exactly this condition re-activates (spec §6.3). */
-export async function restoreCondition(db: DB, campaignId: string, conditionId: string, createdBy?: string | null) {
+export async function restoreCondition(
+  db: DB,
+  campaignId: string,
+  conditionId: string,
+  createdBy?: string | null,
+) {
   return db.transaction(async (tx) => {
-    const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(tx, campaignId, { forUpdate: true });
+    const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(
+      tx,
+      campaignId,
+      { forUpdate: true },
+    );
     const condRows = await loadCampaignConditionCombos(tx, campaignId);
     const target = condRows.find((r) => r.condition.id === conditionId);
     if (!target) throw new CampaignError("not_found", "condition not found");
-    if (target.condition.status === "active") throw new CampaignError("invalid_state", "condition is already active");
+    if (target.condition.status === "active")
+      throw new CampaignError("invalid_state", "condition is already active");
 
-    const [t, p, speed, chord] = target.comboKey.split("|") as [string, string, string, string];
-    const activeKeys = new Set(condRows.filter((r) => r.condition.status === "active").map((r) => r.comboKey));
+    const [t, p, speed, chord] = target.comboKey.split("|") as [
+      string,
+      string,
+      string,
+      string,
+    ];
+    const activeKeys = new Set(
+      condRows
+        .filter((r) => r.condition.status === "active")
+        .map((r) => r.comboKey),
+    );
     const draft: CampaignPlan = {
       ...plan,
       ambients: dedupeSorted(
@@ -2668,16 +4581,36 @@ export async function restoreCondition(db: DB, campaignId: string, conditionId: 
         (a) => `${a[0]}|${a[1]}`,
         (a, b) => Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1]),
       ),
-      speedsMps: dedupeSorted([...plan.speedsMps, speed], (x) => x, (a, b) => Number(a) - Number(b)),
-      chordsM: dedupeSorted([...plan.chordsM, chord], (x) => x, (a, b) => Number(a) - Number(b)),
-      excludedConditions: plan.excludedConditions.filter((x) => x.join("|") !== target.comboKey),
+      speedsMps: dedupeSorted(
+        [...plan.speedsMps, speed],
+        (x) => x,
+        (a, b) => Number(a) - Number(b),
+      ),
+      chordsM: dedupeSorted(
+        [...plan.chordsM, chord],
+        (x) => x,
+        (a, b) => Number(a) - Number(b),
+      ),
+      excludedConditions: plan.excludedConditions.filter(
+        (x) => x.join("|") !== target.comboKey,
+      ),
     };
     // Exclude every combo the widened envelope would introduce except the
     // restored one and combos already active.
     const wouldBe = conditionCombosFromPlan(draft);
     const extraExclusions = wouldBe
-      .filter((c) => c.comboKey !== target.comboKey && !activeKeys.has(c.comboKey))
-      .map((c) => [c.temperatureK, c.pressurePa, c.speedMps, c.chordM] as [string, string, string, string]);
+      .filter(
+        (c) => c.comboKey !== target.comboKey && !activeKeys.has(c.comboKey),
+      )
+      .map(
+        (c) =>
+          [c.temperatureK, c.pressurePa, c.speedMps, c.chordM] as [
+            string,
+            string,
+            string,
+            string,
+          ],
+      );
     const newPlanInput: CampaignPlanInput = {
       ...draft,
       excludedConditions: dedupeSorted(
@@ -2686,21 +4619,42 @@ export async function restoreCondition(db: DB, campaignId: string, conditionId: 
         (a, b) => a.join("|").localeCompare(b.join("|")),
       ),
     };
-    const { classification } = await classifyPlanChange(tx, campaignId, newPlanInput);
-    return applyPlanEditCore(tx, campaign, revision.revisionNumber, classification, "edit", createdBy, {
-      restoredConditionId: conditionId,
-    });
+    const { classification } = await classifyPlanChange(
+      tx,
+      campaignId,
+      newPlanInput,
+    );
+    return applyPlanEditCore(
+      tx,
+      campaign,
+      revision.revisionNumber,
+      classification,
+      "edit",
+      createdBy,
+      {
+        restoredConditionId: conditionId,
+      },
+    );
   });
 }
 
 export async function continueLane(
   db: DB,
   campaignId: string,
-  laneKey: { airfoilId: string; conditionId: string; objective: CampaignObjectiveKey },
+  laneKey: {
+    airfoilId: string;
+    conditionId: string;
+    objective: CampaignObjectiveKey;
+  },
   extraRounds: number,
 ) {
-  if (!(Number.isInteger(extraRounds) && extraRounds >= 1 && extraRounds <= 50)) {
-    throw new CampaignError("validation", "extraRounds must be an integer 1..50");
+  if (
+    !(Number.isInteger(extraRounds) && extraRounds >= 1 && extraRounds <= 50)
+  ) {
+    throw new CampaignError(
+      "validation",
+      "extraRounds must be an integer 1..50",
+    );
   }
   const [lane] = await db
     .update(simCampaignLanes)
@@ -2724,7 +4678,15 @@ export async function continueLane(
 // ---------------------------------------------------------------------------
 // Failures + scoped requeue (spec §10)
 // ---------------------------------------------------------------------------
-export const CAMPAIGN_ERROR_CLASSES = ["mesh", "diverged", "timeout", "engine", "cancelled", "solver", "unknown"] as const;
+export const CAMPAIGN_ERROR_CLASSES = [
+  "mesh",
+  "diverged",
+  "timeout",
+  "engine",
+  "cancelled",
+  "solver",
+  "unknown",
+] as const;
 export type CampaignErrorClass = (typeof CAMPAIGN_ERROR_CLASSES)[number];
 
 /** Deterministic error-class bucket, shared by the failures view, the scoped
@@ -2745,7 +4707,10 @@ END`;
 // sets state='terminal', result_id=<failed result>), so the failures list,
 // counters, and requeue must all match on the terminal model and join by
 // result_id. Callers MUST join `results r ON r.id = p.result_id`.
-function failedResultsWhere(campaignId: string, filters: { conditionId?: string; airfoilId?: string }) {
+function failedResultsWhere(
+  campaignId: string,
+  filters: { conditionId?: string; airfoilId?: string },
+) {
   return sql`
     p.campaign_id = ${campaignId}
     AND p.state = 'terminal'
@@ -2757,12 +4722,35 @@ function failedResultsWhere(campaignId: string, filters: { conditionId?: string;
   `;
 }
 
+const DETERMINISTIC_MESH_BLOCKER_SQL = sql`(
+  position(${DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER} in lower(COALESCE(r.error, ''))) > 0
+  AND position(${DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER} in lower(COALESCE(r.error, ''))) > 0
+)`;
+
+/** Generic retry is deliberately RANS-only. Once a physical cell has any
+ * PRECALC obligation row, every state (including satisfied/cancelled) remains
+ * durable evidence that the fidelity ladder owns that cell; ordinary campaign
+ * requeue must never downgrade it back to a wave-1 solve. */
+const GENERIC_RANS_REQUEUE_ELIGIBLE_SQL = sql`(
+  r.regime IS DISTINCT FROM 'urans'
+  AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+  AND NOT EXISTS (
+    SELECT 1 FROM sim_precalc_obligations obligation
+    WHERE obligation.airfoil_id = p.airfoil_id
+      AND obligation.revision_id = p.revision_id
+      AND obligation.aoa_deg = p.aoa_deg
+  )
+)`;
+
 // A rejected campaign point is TERMINAL with its authoritative results row
 // DONE but classified 'rejected' (physics-invalid evidence) — the same
 // terminal+result_id model as failedResultsWhere, with the classification
 // join matching the canonical counter (rc.result_id = p.result_id,
 // rc.state='rejected'). Callers MUST join `results r ON r.id = p.result_id`.
-function rejectedResultsWhere(campaignId: string, filters: { conditionId?: string; airfoilId?: string }) {
+function rejectedResultsWhere(
+  campaignId: string,
+  filters: { conditionId?: string; airfoilId?: string },
+) {
   return sql`
     p.campaign_id = ${campaignId}
     AND p.state = 'terminal'
@@ -2814,6 +4802,7 @@ export async function campaignRejected(
       JOIN airfoils af ON af.id = p.airfoil_id
       JOIN result_classifications rc ON rc.result_id = r.id
       WHERE ${rejectedResultsWhere(campaignId, filters)}
+        AND ${GENERIC_RANS_REQUEUE_ELIGIBLE_SQL}
     ) ranked
     WHERE rn <= 20
     ORDER BY rn ASC
@@ -2847,6 +4836,8 @@ export async function campaignRejected(
 export interface CampaignFailureGroup {
   errorClass: CampaignErrorClass;
   count: number;
+  /** Failed rows safe to repeat without first changing the immutable setup. */
+  retryableCount: number;
   samples: Array<{
     resultId: string;
     conditionId: string;
@@ -2856,6 +4847,7 @@ export interface CampaignFailureGroup {
     aoaDeg: number;
     error: string | null;
     attempts: number;
+    retryable: boolean;
   }>;
 }
 
@@ -2863,7 +4855,11 @@ export async function campaignFailures(
   db: DB,
   campaignId: string,
   filters: { conditionId?: string; airfoilId?: string } = {},
-): Promise<{ total: number; groups: CampaignFailureGroup[] }> {
+): Promise<{
+  total: number;
+  retryableTotal: number;
+  groups: CampaignFailureGroup[];
+}> {
   await requireCampaign(db, campaignId);
   const rows = (await db.execute(sql`
     SELECT * FROM (
@@ -2876,8 +4872,11 @@ export async function campaignFailures(
         af.name AS airfoil_name,
         p.aoa_deg::float8 AS aoa_deg,
         r.error,
+        (NOT (${DETERMINISTIC_MESH_BLOCKER_SQL}) AND ${GENERIC_RANS_REQUEUE_ELIGIBLE_SQL}) AS retryable,
         (SELECT count(*)::int FROM result_attempts ra WHERE ra.result_id = r.id) AS attempts,
         count(*) OVER (PARTITION BY ${ERROR_CLASS_SQL})::int AS class_count,
+        count(*) FILTER (WHERE NOT (${DETERMINISTIC_MESH_BLOCKER_SQL}) AND ${GENERIC_RANS_REQUEUE_ELIGIBLE_SQL})
+          OVER (PARTITION BY ${ERROR_CLASS_SQL})::int AS retryable_count,
         row_number() OVER (PARTITION BY ${ERROR_CLASS_SQL} ORDER BY r."updatedAt" DESC) AS rn
       FROM results r
       JOIN sim_campaign_points p ON p.result_id = r.id
@@ -2895,18 +4894,27 @@ export async function campaignFailures(
     airfoil_name: string;
     aoa_deg: number;
     error: string | null;
+    retryable: boolean;
     attempts: number;
     class_count: number;
+    retryable_count: number;
     rn: number;
   }>;
   const groups = new Map<CampaignErrorClass, CampaignFailureGroup>();
   let total = 0;
+  let retryableTotal = 0;
   for (const row of rows) {
     let group = groups.get(row.error_class);
     if (!group) {
-      group = { errorClass: row.error_class, count: Number(row.class_count), samples: [] };
+      group = {
+        errorClass: row.error_class,
+        count: Number(row.class_count),
+        retryableCount: Number(row.retryable_count),
+        samples: [],
+      };
       groups.set(row.error_class, group);
       total += Number(row.class_count);
+      retryableTotal += Number(row.retryable_count);
     }
     group.samples.push({
       resultId: row.result_id,
@@ -2917,17 +4925,19 @@ export async function campaignFailures(
       aoaDeg: Number(row.aoa_deg),
       error: row.error,
       attempts: Number(row.attempts),
+      retryable: Boolean(row.retryable),
     });
   }
-  return { total, groups: [...groups.values()] };
+  return { total, retryableTotal, groups: [...groups.values()] };
 }
 
-/** Scoped requeue with exact expected-count verification (409 on drift).
- *  Covers BOTH review buckets: terminal-FAILED points (always) and, when
- *  includeRejected is set, terminal-DONE points whose classification is
- *  'rejected' (physics-invalid evidence that should re-solve, e.g. on a fixed
- *  engine build). Each bucket carries its own expected count so a stale dialog
- *  can never silently requeue more (or fewer) points than the admin confirmed. */
+/** Scoped maintenance requeue with exact expected-count verification (409 on
+ *  drift). Covers eligible ordinary-RANS terminal failures and, when
+ *  includeRejected is set, eligible ordinary-RANS terminal rejected evidence.
+ *  PRECALC-ledger and URANS rows are deliberately excluded: their automatic
+ *  ladder owns recovery, and this endpoint must never downgrade them to RANS.
+ *  Each class carries its own expected count so a stale dialog cannot silently
+ *  requeue more (or fewer) points than the operator confirmed. */
 export async function requeueCampaignFailed(
   db: DB,
   campaignId: string,
@@ -2939,26 +4949,75 @@ export async function requeueCampaignFailed(
     includeRejected?: boolean;
     expectedRejectedCount?: number;
   },
-): Promise<{ requeued: number; requeuedFailed: number; requeuedRejected: number; totals: CampaignProgressTotals }> {
+): Promise<{
+  requeued: number;
+  requeuedFailed: number;
+  requeuedRejected: number;
+  totals: CampaignProgressTotals;
+}> {
   return db.transaction(async (tx) => {
+    await asDb(tx).execute(
+      sql`SELECT id FROM sim_campaigns WHERE id = ${campaignId} FOR UPDATE`,
+    );
     await requireCampaign(tx, campaignId);
     const classFilter =
       args.errorClasses && args.errorClasses.length > 0
         ? sql`AND ${ERROR_CLASS_SQL} = ANY(${pgTextArray(args.errorClasses)}::text[])`
         : sql``;
+    const lockRows = (await asDb(tx).execute(sql`
+      SELECT DISTINCT candidate.airfoil_id, candidate.revision_id,
+             candidate.aoa_deg::float8 AS aoa_deg
+      FROM (
+        SELECT p.airfoil_id, p.revision_id, p.aoa_deg
+        FROM results r
+        JOIN sim_campaign_points p ON p.result_id = r.id
+        WHERE ${failedResultsWhere(campaignId, { conditionId: args.conditionId, airfoilId: args.airfoilId })}
+          ${classFilter}
+        ${
+          args.includeRejected
+            ? sql`
+          UNION
+          SELECT p.airfoil_id, p.revision_id, p.aoa_deg
+          FROM results r
+          JOIN sim_campaign_points p ON p.result_id = r.id
+          WHERE ${rejectedResultsWhere(campaignId, { conditionId: args.conditionId, airfoilId: args.airfoilId })}
+        `
+            : sql``
+        }
+      ) candidate
+      ORDER BY candidate.airfoil_id, candidate.revision_id, candidate.aoa_deg
+    `)) as unknown as Array<{
+      airfoil_id: string;
+      revision_id: string;
+      aoa_deg: number;
+    }>;
+    await lockPrecalcCells(
+      asDb(tx),
+      lockRows.map((row) => ({
+        airfoilId: row.airfoil_id,
+        revisionId: row.revision_id,
+        aoaDeg: Number(row.aoa_deg),
+      })),
+    );
     const matching = (await asDb(tx).execute(sql`
       SELECT r.id
       FROM results r
       JOIN sim_campaign_points p ON p.result_id = r.id
       WHERE ${failedResultsWhere(campaignId, { conditionId: args.conditionId, airfoilId: args.airfoilId })}
+        AND NOT (${DETERMINISTIC_MESH_BLOCKER_SQL})
+        AND ${GENERIC_RANS_REQUEUE_ELIGIBLE_SQL}
         ${classFilter}
       FOR UPDATE OF r
     `)) as unknown as Array<{ id: string }>;
     if (matching.length !== args.expectedCount) {
-      throw new CampaignError("drift", `expected ${args.expectedCount} failed points but found ${matching.length} — refresh and confirm again`, {
-        expected: args.expectedCount,
-        actual: matching.length,
-      });
+      throw new CampaignError(
+        "drift",
+        `expected ${args.expectedCount} failed points but found ${matching.length} — refresh and confirm again`,
+        {
+          expected: args.expectedCount,
+          actual: matching.length,
+        },
+      );
     }
     let matchingRejected: Array<{ id: string }> = [];
     if (args.includeRejected) {
@@ -2967,6 +5026,7 @@ export async function requeueCampaignFailed(
         FROM results r
         JOIN sim_campaign_points p ON p.result_id = r.id
         WHERE ${rejectedResultsWhere(campaignId, { conditionId: args.conditionId, airfoilId: args.airfoilId })}
+          AND ${GENERIC_RANS_REQUEUE_ELIGIBLE_SQL}
         FOR UPDATE OF r
       `)) as unknown as Array<{ id: string }>;
       const expectedRejected = args.expectedRejectedCount ?? 0;
@@ -2978,14 +5038,27 @@ export async function requeueCampaignFailed(
         );
       }
     }
-    const ids = [...matching.map((m) => m.id), ...matchingRejected.map((m) => m.id)];
+    const ids = [
+      ...matching.map((m) => m.id),
+      ...matchingRejected.map((m) => m.id),
+    ];
     if (ids.length > 0) {
-      // Reset the failed/rejected evidence rows to re-claimable pending work.
-      // (A rejected row was status='done'; flipping it to 'pending' keeps its
-      // attempts/evidence history and lets the re-solve overwrite in place —
-      // the still-'rejected' classification row is re-verdicted by the polar
-      // cache refresh after the new evidence lands.)
-      await asDb(tx).update(results).set({ status: "pending", simJobId: null }).where(inArray(results.id, ids));
+      // Reset only eligible ordinary-RANS rows to re-claimable pending work.
+      // A rejected row was status='done'; its evidence/attempt history remains
+      // stored while the replacement result is produced. PRECALC/URANS rows
+      // cannot enter this set because their machine-owned ladder is authoritative.
+      await asDb(tx)
+        .update(results)
+        .set({ status: "pending", simJobId: null })
+        .where(inArray(results.id, ids));
+      // The admin-confirmed requeue is a new submit lifecycle. Clear any
+      // prior answered-HTTP delay/block in the same transaction as the result
+      // and campaign-point reset, or the UI can claim success while the
+      // scheduler continues to exclude the cells.
+      await asDb(tx).execute(sql`
+        DELETE FROM sim_result_submit_retries
+        WHERE result_id = ANY(${pgUuidArray(ids)}::uuid[])
+      `);
       // Flip the terminal points back to 'requested' so the campaign sweeper
       // branch (which schedules only state='requested' points) will actually
       // reschedule them. Without this the point would be a terminal orphan
@@ -3031,14 +5104,16 @@ export interface CampaignListItem {
   conditionCount: number;
   airfoilCount: number;
   totals: CampaignProgressTotals;
-  /** Semantic split of the rejected/failed review surface (amendment A):
-   *  awaitingUrans = tier-1 rejects queued for stage 2 (violet, calm);
-   *  needsReview = failed-after-auto-retry + urans-rejected with nothing
-   *  further scheduled (red chip only when > 0). */
+  /** Compatibility split retained for rolling clients. `awaitingUrans` is
+   *  machine-owned stage-2 work. `needsReview` is a legacy wire field whose
+   *  canonical predicate is now empty; unavailable machine outcomes are
+   *  reported by failed/rejected/blocked totals instead. */
   reviewBuckets: CampaignReviewBuckets;
+  automaticPrecalcOpen: number;
 }
 
-const isoOf = (v: Date | string | null): string | null => (v == null ? null : v instanceof Date ? v.toISOString() : v);
+const isoOf = (v: Date | string | null): string | null =>
+  v == null ? null : v instanceof Date ? v.toISOString() : v;
 
 export async function listCampaigns(
   db: DB,
@@ -3046,7 +5121,10 @@ export async function listCampaigns(
 ): Promise<{ items: CampaignListItem[]; total: number }> {
   const limit = Math.min(Math.max(opts.limit ?? 25, 1), 100);
   const offset = Math.max(opts.offset ?? 0, 0);
-  const statusFilter = opts.statuses && opts.statuses.length > 0 ? sql`WHERE c.status = ANY(${pgTextArray(opts.statuses)}::text[])` : sql``;
+  const statusFilter =
+    opts.statuses && opts.statuses.length > 0
+      ? sql`WHERE c.status = ANY(${pgTextArray(opts.statuses)}::text[])`
+      : sql``;
   const rows = (await db.execute(sql`
     SELECT
       c.id, c.slug, c.name, c.status, c.priority, c.notes,
@@ -3060,11 +5138,34 @@ export async function listCampaigns(
       COALESCE(pr.superseded, 0)::int AS superseded,
       COALESCE(pr.derived, 0)::int AS derived,
       COALESCE(pr.rejected, 0)::int AS rejected,
+      COALESCE(pr.blocked, 0)::int AS blocked,
+      (
+        SELECT count(*)::int
+        FROM (
+          SELECT req.airfoil_id, req.revision_id, req.aoa_deg
+          FROM sim_urans_request_campaigns ownership
+          JOIN sim_urans_requests req ON req.id = ownership.request_id
+          WHERE ownership.campaign_id = c.id
+            AND ownership.state = 'active'
+            AND req.state IN ('pending', 'running')
+
+          UNION
+
+          SELECT obligation.airfoil_id, obligation.revision_id, obligation.aoa_deg
+          FROM sim_precalc_obligation_campaigns obligation_owner
+          JOIN sim_precalc_obligations obligation
+            ON obligation.id = obligation_owner.obligation_id
+          WHERE obligation_owner.campaign_id = c.id
+            AND obligation_owner.state = 'active'
+            AND obligation.state IN ('pending', 'running')
+        ) automatic_precalc_cells
+      ) AS automatic_precalc_open,
       count(*) OVER ()::int AS total
     FROM sim_campaigns c
     LEFT JOIN (
       SELECT campaign_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
-             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived, sum(rejected) AS rejected
+             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
+             sum(rejected) AS rejected, sum(blocked) AS blocked
       FROM sim_campaign_progress GROUP BY campaign_id
     ) pr ON pr.campaign_id = c.id
     ${statusFilter}
@@ -3085,11 +5186,18 @@ export async function listCampaigns(
       status: String(r.status),
       priority: Number(r.priority),
       notes: (r.notes as string | null) ?? null,
-      closedWithFailedCount: r.closed_with_failed_count == null ? null : Number(r.closed_with_failed_count),
-      closedWithRejectedCount: r.closed_with_rejected_count == null ? null : Number(r.closed_with_rejected_count),
+      closedWithFailedCount:
+        r.closed_with_failed_count == null
+          ? null
+          : Number(r.closed_with_failed_count),
+      closedWithRejectedCount:
+        r.closed_with_rejected_count == null
+          ? null
+          : Number(r.closed_with_rejected_count),
       completedAt: isoOf(r.completed_at as Date | string | null),
       createdAt: isoOf(r.created_at as Date | string | null)!,
       updatedAt: isoOf(r.updated_at as Date | string | null)!,
+      automaticPrecalcOpen: Number(r.automatic_precalc_open ?? 0),
       conditionCount: Number(r.condition_count),
       airfoilCount: Number(r.airfoil_count),
       totals: {
@@ -3100,9 +5208,21 @@ export async function listCampaigns(
         superseded: Number(r.superseded),
         derived: Number(r.derived),
         rejected: Number(r.rejected),
-        remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed) - Number(r.rejected)),
+        blocked: Number(r.blocked),
+        remaining: Math.max(
+          0,
+          Number(r.requested) -
+            Number(r.solved) -
+            Number(r.derived) -
+            Number(r.failed) -
+            Number(r.rejected) -
+            Number(r.blocked),
+        ),
       },
-      reviewBuckets: reviewBuckets.get(String(r.id)) ?? { awaitingUrans: 0, needsReview: 0 },
+      reviewBuckets: reviewBuckets.get(String(r.id)) ?? {
+        awaitingUrans: 0,
+        needsReview: 0,
+      },
     })),
   };
 }
@@ -3128,7 +5248,7 @@ export interface CampaignConditionSummary {
   drift: boolean;
   gainedEvidenceAfterRelease: boolean;
   counters: CampaignProgressTotals;
-  /** Per-condition semantic split of the rejected/failed surface (amendment A). */
+  /** Per-condition rolling-compatibility ladder split; see CampaignListItem. */
   reviewBuckets: CampaignReviewBuckets;
 }
 
@@ -3151,8 +5271,9 @@ export interface CampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
-  /** Semantic review-bucket split (amendment A): violet awaiting-URANS segment
-   *  + the red "needs review · N" chip (chip renders ONLY when N > 0). */
+  /** Rolling-compatibility ladder split. `needsReview` remains on the wire for
+   *  old clients but has an empty canonical predicate; it must not promise a
+   *  routine human adjudication workflow. */
   reviewBuckets: CampaignReviewBuckets;
   /** Fidelity ladder per-tier open counts (contract 7). */
   tierCounts: CampaignTierCounts;
@@ -3165,18 +5286,30 @@ export interface CampaignSummary {
 }
 
 /** Bounded summary for the 10 s poll: O(conditions), counters only. */
-export async function campaignSummary(db: DB, campaignId: string): Promise<CampaignSummary> {
-  const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(db, campaignId);
+export async function campaignSummary(
+  db: DB,
+  campaignId: string,
+): Promise<CampaignSummary> {
+  const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(
+    db,
+    campaignId,
+  );
   const totals = await campaignProgressTotals(db, campaignId);
   const tierCounts = await campaignOpenTierCounts(db, campaignId);
   const reviewBucketRows = await campaignReviewBucketRows(db, campaignId);
   const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
-    (acc, row) => ({ awaitingUrans: acc.awaitingUrans + row.awaitingUrans, needsReview: acc.needsReview + row.needsReview }),
+    (acc, row) => ({
+      awaitingUrans: acc.awaitingUrans + row.awaitingUrans,
+      needsReview: acc.needsReview + row.needsReview,
+    }),
     { awaitingUrans: 0, needsReview: 0 },
   );
   const reviewByCondition = new Map<string, CampaignReviewBuckets>();
   for (const row of reviewBucketRows) {
-    const prev = reviewByCondition.get(row.conditionId) ?? { awaitingUrans: 0, needsReview: 0 };
+    const prev = reviewByCondition.get(row.conditionId) ?? {
+      awaitingUrans: 0,
+      needsReview: 0,
+    };
     reviewByCondition.set(row.conditionId, {
       awaitingUrans: prev.awaitingUrans + row.awaitingUrans,
       needsReview: prev.needsReview + row.needsReview,
@@ -3212,13 +5345,15 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
       COALESCE(pr.running, 0)::int AS running,
       COALESCE(pr.superseded, 0)::int AS superseded,
       COALESCE(pr.derived, 0)::int AS derived,
-      COALESCE(pr.rejected, 0)::int AS rejected
+      COALESCE(pr.rejected, 0)::int AS rejected,
+      COALESCE(pr.blocked, 0)::int AS blocked
     FROM sim_campaign_conditions cc
     JOIN simulation_presets p ON p.id = cc.preset_id
     JOIN simulation_preset_revisions rev ON rev.id = cc.simulation_preset_revision_id
     LEFT JOIN (
       SELECT condition_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
-             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived, sum(rejected) AS rejected
+             sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
+             sum(rejected) AS rejected, sum(blocked) AS blocked
       FROM sim_campaign_progress WHERE campaign_id = ${campaignId} GROUP BY condition_id
     ) pr ON pr.condition_id = cc.id
     WHERE cc.campaign_id = ${campaignId}
@@ -3229,9 +5364,14 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
   `)) as unknown as Array<{ objective: string; state: string; n: number }>;
   const lanesSummary: Record<string, Record<string, number>> = {};
   for (const row of laneRows) {
-    lanesSummary[row.objective] = { ...(lanesSummary[row.objective] ?? {}), [row.state]: Number(row.n) };
+    lanesSummary[row.objective] = {
+      ...(lanesSummary[row.objective] ?? {}),
+      [row.state]: Number(row.n),
+    };
   }
-  const summaryRateBaseline = (revision.summary as Record<string, unknown> | null)?.rateBaselineAt;
+  const summaryRateBaseline = (
+    revision.summary as Record<string, unknown> | null
+  )?.rateBaselineAt;
   return {
     campaign: {
       id: campaign.id,
@@ -3248,7 +5388,10 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
       updatedAt: isoOf(campaign.updatedAt)!,
       planRevisionNumber: revision.revisionNumber,
       plan,
-      rateBaselineAt: typeof summaryRateBaseline === "string" ? summaryRateBaseline : isoOf(revision.createdAt),
+      rateBaselineAt:
+        typeof summaryRateBaseline === "string"
+          ? summaryRateBaseline
+          : isoOf(revision.createdAt),
     },
     totals,
     reviewBuckets,
@@ -3283,9 +5426,21 @@ export async function campaignSummary(db: DB, campaignId: string): Promise<Campa
         superseded: Number(r.superseded),
         derived: Number(r.derived),
         rejected: Number(r.rejected),
-        remaining: Math.max(0, Number(r.requested) - Number(r.solved) - Number(r.derived) - Number(r.failed) - Number(r.rejected)),
+        blocked: Number(r.blocked),
+        remaining: Math.max(
+          0,
+          Number(r.requested) -
+            Number(r.solved) -
+            Number(r.derived) -
+            Number(r.failed) -
+            Number(r.rejected) -
+            Number(r.blocked),
+        ),
       },
-      reviewBuckets: reviewByCondition.get(String(r.id)) ?? { awaitingUrans: 0, needsReview: 0 },
+      reviewBuckets: reviewByCondition.get(String(r.id)) ?? {
+        awaitingUrans: 0,
+        needsReview: 0,
+      },
     })),
     lanesSummary,
   };
@@ -3296,7 +5451,9 @@ export interface CampaignAirfoilRow {
   slug: string;
   name: string;
   isSymmetric: boolean;
-  perCondition: Array<{ conditionId: string } & CampaignProgressTotals & CampaignReviewBuckets>;
+  perCondition: Array<
+    { conditionId: string } & CampaignProgressTotals & CampaignReviewBuckets
+  >;
 }
 
 /** Keyset matrix rows by airfoil slug (spec §10, cursor = last slug). */
@@ -3315,27 +5472,47 @@ export async function campaignAirfoilRows(
     WHERE ca.campaign_id = ${campaignId} ${cursorFilter}
     ORDER BY af.slug ASC
     LIMIT ${limit + 1}
-  `)) as unknown as Array<{ id: string; slug: string; name: string; is_symmetric: boolean }>;
+  `)) as unknown as Array<{
+    id: string;
+    slug: string;
+    name: string;
+    is_symmetric: boolean;
+  }>;
   const page = airfoilRowsPage.slice(0, limit);
-  const nextCursor = airfoilRowsPage.length > limit ? page[page.length - 1]?.slug ?? null : null;
+  const nextCursor =
+    airfoilRowsPage.length > limit
+      ? (page[page.length - 1]?.slug ?? null)
+      : null;
   if (page.length === 0) return { items: [], nextCursor: null };
   const ids = page.map((r) => r.id);
   const progressRows = await db
     .select()
     .from(simCampaignProgress)
-    .where(and(eq(simCampaignProgress.campaignId, campaignId), inArray(simCampaignProgress.airfoilId, ids)));
-  // Per-cell review-bucket split (amendment A): the matrix recolors rejected
-  // cells violet (awaiting URANS) vs red (needs review) from the same
-  // canonical predicate the summary/dashboard use.
-  const reviewRows = await campaignReviewBucketRows(db, campaignId, { airfoilIds: ids });
+    .where(
+      and(
+        eq(simCampaignProgress.campaignId, campaignId),
+        inArray(simCampaignProgress.airfoilId, ids),
+      ),
+    );
+  // Per-cell machine-owned awaiting-URANS work. The legacy needsReview field
+  // remains for rolling compatibility but its canonical predicate is empty.
+  const reviewRows = await campaignReviewBucketRows(db, campaignId, {
+    airfoilIds: ids,
+  });
   const reviewByCell = new Map<string, CampaignReviewBuckets>();
   for (const row of reviewRows) {
-    reviewByCell.set(`${row.airfoilId}:${row.conditionId}`, { awaitingUrans: row.awaitingUrans, needsReview: row.needsReview });
+    reviewByCell.set(`${row.airfoilId}:${row.conditionId}`, {
+      awaitingUrans: row.awaitingUrans,
+      needsReview: row.needsReview,
+    });
   }
   const byAirfoil = new Map<string, CampaignAirfoilRow["perCondition"]>();
   for (const row of progressRows) {
     const bucket = byAirfoil.get(row.airfoilId) ?? [];
-    const review = reviewByCell.get(`${row.airfoilId}:${row.conditionId}`) ?? { awaitingUrans: 0, needsReview: 0 };
+    const review = reviewByCell.get(`${row.airfoilId}:${row.conditionId}`) ?? {
+      awaitingUrans: 0,
+      needsReview: 0,
+    };
     bucket.push({
       conditionId: row.conditionId,
       requested: row.requested,
@@ -3345,7 +5522,16 @@ export async function campaignAirfoilRows(
       superseded: row.superseded,
       derived: row.derived,
       rejected: row.rejected,
-      remaining: Math.max(0, row.requested - row.solved - row.derived - row.failed - row.rejected),
+      blocked: row.blocked,
+      remaining: Math.max(
+        0,
+        row.requested -
+          row.solved -
+          row.derived -
+          row.failed -
+          row.rejected -
+          row.blocked,
+      ),
       awaitingUrans: review.awaitingUrans,
       needsReview: review.needsReview,
     });
@@ -3384,7 +5570,12 @@ export interface CampaignLaneRow {
 export async function campaignLanes(
   db: DB,
   campaignId: string,
-  opts: { objective?: CampaignObjectiveKey; state?: string; cursor?: string | null; limit?: number } = {},
+  opts: {
+    objective?: CampaignObjectiveKey;
+    state?: string;
+    cursor?: string | null;
+    limit?: number;
+  } = {},
 ): Promise<{ items: CampaignLaneRow[]; nextCursor: string | null }> {
   await requireCampaign(db, campaignId);
   const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
@@ -3415,7 +5606,10 @@ export async function campaignLanes(
   `)) as unknown as Array<Record<string, unknown>>;
   const page = rows.slice(0, limit);
   const last = page[page.length - 1];
-  const nextCursor = rows.length > limit && last ? `${last.airfoil_slug}~${last.condition_ord}~${last.objective}` : null;
+  const nextCursor =
+    rows.length > limit && last
+      ? `${last.airfoil_slug}~${last.condition_ord}~${last.objective}`
+      : null;
   return {
     items: page.map((r) => ({
       campaignId: String(r.campaign_id),
@@ -3428,7 +5622,8 @@ export async function campaignLanes(
       reynolds: Number(r.reynolds),
       objective: String(r.objective),
       state: String(r.state),
-      currentTargetAlpha: r.current_target_alpha == null ? null : Number(r.current_target_alpha),
+      currentTargetAlpha:
+        r.current_target_alpha == null ? null : Number(r.current_target_alpha),
       iterationCount: Number(r.iteration_count),
       extraRoundsGranted: Number(r.extra_rounds_granted),
       witnessFitSetId: (r.witness_fit_set_id as string | null) ?? null,
@@ -3441,7 +5636,11 @@ export async function campaignLanes(
 export async function campaignLaneDetail(
   db: DB,
   campaignId: string,
-  laneKey: { airfoilId: string; conditionId: string; objective: CampaignObjectiveKey },
+  laneKey: {
+    airfoilId: string;
+    conditionId: string;
+    objective: CampaignObjectiveKey;
+  },
 ) {
   const [lane] = await db
     .select()
@@ -3499,7 +5698,12 @@ export interface CampaignRate {
 /** Measured ingest rate (spec §12): trailing 24 h of solvedAt on campaign
  *  solver cells, window reset to the latest plan-revision baseline. Returns
  *  null (suppressed) unless the campaign is active and ≥50 points landed. */
-export async function campaignRate(db: DB, campaignId: string, baselineAt: string | null, remainingPoints: number): Promise<CampaignRate | null> {
+export async function campaignRate(
+  db: DB,
+  campaignId: string,
+  baselineAt: string | null,
+  remainingPoints: number,
+): Promise<CampaignRate | null> {
   const baselineIso = baselineAt ?? new Date(0).toISOString();
   const [row] = (await db.execute(sql`
     SELECT count(*)::int AS n, min(r."solvedAt") AS since
@@ -3530,16 +5734,20 @@ export interface CampaignBacklogStripEntry {
   priority: number;
   remainingPoints: number;
   failedPoints: number;
+  blockedPoints: number;
   runningPoints: number;
 }
 
 /** Queue-page backlog strip: per-non-terminal-campaign remaining work from the
  *  counters table only (no point scans). */
-export async function campaignBacklogStrip(db: DB): Promise<CampaignBacklogStripEntry[]> {
+export async function campaignBacklogStrip(
+  db: DB,
+): Promise<CampaignBacklogStripEntry[]> {
   const rows = (await db.execute(sql`
     SELECT c.id, c.slug, c.name, c.status, c.priority,
-      COALESCE(sum(pr.requested - pr.solved - pr.derived - pr.failed - pr.rejected), 0)::int AS remaining,
+      COALESCE(sum(pr.requested - pr.solved - pr.derived - pr.failed - pr.rejected - pr.blocked), 0)::int AS remaining,
       COALESCE(sum(pr.failed), 0)::int AS failed,
+      COALESCE(sum(pr.blocked), 0)::int AS blocked,
       COALESCE(sum(pr.running), 0)::int AS running
     FROM sim_campaigns c
     LEFT JOIN sim_campaign_progress pr ON pr.campaign_id = c.id
@@ -3555,6 +5763,7 @@ export async function campaignBacklogStrip(db: DB): Promise<CampaignBacklogStrip
     priority: Number(r.priority),
     remainingPoints: Math.max(0, Number(r.remaining)),
     failedPoints: Number(r.failed),
+    blockedPoints: Number(r.blocked),
     runningPoints: Number(r.running),
   }));
 }

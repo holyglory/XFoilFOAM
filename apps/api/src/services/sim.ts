@@ -21,6 +21,8 @@ import {
   fieldColorScales,
   mediums,
   type Result,
+  resultAttempts,
+  resultClassifications,
   resultMedia,
   results,
   simulationPresetRevisions,
@@ -36,7 +38,7 @@ import { db } from "../db";
 import { mediaStore } from "../media-store";
 
 type ReviewDisclosure = {
-  verdict: "waive" | "exclude";
+  verdict: "exclude";
   note: string | null;
   reviewer: string;
   at: string;
@@ -44,6 +46,10 @@ type ReviewDisclosure = {
 type SimulationDetailWithReview = SimulationDetail & {
   review?: ReviewDisclosure;
 };
+
+function finiteStored(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
 
 const ENGINE_TO_FIELD: Record<string, FieldId> = {
   velocity_magnitude: "velocity_magnitude",
@@ -97,7 +103,53 @@ function snapshotParts(snapshot: SimulationSetupSnapshot | undefined) {
     kinematicViscosity:
       snapshot.flowState?.kinematicViscosity ??
       legacy.operating?.kinematicViscosity,
+    mach: snapshot.flowState?.mach ?? legacy.operating?.mach,
     mesh: snapshot.mesh ?? legacy.mesh,
+  };
+}
+
+/** Build the public/detail projection from the exact selected attempt. The
+ * results row owns cell/physical identity; every solver output/provenance
+ * value comes from current_result_attempt_id so generations can never mix. */
+function selectedResultProjection(
+  result: Result,
+  attempt: typeof resultAttempts.$inferSelect,
+): Result {
+  const payload =
+    attempt.evidencePayload && typeof attempt.evidencePayload === "object"
+      ? (attempt.evidencePayload as Record<string, unknown>)
+      : {};
+  return {
+    ...result,
+    status: attempt.status,
+    source: attempt.source,
+    regime: attempt.regime,
+    cl: attempt.cl,
+    cd: attempt.cd,
+    cm: attempt.cm,
+    clCd: attempt.clCd,
+    clStd: attempt.clStd,
+    cdStd: attempt.cdStd,
+    cmStd: attempt.cmStd,
+    stalled: attempt.stalled,
+    unsteady: attempt.unsteady,
+    converged: attempt.converged,
+    finalResidual: attempt.finalResidual,
+    iterations: attempt.iterations,
+    yPlusAvg: attempt.yPlusAvg,
+    yPlusMax: attempt.yPlusMax,
+    nCells: attempt.nCells,
+    firstOrderFallback: attempt.firstOrderFallback,
+    strouhal: attempt.strouhal,
+    error: attempt.error,
+    qualityWarnings: attempt.qualityWarnings,
+    frameTrack: payload.frame_track ?? payload.frameTrack ?? null,
+    fidelity: typeof payload.fidelity === "string" ? payload.fidelity : null,
+    steadyHistory: payload.steady_history ?? payload.steadyHistory ?? null,
+    simJobId: attempt.simJobId,
+    engineJobId: attempt.engineJobId,
+    engineCaseSlug: attempt.engineCaseSlug,
+    solvedAt: attempt.solvedAt,
   };
 }
 
@@ -210,14 +262,29 @@ async function solvedDetail(
   re: number,
   r: Result,
 ): Promise<SimulationDetailWithReview | null> {
-  const cl = r.cl ?? 0;
-  const cd = r.cd ?? 0;
+  if (!r.currentResultAttemptId) return null;
+  if (
+    !finiteStored(r.cl) ||
+    !finiteStored(r.cd) ||
+    r.cd <= 0 ||
+    !finiteStored(re) ||
+    re <= 0
+  ) {
+    return null;
+  }
+  const cl = r.cl;
+  const cd = r.cd;
   const review = await activeReviewVerdict(db, r.id);
   const media: Partial<Record<FieldId, FieldMedia>> = {};
   const rows = await db
     .select()
     .from(resultMedia)
-    .where(eq(resultMedia.resultId, r.id));
+    .where(
+      and(
+        eq(resultMedia.resultId, r.id),
+        eq(resultMedia.resultAttemptId, r.currentResultAttemptId!),
+      ),
+    );
   const scaleIds = Array.from(
     new Set(
       rows
@@ -266,7 +333,12 @@ async function solvedDetail(
   const allEvidenceRows = await db
     .select()
     .from(solverEvidenceArtifacts)
-    .where(eq(solverEvidenceArtifacts.resultId, r.id))
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultId, r.id),
+        eq(solverEvidenceArtifacts.resultAttemptId, r.currentResultAttemptId!),
+      ),
+    )
     .orderBy(desc(solverEvidenceArtifacts.createdAt));
   // Per-frame URANS PNGs feed frameTrack.frames[].imageUrls; keeping their
   // <=240 rows out of the generic evidenceArtifacts list keeps the payload
@@ -280,7 +352,12 @@ async function solvedDetail(
   const [hist] = await db
     .select()
     .from(forceHistory)
-    .where(eq(forceHistory.resultId, r.id))
+    .where(
+      and(
+        eq(forceHistory.resultId, r.id),
+        eq(forceHistory.resultAttemptId, r.currentResultAttemptId!),
+      ),
+    )
     .limit(1);
   const [revision] = r.simulationPresetRevisionId
     ? await db
@@ -301,17 +378,75 @@ async function solvedDetail(
         .where(eq(boundaryConditions.id, r.bcId))
         .limit(1);
   const setup = snapshotParts(snapshot);
+  const mach = r.mach ?? revision?.mach ?? setup?.mach;
+  if (!finiteStored(mach) || mach < 0) return null;
+  const snapshotMesh =
+    setup?.mesh &&
+    typeof setup.mesh.mesher === "string" &&
+    setup.mesh.mesher.trim() &&
+    finiteStored(setup.mesh.farfieldRadiusChords) &&
+    finiteStored(setup.mesh.wakeLengthChords) &&
+    finiteStored(setup.mesh.nSurface) &&
+    finiteStored(setup.mesh.nRadial) &&
+    finiteStored(setup.mesh.nWake) &&
+    finiteStored(setup.mesh.targetYPlus) &&
+    finiteStored(setup.mesh.spanChords)
+      ? {
+          mesher: setup.mesh.mesher,
+          farfieldRadiusChords: setup.mesh.farfieldRadiusChords,
+          wakeLengthChords: setup.mesh.wakeLengthChords,
+          nSurface: setup.mesh.nSurface,
+          nRadial: setup.mesh.nRadial,
+          nWake: setup.mesh.nWake,
+          targetYPlus: setup.mesh.targetYPlus,
+          spanChords: setup.mesh.spanChords,
+          nCells: r.nCells,
+          yPlusAvg: r.yPlusAvg,
+          yPlusMax: r.yPlusMax,
+          iterations: r.iterations,
+          finalResidual: r.finalResidual,
+        }
+      : null;
+  const snapshotCondition =
+    snapshot &&
+    setup &&
+    typeof setup.mediumName === "string" &&
+    setup.mediumName.trim() &&
+    finiteStored(setup.speedMps) &&
+    setup.speedMps >= 0 &&
+    finiteStored(setup.referenceChordM) &&
+    setup.referenceChordM > 0 &&
+    finiteStored(setup.temperatureK) &&
+    setup.temperatureK > 0 &&
+    finiteStored(setup.pressurePa) &&
+    setup.pressurePa > 0
+      ? {
+          boundaryConditionName: snapshot.preset.name,
+          mediumName: setup.mediumName,
+          speedMps: setup.speedMps,
+          referenceChordM: setup.referenceChordM,
+          temperatureK: setup.temperatureK,
+          pressurePa: setup.pressurePa,
+          density: setup.density,
+          dynamicViscosity: setup.dynamicViscosity,
+          kinematicViscosity: setup.kinematicViscosity,
+          turbulenceModel: snapshot.solver.turbulenceModel,
+          turbulenceIntensity: snapshot.boundary.turbulenceIntensity,
+          viscosityRatio: snapshot.boundary.viscosityRatio,
+          mesh: snapshotMesh,
+        }
+      : null;
   return {
     status: "solved",
     regime: r.unsteady ? "stalled" : "attached",
     airfoilName: name,
     alpha: r.aoaDeg,
     re,
-    mach: r.mach ?? 0.1,
+    mach,
     cl,
     cd,
     cm: r.cm,
-    ld: r.clCd ?? (cd !== 0 ? cl / cd : 0),
+    ld: r.clCd ?? cl / cd,
     clStd: r.clStd,
     cdStd: r.cdStd,
     strouhal: r.strouhal,
@@ -342,70 +477,39 @@ async function solvedDetail(
           at: review.createdAt.toISOString(),
         }
       : undefined,
-    condition:
-      snapshot && setup
+    condition: snapshotCondition
+      ? snapshotCondition
+      : legacyCondition
         ? {
-            boundaryConditionName: snapshot.preset.name,
-            mediumName: setup.mediumName ?? "medium",
-            speedMps: setup.speedMps ?? 0,
-            referenceChordM: setup.referenceChordM ?? 1,
-            temperatureK: setup.temperatureK ?? 288.15,
-            pressurePa: setup.pressurePa ?? 101325,
-            density: setup.density,
-            dynamicViscosity: setup.dynamicViscosity,
-            kinematicViscosity: setup.kinematicViscosity,
-            turbulenceModel: snapshot.solver.turbulenceModel,
-            turbulenceIntensity: snapshot.boundary.turbulenceIntensity,
-            viscosityRatio: snapshot.boundary.viscosityRatio,
-            mesh: setup.mesh
-              ? {
-                  mesher: setup.mesh.mesher,
-                  farfieldRadiusChords: setup.mesh.farfieldRadiusChords,
-                  wakeLengthChords: setup.mesh.wakeLengthChords,
-                  nSurface: setup.mesh.nSurface,
-                  nRadial: setup.mesh.nRadial,
-                  nWake: setup.mesh.nWake,
-                  targetYPlus: setup.mesh.targetYPlus,
-                  spanChords: setup.mesh.spanChords,
-                  nCells: r.nCells,
-                  yPlusAvg: r.yPlusAvg,
-                  yPlusMax: r.yPlusMax,
-                  iterations: r.iterations,
-                  finalResidual: r.finalResidual,
-                }
-              : null,
+            boundaryConditionName: legacyCondition.bc.name,
+            mediumName: legacyCondition.mediumName,
+            speedMps: legacyCondition.bc.speedMps,
+            referenceChordM: legacyCondition.bc.referenceChordM,
+            temperatureK: legacyCondition.bc.temperatureK,
+            pressurePa: legacyCondition.bc.pressurePa,
+            density: legacyCondition.bc.density,
+            dynamicViscosity: legacyCondition.bc.dynamicViscosity,
+            kinematicViscosity: legacyCondition.bc.kinematicViscosity,
+            turbulenceModel: legacyCondition.bc.turbulenceModel,
+            turbulenceIntensity: legacyCondition.bc.turbulenceIntensity,
+            viscosityRatio: legacyCondition.bc.viscosityRatio,
+            mesh: {
+              mesher: legacyCondition.bc.mesher,
+              farfieldRadiusChords: legacyCondition.bc.farfieldRadiusChords,
+              wakeLengthChords: legacyCondition.bc.wakeLengthChords,
+              nSurface: legacyCondition.bc.nSurface,
+              nRadial: legacyCondition.bc.nRadial,
+              nWake: legacyCondition.bc.nWake,
+              targetYPlus: legacyCondition.bc.targetYPlus,
+              spanChords: legacyCondition.bc.spanChords,
+              nCells: r.nCells,
+              yPlusAvg: r.yPlusAvg,
+              yPlusMax: r.yPlusMax,
+              iterations: r.iterations,
+              finalResidual: r.finalResidual,
+            },
           }
-        : legacyCondition
-          ? {
-              boundaryConditionName: legacyCondition.bc.name,
-              mediumName: legacyCondition.mediumName,
-              speedMps: legacyCondition.bc.speedMps,
-              referenceChordM: legacyCondition.bc.referenceChordM,
-              temperatureK: legacyCondition.bc.temperatureK,
-              pressurePa: legacyCondition.bc.pressurePa,
-              density: legacyCondition.bc.density,
-              dynamicViscosity: legacyCondition.bc.dynamicViscosity,
-              kinematicViscosity: legacyCondition.bc.kinematicViscosity,
-              turbulenceModel: legacyCondition.bc.turbulenceModel,
-              turbulenceIntensity: legacyCondition.bc.turbulenceIntensity,
-              viscosityRatio: legacyCondition.bc.viscosityRatio,
-              mesh: {
-                mesher: legacyCondition.bc.mesher,
-                farfieldRadiusChords: legacyCondition.bc.farfieldRadiusChords,
-                wakeLengthChords: legacyCondition.bc.wakeLengthChords,
-                nSurface: legacyCondition.bc.nSurface,
-                nRadial: legacyCondition.bc.nRadial,
-                nWake: legacyCondition.bc.nWake,
-                targetYPlus: legacyCondition.bc.targetYPlus,
-                spanChords: legacyCondition.bc.spanChords,
-                nCells: r.nCells,
-                yPlusAvg: r.yPlusAvg,
-                yPlusMax: r.yPlusMax,
-                iterations: r.iterations,
-                finalResidual: r.finalResidual,
-              },
-            }
-          : null,
+        : null,
   };
 }
 
@@ -429,20 +533,34 @@ export async function assembleSim(
   if (!a) return null;
 
   if (resultId) {
-    const [r] = await db
-      .select()
+    const [selected] = await db
+      .select({ result: results, attempt: resultAttempts })
       .from(results)
+      .innerJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.id, results.currentResultAttemptId),
+          eq(resultAttempts.resultId, results.id),
+        ),
+      )
+      .innerJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
       .where(
         and(
           eq(results.id, resultId),
           eq(results.airfoilId, a.id),
-          eq(results.source, "solved"),
-          eq(results.status, "done"),
+          eq(resultAttempts.source, "solved"),
+          eq(resultAttempts.status, "done"),
+          inArray(resultClassifications.state, ["accepted", "needs_urans"]),
         ),
       )
       .limit(1);
-    if (!r) return null;
-    const effectiveRe = r.reynolds ?? re ?? 0;
+    if (!selected) return null;
+    const r = selectedResultProjection(selected.result, selected.attempt);
+    const effectiveRe = r.reynolds ?? re;
+    if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
     return solvedDetail(a.name, effectiveRe, r);
   }
 
@@ -483,9 +601,20 @@ export async function assembleSim(
       presets.map((preset) => [preset.revisionId, preset.reynolds]),
     );
     if (revisionIds.length) {
-      const rows = await db
-        .select()
+      const selectedRows = await db
+        .select({ result: results, attempt: resultAttempts })
         .from(results)
+        .innerJoin(
+          resultAttempts,
+          and(
+            eq(resultAttempts.id, results.currentResultAttemptId),
+            eq(resultAttempts.resultId, results.id),
+          ),
+        )
+        .innerJoin(
+          resultClassifications,
+          eq(resultClassifications.resultAttemptId, resultAttempts.id),
+        )
         .where(
           and(
             eq(results.airfoilId, a.id),
@@ -496,11 +625,13 @@ export async function assembleSim(
             // of being rounded to the nearest integer. Fractional evidence can
             // also always be opened by resultId.
             eq(results.aoaDeg, canonicalAoa(aoa)),
-            eq(results.source, "solved"),
-            eq(results.status, "done"),
+            eq(resultAttempts.source, "solved"),
+            eq(resultAttempts.status, "done"),
+            inArray(resultClassifications.state, ["accepted", "needs_urans"]),
           ),
         );
-      const candidates = rows
+      const candidates = selectedRows
+        .map(({ result, attempt }) => selectedResultProjection(result, attempt))
         .map((row) => {
           const effectiveRe =
             row.reynolds ??

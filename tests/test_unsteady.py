@@ -238,7 +238,7 @@ def test_urans_quality_missing_strouhal_does_not_refine(tmp_path):
     # steady (no-shedding) URANS. It must resolve as a valid steady-mean point,
     # never as a refinable shedding case (auto-refining it triggers the
     # degenerate refined-copy crash).
-    hist = _history(0.0, 1.0, st=0.0, cl_rms=0.0, cd_rms=0.0)
+    hist = _history(0.0, 4.3, st=0.0, cl_rms=0.0, cd_rms=0.0)
 
     quality = evaluate_urans_quality(tmp_path, hist, speed=10.0, chord=1.0)
 

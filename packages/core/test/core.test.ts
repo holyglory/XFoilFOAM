@@ -4,6 +4,7 @@ import {
   buildNaca4,
   buildPolarFit,
   classifyPolarEvidence,
+  DEFAULT_TRANSIENT_MAX_COURANT,
   deriveGeometry,
   deriveFlowConditionState,
   deriveOperatingConditionState,
@@ -19,7 +20,11 @@ import {
   projectChart,
   evaluateUransMediaQuality,
   FRAME_TRACK_MIN_PERIODS,
+  INCOMPLETE_URANS_INTEGRATION_REASON,
+  isDeterministicMeshBlockerError,
   NON_PHYSICAL_COEFFICIENT_LIMIT,
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
   reynolds,
   reynoldsFromFlowReference,
   speedForReynolds,
@@ -28,6 +33,32 @@ import {
 
 // The original design engine, copied verbatim — our port must match it.
 import * as ref from "./fixtures/airfoil-db.reference.js";
+
+it("pins distinct restartable URANS warning markers", () => {
+  expect(URANS_BUDGET_STOP_MARKER).toBe(
+    "stopped by the wall-clock budget guard",
+  );
+  expect(URANS_CONTINUATION_REQUIRED_MARKER).toBe(
+    "requires further same-case integration",
+  );
+  expect(URANS_CONTINUATION_REQUIRED_MARKER).not.toContain("budget");
+});
+
+it("recognizes only the exact deterministic precalc mesh blocker pair", () => {
+  expect(
+    isDeterministicMeshBlockerError(
+      "mesh degenerate at this fidelity tier (max non-orthogonality 88.3 deg)",
+    ),
+  ).toBe(true);
+  expect(
+    isDeterministicMeshBlockerError("mesh generation failed transiently"),
+  ).toBe(false);
+  expect(isDeterministicMeshBlockerError(null)).toBe(false);
+});
+
+it("pins the safe cross-runtime transient Courant default", () => {
+  expect(DEFAULT_TRANSIENT_MAX_COURANT).toBe(4);
+});
 
 const AIRFOILS: Record<string, NacaParams> = {
   "NACA 0012": { t: 0.12, m: 0.0, p: 0.0 },
@@ -65,13 +96,15 @@ describe("geometry port matches airfoil-db.js", () => {
   it("makePath == reference makePath", () => {
     const { contour } = buildNaca4(AIRFOILS["NACA 4412"]);
     expect(makePath(contour, 14, 80, 312, true)).toBe(
-      (ref.makePath as (p: unknown, mx: number, cy: number, s: number, c: boolean) => string)(
-        contour,
-        14,
-        80,
-        312,
-        true,
-      ),
+      (
+        ref.makePath as (
+          p: unknown,
+          mx: number,
+          cy: number,
+          s: number,
+          c: boolean,
+        ) => string
+      )(contour, 14, 80, 312, true),
     );
   });
 });
@@ -125,7 +158,15 @@ describe("polar chart evidence gating", () => {
 
     const projection = projectChart({
       chartType: "cla",
-      polars: [{ seriesId: "series-a", label: "Re 100k", re: 100000, color: "#f5a524", points: [solved, queued] }],
+      polars: [
+        {
+          seriesId: "series-a",
+          label: "Re 100k",
+          re: 100000,
+          color: "#f5a524",
+          points: [solved, queued],
+        },
+      ],
       visibleSeries: { "series-a": true },
     });
 
@@ -136,7 +177,15 @@ describe("polar chart evidence gating", () => {
   it("keeps an empty solved-only chart finite while sweeps are still queued", () => {
     const projection = projectChart({
       chartType: "cla",
-      polars: [{ seriesId: "series-a", label: "Re 100k", re: 100000, color: "#f5a524", points: [] }],
+      polars: [
+        {
+          seriesId: "series-a",
+          label: "Re 100k",
+          re: 100000,
+          color: "#f5a524",
+          points: [],
+        },
+      ],
       visibleSeries: { "series-a": true },
     });
 
@@ -148,14 +197,14 @@ describe("polar chart evidence gating", () => {
 
 describe("RANS stall classification and fitted polar", () => {
   const ag24Like = [
-    [-7, -0.45, 0.020],
+    [-7, -0.45, 0.02],
     [-6, -0.34, 0.017],
     [-5, -0.23, 0.014],
     [-4, -0.12, 0.012],
     [-3, -0.01, 0.011],
-    [-2, 0.10, 0.0105],
-    [-1, 0.20, 0.0103],
-    [0, 0.30, 0.0102],
+    [-2, 0.1, 0.0105],
+    [-1, 0.2, 0.0103],
+    [0, 0.3, 0.0102],
     [1, 0.41, 0.0104],
     [2, 0.51, 0.011],
     [3, 0.62, 0.012],
@@ -164,15 +213,15 @@ describe("RANS stall classification and fitted polar", () => {
     [6, 0.95, 0.021],
     [7, 1.04, 0.027],
     [8, 1.12, 0.034],
-    [9, 1.20, 0.043],
+    [9, 1.2, 0.043],
     [10, 1.27, 0.054],
     [11, 1.32, 0.066],
     [12, 1.34, 0.078],
     [13, 1.32, 0.092],
-    [14, 1.19, 0.080],
-    [15, 0.90, 0.145],
+    [14, 1.19, 0.08],
+    [15, 0.9, 0.145],
     [16, 0.82, 0.182],
-    [17, 0.79, 0.210],
+    [17, 0.79, 0.21],
     [18, 0.78, 0.239],
   ] as const;
 
@@ -191,7 +240,9 @@ describe("RANS stall classification and fitted polar", () => {
         stalled: false,
       })),
     );
-    const stateByAoa = new Map(classified.classifications.map((c) => [c.evidence.a, c.state]));
+    const stateByAoa = new Map(
+      classified.classifications.map((c) => [c.evidence.a, c.state]),
+    );
     expect([14, 15, 16, 17, 18].map((a) => stateByAoa.get(a))).toEqual([
       "needs_urans",
       "needs_urans",
@@ -227,7 +278,11 @@ describe("RANS stall classification and fitted polar", () => {
     const finalFit = buildPolarFit(
       classified.classifications.map((c) =>
         c.state === "needs_urans"
-          ? { ...c, state: "superseded_by_urans" as const, reasons: [...c.reasons, "urans-replacement"] }
+          ? {
+              ...c,
+              state: "superseded_by_urans" as const,
+              reasons: [...c.reasons, "urans-replacement"],
+            }
           : c,
       ),
     );
@@ -238,9 +293,39 @@ describe("RANS stall classification and fitted polar", () => {
 
   it("detects low-AoA failure for whole-polar URANS promotion", () => {
     const classified = classifyPolarEvidence([
-      { a: 0, cl: null, cd: null, cm: null, status: "failed", source: "queued", regime: "rans", converged: false, stalled: true },
-      { a: 1, cl: 0.2, cd: 0.01, cm: 0, status: "done", source: "solved", regime: "rans", converged: true, stalled: false },
-      { a: 2, cl: 0.3, cd: 0.011, cm: 0, status: "done", source: "solved", regime: "rans", converged: true, stalled: false },
+      {
+        a: 0,
+        cl: null,
+        cd: null,
+        cm: null,
+        status: "failed",
+        source: "queued",
+        regime: "rans",
+        converged: false,
+        stalled: true,
+      },
+      {
+        a: 1,
+        cl: 0.2,
+        cd: 0.01,
+        cm: 0,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        converged: true,
+        stalled: false,
+      },
+      {
+        a: 2,
+        cl: 0.3,
+        cd: 0.011,
+        cm: 0,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        converged: true,
+        stalled: false,
+      },
     ]);
 
     expect(classified.lowAoaFailure).toBe(true);
@@ -295,6 +380,34 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
     expect(classified.hardRejectedAoas).toEqual([]);
   });
 
+  it.each([URANS_BUDGET_STOP_MARKER, URANS_CONTINUATION_REQUIRED_MARKER])(
+    "rejects restartable but incomplete URANS carrying %s",
+    (marker) => {
+      const classified = classifyPolarEvidence([
+        {
+          ...ingestShapedUrans,
+          qualityWarnings: [
+            `measured integration ${marker}; saved state retained`,
+          ],
+        },
+      ]);
+      expect(classified.classifications[0].state).toBe("rejected");
+      expect(classified.classifications[0].reasons).toContain(
+        INCOMPLETE_URANS_INTEGRATION_REASON,
+      );
+    },
+  );
+
+  it("does not reject an unrelated quality warning", () => {
+    const classified = classifyPolarEvidence([
+      {
+        ...ingestShapedUrans,
+        qualityWarnings: ["wall-clock timing recorded; integration complete"],
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("accepted");
+  });
+
   it("BACKWARD COMPAT: still accepts legacy URANS evidence with frame_track NULL/absent (pre-0032 rows keep the v2 gate — deploy must not mass-reject history)", () => {
     const { frameTrack: _ft, ...legacyShape } = ingestShapedUrans;
     for (const legacy of [legacyShape, { ...legacyShape, frameTrack: null }]) {
@@ -306,7 +419,10 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
 
   it("rejects a non-stationary frame track with the honest reason (confidence high)", () => {
     const classified = classifyPolarEvidence([
-      { ...ingestShapedUrans, frameTrack: { ...contractFrameTrack, stationary: false } },
+      {
+        ...ingestShapedUrans,
+        frameTrack: { ...contractFrameTrack, stationary: false },
+      },
     ]);
     expect(classified.classifications[0].state).toBe("rejected");
     expect(classified.classifications[0].reasons).toEqual(["non-stationary"]);
@@ -315,16 +431,30 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
 
   it(`rejects a short recording window (< ${FRAME_TRACK_MIN_PERIODS} retained periods)`, () => {
     const classified = classifyPolarEvidence([
-      { ...ingestShapedUrans, frameTrack: { ...contractFrameTrack, periods_retained: FRAME_TRACK_MIN_PERIODS - 1 } },
+      {
+        ...ingestShapedUrans,
+        frameTrack: {
+          ...contractFrameTrack,
+          periods_retained: FRAME_TRACK_MIN_PERIODS - 1,
+        },
+      },
     ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toEqual(["insufficient-periods"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "insufficient-periods",
+    ]);
     expect(classified.classifications[0].confidence).toBe(1);
   });
 
   it(`accepts exactly ${FRAME_TRACK_MIN_PERIODS} retained periods (gate is >=)`, () => {
     const classified = classifyPolarEvidence([
-      { ...ingestShapedUrans, frameTrack: { ...contractFrameTrack, periods_retained: FRAME_TRACK_MIN_PERIODS } },
+      {
+        ...ingestShapedUrans,
+        frameTrack: {
+          ...contractFrameTrack,
+          periods_retained: FRAME_TRACK_MIN_PERIODS,
+        },
+      },
     ]);
     expect(classified.classifications[0].state).toBe("accepted");
   });
@@ -340,19 +470,30 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
       periods_retained: null,
       reason: "engine shipped no frame_track for a shedding URANS point",
     };
-    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, frameTrack: sentinel }]);
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, frameTrack: sentinel },
+    ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toEqual(["non-stationary", "insufficient-periods"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "non-stationary",
+      "insufficient-periods",
+    ]);
   });
 
   it("MUST-CATCH: a contract-drifted frame track FAILS CLOSED (missing verdict fields reject, never accept)", () => {
     // Shaped like a real drifted engine payload (renamed/retyped keys), not
     // like the parser's own fixtures.
     const classified = classifyPolarEvidence([
-      { ...ingestShapedUrans, frameTrack: { periodsRetained: 9, stationary: "true" } },
+      {
+        ...ingestShapedUrans,
+        frameTrack: { periodsRetained: 9, stationary: "true" },
+      },
     ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toEqual(["non-stationary", "insufficient-periods"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "non-stationary",
+      "insufficient-periods",
+    ]);
   });
 
   it("still rejects a non-converged STEADY row as solver-stalled", () => {
@@ -376,22 +517,34 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
   });
 
   it("rejects an unsteady row missing its video (evidence-first honesty)", () => {
-    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, hasVideo: false }]);
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, hasVideo: false },
+    ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toEqual(["missing-urans-video"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "missing-urans-video",
+    ]);
   });
 
   it("rejects an unsteady row missing its force history", () => {
-    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, hasForceHistory: false }]);
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, hasForceHistory: false },
+    ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toEqual(["missing-force-history"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "missing-force-history",
+    ]);
   });
 
   it("rejects a non-converged unsteady row (not-converged, without solver-stalled)", () => {
-    const classified = classifyPolarEvidence([{ ...ingestShapedUrans, converged: false }]);
+    const classified = classifyPolarEvidence([
+      { ...ingestShapedUrans, converged: false },
+    ]);
     expect(classified.classifications[0].state).toBe("rejected");
     expect(classified.classifications[0].reasons).toContain("not-converged");
-    expect(classified.classifications[0].reasons).not.toContain("solver-stalled");
+    expect(classified.classifications[0].reasons).not.toContain(
+      "solver-stalled",
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -409,7 +562,9 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
     expect(classified.classifications[0].state).toBe("rejected");
     // EXACTLY this reason: proves the pre-existing gates were all silent and
     // only the magnitude bound caught the divergence.
-    expect(classified.classifications[0].reasons).toEqual(["non-physical-coefficients"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "non-physical-coefficients",
+    ]);
   });
 
   it("MUST-CATCH: the same divergence WITH a non-stationary frame track carries both honest reasons", () => {
@@ -419,11 +574,17 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
         cl: -79.8,
         cd: 12.4,
         cm: 0.31,
-        frameTrack: { ...contractFrameTrack, stationary: false, drift_frac: 0.94 },
+        frameTrack: {
+          ...contractFrameTrack,
+          stationary: false,
+          drift_frac: 0.94,
+        },
       },
     ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toContain("non-physical-coefficients");
+    expect(classified.classifications[0].reasons).toContain(
+      "non-physical-coefficients",
+    );
     expect(classified.classifications[0].reasons).toContain("non-stationary");
   });
 
@@ -443,20 +604,32 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
       },
     ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toEqual(["non-physical-coefficients"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "non-physical-coefficients",
+    ]);
   });
 
   it("triggers on |cm| alone (moment blow-up with plausible lift)", () => {
     const { frameTrack: _ft, ...legacyShape } = ingestShapedUrans;
-    const classified = classifyPolarEvidence([{ ...legacyShape, cl: 0.9, cd: 0.08, cm: -37.2 }]);
+    const classified = classifyPolarEvidence([
+      { ...legacyShape, cl: 0.9, cd: 0.08, cm: -37.2 },
+    ]);
     expect(classified.classifications[0].state).toBe("rejected");
-    expect(classified.classifications[0].reasons).toEqual(["non-physical-coefficients"]);
+    expect(classified.classifications[0].reasons).toEqual([
+      "non-physical-coefficients",
+    ]);
   });
 
   it("FALSE-POSITIVE GUARD: legitimate extreme aerodynamics stay accepted (post-stall cl 2.5, high-lift S1223-like cl 2.4)", () => {
     // Highest physical section coefficients this database can produce — the
     // bound (5) must clear them with margin.
-    const postStallFlatPlate = { ...ingestShapedUrans, a: 42, cl: 2.5, cd: 1.8, cm: -0.55 };
+    const postStallFlatPlate = {
+      ...ingestShapedUrans,
+      a: 42,
+      cl: 2.5,
+      cd: 1.8,
+      cm: -0.55,
+    };
     const s1223HighLift = {
       a: 12,
       cl: 2.4,
@@ -469,7 +642,10 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
       stalled: false,
       unsteady: false,
     };
-    const classified = classifyPolarEvidence([postStallFlatPlate, s1223HighLift]);
+    const classified = classifyPolarEvidence([
+      postStallFlatPlate,
+      s1223HighLift,
+    ]);
     for (const c of classified.classifications) {
       expect(c.state).toBe("accepted");
       expect(c.reasons).toEqual([]);
@@ -478,8 +654,12 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
 
   it("FALSE-POSITIVE GUARD: the bound is strict (> limit) — |cl| exactly at the limit is not caught", () => {
     const { frameTrack: _ft, ...legacyShape } = ingestShapedUrans;
-    const classified = classifyPolarEvidence([{ ...legacyShape, cl: -NON_PHYSICAL_COEFFICIENT_LIMIT, cd: 0.9, cm: 0.1 }]);
-    expect(classified.classifications[0].reasons).not.toContain("non-physical-coefficients");
+    const classified = classifyPolarEvidence([
+      { ...legacyShape, cl: -NON_PHYSICAL_COEFFICIENT_LIMIT, cd: 0.9, cm: 0.1 },
+    ]);
+    expect(classified.classifications[0].reasons).not.toContain(
+      "non-physical-coefficients",
+    );
   });
 });
 
@@ -560,11 +740,20 @@ describe("viscosity models", () => {
   });
 
   it("constant + table models", () => {
-    expect(evalDynamicViscosity({ model: "constant", mu: 1.002e-3 }, 300)).toBe(1.002e-3);
-    const table = { model: "table" as const, tempsK: [298, 313, 373], mu: [0.29, 0.1, 0.009] };
+    expect(evalDynamicViscosity({ model: "constant", mu: 1.002e-3 }, 300)).toBe(
+      1.002e-3,
+    );
+    const table = {
+      model: "table" as const,
+      tempsK: [298, 313, 373],
+      mu: [0.29, 0.1, 0.009],
+    };
     expect(evalDynamicViscosity(table, 298)).toBe(0.29);
     expect(evalDynamicViscosity(table, 373)).toBe(0.009);
-    expect(evalDynamicViscosity(table, 305.5)).toBeCloseTo(0.29 + (0.1 - 0.29) * 0.5, 10);
+    expect(evalDynamicViscosity(table, 305.5)).toBeCloseTo(
+      0.29 + (0.1 - 0.29) * 0.5,
+      10,
+    );
   });
 
   it("derives gas density, Reynolds, and Mach from speed/chord/state", () => {
@@ -574,10 +763,20 @@ describe("viscosity models", () => {
         density: 1.225,
         refTemperatureK: 288.15,
         refPressurePa: 101325,
-        viscosity: { model: "sutherland", muRef: 1.716e-5, tRef: 273.15, s: 110.4 },
+        viscosity: {
+          model: "sutherland",
+          muRef: 1.716e-5,
+          tRef: 273.15,
+          s: 110.4,
+        },
         speedOfSound: 340.3,
       },
-      { temperatureK: 288.15, pressurePa: 101325, referenceChordM: 1, speedMps: 7.3 },
+      {
+        temperatureK: 288.15,
+        pressurePa: 101325,
+        referenceChordM: 1,
+        speedMps: 7.3,
+      },
     );
     expect(state.dynamicViscosity).toBeGreaterThan(1.78e-5);
     expect(state.density).toBeCloseTo(1.225, 8);
@@ -592,20 +791,29 @@ describe("viscosity models", () => {
         density: 1.225,
         refTemperatureK: 288.15,
         refPressurePa: 101325,
-        viscosity: { model: "sutherland", muRef: 1.716e-5, tRef: 273.15, s: 110.4 },
+        viscosity: {
+          model: "sutherland",
+          muRef: 1.716e-5,
+          tRef: 273.15,
+          s: 110.4,
+        },
         speedOfSound: 340.3,
       },
       { temperatureK: 288.15, pressurePa: 101325, speedMps: 12 },
     );
     expect(flow.mach).toBeCloseTo(12 / 340.3, 8);
-    expect(reynoldsFromFlowReference({ speedMps: 12, kinematicViscosity: flow.kinematicViscosity }, 0.5)).toBeCloseTo(
-      (12 * 0.5) / flow.kinematicViscosity,
-      8,
-    );
-    expect(reynoldsFromFlowReference({ speedMps: 12, kinematicViscosity: flow.kinematicViscosity }, 2)).toBeCloseTo(
-      (12 * 2) / flow.kinematicViscosity,
-      8,
-    );
+    expect(
+      reynoldsFromFlowReference(
+        { speedMps: 12, kinematicViscosity: flow.kinematicViscosity },
+        0.5,
+      ),
+    ).toBeCloseTo((12 * 0.5) / flow.kinematicViscosity, 8);
+    expect(
+      reynoldsFromFlowReference(
+        { speedMps: 12, kinematicViscosity: flow.kinematicViscosity },
+        2,
+      ),
+    ).toBeCloseTo((12 * 2) / flow.kinematicViscosity, 8);
   });
 });
 

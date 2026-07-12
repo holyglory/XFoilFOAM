@@ -1,7 +1,9 @@
 import {
+  acquireResultEvidenceLock,
   airfoils,
   type CampaignLaneKey,
   fieldColorScales,
+  enqueuePrecalcVerifications,
   forceHistory,
   laneKeyId,
   onResultIngested,
@@ -10,11 +12,18 @@ import {
   resultAttempts,
   resultClassifications,
   resultFieldExtents,
+  resultMediaRepairs,
+  refreshPolarCacheForRevision,
   results,
   resultMedia,
   solverEvidenceArtifacts,
+  withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
-import { baseRejectionReasons, canonicalSi, type PolarEvidencePoint } from "@aerodb/core";
+import {
+  baseRejectionReasons,
+  canonicalSi,
+  type PolarEvidencePoint,
+} from "@aerodb/core";
 import {
   ALL_IMAGE_FIELDS,
   type EngineClient,
@@ -30,8 +39,8 @@ import {
   type UransFidelity,
 } from "@aerodb/engine-client";
 import { and, desc, eq, inArray, lt, notInArray, sql } from "drizzle-orm";
-import { constants } from "node:fs";
-import { access } from "node:fs/promises";
+import { constants, createReadStream } from "node:fs";
+import { access, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { resolve, sep } from "node:path";
@@ -40,13 +49,35 @@ import { promisify } from "node:util";
 import { touchHeartbeat } from "./heartbeat";
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_RENDER_PROFILE_KEY = "default:v1:zoom2";
+export const DEFAULT_RENDER_PROFILE_KEY = "default:v1:zoom2";
 
 interface VideoMetadata {
   durationS?: number;
   width?: number;
   height?: number;
   frameCount?: number;
+}
+
+interface MediaRepairWriteFence {
+  repairId: string;
+  resultAttemptId: string;
+  claimToken: string;
+  evidenceSignature: string;
+}
+
+interface MediaRegistrationEvidence {
+  /** Solver manifest that produced this media. */
+  evidenceSha256: string;
+  /** Render responses supply both values; when present the shared-volume
+   * bytes are verified before any database row can be committed. */
+  expectedSha256?: string;
+  expectedByteSize?: number;
+  /** Durable repair paths re-read the shared-volume bytes. Normal ingest has
+   * already received the content identity from the local engine contract (or
+   * computed it directly for shipped media), so it may persist that identity
+   * without a second multi-gigabyte read. */
+  verifyExpectedBytes?: boolean;
+  repairFence?: MediaRepairWriteFence;
 }
 
 export interface SpeedBc {
@@ -72,7 +103,10 @@ export interface ConditionMapEntry {
 /** Pure speed→condition mapping for batched jobs: canonical float equality.
  *  Returns null when no entry matches (a mismatched polar must be skipped, not
  *  misattributed to the nearest revision). */
-export function matchConditionEntryBySpeed(entries: ConditionMapEntry[], polarSpeed: number): ConditionMapEntry | null {
+export function matchConditionEntryBySpeed(
+  entries: ConditionMapEntry[],
+  polarSpeed: number,
+): ConditionMapEntry | null {
   const canonical = canonicalSi("speedMps", polarSpeed);
   return entries.find((entry) => entry.speed === canonical) ?? null;
 }
@@ -85,16 +119,24 @@ function storageKeyOf(urlPath: string): string {
 }
 
 function finitePositiveNumber(value: unknown): number | undefined {
-  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number(value)
+        : NaN;
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 function mediaRoots(): string[] {
   return Array.from(
     new Set(
-      [process.env.MEDIA_DIR, process.env.DATA_DIR, "/data/airfoilfoam", "data/airfoilfoam"].filter(
-        (x): x is string => Boolean(x),
-      ),
+      [
+        process.env.MEDIA_DIR,
+        process.env.DATA_DIR,
+        "/data/airfoilfoam",
+        "data/airfoilfoam",
+      ].filter((x): x is string => Boolean(x)),
     ),
   );
 }
@@ -139,10 +181,131 @@ async function probeVideoMetadata(storageKey: string): Promise<VideoMetadata> {
       durationS: finitePositiveNumber(stream.duration),
       width: finitePositiveNumber(stream.width),
       height: finitePositiveNumber(stream.height),
-      frameCount: finitePositiveNumber(stream.nb_read_frames) ?? finitePositiveNumber(stream.nb_frames),
+      frameCount:
+        finitePositiveNumber(stream.nb_read_frames) ??
+        finitePositiveNumber(stream.nb_frames),
     };
   } catch {
     return {};
+  }
+}
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+async function verifyRenderedMediaBytes(
+  storageKey: string,
+  expectedSha256: string,
+  expectedByteSize: number,
+): Promise<void> {
+  const full = await localMediaPath(storageKey);
+  if (!full) {
+    throw new Error(
+      `rendered media is not readable on the shared volume: ${storageKey}`,
+    );
+  }
+  const info = await stat(full);
+  if (!info.isFile() || info.size !== expectedByteSize) {
+    throw new Error(
+      `rendered media byte-size mismatch for ${storageKey}: expected ${expectedByteSize}, found ${info.isFile() ? info.size : "non-file"}`,
+    );
+  }
+  const actualSha256 = await sha256File(full);
+  if (actualSha256.toLowerCase() !== expectedSha256.toLowerCase()) {
+    throw new Error(
+      `rendered media checksum mismatch for ${storageKey}: expected ${expectedSha256}, found ${actualSha256}`,
+    );
+  }
+}
+
+async function requireMediaRepairWriteFence(
+  db: DB,
+  fence: MediaRepairWriteFence,
+  resultId: string,
+  evidenceSha256: string,
+): Promise<void> {
+  // Serialize canonical result identity, current-manifest writes, and media
+  // repair mutations before taking row locks. Every artifact producer that
+  // can attach a manifest to a result acquires this same transaction lock.
+  await acquireResultEvidenceLock(db, resultId);
+
+  // Lock the canonical cell next, then the mutable repair row. The obligation
+  // owns one immutable attempt directly; it never borrows public authority
+  // from results.current_result_attempt_id.
+  const [cell] = await db
+    .select({
+      id: results.id,
+      revisionId: results.simulationPresetRevisionId,
+    })
+    .from(results)
+    .where(eq(results.id, resultId))
+    .for("update")
+    .limit(1);
+  const [attempt] = await db
+    .select({
+      resultId: resultAttempts.resultId,
+      revisionId: resultAttempts.simulationPresetRevisionId,
+      status: resultAttempts.status,
+      source: resultAttempts.source,
+      engineJobId: resultAttempts.engineJobId,
+      engineCaseSlug: resultAttempts.engineCaseSlug,
+    })
+    .from(resultAttempts)
+    .where(
+      and(
+        eq(resultAttempts.id, fence.resultAttemptId),
+        eq(resultAttempts.resultId, resultId),
+      ),
+    )
+    .limit(1);
+  const expectedSignature = attempt
+    ? `${attempt.engineJobId ?? ""}:${attempt.engineCaseSlug ?? ""}:${evidenceSha256}`
+    : null;
+  if (
+    !cell ||
+    !attempt ||
+    attempt.revisionId !== cell.revisionId ||
+    attempt.status !== "done" ||
+    attempt.source !== "solved" ||
+    expectedSignature !== fence.evidenceSignature
+  ) {
+    throw new Error(
+      `result media repair exact-attempt fence lost for result ${resultId}`,
+    );
+  }
+  const exactManifest = await manifestForAttempt(
+    db,
+    resultId,
+    fence.resultAttemptId,
+  );
+  if (exactManifest?.sha256 !== evidenceSha256) {
+    throw new Error(
+      `result media repair exact-manifest fence lost for result ${resultId}`,
+    );
+  }
+  const [owned] = await db
+    .select({ id: resultMediaRepairs.id })
+    .from(resultMediaRepairs)
+    .where(
+      sql`
+      ${resultMediaRepairs.id} = ${fence.repairId}
+      AND ${resultMediaRepairs.resultId} = ${resultId}
+      AND ${resultMediaRepairs.resultAttemptId} = ${fence.resultAttemptId}
+      AND ${resultMediaRepairs.state} = 'running'
+      AND ${resultMediaRepairs.claimToken} = ${fence.claimToken}::uuid
+      AND ${resultMediaRepairs.claimExpiresAt} > now()
+      AND ${resultMediaRepairs.evidenceSignature} = ${fence.evidenceSignature}
+    `,
+    )
+    .for("update")
+    .limit(1);
+  if (!owned) {
+    throw new Error(
+      `result media repair lease/evidence fence lost for result ${resultId}`,
+    );
   }
 }
 
@@ -150,6 +313,7 @@ async function registerMedia(
   db: DB,
   engine: EngineClient,
   resultId: string,
+  resultAttemptId: string,
   kind: "image" | "video",
   role: "instantaneous" | "mean",
   field: string,
@@ -163,48 +327,110 @@ async function registerMedia(
     policy: string;
     renderProfileKey: string;
   },
+  evidence?: MediaRegistrationEvidence,
 ): Promise<void> {
   const storageKey = storageKeyOf(urlPath);
-  const video = kind === "video" ? await probeVideoMetadata(storageKey) : {};
-  await db
-    .insert(resultMedia)
-    .values({
-      resultId,
-      kind,
-      field,
-      role,
-      storageKey,
-      mimeType,
-      width: video.width ? Math.round(video.width) : null,
-      height: video.height ? Math.round(video.height) : null,
-      frameCount: video.frameCount ? Math.round(video.frameCount) : null,
-      durationS: video.durationS ?? null,
-      colorScaleId: scale?.colorScaleId ?? null,
-      colorScaleVersion: scale?.colorScaleVersion ?? null,
-      scaleVmin: scale?.vmin ?? null,
-      scaleVmax: scale?.vmax ?? null,
-      scalePolicy: scale?.policy ?? null,
-      renderProfileKey: scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
-      engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
-    })
-    .onConflictDoUpdate({
-      target: [resultMedia.resultId, resultMedia.kind, resultMedia.field, resultMedia.role],
-      set: {
+  if (evidence?.expectedSha256 != null || evidence?.expectedByteSize != null) {
+    if (
+      !evidence.expectedSha256 ||
+      evidence.expectedByteSize == null ||
+      !Number.isInteger(evidence.expectedByteSize) ||
+      evidence.expectedByteSize <= 0
+    ) {
+      throw new Error(
+        `rendered media identity is incomplete for ${storageKey}`,
+      );
+    }
+    if (evidence.verifyExpectedBytes) {
+      await verifyRenderedMediaBytes(
         storageKey,
-        mimeType,
-        width: video.width ? Math.round(video.width) : null,
-        height: video.height ? Math.round(video.height) : null,
-        frameCount: video.frameCount ? Math.round(video.frameCount) : null,
-        durationS: video.durationS ?? null,
-        colorScaleId: scale?.colorScaleId ?? null,
-        colorScaleVersion: scale?.colorScaleVersion ?? null,
-        scaleVmin: scale?.vmin ?? null,
-        scaleVmax: scale?.vmax ?? null,
-        scalePolicy: scale?.policy ?? null,
-        renderProfileKey: scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
-        engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
-      },
-    });
+        evidence.expectedSha256,
+        evidence.expectedByteSize,
+      );
+    }
+  }
+  const video = kind === "video" ? await probeVideoMetadata(storageKey) : {};
+  const values = {
+    resultId,
+    resultAttemptId,
+    kind,
+    field,
+    role,
+    storageKey,
+    mimeType,
+    width: video.width ? Math.round(video.width) : null,
+    height: video.height ? Math.round(video.height) : null,
+    frameCount: video.frameCount ? Math.round(video.frameCount) : null,
+    durationS: video.durationS ?? null,
+    colorScaleId: scale?.colorScaleId ?? null,
+    colorScaleVersion: scale?.colorScaleVersion ?? null,
+    scaleVmin: scale?.vmin ?? null,
+    scaleVmax: scale?.vmax ?? null,
+    scalePolicy: scale?.policy ?? null,
+    renderProfileKey: scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
+    evidenceSha256: evidence?.evidenceSha256 ?? null,
+    sha256: evidence?.expectedSha256 ?? null,
+    byteSize: evidence?.expectedByteSize ?? null,
+    engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
+  };
+  const write = async (writeDb: DB) => {
+    const [inserted] = await writeDb
+      .insert(resultMedia)
+      .values(values)
+      .onConflictDoNothing()
+      .returning({ id: resultMedia.id });
+    if (!inserted) {
+      await writeDb
+        .update(resultMedia)
+        .set({
+          storageKey,
+          mimeType,
+          width: video.width ? Math.round(video.width) : null,
+          height: video.height ? Math.round(video.height) : null,
+          frameCount: video.frameCount ? Math.round(video.frameCount) : null,
+          durationS: video.durationS ?? null,
+          colorScaleId: scale?.colorScaleId ?? null,
+          colorScaleVersion: scale?.colorScaleVersion ?? null,
+          scaleVmin: scale?.vmin ?? null,
+          scaleVmax: scale?.vmax ?? null,
+          scalePolicy: scale?.policy ?? null,
+          renderProfileKey:
+            scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
+          evidenceSha256: evidence?.evidenceSha256 ?? null,
+          sha256: evidence?.expectedSha256 ?? null,
+          byteSize: evidence?.expectedByteSize ?? null,
+          engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
+        })
+        .where(
+          and(
+            eq(resultMedia.resultAttemptId, resultAttemptId),
+            eq(resultMedia.kind, kind),
+            sql`${resultMedia.field} IS NOT DISTINCT FROM ${field}`,
+            eq(resultMedia.role, role),
+            eq(
+              resultMedia.renderProfileKey,
+              scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
+            ),
+          ),
+        );
+    }
+  };
+  if (!evidence?.repairFence) {
+    await write(db);
+    return;
+  }
+
+  const fence = evidence.repairFence;
+  await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    await requireMediaRepairWriteFence(
+      tx,
+      fence,
+      resultId,
+      evidence.evidenceSha256,
+    );
+    await write(tx);
+  });
 }
 
 function finiteNumber(value: unknown): value is number {
@@ -227,37 +453,75 @@ function shippedMimeType(kind: "image" | "video", urlPath: string): string {
  *  path's (result, kind, field, role) upsert key, so a successful scaled
  *  render simply overwrites these with the scale-stamped versions.
  *
- *  Video rows are additionally RECONCILED to the current shipment: upserts
- *  never delete, so a wave-2 re-solve that ships no video (video:{}) would
- *  otherwise leave the wave-1 video row satisfying the classifier's hasVideo
- *  gate for the NEW coefficients. Only kind='video' rows whose field is
- *  absent from the current p.video map are removed — scaled-render video
- *  rows share the same (result, kind, field, role) key, so for any field the
- *  new shipment DOES cover, the row survives and is overwritten/re-rendered
- *  by the chain instead of being orphaned. */
-async function registerShippedMedia(db: DB, engine: EngineClient, resultId: string, p: PolarPoint): Promise<number> {
-  const groups: Array<{ kind: "image" | "video"; role: "instantaneous" | "mean"; entries: Record<string, string> }> = [
+ *  Every media role is additionally RECONCILED to the current shipment:
+ *  upserts never delete, so a new solve that ships no still/mean/video would
+ *  otherwise leave an older result_media row satisfying the classifier or
+ *  repair-completeness scan for NEW coefficients. Scaled rows share the same
+ *  (result, kind, field, role) key; fields the new shipment really covers are
+ *  immediately upserted and later scale-stamped again. */
+async function registerShippedMedia(
+  db: DB,
+  engine: EngineClient,
+  resultId: string,
+  resultAttemptId: string,
+  p: PolarPoint,
+): Promise<number> {
+  const groups: Array<{
+    kind: "image" | "video";
+    role: "instantaneous" | "mean";
+    entries: Record<string, string>;
+  }> = [
     { kind: "image", role: "instantaneous", entries: p.images ?? {} },
     { kind: "image", role: "mean", entries: p.mean_images ?? {} },
     { kind: "video", role: "instantaneous", entries: p.video ?? {} },
   ];
-  const shippedVideoFields = Object.entries(p.video ?? {})
-    .filter(([, urlPath]) => Boolean(urlPath))
-    .map(([field]) => field);
-  await db
-    .delete(resultMedia)
-    .where(
-      and(
-        eq(resultMedia.resultId, resultId),
-        eq(resultMedia.kind, "video"),
-        shippedVideoFields.length ? notInArray(resultMedia.field, shippedVideoFields) : undefined,
-      ),
-    );
   let count = 0;
   for (const group of groups) {
+    const shippedFields = Object.entries(group.entries)
+      .filter(([, urlPath]) => Boolean(urlPath))
+      .map(([field]) => field);
+    await db
+      .delete(resultMedia)
+      .where(
+        and(
+          eq(resultMedia.resultId, resultId),
+          eq(resultMedia.resultAttemptId, resultAttemptId),
+          eq(resultMedia.kind, group.kind),
+          eq(resultMedia.role, group.role),
+          shippedFields.length
+            ? notInArray(resultMedia.field, shippedFields)
+            : undefined,
+        ),
+      );
     for (const [field, urlPath] of Object.entries(group.entries)) {
       if (!urlPath) continue;
-      await registerMedia(db, engine, resultId, group.kind, group.role, field, urlPath, shippedMimeType(group.kind, urlPath));
+      const storageKey = storageKeyOf(urlPath);
+      const localPath = await localMediaPath(storageKey);
+      const localIdentity = localPath
+        ? await (async () => {
+            const info = await stat(localPath);
+            return info.isFile() && info.size > 0
+              ? { sha256: await sha256File(localPath), byteSize: info.size }
+              : null;
+          })()
+        : null;
+      await registerMedia(
+        db,
+        engine,
+        resultId,
+        resultAttemptId,
+        group.kind,
+        group.role,
+        field,
+        urlPath,
+        shippedMimeType(group.kind, urlPath),
+        undefined,
+        {
+          evidenceSha256: evidenceShaFromPoint(p),
+          expectedSha256: localIdentity?.sha256,
+          expectedByteSize: localIdentity?.byteSize,
+        },
+      );
       count++;
     }
   }
@@ -271,7 +535,9 @@ function stalledForPoint(p: PolarPoint): boolean {
 function validForPolarPoint(p: PolarPoint): boolean {
   const hasCoefficients = finiteNumber(p.cl) && finiteNumber(p.cd) && p.cd > 0;
   if (p.unsteady) return !p.error && hasCoefficients;
-  return p.converged === true && !stalledForPoint(p) && !p.error && hasCoefficients;
+  return (
+    p.converged === true && !stalledForPoint(p) && !p.error && hasCoefficients
+  );
 }
 
 /** A point with an error or without finite coefficients is failure/absence —
@@ -315,7 +581,9 @@ export function frameTrackForPoint(p: PolarPoint, context: string): unknown {
     // Loud, never silent: a drifted engine payload means the pinned
     // frame-track contract broke on one side. Tests pin both sides; this log
     // is the production tripwire.
-    console.error(`[sweeper] frame_track CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`);
+    console.error(
+      `[sweeper] frame_track CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`,
+    );
   }
   return raw;
 }
@@ -326,14 +594,20 @@ export function frameTrackForPoint(p: PolarPoint, context: string): unknown {
  *  loud drift log, because a post-ladder engine must echo); else the honest
  *  regime-derived tier matching the 0034 backfill semantics (pre-ladder
  *  engines: urans = full behavior, steady = rans). Exported for the pin test. */
-export function fidelityForPoint(p: PolarPoint, requestedUransFidelity: UransFidelity | undefined, context: string): PointFidelity {
+export function fidelityForPoint(
+  p: PolarPoint,
+  requestedUransFidelity: UransFidelity | undefined,
+  context: string,
+): PointFidelity {
   const echoed = parsePointFidelity(p.fidelity);
   if (echoed) return echoed;
   if (p.unsteady && requestedUransFidelity) {
     console.error(
       `[sweeper] fidelity echo MISSING on URANS point of a '${requestedUransFidelity}'-fidelity job (${context}); persisting the requested tier — engine contract drift`,
     );
-    return requestedUransFidelity === "precalc" ? "urans_precalc" : "urans_full";
+    return requestedUransFidelity === "precalc"
+      ? "urans_precalc"
+      : "urans_full";
   }
   return p.unsteady ? "urans_full" : "rans";
 }
@@ -348,7 +622,9 @@ export function steadyHistoryForPoint(p: PolarPoint, context: string): unknown {
   if (raw === null) return null;
   const parsed = parseSteadyHistory(raw);
   if (!parsed.ok) {
-    console.error(`[sweeper] steady_history CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`);
+    console.error(
+      `[sweeper] steady_history CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`,
+    );
   }
   return raw;
 }
@@ -359,13 +635,24 @@ export function steadyHistoryForPoint(p: PolarPoint, context: string): unknown {
  *  reads. Never duplicates an engine-shipped warning. Exported for tests. */
 export const STEADY_OSCILLATING_MARKER = "steady-oscillating-mean";
 
+function hasStableSteadyMean(p: PolarPoint): boolean {
+  return Boolean(
+    !p.unsteady &&
+    p.steady_history &&
+    typeof p.steady_history === "object" &&
+    (p.steady_history as { mean_stable?: unknown }).mean_stable === true,
+  );
+}
+
 export function qualityWarningsForPoint(p: PolarPoint): string[] | null {
   const warnings = [...(p.quality_warnings ?? [])];
   const history = p.steady_history;
-  if (!p.unsteady && history && typeof history === "object" && (history as { mean_stable?: unknown }).mean_stable === true) {
-    const note = typeof (history as { note?: unknown }).note === "string" && (history as { note: string }).note.trim()
-      ? (history as { note: string }).note
-      : "steady solve settled into a bounded oscillation; coefficients are stable window means";
+  if (hasStableSteadyMean(p) && history && typeof history === "object") {
+    const note =
+      typeof (history as { note?: unknown }).note === "string" &&
+      (history as { note: string }).note.trim()
+        ? (history as { note: string }).note
+        : "steady solve settled into a bounded oscillation; coefficients are stable window means";
     const marker = `${STEADY_OSCILLATING_MARKER}: ${note}`;
     if (!warnings.includes(marker)) warnings.push(marker);
   }
@@ -390,7 +677,10 @@ export const RELEASED_CELL_MARKER = "released-cell failure quarantined";
 /** Classification states whose canonical row the replace guard protects.
  *  needs_urans is PROVISIONAL ACCEPTED evidence (it feeds the polar fit), so
  *  it is protected exactly like accepted — never treated as rejected. */
-const REPLACE_GUARD_PROTECTED_STATES = new Set<string>(["accepted", "needs_urans"]);
+const REPLACE_GUARD_PROTECTED_STATES = new Set<string>([
+  "accepted",
+  "needs_urans",
+]);
 
 /** Evidence view of an INCOMING engine point, shaped exactly like the row the
  *  post-ingest classifier would load from the results table (polar-cache
@@ -400,7 +690,12 @@ const REPLACE_GUARD_PROTECTED_STATES = new Set<string>(["accepted", "needs_urans
  *  row. Exported for the replace-guard tests. */
 export function incomingPointEvidence(
   p: PolarPoint,
-  derived: { fidelity: PointFidelity; frameTrack: unknown; steadyHistory: unknown; error: string | null },
+  derived: {
+    fidelity: PointFidelity;
+    frameTrack: unknown;
+    steadyHistory: unknown;
+    error: string | null;
+  },
 ): PolarEvidencePoint {
   const failed = failedForPoint(p);
   return {
@@ -422,9 +717,12 @@ export function incomingPointEvidence(
     validForPolar: validForPolarPoint(p),
     hasForceHistory: Boolean(p.force_history),
     hasVideo: Object.values(p.video ?? {}).some(Boolean),
-    frameTrack: (derived.frameTrack ?? null) as PolarEvidencePoint["frameTrack"],
+    frameTrack: (derived.frameTrack ??
+      null) as PolarEvidencePoint["frameTrack"],
     fidelity: derived.fidelity,
-    steadyHistory: (derived.steadyHistory ?? null) as PolarEvidencePoint["steadyHistory"],
+    steadyHistory: (derived.steadyHistory ??
+      null) as PolarEvidencePoint["steadyHistory"],
+    qualityWarnings: qualityWarningsForPoint(p),
   };
 }
 
@@ -446,7 +744,12 @@ export function incomingPointEvidence(
  *  rejects. Exported for the replace-guard tests. */
 export function incomingRejectionReasons(
   p: PolarPoint,
-  derived: { fidelity: PointFidelity; frameTrack: unknown; steadyHistory: unknown; error: string | null },
+  derived: {
+    fidelity: PointFidelity;
+    frameTrack: unknown;
+    steadyHistory: unknown;
+    error: string | null;
+  },
 ): string[] {
   return baseRejectionReasons(incomingPointEvidence(p, derived));
 }
@@ -474,7 +777,12 @@ async function replaceGuardVerdict(opts: {
   airfoilId: string;
   presetRevisionId: string | null;
   point: PolarPoint;
-  derived: { fidelity: PointFidelity; frameTrack: unknown; steadyHistory: unknown; error: string | null };
+  derived: {
+    fidelity: PointFidelity;
+    frameTrack: unknown;
+    steadyHistory: unknown;
+    error: string | null;
+  };
 }): Promise<ReplaceGuardVerdict | null> {
   const { db, airfoilId, presetRevisionId, point: p, derived } = opts;
   // Legacy rows without a revision can't be addressed by the upsert's natural
@@ -491,7 +799,10 @@ async function replaceGuardVerdict(opts: {
       state: resultClassifications.state,
     })
     .from(results)
-    .leftJoin(resultClassifications, eq(resultClassifications.resultId, results.id))
+    .leftJoin(
+      resultClassifications,
+      eq(resultClassifications.resultId, results.id),
+    )
     .where(
       and(
         eq(results.airfoilId, airfoilId),
@@ -503,7 +814,8 @@ async function replaceGuardVerdict(opts: {
   // Absent / failed / claimed / rejected / unclassified existing evidence:
   // any honest evidence beats none — upsert as today.
   if (!existing || existing.status !== "done") return null;
-  if (!existing.state || !REPLACE_GUARD_PROTECTED_STATES.has(existing.state)) return null;
+  if (!existing.state || !REPLACE_GUARD_PROTECTED_STATES.has(existing.state))
+    return null;
   return {
     keptResultId: existing.id,
     keptFidelity: existing.fidelity ?? null,
@@ -515,27 +827,54 @@ async function replaceGuardVerdict(opts: {
 
 async function insertResultAttempt(opts: {
   db: DB;
-  resultId?: string | null;
+  resultId: string;
   airfoilId: string;
   bcId: string;
   presetRevisionId?: string | null;
   simJobId: string;
   engineJobId: string;
   point: PolarPoint;
+  derived?: {
+    fidelity: PointFidelity;
+    frameTrack: unknown;
+    steadyHistory: unknown;
+    error: string | null;
+  };
   /** Extra honest markers appended to the attempt's quality warnings (replace
    *  guard: "higher-tier attempt rejected: …"). Never duplicated. */
   extraQualityWarnings?: string[];
 }): Promise<string | null> {
-  const { db, resultId, airfoilId, bcId, presetRevisionId, simJobId, engineJobId, point: p } = opts;
+  const {
+    db,
+    resultId,
+    airfoilId,
+    bcId,
+    presetRevisionId,
+    simJobId,
+    engineJobId,
+    point: p,
+    derived,
+  } = opts;
   const stalled = stalledForPoint(p);
   const warnings = [...(qualityWarningsForPoint(p) ?? [])];
   for (const extra of opts.extraQualityWarnings ?? []) {
     if (!warnings.includes(extra)) warnings.push(extra);
   }
+  const evidencePayload = {
+    ...p,
+    // Keep the immutable payload engine-owned. Job-level failure fallback and
+    // local quarantine/replace annotations are scheduler context; a running
+    // partial and terminal replay of the same engine case must compare equal.
+    error: p.error ?? null,
+    fidelity: derived?.fidelity ?? p.fidelity ?? null,
+    frame_track: derived?.frameTrack ?? p.frame_track ?? null,
+    steady_history: derived?.steadyHistory ?? p.steady_history ?? null,
+    quality_warnings: qualityWarningsForPoint(p) ?? [],
+  };
   const [inserted] = await db
     .insert(resultAttempts)
     .values({
-      resultId: resultId ?? null,
+      resultId,
       airfoilId,
       bcId,
       simulationPresetRevisionId: presetRevisionId ?? null,
@@ -564,37 +903,57 @@ async function insertResultAttempt(opts: {
       nCells: p.n_cells ?? null,
       firstOrderFallback: p.first_order_fallback,
       strouhal: p.strouhal ?? null,
-      error: p.error ?? null,
+      error: derived?.error ?? p.error ?? null,
       // Engine non-fatal quality warnings — persisted verbatim so the point
       // story timeline can show the honest "why" (empty list → NULL, absence
       // stays absence). The oscillating-steady mean-stable marker is appended
       // here too (ladder contract 2), plus any caller-supplied markers
       // (replace guard).
       qualityWarnings: warnings.length ? warnings : null,
-      evidencePayload: p,
+      evidencePayload,
       solvedAt: new Date(),
     })
     .onConflictDoNothing({
-      target: [resultAttempts.simJobId, resultAttempts.engineJobId, resultAttempts.aoaDeg, resultAttempts.regime],
+      target: [
+        resultAttempts.simJobId,
+        resultAttempts.engineJobId,
+        resultAttempts.resultId,
+        resultAttempts.aoaDeg,
+        resultAttempts.regime,
+      ],
     })
     .returning({ id: resultAttempts.id });
   if (inserted?.id) return inserted.id;
   const [existing] = await db
-    .select({ id: resultAttempts.id })
+    .select({
+      id: resultAttempts.id,
+      resultId: resultAttempts.resultId,
+      evidencePayload: resultAttempts.evidencePayload,
+    })
     .from(resultAttempts)
     .where(
       and(
         eq(resultAttempts.simJobId, simJobId),
         eq(resultAttempts.engineJobId, engineJobId),
+        eq(resultAttempts.resultId, resultId),
         eq(resultAttempts.aoaDeg, p.aoa_deg),
         eq(resultAttempts.regime, p.unsteady ? "urans" : "rans"),
       ),
     )
     .limit(1);
-  return existing?.id ?? null;
+  if (!existing) return null;
+  if (
+    existing.resultId !== resultId ||
+    stableHash(existing.evidencePayload ?? null) !== stableHash(evidencePayload)
+  ) {
+    throw new Error(
+      `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
+    );
+  }
+  return existing.id;
 }
 
-async function registerEvidenceArtifacts(opts: {
+export async function registerEvidenceArtifacts(opts: {
   db: DB;
   engine: EngineClient;
   resultId?: string | null;
@@ -605,7 +964,17 @@ async function registerEvidenceArtifacts(opts: {
   point: PolarPoint;
   artifact: EngineEvidenceArtifact;
 }): Promise<void> {
-  const { db, engine, resultId, resultAttemptId, airfoilId, simJobId, engineJobId, point, artifact } = opts;
+  const {
+    db,
+    engine,
+    resultId,
+    resultAttemptId,
+    airfoilId,
+    simJobId,
+    engineJobId,
+    point,
+    artifact,
+  } = opts;
   const urlPath = artifact.url ?? artifact.path;
   if (!urlPath) return;
   const storageKey = storageKeyOf(urlPath);
@@ -632,9 +1001,8 @@ async function registerEvidenceArtifacts(opts: {
     );
     return;
   }
-  await db
-    .insert(solverEvidenceArtifacts)
-    .values({
+  const write = async (writeDb: DB) => {
+    const association = {
       resultId: resultId ?? null,
       resultAttemptId: resultAttemptId ?? null,
       airfoilId,
@@ -651,16 +1019,60 @@ async function registerEvidenceArtifacts(opts: {
       byteSize: artifact.byte_size,
       engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
       metadata: artifact.metadata ?? {},
-    })
-    .onConflictDoUpdate({
-      target: [solverEvidenceArtifacts.storageKey, solverEvidenceArtifacts.sha256],
-      set: {
-        resultId: resultId ?? null,
-        resultAttemptId: resultAttemptId ?? null,
-        engineCaseSlug: point.case_slug ?? null,
-        metadata: artifact.metadata ?? {},
-      },
-    });
+    };
+    const [inserted] = await writeDb
+      .insert(solverEvidenceArtifacts)
+      .values(association)
+      // Content-addressed bytes are intentionally reusable across attempts
+      // and results. Owner-scoped partial indexes make exact replay
+      // idempotent while each new owner gets its own immutable association;
+      // never relabel another attempt's row just because the bytes match.
+      .onConflictDoNothing()
+      .returning({ id: solverEvidenceArtifacts.id });
+    if (inserted) return;
+    const [replayed] = await writeDb
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          resultAttemptId
+            ? eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId)
+            : sql`${solverEvidenceArtifacts.resultAttemptId} IS NULL`,
+          eq(solverEvidenceArtifacts.kind, kind),
+          sql`${solverEvidenceArtifacts.field} IS NOT DISTINCT FROM ${association.field}`,
+          sql`${solverEvidenceArtifacts.role} IS NOT DISTINCT FROM ${association.role}`,
+          eq(solverEvidenceArtifacts.storageKey, storageKey),
+          eq(solverEvidenceArtifacts.sha256, artifact.sha256),
+        ),
+      )
+      .limit(1);
+    if (
+      !replayed ||
+      replayed.resultId !== association.resultId ||
+      replayed.airfoilId !== association.airfoilId ||
+      replayed.simJobId !== association.simJobId ||
+      replayed.engineJobId !== association.engineJobId ||
+      replayed.engineCaseSlug !== association.engineCaseSlug ||
+      replayed.aoaDeg !== association.aoaDeg ||
+      replayed.mimeType !== association.mimeType ||
+      replayed.byteSize !== association.byteSize ||
+      replayed.engineUrl !== association.engineUrl ||
+      stableHash(replayed.metadata ?? {}) !== stableHash(association.metadata)
+    ) {
+      throw new Error(
+        `evidence artifact replay changed immutable association metadata for attempt ${resultAttemptId ?? "unbound"} (${kind}/${artifact.field ?? ""}/${artifact.role ?? ""})`,
+      );
+    }
+  };
+  await withEvidenceArtifactWriteLocks(
+    db,
+    {
+      storageKey,
+      sha256: artifact.sha256,
+      incomingResultId: resultId ?? null,
+    },
+    write,
+  );
 }
 
 type ScaleGroupKey = `${string}:${string}:${ImageFieldName}`;
@@ -676,13 +1088,21 @@ function isImageFieldName(value: string): value is ImageFieldName {
   return (ALL_IMAGE_FIELDS as string[]).includes(value);
 }
 
-function fieldScalePolicy(field: ImageFieldName): "sequential_zero" | "diverging_zero" {
-  return field === "velocity_magnitude" || field === "turbulent_kinetic_energy" || field === "turbulent_viscosity"
+function fieldScalePolicy(
+  field: ImageFieldName,
+): "sequential_zero" | "diverging_zero" {
+  return field === "velocity_magnitude" ||
+    field === "turbulent_kinetic_energy" ||
+    field === "turbulent_viscosity"
     ? "sequential_zero"
     : "diverging_zero";
 }
 
-function normalizeScale(field: ImageFieldName, minValue: number, maxValue: number): { vmin: number; vmax: number; policy: string } {
+function normalizeScale(
+  field: ImageFieldName,
+  minValue: number,
+  maxValue: number,
+): { vmin: number; vmax: number; policy: string } {
   const policy = fieldScalePolicy(field);
   if (policy === "sequential_zero") {
     const vmax = Math.max(0, maxValue);
@@ -702,30 +1122,52 @@ function stableHash(value: unknown): string {
   const stable = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(stable);
     if (v && typeof v === "object") {
-      return Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)).map(([k, nested]) => [k, stable(nested)]));
+      return Object.fromEntries(
+        Object.entries(v)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([k, nested]) => [k, stable(nested)]),
+      );
     }
     return v;
   };
-  return createHash("sha256").update(JSON.stringify(stable(value))).digest("hex").slice(0, 24);
+  return createHash("sha256")
+    .update(JSON.stringify(stable(value)))
+    .digest("hex")
+    .slice(0, 24);
 }
 
-function scaleGroupKey(airfoilId: string, presetRevisionId: string, field: ImageFieldName): ScaleGroupKey {
+function scaleGroupKey(
+  airfoilId: string,
+  presetRevisionId: string,
+  field: ImageFieldName,
+): ScaleGroupKey {
   return `${airfoilId}:${presetRevisionId}:${field}`;
 }
 
 function evidenceBaseFromPoint(point: PolarPoint): string | null {
-  const manifest = point.evidence_artifacts?.find((artifact) => artifact.kind === "manifest");
+  const manifest = point.evidence_artifacts?.find(
+    (artifact) => artifact.kind === "manifest",
+  );
   const base = manifest?.metadata?.evidenceBase;
   return typeof base === "string" && base.trim() ? base : null;
 }
 
 function evidenceShaFromPoint(point: PolarPoint): string {
-  const manifest = point.evidence_artifacts?.find((artifact) => artifact.kind === "manifest");
+  const manifest = point.evidence_artifacts?.find(
+    (artifact) => artifact.kind === "manifest",
+  );
   return manifest?.sha256 ?? stableHash(point.evidence_artifacts ?? []);
 }
 
-async function airfoilContourPoints(db: DB, airfoilId: string): Promise<[number, number][] | null> {
-  const [row] = await db.select({ points: airfoils.points }).from(airfoils).where(eq(airfoils.id, airfoilId)).limit(1);
+async function airfoilContourPoints(
+  db: DB,
+  airfoilId: string,
+): Promise<[number, number][] | null> {
+  const [row] = await db
+    .select({ points: airfoils.points })
+    .from(airfoils)
+    .where(eq(airfoils.id, airfoilId))
+    .limit(1);
   const points = row?.points as { x: number; y: number }[] | undefined;
   if (!points?.length) return null;
   return points.map((p) => [p.x, p.y]);
@@ -738,13 +1180,27 @@ async function computeAndStoreFieldExtents(opts: {
   airfoilId: string;
   presetRevisionId: string | null;
   resultId: string;
+  resultAttemptId: string;
   point: PolarPoint;
   speed: number;
   chord: number;
   airfoilPoints: [number, number][];
   groups: Map<ScaleGroupKey, ScaleGroup>;
 }): Promise<void> {
-  const { db, engine, engineJobId, airfoilId, presetRevisionId, resultId, point, speed, chord, airfoilPoints, groups } = opts;
+  const {
+    db,
+    engine,
+    engineJobId,
+    airfoilId,
+    presetRevisionId,
+    resultId,
+    resultAttemptId,
+    point,
+    speed,
+    chord,
+    airfoilPoints,
+    groups,
+  } = opts;
   if (!presetRevisionId || !point.case_slug || failedForPoint(point)) return;
   const evidenceBase = evidenceBaseFromPoint(point);
   if (!evidenceBase) {
@@ -780,11 +1236,17 @@ async function computeAndStoreFieldExtents(opts: {
   const evidenceSha256 = evidenceShaFromPoint(point);
   for (const [rawField, extent] of Object.entries(response.fields)) {
     if (!isImageFieldName(rawField) || !extent) continue;
-    if (!Number.isFinite(extent.min) || !Number.isFinite(extent.max) || extent.finite_count <= 0) continue;
+    if (
+      !Number.isFinite(extent.min) ||
+      !Number.isFinite(extent.max) ||
+      extent.finite_count <= 0
+    )
+      continue;
     await db
       .insert(resultFieldExtents)
       .values({
         resultId,
+        resultAttemptId,
         airfoilId,
         simulationPresetRevisionId: presetRevisionId,
         field: rawField,
@@ -797,7 +1259,12 @@ async function computeAndStoreFieldExtents(opts: {
         evidenceSha256,
       })
       .onConflictDoUpdate({
-        target: [resultFieldExtents.resultId, resultFieldExtents.field, resultFieldExtents.renderProfileKey],
+        target: [
+          resultFieldExtents.resultAttemptId,
+          resultFieldExtents.field,
+          resultFieldExtents.renderProfileKey,
+        ],
+        targetWhere: sql`${resultFieldExtents.resultAttemptId} IS NOT NULL`,
         set: {
           vmin: extent.min,
           vmax: extent.max,
@@ -809,21 +1276,164 @@ async function computeAndStoreFieldExtents(opts: {
         },
       });
     const key = scaleGroupKey(airfoilId, presetRevisionId, rawField);
-    const group = groups.get(key) ?? { airfoilId, presetRevisionId, field: rawField, changedResultIds: new Set<string>() };
+    const group = groups.get(key) ?? {
+      airfoilId,
+      presetRevisionId,
+      field: rawField,
+      changedResultIds: new Set<string>(),
+    };
     group.changedResultIds.add(resultId);
     groups.set(key, group);
   }
 }
 
-async function manifestEvidenceBaseForResult(db: DB, resultId: string): Promise<string | null> {
-  const [manifest] = await db
-    .select()
-    .from(solverEvidenceArtifacts)
-    .where(and(eq(solverEvidenceArtifacts.resultId, resultId), eq(solverEvidenceArtifacts.kind, "manifest")))
-    .orderBy(desc(solverEvidenceArtifacts.createdAt))
+async function manifestForResult(
+  db: DB,
+  resultId: string,
+): Promise<{ evidenceBase: string; sha256: string } | null> {
+  const [owner] = await db
+    .select({ attemptId: results.currentResultAttemptId })
+    .from(results)
+    .where(eq(results.id, resultId))
     .limit(1);
-  const base = manifest?.metadata && typeof manifest.metadata === "object" ? (manifest.metadata as Record<string, unknown>).evidenceBase : null;
-  return typeof base === "string" && base.trim() ? base : null;
+  if (!owner?.attemptId) return null;
+  return manifestForAttempt(db, resultId, owner.attemptId);
+}
+
+async function manifestForAttempt(
+  db: DB,
+  resultId: string,
+  resultAttemptId: string,
+): Promise<{ evidenceBase: string; sha256: string } | null> {
+  const manifests = await db
+    .select({ artifact: solverEvidenceArtifacts })
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultId, resultId),
+        eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId),
+        eq(solverEvidenceArtifacts.kind, "manifest"),
+      ),
+    )
+    .orderBy(desc(solverEvidenceArtifacts.createdAt));
+  // One exact generation owns exactly one manifest. Ambiguity fails closed;
+  // choosing the newest row would reintroduce generation rediscovery.
+  if (manifests.length !== 1) return null;
+  const artifact = manifests[0]?.artifact;
+  const base =
+    artifact?.metadata && typeof artifact.metadata === "object"
+      ? (artifact.metadata as Record<string, unknown>).evidenceBase
+      : null;
+  return typeof base === "string" &&
+    base.trim() &&
+    artifact?.sha256 &&
+    /^[a-f0-9]{64}$/i.test(artifact.sha256) &&
+    artifact.byteSize > 0 &&
+    artifact.storageKey.trim() &&
+    artifact.mimeType.trim()
+    ? { evidenceBase: base, sha256: artifact.sha256 }
+    : null;
+}
+
+async function manifestEvidenceBaseForResult(
+  db: DB,
+  resultId: string,
+): Promise<string | null> {
+  return (await manifestForResult(db, resultId))?.evidenceBase ?? null;
+}
+
+function assertRenderedArtifact(
+  media: RenderedDefaultMedia,
+  expected: {
+    field: ImageFieldName;
+    kind: "image" | "video";
+    role: "instantaneous" | "mean";
+  },
+): void {
+  const cleanPath =
+    typeof media.path === "string" ? media.path.replace(/^\/+/, "") : "";
+  if (
+    media.field !== expected.field ||
+    media.kind !== expected.kind ||
+    media.role !== expected.role ||
+    typeof media.url !== "string" ||
+    !media.url.trim() ||
+    typeof media.path !== "string" ||
+    !cleanPath ||
+    !media.url.endsWith(`/${cleanPath}`) ||
+    typeof media.mime_type !== "string" ||
+    !media.mime_type.startsWith(`${expected.kind}/`) ||
+    typeof media.sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(media.sha256) ||
+    typeof media.byte_size !== "number" ||
+    !Number.isInteger(media.byte_size) ||
+    media.byte_size <= 0
+  ) {
+    throw new Error(
+      `incomplete default-media artifact for ${expected.field} (${expected.kind}/${expected.role})`,
+    );
+  }
+}
+
+/** Fail closed on a 200 response that omitted a requested default artifact.
+ *  Every extent-backed field gets an instantaneous still. A transient or
+ *  preliminary-URANS result additionally gets its mean still and real
+ *  instantaneous video. */
+function completeRenderedMediaForField(
+  response: {
+    images?: RenderedDefaultMedia[];
+    mean_images?: RenderedDefaultMedia[];
+    videos?: RenderedDefaultMedia[];
+  },
+  field: ImageFieldName,
+  requiresVideo: boolean,
+): RenderedDefaultMedia[] {
+  const images = Array.isArray(response.images) ? response.images : [];
+  const means = Array.isArray(response.mean_images) ? response.mean_images : [];
+  const videos = Array.isArray(response.videos) ? response.videos : [];
+  const instantaneous = images.find(
+    (media) =>
+      media.field === field &&
+      media.kind === "image" &&
+      media.role === "instantaneous",
+  );
+  if (!instantaneous) {
+    throw new Error(
+      `default-media response missing instantaneous image for ${field}`,
+    );
+  }
+  assertRenderedArtifact(instantaneous, {
+    field,
+    kind: "image",
+    role: "instantaneous",
+  });
+  const accepted = [instantaneous];
+  if (!requiresVideo) return accepted;
+  const mean = means.find(
+    (media) =>
+      media.field === field && media.kind === "image" && media.role === "mean",
+  );
+  if (!mean)
+    throw new Error(`default-media response missing mean image for ${field}`);
+  assertRenderedArtifact(mean, { field, kind: "image", role: "mean" });
+  accepted.push(mean);
+  const video = videos.find(
+    (media) =>
+      media.field === field &&
+      media.kind === "video" &&
+      media.role === "instantaneous",
+  );
+  if (!video)
+    throw new Error(
+      `default-media response missing instantaneous video for ${field}`,
+    );
+  assertRenderedArtifact(video, {
+    field,
+    kind: "video",
+    role: "instantaneous",
+  });
+  accepted.push(video);
+  return accepted;
 }
 
 async function renderScaledMediaRows(opts: {
@@ -831,33 +1441,89 @@ async function renderScaledMediaRows(opts: {
   engine: EngineClient;
   resultRows: (typeof results.$inferSelect)[];
   field: ImageFieldName;
-  scale: { id: string; version: number; vmin: number; vmax: number; policy: string };
+  scale: {
+    id: string;
+    version: number;
+    vmin: number;
+    vmax: number;
+    policy: string;
+  };
   airfoilPoints: [number, number][];
   heartbeat: () => Promise<void>;
-}): Promise<{ resultId: string; media: RenderedDefaultMedia[] }[]> {
-  const rendered: { resultId: string; media: RenderedDefaultMedia[] }[] = [];
+}): Promise<
+  {
+    resultId: string;
+    resultAttemptId: string;
+    evidenceSha256: string;
+    media: RenderedDefaultMedia[];
+  }[]
+> {
+  const rendered: {
+    resultId: string;
+    resultAttemptId: string;
+    evidenceSha256: string;
+    media: RenderedDefaultMedia[];
+  }[] = [];
   for (const result of opts.resultRows) {
-    if (!result.engineJobId || !result.engineCaseSlug || result.status !== "done" || result.source !== "solved") continue;
+    if (
+      !result.engineJobId ||
+      !result.engineCaseSlug ||
+      result.status !== "done" ||
+      result.source !== "solved"
+    )
+      continue;
+    if (!result.currentResultAttemptId) continue;
     // Invariant: no ingest code path may run >30 s without a heartbeat touch.
     // Each renderDefaultMedia call is a full engine render round-trip (video
     // re-encode included) — the longest single stretch of the ingest chain.
     await opts.heartbeat();
-    const evidenceBase = await manifestEvidenceBaseForResult(opts.db, result.id);
-    if (!evidenceBase) continue;
+    const manifest = await manifestForAttempt(
+      opts.db,
+      result.id,
+      result.currentResultAttemptId,
+    );
+    if (!manifest) continue;
+    if (
+      result.chord == null ||
+      !Number.isFinite(result.chord) ||
+      result.chord <= 0 ||
+      result.speed == null ||
+      !Number.isFinite(result.speed) ||
+      result.speed <= 0
+    ) {
+      throw new Error(
+        `default-media render refused for result ${result.id}: stored chord and flow speed must be finite and positive`,
+      );
+    }
+    const requiresTransientMedia =
+      result.unsteady || result.fidelity === "urans_precalc";
     const response = await opts.engine.renderDefaultMedia(result.engineJobId, {
       case_slug: result.engineCaseSlug,
-      evidence_base: evidenceBase,
+      evidence_base: manifest.evidenceBase,
       airfoil_points: opts.airfoilPoints,
-      chord: result.chord ?? 1,
-      speed: result.speed ?? 0,
+      chord: result.chord,
+      speed: result.speed,
       fields: [opts.field],
-      scales: { [opts.field]: { vmin: opts.scale.vmin, vmax: opts.scale.vmax } },
-      unsteady: result.unsteady,
+      scales: {
+        [opts.field]: { vmin: opts.scale.vmin, vmax: opts.scale.vmax },
+      },
+      // A no-shedding precalc is represented as steady-equivalent, but its
+      // fidelity proves a transient evidence window exists and owns video.
+      unsteady: requiresTransientMedia,
       zoom_chords: 2,
       scale_version: opts.scale.version,
       render_profile_key: DEFAULT_RENDER_PROFILE_KEY,
     });
-    rendered.push({ resultId: result.id, media: [...response.images, ...response.mean_images, ...response.videos] });
+    rendered.push({
+      resultId: result.id,
+      resultAttemptId: result.currentResultAttemptId,
+      evidenceSha256: manifest.sha256,
+      media: completeRenderedMediaForField(
+        response,
+        opts.field,
+        requiresTransientMedia,
+      ),
+    });
   }
   return rendered;
 }
@@ -865,20 +1531,50 @@ async function renderScaledMediaRows(opts: {
 async function registerRenderedMediaSet(
   db: DB,
   engine: EngineClient,
-  rows: { resultId: string; media: RenderedDefaultMedia[] }[],
-  scale: { id: string; version: number; vmin: number; vmax: number; policy: string },
+  rows: {
+    resultId: string;
+    resultAttemptId: string;
+    evidenceSha256: string;
+    media: RenderedDefaultMedia[];
+  }[],
+  scale: {
+    id: string;
+    version: number;
+    vmin: number;
+    vmax: number;
+    policy: string;
+  },
+  repairFence?: MediaRepairWriteFence,
 ): Promise<number> {
   let count = 0;
   for (const row of rows) {
     for (const media of row.media) {
-      await registerMedia(db, engine, row.resultId, media.kind, media.role, media.field, media.url, media.mime_type, {
-        colorScaleId: scale.id,
-        colorScaleVersion: scale.version,
-        vmin: scale.vmin,
-        vmax: scale.vmax,
-        policy: scale.policy,
-        renderProfileKey: DEFAULT_RENDER_PROFILE_KEY,
-      });
+      await registerMedia(
+        db,
+        engine,
+        row.resultId,
+        row.resultAttemptId,
+        media.kind,
+        media.role,
+        media.field,
+        media.url,
+        media.mime_type,
+        {
+          colorScaleId: scale.id,
+          colorScaleVersion: scale.version,
+          vmin: scale.vmin,
+          vmax: scale.vmax,
+          policy: scale.policy,
+          renderProfileKey: DEFAULT_RENDER_PROFILE_KEY,
+        },
+        {
+          evidenceSha256: row.evidenceSha256,
+          expectedSha256: media.sha256,
+          expectedByteSize: media.byte_size,
+          verifyExpectedBytes: Boolean(repairFence),
+          repairFence,
+        },
+      );
       count++;
     }
   }
@@ -891,6 +1587,14 @@ async function rebalanceFieldScales(opts: {
   groups: Map<ScaleGroupKey, ScaleGroup>;
   airfoilPoints: [number, number][];
   heartbeat: () => Promise<void>;
+  /** Durable repair owns a bounded attempt and must observe any field failure. */
+  strict?: boolean;
+  /** When present, every post-render media upsert is atomically fenced by the
+   * live durable repair claim and current manifest identity. */
+  repairFence?: MediaRepairWriteFence;
+  /** Exact attempt projection for a durable repair. It may intentionally be
+   * pointer-null until repaired evidence classifies publishable. */
+  repairSource?: typeof results.$inferSelect;
 }): Promise<number> {
   let mediaCount = 0;
   for (const group of opts.groups.values()) {
@@ -904,9 +1608,24 @@ async function rebalanceFieldScales(opts: {
       .where(
         and(
           eq(resultFieldExtents.airfoilId, group.airfoilId),
-          eq(resultFieldExtents.simulationPresetRevisionId, group.presetRevisionId),
+          eq(
+            resultFieldExtents.simulationPresetRevisionId,
+            group.presetRevisionId,
+          ),
           eq(resultFieldExtents.field, group.field),
           eq(resultFieldExtents.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+          sql`(
+            EXISTS (
+              SELECT 1 FROM results current_result
+              WHERE current_result.id = ${resultFieldExtents.resultId}
+                AND current_result.current_result_attempt_id = ${resultFieldExtents.resultAttemptId}
+            )
+            OR (
+              ${opts.repairSource?.id ?? null}::uuid IS NOT NULL
+              AND ${resultFieldExtents.resultId} = ${opts.repairSource?.id ?? null}::uuid
+              AND ${resultFieldExtents.resultAttemptId} = ${opts.repairSource?.currentResultAttemptId ?? null}::uuid
+            )
+          )`,
         ),
       );
     if (!extents.length) continue;
@@ -930,7 +1649,10 @@ async function rebalanceFieldScales(opts: {
       .where(
         and(
           eq(fieldColorScales.airfoilId, group.airfoilId),
-          eq(fieldColorScales.simulationPresetRevisionId, group.presetRevisionId),
+          eq(
+            fieldColorScales.simulationPresetRevisionId,
+            group.presetRevisionId,
+          ),
           eq(fieldColorScales.field, group.field),
           eq(fieldColorScales.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
           eq(fieldColorScales.active, true),
@@ -943,7 +1665,10 @@ async function rebalanceFieldScales(opts: {
       .where(
         and(
           eq(fieldColorScales.airfoilId, group.airfoilId),
-          eq(fieldColorScales.simulationPresetRevisionId, group.presetRevisionId),
+          eq(
+            fieldColorScales.simulationPresetRevisionId,
+            group.presetRevisionId,
+          ),
           eq(fieldColorScales.field, group.field),
           eq(fieldColorScales.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
         ),
@@ -951,68 +1676,154 @@ async function rebalanceFieldScales(opts: {
       .orderBy(desc(fieldColorScales.version))
       .limit(1);
 
-    if (active && nearlyEqual(active.vmin, normalized.vmin) && nearlyEqual(active.vmax, normalized.vmax)) {
-      const targets = await opts.db
+    if (
+      active &&
+      nearlyEqual(active.vmin, normalized.vmin) &&
+      nearlyEqual(active.vmax, normalized.vmax)
+    ) {
+      let targets = await opts.db
         .select()
         .from(results)
         .where(inArray(results.id, Array.from(group.changedResultIds)));
+      if (opts.repairSource) {
+        targets = targets.map((target) =>
+          target.id === opts.repairSource!.id ? opts.repairSource! : target,
+        );
+      }
       const rendered = await renderScaledMediaRows({
         db: opts.db,
         engine: opts.engine,
         resultRows: targets,
         field: group.field,
-        scale: { id: active.id, version: active.version, vmin: active.vmin, vmax: active.vmax, policy: active.scalePolicy },
+        scale: {
+          id: active.id,
+          version: active.version,
+          vmin: active.vmin,
+          vmax: active.vmax,
+          policy: active.scalePolicy,
+        },
         airfoilPoints: opts.airfoilPoints,
         heartbeat: opts.heartbeat,
       });
-      mediaCount += await registerRenderedMediaSet(opts.db, opts.engine, rendered, {
-        id: active.id,
-        version: active.version,
-        vmin: active.vmin,
-        vmax: active.vmax,
-        policy: active.scalePolicy,
-      });
+      mediaCount += await registerRenderedMediaSet(
+        opts.db,
+        opts.engine,
+        rendered,
+        {
+          id: active.id,
+          version: active.version,
+          vmin: active.vmin,
+          vmax: active.vmax,
+          policy: active.scalePolicy,
+        },
+        opts.repairFence,
+      );
       continue;
     }
 
     const nextVersion = (latest?.version ?? 0) + 1;
-    const [scale] = await opts.db
-      .insert(fieldColorScales)
-      .values({
-        airfoilId: group.airfoilId,
-        simulationPresetRevisionId: group.presetRevisionId,
-        field: group.field,
-        renderProfileKey: DEFAULT_RENDER_PROFILE_KEY,
-        scalePolicy: normalized.policy,
-        vmin: normalized.vmin,
-        vmax: normalized.vmax,
-        evidenceSignature,
-        status: "rebalancing",
-        version: nextVersion,
-        active: false,
-      })
-      .returning();
+    const scaleValues = {
+      airfoilId: group.airfoilId,
+      simulationPresetRevisionId: group.presetRevisionId,
+      field: group.field,
+      renderProfileKey: DEFAULT_RENDER_PROFILE_KEY,
+      scalePolicy: normalized.policy,
+      vmin: normalized.vmin,
+      vmax: normalized.vmax,
+      evidenceSignature,
+      status: "rebalancing" as const,
+      version: nextVersion,
+      active: false,
+    };
+    const insertScale = async (writeDb: DB) => {
+      const [created] = await writeDb
+        .insert(fieldColorScales)
+        .values(scaleValues)
+        .returning();
+      if (!created) throw new Error("failed to create field color scale");
+      return created;
+    };
+    const fenceResultId = opts.repairFence
+      ? Array.from(group.changedResultIds)[0]
+      : null;
+    const fenceEvidenceSha256 = fenceResultId
+      ? extents.find((extent) => extent.resultId === fenceResultId)
+          ?.evidenceSha256
+      : null;
+    const scale = opts.repairFence
+      ? await opts.db.transaction(async (rawTx) => {
+          const tx = rawTx as unknown as DB;
+          if (!fenceResultId || !fenceEvidenceSha256) {
+            throw new Error(
+              "durable media repair scale change has no owned evidence row",
+            );
+          }
+          await requireMediaRepairWriteFence(
+            tx,
+            opts.repairFence!,
+            fenceResultId,
+            fenceEvidenceSha256,
+          );
+          return insertScale(tx);
+        })
+      : await insertScale(opts.db);
 
-    const allResultIds = Array.from(new Set(extents.map((row) => row.resultId)));
-    const targets = await opts.db.select().from(results).where(inArray(results.id, allResultIds));
+    // A durable repair claim owns exactly one result. Activating a new shared
+    // scale makes every other result's old color_scale_id discoverably stale;
+    // each receives its own fenced repair instead of writing several results
+    // under one result's lease token.
+    const allResultIds = opts.repairFence
+      ? Array.from(group.changedResultIds)
+      : Array.from(new Set(extents.map((row) => row.resultId)));
+    let targets = await opts.db
+      .select()
+      .from(results)
+      .where(inArray(results.id, allResultIds));
+    if (opts.repairSource) {
+      targets = targets.map((target) =>
+        target.id === opts.repairSource!.id ? opts.repairSource! : target,
+      );
+    }
     try {
       const rendered = await renderScaledMediaRows({
         db: opts.db,
         engine: opts.engine,
         resultRows: targets,
         field: group.field,
-        scale: { id: scale.id, version: scale.version, vmin: scale.vmin, vmax: scale.vmax, policy: scale.scalePolicy },
+        scale: {
+          id: scale.id,
+          version: scale.version,
+          vmin: scale.vmin,
+          vmax: scale.vmax,
+          policy: scale.scalePolicy,
+        },
         airfoilPoints: opts.airfoilPoints,
         heartbeat: opts.heartbeat,
       });
       await opts.db.transaction(async (tx) => {
+        if (opts.repairFence) {
+          if (!fenceResultId || !fenceEvidenceSha256) {
+            throw new Error(
+              "durable media repair scale activation has no owned evidence row",
+            );
+          }
+          await requireMediaRepairWriteFence(
+            tx as unknown as DB,
+            opts.repairFence,
+            fenceResultId,
+            fenceEvidenceSha256,
+          );
+        }
         await tx
           .update(fieldColorScales)
           .set({ active: false })
           .where(
             and(
               eq(fieldColorScales.airfoilId, group.airfoilId),
-              eq(fieldColorScales.simulationPresetRevisionId, group.presetRevisionId),
+              eq(
+                fieldColorScales.simulationPresetRevisionId,
+                group.presetRevisionId,
+              ),
               eq(fieldColorScales.field, group.field),
               eq(fieldColorScales.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
               eq(fieldColorScales.active, true),
@@ -1022,16 +1833,25 @@ async function rebalanceFieldScales(opts: {
           .update(fieldColorScales)
           .set({ active: true, status: "active", activatedAt: new Date() })
           .where(eq(fieldColorScales.id, scale.id));
-        mediaCount += await registerRenderedMediaSet(tx as unknown as DB, opts.engine, rendered, {
-          id: scale.id,
-          version: scale.version,
-          vmin: scale.vmin,
-          vmax: scale.vmax,
-          policy: scale.scalePolicy,
-        });
+        mediaCount += await registerRenderedMediaSet(
+          tx as unknown as DB,
+          opts.engine,
+          rendered,
+          {
+            id: scale.id,
+            version: scale.version,
+            vmin: scale.vmin,
+            vmax: scale.vmax,
+            policy: scale.scalePolicy,
+          },
+          opts.repairFence,
+        );
       });
     } catch (error) {
-      const reason = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+      const reason =
+        error instanceof Error
+          ? error.message.slice(0, 500)
+          : String(error).slice(0, 500);
       // Loud + recorded: the failure lands on the scale row (status='failed',
       // failureReason, render_attempts) AND in the log with full addressing,
       // never silently. The reconcile retry pass re-attempts failed rows until
@@ -1042,8 +1862,13 @@ async function rebalanceFieldScales(opts: {
       );
       await opts.db
         .update(fieldColorScales)
-        .set({ status: "failed", failureReason: reason, renderAttempts: sql`${fieldColorScales.renderAttempts} + 1` })
+        .set({
+          status: "failed",
+          failureReason: reason,
+          renderAttempts: sql`${fieldColorScales.renderAttempts} + 1`,
+        })
         .where(eq(fieldColorScales.id, scale.id));
+      if (opts.strict) throw error;
     }
   }
   return mediaCount;
@@ -1053,19 +1878,520 @@ async function rebalanceFieldScales(opts: {
  *  the reconcile retry pass re-runs failed rows until the count reaches this. */
 export const MAX_SCALE_RENDER_ATTEMPTS = 3;
 
+export interface StoredResultMediaRepairOutcome {
+  mediaCount: number;
+  expectedFields: ImageFieldName[];
+}
+
+/**
+ * Rebuild complete default media for one already-solved preliminary/unsteady
+ * result without touching its immutable coefficients or raw evidence.
+ *
+ * Extents are recomputed from the stored manifest. A partial extent response
+ * may not silently forget a field that prior evidence already exposed. Every
+ * valid returned field is fed through the shared track-scale renderer, whose
+ * response is fail-closed by `completeRenderedMediaForField`.
+ */
+export async function repairDefaultMediaForStoredResult(opts: {
+  db: DB;
+  engine: EngineClient;
+  resultId: string;
+  resultAttemptId: string;
+  heartbeat?: () => Promise<void>;
+  repairFence?: MediaRepairWriteFence;
+}): Promise<StoredResultMediaRepairOutcome> {
+  const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(opts.db));
+  const [result] = await opts.db
+    .select()
+    .from(results)
+    .where(eq(results.id, opts.resultId))
+    .limit(1);
+  if (!result)
+    throw new Error(`media-repair result ${opts.resultId} no longer exists`);
+  const [attempt] = await opts.db
+    .select()
+    .from(resultAttempts)
+    .where(
+      and(
+        eq(resultAttempts.id, opts.resultAttemptId),
+        eq(resultAttempts.resultId, opts.resultId),
+      ),
+    )
+    .limit(1);
+  if (!attempt) {
+    throw new Error(
+      `media-repair attempt ${opts.resultAttemptId} no longer exists for result ${opts.resultId}`,
+    );
+  }
+  if (attempt.status !== "done" || attempt.source !== "solved") {
+    throw new Error(
+      `media-repair attempt ${opts.resultAttemptId} is not done solved evidence`,
+    );
+  }
+  if (
+    !result.simulationPresetRevisionId ||
+    attempt.simulationPresetRevisionId !== result.simulationPresetRevisionId ||
+    attempt.airfoilId !== result.airfoilId
+  ) {
+    throw new Error(
+      `media-repair attempt ${opts.resultAttemptId} does not own the result's immutable setup`,
+    );
+  }
+  const currentAttemptId = attempt.id;
+  const presetRevisionId = result.simulationPresetRevisionId;
+  if (!attempt.engineJobId || !attempt.engineCaseSlug) {
+    throw new Error(
+      `media-repair attempt ${opts.resultAttemptId} has no saved engine job/case address`,
+    );
+  }
+  if (!Number.isFinite(result.chord) || !result.chord || result.chord <= 0) {
+    throw new Error(
+      `media-repair result ${opts.resultId} has no valid reference chord`,
+    );
+  }
+  if (
+    !Number.isFinite(result.speed) ||
+    result.speed == null ||
+    result.speed <= 0
+  ) {
+    throw new Error(
+      `media-repair result ${opts.resultId} has no valid flow speed`,
+    );
+  }
+  const contour = await airfoilContourPoints(opts.db, result.airfoilId);
+  if (!contour?.length) {
+    throw new Error(
+      `media-repair result ${opts.resultId} has no stored airfoil coordinates`,
+    );
+  }
+  const manifest = await manifestForAttempt(
+    opts.db,
+    result.id,
+    currentAttemptId,
+  );
+  if (!manifest) {
+    throw new Error(
+      `media-repair result ${opts.resultId} has no usable stored evidence manifest`,
+    );
+  }
+
+  const priorExtents = await opts.db
+    .select({ field: resultFieldExtents.field })
+    .from(resultFieldExtents)
+    .where(
+      and(
+        eq(resultFieldExtents.resultId, result.id),
+        eq(resultFieldExtents.resultAttemptId, currentAttemptId),
+        eq(resultFieldExtents.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+        eq(resultFieldExtents.evidenceSha256, manifest.sha256),
+      ),
+    );
+  await heartbeat();
+  const response = await opts.engine.computeFieldExtents(attempt.engineJobId, {
+    case_slug: attempt.engineCaseSlug,
+    evidence_base: manifest.evidenceBase,
+    airfoil_points: contour,
+    chord: result.chord,
+    speed: result.speed,
+    fields: ALL_IMAGE_FIELDS,
+    zoom_chords: 2,
+    max_frames: 220,
+  });
+  // The engine round-trip may be slow. Revalidate ownership immediately
+  // before any destructive presentation write; a stale renderer may inspect
+  // its response, but cannot delete media or replace current extents.
+  await heartbeat();
+  if (!response || !response.fields || typeof response.fields !== "object") {
+    throw new Error("field-extents response was empty");
+  }
+  const validExtents = Object.entries(response.fields).filter(
+    (
+      entry,
+    ): entry is [
+      ImageFieldName,
+      { min: number; max: number; finite_count: number },
+    ] => {
+      const [field, extent] = entry;
+      return Boolean(
+        isImageFieldName(field) &&
+        extent &&
+        Number.isFinite(extent.min) &&
+        Number.isFinite(extent.max) &&
+        Number.isInteger(extent.finite_count) &&
+        extent.finite_count > 0,
+      );
+    },
+  );
+  if (!validExtents.length) {
+    throw new Error(
+      "field-extents response contained no evidence-backed fields",
+    );
+  }
+  const freshFields = new Set(validExtents.map(([field]) => field));
+  const omittedPrior = priorExtents
+    .map((row) => row.field)
+    .filter(isImageFieldName)
+    .filter((field) => !freshFields.has(field));
+  if (omittedPrior.length) {
+    throw new Error(
+      `field-extents response incomplete; omitted prior evidence-backed fields: ${omittedPrior.sort().join(", ")}`,
+    );
+  }
+
+  const groups = new Map<ScaleGroupKey, ScaleGroup>();
+  const writeFreshExtents = async (writeDb: DB) => {
+    // Remove presentation rows from the prior/incomplete render before the
+    // fresh extent signature becomes visible. Raw solver artifacts remain
+    // immutable and untouched.
+    await writeDb.delete(resultMedia).where(
+      and(
+        eq(resultMedia.resultId, result.id),
+        eq(resultMedia.resultAttemptId, currentAttemptId),
+        eq(resultMedia.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+        sql`(${resultMedia.evidenceSha256} IS DISTINCT FROM ${manifest.sha256}
+            OR ${inArray(resultMedia.field, [...freshFields])})`,
+      ),
+    );
+    await writeDb
+      .delete(resultFieldExtents)
+      .where(
+        and(
+          eq(resultFieldExtents.resultId, result.id),
+          eq(resultFieldExtents.resultAttemptId, currentAttemptId),
+          eq(resultFieldExtents.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+          sql`${resultFieldExtents.evidenceSha256} IS DISTINCT FROM ${manifest.sha256}`,
+        ),
+      );
+    for (const [field, extent] of validExtents) {
+      await writeDb
+        .insert(resultFieldExtents)
+        .values({
+          resultId: result.id,
+          resultAttemptId: currentAttemptId,
+          airfoilId: result.airfoilId,
+          simulationPresetRevisionId: presetRevisionId,
+          field,
+          renderProfileKey: DEFAULT_RENDER_PROFILE_KEY,
+          vmin: extent.min,
+          vmax: extent.max,
+          finiteCount: extent.finite_count,
+          sourceTimeStart: response.window_start ?? null,
+          sourceTimeEnd: response.window_end ?? null,
+          evidenceSha256: manifest.sha256,
+        })
+        .onConflictDoUpdate({
+          target: [
+            resultFieldExtents.resultAttemptId,
+            resultFieldExtents.field,
+            resultFieldExtents.renderProfileKey,
+          ],
+          targetWhere: sql`${resultFieldExtents.resultAttemptId} IS NOT NULL`,
+          set: {
+            vmin: extent.min,
+            vmax: extent.max,
+            finiteCount: extent.finite_count,
+            sourceTimeStart: response.window_start ?? null,
+            sourceTimeEnd: response.window_end ?? null,
+            evidenceSha256: manifest.sha256,
+            updatedAt: new Date(),
+          },
+        });
+    }
+  };
+  if (opts.repairFence) {
+    await opts.db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await requireMediaRepairWriteFence(
+        tx,
+        opts.repairFence!,
+        result.id,
+        manifest.sha256,
+      );
+      await writeFreshExtents(tx);
+    });
+  } else {
+    await writeFreshExtents(opts.db);
+  }
+
+  for (const [field] of validExtents) {
+    groups.set(scaleGroupKey(result.airfoilId, presetRevisionId, field), {
+      airfoilId: result.airfoilId,
+      presetRevisionId,
+      field,
+      changedResultIds: new Set([result.id]),
+    });
+  }
+
+  const payload =
+    attempt.evidencePayload && typeof attempt.evidencePayload === "object"
+      ? (attempt.evidencePayload as Record<string, unknown>)
+      : {};
+  const repairSource: typeof results.$inferSelect = {
+    ...result,
+    currentResultAttemptId: currentAttemptId,
+    status: attempt.status,
+    source: attempt.source,
+    regime: attempt.regime,
+    cl: attempt.cl,
+    cd: attempt.cd,
+    cm: attempt.cm,
+    clCd: attempt.clCd,
+    clStd: attempt.clStd,
+    cdStd: attempt.cdStd,
+    cmStd: attempt.cmStd,
+    stalled: attempt.stalled,
+    unsteady: attempt.unsteady,
+    converged: attempt.converged,
+    finalResidual: attempt.finalResidual,
+    iterations: attempt.iterations,
+    yPlusAvg: attempt.yPlusAvg,
+    yPlusMax: attempt.yPlusMax,
+    nCells: attempt.nCells,
+    firstOrderFallback: attempt.firstOrderFallback,
+    strouhal: attempt.strouhal,
+    error: attempt.error,
+    qualityWarnings: attempt.qualityWarnings,
+    frameTrack: payload.frame_track ?? payload.frameTrack ?? null,
+    fidelity: typeof payload.fidelity === "string" ? payload.fidelity : null,
+    steadyHistory: payload.steady_history ?? payload.steadyHistory ?? null,
+    simJobId: attempt.simJobId,
+    engineJobId: attempt.engineJobId,
+    engineCaseSlug: attempt.engineCaseSlug,
+    solvedAt: attempt.solvedAt,
+  };
+
+  const mediaCount = await rebalanceFieldScales({
+    db: opts.db,
+    engine: opts.engine,
+    groups,
+    airfoilPoints: contour,
+    heartbeat,
+    strict: true,
+    repairFence: opts.repairFence,
+    repairSource,
+  });
+
+  const mediaRows = await opts.db
+    .select({
+      field: resultMedia.field,
+      kind: resultMedia.kind,
+      role: resultMedia.role,
+      storageKey: resultMedia.storageKey,
+      mimeType: resultMedia.mimeType,
+      evidenceSha256: resultMedia.evidenceSha256,
+    })
+    .from(resultMedia)
+    .where(
+      and(
+        eq(resultMedia.resultId, result.id),
+        eq(resultMedia.resultAttemptId, currentAttemptId),
+        eq(resultMedia.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+      ),
+    );
+  const requiresVideo =
+    attempt.unsteady || payload.fidelity === "urans_precalc";
+  for (const field of freshFields) {
+    const required: Array<{
+      kind: "image" | "video";
+      role: "instantaneous" | "mean";
+    }> = [{ kind: "image", role: "instantaneous" }];
+    if (requiresVideo) {
+      required.push(
+        { kind: "image", role: "mean" },
+        { kind: "video", role: "instantaneous" },
+      );
+    }
+    for (const expected of required) {
+      const present = mediaRows.some(
+        (media) =>
+          media.field === field &&
+          media.kind === expected.kind &&
+          media.role === expected.role &&
+          media.storageKey.trim().length > 0 &&
+          media.mimeType.startsWith(`${expected.kind}/`) &&
+          media.evidenceSha256 === manifest.sha256,
+      );
+      if (!present) {
+        throw new Error(
+          `media commit incomplete for ${field}: missing ${expected.kind}/${expected.role}`,
+        );
+      }
+    }
+  }
+  return { mediaCount, expectedFields: [...freshFields].sort() };
+}
+
+/** Re-prove crash-recovered default media against the actual shared-volume
+ * bytes before classification or verification can settle. DB metadata alone
+ * is not artifact evidence: a removed/truncated file invalidates its mutable
+ * presentation row and reopens the bounded repair obligation. */
+export async function verifyStoredDefaultMediaForResult(
+  db: DB,
+  resultId: string,
+  resultAttemptId: string,
+): Promise<number> {
+  const [result] = await db
+    .select()
+    .from(results)
+    .where(eq(results.id, resultId))
+    .limit(1);
+  if (!result?.simulationPresetRevisionId) {
+    throw new Error(
+      `media verification result ${resultId} has no immutable setup revision`,
+    );
+  }
+  const [attempt] = await db
+    .select()
+    .from(resultAttempts)
+    .where(
+      and(
+        eq(resultAttempts.id, resultAttemptId),
+        eq(resultAttempts.resultId, resultId),
+      ),
+    )
+    .limit(1);
+  if (!attempt) {
+    throw new Error(
+      `media verification attempt ${resultAttemptId} no longer exists for result ${resultId}`,
+    );
+  }
+  if (attempt.status !== "done" || attempt.source !== "solved") {
+    throw new Error(
+      `media verification attempt ${resultAttemptId} is not done solved evidence`,
+    );
+  }
+  const manifest = await manifestForAttempt(db, resultId, resultAttemptId);
+  if (!manifest) {
+    throw new Error(
+      `media verification attempt ${resultAttemptId} has no exact evidence manifest`,
+    );
+  }
+  const extents = await db
+    .select()
+    .from(resultFieldExtents)
+    .where(
+      and(
+        eq(resultFieldExtents.resultId, resultId),
+        eq(resultFieldExtents.resultAttemptId, resultAttemptId),
+        eq(resultFieldExtents.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+        eq(resultFieldExtents.evidenceSha256, manifest.sha256),
+      ),
+    );
+  if (!extents.length) {
+    throw new Error(
+      `media verification result ${resultId} has no current default field extents`,
+    );
+  }
+  const scales = await db
+    .select()
+    .from(fieldColorScales)
+    .where(
+      and(
+        eq(fieldColorScales.airfoilId, result.airfoilId),
+        eq(
+          fieldColorScales.simulationPresetRevisionId,
+          result.simulationPresetRevisionId,
+        ),
+        eq(fieldColorScales.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+        eq(fieldColorScales.active, true),
+      ),
+    );
+  const mediaRows = await db
+    .select()
+    .from(resultMedia)
+    .where(
+      and(
+        eq(resultMedia.resultId, resultId),
+        eq(resultMedia.resultAttemptId, resultAttemptId),
+        eq(resultMedia.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+        eq(resultMedia.evidenceSha256, manifest.sha256),
+      ),
+    );
+  const fidelity = payloadField<string>(
+    attempt.evidencePayload,
+    "fidelity",
+    "fidelity",
+  );
+  const requiresTransientMedia =
+    attempt.unsteady || fidelity === "urans_precalc";
+  let verified = 0;
+  for (const extent of extents) {
+    const scale = scales.find((candidate) => candidate.field === extent.field);
+    if (!scale) {
+      throw new Error(
+        `media verification has no active color scale for ${extent.field}`,
+      );
+    }
+    const required: Array<{
+      kind: "image" | "video";
+      role: "instantaneous" | "mean";
+    }> = [{ kind: "image", role: "instantaneous" }];
+    if (requiresTransientMedia) {
+      required.push(
+        { kind: "image", role: "mean" },
+        { kind: "video", role: "instantaneous" },
+      );
+    }
+    for (const expected of required) {
+      const media = mediaRows.find(
+        (candidate) =>
+          candidate.field === extent.field &&
+          candidate.kind === expected.kind &&
+          candidate.role === expected.role &&
+          candidate.colorScaleId === scale.id,
+      );
+      if (
+        !media ||
+        !media.sha256 ||
+        !/^[a-f0-9]{64}$/i.test(media.sha256) ||
+        media.byteSize == null ||
+        media.byteSize <= 0
+      ) {
+        throw new Error(
+          `media verification missing identity for ${extent.field} ${expected.kind}/${expected.role}`,
+        );
+      }
+      try {
+        await verifyRenderedMediaBytes(
+          media.storageKey,
+          media.sha256,
+          media.byteSize,
+        );
+      } catch (error) {
+        // Mutable presentation metadata must not keep pointing at corrupt or
+        // absent bytes. Raw solver artifacts and coefficients are untouched.
+        await db.delete(resultMedia).where(eq(resultMedia.id, media.id));
+        throw error;
+      }
+      verified++;
+    }
+  }
+  return verified;
+}
+
 /** Re-attempt failed shared-scale renders (bounded). A scale row that failed
  *  its render at ingest time (e.g. one transient engine fetch failure) is
  *  retried here with FRESH extents: only latest-version failed rows are live
  *  rebalance intent — a later ingest that rebalanced the same scope created a
  *  newer version that already re-rendered every extents row, so older failed
- *  rows are dead history and stay untouched. Returns registered media count. */
+ *  rows are dead history and stay untouched. Successful media repair refreshes
+ *  the exact evidence-derived polar cache immediately; otherwise a row first
+ *  classified `missing-urans-video` would remain rejected until unrelated
+ *  evidence happened to land. Returns registered media count. */
 export async function retryFailedScaleRenders(
   db: DB,
   engine: EngineClient,
-  opts: { heartbeat?: () => Promise<void>; maxAttempts?: number } = {},
-): Promise<number> {
+  opts: {
+    heartbeat?: () => Promise<void>;
+    maxAttempts?: number;
+    /** Optional deterministic scope for targeted repair/tests. Omitted in the
+     * production reconcile loop, which intentionally scans every failed row. */
+    scaleIds?: string[];
+  } = {},
+): Promise<{ mediaCount: number; dirtyLanes: CampaignLaneKey[] }> {
   const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(db));
   const maxAttempts = opts.maxAttempts ?? MAX_SCALE_RENDER_ATTEMPTS;
+  if (opts.scaleIds?.length === 0) return { mediaCount: 0, dirtyLanes: [] };
   const retryable = await db
     .select()
     .from(fieldColorScales)
@@ -1073,6 +2399,7 @@ export async function retryFailedScaleRenders(
       and(
         eq(fieldColorScales.status, "failed"),
         lt(fieldColorScales.renderAttempts, maxAttempts),
+        opts.scaleIds ? inArray(fieldColorScales.id, opts.scaleIds) : undefined,
         sql`NOT EXISTS (
           SELECT 1 FROM field_color_scales newer
           WHERE newer.airfoil_id = ${fieldColorScales.airfoilId}
@@ -1084,29 +2411,67 @@ export async function retryFailedScaleRenders(
       ),
     );
   let mediaCount = 0;
-  for (const scaleRow of retryable) {
-    if (!isImageFieldName(scaleRow.field)) continue;
-    const field: ImageFieldName = scaleRow.field;
+  const refreshedScopes = new Map<
+    string,
+    { airfoilId: string; revisionId: string; resultIds: Set<string> }
+  >();
+  const dirtyLanes = new Map<string, CampaignLaneKey>();
+  const rememberRendered = (
+    scaleRow: typeof fieldColorScales.$inferSelect,
+    rendered: Array<{ resultId: string; media: RenderedDefaultMedia[] }>,
+  ) => {
+    const ids = rendered
+      .filter((row) => row.media.length > 0)
+      .map((row) => row.resultId);
+    if (!ids.length) return;
+    const key = `${scaleRow.airfoilId}:${scaleRow.simulationPresetRevisionId}`;
+    const scope = refreshedScopes.get(key) ?? {
+      airfoilId: scaleRow.airfoilId,
+      revisionId: scaleRow.simulationPresetRevisionId,
+      resultIds: new Set<string>(),
+    };
+    for (const id of ids) scope.resultIds.add(id);
+    refreshedScopes.set(key, scope);
+  };
+  for (const candidateScale of retryable) {
+    if (!isImageFieldName(candidateScale.field)) continue;
+    const field: ImageFieldName = candidateScale.field;
     // Invariant: no code path may run >30 s without a heartbeat touch — each
     // retry is a per-result engine render round-trip chain.
     await heartbeat();
-    const airfoilPoints = await airfoilContourPoints(db, scaleRow.airfoilId);
+    const airfoilPoints = await airfoilContourPoints(
+      db,
+      candidateScale.airfoilId,
+    );
     if (!airfoilPoints) continue;
     const extents = await db
       .select()
       .from(resultFieldExtents)
       .where(
         and(
-          eq(resultFieldExtents.airfoilId, scaleRow.airfoilId),
-          eq(resultFieldExtents.simulationPresetRevisionId, scaleRow.simulationPresetRevisionId),
-          eq(resultFieldExtents.field, scaleRow.field),
-          eq(resultFieldExtents.renderProfileKey, scaleRow.renderProfileKey),
+          eq(resultFieldExtents.airfoilId, candidateScale.airfoilId),
+          eq(
+            resultFieldExtents.simulationPresetRevisionId,
+            candidateScale.simulationPresetRevisionId,
+          ),
+          eq(resultFieldExtents.field, candidateScale.field),
+          eq(
+            resultFieldExtents.renderProfileKey,
+            candidateScale.renderProfileKey,
+          ),
+          sql`EXISTS (
+            SELECT 1 FROM results current_result
+            WHERE current_result.id = ${resultFieldExtents.resultId}
+              AND current_result.current_result_attempt_id = ${resultFieldExtents.resultAttemptId}
+          )`,
         ),
       );
     if (!extents.length) {
       // Nothing left to scale (results pruned since the failure): the pending
       // rebalance is moot and nothing references a never-activated row.
-      await db.delete(fieldColorScales).where(eq(fieldColorScales.id, scaleRow.id));
+      await db
+        .delete(fieldColorScales)
+        .where(eq(fieldColorScales.id, candidateScale.id));
       continue;
     }
     const minValue = Math.min(...extents.map((row) => row.vmin));
@@ -1114,7 +2479,13 @@ export async function retryFailedScaleRenders(
     const normalized = normalizeScale(field, minValue, maxValue);
     const evidenceSignature = stableHash(
       extents
-        .map((row) => ({ resultId: row.resultId, field: row.field, min: row.vmin, max: row.vmax, evidenceSha256: row.evidenceSha256 }))
+        .map((row) => ({
+          resultId: row.resultId,
+          field: row.field,
+          min: row.vmin,
+          max: row.vmax,
+          evidenceSha256: row.evidenceSha256,
+        }))
         .sort((a, b) => a.resultId.localeCompare(b.resultId)),
     );
     const [active] = await db
@@ -1122,17 +2493,48 @@ export async function retryFailedScaleRenders(
       .from(fieldColorScales)
       .where(
         and(
-          eq(fieldColorScales.airfoilId, scaleRow.airfoilId),
-          eq(fieldColorScales.simulationPresetRevisionId, scaleRow.simulationPresetRevisionId),
-          eq(fieldColorScales.field, scaleRow.field),
-          eq(fieldColorScales.renderProfileKey, scaleRow.renderProfileKey),
+          eq(fieldColorScales.airfoilId, candidateScale.airfoilId),
+          eq(
+            fieldColorScales.simulationPresetRevisionId,
+            candidateScale.simulationPresetRevisionId,
+          ),
+          eq(fieldColorScales.field, candidateScale.field),
+          eq(
+            fieldColorScales.renderProfileKey,
+            candidateScale.renderProfileKey,
+          ),
           eq(fieldColorScales.active, true),
         ),
       )
       .limit(1);
-    const targets = await db.select().from(results).where(inArray(results.id, [...new Set(extents.map((row) => row.resultId))]));
+    const targets = await db
+      .select()
+      .from(results)
+      .where(
+        inArray(results.id, [...new Set(extents.map((row) => row.resultId))]),
+      );
+    // Fence the renderer before the first engine call. Two sweepers may have
+    // selected the same failed row, but only one can transition failed →
+    // rebalancing; a stale loser cannot later overwrite the winner's active
+    // scale or failure state.
+    const [scaleRow] = await db
+      .update(fieldColorScales)
+      .set({ status: "rebalancing" })
+      .where(
+        and(
+          eq(fieldColorScales.id, candidateScale.id),
+          eq(fieldColorScales.status, "failed"),
+          lt(fieldColorScales.renderAttempts, maxAttempts),
+        ),
+      )
+      .returning();
+    if (!scaleRow) continue;
     try {
-      if (active && nearlyEqual(active.vmin, normalized.vmin) && nearlyEqual(active.vmax, normalized.vmax)) {
+      if (
+        active &&
+        nearlyEqual(active.vmin, normalized.vmin) &&
+        nearlyEqual(active.vmax, normalized.vmax)
+      ) {
         // Extents drifted back to the ACTIVE scale since the failure: the
         // pending rebalance is moot — heal media at the active scale and
         // retire the never-activated failed row.
@@ -1141,35 +2543,65 @@ export async function retryFailedScaleRenders(
           engine,
           resultRows: targets,
           field,
-          scale: { id: active.id, version: active.version, vmin: active.vmin, vmax: active.vmax, policy: active.scalePolicy },
+          scale: {
+            id: active.id,
+            version: active.version,
+            vmin: active.vmin,
+            vmax: active.vmax,
+            policy: active.scalePolicy,
+          },
           airfoilPoints,
           heartbeat,
         });
-        mediaCount += await registerRenderedMediaSet(db, engine, rendered, {
-          id: active.id,
-          version: active.version,
-          vmin: active.vmin,
-          vmax: active.vmax,
-          policy: active.scalePolicy,
-        });
-        await db.delete(fieldColorScales).where(eq(fieldColorScales.id, scaleRow.id));
+        const registered = await registerRenderedMediaSet(
+          db,
+          engine,
+          rendered,
+          {
+            id: active.id,
+            version: active.version,
+            vmin: active.vmin,
+            vmax: active.vmax,
+            policy: active.scalePolicy,
+          },
+        );
+        mediaCount += registered;
+        if (registered > 0) {
+          rememberRendered(scaleRow, rendered);
+        }
+        await db
+          .delete(fieldColorScales)
+          .where(eq(fieldColorScales.id, scaleRow.id));
         continue;
       }
       // Re-run the rebalance on the SAME version row with fresh values (no
       // version churn per retry — the version was already allocated).
       await db
         .update(fieldColorScales)
-        .set({ status: "rebalancing", scalePolicy: normalized.policy, vmin: normalized.vmin, vmax: normalized.vmax, evidenceSignature })
+        .set({
+          status: "rebalancing",
+          scalePolicy: normalized.policy,
+          vmin: normalized.vmin,
+          vmax: normalized.vmax,
+          evidenceSignature,
+        })
         .where(eq(fieldColorScales.id, scaleRow.id));
       const rendered = await renderScaledMediaRows({
         db,
         engine,
         resultRows: targets,
         field,
-        scale: { id: scaleRow.id, version: scaleRow.version, vmin: normalized.vmin, vmax: normalized.vmax, policy: normalized.policy },
+        scale: {
+          id: scaleRow.id,
+          version: scaleRow.version,
+          vmin: normalized.vmin,
+          vmax: normalized.vmax,
+          policy: normalized.policy,
+        },
         airfoilPoints,
         heartbeat,
       });
+      let registered = 0;
       await db.transaction(async (tx) => {
         await tx
           .update(fieldColorScales)
@@ -1177,7 +2609,10 @@ export async function retryFailedScaleRenders(
           .where(
             and(
               eq(fieldColorScales.airfoilId, scaleRow.airfoilId),
-              eq(fieldColorScales.simulationPresetRevisionId, scaleRow.simulationPresetRevisionId),
+              eq(
+                fieldColorScales.simulationPresetRevisionId,
+                scaleRow.simulationPresetRevisionId,
+              ),
               eq(fieldColorScales.field, scaleRow.field),
               eq(fieldColorScales.renderProfileKey, scaleRow.renderProfileKey),
               eq(fieldColorScales.active, true),
@@ -1185,37 +2620,1032 @@ export async function retryFailedScaleRenders(
           );
         await tx
           .update(fieldColorScales)
-          .set({ active: true, status: "active", activatedAt: new Date(), failureReason: null })
+          .set({
+            active: true,
+            status: "active",
+            activatedAt: new Date(),
+            failureReason: null,
+          })
           .where(eq(fieldColorScales.id, scaleRow.id));
-        mediaCount += await registerRenderedMediaSet(tx as unknown as DB, engine, rendered, {
-          id: scaleRow.id,
-          version: scaleRow.version,
-          vmin: normalized.vmin,
-          vmax: normalized.vmax,
-          policy: normalized.policy,
-        });
+        registered = await registerRenderedMediaSet(
+          tx as unknown as DB,
+          engine,
+          rendered,
+          {
+            id: scaleRow.id,
+            version: scaleRow.version,
+            vmin: normalized.vmin,
+            vmax: normalized.vmax,
+            policy: normalized.policy,
+          },
+        );
       });
+      mediaCount += registered;
+      if (registered > 0) {
+        rememberRendered(scaleRow, rendered);
+      }
       console.log(
         `[sweeper] scaled-media retry RECOVERED (airfoil ${scaleRow.airfoilId}, revision ${scaleRow.simulationPresetRevisionId}, field ${scaleRow.field}, scale v${scaleRow.version}, attempt ${scaleRow.renderAttempts + 1})`,
       );
     } catch (error) {
-      const reason = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+      const reason =
+        error instanceof Error
+          ? error.message.slice(0, 500)
+          : String(error).slice(0, 500);
       const attempt = scaleRow.renderAttempts + 1;
       console.error(
         `[sweeper] scaled-media retry FAILED (airfoil ${scaleRow.airfoilId}, revision ${scaleRow.simulationPresetRevisionId}, field ${scaleRow.field}, scale v${scaleRow.version}, attempt ${attempt}/${maxAttempts}${attempt >= maxAttempts ? " — EXHAUSTED, no further retries" : ""}): ${reason}`,
       );
       await db
         .update(fieldColorScales)
-        .set({ status: "failed", failureReason: reason, renderAttempts: sql`${fieldColorScales.renderAttempts} + 1` })
+        .set({
+          status: "failed",
+          failureReason: reason,
+          renderAttempts: sql`${fieldColorScales.renderAttempts} + 1`,
+        })
         .where(eq(fieldColorScales.id, scaleRow.id));
     }
   }
-  return mediaCount;
+  for (const scope of refreshedScopes.values()) {
+    await refreshPolarCacheForRevision(db, scope.airfoilId, scope.revisionId);
+    if (!scope.resultIds.size) continue;
+    const campaignOwners = (await db.execute(sql`
+      SELECT DISTINCT p.campaign_id, campaign.status
+      FROM sim_campaign_points p
+      JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
+      WHERE p.result_id = ANY(${sql`ARRAY[${sql.join(
+        [...scope.resultIds].map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`})
+      ORDER BY p.campaign_id
+    `)) as unknown as Array<{ campaign_id: string; status: string }>;
+    const liveOwner = campaignOwners.find(
+      (row) => row.status === "active" || row.status === "attention",
+    );
+    if (liveOwner || campaignOwners.length === 0) {
+      await enqueuePrecalcVerifications(db, {
+        airfoilId: scope.airfoilId,
+        revisionId: scope.revisionId,
+        campaignId: liveOwner?.campaign_id ?? null,
+      });
+    }
+    const repairedResults = await db
+      .select({
+        id: results.id,
+        aoaDeg: results.aoaDeg,
+        status: results.status,
+        regime: results.regime,
+      })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, scope.airfoilId),
+          eq(results.simulationPresetRevisionId, scope.revisionId),
+          inArray(results.id, [...scope.resultIds]),
+        ),
+      );
+    for (const result of repairedResults) {
+      if (result.status !== "done" && result.status !== "failed") continue;
+      const lanes = await onResultIngested(db, {
+        airfoilId: scope.airfoilId,
+        revisionId: scope.revisionId,
+        aoaDeg: result.aoaDeg,
+        resultId: result.id,
+        status: result.status,
+        regime: result.regime,
+      });
+      for (const lane of lanes) dirtyLanes.set(laneKeyId(lane), lane);
+    }
+  }
+  return { mediaCount, dirtyLanes: [...dirtyLanes.values()] };
 }
 
-/** Ingest a completed JobResult into Postgres. Pure upsert on the natural key, so
- *  re-ingesting a job is a no-op (idempotent). Registers RANS contour images now;
- *  URANS video / force-history slots fill once the Python pipeline emits them. */
+type StagedPoint = {
+  airfoilId: string;
+  bcId: string;
+  presetRevisionId: string | null;
+  resultId: string;
+  resultAttemptId: string;
+  point: PolarPoint;
+  derived: {
+    fidelity: PointFidelity;
+    frameTrack: unknown;
+    steadyHistory: unknown;
+    error: string | null;
+  };
+  reynolds: number;
+  speed: number;
+  chord: number;
+  mach: number | null;
+  simJobId: string;
+  engineJobId: string;
+  ingestLeaseToken: string | null;
+  observedCurrentAttemptId: string | null;
+  observedStatus: string;
+  observedSimJobId: string | null;
+  quarantined: boolean;
+};
+
+type FinalizedPoint = {
+  resultId: string;
+  aoaDeg: number;
+  status: "done" | "failed";
+  regime: "rans" | "urans" | null;
+};
+
+function fidelityRank(value: unknown): number {
+  return value === "urans_full"
+    ? 3
+    : value === "urans_precalc"
+      ? 2
+      : value === "rans"
+        ? 1
+        : 0;
+}
+
+function classificationRank(value: unknown): number {
+  return value === "accepted" ? 2 : value === "needs_urans" ? 1 : 0;
+}
+
+/** Public for the exact-generation precedence regression: classification
+ * improvement always wins (accepted evidence is stronger than provisional),
+ * while equal-state corrections may only move fidelity forward. */
+export function shouldPublishGeneration(input: {
+  hasCurrent: boolean;
+  candidateState: unknown;
+  currentState: unknown;
+  candidateFidelity: unknown;
+  currentFidelity: unknown;
+}): boolean {
+  if (!input.hasCurrent) return classificationRank(input.candidateState) > 0;
+  const candidateState = classificationRank(input.candidateState);
+  const currentState = classificationRank(input.currentState);
+  return (
+    candidateState > currentState ||
+    (candidateState === currentState &&
+      candidateState > 0 &&
+      fidelityRank(input.candidateFidelity) >=
+        fidelityRank(input.currentFidelity))
+  );
+}
+
+function payloadField<T>(
+  payload: unknown,
+  snake: string,
+  camel: string,
+): T | null {
+  if (!payload || typeof payload !== "object") return null;
+  const row = payload as Record<string, unknown>;
+  return (row[snake] ?? row[camel] ?? null) as T | null;
+}
+
+/**
+ * A correction/verification job may legitimately publish over a terminal
+ * generation without first rewriting the canonical result's scheduling
+ * owner. Prove that authority from the durable physical-work ledger; a parent
+ * link or matching display values alone are never sufficient.
+ */
+async function incomingJobPublicationAuthority(
+  db: DB,
+  input: {
+    simJobId: string;
+    engineJobId: string;
+    ingestLeaseToken?: string | null;
+    airfoilId: string;
+    revisionId: string | null;
+    bcId: string;
+    aoaDeg: number;
+  },
+  opts: { lock?: boolean } = {},
+): Promise<{ jobValid: boolean; correctionAuthority: boolean }> {
+  if (!input.revisionId) return { jobValid: false, correctionAuthority: false };
+  const lock = opts.lock ? sql`FOR SHARE OF incoming` : sql``;
+  const [job] = (await db.execute(sql`
+    SELECT incoming.id,
+           incoming.request_payload AS "requestPayload"
+    FROM sim_jobs incoming
+    WHERE incoming.id = ${input.simJobId}
+      AND incoming.airfoil_id = ${input.airfoilId}
+      -- Ordinary jobs own one pinned revision directly. A batched campaign
+      -- job deliberately stores only its min-Re compatibility anchor in the
+      -- scalar column; every other pinned member must prove its exact
+      -- revision + boundary-condition tuple from the persisted conditionMap.
+      AND (
+        incoming.simulation_preset_revision_id = ${input.revisionId}
+        OR incoming.request_payload -> 'conditionMap' @>
+          jsonb_build_array(jsonb_build_object(
+            'revisionId', ${input.revisionId}::text,
+            'bcId', ${input.bcId}::text
+          ))
+      )
+      AND incoming.engine_job_id = ${input.engineJobId}
+      AND (
+        (
+          ${input.ingestLeaseToken ?? null}::text IS NOT NULL
+          AND incoming.status = 'ingesting'
+          AND incoming.ingest_lease_token = ${input.ingestLeaseToken ?? null}
+          AND incoming.ingest_lease_expires_at > now()
+        )
+        OR (
+          ${input.ingestLeaseToken ?? null}::text IS NULL
+          AND incoming.status IN ('submitted', 'running', 'failed')
+        )
+      )
+    LIMIT 1
+    ${lock}
+  `)) as unknown as Array<{
+    id: string;
+    requestPayload: Record<string, unknown> | null;
+  }>;
+  if (!job) return { jobValid: false, correctionAuthority: false };
+
+  const payload = job.requestPayload ?? {};
+  const verifyQueueItemId =
+    typeof payload.verifyQueueItemId === "string"
+      ? payload.verifyQueueItemId
+      : null;
+  if (verifyQueueItemId) {
+    const ownerLock = opts.lock ? sql`FOR SHARE OF verify` : sql``;
+    const rows = (await db.execute(sql`
+      SELECT verify.id
+      FROM sim_urans_verify_queue verify
+      WHERE verify.id::text = ${verifyQueueItemId}
+        AND verify.sim_job_id = ${input.simJobId}
+        AND verify.airfoil_id = ${input.airfoilId}
+        AND verify.revision_id = ${input.revisionId}
+        AND verify.aoa_deg = ${input.aoaDeg}
+        AND verify.state = 'running'
+      LIMIT 1
+      ${ownerLock}
+    `)) as unknown as Array<{ id: string }>;
+    return { jobValid: true, correctionAuthority: rows.length === 1 };
+  }
+
+  const uransRequestId =
+    typeof payload.uransRequestId === "string" ? payload.uransRequestId : null;
+  if (uransRequestId) {
+    const ownerLock = opts.lock ? sql`FOR SHARE OF request` : sql``;
+    const rows = (await db.execute(sql`
+      SELECT request.id
+      FROM sim_urans_requests request
+      WHERE request.id::text = ${uransRequestId}
+        AND request.sim_job_id = ${input.simJobId}
+        AND request.airfoil_id = ${input.airfoilId}
+        AND request.revision_id = ${input.revisionId}
+        AND (request.aoa_deg IS NULL OR request.aoa_deg = ${input.aoaDeg})
+        AND request.state = 'running'
+      LIMIT 1
+      ${ownerLock}
+    `)) as unknown as Array<{ id: string }>;
+    return { jobValid: true, correctionAuthority: rows.length === 1 };
+  }
+
+  const ownerLock = opts.lock ? sql`FOR SHARE OF obligation` : sql``;
+  const rows = (await db.execute(sql`
+    SELECT obligation.id
+    FROM sim_precalc_obligations obligation
+    WHERE obligation.latest_sim_job_id = ${input.simJobId}
+      AND obligation.airfoil_id = ${input.airfoilId}
+      AND obligation.revision_id = ${input.revisionId}
+      AND obligation.aoa_deg = ${input.aoaDeg}
+      AND obligation.state = 'running'
+    ORDER BY obligation.id
+    LIMIT 1
+    ${ownerLock}
+  `)) as unknown as Array<{ id: string }>;
+  return { jobValid: true, correctionAuthority: rows.length === 1 };
+}
+
+/** Create only the scheduling shell needed to keep this in-flight engine cell
+ * non-claimable. Existing canonical/public evidence is never overwritten at
+ * this boundary; all solver fields remain owned by the immutable attempt until
+ * the revision-locked publication transaction below. */
+async function ensureIngestCell(opts: {
+  db: DB;
+  airfoilId: string;
+  bcId: string;
+  presetRevisionId: string | null;
+  aoaDeg: number;
+  simJobId: string;
+  engineJobId: string;
+  ingestLeaseToken?: string | null;
+  reynolds: number;
+  speed: number;
+  chord: number;
+  mach: number | null;
+}): Promise<{
+  id: string;
+  currentAttemptId: string | null;
+  status: string;
+  simJobId: string | null;
+  quarantined: boolean;
+}> {
+  const [created] = await opts.db
+    .insert(results)
+    .values({
+      airfoilId: opts.airfoilId,
+      bcId: opts.bcId,
+      simulationPresetRevisionId: opts.presetRevisionId,
+      aoaDeg: opts.aoaDeg,
+      // Running + job ownership prevents a gap scan from claiming a second
+      // solve while potentially slow evidence/media staging is in progress.
+      status: "running",
+      source: "queued",
+      simJobId: opts.simJobId,
+      reynolds: opts.reynolds,
+      speed: opts.speed,
+      chord: opts.chord,
+      mach: opts.mach,
+      priority: 0,
+    })
+    .onConflictDoNothing({
+      target: [
+        results.airfoilId,
+        results.simulationPresetRevisionId,
+        results.aoaDeg,
+      ],
+    })
+    .returning({
+      id: results.id,
+      currentAttemptId: results.currentResultAttemptId,
+      status: results.status,
+      simJobId: results.simJobId,
+    });
+  const row =
+    created ??
+    (
+      await opts.db
+        .select({
+          id: results.id,
+          currentAttemptId: results.currentResultAttemptId,
+          status: results.status,
+          simJobId: results.simJobId,
+        })
+        .from(results)
+        .where(
+          and(
+            eq(results.airfoilId, opts.airfoilId),
+            opts.presetRevisionId
+              ? eq(results.simulationPresetRevisionId, opts.presetRevisionId)
+              : sql`${results.simulationPresetRevisionId} IS NULL`,
+            eq(results.aoaDeg, opts.aoaDeg),
+          ),
+        )
+        .limit(1)
+    )[0];
+  if (!row)
+    throw new Error(`failed to allocate ingest cell at a=${opts.aoaDeg}`);
+  const differentOwner = row.simJobId !== opts.simJobId;
+  const authorizedCorrection =
+    differentOwner &&
+    (row.status === "done" || row.status === "failed") &&
+    (
+      await incomingJobPublicationAuthority(opts.db, {
+        simJobId: opts.simJobId,
+        engineJobId: opts.engineJobId,
+        ingestLeaseToken: opts.ingestLeaseToken,
+        airfoilId: opts.airfoilId,
+        revisionId: opts.presetRevisionId,
+        bcId: opts.bcId,
+        aoaDeg: opts.aoaDeg,
+      })
+    ).correctionAuthority;
+  return {
+    ...row,
+    // Late output from a job that no longer owns the cell remains exact
+    // history only, even if the prior owner already left it terminal. A real
+    // correction/retry claim must first put the cell under its own simJobId;
+    // terminal status alone is not authority to overwrite selected evidence.
+    quarantined: differentOwner && !authorizedCorrection,
+  };
+}
+
+async function stageForceHistory(
+  db: DB,
+  resultId: string,
+  resultAttemptId: string,
+  p: PolarPoint,
+): Promise<void> {
+  if (!p.force_history) return;
+  const fh = p.force_history;
+  await db
+    .insert(forceHistory)
+    .values({
+      resultId,
+      resultAttemptId,
+      t: fh.t,
+      cl: fh.cl,
+      cd: fh.cd,
+      cm: fh.cm ?? null,
+      clMean: p.cl ?? null,
+      clRms: p.cl_std ?? null,
+      cdMean: p.cd ?? null,
+      cdRms: p.cd_std ?? null,
+      strouhal: p.strouhal ?? null,
+      sheddingFreqHz: fh.shedding_freq_hz ?? null,
+      sampleCount: fh.samples ?? null,
+    })
+    .onConflictDoUpdate({
+      target: forceHistory.resultAttemptId,
+      targetWhere: sql`${forceHistory.resultAttemptId} IS NOT NULL`,
+      set: {
+        t: fh.t,
+        cl: fh.cl,
+        cd: fh.cd,
+        cm: fh.cm ?? null,
+        clMean: p.cl ?? null,
+        clRms: p.cl_std ?? null,
+        cdMean: p.cd ?? null,
+        cdRms: p.cd_std ?? null,
+        strouhal: p.strouhal ?? null,
+        sheddingFreqHz: fh.shedding_freq_hz ?? null,
+        sampleCount: fh.samples ?? null,
+      },
+    });
+}
+
+async function selectedManifestExists(
+  tx: DB,
+  resultId: string,
+  resultAttemptId: string,
+): Promise<boolean> {
+  const rows = (await tx.execute(sql`
+    SELECT count(*)::int AS count,
+           COALESCE(bool_and(
+             sha256 ~ '^[0-9a-fA-F]{64}$'
+             AND byte_size > 0
+             AND length(trim(storage_key)) > 0
+             AND length(trim(mime_type)) > 0
+           ), false) AS valid
+    FROM solver_evidence_artifacts
+    WHERE result_id = ${resultId}
+      AND result_attempt_id = ${resultAttemptId}
+      AND kind = 'manifest'
+  `)) as unknown as Array<{ count: number; valid: boolean }>;
+  return rows[0]?.count === 1 && rows[0].valid === true;
+}
+
+async function currentTerminalState(
+  tx: DB,
+  resultId: string,
+): Promise<FinalizedPoint | null> {
+  const [row] = await tx
+    .select({
+      resultId: results.id,
+      aoaDeg: results.aoaDeg,
+      status: results.status,
+      regime: results.regime,
+    })
+    .from(results)
+    .where(eq(results.id, resultId))
+    .limit(1);
+  return row && (row.status === "done" || row.status === "failed")
+    ? (row as FinalizedPoint)
+    : null;
+}
+
+/** Select one staged exact generation under the same revision lock and SQL
+ * transaction that rebuilds the canonical classification and fitted polar.
+ * The observed pointer + scheduling owner form the CAS: a stale writer may
+ * remain history but cannot publish over a newer generation or re-claimed
+ * cell. */
+async function publishStagedPoints(
+  db: DB,
+  airfoilId: string,
+  revisionId: string,
+  candidates: StagedPoint[],
+): Promise<FinalizedPoint[]> {
+  const finalized = new Map<string, FinalizedPoint>();
+  await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
+    afterAttemptClassifications: async (tx) => {
+      for (const candidate of [...candidates].sort((a, b) =>
+        a.resultId.localeCompare(b.resultId),
+      )) {
+        if (candidate.quarantined) continue;
+        // Global writer order is job -> physical ledger -> result. Holding
+        // SHARE locks through the pointer update makes lease recovery,
+        // cancellation, and owner replacement serialize with publication.
+        const authority = await incomingJobPublicationAuthority(
+          tx,
+          {
+            simJobId: candidate.simJobId,
+            engineJobId: candidate.engineJobId,
+            ingestLeaseToken: candidate.ingestLeaseToken,
+            airfoilId: candidate.airfoilId,
+            revisionId: candidate.presetRevisionId,
+            bcId: candidate.bcId,
+            aoaDeg: candidate.point.aoa_deg,
+          },
+          { lock: true },
+        );
+        if (!authority.jobValid) {
+          console.error(
+            "[sweeper] RELEASED-CELL GUARD: publication lease/engine authority expired " +
+              `(sim_job ${candidate.simJobId}, engine ${candidate.engineJobId}, ` +
+              `aoa ${candidate.point.aoa_deg}, result ${candidate.resultId}); exact attempt retained as history only`,
+          );
+          continue;
+        }
+        const [cell] = await tx
+          .select({
+            id: results.id,
+            currentAttemptId: results.currentResultAttemptId,
+            status: results.status,
+            simJobId: results.simJobId,
+          })
+          .from(results)
+          .where(eq(results.id, candidate.resultId))
+          .for("update")
+          .limit(1);
+        if (!cell) continue;
+        const casMatches =
+          cell.currentAttemptId === candidate.observedCurrentAttemptId &&
+          cell.status === candidate.observedStatus &&
+          cell.simJobId === candidate.observedSimJobId;
+        if (!casMatches) {
+          const terminal = await currentTerminalState(tx, candidate.resultId);
+          if (terminal) finalized.set(terminal.resultId, terminal);
+          continue;
+        }
+        const ownsCurrentCell =
+          cell.simJobId === candidate.simJobId ||
+          ((cell.status === "done" || cell.status === "failed") &&
+            authority.correctionAuthority);
+        if (!ownsCurrentCell) {
+          console.error(
+            `[sweeper] RELEASED-CELL GUARD: publication authority expired (sim_job ${candidate.simJobId}, case ${candidate.point.case_slug ?? "?"}, aoa ${candidate.point.aoa_deg}, result ${candidate.resultId}); exact attempt retained as history only`,
+          );
+          continue;
+        }
+
+        const [candidateAttempt] = await tx
+          .select()
+          .from(resultAttempts)
+          .where(
+            and(
+              eq(resultAttempts.id, candidate.resultAttemptId),
+              eq(resultAttempts.resultId, candidate.resultId),
+            ),
+          )
+          .limit(1);
+        if (!candidateAttempt) continue;
+        const [candidateClassification] = await tx
+          .select({
+            state: resultClassifications.state,
+            reasons: resultClassifications.reasons,
+          })
+          .from(resultClassifications)
+          .where(
+            eq(
+              resultClassifications.resultAttemptId,
+              candidate.resultAttemptId,
+            ),
+          )
+          .limit(1);
+        const candidateStateRank = classificationRank(
+          candidateClassification?.state,
+        );
+        const candidateFidelity = payloadField<string>(
+          candidateAttempt.evidencePayload,
+          "fidelity",
+          "fidelity",
+        );
+        const hasManifest = await selectedManifestExists(
+          tx,
+          candidate.resultId,
+          candidate.resultAttemptId,
+        );
+        let currentStateRank = 0;
+        let currentFidelityRank = 0;
+        if (cell.currentAttemptId) {
+          const [currentAttempt] = await tx
+            .select({ evidencePayload: resultAttempts.evidencePayload })
+            .from(resultAttempts)
+            .where(
+              and(
+                eq(resultAttempts.id, cell.currentAttemptId),
+                eq(resultAttempts.resultId, candidate.resultId),
+              ),
+            )
+            .limit(1);
+          const [currentClassification] = await tx
+            .select({ state: resultClassifications.state })
+            .from(resultClassifications)
+            .where(
+              eq(resultClassifications.resultAttemptId, cell.currentAttemptId),
+            )
+            .limit(1);
+          currentStateRank = classificationRank(currentClassification?.state);
+          currentFidelityRank = fidelityRank(
+            payloadField<string>(
+              currentAttempt?.evidencePayload,
+              "fidelity",
+              "fidelity",
+            ),
+          );
+        }
+        const eligible = hasManifest && candidateStateRank > 0;
+        const outranksCurrent = shouldPublishGeneration({
+          hasCurrent: Boolean(cell.currentAttemptId),
+          candidateState: candidateClassification?.state,
+          currentState:
+            currentStateRank === 2
+              ? "accepted"
+              : currentStateRank === 1
+                ? "needs_urans"
+                : null,
+          candidateFidelity,
+          currentFidelity:
+            currentFidelityRank === 3
+              ? "urans_full"
+              : currentFidelityRank === 2
+                ? "urans_precalc"
+                : currentFidelityRank === 1
+                  ? "rans"
+                  : null,
+        });
+
+        if (eligible && outranksCurrent) {
+          const payload = candidateAttempt.evidencePayload;
+          const [published] = await tx
+            .update(results)
+            .set({
+              currentResultAttemptId: candidate.resultAttemptId,
+              bcId: candidate.bcId,
+              status: candidateAttempt.status,
+              source: candidateAttempt.source,
+              regime: candidateAttempt.regime,
+              reynolds: candidate.reynolds,
+              speed: candidate.speed,
+              chord: candidate.chord,
+              mach: candidate.mach,
+              cl: candidateAttempt.cl,
+              cd: candidateAttempt.cd,
+              cm: candidateAttempt.cm,
+              clCd: candidateAttempt.clCd,
+              clStd: candidateAttempt.clStd,
+              cdStd: candidateAttempt.cdStd,
+              cmStd: candidateAttempt.cmStd,
+              stalled: candidateAttempt.stalled,
+              unsteady: candidateAttempt.unsteady,
+              converged: candidateAttempt.converged,
+              finalResidual: candidateAttempt.finalResidual,
+              iterations: candidateAttempt.iterations,
+              yPlusAvg: candidateAttempt.yPlusAvg,
+              yPlusMax: candidateAttempt.yPlusMax,
+              nCells: candidateAttempt.nCells,
+              firstOrderFallback: candidateAttempt.firstOrderFallback,
+              strouhal: candidateAttempt.strouhal,
+              error: candidateAttempt.error,
+              qualityWarnings: candidateAttempt.qualityWarnings,
+              frameTrack: payloadField(payload, "frame_track", "frameTrack"),
+              fidelity: candidateFidelity,
+              steadyHistory: payloadField(
+                payload,
+                "steady_history",
+                "steadyHistory",
+              ),
+              engineJobId: candidateAttempt.engineJobId,
+              engineCaseSlug: candidateAttempt.engineCaseSlug,
+              simJobId: candidateAttempt.simJobId,
+              solvedAt: candidateAttempt.solvedAt,
+              priority: 0,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(results.id, candidate.resultId),
+                sql`${results.currentResultAttemptId} IS NOT DISTINCT FROM ${candidate.observedCurrentAttemptId}::uuid`,
+                eq(results.status, candidate.observedStatus as never),
+                sql`${results.simJobId} IS NOT DISTINCT FROM ${candidate.observedSimJobId}::uuid`,
+              ),
+            )
+            .returning({
+              resultId: results.id,
+              aoaDeg: results.aoaDeg,
+              status: results.status,
+              regime: results.regime,
+            });
+          if (published && published.status === "done") {
+            finalized.set(published.resultId, published as FinalizedPoint);
+          }
+          continue;
+        }
+
+        if (!cell.currentAttemptId) {
+          const reasons = candidateClassification?.reasons ?? [];
+          const reason = hasManifest
+            ? reasons.length
+              ? `solver evidence rejected: ${reasons.join(", ")}`
+              : "solver evidence rejected by the polar classifier"
+            : "solver evidence unavailable: exact manifest is missing or ambiguous";
+          const [failedProjection] = await tx
+            .update(results)
+            .set({
+              status: "failed",
+              source: "queued",
+              regime: candidateAttempt.regime,
+              reynolds: candidate.reynolds,
+              speed: candidate.speed,
+              chord: candidate.chord,
+              mach: candidate.mach,
+              cl: candidateAttempt.cl,
+              cd: candidateAttempt.cd,
+              cm: candidateAttempt.cm,
+              clCd: candidateAttempt.clCd,
+              clStd: candidateAttempt.clStd,
+              cdStd: candidateAttempt.cdStd,
+              cmStd: candidateAttempt.cmStd,
+              stalled: candidateAttempt.stalled,
+              unsteady: candidateAttempt.unsteady,
+              converged: candidateAttempt.converged,
+              finalResidual: candidateAttempt.finalResidual,
+              iterations: candidateAttempt.iterations,
+              yPlusAvg: candidateAttempt.yPlusAvg,
+              yPlusMax: candidateAttempt.yPlusMax,
+              nCells: candidateAttempt.nCells,
+              firstOrderFallback: candidateAttempt.firstOrderFallback,
+              strouhal: candidateAttempt.strouhal,
+              error:
+                candidate.derived.error ?? candidateAttempt.error ?? reason,
+              qualityWarnings: candidateAttempt.qualityWarnings,
+              frameTrack: payloadField(
+                candidateAttempt.evidencePayload,
+                "frame_track",
+                "frameTrack",
+              ),
+              fidelity: candidateFidelity,
+              steadyHistory: payloadField(
+                candidateAttempt.evidencePayload,
+                "steady_history",
+                "steadyHistory",
+              ),
+              engineJobId: candidateAttempt.engineJobId,
+              engineCaseSlug: candidateAttempt.engineCaseSlug,
+              simJobId: candidateAttempt.simJobId,
+              solvedAt: candidateAttempt.solvedAt,
+              priority: 0,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(results.id, candidate.resultId),
+                sql`${results.currentResultAttemptId} IS NULL`,
+                eq(results.status, candidate.observedStatus as never),
+                sql`${results.simJobId} IS NOT DISTINCT FROM ${candidate.observedSimJobId}::uuid`,
+              ),
+            )
+            .returning({
+              resultId: results.id,
+              aoaDeg: results.aoaDeg,
+              status: results.status,
+              regime: results.regime,
+            });
+          if (failedProjection) {
+            finalized.set(
+              failedProjection.resultId,
+              failedProjection as FinalizedPoint,
+            );
+          }
+          continue;
+        }
+
+        // A rejected/lower-fidelity child settles against the kept selected
+        // generation, never against the incoming failed attempt.
+        console.error(
+          `[sweeper] REPLACE GUARD: exact attempt ${candidate.resultAttemptId} was not publishable (${candidateClassification?.state ?? "unclassified"}${candidateClassification?.reasons?.length ? `: ${candidateClassification.reasons.join(", ")}` : ""}); kept selected generation ${cell.currentAttemptId} on result ${candidate.resultId}`,
+        );
+        let terminal = await currentTerminalState(tx, candidate.resultId);
+        if (!terminal && cell.currentAttemptId) {
+          const [selectedAttempt] = await tx
+            .select()
+            .from(resultAttempts)
+            .where(
+              and(
+                eq(resultAttempts.id, cell.currentAttemptId),
+                eq(resultAttempts.resultId, candidate.resultId),
+              ),
+            )
+            .limit(1);
+          if (selectedAttempt) {
+            const payload = selectedAttempt.evidencePayload;
+            const [restored] = await tx
+              .update(results)
+              .set({
+                status: selectedAttempt.status,
+                source: selectedAttempt.source,
+                regime: selectedAttempt.regime,
+                cl: selectedAttempt.cl,
+                cd: selectedAttempt.cd,
+                cm: selectedAttempt.cm,
+                clCd: selectedAttempt.clCd,
+                clStd: selectedAttempt.clStd,
+                cdStd: selectedAttempt.cdStd,
+                cmStd: selectedAttempt.cmStd,
+                stalled: selectedAttempt.stalled,
+                unsteady: selectedAttempt.unsteady,
+                converged: selectedAttempt.converged,
+                finalResidual: selectedAttempt.finalResidual,
+                iterations: selectedAttempt.iterations,
+                yPlusAvg: selectedAttempt.yPlusAvg,
+                yPlusMax: selectedAttempt.yPlusMax,
+                nCells: selectedAttempt.nCells,
+                firstOrderFallback: selectedAttempt.firstOrderFallback,
+                strouhal: selectedAttempt.strouhal,
+                error: selectedAttempt.error,
+                qualityWarnings: selectedAttempt.qualityWarnings,
+                frameTrack: payloadField(payload, "frame_track", "frameTrack"),
+                fidelity: payloadField(payload, "fidelity", "fidelity"),
+                steadyHistory: payloadField(
+                  payload,
+                  "steady_history",
+                  "steadyHistory",
+                ),
+                engineJobId: selectedAttempt.engineJobId,
+                engineCaseSlug: selectedAttempt.engineCaseSlug,
+                simJobId: selectedAttempt.simJobId,
+                solvedAt: selectedAttempt.solvedAt,
+                priority: 0,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(results.id, candidate.resultId),
+                  eq(results.currentResultAttemptId, cell.currentAttemptId),
+                  eq(results.status, candidate.observedStatus as never),
+                  sql`${results.simJobId} IS NOT DISTINCT FROM ${candidate.observedSimJobId}::uuid`,
+                ),
+              )
+              .returning({
+                resultId: results.id,
+                aoaDeg: results.aoaDeg,
+                status: results.status,
+                regime: results.regime,
+              });
+            if (restored && restored.status === "done") {
+              terminal = restored as FinalizedPoint;
+            }
+          }
+        }
+        if (terminal) finalized.set(terminal.resultId, terminal);
+      }
+    },
+  });
+  return [...finalized.values()];
+}
+
+/** Publish an exact media-repair owner only after its repaired attempt has
+ * reclassified accepted/provisional inside the revision-locked cache refresh.
+ * A concurrent different current generation always wins; media repair is
+ * presentation recovery, not authority to replace newer solver truth. */
+export async function publishRepairedResultAttempt(opts: {
+  db: DB;
+  resultId: string;
+  resultAttemptId: string;
+  repairId: string;
+  evidenceSignature: string;
+}): Promise<boolean> {
+  const [scope] = await opts.db
+    .select({
+      airfoilId: results.airfoilId,
+      revisionId: results.simulationPresetRevisionId,
+    })
+    .from(results)
+    .where(eq(results.id, opts.resultId))
+    .limit(1);
+  if (!scope?.revisionId) return false;
+
+  let published = false;
+  await refreshPolarCacheForRevision(
+    opts.db,
+    scope.airfoilId,
+    scope.revisionId,
+    {
+      afterAttemptClassifications: async (tx) => {
+        const [cell] = await tx
+          .select({
+            currentAttemptId: results.currentResultAttemptId,
+            status: results.status,
+          })
+          .from(results)
+          .where(eq(results.id, opts.resultId))
+          .for("update")
+          .limit(1);
+        if (
+          !cell ||
+          ["pending", "queued", "running", "stale"].includes(cell.status) ||
+          (cell.currentAttemptId !== null &&
+            cell.currentAttemptId !== opts.resultAttemptId)
+        ) {
+          return;
+        }
+        const [repair] = await tx
+          .select({
+            resultAttemptId: resultMediaRepairs.resultAttemptId,
+            state: resultMediaRepairs.state,
+            evidenceSignature: resultMediaRepairs.evidenceSignature,
+          })
+          .from(resultMediaRepairs)
+          .where(eq(resultMediaRepairs.id, opts.repairId))
+          .for("update")
+          .limit(1);
+        if (
+          !repair ||
+          repair.resultAttemptId !== opts.resultAttemptId ||
+          repair.state !== "done" ||
+          repair.evidenceSignature !== opts.evidenceSignature
+        ) {
+          return;
+        }
+        const [attempt] = await tx
+          .select()
+          .from(resultAttempts)
+          .where(
+            and(
+              eq(resultAttempts.id, opts.resultAttemptId),
+              eq(resultAttempts.resultId, opts.resultId),
+            ),
+          )
+          .limit(1);
+        const [classification] = await tx
+          .select({ state: resultClassifications.state })
+          .from(resultClassifications)
+          .where(
+            eq(resultClassifications.resultAttemptId, opts.resultAttemptId),
+          )
+          .limit(1);
+        const manifest = await manifestForAttempt(
+          tx,
+          opts.resultId,
+          opts.resultAttemptId,
+        );
+        if (
+          !attempt ||
+          !manifest ||
+          !["accepted", "needs_urans"].includes(classification?.state ?? "") ||
+          `${attempt.engineJobId ?? ""}:${attempt.engineCaseSlug ?? ""}:${manifest.sha256}` !==
+            opts.evidenceSignature
+        ) {
+          return;
+        }
+        const payload = attempt.evidencePayload;
+        const [updated] = await tx
+          .update(results)
+          .set({
+            currentResultAttemptId: attempt.id,
+            bcId: attempt.bcId,
+            status: attempt.status,
+            source: attempt.source,
+            regime: attempt.regime,
+            cl: attempt.cl,
+            cd: attempt.cd,
+            cm: attempt.cm,
+            clCd: attempt.clCd,
+            clStd: attempt.clStd,
+            cdStd: attempt.cdStd,
+            cmStd: attempt.cmStd,
+            stalled: attempt.stalled,
+            unsteady: attempt.unsteady,
+            converged: attempt.converged,
+            finalResidual: attempt.finalResidual,
+            iterations: attempt.iterations,
+            yPlusAvg: attempt.yPlusAvg,
+            yPlusMax: attempt.yPlusMax,
+            nCells: attempt.nCells,
+            firstOrderFallback: attempt.firstOrderFallback,
+            strouhal: attempt.strouhal,
+            error: attempt.error,
+            qualityWarnings: attempt.qualityWarnings,
+            frameTrack: payloadField(payload, "frame_track", "frameTrack"),
+            fidelity: payloadField(payload, "fidelity", "fidelity"),
+            steadyHistory: payloadField(
+              payload,
+              "steady_history",
+              "steadyHistory",
+            ),
+            engineJobId: attempt.engineJobId,
+            engineCaseSlug: attempt.engineCaseSlug,
+            simJobId: attempt.simJobId,
+            solvedAt: attempt.solvedAt,
+            priority: 0,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(results.id, opts.resultId),
+              sql`${results.currentResultAttemptId} IS NOT DISTINCT FROM ${cell.currentAttemptId}::uuid`,
+            ),
+          )
+          .returning({ id: results.id });
+        published = Boolean(updated);
+      },
+    },
+  );
+  return published;
+}
+
+/** Ingest a completed JobResult through immutable attempt staging followed by
+ * revision-locked exact-generation publication. */
 export async function ingestResult(opts: {
   db: DB;
   engine: EngineClient;
@@ -1237,14 +3667,37 @@ export async function ingestResult(opts: {
    *  failures endpoint errorClass 'unknown'). Only the failed-job ingest path
    *  passes this; results.error must never be empty for a failed row. */
   failedPointErrorFallback?: string;
+  /** Durable ingest-lease owner. Production callers always provide this;
+   * direct unit fixtures may omit it only while their sim_job is not in the
+   * ingesting state. A live ingesting writer without the exact token cannot
+   * publish a pointer. */
+  ingestLeaseToken?: string;
   /** Heartbeat hook, called per point / per scaled-render batch so a
    *  multi-minute ingest never lets sweeper_state.heartbeatAt go stale past
    *  the web's 90 s truth gate (2026-07-06: 204 s stale under 7 jobs in
    *  flight read as PROCESS NOT RUNNING on a healthy process). Defaults to
    *  the real touchHeartbeat; tests inject a spy to count touches. */
   heartbeat?: () => Promise<void>;
-}): Promise<{ points: number; media: number; attempts: number; dirtyLanes: CampaignLaneKey[] }> {
-  const { db, engine, engineJobId, simJobId, airfoilId, speedMap, conditionMap, result } = opts;
+  /** Deterministic crash-boundary hook used by the exact-generation replay
+   * regression. It runs after every immutable evidence row is committed but
+   * before classification/pointer publication. */
+  hooks?: { afterEvidenceStaged?: () => Promise<void> };
+}): Promise<{
+  points: number;
+  media: number;
+  attempts: number;
+  dirtyLanes: CampaignLaneKey[];
+}> {
+  const {
+    db,
+    engine,
+    engineJobId,
+    simJobId,
+    airfoilId,
+    speedMap,
+    conditionMap,
+    result,
+  } = opts;
   const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(db));
   let points = 0;
   let media = 0;
@@ -1257,6 +3710,139 @@ export async function ingestResult(opts: {
   const airfoilPoints = await airfoilContourPoints(db, airfoilId);
   const scaleGroups = new Map<ScaleGroupKey, ScaleGroup>();
   const dirtyLanes = new Map<string, CampaignLaneKey>();
+  const candidatesByRevision = new Map<string, StagedPoint[]>();
+  const legacyCandidates: StagedPoint[] = [];
+
+  const stagePoint = async (input: {
+    point: PolarPoint;
+    bcId: string;
+    presetRevisionId: string | null;
+    mappedMach: number | null;
+    reynolds: number;
+    speed: number;
+    chord: number;
+  }): Promise<StagedPoint> => {
+    const p = input.point;
+    const failed = failedForPoint(p);
+    const pointError = p.error?.trim()
+      ? p.error
+      : failed || (p.converged === false && !hasStableSteadyMean(p))
+        ? (opts.failedPointErrorFallback ?? null)
+        : null;
+    const pointContext = `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`;
+    const derived = {
+      frameTrack: frameTrackForPoint(p, pointContext),
+      fidelity: fidelityForPoint(p, opts.uransFidelity, pointContext),
+      steadyHistory: steadyHistoryForPoint(p, pointContext),
+      error: pointError,
+    };
+    const cell = await ensureIngestCell({
+      db,
+      airfoilId,
+      bcId: input.bcId,
+      presetRevisionId: input.presetRevisionId,
+      aoaDeg: p.aoa_deg,
+      simJobId,
+      engineJobId,
+      ingestLeaseToken: opts.ingestLeaseToken,
+      reynolds: Math.round(input.reynolds),
+      speed: input.speed,
+      chord: input.chord,
+      mach: p.unsteady ? (input.mappedMach ?? null) : input.mappedMach,
+    });
+    const incomingReasons = incomingRejectionReasons(p, derived);
+    const extraQualityWarnings: string[] = [];
+    if (cell.quarantined) {
+      console.error(
+        `[sweeper] RELEASED-CELL GUARD: ${RELEASED_CELL_MARKER} (${pointContext}); cell was ${cell.status}${cell.simJobId ? ` under ${cell.simJobId}` : " (released)"}; exact attempt retained as history only`,
+      );
+      extraQualityWarnings.push(
+        `${RELEASED_CELL_MARKER}: cell was ${cell.status}${cell.simJobId ? " under another job" : " (released)"} at ingest; canonical row not changed`,
+      );
+    } else if (cell.currentAttemptId && incomingReasons.length) {
+      extraQualityWarnings.push(
+        `${REPLACE_GUARD_MARKER}: ${incomingReasons.join(", ")}; selected generation retained unless exact classification accepts this attempt`,
+      );
+    }
+    const resultAttemptId = await insertResultAttempt({
+      db,
+      resultId: cell.id,
+      airfoilId,
+      bcId: input.bcId,
+      presetRevisionId: input.presetRevisionId,
+      simJobId,
+      engineJobId,
+      point: p,
+      derived,
+      extraQualityWarnings,
+    });
+    if (!resultAttemptId) {
+      throw new Error(`failed to stage exact attempt (${pointContext})`);
+    }
+
+    // Exact immutable evidence is complete before any canonical projection or
+    // current pointer can change. Every row carries both owner ids, enforced
+    // by the 0053 composite foreign keys.
+    for (const artifact of p.evidence_artifacts ?? []) {
+      await registerEvidenceArtifacts({
+        db,
+        engine,
+        resultId: cell.id,
+        resultAttemptId,
+        airfoilId,
+        simJobId,
+        engineJobId,
+        point: p,
+        artifact,
+      });
+    }
+    if (!failed) {
+      media += await registerShippedMedia(
+        db,
+        engine,
+        cell.id,
+        resultAttemptId,
+        p,
+      );
+    }
+    await stageForceHistory(db, cell.id, resultAttemptId, p);
+    if (airfoilPoints) {
+      await computeAndStoreFieldExtents({
+        db,
+        engine,
+        engineJobId,
+        airfoilId,
+        presetRevisionId: input.presetRevisionId,
+        resultId: cell.id,
+        resultAttemptId,
+        point: p,
+        speed: input.speed,
+        chord: input.chord,
+        airfoilPoints,
+        groups: scaleGroups,
+      });
+    }
+    return {
+      airfoilId,
+      bcId: input.bcId,
+      presetRevisionId: input.presetRevisionId,
+      resultId: cell.id,
+      resultAttemptId,
+      point: p,
+      derived,
+      reynolds: Math.round(input.reynolds),
+      speed: input.speed,
+      chord: input.chord,
+      mach: input.mappedMach,
+      simJobId,
+      engineJobId,
+      ingestLeaseToken: opts.ingestLeaseToken ?? null,
+      observedCurrentAttemptId: cell.currentAttemptId,
+      observedStatus: cell.status,
+      observedSimJobId: cell.simJobId,
+      quarantined: cell.quarantined,
+    };
+  };
 
   for (const polar of result.polars) {
     let bcId: string;
@@ -1274,341 +3860,137 @@ export async function ingestResult(opts: {
       }
       bcId = entry.bcId;
       presetRevisionId = entry.revisionId;
-      mappedMach = speedMap.find((s) => canonicalSi("speedMps", s.speed) === entry.speed)?.mach ?? null;
+      mappedMach =
+        speedMap.find((s) => canonicalSi("speedMps", s.speed) === entry.speed)
+          ?.mach ?? null;
     } else {
       if (speedMap.length === 0) continue;
       const match = speedMap.reduce((best, s) =>
-        Math.abs(s.speed - polar.speed) < Math.abs(best.speed - polar.speed) ? s : best,
+        Math.abs(s.speed - polar.speed) < Math.abs(best.speed - polar.speed)
+          ? s
+          : best,
       );
       bcId = match.bcId;
       presetRevisionId = match.presetRevisionId ?? null;
       mappedMach = match.mach ?? null;
     }
-    const resultIdsByAoa = new Map<number, string>();
-    // AoAs whose canonical row the replace guard KEPT in this polar: the
-    // engine's warm-start march ships every point ALSO in polars[].attempts
-    // (same evidence_artifacts, same storageKey+sha256), and the artifact
-    // upsert's conflict SET rewrites resultId — without this set, the
-    // attempts loop below would re-attach the rejected shipment's manifest
-    // to the kept row, undoing the guard's resultId:null isolation.
-    const guardedAoas = new Set<number>();
-
+    const canonicalAoas = new Set(polar.points.map((point) => point.aoa_deg));
+    const pointCandidates: StagedPoint[] = [];
     for (const p of polar.points) {
-      // Invariant: no ingest code path may run >30 s without a heartbeat
-      // touch. Each point below does result/attempt/evidence upserts plus a
-      // computeFieldExtents engine round-trip — a many-point ingest is the
-      // prime multi-minute stretch that starved the heartbeat on 2026-07-06.
       await heartbeat();
-      const stalled = stalledForPoint(p);
-      const failed = failedForPoint(p);
-      // A failed row must carry WHY it failed: the point's own error when the
-      // solver produced one, else the job-level failure message (see
-      // failedPointErrorFallback above). Never NULL/empty on a failed row.
-      const pointError = p.error?.trim() ? p.error : failed ? (opts.failedPointErrorFallback ?? null) : null;
-      const pointContext = `job ${engineJobId}, case ${p.case_slug ?? "?"}, aoa ${p.aoa_deg}`;
-      // Evidence derivations shared by the results row AND the replace-guard
-      // pre-classification — derived ONCE so both see identical values.
-      const derived = {
-        frameTrack: frameTrackForPoint(p, pointContext),
-        fidelity: fidelityForPoint(p, opts.uransFidelity, pointContext),
-        steadyHistory: steadyHistoryForPoint(p, pointContext),
-        error: pointError,
-      };
-
-      // REPLACE GUARD (gate incident 2026-07-07): an incoming point that would
-      // fail the classifier's evidence gate must NOT replace a canonical row
-      // holding accepted (or needs_urans) evidence — the attempt + its
-      // evidence artifacts are ingested instead, and the canonical row stays
-      // untouched (verify/request bookkeeping settles in reconcile against
-      // the unchanged row). Advisory pre-classification only: the post-ingest
-      // classifier remains the source of truth for whatever row IS canonical.
-      const guard = await replaceGuardVerdict({ db, airfoilId, presetRevisionId, point: p, derived });
-      if (guard) {
-        const keptLabel = guard.keptFidelity ?? guard.keptRegime ?? "existing";
-        console.error(
-          `[sweeper] REPLACE GUARD: higher-tier ${derived.fidelity} attempt rejected {${guard.reasons.join(", ")}} (${pointContext}) — kept ${keptLabel} ${guard.keptState} evidence on canonical row ${guard.keptResultId}; attempt + evidence artifacts ingested, canonical row NOT replaced`,
-        );
-        resultIdsByAoa.set(p.aoa_deg, guard.keptResultId);
-        guardedAoas.add(p.aoa_deg);
-        const attemptId = await insertResultAttempt({
-          db,
-          resultId: guard.keptResultId,
-          airfoilId,
-          bcId,
-          presetRevisionId,
-          simJobId,
-          engineJobId,
-          point: p,
-          extraQualityWarnings: [`${REPLACE_GUARD_MARKER}: ${guard.reasons.join(", ")}; kept ${keptLabel} ${guard.keptState} evidence`],
-        });
-        attempts++;
-        for (const artifact of p.evidence_artifacts ?? []) {
-          await registerEvidenceArtifacts({
-            db,
-            engine,
-            // resultId stays NULL on purpose: attaching the rejected attempt's
-            // manifest to the kept row would let manifestEvidenceBaseForResult
-            // re-render the ACCEPTED row's media from the rejected attempt's
-            // evidence base. The attempt row owns this evidence.
-            resultId: null,
-            resultAttemptId: attemptId,
-            airfoilId,
-            simJobId,
-            engineJobId,
-            point: p,
-            artifact,
-          });
-        }
-        // Campaign bookkeeping still settles against the KEPT canonical row
-        // (idempotent terminal-link + counters + completion probe) — the cell
-        // HAS accepted evidence; nothing else (media, force history, field
-        // extents) may touch the kept row.
-        const laneKeys = await onResultIngested(db, {
-          airfoilId,
-          revisionId: presetRevisionId,
-          aoaDeg: p.aoa_deg,
-          resultId: guard.keptResultId,
-          status: "done",
-          regime: guard.keptRegime,
-        });
-        for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
-        continue;
-      }
-
-      // RELEASED-CELL GUARD (live gap 2026-07-08, campaign 495d78e0): an
-      // incoming FAILED point must not clobber a canonical row this job no
-      // longer owns. The running-partial auto-retry (amendment B) releases a
-      // crashed cell back to pending MID-JOB; the same job's later partial and
-      // terminal ingests re-ship the very same failed case, and without this
-      // guard the natural-key upsert re-failed the released row — re-claiming
-      // ownership and letting the terminal auto-retry pass falsely ESCALATE
-      // the cell to needs_review (one crash consumed both the retry and the
-      // escalation). Same protection when a NEW job already re-claimed the
-      // cell (queued/running under another sim_job): the failure still lands
-      // as attempt evidence; the canonical row stays with its current owner
-      // (spec §6.3 no-resurrection: late evidence stays evidence). Terminal
-      // rows (done/failed/stale) keep today's upsert semantics, incl. the
-      // replace guard above. Legacy rows without a revision are never guarded
-      // (NULL natural keys), mirroring the replace guard.
-      if (failed && presetRevisionId) {
-        const [owned] = await db
-          .select({ id: results.id, status: results.status, simJobId: results.simJobId })
-          .from(results)
-          .where(
-            and(
-              eq(results.airfoilId, airfoilId),
-              eq(results.simulationPresetRevisionId, presetRevisionId),
-              eq(results.aoaDeg, p.aoa_deg),
-            ),
-          )
-          .limit(1);
-        if (owned && owned.simJobId !== simJobId && ["pending", "queued", "running"].includes(owned.status)) {
-          console.error(
-            `[sweeper] RELEASED-CELL GUARD: failed point NOT re-terminalized — cell is ${owned.status} under ${owned.simJobId ?? "no job"}, not this job (${pointContext}); failure kept as attempt evidence only`,
-          );
-          resultIdsByAoa.set(p.aoa_deg, owned.id);
-          guardedAoas.add(p.aoa_deg);
-          const attemptId = await insertResultAttempt({
-            db,
-            resultId: owned.id,
-            airfoilId,
-            bcId,
-            presetRevisionId,
-            simJobId,
-            engineJobId,
-            point: p,
-            extraQualityWarnings: [
-              `${RELEASED_CELL_MARKER}: cell was ${owned.status}${owned.simJobId ? " under another job" : " (released)"} at ingest; canonical row not re-failed`,
-            ],
-          });
-          attempts++;
-          for (const artifact of p.evidence_artifacts ?? []) {
-            await registerEvidenceArtifacts({
-              db,
-              engine,
-              // resultId stays NULL on purpose (same isolation as the replace
-              // guard): the quarantined shipment's manifest must not become
-              // the cell's newest manifest.
-              resultId: null,
-              resultAttemptId: attemptId,
-              airfoilId,
-              simJobId,
-              engineJobId,
-              point: p,
-              artifact,
-            });
-          }
-          // No onResultIngested signal: the cell is OPEN (pending/claimed) —
-          // its campaign point state and counters were already settled by the
-          // release/claim that severed this job's ownership.
-          continue;
-        }
-      }
-
-      const v: ResultInsert = {
-        airfoilId,
-        bcId,
-        simulationPresetRevisionId: presetRevisionId,
-        aoaDeg: p.aoa_deg,
-        status: failed ? "failed" : "done",
-        source: failed ? "queued" : "solved",
-        regime: p.unsteady ? "urans" : "rans",
-        reynolds: Math.round(polar.reynolds),
-        speed: polar.speed,
-        chord: polar.chord,
-        mach: polar.mach ?? mappedMach,
-        cl: p.cl ?? null,
-        cd: p.cd ?? null,
-        cm: p.cm ?? null,
-        clCd: p.cl_cd ?? null,
-        clStd: p.cl_std ?? null,
-        cdStd: p.cd_std ?? null,
-        cmStd: p.cm_std ?? null,
-        stalled,
-        unsteady: p.unsteady,
-        converged: p.converged,
-        finalResidual: p.final_residual ?? null,
-        iterations: p.iterations ?? null,
-        yPlusAvg: p.y_plus_avg ?? null,
-        yPlusMax: p.y_plus_max ?? null,
-        nCells: p.n_cells ?? null,
-        firstOrderFallback: p.first_order_fallback,
-        strouhal: p.strouhal ?? null,
-        error: pointError,
-        qualityWarnings: qualityWarningsForPoint(p),
-        // URANS frame-track contract payload, verbatim. NULL = steady /
-        // no-shedding / legacy engine — the classifier gates only non-NULL.
-        frameTrack: derived.frameTrack,
-        // Fidelity ladder (contract 1/3): tier the evidence was solved at.
-        fidelity: derived.fidelity,
-        // Oscillating-averaged steady evidence (contract 2), verbatim.
-        steadyHistory: derived.steadyHistory,
-        engineJobId,
-        engineCaseSlug: p.case_slug ?? null,
-        simJobId,
-        solvedAt: new Date(),
-        priority: 0,
-      };
-      const { airfoilId: _a, bcId: _b, simulationPresetRevisionId: _rev, aoaDeg: _c, ...setV } = v;
-      const [row] = await db
-        .insert(results)
-        .values(v)
-        .onConflictDoUpdate({ target: [results.airfoilId, results.simulationPresetRevisionId, results.aoaDeg], set: setV })
-        .returning({ id: results.id });
-      resultIdsByAoa.set(p.aoa_deg, row.id);
-      const attemptId = await insertResultAttempt({ db, resultId: row.id, airfoilId, bcId, presetRevisionId, simJobId, engineJobId, point: p });
-      points++;
-
-      // Campaign ingest hook (spec §7): terminal-link matching campaign points
-      // (incl. derived-by-symmetry cells), bump progress counters, collect
-      // dirty lane keys. Lanes are drained by the caller AFTER the polar fit
-      // cache refresh so laneTick sees the new fit.
-      const laneKeys = await onResultIngested(db, {
-        airfoilId,
-        revisionId: presetRevisionId,
-        aoaDeg: p.aoa_deg,
-        resultId: row.id,
-        status: failed ? "failed" : "done",
-        regime: p.unsteady ? "urans" : "rans",
-      });
-      for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
-
-      if (!failed) {
-        media += await registerShippedMedia(db, engine, row.id, p);
-      }
-
-      for (const artifact of p.evidence_artifacts ?? []) {
-        await registerEvidenceArtifacts({
-          db,
-          engine,
-          resultId: row.id,
-          resultAttemptId: attemptId,
-          airfoilId,
-          simJobId,
-          engineJobId,
-          point: p,
-          artifact,
-        });
-      }
-
-      if (airfoilPoints) {
-        await computeAndStoreFieldExtents({
-          db,
-          engine,
-          engineJobId,
-          airfoilId,
-          presetRevisionId,
-          resultId: row.id,
-          point: p,
-          speed: polar.speed,
-          chord: polar.chord,
-          airfoilPoints,
-          groups: scaleGroups,
-        });
-      }
-
-      if (p.force_history) {
-        const fh = p.force_history;
-        await db
-          .insert(forceHistory)
-          .values({
-            resultId: row.id,
-            t: fh.t,
-            cl: fh.cl,
-            cd: fh.cd,
-            cm: fh.cm ?? null,
-            clMean: p.cl ?? null,
-            clRms: p.cl_std ?? null,
-            cdMean: p.cd ?? null,
-            cdRms: p.cd_std ?? null,
-            strouhal: p.strouhal ?? null,
-            sheddingFreqHz: fh.shedding_freq_hz ?? null,
-            sampleCount: fh.samples ?? null,
-          })
-          .onConflictDoUpdate({
-            target: forceHistory.resultId,
-            set: { t: fh.t, cl: fh.cl, cd: fh.cd, cm: fh.cm ?? null, strouhal: p.strouhal ?? null },
-          });
-      }
-    }
-    for (const p of polar.attempts ?? []) {
-      // Invariant: no ingest code path may run >30 s without a heartbeat
-      // touch — attempt rows carry evidence-artifact registration too.
-      await heartbeat();
-      attempts++;
-      const attemptId = await insertResultAttempt({
-        db,
-        resultId: resultIdsByAoa.get(p.aoa_deg) ?? null,
-        airfoilId,
+      const staged = await stagePoint({
+        point: p,
         bcId,
         presetRevisionId,
-        simJobId,
-        engineJobId,
-        point: p,
+        mappedMach: polar.mach ?? mappedMach,
+        reynolds: polar.reynolds,
+        speed: polar.speed,
+        chord: polar.chord,
       });
-      for (const artifact of p.evidence_artifacts ?? []) {
-        await registerEvidenceArtifacts({
-          db,
-          engine,
-          // Guarded cell: the attempt duplicate of a guard-rejected point (or
-          // any sibling attempt of that shipment) must NOT re-attach its
-          // manifest to the KEPT row — the (storageKey, sha256) conflict SET
-          // would overwrite the guard's deliberate resultId:null and let
-          // manifestEvidenceBaseForResult re-render the accepted row's media
-          // from the rejected shipment's evidence base.
-          resultId: guardedAoas.has(p.aoa_deg) ? null : (resultIdsByAoa.get(p.aoa_deg) ?? null),
-          resultAttemptId: attemptId,
-          airfoilId,
-          simJobId,
-          engineJobId,
-          point: p,
-          artifact,
-        });
+      pointCandidates.push(staged);
+      points++;
+    }
+    const attemptOnlyByAoa = new Map<number, StagedPoint>();
+    for (const p of polar.attempts ?? []) {
+      await heartbeat();
+      attempts++;
+      const staged = await stagePoint({
+        point: p,
+        bcId,
+        presetRevisionId,
+        mappedMach: polar.mach ?? mappedMach,
+        reynolds: polar.reynolds,
+        speed: polar.speed,
+        chord: polar.chord,
+      });
+      if (!canonicalAoas.has(p.aoa_deg))
+        attemptOnlyByAoa.set(p.aoa_deg, staged);
+    }
+    for (const candidate of [
+      ...pointCandidates,
+      ...attemptOnlyByAoa.values(),
+    ]) {
+      if (candidate.presetRevisionId) {
+        const bucket = candidatesByRevision.get(candidate.presetRevisionId);
+        if (bucket) bucket.push(candidate);
+        else candidatesByRevision.set(candidate.presetRevisionId, [candidate]);
+      } else {
+        legacyCandidates.push(candidate);
       }
     }
   }
+
+  await opts.hooks?.afterEvidenceStaged?.();
+
+  const finalizedByResult = new Map<string, FinalizedPoint>();
+  for (const [revisionId, candidates] of candidatesByRevision) {
+    const finalized = await publishStagedPoints(
+      db,
+      airfoilId,
+      revisionId,
+      candidates,
+    );
+    for (const row of finalized) finalizedByResult.set(row.resultId, row);
+  }
+  // Revision-less legacy evidence cannot participate in the compatibility
+  // identity or fitted-polar transaction. Preserve it as exact attempt
+  // history and fail the scheduling shell closed; public reads require a
+  // selected revision-backed generation.
+  for (const candidate of legacyCandidates) {
+    if (candidate.quarantined) continue;
+    const [failed] = await db
+      .update(results)
+      .set({
+        status: "failed",
+        source: "queued",
+        error: "solver evidence has no immutable setup revision",
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(results.id, candidate.resultId),
+          sql`${results.currentResultAttemptId} IS NULL`,
+          eq(results.status, candidate.observedStatus as never),
+          sql`${results.simJobId} IS NOT DISTINCT FROM ${candidate.observedSimJobId}::uuid`,
+        ),
+      )
+      .returning({
+        resultId: results.id,
+        aoaDeg: results.aoaDeg,
+        status: results.status,
+        regime: results.regime,
+      });
+    if (failed)
+      finalizedByResult.set(failed.resultId, failed as FinalizedPoint);
+  }
+
+  // Finish the presentation rows produced by this ingest before campaign
+  // consumers observe the newly selected generation.
   if (airfoilPoints && scaleGroups.size) {
-    media += await rebalanceFieldScales({ db, engine, groups: scaleGroups, airfoilPoints, heartbeat });
+    media += await rebalanceFieldScales({
+      db,
+      engine,
+      groups: scaleGroups,
+      airfoilPoints,
+      heartbeat,
+    });
+  }
+  // Campaign and obligation state observe only committed selected evidence (or
+  // a pointer-null machine failure). A rejected child of an existing public
+  // generation settles against the kept current row returned above.
+  for (const finalized of finalizedByResult.values()) {
+    const candidate = [...candidatesByRevision.values(), legacyCandidates]
+      .flat()
+      .find((item) => item.resultId === finalized.resultId);
+    const laneKeys = await onResultIngested(db, {
+      airfoilId,
+      revisionId: candidate?.presetRevisionId ?? null,
+      aoaDeg: finalized.aoaDeg,
+      resultId: finalized.resultId,
+      status: finalized.status,
+      regime: finalized.regime,
+    });
+    for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
   }
   return { points, media, attempts, dirtyLanes: [...dirtyLanes.values()] };
 }

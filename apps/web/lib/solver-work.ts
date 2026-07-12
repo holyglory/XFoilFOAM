@@ -26,7 +26,7 @@ export interface SolverWorkChainItem {
 export type SolverWorkReviewVerdict = "waive" | "exclude" | "defer";
 
 export interface SolverWorkReviewed {
-  verdict: SolverWorkReviewVerdict;
+  verdict: "exclude";
   note: string | null;
   reviewer: string | null;
   at: string;
@@ -46,7 +46,8 @@ export interface SolverWorkPoint {
   continuable: boolean;
   actions: string[];
   supersededBy: string | null;
-  reviewed?: SolverWorkReviewed | null;
+  reviewed: boolean;
+  review: SolverWorkReviewed | null;
 }
 
 export interface SolverWorkJob {
@@ -104,7 +105,10 @@ export interface SolverWorkStateStyle {
   border: string;
 }
 
-export const SOLVER_WORK_STATE_STYLES: Record<SolverWorkPointState, SolverWorkStateStyle> = {
+export const SOLVER_WORK_STATE_STYLES: Record<
+  SolverWorkPointState,
+  SolverWorkStateStyle
+> = {
   verified: {
     label: "verified",
     className: "solver-work-state--verified",
@@ -148,7 +152,7 @@ export const SOLVER_WORK_STATE_STYLES: Record<SolverWorkPointState, SolverWorkSt
     border: "#92400e",
   },
   needs_review: {
-    label: "needs review",
+    label: "automatic checks unavailable",
     className: "solver-work-state--needs-review",
     color: "#fb923c",
     background: "#25140a",
@@ -203,7 +207,14 @@ export interface SolverWorkResultContext {
 }
 
 export interface SolverWorkPopoverAction {
-  kind: "open-results" | "continue-2h" | "continue-6h" | "continue-24h" | "retry" | "request-full-tier" | "revoke-review";
+  kind:
+    | "open-results"
+    | "continue-2h"
+    | "continue-6h"
+    | "continue-24h"
+    | "retry"
+    | "request-full-tier"
+    | "revoke-review";
   label: string;
   adminOnly: boolean;
 }
@@ -233,33 +244,32 @@ export function solverWorkStateClass(state: SolverWorkPointState): string {
   return `solver-work-state ${SOLVER_WORK_STATE_STYLES[state].className}`;
 }
 
-export function solverWorkPointPresentation(point: SolverWorkPoint): SolverWorkPointPresentation {
-  const reviewed = point.reviewed ?? null;
-  if (reviewed?.verdict === "waive") {
-    return {
-      visualState: "verified",
-      stateLabel: "verified · reviewed ✓",
-      badgeMark: "✓",
-      reviewedDisclosure: solverWorkReviewDisclosure(reviewed),
-    };
-  }
-  if (point.state === "excluded" || reviewed?.verdict === "exclude") {
+export function solverWorkPointPresentation(
+  point: SolverWorkPoint,
+): SolverWorkPointPresentation {
+  const review = point.review ?? null;
+  if (point.state === "excluded" || review?.verdict === "exclude") {
     return {
       visualState: "excluded",
-      stateLabel: reviewed ? "excluded · reviewed" : SOLVER_WORK_STATE_STYLES.excluded.label,
+      stateLabel: review
+        ? "excluded · reviewed"
+        : SOLVER_WORK_STATE_STYLES.excluded.label,
       badgeMark: null,
-      reviewedDisclosure: reviewed ? solverWorkReviewDisclosure(reviewed) : null,
+      reviewedDisclosure: review ? solverWorkReviewDisclosure(review) : null,
     };
   }
   return {
     visualState: point.state,
     stateLabel: SOLVER_WORK_STATE_STYLES[point.state].label,
     badgeMark: null,
-    reviewedDisclosure: reviewed ? solverWorkReviewDisclosure(reviewed) : null,
+    reviewedDisclosure: review ? solverWorkReviewDisclosure(review) : null,
   };
 }
 
-export function solverWorkPointKey(condition: SolverWorkCondition, point: SolverWorkPoint): string {
+export function solverWorkPointKey(
+  condition: SolverWorkCondition,
+  point: SolverWorkPoint,
+): string {
   return `${condition.presetRevisionId}:${point.aoaDeg}:${point.resultId ?? "no-result"}:${point.supersededBy ?? ""}`;
 }
 
@@ -284,7 +294,10 @@ export function formatCompactNumber(value: number, digits = 2): string {
 
 export function formatAgo(iso: string | null, nowMs = Date.now()): string {
   if (!iso) return "—";
-  const seconds = Math.max(0, Math.round((nowMs - new Date(iso).getTime()) / 1000));
+  const seconds = Math.max(
+    0,
+    Math.round((nowMs - new Date(iso).getTime()) / 1000),
+  );
   if (seconds < 10) return "now";
   if (seconds < 60) return `${seconds} sec ago`;
   const minutes = Math.round(seconds / 60);
@@ -298,20 +311,34 @@ export function conditionHasSolving(condition: SolverWorkCondition): boolean {
   return condition.points.some((point) => point.state === "solving");
 }
 
-export function visibleSolverWorkPoints(points: SolverWorkPoint[], showSuperseded: boolean): SolverWorkPoint[] {
-  return showSuperseded ? points : points.filter((point) => point.state !== "superseded");
+export function visibleSolverWorkPoints(
+  points: SolverWorkPoint[],
+  showSuperseded: boolean,
+): SolverWorkPoint[] {
+  return showSuperseded
+    ? points
+    : points.filter((point) => point.state !== "superseded");
 }
 
-export function solverWorkLegendStates(points: SolverWorkPoint[], showSuperseded: boolean): SolverWorkPointState[] {
-  const present = new Set(visibleSolverWorkPoints(points, showSuperseded).map((point) => point.state));
+export function solverWorkLegendStates(
+  points: SolverWorkPoint[],
+  showSuperseded: boolean,
+): SolverWorkPointState[] {
+  const present = new Set(
+    visibleSolverWorkPoints(points, showSuperseded).map((point) => point.state),
+  );
   return SOLVER_WORK_STATES.filter((state) => present.has(state));
 }
 
-export function solverWorkRollup(points: SolverWorkPoint[], showSuperseded = false): SolverWorkRollupSegment[] {
+export function solverWorkRollup(
+  points: SolverWorkPoint[],
+  showSuperseded = false,
+): SolverWorkRollupSegment[] {
   const visible = visibleSolverWorkPoints(points, showSuperseded);
   if (!visible.length) return [];
   const counts = new Map<SolverWorkPointState, number>();
-  for (const point of visible) counts.set(point.state, (counts.get(point.state) ?? 0) + 1);
+  for (const point of visible)
+    counts.set(point.state, (counts.get(point.state) ?? 0) + 1);
   return SOLVER_WORK_STATES.flatMap((state) => {
     const count = counts.get(state) ?? 0;
     return count
@@ -340,20 +367,28 @@ export function filterSortSolverWorkConditions(
   return filtered
     .map((condition, index) => ({ condition, index }))
     .sort((a, b) => {
-      if (sort === "re-asc") return a.condition.reynolds - b.condition.reynolds || a.index - b.index;
+      if (sort === "re-asc")
+        return a.condition.reynolds - b.condition.reynolds || a.index - b.index;
       if (sort === "attention-first") {
         return (
           b.condition.attentionCount - a.condition.attentionCount ||
-          new Date(b.condition.updatedAt).getTime() - new Date(a.condition.updatedAt).getTime() ||
+          new Date(b.condition.updatedAt).getTime() -
+            new Date(a.condition.updatedAt).getTime() ||
           a.index - b.index
         );
       }
-      return new Date(b.condition.updatedAt).getTime() - new Date(a.condition.updatedAt).getTime() || a.index - b.index;
+      return (
+        new Date(b.condition.updatedAt).getTime() -
+          new Date(a.condition.updatedAt).getTime() || a.index - b.index
+      );
     })
     .map(({ condition }) => condition);
 }
 
-export function buildSolverWorkConditionSummary(condition: SolverWorkCondition, nowMs = Date.now()): SolverWorkConditionSummary {
+export function buildSolverWorkConditionSummary(
+  condition: SolverWorkCondition,
+  nowMs = Date.now(),
+): SolverWorkConditionSummary {
   const visibleCount = visibleSolverWorkPoints(condition.points, false).length;
   const totalCount = condition.points.length;
   const ransLabel = deriveRansLabel(condition.points);
@@ -367,38 +402,83 @@ export function buildSolverWorkConditionSummary(condition: SolverWorkCondition, 
     },
     meta: `${ransLabel} · URANS ${urans.done}/${urans.total} · updated ${formatAgo(condition.updatedAt, nowMs)}`,
     countLabel: `${visibleCount}/${totalCount}`,
-    attentionLabel: condition.attentionCount > 0 ? `attention ${condition.attentionCount}` : null,
+    attentionLabel:
+      condition.attentionCount > 0
+        ? `attention ${condition.attentionCount}`
+        : null,
   };
 }
 
-export function solverWorkResultContext(condition: SolverWorkCondition, point: SolverWorkPoint): SolverWorkResultContext | null {
+export function solverWorkResultContext(
+  condition: SolverWorkCondition,
+  point: SolverWorkPoint,
+): SolverWorkResultContext | null {
   if (!point.resultId) return null;
-  return { re: condition.reynolds, aoa: point.aoaDeg, resultId: point.resultId };
+  return {
+    re: condition.reynolds,
+    aoa: point.aoaDeg,
+    resultId: point.resultId,
+  };
 }
 
-export function buildContinueUransPayload(resultId: string, hours: 2 | 6 | 24): { continueFromResultId: string; budgetOverrideS: number } {
+export function buildContinueUransPayload(
+  resultId: string,
+  hours: 2 | 6 | 24,
+): { continueFromResultId: string; budgetOverrideS: number } {
   return { continueFromResultId: resultId, budgetOverrideS: hours * 3600 };
 }
 
-export function buildSolverWorkPopoverView(condition: SolverWorkCondition, point: SolverWorkPoint, admin: boolean): SolverWorkPopoverView {
+export function buildSolverWorkPopoverView(
+  condition: SolverWorkCondition,
+  point: SolverWorkPoint,
+  admin: boolean,
+): SolverWorkPopoverView {
   const presentation = solverWorkPointPresentation(point);
   const actions: SolverWorkPopoverAction[] = [];
-  if (point.resultId) actions.push({ kind: "open-results", label: "full results ▸", adminOnly: false });
-  if (admin && point.state === "needs_time" && point.continuable && point.resultId) {
+  if (point.resultId)
+    actions.push({
+      kind: "open-results",
+      label: "full results ▸",
+      adminOnly: false,
+    });
+  if (
+    admin &&
+    point.state === "needs_time" &&
+    point.continuable &&
+    point.resultId
+  ) {
     actions.push(
       { kind: "continue-2h", label: "Continue +2h", adminOnly: true },
       { kind: "continue-6h", label: "Continue +6h", adminOnly: true },
       { kind: "continue-24h", label: "Continue +24h", adminOnly: true },
     );
   }
-  if (admin && point.state === "needs_review" && point.resultId && hasSolverWorkAction(point, "retry")) {
+  if (
+    admin &&
+    point.state === "needs_review" &&
+    point.resultId &&
+    hasSolverWorkAction(point, "retry")
+  ) {
     actions.push({ kind: "retry", label: "Retry", adminOnly: true });
   }
-  if (admin && (point.state === "needs_review" || point.state === "blocked") && hasFullTierAction(point) && condition.presetRevisionId) {
-    actions.push({ kind: "request-full-tier", label: "Request full tier", adminOnly: true });
+  if (
+    admin &&
+    (point.state === "needs_review" || point.state === "blocked") &&
+    hasFullTierAction(point) &&
+    condition.presetRevisionId
+  ) {
+    actions.push({
+      kind: "request-full-tier",
+      label: "Request full tier",
+      adminOnly: true,
+    });
   }
-  if (admin && point.reviewed && point.resultId) {
-    actions.push({ kind: "revoke-review", label: "revoke review", adminOnly: true });
+  if (admin && point.review && point.resultId) {
+    actions.push({
+      kind: "revoke-review",
+      label: "revoke review",
+      adminOnly: true,
+    });
   }
 
   return {
@@ -409,11 +489,21 @@ export function buildSolverWorkPopoverView(condition: SolverWorkCondition, point
     plain: point.plain,
     gate: point.gate,
     coefficients: [
-      point.cl == null ? null : { label: "Cl" as const, value: point.cl.toFixed(3) },
-      point.cd == null ? null : { label: "Cd" as const, value: point.cd.toFixed(4) },
-      point.cm == null ? null : { label: "Cm" as const, value: point.cm.toFixed(3) },
-    ].filter((item): item is { label: "Cl" | "Cd" | "Cm"; value: string } => item != null),
-    provisionalNote: point.state === "needs_time" || point.state === "provisional",
+      point.cl == null
+        ? null
+        : { label: "Cl" as const, value: point.cl.toFixed(3) },
+      point.cd == null
+        ? null
+        : { label: "Cd" as const, value: point.cd.toFixed(4) },
+      point.cm == null
+        ? null
+        : { label: "Cm" as const, value: point.cm.toFixed(3) },
+    ].filter(
+      (item): item is { label: "Cl" | "Cd" | "Cm"; value: string } =>
+        item != null,
+    ),
+    provisionalNote:
+      point.state === "needs_time" || point.state === "provisional",
     chain: point.chain.map((item) => ({
       label: item.label,
       tone: item.tone,
@@ -425,7 +515,7 @@ export function buildSolverWorkPopoverView(condition: SolverWorkCondition, point
 }
 
 function solverWorkReviewDisclosure(reviewed: SolverWorkReviewed): string {
-  const verb = reviewed.verdict === "waive" ? "waived" : reviewed.verdict === "exclude" ? "excluded" : "deferred";
+  const verb = "excluded";
   const note = reviewed.note?.trim();
   return `${verb} by ${reviewed.reviewer || "unknown"} ${formatReviewDate(reviewed.at)}${note ? `: ${note}` : ""}`;
 }
@@ -440,17 +530,25 @@ function normalizedAction(action: string): string {
 
 function hasSolverWorkAction(point: SolverWorkPoint, action: string): boolean {
   const target = normalizedAction(action);
-  return point.actions.some((candidate) => normalizedAction(candidate) === target);
+  return point.actions.some(
+    (candidate) => normalizedAction(candidate) === target,
+  );
 }
 
 function hasFullTierAction(point: SolverWorkPoint): boolean {
   const actions = point.actions.map(normalizedAction);
-  return actions.some((action) => action === "request_full_tier" || action === "request_full" || action === "full_tier");
+  return actions.some(
+    (action) =>
+      action === "request_full_tier" ||
+      action === "request_full" ||
+      action === "full_tier",
+  );
 }
 
 function styleForTone(tone: string): SolverWorkStateStyle {
   const normalized = normalizedAction(tone);
-  if (isSolverWorkState(normalized)) return SOLVER_WORK_STATE_STYLES[normalized];
+  if (isSolverWorkState(normalized))
+    return SOLVER_WORK_STATE_STYLES[normalized];
   if (normalized === "teal") return SOLVER_WORK_STATE_STYLES.provisional;
   if (normalized === "amber") return SOLVER_WORK_STATE_STYLES.needs_time;
   if (normalized === "orange") return SOLVER_WORK_STATE_STYLES.needs_review;
@@ -465,17 +563,33 @@ function isSolverWorkState(value: string): value is SolverWorkPointState {
 }
 
 function deriveRansLabel(points: SolverWorkPoint[]): string {
-  const ransChain = points.flatMap((point) => point.chain).filter((item) => /^rans\b/i.test(item.label.trim()));
+  const ransChain = points
+    .flatMap((point) => point.chain)
+    .filter((item) => /^rans\b/i.test(item.label.trim()));
   if (ransChain.some((item) => item.label.includes("✓"))) return "RANS ✓";
-  if (ransChain.some((item) => item.label.includes("✗") || /fail|reject|stall/i.test(item.label))) return "RANS ✗";
-  if (points.some((point) => point.state === "verified" && !isUransRelated(point))) return "RANS ✓";
+  if (
+    ransChain.some(
+      (item) =>
+        item.label.includes("✗") || /fail|reject|stall/i.test(item.label),
+    )
+  )
+    return "RANS ✗";
+  if (
+    points.some((point) => point.state === "verified" && !isUransRelated(point))
+  )
+    return "RANS ✓";
   return "RANS —";
 }
 
-function deriveUransCounts(points: SolverWorkPoint[]): { done: number; total: number } {
+function deriveUransCounts(points: SolverWorkPoint[]): {
+  done: number;
+  total: number;
+} {
   const uransPoints = points.filter(isUransRelated);
   return {
-    done: uransPoints.filter((point) => point.state === "verified" || point.state === "provisional").length,
+    done: uransPoints.filter(
+      (point) => point.state === "verified" || point.state === "provisional",
+    ).length,
     total: uransPoints.length,
   };
 }

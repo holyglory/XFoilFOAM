@@ -5,12 +5,16 @@ import {
   boundaryProfiles,
   categories,
   flowConditions,
+  forceHistory,
   mediums,
   meshProfiles,
   outputProfiles,
   polarCompatibilityFitSets,
   referenceGeometryProfiles,
+  type Result,
+  resultAttempts,
   resultClassifications,
+  resultMedia,
   results,
   schedulingProfiles,
   simulationPresetRevisions,
@@ -79,6 +83,8 @@ describe("public polar compatibility series", () => {
     snapshot: Record<string, unknown>;
   } | null = null;
   let refreshBaseCache: () => Promise<void> = async () => undefined;
+  let bindAcceptedResults: (rows: Result[]) => Promise<void> = async () =>
+    undefined;
 
   beforeAll(async () => {
     const [air] = await db
@@ -384,6 +390,93 @@ describe("public polar compatibility series", () => {
     expect(differentMesh.revision.reynolds).toBe(reynolds);
     expect(differentSolver.revision.reynolds).toBe(reynolds);
 
+    bindAcceptedResults = async (rows: Result[]) => {
+      if (!rows.length) return;
+      const attempts = await db
+        .insert(resultAttempts)
+        .values(
+          rows.map((row) => ({
+            resultId: row.id,
+            airfoilId: row.airfoilId,
+            bcId: row.bcId,
+            simulationPresetRevisionId: row.simulationPresetRevisionId,
+            aoaDeg: row.aoaDeg,
+            simJobId: row.simJobId,
+            engineJobId: row.engineJobId,
+            engineCaseSlug: row.engineCaseSlug,
+            status: row.status,
+            source: row.source,
+            regime: row.regime,
+            validForPolar: true,
+            cl: row.cl,
+            cd: row.cd,
+            cm: row.cm,
+            clCd: row.clCd,
+            clStd: row.clStd,
+            cdStd: row.cdStd,
+            cmStd: row.cmStd,
+            stalled: row.stalled,
+            unsteady: row.unsteady,
+            converged: row.converged,
+            finalResidual: row.finalResidual,
+            iterations: row.iterations,
+            yPlusAvg: row.yPlusAvg,
+            yPlusMax: row.yPlusMax,
+            nCells: row.nCells,
+            firstOrderFallback: row.firstOrderFallback,
+            strouhal: row.strouhal,
+            error: row.error,
+            qualityWarnings: row.qualityWarnings,
+            evidencePayload: {
+              fidelity: row.fidelity,
+              frame_track: row.frameTrack,
+              steady_history: row.steadyHistory,
+            },
+            solvedAt: row.solvedAt,
+          })),
+        )
+        .returning({
+          id: resultAttempts.id,
+          resultId: resultAttempts.resultId,
+          aoaDeg: resultAttempts.aoaDeg,
+          regime: resultAttempts.regime,
+        });
+      for (const attempt of attempts) {
+        await db
+          .update(results)
+          .set({ currentResultAttemptId: attempt.id })
+          .where(eq(results.id, attempt.resultId!));
+      }
+      await db.insert(resultClassifications).values([
+        ...rows.map((row) => ({
+          resultId: row.id,
+          airfoilId: row.airfoilId,
+          simulationPresetRevisionId: row.simulationPresetRevisionId!,
+          aoaDeg: row.aoaDeg,
+          regime: row.regime,
+          classifierVersion: "detail-compat-test-v1",
+          state: "accepted" as const,
+          region: "attached" as const,
+          confidence: 1,
+          reasons: [],
+        })),
+        ...attempts.map((attempt) => ({
+          resultAttemptId: attempt.id,
+          airfoilId,
+          simulationPresetRevisionId: rows.find(
+            (row) => row.id === attempt.resultId,
+          )!.simulationPresetRevisionId!,
+          aoaDeg: attempt.aoaDeg,
+          regime: attempt.regime,
+          classifierVersion: "detail-compat-test-v1",
+          state: "accepted" as const,
+          region: "attached" as const,
+          confidence: 1,
+          reasons: [],
+        })),
+      ]);
+    };
+
     const insertAccepted = async (
       setup: typeof baseA,
       aoas: number[],
@@ -418,22 +511,9 @@ describe("public polar compatibility series", () => {
             };
           }),
         )
-        .returning({ id: results.id, aoaDeg: results.aoaDeg });
+        .returning();
       cleanup.resultIds.push(...inserted.map((row) => row.id));
-      await db.insert(resultClassifications).values(
-        inserted.map((row) => ({
-          resultId: row.id,
-          airfoilId,
-          simulationPresetRevisionId: setup.revision.id,
-          aoaDeg: row.aoaDeg,
-          regime: "rans" as const,
-          classifierVersion: "detail-compat-test-v1",
-          state: "accepted" as const,
-          region: "attached" as const,
-          confidence: 1,
-          reasons: [],
-        })),
-      );
+      await bindAcceptedResults(inserted);
       return inserted.map((row) => row.id);
     };
 
@@ -484,6 +564,10 @@ describe("public polar compatibility series", () => {
     }
     if (cleanup.resultIds.length) {
       await db
+        .update(results)
+        .set({ currentResultAttemptId: null })
+        .where(inArray(results.id, cleanup.resultIds));
+      await db
         .delete(resultClassifications)
         .where(inArray(resultClassifications.resultId, cleanup.resultIds));
     }
@@ -519,6 +603,155 @@ describe("public polar compatibility series", () => {
     expect(merged!.label).not.toMatch(
       /remote|validation|preset|revision|batch/i,
     );
+  });
+
+  it("reads Detail from the exact selected attempt and fails pointer-null evidence closed", async () => {
+    const resultId = baseResultIds[0];
+    const [projection] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, resultId))
+      .limit(1);
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, resultId))
+      .limit(1);
+    expect(projection?.currentResultAttemptId).toBe(attempt?.id);
+    try {
+      // A mutable projection is deliberately corrupted while its exact pointer
+      // remains valid. Detail must still expose the immutable attempt values.
+      await db
+        .update(results)
+        .set({
+          status: "failed",
+          source: "queued",
+          regime: "urans",
+          fidelity: "urans_full",
+          cl: null,
+          cd: null,
+          cm: 999,
+          clCd: null,
+          converged: false,
+          stalled: true,
+          unsteady: true,
+          engineJobId: `${PREFIX}-stale-projection`,
+          engineCaseSlug: "stale-projection",
+        })
+        .where(eq(results.id, resultId));
+      const exactDetail = await assembleDetail(slug);
+      const exactPoint = exactDetail!.polars
+        .flatMap((polar) => polar.points)
+        .find((point) => point.resultId === resultId);
+      expect(exactPoint).toMatchObject({
+        cl: attempt!.cl,
+        cd: attempt!.cd,
+        cm: attempt!.cm,
+        converged: attempt!.converged,
+        stalled: attempt!.stalled,
+        unsteady: attempt!.unsteady,
+      });
+      const exactWork = await assembleSolverWork(slug);
+      const exactWorkPoint = exactWork!.conditions
+        .flatMap((condition) => condition.points)
+        .find((point) => point.resultId === resultId);
+      expect(exactWorkPoint).toMatchObject({
+        state: "verified",
+        cl: attempt!.cl,
+        cd: attempt!.cd,
+        cm: attempt!.cm,
+      });
+
+      // Even a stale accepted verdict may not turn missing coefficients into
+      // the display layer's numeric defaults.
+      await db
+        .update(resultAttempts)
+        .set({ cl: null })
+        .where(eq(resultAttempts.id, attempt!.id));
+      const incompleteDetail = await assembleDetail(slug);
+      expect(
+        incompleteDetail!.polars
+          .flatMap((polar) => polar.points)
+          .some((point) => point.resultId === resultId),
+      ).toBe(false);
+      await db
+        .update(resultAttempts)
+        .set({ cl: attempt!.cl })
+        .where(eq(resultAttempts.id, attempt!.id));
+
+      // Restore the otherwise-valid legacy projection but remove its selected
+      // generation. It must stay unavailable with and without aggregate cache.
+      await db
+        .update(results)
+        .set({
+          currentResultAttemptId: null,
+          status: projection.status,
+          source: projection.source,
+          regime: projection.regime,
+          fidelity: projection.fidelity,
+          cl: projection.cl,
+          cd: projection.cd,
+          cm: projection.cm,
+          clCd: projection.clCd,
+          converged: projection.converged,
+          stalled: projection.stalled,
+          unsteady: projection.unsteady,
+          engineJobId: projection.engineJobId,
+          engineCaseSlug: projection.engineCaseSlug,
+        })
+        .where(eq(results.id, resultId));
+      for (const cachePresent of [true, false]) {
+        if (!cachePresent) {
+          await db
+            .delete(polarCompatibilityFitSets)
+            .where(eq(polarCompatibilityFitSets.compatibilityHash, baseHash));
+        }
+        const [detail, solverWork] = await Promise.all([
+          assembleDetail(slug),
+          assembleSolverWork(slug),
+        ]);
+        expect(
+          detail!.polars
+            .flatMap((polar) => polar.points)
+            .some((point) => point.resultId === resultId),
+        ).toBe(false);
+        const retained = solverWork!.conditions
+          .flatMap((condition) => condition.points)
+          .find((point) => point.resultId === resultId);
+        expect(retained).toMatchObject({
+          state: "blocked",
+          cl: null,
+          cd: null,
+          cm: null,
+          actions: [],
+        });
+      }
+    } finally {
+      await db
+        .update(resultAttempts)
+        .set({ cl: attempt!.cl })
+        .where(eq(resultAttempts.id, attempt!.id));
+      await db
+        .update(results)
+        .set({
+          currentResultAttemptId: projection.currentResultAttemptId,
+          status: projection.status,
+          source: projection.source,
+          regime: projection.regime,
+          fidelity: projection.fidelity,
+          cl: projection.cl,
+          cd: projection.cd,
+          cm: projection.cm,
+          clCd: projection.clCd,
+          converged: projection.converged,
+          stalled: projection.stalled,
+          unsteady: projection.unsteady,
+          engineJobId: projection.engineJobId,
+          engineCaseSlug: projection.engineCaseSlug,
+        })
+        .where(eq(results.id, resultId));
+      await refreshBaseCache();
+    }
   });
 
   it("keeps same-Re different Mach, mesh, and solver physics separate", async () => {
@@ -627,20 +860,9 @@ describe("public polar compatibility series", () => {
         stalled: false,
         solvedAt: primary.solvedAt,
       })
-      .returning({ id: results.id });
+      .returning();
     cleanup.resultIds.push(alternate.id);
-    await db.insert(resultClassifications).values({
-      resultId: alternate.id,
-      airfoilId,
-      simulationPresetRevisionId: legacyFallbackRevision!.id,
-      aoaDeg: primary.aoaDeg,
-      regime: "rans",
-      classifierVersion: "detail-compat-test-v1",
-      state: "accepted",
-      region: "attached",
-      confidence: 1,
-      reasons: [],
-    });
+    await bindAcceptedResults([alternate]);
     try {
       await refreshBaseCache();
       for (const cachePresent of [true, false]) {
@@ -676,6 +898,10 @@ describe("public polar compatibility series", () => {
         expect(workIds.has(alternate.id)).toBe(true);
       }
     } finally {
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: null })
+        .where(eq(results.id, alternate.id));
       await db
         .delete(resultClassifications)
         .where(eq(resultClassifications.resultId, alternate.id));
@@ -717,20 +943,9 @@ describe("public polar compatibility series", () => {
         stalled: false,
         solvedAt: new Date(),
       })
-      .returning({ id: results.id });
+      .returning();
     cleanup.resultIds.push(missingCm.id);
-    await db.insert(resultClassifications).values({
-      resultId: missingCm.id,
-      airfoilId,
-      simulationPresetRevisionId: legacyFallbackRevision!.id,
-      aoaDeg,
-      regime: "rans",
-      classifierVersion: "detail-compat-test-v1",
-      state: "accepted",
-      region: "attached",
-      confidence: 1,
-      reasons: [],
-    });
+    await bindAcceptedResults([missingCm]);
     try {
       await refreshBaseCache();
       const detail = await assembleDetail(slug);
@@ -741,10 +956,84 @@ describe("public polar compatibility series", () => {
       expect(point?.evidenceRole).toBe("primary");
     } finally {
       await db
+        .update(results)
+        .set({ currentResultAttemptId: null })
+        .where(eq(results.id, missingCm.id));
+      await db
         .delete(resultClassifications)
         .where(eq(resultClassifications.resultId, missingCm.id));
       await db.delete(results).where(eq(results.id, missingCm.id));
       await refreshBaseCache();
+    }
+  });
+
+  it("never publishes unclassified nonstationary URANS through the raw fallback", async () => {
+    expect(legacyFallbackRevision).toBeTruthy();
+    const [template] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, baseResultIds[0]))
+      .limit(1);
+    const [unclassified] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: template.bcId,
+        simulationPresetRevisionId: legacyFallbackRevision!.id,
+        aoaDeg: 3,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        reynolds: template.reynolds,
+        speed: template.speed,
+        chord: template.chord,
+        mach: template.mach,
+        cl: 0.79,
+        cd: 0.031,
+        cm: -0.04,
+        clCd: 0.79 / 0.031,
+        converged: true,
+        stalled: true,
+        unsteady: true,
+        frameTrack: {
+          stationary: false,
+          periods_retained: 3,
+          reason: "retained window still drifting",
+        },
+        solvedAt: new Date(),
+      })
+      .returning({ id: results.id });
+    cleanup.resultIds.push(unclassified.id);
+    await db.insert(forceHistory).values({
+      resultId: unclassified.id,
+      t: [0, 0.1, 0.2, 0.3],
+      cl: [0.6, 0.7, 0.8, 0.9],
+      cd: [0.02, 0.025, 0.03, 0.035],
+      cm: [-0.04, -0.04, -0.04, -0.04],
+    });
+    await db.insert(resultMedia).values({
+      resultId: unclassified.id,
+      kind: "video",
+      field: "velocity_magnitude",
+      role: "instantaneous",
+      storageKey: `${PREFIX}/unclassified-nonstationary.mp4`,
+      mimeType: "video/mp4",
+    });
+
+    try {
+      const detail = await assembleDetail(slug, {
+        revisionId: legacyFallbackRevision!.id,
+      });
+      expect(
+        detail!.polars
+          .flatMap((polar) => polar.points)
+          .some((point) => point.resultId === unclassified.id),
+      ).toBe(false);
+    } finally {
+      // Keep later Solver Work/chart conservation assertions scoped to their
+      // accepted fixture set.  Child force/media evidence cascades.
+      await db.delete(results).where(eq(results.id, unclassified.id));
     }
   });
 

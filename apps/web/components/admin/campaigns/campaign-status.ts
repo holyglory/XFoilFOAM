@@ -9,7 +9,12 @@
 // and the lifecycle ("active") demotes to a small secondary chip in the
 // renderers — never an "Active" headline next to a contradictory red line.
 import type { AdminCampaignSummary } from "../../../lib/admin";
-import { formatAge, isProcessDead, type SolverStateName, tickStalledForMs } from "../../../lib/solver-state";
+import {
+  formatAge,
+  isProcessDead,
+  type SolverStateName,
+  tickStalledForMs,
+} from "../../../lib/solver-state";
 
 // Local copy of ui.tsx's fCount: importing ui.tsx here would drag the React
 // component tree into node vitest, defeating the point of this pure module.
@@ -46,7 +51,9 @@ export interface CampaignStatusView {
  *  per-card summary arrives, the Solver page backlog strip). Same precedence
  *  as campaignStatusLine: process dead / engine unreachable / engine
  *  unhealthy / sweeper disabled ("paused" solver state). */
-export function gateFromSolverState(state: SolverStateName): CampaignGate | null {
+export function gateFromSolverState(
+  state: SolverStateName,
+): CampaignGate | null {
   switch (state) {
     case "process_not_running":
       return { text: "BLOCKED — solver process not running", tone: "red" };
@@ -59,7 +66,10 @@ export function gateFromSolverState(state: SolverStateName): CampaignGate | null
     case "tick_stalled":
       // Not a BLOCKED gate: scheduling continues next tick — the badge is an
       // honest amber slowness signal, never a false red.
-      return { text: "SLOW — tick running; engine responding slowly", tone: "amber" };
+      return {
+        text: "SLOW — tick running; engine responding slowly",
+        tone: "amber",
+      };
     default:
       return null;
   }
@@ -70,7 +80,12 @@ export function gateFromSolverState(state: SolverStateName): CampaignGate | null
 // The phase badge decorates a RUNNING ladder; the liveness-split gate badge
 // always outranks it (a blocked campaign shows BLOCKED, not a phase).
 // ---------------------------------------------------------------------------
-export type CampaignLadderPhase = "running_rans" | "running_precalc" | "running_refinement" | "completed" | null;
+export type CampaignLadderPhase =
+  | "running_rans"
+  | "running_precalc"
+  | "running_refinement"
+  | "completed"
+  | null;
 
 export interface CampaignTierCounts {
   ransOpen: number;
@@ -104,29 +119,47 @@ export function campaignPhaseBadge(
       // Transient window: every tier terminal but the completion probe has
       // not flipped the lifecycle yet. Once the chip says COMPLETED the badge
       // would be a duplicate.
-      return lifecycleStatus === "completed" ? null : { key: phase, label: "ALL TIERS TERMINAL", tone: "teal" };
+      return lifecycleStatus === "completed"
+        ? null
+        : { key: phase, label: "ALL TIERS TERMINAL", tone: "teal" };
   }
 }
 
 /** Header-strip per-tier open counts (contract 7). null = payload has no tier
  *  counts (older API) — render nothing rather than invented zeros. */
-export function tierCountsLine(tiers: CampaignTierCounts | undefined | null): string | null {
+export function tierCountsLine(
+  tiers: CampaignTierCounts | undefined | null,
+): string | null {
   if (!tiers) return null;
   return `tiers open — RANS ${fCount(tiers.ransOpen)} · precalc ${fCount(tiers.precalcOpen)} · verify ${fCount(tiers.verifyOpen)}`;
 }
 
 /** Never a bare "Active" while nothing can run. `nowMs` is injectable for
  *  deterministic tests of the heartbeat/tick-staleness clauses. */
-export function campaignStatusLine(s: AdminCampaignSummary, nowMs: number = Date.now()): CampaignStatusView {
+export function campaignStatusLine(
+  s: AdminCampaignSummary,
+  nowMs: number = Date.now(),
+): CampaignStatusView {
   const { campaign, totals, scheduler } = s;
+  const blocked = totals.blocked ?? 0;
   const jobs = scheduler.campaignJobsRunning;
   const lifecycle = campaign.status;
   switch (campaign.status) {
     case "archived":
-      return { gate: null, lifecycle, text: "Archived — read-only.", tone: "dim" };
+      return {
+        gate: null,
+        lifecycle,
+        text: "Archived — read-only.",
+        tone: "dim",
+      };
     case "cancelled":
       return jobs > 0
-        ? { gate: null, lifecycle, text: `Cancelled — ${fCount(jobs)} job${jobs === 1 ? "" : "s"} finishing.`, tone: "dim" }
+        ? {
+            gate: null,
+            lifecycle,
+            text: `Cancelled — ${fCount(jobs)} job${jobs === 1 ? "" : "s"} finishing.`,
+            tone: "dim",
+          }
         : { gate: null, lifecycle, text: "Cancelled.", tone: "dim" };
     case "completed": {
       // Honest close record (F2): a close from attention can be driven by
@@ -134,6 +167,21 @@ export function campaignStatusLine(s: AdminCampaignSummary, nowMs: number = Date
       // render "closed with 0 failed points" for a rejected-only close.
       const closedFailed = campaign.closedWithFailedCount ?? 0;
       const closedRejected = campaign.closedWithRejectedCount ?? 0;
+      if (blocked > 0) {
+        const unavailable = [
+          closedFailed > 0
+            ? `${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"}`
+            : null,
+          closedRejected > 0 ? `${fCount(closedRejected)} rejected` : null,
+          `${fCount(blocked)} machine-blocked`,
+        ].filter((part): part is string => part != null);
+        return {
+          gate: null,
+          lifecycle,
+          text: `Completed — closed with ${unavailable.join(" · ")}.`,
+          tone: "amber",
+        };
+      }
       if (closedFailed > 0 && closedRejected > 0) {
         return {
           gate: null,
@@ -143,45 +191,99 @@ export function campaignStatusLine(s: AdminCampaignSummary, nowMs: number = Date
         };
       }
       if (closedFailed > 0) {
-        return { gate: null, lifecycle, text: `Completed — closed with ${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"}.`, tone: "teal" };
+        return {
+          gate: null,
+          lifecycle,
+          text: `Completed — closed with ${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"}.`,
+          tone: "teal",
+        };
       }
       if (closedRejected > 0) {
-        return { gate: null, lifecycle, text: `Completed — closed with ${fCount(closedRejected)} rejected point${closedRejected === 1 ? "" : "s"}.`, tone: "teal" };
+        return {
+          gate: null,
+          lifecycle,
+          text: `Completed — closed with ${fCount(closedRejected)} rejected point${closedRejected === 1 ? "" : "s"}.`,
+          tone: "teal",
+        };
       }
-      return { gate: null, lifecycle, text: "Completed — every obligated point is terminal.", tone: "teal" };
+      return {
+        gate: null,
+        lifecycle,
+        text: "Completed — every obligated point is terminal.",
+        tone: "teal",
+      };
     }
     case "attention": {
+      const automaticPrecalc = s.tierCounts?.precalcOpen ?? 0;
+      if (automaticPrecalc > 0) {
+        const blockedSuffix =
+          blocked > 0
+            ? ` ${fCount(blocked)} other point${blocked === 1 ? " is" : "s are"} machine-blocked and unavailable.`
+            : "";
+        return {
+          gate: null,
+          lifecycle,
+          text: `Preliminary URANS work is queued or running for ${fCount(automaticPrecalc)} point${automaticPrecalc === 1 ? "" : "s"}; no human review is required.${blockedSuffix}`,
+          tone: blocked > 0 ? "amber" : "violet",
+        };
+      }
       // Amendment-A split when the payload carries it: red strictly for
       // needs-review evidence; an awaiting-URANS-only attention state is the
       // calm violet stage-2 queue, never a false red.
       const rb = s.reviewBuckets;
-      if (rb && (rb.needsReview > 0 || rb.awaitingUrans > 0)) {
-        if (rb.needsReview > 0) {
-          const suffix = rb.awaitingUrans > 0 ? ` · ${fCount(rb.awaitingUrans)} awaiting URANS` : "";
+      if (rb) {
+        if (blocked > 0) {
+          const unavailable = totals.failed + totals.rejected;
+          const suffix = [
+            rb.awaitingUrans > 0
+              ? `${fCount(rb.awaitingUrans)} awaiting URANS`
+              : null,
+            unavailable > 0 ? `${fCount(unavailable)} other unavailable` : null,
+          ].filter((part): part is string => part != null);
           return {
             gate: null,
             lifecycle,
-            text: `All obligated work is terminal — ${fCount(rb.needsReview)} point${rb.needsReview === 1 ? "" : "s"} need${rb.needsReview === 1 ? "s" : ""} review${suffix}.`,
+            text: `All obligated work is terminal — ${fCount(blocked)} machine-blocked${suffix.length ? ` · ${suffix.join(" · ")}` : ""}. No human review is required.`,
+            tone: "amber",
+          };
+        }
+        if (rb.needsReview > 0) {
+          const suffix =
+            rb.awaitingUrans > 0
+              ? ` · ${fCount(rb.awaitingUrans)} awaiting URANS`
+              : "";
+          return {
+            gate: null,
+            lifecycle,
+            text: `All obligated work is terminal — ${fCount(rb.needsReview)} unavailable result${rb.needsReview === 1 ? "" : "s"}${suffix}. No human review is required.`,
             tone: "red",
           };
         }
+        if (rb.awaitingUrans > 0) {
+          return {
+            gate: null,
+            lifecycle,
+            text: `All obligated work is terminal — ${fCount(rb.awaitingUrans)} point${rb.awaitingUrans === 1 ? "" : "s"} awaiting URANS.`,
+            tone: "violet",
+          };
+        }
+        const unavailable = totals.failed + totals.rejected + blocked;
         return {
           gate: null,
           lifecycle,
-          text: `All obligated work is terminal — ${fCount(rb.awaitingUrans)} point${rb.awaitingUrans === 1 ? "" : "s"} awaiting URANS.`,
-          tone: "violet",
+          text: `All obligated work is terminal — ${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}. No human review is required.`,
+          tone: "amber",
         };
       }
-      // Older payloads (no reviewBuckets): the pre-split failed/rejected copy.
-      const parts: string[] = [];
-      if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
-      if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);
-      const needs = parts.length ? parts.join(" + ") : "0 failed";
+      // Older payloads have no refined machine-owned buckets. Failed and
+      // rejected evidence is unavailable; it must never be relabelled as a
+      // human-review obligation merely because the API predates the split.
+      const unavailable = totals.failed + totals.rejected + blocked;
       return {
         gate: null,
         lifecycle,
-        text: `All obligated work is terminal — ${needs} point${totals.failed + totals.rejected === 1 ? "" : "s"} need review.`,
-        tone: "red",
+        text: `All obligated work is terminal — ${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}. No human review is required.`,
+        tone: "amber",
       };
     }
     case "paused":
@@ -233,10 +335,17 @@ export function campaignStatusLine(s: AdminCampaignSummary, nowMs: number = Date
       // current tick started >5 min ago without completing — a slow engine
       // call is holding the tick. AMBER and non-blocking: scheduling
       // continues next tick, so this ranks below every BLOCKED gate above.
-      const stalledForMs = tickStalledForMs(scheduler.lastTickStartedAt ?? null, scheduler.lastTickCompletedAt ?? null, nowMs);
+      const stalledForMs = tickStalledForMs(
+        scheduler.lastTickStartedAt ?? null,
+        scheduler.lastTickCompletedAt ?? null,
+        nowMs,
+      );
       if (stalledForMs != null) {
         return {
-          gate: { text: "SLOW — tick running; engine responding slowly", tone: "amber" },
+          gate: {
+            text: "SLOW — tick running; engine responding slowly",
+            tone: "amber",
+          },
           lifecycle,
           text: `Tick running ${formatAge(stalledForMs)} — engine responding slowly; scheduling continues next tick.`,
           tone: "amber",

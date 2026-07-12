@@ -108,7 +108,11 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "node -e 'fetch(\"http://127.0.0.1:4000/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'"]
+      test:
+        [
+          "CMD-SHELL",
+          'node -e ''fetch("http://127.0.0.1:4000/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))''',
+        ]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -143,6 +147,7 @@ services:
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
     volumes:
       - results:/data/airfoilfoam
+      - sync_imports:/data/airfoilfoam/sync-imports # GC crash-orphan sync uploads
     depends_on:
       postgres:
         condition: service_healthy

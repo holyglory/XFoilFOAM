@@ -1,5 +1,596 @@
 # Decision History
 
+## 2026-07-12 — Exact repair and publication authority close the selected-generation boundary
+
+- Remediation trigger: exact-generation migration 0053 made public truth point
+  at one immutable result attempt, but two follow-on paths still crossed that
+  boundary. A rejected URANS attempt missing its video could be installed as
+  `results.current_result_attempt_id` solely so the renderer could reach it,
+  and a media-repair row named only the mutable result. Full-verification work
+  also carried its job id only in request JSON. Those shortcuts let a repair,
+  stale worker, or result-level classification act on a different attempt than
+  the one it appeared to describe. Separately, a failed job's generic error
+  could be copied onto a valid mean-stable oscillating RANS point.
+- Decision: migration 0056 adds exact normalized ownership. Every
+  `result_media_repairs` row names one `result_attempt_id`, constrained to the
+  same result, and every `sim_urans_verify_queue` row names its current
+  `sim_job_id`. A repair claims one attempt, one valid manifest checksum, and
+  one lease token. It may write only media/extents owned by that same attempt.
+  Rejected missing-media evidence stays pointer-null and historical until the
+  repaired attempt itself classifies `accepted` or `needs_urans`; only then may
+  it become the selected public generation. A valid mean-stable steady point
+  no longer inherits a sibling/job-level failure message.
+- Backfill is deliberately fail-closed. A legacy repair is bound only when one
+  exact attempt and one valid manifest match. Ambiguous or unowned scheduling
+  rows are removed rather than attached to the newest-looking attempt. A
+  rejected attempt that was selected only for `missing-urans-video` is first
+  captured as an exact repair obligation and then removed from the public
+  pointer. Any invalid selected pointer retires the affected current revision
+  and compatibility caches before the pointer is cleared.
+- Publication authority is checked again inside the revision-locked commit.
+  Production ingestion requires the exact local job and engine id, a live
+  ingest lease/token, and the normalized physical owner: the exact
+  verification queue row, full request row, or preliminary-obligation row.
+  Lock order is job, physical owner, then result. A stale or replaced worker may
+  retain immutable attempt history but cannot move the current pointer or its
+  media/force/extents projections. Verification/request owner ids in JSON are
+  provenance and require their normalized owner row; they are not authority by
+  themselves. Regression fixtures now bind and assert that owner explicitly.
+- The owner-approved multi-revision campaign batching decision remains in
+  force. A batched job's scalar revision is only its compatibility anchor.
+  Publication for another member requires the persisted `conditionMap` to
+  contain the exact `(revisionId, bcId)` tuple selected by exact canonical
+  speed. The resulting attempt is classified and published under that member's
+  revision lock. Rounded Reynolds, nearest-speed matching, preset names, and
+  internal batch labels never grant publication authority.
+- Public read models fail closed at the same boundary. Public simulation,
+  conflict settlement, promise fulfillment, and compatibility aggregation
+  require the classification attached to the exact selected attempt.
+  `polar-compat-v4` includes the selected attempt id in its evidence signature
+  and reads coefficients, quality, fidelity, and classification from that
+  attempt. Reusing v3 was considered, but an installation with no pointer
+  cleanup could retain a stale v3 cache. The v4 bump may temporarily leave a
+  public metric empty until evidence-backed refresh; it cannot show an older or
+  mismatched coefficient as current.
+- Alternatives considered in plain language: keeping a result-wide repair and
+  temporarily selecting rejected evidence would avoid a migration, but public
+  readers and stale workers could observe the rejected solve as truth. Inferring
+  ownership from job JSON, rounded values, or batch labels is less schema, but
+  becomes ambiguous after retries and retention. Exact attempt/job links,
+  leases, and locks add migration and concurrency-test cost, but make repair,
+  correction, and publication attributable and crash-safe. The exact model is
+  the recommended implementation. It extends the agent-recommended durable
+  architecture and selected-generation model already recorded on 2026-07-11;
+  those architecture choices still await explicit owner confirmation. The v4
+  cache bump and fail-closed read fixes are correctness remediation under the
+  existing no-fake rule, not a separate owner choice.
+- Migration proof: a fresh empty database applied all 57 migrations through
+  0056 with zero unvalidated constraints. A fresh production-0041 clone
+  conserved 933 results, 206,371 artifacts, 8,648 media rows, 81 force-history
+  rows, and 7,464 extents. Expected exact duplicate collapse changed attempts
+  906→894 and classifications 1,839→1,827; 618 eligible exact pointers
+  remained. Exact-owner, provenance, projection, and manifest audits reported
+  zero violations. All 148 foreign keys and 28 checks validated. Direct versus
+  migrated schema parity covered 65 tables and 963 columns/constraints, with
+  only equivalent Boolean-index syntax and one intentional synthesized legacy
+  enum label differing.
+- Verification recorded before delivery: Python 400 passed, 1 skipped, 6
+  integration tests deselected; core 119; web 272; DB 47; API 215. The final
+  full sweeper run passed 25/25 files and 273/273 tests (51.95 s Vitest,
+  53.99 s wall), and a prior independent full run on a fresh 0056 database also
+  passed 273/273. Independently rerun sweeper files passed:
+  `sweeper.test.ts` 34/34, media repair 22/22, replace guard 18/18, campaign
+  submit lifecycle 29/29, URANS ladder 16/16, and ladder submit retry 13/13.
+- Production-shaped local browser verification loaded E387, AG24, the campaign
+  list/detail, and Health at 390x844 and 1440x900. E387 rendered one six-point
+  public polar across compatible stored runs, omitted the internal
+  `remote-validation-e387` label, and produced no browser error or horizontal
+  document overflow. Formal verification checked all 10 route/viewport pairs
+  with zero critical findings. The polar toolbar records one narrow overlap
+  allowance because the fixed top navigation intentionally covers ordinary
+  document content only after that content scrolls underneath it; the initial
+  desktop and mobile controls were separately captured and interactive.
+- Immediately before the release commit, production PostgreSQL container
+  `a7136886aaae…` produced a 61,279,916-byte custom dump with SHA-256
+  `925dc429af50acd3e525e2148362ed9e13ce83fb767510195ee2277d57ca7765`.
+  Strong verification restored all 54 source tables into a disposable scratch
+  database. The live campaign was still cancelled, the sweeper flag false,
+  engine queue empty, and no OpenFOAM/meshing child process was present.
+- Production boundary: campaign `b96594a6-e0bf-40ce-b3c6-5dee77b35116`
+  remains cancelled and `sweeper_state.enabled` remains false in the last
+  verified production snapshot. This entry records no production deploy,
+  production migration, or OpenFOAM canary. The controller remains unproven on
+  production OpenFOAM until an explicitly isolated post-deploy canary succeeds.
+- Remaining owner decisions, stated for a non-specialist: keeping durable
+  database owners and exact attempt pointers costs more schema and operations
+  but preserves crash recovery and provenance; simplifying to memory/JSON or
+  inferred ownership costs less but can lose or misattribute work. Keeping the
+  one-answered-5xx retry after 30 seconds bounds waste; allowing more retries
+  may ride through longer outages but increases delay and solver pressure.
+  Indefinite delivered-cancellation audit rows preserve release proof but grow
+  slowly; a fixed expiry needs an owner-chosen retention window. Current
+  recommendations are durable/exact ownership, the bounded retry, and retained
+  cancellation audit until the owner explicitly decides otherwise.
+
+## 2026-07-11 — Remote evidence identity and public caches fail closed under concurrency
+
+- Live trigger: the remote validation path had stored 13 byte/value-equivalent
+  `result_attempts` for one E387 solve. All 13 shared the remote engine id,
+  angle, regime, and immutable evidence values, but only the newest attempt
+  owned the 2,463 solver artifacts. The old uniqueness rule included nullable
+  `sim_job_id`, and PostgreSQL treats nulls as distinct, so it did not protect
+  imported attempts. Raw remote engine ids were also instance-local and could
+  collide when a second solver used the same id.
+- Decision: imported engine identities are now
+  `sync:<validated source instance>:<validated remote engine id>`. An imported
+  attempt is unique by that identity plus exact AoA and regime when it has no
+  local job. Migration 0051 namespaces historical rows only when a fulfilled
+  promise supplies unambiguous source provenance. It refuses multiple source
+  attributions, divergent immutable attempt payloads, or materially different
+  classifications instead of guessing; identities that do not satisfy the new
+  syntax remain untouched rather than being rewritten. Equivalent
+  duplicates collapse onto the evidence-bearing keeper, and every artifact,
+  classification, preliminary-obligation, obligation-attempt, and remote-asset
+  reference is repointed before deletion. Rows without attributable provenance
+  remain untouched for explicit investigation. New imports reject invalid
+  source or engine identities at the API boundary.
+- Import settlement now resolves and verifies file bytes before acquiring
+  database locks, then serializes one natural physical cell and its sorted
+  evidence keys. Exact-attempt associations settle transactionally. A new
+  generation is classified from its own evidence before a separate atomic
+  promotion advances the canonical current-generation pointer and its
+  presentation projections; a rejected child cannot replace previously
+  accepted truth. An exact replay reuses the attempt; missing evidence may be
+  filled; differing stored evidence becomes a sync conflict and is never
+  overwritten. Source ids and engine ids reject delimiters or unbounded text
+  so namespaced identities cannot be forged or parsed ambiguously.
+- A remote promise is fulfilled only after every promised AoA has an accepted
+  canonical result backed by an accepted imported attempt. Partial pushes stay
+  open. Whole-request ownership and scope are preflighted; each point settles
+  atomically, while a legacy multi-point request may report a committed prefix
+  plus later conflicts rather than pretending to be batch-atomic. The native
+  delivery ledger sends one point per request. The transport preserves
+  fidelity, convergence and unsteady evidence, quality warnings, frame-track
+  statistics, force histories, media, artifacts, and field extents so the hub
+  applies the same no-fake classifier rather than trusting a remote summary.
+  Child solves preserve direct source provenance and cannot overwrite newer
+  local truth.
+- Migration 0052 separates immutable blob identity from evidence ownership.
+  One content-addressed mesh, dictionary, log, or field archive may be
+  referenced by many result-attempt association rows; replay is unique within
+  one owner, but identical bytes at a second AoA or continuation never relabel
+  the first owner's row and are not copied merely to evade a uniqueness rule.
+  Promise points retain the exact imported attempt id used to fulfill them.
+- Migration 0053 makes the selected public evidence generation explicit.
+  `results` points to one exact `result_attempt`; media, force-history
+  projections, and field-extents are owned by exact attempts and constrained
+  to the same result. The pointer may select machine-accepted evidence or the
+  one eligible `needs_urans` provisional generation required on Detail.
+  Accepted evidence always outranks provisional evidence; accepted URANS may
+  replace provisional RANS, while rejected evidence never advances the
+  pointer. Older generations remain addressable instead of being overwritten.
+  Public/cache/scale reads use only the current pointer; legacy rows are
+  backfilled only when one attempt and manifest match unambiguously. A zero- or
+  multi-match legacy row remains null and therefore unavailable/repairable
+  rather than being assigned to the newest-looking attempt. A stale worker may
+  retain its immutable child evidence, but its attempt id cannot overwrite a
+  newer generation's current projections.
+- Alternatives considered for 0053: repeatedly joining engine job, case,
+  angle, regime, and manifest values avoids a new pointer but becomes
+  ambiguous after job retention clears job ids and leaves every read path to
+  reimplement the same inference. Keeping one result-wide media/force slot and
+  overwriting it is less code, but erases which artifact belonged to the older
+  attempt. Refusing every same-value correction is safe but strands valid
+  remote continuations. The explicit pointer and attempt-owned associations
+  add a migration, conservative backfill, more writer/read fences, and rollout
+  tests; they make current-versus-history ownership direct and auditable. This
+  is the recommended high-integrity model and is an agent decision pending
+  owner confirmation; the owner was given these costs and alternatives while
+  implementation was in progress.
+- Remote delivery is a typed database ledger per promise and result
+  generation, not timestamps and retry state hidden in a job's JSON payload.
+  It publishes each durably ingested AoA from running or terminal sweeps,
+  renews the promise lease while work is healthy, retries transient transport
+  failures with a bounded next-at time, and blocks one answered conflict until
+  it is resolved instead of posting every sweeper tick. Historical delivered
+  and empty/superseded jobs are terminally accounted for so they cannot fill a
+  scan window and starve new evidence. A newly claimed promise either reuses
+  exact accepted evidence through a new delivery association or schedules the
+  normal bounded correction path; it is never marked busy with no owner/job.
+- Remote promise cancellation is also a typed durable obligation. The local
+  mirror is cancelled first; a separate cancellation row then retries the
+  authoritative hub call with bounded backoff until the hub answers success or
+  confirms that the promise is already absent. A one-shot network call was
+  considered, but a timeout or process restart would leave the hub lease alive
+  and able to suppress legitimate work. Reusing a result-delivery row or
+  embedding cancel flags in a job payload avoids a migration, but conflates
+  point evidence delivery with promise lifecycle and makes empty/superseded
+  jobs ambiguous. The dedicated queue adds migration 0055, retry state, and
+  recovery tests; it makes cancellation crash-safe and auditable. Cancellation
+  itself is idempotent, so concurrent sweepers may issue the same POST while
+  conditional settlement prevents a delivered row from returning to retry.
+  An exclusive network-call lease would reduce duplicate requests but adds
+  claim expiry/recovery state without changing the outcome. This is
+  the recommended high-integrity model and an agent decision pending owner
+  confirmation; the owner was given the cost and alternatives while the
+  remediation was in progress.
+- Each point now streams as multipart content, build→POST→release, rather than
+  base64-loading every result in a long sweep before the first request. The
+  receiver validates declared sizes/checksums and binds artifacts to the exact
+  attempt and media/extents to that attempt's manifest checksum. Force history
+  is replaced completely for a new generation, or removed when absent, so a
+  child cannot inherit a parent's statistics. Multipart counts, cumulative
+  bytes, free-disk use, temporary-file cleanup, and progress-aware idle/absolute
+  deadlines are bounded and tested above the measured production maximum of
+  3,620 artifacts plus media (3,628 file parts and about 1.15 GB for one
+  attempt). JSON and multipart share one 8,192-file ceiling, a 500-result
+  ceiling, bounded extent/scale arrays, and the engine's 400-sample
+  force-history transport contract. Disk reserve checks run before either
+  transport writes bytes.
+- Concurrent uploads reserve capacity in a durable database lease before
+  staging bytes. The reservation transaction prunes expired leases, accounts
+  for every still-live reservation against the shared sync-import volume, and
+  refuses work that would cross the 2 GiB free-space floor. Progress renews the
+  lease and every terminal path releases it; a crashed process therefore stops
+  consuming logical capacity after a bounded expiry. A single global advisory
+  lock held for an entire multi-gigabyte transfer was considered: it is less
+  schema/code, but serializes independent solvers and makes throughput depend
+  on one long-lived pooled connection. Independent `statfs` checks permit
+  concurrent overcommit and are unsafe. The leased reservation ledger adds one
+  migration, renewal/expiry cleanup, and oversubscription tests while allowing
+  safe concurrency. It is the recommended model and an agent decision pending
+  owner confirmation.
+- Identical sync conflicts have a canonical fingerprint and one pending audit
+  row. Resolution/promotion commits atomically with the imported evidence;
+  retry after a crash is an exact no-op completion rather than a wedged pending
+  conflict. This dedupe is review hygiene only—the production dashboard's 99
+  items were independently proven to be URANS obligations, not sync conflicts.
+- Alternatives considered: adding only a partial unique index was smaller but
+  would fail deployment on the live duplicates and leave instance-id
+  collisions; deleting all but the oldest row would have discarded the only
+  artifact owner; last-write-wins import would be simpler but could replace
+  immutable local evidence during a race. The selected namespaced,
+  transactionally serialized model plus the delivery ledger and streaming
+  protocol cost migrations 0051–0054, more locks, multipart handling, and
+  stricter conflict states; they make replay idempotent, memory-bounded,
+  incremental, and attributable. This follows the existing cross-instance-sync
+  and no-fake guardrails rather than creating an owner choice to overwrite
+  evidence. The
+  broader durable orchestration architecture remains an agent decision pending
+  owner confirmation, as recorded below.
+- Migration and regression proof includes a populated 0050→0051 upgrade with
+  the production-shaped 13-row duplicate, every durable foreign-key repoint,
+  exact-replay cardinality, concurrent winner/loser imports, malformed force
+  history, ambiguous provenance, divergent coefficient/classification
+  rollback, and a fresh 0000→0051 build.
+- Polar cache integrity is part of the same publication boundary. Migration
+  0050 adds a partial unique current-cache fence; revision refreshes take a
+  transaction-scoped advisory lock, write the new evidence-signature set, and
+  retire the old current set atomically. Compatibility caches advance their
+  evidence/classifier version and reject unclassified, continuation-required,
+  budget-stopped, or otherwise provisional evidence. A reader therefore sees
+  either the prior complete cache or the new complete cache, never an empty or
+  mixed generation during concurrent ingestion.
+- Compatibility cache version `polar-compat-v4` makes that boundary explicit:
+  every coefficient, quality field, fidelity label, and classification comes
+  from the immutable attempt named by `results.current_result_attempt_id`, and
+  the attempt id itself participates in the evidence signature. A pointer-less
+  result, a stale mutable result projection, or an accepted classification for
+  a different historical attempt cannot enter the aggregate. Reusing v3 and
+  relying only on migration 0056 to retire caches was considered, but an
+  installation with no invalid pointer could retain a pre-fix v3 cache as
+  current. The version bump instead makes every old v3 cache unreadable by v4
+  readers until normal evidence-backed refresh rebuilds it; the cost is a
+  temporary empty cache rather than stale public coefficients. This is an
+  agent correctness remediation under the existing no-fake/exact-generation
+  decision, not a separately owner-approved architecture choice.
+- Authentication residual: the federation currently uses one shared sync
+  secret. It authenticates membership but does not cryptographically bind a
+  request to the claimed source-instance id, so one compromised trusted solver
+  could impersonate another. Per-solver revocable credentials (recommended)
+  add credential issuance/rotation and a schema/admin surface but give clear
+  attribution and isolated revocation; mutual TLS is stronger still but adds
+  certificate operations. This is a future owner decision, not silently
+  changed as part of the solver rollout.
+
+## 2026-07-11 — Preliminary solver remediation is machine-owned, durable, and never fake-accepted
+
+- Owner request: stop the campaign whose dashboard reported 99 points needing
+  review, diagnose why preliminary URANS did not settle reliably, and make
+  future precalculation fast and self-correcting without requiring routine
+  human coefficient review. The production campaign was cancelled and the
+  sweeper disabled before implementation; no old work is resumed by this
+  decision.
+- Product semantics: `needs_review` is reserved for a future workflow in which
+  a person can actually adjudicate conflicting evidence. Solver crashes,
+  exhausted integration, deterministic mesh QA, and missing derived media are
+  machine/setup outcomes. They remain retained and visible as failed,
+  rejected, blocked, or unavailable, but do not become human chores and are
+  never auto-accepted. A preliminary coefficient enters a polar only after the
+  existing evidence classifier accepts it. Historical `waive` verdicts remain
+  immutable audit history but no longer override classification or fitted
+  polars; migration 0046 revokes active waiver overlays, the API no longer
+  creates them, and the fit/cache versions advance so a previously
+  waiver-derived cache cannot remain current after rollout. Historical active
+  exclusions remain enforced and revocable through their audit history. New
+  exclude/defer verdict creation is inactive until a real conflict workflow
+  gives a person evidence they can genuinely adjudicate; this rollout adds no
+  new human-review surface.
+- Stored-but-unclassified evidence also fails closed. A completed engine row
+  with no recognized machine classification is shown as blocked/unavailable,
+  carries a failed classification gate, receives no review/retry action, and
+  is excluded from polars. The former legacy fallback that labeled a null
+  classification `verified`—and synthesized a passed RANS-validity gate—was
+  removed and is pinned for both RANS and URANS endpoint payloads.
+- Automatic continuation: migration 0047 permits at most two engine-accepted
+  precalc attempts per physical cell: the initial solve and one corrective
+  solve. When restartable case state exists, the corrective solve is a bounded
+  7,200-second same-case continuation. Composition, cancellation, or a
+  connection failure before engine acceptance consumes no solver attempt. A
+  process restart, cache refresh, or second campaign referencing the same cell
+  cannot create an unbounded loop. Operational job purging may null the job
+  link, but preserves the immutable attempt audit.
+- Historical-upgrade completeness uses the same persisted marker literals as
+  the runtime classifier: `stopped by the wall-clock budget guard` and
+  `requires further same-case integration`. An older classifier's `accepted`
+  row cannot make marker-bearing evidence satisfied. The spent attempt is
+  retained as rejected/continuable; one live-owner attempt remains pending,
+  two spent attempts are blocked, and ownerless work is cancelled. This rule
+  also covers canonical-only legacy rows that have no result-attempt child.
+  The pre-deploy audit caught and replaced obsolete placeholder marker strings
+  in migration 0047; a populated 0046→0047 regression now pins the real text,
+  attempt ledger, and projected obligation state.
+- Answered engine-submit failures are execution policy, never CFD evidence.
+  Migration 0047 owns preliminary obligations, 0048 owns ordinary claimed
+  result cells, and 0049 owns full-fidelity request/verification work. A
+  connection/timeout failure releases work without consuming the answered
+  allowance; global engine backoff limits frequency. The first answered 5xx
+  waits 30 seconds and gets exactly one automatic submit retry. A second 5xx,
+  any answered 4xx, or another answered rejection becomes `blocked`. Engine
+  acceptance clears that failure sequence. No coefficient or result-attempt
+  evidence is invented. This exact one-retry/30-second bound is an agent policy
+  pending owner confirmation together with the durable architecture.
+- Durable media repair: missing default URANS media is execution/output work,
+  not immutable CFD evidence. Each affected result gets a separate database
+  repair obligation with a bounded attempt count, lease, retry time/backoff,
+  and terminal error. The worker recomputes real field extents and requires
+  real stored media for every evidence-backed field; it does not invent scale
+  values or mark an empty renderer response successful. Classification refresh
+  and required full verification are part of settlement. A crash after media
+  bytes commit is healed from database truth on the next pass. Repaired media
+  is readable from the shared volume and must match the renderer's exact byte
+  size and SHA-256 before commit. Each row is stamped with the source manifest
+  checksum, and every upsert is atomically fenced by the live repair token plus
+  current evidence signature. A separate downstream-finalized marker makes a
+  crash after media settlement but before cache/verification/campaign hooks
+  resumable without falsely completing newer evidence. Background provenance
+  comes from the producing job/request/verification owner, not from whether a
+  campaign happened to link the result before discovery.
+- Shared ownership: public solver evidence is physical-result work and can be
+  referenced by more than one campaign. A single campaign id on a continuation
+  or verification row was considered because it is a smaller migration, but
+  it lets one campaign cancel, adopt, or strand another campaign's work. The
+  selected model stores one physical obligation plus explicit many-to-many
+  campaign associations; background work is represented independently.
+  Paused-only ownership freezes scheduling, any active owner permits it, and
+  cancellation settles only that campaign's association. The physical pending
+  item is cancelled only when it has no live or background owner. For request
+  rows, `requested_by` is immutable creator audit only; `background_owner` is
+  the durable independent-owner bit. A later manual/admin reuse promotes that
+  bit without rewriting the creator, so campaign cancellation cannot erase the
+  administrator's still-live obligation.
+- Ingest ownership: a status string alone is not an exclusive lock. Solver-job
+  ingestion uses a renewable database lease/token; only the lease owner may
+  refresh it, release it, or commit terminal job state. An expired lease is
+  recoverable without holding a database transaction open across engine or
+  media network calls.
+- Plain-language decision context presented to the owner while work was in
+  progress: periodic in-memory scans and one scalar campaign owner would cost
+  less code and no/one small migration, but permanent failures could be retried
+  forever, crashes could lose the finalization step, and shared campaigns could
+  cancel each other's work. Durable queues, leases, and association rows cost
+  additional migrations and concurrency tests and carry rollout risk if their
+  backfill is wrong; they make bounded retries, restart recovery, pause/cancel,
+  and future multi-instance solving explicit and auditable. Recommendation was
+  the durable model. The owner had not explicitly approved that choice at the
+  time it was implemented, so this is recorded as an agent decision pending
+  owner confirmation and must be re-surfaced rather than described as an owner
+  decision.
+
+## 2026-07-11 — Campaign lifecycle owns the compose-to-submit boundary
+
+- Incident class: campaign cancellation guarded queued verification selection,
+  but a stale RANS batch or automatic wave-2 retry could still insert a
+  `pending` sim job and call the engine after pause/cancel committed. A second
+  race existed while `submitPolar` was awaiting its response: the old code
+  stamped `submitted` unconditionally, resurrecting work the lifecycle action
+  had already stopped. Pending jobs were also absent from terminal campaign
+  cleanup.
+- Decision: `pending` is pre-boundary composition, never in-flight work. A
+  conditional `engine_state = 'submitting'` lease is acquired before the
+  external call, so only one cooperating submitter can reach the engine.
+  Pause/cancel atomically transitions pending campaign jobs to `cancelled` and
+  releases only claims owned by transitions it won; already submitted/running
+  campaign jobs retain the recorded finish-and-ingest policy. An explicit
+  admin cancellation of a submitted/running job uses a persisted engine-side
+  obligation, while `ingesting` owns evidence settlement and cannot be
+  cancelled underneath its writes. If lifecycle wins while the engine call is
+  in flight, the accepted id is persisted on the cancelled job and a
+  compensating engine cancel runs.
+  `cancelling` / `cancel_pending` rows are retried from the database even when
+  the engine queue omits the task.
+- Startup recovery terminalizes every pre-boundary job left by the previous
+  sweeper process before queue pressure is measured, releases its claims, and
+  heals linked verification/admin-request ownership. Verification items and
+  admin URANS requests are themselves claimed atomically before composition;
+  process death releases only claims whose job never crossed the submission
+  boundary. Admin cancellation and ingestion use competing conditional status
+  transitions, so exactly one owns the result rows.
+- Solver-tier routing is durable across these lifecycle transitions. For
+  preliminary wave-2 work, the authoritative scheduling state is one
+  `sim_precalc_obligations` row per `(airfoil, immutable revision, AoA)`, not a
+  queued canonical result. Physical precalc jobs carry exact obligation ids,
+  use `campaign_id = NULL`, and derive authorization from many-to-many
+  campaign/request ownership. Legacy routed result rows and parent scans remain
+  discovery/recovery inputs only; they cannot downgrade obligation-owned work
+  to wave-1 RANS. Terminal campaign cancellation settles only its ownership;
+  immutable attempt evidence remains.
+- Honest residual limit: the engine API does not yet accept a client-addressed
+  idempotency key. A process death, response loss, or timeout after the engine
+  accepts `submitPolar` but before its id is persisted can still leave an
+  unaddressed task. The new guard closes duplicate cooperating submits and the
+  pause/cancel races, and makes compensation retryable after its DB record; it
+  does not claim end-to-end transactional submission.
+- Guardrails: `campaign-submit-lifecycle.test.ts` pins stale post-cancel batch
+  suppression, single pre-call ownership, queue-independent cancellation
+  compensation, mid-submit pause compensation for RANS and wave-2, and
+  pause/restart/resume remaining forced-transient precalc.
+  `campaign-lifecycle-guard.test.ts` pins pending-job and routed-row terminal
+  cleanup, request/verify orphan healing, pending admin cancellation, and the
+  ingest-versus-cancel boundary. Sweeper regressions pin that orphan cleanup
+  removes phantom queue pressure and completed ingest stamps the full case
+  count.
+- Production evidence: campaign `b96594a6-e0bf-40ce-b3c6-5dee77b35116`'s
+  headline 99 were automatic RANS-to-URANS obligations, not 99 human verdicts.
+  The true attention set was 49 (18 deterministic S1223 mesh blockers plus 31
+  rejected precalc windows). After a verified PostgreSQL backup/restore, both
+  live engine jobs and the campaign were cancelled; 40 latent pending verify
+  items joined two existing items as 42 retained cancelled queue rows. The
+  sweeper remains disabled; zero campaign jobs or OpenFOAM processes are live.
+- Recovery completeness: cancelled wave-1 parents remain discoverable when
+  running-partial ingestion left immutable attempt evidence but no terminal
+  ingest timestamp. Completed engine results now stamp the full case count.
+- Implementation and approval status: migrations 0043–0049 now implement the
+  database side of the recommended durable model—normalized campaign
+  ownership, media-repair obligations, ingest leases, evidence fences,
+  physical precalc obligations, and separate answered-submit retry ledgers.
+  Parent-job scans remain for source discovery and reconciliation, not retry
+  ownership. This was implemented as the recommended agent decision after its
+  costs and rollout risks were presented, but the owner has not explicitly
+  confirmed it; it must remain recorded and re-surfaced as pending owner
+  confirmation. The open architecture residual is the engine API's lack of a
+  client-chosen idempotency key: response loss after acceptance can still leave
+  an unaddressed task.
+
+## 2026-07-11 — Precalc URANS controls its own publishable window
+
+- Fired planned trigger: HANDOVER section 6 proposed adapting field-write
+  cadence after measuring the real shedding period. Production proved it: all
+  31 rejected precalc results were non-stationary; 25 already retained at
+  least three periods; 19 were frame-sparse and 15 were sparse despite those
+  three periods. None exhausted the 4 h solver budget (completed jobs took
+  roughly 4–78 minutes). The controller stopped at the period-count bar, but
+  the exact established-oscillation test ran only later during finalization,
+  after the same-case continuation opportunity was lost. Short guessed-period
+  horizons could also call physically plausible slow shedding missing/flat
+  before two real cycles existed.
+- Decision: precalc's fresh first chunk targets its tier-owned three retained
+  periods plus the whole-cycle margin, not a legacy ten-cycle profile horizon.
+  Full fidelity keeps its configured horizon and five-period early-stop floor.
+  The live precalc early-stop monitor nevertheless retains 4.0 certified
+  periods before stopping: the accepted preliminary bar remains K=3, while
+  the extra span is the maximum of the existing half-period stop margin and
+  the two independent two-period estimator halves. A 3.5-period stop was
+  rejected during review because each half contained only 1.75 periods and
+  could never corroborate the final stationarity verdict. Full fidelity's
+  effective certified stop remains 5.5 periods.
+  Every precalc attempt now runs the exact final stationarity gate while the
+  restartable case is live. Under-retained or relaxing windows extend that same
+  case; sparse media tails get three measured-period chunks at 30 real field
+  writes per cycle. No copied refined rerun discards the trajectory.
+- One monotonic tier deadline spans the fresh or resumed transient, every
+  same-case extension, reconstruction, and any refined pass. Each subprocess
+  receives only the remaining time; a chunk can no longer acquire a fresh
+  four-hour timeout. An MPI `reconstructPar` timeout now enters the same honest
+  restartable wall-budget result as a solver timeout; a non-timeout
+  reconstruction failure remains a real failure. When the live monitor extends OpenFOAM `endTime`, it also
+  moves the march-watchdog target atomically while preserving the original wall
+  deadline. Unknown-period acquisition writes at 30 fields per physical
+  slow-edge period (about 111 writes through the default 37-guess horizon,
+  rather than roughly 1,100); once a credible period locks, the monitor switches
+  immediately to measured-period/30. Sparse-only tail repair adds exactly three
+  measured periods, while aerodynamic under-retention or nonstationarity keeps
+  the conservative retained-window sizing.
+- Slow-period acquisition is bounded at cumulative guessed-period horizons
+  10, 20, then a horizon derived from the slow edge of the accepted Strouhal
+  band and startup discard. A flat-looking force trace is not accepted as
+  no-shedding until the retained window covers 2.1 periods at the physical
+  slow edge (St=0.05), for both preliminary and full fidelity; acquisition
+  targets 2.2 slow-edge periods so sample/discard rounding cannot undershoot
+  that floor. At U=10 m/s and chord=1 m this means 4.2 s retained evidence,
+  reached by a 7.4 s total run with the default 40% discard. This closes the
+  false-steady path where a short weak slow wake looked flat before one real
+  cycle. The amplitude/no-shedding decision uses the full post-discard real
+  observation before any FFT-period window is cropped, so a harmless
+  low-amplitude spectral peak cannot shorten 4.21 s of evidence back below the
+  4.2 s floor. Established-oscillation stationarity also requires a fresh,
+  corroborated period estimate; an older FFT-only cadence may size another
+  continuation but can never be treated as a stable acceptance verdict.
+  Existing wall-budget, timeout, crash, and divergence guards remain
+  authoritative. The six-chunk cap emits the
+  distinct truthful `requires further same-case integration` marker only when
+  period count or stationarity still needs evidence. Sparse recording alone is
+  remediation metadata: coefficient means remain force-history-derived and do
+  not require human review merely because animation is coarse.
+- The mandatory intermediate stationarity grade fails closed: an exception,
+  missing whole-period statistics, invalid period, or missing coefficient
+  evidence can never inherit a prior accepted grade. Corrective same-case
+  integration is authorized only when a finite measured period can size it.
+  The existing null-frame ingest sentinel remains the cross-runtime rejection
+  path; a broader frame-track API union was considered and rejected as needless
+  parser/player churn.
+- The recorded K=3 policy is not weakened: slow modulation still rejects when
+  more evidence cannot distinguish it from relaxation. This change lets the
+  preliminary tier gather that evidence; full fidelity keeps its strict drift
+  gate.
+- Rejected alternative: a Node frames/cycle acceptance gate
+  (`fidelity-ladder-v5`) would have reclassified 30 of 44 accepted production
+  precalc rows even though field-frame sparsity does not change force-history
+  means. That experiment was fully reverted; the public classifier remains
+  `fidelity-ladder-v4`.
+
+## 2026-07-11 — Node creation defaults complete the Courant-4 decision
+
+- Follow-up to the recorded 2026-07-07 engine decision: every Node creation
+  surface now imports `DEFAULT_TRANSIENT_MAX_COURANT = 4` (legacy boundary API,
+  solver-profile API, Setup editor, campaign quick-create, and DB schema
+  defaults). Migration 0042 changes only the two column defaults; it does not
+  rewrite existing profiles or immutable setup/result evidence. Explicit
+  expert overrides remain allowed.
+- Production already stores 4 in every live solver profile, legacy boundary
+  row, and immutable preset revision, so no backfill is needed. The migration
+  prevents future omitted-value writes from returning to the unsafe historical
+  default of 15.
+
+## 2026-07-11 — Deterministic precalc mesh-QA failures bypass unchanged auto-retry
+
+- Fired trigger: the 2026-07-10 mesh-gate decision accepted at most one cheap
+  self-healing retry for a path that might first build the wrong derived mesh.
+  Production campaign b96594a6 disproved that bound: 18 S1223 cells retained
+  the exact `mesh degenerate at this fidelity tier` / max-non-orthogonality
+  88.2–88.3° verdict while accumulating 66 attempts (4–5 per cell) against the
+  same immutable campaign revision. An unchanged retry was deterministic waste,
+  not transient crash recovery.
+- Decision after migration 0047: an engine-accepted precalc attempt carrying
+  both pinned deterministic mesh markers immediately settles its physical
+  obligation as `blocked`; it receives no unchanged second solve. Jobs carrying
+  valid `precalcObligationIds` are excluded from generic result auto-retry.
+  Restartable or transient non-deterministic outcomes may use the obligation's
+  one remaining corrective attempt. Attempt evidence remains immutable,
+  blocked work is excluded from human review and valid polars, and an unchanged
+  deterministic mesh setup cannot be manually requeued; remediation requires a
+  changed immutable mesh/setup revision.
+- Guardrail first: `auto-retry-mesh-qa.test.ts` drives a production-shaped
+  failed precalc child containing one 88.3° mesh-QA point and one transient
+  divergence through `reconcile()`. Pre-fix recall proof failed because both
+  rows returned to pending. Post-fix it pins one stored attempt and terminal
+  blocked state for the deterministic mesh row, while the transient sibling
+  still requeues once with its durable marker. A failed/cancelled wave-2 child
+  settles the whole request only when every requested angle has exact stored
+  deterministic mesh evidence. Mixed partial children instead filter the
+  blocked angles and resubmit only transient/unattempted siblings as
+  forced-transient precalc, including across process-memory reset.
+
 ## 2026-07-08 — Auto-retry-once route gap: running-partial ingest + released-cell guard
 
 - LIVE GAP (prod campaign 495d78e0, minutes after stage-2 opened): s1223 −5°
@@ -111,7 +702,7 @@
   re-verified cell stops reading disagreed; API-pinned in
   apps/api/test/point-history.test.ts).
 - Points tab filters: `pverify=pending|disagreed` URL param (same replace
-  semantics as the other p* params); the derived-mirror arm is excluded under
+  semantics as the other p\* params); the derived-mirror arm is excluded under
   a verify filter (mirrors are never verified in their own right).
 - Request-URANS (contract 6) wired on three surfaces: story panel
   (single point, idempotent-aware buttons fed by GET /api/admin/urans-requests
@@ -217,7 +808,7 @@
     target and domain extents); full ⇒ 7 periods, 21600 s (6 h), full mesh.
     Echoed on `PolarPoint.fidelity`: `"rans" | "urans_precalc" | "urans_full"`.
   - `PolarPoint.steady_history` (nullable): `{iterations, cl, cd, cm,
-    window{start_iter, end_iter}, mean_stable, note}`, ≤ 2000 samples
+window{start_iter, end_iter}, mean_stable, note}`, ≤ 2000 samples
     (`STEADY_HISTORY_MAX_SAMPLES`), shipped whenever the steady solve used
     oscillating-averaging OR failed to stabilise (analysis evidence on the
     escalation path); null for classic pointwise convergence.
@@ -229,7 +820,7 @@
   existing `rans_solver_timeout` cap; media budgets stay derived from
   `settings.solver_timeout`.
 - Decision — precalc mesh derivation is param-level (`derive_precalc_mesh_
-  params` + `effective_mesh_params` in models.py): the mesh cache keys on the
+params` + `effective_mesh_params` in models.py): the mesh cache keys on the
   resolved MeshParams, so the derived half mesh caches under its OWN key with
   zero cache-schema changes. Applied in jobs.execute_job (job mesh for
   force_transient+precalc requests) and in run_case when it builds its own
@@ -306,7 +897,7 @@
   stale markers before every fresh attempt and, on solver exit, raises the
   marker reason as OpenFOAMError — so the case flows the EXISTING
   failed/timeout grading path (attempt evidence retained, honest error, job
-  continues its other cases), NEVER the stall detector's whole-job os._exit,
+  continues its other cases), NEVER the stall detector's whole-job os.\_exit,
   and a condemned partial window is NEVER graded like an honest timeout
   (the garbage must not even reach the node gate). False-positive guards
   pinned by tests: post-stall |Cl|~3 never trips the bound; startup-ramp
@@ -366,7 +957,7 @@
 - Incident (prod, py-spy-proven, build prod-20260707-1dc13ea-frametrack): the
   first URANS media runs pinned both worker tasks ALIVE at full CPU for 3+
   hours inside `render_mean_contours -> compute_vorticity ->
-  matplotlib CubicTriInterpolator.__init__ -> _cg` — a min-energy
+matplotlib CubicTriInterpolator.__init__ -> _cg` — a min-energy
   conjugate-gradient solve over the FULL refined triangulation, TWICE PER
   FRAME x up to 141 frames, GIL-serialized with OpenBLAS spin threads; the
   API container burned ~390% on the same class for scaled media. No timeout
@@ -416,7 +1007,7 @@
   postprocessing with ZERO live processes under the job dir AND no
   progress-token advance for `stall_no_progress_minutes` (=20, Settings) is
   marked failed "stalled in <phase> — no progress for Nm" and the worker
-  CHILD exits (os._exit 70) — the only way to stop an in-process C-level
+  CHILD exits (os.\_exit 70) — the only way to stop an in-process C-level
   grind. Progress tokens: status.json updated_at (any message/phase write),
   coefficient.dat mtimes (live march), frame PNG mtimes (advancing media),
   .vtu mtimes (docker-runner foamToVTK). FALSE-POSITIVE GUARDS pinned by
@@ -618,7 +1209,7 @@
 ## 2026-07-01 — Boundary Forms Prefer Domain Presets Over Raw Solver Numbers
 
 - Decision: Turbulent viscosity ratio is presented as `Turbulent viscosity
-  ratio νt/ν` with practical presets, while the exact raw numeric value remains
+ratio νt/ν` with practical presets, while the exact raw numeric value remains
   available in an advanced disclosure.
 - Why: The previous `Viscosity ratio` label exposed a solver parameter without
   its physical meaning or a reasonable default choice for 2D airfoil work.
@@ -1051,6 +1642,7 @@
   objectives that are auditable evidence chains rather than claims.
 
 ## 2026-07-04 — Campaign detail UI: pinned-revision detail scope (surgical API exception)
+
 - Decision: `GET /api/airfoils/:slug` accepts an optional `revisionId` query
   param (`assembleDetail(slug, { revisionId })`) that scopes the polar payload
   to ONE pinned `simulation_preset_revisions` row, bypassing the
@@ -1066,6 +1658,7 @@
   never re-implements polar assembly.
 
 ## 2026-07-04 — Admin shell integration: URL routing, nav regroup, queue campaign surfaces
+
 - Decision: `/admin` navigation regrouped to five sections (Simulations first +
   default, Queue, Setup library with Mediums folded in as a 10th tab, Catalog
   with Add airfoils/Categories/Hashtags tabs, Sync API) and all admin routing
@@ -1085,6 +1678,7 @@
   queue job cards; exactly one global solver-capacity control.
 
 ## 2026-07-04 — API integration tests serialized (vitest fileParallelism=false)
+
 - Decision: `apps/api/vitest.config.ts` disables test-file parallelism.
 - Why: All four API test files are shared-Postgres integration tests; run in
   parallel they race — observed: the catalog sync-claim test claimed a pending
@@ -1093,8 +1687,9 @@
 - Expected effect: Deterministic API suite; per-file DB assumptions hold.
 
 ## 2026-07-04 — Admin routing goes shallow (native history API, no RSC refetch)
+
 - Decision: `AdminConsole.navigate()` now uses `window.history.pushState/
-  replaceState` (Next ≥14.1 syncs `useSearchParams` with the native history
+replaceState` (Next ≥14.1 syncs `useSearchParams` with the native history
   API) instead of `router.push/replace` for all section/tab/step/campaign/
   wizard URL transitions; push mode keeps an explicit `scrollTo(0, 0)`.
 - Why: `/admin` is `force-dynamic`, so every router navigation refetched the
@@ -1108,6 +1703,7 @@
   Next's popstate handling; e2e navigation is deterministic.
 
 ## 2026-07-04 — Airfoil symmetry computed at creation time
+
 - Decision: `createAirfoil` (apps/api/src/services/airfoils.ts) computes
   `isSymmetric` + `symmetryCheckedAt` via `isAirfoilSymmetric(geo.contour)`
   at insert time (detection failure records false + null checked-at, never a
@@ -1122,6 +1718,7 @@
   apps/api/test/purge.test.ts and the campaign wizard e2e.
 
 ## 2026-07-04 — Test-artifact purge cascades the campaign family
+
 - Decision: `POST /api/admin/test-artifacts/purge` now removes, for pw-
   prefixed campaigns (matched on slug/name/idempotency key), in FK order:
   results landed at campaign points → campaign sim_jobs → campaigns (FK
@@ -1141,6 +1738,7 @@
   purge → zero-residue assertions across 21 queries).
 
 ## 2026-07-04 — Formal UI verification pass: zero criticals on admin surfaces
+
 - Decision: (1) TopBar nav tabs become their own overflow-x scroll container
   at ≤860px (`.topbar-tabs` min-width:0 + overflow-x:auto; brand/actions
   flex-shrink:0) instead of pushing the actions group past the document edge —
@@ -1192,11 +1790,11 @@
     (keyed after y+/speed sizing). `prepare_mesh` copies a hit into the job
     workspace instead of re-running blockMesh and publishes fresh builds.
   - **seed/**: latest-time fields of ACCEPTED steady solves, keyed by mesh key
-    + fluid (density, dynamic viscosity) + canonical speed; entries also carry
-    a solver signature (turbulence model/intensity/ratio + roughness) so seeds
-    only apply where the 0/-file boundary conditions match. A fresh steady case
-    with no in-job previous field seeds from the nearest donor within 2.0 deg
-    instead of a potentialFoam cold start.
+    - fluid (density, dynamic viscosity) + canonical speed; entries also carry
+      a solver signature (turbulence model/intensity/ratio + roughness) so seeds
+      only apply where the 0/-file boundary conditions match. A fresh steady case
+      with no in-job previous field seeds from the nearest donor within 2.0 deg
+      instead of a potentialFoam cold start.
 - Seeding deliberately reuses the SAME field-carry mechanism as the in-polar
   warm-start march (`_rewrite_carried_inlet_velocity`, extracted from
   `_solve_warm`): donor fields are staged inside the case, the inlet/outlet U
@@ -1261,7 +1859,7 @@
 - Decision: the solver-profile "Momentum scheme" field is a select fed by a
   shared constant (apps/web/components/admin/solver-schemes.ts) in BOTH the
   Setup library editor and the wizard quick-create modal. Engine ground truth
-  (src/airfoilfoam/case/builder.py _write_fv_schemes): "upwind" maps to
+  (src/airfoilfoam/case/builder.py \_write_fv_schemes): "upwind" maps to
   "bounded Gauss upwind"; every other string silently maps to
   "bounded Gauss linearUpwind grad(U)" — so free text was a
   silent-wrong-behavior trap (typing "LUST" ran linearUpwind without error).
@@ -1470,7 +2068,7 @@
   green. The missed-coverage class was "finished job → detail → evidence
   visible on a campaign-only DB"; no test walked that journey before.
 - Follow-up (formal UI verification of the pinned-detail delivery): the
-  formal-web-ui-verification run on /airfoils/* mobile (390x844) failed with
+  formal-web-ui-verification run on /airfoils/\* mobile (390x844) failed with
   criticals. Root causes: (a) pre-existing — DetailIsland's two-column grid was
   a fixed `344px 1fr`, so at 390px the whole chart column rendered off-canvas
   (confirmed identical criticals on the committed baseline via git stash);
@@ -1497,7 +2095,7 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
 - D3 (classifier): `results.stalled` stays the AERODYNAMIC post-stall marker
   (ingest sets it true for every unsteady point by construction). The
   classifier's `solver-stalled` reason now fires only for `stalled &&
-  !unsteady` (non-converged steady points). Unsteady rows are judged on their
+!unsteady` (non-converged steady points). Unsteady rows are judged on their
   own gate: converged + force history + VIDEO are hard requirements for
   `accepted` (evidence-first honesty). POLAR_CLASSIFIER_VERSION →
   `rans-stall-v2`. Must-catch core tests use the exact ingest-shaped row
@@ -1505,12 +2103,12 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   tests fail (recall proven).
 - Found while proving D3 end-to-end — correlated-subquery bug in
   `packages/db/src/polar-cache.ts`: drizzle renders `${results.id}` inside a
-  sql`` fragment as UNQUALIFIED `"id"`, which Postgres scope-resolves to the
-  subquery's own table (`fh.result_id = fh.id` — always false; on the attempt
-  path `media.result_id = media.result_id` — always true). hasForceHistory/
-  hasVideo were permanently false for result rows, so even registered video
-  could never be seen. Rule: hand-qualify correlated outer columns in raw sql
-  fragments (`"results"."id"`).
+  sql``fragment as UNQUALIFIED`"id"`, which Postgres scope-resolves to the
+subquery's own table (`fh.result_id = fh.id`— always false; on the attempt
+path`media.result_id = media.result_id` — always true). hasForceHistory/
+hasVideo were permanently false for result rows, so even registered video
+could never be seen. Rule: hand-qualify correlated outer columns in raw sql
+fragments (`"results"."id"`).
 - D4 (ingest media): engine-shipped media (`p.images`, `p.mean_images`,
   `p.video`) now register into result_media AT INGEST, before the scaled-render
   round-trip, on the same (result, kind, field, role) upsert key — a
@@ -1654,6 +2252,7 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   whole-polar promotion heuristics read REVISION-WIDE classifications, so
   leaked evidence shifts later suites' decisions (caught: the new scale-retry
   test's α=87 accepted point flipped whole-polar-urans → invalid-rans-points).
+
 ## 2026-07-06 — Targeted URANS: steady-RANS-first warm start + timeout honesty (prod clarky -2..4 timeouts)
 
 - Prod evidence (job 9ab16d4b, clarky alpha=4, single-point targeted-urans):
@@ -1669,14 +2268,14 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   `solve_once` incl. seed-cache donor lookup, first-order fallback,
   `rans_max_iterations` cap — the `force_transient` bypass in
   `_steady_rans_params` was removed), but a steady failure is tolerated (logged
-  + quality warning) and steady coefficients are never accepted as the URANS
-  result. When the steady field exists on the shared job mesh, its latest-time
-  fields are copied into the transient's `0/` (`_seed_transient_from_steady`)
-  — potentialFoam is skipped so it cannot clobber the developed field.
-  Otherwise the transient prep now runs the short potentialFoam+simpleFoam
-  init UNCONDITIONALLY (previously skipped for force_transient). Batch
-  fallback-path behavior is unchanged; the batch URANS-promotion path
-  (`_run_full_urans_replacement`) inherits the same steady-first fix.
+  - quality warning) and steady coefficients are never accepted as the URANS
+    result. When the steady field exists on the shared job mesh, its latest-time
+    fields are copied into the transient's `0/` (`_seed_transient_from_steady`)
+    — potentialFoam is skipped so it cannot clobber the developed field.
+    Otherwise the transient prep now runs the short potentialFoam+simpleFoam
+    init UNCONDITIONALLY (previously skipped for force_transient). Batch
+    fallback-path behavior is unchanged; the batch URANS-promotion path
+    (`_run_full_urans_replacement`) inherits the same steady-first fix.
 - F2 decision: a transient solver TIMEOUT is not a crash. `RunResult` gained
   `timed_out`; a timed-out attempt with gradable coefficient.dat rows is graded
   through the existing history/quality machinery and reported with
@@ -1749,10 +2348,10 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
 
 - Cross-runtime contract pin (same pattern as the worker-restart orphan
   message): the engine ships per URANS point `result.json →
-  point.frame_track` = `{ period_s, periods_retained, stationary, drift_frac,
-  window{t_start,t_end}, stats{cl,cd,cm × mean/std/min/max — time-weighted
-  trapezoidal over an INTEGER number of periods}, fields[], frames[≤120 ×
-  {i,t,cl,cd,cm}], image_pattern "frames/{field}/f{i04}.png" }`. Point-level
+point.frame_track` = `{ period_s, periods_retained, stationary, drift_frac,
+window{t_start,t_end}, stats{cl,cd,cm × mean/std/min/max — time-weighted
+trapezoidal over an INTEGER number of periods}, fields[], frames[≤120 ×
+{i,t,cl,cd,cm}], image_pattern "frames/{field}/f{i04}.png" }`. Point-level
   cl/cd/cm/strouhal = frame_track.stats means / measured St (single source of
   truth). No-shedding steady points ship `frame_track = null`. Node pins the
   shape with a strict parser (`parseFrameTrack`, rejects added/removed/
@@ -1818,10 +2417,10 @@ Locked decisions implemented (Node side only; engine D1/D2 tracked separately):
   `SolverParams` (models → request → pipeline, same wiring as
   transient_cycles). The transient extends in continuation chunks by
   REUSING the existing restart mechanics (`write_transient` from latestTime
-  + solver restart) — deliberately no second continuation path. Each chunk's
-  coefficient.dat segment is merged for grading
-  (`_transient_coeff_selection` excludes the steady-init pseudo-time
-  history; must-catch test proves cl=99 init rows can never contaminate).
+  - solver restart) — deliberately no second continuation path. Each chunk's
+    coefficient.dat segment is merged for grading
+    (`_transient_coeff_selection` excludes the steady-init pseudo-time
+    history; must-catch test proves cl=99 init rows can never contaminate).
 - Period tracking: autocorrelation (`measure_period`) on the Cl signal
   (uniform resample, demean, first peak past the first zero crossing,
   parabolic refinement) — chosen over zero crossings because it is robust to
@@ -1904,7 +2503,7 @@ defects; fixes, in decision form:
   silently skipping the gate. DECISION: ingest is the trust boundary — any
   FRESH ingest is post-contract by definition, so `frameTrackForPoint` now
   persists a fail-closed sentinel (`{missing:true, stationary:false,
-  periods_retained:null, reason}`) for shedding points missing frame_track;
+periods_retained:null, reason}`) for shedding points missing frame_track;
   the gate rejects it honestly, the modal falls back to the mp4. NULL
   remains reserved for steady/no-shedding points and pre-existing legacy
   rows.
@@ -1978,6 +2577,7 @@ silent drop the terminal behavior, and the new oscillating-averaging gate
 into that hole.
 
 DECISIONS (engine):
+
 1. A steady case with real force data NEVER fails or vanishes for
    non-convergence. `steady_outcome_shippable` (pipeline.py): a rejected
    steady outcome with finite cl/cd and no error ships as an honest point
@@ -2021,6 +2621,7 @@ unreachable (points===0 → failJob + return), and no sweeper log line between
 claim and terminal failure.
 
 Decisions (apps/sweeper):
+
 1. `ingestResult` now reports `attempts` (rows ingested from
    polars[].attempts) so the failed-job path can tell "evidence shipped" from
    a true crash (ingest.ts).
@@ -2036,7 +2637,7 @@ Decisions (apps/sweeper):
    result_message → status_message → generic (the engine writes "All cases
    failed" on the STATUS, not the result payload).
 3. Loud events: one `engine job FAILED (…campaign, airfoil, angles…): <msg> —
-   N point(s), M attempt(s) ingested; <verdict>` line per terminal failed
+N point(s), M attempt(s) ingested; <verdict>` line per terminal failed
    ingest (incl. the previously silent catch), one `job submitted → engine …`
    line per wave-1 submit outcome (loop.ts submitComposedJob), one
    `URANS retry submitted → engine …` line per wave-2 retry submit.
@@ -2158,6 +2759,7 @@ retained-cycle counts collapsed and precalc acceptance became a lottery at
 exactly the deep-stall angles that need URANS.
 
 Decisions (src/airfoilfoam/postprocess/unsteady.py):
+
 1. PHYSICAL BAND: plausible shedding window St in [0.05, 0.5]
    (`SHEDDING_STROUHAL_BAND`) -> period in [c/(0.5 U), c/(0.05 U)]
    (`shedding_period_band` / `shedding_frequency_band`; U=25, c=0.1 =>
@@ -2215,32 +2817,30 @@ legacy locked 0.033/0.135/0.10-0.37 s across 20 identical-physics
 realizations (3/11/6 split), banded locked the 0.0339 s fundamental 20/20
 within ~5%. Verification also found and fixed three out-of-band honesty
 defects in the banded search (genuinely long-period phenomena, e.g.
-bluff-body-like St < 0.05):
-5. IN-BAND SPECTRAL CREDIBILITY GATE (`IN_BAND_CREDIBILITY_FRACTION`=0.05):
-   an in-band period may only be locked when the band contains a real
-   spectral LINE — an interior local FFT peak at >= 5% of the strongest
-   spectral magnitude anywhere. Pre-fix, a clean St 0.04 signal (T=0.100 s)
-   was silently reported as 0.0799 s (the band-edge Hanning leakage skirt,
-   corroborated by the rising autocorrelation slope), and a noisy one
-   minted 0.0117 s (8.5x short) from a noise wiggle on the sloping in-band
-   autocorrelation. The in-band-argmax fallback in `dominant_frequency`
-   (slope, not peak) was removed for banded searches. Post-fix these grade
-   as None — no lock, honest {no measurable period} — while legit St
-   0.05-0.06 (thick-airfoil) cases still resolve to <0.1% error.
-6. AC/FFT UNDERCUT GUARD (`AC_FFT_UNDERCUT_TOLERANCE`=0.25): at
-   modulation/fundamental amplitude ratio ~2 the in-band autocorrelation
-   ripple peaks ride the out-of-band modulation's correlation slope and
-   were dragged 30-36% SHORT of the fundamental, unflagged. The refined lag
-   must now agree with the credibility-gated FFT line (may not undercut it
-   by >25%); a dragged lag falls back to the corroborated FFT line, else
-   None. Asymmetric: an autocorrelation period LONGER than the FFT line
-   stays trusted (harmonic-rich signals). Known conservative edges: St
-   exactly at the 0.5 band edge and shedding lines >~20x weaker than an
-   out-of-band modulation line grade as no-lock (disclosed) rather than
-   guessed; an in-band harmonic >= 80% of the fundamental's FFT magnitude
-   could still halve the period in the pure-FFT chain (rule-2 design
-   trade-off; the autocorrelation-primary `estimate_period` paths require
-   ~3x amplitude for the same flip).
+bluff-body-like St < 0.05): 5. IN-BAND SPECTRAL CREDIBILITY GATE (`IN_BAND_CREDIBILITY_FRACTION`=0.05):
+an in-band period may only be locked when the band contains a real
+spectral LINE — an interior local FFT peak at >= 5% of the strongest
+spectral magnitude anywhere. Pre-fix, a clean St 0.04 signal (T=0.100 s)
+was silently reported as 0.0799 s (the band-edge Hanning leakage skirt,
+corroborated by the rising autocorrelation slope), and a noisy one
+minted 0.0117 s (8.5x short) from a noise wiggle on the sloping in-band
+autocorrelation. The in-band-argmax fallback in `dominant_frequency`
+(slope, not peak) was removed for banded searches. Post-fix these grade
+as None — no lock, honest {no measurable period} — while legit St
+0.05-0.06 (thick-airfoil) cases still resolve to <0.1% error. 6. AC/FFT UNDERCUT GUARD (`AC_FFT_UNDERCUT_TOLERANCE`=0.25): at
+modulation/fundamental amplitude ratio ~2 the in-band autocorrelation
+ripple peaks ride the out-of-band modulation's correlation slope and
+were dragged 30-36% SHORT of the fundamental, unflagged. The refined lag
+must now agree with the credibility-gated FFT line (may not undercut it
+by >25%); a dragged lag falls back to the corroborated FFT line, else
+None. Asymmetric: an autocorrelation period LONGER than the FFT line
+stays trusted (harmonic-rich signals). Known conservative edges: St
+exactly at the 0.5 band edge and shedding lines >~20x weaker than an
+out-of-band modulation line grade as no-lock (disclosed) rather than
+guessed; an in-band harmonic >= 80% of the fundamental's FFT magnitude
+could still halve the period in the pure-FFT chain (rule-2 design
+trade-off; the autocorrelation-primary `estimate_period` paths require
+~3x amplitude for the same flip).
 Recall of the fixes proven the same way: 3 new must-catch tests (band-edge
 leakage lock, noise-minted period, slope-dragged period) fail on the
 pre-fix code and pass post-fix; a near-band-edge low-St false-positive
@@ -2326,12 +2926,12 @@ Decisions (node implementation of amendments A/B/C; web dashboard is a
 separate lane; engine continuation restart is the parallel python lane):
 
 1. SEMANTIC SPLIT (A) is DERIVED LIVE, never stored: one canonical SQL
-   predicate (packages/db/src/urans-ladder.ts) — awaiting_urans = terminal,
+   predicate (packages/db/src/urans-ladder.ts) — awaiting*urans = terminal,
    non-derived, done+rejected at fidelity 'rans' (NULL = 0034-backfill rans);
    needs_review = terminal failed (derived symmetry mirrors EXCLUDED — see
    the review-fix entry below: the red chip's count must equal its Points-tab
    click-through, which lists source rows only; repairing the source repairs
-   the mirror) OR done+rejected urans_* with NOTHING FURTHER SCHEDULED (no open
+   the mirror) OR done+rejected urans*\* with NOTHING FURTHER SCHEDULED (no open
    verify item, no open request-URANS item covering the cell — exact angle or
    whole-polar NULL aoa; an in-flight re-solve already left the done+rejected
    shape, and a rejected wave-2 child never earns a second gated retry).
@@ -2359,7 +2959,7 @@ separate lane; engine continuation restart is the parallel python lane):
    campaign to 'attention' the instant its last point terminal-fails, BEFORE
    the retry reopens it — without the active flip the requeued points were
    invisible to the gap finder (caught by the auto-retry must-catch suite).
-3. CONTINUATION (C) extends sim_urans_requests (migration 0037:
+3. CONTINUATION (C) extends sim*urans_requests (migration 0037:
    continue_from_result_id FK SET NULL + budget_override_s int) instead of a
    sibling table: fidelity, idempotency (one open item per cell+fidelity) and
    precalc scheduler rank carry over unchanged. POST /api/admin/urans-requests
@@ -2368,7 +2968,7 @@ separate lane; engine continuation restart is the parallel python lane):
    case state means no honest resume). The ladder tick composes
    { continue_from: { engine_job_id, case_slug }, budget_override_s } into the
    engine request (typed in engine-client PolarRequest) and pins both on the
-   sim_job requestPayload. Continuable detection for the UI: rejected urans_*
+   sim_job requestPayload. Continuable detection for the UI: rejected urans*\*
    row + engine ids + quality warning containing the pinned budget-stop marker
    "stopped by the wall-clock budget guard" (URANS_BUDGET_STOP_MARKER,
    packages/core/src/urans-quality.ts — engine phrasing drift is a cross-side
@@ -2436,7 +3036,7 @@ Verification of the review-fix pass (same day, no commit yet): pnpm typecheck
 6/6; core 85, api 104 (+3: derived-mirror needsReview must-catch, budget-cap
 bounds, continuation/fresh-request 409), sweeper 129, web 226; engine pytest
 286 (-m "not integration"; +4 marker pins incl. chunk-timeout continuable and
-chunk-crash false-positive guard). e2e (local-solve openfoam-* specs skipped,
+chunk-crash false-positive guard). e2e (local-solve openfoam-\* specs skipped,
 engine :8000 intentionally down in remote-solving mode): 23 passed / 2
 conditional skips after updating campaign-management.spec for the shipped
 D-design (plan-edit verbs behind the "⋯" overflow; objective chips behind the
@@ -2467,20 +3067,20 @@ mean).
    stable (the existing half-window PeriodEstimate.ambiguous check, passed in
    by the pipeline) AND amplitude bounded (the oscillating-steady
    OSCILLATING_AMPLITUDE_GROWTH_MAX=1.3 half-window peak-to-peak guard) AND
-   K >= 3. Trend test (_cycle_mean_trend): TRENDING iff |net| = |m_K - m_1|
-   >= 2% of the drift scale (same denominator as drift_frac; femto-noise
-   floor) AND (all successive diffs share one strict sign AND |net| >= 3.0 x
-   the dof-adjusted rms residual about the least-squares line, OR |net| >=
-   4.0 x that residual — the slow-drift guard for drifts whose noise flips
-   one cycle mean). The 3.0 monotone threshold is deliberately ABOVE the K=3
-   collinearity bound net/s_resid = 2.449 (monotone geometry pins d = interior
-   deviation from the endpoint chord < |net|/2, s_resid = d*sqrt(2/3)):
-   below 2.449 every monotone triple would trend and the significance clause
-   would be vacuous. At 3.0 a monotone-by-luck triple with d > 0.408|net| is
-   accepted; smooth relaxations (geometric decay ratio rho > 0.105) reject.
-   A slow smooth modulation (period >> 3 cycles) still rejects at K=3 — it is
-   genuinely indistinguishable from a relaxing drift; rejection escalates to
-   the full tier (conservative direction).
+   K >= 3. Trend test (\_cycle_mean_trend): TRENDING iff |net| = |m_K - m_1|
+   > = 2% of the drift scale (same denominator as drift_frac; femto-noise
+   > floor) AND (all successive diffs share one strict sign AND |net| >= 3.0 x
+   > the dof-adjusted rms residual about the least-squares line, OR |net| >=
+   > 4.0 x that residual — the slow-drift guard for drifts whose noise flips
+   > one cycle mean). The 3.0 monotone threshold is deliberately ABOVE the K=3
+   > collinearity bound net/s_resid = 2.449 (monotone geometry pins d = interior
+   > deviation from the endpoint chord < |net|/2, s_resid = d\*sqrt(2/3)):
+   > below 2.449 every monotone triple would trend and the significance clause
+   > would be vacuous. At 3.0 a monotone-by-luck triple with d > 0.408|net| is
+   > accepted; smooth relaxations (geometric decay ratio rho > 0.105) reject.
+   > A slow smooth modulation (period >> 3 cycles) still rejects at K=3 — it is
+   > genuinely indistinguishable from a relaxing drift; rejection escalates to
+   > the full tier (conservative direction).
 2. Disclosure, no contract change: acceptance appends the quality warning
    "cycle means scatter ±<std m_i> over K cycles (precalc)". The strict
    cross-runtime frame_track parser rejects new keys, so cycle_means /
@@ -2515,7 +3115,7 @@ mean).
    boundary and the femto floor; K=2 not certifiable; full-tier verdicts
    pinned drift-only (period_stable must not leak). Wave-1 must-catch:
    marched reject at aoa=2 with transient_fallback=false never calls
-   _run_full_urans_replacement (recall proven: test fails on reverted gate),
+   \_run_full_urans_replacement (recall proven: test fails on reverted gate),
    default-params promotion preserved (false-positive guard). Engine suite
    286 -> 303, all green. Engine rebuild required for deploy.
 
@@ -2566,8 +3166,7 @@ mean).
      cycle ⇒ no measurable period ⇒ the period-based projection guard can
      never engage ⇒ the budget burns blind to the wall.
 - Decision 1: URANS_FIDELITY_BUDGET_S[precalc] 7200 → 14400 (models.py +
-  engine-client fidelity.ts + pin tests on both runtimes). Full tier stays
-  43200. Celery hard limit derives from max(budgets) = 43200 — unchanged.
+  engine-client fidelity.ts + pin tests on both runtimes). Full tier stays 43200. Celery hard limit derives from max(budgets) = 43200 — unchanged.
 - Decision 2 (companion, load-bearing for the raise): march-rate guard.
   The pipeline arms every pimpleFoam chunk with march_budget.json
   ({end_t, budget_s, wall_start}); the worker heartbeat's MarchRateWatchdog
@@ -2585,7 +3184,7 @@ mean).
   via ONE continuation; >3× means even a full continuation cannot finish.
 - Guards against false positives (tests/test_march_guard.py, recall-shaped
   from the s1223 breakage, driven through the REAL heartbeat check + kill
-  path and the REAL _run_transient_attempt grading seam): warmup never
+  path and the REAL \_run_transient_attempt grading seam): warmup never
   judged; dt-ramp-then-recovery passes (trailing window sees only the
   recovered rate); feasible-but-over-budget (<3×) left to grade at the wall;
   completed chunks and zero-rate (stall watchdog's turf) never judged;
@@ -2776,8 +3375,8 @@ mean).
      resumed/extension/refined chunks keep their measured-period caps.
   2. Extension loop exited with hours of budget left (naca-4412 −15° u=100:
      retained 2.00/3.00 cycles, 19.5 frames/cycle, 26 min of a 4 h budget,
-     honest reject). Root cause: _extend_transient_until_periods treated
-     ANY can_refine=False as terminal. Fix: _quality_allows_more_integration
+     honest reject). Root cause: \_extend_transient_until_periods treated
+     ANY can_refine=False as terminal. Fix: \_quality_allows_more_integration
      — measured-period windows blocked only by retention/frame-rate/
      stationarity (all fixed by more integration; extension chunks write at
      period/20) continue until the existing budget projection guard stops
@@ -2858,7 +3457,7 @@ mean).
   init is a warm-start optimization with no advance way to know when it
   turns harmful.
 - Fix: freestream_fallback flag — when the full steady seed was refused,
-  _prepare_transient_case keeps the pristine 0/ freestream fields and
+  \_prepare_transient_case keeps the pristine 0/ freestream fields and
   skips potentialFoam + simpleFoam.init entirely; transient starts at
   t=0 (pseudo-time-600 axis and uniform/time hazard vanish on this path).
   Standalone no-seed cases keep their init (pinned); warm seeds unchanged;
@@ -2921,7 +3520,7 @@ mean).
   guard. Expected S1223 heavy outcome: slow-but-structurally-sound
   integration governed by the march guard/budget (continuable budget
   stops), never detonation.
-- Fix B: _run_transient_mesh_qa_gate after transient mesh build/link:
+- Fix B: \_run_transient_mesh_qa_gate after transient mesh build/link:
   checkMesh -time 0, fail honestly at MESH time over
   MESH_MAX_NON_ORTHO_DEG=85 ("mesh degenerate at this fidelity tier
   (max non-orthogonality X deg)") or on failed mesh checks; 75-85 deg =
@@ -3005,7 +3604,7 @@ mean).
   mediums, 1621 airfoils), symmetry backfill (119 symmetric — matches
   2026-07-07 exactly).
 - Numerics profiles recreated from values captured pre-wipe (SQL,
-  slugs prod-default-*); plan JSON captured pre-wipe and re-posted by
+  slugs prod-default-\*); plan JSON captured pre-wipe and re-posted by
   slug-resolved ids. New campaign production-campaign-20260710
   (b96594a6-e0bf-40ce-b3c6-5dee77b35116): 450 points, 9 conditions,
   135 lanes — all THREE objectives enabled this time (ld_max 0.10/4,
@@ -3075,7 +3674,7 @@ mean).
 - Engine (retention.py + api): POST /jobs/{id}/strip {keep_case_state},
   DELETE /jobs/{id}, GET /maintenance/jobs, GET /maintenance/disk.
   Keep set derived from real consumers and pinned by test: root API
-  JSONs; a*/images, frames, evidence/{manifest, scaled_media,
+  JSONs; a\*/images, frames, evidence/{manifest, scaled_media,
   custom_renders, openfoam_evidence.tar.gz}; evidence/VTK is the
   re-render source (render endpoints prefer it) — redundant
   evidence/openfoam/ and evidence/time_directories/ strip (measured
@@ -3170,13 +3769,13 @@ mean).
   long), and the transient p/pFinal smoother was hardened for exactly
   this. Left unfixed the gate would have falsely parked heavy
   conditions across every airfoil as wave-2 progressed.
-- Fix: the gate now parses WHICH checks failed (checkMesh's ***
+- Fix: the gate now parses WHICH checks failed (checkMesh's **_
   fail-lines); an aspect-ratio-ONLY failure becomes a quality
   disclosure ("N high-aspect-ratio wall cells (max AR X) — checkMesh
   aspect-ratio heuristic waived") instead of a fatal mesh-degenerate
   verdict. Fatal verdicts unchanged for: non-ortho > 85 deg, negative
   volumes, any failed check other than aspect ratio, and failed checks
-  with no ***-line detail (fail-safe). Pinned with the verbatim prod
+  with no _**-line detail (fail-safe). Pinned with the verbatim prod
   checkMesh output as must-catch + two false-positive guards for the
   waiver itself; toggle-revert recall proof run. Engine suite 365.
 - Bundled: solver-work gate naming — "frames/cycle" warnings now map
@@ -3223,10 +3822,10 @@ mean).
      fulfilled/expired promises accept idempotent late chunks (only
      cancelled/unknown reject); the guard blocks only while a child is
      actively pending/submitted/running/ingesting.
-  Plus a deploy gap: node-api mounts engine data :ro — sync imports
-  now get a dedicated writable volume nested at
-  /data/airfoilfoam/sync-imports (mountpoint pre-created in the
-  results volume; nested mounts cannot create dirs under ro parents).
+     Plus a deploy gap: node-api mounts engine data :ro — sync imports
+     now get a dedicated writable volume nested at
+     /data/airfoilfoam/sync-imports (mountpoint pre-created in the
+     results volume; nested mounts cannot create dirs under ro parents).
 - Final prod evidence: e387 carries all 7 α as verified (mixed VPS +
   Mac provenance), pushed media serves via /api/media (sync-imports
   key, HTTP 200), promise fulfilled, solver registered/heartbeating.
@@ -3283,3 +3882,28 @@ mean).
   result-id conservation against Solver Work, same-Re different-physics
   separation, conflict handling, cache-absent rollout fallback, and public
   terminology.
+
+## 2026-07-12 — Remote cancellation audit retention (agent decision; owner confirmation pending)
+
+- New exact remote-solver cancellation handling uses a durable outbox. A local
+  promise can stop owning work immediately, while failed release calls remain
+  retryable against that promise's stored hub endpoint. Disabling solver work
+  does not disable this release path.
+- Agent recommendation implemented pending owner confirmation: retain a
+  delivered cancellation row indefinitely with its terminal promise. The cost
+  is one small audit row per cancelled mirrored promise and a parent purge that
+  must explicitly remove delivered audit rows first. The benefit is that no
+  arbitrary timer can erase proof that the upstream lease release was sent.
+- Explicit purge is all-or-nothing for its requested promise set. It refuses
+  active/expired promises and pending/retry cancellation rows without deleting
+  anything. For terminal promises whose cancellations are delivered, it
+  deletes those audit rows and then their parents in one transaction. The real
+  admin test-artifact purge applies the same preflight before any target
+  campaign or catalog deletion.
+- Alternative not chosen without owner direction: delete delivered rows after
+  a fixed retention window. That bounds table growth, but choosing the window
+  creates an operational/legal retention policy and can erase useful incident
+  history. Revisit only after the owner states the required audit window.
+- Owner decision status: not yet confirmed. The owner should be shown the
+  storage-growth versus permanent-audit tradeoff above; until then the safer
+  no-data-loss policy remains in force.

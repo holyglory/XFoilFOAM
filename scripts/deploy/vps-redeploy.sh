@@ -55,6 +55,12 @@ main() {
   echo "Airfoils.Pro deploy starting in $APP_DIR"
   echo "Compose project: $COMPOSE_PROJECT_NAME"
 
+  if [[ "${DEPLOY_OPENFOAM_SERVICES:-0}" == "1" ]]; then
+    echo "Refusing DEPLOY_OPENFOAM_SERVICES=1 in the control-plane deploy." >&2
+    echo "Use scripts/deploy/rebuild-engine.sh <build-id>; it owns the queue/process idle guards and coordinated build-id cutover." >&2
+    exit 12
+  fi
+
   local before_openfoam
   before_openfoam="$(openfoam_processes)"
   if [[ -n "$before_openfoam" ]]; then
@@ -70,6 +76,14 @@ main() {
   echo "Building control-plane images..."
   compose build node-api web sweeper
 
+  # The node-api runs database migrations during startup.  Stop the old
+  # sweeper before that cutover so an older writer cannot ingest evidence into
+  # a newly migrated schema between the migration commit and the new sweeper
+  # starting.  This stops only control-plane scheduling/ingest; api, worker,
+  # and any live OpenFOAM child processes remain untouched.
+  echo "Quiescing the old sweeper before database migration..."
+  compose stop sweeper
+
   echo "Restarting node-api only..."
   compose up -d --no-deps node-api
   wait_http "node-api" "http://127.0.0.1:4000/health" 90
@@ -78,21 +92,7 @@ main() {
   compose up -d --no-deps web sweeper
   wait_http "web" "http://127.0.0.1:3100/health" 90
 
-  if [[ "${DEPLOY_OPENFOAM_SERVICES:-0}" == "1" ]]; then
-    local active
-    active="$(openfoam_processes)"
-    if [[ -n "$active" ]]; then
-      echo "Refusing to redeploy api/worker because OpenFOAM processes are active:" >&2
-      echo "$active" >&2
-      exit 12
-    fi
-    echo "DEPLOY_OPENFOAM_SERVICES=1 and worker is idle; rebuilding api/worker..."
-    compose build api worker
-    compose up -d --no-deps api worker
-    wait_http "engine API" "http://127.0.0.1:8000/health" 60
-  else
-    echo "Skipping api/worker redeploy. Set DEPLOY_OPENFOAM_SERVICES=1 only for an idle solver window."
-  fi
+  echo "Skipping api/worker redeploy. Engine maintenance is available only through scripts/deploy/rebuild-engine.sh."
 
   echo "Container status:"
   compose ps

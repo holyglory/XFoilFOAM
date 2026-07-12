@@ -53,6 +53,7 @@ export async function findGaps(db: DB, limit = 500): Promise<Gap[]> {
     ) AS g
     LEFT JOIN results r
       ON r.airfoil_id = a.id AND r.simulation_preset_revision_id = rev.id AND r.aoa_deg = g.aoa
+    LEFT JOIN sim_result_submit_retries submit_retry ON submit_retry.result_id = r.id
     WHERE p.enabled = true
       AND (
         p.target_scope = 'all'
@@ -64,7 +65,27 @@ export async function findGaps(db: DB, limit = 500): Promise<Gap[]> {
       )
       AND a."archivedAt" IS NULL
       AND a."deletedAt" IS NULL
-      AND (r.id IS NULL OR r.status IN ('pending', 'stale'))
+      AND (
+        r.id IS NULL
+        OR (
+          r.status IN ('pending', 'stale')
+          AND (
+            submit_retry.result_id IS NULL
+            OR submit_retry.state <> 'retry_wait'
+            OR submit_retry.next_attempt_at <= now()
+          )
+        )
+      )
+      AND (r.id IS NULL OR (
+        r.regime IS DISTINCT FROM 'urans'
+        AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+      ))
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_precalc_obligations obligation
+        WHERE obligation.airfoil_id = a.id
+          AND obligation.revision_id = rev.id
+          AND obligation.aoa_deg = g.aoa
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM sync_sweep_promise_points pp
@@ -79,7 +100,18 @@ export async function findGaps(db: DB, limit = 500): Promise<Gap[]> {
     ORDER BY COALESCE(r.priority, 0) DESC, rev.reynolds ASC, a.slug ASC, g.aoa ASC
     LIMIT ${limit}
   `);
-  return (rows as unknown as { airfoil_id: string; bc_id: string; preset_id: string; preset_revision_id: string; aoa_deg: number; priority: number; reynolds: number; slug: string }[]).map((r) => ({
+  return (
+    rows as unknown as {
+      airfoil_id: string;
+      bc_id: string;
+      preset_id: string;
+      preset_revision_id: string;
+      aoa_deg: number;
+      priority: number;
+      reynolds: number;
+      slug: string;
+    }[]
+  ).map((r) => ({
     airfoilId: r.airfoil_id,
     bcId: r.bc_id,
     presetId: r.preset_id,
@@ -111,7 +143,11 @@ export function firstBatch(gaps: Gap[]): ContinuousBatch | null {
   if (gaps.length === 0) return null;
   const head = gaps[0];
   const aoas = gaps
-    .filter((g) => g.airfoilId === head.airfoilId && g.presetRevisionId === head.presetRevisionId)
+    .filter(
+      (g) =>
+        g.airfoilId === head.airfoilId &&
+        g.presetRevisionId === head.presetRevisionId,
+    )
     .map((g) => g.aoaDeg)
     .sort((x, y) => x - y);
   return {

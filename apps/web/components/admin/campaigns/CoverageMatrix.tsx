@@ -5,7 +5,7 @@
 // /airfoils pages with per-airfoil SEGMENTED BARS — one flex segment per
 // condition (2px gap), fill height = fraction of that condition's angles
 // terminal, VIOLET fill = awaiting URANS (calm stage-2 queue), solid RED =
-// needs review / failed, empty = panel background (legacy payloads without
+// unavailable / failed, empty = panel background (legacy payloads without
 // the split keep the amber rejected tint). The per-condition column headers are
 // gone: a slim AIRFOIL | DONE | CONDITIONS legend row sits above and the
 // hover tooltip + cell side panel carry the identification. Click on a
@@ -52,11 +52,13 @@ interface PageState {
   rows: AdminCampaignAirfoilRow[];
 }
 
-/** Red-segment weight for the "needs review first" sort: crash-failed points
- *  plus the amendment-A needsReview count when the payload ships it (the two
- *  overlap — only the >0 comparison matters here). */
-function rowNeedsReview(row: AdminCampaignAirfoilRow): number {
-  return row.perCondition.reduce((s, c) => s + c.failed + (c.needsReview ?? 0), 0);
+/** Attention weight for the blocked-first sort. Failed solver/setup outcomes
+ * remain unavailable evidence, not human coefficient-review assignments. */
+function rowBlocked(row: AdminCampaignAirfoilRow): number {
+  return row.perCondition.reduce(
+    (s, c) => s + c.failed + (c.blocked ?? 0) + (c.needsReview ?? 0),
+    0,
+  );
 }
 
 interface HoverTip {
@@ -78,7 +80,11 @@ export function CoverageMatrix({
   conditions: AdminCampaignConditionSummary[];
   airfoilCount: number;
   pollKey: number;
-  onCellClick: (row: AdminCampaignAirfoilRow, condition: AdminCampaignConditionSummary, cell: CampaignProgressTotals | null) => void;
+  onCellClick: (
+    row: AdminCampaignAirfoilRow,
+    condition: AdminCampaignConditionSummary,
+    cell: CampaignProgressTotals | null,
+  ) => void;
 }) {
   const [pages, setPages] = useState<PageState[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -86,7 +92,7 @@ export function CoverageMatrix({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
-  const [failedFirst, setFailedFirst] = useState(true);
+  const [blockedFirst, setBlockedFirst] = useState(true);
   const [showReleased, setShowReleased] = useState(false);
   const [scrollTop, setScrollTop] = useState(0);
   const [rootWidth, setRootWidth] = useState(1024);
@@ -137,7 +143,11 @@ export function CoverageMatrix({
     loadingRef.current = true;
     setLoading(true);
     try {
-      const page = await getCampaignAirfoils(campaignId, nextCursor, PAGE_LIMIT);
+      const page = await getCampaignAirfoils(
+        campaignId,
+        nextCursor,
+        PAGE_LIMIT,
+      );
       setPages((prev) => [...prev, { cursor: nextCursor, rows: page.items }]);
       setNextCursor(page.nextCursor);
       setExhausted(page.nextCursor == null);
@@ -155,12 +165,18 @@ export function CoverageMatrix({
   const visiblePagesRef = useRef<Set<number>>(new Set([0]));
   useEffect(() => {
     if (pollKey === 0 || pages.length === 0) return;
-    const targets = [...visiblePagesRef.current].filter((i) => i < pages.length);
+    const targets = [...visiblePagesRef.current].filter(
+      (i) => i < pages.length,
+    );
     if (targets.length === 0) targets.push(0);
     let cancelled = false;
     void Promise.all(
       targets.map(async (i) => {
-        const refreshed = await getCampaignAirfoils(campaignId, pages[i].cursor, PAGE_LIMIT).catch(() => null);
+        const refreshed = await getCampaignAirfoils(
+          campaignId,
+          pages[i].cursor,
+          PAGE_LIMIT,
+        ).catch(() => null);
         return { i, refreshed };
       }),
     ).then((updates) => {
@@ -168,7 +184,8 @@ export function CoverageMatrix({
       setPages((prev) => {
         const next = [...prev];
         for (const { i, refreshed } of updates) {
-          if (refreshed && next[i]) next[i] = { cursor: next[i].cursor, rows: refreshed.items };
+          if (refreshed && next[i])
+            next[i] = { cursor: next[i].cursor, rows: refreshed.items };
         }
         return next;
       });
@@ -196,32 +213,58 @@ export function CoverageMatrix({
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
     let out = loadedRows;
-    if (q) out = out.filter((r) => r.slug.toLowerCase().includes(q) || r.name.toLowerCase().includes(q));
-    if (failedFirst) {
-      out = [...out].sort((a, b) => Number(rowNeedsReview(b) > 0) - Number(rowNeedsReview(a) > 0) || a.slug.localeCompare(b.slug));
+    if (q)
+      out = out.filter(
+        (r) =>
+          r.slug.toLowerCase().includes(q) || r.name.toLowerCase().includes(q),
+      );
+    if (blockedFirst) {
+      out = [...out].sort(
+        (a, b) =>
+          Number(rowBlocked(b) > 0) - Number(rowBlocked(a) > 0) ||
+          a.slug.localeCompare(b.slug),
+      );
     }
     return out;
-  }, [loadedRows, search, failedFirst]);
+  }, [loadedRows, search, blockedFirst]);
 
   const cellByCondition = useCallback((row: AdminCampaignAirfoilRow) => {
-    const map = new Map<string, CampaignProgressTotals & { conditionId: string }>();
+    const map = new Map<
+      string,
+      CampaignProgressTotals & { conditionId: string }
+    >();
     for (const c of row.perCondition) map.set(c.conditionId, c);
     return map;
   }, []);
 
   // ---- segmented-bar geometry (mockup grid: name | done | flex bar) ----
   const nameCol = rootWidth >= 720 ? 220 : 170;
-  const barWidth = Math.max(0, rootWidth - 2 * ROW_PAD_X - nameCol - FRAC_COL - 2 * COL_GAP);
+  const barWidth = Math.max(
+    0,
+    rootWidth - 2 * ROW_PAD_X - nameCol - FRAC_COL - 2 * COL_GAP,
+  );
   const gridColumns = `${nameCol}px ${FRAC_COL}px minmax(0, 1fr)`;
 
   // Chord grouping fallback: only when the measured bar cannot give every
   // visible condition MIN_SEGMENT_PX (threshold documented in
   // coverage-segments.ts) AND more than one chord exists to split by.
-  const chordGroups = useMemo(() => groupConditionsByChord(visibleConditions), [visibleConditions]);
-  const grouped = chordGroups.length > 1 && needsChordGrouping(visibleConditions.length, barWidth);
-  const activeGroup = grouped ? (chordGroups.find((g) => g.key === selectedChordKey) ?? chordGroups[0]) : null;
-  const renderedConditions = activeGroup ? activeGroup.conditions : visibleConditions;
-  const renderedConditionIds = useMemo(() => new Set(renderedConditions.map((c) => c.id)), [renderedConditions]);
+  const chordGroups = useMemo(
+    () => groupConditionsByChord(visibleConditions),
+    [visibleConditions],
+  );
+  const grouped =
+    chordGroups.length > 1 &&
+    needsChordGrouping(visibleConditions.length, barWidth);
+  const activeGroup = grouped
+    ? (chordGroups.find((g) => g.key === selectedChordKey) ?? chordGroups[0])
+    : null;
+  const renderedConditions = activeGroup
+    ? activeGroup.conditions
+    : visibleConditions;
+  const renderedConditionIds = useMemo(
+    () => new Set(renderedConditions.map((c) => c.id)),
+    [renderedConditions],
+  );
 
   // ---- windowing (constant-height rows) ----
   const totalHeight = rows.length * ROW_H;
@@ -244,62 +287,144 @@ export function CoverageMatrix({
     if (!exhausted && end >= loadedRows.length - OVERSCAN) void loadMore();
   }, [end, loadedRows.length, exhausted, loadMore]);
 
-  const showTip = useCallback((el: HTMLElement, key: string, label: string, failed: boolean) => {
-    const r = el.getBoundingClientRect();
-    setHover({ key, label, failed, x: r.left + r.width / 2, y: r.top });
-  }, []);
+  const showTip = useCallback(
+    (el: HTMLElement, key: string, label: string, failed: boolean) => {
+      const r = el.getBoundingClientRect();
+      setHover({ key, label, failed, x: r.left + r.width / 2, y: r.top });
+    },
+    [],
+  );
   const hideTip = useCallback(() => setHover(null), []);
 
   return (
     <div
       ref={rootRef}
       data-testid="campaign-coverage-matrix"
-      style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}
+      style={{
+        background: C.panel,
+        border: `1px solid ${C.border}`,
+        borderRadius: 12,
+        overflow: "hidden",
+      }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "10px 12px", borderBottom: `1px solid ${C.borderSoft}` }}>
-        <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: "0.1em", color: C.dim }}>COVERAGE</span>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          flexWrap: "wrap",
+          padding: "10px 12px",
+          borderBottom: `1px solid ${C.borderSoft}`,
+        }}
+      >
+        <span
+          style={{
+            fontFamily: MONO,
+            fontSize: 10,
+            letterSpacing: "0.1em",
+            color: C.dim,
+          }}
+        >
+          COVERAGE
+        </span>
         <input
           data-testid="matrix-search"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="search airfoils…"
           aria-label="search airfoils"
-          style={{ ...inputStyle, width: 200, padding: "6px 9px", fontSize: 11 }}
+          style={{
+            ...inputStyle,
+            width: 200,
+            padding: "6px 9px",
+            fontSize: 11,
+          }}
         />
         <button
           type="button"
           data-testid="matrix-filter-failed-first"
-          onClick={() => setFailedFirst((v) => !v)}
-          style={{ ...ghostBtn, padding: "5px 10px", fontSize: 10, color: failedFirst ? C.teal : C.muted, borderColor: failedFirst ? C.tealBorder : C.stroke }}
+          onClick={() => setBlockedFirst((v) => !v)}
+          style={{
+            ...ghostBtn,
+            padding: "5px 10px",
+            fontSize: 10,
+            color: blockedFirst ? C.teal : C.muted,
+            borderColor: blockedFirst ? C.tealBorder : C.stroke,
+          }}
         >
-          needs review first
+          blocked first
         </button>
         {releasedConditions.length > 0 && (
           <button
             type="button"
             data-testid="matrix-toggle-released"
             onClick={() => setShowReleased((v) => !v)}
-            style={{ ...ghostBtn, padding: "5px 10px", fontSize: 10, color: showReleased ? C.teal : C.muted, borderColor: showReleased ? C.tealBorder : C.stroke }}
+            style={{
+              ...ghostBtn,
+              padding: "5px 10px",
+              fontSize: 10,
+              color: showReleased ? C.teal : C.muted,
+              borderColor: showReleased ? C.tealBorder : C.stroke,
+            }}
           >
-            {showReleased ? `Hide released (${releasedConditions.length})` : `Show released (${releasedConditions.length})`}
+            {showReleased
+              ? `Hide released (${releasedConditions.length})`
+              : `Show released (${releasedConditions.length})`}
           </button>
         )}
-        <span style={{ marginLeft: "auto", fontFamily: MONO, fontSize: 10, color: C.dim }}>
+        <span
+          style={{
+            marginLeft: "auto",
+            fontFamily: MONO,
+            fontSize: 10,
+            color: C.dim,
+          }}
+        >
           {fCount(loadedRows.length)}/{fCount(airfoilCount)} airfoils loaded
         </span>
       </div>
 
-      {error && <div style={{ fontFamily: MONO, fontSize: 11, color: C.red, padding: "8px 12px" }}>{error}</div>}
+      {error && (
+        <div
+          style={{
+            fontFamily: MONO,
+            fontSize: 11,
+            color: C.red,
+            padding: "8px 12px",
+          }}
+        >
+          {error}
+        </div>
+      )}
       {search.trim() && !exhausted && (
-        <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber, padding: "6px 12px" }}>
-          search covers the {fCount(loadedRows.length)} loaded rows — scroll the matrix to load the rest
+        <div
+          style={{
+            fontFamily: MONO,
+            fontSize: 10,
+            color: C.amber,
+            padding: "6px 12px",
+          }}
+        >
+          search covers the {fCount(loadedRows.length)} loaded rows — scroll the
+          matrix to load the rest
         </div>
       )}
 
       {grouped && (
-        <div data-testid="matrix-chord-chips" style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", padding: "8px 12px", borderBottom: `1px solid ${C.borderSoft}` }}>
+        <div
+          data-testid="matrix-chord-chips"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            flexWrap: "wrap",
+            padding: "8px 12px",
+            borderBottom: `1px solid ${C.borderSoft}`,
+          }}
+        >
           <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>
-            {fCount(visibleConditions.length)} conditions — grouped by chord, one chord per view
+            {fCount(visibleConditions.length)} conditions — grouped by chord,
+            one chord per view
           </span>
           {chordGroups.map((g) => {
             const active = g.key === (activeGroup?.key ?? "");
@@ -309,7 +434,13 @@ export function CoverageMatrix({
                 type="button"
                 data-testid={`matrix-chord-${g.key}`}
                 onClick={() => setSelectedChordKey(g.key)}
-                style={{ ...ghostBtn, padding: "3px 9px", fontSize: 10, color: active ? C.teal : C.muted, borderColor: active ? C.tealBorder : C.stroke }}
+                style={{
+                  ...ghostBtn,
+                  padding: "3px 9px",
+                  fontSize: 10,
+                  color: active ? C.teal : C.muted,
+                  borderColor: active ? C.tealBorder : C.stroke,
+                }}
               >
                 {g.label} · {fCount(g.conditions.length)}
               </button>
@@ -321,12 +452,32 @@ export function CoverageMatrix({
       {/* slim legend row — replaces the per-condition column headers */}
       <div
         data-testid="matrix-legend"
-        style={{ display: "grid", gridTemplateColumns: gridColumns, gap: COL_GAP, alignItems: "center", padding: `6px ${ROW_PAD_X}px`, borderBottom: `1px solid ${C.borderRow}`, fontFamily: MONO, fontSize: 9.5, color: C.dimmest }}
+        style={{
+          display: "grid",
+          gridTemplateColumns: gridColumns,
+          gap: COL_GAP,
+          alignItems: "center",
+          padding: `6px ${ROW_PAD_X}px`,
+          borderBottom: `1px solid ${C.borderRow}`,
+          fontFamily: MONO,
+          fontSize: 9.5,
+          color: C.dimmest,
+        }}
       >
         <span style={{ letterSpacing: "0.1em" }}>AIRFOIL</span>
         <span style={{ letterSpacing: "0.1em", textAlign: "right" }}>DONE</span>
-        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-          CONDITIONS → fill = angles done · <span style={{ color: C.violet }}>violet</span> = awaiting URANS · <span style={{ color: C.redText }}>red</span> = needs review · hover for detail · click opens the cell panel
+        <span
+          style={{
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          CONDITIONS → fill = angles done ·{" "}
+          <span style={{ color: C.violet }}>violet</span> = awaiting URANS ·{" "}
+          <span style={{ color: C.amber }}>amber</span> = machine-blocked ·{" "}
+          <span style={{ color: C.redText }}>red</span> = failed · hover for
+          detail · click opens the cell panel
         </span>
       </div>
 
@@ -336,7 +487,11 @@ export function CoverageMatrix({
           setScrollTop(e.currentTarget.scrollTop);
           setHover(null);
         }}
-        style={{ height: Math.min(VIEWPORT_H, Math.max(ROW_H, totalHeight)), overflowY: "auto", position: "relative" }}
+        style={{
+          height: Math.min(VIEWPORT_H, Math.max(ROW_H, totalHeight)),
+          overflowY: "auto",
+          position: "relative",
+        }}
       >
         <div style={{ height: totalHeight, position: "relative" }}>
           {rows.slice(start, end).map((row, sliceIdx) => {
@@ -347,30 +502,98 @@ export function CoverageMatrix({
               <div
                 key={row.slug}
                 data-testid={`matrix-row-${row.slug}`}
-                style={{ position: "absolute", top: i * ROW_H, left: 0, right: 0, height: ROW_H, boxSizing: "border-box", display: "grid", gridTemplateColumns: gridColumns, gap: COL_GAP, alignItems: "center", padding: `0 ${ROW_PAD_X}px`, borderBottom: `1px solid ${C.borderRow}` }}
+                style={{
+                  position: "absolute",
+                  top: i * ROW_H,
+                  left: 0,
+                  right: 0,
+                  height: ROW_H,
+                  boxSizing: "border-box",
+                  display: "grid",
+                  gridTemplateColumns: gridColumns,
+                  gap: COL_GAP,
+                  alignItems: "center",
+                  padding: `0 ${ROW_PAD_X}px`,
+                  borderBottom: `1px solid ${C.borderRow}`,
+                }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-                  <span style={{ fontFamily: MONO, fontSize: 11, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 7,
+                    minWidth: 0,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontFamily: MONO,
+                      fontSize: 11,
+                      color: C.text,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
                     {row.name}
                   </span>
-                  {row.isSymmetric && <span title="symmetric airfoil — negative angles derived" style={{ fontFamily: MONO, fontSize: 9, color: C.dim, flex: "0 0 auto" }}>sym</span>}
+                  {row.isSymmetric && (
+                    <span
+                      title="symmetric airfoil — negative angles derived"
+                      style={{
+                        fontFamily: MONO,
+                        fontSize: 9,
+                        color: C.dim,
+                        flex: "0 0 auto",
+                      }}
+                    >
+                      sym
+                    </span>
+                  )}
                 </div>
-                <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, textAlign: "right", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 10,
+                    color: C.dim,
+                    textAlign: "right",
+                    fontVariantNumeric: "tabular-nums",
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {fCount(frac.done)}/{fCount(frac.total)}
                 </span>
-                <div style={{ display: "flex", gap: SEGMENT_GAP_PX, height: BAR_H, minWidth: 0 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: SEGMENT_GAP_PX,
+                    height: BAR_H,
+                    minWidth: 0,
+                  }}
+                >
                   {renderedConditions.map((c) => {
                     const cell = byId.get(c.id) ?? null;
                     const view = segmentView(cell);
                     const released = c.status === "released";
-                    const label = segmentTitle(c, cell, conditionDisplayState(c));
+                    const label = segmentTitle(
+                      c,
+                      cell,
+                      conditionDisplayState(c),
+                    );
                     const hoverKey = `${row.slug}:${c.id}`;
                     const fillH = segmentFillHeight(view);
                     // Amendment-A recolor: red strictly for needs-review /
                     // failed; violet = calm awaiting-URANS; amber only for
                     // legacy payloads without the split counters.
-                    const red = view.state === "failed" || view.state === "needs_review";
-                    const fillColor = red ? C.red : view.state === "awaiting_urans" ? C.violet : view.state === "rejected" ? C.amber : C.teal;
+                    const red =
+                      view.state === "failed" || view.state === "needs_review";
+                    const fillColor = red
+                      ? C.red
+                      : view.state === "awaiting_urans"
+                        ? C.violet
+                        : view.state === "blocked" || view.state === "rejected"
+                          ? C.amber
+                          : C.teal;
                     return (
                       <button
                         key={c.id}
@@ -378,9 +601,13 @@ export function CoverageMatrix({
                         data-testid={`matrix-cell-${row.slug}-${c.ord}`}
                         aria-label={label}
                         onClick={() => onCellClick(row, c, cell)}
-                        onMouseEnter={(e) => showTip(e.currentTarget, hoverKey, label, red)}
+                        onMouseEnter={(e) =>
+                          showTip(e.currentTarget, hoverKey, label, red)
+                        }
                         onMouseLeave={hideTip}
-                        onFocus={(e) => showTip(e.currentTarget, hoverKey, label, red)}
+                        onFocus={(e) =>
+                          showTip(e.currentTarget, hoverKey, label, red)
+                        }
                         onBlur={hideTip}
                         style={{
                           flex: "1 1 0",
@@ -394,11 +621,24 @@ export function CoverageMatrix({
                           padding: 0,
                           cursor: "pointer",
                           opacity: released ? 0.55 : 1,
-                          outline: hover?.key === hoverKey ? `1px solid ${C.teal}` : undefined,
+                          outline:
+                            hover?.key === hoverKey
+                              ? `1px solid ${C.teal}`
+                              : undefined,
                         }}
                       >
                         {view.state !== "empty" && fillH > 0 && (
-                          <span style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: `${fillH * 100}%`, background: fillColor, display: "block" }} />
+                          <span
+                            style={{
+                              position: "absolute",
+                              left: 0,
+                              right: 0,
+                              bottom: 0,
+                              height: `${fillH * 100}%`,
+                              background: fillColor,
+                              display: "block",
+                            }}
+                          />
                         )}
                       </button>
                     );
@@ -410,15 +650,39 @@ export function CoverageMatrix({
         </div>
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", padding: "8px 12px", borderTop: `1px solid ${C.borderRow}` }}>
-        {loading && <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>loading rows…</span>}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          flexWrap: "wrap",
+          padding: "8px 12px",
+          borderTop: `1px solid ${C.borderRow}`,
+        }}
+      >
+        {loading && (
+          <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
+            loading rows…
+          </span>
+        )}
         {!loading && rows.length === 0 && (
           <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
-            {loadedRows.length === 0 ? "no airfoils in this campaign" : "no loaded airfoil matches the search"}
+            {loadedRows.length === 0
+              ? "no airfoils in this campaign"
+              : "no loaded airfoil matches the search"}
           </span>
         )}
         {showReleased && releasedConditions.length > 0 && (
-          <span style={{ marginLeft: "auto", fontFamily: MONO, fontSize: 9.5, color: C.dim }}>dimmed — released (solved cells kept)</span>
+          <span
+            style={{
+              marginLeft: "auto",
+              fontFamily: MONO,
+              fontSize: 9.5,
+              color: C.dim,
+            }}
+          >
+            dimmed — released (solved cells kept)
+          </span>
         )}
       </div>
 

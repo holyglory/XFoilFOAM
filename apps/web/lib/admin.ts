@@ -6,7 +6,11 @@ import type {
   ViscosityModelName,
   ViscosityTablePointDTO,
 } from "@aerodb/core";
-import { buildResultReviewPayload, type ResultReviewRecord, type ResultReviewVerdict } from "./result-review";
+import {
+  buildResultReviewPayload,
+  type ResultReviewRecord,
+  type ResultReviewVerdict,
+} from "./result-review";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 
@@ -18,7 +22,11 @@ export interface AdminApiError extends Error {
 }
 
 export function isAdminApiError(e: unknown): e is AdminApiError {
-  return e instanceof Error && typeof (e as AdminApiError).status === "number" && typeof (e as AdminApiError).body === "object";
+  return (
+    e instanceof Error &&
+    typeof (e as AdminApiError).status === "number" &&
+    typeof (e as AdminApiError).body === "object"
+  );
 }
 
 async function aj<T>(path: string, init?: RequestInit): Promise<T> {
@@ -33,10 +41,13 @@ async function aj<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const e = (await res.json().catch(() => ({}))) as { error?: string };
-    throw Object.assign(new Error(e.error || `request failed (${res.status})`), {
-      status: res.status,
-      body: e as Record<string, unknown>,
-    });
+    throw Object.assign(
+      new Error(e.error || `request failed (${res.status})`),
+      {
+        status: res.status,
+        body: e as Record<string, unknown>,
+      },
+    );
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -273,6 +284,7 @@ export interface AdminCampaignBacklogEntry {
   priority: number;
   remainingPoints: number;
   failedPoints: number;
+  blockedPoints?: number;
   runningPoints: number;
 }
 
@@ -354,7 +366,10 @@ export interface AdminQueue {
  *  values — a fresh "unavailable" must replace stale data). Sections outside
  *  the scope keep their previous values; the UI only renders those on their
  *  own tabs, where that tab's scope poll refreshes them. */
-export function mergeAdminQueue(prev: AdminQueue | null, next: AdminQueue): AdminQueue {
+export function mergeAdminQueue(
+  prev: AdminQueue | null,
+  next: AdminQueue,
+): AdminQueue {
   if (!prev || next.scope === "all") return next;
   const merged: AdminQueue = { ...prev };
   // Shell state ships with every scope.
@@ -482,10 +497,14 @@ export interface AdminSyncState {
 
 export const adminMe = () => aj<AdminMe>("/api/admin/me");
 export const adminLogin = (email: string, password: string) =>
-  aj<{ ok: boolean }>("/api/admin/login", { method: "POST", body: JSON.stringify({ email, password }) });
+  aj<{ ok: boolean }>("/api/admin/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
 export const adminGoogleLoginUrl = (returnTo = "/admin") =>
   `${BASE}/api/admin/oauth/google?returnTo=${encodeURIComponent(returnTo)}`;
-export const adminLogout = () => aj<{ ok: boolean }>("/api/admin/logout", { method: "POST" });
+export const adminLogout = () =>
+  aj<{ ok: boolean }>("/api/admin/logout", { method: "POST" });
 export const getAdminHealth = () => aj<AdminHealth>("/api/admin/health");
 export const getAdminQueue = (scope: AdminQueueScope = "all") =>
   aj<AdminQueue>(`/api/admin/queue${scope === "all" ? "" : `?scope=${scope}`}`);
@@ -514,27 +533,33 @@ export interface AdminSolvedPointsPage {
    *  (jobId or global) as items — the count always accompanies its rows. */
   solvedToday: number;
 }
-export const getSolvedPoints = (opts: { jobId?: string | null; cursor?: string | null; limit?: number } = {}) => {
+export const getSolvedPoints = (
+  opts: { jobId?: string | null; cursor?: string | null; limit?: number } = {},
+) => {
   const qs = new URLSearchParams();
   if (opts.jobId) qs.set("jobId", opts.jobId);
   if (opts.cursor) qs.set("cursor", opts.cursor);
   if (opts.limit != null) qs.set("limit", String(opts.limit));
   const suffix = qs.toString();
-  return aj<AdminSolvedPointsPage>(`/api/admin/solved-points${suffix ? `?${suffix}` : ""}`);
+  return aj<AdminSolvedPointsPage>(
+    `/api/admin/solved-points${suffix ? `?${suffix}` : ""}`,
+  );
 };
 // ---- Point History Explorer (Solver ▸ Points tab) ----
-export const getPointHistory = (opts: {
-  status?: string;
-  airfoil?: string;
-  campaignId?: string;
-  regime?: string;
-  errorClass?: string;
-  reynolds?: string;
-  verify?: string;
-  cursor?: string | null;
-  limit?: number;
-  facets?: boolean;
-} = {}) => {
+export const getPointHistory = (
+  opts: {
+    status?: string;
+    airfoil?: string;
+    campaignId?: string;
+    regime?: string;
+    errorClass?: string;
+    reynolds?: string;
+    verify?: string;
+    cursor?: string | null;
+    limit?: number;
+    facets?: boolean;
+  } = {},
+) => {
   const qs = new URLSearchParams();
   if (opts.status && opts.status !== "all") qs.set("status", opts.status);
   if (opts.airfoil?.trim()) qs.set("airfoil", opts.airfoil.trim());
@@ -547,10 +572,14 @@ export const getPointHistory = (opts: {
   if (opts.limit != null) qs.set("limit", String(opts.limit));
   if (opts.facets) qs.set("facets", "true");
   const suffix = qs.toString();
-  return aj<import("./point-history").PointHistoryPagePayload>(`/api/admin/point-history${suffix ? `?${suffix}` : ""}`);
+  return aj<import("./point-history").PointHistoryPagePayload>(
+    `/api/admin/point-history${suffix ? `?${suffix}` : ""}`,
+  );
 };
 export const getPointStory = (resultId: string) =>
-  aj<import("./point-history").PointStoryPayload>(`/api/admin/point-history/${encodeURIComponent(resultId)}/story`);
+  aj<import("./point-history").PointStoryPayload>(
+    `/api/admin/point-history/${encodeURIComponent(resultId)}/story`,
+  );
 export const requeuePoint = (resultId: string) =>
   aj<{ requeued: 1; scope: "failed" | "rejected"; campaignIds: string[] }>(
     `/api/admin/point-history/${encodeURIComponent(resultId)}/requeue`,
@@ -558,6 +587,18 @@ export const requeuePoint = (resultId: string) =>
   );
 
 // ---- Fidelity ladder: admin request-URANS (contract 6) ----
+export interface AdminLadderSubmitRetry {
+  id: string;
+  state: "retry_wait" | "blocked";
+  attemptCount: number;
+  nextAttemptAt: string | null;
+  latestSimJobId: string | null;
+  lastHttpStatus: number | null;
+  lastError: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** One sim_urans_requests row: an admin work item the scheduler runs at
  *  precalc rank. aoaDeg null = whole polar. */
 export interface AdminUransRequest {
@@ -566,9 +607,13 @@ export interface AdminUransRequest {
   revisionId: string;
   aoaDeg: number | null;
   fidelity: "precalc" | "full" | string;
-  state: "pending" | "running" | "done" | "cancelled" | string;
+  state: "pending" | "running" | "done" | "blocked" | "cancelled" | string;
   simJobId: string | null;
+  backgroundOwner: boolean;
   requestedBy: string | null;
+  independentOwner: boolean;
+  campaignOwners: Array<{ campaignId: string; state: string }>;
+  submitRetry: AdminLadderSubmitRetry | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -579,55 +624,101 @@ export interface AdminUransVerifyItem {
   airfoilId: string;
   revisionId: string;
   aoaDeg: number;
-  campaignId: string | null;
-  state: "pending" | "running" | "done" | "disagreed" | "cancelled" | string;
+  backgroundOwner: boolean;
+  campaignOwners: Array<{ campaignId: string; state: string }>;
+  state:
+    | "pending"
+    | "running"
+    | "done"
+    | "disagreed"
+    | "blocked"
+    | "cancelled"
+    | string;
   precalcResultId: string;
   verifyResultId: string | null;
   deltaCl: number | null;
   deltaCd: number | null;
   deltaCm: number | null;
+  submitRetry: AdminLadderSubmitRetry | null;
   createdAt: string;
   updatedAt: string;
 }
 
 /** Idempotent per (cell, fidelity): created=false replays the open item. */
-export const requestUrans = (body: { airfoilId: string; revisionId: string; aoaDeg?: number; fidelity: "precalc" | "full" }) =>
-  aj<{ request: AdminUransRequest; created: boolean }>("/api/admin/urans-requests", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
+export const requestUrans = (body: {
+  airfoilId: string;
+  revisionId: string;
+  aoaDeg?: number;
+  fidelity: "precalc" | "full";
+}) =>
+  aj<{ request: AdminUransRequest; created: boolean }>(
+    "/api/admin/urans-requests",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
 
 /** Continuation (amendment C): resume a budget-stopped URANS solve from its
  *  saved engine case state with an increased wall-clock budget. The server
  *  derives cell/angle/fidelity from the SOURCE results row; idempotent like
  *  requestUrans (created=false replays the open item). */
-export const continueUransResult = (resultId: string, budgetOverrideS: number) =>
-  aj<{ request: AdminUransRequest; created: boolean }>("/api/admin/urans-requests", {
-    method: "POST",
-    body: JSON.stringify({ continueFromResultId: resultId, budgetOverrideS }),
-  });
+export const continueUransResult = (
+  resultId: string,
+  budgetOverrideS: number,
+) =>
+  aj<{ request: AdminUransRequest; created: boolean }>(
+    "/api/admin/urans-requests",
+    {
+      method: "POST",
+      body: JSON.stringify({ continueFromResultId: resultId, budgetOverrideS }),
+    },
+  );
 
-export const reviewResult = (resultId: string, verdict: ResultReviewVerdict, note: string) =>
-  aj<{ review: ResultReviewRecord }>(`/api/admin/results/${encodeURIComponent(resultId)}/review`, {
-    method: "POST",
-    body: JSON.stringify(buildResultReviewPayload(verdict, note)),
-  });
+export const reviewResult = (
+  resultId: string,
+  verdict: ResultReviewVerdict,
+  note: string,
+) =>
+  aj<{ review: ResultReviewRecord }>(
+    `/api/admin/results/${encodeURIComponent(resultId)}/review`,
+    {
+      method: "POST",
+      body: JSON.stringify(buildResultReviewPayload(verdict, note)),
+    },
+  );
 
 export const deleteResultReview = (resultId: string) =>
-  aj<void>(`/api/admin/results/${encodeURIComponent(resultId)}/review`, { method: "DELETE" });
+  aj<void>(`/api/admin/results/${encodeURIComponent(resultId)}/review`, {
+    method: "DELETE",
+  });
 
 export const getResultReviews = (resultId: string) =>
-  aj<{ items: ResultReviewRecord[] }>(`/api/admin/results/${encodeURIComponent(resultId)}/reviews`);
+  aj<{ items: ResultReviewRecord[] }>(
+    `/api/admin/results/${encodeURIComponent(resultId)}/reviews`,
+  );
 
-/** Bulk continuation: queue a resume for EVERY continuable needs-review row
+/** Bulk continuation: queue a resume for every unavailable row with saved,
+ *  restartable solver state
  *  (optionally scoped to one campaign) with the same budget override. The
- *  server recomputes membership and excludes non-continuable rows (crashes,
- *  non-budget rejections); idempotent — replays count as reused; conflicted =
+ *  server recomputes membership and excludes non-continuable rows (crashes or
+ *  rejections without restartable state); replays are idempotent; conflicted =
  *  cells whose open request is NOT this row's continuation. */
-export const bulkContinueUrans = (campaignId: string | null, budgetOverrideS: number) =>
-  aj<{ continuable: number; created: number; reused: number; conflicted: number }>("/api/admin/urans-requests/bulk-continue", {
+export const bulkContinueUrans = (
+  campaignId: string | null,
+  budgetOverrideS: number,
+) =>
+  aj<{
+    continuable: number;
+    created: number;
+    reused: number;
+    conflicted: number;
+  }>("/api/admin/urans-requests/bulk-continue", {
     method: "POST",
-    body: JSON.stringify({ ...(campaignId ? { campaignId } : {}), budgetOverrideS }),
+    body: JSON.stringify({
+      ...(campaignId ? { campaignId } : {}),
+      budgetOverrideS,
+    }),
   });
 
 /** Open/settled request items + verify-queue items for one cell scope — the
@@ -638,22 +729,68 @@ export const getUransRequests = (airfoilId: string, revisionId: string) =>
   );
 
 export const getAdminSync = () => aj<AdminSyncState>("/api/admin/sync");
-export const patchAdminSync = (body: Partial<AdminSyncState["settings"]> & { permissions?: AdminSyncPermission[] }) =>
-  aj<AdminSyncState>("/api/admin/sync", { method: "PATCH", body: JSON.stringify(body) });
-export const runUpstreamSync = (body: { mode?: "full" | "db_only_remote_assets"; types?: SyncDataType[]; limit?: number }) =>
-  aj<AdminSyncState & { lastRun?: { imported: number; conflicts: string[]; mode: string; sourceInstanceId: string } }>("/api/admin/sync/upstream/run", {
+export const patchAdminSync = (
+  body: Partial<AdminSyncState["settings"]> & {
+    permissions?: AdminSyncPermission[];
+  },
+) =>
+  aj<AdminSyncState>("/api/admin/sync", {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+export const runUpstreamSync = (body: {
+  mode?: "full" | "db_only_remote_assets";
+  types?: SyncDataType[];
+  limit?: number;
+}) =>
+  aj<
+    AdminSyncState & {
+      lastRun?: {
+        imported: number;
+        conflicts: string[];
+        mode: string;
+        sourceInstanceId: string;
+      };
+    }
+  >("/api/admin/sync/upstream/run", {
     method: "POST",
     body: JSON.stringify(body),
   });
 export const archiveSyncConflict = (id: string) =>
-  aj<AdminSyncState>(`/api/admin/sync/conflicts/${encodeURIComponent(id)}/archive`, { method: "POST", body: JSON.stringify({}) });
+  aj<AdminSyncState>(
+    `/api/admin/sync/conflicts/${encodeURIComponent(id)}/archive`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
 export const promoteSyncConflict = (id: string) =>
-  aj<AdminSyncState>(`/api/admin/sync/conflicts/${encodeURIComponent(id)}/promote`, { method: "POST", body: JSON.stringify({}) });
-export const patchSweeper = (b: Partial<Pick<SweeperState, "enabled" | "maxConcurrentJobs" | "cpuSlots" | "pollIntervalMs" | "submitIntervalMs">>) =>
-  aj<SweeperState>("/api/admin/sweeper", { method: "PATCH", body: JSON.stringify(b) });
-export const requeueFailed = () => aj<{ requeued: number }>("/api/admin/results/requeue-failed", { method: "POST", body: JSON.stringify({}) });
+  aj<AdminSyncState>(
+    `/api/admin/sync/conflicts/${encodeURIComponent(id)}/promote`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+export const patchSweeper = (
+  b: Partial<
+    Pick<
+      SweeperState,
+      | "enabled"
+      | "maxConcurrentJobs"
+      | "cpuSlots"
+      | "pollIntervalMs"
+      | "submitIntervalMs"
+    >
+  >,
+) =>
+  aj<SweeperState>("/api/admin/sweeper", {
+    method: "PATCH",
+    body: JSON.stringify(b),
+  });
 export const recoverStaleJobs = (olderThanMinutes = 30) =>
-  aj<{ recovered: number; requeuedResults: number; requeued: number; keptRunning: number; markedIngesting: number; unchanged: number }>("/api/admin/jobs/recover-stale", {
+  aj<{
+    recovered: number;
+    requeuedResults: number;
+    requeued: number;
+    keptRunning: number;
+    markedIngesting: number;
+    unchanged: number;
+  }>("/api/admin/jobs/recover-stale", {
     method: "POST",
     body: JSON.stringify({ olderThanMinutes }),
   });
@@ -662,7 +799,11 @@ export const purgeTestArtifacts = (prefix: string) =>
     method: "POST",
     body: JSON.stringify({ prefix }),
   });
-export const cancelJob = (id: string) => aj<{ cancelled: boolean }>(`/api/admin/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+export const cancelJob = (id: string) =>
+  aj<{ cancelled: boolean }>(
+    `/api/admin/jobs/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" },
+  );
 
 export interface MediumInput {
   slug?: string;
@@ -704,20 +845,50 @@ export interface AdminBoundaryCondition extends BoundaryConditionDTO {
   updatedAt: string;
 }
 
-export type BoundaryConditionInput = Omit<AdminBoundaryCondition, "id" | "slug" | "mediumSlug" | "mediumName" | "reynolds" | "mach" | "density" | "dynamicViscosity" | "kinematicViscosity" | "createdAt" | "updatedAt"> & {
+export type BoundaryConditionInput = Omit<
+  AdminBoundaryCondition,
+  | "id"
+  | "slug"
+  | "mediumSlug"
+  | "mediumName"
+  | "reynolds"
+  | "mach"
+  | "density"
+  | "dynamicViscosity"
+  | "kinematicViscosity"
+  | "createdAt"
+  | "updatedAt"
+> & {
   slug?: string;
 };
 
-export const getAdminMediums = () => aj<{ items: MediumDTO[] }>("/api/admin/mediums");
+export const getAdminMediums = () =>
+  aj<{ items: MediumDTO[] }>("/api/admin/mediums");
 export const createAdminMedium = (body: MediumInput) =>
-  aj<MediumDTO>("/api/admin/mediums", { method: "POST", body: JSON.stringify(body) });
+  aj<MediumDTO>("/api/admin/mediums", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 export const updateAdminMedium = (id: string, body: Partial<MediumInput>) =>
-  aj<MediumDTO>(`/api/admin/mediums/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
-export const getAdminBoundaryConditions = () => aj<{ items: AdminBoundaryCondition[] }>("/api/admin/boundary-conditions");
+  aj<MediumDTO>(`/api/admin/mediums/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+export const getAdminBoundaryConditions = () =>
+  aj<{ items: AdminBoundaryCondition[] }>("/api/admin/boundary-conditions");
 export const createAdminBoundaryCondition = (body: BoundaryConditionInput) =>
-  aj<AdminBoundaryCondition>("/api/admin/boundary-conditions", { method: "POST", body: JSON.stringify(body) });
-export const updateAdminBoundaryCondition = (id: string, body: Partial<BoundaryConditionInput>) =>
-  aj<AdminBoundaryCondition>(`/api/admin/boundary-conditions/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminBoundaryCondition>("/api/admin/boundary-conditions", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateAdminBoundaryCondition = (
+  id: string,
+  body: Partial<BoundaryConditionInput>,
+) =>
+  aj<AdminBoundaryCondition>(
+    `/api/admin/boundary-conditions/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 
 export interface AdminFlowCondition {
   id: string;
@@ -885,86 +1056,232 @@ export type FlowConditionInput = Pick<
 > & { slug?: string };
 export type ReferenceGeometryProfileInput = Pick<
   AdminReferenceGeometryProfile,
-  "name" | "geometryType" | "referenceLengthKind" | "referenceLengthM" | "spanM" | "referenceAreaM2"
+  | "name"
+  | "geometryType"
+  | "referenceLengthKind"
+  | "referenceLengthM"
+  | "spanM"
+  | "referenceAreaM2"
 > & { slug?: string };
 export type BoundaryProfileInput = Pick<
   AdminBoundaryProfile,
-  "name" | "turbulenceIntensity" | "viscosityRatio" | "sandGrainHeight" | "roughnessConstant"
+  | "name"
+  | "turbulenceIntensity"
+  | "viscosityRatio"
+  | "sandGrainHeight"
+  | "roughnessConstant"
 > & { slug?: string };
 export type MeshProfileInput = Pick<
   AdminMeshProfile,
-  "name" | "mesher" | "farfieldRadiusChords" | "wakeLengthChords" | "nSurface" | "nRadial" | "nWake" | "targetYPlus" | "spanChords"
+  | "name"
+  | "mesher"
+  | "farfieldRadiusChords"
+  | "wakeLengthChords"
+  | "nSurface"
+  | "nRadial"
+  | "nWake"
+  | "targetYPlus"
+  | "spanChords"
 > & { slug?: string };
 export type SolverProfileInput = Pick<
   AdminSolverProfile,
-  "name" | "turbulenceModel" | "nIterations" | "convergenceTolerance" | "momentumScheme" | "transientCycles" | "transientDiscardFraction" | "transientMaxCourant"
+  | "name"
+  | "turbulenceModel"
+  | "nIterations"
+  | "convergenceTolerance"
+  | "momentumScheme"
+  | "transientCycles"
+  | "transientDiscardFraction"
+  | "transientMaxCourant"
 > & { slug?: string };
 export type SchedulingProfileInput = Pick<
   AdminSchedulingProfile,
-  "name" | "schedulingPolicy" | "cpuBudget" | "caseConcurrency" | "solverProcesses"
+  | "name"
+  | "schedulingPolicy"
+  | "cpuBudget"
+  | "caseConcurrency"
+  | "solverProcesses"
 > & { slug?: string };
-export type OutputProfileInput = Pick<AdminOutputProfile, "name" | "writeImages" | "imageZoomChords"> & { slug?: string };
-export type SweepDefinitionInput = Pick<AdminSweepDefinition, "name" | "aoaStart" | "aoaStop" | "aoaStep" | "aoaList"> & {
+export type OutputProfileInput = Pick<
+  AdminOutputProfile,
+  "name" | "writeImages" | "imageZoomChords"
+> & { slug?: string };
+export type SweepDefinitionInput = Pick<
+  AdminSweepDefinition,
+  "name" | "aoaStart" | "aoaStop" | "aoaStep" | "aoaList"
+> & {
   slug?: string;
 };
 export type SimulationPresetInput = Pick<
   AdminSimulationPreset,
-  "name" | "flowConditionId" | "referenceGeometryProfileId" | "boundaryProfileId" | "meshProfileId" | "solverProfileId" | "schedulingProfileId" | "outputProfileId" | "sweepDefinitionId" | "targetScope" | "targetAirfoilIds" | "enabled"
+  | "name"
+  | "flowConditionId"
+  | "referenceGeometryProfileId"
+  | "boundaryProfileId"
+  | "meshProfileId"
+  | "solverProfileId"
+  | "schedulingProfileId"
+  | "outputProfileId"
+  | "sweepDefinitionId"
+  | "targetScope"
+  | "targetAirfoilIds"
+  | "enabled"
 > & { slug?: string };
 
-export const getAdminSimulationSetup = () => aj<AdminSimulationSetup>("/api/admin/simulation-setup");
+export const getAdminSimulationSetup = () =>
+  aj<AdminSimulationSetup>("/api/admin/simulation-setup");
 export const createFlowCondition = (body: FlowConditionInput) =>
-  aj<AdminFlowCondition>("/api/admin/flow-conditions", { method: "POST", body: JSON.stringify(body) });
-export const updateFlowCondition = (id: string, body: Partial<FlowConditionInput>) =>
-  aj<AdminFlowCondition>(`/api/admin/flow-conditions/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminFlowCondition>("/api/admin/flow-conditions", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateFlowCondition = (
+  id: string,
+  body: Partial<FlowConditionInput>,
+) =>
+  aj<AdminFlowCondition>(
+    `/api/admin/flow-conditions/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const deleteFlowCondition = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/flow-conditions/${encodeURIComponent(id)}`, { method: "DELETE" });
-export const createReferenceGeometryProfile = (body: ReferenceGeometryProfileInput) =>
-  aj<AdminReferenceGeometryProfile>("/api/admin/reference-geometry-profiles", { method: "POST", body: JSON.stringify(body) });
-export const updateReferenceGeometryProfile = (id: string, body: Partial<ReferenceGeometryProfileInput>) =>
-  aj<AdminReferenceGeometryProfile>(`/api/admin/reference-geometry-profiles/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<{ ok: true }>(`/api/admin/flow-conditions/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+export const createReferenceGeometryProfile = (
+  body: ReferenceGeometryProfileInput,
+) =>
+  aj<AdminReferenceGeometryProfile>("/api/admin/reference-geometry-profiles", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateReferenceGeometryProfile = (
+  id: string,
+  body: Partial<ReferenceGeometryProfileInput>,
+) =>
+  aj<AdminReferenceGeometryProfile>(
+    `/api/admin/reference-geometry-profiles/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const deleteReferenceGeometryProfile = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/reference-geometry-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+  aj<{ ok: true }>(
+    `/api/admin/reference-geometry-profiles/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
 export const createBoundaryProfile = (body: BoundaryProfileInput) =>
-  aj<AdminBoundaryProfile>("/api/admin/boundary-profiles", { method: "POST", body: JSON.stringify(body) });
-export const updateBoundaryProfile = (id: string, body: Partial<BoundaryProfileInput>) =>
-  aj<AdminBoundaryProfile>(`/api/admin/boundary-profiles/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminBoundaryProfile>("/api/admin/boundary-profiles", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateBoundaryProfile = (
+  id: string,
+  body: Partial<BoundaryProfileInput>,
+) =>
+  aj<AdminBoundaryProfile>(
+    `/api/admin/boundary-profiles/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const deleteBoundaryProfile = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/boundary-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+  aj<{ ok: true }>(`/api/admin/boundary-profiles/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 export const createMeshProfile = (body: MeshProfileInput) =>
-  aj<AdminMeshProfile>("/api/admin/mesh-profiles", { method: "POST", body: JSON.stringify(body) });
-export const updateMeshProfile = (id: string, body: Partial<MeshProfileInput>) =>
-  aj<AdminMeshProfile>(`/api/admin/mesh-profiles/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminMeshProfile>("/api/admin/mesh-profiles", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateMeshProfile = (
+  id: string,
+  body: Partial<MeshProfileInput>,
+) =>
+  aj<AdminMeshProfile>(`/api/admin/mesh-profiles/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
 export const deleteMeshProfile = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/mesh-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+  aj<{ ok: true }>(`/api/admin/mesh-profiles/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 export const createSolverProfile = (body: SolverProfileInput) =>
-  aj<AdminSolverProfile>("/api/admin/solver-profiles", { method: "POST", body: JSON.stringify(body) });
-export const updateSolverProfile = (id: string, body: Partial<SolverProfileInput>) =>
-  aj<AdminSolverProfile>(`/api/admin/solver-profiles/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminSolverProfile>("/api/admin/solver-profiles", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateSolverProfile = (
+  id: string,
+  body: Partial<SolverProfileInput>,
+) =>
+  aj<AdminSolverProfile>(
+    `/api/admin/solver-profiles/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const deleteSolverProfile = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/solver-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+  aj<{ ok: true }>(`/api/admin/solver-profiles/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 export const createSchedulingProfile = (body: SchedulingProfileInput) =>
-  aj<AdminSchedulingProfile>("/api/admin/scheduling-profiles", { method: "POST", body: JSON.stringify(body) });
-export const updateSchedulingProfile = (id: string, body: Partial<SchedulingProfileInput>) =>
-  aj<AdminSchedulingProfile>(`/api/admin/scheduling-profiles/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminSchedulingProfile>("/api/admin/scheduling-profiles", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateSchedulingProfile = (
+  id: string,
+  body: Partial<SchedulingProfileInput>,
+) =>
+  aj<AdminSchedulingProfile>(
+    `/api/admin/scheduling-profiles/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const deleteSchedulingProfile = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/scheduling-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+  aj<{ ok: true }>(`/api/admin/scheduling-profiles/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 export const createOutputProfile = (body: OutputProfileInput) =>
-  aj<AdminOutputProfile>("/api/admin/output-profiles", { method: "POST", body: JSON.stringify(body) });
-export const updateOutputProfile = (id: string, body: Partial<OutputProfileInput>) =>
-  aj<AdminOutputProfile>(`/api/admin/output-profiles/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminOutputProfile>("/api/admin/output-profiles", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateOutputProfile = (
+  id: string,
+  body: Partial<OutputProfileInput>,
+) =>
+  aj<AdminOutputProfile>(
+    `/api/admin/output-profiles/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const deleteOutputProfile = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/output-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+  aj<{ ok: true }>(`/api/admin/output-profiles/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 export const createSweepDefinition = (body: SweepDefinitionInput) =>
-  aj<AdminSweepDefinition>("/api/admin/sweep-definitions", { method: "POST", body: JSON.stringify(body) });
-export const updateSweepDefinition = (id: string, body: Partial<SweepDefinitionInput>) =>
-  aj<AdminSweepDefinition>(`/api/admin/sweep-definitions/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminSweepDefinition>("/api/admin/sweep-definitions", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateSweepDefinition = (
+  id: string,
+  body: Partial<SweepDefinitionInput>,
+) =>
+  aj<AdminSweepDefinition>(
+    `/api/admin/sweep-definitions/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const deleteSweepDefinition = (id: string) =>
-  aj<{ ok: true }>(`/api/admin/sweep-definitions/${encodeURIComponent(id)}`, { method: "DELETE" });
+  aj<{ ok: true }>(`/api/admin/sweep-definitions/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 export const createSimulationPreset = (body: SimulationPresetInput) =>
-  aj<AdminSimulationPreset>("/api/admin/simulation-presets", { method: "POST", body: JSON.stringify(body) });
-export const updateSimulationPreset = (id: string, body: Partial<SimulationPresetInput>) =>
-  aj<AdminSimulationPreset>(`/api/admin/simulation-presets/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+  aj<AdminSimulationPreset>("/api/admin/simulation-presets", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateSimulationPreset = (
+  id: string,
+  body: Partial<SimulationPresetInput>,
+) =>
+  aj<AdminSimulationPreset>(
+    `/api/admin/simulation-presets/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 
 export interface AdminCategoryInput {
   name: string;
@@ -984,16 +1301,30 @@ export interface AdminCategoryRow {
   description: string | null;
 }
 
-export const getAdminCategoryTree = () => aj<CategoryNode[]>("/api/admin/categories/tree");
+export const getAdminCategoryTree = () =>
+  aj<CategoryNode[]>("/api/admin/categories/tree");
 export const createAdminCategory = (body: AdminCategoryInput) =>
-  aj<AdminCategoryRow>("/api/admin/categories", { method: "POST", body: JSON.stringify(body) });
-export const updateAdminCategory = (id: string, body: Partial<AdminCategoryInput>) =>
+  aj<AdminCategoryRow>("/api/admin/categories", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+export const updateAdminCategory = (
+  id: string,
+  body: Partial<AdminCategoryInput>,
+) =>
   aj<AdminCategoryRow>(`/api/admin/categories/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
   });
-export const reorderAdminCategory = (body: { draggedId: string; targetId: string; position: "before" | "inside" | "after" }) =>
-  aj<CategoryNode[]>("/api/admin/categories/reorder", { method: "POST", body: JSON.stringify(body) });
+export const reorderAdminCategory = (body: {
+  draggedId: string;
+  targetId: string;
+  position: "before" | "inside" | "after";
+}) =>
+  aj<CategoryNode[]>("/api/admin/categories/reorder", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 export const deleteAdminCategory = (id: string) =>
   fetch(`${BASE}/api/admin/categories/${encodeURIComponent(id)}`, {
     method: "DELETE",
@@ -1005,9 +1336,13 @@ export const deleteAdminCategory = (id: string) =>
     }
   });
 
-export const getAdminHashtags = () => aj<{ items: HashtagDTO[] }>("/api/admin/hashtags");
+export const getAdminHashtags = () =>
+  aj<{ items: HashtagDTO[] }>("/api/admin/hashtags");
 export const createAdminHashtag = (name: string) =>
-  aj<HashtagDTO>("/api/admin/hashtags", { method: "POST", body: JSON.stringify({ name }) });
+  aj<HashtagDTO>("/api/admin/hashtags", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
 export const updateAdminHashtag = (id: string, name: string) =>
   aj<HashtagDTO>(`/api/admin/hashtags/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -1024,13 +1359,23 @@ export const deleteAdminHashtag = (id: string) =>
     }
   });
 
-export type BulkAirfoilAction = "move" | "archive" | "remove" | "restore" | "assignHashtags" | "removeHashtags";
+export type BulkAirfoilAction =
+  | "move"
+  | "archive"
+  | "remove"
+  | "restore"
+  | "assignHashtags"
+  | "removeHashtags";
 export const bulkAirfoils = (body: {
   ids: string[];
   action: BulkAirfoilAction;
   categoryId?: string;
   hashtagIds?: string[];
-}) => aj<{ ok: boolean; updated: number }>("/api/admin/airfoils/bulk", { method: "POST", body: JSON.stringify(body) });
+}) =>
+  aj<{ ok: boolean; updated: number }>("/api/admin/airfoils/bulk", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 
 // ---------------------------------------------------------------------------
 // Simulation campaigns (spec docs/simulation-campaigns-spec.md §10/§11).
@@ -1039,7 +1384,14 @@ export const bulkAirfoils = (body: {
 // ---------------------------------------------------------------------------
 
 export type CampaignObjectiveKey = "ld_max" | "cl_zero" | "cl_max";
-export type CampaignErrorClass = "mesh" | "diverged" | "timeout" | "engine" | "cancelled" | "solver" | "unknown";
+export type CampaignErrorClass =
+  | "mesh"
+  | "diverged"
+  | "timeout"
+  | "engine"
+  | "cancelled"
+  | "solver"
+  | "unknown";
 
 export interface CampaignProgressTotals {
   requested: number;
@@ -1051,15 +1403,16 @@ export interface CampaignProgressTotals {
   /** Terminal-done points whose result classified 'rejected' (physics-invalid
    *  evidence): settled but NOT solved — surfaced like failed. */
   rejected: number;
+  /** Terminal machine-owned PRECALC obligations whose bounded attempts are
+   *  exhausted or deterministically blocked. Never a review count. */
+  blocked?: number;
   remaining: number;
 }
 
-/** Amendment-A semantic split of the review surface (approved design
- *  c19fd74a): awaitingUrans = tier-1 rejects queued for stage 2 (calm violet,
- *  no repair verbs); needsReview = failed-after-auto-retry + urans-rejected
- *  with nothing further scheduled (red chip, repair actions on the Points
- *  tab). Derived live server-side from the canonical predicate — optional on
- *  every payload because older APIs omit it (render nothing, never zeros). */
+/** Rolling-compatibility ladder split. `awaitingUrans` is machine-owned stage-2
+ *  work. `needsReview` is retained as a legacy wire key, but the canonical
+ *  server predicate is empty; clients must describe any nonzero old payload as
+ *  unavailable evidence, not as a promise of human review. */
 export interface CampaignReviewBuckets {
   awaitingUrans: number;
   needsReview: number;
@@ -1103,7 +1456,11 @@ export interface CampaignPlanInput {
   };
   /** clMax is optional: plan revisions stored before the third objective have
    *  no block for it — readers must treat absence as disabled. */
-  objectives: { ldMax: CampaignObjectivePlanInput; clZero: CampaignObjectivePlanInput; clMax?: CampaignObjectivePlanInput };
+  objectives: {
+    ldMax: CampaignObjectivePlanInput;
+    clZero: CampaignObjectivePlanInput;
+    clMax?: CampaignObjectivePlanInput;
+  };
   numerics: CampaignPlanNumericsInput;
 }
 
@@ -1123,6 +1480,7 @@ export interface AdminCampaignListItem {
   airfoilCount: number;
   totals: CampaignProgressTotals;
   reviewBuckets?: CampaignReviewBuckets;
+  automaticPrecalcOpen: number;
 }
 
 export interface AdminCampaignConditionSummary {
@@ -1169,15 +1527,19 @@ export interface AdminCampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
-  /** Amendment-A review-bucket split (violet awaiting-URANS bar segment + the
-   *  red "needs review · N" chip). Optional: older APIs omit it. */
+  /** Rolling-compatibility ladder split. Optional: older APIs omit it. */
   reviewBuckets?: CampaignReviewBuckets;
   /** Fidelity ladder per-tier open counts (contract 7). Optional: older API
    *  payloads omit it — render nothing, never invented zeros. */
   tierCounts?: { ransOpen: number; precalcOpen: number; verifyOpen: number };
   /** Derived ladder phase (contract 7): running_rans → running_precalc →
    *  running_refinement → completed; null for paused/cancelled/archived. */
-  phase?: "running_rans" | "running_precalc" | "running_refinement" | "completed" | null;
+  phase?:
+    | "running_rans"
+    | "running_precalc"
+    | "running_refinement"
+    | "completed"
+    | null;
   airfoilCount: number;
   conditions: AdminCampaignConditionSummary[];
   lanesSummary: Record<string, Record<string, number>>;
@@ -1208,14 +1570,17 @@ export interface AdminCampaignAirfoilRow {
   slug: string;
   name: string;
   isSymmetric: boolean;
-  /** Per-cell counters; awaitingUrans/needsReview ride along (amendment A)
-   *  when the API ships the split — optional for older payloads. */
-  perCondition: Array<{ conditionId: string } & CampaignProgressTotals & Partial<CampaignReviewBuckets>>;
+  /** Per-cell rolling-compatibility counters; optional for older payloads. */
+  perCondition: Array<
+    { conditionId: string } & CampaignProgressTotals &
+      Partial<CampaignReviewBuckets>
+  >;
 }
 
 export interface AdminCampaignFailureGroup {
   errorClass: CampaignErrorClass;
   count: number;
+  retryableCount: number;
   samples: Array<{
     resultId: string;
     conditionId: string;
@@ -1225,6 +1590,7 @@ export interface AdminCampaignFailureGroup {
     aoaDeg: number;
     error: string | null;
     attempts: number;
+    retryable: boolean;
   }>;
 }
 
@@ -1283,7 +1649,12 @@ export interface AdminCampaignLaneDetail {
     solvedResultId: string | null;
     outcome: "predicted" | "solved" | "superseded" | "released" | string;
     createdAt: string;
-    solved: { aoaDeg: number | null; cl: number | null; cd: number | null; status: string | null } | null;
+    solved: {
+      aoaDeg: number | null;
+      cl: number | null;
+      cd: number | null;
+      status: string | null;
+    } | null;
   }>;
 }
 
@@ -1292,10 +1663,30 @@ export interface CampaignPlanDiff {
   basePlanRevisionNumber: number;
   newPlan: CampaignPlanInput;
   diffHash: string;
-  addedConditions: Array<{ comboKey: string; temperatureK: string; pressurePa: string; speedMps: string; chordM: string }>;
-  reactivatedConditions: Array<{ conditionId: string; comboKey: string; previousStatus: string }>;
-  keptConditions: Array<{ conditionId: string; comboKey: string; solvedAngles: number[]; releasedPoints: number; keptOpenPoints: number }>;
-  releasedConditions: Array<{ conditionId: string; comboKey: string; releasedPoints: number }>;
+  addedConditions: Array<{
+    comboKey: string;
+    temperatureK: string;
+    pressurePa: string;
+    speedMps: string;
+    chordM: string;
+  }>;
+  reactivatedConditions: Array<{
+    conditionId: string;
+    comboKey: string;
+    previousStatus: string;
+  }>;
+  keptConditions: Array<{
+    conditionId: string;
+    comboKey: string;
+    solvedAngles: number[];
+    releasedPoints: number;
+    keptOpenPoints: number;
+  }>;
+  releasedConditions: Array<{
+    conditionId: string;
+    comboKey: string;
+    releasedPoints: number;
+  }>;
   addedAngles: number[];
   removedAngles: number[];
   removedAngleKeptCells: number;
@@ -1308,7 +1699,13 @@ export interface CampaignPlanDiff {
   runningOnRemoved: number;
   objectiveDeltas: Array<{
     objective: CampaignObjectiveKey;
-    changes: Array<"enabled" | "disabled" | "tolerance_tightened" | "tolerance_loosened" | "rounds_changed">;
+    changes: Array<
+      | "enabled"
+      | "disabled"
+      | "tolerance_tightened"
+      | "tolerance_loosened"
+      | "rounds_changed"
+    >;
     toleranceDeg: string;
   }>;
   valueDiffs: Record<string, { added: string[]; removed: string[] }>;
@@ -1326,7 +1723,13 @@ export interface CampaignLaunchInput {
 }
 
 export interface CampaignLaunchResponse {
-  campaign: { id: string; slug: string; name: string; status: string; priority: number };
+  campaign: {
+    id: string;
+    slug: string;
+    name: string;
+    status: string;
+    priority: number;
+  };
   replayed: boolean;
   totals: CampaignProgressTotals;
   conditionCount: number;
@@ -1375,7 +1778,11 @@ export interface CampaignAddAirfoilsPreview {
   alreadyIncluded: string[];
   addedPoints: number;
   addedSolverRuns: number;
-  perCondition: Array<{ conditionId: string; status: string; cellCount: number }>;
+  perCondition: Array<{
+    conditionId: string;
+    status: string;
+    cellCount: number;
+  }>;
 }
 
 export interface CampaignPlanApplyResult {
@@ -1388,7 +1795,12 @@ export interface CampaignPlanApplyResult {
   totals: CampaignProgressTotals;
 }
 
-export type CampaignLifecycleVerb = "pause" | "resume" | "cancel" | "close-with-failures" | "archive";
+export type CampaignLifecycleVerb =
+  | "pause"
+  | "resume"
+  | "cancel"
+  | "close-with-failures"
+  | "archive";
 
 export interface CampaignLaneKey {
   airfoilId: string;
@@ -1410,20 +1822,31 @@ export interface AdminCampaignsSolverState {
   lastTickCompletedAt: string | null;
 }
 
-export const listCampaigns = (params?: { statuses?: string[]; limit?: number; offset?: number }) => {
+export const listCampaigns = (params?: {
+  statuses?: string[];
+  limit?: number;
+  offset?: number;
+}) => {
   const qs = new URLSearchParams();
   if (params?.statuses?.length) qs.set("status", params.statuses.join(","));
   if (params?.limit != null) qs.set("limit", String(params.limit));
   if (params?.offset != null) qs.set("offset", String(params.offset));
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
-  return aj<{ items: AdminCampaignListItem[]; total: number; solverState: AdminCampaignsSolverState }>(
-    `/api/admin/campaigns${suffix}`,
-  );
+  return aj<{
+    items: AdminCampaignListItem[];
+    total: number;
+    solverState: AdminCampaignsSolverState;
+  }>(`/api/admin/campaigns${suffix}`);
 };
 
-export const getCampaign = (id: string) => aj<AdminCampaignSummary>(`/api/admin/campaigns/${encodeURIComponent(id)}`);
+export const getCampaign = (id: string) =>
+  aj<AdminCampaignSummary>(`/api/admin/campaigns/${encodeURIComponent(id)}`);
 
-export const getCampaignAirfoils = (id: string, cursor?: string | null, limit = 25) => {
+export const getCampaignAirfoils = (
+  id: string,
+  cursor?: string | null,
+  limit = 25,
+) => {
   const qs = new URLSearchParams({ limit: String(limit) });
   if (cursor) qs.set("cursor", cursor);
   return aj<{ items: AdminCampaignAirfoilRow[]; nextCursor: string | null }>(
@@ -1431,19 +1854,30 @@ export const getCampaignAirfoils = (id: string, cursor?: string | null, limit = 
   );
 };
 
-export const getCampaignFailures = (id: string, opts?: { conditionId?: string; airfoilId?: string }) => {
+export const getCampaignFailures = (
+  id: string,
+  opts?: { conditionId?: string; airfoilId?: string },
+) => {
   const qs = new URLSearchParams();
   if (opts?.conditionId) qs.set("conditionId", opts.conditionId);
   if (opts?.airfoilId) qs.set("airfoilId", opts.airfoilId);
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
-  return aj<{ total: number; groups: AdminCampaignFailureGroup[]; rejected: AdminCampaignRejected }>(
-    `/api/admin/campaigns/${encodeURIComponent(id)}/failures${suffix}`,
-  );
+  return aj<{
+    total: number;
+    retryableTotal: number;
+    groups: AdminCampaignFailureGroup[];
+    rejected: AdminCampaignRejected;
+  }>(`/api/admin/campaigns/${encodeURIComponent(id)}/failures${suffix}`);
 };
 
 export const getCampaignLanes = (
   id: string,
-  opts?: { objective?: CampaignObjectiveKey; state?: string; cursor?: string | null; limit?: number },
+  opts?: {
+    objective?: CampaignObjectiveKey;
+    state?: string;
+    cursor?: string | null;
+    limit?: number;
+  },
 ) => {
   const qs = new URLSearchParams();
   if (opts?.objective) qs.set("objective", opts.objective);
@@ -1456,52 +1890,106 @@ export const getCampaignLanes = (
   );
 };
 
-export const getCampaignLaneDetail = (id: string, airfoilId: string, conditionId: string, objective: CampaignObjectiveKey) =>
+export const getCampaignLaneDetail = (
+  id: string,
+  airfoilId: string,
+  conditionId: string,
+  objective: CampaignObjectiveKey,
+) =>
   aj<AdminCampaignLaneDetail>(
     `/api/admin/campaigns/${encodeURIComponent(id)}/lanes/${encodeURIComponent(airfoilId)}/${encodeURIComponent(conditionId)}/${encodeURIComponent(objective)}`,
   );
 
-export const previewCampaign = (input: { plan: CampaignPlanInput; airfoilIds: string[] }) =>
-  aj<CampaignReusePreview>("/api/admin/campaigns/preview", { method: "POST", body: JSON.stringify(input) });
+export const previewCampaign = (input: {
+  plan: CampaignPlanInput;
+  airfoilIds: string[];
+}) =>
+  aj<CampaignReusePreview>("/api/admin/campaigns/preview", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 
 export const launchCampaign = (input: CampaignLaunchInput) =>
-  aj<CampaignLaunchResponse>("/api/admin/campaigns", { method: "POST", body: JSON.stringify(input) });
-
-export const previewCampaignPlan = (id: string, body: { plan: CampaignPlanInput; basePlanRevisionNumber: number }) =>
-  aj<CampaignPlanDiff>(`/api/admin/campaigns/${encodeURIComponent(id)}/plan/preview`, {
+  aj<CampaignLaunchResponse>("/api/admin/campaigns", {
     method: "POST",
-    body: JSON.stringify(body),
+    body: JSON.stringify(input),
   });
+
+export const previewCampaignPlan = (
+  id: string,
+  body: { plan: CampaignPlanInput; basePlanRevisionNumber: number },
+) =>
+  aj<CampaignPlanDiff>(
+    `/api/admin/campaigns/${encodeURIComponent(id)}/plan/preview`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
 
 export const applyCampaignPlan = (
   id: string,
-  body: { plan: CampaignPlanInput; basePlanRevisionNumber: number; diffHash: string },
+  body: {
+    plan: CampaignPlanInput;
+    basePlanRevisionNumber: number;
+    diffHash: string;
+  },
 ) =>
-  aj<CampaignPlanApplyResult>(`/api/admin/campaigns/${encodeURIComponent(id)}/plan/apply`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
+  aj<CampaignPlanApplyResult>(
+    `/api/admin/campaigns/${encodeURIComponent(id)}/plan/apply`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
 
 export const previewCampaignAirfoils = (id: string, airfoilIds: string[]) =>
-  aj<CampaignAddAirfoilsPreview>(`/api/admin/campaigns/${encodeURIComponent(id)}/airfoils`, {
+  aj<CampaignAddAirfoilsPreview>(
+    `/api/admin/campaigns/${encodeURIComponent(id)}/airfoils`,
+    {
+      method: "POST",
+      body: JSON.stringify({ airfoilIds, mode: "preview" }),
+    },
+  );
+
+export const addCampaignAirfoils = (
+  id: string,
+  body: { airfoilIds: string[]; diffHash: string },
+) =>
+  aj<{
+    status: "applied";
+    addedAirfoils: number;
+    addedPoints: number;
+    totals: CampaignProgressTotals;
+  }>(`/api/admin/campaigns/${encodeURIComponent(id)}/airfoils`, {
     method: "POST",
-    body: JSON.stringify({ airfoilIds, mode: "preview" }),
+    body: JSON.stringify({
+      airfoilIds: body.airfoilIds,
+      mode: "apply",
+      diffHash: body.diffHash,
+    }),
   });
 
-export const addCampaignAirfoils = (id: string, body: { airfoilIds: string[]; diffHash: string }) =>
-  aj<{ status: "applied"; addedAirfoils: number; addedPoints: number; totals: CampaignProgressTotals }>(
-    `/api/admin/campaigns/${encodeURIComponent(id)}/airfoils`,
-    { method: "POST", body: JSON.stringify({ airfoilIds: body.airfoilIds, mode: "apply", diffHash: body.diffHash }) },
-  );
-
 export const campaignVerb = (id: string, verb: CampaignLifecycleVerb) =>
-  aj<{ campaign?: { id: string; status: string } & Record<string, unknown> } & Record<string, unknown>>(
-    `/api/admin/campaigns/${encodeURIComponent(id)}/${verb}`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
+  aj<
+    {
+      campaign?: { id: string; status: string } & Record<string, unknown>;
+    } & Record<string, unknown>
+  >(`/api/admin/campaigns/${encodeURIComponent(id)}/${verb}`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 
-export const forceReleaseCondition = (id: string, conditionId: string, body: { expectedCancelledPoints?: number }) =>
-  aj<{ planRevisionNumber: number; cancelledPoints: number; totals: CampaignProgressTotals }>(
+export const forceReleaseCondition = (
+  id: string,
+  conditionId: string,
+  body: { expectedCancelledPoints?: number },
+) =>
+  aj<{
+    planRevisionNumber: number;
+    cancelledPoints: number;
+    totals: CampaignProgressTotals;
+  }>(
     `/api/admin/campaigns/${encodeURIComponent(id)}/conditions/${encodeURIComponent(conditionId)}/force-release`,
     { method: "POST", body: JSON.stringify(body) },
   );
@@ -1512,7 +2000,11 @@ export const restoreCondition = (id: string, conditionId: string) =>
     { method: "POST", body: JSON.stringify({}) },
   );
 
-export const continueLane = (id: string, laneKey: CampaignLaneKey, extraRounds: number) =>
+export const continueLane = (
+  id: string,
+  laneKey: CampaignLaneKey,
+  extraRounds: number,
+) =>
   aj<{ lane: AdminCampaignLaneDetail["lane"] }>(
     `/api/admin/campaigns/${encodeURIComponent(id)}/lanes/${encodeURIComponent(laneKey.airfoilId)}/${encodeURIComponent(laneKey.conditionId)}/${encodeURIComponent(laneKey.objective)}/continue`,
     { method: "POST", body: JSON.stringify({ extraRounds }) },
@@ -1529,13 +2021,21 @@ export const requeueCampaignFailed = (
     expectedRejectedCount?: number;
   },
 ) =>
-  aj<{ requeued: number; requeuedFailed: number; requeuedRejected: number; totals: CampaignProgressTotals }>(
-    `/api/admin/campaigns/${encodeURIComponent(id)}/requeue-failed`,
-    { method: "POST", body: JSON.stringify(body) },
-  );
+  aj<{
+    requeued: number;
+    requeuedFailed: number;
+    requeuedRejected: number;
+    totals: CampaignProgressTotals;
+  }>(`/api/admin/campaigns/${encodeURIComponent(id)}/requeue-failed`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 
 export const getCampaignDuplicatePrefill = (id: string) =>
-  aj<CampaignDuplicatePrefill>(`/api/admin/campaigns/${encodeURIComponent(id)}/duplicate`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
+  aj<CampaignDuplicatePrefill>(
+    `/api/admin/campaigns/${encodeURIComponent(id)}/duplicate`,
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+  );

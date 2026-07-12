@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  POLAR_COMPATIBILITY_VERSION,
+  compatibilityClassificationWithQualityGate,
   polarCompatibilitySelectionRank,
   resolvePolarCompatibilityMembers,
   type PolarCompatibilityCandidate,
 } from "../src/polar-compatibility-cache";
+import {
+  INCOMPLETE_URANS_INTEGRATION_REASON,
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "@aerodb/core";
 import {
   physicsHashForSnapshot,
   type SimulationSetupSnapshot,
@@ -42,6 +49,7 @@ function candidate(
     firstOrderFallback: false,
     resultUpdatedAt: new Date("2026-07-11T00:00:00Z"),
     solvedAt: new Date("2026-07-11T00:00:00Z"),
+    qualityWarnings: null,
     reviewVerdict: null,
   };
   const row = { ...base, ...overrides } as PolarCompatibilityCandidate;
@@ -52,6 +60,29 @@ function candidate(
 }
 
 describe("public polar compatibility evidence resolution", () => {
+  it("invalidates caches built before incomplete-URANS quality gating", () => {
+    expect(POLAR_COMPATIBILITY_VERSION).toBe("polar-compat-v4");
+  });
+
+  it.each([URANS_BUDGET_STOP_MARKER, URANS_CONTINUATION_REQUIRED_MARKER])(
+    "fails closed on legacy accepted compatibility evidence carrying %s",
+    (marker) => {
+      expect(
+        compatibilityClassificationWithQualityGate({
+          state: "accepted",
+          region: "attached",
+          reasons: [],
+          regime: "urans",
+          qualityWarnings: [`partial result ${marker}`],
+        }),
+      ).toEqual({
+        state: "rejected",
+        region: "unknown",
+        reasons: [INCOMPLETE_URANS_INTEGRATION_REASON],
+      });
+    },
+  );
+
   it("ranks classification before fidelity and full URANS before precalc before RANS", () => {
     const acceptedRans = candidate("accepted-rans");
     const provisionalFull = candidate("provisional-full", {
@@ -218,9 +249,22 @@ describe("physics compatibility hash contract", () => {
   it("ignores batch/preset metadata, sweep, scheduling, and output policy", () => {
     const changed: SimulationSetupSnapshot = {
       ...snapshot,
-      preset: { ...snapshot.preset, id: "preset-b", slug: "batch-b", name: "Batch B" },
-      scheduling: { ...snapshot.scheduling, cpuBudget: 64, caseConcurrency: 16 },
-      output: { ...snapshot.output, writeImages: ["vorticity"], imageZoomChords: 8 },
+      preset: {
+        ...snapshot.preset,
+        id: "preset-b",
+        slug: "batch-b",
+        name: "Batch B",
+      },
+      scheduling: {
+        ...snapshot.scheduling,
+        cpuBudget: 64,
+        caseConcurrency: 16,
+      },
+      output: {
+        ...snapshot.output,
+        writeImages: ["vorticity"],
+        imageZoomChords: 8,
+      },
       sweep: { ...snapshot.sweep, aoaList: [-4, 0, 4] },
     };
     expect(physicsHashForSnapshot(changed)).toBe(

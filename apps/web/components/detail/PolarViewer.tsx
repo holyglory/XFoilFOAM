@@ -204,6 +204,7 @@ export function PolarViewer(props: {
     >
       {/* toolbar */}
       <div
+        data-ui-allow-overlap="fixed top navigation intentionally covers this toolbar only after it has scrolled underneath the persistent header"
         style={{
           display: "flex",
           alignItems: "center",

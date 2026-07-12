@@ -46,7 +46,9 @@ from airfoilfoam.pipeline import (
 from airfoilfoam.postprocess.images import nearest_vtu_indices, render_frame_track_images
 from airfoilfoam.postprocess.unsteady import (
     ForceHistory,
+    PeriodEstimate,
     coefficient_series,
+    estimate_period,
     frame_coefficients,
     frame_target_times,
     measure_period,
@@ -156,6 +158,31 @@ def test_measure_period_rejects_flat_short_and_subcycle_signals():
     assert measure_period(t, np.ones_like(t)) is None  # flat
     t = np.linspace(0.0, 0.3, 100)  # only 1.2 cycles of a 0.25 s period
     assert measure_period(t, np.sin(2 * np.pi * t / 0.25)) is None
+
+
+def test_period_estimate_missing_half_is_ambiguous():
+    """A full-window cadence cannot certify a signal absent from one half.
+
+    The first half oscillates outside the physical shedding band while the
+    second half has a clean in-band 0.5 s cadence.  The combined window still
+    yields that cadence, reproducing the fail-open shape that previously
+    labelled the estimate stable when one corroborating half was missing.
+    """
+
+    t = np.linspace(0.0, 4.0, 4001)
+    cl = np.where(
+        t < 2.0,
+        np.sin(2.0 * np.pi * 10.0 * t),
+        np.sin(2.0 * np.pi * 2.0 * t),
+    )
+
+    estimate = estimate_period(t, cl, speed=10.0, chord=1.0, min_cycles=2.0)
+
+    assert estimate is not None
+    assert estimate.period_s == pytest.approx(0.5, rel=0.01)
+    assert estimate.first_half_s is None
+    assert estimate.second_half_s == pytest.approx(0.5, rel=0.01)
+    assert estimate.ambiguous
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +376,326 @@ def test_transient_attempt_merges_only_transient_segments(tmp_path, monkeypatch)
     assert max(result.force_history.cl) < 1.0
 
 
+def test_precalc_attempt_grades_established_oscillation_before_returning(tmp_path, monkeypatch):
+    """Production-shaped must-catch: cycles and frames already satisfy their
+    bars, but the per-cycle means still relax monotonically. The attempt must
+    return refinable/nonstationary so the same-case continuation loop sees it;
+    discovering this only later in _finalize_outcome is too late."""
+
+    class FakeCaseBuilder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def write_transient(self, *_args, **_kwargs):
+            pass
+
+    period = 0.5
+
+    class FakeRunner:
+        def solver(self, case_dir, *_args, **_kwargs):
+            coeff = (
+                case_dir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat"
+            )
+            times = np.linspace(0.0, 2.5, 2501)
+            _write_coeff_rows(
+                coeff,
+                times,
+                lambda t: 0.7
+                + 0.08 * math.sin(2 * math.pi * t / period)
+                + 0.12 * (t / times[-1]),
+            )
+            # Dense real field states: frame cadence itself passes, isolating
+            # the late-stationarity defect.
+            for t in np.linspace(0.0, 2.5, 151):
+                (case_dir / f"{t:.8g}").mkdir(exist_ok=True)
+            return SimpleNamespace(ok=True, stdout="pimple ok")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+
+    result = _run_transient_attempt(
+        tcase,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=120,
+        run_time=2.5,
+        delta_t=0.001,
+        coeff_start_time=0.0,
+    )
+
+    assert result is not None
+    assert result.quality.retained_cycles >= 3.0
+    assert result.quality.frames_per_cycle >= pipeline.URANS_MIN_FRAMES_PER_CYCLE
+    assert not result.quality.ok
+    assert result.quality.can_refine
+    assert "not stationary" in result.quality.reason
+    assert "established-oscillation" in result.quality.reason
+
+
+def test_precalc_frame_density_matches_exported_last_three_periods(tmp_path):
+    """A long sparse startup is outside the published player once the last
+    three whole periods are dense. The attempt gate must grade that exact real
+    export window instead of diluting it with frames users never receive."""
+
+    period = 0.5
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    times = np.linspace(0.0, 3.5, 3501)
+    _write_coeff_rows(
+        coeff,
+        times,
+        lambda t: 0.7 + 0.08 * math.sin(2 * math.pi * t / period),
+    )
+    # First four periods: two frames/period. Last three periods: thirty/period.
+    frame_times = {*np.linspace(0.0, 2.0, 9), *np.linspace(2.0, 3.5, 91)}
+    for t in sorted(frame_times):
+        (tmp_path / f"{t:.8g}").mkdir(exist_ok=True)
+
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+        UransQuality(
+            ok=True,
+            can_refine=False,
+            reason="URANS quality target met.",
+            measured_period_s=period,
+        ),
+        early_stopped=False,
+    )
+
+    assert quality.ok
+    assert quality.retained_cycles >= 5.0
+    assert quality.retained_frame_count == pytest.approx(91, abs=2)
+    assert quality.frames_per_cycle >= pipeline.URANS_FRAME_WRITE_PER_CYCLE
+
+
+def _accepted_precalc_quality(period: float) -> UransQuality:
+    return UransQuality(
+        ok=True,
+        can_refine=False,
+        reason="URANS quality target met.",
+        measured_period_s=period,
+        retained_cycles=3.0,
+        retained_frame_count=90,
+        frames_per_cycle=30.0,
+    )
+
+
+def _precalc_grade_fixture(tmp_path, period: float):
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    times = np.linspace(0.0, 2.0, 2001)
+    _write_coeff_rows(
+        coeff,
+        times,
+        lambda t: 0.7 + 0.08 * math.sin(2 * math.pi * t / period),
+    )
+    return (
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+    )
+
+
+def test_precalc_live_grade_rejects_missing_half_period(tmp_path, monkeypatch):
+    """The live precalc gate must consume the half-window ambiguity verdict."""
+
+    period = 0.5
+    coeff_paths, spec, solver = _precalc_grade_fixture(tmp_path, period)
+    for t in np.linspace(0.0, 2.0, 121):
+        (tmp_path / f"{t:.8g}").mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        pipeline,
+        "estimate_period",
+        lambda *_args, **_kwargs: PeriodEstimate(
+            period_s=period,
+            ambiguous=True,
+            first_half_s=None,
+            second_half_s=period,
+        ),
+    )
+
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        coeff_paths,
+        spec,
+        solver,
+        _accepted_precalc_quality(period),
+        early_stopped=False,
+    )
+
+    assert not quality.ok
+    assert quality.can_refine
+    assert "not stationary" in quality.reason
+    assert "period" in quality.reason
+
+
+def test_precalc_stationarity_grading_exception_fails_closed(tmp_path, monkeypatch):
+    """A new-tier precalc must not retain a prior ``ok=True`` grade when its
+    mandatory established-oscillation verdict raises unexpectedly."""
+
+    period = 0.5
+    coeff_paths, spec, solver = _precalc_grade_fixture(tmp_path, period)
+
+    def raise_stats_error(*_args, **_kwargs):
+        raise RuntimeError("synthetic stationarity failure")
+
+    monkeypatch.setattr(pipeline, "period_window_stats", raise_stats_error)
+
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        coeff_paths,
+        spec,
+        solver,
+        _accepted_precalc_quality(period),
+        early_stopped=False,
+    )
+
+    assert not quality.ok
+    assert quality.can_refine
+    assert "established-oscillation stationarity verdict unavailable" in quality.reason
+    assert "grading error" in quality.reason
+
+
+def test_precalc_missing_stationarity_stats_fails_closed(tmp_path, monkeypatch):
+    """``period_window_stats`` returning no whole-period verdict is likewise
+    unavailable evidence, never permission to finalize a previously-ok row."""
+
+    period = 0.5
+    coeff_paths, spec, solver = _precalc_grade_fixture(tmp_path, period)
+    monkeypatch.setattr(pipeline, "period_window_stats", lambda *_args, **_kwargs: None)
+
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        coeff_paths,
+        spec,
+        solver,
+        _accepted_precalc_quality(period),
+        early_stopped=False,
+    )
+
+    assert not quality.ok
+    assert quality.can_refine
+    assert "established-oscillation stationarity verdict unavailable" in quality.reason
+    assert "no whole-period statistics" in quality.reason
+
+
+def test_precalc_unavailable_stationarity_without_valid_period_is_not_refinable(
+    tmp_path, monkeypatch
+):
+    """Fail-closed does not itself authorize continuation when there is no
+    measured cadence from which a safe same-case chunk can be sized."""
+
+    period = 0.5
+    coeff_paths, spec, solver = _precalc_grade_fixture(tmp_path, period)
+    monkeypatch.setattr(pipeline, "estimate_period", lambda *_args, **_kwargs: None)
+    prior = _accepted_precalc_quality(period)
+    prior.measured_period_s = None
+
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        coeff_paths,
+        spec,
+        solver,
+        prior,
+        early_stopped=False,
+    )
+
+    assert not quality.ok
+    assert not quality.can_refine
+    assert "established-oscillation stationarity verdict unavailable" in quality.reason
+    assert "no corroborated shedding period" in quality.reason
+
+
+def test_precalc_prior_fft_period_cannot_replace_missing_corroborated_estimate(
+    tmp_path, monkeypatch
+):
+    """An FFT-only history period may size continuation, never certify stability.
+
+    This is the exact fail-open shape from the adversarial review: the prior
+    force-history grade carries a finite spectral period, but the stricter
+    autocorrelation/corroboration estimator returns None. The stationarity
+    grader must fail closed without calling period_window_stats under a period
+    it could not corroborate.
+    """
+
+    period = 0.5
+    coeff_paths, spec, solver = _precalc_grade_fixture(tmp_path, period)
+    monkeypatch.setattr(pipeline, "estimate_period", lambda *_args, **_kwargs: None)
+
+    def forbidden_stats(*_args, **_kwargs):
+        raise AssertionError("uncorroborated FFT period reached stationarity stats")
+
+    monkeypatch.setattr(pipeline, "period_window_stats", forbidden_stats)
+    prior = _accepted_precalc_quality(period)
+
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        coeff_paths,
+        spec,
+        solver,
+        prior,
+        early_stopped=False,
+    )
+
+    assert not quality.ok
+    assert quality.can_refine
+    assert quality.measured_period_s == pytest.approx(period)
+    assert "established-oscillation stationarity verdict unavailable" in quality.reason
+    assert "no corroborated shedding period" in quality.reason
+    assert "grading error" not in quality.reason
+
+
+def test_full_fidelity_does_not_enter_precalc_stationarity_grader(
+    tmp_path, monkeypatch
+):
+    """Default/full requests keep their established legacy grading path."""
+
+    original = _accepted_precalc_quality(0.5)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("precalc grader called for full fidelity")
+
+    monkeypatch.setattr(pipeline, "period_window_stats", forbidden)
+    result = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        [],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        SolverParams(),
+        original,
+        early_stopped=False,
+    )
+
+    assert result is original
+
+
 # --------------------------------------------------------------------------- #
 # Continuation until N whole periods + honest budget grading
 # --------------------------------------------------------------------------- #
@@ -378,7 +725,16 @@ def _history_over(t0, t1, period, n=600):
     )
 
 
-def _install_continuation_fakes(monkeypatch, *, period, spans, wall_seconds, quality_ok_at_end=True):
+def _install_continuation_fakes(
+    monkeypatch,
+    *,
+    period,
+    spans,
+    wall_seconds,
+    quality_ok_at_end=True,
+    failure_reason=None,
+    failure_frames_per_cycle=0.0,
+):
     """Fake attempts: attempt k extends the case to cumulative ``spans[k]``
     seconds and returns the merged history over [0, spans[k]]."""
     calls: list[dict] = []
@@ -421,9 +777,15 @@ def _install_continuation_fakes(monkeypatch, *, period, spans, wall_seconds, qua
             quality=UransQuality(
                 ok=ok,
                 can_refine=not ok,
-                reason="URANS quality target met." if ok else f"retained cycles {end / period:.2f} < 7.00",
+                reason=(
+                    "URANS quality target met."
+                    if ok
+                    else failure_reason
+                    or f"retained cycles {end / period:.2f} < 7.00"
+                ),
                 measured_period_s=period,
                 retained_cycles=end / period,
+                frames_per_cycle=failure_frames_per_cycle,
             ),
             start_time=0.0 if k == 0 else spans[k - 1],
             end_time=end,
@@ -461,6 +823,258 @@ def test_fresh_transient_startup_caps_first_chunk_max_delta_t(tmp_path, monkeypa
     assert calls[0]["write_interval"] is None
 
 
+def test_precalc_initial_chunk_uses_tier_target_not_profile_cycle_count(tmp_path, monkeypatch):
+    """Precalc is a three-period preliminary tier, so a profile's legacy
+    ten-cycle horizon must not make its first chunk integrate ten guessed
+    periods before the measured-period controller can take over."""
+
+    period = pipeline.physics.shedding_period(
+        10.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[6.0 * period],
+        wall_seconds=1.0,
+    )
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        urans_min_periods=3,
+        transient_cycles=17,
+        transient_discard_fraction=0.4,
+    )
+
+    result = _run_transient_for_test(tmp_path / "case", solver)
+
+    assert result is not None
+    # (3 required retained periods + 0.6 whole-cycle safety) / 60% retained.
+    assert calls[0]["run_time"] == pytest.approx(6.0 * period)
+    # The period is not known yet, so the very first chunk must already use
+    # the physical slow-edge acquisition cadence.  Leaving this as ``None``
+    # delegates to a generic renderer-oriented default and defeats the
+    # controller's bounded-write promise before the first continuation.
+    assert calls[0]["write_interval"] == pytest.approx(
+        pipeline._period_acquisition_write_interval(period)
+    )
+
+
+def test_full_initial_chunk_keeps_profile_cycle_count(tmp_path, monkeypatch):
+    period = pipeline.physics.shedding_period(
+        10.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[13.0 * period],
+        wall_seconds=1.0,
+    )
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="full",
+        transient_cycles=13,
+    )
+
+    result = _run_transient_for_test(tmp_path / "case", solver)
+
+    assert result is not None
+    assert calls[0]["run_time"] == pytest.approx(13.0 * period)
+
+
+def test_precalc_acquires_slow_plausible_period_in_same_case(tmp_path, monkeypatch):
+    """At real St=0.1 the six-guess fast first chunk spans only 1.2 real
+    cycles before startup discard, so declaring a missing period terminal would
+    create a review. The controller must acquire more data in bounded same-case
+    chunks until the physical period can lock."""
+
+    guess = pipeline.physics.shedding_period(
+        10.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    actual_period = 5.0 * guess  # St=0.1 vs the St=0.5 initial guess.
+    calls: list[dict] = []
+
+    def fake_prepare(tcase, *_args, **_kwargs):
+        tcase.mkdir(parents=True, exist_ok=True)
+        (tcase / "0").mkdir(exist_ok=True)
+        return (None, {})
+
+    def fake_attempt(
+        tcase,
+        *_args,
+        run_time=None,
+        write_interval=None,
+        max_delta_t=None,
+        coeff_start_time=None,
+        refined=False,
+        **_kwargs,
+    ):
+        start = pipeline._latest_time(tcase)
+        end = start + float(run_time)
+        (tcase / f"{end:.10g}").mkdir(exist_ok=True)
+        locked = end + 1e-9 >= 20.0 * guess
+        calls.append(
+            {
+                "run_time": run_time,
+                "write_interval": write_interval,
+                "max_delta_t": max_delta_t,
+                "coeff_start_time": coeff_start_time,
+                "refined": refined,
+            }
+        )
+        return TransientResult(
+            avg=SimpleNamespace(
+                cl=0.7,
+                cd=0.05,
+                cm=-0.02,
+                cl_cd=14.0,
+                cl_std=0.07,
+                cd_std=0.0,
+                cm_std=0.0,
+            ),
+            case_dir=tcase,
+            force_history=(
+                _history_over(0.0, end, actual_period) if locked else None
+            ),
+            quality=UransQuality(
+                ok=locked,
+                can_refine=False,
+                reason=(
+                    "URANS quality target met."
+                    if locked
+                    else "URANS quality could not be measured: missing or flat shedding history."
+                ),
+                measured_period_s=actual_period if locked else None,
+                retained_cycles=3.0 if locked else 0.0,
+                frames_per_cycle=30.0 if locked else 0.0,
+            ),
+            start_time=start,
+            end_time=end,
+            run_time=float(run_time),
+            wall_seconds=0.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_cycles=10,
+            transient_discard_fraction=0.4,
+        ),
+        timeout=4 * 3600,
+    )
+
+    assert result is not None and result.quality.ok
+    assert [call["run_time"] / guess for call in calls] == pytest.approx(
+        [6.0, 4.0, 10.0]
+    )
+    assert all(not call["refined"] for call in calls)
+    assert calls[1]["coeff_start_time"] == pytest.approx(0.0)
+    assert calls[2]["coeff_start_time"] == pytest.approx(0.0)
+    assert calls[1]["write_interval"] == pytest.approx(
+        pipeline._period_acquisition_write_interval(guess)
+    )
+    assert calls[2]["max_delta_t"] == pytest.approx(
+        pipeline._period_acquisition_write_interval(guess)
+    )
+
+
+def test_period_acquisition_cadence_is_bounded_at_slow_edge():
+    """Unknown-period acquisition must not write ~300 states/slow cycle.
+
+    With the current St=[0.05, 0.5] band a slow-edge period spans ten initial
+    guesses.  The acquisition cadence records 30 states across that physical
+    period; after a credible lock the live monitor owns measured-period / 30.
+    """
+    guess = pipeline.physics.shedding_period(
+        10.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    interval = pipeline._period_acquisition_write_interval(guess)
+    slow_period = 1.0 / (pipeline.SHEDDING_STROUHAL_BAND[0] * 10.0)
+
+    assert interval == pytest.approx(slow_period / pipeline.URANS_FRAME_WRITE_PER_CYCLE)
+    horizon = pipeline._period_acquisition_horizons(
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            transient_discard_fraction=0.4,
+        )
+    )[-1] * guess
+    assert horizon / interval == pytest.approx(111.0)
+
+
+def test_precalc_period_acquisition_respects_budget_without_inventing_period(
+    tmp_path, monkeypatch
+):
+    guess = pipeline.physics.shedding_period(
+        10.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    (tcase / f"{6.0 * guess:.10g}").mkdir()
+    first = TransientResult(
+        avg=None,
+        case_dir=tcase,
+        force_history=None,
+        quality=UransQuality(
+            ok=False,
+            can_refine=False,
+            reason="URANS quality could not be measured: missing or flat shedding history.",
+        ),
+        start_time=0.0,
+        end_time=6.0 * guess,
+        run_time=6.0 * guess,
+        wall_seconds=10_000.0,
+    )
+    attempted = False
+
+    def fail_if_attempted(*_args, **_kwargs):
+        nonlocal attempted
+        attempted = True
+        raise AssertionError("budget guard should stop before acquisition chunk")
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fail_if_attempted)
+    result = pipeline._extend_transient_until_periods(
+        tcase,
+        first,
+        0.0,
+        None,
+        None,
+        {},
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        None,
+        None,
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.4,
+        ),
+        None,
+        1,
+        4 * 3600,
+        guess / 5000.0,
+    )
+
+    assert not attempted
+    assert pipeline.URANS_BUDGET_STOP_MARKER in result.quality.reason
+    assert result.quality.measured_period_s is None
+
+
 def test_fresh_chunk_monitor_switches_to_frame_write_cadence(tmp_path, monkeypatch):
     tcase = tmp_path / "transient"
     (tcase / "system").mkdir(parents=True)
@@ -488,6 +1102,259 @@ def test_fresh_chunk_monitor_switches_to_frame_write_cadence(tmp_path, monkeypat
     assert pipeline.URANS_MIN_FRAMES_PER_CYCLE == pytest.approx(20.0)
     assert f"writeInterval {period / pipeline.URANS_FRAME_WRITE_PER_CYCLE:.12g};" in control
     assert f"maxDeltaT {period / pipeline.URANS_FRAME_WRITE_PER_CYCLE:.12g};" in control
+
+
+@pytest.mark.parametrize(
+    ("fidelity", "min_periods", "expected_certification_cycles"),
+    [("precalc", 3, 4.0), ("full", 7, 5.5)],
+)
+def test_early_stop_retention_is_fidelity_aware(
+    tmp_path,
+    monkeypatch,
+    fidelity,
+    min_periods,
+    expected_certification_cycles,
+):
+    tcase = tmp_path / fidelity
+    (tcase / "system").mkdir(parents=True)
+    (tcase / "system" / "controlDict").write_text(
+        "stopAt endTime;\nendTime 1;\nwriteInterval 0.1;\nmaxDeltaT 0.1;\nrunTimeModifiable true;\n"
+    )
+    (tcase / "1").mkdir()
+    period = 0.5
+    monkeypatch.setattr(
+        pipeline,
+        "_transient_coeff_selection",
+        lambda *_args, **_kwargs: [tmp_path / "coefficient.dat"],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "stable_two_period_window",
+        lambda *_args, **_kwargs: pipeline.StablePeriodResult(
+            ok=False,
+            reason="stable, retention pending",
+            stable=True,
+            period_s=period,
+            window_start=0.0,
+            window_end=1.0,
+            cycles=2,
+            frame_count=60,
+            frames_per_cycle=30.0,
+        ),
+    )
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity=fidelity,
+        urans_min_periods=min_periods,
+    )
+    pipeline.write_march_budget_marker(
+        tcase,
+        end_t=1.0,
+        budget_s=4321.0,
+        wall_start=123.0,
+    )
+
+    monitor = pipeline._make_urans_monitor(
+        tcase,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=8.0),
+        solver_params=solver,
+    )
+    monitor()
+
+    control = (tcase / "system" / "controlDict").read_text()
+    expected_end = expected_certification_cycles * period
+    assert f"endTime {expected_end:.12g};" in control
+    march = pipeline.read_march_budget_marker(tcase)
+    assert march == {
+        "end_t": pytest.approx(expected_end),
+        "budget_s": pytest.approx(4321.0),
+        "wall_start": pytest.approx(123.0),
+    }
+
+
+def test_precalc_four_period_early_stop_is_unambiguous_and_accepted(
+    tmp_path, monkeypatch
+):
+    """The live precalc stop span must satisfy its own final period check.
+
+    A 3.5-period tail cannot give the estimator two cycles in each independent
+    half.  Four real periods can, so the end-to-end attempt grade must retain an
+    unambiguous period and accept the established oscillation instead of
+    entering another same-case continuation loop.
+    """
+
+    class FakeCaseBuilder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def write_transient(self, *_args, **_kwargs):
+            pass
+
+    period = 0.5
+
+    class FakeRunner:
+        def solver(self, case_dir, *_args, **_kwargs):
+            coeff = (
+                case_dir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat"
+            )
+            times = np.linspace(0.0, 4.0 * period, 2001)
+            _write_coeff_rows(
+                coeff,
+                times,
+                lambda t: 0.7 + 0.08 * math.sin(2 * math.pi * t / period),
+            )
+            for t in np.linspace(0.0, 4.0 * period, 121):
+                (case_dir / f"{t:.8g}").mkdir(exist_ok=True)
+            pipeline._write_early_stop_marker(
+                case_dir,
+                pipeline.StablePeriodResult(
+                    ok=True,
+                    reason="two stable periods with sufficient frames",
+                    stable=True,
+                    period_s=period,
+                    window_start=2.0 * period,
+                    window_end=4.0 * period,
+                    cycles=2,
+                    frame_count=61,
+                    frames_per_cycle=30.5,
+                ),
+                retain_from=0.0,
+            )
+            return SimpleNamespace(ok=True, stdout="pimple ok")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        urans_min_periods=3,
+        transient_discard_fraction=0.0,
+    )
+
+    result = _run_transient_attempt(
+        tcase,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        solver_params=solver,
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=120,
+        run_time=4.0 * period,
+        delta_t=0.001,
+        coeff_start_time=0.0,
+    )
+
+    assert pipeline._early_stop_certification_cycles(solver) == pytest.approx(4.0)
+    assert result is not None and result.early_stopped
+    assert result.quality.ok
+    assert not result.quality.can_refine
+    assert result.quality.measured_period_s == pytest.approx(period, rel=0.01)
+    assert result.quality.retained_cycles >= 3.0
+    assert "early-stop target met" in result.quality.reason
+
+
+def test_same_case_chunks_share_one_monotonic_tier_deadline(tmp_path, monkeypatch):
+    """A slowing continuation cannot receive a fresh full tier timeout.
+
+    The first continuation gets only the four seconds left on the common
+    deadline.  Once the fake chunk consumes five seconds, no second chunk is
+    launched and the saved case is graded with the pinned budget-stop marker.
+    """
+    period = 0.5
+    clock = [100.0]
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: clock[0])
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    (tcase / "1").mkdir()
+    first = TransientResult(
+        avg=SimpleNamespace(
+            cl=0.7,
+            cd=0.05,
+            cm=-0.02,
+            cl_cd=14.0,
+            cl_std=0.07,
+            cd_std=0.0,
+            cm_std=0.0,
+        ),
+        case_dir=tcase,
+        force_history=_history_over(0.0, 1.0, period),
+        quality=UransQuality(
+            ok=False,
+            can_refine=True,
+            reason="retained cycles 1.20 < 3.00",
+            measured_period_s=period,
+            retained_cycles=1.2,
+            frames_per_cycle=30.0,
+        ),
+        start_time=0.0,
+        end_time=1.0,
+        run_time=1.0,
+        wall_seconds=0.0,
+    )
+    timeouts: list[float] = []
+
+    def fake_attempt(case_dir, *_args, timeout=None, run_time=None, **_kwargs):
+        # `_run_transient_attempt` receives its legacy solver timeout
+        # positionally; the deadline is the new keyword-only controller input.
+        effective_timeout = timeout if timeout is not None else _args[-1]
+        timeouts.append(float(effective_timeout))
+        start = pipeline._latest_time(case_dir)
+        end = start + float(run_time)
+        (case_dir / f"{end:.10g}").mkdir()
+        clock[0] += 5.0
+        return TransientResult(
+            avg=first.avg,
+            case_dir=case_dir,
+            force_history=_history_over(0.0, end, period),
+            quality=UransQuality(
+                ok=False,
+                can_refine=True,
+                reason="URANS window not stationary",
+                measured_period_s=period,
+                retained_cycles=3.0,
+                frames_per_cycle=30.0,
+            ),
+            start_time=start,
+            end_time=end,
+            run_time=float(run_time),
+            wall_seconds=5.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+    result = pipeline._extend_transient_until_periods(
+        tcase,
+        first,
+        0.0,
+        None,
+        None,
+        {},
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        None,
+        None,
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.4,
+        ),
+        None,
+        1,
+        10.0,
+        period / 5000.0,
+        deadline=104.0,
+    )
+
+    assert timeouts == pytest.approx([4.0])
+    assert pipeline.URANS_BUDGET_STOP_MARKER in result.quality.reason
 
 
 def _run_transient_for_test(tmp_path, solver_params, timeout=7200):
@@ -624,14 +1491,19 @@ def test_continuation_extends_underretained_sparse_nonstationary_window(tmp_path
 
     result = _run_transient_for_test(
         tmp_path / "case",
-        SolverParams(urans_min_periods=3, transient_discard_fraction=0.0),
+        SolverParams(
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
         timeout=4 * 3600,
     )
 
     assert len(calls) == 2
-    # deficit (3 − 2 cycles) plus the whole-cycle safety margin
+    # The sparse published window is replaced by three dense measured-cadence
+    # periods in one same-case chunk (also covers the 3-period target deficit).
     assert calls[1]["run_time"] == pytest.approx(
-        (1.0 + pipeline.RETENTION_SAFETY_CYCLES) * period, rel=0.01
+        pipeline.URANS_FRAME_SPAN_PERIODS * period, rel=0.01
     )
     assert calls[1]["write_interval"] == pytest.approx(
         period / pipeline.URANS_FRAME_WRITE_PER_CYCLE,
@@ -643,6 +1515,212 @@ def test_continuation_extends_underretained_sparse_nonstationary_window(tmp_path
     )
     assert result is not None
     assert result.quality.ok
+
+
+@pytest.mark.parametrize(
+    ("first_reason", "frames_per_cycle", "expected_chunk_periods"),
+    [
+        ("frames/cycle 10.67 < 20.00", 10.67, 3.0),
+        (
+            "URANS window not stationary (precalc established-oscillation test): "
+            "cycle means trend upward monotonically",
+            30.0,
+            1.0,
+        ),
+    ],
+)
+def test_precalc_continues_same_case_after_period_target_for_sparse_or_nonstationary_window(
+    tmp_path,
+    monkeypatch,
+    first_reason,
+    frames_per_cycle,
+    expected_chunk_periods,
+):
+    """Production had 25 rejected precalc rows with >=3 periods. Fifteen were
+    sparse and all were nonstationary, but the retained-period break prevented
+    a dense same-case continuation and sent them toward terminal review."""
+
+    period = 0.5
+    spans = [2.0, 2.5]
+    calls: list[dict] = []
+
+    def fake_prepare(tcase, *_args, **_kwargs):
+        tcase.mkdir(parents=True, exist_ok=True)
+        (tcase / "0").mkdir(exist_ok=True)
+        return (None, {})
+
+    def fake_attempt(
+        tcase,
+        *_args,
+        run_time=None,
+        write_interval=None,
+        max_delta_t=None,
+        coeff_start_time=None,
+        refined=False,
+        **_kwargs,
+    ):
+        k = len(calls)
+        calls.append(
+            {
+                "run_time": run_time,
+                "write_interval": write_interval,
+                "max_delta_t": max_delta_t,
+                "coeff_start_time": coeff_start_time,
+                "refined": refined,
+            }
+        )
+        end = spans[min(k, len(spans) - 1)]
+        (tcase / f"{end:.10g}").mkdir(exist_ok=True)
+        ok = k >= 1
+        return TransientResult(
+            avg=SimpleNamespace(
+                cl=0.7,
+                cd=0.05,
+                cm=-0.02,
+                cl_cd=14.0,
+                cl_std=0.07,
+                cd_std=0.0,
+                cm_std=0.0,
+            ),
+            case_dir=tcase,
+            force_history=_history_over(0.0, end, period),
+            quality=UransQuality(
+                ok=ok,
+                can_refine=not ok,
+                reason="URANS quality target met." if ok else first_reason,
+                measured_period_s=period,
+                retained_cycles=end / period,
+                retained_frame_count=round(frames_per_cycle * end / period),
+                frames_per_cycle=30.0 if ok else frames_per_cycle,
+            ),
+            start_time=0.0 if k == 0 else spans[k - 1],
+            end_time=end,
+            run_time=end if k == 0 else end - spans[k - 1],
+            wall_seconds=10.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+        timeout=4 * 3600,
+    )
+
+    assert len(calls) == 2
+    assert not calls[1]["refined"]
+    assert calls[1]["coeff_start_time"] == pytest.approx(0.0)
+    assert calls[1]["run_time"] == pytest.approx(expected_chunk_periods * period)
+    assert calls[1]["write_interval"] == pytest.approx(
+        period / pipeline.URANS_FRAME_WRITE_PER_CYCLE
+    )
+    assert calls[1]["max_delta_t"] == pytest.approx(
+        period / pipeline.URANS_FRAME_WRITE_PER_CYCLE
+    )
+    assert result is not None and result.quality.ok
+
+
+def test_sparse_only_tail_adds_three_periods_without_reapplying_startup_discard(
+    tmp_path, monkeypatch
+):
+    """Once aerodynamics are retained, only three new dense periods are needed.
+
+    The 40% startup discard is global over the coefficient history; it does not
+    apply to replacement of the final media tail. The old math divided the
+    three-period tail by 0.6 and scheduled five unnecessary periods.
+    """
+    period = 0.5
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[3.0, 4.5],
+        wall_seconds=1.0,
+        failure_reason="frames/cycle 10.00 < 20.00",
+        failure_frames_per_cycle=10.0,
+    )
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.4,
+        ),
+        timeout=4 * 3600,
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["run_time"] == pytest.approx(
+        pipeline.URANS_FRAME_SPAN_PERIODS * period
+    )
+    assert result is not None and result.quality.ok
+
+
+@pytest.mark.parametrize(
+    ("failure_reason", "frames_per_cycle", "expects_continuation"),
+    [
+        (
+            "URANS window not stationary (precalc established-oscillation test)",
+            30.0,
+            True,
+        ),
+        ("frames/cycle 10.00 < 20.00", 10.0, False),
+    ],
+)
+def test_precalc_same_case_continuation_is_bounded_without_copied_refine(
+    tmp_path,
+    monkeypatch,
+    failure_reason,
+    frames_per_cycle,
+    expects_continuation,
+):
+    """If dense same-case chunks cannot clear the quality gate, stop at the
+    controller's existing bound; never discard that trajectory for a separate
+    ``transient_refined`` rerun."""
+
+    period = 0.5
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[
+            2.0 + i * period
+            for i in range(pipeline.URANS_CONTINUATION_MAX_CHUNKS + 1)
+        ],
+        wall_seconds=1.0,
+        quality_ok_at_end=False,
+        failure_reason=failure_reason,
+        failure_frames_per_cycle=frames_per_cycle,
+    )
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+        timeout=4 * 3600,
+    )
+
+    assert len(calls) == 1 + pipeline.URANS_CONTINUATION_MAX_CHUNKS
+    assert all(not call["refined"] for call in calls)
+    assert result is not None and not result.quality.ok
+    assert (
+        pipeline.URANS_CONTINUATION_REQUIRED_MARKER in result.quality.reason
+    ) is expects_continuation
+    assert ("frame-recorder remediation" in result.quality.reason) is (
+        not expects_continuation
+    )
+    assert pipeline.URANS_BUDGET_STOP_MARKER not in result.quality.reason
+    assert "6-chunk in-run safety cap" in result.quality.reason
 
 
 def test_continuation_chunk_timeout_keeps_grade_and_marks_continuable(tmp_path, monkeypatch):
@@ -722,7 +1800,10 @@ def test_continuation_respects_no_shedding_early_exit(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
     monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
 
-    result = _run_transient_for_test(tmp_path / "case", SolverParams())
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(force_transient=True, urans_fidelity="precalc"),
+    )
 
     assert calls == [False]  # no continuation, no refine
     assert result is not None
@@ -972,6 +2053,78 @@ def test_non_stationary_window_gets_quality_warning(tmp_path, monkeypatch):
     assert outcome.frame_track is not None
     assert not outcome.frame_track.stationary
     assert any("not stationary" in w for w in outcome.quality_warnings)
+
+
+def test_finalize_rejects_missing_half_period_without_format_error(tmp_path, monkeypatch):
+    """Final frame-track grading fails closed and records a safe diagnostic."""
+
+    period = 0.5
+    transient = _fake_transient_with_series(tmp_path, period=period)
+    monkeypatch.setattr(
+        pipeline,
+        "estimate_period",
+        lambda *_args, **_kwargs: PeriodEstimate(
+            period_s=period,
+            ambiguous=True,
+            first_half_s=None,
+            second_half_s=period,
+        ),
+    )
+
+    outcome = _finalize_with(
+        tmp_path,
+        transient,
+        monkeypatch,
+        solver_params=SolverParams(
+            force_transient=True,
+            write_images=[],
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+    )
+
+    assert outcome.frame_track is not None
+    assert not outcome.frame_track.stationary
+    assert any(
+        "period ambiguous" in warning.lower() and "unavailable" in warning.lower()
+        for warning in outcome.quality_warnings
+    )
+
+
+def test_finalize_does_not_mark_uncorroborated_fallback_period_stationary(
+    tmp_path, monkeypatch
+):
+    """Live and final precalc grading must fail closed on the same evidence.
+
+    The force-history FFT period may size a continuation, but when the
+    autocorrelation/half-window estimator returns ``None`` it is not a stable
+    period verdict.  Finalization used to fall back to that FFT period and pass
+    ``period_stable=True``, contradicting the live gate and publishing a false
+    ``frame_track.stationary=true``.
+    """
+
+    period = 0.5
+    transient = _fake_transient_with_series(tmp_path, period=period)
+    monkeypatch.setattr(pipeline, "estimate_period", lambda *_args, **_kwargs: None)
+
+    outcome = _finalize_with(
+        tmp_path,
+        transient,
+        monkeypatch,
+        solver_params=SolverParams(
+            force_transient=True,
+            write_images=[],
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+    )
+
+    assert outcome.frame_track is not None
+    assert outcome.frame_track.period_s == pytest.approx(period)
+    assert not outcome.frame_track.stationary
+    assert any("not stationary" in warning.lower() for warning in outcome.quality_warnings)
 
 
 def test_no_shedding_point_ships_frame_track_null(tmp_path, monkeypatch):

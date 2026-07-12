@@ -1,14 +1,12 @@
 import {
+  MISSING_URANS_VIDEO_REASON,
   URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
   canonicalAoa,
   frameTrackMinPeriodsFor,
   type SimulationWorkItem,
 } from "@aerodb/core";
-import {
-  CONTINUABLE_SQL,
-  airfoils,
-  simulationPresetRevisions,
-} from "@aerodb/db";
+import { airfoils, simulationPresetRevisions } from "@aerodb/db";
 import { and, eq, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
@@ -38,6 +36,19 @@ export type SolverWorkTone =
   | "neutral";
 export type SolverWorkAction = "continue" | "retry" | "request_full";
 
+const UNCLASSIFIED_EVIDENCE_DETAIL =
+  "Automatic evidence classification is unavailable; this stored result is not used in the polar.";
+const KNOWN_CLASSIFICATION_STATES = new Set([
+  "accepted",
+  "needs_urans",
+  "rejected",
+  "superseded_by_urans",
+]);
+
+function hasKnownClassification(state: string | null | undefined): boolean {
+  return Boolean(state && KNOWN_CLASSIFICATION_STATES.has(state));
+}
+
 export interface SolverWorkGate {
   name:
     | "march-rate guard"
@@ -55,7 +66,7 @@ export interface SolverWorkGateCheck extends SolverWorkGate {
 }
 
 export interface SolverWorkReview {
-  verdict: "waive" | "exclude";
+  verdict: "exclude";
   note: string | null;
   reviewer: string;
   at: string;
@@ -68,9 +79,18 @@ export interface SolverWorkPointStateRow {
   regime?: "rans" | "urans" | string | null;
   fidelity?: string | null;
   classificationState?: string | null;
+  classificationReasons?: string[] | null;
   continuable?: boolean | null;
   openVerify?: boolean | null;
   openRequest?: boolean | null;
+  mediaRepairState?: string | null;
+  mediaRepairAttemptCount?: number | null;
+  mediaRepairMaxAttempts?: number | null;
+  mediaRepairLastError?: string | null;
+  precalcObligationState?: string | null;
+  precalcObligationAttemptCount?: number | null;
+  precalcObligationMaxAttempts?: number | null;
+  precalcObligationLastError?: string | null;
   reviewVerdict?: "waive" | "exclude" | string | null;
   autoRetriedAt?: Date | string | null;
   error?: string | null;
@@ -115,42 +135,53 @@ export function solverWorkStateForPoint(
   row: SolverWorkPointStateRow,
 ): SolverWorkState {
   if (row.reviewVerdict === "exclude") return "excluded";
-  if (row.reviewVerdict === "waive") return "verified";
   if (row.classificationState === "superseded_by_urans") return "superseded";
+
+  // The physical-cell obligation is authoritative for automatic preliminary
+  // work. Canonical RANS evidence can remain done/needs_urans behind the
+  // replace guard while a precalc attempt is running or has exhausted.
+  if (["pending", "running"].includes(row.precalcObligationState ?? ""))
+    return "ladder";
+  if (row.precalcObligationState === "blocked") return "blocked";
 
   if (row.status === "queued" || row.status === "running") return "solving";
   if (!row.resultId || row.status === "pending" || row.status === "stale")
     return "queued";
 
-  if (row.status === "failed")
-    return blockerFromError(row.error, row.autoRetriedAt)
-      ? "blocked"
-      : "needs_review";
+  if (row.status === "failed") return "blocked";
+
+  if (["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? ""))
+    return "ladder";
+  if (row.mediaRepairState === "blocked") return "blocked";
 
   if (row.continuable) return "needs_time";
-  if (row.status === "done" && row.error)
-    return blockerFromError(row.error, row.autoRetriedAt)
-      ? "blocked"
-      : "needs_review";
+  if (row.status === "done" && row.error) return "blocked";
 
   if (row.classificationState === "rejected") {
     if (row.openVerify || row.openRequest) return "ladder";
     if (
+      row.classificationReasons?.length === 1 &&
+      row.classificationReasons[0] === MISSING_URANS_VIDEO_REASON
+    )
+      return "blocked";
+    if (
       row.regime === "rans" ||
       row.fidelity === "rans" ||
-      row.fidelity == null
+      (row.fidelity == null && row.regime !== "urans")
     )
       return "ladder";
-    return "needs_review";
+    return "blocked";
   }
 
   if (row.classificationState === "needs_urans") return "provisional";
-  if (
-    row.classificationState === "accepted" ||
-    row.classificationState == null
-  ) {
+  if (row.classificationState === "accepted") {
     return row.openVerify ? "provisional" : "verified";
   }
+
+  // A completed solve proves only that evidence was stored. Until the machine
+  // classifier records one of the handled verdicts above, it is not accepted
+  // polar evidence. Fail closed without assigning a human-review task.
+  if (row.status === "done") return "blocked";
 
   return "queued";
 }
@@ -182,6 +213,14 @@ type ResultPointRow = {
   review_note: string | null;
   review_reviewer: string | null;
   review_created_at: Date | string | null;
+  media_repair_state: string | null;
+  media_repair_attempt_count: number | string | null;
+  media_repair_max_attempts: number | string | null;
+  media_repair_last_error: string | null;
+  precalc_obligation_state: string | null;
+  precalc_obligation_attempt_count: number | string | null;
+  precalc_obligation_max_attempts: number | string | null;
+  precalc_obligation_last_error: string | null;
 };
 
 type CampaignPointRow = ResultPointRow & {
@@ -306,7 +345,10 @@ function firstDetailLine(row: {
   // non-disclosure line; fall back to the disclosure only if nothing else
   // explains the state.
   const isDisclosure = (line: string) =>
-    /^mesh quality warning:/i.test(line) || /heuristic waived/i.test(line) || /^converged \(oscillating steady/i.test(line) || /^steady-oscillating-mean:/i.test(line);
+    /^mesh quality warning:/i.test(line) ||
+    /heuristic waived/i.test(line) ||
+    /^converged \(oscillating steady/i.test(line) ||
+    /^steady-oscillating-mean:/i.test(line);
   return lines.find((line) => !isDisclosure(line)) ?? lines[0] ?? null;
 }
 
@@ -344,7 +386,11 @@ function gateFromLine(line: string): SolverWorkGate {
   ) {
     return { name: "mesh QA gate", detail };
   }
-  if (/frames?\s*\/\s*cycle|frames? per cycle|frame track|frame recorder/.test(lower)) {
+  if (
+    /frames?\s*\/\s*cycle|frames? per cycle|frame track|frame recorder/.test(
+      lower,
+    )
+  ) {
     return { name: "frame recorder", detail };
   }
   if (
@@ -398,7 +444,21 @@ function gateChecksFromPoint(row: {
     put({ ...gateFromLine(trimmed), pass: false });
   }
 
-  if (row.status === "done") {
+  if (
+    row.status === "done" &&
+    !hasKnownClassification(row.classificationState)
+  ) {
+    put({
+      name: "quality gate",
+      detail: UNCLASSIFIED_EVIDENCE_DETAIL,
+      pass: false,
+    });
+  }
+
+  if (
+    row.status === "done" &&
+    hasKnownClassification(row.classificationState)
+  ) {
     if (!checks.has("RANS validity gate")) {
       put({
         name: "RANS validity gate",
@@ -444,6 +504,17 @@ function plainForPoint(
   state: SolverWorkState,
   gate: SolverWorkGate | null,
 ): string {
+  if (gate?.detail === UNCLASSIFIED_EVIDENCE_DETAIL) {
+    return "Stored solver evidence is available, but its automatic classification is unavailable. This point is not used in the polar, and no human review is required.";
+  }
+  if (
+    gate?.name === "frame recorder" &&
+    gate.detail.startsWith("Automatic media repair")
+  ) {
+    return state === "blocked"
+      ? `${gate.detail} The solver evidence is retained, but this point remains unavailable until its stored media can be rebuilt.`
+      : `${gate.detail} No manual review is required.`;
+  }
   switch (state) {
     case "verified":
       return "This point is verified and is used in the stored polar.";
@@ -456,13 +527,15 @@ function plainForPoint(
     case "ladder":
       return "RANS found that this point needs unsteady treatment, so the URANS ladder is the next step.";
     case "needs_time":
+      if (gate?.name === "march-rate guard")
+        return `URANS reached the time budget after ${gate.detail}; the saved case can be continued.`;
       return gate
-        ? `URANS reached the time budget after ${gate.detail}; the saved case can be continued.`
-        : "URANS reached the time budget with saved state, so the solve can be continued.";
+        ? `URANS needs more same-case integration because ${gate.detail}; the saved case can be continued.`
+        : "URANS stopped with restartable saved state, so the solve can be continued.";
     case "needs_review":
       return gate
-        ? `The solver produced evidence, but the ${gate.name} needs review before this point can be used.`
-        : "The solver produced evidence, but a quality gate needs review before this point can be used.";
+        ? `The solver produced evidence, but it did not pass the automatic ${gate.name}; this point is unavailable.`
+        : "The solver produced evidence, but its automatic quality classification is unavailable; this point is not used.";
     case "excluded":
       return gate
         ? `This point was excluded after review of the ${gate.name}.`
@@ -509,6 +582,14 @@ function chainForPoint(
   attempts: AttemptRow[],
   state: SolverWorkState,
 ): Array<{ label: string; tone: SolverWorkTone }> {
+  if (
+    ["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? "")
+  ) {
+    return [{ label: "Repairing stored media", tone: "ladder" }];
+  }
+  if (row.mediaRepairState === "blocked") {
+    return [{ label: "Media unavailable", tone: "blocked" }];
+  }
   if (attempts.length > 0) {
     return attempts.map((attempt) => {
       const labelBase = attempt.regime
@@ -569,17 +650,46 @@ function makePoint(
     regime: row.regime,
     fidelity: row.fidelity,
     classificationState: row.classification_state,
+    classificationReasons: row.classification_reasons,
     continuable: row.continuable,
     openVerify: row.open_verify,
     openRequest: row.open_request,
+    mediaRepairState: row.media_repair_state,
+    mediaRepairAttemptCount: numberOrNull(row.media_repair_attempt_count),
+    mediaRepairMaxAttempts: numberOrNull(row.media_repair_max_attempts),
+    mediaRepairLastError: row.media_repair_last_error,
+    precalcObligationState: row.precalc_obligation_state,
+    precalcObligationAttemptCount: numberOrNull(
+      row.precalc_obligation_attempt_count,
+    ),
+    precalcObligationMaxAttempts: numberOrNull(
+      row.precalc_obligation_max_attempts,
+    ),
+    precalcObligationLastError: row.precalc_obligation_last_error,
     reviewVerdict: row.review_verdict,
     autoRetriedAt: row.auto_retried_at,
-    error: row.error,
+    error: row.precalc_obligation_last_error ?? row.error,
   };
   const state = solverWorkStateForPoint(stateRow);
   // A "deciding gate" only exists for states a gate actually decided; benign
   // disclosures on verified rows (e.g. "converged (oscillating steady…)")
   // must not render as a gate verdict in the popover.
+  const repairGate: SolverWorkGate | null = row.media_repair_state
+    ? {
+        name: "frame recorder",
+        detail:
+          row.media_repair_state === "blocked"
+            ? `Automatic media repair exhausted ${Number(row.media_repair_attempt_count ?? 0)} / ${Number(row.media_repair_max_attempts ?? 3)} attempts${row.media_repair_last_error ? `: ${row.media_repair_last_error}` : "."}`
+            : `Automatic media repair is ${row.media_repair_state === "running" ? "running" : row.media_repair_state === "retry_wait" ? "waiting to retry" : "queued"} (${Number(row.media_repair_attempt_count ?? 0)} / ${Number(row.media_repair_max_attempts ?? 3)} attempts used).`,
+      }
+    : null;
+  const classificationGate: SolverWorkGate | null =
+    row.status === "done" && !hasKnownClassification(row.classification_state)
+      ? {
+          name: "quality gate",
+          detail: UNCLASSIFIED_EVIDENCE_DETAIL,
+        }
+      : null;
   const gate = [
     "ladder",
     "needs_time",
@@ -587,11 +697,13 @@ function makePoint(
     "excluded",
     "blocked",
   ].includes(state)
-    ? gateFromPoint({
+    ? (repairGate ??
+      classificationGate ??
+      gateFromPoint({
         qualityWarnings: row.quality_warnings,
         classificationReasons: row.classification_reasons,
-        error: row.error,
-      })
+        error: row.precalc_obligation_last_error ?? row.error,
+      }))
     : null;
   const gates = gateChecksFromPoint({
     status: row.status,
@@ -617,10 +729,9 @@ function makePoint(
     plain: plainForPoint(state, gate),
     gate,
     gates,
-    reviewed:
-      row.review_verdict === "waive" || row.review_verdict === "exclude",
+    reviewed: row.review_verdict === "exclude",
     review:
-      (row.review_verdict === "waive" || row.review_verdict === "exclude") &&
+      row.review_verdict === "exclude" &&
       row.review_created_at &&
       row.review_reviewer
         ? {
@@ -704,22 +815,38 @@ async function loadResultRows(
       r.id AS result_id,
       r.simulation_preset_revision_id AS revision_id,
       r.aoa_deg::float8 AS aoa_deg,
-      r.status::text AS status,
-      r.source::text AS source,
-      r.regime::text AS regime,
-      r.fidelity AS fidelity,
-      r.cl,
-      r.cd,
-      r.cm,
-      r.error,
-      r.quality_warnings,
+      COALESCE(selected_attempt.status, r.status)::text AS status,
+      CASE WHEN selected_attempt.id IS NOT NULL
+        THEN selected_attempt.source::text ELSE r.source::text END AS source,
+      selected_attempt.regime::text AS regime,
+      selected_attempt.evidence_payload ->> 'fidelity' AS fidelity,
+      selected_attempt.cl,
+      selected_attempt.cd,
+      selected_attempt.cm,
+      selected_attempt.error,
+      selected_attempt.quality_warnings,
       r.auto_retried_at,
-      r."updatedAt" AS updated_at,
+      COALESCE(selected_attempt."solvedAt", selected_attempt."createdAt", r."updatedAt") AS updated_at,
       rc.state::text AS classification_state,
       rc.reasons AS classification_reasons,
-      r.frame_track,
+      COALESCE(
+        NULLIF(selected_attempt.evidence_payload -> 'frame_track', 'null'::jsonb),
+        selected_attempt.evidence_payload -> 'frameTrack'
+      ) AS frame_track,
       rc.superseded_by_result_id,
-      ${CONTINUABLE_SQL} AS continuable,
+      (
+        selected_attempt.status = 'done'
+        AND rc.state = 'rejected'
+        AND selected_attempt.evidence_payload ->> 'fidelity' LIKE 'urans%'
+        AND selected_attempt.engine_job_id IS NOT NULL
+        AND selected_attempt.engine_case_slug IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(selected_attempt.quality_warnings, ARRAY[]::text[])) warning
+          WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+             OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+        )
+      ) AS continuable,
       EXISTS (
         SELECT 1 FROM sim_urans_verify_queue q
         WHERE q.airfoil_id = r.airfoil_id
@@ -735,16 +862,33 @@ async function loadResultRows(
           AND req.state IN ('pending', 'running')
       ) AS open_request
       ,
+      rmr.state AS media_repair_state,
+      rmr.attempt_count AS media_repair_attempt_count,
+      rmr.max_attempts AS media_repair_max_attempts,
+      rmr.last_error AS media_repair_last_error,
+      precalc_obligation.state AS precalc_obligation_state,
+      precalc_obligation.attempt_count AS precalc_obligation_attempt_count,
+      precalc_obligation.max_attempts AS precalc_obligation_max_attempts,
+      precalc_obligation.last_error AS precalc_obligation_last_error,
       rrv.id AS review_id,
       rrv.verdict AS review_verdict,
       rrv.note AS review_note,
       rrv.reviewer AS review_reviewer,
       rrv."createdAt" AS review_created_at
     FROM results r
-    LEFT JOIN result_classifications rc ON rc.result_id = r.id
+    LEFT JOIN result_attempts selected_attempt
+      ON selected_attempt.id = r.current_result_attempt_id
+     AND selected_attempt.result_id = r.id
+    LEFT JOIN result_classifications rc
+      ON rc.result_attempt_id = selected_attempt.id
+    LEFT JOIN result_media_repairs rmr ON rmr.result_id = r.id
+    LEFT JOIN sim_precalc_obligations precalc_obligation
+      ON precalc_obligation.airfoil_id = r.airfoil_id
+     AND precalc_obligation.revision_id = r.simulation_preset_revision_id
+     AND precalc_obligation.aoa_deg = r.aoa_deg
     LEFT JOIN result_review_verdicts rrv ON rrv.result_id = r.id
       AND rrv."revokedAt" IS NULL
-      AND rrv.verdict IN ('waive', 'exclude')
+      AND rrv.verdict = 'exclude'
     WHERE r.airfoil_id = ${airfoilId}
       AND r.simulation_preset_revision_id IS NOT NULL
       ${revisionId ? sql`AND r.simulation_preset_revision_id = ${revisionId}` : sql``}
@@ -764,22 +908,38 @@ async function loadCampaignPointRows(
       p."updatedAt" AS point_updated_at,
       r.id AS result_id,
       r.aoa_deg::float8 AS source_aoa_deg,
-      r.status::text AS status,
-      r.source::text AS source,
-      r.regime::text AS regime,
-      r.fidelity AS fidelity,
-      r.cl,
-      r.cd,
-      r.cm,
-      r.error,
-      r.quality_warnings,
+      COALESCE(selected_attempt.status, r.status)::text AS status,
+      CASE WHEN selected_attempt.id IS NOT NULL
+        THEN selected_attempt.source::text ELSE r.source::text END AS source,
+      selected_attempt.regime::text AS regime,
+      selected_attempt.evidence_payload ->> 'fidelity' AS fidelity,
+      selected_attempt.cl,
+      selected_attempt.cd,
+      selected_attempt.cm,
+      selected_attempt.error,
+      selected_attempt.quality_warnings,
       r.auto_retried_at,
-      COALESCE(r."updatedAt", p."updatedAt") AS updated_at,
+      COALESCE(selected_attempt."solvedAt", selected_attempt."createdAt", r."updatedAt", p."updatedAt") AS updated_at,
       rc.state::text AS classification_state,
       rc.reasons AS classification_reasons,
-      r.frame_track,
+      COALESCE(
+        NULLIF(selected_attempt.evidence_payload -> 'frame_track', 'null'::jsonb),
+        selected_attempt.evidence_payload -> 'frameTrack'
+      ) AS frame_track,
       rc.superseded_by_result_id,
-      ${CONTINUABLE_SQL} AS continuable,
+      (
+        selected_attempt.status = 'done'
+        AND rc.state = 'rejected'
+        AND selected_attempt.evidence_payload ->> 'fidelity' LIKE 'urans%'
+        AND selected_attempt.engine_job_id IS NOT NULL
+        AND selected_attempt.engine_case_slug IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(selected_attempt.quality_warnings, ARRAY[]::text[])) warning
+          WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+             OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+        )
+      ) AS continuable,
       EXISTS (
         SELECT 1 FROM sim_urans_verify_queue q
         WHERE q.airfoil_id = p.airfoil_id
@@ -795,6 +955,14 @@ async function loadCampaignPointRows(
           AND req.state IN ('pending', 'running')
       ) AS open_request
       ,
+      rmr.state AS media_repair_state,
+      rmr.attempt_count AS media_repair_attempt_count,
+      rmr.max_attempts AS media_repair_max_attempts,
+      rmr.last_error AS media_repair_last_error,
+      precalc_obligation.state AS precalc_obligation_state,
+      precalc_obligation.attempt_count AS precalc_obligation_attempt_count,
+      precalc_obligation.max_attempts AS precalc_obligation_max_attempts,
+      precalc_obligation.last_error AS precalc_obligation_last_error,
       rrv.id AS review_id,
       rrv.verdict AS review_verdict,
       rrv.note AS review_note,
@@ -802,10 +970,19 @@ async function loadCampaignPointRows(
       rrv."createdAt" AS review_created_at
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
-    LEFT JOIN result_classifications rc ON rc.result_id = r.id
+    LEFT JOIN result_attempts selected_attempt
+      ON selected_attempt.id = r.current_result_attempt_id
+     AND selected_attempt.result_id = r.id
+    LEFT JOIN result_classifications rc
+      ON rc.result_attempt_id = selected_attempt.id
+    LEFT JOIN result_media_repairs rmr ON rmr.result_id = r.id
+    LEFT JOIN sim_precalc_obligations precalc_obligation
+      ON precalc_obligation.airfoil_id = p.airfoil_id
+     AND precalc_obligation.revision_id = p.revision_id
+     AND precalc_obligation.aoa_deg = p.aoa_deg
     LEFT JOIN result_review_verdicts rrv ON rrv.result_id = r.id
       AND rrv."revokedAt" IS NULL
-      AND rrv.verdict IN ('waive', 'exclude')
+      AND rrv.verdict = 'exclude'
     WHERE p.airfoil_id = ${airfoilId}
       ${revisionId ? sql`AND p.revision_id = ${revisionId}` : sql``}
   `)) as unknown as CampaignPointRow[];

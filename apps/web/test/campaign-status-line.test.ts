@@ -6,7 +6,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { AdminCampaignSummary } from "../lib/admin";
-import { campaignStatusLine, gateFromSolverState } from "../components/admin/campaigns/campaign-status";
+import {
+  campaignStatusLine,
+  gateFromSolverState,
+} from "../components/admin/campaigns/campaign-status";
 
 function summary(overrides: {
   status?: string;
@@ -21,13 +24,18 @@ function summary(overrides: {
   lastTickCompletedAt?: string | null;
   failed?: number;
   rejected?: number;
+  blocked?: number;
   closedWithFailedCount?: number | null;
   closedWithRejectedCount?: number | null;
   reviewBuckets?: { awaitingUrans: number; needsReview: number };
+  tierCounts?: { ransOpen: number; precalcOpen: number; verifyOpen: number };
 }): AdminCampaignSummary {
   const now = new Date().toISOString();
   return {
-    ...(overrides.reviewBuckets ? { reviewBuckets: overrides.reviewBuckets } : {}),
+    ...(overrides.reviewBuckets
+      ? { reviewBuckets: overrides.reviewBuckets }
+      : {}),
+    ...(overrides.tierCounts ? { tierCounts: overrides.tierCounts } : {}),
     campaign: {
       status: overrides.status ?? "active",
       closedWithFailedCount: overrides.closedWithFailedCount ?? null,
@@ -41,6 +49,7 @@ function summary(overrides: {
       superseded: 0,
       derived: 0,
       rejected: overrides.rejected ?? 0,
+      blocked: overrides.blocked ?? 0,
       remaining: overrides.remaining ?? 32,
     } as AdminCampaignSummary["totals"],
     scheduler: {
@@ -49,7 +58,8 @@ function summary(overrides: {
       engineUnreachableSince: overrides.engineUnreachableSince ?? null,
       engineError: null,
       campaignJobsRunning: overrides.jobs ?? 0,
-      heartbeatAt: overrides.heartbeatAt === undefined ? now : overrides.heartbeatAt,
+      heartbeatAt:
+        overrides.heartbeatAt === undefined ? now : overrides.heartbeatAt,
       lastTickStartedAt: overrides.lastTickStartedAt ?? null,
       lastTickCompletedAt: overrides.lastTickCompletedAt ?? null,
     } as AdminCampaignSummary["scheduler"],
@@ -58,7 +68,9 @@ function summary(overrides: {
 
 describe("campaignStatusLine — active gate", () => {
   it("leads with the live job count during the claim→first-ingest window", () => {
-    const line = campaignStatusLine(summary({ jobs: 4, running: 0, remaining: 32 }));
+    const line = campaignStatusLine(
+      summary({ jobs: 4, running: 0, remaining: 32 }),
+    );
     expect(line.tone).toBe("teal");
     expect(line.text).toContain("4 jobs solving");
     expect(line.text).toContain("0 points mid-ingest");
@@ -66,12 +78,16 @@ describe("campaignStatusLine — active gate", () => {
   });
 
   it("keeps the point-based copy when no jobs are in flight", () => {
-    const line = campaignStatusLine(summary({ jobs: 0, running: 0, remaining: 32 }));
+    const line = campaignStatusLine(
+      summary({ jobs: 0, running: 0, remaining: 32 }),
+    );
     expect(line.text).toBe("Active — 0 points running, 32 remaining.");
   });
 
   it("dead solver process still outranks everything (regression guard)", () => {
-    const line = campaignStatusLine(summary({ jobs: 0, heartbeatAt: "2026-07-01T00:00:00Z" }));
+    const line = campaignStatusLine(
+      summary({ jobs: 0, heartbeatAt: "2026-07-01T00:00:00Z" }),
+    );
     expect(line.tone).toBe("red");
     expect(line.text).toContain("Solver process is not running");
   });
@@ -79,34 +95,55 @@ describe("campaignStatusLine — active gate", () => {
 
 describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)", () => {
   it("dead process → gate badge BLOCKED + lifecycle 'active', never a bare Active headline", () => {
-    const line = campaignStatusLine(summary({ heartbeatAt: "2026-07-01T00:00:00Z" }));
-    expect(line.gate).toEqual({ text: "BLOCKED — solver process not running", tone: "red" });
+    const line = campaignStatusLine(
+      summary({ heartbeatAt: "2026-07-01T00:00:00Z" }),
+    );
+    expect(line.gate).toEqual({
+      text: "BLOCKED — solver process not running",
+      tone: "red",
+    });
     expect(line.lifecycle).toBe("active");
     expect(line.text).not.toMatch(/^Active/);
   });
 
   it("engine unreachable → red gate badge", () => {
-    const line = campaignStatusLine(summary({ engineUnreachableSince: new Date().toISOString() }));
-    expect(line.gate).toEqual({ text: "BLOCKED — engine unreachable", tone: "red" });
+    const line = campaignStatusLine(
+      summary({ engineUnreachableSince: new Date().toISOString() }),
+    );
+    expect(line.gate).toEqual({
+      text: "BLOCKED — engine unreachable",
+      tone: "red",
+    });
     expect(line.lifecycle).toBe("active");
     expect(line.text).not.toMatch(/^Active/);
   });
 
   it("sweeper disabled → amber gate badge", () => {
     const line = campaignStatusLine(summary({ sweeperEnabled: false }));
-    expect(line.gate).toEqual({ text: "BLOCKED — sweeper disabled", tone: "amber" });
+    expect(line.gate).toEqual({
+      text: "BLOCKED — sweeper disabled",
+      tone: "amber",
+    });
     expect(line.text).not.toMatch(/^Active/);
   });
 
   it("engine unhealthy → red gate badge", () => {
     const line = campaignStatusLine(summary({ engineHealthy: false }));
-    expect(line.gate).toEqual({ text: "BLOCKED — engine unhealthy", tone: "red" });
+    expect(line.gate).toEqual({
+      text: "BLOCKED — engine unhealthy",
+      tone: "red",
+    });
     expect(line.text).not.toMatch(/^Active/);
   });
 
   it("dead process outranks every other gate (precedence)", () => {
     const line = campaignStatusLine(
-      summary({ heartbeatAt: "2026-07-01T00:00:00Z", sweeperEnabled: false, engineHealthy: false, engineUnreachableSince: new Date().toISOString() }),
+      summary({
+        heartbeatAt: "2026-07-01T00:00:00Z",
+        sweeperEnabled: false,
+        engineHealthy: false,
+        engineUnreachableSince: new Date().toISOString(),
+      }),
     );
     expect(line.gate?.text).toBe("BLOCKED — solver process not running");
   });
@@ -119,18 +156,38 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
   });
 
   it("non-active lifecycles never carry a gate (paused/completed/attention)", () => {
-    expect(campaignStatusLine(summary({ status: "paused", heartbeatAt: "2026-07-01T00:00:00Z" })).gate).toBeNull();
-    expect(campaignStatusLine(summary({ status: "completed" })).gate).toBeNull();
-    expect(campaignStatusLine(summary({ status: "attention", failed: 1 })).gate).toBeNull();
+    expect(
+      campaignStatusLine(
+        summary({ status: "paused", heartbeatAt: "2026-07-01T00:00:00Z" }),
+      ).gate,
+    ).toBeNull();
+    expect(
+      campaignStatusLine(summary({ status: "completed" })).gate,
+    ).toBeNull();
+    expect(
+      campaignStatusLine(summary({ status: "attention", failed: 1 })).gate,
+    ).toBeNull();
   });
 });
 
 describe("gateFromSolverState — hub/backlog gate from the global derivation", () => {
   it("maps the four blocking solver states to gate badges", () => {
-    expect(gateFromSolverState("process_not_running")).toEqual({ text: "BLOCKED — solver process not running", tone: "red" });
-    expect(gateFromSolverState("engine_unreachable")).toEqual({ text: "BLOCKED — engine unreachable", tone: "red" });
-    expect(gateFromSolverState("engine_unhealthy")).toEqual({ text: "BLOCKED — engine unhealthy", tone: "red" });
-    expect(gateFromSolverState("paused")).toEqual({ text: "BLOCKED — sweeper disabled", tone: "amber" });
+    expect(gateFromSolverState("process_not_running")).toEqual({
+      text: "BLOCKED — solver process not running",
+      tone: "red",
+    });
+    expect(gateFromSolverState("engine_unreachable")).toEqual({
+      text: "BLOCKED — engine unreachable",
+      tone: "red",
+    });
+    expect(gateFromSolverState("engine_unhealthy")).toEqual({
+      text: "BLOCKED — engine unhealthy",
+      tone: "red",
+    });
+    expect(gateFromSolverState("paused")).toEqual({
+      text: "BLOCKED — sweeper disabled",
+      tone: "amber",
+    });
   });
 
   it("running / idle / unknown produce no gate", () => {
@@ -141,7 +198,10 @@ describe("gateFromSolverState — hub/backlog gate from the global derivation", 
 
   it("tick_stalled maps to the amber SLOW badge — honest slowness, never a BLOCKED lie", () => {
     const gate = gateFromSolverState("tick_stalled");
-    expect(gate).toEqual({ text: "SLOW — tick running; engine responding slowly", tone: "amber" });
+    expect(gate).toEqual({
+      text: "SLOW — tick running; engine responding slowly",
+      tone: "amber",
+    });
     expect(gate?.text).not.toContain("BLOCKED");
     expect(gate?.tone).not.toBe("red");
   });
@@ -162,38 +222,68 @@ describe("campaignStatusLine — tick_stalled (fresh heartbeat, slow tick)", () 
 
   it("MUST-CATCH: fresh heartbeat + >5 min unfinished tick → amber SLOW gate with the tick copy, NEVER red", () => {
     const line = campaignStatusLine(summary(stalledOverrides), NOW);
-    expect(line.gate).toEqual({ text: "SLOW — tick running; engine responding slowly", tone: "amber" });
+    expect(line.gate).toEqual({
+      text: "SLOW — tick running; engine responding slowly",
+      tone: "amber",
+    });
     expect(line.tone).toBe("amber");
-    expect(line.text).toBe("Tick running 6m — engine responding slowly; scheduling continues next tick.");
+    expect(line.text).toBe(
+      "Tick running 6m — engine responding slowly; scheduling continues next tick.",
+    );
     expect(line.lifecycle).toBe("active");
   });
 
   it("MUST-CATCH: stale heartbeat with the same tick fields is still the red process gate", () => {
-    const line = campaignStatusLine(summary({ ...stalledOverrides, heartbeatAt: iso(120_000) }), NOW);
+    const line = campaignStatusLine(
+      summary({ ...stalledOverrides, heartbeatAt: iso(120_000) }),
+      NOW,
+    );
     expect(line.gate?.text).toBe("BLOCKED — solver process not running");
     expect(line.tone).toBe("red");
   });
 
   it("precedence: every BLOCKED gate outranks tick_stalled", () => {
-    expect(campaignStatusLine(summary({ ...stalledOverrides, engineUnreachableSince: iso(60_000) }), NOW).gate?.text).toBe(
-      "BLOCKED — engine unreachable",
-    );
-    expect(campaignStatusLine(summary({ ...stalledOverrides, sweeperEnabled: false }), NOW).gate?.text).toBe(
-      "BLOCKED — sweeper disabled",
-    );
-    expect(campaignStatusLine(summary({ ...stalledOverrides, engineHealthy: false }), NOW).gate?.text).toBe(
-      "BLOCKED — engine unhealthy",
-    );
+    expect(
+      campaignStatusLine(
+        summary({ ...stalledOverrides, engineUnreachableSince: iso(60_000) }),
+        NOW,
+      ).gate?.text,
+    ).toBe("BLOCKED — engine unreachable");
+    expect(
+      campaignStatusLine(
+        summary({ ...stalledOverrides, sweeperEnabled: false }),
+        NOW,
+      ).gate?.text,
+    ).toBe("BLOCKED — sweeper disabled");
+    expect(
+      campaignStatusLine(
+        summary({ ...stalledOverrides, engineHealthy: false }),
+        NOW,
+      ).gate?.text,
+    ).toBe("BLOCKED — engine unhealthy");
   });
 
   it("false-positive guards: short ticks and completed ticks keep the Active line", () => {
-    const quick = campaignStatusLine(summary({ ...stalledOverrides, lastTickStartedAt: iso(60_000) }), NOW);
+    const quick = campaignStatusLine(
+      summary({ ...stalledOverrides, lastTickStartedAt: iso(60_000) }),
+      NOW,
+    );
     expect(quick.gate).toBeNull();
     expect(quick.text).toMatch(/^Active/);
-    const finished = campaignStatusLine(summary({ ...stalledOverrides, lastTickCompletedAt: iso(30_000) }), NOW);
+    const finished = campaignStatusLine(
+      summary({ ...stalledOverrides, lastTickCompletedAt: iso(30_000) }),
+      NOW,
+    );
     expect(finished.gate).toBeNull();
     expect(finished.text).toMatch(/^Active/);
-    const preMigration = campaignStatusLine(summary({ heartbeatAt: iso(5_000), lastTickStartedAt: null, lastTickCompletedAt: null }), NOW);
+    const preMigration = campaignStatusLine(
+      summary({
+        heartbeatAt: iso(5_000),
+        lastTickStartedAt: null,
+        lastTickCompletedAt: null,
+      }),
+      NOW,
+    );
     expect(preMigration.gate).toBeNull();
     expect(preMigration.text).toMatch(/^Active/);
   });
@@ -201,38 +291,86 @@ describe("campaignStatusLine — tick_stalled (fresh heartbeat, slow tick)", () 
 
 describe("campaignStatusLine — honest close record (completed branch)", () => {
   it("keeps the failed-only copy when the close recorded only failed points", () => {
-    const line = campaignStatusLine(summary({ status: "completed", closedWithFailedCount: 2, closedWithRejectedCount: 0 }));
+    const line = campaignStatusLine(
+      summary({
+        status: "completed",
+        closedWithFailedCount: 2,
+        closedWithRejectedCount: 0,
+      }),
+    );
     expect(line.text).toBe("Completed — closed with 2 failed points.");
   });
 
   it("names both buckets when the close recorded failed AND rejected points", () => {
-    const line = campaignStatusLine(summary({ status: "completed", closedWithFailedCount: 1, closedWithRejectedCount: 3 }));
-    expect(line.text).toBe("Completed — closed with 1 failed point · 3 rejected.");
+    const line = campaignStatusLine(
+      summary({
+        status: "completed",
+        closedWithFailedCount: 1,
+        closedWithRejectedCount: 3,
+      }),
+    );
+    expect(line.text).toBe(
+      "Completed — closed with 1 failed point · 3 rejected.",
+    );
   });
 
   it("never renders 'closed with 0 failed points' for a rejected-only close", () => {
-    const line = campaignStatusLine(summary({ status: "completed", closedWithFailedCount: 0, closedWithRejectedCount: 3 }));
+    const line = campaignStatusLine(
+      summary({
+        status: "completed",
+        closedWithFailedCount: 0,
+        closedWithRejectedCount: 3,
+      }),
+    );
     expect(line.text).toBe("Completed — closed with 3 rejected points.");
     expect(line.text).not.toContain("0 failed");
   });
 
   it("falls back to the clean-completion copy when both close counts are 0/null", () => {
-    const line = campaignStatusLine(summary({ status: "completed", closedWithFailedCount: 0, closedWithRejectedCount: null }));
+    const line = campaignStatusLine(
+      summary({
+        status: "completed",
+        closedWithFailedCount: 0,
+        closedWithRejectedCount: null,
+      }),
+    );
     expect(line.text).toBe("Completed — every obligated point is terminal.");
   });
 });
 
 describe("campaignStatusLine — attention covers rejected points (legacy payloads without the split)", () => {
-  it("names rejected points in the attention copy", () => {
-    const line = campaignStatusLine(summary({ status: "attention", rejected: 3, failed: 0 }));
-    expect(line.tone).toBe("red");
-    expect(line.text).toContain("3 rejected");
+  it("treats rejected points as unavailable, not a human-review obligation", () => {
+    const line = campaignStatusLine(
+      summary({ status: "attention", rejected: 3, failed: 0 }),
+    );
+    expect(line.tone).toBe("amber");
+    expect(line.text).toBe(
+      "All obligated work is terminal — 3 unavailable results. No human review is required.",
+    );
   });
 
-  it("names both failed and rejected when both exist", () => {
-    const line = campaignStatusLine(summary({ status: "attention", rejected: 2, failed: 1 }));
-    expect(line.text).toContain("1 failed");
-    expect(line.text).toContain("2 rejected");
+  it("conserves the combined unavailable count when both kinds exist", () => {
+    const line = campaignStatusLine(
+      summary({ status: "attention", rejected: 2, failed: 1 }),
+    );
+    expect(line.text).toBe(
+      "All obligated work is terminal — 3 unavailable results. No human review is required.",
+    );
+  });
+});
+
+describe("campaignStatusLine — machine-owned blocked work", () => {
+  it("names blocked work as unavailable without a review obligation", () => {
+    const line = campaignStatusLine(
+      summary({
+        status: "attention",
+        blocked: 3,
+        reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
+      }),
+    );
+    expect(line.tone).toBe("amber");
+    expect(line.text).toContain("3 machine-blocked");
+    expect(line.text).toContain("No human review is required");
   });
 });
 
@@ -240,34 +378,76 @@ describe("campaignStatusLine — attention covers rejected points (legacy payloa
 // needs-review evidence; an awaiting-URANS-only attention state is the calm
 // violet stage-2 queue — never a false red.
 describe("campaignStatusLine — attention with the reviewBuckets split", () => {
-  it("needs-review points drive the red copy (awaiting listed alongside)", () => {
+  it("shows open preliminary URANS work as machine-owned, not human review", () => {
     const line = campaignStatusLine(
-      summary({ status: "attention", rejected: 5, failed: 1, reviewBuckets: { awaitingUrans: 3, needsReview: 2 } }),
+      summary({
+        status: "attention",
+        rejected: 1,
+        reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
+        tierCounts: { ransOpen: 0, precalcOpen: 1, verifyOpen: 0 },
+      }),
+    );
+    expect(line.tone).toBe("violet");
+    expect(line.text).toBe(
+      "Preliminary URANS work is queued or running for 1 point; no human review is required.",
+    );
+  });
+
+  it("legacy nonzero needsReview payload is unavailable, never human work", () => {
+    const line = campaignStatusLine(
+      summary({
+        status: "attention",
+        rejected: 5,
+        failed: 1,
+        reviewBuckets: { awaitingUrans: 3, needsReview: 2 },
+      }),
     );
     expect(line.tone).toBe("red");
-    expect(line.text).toBe("All obligated work is terminal — 2 points need review · 3 awaiting URANS.");
+    expect(line.text).toBe(
+      "All obligated work is terminal — 2 unavailable results · 3 awaiting URANS. No human review is required.",
+    );
   });
 
   it("MUST-CATCH: awaiting-URANS-only attention is VIOLET, never red, no 'review' wording", () => {
     const line = campaignStatusLine(
-      summary({ status: "attention", rejected: 3, failed: 0, reviewBuckets: { awaitingUrans: 3, needsReview: 0 } }),
+      summary({
+        status: "attention",
+        rejected: 3,
+        failed: 0,
+        reviewBuckets: { awaitingUrans: 3, needsReview: 0 },
+      }),
     );
     expect(line.tone).toBe("violet");
-    expect(line.text).toBe("All obligated work is terminal — 3 points awaiting URANS.");
+    expect(line.text).toBe(
+      "All obligated work is terminal — 3 points awaiting URANS.",
+    );
     expect(line.text).not.toContain("review");
   });
 
-  it("singular copy for one needs-review point", () => {
+  it("singular legacy wire count is unavailable", () => {
     const line = campaignStatusLine(
-      summary({ status: "attention", failed: 1, reviewBuckets: { awaitingUrans: 0, needsReview: 1 } }),
+      summary({
+        status: "attention",
+        failed: 1,
+        reviewBuckets: { awaitingUrans: 0, needsReview: 1 },
+      }),
     );
-    expect(line.text).toBe("All obligated work is terminal — 1 point needs review.");
+    expect(line.text).toBe(
+      "All obligated work is terminal — 1 unavailable result. No human review is required.",
+    );
   });
 
-  it("empty split buckets fall back to the legacy failed/rejected copy", () => {
+  it("empty split buckets describe unavailable evidence without assigning human review", () => {
     const line = campaignStatusLine(
-      summary({ status: "attention", failed: 2, reviewBuckets: { awaitingUrans: 0, needsReview: 0 } }),
+      summary({
+        status: "attention",
+        failed: 2,
+        reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
+      }),
     );
-    expect(line.text).toContain("2 failed");
+    expect(line.tone).toBe("amber");
+    expect(line.text).toBe(
+      "All obligated work is terminal — 2 unavailable results. No human review is required.",
+    );
   });
 });

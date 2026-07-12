@@ -34,12 +34,18 @@ import {
   results,
   simCampaignPoints,
   simJobs,
+  simResultSubmitRetries,
   solverProfiles,
   sweeperState,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
-import type { EngineClient, JobResult, JobStatus, PolarRequest } from "@aerodb/engine-client";
-import { and, asc, eq } from "drizzle-orm";
+import type {
+  EngineClient,
+  JobResult,
+  JobStatus,
+  PolarRequest,
+} from "@aerodb/engine-client";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { ConditionMapEntry } from "../src/ingest";
@@ -89,12 +95,20 @@ function crashEngine(engineJobId: string): EngineClient {
       completed_cases: 0,
       message: CRASH_MESSAGE,
     }),
-    getResult: async (): Promise<JobResult> => ({ job_id: engineJobId, state: "failed", message: CRASH_MESSAGE, polars: [] }),
+    getResult: async (): Promise<JobResult> => ({
+      job_id: engineJobId,
+      state: "failed",
+      message: CRASH_MESSAGE,
+      polars: [],
+    }),
   } as unknown as EngineClient;
 }
 
 async function composeAndSubmit(engineJobId: string): Promise<string> {
-  const batch = (await findCampaignGapBatch(db, { limit: 500, campaignIds: [campaignId] }))!;
+  const batch = (await findCampaignGapBatch(db, {
+    limit: 500,
+    campaignIds: [campaignId],
+  }))!;
   expect(batch).not.toBeNull();
   const composeEngine = {
     submitPolar: async (request: PolarRequest): Promise<JobStatus> => ({
@@ -105,9 +119,19 @@ async function composeAndSubmit(engineJobId: string): Promise<string> {
     }),
   } as unknown as EngineClient;
   expect(await submitCampaignBatch(db, composeEngine, batch, 0, 0)).toBe(true);
-  const [job] = await db.select().from(simJobs).where(and(eq(simJobs.campaignId, campaignId), eq(simJobs.engineJobId, engineJobId)));
+  const [job] = await db
+    .select()
+    .from(simJobs)
+    .where(
+      and(
+        eq(simJobs.campaignId, campaignId),
+        eq(simJobs.engineJobId, engineJobId),
+      ),
+    );
   expect(job).toBeTruthy();
-  const entries = ((job.requestPayload as { conditionMap?: ConditionMapEntry[] })?.conditionMap ?? []) as ConditionMapEntry[];
+  const entries = ((
+    job.requestPayload as { conditionMap?: ConditionMapEntry[] }
+  )?.conditionMap ?? []) as ConditionMapEntry[];
   expect(entries.length).toBe(1);
   bcId = entries[0].bcId;
   revisionId = entries[0].revisionId;
@@ -117,6 +141,7 @@ async function composeAndSubmit(engineJobId: string): Promise<string> {
 async function cellRows() {
   return db
     .select({
+      id: results.id,
       aoaDeg: results.aoaDeg,
       status: results.status,
       simJobId: results.simJobId,
@@ -124,12 +149,21 @@ async function cellRows() {
       error: results.error,
     })
     .from(results)
-    .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, revisionId)))
+    .where(
+      and(
+        eq(results.airfoilId, airfoilId),
+        eq(results.simulationPresetRevisionId, revisionId),
+      ),
+    )
     .orderBy(asc(results.aoaDeg));
 }
 
 beforeAll(async () => {
-  const [state] = await db.select({ enabled: sweeperState.enabled }).from(sweeperState).where(eq(sweeperState.id, 1)).limit(1);
+  const [state] = await db
+    .select({ enabled: sweeperState.enabled })
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1))
+    .limit(1);
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
@@ -138,12 +172,23 @@ beforeAll(async () => {
 
   const [cat] = await db
     .insert(categories)
-    .values({ slug: `${PREFIX}-cat`, name: `${PREFIX} cat`, path: `${PREFIX}-cat`, depth: 0 })
+    .values({
+      slug: `${PREFIX}-cat`,
+      name: `${PREFIX} cat`,
+      path: `${PREFIX}-cat`,
+      depth: 0,
+    })
     .returning();
   categoryId = cat.id;
   const [airfoil] = await db
     .insert(airfoils)
-    .values({ slug: `${PREFIX}-cambered`, name: `${PREFIX} cambered`, categoryId: cat.id, points: camberedPoints, isSymmetric: false })
+    .values({
+      slug: `${PREFIX}-cambered`,
+      name: `${PREFIX} cambered`,
+      categoryId: cat.id,
+      points: camberedPoints,
+      isSymmetric: false,
+    })
     .returning();
   airfoilId = airfoil.id;
   const [medium] = await db
@@ -161,10 +206,22 @@ beforeAll(async () => {
     })
     .returning();
   mediumId = medium.id;
-  const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` }).returning();
-  const [mesh] = await db.insert(meshProfiles).values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` }).returning();
-  const [solver] = await db.insert(solverProfiles).values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` }).returning();
-  const [output] = await db.insert(outputProfiles).values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` }).returning();
+  const [boundary] = await db
+    .insert(boundaryProfiles)
+    .values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` })
+    .returning();
+  const [mesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` })
+    .returning();
+  const [solver] = await db
+    .insert(solverProfiles)
+    .values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` })
+    .returning();
+  const [output] = await db
+    .insert(outputProfiles)
+    .values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` })
+    .returning();
   profileIds.boundary = boundary.id;
   profileIds.mesh = mesh.id;
   profileIds.solver = solver.id;
@@ -204,18 +261,32 @@ afterAll(async () => {
     campaignIds: [campaignId],
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
   });
-  if (profileIds.boundary) await db.delete(boundaryProfiles).where(eq(boundaryProfiles.id, profileIds.boundary));
-  if (profileIds.mesh) await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
-  if (profileIds.solver) await db.delete(solverProfiles).where(eq(solverProfiles.id, profileIds.solver));
-  if (profileIds.output) await db.delete(outputProfiles).where(eq(outputProfiles.id, profileIds.output));
+  if (profileIds.boundary)
+    await db
+      .delete(boundaryProfiles)
+      .where(eq(boundaryProfiles.id, profileIds.boundary));
+  if (profileIds.mesh)
+    await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
+  if (profileIds.solver)
+    await db
+      .delete(solverProfiles)
+      .where(eq(solverProfiles.id, profileIds.solver));
+  if (profileIds.output)
+    await db
+      .delete(outputProfiles)
+      .where(eq(outputProfiles.id, profileIds.output));
   if (mediumId) await db.delete(mediums).where(eq(mediums.id, mediumId));
   if (airfoilId) await db.delete(airfoils).where(eq(airfoils.id, airfoilId));
-  if (categoryId) await db.delete(categories).where(eq(categories.id, categoryId));
+  if (categoryId)
+    await db.delete(categories).where(eq(categories.id, categoryId));
   if (restoreSweeperEnabled !== null) {
     await db
       .insert(sweeperState)
       .values({ id: 1, enabled: restoreSweeperEnabled })
-      .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: restoreSweeperEnabled } });
+      .onConflictDoUpdate({
+        target: sweeperState.id,
+        set: { enabled: restoreSweeperEnabled },
+      });
   }
   await sql.end();
 });
@@ -223,7 +294,20 @@ afterAll(async () => {
 describe("auto-retry-once for crash-class failed points (amendment B)", () => {
   it("MUST-CATCH: the first crash auto-requeues every cell exactly once (marker stamped, points reopen, failed counter 0)", async () => {
     firstJobId = await composeAndSubmit(`${PREFIX}-engine-1`);
-    await reconcile(db, crashEngine(`${PREFIX}-engine-1`), { jobIds: [firstJobId], skipFailedRecovery: true });
+    const claimedBeforeCrash = await cellRows();
+    await db.insert(simResultSubmitRetries).values(
+      claimedBeforeCrash.map((row) => ({
+        resultId: row.id,
+        state: "blocked",
+        attemptCount: 1,
+        lastHttpStatus: 503,
+        lastError: "stale pre-submit retry fence",
+      })),
+    );
+    await reconcile(db, crashEngine(`${PREFIX}-engine-1`), {
+      jobIds: [firstJobId],
+      skipFailedRecovery: true,
+    });
 
     const rows = await cellRows();
     expect(rows.length).toBe(ANGLES.length);
@@ -233,6 +317,17 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       expect(row.simJobId).toBeNull();
       expect(row.error).toBe(CRASH_MESSAGE); // crash evidence kept
     }
+    expect(
+      await db
+        .select({ resultId: simResultSubmitRetries.resultId })
+        .from(simResultSubmitRetries)
+        .where(
+          inArray(
+            simResultSubmitRetries.resultId,
+            rows.map((row) => row.id),
+          ),
+        ),
+    ).toHaveLength(0);
 
     const points = await db
       .select({ state: simCampaignPoints.state })
@@ -250,11 +345,14 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     expect(again.escalated).toEqual([]);
   }, 240000);
 
-  it("MUST-CATCH: the second crash escalates — rows stay failed, needs_review counts them, awaiting_urans does not", async () => {
+  it("MUST-CATCH: the second crash escalates to unavailable without assigning human review", async () => {
     // The pending rows are ordinary gaps again: the next tick re-claims them.
     secondJobId = await composeAndSubmit(`${PREFIX}-engine-2`);
     expect(secondJobId).not.toBe(firstJobId);
-    await reconcile(db, crashEngine(`${PREFIX}-engine-2`), { jobIds: [secondJobId], skipFailedRecovery: true });
+    await reconcile(db, crashEngine(`${PREFIX}-engine-2`), {
+      jobIds: [secondJobId],
+      skipFailedRecovery: true,
+    });
 
     const rows = await cellRows();
     for (const row of rows) {
@@ -270,7 +368,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     const totals = await campaignProgressTotals(db, campaignId);
     expect(totals.failed).toBe(ANGLES.length);
     const buckets = await campaignReviewBuckets(db, campaignId);
-    expect(buckets.needsReview).toBe(ANGLES.length);
+    expect(buckets.needsReview).toBe(0);
     expect(buckets.awaitingUrans).toBe(0);
   }, 240000);
 

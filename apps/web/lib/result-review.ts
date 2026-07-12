@@ -1,8 +1,13 @@
 import type { SimulationDetail } from "@aerodb/core";
 
-import { solverWorkPointKey, type SolverWorkCondition, type SolverWorkPoint } from "./solver-work";
+import {
+  solverWorkPointKey,
+  type SolverWorkCondition,
+  type SolverWorkPoint,
+} from "./solver-work";
 
-export type ResultReviewVerdict = "waive" | "exclude" | "defer";
+export type ResultReviewVerdict = "exclude" | "defer";
+export type ResultReviewHistoryVerdict = ResultReviewVerdict | "waive";
 
 export interface ResultReviewGate {
   name: string;
@@ -12,7 +17,7 @@ export interface ResultReviewGate {
 
 export interface ResultReviewRecord {
   id?: string;
-  verdict: ResultReviewVerdict;
+  verdict: ResultReviewHistoryVerdict;
   note: string | null;
   reviewer: string | null;
   createdAt: string;
@@ -57,14 +62,23 @@ export interface ReviewStepperView {
   next: ReviewQueueItem;
 }
 
-export function resultReviewGates(sim: SimulationDetail | null | undefined): ResultReviewGate[] {
+export function resultReviewGates(
+  sim: SimulationDetail | null | undefined,
+): ResultReviewGate[] {
   const gates = (sim as SimulationDetailWithReview | null | undefined)?.gates;
   return Array.isArray(gates)
-    ? gates.filter((gate): gate is ResultReviewGate => typeof gate?.name === "string" && typeof gate.detail === "string" && typeof gate.pass === "boolean")
+    ? gates.filter(
+        (gate): gate is ResultReviewGate =>
+          typeof gate?.name === "string" &&
+          typeof gate.detail === "string" &&
+          typeof gate.pass === "boolean",
+      )
     : [];
 }
 
-export function gateChecklistView(gates: ResultReviewGate[] | null | undefined): GateChecklistLine[] {
+export function gateChecklistView(
+  gates: ResultReviewGate[] | null | undefined,
+): GateChecklistLine[] {
   if (!gates?.length) return [];
   return gates.map((gate, index) => ({
     key: `${gate.name}:${index}`,
@@ -73,30 +87,45 @@ export function gateChecklistView(gates: ResultReviewGate[] | null | undefined):
   }));
 }
 
-export function isReviewLayerPoint(point: SolverWorkPoint | null | undefined): boolean {
+export function isReviewLayerPoint(
+  point: SolverWorkPoint | null | undefined,
+): boolean {
   if (!point) return false;
   if (point.state === "needs_review" || point.state === "excluded") return true;
-  return point.reviewed?.verdict === "waive" || point.reviewed?.verdict === "exclude";
+  return point.review?.verdict === "exclude";
 }
 
-export function shouldShowReviewLayer(admin: boolean, point: SolverWorkPoint | null | undefined): boolean {
+export function shouldShowReviewLayer(
+  admin: boolean,
+  point: SolverWorkPoint | null | undefined,
+): boolean {
   return admin && isReviewLayerPoint(point);
 }
 
-export function reviewVerdictRequiresNote(verdict: ResultReviewVerdict): boolean {
-  return verdict === "waive" || verdict === "exclude";
+export function reviewVerdictRequiresNote(
+  verdict: ResultReviewVerdict,
+): boolean {
+  return verdict === "exclude";
 }
 
-export function canSubmitResultReview(verdict: ResultReviewVerdict, note: string): boolean {
+export function canSubmitResultReview(
+  verdict: ResultReviewVerdict,
+  note: string,
+): boolean {
   return !reviewVerdictRequiresNote(verdict) || note.trim().length > 0;
 }
 
-export function buildResultReviewPayload(verdict: ResultReviewVerdict, note: string): { verdict: ResultReviewVerdict; note?: string } {
+export function buildResultReviewPayload(
+  verdict: ResultReviewVerdict,
+  note: string,
+): { verdict: ResultReviewVerdict; note?: string } {
   const trimmed = note.trim();
   return trimmed ? { verdict, note: trimmed } : { verdict };
 }
 
-export function buildReviewQueue(conditions: SolverWorkCondition[]): ReviewQueueItem[] {
+export function buildReviewQueue(
+  conditions: SolverWorkCondition[],
+): ReviewQueueItem[] {
   return conditions.flatMap((condition) =>
     condition.points
       .filter((point) => point.state === "needs_review" && !!point.resultId)
@@ -113,9 +142,14 @@ export function buildReviewQueue(conditions: SolverWorkCondition[]): ReviewQueue
   );
 }
 
-export function reviewStepperView(queue: ReviewQueueItem[], currentResultId: string | null | undefined): ReviewStepperView | null {
+export function reviewStepperView(
+  queue: ReviewQueueItem[],
+  currentResultId: string | null | undefined,
+): ReviewStepperView | null {
   if (queue.length <= 1 || !currentResultId) return null;
-  const currentIndex = queue.findIndex((item) => item.resultId === currentResultId);
+  const currentIndex = queue.findIndex(
+    (item) => item.resultId === currentResultId,
+  );
   if (currentIndex < 0) return null;
   const next = queue[(currentIndex + 1) % queue.length];
   return {
@@ -127,7 +161,9 @@ export function reviewStepperView(queue: ReviewQueueItem[], currentResultId: str
   };
 }
 
-export function resultReviewPastTense(verdict: ResultReviewVerdict): string {
+export function resultReviewPastTense(
+  verdict: ResultReviewHistoryVerdict,
+): string {
   if (verdict === "waive") return "waived";
   if (verdict === "exclude") return "excluded";
   return "deferred";
@@ -137,15 +173,25 @@ export function formatResultReviewDate(iso: string): string {
   return iso ? iso.slice(0, 10) : "unknown date";
 }
 
-export function formatResultReviewLine(review: Pick<ResultReviewRecord, "verdict" | "note" | "reviewer" | "createdAt" | "revokedAt">): string {
+export function formatResultReviewLine(
+  review: Pick<
+    ResultReviewRecord,
+    "verdict" | "note" | "reviewer" | "createdAt" | "revokedAt"
+  >,
+): string {
   const note = review.note?.trim();
   return `${resultReviewPastTense(review.verdict)} by ${review.reviewer || "unknown"} · ${formatResultReviewDate(review.createdAt)}${review.revokedAt ? " · revoked" : ""}${note ? `: ${note}` : ""}`;
 }
 
-export function latestResultReviewLine(items: ResultReviewRecord[]): string | null {
+export function latestResultReviewLine(
+  items: ResultReviewRecord[],
+): string | null {
   if (!items.length) return null;
   const latest = items
     .slice()
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+    .sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )[0];
   return formatResultReviewLine(latest);
 }

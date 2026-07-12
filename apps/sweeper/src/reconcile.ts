@@ -5,22 +5,35 @@ import {
   campaignHasOpenRansGaps,
   type DB,
   enqueuePrecalcVerifications,
+  ensurePrecalcObligations,
   laneKeyId,
   laneTick,
   onResultIngested,
   probeCampaignCompletion,
+  precalcContinuationsForObligations,
   reconcileCampaigns,
   recomputeProgressForCampaign,
+  recordPrecalcObligationSubmission,
+  refreshPrecalcSettlementCampaigns,
   refreshPolarCacheForRevision,
+  resultAttempts,
   results,
+  settlePrecalcObligationsForJob,
+  settlePrecalcObligationsForJobInTransaction,
   simCampaignLanes,
   simCampaigns,
   simJobs,
   simulationPresetRevisions,
+  syncSweepPromises,
   simUransRequests,
   simUransVerifyQueue,
   sweeperState,
 } from "@aerodb/db";
+import {
+  EVIDENCE_BACKED_WAVE2_RESULT_SQL,
+  releaseResultClaimsForJob,
+  releasedResultStatusSql,
+} from "@aerodb/db/result-claim-lifecycle";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
   EngineError,
@@ -36,25 +49,72 @@ import {
   type JobStatus,
   type UransFidelity,
 } from "@aerodb/engine-client";
-import { and, count, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
+import {
+  and,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  lte,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
 
 import { buildPolarRequest } from "./build-request";
-import { isEngineConnectionFailure, recordEngineUnreachable } from "./engine-backoff";
+import { recordEngineUnreachable } from "./engine-backoff";
 import { touchHeartbeat } from "./heartbeat";
-import { type ConditionMapEntry, failedForPoint, ingestResult, retryFailedScaleRenders, type SpeedBc } from "./ingest";
-import { ransRetryPlanForJobScoped } from "./retry-plan";
+import { composePhysicalPrecalcJob } from "./precalc-composition";
+import {
+  type ConditionMapEntry,
+  failedForPoint,
+  ingestResult,
+  type SpeedBc,
+} from "./ingest";
+import {
+  claimJobForIngest,
+  DEFAULT_INGEST_LEASE_MS,
+  type IngestLease,
+  IngestLeaseLostError,
+  ingestLeaseOwnedWhere,
+  releaseIngestLeaseToRunning,
+  renewIngestLeaseOrThrow,
+} from "./ingest-lease";
+import { resultMediaRepairTick } from "./media-repair";
+import {
+  ransRetryPlanForJobScoped,
+  type RansRetryDecision,
+} from "./retry-plan";
+import {
+  solverQueuePressure,
+  submitPendingJobWithLifecycleGuard,
+} from "./submit-lifecycle";
 
 export { touchHeartbeat } from "./heartbeat";
 
-const MISSING_JOB_REQUEUE_MS = Number(process.env.SWEEPER_MISSING_JOB_REQUEUE_MS ?? 10 * 60 * 1000);
+const MISSING_JOB_REQUEUE_MS = Number(
+  process.env.SWEEPER_MISSING_JOB_REQUEUE_MS ?? 10 * 60 * 1000,
+);
 type SimJobRow = typeof simJobs.$inferSelect;
 interface ReconcileOptions {
   jobIds?: string[];
   recoverFailedJobIds?: string[];
   skipFailedRecovery?: boolean;
+  /** Deterministic crash injection for the durable-ingest regression suite.
+   * Production never supplies hooks. The callback runs inside the failure
+   * settlement transaction after result rows change but before campaign
+   * points/counters are linked, so a thrown error must roll the whole unit
+   * back. */
+  testHooks?: {
+    afterFailedRowsMarked?: () => void | Promise<void>;
+  };
 }
 
-const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = ["submitted", "running", "ingesting"];
+const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = [
+  "submitted",
+  "running",
+  "ingesting",
+];
 
 // Campaign maintenance state (spec §7/§8): lane keys marked dirty by the
 // ingest hooks, drained at the end of every reconcile pass AFTER polar-fit
@@ -62,65 +122,227 @@ const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = ["submit
 // low-frequency campaign reconciler.
 const LANE_SAFETY_SWEEP_MS = 60_000;
 const CAMPAIGN_RECONCILE_MS = 5 * 60_000;
-// Failed shared-scale renders retry on this cadence (bounded per row by
-// MAX_SCALE_RENDER_ATTEMPTS): spaced retries outlast the transient engine
-// hiccups that a burst of immediate retries would just re-hit. The timer
-// starts at module load (not 0) so the first pass runs one full interval
-// after boot: recovery semantics are unchanged for the long-lived sweeper,
-// and short-lived processes (tests) never fire it implicitly.
-const SCALE_RENDER_RETRY_MS = 5 * 60_000;
+// Durable per-result media obligations replace unclaimed field-scale retries.
+// One expensive render is claimed per pass; the first boot pass waits a full
+// interval so short-lived commands/tests do not unexpectedly start rendering.
+const RESULT_MEDIA_REPAIR_MS = 60_000;
 const pendingDirtyLanes = new Map<string, CampaignLaneKey>();
 let lastLaneSweepAt = 0;
 let lastCampaignReconcileAt = 0;
-let lastScaleRenderRetryAt = Date.now();
+let lastResultMediaRepairAt = Date.now();
 
 function collectDirtyLanes(keys: CampaignLaneKey[]): void {
   for (const key of keys) pendingDirtyLanes.set(laneKeyId(key), key);
 }
 
-function activeJobWhere(jobId: string) {
-  return and(eq(simJobs.id, jobId), inArray(simJobs.status, activeJobStatuses));
+/** Ordinary poll/lost/cancel reconciliation may touch an ingesting row only
+ * after its durable lease expired (or a pre-migration tokenless row exceeded
+ * the same grace). A live ingest owner is the sole writer until then. */
+function outsideLiveIngestLeaseWhere() {
+  return sql`(
+    ${simJobs.status} <> 'ingesting'
+    OR ${simJobs.ingestLeaseExpiresAt} <= now()
+    OR (
+      ${simJobs.ingestLeaseExpiresAt} IS NULL
+      AND ${simJobs.updatedAt} < now() - (${DEFAULT_INGEST_LEASE_MS} * interval '1 millisecond')
+    )
+  )`;
 }
 
-/** Freshly composed jobs are `pending` until their submit lands: the
- *  post-submit stamp must match them too (activeJobWhere alone silently
- *  no-ops on a just-inserted wave-2 child, leaving it pending forever with no
- *  engineJobId), while still refusing to resurrect cancelled/failed rows. */
-function submittableJobWhere(jobId: string) {
-  return and(eq(simJobs.id, jobId), inArray(simJobs.status, ["pending", ...activeJobStatuses]));
+function activeJobWhere(jobId: string) {
+  return and(
+    eq(simJobs.id, jobId),
+    inArray(simJobs.status, activeJobStatuses),
+    outsideLiveIngestLeaseWhere(),
+  );
 }
 
 function reconcilableJobWhere(jobId: string) {
-  return and(eq(simJobs.id, jobId), inArray(simJobs.status, [...activeJobStatuses, "failed"]));
+  return and(
+    eq(simJobs.id, jobId),
+    inArray(simJobs.status, [...activeJobStatuses, "failed"]),
+    outsideLiveIngestLeaseWhere(),
+  );
 }
 
-async function failJob(db: DB, jobId: string, msg: string): Promise<void> {
+async function markOwnedJobResultsFailed(
+  db: DB,
+  jobId: string,
+  msg: string,
+  lease: Pick<IngestLease, "jobId" | "token">,
+  hooks: ReconcileOptions["testHooks"] = {},
+): Promise<boolean> {
   // Failed evidence rows must carry WHY: without the error stamp the failures
   // endpoint classifies them 'unknown' (ERROR_CLASS_SQL treats NULL/'' as
   // unknown — incident 2026-07-04: 12 campaign points terminal-failed with
   // empty error). Callers guarantee msg is non-empty (nonEmptyFailureMessage).
-  const failedRows = await db
-    .update(results)
-    .set({ status: "failed", source: "queued", error: msg })
-    .where(and(eq(results.simJobId, jobId), inArray(results.status, ["queued", "running"])))
-    .returning({
-      id: results.id,
-      airfoilId: results.airfoilId,
-      simulationPresetRevisionId: results.simulationPresetRevisionId,
-      aoaDeg: results.aoaDeg,
-    });
-  await db.update(simJobs).set({ status: "failed", error: msg, finishedAt: new Date() }).where(activeJobWhere(jobId));
-  for (const row of failedRows) {
-    collectDirtyLanes(
-      await onResultIngested(db, {
-        airfoilId: row.airfoilId,
-        revisionId: row.simulationPresetRevisionId,
-        aoaDeg: row.aoaDeg,
-        resultId: row.id,
-        status: "failed",
-      }),
-    );
-  }
+  const outcome = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [owned] = await tx
+      .update(simJobs)
+      .set({
+        error: msg,
+      })
+      .where(ingestLeaseOwnedWhere(jobId, lease.token))
+      .returning({ id: simJobs.id });
+    if (!owned)
+      return {
+        owned: false,
+        failedRows: [] as Array<{
+          id: string;
+          airfoilId: string;
+          simulationPresetRevisionId: string | null;
+          aoaDeg: number;
+        }>,
+      };
+    // A correction/verification job temporarily owns the scheduling cell, but
+    // a pre-existing current attempt remains the canonical public generation.
+    // If the child crashes before shipping any attempt, the sim_job/ladder row
+    // owns that failure; it must not turn the still-valid selected generation
+    // into a failed mutable projection. Reproject every pointer-owned cell from
+    // its immutable attempt and detach it from the failed correction job.
+    const restoredRows = (await tx.execute(sql`
+      UPDATE results result
+      SET bc_id = attempt.bc_id,
+          status = attempt.status,
+          source = attempt.source,
+          regime = attempt.regime,
+          cl = attempt.cl,
+          cd = attempt.cd,
+          cm = attempt.cm,
+          cl_cd = attempt.cl_cd,
+          cl_std = attempt.cl_std,
+          cd_std = attempt.cd_std,
+          cm_std = attempt.cm_std,
+          stalled = attempt.stalled,
+          unsteady = attempt.unsteady,
+          converged = attempt.converged,
+          final_residual = attempt.final_residual,
+          iterations = attempt.iterations,
+          y_plus_avg = attempt.y_plus_avg,
+          y_plus_max = attempt.y_plus_max,
+          n_cells = attempt.n_cells,
+          first_order_fallback = attempt.first_order_fallback,
+          strouhal = attempt.strouhal,
+          error = attempt.error,
+          quality_warnings = attempt.quality_warnings,
+          frame_track = COALESCE(
+            NULLIF(attempt.evidence_payload -> 'frame_track', 'null'::jsonb),
+            NULLIF(attempt.evidence_payload -> 'frameTrack', 'null'::jsonb),
+            result.frame_track
+          ),
+          fidelity = COALESCE(
+            attempt.evidence_payload ->> 'fidelity',
+            result.fidelity
+          ),
+          steady_history = COALESCE(
+            NULLIF(attempt.evidence_payload -> 'steady_history', 'null'::jsonb),
+            NULLIF(attempt.evidence_payload -> 'steadyHistory', 'null'::jsonb),
+            result.steady_history
+          ),
+          engine_job_id = attempt.engine_job_id,
+          engine_case_slug = attempt.engine_case_slug,
+          sim_job_id = attempt.sim_job_id,
+          "solvedAt" = attempt."solvedAt",
+          priority = 0,
+          "updatedAt" = now()
+      FROM result_attempts attempt
+      WHERE result.sim_job_id = ${jobId}
+        AND result.status IN ('queued', 'running')
+        AND result.current_result_attempt_id = attempt.id
+        AND attempt.result_id = result.id
+      RETURNING result.id,
+                result.airfoil_id,
+                result.simulation_preset_revision_id,
+                result.aoa_deg,
+                result.status::text AS status
+    `)) as unknown as Array<{
+      id: string;
+      airfoil_id: string;
+      simulation_preset_revision_id: string | null;
+      aoa_deg: number;
+      status: "done" | "failed";
+    }>;
+    const failedRows = await tx
+      .update(results)
+      .set({ status: "failed", source: "queued", error: msg })
+      .where(
+        and(
+          eq(results.simJobId, jobId),
+          inArray(results.status, ["queued", "running"]),
+          isNull(results.currentResultAttemptId),
+        ),
+      )
+      .returning({
+        id: results.id,
+        airfoilId: results.airfoilId,
+        simulationPresetRevisionId: results.simulationPresetRevisionId,
+        aoaDeg: results.aoaDeg,
+      });
+    await hooks?.afterFailedRowsMarked?.();
+    const dirtyLanes: CampaignLaneKey[] = [];
+    let linked = 0;
+    for (const row of [
+      ...restoredRows.map((restored) => ({
+        id: restored.id,
+        airfoilId: restored.airfoil_id,
+        simulationPresetRevisionId: restored.simulation_preset_revision_id,
+        aoaDeg: restored.aoa_deg,
+        status: restored.status,
+      })),
+      ...failedRows.map((failed) => ({ ...failed, status: "failed" as const })),
+    ]) {
+      // Keep the exclusive ingest lease live for large batched failures. The
+      // renewal and heartbeat are in the same transaction as the result and
+      // campaign writes, so a rollback cannot leave a false progress stamp.
+      if (++linked % 10 === 0) await renewIngestAndHeartbeat(tx, lease);
+      dirtyLanes.push(
+        ...(await onResultIngested(tx, {
+          airfoilId: row.airfoilId,
+          revisionId: row.simulationPresetRevisionId,
+          aoaDeg: row.aoaDeg,
+          resultId: row.id,
+          status: row.status,
+        })),
+      );
+    }
+    return { owned: true, failedRows, dirtyLanes };
+  });
+  if (!outcome.owned) return false;
+  // Publish dirty lanes only after the transaction commits. A process death
+  // after commit but before this in-memory write is recovered by the existing
+  // 60-second active-lane safety sweep; publishing before commit could tick a
+  // lane against rolled-back evidence.
+  collectDirtyLanes(outcome.dirtyLanes ?? []);
+  return true;
+}
+
+/** Terminalize only after every classification/ladder/campaign write owned by
+ * this ingest pass is complete. Clearing the token earlier would let another
+ * sweeper claim `failed` and overlap the still-running bookkeeping tail. */
+async function finalizeOwnedFailedJob(
+  db: DB,
+  jobId: string,
+  msg: string,
+  lease: Pick<IngestLease, "jobId" | "token">,
+  opts: { evidenceIngested?: boolean } = {},
+): Promise<boolean> {
+  const now = new Date();
+  const [finished] = await db
+    .update(simJobs)
+    .set({
+      status: "failed",
+      engineState: "failed",
+      error: msg,
+      ...(opts.evidenceIngested ? { ingestedAt: now } : {}),
+      finishedAt: now,
+      ingestLeaseToken: null,
+      ingestLeaseClaimedAt: null,
+      ingestLeaseExpiresAt: null,
+    })
+    .where(ingestLeaseOwnedWhere(jobId, lease.token))
+    .returning({ id: simJobs.id });
+  return Boolean(finished);
 }
 
 function errorMessage(e: unknown): string {
@@ -134,7 +356,9 @@ function isNotFound(e: unknown): boolean {
 function queueListsJob(queue: EngineQueueState, engineJobId: string): boolean {
   return (
     queue.job_ids.includes(engineJobId) ||
-    [...queue.active, ...queue.reserved, ...queue.scheduled].some((task) => task.job_id === engineJobId)
+    [...queue.active, ...queue.reserved, ...queue.scheduled].some(
+      (task) => task.job_id === engineJobId,
+    )
   );
 }
 
@@ -144,7 +368,10 @@ function queueTaskJobIds(queue: EngineQueueState): string[] {
     .filter((id): id is string => Boolean(id));
 }
 
-async function engineQueueMentionsJob(engine: EngineClient, engineJobId: string): Promise<boolean | null> {
+async function engineQueueMentionsJob(
+  engine: EngineClient,
+  engineJobId: string,
+): Promise<boolean | null> {
   try {
     return queueListsJob(await engine.getQueue(), engineJobId);
   } catch {
@@ -152,8 +379,12 @@ async function engineQueueMentionsJob(engine: EngineClient, engineJobId: string)
   }
 }
 
-async function engineRuntimeMap(engine: EngineClient, jobIds: string[]): Promise<Map<string, JobRuntimeSummary>> {
-  if (jobIds.length === 0 || typeof engine.getJobRuntimes !== "function") return new Map();
+async function engineRuntimeMap(
+  engine: EngineClient,
+  jobIds: string[],
+): Promise<Map<string, JobRuntimeSummary>> {
+  if (jobIds.length === 0 || typeof engine.getJobRuntimes !== "function")
+    return new Map();
   try {
     const response = await engine.getJobRuntimes(jobIds);
     return new Map(response.jobs.map((job) => [job.job_id, job]));
@@ -162,9 +393,14 @@ async function engineRuntimeMap(engine: EngineClient, jobIds: string[]): Promise
   }
 }
 
-function requestPayloadWithScheduling(job: SimJobRow, status: JobStatus): Record<string, unknown> {
+function requestPayloadWithScheduling(
+  job: SimJobRow,
+  status: JobStatus,
+): Record<string, unknown> {
   const payload = ((job.requestPayload ?? {}) as Record<string, unknown>) ?? {};
-  return status.scheduling ? { ...payload, scheduling: status.scheduling } : payload;
+  return status.scheduling
+    ? { ...payload, scheduling: status.scheduling }
+    : payload;
 }
 
 function requestPayload(job: SimJobRow): Record<string, unknown> {
@@ -177,50 +413,163 @@ function requestPayload(job: SimJobRow): Record<string, unknown> {
  *  assumption in this module goes through this helper or releases claims by
  *  simJobId (which already spans all entries of a batched job). */
 function conditionMapForJob(job: SimJobRow): ConditionMapEntry[] | null {
-  const raw = (requestPayload(job) as { conditionMap?: ConditionMapEntry[] }).conditionMap;
+  const raw = (requestPayload(job) as { conditionMap?: ConditionMapEntry[] })
+    .conditionMap;
   return Array.isArray(raw) && raw.length > 0 ? raw : null;
 }
 
 /** URANS fidelity tier a wave-2 job requested (requestPayload.uransFidelity),
  *  the honest fallback for points whose engine fidelity echo is missing. */
 function uransFidelityForJob(job: SimJobRow): UransFidelity | undefined {
-  const raw = (requestPayload(job) as { uransFidelity?: unknown }).uransFidelity;
+  const raw = (requestPayload(job) as { uransFidelity?: unknown })
+    .uransFidelity;
   return raw === "precalc" || raw === "full" ? raw : undefined;
 }
 
 /** Ladder contract 4: after the polar-cache refresh classified a job's fresh
  *  rows, every ACCEPTED urans_precalc results row in the job's revisions owes
  *  a full-fidelity verification — enqueue idempotently (partial unique index).
- *  campaign_id rides along for phase derivation; continuous rows enqueue with
- *  NULL campaign. Loud, never silent on failure (the verify tier must not
- *  silently starve). */
-async function enqueueVerificationsForJob(db: DB, job: SimJobRow): Promise<void> {
+ *  Shared request jobs carry campaign_id=NULL, so current provenance comes
+ *  from request associations plus background_owner, never requested_by (the
+ *  immutable creator). Enqueue failure is an ingest
+ *  failure: idempotent retry is safer than permanently losing the obligation. */
+export async function enqueueVerificationsForJob(
+  db: DB,
+  job: SimJobRow,
+): Promise<void> {
   const conditionMap = conditionMapForJob(job);
   const revisionIds = conditionMap
     ? [...new Set(conditionMap.map((entry) => entry.revisionId))]
     : job.simulationPresetRevisionId
       ? [job.simulationPresetRevisionId]
       : [];
-  for (const revisionId of revisionIds) {
-    try {
-      const enqueued = await enqueuePrecalcVerifications(db, {
-        airfoilId: job.airfoilId,
-        revisionId,
-        campaignId: job.campaignId,
-      });
-      if (enqueued > 0) {
-        console.log(`[sweeper] verify queue: enqueued ${enqueued} precalc-accepted point(s) (job ${job.id}, revision ${revisionId})`);
+  const payload = requestPayload(job) as {
+    uransRequestId?: unknown;
+    precalcObligationIds?: unknown;
+    aoas?: unknown;
+  };
+  const aoas = Array.isArray(payload.aoas)
+    ? payload.aoas.filter(
+        (aoa): aoa is number => typeof aoa === "number" && Number.isFinite(aoa),
+      )
+    : [];
+  const cells = [
+    ...new Map(
+      revisionIds.flatMap((revisionId) =>
+        aoas.map(
+          (aoaDeg) =>
+            [`${revisionId}:${aoaDeg}`, { revisionId, aoaDeg }] as const,
+        ),
+      ),
+    ).values(),
+  ];
+  if (!cells.length) return;
+
+  let requestOwners: Array<string | null> | null = null;
+  if (!job.campaignId && typeof payload.uransRequestId === "string") {
+    const [request] = await db
+      .select({ backgroundOwner: simUransRequests.backgroundOwner })
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, payload.uransRequestId))
+      .limit(1);
+    const owners = (await db.execute(sql`
+      SELECT ownership.campaign_id
+      FROM sim_urans_request_campaigns ownership
+      JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+      WHERE ownership.request_id = ${payload.uransRequestId}
+        AND ownership.state = 'active'
+        AND campaign.status IN ('active', 'attention', 'paused')
+      ORDER BY ownership.campaign_id
+    `)) as unknown as Array<{ campaign_id: string }>;
+    requestOwners = owners.map((owner) => owner.campaign_id);
+    if (request?.backgroundOwner) requestOwners.push(null);
+    // A missing request row cannot prove campaign provenance; preserve the
+    // pre-existing fail-safe behavior and create an independent obligation.
+    if (!request) requestOwners.push(null);
+  }
+
+  const obligationIds = Array.isArray(payload.precalcObligationIds)
+    ? payload.precalcObligationIds.filter(
+        (id): id is string => typeof id === "string",
+      )
+    : [];
+  const obligationOwnership = obligationIds.length
+    ? ((await db.execute(sql`
+        SELECT obligation.revision_id,
+               obligation.aoa_deg::float8 AS aoa_deg,
+               obligation.background_owner,
+               COALESCE(
+                 array_agg(DISTINCT campaign.id ORDER BY campaign.id)
+                   FILTER (WHERE campaign.id IS NOT NULL),
+                 ARRAY[]::uuid[]
+               ) AS campaign_ids
+        FROM sim_precalc_obligations obligation
+        LEFT JOIN sim_precalc_obligation_campaigns ownership
+          ON ownership.obligation_id = obligation.id
+         AND ownership.state = 'active'
+        LEFT JOIN sim_campaigns campaign
+          ON campaign.id = ownership.campaign_id
+         AND campaign.status IN ('active', 'attention', 'paused')
+        WHERE obligation.id = ANY(${sql`ARRAY[${sql.join(
+          obligationIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})
+        GROUP BY obligation.id
+      `)) as unknown as Array<{
+        revision_id: string;
+        aoa_deg: number;
+        background_owner: boolean;
+        campaign_ids: string[];
+      }>)
+    : [];
+  const obligationOwnersByCell = new Map(
+    obligationOwnership.map((row) => [
+      `${row.revision_id}:${Number(row.aoa_deg)}`,
+      [...row.campaign_ids, ...(row.background_owner ? [null] : [])] as Array<
+        string | null
+      >,
+    ]),
+  );
+
+  for (const cell of cells) {
+    const verificationOwners = job.campaignId
+      ? [job.campaignId]
+      : (requestOwners ??
+        obligationOwnersByCell.get(`${cell.revisionId}:${cell.aoaDeg}`) ??
+        (obligationIds.length ? [] : [null]));
+    for (const campaignId of verificationOwners) {
+      try {
+        const enqueued = await enqueuePrecalcVerifications(db, {
+          airfoilId: job.airfoilId,
+          revisionId: cell.revisionId,
+          campaignId,
+          aoaDeg: cell.aoaDeg,
+        });
+        if (enqueued > 0) {
+          console.log(
+            `[sweeper] verify queue: enqueued ${enqueued} precalc-accepted point(s) (job ${job.id}, revision ${cell.revisionId}, aoa ${cell.aoaDeg})`,
+          );
+        }
+      } catch (e) {
+        console.error(
+          `[sweeper] verify-queue enqueue FAILED (job ${job.id}, revision ${cell.revisionId}, aoa ${cell.aoaDeg}): ${errorMessage(e)}`,
+        );
+        throw e;
       }
-    } catch (e) {
-      console.error(`[sweeper] verify-queue enqueue FAILED (job ${job.id}, revision ${revisionId}): ${errorMessage(e)}`);
     }
   }
 }
 
 interface VerifyJobPayload {
   verifyQueueItemId?: string;
-  verifyPrecalc?: { cl?: number | null; cd?: number | null; cm?: number | null };
+  verifyPrecalc?: {
+    cl?: number | null;
+    cd?: number | null;
+    cm?: number | null;
+  };
   uransRequestId?: string;
+  uransFidelity?: string;
+  precalcObligationIds?: string[];
 }
 
 function finiteOrNull(value: unknown): number | null {
@@ -232,93 +581,177 @@ function finiteOrNull(value: unknown): number | null {
  *    record deltas vs the precalc snapshot captured at consume time, mark
  *    done, or DISAGREED when |ΔCl| > 0.05 or |ΔCd| > 0.01 (contract 4). The
  *    classification stays on the VERIFIED row (it IS the results row now);
- *    the disagreement is surfaced via a quality-warning marker on that row
- *    and the queue deltas — nothing silently swapped. A failed verify solve
- *    cancels the item loudly (the failure evidence lives on the results row).
+ *    the machine disagreement is surfaced by the queue state and deltas
+ *    without mutating immutable solver-attempt warnings. A failed verify solve
+ *    cancels the item loudly (the failure evidence remains in attempt history).
  *  - admin request jobs (payload.uransRequestId): flip the request done. */
-async function settleUransLadderForJob(db: DB, job: SimJobRow): Promise<void> {
+async function settleUransLadderForJob(
+  db: DB,
+  job: SimJobRow,
+  opts: { terminalError?: string | null } = {},
+): Promise<void> {
   const payload = requestPayload(job) as VerifyJobPayload;
-  if (payload.uransRequestId) {
-    await db
-      .update(simUransRequests)
-      .set({ state: "done" })
-      .where(and(eq(simUransRequests.id, payload.uransRequestId), eq(simUransRequests.state, "running")));
-  }
-  if (!payload.verifyQueueItemId) return;
-  const [item] = await db.select().from(simUransVerifyQueue).where(eq(simUransVerifyQueue.id, payload.verifyQueueItemId)).limit(1);
-  if (!item || (item.state !== "running" && item.state !== "pending")) return;
-  const [verified] = await db
-    .select({ id: results.id, status: results.status, fidelity: results.fidelity, cl: results.cl, cd: results.cd, cm: results.cm, qualityWarnings: results.qualityWarnings })
-    .from(results)
-    .where(and(eq(results.airfoilId, item.airfoilId), eq(results.simulationPresetRevisionId, item.revisionId), eq(results.aoaDeg, item.aoaDeg)))
-    .limit(1);
-  // The verified ROW is the judge, not the job verdict: a partially-failed
-  // job whose verify angle still solved (done, full fidelity) completes the
-  // item honestly; anything else cancels it loudly.
-  const verifiedSolved = Boolean(verified && verified.status === "done" && verified.fidelity === "urans_full");
-  if (!verifiedSolved || !verified) {
+  const precalcSettlement = await settlePrecalcObligationsForJob(db, job, {
+    terminalError: opts.terminalError ?? null,
+  });
+  if (precalcSettlement.blocked.length) {
     console.error(
-      `[sweeper] URANS verify solve did not complete (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}) — item cancelled; failure evidence stays on the results row`,
+      `[sweeper] PRECALC OBLIGATION BLOCKED (job ${job.id}): ${precalcSettlement.blocked.length} physical cell(s) exhausted or deterministic; canonical evidence retained and no human review assigned`,
     );
-    await db
-      .update(simUransVerifyQueue)
-      .set({ state: "cancelled", verifyResultId: verified?.id ?? null })
-      .where(eq(simUransVerifyQueue.id, item.id));
-    return;
   }
-  const precalc = payload.verifyPrecalc ?? {};
-  const deltaOf = (a: unknown, b: number | null): number | null => {
-    const pa = finiteOrNull(a);
-    return pa !== null && b !== null ? b - pa : null;
-  };
-  const deltaCl = deltaOf(precalc.cl, finiteOrNull(verified.cl));
-  const deltaCd = deltaOf(precalc.cd, finiteOrNull(verified.cd));
-  const deltaCm = deltaOf(precalc.cm, finiteOrNull(verified.cm));
-  const disagreed =
-    (deltaCl !== null && Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
-    (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
-  await db
-    .update(simUransVerifyQueue)
-    .set({
-      state: disagreed ? "disagreed" : "done",
-      verifyResultId: verified.id,
-      deltaCl,
-      deltaCd,
-      deltaCm,
-    })
-    .where(eq(simUransVerifyQueue.id, item.id));
-  if (disagreed) {
-    const marker =
-      `urans-verify-disagreement: full-fidelity verification differs from precalc beyond bounds ` +
-      `(ΔCl=${deltaCl?.toFixed(4) ?? "n/a"}, ΔCd=${deltaCd?.toFixed(5) ?? "n/a"}; limits ${URANS_VERIFY_DELTA_CL_LIMIT}/${URANS_VERIFY_DELTA_CD_LIMIT}) — point flagged for review`;
-    console.error(`[sweeper] ${marker} (item ${item.id}, result ${verified.id})`);
-    const warnings = verified.qualityWarnings ?? [];
-    if (!warnings.some((w) => w.startsWith("urans-verify-disagreement:"))) {
+  if (payload.uransRequestId) {
+    const physicalPrecalcRequest =
+      payload.uransFidelity === "precalc" &&
+      Array.isArray(payload.precalcObligationIds) &&
+      payload.precalcObligationIds.length > 0;
+    if (!physicalPrecalcRequest) {
       await db
-        .update(results)
-        .set({ qualityWarnings: [...warnings, marker] })
-        .where(eq(results.id, verified.id));
+        .update(simUransRequests)
+        .set({ state: "done", simJobId: job.id })
+        .where(
+          and(
+            eq(simUransRequests.id, payload.uransRequestId),
+            eq(simUransRequests.state, "running"),
+          ),
+        );
     }
   }
+  if (!payload.verifyQueueItemId) return;
+  await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [item] = await tx
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, payload.verifyQueueItemId!))
+      .for("update")
+      .limit(1);
+    if (!item || item.state !== "running" || item.simJobId !== job.id) {
+      console.error(
+        `[sweeper] stale URANS verify settlement ignored (item ${payload.verifyQueueItemId}, job ${job.id}); exact owner: ${item?.simJobId ?? "none"}`,
+      );
+      return;
+    }
+
+    const [verified] = await tx
+      .select({
+        id: results.id,
+        attemptId: resultAttempts.id,
+        attemptSimJobId: resultAttempts.simJobId,
+        status: resultAttempts.status,
+        source: resultAttempts.source,
+        fidelity: sql<
+          string | null
+        >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+        cl: resultAttempts.cl,
+        cd: resultAttempts.cd,
+        cm: resultAttempts.cm,
+      })
+      .from(results)
+      .innerJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.id, results.currentResultAttemptId),
+          eq(resultAttempts.resultId, results.id),
+        ),
+      )
+      .where(
+        and(
+          eq(results.airfoilId, item.airfoilId),
+          eq(results.simulationPresetRevisionId, item.revisionId),
+          eq(results.aoaDeg, item.aoaDeg),
+        ),
+      )
+      .limit(1);
+    // The selected immutable attempt is the judge. A partially-failed job whose
+    // own verify angle solved can complete the item; another generation at the
+    // same cell can never stand in for this job.
+    const verifiedSolved = Boolean(
+      verified &&
+      verified.attemptSimJobId === job.id &&
+      verified.status === "done" &&
+      verified.source === "solved" &&
+      verified.fidelity === "urans_full",
+    );
+    if (!verifiedSolved || !verified) {
+      console.error(
+        `[sweeper] URANS verify solve did not complete with this job's selected full-fidelity attempt (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}) — item cancelled; immutable attempt/job evidence is retained`,
+      );
+      await tx
+        .update(simUransVerifyQueue)
+        .set({ state: "cancelled", verifyResultId: null })
+        .where(
+          and(
+            eq(simUransVerifyQueue.id, item.id),
+            eq(simUransVerifyQueue.state, "running"),
+            eq(simUransVerifyQueue.simJobId, job.id),
+          ),
+        );
+      return;
+    }
+    const precalc = payload.verifyPrecalc ?? {};
+    const deltaOf = (a: unknown, b: number | null): number | null => {
+      const pa = finiteOrNull(a);
+      return pa !== null && b !== null ? b - pa : null;
+    };
+    const deltaCl = deltaOf(precalc.cl, finiteOrNull(verified.cl));
+    const deltaCd = deltaOf(precalc.cd, finiteOrNull(verified.cd));
+    const deltaCm = deltaOf(precalc.cm, finiteOrNull(verified.cm));
+    const disagreed =
+      (deltaCl !== null && Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
+      (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
+    await tx
+      .update(simUransVerifyQueue)
+      .set({
+        state: disagreed ? "disagreed" : "done",
+        verifyResultId: verified.id,
+        deltaCl,
+        deltaCd,
+        deltaCm,
+      })
+      .where(
+        and(
+          eq(simUransVerifyQueue.id, item.id),
+          eq(simUransVerifyQueue.state, "running"),
+          eq(simUransVerifyQueue.simJobId, job.id),
+        ),
+      );
+    if (disagreed) {
+      console.error(
+        `[sweeper] urans-verify-disagreement: full-fidelity verification differs from precalc beyond bounds ` +
+          `(ΔCl=${deltaCl?.toFixed(4) ?? "n/a"}, ΔCd=${deltaCd?.toFixed(5) ?? "n/a"}; limits ${URANS_VERIFY_DELTA_CL_LIMIT}/${URANS_VERIFY_DELTA_CD_LIMIT}) — machine disagreement retained on queue item ${item.id}, selected attempt ${verified.attemptId}`,
+      );
+    }
+  });
 }
 
 /** Refresh polar-fit caches for every revision a job touched: each
  *  conditionMap entry's revision for batched campaign jobs, the job's single
  *  revision otherwise (today's path, unchanged). */
-async function refreshPolarCachesForJob(db: DB, job: SimJobRow): Promise<void> {
+async function refreshPolarCachesForJob(
+  db: DB,
+  job: SimJobRow,
+  heartbeat: () => Promise<void> = () => touchHeartbeat(db),
+): Promise<void> {
   const conditionMap = conditionMapForJob(job);
   if (conditionMap) {
-    for (const revisionId of new Set(conditionMap.map((entry) => entry.revisionId))) {
+    for (const revisionId of new Set(
+      conditionMap.map((entry) => entry.revisionId),
+    )) {
       // Invariant: no code path may run >30 s without a heartbeat touch —
       // each revision refresh re-fits + re-classifies a whole lane and a
       // batched campaign job can span many revisions.
-      await touchHeartbeat(db);
+      await heartbeat();
       await refreshPolarCacheForRevision(db, job.airfoilId, revisionId);
     }
     return;
   }
   if (job.simulationPresetRevisionId) {
-    await refreshPolarCacheForRevision(db, job.airfoilId, job.simulationPresetRevisionId);
+    await heartbeat();
+    await refreshPolarCacheForRevision(
+      db,
+      job.airfoilId,
+      job.simulationPresetRevisionId,
+    );
   }
 }
 
@@ -327,8 +760,15 @@ async function setupSnapshotForJob(
   job: SimJobRow,
 ): Promise<{ snapshot: SimulationSetupSnapshot; revisionId: string } | null> {
   const payload = requestPayload(job);
-  if (payload.setupSnapshot && typeof payload.setupSnapshot === "object" && job.simulationPresetRevisionId) {
-    return { snapshot: payload.setupSnapshot as SimulationSetupSnapshot, revisionId: job.simulationPresetRevisionId };
+  if (
+    payload.setupSnapshot &&
+    typeof payload.setupSnapshot === "object" &&
+    job.simulationPresetRevisionId
+  ) {
+    return {
+      snapshot: payload.setupSnapshot as SimulationSetupSnapshot,
+      revisionId: job.simulationPresetRevisionId,
+    };
   }
   if (!job.simulationPresetRevisionId) return null;
   const [revision] = await db
@@ -337,7 +777,10 @@ async function setupSnapshotForJob(
     .where(eq(simulationPresetRevisions.id, job.simulationPresetRevisionId))
     .limit(1);
   if (!revision) return null;
-  return { snapshot: revision.snapshot as unknown as SimulationSetupSnapshot, revisionId: revision.id };
+  return {
+    snapshot: revision.snapshot as unknown as SimulationSetupSnapshot,
+    revisionId: revision.id,
+  };
 }
 
 /** Engine-side cancellation (G2, incident 2026-07-05): a job the ENGINE
@@ -349,15 +792,41 @@ async function setupSnapshotForJob(
  *  helper existed, engine state `cancelled` fell through the status mapping to
  *  "running" and the sweeper polled the dead job forever. Never ingests
  *  coefficients — released rows stay coefficient-free until re-solved. */
-async function cancelJobAndReleaseClaims(db: DB, job: SimJobRow, msg: string): Promise<void> {
-  await db
-    .update(results)
-    .set({ status: "pending", source: "queued", simJobId: null, engineJobId: null, engineCaseSlug: null })
-    .where(and(eq(results.simJobId, job.id), inArray(results.status, ["queued", "running"])));
-  await db
-    .update(simJobs)
-    .set({ status: "cancelled", engineState: "cancelled", error: msg, finishedAt: new Date() })
-    .where(reconcilableJobWhere(job.id));
+async function cancelJobAndReleaseClaims(
+  db: DB,
+  job: SimJobRow,
+  msg: string,
+  lease?: Pick<IngestLease, "jobId" | "token">,
+): Promise<boolean> {
+  const settlement = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [stopped] = await tx
+      .update(simJobs)
+      .set({
+        status: "cancelled",
+        engineState: "cancelled",
+        error: msg,
+        finishedAt: new Date(),
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeaseExpiresAt: null,
+      })
+      .where(
+        lease
+          ? ingestLeaseOwnedWhere(job.id, lease.token)
+          : reconcilableJobWhere(job.id),
+      )
+      .returning({ id: simJobs.id });
+    if (!stopped) return null;
+    await releaseResultClaimsForJob(tx, job.id, ["queued", "running"]);
+    return settlePrecalcObligationsForJobInTransaction(tx, job, {
+      terminalError: msg,
+      cancellation: "transient",
+    });
+  });
+  if (!settlement) return false;
+  await refreshPrecalcSettlementCampaigns(db, settlement.campaignIds);
+  return true;
 }
 
 /** Zombie auto-recovery (G3, incident 2026-07-05): 4 in-flight celery tasks
@@ -388,7 +857,9 @@ function classifyLostRunning(
   if (heartbeatAlive) return null;
   if (!queue || engineQueueListsJob(queue, job.engineJobId)) return null;
   const lastProgress =
-    parseEngineDate(status.last_progress_at) ?? parseEngineDate(status.started_at) ?? parseEngineDate(status.queued_at);
+    parseEngineDate(status.last_progress_at) ??
+    parseEngineDate(status.started_at) ??
+    parseEngineDate(status.queued_at);
   if (!lastProgress) return null;
   const quietMs = now - lastProgress.getTime();
   if (quietMs < LOST_RUNNING_GRACE_MS) return null;
@@ -410,7 +881,9 @@ function classifyLostRunning(
  *  process liveness is the primary signal anyway: the lost path additionally
  *  requires process_count == 0, a stale worker heartbeat, and absence from
  *  Celery — a healthy quiet case fails all three of those guards. */
-const LOST_RUNNING_GRACE_MS = Number(process.env.SWEEPER_LOST_RUNNING_GRACE_MS ?? 30 * 60 * 1000);
+const LOST_RUNNING_GRACE_MS = Number(
+  process.env.SWEEPER_LOST_RUNNING_GRACE_MS ?? 30 * 60 * 1000,
+);
 
 function parseEngineDate(value: string | null | undefined): Date | null {
   if (!value) return null;
@@ -418,11 +891,19 @@ function parseEngineDate(value: string | null | undefined): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-async function updateJobFromEngineStatus(db: DB, job: SimJobRow, status: JobStatus): Promise<void> {
+export async function updateJobFromEngineStatus(
+  db: DB,
+  job: SimJobRow,
+  status: JobStatus,
+): Promise<void> {
   if (status.state === "cancelled") {
     // G2 dispatch site 1 (status mapping): `cancelled` used to fall through
     // the ternary below to status "running".
-    await cancelJobAndReleaseClaims(db, job, status.message ?? "engine reported job cancelled; claims released");
+    await cancelJobAndReleaseClaims(
+      db,
+      job,
+      status.message ?? "engine reported job cancelled; claims released",
+    );
     return;
   }
   await db
@@ -435,58 +916,339 @@ async function updateJobFromEngineStatus(db: DB, job: SimJobRow, status: JobStat
       error: status.state === "failed" ? (status.message ?? job.error) : null,
       finishedAt: null,
       requestPayload: requestPayloadWithScheduling(job, status),
-      status: status.state === "completed" ? "ingesting" : status.state === "failed" ? "ingesting" : status.state === "pending" ? "submitted" : "running",
+      // Terminal engine state does NOT pre-claim DB ingestion. Completed
+      // evidence stays on the submitted/running side until the atomic lease
+      // claim wins; failed is itself a claimable recovery source. Writing a
+      // tokenless `ingesting` row here stranded work for the legacy grace and
+      // let stale pollers overwrite a real owner.
+      status:
+        status.state === "failed"
+          ? "failed"
+          : status.state === "pending"
+            ? "submitted"
+            : "running",
+      ingestLeaseToken: null,
+      ingestLeaseClaimedAt: null,
+      ingestLeaseExpiresAt: null,
     })
     .where(reconcilableJobWhere(job.id));
 }
 
-async function markIngestRetry(db: DB, jobId: string, e: unknown): Promise<void> {
+async function markIngestRetry(
+  db: DB,
+  jobId: string,
+  e: unknown,
+  lease?: Pick<IngestLease, "jobId" | "token">,
+): Promise<void> {
+  const now = new Date();
   await db
     .update(simJobs)
     .set({
       status: "ingesting",
       engineState: "completed",
       error: "ingest retry pending: " + errorMessage(e),
+      polledAt: now,
+      finishedAt: null,
+      ingestLeaseToken: null,
+      ingestLeaseClaimedAt: null,
+      // An explicit expired timestamp makes the row immediately reclaimable;
+      // it does not wait for the legacy null-lease grace window.
+      ingestLeaseExpiresAt: now,
+    })
+    .where(
+      lease
+        ? ingestLeaseOwnedWhere(jobId, lease.token)
+        : and(
+            reconcilableJobWhere(jobId),
+            or(
+              sql`${simJobs.status} <> 'ingesting'`,
+              lte(simJobs.ingestLeaseExpiresAt, now),
+              and(
+                isNull(simJobs.ingestLeaseExpiresAt),
+                lte(
+                  simJobs.updatedAt,
+                  new Date(now.getTime() - DEFAULT_INGEST_LEASE_MS),
+                ),
+              ),
+            ),
+          ),
+    );
+}
+
+async function requeueLostJob(
+  db: DB,
+  job: SimJobRow,
+  msg: string,
+): Promise<void> {
+  const settlement = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [stopped] = await tx
+      .update(simJobs)
+      .set({
+        status: "cancelled",
+        engineState: "missing",
+        error: msg,
+        finishedAt: new Date(),
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeaseExpiresAt: null,
+      })
+      .where(reconcilableJobWhere(job.id))
+      .returning({ id: simJobs.id });
+    if (!stopped) return null;
+    await releaseResultClaimsForJob(tx, job.id, [
+      "queued",
+      "running",
+      "pending",
+      "stale",
+      "failed",
+    ]);
+    return settlePrecalcObligationsForJobInTransaction(tx, job, {
+      terminalError: msg,
+      cancellation: "transient",
+    });
+  });
+  if (settlement)
+    await refreshPrecalcSettlementCampaigns(db, settlement.campaignIds);
+}
+
+async function markPollMiss(
+  db: DB,
+  job: SimJobRow,
+  msg: string,
+): Promise<void> {
+  await db
+    .update(simJobs)
+    .set({
+      status: "running",
+      engineState: "missing",
+      error: msg,
       polledAt: new Date(),
       finishedAt: null,
+      ingestLeaseToken: null,
+      ingestLeaseClaimedAt: null,
+      ingestLeaseExpiresAt: null,
     })
-    .where(reconcilableJobWhere(jobId));
-}
-
-async function requeueLostJob(db: DB, job: SimJobRow, msg: string): Promise<void> {
-  await db
-    .update(results)
-    .set({ status: "pending", source: "queued", simJobId: null, engineJobId: null, engineCaseSlug: null })
-    .where(and(eq(results.simJobId, job.id), inArray(results.status, ["queued", "running", "pending", "stale", "failed"])));
-  await db
-    .update(simJobs)
-    .set({ status: "cancelled", engineState: "missing", error: msg, finishedAt: new Date() })
-    .where(reconcilableJobWhere(job.id));
-}
-
-async function markPollMiss(db: DB, job: SimJobRow, msg: string): Promise<void> {
-  await db
-    .update(simJobs)
-    .set({ status: "running", engineState: "missing", error: msg, polledAt: new Date(), finishedAt: null })
     .where(activeJobWhere(job.id));
 }
 
-async function dbQueuePressure(db: DB): Promise<number> {
-  const [row] = await db
-    .select({ n: count() })
-    .from(simJobs)
-    .where(inArray(simJobs.status, ["pending", ...activeJobStatuses]));
-  return Number(row?.n ?? 0);
+/** Remove only immutable, exact deterministic mesh-QA cells from a repeated
+ * campaign precalc plan. A partially-ingested cancelled child can contain one
+ * such blocker alongside an unattempted or transient sibling; child-level
+ * dedupe must not either replay the blocker or hide the retryable sibling.
+ * Attempt evidence is authoritative, with the canonical failed row as a
+ * compatibility fallback for older ingests. */
+async function withoutDeterministicPrecalcBlockers(
+  db: DB,
+  opts: {
+    parentJobId: string;
+    airfoilId: string;
+    revisionId: string;
+    retry: RansRetryDecision;
+  },
+): Promise<RansRetryDecision | null> {
+  if (!opts.retry.aoas.length) return null;
+  const rows = (await db.execute(sql`
+    SELECT blocked.aoa_deg::float8 AS aoa_deg
+    FROM (
+      SELECT DISTINCT evidence.aoa_deg
+      FROM sim_jobs child
+      CROSS JOIN LATERAL (
+        SELECT attempt.aoa_deg, attempt.error
+        FROM result_attempts attempt
+        WHERE attempt.sim_job_id = child.id
+        UNION ALL
+        SELECT canonical.aoa_deg, canonical.error
+        FROM results canonical
+        WHERE canonical.sim_job_id = child.id
+      ) evidence
+      WHERE child.parent_job_id = ${opts.parentJobId}
+        AND child.wave = 2
+        AND child.status IN ('done', 'failed', 'cancelled')
+        AND child.simulation_preset_revision_id = ${opts.revisionId}
+        AND child.request_payload ->> 'uransFidelity' = 'precalc'
+        AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(evidence.error, ''))) > 0
+        AND position('max non-orthogonality' in lower(COALESCE(evidence.error, ''))) > 0
+      UNION
+      SELECT obligation.aoa_deg
+      FROM sim_precalc_obligations obligation
+      WHERE obligation.airfoil_id = ${opts.airfoilId}
+        AND obligation.revision_id = ${opts.revisionId}
+        AND obligation.state IN ('blocked', 'satisfied', 'cancelled')
+      UNION
+      SELECT request_item.aoa_deg
+      FROM sim_urans_requests request_item
+      WHERE request_item.airfoil_id = ${opts.airfoilId}
+        AND request_item.revision_id = ${opts.revisionId}
+        AND request_item.fidelity = 'precalc'
+        AND request_item.aoa_deg IS NOT NULL
+        AND request_item.state IN ('pending', 'running')
+    ) blocked
+    WHERE blocked.aoa_deg = ANY(${sql`ARRAY[${sql.join(
+      opts.retry.aoas.map((aoa) => sql`${aoa}::float8`),
+      sql`, `,
+    )}]`})
+  `)) as unknown as Array<{ aoa_deg: number }>;
+  const blocked = new Set(rows.map((row) => Number(row.aoa_deg)));
+  if (!blocked.size) return opts.retry;
+  const aoas = opts.retry.aoas.filter((aoa) => !blocked.has(aoa));
+  console.error(
+    `[sweeper] PRECALC RETRY BLOCKED for deterministic mesh QA (parent ${opts.parentJobId}, revision ${opts.revisionId}, angles [${[...blocked].sort((a, b) => a - b).join(", ")}]) — immutable attempt evidence retained; unchanged mesh will not be submitted again`,
+  );
+  if (!aoas.length) return null;
+  return {
+    ...opts.retry,
+    aoas,
+    queueCanonicalAoas: opts.retry.queueCanonicalAoas.filter(
+      (aoa) => !blocked.has(aoa),
+    ),
+  };
 }
 
-async function cancelTerminalEngineTasks(db: DB, engine: EngineClient, queue: EngineQueueState, liveEngineJobIds: Set<string>): Promise<void> {
-  const candidateIds = [...new Set(queueTaskJobIds(queue).filter((jobId) => !liveEngineJobIds.has(jobId)))];
+interface Wave2CompositionSpec {
+  parentJobId: string;
+  revisionId: string;
+  conditionId?: string;
+  job: typeof simJobs.$inferInsert;
+  obligationIds: string[];
+}
+
+/** Atomically compose one physical wave-2 child.
+ *
+ * The parent row is the no-schema-needed mutex for all sweepers considering
+ * this parent. After winning it, the transaction rechecks the exact
+ * (parent, revision, condition) child identity and inserts the child while
+ * every physical obligation is still runnable. Canonical results are not
+ * claimed: completed RANS evidence stays immutable until accepted URANS
+ * ingestion replaces it by natural key. */
+async function composeWave2Child(
+  db: DB,
+  spec: Wave2CompositionSpec,
+): Promise<{ id: string } | null> {
+  return composePhysicalPrecalcJob(db, {
+    obligationIds: spec.obligationIds,
+    job: spec.job,
+    directParent: {
+      parentJobId: spec.parentJobId,
+      revisionId: spec.revisionId,
+      conditionId: spec.conditionId,
+    },
+  });
+}
+
+/** Durable ownerless row shape for a wave-2 obligation.
+ *
+ * - a failed precalc retry carries its one-shot marker; or
+ * - a RANS result has a stored rejected/needs_urans verdict that caused the
+ *   ladder escalation.
+ *
+ * Both must remain invisible to the wave-1 gap finder while a paused or
+ * transiently-unsubmitted wave-2 child waits to be recomposed. */
+/** A rejected/unreachable engine submit releases generic claims to `pending`.
+ * Restore only evidence-backed wave-2 cells to their durable queued-without-
+ * owner route, so the next tick cannot downgrade them to RANS. */
+async function restoreUnsubmittedWave2Route(
+  db: DB,
+  opts: { airfoilId: string; revisionId: string; aoas: number[] },
+): Promise<void> {
+  await db
+    .update(results)
+    .set({ status: "queued", source: "queued", simJobId: null })
+    .where(
+      and(
+        eq(results.airfoilId, opts.airfoilId),
+        eq(results.simulationPresetRevisionId, opts.revisionId),
+        inArray(results.aoaDeg, opts.aoas),
+        eq(results.status, "pending"),
+        isNull(results.simJobId),
+        EVIDENCE_BACKED_WAVE2_RESULT_SQL,
+      ),
+    );
+}
+
+async function campaignIsPaused(
+  db: DB,
+  campaignId: string | null,
+): Promise<boolean> {
+  if (!campaignId) return false;
+  const [row] = await db
+    .select({ status: simCampaigns.status })
+    .from(simCampaigns)
+    .where(eq(simCampaigns.id, campaignId))
+    .limit(1);
+  return row?.status === "paused";
+}
+
+interface RemotePromiseProvenance {
+  syncPromiseId: string;
+  remoteSolver: true;
+  upstreamBaseUrl: string;
+}
+
+/** Resolve remote ownership only from the durable local mirror. A scalar
+ * campaign_id=NULL is not background ownership: remote work remains live only
+ * while its exact upstream promise lease is active and unexpired. */
+async function remotePromiseProvenanceForJob(
+  db: DB,
+  job: SimJobRow,
+): Promise<RemotePromiseProvenance | null> {
+  const payload = requestPayload(job) as { syncPromiseId?: unknown };
+  if (typeof payload.syncPromiseId !== "string") return null;
+  const [promise] = await db
+    .select({
+      id: syncSweepPromises.id,
+      sourceBaseUrl: syncSweepPromises.sourceBaseUrl,
+    })
+    .from(syncSweepPromises)
+    .where(
+      and(
+        eq(syncSweepPromises.id, payload.syncPromiseId),
+        eq(syncSweepPromises.status, "active"),
+        eq(syncSweepPromises.airfoilId, job.airfoilId),
+        eq(
+          syncSweepPromises.simulationPresetRevisionId,
+          job.simulationPresetRevisionId!,
+        ),
+        sql`${syncSweepPromises.expiresAt} > now()`,
+        sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
+      ),
+    )
+    .limit(1);
+  if (!promise?.sourceBaseUrl) return null;
+  return {
+    syncPromiseId: promise.id,
+    remoteSolver: true,
+    upstreamBaseUrl: promise.sourceBaseUrl,
+  };
+}
+
+async function cancelTerminalEngineTasks(
+  db: DB,
+  engine: EngineClient,
+  queue: EngineQueueState,
+  liveEngineJobIds: Set<string>,
+): Promise<void> {
+  const candidateIds = [
+    ...new Set(
+      queueTaskJobIds(queue).filter((jobId) => !liveEngineJobIds.has(jobId)),
+    ),
+  ];
   if (candidateIds.length === 0) return;
 
   const terminalRows = await db
-    .select({ id: simJobs.id, engineJobId: simJobs.engineJobId, status: simJobs.status, error: simJobs.error })
+    .select({
+      id: simJobs.id,
+      engineJobId: simJobs.engineJobId,
+      status: simJobs.status,
+      error: simJobs.error,
+    })
     .from(simJobs)
-    .where(and(inArray(simJobs.engineJobId, candidateIds), inArray(simJobs.status, ["done", "failed", "cancelled"])));
+    .where(
+      and(
+        inArray(simJobs.engineJobId, candidateIds),
+        inArray(simJobs.status, ["done", "failed", "cancelled"]),
+      ),
+    );
 
   for (const row of terminalRows) {
     if (!row.engineJobId) continue;
@@ -500,7 +1262,9 @@ async function cancelTerminalEngineTasks(db: DB, engine: EngineClient, queue: En
         .update(simJobs)
         .set({
           engineState: "cancelled",
-          error: row.error ?? `obsolete engine task cancelled after DB job reached ${row.status}`,
+          error:
+            row.error ??
+            `obsolete engine task cancelled after DB job reached ${row.status}`,
         })
         .where(eq(simJobs.id, row.id));
     } catch (e) {
@@ -514,12 +1278,91 @@ async function cancelTerminalEngineTasks(db: DB, engine: EngineClient, queue: En
   }
 }
 
-export async function submitUransRetryForJob(db: DB, engine: EngineClient, parent: typeof simJobs.$inferSelect): Promise<void> {
-  if (parent.wave !== 1 || parent.bcIds.length === 0 || !parent.simulationPresetRevisionId) return;
+/** Retry a persisted compensating cancel by its stored engine id even when
+ * the engine queue omits the task. Queue visibility is observability, not the
+ * durable ownership record. */
+async function retryPersistedCancellationObligations(
+  db: DB,
+  engine: EngineClient,
+  jobIds: string[] = [],
+): Promise<Set<string>> {
+  const filters = [
+    eq(simJobs.status, "cancelled"),
+    inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+    isNotNull(simJobs.engineJobId),
+  ];
+  if (jobIds.length) filters.push(inArray(simJobs.id, jobIds));
+  const rows = await db
+    .select({
+      id: simJobs.id,
+      engineJobId: simJobs.engineJobId,
+      error: simJobs.error,
+    })
+    .from(simJobs)
+    .where(and(...filters))
+    .limit(10);
+  const settled = new Set<string>();
+  for (const row of rows) {
+    if (!row.engineJobId) continue;
+    await touchHeartbeat(db);
+    try {
+      await engine.cancelJob(row.engineJobId);
+      await db
+        .update(simJobs)
+        .set({
+          engineState: "cancelled",
+          error: row.error?.includes("compensating engine cancellation")
+            ? row.error.replace(
+                /; compensating engine cancellation failed:.*$/,
+                "; compensating engine cancellation confirmed",
+              )
+            : row.error,
+        })
+        .where(
+          and(
+            eq(simJobs.id, row.id),
+            eq(simJobs.status, "cancelled"),
+            eq(simJobs.engineJobId, row.engineJobId),
+          ),
+        );
+      settled.add(row.engineJobId);
+    } catch (error) {
+      await db
+        .update(simJobs)
+        .set({
+          engineState: "cancel_pending",
+          error: `${row.error ?? "compensating engine cancellation pending"}; retry failed: ${errorMessage(error)}`,
+        })
+        .where(
+          and(
+            eq(simJobs.id, row.id),
+            eq(simJobs.status, "cancelled"),
+            eq(simJobs.engineJobId, row.engineJobId),
+          ),
+        );
+    }
+  }
+  return settled;
+}
+
+export async function submitUransRetryForJob(
+  db: DB,
+  engine: EngineClient,
+  parent: typeof simJobs.$inferSelect,
+): Promise<void> {
+  if (
+    parent.wave !== 1 ||
+    parent.bcIds.length === 0 ||
+    !parent.simulationPresetRevisionId
+  )
+    return;
   // Fidelity ladder gate (contract 5): within a campaign, URANS (precalc)
   // work is gated until the campaign has ZERO open RANS gaps. Gated parents
   // are re-attempted by the sweeper's ladder tick once the gaps close.
-  if (parent.campaignId && (await campaignHasOpenRansGaps(db, parent.campaignId))) {
+  if (
+    parent.campaignId &&
+    (await campaignHasOpenRansGaps(db, parent.campaignId))
+  ) {
     console.log(
       `[sweeper] URANS retry for job ${parent.id} deferred: campaign ${parent.campaignId} still has open RANS gaps (ladder gate)`,
     );
@@ -533,31 +1376,102 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
     return;
   }
   const parentPayload = requestPayload(parent);
+  const remotePromiseHint =
+    typeof (parentPayload as { syncPromiseId?: unknown }).syncPromiseId ===
+    "string";
+  const remoteProvenance = await remotePromiseProvenanceForJob(db, parent);
+  if (remotePromiseHint && !remoteProvenance) return;
   const [existing] = await db
     .select({ id: simJobs.id })
     .from(simJobs)
-    .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2), inArray(simJobs.status, ["pending", "submitted", "running", "ingesting", "done"])))
+    .where(
+      and(
+        eq(simJobs.parentJobId, parent.id),
+        eq(simJobs.wave, 2),
+        inArray(simJobs.status, [
+          "pending",
+          "submitted",
+          "running",
+          "ingesting",
+        ]),
+      ),
+    )
     .limit(1);
   if (existing) return;
 
-  await refreshPolarCacheForRevision(db, parent.airfoilId, parent.simulationPresetRevisionId);
+  await refreshPolarCacheForRevision(
+    db,
+    parent.airfoilId,
+    parent.simulationPresetRevisionId,
+  );
   // Retry scoping (ladder R2): TARGETED-ONLY — every retry re-solves only the
   // job's own rejected/needs_urans angles at 'precalc' fidelity; whole-polar
   // URANS is an explicit admin action, never an automatic escalation.
-  const retry = await ransRetryPlanForJobScoped(db, {
+  const plannedRetry = await ransRetryPlanForJobScoped(db, {
     parentJobId: parent.id,
     airfoilId: parent.airfoilId,
     revisionId: parent.simulationPresetRevisionId,
     jobKind: parent.jobKind,
   });
+  const retry = plannedRetry
+    ? await withoutDeterministicPrecalcBlockers(db, {
+        parentJobId: parent.id,
+        airfoilId: parent.airfoilId,
+        revisionId: parent.simulationPresetRevisionId,
+        retry: plannedRetry,
+      })
+    : null;
   if (!retry || retry.aoas.length === 0) return;
-  const aoas = retry.aoas;
-
-  const [a] = await db.select().from(airfoils).where(eq(airfoils.id, parent.airfoilId)).limit(1);
+  // Resolve every immutable input before creating a durable physical
+  // obligation. A missing/deleted setup cannot leave an open ledger row with
+  // no child payload for the parent scan to recover.
+  const [a] = await db
+    .select()
+    .from(airfoils)
+    .where(eq(airfoils.id, parent.airfoilId))
+    .limit(1);
   const setup = await setupSnapshotForJob(db, parent);
   if (!a || !setup) return;
-  const bcId = setup.snapshot.preset.legacyBoundaryConditionId ?? parent.bcIds[0];
-
+  const bcId =
+    setup.snapshot.preset.legacyBoundaryConditionId ?? parent.bcIds[0];
+  const obligations = await ensurePrecalcObligations(
+    db,
+    retry.aoas.map((aoaDeg) => ({
+      airfoilId: parent.airfoilId,
+      revisionId: parent.simulationPresetRevisionId!,
+      aoaDeg,
+    })),
+    {
+      campaignIds: parent.campaignId ? [parent.campaignId] : [],
+      backgroundOwner: parent.campaignId == null && !remoteProvenance,
+      syncPromiseIds: remoteProvenance ? [remoteProvenance.syncPromiseId] : [],
+    },
+  );
+  const schedulableByAoa = new Map(
+    obligations
+      .filter(
+        (obligation) =>
+          obligation.state === "pending" &&
+          obligation.attemptCount < obligation.maxAttempts &&
+          (!obligation.nextSubmitAt ||
+            new Date(obligation.nextSubmitAt).getTime() <= Date.now()),
+      )
+      .map((obligation) => [obligation.aoaDeg, obligation]),
+  );
+  let aoas = retry.aoas.filter((aoa) => schedulableByAoa.has(aoa));
+  if (!aoas.length) return;
+  let obligationIds = aoas.map((aoa) => schedulableByAoa.get(aoa)!.id);
+  const continuations = await precalcContinuationsForObligations(
+    db,
+    obligationIds,
+  );
+  const continuation = continuations[0] ?? null;
+  if (continuation) {
+    // One engine request can resume one saved case. Remaining cells stay
+    // pending and are composed on later ladder ticks.
+    aoas = [continuation.aoaDeg];
+    obligationIds = [continuation.obligationId];
+  }
   const [capacity] = await db
     .select({ cpuSlots: sweeperState.cpuSlots })
     .from(sweeperState)
@@ -569,27 +1483,53 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
     aoaList: aoas,
     wave: 2,
     uransFidelity: "precalc",
-    queuePressure: await dbQueuePressure(db),
+    queuePressure: await solverQueuePressure(db),
     cpuSlots: capacity?.cpuSlots ?? 0,
   });
-  const [job] = await db
-    .insert(simJobs)
-    .values({
+  if (continuation) {
+    request.continue_from = {
+      engine_job_id: continuation.engineJobId,
+      case_slug: continuation.engineCaseSlug,
+    };
+    request.budget_override_s = continuation.budgetOverrideS;
+  }
+  const job = await composeWave2Child(db, {
+    parentJobId: parent.id,
+    revisionId: setup.revisionId,
+    obligationIds,
+    job: {
       parentJobId: parent.id,
       airfoilId: a.id,
       bcIds: [bcId],
       simulationPresetRevisionId: setup.revisionId,
-      campaignId: parent.campaignId,
+      // Physical preliminary work can satisfy several campaigns. Ownership
+      // lives in sim_precalc_obligation_campaigns; a scalar campaign_id would
+      // let one beneficiary cancel every other owner's solve.
+      campaignId: null,
       jobKind: "targeted",
       referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
       wave: 2,
       status: "pending",
       totalCases: aoas.length,
       requestPayload: {
-        syncPromiseId: parentPayload.syncPromiseId,
-        speedMap: [{ speed, bcId, presetRevisionId: setup.revisionId, mach: setup.snapshot.flowState.mach }],
+        ...(remoteProvenance ?? {}),
+        speedMap: [
+          {
+            speed,
+            bcId,
+            presetRevisionId: setup.revisionId,
+            mach: setup.snapshot.flowState.mach,
+          },
+        ],
         aoas,
         parentJobId: parent.id,
+        precalcObligationIds: obligationIds,
+        ...(continuation
+          ? {
+              continueFromResultAttemptId: continuation.resultAttemptId,
+              budgetOverrideS: continuation.budgetOverrideS,
+            }
+          : {}),
         uransFidelity: "precalc",
         retryMode: retry.retryMode,
         validRansPointCount: retry.validRansPointCount,
@@ -598,71 +1538,57 @@ export async function submitUransRetryForJob(db: DB, engine: EngineClient, paren
         resources: request.resources,
         setupSnapshot: setup.snapshot,
       },
-    })
-    .returning({ id: simJobs.id });
+    },
+  });
+  // Another sweeper may have composed the exact child while this caller was
+  // building its request. The parent-locked transaction above is the final
+  // authority; only its winner may call the external engine.
+  if (!job) return;
 
-  if (retry.queueCanonicalAoas.length) {
-    // The stored classification must stay the AT-INGEST verdict (already
-    // refreshed above, before the retry plan): flipping rows to queued and
-    // re-refreshing here rewrote every retried point's classification to a
-    // synthetic post-requeue "not-solved" snapshot, destroying the evidence
-    // trail (prod row 741db07a). No refresh after this flip.
-    await db
-      .update(results)
-      .set({ status: "queued", source: "queued", simJobId: job.id })
-      .where(
-        and(
-          eq(results.airfoilId, a.id),
-          eq(results.simulationPresetRevisionId, setup.revisionId),
-          inArray(results.aoaDeg, retry.queueCanonicalAoas),
-        ),
-      );
-  }
-
-  try {
-    const status = await engine.submitPolar(request);
-    await db
-      .update(simJobs)
-      .set({
-        status: "submitted",
-        engineJobId: status.job_id,
-        submittedAt: new Date(),
-        engineState: status.state,
-        totalCases: status.total_cases,
-      })
-      .where(submittableJobWhere(job.id));
+  const submit = await submitPendingJobWithLifecycleGuard({
+    db,
+    engine,
+    jobId: job.id,
+    campaignId: null,
+    request,
+    connectionErrorPrefix: "engine unreachable at URANS submit: ",
+    submitErrorPrefix: "URANS submit failed: ",
+    precalcObligationIds: obligationIds,
+  });
+  if (submit.kind === "submitted") {
+    await recordPrecalcObligationSubmission(db, job.id, obligationIds);
     console.log(
-      `[sweeper] URANS retry submitted → engine ${status.job_id} (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, airfoil ${parent.airfoilId}, precalc, angles [${aoas.join(", ")}])`,
+      `[sweeper] URANS retry submitted → engine ${submit.status.job_id} (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, airfoil ${parent.airfoilId}, precalc, angles [${aoas.join(", ")}])`,
     );
-  } catch (e) {
-    if (retry.queueCanonicalAoas.length) {
-      await db
-        .update(results)
-        .set({ status: "pending", source: "queued", simJobId: null, engineJobId: null, engineCaseSlug: null })
-        .where(
-          and(
-            eq(results.airfoilId, a.id),
-            eq(results.simulationPresetRevisionId, setup.revisionId),
-            inArray(results.aoaDeg, retry.queueCanonicalAoas),
-            eq(results.simJobId, job.id),
-          ),
-        );
-    }
-    if (isEngineConnectionFailure(e)) {
-      // Engine-down backoff (spec §7): connection failures release the
-      // composed retry instead of burning a `failed` job.
-      await db
-        .update(simJobs)
-        .set({ status: "cancelled", error: "engine unreachable at URANS submit: " + (e as Error).message, finishedAt: new Date() })
-        .where(eq(simJobs.id, job.id));
-      await recordEngineUnreachable(db);
-      return;
-    }
-    await db
-      .update(simJobs)
-      .set({ status: "failed", error: "URANS submit failed: " + (e as Error).message, finishedAt: new Date() })
-      .where(eq(simJobs.id, job.id));
+    return;
   }
+  if (submit.kind === "submission_in_progress") return;
+  if (
+    submit.kind !== "lifecycle_stopped" ||
+    (await campaignIsPaused(db, parent.campaignId))
+  ) {
+    await restoreUnsubmittedWave2Route(db, {
+      airfoilId: a.id,
+      revisionId: setup.revisionId,
+      aoas,
+    });
+  }
+  if (submit.kind === "connection_failure") {
+    await recordEngineUnreachable(db);
+    return;
+  }
+  if (submit.kind === "lifecycle_stopped") {
+    console.log(
+      `[sweeper] URANS retry stopped by campaign lifecycle (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}): ${submit.error}` +
+        (submit.engineCancelError
+          ? `; compensating cancel pending: ${submit.engineCancelError}`
+          : ""),
+    );
+    return;
+  }
+  console.error(
+    `[sweeper] URANS retry submit failed (sim_job ${job.id}, parent ${parent.id}): ${submit.error}`,
+  );
 }
 
 /** RANS→URANS wave-2 for batched campaign parents: retry plans are computed
@@ -677,6 +1603,11 @@ async function submitCampaignUransRetries(
   conditionMap: ConditionMapEntry[],
 ): Promise<void> {
   const parentPayload = requestPayload(parent);
+  const remotePromiseHint =
+    typeof (parentPayload as { syncPromiseId?: unknown }).syncPromiseId ===
+    "string";
+  const remoteProvenance = await remotePromiseProvenanceForJob(db, parent);
+  if (remotePromiseHint && !remoteProvenance) return;
   const children = await db
     .select({ id: simJobs.id, requestPayload: simJobs.requestPayload })
     .from(simJobs)
@@ -684,28 +1615,45 @@ async function submitCampaignUransRetries(
       and(
         eq(simJobs.parentJobId, parent.id),
         eq(simJobs.wave, 2),
-        inArray(simJobs.status, ["pending", "submitted", "running", "ingesting", "done"]),
+        inArray(simJobs.status, [
+          "pending",
+          "submitted",
+          "running",
+          "ingesting",
+        ]),
       ),
     );
   const retriedConditionIds = new Set(
     children
-      .map((child) => ((child.requestPayload ?? {}) as { conditionId?: string }).conditionId)
+      .map(
+        (child) =>
+          ((child.requestPayload ?? {}) as { conditionId?: string })
+            .conditionId,
+      )
       .filter((id): id is string => Boolean(id)),
   );
 
-  const [a] = await db.select().from(airfoils).where(eq(airfoils.id, parent.airfoilId)).limit(1);
+  const [a] = await db
+    .select()
+    .from(airfoils)
+    .where(eq(airfoils.id, parent.airfoilId))
+    .limit(1);
   if (!a) return;
   const [capacity] = await db
     .select({ cpuSlots: sweeperState.cpuSlots })
     .from(sweeperState)
     .where(eq(sweeperState.id, 1))
     .limit(1);
-  const revisionIds = [...new Set(conditionMap.map((entry) => entry.revisionId))];
+  const revisionIds = [
+    ...new Set(conditionMap.map((entry) => entry.revisionId)),
+  ];
   const revisions = await db
     .select()
     .from(simulationPresetRevisions)
     .where(inArray(simulationPresetRevisions.id, revisionIds));
-  const revisionById = new Map(revisions.map((revision) => [revision.id, revision]));
+  const revisionById = new Map(
+    revisions.map((revision) => [revision.id, revision]),
+  );
 
   for (const entry of conditionMap) {
     if (retriedConditionIds.has(entry.conditionId)) continue;
@@ -715,43 +1663,113 @@ async function submitCampaignUransRetries(
     // retrying condition does a cache refresh + retry plan + engine submit.
     await touchHeartbeat(db);
     await refreshPolarCacheForRevision(db, parent.airfoilId, entry.revisionId);
-    const retry = await ransRetryPlanForJobScoped(db, {
+    const plannedRetry = await ransRetryPlanForJobScoped(db, {
       parentJobId: parent.id,
       airfoilId: parent.airfoilId,
       revisionId: entry.revisionId,
       jobKind: parent.jobKind,
       attemptRevisionId: entry.revisionId,
     });
+    const retry = plannedRetry
+      ? await withoutDeterministicPrecalcBlockers(db, {
+          parentJobId: parent.id,
+          airfoilId: parent.airfoilId,
+          revisionId: entry.revisionId,
+          retry: plannedRetry,
+        })
+      : null;
     if (!retry || retry.aoas.length === 0) continue;
+    const obligations = await ensurePrecalcObligations(
+      db,
+      retry.aoas.map((aoaDeg) => ({
+        airfoilId: parent.airfoilId,
+        revisionId: entry.revisionId,
+        aoaDeg,
+      })),
+      {
+        campaignIds: parent.campaignId ? [parent.campaignId] : [],
+        backgroundOwner: parent.campaignId == null && !remoteProvenance,
+        syncPromiseIds: remoteProvenance
+          ? [remoteProvenance.syncPromiseId]
+          : [],
+      },
+    );
+    const schedulableByAoa = new Map(
+      obligations
+        .filter(
+          (obligation) =>
+            obligation.state === "pending" &&
+            obligation.attemptCount < obligation.maxAttempts &&
+            (!obligation.nextSubmitAt ||
+              new Date(obligation.nextSubmitAt).getTime() <= Date.now()),
+        )
+        .map((obligation) => [obligation.aoaDeg, obligation]),
+    );
+    let retryAoas = retry.aoas.filter((aoa) => schedulableByAoa.has(aoa));
+    if (!retryAoas.length) continue;
+    let obligationIds = retryAoas.map((aoa) => schedulableByAoa.get(aoa)!.id);
+    const continuations = await precalcContinuationsForObligations(
+      db,
+      obligationIds,
+    );
+    const continuation = continuations[0] ?? null;
+    if (continuation) {
+      retryAoas = [continuation.aoaDeg];
+      obligationIds = [continuation.obligationId];
+    }
     const snapshot = revision.snapshot as unknown as SimulationSetupSnapshot;
     const { request, speed } = buildPolarRequest({
       airfoil: a,
       setup: snapshot,
-      aoaList: retry.aoas,
+      aoaList: retryAoas,
       wave: 2,
       uransFidelity: "precalc",
-      queuePressure: await dbQueuePressure(db),
+      queuePressure: await solverQueuePressure(db),
       cpuSlots: capacity?.cpuSlots ?? 0,
     });
-    const [job] = await db
-      .insert(simJobs)
-      .values({
+    if (continuation) {
+      request.continue_from = {
+        engine_job_id: continuation.engineJobId,
+        case_slug: continuation.engineCaseSlug,
+      };
+      request.budget_override_s = continuation.budgetOverrideS;
+    }
+    const job = await composeWave2Child(db, {
+      parentJobId: parent.id,
+      revisionId: entry.revisionId,
+      conditionId: entry.conditionId,
+      obligationIds,
+      job: {
         parentJobId: parent.id,
         airfoilId: a.id,
         bcIds: [entry.bcId],
         simulationPresetRevisionId: entry.revisionId,
-        campaignId: parent.campaignId,
+        campaignId: null,
         jobKind: "targeted",
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,
         wave: 2,
         status: "pending",
-        totalCases: retry.aoas.length,
+        totalCases: retryAoas.length,
         requestPayload: {
-          syncPromiseId: parentPayload.syncPromiseId,
-          speedMap: [{ speed, bcId: entry.bcId, presetRevisionId: entry.revisionId, mach: snapshot.flowState.mach }],
-          aoas: retry.aoas,
+          ...(remoteProvenance ?? {}),
+          speedMap: [
+            {
+              speed,
+              bcId: entry.bcId,
+              presetRevisionId: entry.revisionId,
+              mach: snapshot.flowState.mach,
+            },
+          ],
+          aoas: retryAoas,
           parentJobId: parent.id,
           conditionId: entry.conditionId,
+          precalcObligationIds: obligationIds,
+          ...(continuation
+            ? {
+                continueFromResultAttemptId: continuation.resultAttemptId,
+                budgetOverrideS: continuation.budgetOverrideS,
+              }
+            : {}),
           uransFidelity: "precalc",
           retryMode: retry.retryMode,
           validRansPointCount: retry.validRansPointCount,
@@ -760,69 +1778,54 @@ async function submitCampaignUransRetries(
           resources: request.resources,
           setupSnapshot: snapshot,
         },
-      })
-      .returning({ id: simJobs.id });
+      },
+    });
+    if (!job) continue;
 
-    if (retry.queueCanonicalAoas.length) {
-      // Same at-ingest-verdict rule as the single-revision path: the cache was
-      // refreshed BEFORE the retry plan; a post-flip refresh would overwrite
-      // the stored classification with a post-requeue "not-solved" snapshot.
-      await db
-        .update(results)
-        .set({ status: "queued", source: "queued", simJobId: job.id })
-        .where(
-          and(
-            eq(results.airfoilId, a.id),
-            eq(results.simulationPresetRevisionId, entry.revisionId),
-            inArray(results.aoaDeg, retry.queueCanonicalAoas),
-          ),
-        );
-    }
-
-    try {
-      const status = await engine.submitPolar(request);
-      await db
-        .update(simJobs)
-        .set({
-          status: "submitted",
-          engineJobId: status.job_id,
-          submittedAt: new Date(),
-          engineState: status.state,
-          totalCases: status.total_cases,
-        })
-        .where(submittableJobWhere(job.id));
+    const submit = await submitPendingJobWithLifecycleGuard({
+      db,
+      engine,
+      jobId: job.id,
+      campaignId: null,
+      request,
+      connectionErrorPrefix: "engine unreachable at URANS submit: ",
+      submitErrorPrefix: "URANS submit failed: ",
+      precalcObligationIds: obligationIds,
+    });
+    if (submit.kind === "submitted") {
+      await recordPrecalcObligationSubmission(db, job.id, obligationIds);
       console.log(
-        `[sweeper] URANS retry submitted → engine ${status.job_id} (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, airfoil ${parent.airfoilId}, condition ${entry.conditionId}, precalc, angles [${retry.aoas.join(", ")}])`,
+        `[sweeper] URANS retry submitted → engine ${submit.status.job_id} (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, airfoil ${parent.airfoilId}, condition ${entry.conditionId}, precalc, angles [${retryAoas.join(", ")}])`,
       );
-    } catch (e) {
-      if (retry.queueCanonicalAoas.length) {
-        await db
-          .update(results)
-          .set({ status: "pending", source: "queued", simJobId: null, engineJobId: null, engineCaseSlug: null })
-          .where(
-            and(
-              eq(results.airfoilId, a.id),
-              eq(results.simulationPresetRevisionId, entry.revisionId),
-              inArray(results.aoaDeg, retry.queueCanonicalAoas),
-              eq(results.simJobId, job.id),
-            ),
-          );
-      }
-      if (isEngineConnectionFailure(e)) {
-        // Engine-down backoff (spec §7): release this child and stop composing
-        // further children until the engine is reachable again.
-        await db
-          .update(simJobs)
-          .set({ status: "cancelled", error: "engine unreachable at URANS submit: " + (e as Error).message, finishedAt: new Date() })
-          .where(eq(simJobs.id, job.id));
-        await recordEngineUnreachable(db);
-        return;
-      }
-      await db
-        .update(simJobs)
-        .set({ status: "failed", error: "URANS submit failed: " + (e as Error).message, finishedAt: new Date() })
-        .where(eq(simJobs.id, job.id));
+      continue;
     }
+    if (submit.kind === "submission_in_progress") continue;
+    if (
+      submit.kind !== "lifecycle_stopped" ||
+      (await campaignIsPaused(db, parent.campaignId))
+    ) {
+      await restoreUnsubmittedWave2Route(db, {
+        airfoilId: a.id,
+        revisionId: entry.revisionId,
+        aoas: retryAoas,
+      });
+    }
+    if (submit.kind === "connection_failure") {
+      await recordEngineUnreachable(db);
+      return;
+    }
+    if (submit.kind === "lifecycle_stopped") {
+      console.log(
+        `[sweeper] URANS retry stopped by campaign lifecycle (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, condition ${entry.conditionId}): ${submit.error}` +
+          (submit.engineCancelError
+            ? `; compensating cancel pending: ${submit.engineCancelError}`
+            : ""),
+      );
+      return;
+    }
+    console.error(
+      `[sweeper] URANS retry submit failed (sim_job ${job.id}, parent ${parent.id}, condition ${entry.conditionId}): ${submit.error}`,
+    );
   }
 }
 
@@ -831,122 +1834,264 @@ async function submitCampaignUransRetries(
  *  unjudged points), so after the refresh the campaign's counters must absorb
  *  the verdicts (rejected bucket) and the probe must run again to settle
  *  completed vs attention honestly. */
-async function settleCampaignAfterRefresh(db: DB, job: SimJobRow): Promise<void> {
-  if (!job.campaignId) return;
-  try {
-    await recomputeProgressForCampaign(db, job.campaignId);
-    await probeCampaignCompletion(db, job.campaignId);
-  } catch (e) {
-    // Counters/probe hiccups (e.g. a recompute deadlock against the periodic
-    // reconciler) must not fail an already-ingested job — the reconciler
-    // heals counters and re-probes within its 5-minute sweep. Loud, never silent.
-    console.error(`[sweeper] campaign settle failed (campaign ${job.campaignId}, job ${job.id}): ${errorMessage(e)}`);
+export async function settleCampaignAfterRefresh(
+  db: DB,
+  job: SimJobRow,
+): Promise<void> {
+  const payload = (job.requestPayload ?? {}) as {
+    uransRequestId?: unknown;
+    verifyQueueItemId?: unknown;
+    aoas?: unknown;
+  };
+  const requestId =
+    typeof payload.uransRequestId === "string" ? payload.uransRequestId : null;
+  const verifyQueueItemId =
+    typeof payload.verifyQueueItemId === "string"
+      ? payload.verifyQueueItemId
+      : null;
+  const aoas = Array.isArray(payload.aoas)
+    ? payload.aoas.filter(
+        (aoa): aoa is number => typeof aoa === "number" && Number.isFinite(aoa),
+      )
+    : [];
+  const directOwner = job.campaignId
+    ? sql`SELECT ${job.campaignId}::uuid AS campaign_id`
+    : sql`SELECT NULL::uuid AS campaign_id WHERE false`;
+  const requestOwners = requestId
+    ? sql`SELECT campaign_id FROM sim_urans_request_campaigns WHERE request_id::text = ${requestId}`
+    : sql`SELECT NULL::uuid AS campaign_id WHERE false`;
+  const verifyOwners = verifyQueueItemId
+    ? sql`SELECT campaign_id FROM sim_urans_verify_queue_campaigns WHERE queue_id::text = ${verifyQueueItemId}`
+    : sql`SELECT NULL::uuid AS campaign_id WHERE false`;
+  // Association rows are authoritative. The physical-cell fallback also
+  // catches a campaign attached after a background/shared solve was already
+  // submitted but before its refreshed evidence settled.
+  const pointOwners =
+    job.simulationPresetRevisionId && aoas.length
+      ? sql`
+        SELECT DISTINCT campaign_id
+        FROM sim_campaign_points
+        WHERE airfoil_id = ${job.airfoilId}
+          AND revision_id = ${job.simulationPresetRevisionId}
+          AND aoa_deg = ANY(${sql`ARRAY[${sql.join(
+            aoas.map((aoa) => sql`${aoa}::float8`),
+            sql`, `,
+          )}]`})
+          AND state <> 'released'
+      `
+      : sql`SELECT NULL::uuid AS campaign_id WHERE false`;
+  const owners = (await db.execute(sql`
+    SELECT DISTINCT owner.campaign_id
+    FROM (
+      ${directOwner}
+      UNION ALL ${requestOwners}
+      UNION ALL ${verifyOwners}
+      UNION ALL ${pointOwners}
+    ) owner
+    WHERE owner.campaign_id IS NOT NULL
+    ORDER BY owner.campaign_id
+  `)) as unknown as Array<{ campaign_id: string }>;
+
+  for (const owner of owners) {
+    try {
+      await recomputeProgressForCampaign(db, owner.campaign_id);
+      await probeCampaignCompletion(db, owner.campaign_id);
+    } catch (e) {
+      // Counters/probe hiccups (e.g. a recompute deadlock against the periodic
+      // reconciler) must not fail an already-ingested job — the reconciler
+      // heals counters and re-probes within its 5-minute sweep. Loud, never silent.
+      console.error(
+        `[sweeper] campaign settle failed (campaign ${owner.campaign_id}, job ${job.id}): ${errorMessage(e)}`,
+      );
+    }
   }
 }
 
 /** Auto-retry-once (amendment B): requeue this job's unmarked crash-class
- *  failed rows exactly once and log BOTH directions loudly — the requeue and
- *  the escalation. Runs AFTER every polar-cache refresh of the terminal ingest
- *  path (flipping a row to pending before a refresh would overwrite its stored
- *  at-ingest classification — prod row 741db07a) and AFTER the wave-2 retry
- *  submit (angles the URANS ladder just claimed are queued, not failed, so the
- *  two retry mechanisms can never double-schedule one cell). Never throws: a
+ *  failed rows exactly once and log all three directions loudly — retry,
+ *  deterministic mesh-QA suppression, and exhausted escalation. Runs AFTER
+ *  every polar-cache refresh of the terminal ingest path (flipping a row to
+ *  pending before a refresh would overwrite its stored at-ingest
+ *  classification — prod row 741db07a) and AFTER the wave-2 retry submit
+ *  (angles the URANS ladder just claimed are queued, not failed, so the two
+ *  retry mechanisms can never double-schedule one cell). Never throws: a
  *  bookkeeping hiccup must not fail an already-ingested job. */
-async function autoRetryFailedPointsForJob(db: DB, job: SimJobRow): Promise<void> {
+async function autoRetryFailedPointsForJob(
+  db: DB,
+  job: SimJobRow,
+): Promise<void> {
   try {
     const outcome = await autoRetryCrashedResultsForJob(db, job.id);
     for (const cell of outcome.retried) {
       console.error(
-        `[sweeper] AUTO-RETRY: crash-class failed point requeued ONCE (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — a second crash escalates to needs review`,
+        `[sweeper] AUTO-RETRY: crash-class failed point requeued ONCE (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — a second crash remains failed and blocked`,
+      );
+    }
+    for (const cell of outcome.precalcRouted) {
+      console.error(
+        `[sweeper] AUTO-RETRY: precalc crash routed ONCE to the wave-2 ladder (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — queued for another forced-transient precalc child; never downgraded to a wave-1 campaign gap`,
+      );
+    }
+    for (const cell of outcome.suppressed) {
+      console.error(
+        `[sweeper] AUTO-RETRY SUPPRESSED: deterministic mesh QA blocker on immutable precalc setup (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — unchanged retry would reproduce the same mesh; evidence retained, point stays blocked until the mesh setup is repaired`,
+      );
+    }
+    for (const cell of outcome.terminalBlocked) {
+      console.error(
+        `[sweeper] PRECALC RETRY BLOCKED: no authorized retry remains (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — evidence retained as failed; cancelled owners are not reopened and bounded continuations are not repeated`,
       );
     }
     for (const cell of outcome.escalated) {
       console.error(
-        `[sweeper] AUTO-RETRY EXHAUSTED: point failed again after its automatic retry (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — stays failed, needs review`,
+        `[sweeper] AUTO-RETRY EXHAUSTED: point failed again after its automatic retry (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — stays failed and blocked; no human coefficient review is assigned`,
       );
     }
   } catch (e) {
-    console.error(`[sweeper] auto-retry pass FAILED (sim_job ${job.id}): ${errorMessage(e)}`);
+    console.error(
+      `[sweeper] auto-retry pass FAILED (sim_job ${job.id}): ${errorMessage(e)}`,
+    );
   }
 }
 
-async function ingestCompletedJob(db: DB, engine: EngineClient, job: SimJobRow): Promise<void> {
-  if (!job.engineJobId) return;
-  const result = await engine.getResult(job.engineJobId);
-  const speedMap = speedMapForJob(job);
-  const ingested = await ingestResult({
-    db,
-    engine,
-    engineJobId: job.engineJobId,
-    simJobId: job.id,
-    airfoilId: job.airfoilId,
-    speedMap,
-    conditionMap: conditionMapForJob(job) ?? undefined,
-    uransFidelity: uransFidelityForJob(job),
-    result,
-  });
-  collectDirtyLanes(ingested.dirtyLanes);
-  await refreshPolarCachesForJob(db, job);
-  // Fidelity ladder: fresh verdicts exist now — enqueue verifications for
-  // accepted precalc rows and settle verify/request bookkeeping.
-  await enqueueVerificationsForJob(db, job);
-  await settleUransLadderForJob(db, job);
-  await db
-    .update(simJobs)
-    .set({ status: "done", engineState: "completed", error: null, ingestedAt: new Date(), finishedAt: new Date() })
-    .where(reconcilableJobWhere(job.id));
-  await submitUransRetryForJob(db, engine, job);
-  // Amendment B: a COMPLETED job can still ship individual crashed points
-  // (per-case solver error → failed rows) — same one-shot requeue.
-  await autoRetryFailedPointsForJob(db, job);
-  await settleCampaignAfterRefresh(db, job);
+async function renewIngestAndHeartbeat(
+  db: DB,
+  lease: Pick<IngestLease, "jobId" | "token">,
+): Promise<void> {
+  await renewIngestLeaseOrThrow(db, lease);
+  await touchHeartbeat(db);
 }
 
-async function ingestRunningPartialJob(db: DB, engine: EngineClient, job: SimJobRow): Promise<boolean> {
+async function ingestCompletedJob(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+): Promise<void> {
+  if (!job.engineJobId) return;
+  const lease = await claimJobForIngest(db, job.id);
+  if (!lease) return;
+  try {
+    const result = await engine.getResult(job.engineJobId);
+    await renewIngestLeaseOrThrow(db, lease);
+    const speedMap = speedMapForJob(job);
+    const ingested = await ingestResult({
+      db,
+      engine,
+      engineJobId: job.engineJobId,
+      simJobId: job.id,
+      airfoilId: job.airfoilId,
+      speedMap,
+      conditionMap: conditionMapForJob(job) ?? undefined,
+      uransFidelity: uransFidelityForJob(job),
+      result,
+      ingestLeaseToken: lease.token,
+      heartbeat: () => renewIngestAndHeartbeat(db, lease),
+    });
+    collectDirtyLanes(ingested.dirtyLanes);
+    await renewIngestLeaseOrThrow(db, lease);
+    await refreshPolarCachesForJob(db, job, () =>
+      renewIngestAndHeartbeat(db, lease),
+    );
+    // Fidelity ladder: fresh verdicts exist now — enqueue verifications for
+    // accepted precalc rows and settle verify/request bookkeeping.
+    await renewIngestLeaseOrThrow(db, lease);
+    await enqueueVerificationsForJob(db, job);
+    await settleUransLadderForJob(db, job);
+    await renewIngestLeaseOrThrow(db, lease);
+    await submitUransRetryForJob(db, engine, job);
+    // Amendment B: a COMPLETED job can still ship individual crashed points
+    // (per-case solver error → failed rows) — same one-shot requeue.
+    await autoRetryFailedPointsForJob(db, job);
+    await settleCampaignAfterRefresh(db, job);
+    const [finished] = await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        engineState: "completed",
+        // A completed engine result means every composed case reached a
+        // terminal outcome, including honestly rejected/failed cases.  The
+        // runtime-result fast path can ingest before a readable status poll,
+        // so leaving this stale made completed jobs appear one case behind.
+        completedCases: job.totalCases,
+        error: null,
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeaseExpiresAt: null,
+      })
+      .where(ingestLeaseOwnedWhere(job.id, lease.token))
+      .returning({ id: simJobs.id });
+    if (!finished) throw new IngestLeaseLostError(job.id);
+  } catch (error) {
+    await markIngestRetry(db, job.id, error, lease);
+    throw error;
+  }
+}
+
+async function ingestRunningPartialJob(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+): Promise<boolean> {
   if (!job.engineJobId) return false;
+  const lease = await claimJobForIngest(db, job.id);
+  if (!lease) return false;
   let result;
   try {
     result = await engine.getResult(job.engineJobId);
   } catch {
+    await releaseIngestLeaseToRunning(db, lease);
     return false;
   }
-  if (result.state !== "running") return false;
-  const ingested = await ingestResult({
-    db,
-    engine,
-    engineJobId: job.engineJobId,
-    simJobId: job.id,
-    airfoilId: job.airfoilId,
-    speedMap: speedMapForJob(job),
-    conditionMap: conditionMapForJob(job) ?? undefined,
-    uransFidelity: uransFidelityForJob(job),
-    result,
-  });
-  collectDirtyLanes(ingested.dirtyLanes);
-  if (ingested.points > 0) {
-    await refreshPolarCachesForJob(db, job);
-    // Amendment B, live gap 2026-07-08 (campaign 495d78e0, s1223 −5°): a
-    // divergence-condemned case terminalizes its point MID-RUN — the engine's
-    // marched path ships the failed point in the RUNNING partial result
-    // (jobs.py record_outcome → write_partial_result_locked) while sibling
-    // angles keep marching for many more minutes, so a hook only on the
-    // TERMINAL ingest paths left the cell failed/needs_review with no retry
-    // marker and no log for the whole remainder of the job. The one-shot
-    // requeue runs here too, AFTER the refresh (at-ingest classification
-    // preserved — prod row 741db07a), exactly like every terminal-path call.
-    // The released row is protected from the same job's later partial/terminal
-    // re-ships of the identical failed case by the released-cell guard in
-    // ingestResult (a re-fail there would falsely consume the escalation).
-    await autoRetryFailedPointsForJob(db, job);
+  if (result.state !== "running") {
+    await releaseIngestLeaseToRunning(db, lease);
+    return false;
   }
-  return ingested.points > 0 || ingested.media > 0;
+  try {
+    await renewIngestLeaseOrThrow(db, lease);
+    const ingested = await ingestResult({
+      db,
+      engine,
+      engineJobId: job.engineJobId,
+      simJobId: job.id,
+      airfoilId: job.airfoilId,
+      speedMap: speedMapForJob(job),
+      conditionMap: conditionMapForJob(job) ?? undefined,
+      uransFidelity: uransFidelityForJob(job),
+      result,
+      ingestLeaseToken: lease.token,
+      heartbeat: () => renewIngestAndHeartbeat(db, lease),
+    });
+    collectDirtyLanes(ingested.dirtyLanes);
+    if (ingested.points > 0) {
+      await renewIngestLeaseOrThrow(db, lease);
+      await refreshPolarCachesForJob(db, job, () =>
+        renewIngestAndHeartbeat(db, lease),
+      );
+      // Amendment B, live gap 2026-07-08 (campaign 495d78e0, s1223 −5°): a
+      // divergence-condemned case terminalizes its point MID-RUN. The
+      // one-shot retry runs after the at-ingest classification refresh.
+      await autoRetryFailedPointsForJob(db, job);
+    }
+    const changed = ingested.points > 0 || ingested.media > 0;
+    if (!(await releaseIngestLeaseToRunning(db, lease))) {
+      throw new IngestLeaseLostError(job.id);
+    }
+    return changed;
+  } catch (error) {
+    await markIngestRetry(db, job.id, error, lease);
+    throw error;
+  }
 }
 
 function speedMapForJob(job: SimJobRow): SpeedBc[] {
-  const rawSpeedMap = ((job.requestPayload as { speedMap?: SpeedBc[] } | null)?.speedMap ?? []) as SpeedBc[];
+  const rawSpeedMap = ((job.requestPayload as { speedMap?: SpeedBc[] } | null)
+    ?.speedMap ?? []) as SpeedBc[];
   return rawSpeedMap.map((row) => ({
     ...row,
-    presetRevisionId: row.presetRevisionId ?? job.simulationPresetRevisionId ?? null,
+    presetRevisionId:
+      row.presetRevisionId ?? job.simulationPresetRevisionId ?? null,
   }));
 }
 
@@ -955,7 +2100,9 @@ function speedMapForJob(job: SimJobRow): SpeedBc[] {
  *  'unknown', which is exactly how the 2026-07-04 worker-restart incident
  *  surfaced ("15 failed", errorClass unknown, no error text anywhere). */
 function nonEmptyFailureMessage(job: SimJobRow, msg: string): string {
-  return msg.trim() ? msg : `engine job failed without a message (job ${job.engineJobId ?? job.id})`;
+  return msg.trim()
+    ? msg
+    : `engine job failed without a message (job ${job.engineJobId ?? job.id})`;
 }
 
 /** Keep ONLY solved points of a partial result: worker-restart orphan ingest
@@ -966,7 +2113,10 @@ function nonEmptyFailureMessage(job: SimJobRow, msg: string): string {
 function solvedPointsOnly(result: JobResult): JobResult {
   return {
     ...result,
-    polars: result.polars.map((polar) => ({ ...polar, points: polar.points.filter((p) => !failedForPoint(p)) })),
+    polars: result.polars.map((polar) => ({
+      ...polar,
+      points: polar.points.filter((p) => !failedForPoint(p)),
+    })),
   };
 }
 
@@ -988,7 +2138,12 @@ function solvedPointsOnly(result: JobResult): JobResult {
  *  snapshot as 'rejected' until re-solved — deciding now could escalate
  *  interrupted points to whole-polar URANS; the follow-up re-solve job runs
  *  the same revision-wide retry pass on real evidence instead. */
-async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: SimJobRow): Promise<void> {
+async function releaseWorkerRestartOrphan(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+  lease: IngestLease,
+): Promise<void> {
   let solvedPoints = 0;
   if (job.engineJobId) {
     try {
@@ -1003,10 +2158,18 @@ async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: Sim
         conditionMap: conditionMapForJob(job) ?? undefined,
         uransFidelity: uransFidelityForJob(job),
         result: solvedPointsOnly(result),
+        ingestLeaseToken: lease.token,
+        heartbeat: () => renewIngestAndHeartbeat(db, lease),
       });
       collectDirtyLanes(ingested.dirtyLanes);
       solvedPoints = ingested.points;
     } catch (e) {
+      if (e instanceof IngestLeaseLostError) {
+        console.error(
+          `[sweeper] ${e.message}; stale orphan-recovery owner stopped`,
+        );
+        return;
+      }
       // No readable partial result (or ingest hiccup): nothing solved to
       // preserve — release everything below. Loud, never silent.
       console.error(
@@ -1017,11 +2180,23 @@ async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: Sim
   console.error(
     `[sweeper] WORKER RESTART orphan ${job.engineJobId ?? "(unsubmitted)"} (sim_job ${job.id}): ${solvedPoints} solved point(s) kept as evidence, remaining claims released for re-solve — nothing marked failed`,
   );
-  await cancelJobAndReleaseClaims(db, job, "worker restarted mid-solve; points released for re-solve");
   if (solvedPoints > 0) {
-    await refreshPolarCachesForJob(db, job);
+    await renewIngestLeaseOrThrow(db, lease);
+    await refreshPolarCachesForJob(db, job, () =>
+      renewIngestAndHeartbeat(db, lease),
+    );
     await enqueueVerificationsForJob(db, job);
     await settleCampaignAfterRefresh(db, job);
+  }
+  if (
+    !(await cancelJobAndReleaseClaims(
+      db,
+      job,
+      "worker restarted mid-solve; points released for re-solve",
+      lease,
+    ))
+  ) {
+    throw new IngestLeaseLostError(job.id);
   }
 }
 
@@ -1029,31 +2204,57 @@ async function releaseWorkerRestartOrphan(db: DB, engine: EngineClient, job: Sim
  *  addressing only; absent/odd payloads render as an empty list. */
 function anglesForJob(job: SimJobRow): number[] {
   const raw = (requestPayload(job) as { aoas?: unknown }).aoas;
-  return Array.isArray(raw) ? raw.filter((a): a is number => typeof a === "number" && Number.isFinite(a)) : [];
+  return Array.isArray(raw)
+    ? raw.filter(
+        (a): a is number => typeof a === "number" && Number.isFinite(a),
+      )
+    : [];
 }
 
 /** One-line job-failed event (gate incident 2026-07-07: campaign a1802299's
  *  only job failed and the sweeper logged NOTHING between claim and terminal
  *  failure). Every terminal failed-ingest outcome emits exactly one of these
  *  with full addressing + an explicit verdict. */
-function logEngineJobFailed(job: SimJobRow, failure: string, counts: { points: number; attempts: number }, verdict: string): void {
+function logEngineJobFailed(
+  job: SimJobRow,
+  failure: string,
+  counts: { points: number; attempts: number },
+  verdict: string,
+): void {
   console.error(
     `[sweeper] engine job FAILED (engine ${job.engineJobId ?? "-"}, sim_job ${job.id}, campaign ${job.campaignId ?? "-"}, airfoil ${job.airfoilId}, angles [${anglesForJob(job).join(", ")}]): ${failure} — ${counts.points} point(s), ${counts.attempts} attempt(s) ingested; ${verdict}`,
   );
 }
 
-async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRow, msg: string): Promise<void> {
+async function ingestFailedEngineJob(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+  msg: string,
+  hooks: ReconcileOptions["testHooks"] = {},
+): Promise<void> {
+  const lease = await claimJobForIngest(db, job.id);
+  if (!lease) return;
   if (msg === WORKER_RESTART_ORPHAN_MESSAGE) {
     // Infrastructure interruption, not solver failure — release, never fail.
-    await releaseWorkerRestartOrphan(db, engine, job);
+    await releaseWorkerRestartOrphan(db, engine, job, lease);
     return;
   }
   if (!job.engineJobId) {
     const failure = nonEmptyFailureMessage(job, msg);
-    logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, "never submitted to the engine; rows failed");
-    await failJob(db, job.id, failure);
-    await settleUransLadderForJob(db, job);
+    logEngineJobFailed(
+      job,
+      failure,
+      { points: 0, attempts: 0 },
+      "never submitted to the engine; rows failed",
+    );
+    if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+      return;
+    await settleUransLadderForJob(db, job, { terminalError: failure });
     await autoRetryFailedPointsForJob(db, job);
+    if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
+      throw new IngestLeaseLostError(job.id);
+    }
     return;
   }
   let result: JobResult;
@@ -1061,10 +2262,19 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
     result = await engine.getResult(job.engineJobId);
   } catch (e) {
     const failure = nonEmptyFailureMessage(job, msg);
-    logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, `result payload unreadable (${errorMessage(e)}); rows failed with the status message`);
-    await failJob(db, job.id, failure);
-    await settleUransLadderForJob(db, job);
+    logEngineJobFailed(
+      job,
+      failure,
+      { points: 0, attempts: 0 },
+      `result payload unreadable (${errorMessage(e)}); rows failed with the status message`,
+    );
+    if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+      return;
+    await settleUransLadderForJob(db, job, { terminalError: failure });
     await autoRetryFailedPointsForJob(db, job);
+    if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
+      throw new IngestLeaseLostError(job.id);
+    }
     return;
   }
   // The ENGINE's own failure message wins (gate incident 2026-07-07: the
@@ -1072,8 +2282,14 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
   // the real "All cases failed" never reached the evidence rows): prefer the
   // result payload's message, then the caller's status-derived msg, then the
   // pinned non-empty fallback.
-  const failure = nonEmptyFailureMessage(job, typeof result.message === "string" && result.message.trim() ? result.message : msg);
+  const failure = nonEmptyFailureMessage(
+    job,
+    typeof result.message === "string" && result.message.trim()
+      ? result.message
+      : msg,
+  );
   try {
+    await renewIngestLeaseOrThrow(db, lease);
     const ingested = await ingestResult({
       db,
       engine,
@@ -1085,17 +2301,28 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       uransFidelity: uransFidelityForJob(job),
       result,
       failedPointErrorFallback: failure,
+      ingestLeaseToken: lease.token,
+      heartbeat: () => renewIngestAndHeartbeat(db, lease),
     });
     collectDirtyLanes(ingested.dirtyLanes);
     if (ingested.points === 0) {
-      await failJob(db, job.id, failure);
+      if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+        return;
       if (ingested.attempts === 0) {
         // True crash: the payload shipped no evidence at all — current
         // terminal-fail behavior, now loud. The exact crash-class shape the
         // auto-retry-once amendment covers.
-        await settleUransLadderForJob(db, job);
-        logEngineJobFailed(job, failure, ingested, "no shipped evidence; rows failed");
+        await settleUransLadderForJob(db, job, { terminalError: failure });
+        logEngineJobFailed(
+          job,
+          failure,
+          ingested,
+          "no shipped evidence; rows failed",
+        );
         await autoRetryFailedPointsForJob(db, job);
+        if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
+          throw new IngestLeaseLostError(job.id);
+        }
         return;
       }
       // All-rejected job (gate incident 2026-07-07, job a2379532): points: []
@@ -1106,43 +2333,95 @@ async function ingestFailedEngineJob(db: DB, engine: EngineClient, job: SimJobRo
       // and keep the wave-2 gated retry reachable: before this branch existed
       // points===0 returned ABOVE submitUransRetryForJob, so a fully-rejected
       // (e.g. single-point) campaign job could never escalate to URANS.
-      await db
-        .update(simJobs)
-        .set({ engineState: "failed", ingestedAt: new Date(), finishedAt: new Date() })
-        .where(eq(simJobs.id, job.id));
-      await refreshPolarCachesForJob(db, job);
-      await settleUransLadderForJob(db, job);
-      logEngineJobFailed(job, failure, ingested, "attempt evidence kept on the failed rows; gated URANS retry evaluated");
+      await renewIngestLeaseOrThrow(db, lease);
+      await refreshPolarCachesForJob(db, job, () =>
+        renewIngestAndHeartbeat(db, lease),
+      );
+      await settleUransLadderForJob(db, job, { terminalError: failure });
+      logEngineJobFailed(
+        job,
+        failure,
+        ingested,
+        "attempt evidence kept on the failed rows; gated URANS retry evaluated",
+      );
       await submitUransRetryForJob(db, engine, job);
       // Amendment B: rows the wave-2 retry did NOT claim get their one
       // automatic requeue (after the refresh — at-ingest verdicts preserved).
       await autoRetryFailedPointsForJob(db, job);
       await settleCampaignAfterRefresh(db, job);
+      if (
+        !(await finalizeOwnedFailedJob(db, job.id, failure, lease, {
+          evidenceIngested: true,
+        }))
+      ) {
+        throw new IngestLeaseLostError(job.id);
+      }
       return;
     }
-    await refreshPolarCachesForJob(db, job);
+    // A terminal payload may re-ship only the cases that produced evidence.
+    // Fail every still-owned queued/running cell before classification and
+    // auto-retry so omitted sibling cases are not stranded under a dead job.
+    // Published points are already done/failed, while late quarantined output
+    // no longer owns its cell and is therefore excluded by simJobId.
+    if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+      return;
+    await renewIngestLeaseOrThrow(db, lease);
+    await refreshPolarCachesForJob(db, job, () =>
+      renewIngestAndHeartbeat(db, lease),
+    );
     await enqueueVerificationsForJob(db, job);
-    await settleUransLadderForJob(db, job);
-    await db
-      .update(simJobs)
-      .set({ status: "failed", engineState: "failed", error: failure, ingestedAt: new Date(), finishedAt: new Date() })
-      .where(reconcilableJobWhere(job.id));
-    logEngineJobFailed(job, failure, ingested, "partial evidence ingested; failed rows carry the engine message");
+    await settleUransLadderForJob(db, job, { terminalError: failure });
+    logEngineJobFailed(
+      job,
+      failure,
+      ingested,
+      "partial evidence ingested; failed rows carry the engine message",
+    );
+    await renewIngestLeaseOrThrow(db, lease);
     await submitUransRetryForJob(db, engine, job);
     // Amendment B: crashed points of a partially-failed job requeue once.
     await autoRetryFailedPointsForJob(db, job);
     await settleCampaignAfterRefresh(db, job);
+    if (
+      !(await finalizeOwnedFailedJob(db, job.id, failure, lease, {
+        evidenceIngested: true,
+      }))
+    ) {
+      throw new IngestLeaseLostError(job.id);
+    }
   } catch (e) {
+    if (e instanceof IngestLeaseLostError) {
+      console.error(
+        `[sweeper] ${e.message}; stale owner stopped without changing the recovered job`,
+      );
+      return;
+    }
     // Loud, never silent (the old bare catch was exactly how a mid-ingest
     // hiccup erased all trace of the shipped evidence).
-    logEngineJobFailed(job, failure, { points: 0, attempts: 0 }, `failed-result ingest errored (${errorMessage(e)}); rows failed`);
-    await failJob(db, job.id, failure);
-    await settleUransLadderForJob(db, job);
+    logEngineJobFailed(
+      job,
+      failure,
+      { points: 0, attempts: 0 },
+      `failed-result ingest errored (${errorMessage(e)}); rows failed`,
+    );
+    if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+      return;
+    await settleUransLadderForJob(db, job, { terminalError: failure });
     await autoRetryFailedPointsForJob(db, job);
+    if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
+      console.error(
+        `[sweeper] ingest lease lost while terminalizing failed sim_job ${job.id}`,
+      );
+    }
   }
 }
 
-async function ingestResultFileIfReady(db: DB, engine: EngineClient, job: SimJobRow, failedMessage = "engine job failed"): Promise<boolean> {
+async function ingestResultFileIfReady(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+  failedMessage = "engine job failed",
+): Promise<boolean> {
   if (!job.engineJobId) return false;
   let result;
   try {
@@ -1155,19 +2434,32 @@ async function ingestResultFileIfReady(db: DB, engine: EngineClient, job: SimJob
     return true;
   }
   if (result.state === "failed") {
-    await ingestFailedEngineJob(db, engine, job, result.message ?? failedMessage);
+    await ingestFailedEngineJob(
+      db,
+      engine,
+      job,
+      result.message ?? failedMessage,
+    );
     return true;
   }
   if (result.state === "cancelled") {
     // G2 dispatch site 2 (terminal result handling): a cancelled result file
     // is terminal like failed, but its coefficients must NEVER be ingested.
-    await cancelJobAndReleaseClaims(db, job, result.message ?? "engine result marks job cancelled; claims released");
+    await cancelJobAndReleaseClaims(
+      db,
+      job,
+      result.message ?? "engine result marks job cancelled; claims released",
+    );
     return true;
   }
   return false;
 }
 
-async function recoverFailedEngineJobs(db: DB, engine: EngineClient, ids?: string[]): Promise<void> {
+async function recoverFailedEngineJobs(
+  db: DB,
+  engine: EngineClient,
+  ids?: string[],
+): Promise<void> {
   const filters = [
     eq(simJobs.status, "failed"),
     isNotNull(simJobs.engineJobId),
@@ -1197,7 +2489,14 @@ async function recoverFailedEngineJobs(db: DB, engine: EngineClient, ids?: strin
       status = await engine.getJob(job.engineJobId);
     } catch (e) {
       try {
-        if (await ingestResultFileIfReady(db, engine, job, "engine status is unavailable but result file is ready")) {
+        if (
+          await ingestResultFileIfReady(
+            db,
+            engine,
+            job,
+            "engine status is unavailable but result file is ready",
+          )
+        ) {
           continue;
         }
       } catch (ingestError) {
@@ -1206,24 +2505,87 @@ async function recoverFailedEngineJobs(db: DB, engine: EngineClient, ids?: strin
       }
       const listed = await engineQueueMentionsJob(engine, job.engineJobId);
       if (listed) {
-        await db
+        const [restored] = await db
           .update(simJobs)
-          .set({ status: "running", engineState: "running", error: null, polledAt: new Date(), finishedAt: null })
-          .where(eq(simJobs.id, job.id));
-        await db
-          .update(results)
-          .set({ status: "running", source: "queued", engineJobId: job.engineJobId })
-          .where(and(eq(results.simJobId, job.id), inArray(results.status, ["failed", "queued", "running", "pending", "stale"])));
-      } else if (isNotFound(e) && (job.error ?? "").startsWith("engine job not found")) {
-        await requeueLostJob(db, job, "engine job disappeared; safely requeued for a fresh solve");
+          .set({
+            status: "running",
+            engineState: "running",
+            error: null,
+            polledAt: new Date(),
+            finishedAt: null,
+            ingestLeaseToken: null,
+            ingestLeaseClaimedAt: null,
+            ingestLeaseExpiresAt: null,
+          })
+          .where(reconcilableJobWhere(job.id))
+          .returning({ id: simJobs.id });
+        if (restored) {
+          await db
+            .update(results)
+            .set({
+              status: "running",
+              source: "queued",
+              engineJobId: job.engineJobId,
+            })
+            .where(
+              and(
+                eq(results.simJobId, job.id),
+                inArray(results.status, [
+                  "failed",
+                  "queued",
+                  "running",
+                  "pending",
+                  "stale",
+                ]),
+              ),
+            );
+        }
+      } else if (
+        isNotFound(e) &&
+        (job.error ?? "").startsWith("engine job not found")
+      ) {
+        await requeueLostJob(
+          db,
+          job,
+          "engine job disappeared; safely requeued for a fresh solve",
+        );
       }
       continue;
     }
 
-    await db
-      .update(results)
-      .set({ status: status.state === "completed" ? "queued" : "running", source: "queued", engineJobId: job.engineJobId })
-      .where(and(eq(results.simJobId, job.id), inArray(results.status, ["failed", "queued", "running", "pending", "stale"])));
+    if (status.state === "pending" || status.state === "running") {
+      await db
+        .update(results)
+        .set({
+          status: "running",
+          source: "queued",
+          engineJobId: job.engineJobId,
+        })
+        .where(
+          and(
+            eq(results.simJobId, job.id),
+            inArray(results.status, [
+              "failed",
+              "queued",
+              "running",
+              "pending",
+              "stale",
+            ]),
+            sql`EXISTS (
+              SELECT 1 FROM sim_jobs poll_job
+              WHERE poll_job.id = ${job.id}
+                AND (
+                  poll_job.status <> 'ingesting'
+                  OR poll_job.ingest_lease_expires_at <= now()
+                  OR (
+                    poll_job.ingest_lease_expires_at IS NULL
+                    AND poll_job."updatedAt" < now() - (${DEFAULT_INGEST_LEASE_MS} * interval '1 millisecond')
+                  )
+                )
+            )`,
+          ),
+        );
+    }
     await updateJobFromEngineStatus(db, job, status);
 
     if (status.state === "completed") {
@@ -1233,12 +2595,22 @@ async function recoverFailedEngineJobs(db: DB, engine: EngineClient, ids?: strin
         await markIngestRetry(db, job.id, e);
       }
     } else if (status.state === "failed") {
-      await ingestFailedEngineJob(db, engine, job, status.message ?? "engine job failed");
+      await ingestFailedEngineJob(
+        db,
+        engine,
+        job,
+        status.message ?? "engine job failed",
+      );
     }
   }
 }
 
-async function keepDetachedRunning(db: DB, job: SimJobRow, runtime: JobRuntimeSummary, msg: string): Promise<void> {
+async function keepDetachedRunning(
+  db: DB,
+  job: SimJobRow,
+  runtime: JobRuntimeSummary,
+  msg: string,
+): Promise<void> {
   await db
     .update(simJobs)
     .set({
@@ -1249,11 +2621,21 @@ async function keepDetachedRunning(db: DB, job: SimJobRow, runtime: JobRuntimeSu
       error: msg,
       polledAt: new Date(),
       finishedAt: null,
+      ingestLeaseToken: null,
+      ingestLeaseClaimedAt: null,
+      ingestLeaseExpiresAt: null,
     })
     .where(activeJobWhere(job.id));
 }
 
-async function handlePollMiss(db: DB, engine: EngineClient, job: SimJobRow, e: unknown, queue: EngineQueueState | null, runtime: JobRuntimeSummary | null): Promise<void> {
+async function handlePollMiss(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+  e: unknown,
+  queue: EngineQueueState | null,
+  runtime: JobRuntimeSummary | null,
+): Promise<void> {
   if (!job.engineJobId) return;
   const classified = classifyQueueLifecycle(job, runtime, queue);
   if (runtime?.has_result && runtime.result_readable) {
@@ -1267,7 +2649,12 @@ async function handlePollMiss(db: DB, engine: EngineClient, job: SimJobRow, e: u
       // The engine's REAL failure message lives on the status ("All cases
       // failed" — set_status), not necessarily on the result payload: fall
       // through result → status → generic (gate incident 2026-07-07).
-      await ingestFailedEngineJob(db, engine, job, runtime.result_message ?? runtime.status_message ?? "engine job failed");
+      await ingestFailedEngineJob(
+        db,
+        engine,
+        job,
+        runtime.result_message ?? runtime.status_message ?? "engine job failed",
+      );
     } else if (
       runtime.result_state === "running" &&
       runtime.status_completed_cases !== null &&
@@ -1279,48 +2666,109 @@ async function handlePollMiss(db: DB, engine: EngineClient, job: SimJobRow, e: u
     return;
   }
 
-  if (classified.processCount > 0 || classified.runtimeState === "detached_running" || (classified.runtimeState === "corrupt_status" && classified.staleReason?.includes("heartbeat"))) {
-    await keepDetachedRunning(db, job, runtime ?? { job_id: job.engineJobId, exists: true, cancelled: false, process_count: classified.processCount, status_readable: false, result_readable: false, has_result: false }, classified.staleReason ?? "engine task is detached from Celery but OpenFOAM processes are still running");
+  if (
+    classified.processCount > 0 ||
+    classified.runtimeState === "detached_running" ||
+    (classified.runtimeState === "corrupt_status" &&
+      classified.staleReason?.includes("heartbeat"))
+  ) {
+    await keepDetachedRunning(
+      db,
+      job,
+      runtime ?? {
+        job_id: job.engineJobId,
+        exists: true,
+        cancelled: false,
+        process_count: classified.processCount,
+        status_readable: false,
+        result_readable: false,
+        has_result: false,
+      },
+      classified.staleReason ??
+        "engine task is detached from Celery but OpenFOAM processes are still running",
+    );
     return;
   }
 
   if (classified.recoverable) {
-    await requeueLostJob(db, job, classified.staleReason ?? "engine job lost; safely requeued for a fresh solve");
+    await requeueLostJob(
+      db,
+      job,
+      classified.staleReason ??
+        "engine job lost; safely requeued for a fresh solve",
+    );
     return;
   }
 
-  const listed = queue ? classified.engineQueueMatch : await engineQueueMentionsJob(engine, job.engineJobId);
+  const listed = queue
+    ? classified.engineQueueMatch
+    : await engineQueueMentionsJob(engine, job.engineJobId);
   if (listed) {
     await db
       .update(simJobs)
-      .set({ status: "running", engineState: "running", error: null, polledAt: new Date(), finishedAt: null })
+      .set({
+        status: "running",
+        engineState: "running",
+        error: null,
+        polledAt: new Date(),
+        finishedAt: null,
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeaseExpiresAt: null,
+      })
       .where(activeJobWhere(job.id));
     return;
   }
   if (listed === null || !isNotFound(e)) {
     await db
       .update(simJobs)
-      .set({ error: "engine poll failed: " + errorMessage(e), polledAt: new Date(), finishedAt: null })
+      .set({
+        error: "engine poll failed: " + errorMessage(e),
+        polledAt: new Date(),
+        finishedAt: null,
+      })
       .where(activeJobWhere(job.id));
     return;
   }
 
-  const missingSince = job.engineState === "missing" ? (job.polledAt ?? job.submittedAt ?? job.createdAt) : null;
-  if (missingSince && Date.now() - missingSince.getTime() >= MISSING_JOB_REQUEUE_MS) {
-    await requeueLostJob(db, job, "engine job stayed missing; safely requeued for a fresh solve");
+  const missingSince =
+    job.engineState === "missing"
+      ? (job.polledAt ?? job.submittedAt ?? job.createdAt)
+      : null;
+  if (
+    missingSince &&
+    Date.now() - missingSince.getTime() >= MISSING_JOB_REQUEUE_MS
+  ) {
+    await requeueLostJob(
+      db,
+      job,
+      "engine job stayed missing; safely requeued for a fresh solve",
+    );
     return;
   }
-  await markPollMiss(db, job, "engine job temporarily missing; waiting before requeue");
+  await markPollMiss(
+    db,
+    job,
+    "engine job temporarily missing; waiting before requeue",
+  );
 }
 
 /** Poll in-flight engine jobs; completed jobs ingest, transient engine misses recover or requeue. */
-export async function reconcile(db: DB, engine: EngineClient, options: ReconcileOptions = {}): Promise<void> {
+export async function reconcile(
+  db: DB,
+  engine: EngineClient,
+  options: ReconcileOptions = {},
+): Promise<void> {
   if (!options.skipFailedRecovery) {
     await recoverFailedEngineJobs(db, engine, options.recoverFailedJobIds);
   }
 
-  const activeFilters = [inArray(simJobs.status, activeJobStatuses)];
-  if (options.jobIds?.length) activeFilters.push(inArray(simJobs.id, options.jobIds));
+  const activeFilters = [
+    inArray(simJobs.status, activeJobStatuses),
+    outsideLiveIngestLeaseWhere(),
+  ];
+  if (options.jobIds?.length)
+    activeFilters.push(inArray(simJobs.id, options.jobIds));
 
   const jobs = await db
     .select()
@@ -1335,14 +2783,26 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
   }
   const runtimeByJobId = await engineRuntimeMap(
     engine,
-    jobs.map((job) => job.engineJobId).filter((id): id is string => Boolean(id)),
+    jobs
+      .map((job) => job.engineJobId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const compensatedEngineIds = await retryPersistedCancellationObligations(
+    db,
+    engine,
+    options.jobIds,
   );
   if (queue) {
     await cancelTerminalEngineTasks(
       db,
       engine,
       queue,
-      new Set(jobs.map((job) => job.engineJobId).filter((id): id is string => Boolean(id))),
+      new Set([
+        ...jobs
+          .map((job) => job.engineJobId)
+          .filter((id): id is string => Boolean(id)),
+        ...compensatedEngineIds,
+      ]),
     );
   }
 
@@ -1364,7 +2824,15 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
         // Same result → status → generic message fallthrough as handlePollMiss
         // (the runtime dispatch is where "All cases failed" got lost to the
         // generic fallback on the 2026-07-07 gate run).
-        await ingestFailedEngineJob(db, engine, job, runtime.result_message ?? runtime.status_message ?? "engine job failed");
+        await ingestFailedEngineJob(
+          db,
+          engine,
+          job,
+          runtime.result_message ??
+            runtime.status_message ??
+            "engine job failed",
+          options.testHooks,
+        );
         continue;
       } else if (
         runtime.result_state === "running" &&
@@ -1380,7 +2848,14 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
       status = await engine.getJob(job.engineJobId);
     } catch (e) {
       try {
-        if (await ingestResultFileIfReady(db, engine, job, "engine poll failed but result file is ready")) {
+        if (
+          await ingestResultFileIfReady(
+            db,
+            engine,
+            job,
+            "engine poll failed but result file is ready",
+          )
+        ) {
           continue;
         }
       } catch (ingestError) {
@@ -1393,16 +2868,23 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
     const lostReason = classifyLostRunning(job, status, runtime, queue);
     if (lostReason) {
       // G3: loud by design — this is a worker-restart zombie, not a routine state.
-      console.error(`[sweeper] LOST engine job ${job.engineJobId} (sim_job ${job.id}): ${lostReason}`);
+      console.error(
+        `[sweeper] LOST engine job ${job.engineJobId} (sim_job ${job.id}): ${lostReason}`,
+      );
       try {
         await engine.cancelJob(job.engineJobId);
       } catch (cancelError) {
-        console.error(`[sweeper] engine-side cancel of lost job ${job.engineJobId} failed: ${errorMessage(cancelError)}`);
+        console.error(
+          `[sweeper] engine-side cancel of lost job ${job.engineJobId} failed: ${errorMessage(cancelError)}`,
+        );
       }
       await cancelJobAndReleaseClaims(db, job, lostReason);
       continue;
     }
-    if (status.state === "running" && status.completed_cases > job.completedCases) {
+    if (
+      status.state === "running" &&
+      status.completed_cases > job.completedCases
+    ) {
       await ingestRunningPartialJob(db, engine, job);
     }
     await updateJobFromEngineStatus(db, job, status);
@@ -1414,22 +2896,45 @@ export async function reconcile(db: DB, engine: EngineClient, options: Reconcile
         await markIngestRetry(db, job.id, e);
       }
     } else if (status.state === "failed") {
-      await ingestFailedEngineJob(db, engine, job, status.message ?? "engine job failed");
+      await ingestFailedEngineJob(
+        db,
+        engine,
+        job,
+        status.message ?? "engine job failed",
+        options.testHooks,
+      );
     }
   }
 
   await drainCampaignMaintenance(db);
 
-  // Bounded re-attempt of failed shared-scale renders (one transient engine
-  // fetch failure must not orphan a scale permanently — live proof 2026-07-05).
+  // Durable, token-fenced default-media repair. The old unclaimed
+  // field_color_scales retry loop is intentionally not called here: a crashed
+  // or slow scale renderer had no lease/fencing generation and could overwrite
+  // a newer success. Result obligations are the sole production repair owner.
   const now = Date.now();
-  if (now - lastScaleRenderRetryAt >= SCALE_RENDER_RETRY_MS) {
-    lastScaleRenderRetryAt = now;
+  if (now - lastResultMediaRepairAt >= RESULT_MEDIA_REPAIR_MS) {
+    lastResultMediaRepairAt = now;
     try {
-      const recovered = await retryFailedScaleRenders(db, engine);
-      if (recovered > 0) console.log(`[sweeper] scaled-media retry pass registered ${recovered} media rows`);
+      const outcome = await resultMediaRepairTick(db, engine);
+      collectDirtyLanes(outcome.dirtyLanes);
+      if (
+        outcome.discovered ||
+        outcome.finalized ||
+        outcome.claimed ||
+        outcome.blocked
+      ) {
+        console.log(
+          `[sweeper] media-repair pass: discovered ${outcome.discovered}, ` +
+            `finalized ${outcome.finalized}, rendered ${outcome.repairedMedia}, ` +
+            `retrying ${outcome.retrying}, blocked ${outcome.blocked}`,
+        );
+      }
     } catch (e) {
-      console.error("[sweeper] scaled-media retry pass failed:", errorMessage(e));
+      console.error(
+        "[sweeper] result-media repair pass failed:",
+        errorMessage(e),
+      );
     }
   }
 }
@@ -1452,14 +2957,20 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
     try {
       await laneTick(db, key);
     } catch (e) {
-      console.error("[sweeper] lane tick failed:", laneKeyId(key), errorMessage(e));
+      console.error(
+        "[sweeper] lane tick failed:",
+        laneKeyId(key),
+        errorMessage(e),
+      );
     }
     // Invariant: no code path may run >30 s without a heartbeat touch — a
     // 100-lane drain under DB load must beat mid-drain, not only after it.
     if (++drained % 10 === 0) await touchHeartbeat(db);
   }
   if (pendingDirtyLanes.size > 0) {
-    console.log(`[sweeper] dirty-lane backlog: ${pendingDirtyLanes.size} lanes carried to next tick`);
+    console.log(
+      `[sweeper] dirty-lane backlog: ${pendingDirtyLanes.size} lanes carried to next tick`,
+    );
   }
   await touchHeartbeat(db);
 
@@ -1475,15 +2986,27 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
           objective: simCampaignLanes.objective,
         })
         .from(simCampaignLanes)
-        .innerJoin(simCampaigns, eq(simCampaigns.id, simCampaignLanes.campaignId))
-        .where(and(eq(simCampaigns.status, "active"), inArray(simCampaignLanes.state, ["awaiting_seed", "iterating"])))
+        .innerJoin(
+          simCampaigns,
+          eq(simCampaigns.id, simCampaignLanes.campaignId),
+        )
+        .where(
+          and(
+            eq(simCampaigns.status, "active"),
+            inArray(simCampaignLanes.state, ["awaiting_seed", "iterating"]),
+          ),
+        )
         .limit(200);
       let sweepCount = 0;
       for (const key of lanes) {
         try {
           await laneTick(db, key);
         } catch (e) {
-          console.error("[sweeper] lane sweep tick failed:", laneKeyId(key), errorMessage(e));
+          console.error(
+            "[sweeper] lane sweep tick failed:",
+            laneKeyId(key),
+            errorMessage(e),
+          );
         }
         // Invariant: no code path may run >30 s without a heartbeat touch —
         // per-10 (was per-50): 50 lane ticks at ~1 s each under load is a
@@ -1504,7 +3027,11 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
         try {
           await laneTick(db, key);
         } catch (e) {
-          console.error("[sweeper] reconciler lane tick failed:", laneKeyId(key), errorMessage(e));
+          console.error(
+            "[sweeper] reconciler lane tick failed:",
+            laneKeyId(key),
+            errorMessage(e),
+          );
         }
         // Invariant: no code path may run >30 s without a heartbeat touch.
         if (++healedCount % 10 === 0) await touchHeartbeat(db);
@@ -1515,16 +3042,150 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
   }
 }
 
-/** Startup recovery: release result rows claimed by jobs that are no longer live. */
-export async function resetOrphans(db: DB): Promise<void> {
+/** Startup recovery: `pending` sim_jobs are pre-boundary compositions owned by
+ * the previous sweeper process, never live engine work. Terminalize them before
+ * measuring queue pressure, release their claims, and settle their ladder work
+ * items immediately. A campaign precalc one-shot retry is deliberately queued
+ * with no owner until the gated parent rescan composes its next wave-2 child;
+ * preserve that durable routing marker or restart would demote it to RANS. */
+export async function resetOrphans(
+  db: DB,
+  opts: { jobIds?: string[]; resultIds?: string[] } = {},
+): Promise<void> {
+  const pendingFilters = [eq(simJobs.status, "pending")];
+  if (opts.jobIds?.length)
+    pendingFilters.push(inArray(simJobs.id, opts.jobIds));
+  const cancelledPending = await db.transaction(async (tx) => {
+    const cancelled = await tx
+      .update(simJobs)
+      .set({
+        status: "cancelled",
+        engineState: "cancelled",
+        error:
+          "sweeper restarted before engine submission; composition cancelled and claims released",
+        finishedAt: new Date(),
+      })
+      .where(and(...pendingFilters))
+      .returning({ id: simJobs.id });
+    if (cancelled.length) {
+      await tx
+        .update(results)
+        .set({
+          status: releasedResultStatusSql(results.simJobId),
+          source: "queued",
+          simJobId: null,
+          engineJobId: null,
+          engineCaseSlug: null,
+        })
+        .where(
+          and(
+            inArray(
+              results.simJobId,
+              cancelled.map((row) => row.id),
+            ),
+            inArray(results.status, ["queued", "running"]),
+          ),
+        );
+    }
+    return cancelled.map((row) => row.id);
+  });
+
+  if (cancelledPending.length) {
+    const ids = sql`ARRAY[${sql.join(
+      cancelledPending.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    )}]`;
+    await db.execute(sql`
+      UPDATE sim_urans_verify_queue q
+      SET state = CASE
+            WHEN q.background_owner THEN 'pending'
+            WHEN EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_campaigns ownership
+              JOIN sim_campaigns camp ON camp.id = ownership.campaign_id
+              WHERE ownership.queue_id = q.id
+                AND ownership.state = 'active'
+                AND camp.status IN ('active', 'attention', 'paused')
+            ) THEN 'pending'
+            ELSE 'cancelled'
+          END,
+          "updatedAt" = now()
+      WHERE q.state = 'running'
+        AND EXISTS (
+          SELECT 1 FROM sim_jobs j
+          WHERE j.id = ANY(${ids})
+            AND j.request_payload ->> 'verifyQueueItemId' = q.id::text
+        )
+    `);
+    await db.execute(sql`
+      WITH linked_request AS (
+        SELECT DISTINCT ON (req.id)
+          req.id AS request_id,
+          j.id AS job_id,
+          (
+            req.background_owner
+            OR EXISTS (
+              SELECT 1
+              FROM sim_urans_request_campaigns ownership
+              JOIN sim_campaigns camp ON camp.id = ownership.campaign_id
+              WHERE ownership.request_id = req.id
+                AND ownership.state = 'active'
+                AND camp.status IN ('active', 'attention', 'paused')
+            )
+          ) AS may_resume
+        FROM sim_urans_requests req
+        JOIN sim_jobs j
+          ON j.id = ANY(${ids})
+         AND (
+           req.sim_job_id = j.id
+           OR j.request_payload ->> 'uransRequestId' = req.id::text
+         )
+        WHERE req.state = 'running'
+        ORDER BY req.id, j."createdAt" DESC
+      )
+      UPDATE sim_urans_requests req
+      SET state = CASE WHEN linked_request.may_resume THEN 'pending' ELSE 'cancelled' END,
+          sim_job_id = CASE WHEN linked_request.may_resume THEN NULL ELSE linked_request.job_id END,
+          "updatedAt" = now()
+      FROM linked_request
+      WHERE req.id = linked_request.request_id
+    `);
+  }
+
+  const liveFilters = [
+    inArray(simJobs.status, ["submitted", "running", "ingesting"] as const),
+  ];
+  if (opts.jobIds?.length) liveFilters.push(inArray(simJobs.id, opts.jobIds));
   const live = await db
     .select({ id: simJobs.id })
     .from(simJobs)
-    .where(inArray(simJobs.status, ["submitted", "running", "ingesting"]));
-  const liveIds = live.map((l) => l.id);
+    .where(and(...liveFilters));
+  const liveIds = live.map((row) => row.id);
   const claimed = inArray(results.status, ["queued", "running"]);
+  const scopedClaim = opts.resultIds?.length
+    ? and(claimed, inArray(results.id, opts.resultIds))
+    : opts.jobIds?.length
+      ? and(claimed, inArray(results.simJobId, opts.jobIds))
+      : claimed;
   await db
     .update(results)
     .set({ status: "pending", source: "queued", simJobId: null })
-    .where(liveIds.length ? and(claimed, or(isNull(results.simJobId), notInArray(results.simJobId, liveIds))) : claimed);
+    .where(
+      and(
+        liveIds.length
+          ? and(
+              scopedClaim,
+              or(
+                isNull(results.simJobId),
+                notInArray(results.simJobId, liveIds),
+              ),
+            )
+          : scopedClaim,
+        sql`NOT (
+          ${results.status} = 'queued'
+          AND ${results.simJobId} IS NULL
+          AND ${EVIDENCE_BACKED_WAVE2_RESULT_SQL}
+        )`,
+      ),
+    );
 }

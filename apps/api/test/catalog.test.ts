@@ -1,4 +1,5 @@
 import { type Point } from "@aerodb/core";
+import { createHash } from "node:crypto";
 import {
   airfoils,
   boundaryConditions,
@@ -35,6 +36,7 @@ import { buildServer } from "../src/server";
 import { assembleDetail } from "../src/services/detail";
 import { listAirfoils } from "../src/services/catalog";
 import { assembleSim } from "../src/services/sim";
+import { createExactResultAttemptFixture } from "./exact-result-fixture";
 
 const cleanupResultIds = new Set<string>();
 const cleanupClassificationIds = new Set<string>();
@@ -55,6 +57,9 @@ const cleanupCategoryIds = new Set<string>();
 const cleanupSyncPromiseIds = new Set<string>();
 const cleanupRegisteredSolverIds = new Set<string>();
 
+const fixtureSha256 = (key: string) =>
+  createHash("sha256").update(key).digest("hex");
+
 const points: Point[] = [
   { x: 1, y: 0 },
   { x: 0.5, y: 0.05 },
@@ -63,10 +68,19 @@ const points: Point[] = [
   { x: 1, y: 0 },
 ];
 
-async function createTestBoundaryCondition(unique: string, enabled = true, reynolds = 500000) {
-  const [air] = await db.select().from(mediums).where(eq(mediums.slug, "air")).limit(1);
+async function createTestBoundaryCondition(
+  unique: string,
+  enabled = true,
+  reynolds = 500000,
+) {
+  const [air] = await db
+    .select()
+    .from(mediums)
+    .where(eq(mediums.slug, "air"))
+    .limit(1);
   expect(air).toBeTruthy();
-  const speed = Math.round(reynolds * air.kinematicViscosity * 1_000_000) / 1_000_000;
+  const speed =
+    Math.round(reynolds * air.kinematicViscosity * 1_000_000) / 1_000_000;
   const suffix = enabled ? "" : "-disabled";
   const [bc] = await db
     .insert(boundaryConditions)
@@ -149,7 +163,10 @@ async function createTestBoundaryCondition(unique: string, enabled = true, reyno
 
   const [scheduling] = await db
     .insert(schedulingProfiles)
-    .values({ slug: `${unique}-scheduling${suffix}`, name: `${unique} Scheduling` })
+    .values({
+      slug: `${unique}-scheduling${suffix}`,
+      name: `${unique} Scheduling`,
+    })
     .returning({ id: schedulingProfiles.id });
   cleanupSchedulingProfileIds.add(scheduling.id);
 
@@ -161,7 +178,13 @@ async function createTestBoundaryCondition(unique: string, enabled = true, reyno
 
   const [sweep] = await db
     .insert(sweepDefinitions)
-    .values({ slug: `${unique}-sweep${suffix}`, name: `${unique} Sweep`, aoaStart: -8, aoaStop: 20, aoaStep: 1 })
+    .values({
+      slug: `${unique}-sweep${suffix}`,
+      name: `${unique} Sweep`,
+      aoaStart: -8,
+      aoaStop: 20,
+      aoaStep: 1,
+    })
     .returning({ id: sweepDefinitions.id });
   cleanupSweepDefinitionIds.add(sweep.id);
 
@@ -188,26 +211,64 @@ async function createTestBoundaryCondition(unique: string, enabled = true, reyno
   expect(resolved).toBeTruthy();
   expect(resolved!.snapshot.flowState.speedMps).toBe(speed);
   expect(resolved!.snapshot.referenceGeometry.referenceLengthM).toBe(1);
-  expect(Math.abs(resolved!.snapshot.derived.reynolds - reynolds)).toBeLessThan(20);
+  expect(Math.abs(resolved!.snapshot.derived.reynolds - reynolds)).toBeLessThan(
+    20,
+  );
   expect(Math.abs(resolved!.revision.reynolds - reynolds)).toBeLessThan(20);
-  expect((resolved!.snapshot as unknown as { operating?: unknown }).operating).toBeUndefined();
-  return { ...bc, presetId: preset.id, presetRevisionId: resolved!.revision.id };
+  expect(
+    (resolved!.snapshot as unknown as { operating?: unknown }).operating,
+  ).toBeUndefined();
+  return {
+    ...bc,
+    presetId: preset.id,
+    presetRevisionId: resolved!.revision.id,
+  };
 }
 
 afterAll(async () => {
-  if (cleanupSyncPromiseIds.size) await db.delete(syncSweepPromises).where(inArray(syncSweepPromises.id, Array.from(cleanupSyncPromiseIds)));
-  if (cleanupRegisteredSolverIds.size) await db.delete(registeredRemoteSolvers).where(inArray(registeredRemoteSolvers.id, Array.from(cleanupRegisteredSolverIds)));
-  if (cleanupFitSetIds.size) await db.delete(polarFitSets).where(inArray(polarFitSets.id, Array.from(cleanupFitSetIds)));
+  if (cleanupSyncPromiseIds.size)
+    await db
+      .delete(syncSweepPromises)
+      .where(inArray(syncSweepPromises.id, Array.from(cleanupSyncPromiseIds)));
+  if (cleanupRegisteredSolverIds.size)
+    await db
+      .delete(registeredRemoteSolvers)
+      .where(
+        inArray(
+          registeredRemoteSolvers.id,
+          Array.from(cleanupRegisteredSolverIds),
+        ),
+      );
+  if (cleanupFitSetIds.size)
+    await db
+      .delete(polarFitSets)
+      .where(inArray(polarFitSets.id, Array.from(cleanupFitSetIds)));
   if (cleanupClassificationIds.size) {
-    await db.delete(resultClassifications).where(inArray(resultClassifications.id, Array.from(cleanupClassificationIds)));
+    await db
+      .delete(resultClassifications)
+      .where(
+        inArray(resultClassifications.id, Array.from(cleanupClassificationIds)),
+      );
   }
-  if (cleanupResultIds.size) await db.delete(results).where(inArray(results.id, Array.from(cleanupResultIds)));
-  if (cleanupSimJobIds.size) await db.delete(simJobs).where(inArray(simJobs.id, Array.from(cleanupSimJobIds)));
+  if (cleanupResultIds.size)
+    await db
+      .delete(results)
+      .where(inArray(results.id, Array.from(cleanupResultIds)));
+  if (cleanupSimJobIds.size)
+    await db
+      .delete(simJobs)
+      .where(inArray(simJobs.id, Array.from(cleanupSimJobIds)));
   if (cleanupPresetIds.size) {
-    await db.delete(simulationPresets).where(inArray(simulationPresets.id, Array.from(cleanupPresetIds)));
+    await db
+      .delete(simulationPresets)
+      .where(inArray(simulationPresets.id, Array.from(cleanupPresetIds)));
   }
   if (cleanupBoundaryConditionIds.size) {
-    await db.delete(boundaryConditions).where(inArray(boundaryConditions.id, Array.from(cleanupBoundaryConditionIds)));
+    await db
+      .delete(boundaryConditions)
+      .where(
+        inArray(boundaryConditions.id, Array.from(cleanupBoundaryConditionIds)),
+      );
   }
   if (cleanupFlowConditionIds.size) {
     await db
@@ -217,28 +278,57 @@ afterAll(async () => {
   if (cleanupReferenceGeometryIds.size) {
     await db
       .delete(referenceGeometryProfiles)
-      .where(inArray(referenceGeometryProfiles.id, Array.from(cleanupReferenceGeometryIds)));
+      .where(
+        inArray(
+          referenceGeometryProfiles.id,
+          Array.from(cleanupReferenceGeometryIds),
+        ),
+      );
   }
   if (cleanupBoundaryProfileIds.size) {
-    await db.delete(boundaryProfiles).where(inArray(boundaryProfiles.id, Array.from(cleanupBoundaryProfileIds)));
+    await db
+      .delete(boundaryProfiles)
+      .where(
+        inArray(boundaryProfiles.id, Array.from(cleanupBoundaryProfileIds)),
+      );
   }
   if (cleanupMeshProfileIds.size) {
-    await db.delete(meshProfiles).where(inArray(meshProfiles.id, Array.from(cleanupMeshProfileIds)));
+    await db
+      .delete(meshProfiles)
+      .where(inArray(meshProfiles.id, Array.from(cleanupMeshProfileIds)));
   }
   if (cleanupSolverProfileIds.size) {
-    await db.delete(solverProfiles).where(inArray(solverProfiles.id, Array.from(cleanupSolverProfileIds)));
+    await db
+      .delete(solverProfiles)
+      .where(inArray(solverProfiles.id, Array.from(cleanupSolverProfileIds)));
   }
   if (cleanupSchedulingProfileIds.size) {
-    await db.delete(schedulingProfiles).where(inArray(schedulingProfiles.id, Array.from(cleanupSchedulingProfileIds)));
+    await db
+      .delete(schedulingProfiles)
+      .where(
+        inArray(schedulingProfiles.id, Array.from(cleanupSchedulingProfileIds)),
+      );
   }
   if (cleanupOutputProfileIds.size) {
-    await db.delete(outputProfiles).where(inArray(outputProfiles.id, Array.from(cleanupOutputProfileIds)));
+    await db
+      .delete(outputProfiles)
+      .where(inArray(outputProfiles.id, Array.from(cleanupOutputProfileIds)));
   }
   if (cleanupSweepDefinitionIds.size) {
-    await db.delete(sweepDefinitions).where(inArray(sweepDefinitions.id, Array.from(cleanupSweepDefinitionIds)));
+    await db
+      .delete(sweepDefinitions)
+      .where(
+        inArray(sweepDefinitions.id, Array.from(cleanupSweepDefinitionIds)),
+      );
   }
-  if (cleanupAirfoilIds.size) await db.delete(airfoils).where(inArray(airfoils.id, Array.from(cleanupAirfoilIds)));
-  if (cleanupCategoryIds.size) await db.delete(categories).where(inArray(categories.id, Array.from(cleanupCategoryIds)));
+  if (cleanupAirfoilIds.size)
+    await db
+      .delete(airfoils)
+      .where(inArray(airfoils.id, Array.from(cleanupAirfoilIds)));
+  if (cleanupCategoryIds.size)
+    await db
+      .delete(categories)
+      .where(inArray(categories.id, Array.from(cleanupCategoryIds)));
   await sql.end();
 });
 
@@ -247,16 +337,28 @@ describe("catalog solved-metric evidence", () => {
     const secret = `sync-api-test-${Date.now()}`;
     const sourceInstanceId = `sync-api-test-${process.pid}-${Date.now()}`;
     await db.insert(syncApiSettings).values({ id: 1 }).onConflictDoNothing();
-    const [savedSettings] = await db.select().from(syncApiSettings).where(eq(syncApiSettings.id, 1)).limit(1);
+    const [savedSettings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
     const savedPermissions = await db.select().from(syncApiPermissions);
     const app = await buildServer();
     try {
       await db
         .update(syncApiSettings)
-        .set({ enabled: false, secret, defaultPromiseTtlHours: 24, updatedAt: new Date() })
+        .set({
+          enabled: false,
+          secret,
+          defaultPromiseTtlHours: 24,
+          updatedAt: new Date(),
+        })
         .where(eq(syncApiSettings.id, 1));
 
-      const disabled = await app.inject({ method: "GET", url: "/api/sync/v1/status" });
+      const disabled = await app.inject({
+        method: "GET",
+        url: "/api/sync/v1/status",
+      });
       expect(disabled.statusCode).toBe(404);
 
       await db
@@ -266,9 +368,15 @@ describe("catalog solved-metric evidence", () => {
       await db
         .insert(syncApiPermissions)
         .values({ dataType: "sweeps", canFetch: false, canPush: false })
-        .onConflictDoUpdate({ target: syncApiPermissions.dataType, set: { canFetch: false, canPush: false, updatedAt: new Date() } });
+        .onConflictDoUpdate({
+          target: syncApiPermissions.dataType,
+          set: { canFetch: false, canPush: false, updatedAt: new Date() },
+        });
 
-      const unauthorized = await app.inject({ method: "GET", url: "/api/sync/v1/status" });
+      const unauthorized = await app.inject({
+        method: "GET",
+        url: "/api/sync/v1/status",
+      });
       expect(unauthorized.statusCode).toBe(401);
 
       const forbiddenClaim = await app.inject({
@@ -282,11 +390,21 @@ describe("catalog solved-metric evidence", () => {
       await db
         .insert(syncApiPermissions)
         .values({ dataType: "sweeps", canFetch: true, canPush: false })
-        .onConflictDoUpdate({ target: syncApiPermissions.dataType, set: { canFetch: true, canPush: false, updatedAt: new Date() } });
+        .onConflictDoUpdate({
+          target: syncApiPermissions.dataType,
+          set: { canFetch: true, canPush: false, updatedAt: new Date() },
+        });
 
-      const status = await app.inject({ method: "GET", url: "/api/sync/v1/status", headers: { authorization: `Bearer ${secret}` } });
+      const status = await app.inject({
+        method: "GET",
+        url: "/api/sync/v1/status",
+        headers: { authorization: `Bearer ${secret}` },
+      });
       expect(status.statusCode).toBe(200);
-      expect(status.json()).toMatchObject({ ok: true, defaultPromiseTtlHours: 24 });
+      expect(status.json()).toMatchObject({
+        ok: true,
+        defaultPromiseTtlHours: 24,
+      });
 
       const register = await app.inject({
         method: "POST",
@@ -302,42 +420,81 @@ describe("catalog solved-metric evidence", () => {
         },
       });
       expect(register.statusCode).toBe(200);
-      const registered = register.json() as { solver: { id: string; instanceId: string; cpuBudget: number; status: string } };
+      const registered = register.json() as {
+        solver: {
+          id: string;
+          instanceId: string;
+          cpuBudget: number;
+          status: string;
+        };
+      };
       cleanupRegisteredSolverIds.add(registered.solver.id);
-      expect(registered.solver).toMatchObject({ instanceId: `${sourceInstanceId}-solver`, cpuBudget: 2, status: "idle" });
+      expect(registered.solver).toMatchObject({
+        instanceId: `${sourceInstanceId}-solver`,
+        cpuBudget: 2,
+        status: "idle",
+      });
 
       const heartbeat = await app.inject({
         method: "POST",
         url: `/api/sync/v1/solvers/${registered.solver.id}/heartbeat`,
         headers: { "x-xfoilfoam-sync-secret": secret },
-        payload: { status: "solving", activePromiseCount: 1, activeAoaCount: 36, cpuBudget: 2 },
+        payload: {
+          status: "solving",
+          activePromiseCount: 1,
+          activeAoaCount: 36,
+          cpuBudget: 2,
+        },
       });
       expect(heartbeat.statusCode).toBe(200);
-      expect(heartbeat.json()).toMatchObject({ ok: true, solver: { status: "solving", activePromiseCount: 1, activeAoaCount: 36 } });
+      expect(heartbeat.json()).toMatchObject({
+        ok: true,
+        solver: {
+          status: "solving",
+          activePromiseCount: 1,
+          activeAoaCount: 36,
+        },
+      });
 
       const progress = await app.inject({
         method: "POST",
         url: `/api/sync/v1/solvers/${registered.solver.id}/progress`,
         headers: { "x-xfoilfoam-sync-secret": secret },
-        payload: { status: "pushing", solvedCountDelta: 2, pushedCountDelta: 1 },
+        payload: {
+          status: "pushing",
+          solvedCountDelta: 2,
+          pushedCountDelta: 1,
+        },
       });
       expect(progress.statusCode).toBe(200);
-      expect(progress.json()).toMatchObject({ ok: true, solver: { status: "pushing", solvedCount: 2, pushedCount: 1 } });
+      expect(progress.json()).toMatchObject({
+        ok: true,
+        solver: { status: "pushing", solvedCount: 2, pushedCount: 1 },
+      });
 
       const claim = await app.inject({
         method: "POST",
         url: "/api/sync/v1/sweeps/claim",
         headers: { "x-xfoilfoam-sync-secret": secret },
-        payload: { limit: 1, solverId: registered.solver.id, sourceInstanceId, sourceInstanceName: "sync api test" },
+        payload: {
+          limit: 1,
+          solverId: registered.solver.id,
+          sourceInstanceId,
+          sourceInstanceName: "sync api test",
+        },
       });
       expect(claim.statusCode).toBe(200);
-      const body = claim.json() as { promise: null | { id: string; aoas: number[]; expiresAt: string } };
+      const body = claim.json() as {
+        promise: null | { id: string; aoas: number[]; expiresAt: string };
+      };
       if (body.promise) {
         expect(body.promise.aoas.length).toBe(1);
         cleanupSyncPromiseIds.add(body.promise.id);
       }
     } finally {
-      await db.delete(syncSweepPromises).where(eq(syncSweepPromises.sourceInstanceId, sourceInstanceId));
+      await db
+        .delete(syncSweepPromises)
+        .where(eq(syncSweepPromises.sourceInstanceId, sourceInstanceId));
       if (savedSettings) {
         await db
           .update(syncApiSettings)
@@ -357,7 +514,11 @@ describe("catalog solved-metric evidence", () => {
           .values(permission)
           .onConflictDoUpdate({
             target: syncApiPermissions.dataType,
-            set: { canFetch: permission.canFetch, canPush: permission.canPush, updatedAt: new Date() },
+            set: {
+              canFetch: permission.canFetch,
+              canPush: permission.canPush,
+              updatedAt: new Date(),
+            },
           });
       }
       await app.close();
@@ -370,7 +531,13 @@ describe("catalog solved-metric evidence", () => {
 
     const [cat] = await db
       .insert(categories)
-      .values({ slug: unique, name: "Catalog Evidence Test", path: unique, depth: 0, sortOrder: 999 })
+      .values({
+        slug: unique,
+        name: "Catalog Evidence Test",
+        path: unique,
+        depth: 0,
+        sortOrder: 999,
+      })
       .returning({ id: categories.id });
     cleanupCategoryIds.add(cat.id);
 
@@ -393,7 +560,34 @@ describe("catalog solved-metric evidence", () => {
       .returning({ id: airfoils.id });
     cleanupAirfoilIds.add(airfoil.id);
 
-    let [summary] = await listAirfoils({ q: `${unique} Airfoil`, sort: "ldmax", dir: "desc" });
+    // These points model one continuous marched RANS sweep. Attempt
+    // classification is deliberately scoped to its producing job, so the
+    // low-AoA failure below must share that exact job with the otherwise-valid
+    // points for the whole sweep to become provisional.
+    const engineJobId = `${unique}-rans-sweep`;
+    const [ransSweepJob] = await db
+      .insert(simJobs)
+      .values({
+        engineJobId,
+        airfoilId: airfoil.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: bc.presetRevisionId,
+        jobKind: "sweep",
+        referenceChordM: bc.chord,
+        wave: 1,
+        status: "done",
+        totalCases: 4,
+        completedCases: 4,
+        finishedAt: new Date(),
+      })
+      .returning({ id: simJobs.id });
+    cleanupSimJobIds.add(ransSweepJob.id);
+
+    let [summary] = await listAirfoils({
+      q: `${unique} Airfoil`,
+      sort: "ldmax",
+      dir: "desc",
+    });
     expect(summary.ldmax).toBeNull();
     expect(summary.clmax).toBeNull();
     expect(summary.cdmin).toBeNull();
@@ -411,6 +605,9 @@ describe("catalog solved-metric evidence", () => {
           status: "done" as const,
           source: "solved" as const,
           regime: "rans" as const,
+          simJobId: ransSweepJob.id,
+          engineJobId,
+          engineCaseSlug: `aoa-${aoa}`,
           cl: 0.4 + i * 0.2,
           cd: 0.02 - i * 0.002,
           cm: -0.02,
@@ -421,21 +618,40 @@ describe("catalog solved-metric evidence", () => {
       )
       .returning({ id: results.id });
     validRansRows.forEach((row) => cleanupResultIds.add(row.id));
+    for (const row of validRansRows) {
+      await createExactResultAttemptFixture(db, row.id, {
+        publication: "selected-eligible",
+      });
+    }
 
-    [summary] = await listAirfoils({ q: `${unique} Airfoil`, sort: "ldmax", dir: "desc" });
+    [summary] = await listAirfoils({
+      q: `${unique} Airfoil`,
+      sort: "ldmax",
+      dir: "desc",
+    });
     expect(summary.ldmax).toBeNull();
     expect(summary.polarCount).toBe(0);
     expect(summary.metricsSource).toBe("queued");
 
-    const refreshed = await refreshPolarCacheForRevision(db, airfoil.id, bc.presetRevisionId);
+    const refreshed = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
     if (refreshed.fitSetId) cleanupFitSetIds.add(refreshed.fitSetId);
     const cachedClassifications = await db
       .select({ id: resultClassifications.id })
       .from(resultClassifications)
       .where(eq(resultClassifications.airfoilId, airfoil.id));
-    cachedClassifications.forEach((row) => cleanupClassificationIds.add(row.id));
+    cachedClassifications.forEach((row) =>
+      cleanupClassificationIds.add(row.id),
+    );
 
-    [summary] = await listAirfoils({ q: `${unique} Airfoil`, sort: "ldmax", dir: "desc" });
+    [summary] = await listAirfoils({
+      q: `${unique} Airfoil`,
+      sort: "ldmax",
+      dir: "desc",
+    });
     expect(summary.ldmax).not.toBeNull();
     expect(summary.clmax).not.toBeNull();
     expect(summary.cdmin).not.toBeNull();
@@ -448,7 +664,11 @@ describe("catalog solved-metric evidence", () => {
     expect(detail?.polars[0].fit?.status).toBe("final");
     expect(detail?.reList).toEqual([bc.reynolds]);
 
-    const disabledBc = await createTestBoundaryCondition(`${unique}-disabled`, false, 500000);
+    const disabledBc = await createTestBoundaryCondition(
+      `${unique}-disabled`,
+      false,
+      500000,
+    );
     const [disabledResult] = await db
       .insert(results)
       .values({
@@ -469,7 +689,11 @@ describe("catalog solved-metric evidence", () => {
       .returning({ id: results.id });
     cleanupResultIds.add(disabledResult.id);
 
-    [summary] = await listAirfoils({ q: `${unique} Airfoil`, sort: "ldmax", dir: "desc" });
+    [summary] = await listAirfoils({
+      q: `${unique} Airfoil`,
+      sort: "ldmax",
+      dir: "desc",
+    });
     expect(summary.ldmax).not.toBeNull();
     expect(summary.polarCount).toBe(3);
     detail = await assembleDetail(unique);
@@ -487,6 +711,9 @@ describe("catalog solved-metric evidence", () => {
         status: "done",
         source: "solved",
         regime: "rans",
+        simJobId: ransSweepJob.id,
+        engineJobId,
+        engineCaseSlug: "aoa-3",
         cl: 0.9,
         cd: 0.012,
         cm: -0.02,
@@ -497,10 +724,25 @@ describe("catalog solved-metric evidence", () => {
       })
       .returning({ id: results.id });
     cleanupResultIds.add(invalidResult.id);
+    // Legacy current generation: it was selected under the old gate and the
+    // current classifier now rejects it. Fresh ingestion must not publish a
+    // rejected child, but this repair state still drives low-AoA demotion.
+    await createExactResultAttemptFixture(db, invalidResult.id, {
+      publication: "legacy-selected-reclassified",
+    });
 
-    const refreshedAfterLowAoaFailure = await refreshPolarCacheForRevision(db, airfoil.id, bc.presetRevisionId);
-    if (refreshedAfterLowAoaFailure.fitSetId) cleanupFitSetIds.add(refreshedAfterLowAoaFailure.fitSetId);
-    [summary] = await listAirfoils({ q: `${unique} Airfoil`, sort: "ldmax", dir: "desc" });
+    const refreshedAfterLowAoaFailure = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
+    if (refreshedAfterLowAoaFailure.fitSetId)
+      cleanupFitSetIds.add(refreshedAfterLowAoaFailure.fitSetId);
+    [summary] = await listAirfoils({
+      q: `${unique} Airfoil`,
+      sort: "ldmax",
+      dir: "desc",
+    });
     expect(summary.polarCount).toBe(3);
     expect(summary.fitStatus).toBe("provisional");
     detail = await assembleDetail(unique);
@@ -549,11 +791,25 @@ describe("catalog solved-metric evidence", () => {
       mimeType: "video/mp4",
       frameCount: 141,
       durationS: 7,
+      sha256: "1".repeat(64),
+      byteSize: 4096,
+    });
+    await createExactResultAttemptFixture(db, uransReplacement.id, {
+      publication: "selected-eligible",
     });
 
-    const refreshedAfterUrans = await refreshPolarCacheForRevision(db, airfoil.id, bc.presetRevisionId);
-    if (refreshedAfterUrans.fitSetId) cleanupFitSetIds.add(refreshedAfterUrans.fitSetId);
-    [summary] = await listAirfoils({ q: `${unique} Airfoil`, sort: "ldmax", dir: "desc" });
+    const refreshedAfterUrans = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
+    if (refreshedAfterUrans.fitSetId)
+      cleanupFitSetIds.add(refreshedAfterUrans.fitSetId);
+    [summary] = await listAirfoils({
+      q: `${unique} Airfoil`,
+      sort: "ldmax",
+      dir: "desc",
+    });
     expect(summary.ldmax).not.toBeNull();
     expect(summary.clmax).not.toBeNull();
     expect(summary.cdmin).not.toBeNull();
@@ -579,7 +835,13 @@ describe("simulation media evidence", () => {
 
     const [cat] = await db
       .insert(categories)
-      .values({ slug: unique, name: "Dynamic Re Sim Test", path: unique, depth: 0, sortOrder: 999 })
+      .values({
+        slug: unique,
+        name: "Dynamic Re Sim Test",
+        path: unique,
+        depth: 0,
+        sortOrder: 999,
+      })
       .returning({ id: categories.id });
     cleanupCategoryIds.add(cat.id);
 
@@ -622,6 +884,15 @@ describe("simulation media evidence", () => {
       })
       .returning({ id: results.id });
     cleanupResultIds.add(result.id);
+    await createExactResultAttemptFixture(db, result.id, {
+      publication: "selected-eligible",
+    });
+    const dynamicRefresh = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
+    if (dynamicRefresh.fitSetId) cleanupFitSetIds.add(dynamicRefresh.fitSetId);
 
     const [job] = await db
       .insert(simJobs)
@@ -653,7 +924,9 @@ describe("simulation media evidence", () => {
     expect(polar?.points[0].resultId).toBe(result.id);
     expect(detail?.reList).toEqual([dynamicRe]);
     expect(detail?.mach).toBeCloseTo(bc.mach ?? 0);
-    expect(detail?.simulationWorks.find((work) => work.id === job.id)).toMatchObject({
+    expect(
+      detail?.simulationWorks.find((work) => work.id === job.id),
+    ).toMatchObject({
       kind: "urans-retry",
       status: "running",
       retryMode: "invalid-rans-points",
@@ -666,7 +939,12 @@ describe("simulation media evidence", () => {
     expect(simByDynamicRe?.re).toBe(dynamicRe);
     expect(simByDynamicRe?.alpha).toBe(7);
 
-    const simByResultId = await assembleSim(unique, undefined, undefined, result.id);
+    const simByResultId = await assembleSim(
+      unique,
+      undefined,
+      undefined,
+      result.id,
+    );
     expect(simByResultId?.status).toBe("solved");
     expect(simByResultId?.re).toBe(dynamicRe);
     expect(simByResultId?.cl).toBeCloseTo(0.86);
@@ -678,7 +956,13 @@ describe("simulation media evidence", () => {
 
     const [cat] = await db
       .insert(categories)
-      .values({ slug: unique, name: "Sim Media Test", path: unique, depth: 0, sortOrder: 999 })
+      .values({
+        slug: unique,
+        name: "Sim Media Test",
+        path: unique,
+        depth: 0,
+        sortOrder: 999,
+      })
       .returning({ id: categories.id });
     cleanupCategoryIds.add(cat.id);
 
@@ -737,7 +1021,7 @@ describe("simulation media evidence", () => {
       cdMean: 0.3,
       cdRms: 0.01,
       strouhal: st,
-      sheddingFreqHz: st * bc.speed / bc.chord,
+      sheddingFreqHz: (st * bc.speed) / bc.chord,
       sampleCount: 141,
     });
     await db.insert(resultMedia).values([
@@ -748,6 +1032,10 @@ describe("simulation media evidence", () => {
         field: "velocity_magnitude",
         storageKey: "jobs/test/cases/a/images/velocity_magnitude.png",
         mimeType: "image/png",
+        sha256: fixtureSha256(
+          "jobs/test/cases/a/images/velocity_magnitude.png",
+        ),
+        byteSize: 2048,
       },
       {
         resultId: animated.id,
@@ -756,6 +1044,10 @@ describe("simulation media evidence", () => {
         field: "velocity_magnitude",
         storageKey: "jobs/test/cases/a/images/velocity_magnitude_mean.png",
         mimeType: "image/png",
+        sha256: fixtureSha256(
+          "jobs/test/cases/a/images/velocity_magnitude_mean.png",
+        ),
+        byteSize: 2048,
       },
       {
         resultId: animated.id,
@@ -766,13 +1058,31 @@ describe("simulation media evidence", () => {
         mimeType: "video/mp4",
         frameCount: 141,
         durationS: 7,
+        sha256: fixtureSha256(
+          "jobs/test/cases/a/images/velocity_magnitude.mp4",
+        ),
+        byteSize: 8192,
       },
     ]);
+    await createExactResultAttemptFixture(db, animated.id, {
+      publication: "selected-eligible",
+    });
+    const animatedRefresh = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
+    if (animatedRefresh.fitSetId)
+      cleanupFitSetIds.add(animatedRefresh.fitSetId);
 
     const sim = await assembleSim(unique, bc.reynolds, 20);
     expect(sim?.media?.velocity_magnitude?.kind).toBe("video");
-    expect(sim?.media?.velocity_magnitude?.url).toContain("velocity_magnitude.mp4");
-    expect(sim?.media?.velocity_magnitude?.meanUrl).toContain("velocity_magnitude_mean.png");
+    expect(sim?.media?.velocity_magnitude?.url).toContain(
+      "velocity_magnitude.mp4",
+    );
+    expect(sim?.media?.velocity_magnitude?.meanUrl).toContain(
+      "velocity_magnitude_mean.png",
+    );
 
     const [staticOnly] = await db
       .insert(results)
@@ -783,7 +1093,7 @@ describe("simulation media evidence", () => {
         aoaDeg: 21,
         status: "done",
         source: "solved",
-        regime: "urans",
+        regime: "rans",
         reynolds: bc.reynolds,
         speed: bc.speed,
         chord: bc.chord,
@@ -791,7 +1101,7 @@ describe("simulation media evidence", () => {
         cd: 0.3,
         cm: -0.1,
         clCd: 2.333,
-        unsteady: true,
+        unsteady: false,
         converged: true,
         strouhal: st,
         solvedAt: new Date(),
@@ -805,16 +1115,31 @@ describe("simulation media evidence", () => {
       field: "velocity_magnitude",
       storageKey: "jobs/test/cases/b/images/velocity_magnitude.png",
       mimeType: "image/png",
+      sha256: fixtureSha256("jobs/test/cases/b/images/velocity_magnitude.png"),
+      byteSize: 2048,
     });
+    await createExactResultAttemptFixture(db, staticOnly.id, {
+      publication: "selected-eligible",
+    });
+    const staticRefresh = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
+    if (staticRefresh.fitSetId) cleanupFitSetIds.add(staticRefresh.fitSetId);
 
     const staticSim = await assembleSim(unique, bc.reynolds, 21);
     expect(staticSim?.status).toBe("solved");
     expect(staticSim?.media?.velocity_magnitude?.kind).toBe("image");
-    const [stillDone] = await db.select().from(results).where(eq(results.id, staticOnly.id)).limit(1);
+    const [stillDone] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, staticOnly.id))
+      .limit(1);
     expect(stillDone.status).toBe("done");
     expect(stillDone.error).toBeNull();
 
-    // Frame-track contract exposure (task #24): a legacy URANS row without
+    // Frame-track contract exposure (task #24): a legacy result row without
     // frame_track ships frameTrack: null — absence stays absence.
     expect(staticSim?.frameTrack).toBeNull();
   });
@@ -825,7 +1150,13 @@ describe("simulation media evidence", () => {
 
     const [cat] = await db
       .insert(categories)
-      .values({ slug: unique, name: "Frame Track Test", path: unique, depth: 0, sortOrder: 999 })
+      .values({
+        slug: unique,
+        name: "Frame Track Test",
+        path: unique,
+        depth: 0,
+        sortOrder: 999,
+      })
       .returning({ id: categories.id });
     cleanupCategoryIds.add(cat.id);
     const [airfoil] = await db
@@ -890,6 +1221,30 @@ describe("simulation media evidence", () => {
       .returning({ id: results.id });
     cleanupResultIds.add(tracked.id);
 
+    await db.insert(forceHistory).values({
+      resultId: tracked.id,
+      t: [10.21, 11.03],
+      cl: [1.1, 1.19],
+      cd: [0.21, 0.22],
+      cm: [-0.06, -0.07],
+      clMean: 1.12,
+      clRms: 0.18,
+      cdMean: 0.21,
+      cdRms: 0.03,
+      sampleCount: 120,
+    });
+    await db.insert(resultMedia).values({
+      resultId: tracked.id,
+      kind: "video",
+      role: "instantaneous",
+      field: "velocity_magnitude",
+      storageKey: "jobs/ft-job/cases/ft-case/velocity_magnitude.mp4",
+      mimeType: "video/mp4",
+      frameCount: 120,
+      sha256: fixtureSha256("jobs/ft-job/cases/ft-case/velocity_magnitude.mp4"),
+      byteSize: 8192,
+    });
+
     // Frame PNGs registered by the ingest evidence sweep (kind frame_image).
     // Frame 1's velocity_magnitude PNG is deliberately MISSING: its URL must
     // be absent from the payload, never invented.
@@ -910,11 +1265,20 @@ describe("simulation media evidence", () => {
         role: "instantaneous",
         storageKey: `jobs/ft-job/cases/ft-case/frames/${field}/f${String(index).padStart(4, "0")}.png`,
         mimeType: "image/png",
-        sha256: `sha-${field}-${index}`,
+        sha256: fixtureSha256(`frame:${field}:${index}`),
         byteSize: 1000 + index,
         metadata: { frameIndex: index },
       })),
     );
+    await createExactResultAttemptFixture(db, tracked.id, {
+      publication: "selected-eligible",
+    });
+    const trackedRefresh = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
+    if (trackedRefresh.fitSetId) cleanupFitSetIds.add(trackedRefresh.fitSetId);
 
     const sim = await assembleSim(unique, bc.reynolds, 18);
     expect(sim?.frameTrack).toBeTruthy();
@@ -923,19 +1287,29 @@ describe("simulation media evidence", () => {
     expect(sim?.frameTrack?.periodS).toBeCloseTo(0.137);
     expect(sim?.frameTrack?.window).toEqual({ tStart: 10.21, tEnd: 11.03 });
     expect(sim?.frameTrack?.stats.cl.mean).toBeCloseTo(1.12);
-    expect(sim?.frameTrack?.fields).toEqual(["vorticity", "velocity_magnitude"]);
+    expect(sim?.frameTrack?.fields).toEqual([
+      "vorticity",
+      "velocity_magnitude",
+    ]);
     expect(sim?.frameTrack?.frames).toHaveLength(2);
     expect(sim?.frameTrack?.frames[0]).toMatchObject({ i: 0, cl: 1.1 });
     expect(sim?.frameTrack?.frames[0].imageUrls).toEqual({
-      vorticity: "/api/media/jobs/ft-job/cases/ft-case/frames/vorticity/f0000.png",
-      velocity_magnitude: "/api/media/jobs/ft-job/cases/ft-case/frames/velocity_magnitude/f0000.png",
+      vorticity:
+        "/api/media/jobs/ft-job/cases/ft-case/frames/vorticity/f0000.png",
+      velocity_magnitude:
+        "/api/media/jobs/ft-job/cases/ft-case/frames/velocity_magnitude/f0000.png",
     });
     // Missing PNG evidence → missing URL (honest absence).
     expect(sim?.frameTrack?.frames[1].imageUrls).toEqual({
-      vorticity: "/api/media/jobs/ft-job/cases/ft-case/frames/vorticity/f0001.png",
+      vorticity:
+        "/api/media/jobs/ft-job/cases/ft-case/frames/vorticity/f0001.png",
     });
     // Frame PNGs stay OUT of the generic evidence panel list (payload bound).
-    expect(sim?.evidenceArtifacts?.some((artifact) => artifact.kind === "frame_image")).toBe(false);
+    expect(
+      sim?.evidenceArtifacts?.some(
+        (artifact) => artifact.kind === "frame_image",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -948,7 +1322,13 @@ describe("geometry-metric sorts keep NULL-metric rows last", () => {
     const unique = `nullsort-${Date.now().toString(36)}`;
     const [cat] = await db
       .insert(categories)
-      .values({ slug: unique, name: "Null Metric Sort Test", path: unique, depth: 0, sortOrder: 999 })
+      .values({
+        slug: unique,
+        name: "Null Metric Sort Test",
+        path: unique,
+        depth: 0,
+        sortOrder: 999,
+      })
       .returning({ id: categories.id });
     cleanupCategoryIds.add(cat.id);
 
@@ -969,13 +1349,26 @@ describe("geometry-metric sorts keep NULL-metric rows last", () => {
       cleanupAirfoilIds.add(row.id);
     };
     // the repro shape: an artifact airfoil with NO computed geometry metrics
-    await mk("artifact", { thicknessPct: null, camberPct: null, areaProfile: null });
-    await mk("thick", { thicknessPct: 66.39, camberPct: 1.2, areaProfile: 0.21 });
+    await mk("artifact", {
+      thicknessPct: null,
+      camberPct: null,
+      areaProfile: null,
+    });
+    await mk("thick", {
+      thicknessPct: 66.39,
+      camberPct: 1.2,
+      areaProfile: 0.21,
+    });
     await mk("thin", { thicknessPct: 12, camberPct: 4.4, areaProfile: 0.07 });
 
-    const suffixes = (rows: Array<{ name: string }>) => rows.map((r) => r.name.split(" ")[1]);
+    const suffixes = (rows: Array<{ name: string }>) =>
+      rows.map((r) => r.name.split(" ")[1]);
 
-    const desc = await listAirfoils({ q: unique, sort: "thickness", dir: "desc" });
+    const desc = await listAirfoils({
+      q: unique,
+      sort: "thickness",
+      dir: "desc",
+    });
     expect(suffixes(desc)).toEqual(["thick", "thin", "artifact"]);
     // DTO honesty: a missing metric is null, never a fake 0 (camber 0.0 is a
     // REAL value on symmetric airfoils and must stay distinguishable).
@@ -984,10 +1377,18 @@ describe("geometry-metric sorts keep NULL-metric rows last", () => {
     expect(desc[2].areaProfile).toBeNull();
     expect(desc[0].thicknessPct).toBeCloseTo(66.39);
 
-    const ascOrder = await listAirfoils({ q: unique, sort: "thickness", dir: "asc" });
+    const ascOrder = await listAirfoils({
+      q: unique,
+      sort: "thickness",
+      dir: "asc",
+    });
     expect(suffixes(ascOrder)).toEqual(["thin", "thick", "artifact"]);
 
-    const camberDesc = await listAirfoils({ q: unique, sort: "camber", dir: "desc" });
+    const camberDesc = await listAirfoils({
+      q: unique,
+      sort: "camber",
+      dir: "desc",
+    });
     expect(suffixes(camberDesc)).toEqual(["thin", "thick", "artifact"]);
 
     const areaAsc = await listAirfoils({ q: unique, sort: "area", dir: "asc" });
@@ -996,9 +1397,15 @@ describe("geometry-metric sorts keep NULL-metric rows last", () => {
     // HTTP path — the exact reported repro URL shape.
     const app = await buildServer();
     try {
-      const res = await app.inject({ method: "GET", url: `/api/airfoils?q=${unique}&sort=thickness&dir=desc` });
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/airfoils?q=${unique}&sort=thickness&dir=desc`,
+      });
       expect(res.statusCode).toBe(200);
-      const items = res.json().items as Array<{ name: string; thicknessPct: number | null }>;
+      const items = res.json().items as Array<{
+        name: string;
+        thicknessPct: number | null;
+      }>;
       expect(suffixes(items)).toEqual(["thick", "thin", "artifact"]);
       expect(items[2].thicknessPct).toBeNull();
     } finally {

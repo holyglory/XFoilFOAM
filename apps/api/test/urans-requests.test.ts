@@ -5,6 +5,10 @@
 // pw- prefixed and deleted in afterAll (global test-hygiene rule).
 
 import {
+  AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "@aerodb/core";
+import {
   airfoils,
   boundaryConditions,
   boundaryProfiles,
@@ -22,16 +26,17 @@ import {
   solverProfiles,
   sweepDefinitions,
 } from "@aerodb/db";
+import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const ORIGINAL_ENV = { ...process.env };
-const PREFIX = `pw-uransreq-${Date.now().toString(36)}`;
+const PREFIX = `pw-uransreq-${process.pid}-${Date.now().toString(36)}`;
 const ADMIN_EMAIL = "admin@airfoils.pro";
 const ADMIN_PASSWORD = "urans-request-test-password";
 
-let app: Awaited<ReturnType<typeof import("../src/server")["buildServer"]>>;
-let db: typeof import("../src/db")["db"];
+let app: Awaited<ReturnType<(typeof import("../src/server"))["buildServer"]>>;
+let db: (typeof import("../src/db"))["db"];
 let adminCookie = "";
 let categoryId = "";
 let airfoilId = "";
@@ -50,7 +55,10 @@ beforeAll(async () => {
   delete process.env.ADMIN_GOOGLE_CLIENT_ID;
   delete process.env.ADMIN_GOOGLE_CLIENT_SECRET;
 
-  const [{ buildServer }, dbModule] = await Promise.all([import("../src/server"), import("../src/db")]);
+  const [{ buildServer }, dbModule] = await Promise.all([
+    import("../src/server"),
+    import("../src/db"),
+  ]);
   db = dbModule.db;
   app = await buildServer();
 
@@ -61,7 +69,9 @@ beforeAll(async () => {
   });
   expect(login.statusCode).toBe(200);
   const setCookie = login.headers["set-cookie"];
-  adminCookie = String(Array.isArray(setCookie) ? setCookie[0] : setCookie).split(";")[0];
+  adminCookie = String(
+    Array.isArray(setCookie) ? setCookie[0] : setCookie,
+  ).split(";")[0];
 
   const [category] = await db
     .insert(categories)
@@ -105,23 +115,50 @@ beforeAll(async () => {
   // is NOT NULL).
   const [bc] = await db
     .insert(boundaryConditions)
-    .values({ slug: `${PREFIX}-bc`, name: `${PREFIX} bc`, mediumId, reynolds: 300000 })
+    .values({
+      slug: `${PREFIX}-bc`,
+      name: `${PREFIX} bc`,
+      mediumId,
+      reynolds: 300000,
+    })
     .returning({ id: boundaryConditions.id });
   bcId = bc.id;
   const [flow] = await db
     .insert(flowConditions)
-    .values({ slug: `${PREFIX}-flow`, name: `${PREFIX} flow`, mediumId: medium.id })
+    .values({
+      slug: `${PREFIX}-flow`,
+      name: `${PREFIX} flow`,
+      mediumId: medium.id,
+    })
     .returning({ id: flowConditions.id });
   const [geo] = await db
     .insert(referenceGeometryProfiles)
     .values({ slug: `${PREFIX}-geo`, name: `${PREFIX} geo` })
     .returning({ id: referenceGeometryProfiles.id });
-  const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${PREFIX}-b`, name: `${PREFIX} b` }).returning({ id: boundaryProfiles.id });
-  const [mesh] = await db.insert(meshProfiles).values({ slug: `${PREFIX}-m`, name: `${PREFIX} m` }).returning({ id: meshProfiles.id });
-  const [solver] = await db.insert(solverProfiles).values({ slug: `${PREFIX}-s`, name: `${PREFIX} s` }).returning({ id: solverProfiles.id });
-  const [sched] = await db.insert(schedulingProfiles).values({ slug: `${PREFIX}-sc`, name: `${PREFIX} sc` }).returning({ id: schedulingProfiles.id });
-  const [output] = await db.insert(outputProfiles).values({ slug: `${PREFIX}-o`, name: `${PREFIX} o` }).returning({ id: outputProfiles.id });
-  const [sweep] = await db.insert(sweepDefinitions).values({ slug: `${PREFIX}-sw`, name: `${PREFIX} sw` }).returning({ id: sweepDefinitions.id });
+  const [boundary] = await db
+    .insert(boundaryProfiles)
+    .values({ slug: `${PREFIX}-b`, name: `${PREFIX} b` })
+    .returning({ id: boundaryProfiles.id });
+  const [mesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${PREFIX}-m`, name: `${PREFIX} m` })
+    .returning({ id: meshProfiles.id });
+  const [solver] = await db
+    .insert(solverProfiles)
+    .values({ slug: `${PREFIX}-s`, name: `${PREFIX} s` })
+    .returning({ id: solverProfiles.id });
+  const [sched] = await db
+    .insert(schedulingProfiles)
+    .values({ slug: `${PREFIX}-sc`, name: `${PREFIX} sc` })
+    .returning({ id: schedulingProfiles.id });
+  const [output] = await db
+    .insert(outputProfiles)
+    .values({ slug: `${PREFIX}-o`, name: `${PREFIX} o` })
+    .returning({ id: outputProfiles.id });
+  const [sweep] = await db
+    .insert(sweepDefinitions)
+    .values({ slug: `${PREFIX}-sw`, name: `${PREFIX} sw` })
+    .returning({ id: sweepDefinitions.id });
   const [preset] = await db
     .insert(simulationPresets)
     .values({
@@ -165,13 +202,24 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (db) {
-    await db.delete(simUransRequests).where(eq(simUransRequests.revisionId, revisionId));
+    await db
+      .delete(simUransRequests)
+      .where(eq(simUransRequests.revisionId, revisionId));
     // Continuation fixtures: results rows before the revision/bc they reference.
-    await db.delete(results).where(eq(results.simulationPresetRevisionId, revisionId));
-    if (bcId) await db.delete(boundaryConditions).where(eq(boundaryConditions.id, bcId));
+    await db
+      .delete(results)
+      .where(eq(results.simulationPresetRevisionId, revisionId));
+    if (bcId)
+      await db
+        .delete(boundaryConditions)
+        .where(eq(boundaryConditions.id, bcId));
     if (presetId) {
-      await db.delete(simulationPresetRevisions).where(eq(simulationPresetRevisions.presetId, presetId));
-      await db.delete(simulationPresets).where(eq(simulationPresets.id, presetId));
+      await db
+        .delete(simulationPresetRevisions)
+        .where(eq(simulationPresetRevisions.presetId, presetId));
+      await db
+        .delete(simulationPresets)
+        .where(eq(simulationPresets.id, presetId));
     }
     const byTable: Record<string, unknown> = {
       mediums,
@@ -191,7 +239,8 @@ afterAll(async () => {
       await db.delete(table).where(eq(table.id, entry.id));
     }
     if (airfoilId) await db.delete(airfoils).where(eq(airfoils.id, airfoilId));
-    if (categoryId) await db.delete(categories).where(eq(categories.id, categoryId));
+    if (categoryId)
+      await db.delete(categories).where(eq(categories.id, categoryId));
   }
   await app?.close();
   process.env = { ...ORIGINAL_ENV };
@@ -219,7 +268,11 @@ describe("POST /api/admin/urans-requests (contract 6)", () => {
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { airfoilId, revisionId: "00000000-0000-4000-8000-000000000000", fidelity: "full" },
+      payload: {
+        airfoilId,
+        revisionId: "00000000-0000-4000-8000-000000000000",
+        fidelity: "full",
+      },
     });
     expect(missing.statusCode).toBe(404);
   });
@@ -232,10 +285,20 @@ describe("POST /api/admin/urans-requests (contract 6)", () => {
       payload: { airfoilId, revisionId, aoaDeg: 8, fidelity: "precalc" },
     });
     expect(first.statusCode).toBe(201);
-    const created = first.json() as { created: boolean; request: { id: string; state: string; requestedBy: string | null; aoaDeg: number } };
+    const created = first.json() as {
+      created: boolean;
+      request: {
+        id: string;
+        state: string;
+        backgroundOwner: boolean;
+        requestedBy: string | null;
+        aoaDeg: number;
+      };
+    };
     expect(created.created).toBe(true);
     expect(created.request.state).toBe("pending");
     expect(created.request.aoaDeg).toBe(8);
+    expect(created.request.backgroundOwner).toBe(true);
     expect(created.request.requestedBy).toBe(ADMIN_EMAIL);
 
     const replay = await app.inject({
@@ -245,11 +308,32 @@ describe("POST /api/admin/urans-requests (contract 6)", () => {
       payload: { airfoilId, revisionId, aoaDeg: 8, fidelity: "precalc" },
     });
     expect(replay.statusCode).toBe(200);
-    const replayed = replay.json() as { created: boolean; request: { id: string } };
+    const replayed = replay.json() as {
+      created: boolean;
+      request: { id: string };
+    };
     expect(replayed.created).toBe(false);
     expect(replayed.request.id).toBe(created.request.id);
 
-    // Whole polar (aoaDeg absent) is a DIFFERENT idempotency cell.
+    // Exact-angle work already exists, so a later whole-polar request would
+    // overlap it. The API surfaces the typed coverage conflict instead of
+    // silently stacking duplicate solver work.
+    const conflictingWhole = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: { airfoilId, revisionId, fidelity: "precalc" },
+    });
+    expect(conflictingWhole.statusCode).toBe(409);
+    expect(conflictingWhole.json()).toMatchObject({
+      code: "whole_polar_overlaps_open_exact",
+      conflictingRequestIds: [created.request.id],
+    });
+
+    await db
+      .update(simUransRequests)
+      .set({ state: "cancelled" })
+      .where(eq(simUransRequests.id, created.request.id));
     const wholePolar = await app.inject({
       method: "POST",
       url: "/api/admin/urans-requests",
@@ -257,7 +341,23 @@ describe("POST /api/admin/urans-requests (contract 6)", () => {
       payload: { airfoilId, revisionId, fidelity: "precalc" },
     });
     expect(wholePolar.statusCode).toBe(201);
-    expect((wholePolar.json() as { request: { aoaDeg: number | null } }).request.aoaDeg).toBeNull();
+    const whole = wholePolar.json() as {
+      request: { id: string; aoaDeg: number | null };
+    };
+    expect(whole.request.aoaDeg).toBeNull();
+
+    // A whole-polar item covers every exact angle, so exact-after-whole reuses
+    // the global item rather than inserting another row.
+    const coveredExact = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: { airfoilId, revisionId, aoaDeg: 9, fidelity: "precalc" },
+    });
+    expect(coveredExact.statusCode).toBe(200);
+    expect(
+      (coveredExact.json() as { request: { id: string } }).request.id,
+    ).toBe(whole.request.id);
 
     const list = await app.inject({
       method: "GET",
@@ -265,14 +365,87 @@ describe("POST /api/admin/urans-requests (contract 6)", () => {
       headers: { cookie: adminCookie },
     });
     expect(list.statusCode).toBe(200);
-    const body = list.json() as { requests: { id: string }[]; verifyItems: unknown[] };
+    const body = list.json() as {
+      requests: { id: string }[];
+      verifyItems: unknown[];
+    };
     expect(body.requests.length).toBe(2);
     expect(body.verifyItems).toEqual([]);
 
     // DB truth: exactly the two open rows, isolated to this test's revision.
-    const rows = await db.select().from(simUransRequests).where(eq(simUransRequests.revisionId, revisionId));
+    const rows = await db
+      .select()
+      .from(simUransRequests)
+      .where(eq(simUransRequests.revisionId, revisionId));
     expect(rows.length).toBe(2);
-    expect(rows.every((r) => r.state === "pending")).toBe(true);
+    expect(rows.map((r) => r.state).sort()).toEqual(["cancelled", "pending"]);
+    await db
+      .delete(simUransRequests)
+      .where(eq(simUransRequests.revisionId, revisionId));
+  });
+
+  it("promotes a reused automatic request to independent ownership without rewriting its creator", async () => {
+    const [automatic] = await db
+      .insert(simUransRequests)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: 7.75,
+        fidelity: "precalc",
+        state: "pending",
+        backgroundOwner: false,
+        requestedBy: AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
+      })
+      .returning();
+
+    const reuse = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: { airfoilId, revisionId, aoaDeg: 7.75, fidelity: "precalc" },
+    });
+    expect(reuse.statusCode).toBe(200);
+    const body = reuse.json() as {
+      created: boolean;
+      request: {
+        id: string;
+        backgroundOwner: boolean;
+        requestedBy: string | null;
+      };
+    };
+    expect(body).toMatchObject({
+      created: false,
+      request: {
+        id: automatic.id,
+        backgroundOwner: true,
+        requestedBy: AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
+      },
+    });
+
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/admin/urans-requests?airfoilId=${airfoilId}&revisionId=${revisionId}`,
+      headers: { cookie: adminCookie },
+    });
+    expect(list.statusCode).toBe(200);
+    const listed = (
+      list.json() as {
+        requests: Array<{
+          id: string;
+          backgroundOwner: boolean;
+          independentOwner: boolean;
+          requestedBy: string | null;
+        }>;
+      }
+    ).requests.find((request) => request.id === automatic.id);
+    expect(listed).toMatchObject({
+      backgroundOwner: true,
+      independentOwner: true,
+      requestedBy: AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
+    });
+    await db
+      .delete(simUransRequests)
+      .where(eq(simUransRequests.id, automatic.id));
   });
 });
 
@@ -372,7 +545,13 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { airfoilId, revisionId, aoaDeg: 2, fidelity: "precalc", budgetOverrideS: 7200 },
+      payload: {
+        airfoilId,
+        revisionId,
+        aoaDeg: 2,
+        fidelity: "precalc",
+        budgetOverrideS: 7200,
+      },
     });
     expect(strayBudget.statusCode).toBe(400);
   });
@@ -455,7 +634,10 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
       payload: { continueFromResultId: source.id, budgetOverrideS: 21600 },
     });
     expect(cont.statusCode).toBe(409);
-    const body = cont.json() as { error: string; request: { continueFromResultId: string | null } };
+    const body = cont.json() as {
+      error: string;
+      request: { continueFromResultId: string | null };
+    };
     expect(body.error).toContain("NOT a continuation");
     expect(body.request.continueFromResultId).toBeNull();
     // Replaying a MATCHING continuation still reuses idempotently (200).
@@ -503,22 +685,35 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
   const BPREFIX = `${PREFIX}-bulk`;
   let campaignId = "";
   let campaignRevisionId = "";
-  const bulkResultIds: string[] = [];
-  const bulkCleanup: { presetIds: string[] } = { presetIds: [] };
+  const bulkOwned = {
+    medium: "",
+    boundary: "",
+    mesh: "",
+    solver: "",
+    output: "",
+  };
 
   afterAll(async () => {
-    if (bulkResultIds.length) {
-      await db.execute(sql`DELETE FROM sim_urans_requests WHERE continue_from_result_id = ANY(${`{${bulkResultIds.join(",")}}`}::uuid[])`);
-      await db.execute(sql`DELETE FROM result_classifications WHERE result_id = ANY(${`{${bulkResultIds.join(",")}}`}::uuid[])`);
-      await db.execute(sql`DELETE FROM results WHERE id = ANY(${`{${bulkResultIds.join(",")}}`}::uuid[])`);
-    }
-    if (campaignId) {
-      await db.execute(sql`DELETE FROM sim_campaigns WHERE id = ${campaignId}`);
-    }
-    for (const presetId of bulkCleanup.presetIds) {
-      await db.execute(sql`DELETE FROM simulation_preset_revisions WHERE preset_id = ${presetId}`);
-      await db.execute(sql`DELETE FROM simulation_presets WHERE id = ${presetId}`);
-    }
+    await cleanupCampaignFixtures(db, {
+      campaignIds: [campaignId],
+      presetSlugPrefix: `campaign-${BPREFIX.toLowerCase()}`,
+    });
+    if (bulkOwned.boundary)
+      await db
+        .delete(boundaryProfiles)
+        .where(eq(boundaryProfiles.id, bulkOwned.boundary));
+    if (bulkOwned.mesh)
+      await db.delete(meshProfiles).where(eq(meshProfiles.id, bulkOwned.mesh));
+    if (bulkOwned.solver)
+      await db
+        .delete(solverProfiles)
+        .where(eq(solverProfiles.id, bulkOwned.solver));
+    if (bulkOwned.output)
+      await db
+        .delete(outputProfiles)
+        .where(eq(outputProfiles.id, bulkOwned.output));
+    if (bulkOwned.medium)
+      await db.delete(mediums).where(eq(mediums.id, bulkOwned.medium));
   });
 
   it("queues continuations for exactly the continuable needs-review rows of the campaign", async () => {
@@ -537,10 +732,27 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
         speedOfSound: 340.3,
       })
       .returning({ id: mediums.id });
-    const [bp] = await db.insert(boundaryProfiles).values({ slug: `${BPREFIX}-b`, name: `${BPREFIX} b` }).returning({ id: boundaryProfiles.id });
-    const [mp] = await db.insert(meshProfiles).values({ slug: `${BPREFIX}-m`, name: `${BPREFIX} m` }).returning({ id: meshProfiles.id });
-    const [sp] = await db.insert(solverProfiles).values({ slug: `${BPREFIX}-s`, name: `${BPREFIX} s` }).returning({ id: solverProfiles.id });
-    const [op] = await db.insert(outputProfiles).values({ slug: `${BPREFIX}-o`, name: `${BPREFIX} o` }).returning({ id: outputProfiles.id });
+    const [bp] = await db
+      .insert(boundaryProfiles)
+      .values({ slug: `${BPREFIX}-b`, name: `${BPREFIX} b` })
+      .returning({ id: boundaryProfiles.id });
+    const [mp] = await db
+      .insert(meshProfiles)
+      .values({ slug: `${BPREFIX}-m`, name: `${BPREFIX} m` })
+      .returning({ id: meshProfiles.id });
+    const [sp] = await db
+      .insert(solverProfiles)
+      .values({ slug: `${BPREFIX}-s`, name: `${BPREFIX} s` })
+      .returning({ id: solverProfiles.id });
+    const [op] = await db
+      .insert(outputProfiles)
+      .values({ slug: `${BPREFIX}-o`, name: `${BPREFIX} o` })
+      .returning({ id: outputProfiles.id });
+    bulkOwned.medium = medium.id;
+    bulkOwned.boundary = bp.id;
+    bulkOwned.mesh = mp.id;
+    bulkOwned.solver = sp.id;
+    bulkOwned.output = op.id;
 
     const launch = await app.inject({
       method: "POST",
@@ -554,8 +766,8 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
         plan: {
           mediumId: medium.id,
           ambients: [[288.15, 101325]],
-          speedsMps: [17],
-          chordsM: [0.2],
+          speedsMps: [17.9137],
+          chordsM: [0.29137],
           spanM: 1,
           areaMode: "derived",
           excludedConditions: [],
@@ -565,7 +777,12 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
             clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
             clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
           },
-          numerics: { boundaryProfileId: bp.id, meshProfileId: mp.id, solverProfileId: sp.id, outputProfileId: op.id },
+          numerics: {
+            boundaryProfileId: bp.id,
+            meshProfileId: mp.id,
+            solverProfileId: sp.id,
+            outputProfileId: op.id,
+          },
         },
       },
     });
@@ -573,13 +790,16 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
     campaignId = launch.json().campaign.id;
     const [condition] = (await db.execute(sql`
       SELECT id, simulation_preset_revision_id AS revision_id, preset_id FROM sim_campaign_conditions WHERE campaign_id = ${campaignId}
-    `)) as unknown as Array<{ id: string; revision_id: string; preset_id: string }>;
+    `)) as unknown as Array<{
+      id: string;
+      revision_id: string;
+      preset_id: string;
+    }>;
     campaignRevisionId = condition.revision_id;
-    bulkCleanup.presetIds.push(condition.preset_id);
 
-    // Three terminal-rejected precalc rows in the campaign: 5° and 7° are
-    // budget-stopped with saved state (continuable); 6° rejected for a
-    // NON-budget reason (no marker) — must be excluded from the bulk.
+    // Three terminal-rejected precalc rows in the campaign: 5° is budget-
+    // stopped and 7° reached the bounded same-case chunk cap; both have saved
+    // state and are continuable. 6° has no restartable marker and is excluded.
     const mkRow = async (aoa: number, warnings: string[]) => {
       const [row] = await db
         .insert(results)
@@ -602,7 +822,6 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
           solvedAt: new Date(),
         })
         .returning({ id: results.id });
-      bulkResultIds.push(row.id);
       await db.execute(sql`
         INSERT INTO result_classifications (result_id, airfoil_id, simulation_preset_revision_id, aoa_deg, regime, classifier_version, state, region, confidence)
         VALUES (${row.id}, ${airfoilId}, ${campaignRevisionId}, ${aoa}, 'urans', 'test-fixture', 'rejected', 'post_stall', 0.9)
@@ -613,10 +832,15 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
       `);
       return row.id;
     };
-    const budgetStopped = "URANS integration stopped by the wall-clock budget guard: retained 1.1 of 3 periods (budget)";
+    const budgetStopped =
+      "URANS integration stopped by the wall-clock budget guard: retained 1.1 of 3 periods (budget)";
     const idA = await mkRow(5, [budgetStopped]);
-    await mkRow(6, ["URANS quality could not be measured: missing or flat shedding history."]);
-    const idC = await mkRow(7, [budgetStopped]);
+    await mkRow(6, [
+      "URANS quality could not be measured: missing or flat shedding history.",
+    ]);
+    const idC = await mkRow(7, [
+      `URANS continuation ${URANS_CONTINUATION_REQUIRED_MARKER}: reached the 6-chunk in-run safety cap with restartable saved case state; URANS window not stationary (precalc established-oscillation test): cycle means trend upward monotonically`,
+    ]);
 
     const res = await app.inject({
       method: "POST",
@@ -625,9 +849,17 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
       payload: { campaignId, budgetOverrideS: 21600 },
     });
     expect(res.statusCode).toBe(201);
-    expect(res.json()).toEqual({ continuable: 2, created: 2, reused: 0, conflicted: 0 });
+    expect(res.json()).toEqual({
+      continuable: 2,
+      created: 2,
+      reused: 0,
+      conflicted: 0,
+    });
 
-    const queued = await db.select().from(simUransRequests).where(eq(simUransRequests.revisionId, campaignRevisionId));
+    const queued = await db
+      .select()
+      .from(simUransRequests)
+      .where(eq(simUransRequests.revisionId, campaignRevisionId));
     expect(queued.length).toBe(2);
     for (const q of queued) {
       expect(q.state).toBe("pending");
@@ -646,22 +878,41 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
       payload: { campaignId, budgetOverrideS: 21600 },
     });
     expect(replay.statusCode).toBe(200);
-    expect(replay.json()).toEqual({ continuable: 0, created: 0, reused: 0, conflicted: 0 });
-    expect((await db.select().from(simUransRequests).where(eq(simUransRequests.revisionId, campaignRevisionId))).length).toBe(2);
+    expect(replay.json()).toEqual({
+      continuable: 0,
+      created: 0,
+      reused: 0,
+      conflicted: 0,
+    });
+    expect(
+      (
+        await db
+          .select()
+          .from(simUransRequests)
+          .where(eq(simUransRequests.revisionId, campaignRevisionId))
+      ).length,
+    ).toBe(2);
 
     // Foreign-campaign scoping: a random campaign id sweeps nothing.
     const foreign = await app.inject({
       method: "POST",
       url: "/api/admin/urans-requests/bulk-continue",
       headers: { cookie: adminCookie },
-      payload: { campaignId: "00000000-0000-4000-8000-000000000000", budgetOverrideS: 21600 },
+      payload: {
+        campaignId: "00000000-0000-4000-8000-000000000000",
+        budgetOverrideS: 21600,
+      },
     });
     expect(foreign.statusCode).toBe(200);
     expect(foreign.json().continuable).toBe(0);
   });
 
   it("requires admin auth and a budget", async () => {
-    const noAuth = await app.inject({ method: "POST", url: "/api/admin/urans-requests/bulk-continue", payload: { budgetOverrideS: 7200 } });
+    const noAuth = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests/bulk-continue",
+      payload: { budgetOverrideS: 7200 },
+    });
     expect([401, 403]).toContain(noAuth.statusCode);
     const noBudget = await app.inject({
       method: "POST",

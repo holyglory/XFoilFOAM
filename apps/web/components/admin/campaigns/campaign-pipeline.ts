@@ -10,8 +10,14 @@
 // reviewBuckets, totals, rate). Nothing is projected beyond the measured
 // trailing-24h ingest; the ETA hides itself rather than invent a rate.
 
-import type { AdminCampaignSummary, CampaignReviewBuckets } from "../../../lib/admin";
-import type { CampaignLadderPhase, CampaignTierCounts } from "./campaign-status";
+import type {
+  AdminCampaignSummary,
+  CampaignReviewBuckets,
+} from "../../../lib/admin";
+import type {
+  CampaignLadderPhase,
+  CampaignTierCounts,
+} from "./campaign-status";
 
 // Local copy of ui.tsx's fCount (importing ui.tsx would drag React into node
 // vitest — same rationale as campaign-status.ts).
@@ -77,7 +83,12 @@ export function assemblePipelineModel(input: {
       open: unsteadyOpen,
       detail:
         unsteadyOpen > 0
-          ? [tiers.precalcOpen > 0 ? `${fCount(tiers.precalcOpen)} open` : null, awaiting > 0 ? `${fCount(awaiting)} awaiting` : null]
+          ? [
+              tiers.precalcOpen > 0
+                ? `${fCount(tiers.precalcOpen)} open`
+                : null,
+              awaiting > 0 ? `${fCount(awaiting)} awaiting` : null,
+            ]
               .filter(Boolean)
               .join(" · ")
           : null,
@@ -89,10 +100,12 @@ export function assemblePipelineModel(input: {
       key: "verify",
       title: "3 · verify",
       open: tiers.verifyOpen,
-      detail: tiers.verifyOpen > 0 ? `${fCount(tiers.verifyOpen)} queued` : null,
+      detail:
+        tiers.verifyOpen > 0 ? `${fCount(tiers.verifyOpen)} queued` : null,
       active: input.phase === "running_refinement",
       // Precalc solves keep enqueueing verifications until stages 1+2 settle.
-      settled: tiers.verifyOpen === 0 && unsteadyOpen === 0 && tiers.ransOpen === 0,
+      settled:
+        tiers.verifyOpen === 0 && unsteadyOpen === 0 && tiers.ransOpen === 0,
     },
   ];
   return { stages, jobsRunning: input.jobsRunning };
@@ -117,11 +130,13 @@ export interface ProgressBarSegments {
   done: number;
   solving: number;
   awaitingUrans: number;
+  blocked: number;
   /** Open = requested − done − solving − awaiting counts (never negative). */
   openCount: number;
   doneCount: number;
   solvingCount: number;
   awaitingCount: number;
+  blockedCount: number;
 }
 
 /** Done = solved + derived (settled evidence). Solving = running (mid-ingest).
@@ -136,15 +151,22 @@ export function progressBarSegments(
   const doneCount = totals.solved + totals.derived;
   const solvingCount = totals.running;
   const awaitingCount = reviewBuckets?.awaitingUrans ?? 0;
-  const frac = (n: number) => (requested > 0 ? Math.min(1, Math.max(0, n / requested)) : 0);
+  const blockedCount = totals.blocked ?? 0;
+  const frac = (n: number) =>
+    requested > 0 ? Math.min(1, Math.max(0, n / requested)) : 0;
   return {
     done: frac(doneCount),
     solving: frac(solvingCount),
     awaitingUrans: frac(awaitingCount),
-    openCount: Math.max(0, requested - doneCount - solvingCount - awaitingCount),
+    blocked: frac(blockedCount),
+    openCount: Math.max(
+      0,
+      requested - doneCount - solvingCount - awaitingCount - blockedCount,
+    ),
     doneCount,
     solvingCount,
     awaitingCount,
+    blockedCount,
   };
 }
 
@@ -169,7 +191,9 @@ export function formatEtaHours(hours: number): string {
   if (hours >= 10) return `~${Math.round(hours)} h`;
   if (hours >= 1) {
     const rounded = Math.round(hours * 2) / 2; // half-hour steps under 10 h
-    return Number.isInteger(rounded) ? `~${rounded} h` : `~${rounded.toFixed(1)} h`;
+    return Number.isInteger(rounded)
+      ? `~${rounded} h`
+      : `~${rounded.toFixed(1)} h`;
   }
   return "~<1 h";
 }
@@ -183,7 +207,11 @@ export function formatEtaHours(hours: number): string {
  *  all-stages ETA would be invented precision). */
 export function stageEta(input: {
   phase: CampaignLadderPhase | undefined;
-  stageOpenByPhase: { ransOpen: number; unsteadyOpen: number; verifyOpen: number } | null;
+  stageOpenByPhase: {
+    ransOpen: number;
+    unsteadyOpen: number;
+    verifyOpen: number;
+  } | null;
   rate: { pointsLast24h: number; measuredSince: string } | null | undefined;
   nowMs?: number;
 }): StageEta | null {
@@ -218,10 +246,15 @@ export function stageEta(input: {
 /** "1,240 done · 12 solving · 96 awaiting URANS · 402 open of 1,750" — zero
  *  parts are omitted (never "0 solving" noise); done and the total always
  *  render. */
-export function progressSummaryLine(seg: ProgressBarSegments, requested: number): string {
+export function progressSummaryLine(
+  seg: ProgressBarSegments,
+  requested: number,
+): string {
   const parts = [`${fCount(seg.doneCount)} done`];
   if (seg.solvingCount > 0) parts.push(`${fCount(seg.solvingCount)} solving`);
-  if (seg.awaitingCount > 0) parts.push(`${fCount(seg.awaitingCount)} awaiting URANS`);
+  if (seg.awaitingCount > 0)
+    parts.push(`${fCount(seg.awaitingCount)} awaiting URANS`);
+  if (seg.blockedCount > 0) parts.push(`${fCount(seg.blockedCount)} blocked`);
   parts.push(`${fCount(seg.openCount)} open of ${fCount(requested)}`);
   return parts.join(" · ");
 }
@@ -241,7 +274,11 @@ export function sweepChipLabel(baseSweep: {
   if (baseSweep.listDeg && baseSweep.listDeg.length > 0) {
     return `sweep ${baseSweep.listDeg.length} angle${baseSweep.listDeg.length === 1 ? "" : "s"}`;
   }
-  if (baseSweep.fromDeg != null && baseSweep.toDeg != null && baseSweep.stepDeg != null) {
+  if (
+    baseSweep.fromDeg != null &&
+    baseSweep.toDeg != null &&
+    baseSweep.stepDeg != null
+  ) {
     return `sweep ${deg(baseSweep.fromDeg)}…${deg(baseSweep.toDeg)} step ${deg(baseSweep.stepDeg)}`;
   }
   return null;

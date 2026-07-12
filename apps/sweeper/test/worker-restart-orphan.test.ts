@@ -53,6 +53,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ConditionMapEntry } from "../src/ingest";
 import { submitCampaignBatch } from "../src/loop";
 import { reconcile } from "../src/reconcile";
+import { withExactManifestEvidence } from "./exact-result-fixture";
 
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `sw-orphan-${process.pid}-${Date.now().toString(36)}`;
@@ -83,10 +84,15 @@ const camberedPoints = [
 ];
 
 function conditionMapOf(payload: unknown): ConditionMapEntry[] {
-  return ((payload as { conditionMap?: ConditionMapEntry[] })?.conditionMap ?? []) as ConditionMapEntry[];
+  return ((payload as { conditionMap?: ConditionMapEntry[] })?.conditionMap ??
+    []) as ConditionMapEntry[];
 }
 
-async function launchCampaign(name: string, speed: number, idemKey: string): Promise<string> {
+async function launchCampaign(
+  name: string,
+  speed: number,
+  idemKey: string,
+): Promise<string> {
   const launch = await materializeCampaignLaunch(db, {
     name,
     priority: 8,
@@ -116,8 +122,14 @@ async function launchCampaign(name: string, speed: number, idemKey: string): Pro
   return launch.campaign.id;
 }
 
-async function composeAndSubmit(campaignId: string, engineJobId: string): Promise<{ jobId: string; entry: ConditionMapEntry }> {
-  const batch = (await findCampaignGapBatch(db, { limit: 500, campaignIds: [campaignId] }))!;
+async function composeAndSubmit(
+  campaignId: string,
+  engineJobId: string,
+): Promise<{ jobId: string; entry: ConditionMapEntry }> {
+  const batch = (await findCampaignGapBatch(db, {
+    limit: 500,
+    campaignIds: [campaignId],
+  }))!;
   expect(batch).not.toBeNull();
   const composeEngine = {
     submitPolar: async (request: PolarRequest): Promise<JobStatus> => ({
@@ -129,7 +141,15 @@ async function composeAndSubmit(campaignId: string, engineJobId: string): Promis
   } as unknown as EngineClient;
   const submitted = await submitCampaignBatch(db, composeEngine, batch, 0, 0);
   expect(submitted).toBe(true);
-  const [job] = await db.select().from(simJobs).where(and(eq(simJobs.campaignId, campaignId), eq(simJobs.engineJobId, engineJobId)));
+  const [job] = await db
+    .select()
+    .from(simJobs)
+    .where(
+      and(
+        eq(simJobs.campaignId, campaignId),
+        eq(simJobs.engineJobId, engineJobId),
+      ),
+    );
   expect(job).toBeTruthy();
   const entries = conditionMapOf(job.requestPayload);
   expect(entries.length).toBe(1);
@@ -137,7 +157,11 @@ async function composeAndSubmit(campaignId: string, engineJobId: string): Promis
 }
 
 beforeAll(async () => {
-  const [state] = await db.select({ enabled: sweeperState.enabled }).from(sweeperState).where(eq(sweeperState.id, 1)).limit(1);
+  const [state] = await db
+    .select({ enabled: sweeperState.enabled })
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1))
+    .limit(1);
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
@@ -146,12 +170,23 @@ beforeAll(async () => {
 
   const [cat] = await db
     .insert(categories)
-    .values({ slug: `${PREFIX}-cat`, name: `${PREFIX} cat`, path: `${PREFIX}-cat`, depth: 0 })
+    .values({
+      slug: `${PREFIX}-cat`,
+      name: `${PREFIX} cat`,
+      path: `${PREFIX}-cat`,
+      depth: 0,
+    })
     .returning();
   categoryId = cat.id;
   const [airfoil] = await db
     .insert(airfoils)
-    .values({ slug: `${PREFIX}-cambered`, name: `${PREFIX} cambered`, categoryId: cat.id, points: camberedPoints, isSymmetric: false })
+    .values({
+      slug: `${PREFIX}-cambered`,
+      name: `${PREFIX} cambered`,
+      categoryId: cat.id,
+      points: camberedPoints,
+      isSymmetric: false,
+    })
     .returning();
   airfoilId = airfoil.id;
   const [medium] = await db
@@ -169,10 +204,22 @@ beforeAll(async () => {
     })
     .returning();
   mediumId = medium.id;
-  const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` }).returning();
-  const [mesh] = await db.insert(meshProfiles).values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` }).returning();
-  const [solver] = await db.insert(solverProfiles).values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` }).returning();
-  const [output] = await db.insert(outputProfiles).values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` }).returning();
+  const [boundary] = await db
+    .insert(boundaryProfiles)
+    .values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` })
+    .returning();
+  const [mesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` })
+    .returning();
+  const [solver] = await db
+    .insert(solverProfiles)
+    .values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` })
+    .returning();
+  const [output] = await db
+    .insert(outputProfiles)
+    .values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` })
+    .returning();
   profileIds.boundary = boundary.id;
   profileIds.mesh = mesh.id;
   profileIds.solver = solver.id;
@@ -188,26 +235,47 @@ afterAll(async () => {
     campaignIds: [orphanCampaignId, genuineCampaignId],
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
   });
-  if (profileIds.boundary) await db.delete(boundaryProfiles).where(eq(boundaryProfiles.id, profileIds.boundary));
-  if (profileIds.mesh) await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
-  if (profileIds.solver) await db.delete(solverProfiles).where(eq(solverProfiles.id, profileIds.solver));
-  if (profileIds.output) await db.delete(outputProfiles).where(eq(outputProfiles.id, profileIds.output));
+  if (profileIds.boundary)
+    await db
+      .delete(boundaryProfiles)
+      .where(eq(boundaryProfiles.id, profileIds.boundary));
+  if (profileIds.mesh)
+    await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
+  if (profileIds.solver)
+    await db
+      .delete(solverProfiles)
+      .where(eq(solverProfiles.id, profileIds.solver));
+  if (profileIds.output)
+    await db
+      .delete(outputProfiles)
+      .where(eq(outputProfiles.id, profileIds.output));
   if (mediumId) await db.delete(mediums).where(eq(mediums.id, mediumId));
   if (airfoilId) await db.delete(airfoils).where(eq(airfoils.id, airfoilId));
-  if (categoryId) await db.delete(categories).where(eq(categories.id, categoryId));
+  if (categoryId)
+    await db.delete(categories).where(eq(categories.id, categoryId));
   if (restoreSweeperEnabled !== null) {
     await db
       .insert(sweeperState)
       .values({ id: 1, enabled: restoreSweeperEnabled })
-      .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: restoreSweeperEnabled } });
+      .onConflictDoUpdate({
+        target: sweeperState.id,
+        set: { enabled: restoreSweeperEnabled },
+      });
   }
   await sql.end();
 });
 
 describe("worker-restart orphan: interrupted campaign points release, never fail", () => {
   it("ingests solved partial evidence, releases the rest, fails NOTHING, campaign failed counter stays 0", async () => {
-    orphanCampaignId = await launchCampaign(`${PREFIX} orphan campaign`, 10, `${PREFIX}-orphan-key`);
-    const { jobId, entry } = await composeAndSubmit(orphanCampaignId, `${PREFIX}-orphan-engine-job`);
+    orphanCampaignId = await launchCampaign(
+      `${PREFIX} orphan campaign`,
+      10,
+      `${PREFIX}-orphan-key`,
+    );
+    const { jobId, entry } = await composeAndSubmit(
+      orphanCampaignId,
+      `${PREFIX}-orphan-engine-job`,
+    );
 
     // The engine's worker-boot reconciliation shape: status AND result both
     // state=failed with the pinned orphan message; the partial result keeps
@@ -250,16 +318,31 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
         completed_cases: 1,
         message: WORKER_RESTART_ORPHAN_MESSAGE,
       }),
-      getResult: async () => partial,
+      getResult: async () => withExactManifestEvidence(partial),
     } as unknown as EngineClient;
 
-    await reconcile(db, orphanEngine, { jobIds: [jobId], skipFailedRecovery: true });
+    await reconcile(db, orphanEngine, {
+      jobIds: [jobId],
+      skipFailedRecovery: true,
+    });
 
     // Solved case: real evidence, kept.
     const rows = await db
-      .select({ aoaDeg: results.aoaDeg, status: results.status, simJobId: results.simJobId, engineJobId: results.engineJobId, cl: results.cl, error: results.error })
+      .select({
+        aoaDeg: results.aoaDeg,
+        status: results.status,
+        simJobId: results.simJobId,
+        engineJobId: results.engineJobId,
+        cl: results.cl,
+        error: results.error,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, entry.revisionId)))
+      .where(
+        and(
+          eq(results.airfoilId, airfoilId),
+          eq(results.simulationPresetRevisionId, entry.revisionId),
+        ),
+      )
       .orderBy(asc(results.aoaDeg));
     expect(rows.map((r) => r.aoaDeg)).toEqual(ANGLES);
     const solved = rows[0];
@@ -278,18 +361,29 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
     // The sim_job terminates truthfully: cancelled with the release message,
     // never 'failed' — infrastructure interruption is not failure evidence.
     const [job] = await db
-      .select({ status: simJobs.status, engineState: simJobs.engineState, error: simJobs.error, finishedAt: simJobs.finishedAt })
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        error: simJobs.error,
+        finishedAt: simJobs.finishedAt,
+      })
       .from(simJobs)
       .where(eq(simJobs.id, jobId));
     expect(job.status).toBe("cancelled");
     expect(job.engineState).toBe("cancelled");
-    expect(job.error).toBe("worker restarted mid-solve; points released for re-solve");
+    expect(job.error).toBe(
+      "worker restarted mid-solve; points released for re-solve",
+    );
     expect(job.finishedAt).not.toBeNull();
 
     // Campaign points: solved angle terminal-linked, interrupted angles stay
     // 'requested' (the "15 failed" incident showed them terminal-failed).
     const points = await db
-      .select({ aoaDeg: simCampaignPoints.aoaDeg, state: simCampaignPoints.state, resultId: simCampaignPoints.resultId })
+      .select({
+        aoaDeg: simCampaignPoints.aoaDeg,
+        state: simCampaignPoints.state,
+        resultId: simCampaignPoints.resultId,
+      })
       .from(simCampaignPoints)
       .where(eq(simCampaignPoints.campaignId, orphanCampaignId))
       .orderBy(asc(simCampaignPoints.aoaDeg));
@@ -304,7 +398,12 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
     const [progress] = await db
       .select()
       .from(simCampaignProgress)
-      .where(and(eq(simCampaignProgress.campaignId, orphanCampaignId), eq(simCampaignProgress.airfoilId, airfoilId)));
+      .where(
+        and(
+          eq(simCampaignProgress.campaignId, orphanCampaignId),
+          eq(simCampaignProgress.airfoilId, airfoilId),
+        ),
+      );
     expect(progress).toBeTruthy();
     expect(progress.failed).toBe(0);
     expect(progress.solved).toBe(1);
@@ -315,15 +414,25 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
     expect(failures.total).toBe(0);
 
     // Recall check: the released points are re-claimable on the next tick.
-    const rebatch = await findCampaignGapBatch(db, { limit: 500, campaignIds: [orphanCampaignId] });
+    const rebatch = await findCampaignGapBatch(db, {
+      limit: 500,
+      campaignIds: [orphanCampaignId],
+    });
     expect(rebatch).not.toBeNull();
     expect(rebatch!.angles).toEqual(ANGLES.slice(1));
   }, 120000);
 
   it("still terminal-fails a GENUINE engine failure — with the message stamped, classing by text (not 'unknown')", async () => {
     const MSG = "MeshError: snappyHexMesh exited 1 during layer addition";
-    genuineCampaignId = await launchCampaign(`${PREFIX} genuine campaign`, 20, `${PREFIX}-genuine-key`);
-    const { jobId, entry } = await composeAndSubmit(genuineCampaignId, `${PREFIX}-genuine-engine-job`);
+    genuineCampaignId = await launchCampaign(
+      `${PREFIX} genuine campaign`,
+      20,
+      `${PREFIX}-genuine-key`,
+    );
+    const { jobId, entry } = await composeAndSubmit(
+      genuineCampaignId,
+      `${PREFIX}-genuine-engine-job`,
+    );
 
     const genuineEngine = (engineJobId: string): EngineClient =>
       ({
@@ -338,17 +447,34 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
           message: MSG,
         }),
         // tasks.py exception path: failed result with a message and no polars.
-        getResult: async (): Promise<JobResult> => ({ job_id: engineJobId, state: "failed", message: MSG, polars: [] }),
+        getResult: async (): Promise<JobResult> => ({
+          job_id: engineJobId,
+          state: "failed",
+          message: MSG,
+          polars: [],
+        }),
       }) as unknown as EngineClient;
 
-    await reconcile(db, genuineEngine(`${PREFIX}-genuine-engine-job`), { jobIds: [jobId], skipFailedRecovery: true });
+    await reconcile(db, genuineEngine(`${PREFIX}-genuine-engine-job`), {
+      jobIds: [jobId],
+      skipFailedRecovery: true,
+    });
 
     // Amendment B (auto-retry-once): the FIRST genuine crash requeues the
     // cells — pending with the marker and the engine message kept as evidence.
     const firstRows = await db
-      .select({ status: results.status, error: results.error, autoRetriedAt: results.autoRetriedAt })
+      .select({
+        status: results.status,
+        error: results.error,
+        autoRetriedAt: results.autoRetriedAt,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, entry.revisionId)));
+      .where(
+        and(
+          eq(results.airfoilId, airfoilId),
+          eq(results.simulationPresetRevisionId, entry.revisionId),
+        ),
+      );
     expect(firstRows.length).toBe(ANGLES.length);
     for (const row of firstRows) {
       expect(row.status).toBe("pending");
@@ -358,13 +484,24 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
 
     // The SECOND crash exhausts the automatic retry: rows terminal-fail WITH
     // the engine message — never empty.
-    const { jobId: secondJobId } = await composeAndSubmit(genuineCampaignId, `${PREFIX}-genuine-engine-job-2`);
-    await reconcile(db, genuineEngine(`${PREFIX}-genuine-engine-job-2`), { jobIds: [secondJobId], skipFailedRecovery: true });
+    const { jobId: secondJobId } = await composeAndSubmit(
+      genuineCampaignId,
+      `${PREFIX}-genuine-engine-job-2`,
+    );
+    await reconcile(db, genuineEngine(`${PREFIX}-genuine-engine-job-2`), {
+      jobIds: [secondJobId],
+      skipFailedRecovery: true,
+    });
 
     const rows = await db
       .select({ status: results.status, error: results.error })
       .from(results)
-      .where(and(eq(results.airfoilId, airfoilId), eq(results.simulationPresetRevisionId, entry.revisionId)));
+      .where(
+        and(
+          eq(results.airfoilId, airfoilId),
+          eq(results.simulationPresetRevisionId, entry.revisionId),
+        ),
+      );
     expect(rows.length).toBe(ANGLES.length);
     for (const row of rows) {
       expect(row.status).toBe("failed");
@@ -374,7 +511,12 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
     const [progress] = await db
       .select()
       .from(simCampaignProgress)
-      .where(and(eq(simCampaignProgress.campaignId, genuineCampaignId), eq(simCampaignProgress.airfoilId, airfoilId)));
+      .where(
+        and(
+          eq(simCampaignProgress.campaignId, genuineCampaignId),
+          eq(simCampaignProgress.airfoilId, airfoilId),
+        ),
+      );
     expect(progress.failed).toBe(ANGLES.length);
 
     // Failures endpoint: classified by the stamped text ('mesh'), NOT 'unknown'.

@@ -3,16 +3,46 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { eq, inArray } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  EngineError,
+  type EngineClient,
+  type JobStatus,
+  type PolarRequest,
+} from "@aerodb/engine-client";
+import { and, eq, inArray, sql as dsql } from "drizzle-orm";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
-const MEDIA_DIR = join(tmpdir(), `xff-sweeper-remote-${process.pid}-${Date.now().toString(36)}`);
+const MEDIA_DIR = join(
+  tmpdir(),
+  `xff-sweeper-remote-${process.pid}-${Date.now().toString(36)}`,
+);
 mkdirSync(MEDIA_DIR, { recursive: true });
 process.env.MEDIA_DIR = MEDIA_DIR;
 
 const dbSchema = await import("@aerodb/db");
-const { ensureSimulationPresetRevision } = await import("@aerodb/db/simulation-setup");
-const { remoteSolverTick } = await import("../src/remote-solver");
+const { ensureSimulationPresetRevision } =
+  await import("@aerodb/db/simulation-setup");
+const {
+  claimResultDelivery,
+  createProgressAwareAbort,
+  remoteSolverTick,
+  renewResultDeliveryClaim,
+  settleResultDelivery,
+} = await import("../src/remote-solver");
+const { registerEvidenceArtifacts } = await import("../src/ingest");
+const { resetEngineBackoffForTests } = await import("../src/engine-backoff");
+const { submitPendingJobWithLifecycleGuard } =
+  await import("../src/submit-lifecycle");
+const { submitUransRetryForJob } = await import("../src/reconcile");
 
 const {
   airfoils,
@@ -21,20 +51,30 @@ const {
   categories,
   createClient,
   flowConditions,
+  forceHistory,
   mediums,
   meshProfiles,
   outputProfiles,
   polarFitSets,
   referenceGeometryProfiles,
   resultAttempts,
+  resultClassifications,
+  resultFieldExtents,
   resultMedia,
   results,
   schedulingProfiles,
   simJobs,
+  simPrecalcObligationAttempts,
+  simPrecalcObligations,
+  simResultSubmitRetries,
   simulationPresets,
   solverEvidenceArtifacts,
   solverProfiles,
   syncApiSettings,
+  syncRemotePromiseCancellations,
+  syncRemoteResultDeliveries,
+  syncSweepPromisePoints,
+  syncSweepPromises,
   sweepDefinitions,
 } = dbSchema;
 
@@ -64,7 +104,14 @@ let presetId = "";
 let revisionId = "";
 let reynolds = 0;
 let mach: number | null = null;
-const profileIds = { boundary: "", mesh: "", solver: "", scheduling: "", output: "", sweep: "" };
+const profileIds = {
+  boundary: "",
+  mesh: "",
+  solver: "",
+  scheduling: "",
+  output: "",
+  sweep: "",
+};
 
 function sha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
@@ -74,9 +121,41 @@ async function deleteIds(table: any, column: any, ids: string[]) {
   if (ids.length) await db.delete(table).where(inArray(column, ids));
 }
 
+async function deleteSchedulingWhenUnreferenced(id: string) {
+  if (!id) return;
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const deleted = await db
+      .delete(schedulingProfiles)
+      .where(
+        and(
+          eq(schedulingProfiles.id, id),
+          dsql`NOT EXISTS (
+            SELECT 1 FROM simulation_presets foreign_preset
+            WHERE foreign_preset.scheduling_profile_id = ${id}
+          )`,
+        ),
+      )
+      .returning({ id: schedulingProfiles.id });
+    if (deleted.length) return;
+    const [stillExists] = await db
+      .select({ id: schedulingProfiles.id })
+      .from(schedulingProfiles)
+      .where(eq(schedulingProfiles.id, id));
+    if (!stillExists) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `remote validation scheduling fixture ${id} remained referenced after cleanup`,
+  );
+}
+
 async function configureRemoteSolver() {
   await db.insert(syncApiSettings).values({ id: 1 }).onConflictDoNothing();
-  const [settings] = await db.select().from(syncApiSettings).where(eq(syncApiSettings.id, 1)).limit(1);
+  const [settings] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
   savedSettings = savedSettings ?? settings ?? null;
   await db
     .update(syncApiSettings)
@@ -110,17 +189,36 @@ async function restoreRemoteSolver() {
 }
 
 async function createFixture() {
-  const [air] = await db.select().from(mediums).where(eq(mediums.slug, "air")).limit(1);
+  const [air] = await db
+    .select()
+    .from(mediums)
+    .where(eq(mediums.slug, "air"))
+    .limit(1);
   if (!air) throw new Error("seeded air medium required");
   mediumId = air.id;
   reynolds = Math.round((SPEED * CHORD) / air.kinematicViscosity);
   mach = air.speedOfSound ? SPEED / air.speedOfSound : null;
 
-  const [cat] = await db.insert(categories).values({ slug: `${PREFIX}-cat`, name: `${PREFIX} cat`, path: `${PREFIX}-cat`, depth: 0 }).returning();
+  const [cat] = await db
+    .insert(categories)
+    .values({
+      slug: `${PREFIX}-cat`,
+      name: `${PREFIX} cat`,
+      path: `${PREFIX}-cat`,
+      depth: 0,
+    })
+    .returning();
   categoryId = cat.id;
   const [foil] = await db
     .insert(airfoils)
-    .values({ slug: `${PREFIX}-foil`, name: `${PREFIX} foil`, categoryId, points: contour, pointFormat: "normalized", isSymmetric: false })
+    .values({
+      slug: `${PREFIX}-foil`,
+      name: `${PREFIX} foil`,
+      categoryId,
+      points: contour,
+      pointFormat: "normalized",
+      isSymmetric: false,
+    })
     .returning();
   airfoilId = foil.id;
   airfoilSlug = foil.slug;
@@ -162,15 +260,43 @@ async function createFixture() {
   flowId = flow.id;
   const [reference] = await db
     .insert(referenceGeometryProfiles)
-    .values({ slug: `${PREFIX}-reference`, name: `${PREFIX} reference`, geometryType: "airfoil_2d", referenceLengthKind: "chord", referenceLengthM: CHORD })
+    .values({
+      slug: `${PREFIX}-reference`,
+      name: `${PREFIX} reference`,
+      geometryType: "airfoil_2d",
+      referenceLengthKind: "chord",
+      referenceLengthM: CHORD,
+    })
     .returning();
   referenceGeometryId = reference.id;
-  const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` }).returning();
-  const [mesh] = await db.insert(meshProfiles).values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` }).returning();
-  const [solver] = await db.insert(solverProfiles).values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` }).returning();
-  const [scheduling] = await db.insert(schedulingProfiles).values({ slug: `${PREFIX}-scheduling`, name: `${PREFIX} scheduling` }).returning();
-  const [output] = await db.insert(outputProfiles).values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` }).returning();
-  const [sweep] = await db.insert(sweepDefinitions).values({ slug: `${PREFIX}-sweep`, name: `${PREFIX} sweep`, aoaList: [810.001, 811.001, 812.001] }).returning();
+  const [boundary] = await db
+    .insert(boundaryProfiles)
+    .values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` })
+    .returning();
+  const [mesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` })
+    .returning();
+  const [solver] = await db
+    .insert(solverProfiles)
+    .values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` })
+    .returning();
+  const [scheduling] = await db
+    .insert(schedulingProfiles)
+    .values({ slug: `${PREFIX}-scheduling`, name: `${PREFIX} scheduling` })
+    .returning();
+  const [output] = await db
+    .insert(outputProfiles)
+    .values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` })
+    .returning();
+  const [sweep] = await db
+    .insert(sweepDefinitions)
+    .values({
+      slug: `${PREFIX}-sweep`,
+      name: `${PREFIX} sweep`,
+      aoaList: [810.001, 811.001, 812.001],
+    })
+    .returning();
   profileIds.boundary = boundary.id;
   profileIds.mesh = mesh.id;
   profileIds.solver = solver.id;
@@ -211,16 +337,52 @@ function writeMedia(storageKey: string, label: string) {
 
 async function cleanupRemoteRows() {
   if (!revisionId) return;
-  await db.delete(solverEvidenceArtifacts).where(eq(solverEvidenceArtifacts.airfoilId, airfoilId));
-  await db.delete(resultAttempts).where(eq(resultAttempts.simulationPresetRevisionId, revisionId));
-  await db.delete(polarFitSets).where(eq(polarFitSets.simulationPresetRevisionId, revisionId));
-  await db.delete(results).where(eq(results.simulationPresetRevisionId, revisionId));
-  await db.delete(simJobs).where(eq(simJobs.simulationPresetRevisionId, revisionId));
+  const promiseIds = await db
+    .select({ id: syncSweepPromises.id })
+    .from(syncSweepPromises)
+    .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
+  if (promiseIds.length) {
+    await db.delete(syncRemotePromiseCancellations).where(
+      inArray(
+        syncRemotePromiseCancellations.promiseId,
+        promiseIds.map((row) => row.id),
+      ),
+    );
+  }
+  await db
+    .delete(solverEvidenceArtifacts)
+    .where(eq(solverEvidenceArtifacts.airfoilId, airfoilId));
+  await db
+    .delete(resultClassifications)
+    .where(eq(resultClassifications.simulationPresetRevisionId, revisionId));
+  await db
+    .delete(simPrecalcObligations)
+    .where(eq(simPrecalcObligations.revisionId, revisionId));
+  await db
+    .delete(polarFitSets)
+    .where(eq(polarFitSets.simulationPresetRevisionId, revisionId));
+  await db
+    .delete(results)
+    .where(eq(results.simulationPresetRevisionId, revisionId));
+  await db
+    .delete(resultAttempts)
+    .where(eq(resultAttempts.simulationPresetRevisionId, revisionId));
+  await db
+    .delete(simJobs)
+    .where(eq(simJobs.simulationPresetRevisionId, revisionId));
+  await db
+    .delete(syncSweepPromises)
+    .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
 }
 
-async function seedDoneRemoteJob(label: string, aoas: number[], wave = 2) {
+async function seedDoneRemoteJob(
+  label: string,
+  aoas: number[],
+  wave = 2,
+  promisedId?: string,
+) {
   const engineJobId = `${PREFIX}-${label}`;
-  const promiseId = randomUUID();
+  const promiseId = promisedId ?? randomUUID();
   const [job] = await db
     .insert(simJobs)
     .values({
@@ -237,6 +399,8 @@ async function seedDoneRemoteJob(label: string, aoas: number[], wave = 2) {
       finishedAt: new Date(),
       requestPayload: {
         syncPromiseId: promiseId,
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
         speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
       },
     })
@@ -269,10 +433,75 @@ async function seedDoneRemoteJob(label: string, aoas: number[], wave = 2) {
         engineCaseSlug: `aoa_${idx}`,
         solvedAt: new Date(),
       })
-      .returning({ id: results.id });
-    const stored = writeMedia(`jobs/${engineJobId}/cases/${idx}/pressure.png`, `${label}:${idx}`);
+      .returning();
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: row.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug: row.engineCaseSlug,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: true,
+        cl: row.cl,
+        cd: row.cd,
+        cm: row.cm,
+        clCd: row.clCd,
+        stalled: false,
+        unsteady: false,
+        converged: true,
+        evidencePayload: { fixture: label, index: idx },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, row.id));
+    await db.insert(resultClassifications).values({
+      resultId: row.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "rans",
+      classifierVersion: "remote-delivery-test-v1",
+      state: "accepted",
+      reasons: [],
+    });
+    const manifest = writeMedia(
+      `jobs/${engineJobId}/cases/${idx}/manifest.json`,
+      `${label}:${idx}:manifest`,
+    );
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: row.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simJobId: job.id,
+      engineJobId,
+      engineCaseSlug: row.engineCaseSlug,
+      aoaDeg,
+      kind: "manifest",
+      role: "raw",
+      storageKey: manifest.storageKey,
+      mimeType: "application/json",
+      sha256: manifest.sha256,
+      byteSize: manifest.byteSize,
+      metadata: { fixture: label, index: idx },
+    });
+    const stored = writeMedia(
+      `jobs/${engineJobId}/cases/${idx}/pressure.png`,
+      `${label}:${idx}`,
+    );
     await db.insert(resultMedia).values({
       resultId: row.id,
+      resultAttemptId: attempt.id,
       kind: "image",
       field: `pressure_${idx}`,
       role: "instantaneous",
@@ -280,6 +509,9 @@ async function seedDoneRemoteJob(label: string, aoas: number[], wave = 2) {
       mimeType: "image/png",
       width: 4,
       height: 4,
+      evidenceSha256: manifest.sha256,
+      sha256: stored.sha256,
+      byteSize: stored.byteSize,
     });
   }
 
@@ -287,28 +519,154 @@ async function seedDoneRemoteJob(label: string, aoas: number[], wave = 2) {
 }
 
 async function readJobPayload(jobId: string) {
-  const [row] = await db.select({ requestPayload: simJobs.requestPayload }).from(simJobs).where(eq(simJobs.id, jobId)).limit(1);
+  const [row] = await db
+    .select({ requestPayload: simJobs.requestPayload })
+    .from(simJobs)
+    .where(eq(simJobs.id, jobId))
+    .limit(1);
   return (row?.requestPayload ?? {}) as { remotePushedAt?: string };
 }
 
-function stubFetch(opts: { failPolarIndex?: number; observeJobId?: string } = {}) {
+async function deliveriesForJob(jobId: string) {
+  return db
+    .select()
+    .from(syncRemoteResultDeliveries)
+    .where(eq(syncRemoteResultDeliveries.simJobId, jobId))
+    .orderBy(syncRemoteResultDeliveries.aoaDeg, syncRemoteResultDeliveries.id);
+}
+
+async function parsedRequestBody(init?: RequestInit): Promise<unknown> {
+  if (!init?.body) return null;
+  const cached = (init as RequestInit & { __parsedBody?: unknown })
+    .__parsedBody;
+  if (cached !== undefined) return cached;
+  if (typeof init.body === "string") return JSON.parse(init.body);
+  const chunks: Buffer[] = [];
+  for await (const chunk of init.body as unknown as AsyncIterable<unknown>) {
+    if (Buffer.isBuffer(chunk)) chunks.push(chunk);
+    else if (typeof chunk === "string" || chunk instanceof Uint8Array)
+      chunks.push(Buffer.from(chunk));
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  const contentType = new Headers(init.headers).get("content-type") ?? "";
+  const boundary = /boundary=([^;]+)/i.exec(contentType)?.[1];
+  if (!boundary) return JSON.parse(text);
+  const manifestHeader = 'name="manifest"';
+  const fieldAt = text.indexOf(manifestHeader);
+  const valueAt = text.indexOf("\r\n\r\n", fieldAt) + 4;
+  const endAt = text.indexOf(`\r\n--${boundary}`, valueAt);
+  const parsed = JSON.parse(text.slice(valueAt, endAt));
+  (init as RequestInit & { __parsedBody?: unknown }).__parsedBody = parsed;
+  return parsed;
+}
+
+function stubFetch(
+  opts: {
+    conflictIdsByPolarIndex?: Record<number, string[]>;
+    conflictStatuses?: Record<string, "pending" | "promoted" | "archived">;
+    failPolarIndex?: number;
+    failCancelCount?: number;
+    unfulfilledPolarIndex?: number;
+    observeJobId?: string;
+  } = {},
+) {
   let polarIndex = 0;
+  let cancelIndex = 0;
   const pushedAtDuringPosts: (string | undefined)[] = [];
   const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
-    if (opts.observeJobId && (url.endsWith("/polars") || url.includes("/complete"))) {
-      pushedAtDuringPosts.push((await readJobPayload(opts.observeJobId)).remotePushedAt);
+    if (
+      opts.observeJobId &&
+      (url.endsWith("/polars") || url.includes("/complete"))
+    ) {
+      pushedAtDuringPosts.push(
+        (await readJobPayload(opts.observeJobId)).remotePushedAt,
+      );
     }
     if (url.endsWith("/polars")) {
       polarIndex += 1;
-      if (opts.failPolarIndex === polarIndex) return new Response(JSON.stringify({ error: "chunk failed" }), { status: 500 });
-      return new Response(JSON.stringify({ imported: 1 }), { status: 200, headers: { "content-type": "application/json" } });
+      if (opts.failPolarIndex === polarIndex)
+        return new Response(JSON.stringify({ error: "chunk failed" }), {
+          status: 500,
+        });
+      const body = (await parsedRequestBody(init)) as {
+        results?: Array<{ aoaDeg?: unknown }>;
+      };
+      const pushedAoas = Array.isArray(body.results)
+        ? body.results
+            .map((result: { aoaDeg?: unknown }) => result.aoaDeg)
+            .filter((aoa: unknown): aoa is number => typeof aoa === "number")
+        : [];
+      return new Response(
+        JSON.stringify({
+          imported: 1,
+          conflictIds: opts.conflictIdsByPolarIndex?.[polarIndex] ?? [],
+          fulfilledAoas:
+            opts.unfulfilledPolarIndex === polarIndex ||
+            Boolean(opts.conflictIdsByPolarIndex?.[polarIndex]?.length)
+              ? []
+              : pushedAoas,
+          unfulfilledAoas:
+            opts.unfulfilledPolarIndex === polarIndex ? pushedAoas : [],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
     }
-    if (url.includes("/complete")) return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
-    if (url.includes("/heartbeat")) return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
-    if (url.endsWith("/solvers/register")) return new Response(JSON.stringify({ solver: { id: randomUUID() } }), { status: 200, headers: { "content-type": "application/json" } });
-    if (url.endsWith("/sweeps/claim")) return new Response(JSON.stringify({ promise: null }), { status: 200, headers: { "content-type": "application/json" } });
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    if (url.endsWith("/conflicts/status")) {
+      const body = (await parsedRequestBody(init)) as { ids?: string[] };
+      return new Response(
+        JSON.stringify({
+          conflicts: (body.ids ?? []).map((id) => ({
+            id,
+            status: opts.conflictStatuses?.[id] ?? "pending",
+          })),
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+    if (url.includes("/complete"))
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    if (url.includes("/heartbeat"))
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    if (url.includes("/sweeps/") && url.endsWith("/cancel")) {
+      cancelIndex += 1;
+      if (cancelIndex <= (opts.failCancelCount ?? 0)) {
+        return new Response(JSON.stringify({ error: "cancel unavailable" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.endsWith("/solvers/register"))
+      return new Response(JSON.stringify({ solver: { id: randomUUID() } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    if (url.endsWith("/sweeps/claim"))
+      return new Response(JSON.stringify({ promise: null }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   });
   vi.stubGlobal("fetch", fetchMock);
   return { fetchMock, pushedAtDuringPosts };
@@ -316,8 +674,186 @@ function stubFetch(opts: { failPolarIndex?: number; observeJobId?: string } = {}
 
 function requests(fetchMock: ReturnType<typeof vi.fn>, suffix: string) {
   return fetchMock.mock.calls
-    .map(([url, init]) => ({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null }))
+    .map(([url, init]) => ({
+      url: String(url),
+      body:
+        (init as (RequestInit & { __parsedBody?: unknown }) | undefined)
+          ?.__parsedBody ??
+        (typeof init?.body === "string" ? JSON.parse(init.body) : null),
+    }))
     .filter((call) => call.url.endsWith(suffix));
+}
+
+async function seedMirroredPromise(label: string, aoas: number[], id?: string) {
+  const [promise] = await db
+    .insert(syncSweepPromises)
+    .values({
+      ...(id ? { id } : {}),
+      sourceInstanceId: "upstream",
+      sourceInstanceName: `Up-tier ${label}`,
+      sourceBaseUrl: UPSTREAM,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaCount: aoas.length,
+      expiresAt: new Date(Date.now() + 3_600_000),
+      lastHeartbeatAt: new Date(),
+      requestPayload: {
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
+        fixture: label,
+      },
+    })
+    .returning();
+  await db.insert(syncSweepPromisePoints).values(
+    aoas.map((aoaDeg) => ({
+      promiseId: promise.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+    })),
+  );
+  return promise;
+}
+
+async function seedRemoteRejectedParent(label: string, aoaDeg: number) {
+  const promise = await seedMirroredPromise(label, [aoaDeg]);
+  const engineJobId = `${PREFIX}-${label}-rans`;
+  const [parent] = await db
+    .insert(simJobs)
+    .values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      referenceChordM: CHORD,
+      wave: 1,
+      jobKind: "targeted",
+      status: "done",
+      engineJobId,
+      totalCases: 1,
+      completedCases: 1,
+      ingestedAt: new Date(),
+      finishedAt: new Date(),
+      requestPayload: {
+        syncPromiseId: promise.id,
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
+        speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+        aoas: [aoaDeg],
+      },
+    })
+    .returning();
+  const [result] = await db
+    .insert(results)
+    .values({
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      status: "failed",
+      source: "queued",
+      regime: "rans",
+      fidelity: "rans",
+      simJobId: parent.id,
+      engineJobId,
+      converged: false,
+      stalled: true,
+      unsteady: false,
+      error: "RANS did not converge",
+      solvedAt: new Date(),
+    })
+    .returning();
+  const [attempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId: result.id,
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      simJobId: parent.id,
+      engineJobId,
+      status: "failed",
+      source: "queued",
+      regime: "rans",
+      validForPolar: false,
+      converged: false,
+      stalled: true,
+      unsteady: false,
+      error: "RANS did not converge",
+      solvedAt: new Date(),
+    })
+    .returning();
+  await db.insert(resultClassifications).values({
+    resultAttemptId: attempt.id,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg,
+    regime: "rans",
+    classifierVersion: "remote-lifecycle-test-v1",
+    state: "rejected",
+    reasons: ["RANS did not converge"],
+  });
+  return { promise, parent, result, attempt };
+}
+
+async function jobsForPromise(promiseId: string) {
+  const rows = await db
+    .select()
+    .from(simJobs)
+    .where(eq(simJobs.simulationPresetRevisionId, revisionId))
+    .orderBy(simJobs.createdAt, simJobs.id);
+  return rows.filter(
+    (row) =>
+      (row.requestPayload as { syncPromiseId?: string } | null)
+        ?.syncPromiseId === promiseId,
+  );
+}
+
+async function resultForAoa(aoaDeg: number) {
+  const [row] = await db
+    .select({
+      id: results.id,
+      status: results.status,
+      simJobId: results.simJobId,
+      retryState: simResultSubmitRetries.state,
+      retryCount: simResultSubmitRetries.attemptCount,
+      retryAt: simResultSubmitRetries.nextAttemptAt,
+    })
+    .from(results)
+    .leftJoin(
+      simResultSubmitRetries,
+      eq(simResultSubmitRetries.resultId, results.id),
+    )
+    .where(
+      and(
+        eq(results.simulationPresetRevisionId, revisionId),
+        eq(results.aoaDeg, aoaDeg),
+      ),
+    )
+    .limit(1);
+  return row;
+}
+
+function acceptedStatus(label: string, totalCases = 1): JobStatus {
+  return {
+    job_id: `${PREFIX}-${label}-${randomUUID()}`,
+    state: "pending",
+    total_cases: totalCases,
+    completed_cases: 0,
+  };
+}
+
+async function readPromise(promiseId: string) {
+  const [promise] = await db
+    .select()
+    .from(syncSweepPromises)
+    .where(eq(syncSweepPromises.id, promiseId));
+  const points = await db
+    .select()
+    .from(syncSweepPromisePoints)
+    .where(eq(syncSweepPromisePoints.promiseId, promiseId))
+    .orderBy(syncSweepPromisePoints.aoaDeg);
+  return { promise, points };
 }
 
 beforeAll(async () => {
@@ -326,11 +862,13 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  resetEngineBackoffForTests();
   await cleanupRemoteRows();
   await configureRemoteSolver();
 });
 
 afterEach(async () => {
+  resetEngineBackoffForTests();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   await cleanupRemoteRows();
@@ -339,62 +877,980 @@ afterEach(async () => {
 afterAll(async () => {
   await cleanupRemoteRows();
   await restoreRemoteSolver();
-  await deleteIds(simulationPresets, simulationPresets.id, [presetId].filter(Boolean));
-  await deleteIds(boundaryConditions, boundaryConditions.id, [bcId].filter(Boolean));
+  await deleteIds(
+    simulationPresets,
+    simulationPresets.id,
+    [presetId].filter(Boolean),
+  );
+  await deleteIds(
+    boundaryConditions,
+    boundaryConditions.id,
+    [bcId].filter(Boolean),
+  );
   await deleteIds(flowConditions, flowConditions.id, [flowId].filter(Boolean));
-  await deleteIds(referenceGeometryProfiles, referenceGeometryProfiles.id, [referenceGeometryId].filter(Boolean));
-  await deleteIds(boundaryProfiles, boundaryProfiles.id, [profileIds.boundary].filter(Boolean));
-  await deleteIds(meshProfiles, meshProfiles.id, [profileIds.mesh].filter(Boolean));
-  await deleteIds(solverProfiles, solverProfiles.id, [profileIds.solver].filter(Boolean));
-  await deleteIds(schedulingProfiles, schedulingProfiles.id, [profileIds.scheduling].filter(Boolean));
-  await deleteIds(outputProfiles, outputProfiles.id, [profileIds.output].filter(Boolean));
-  await deleteIds(sweepDefinitions, sweepDefinitions.id, [profileIds.sweep].filter(Boolean));
+  await deleteIds(
+    referenceGeometryProfiles,
+    referenceGeometryProfiles.id,
+    [referenceGeometryId].filter(Boolean),
+  );
+  await deleteIds(
+    boundaryProfiles,
+    boundaryProfiles.id,
+    [profileIds.boundary].filter(Boolean),
+  );
+  await deleteIds(
+    meshProfiles,
+    meshProfiles.id,
+    [profileIds.mesh].filter(Boolean),
+  );
+  await deleteIds(
+    solverProfiles,
+    solverProfiles.id,
+    [profileIds.solver].filter(Boolean),
+  );
+  await deleteSchedulingWhenUnreferenced(profileIds.scheduling);
+  await deleteIds(
+    outputProfiles,
+    outputProfiles.id,
+    [profileIds.output].filter(Boolean),
+  );
+  await deleteIds(
+    sweepDefinitions,
+    sweepDefinitions.id,
+    [profileIds.sweep].filter(Boolean),
+  );
   await deleteIds(airfoils, airfoils.id, [airfoilId].filter(Boolean));
   await deleteIds(categories, categories.id, [categoryId].filter(Boolean));
   await sql.end();
   rmSync(MEDIA_DIR, { recursive: true, force: true });
 });
 
-describe("remote solver push validation regressions", () => {
-  it("MUST-CATCH: pushes one completed result per /polars request and stamps remotePushedAt only after /complete", async () => {
-    const job = await seedDoneRemoteJob("chunking", [810.001, 811.001, 812.001]);
-    const { fetchMock, pushedAtDuringPosts } = stubFetch({ observeJobId: job.id });
+describe("remote solver submit lifecycle", () => {
+  it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {
+    const aoa = 901.001;
+    const promise = await seedMirroredPromise("connection", [aoa]);
+    const { fetchMock } = stubFetch();
+    let reachable = false;
+    const submitPolar = vi.fn(async () => {
+      if (!reachable) throw new Error("connect ECONNREFUSED 127.0.0.1");
+      return acceptedStatus("connection-retry");
+    });
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
 
+    await remoteSolverTick(db, engine);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(await jobsForPromise(promise.id)).toMatchObject([
+      { status: "cancelled", engineState: "cancelled" },
+    ]);
+    expect(await resultForAoa(aoa)).toMatchObject({
+      status: "pending",
+      simJobId: null,
+      retryState: null,
+      retryCount: null,
+    });
+
+    reachable = true;
+    await remoteSolverTick(db, engine);
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+
+    resetEngineBackoffForTests();
+    await remoteSolverTick(db, engine);
+    expect(submitPolar).toHaveBeenCalledTimes(2);
+    expect((await jobsForPromise(promise.id)).map((row) => row.status)).toEqual(
+      ["cancelled", "submitted"],
+    );
+    expect(await resultForAoa(aoa)).toMatchObject({
+      status: "queued",
+      retryState: null,
+    });
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+  });
+
+  it("waits 30 seconds after the first answered 5xx, then recomposes the same promise without a new upstream claim", async () => {
+    const aoa = 902.001;
+    const promise = await seedMirroredPromise("first-5xx", [aoa]);
+    const { fetchMock } = stubFetch();
+    let fail = true;
+    const submitPolar = vi.fn(async () => {
+      if (fail) throw new EngineError("engine overloaded", 503);
+      return acceptedStatus("first-5xx-retry");
+    });
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await remoteSolverTick(db, engine);
+    const delayed = await resultForAoa(aoa);
+    expect(delayed).toMatchObject({
+      status: "pending",
+      simJobId: null,
+      retryState: "retry_wait",
+      retryCount: 1,
+    });
+    expect(delayed.retryAt?.getTime()).toBeGreaterThan(Date.now());
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+
+    await remoteSolverTick(db, engine);
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+
+    await db
+      .update(simResultSubmitRetries)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(eq(simResultSubmitRetries.resultId, delayed.id));
+    fail = false;
+    await remoteSolverTick(db, engine);
+
+    expect(submitPolar).toHaveBeenCalledTimes(2);
+    expect((await jobsForPromise(promise.id)).map((row) => row.status)).toEqual(
+      ["failed", "submitted"],
+    );
+    expect(await resultForAoa(aoa)).toMatchObject({
+      status: "queued",
+      retryState: null,
+      retryCount: null,
+    });
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
+  });
+
+  it("blocks the exact cell and cancels the upstream promise after a second answered 5xx", async () => {
+    const aoa = 903.001;
+    const promise = await seedMirroredPromise("second-5xx", [aoa]);
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async () => {
+      throw new EngineError("engine overloaded", 503);
+    });
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await remoteSolverTick(db, engine);
+    const delayed = await resultForAoa(aoa);
+    await db
+      .update(simResultSubmitRetries)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(eq(simResultSubmitRetries.resultId, delayed.id));
+    await remoteSolverTick(db, engine);
+
+    expect(submitPolar).toHaveBeenCalledTimes(2);
+    expect(await resultForAoa(aoa)).toMatchObject({
+      status: "failed",
+      retryState: "blocked",
+      retryCount: 1,
+    });
+    const mirror = await readPromise(promise.id);
+    expect(mirror.promise.status).toBe("cancelled");
+    expect(mirror.points.map((row) => row.status)).toEqual(["cancelled"]);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.simulationPresetRevisionId, revisionId)),
+    ).toHaveLength(0);
+  });
+
+  it("durably retries an expired mirror cancellation against its stored hub", async () => {
+    const aoa = 903.501;
+    const promise = await seedMirroredPromise("cancel-outbox", [aoa]);
+    const { fetchMock } = stubFetch({ failCancelCount: 1 });
+    const submitPolar = vi.fn(async () => {
+      await db
+        .update(syncSweepPromises)
+        .set({
+          status: "expired",
+          expiredAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(syncSweepPromises.id, promise.id));
+      await db
+        .update(syncSweepPromisePoints)
+        .set({ status: "expired", updatedAt: new Date() })
+        .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+      throw new EngineError("invalid request", 422);
+    });
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect((await readPromise(promise.id)).promise.status).toBe("cancelled");
+    const [retry] = await db
+      .select()
+      .from(syncRemotePromiseCancellations)
+      .where(eq(syncRemotePromiseCancellations.promiseId, promise.id));
+    expect(retry).toMatchObject({ state: "retry_wait", attemptCount: 1 });
+    expect(
+      requests(fetchMock, `/sweeps/${promise.id}/cancel`).map(
+        (request) => request.url,
+      ),
+    ).toEqual([`${UPSTREAM}/sweeps/${promise.id}/cancel`]);
+
+    await db
+      .update(syncRemotePromiseCancellations)
+      .set({ nextAttemptAt: dsql`now() - interval '1 second'` })
+      .where(eq(syncRemotePromiseCancellations.promiseId, promise.id));
+    await db
+      .update(syncApiSettings)
+      .set({
+        upstreamBaseUrl: "http://new-hub.test/api/sync/v1",
+        upstreamSecret: `${PREFIX}-rotated-secret`,
+        remoteSolverEnabled: false,
+        remoteSolverRegisteredId: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(syncApiSettings.id, 1));
+
+    await remoteSolverTick(db, {} as never);
+
+    const [delivered] = await db
+      .select()
+      .from(syncRemotePromiseCancellations)
+      .where(eq(syncRemotePromiseCancellations.promiseId, promise.id));
+    expect(delivered).toMatchObject({ state: "delivered", attemptCount: 2 });
+    expect(
+      requests(fetchMock, `/sweeps/${promise.id}/cancel`).map(
+        (request) => request.url,
+      ),
+    ).toEqual([
+      `${UPSTREAM}/sweeps/${promise.id}/cancel`,
+      `${UPSTREAM}/sweeps/${promise.id}/cancel`,
+    ]);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/heartbeat`)).toEqual([]);
+    const retryCall = [...fetchMock.mock.calls]
+      .reverse()
+      .find((call) => String(call[0]).endsWith(`/sweeps/${promise.id}/cancel`));
+    expect(
+      new Headers((retryCall?.[1] as RequestInit | undefined)?.headers).get(
+        "x-xfoilfoam-sync-secret",
+      ),
+    ).toBe(`${PREFIX}-rotated-secret`);
+  });
+
+  it("blocks an answered 4xx immediately without inventing solver evidence", async () => {
+    const aoa = 904.001;
+    const promise = await seedMirroredPromise("4xx", [aoa]);
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async () => {
+      throw new EngineError("invalid request", 422);
+    });
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await remoteSolverTick(db, engine);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(await resultForAoa(aoa)).toMatchObject({
+      status: "failed",
+      retryState: "blocked",
+      retryCount: 0,
+    });
+    expect((await readPromise(promise.id)).promise.status).toBe("cancelled");
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.simulationPresetRevisionId, revisionId)),
+    ).toHaveLength(0);
+  });
+
+  it("allows only one engine submit when two remote ticks race the same mirrored promise", async () => {
+    const aoa = 905.001;
+    const promise = await seedMirroredPromise("concurrent", [aoa]);
+    stubFetch();
+    const submitPolar = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return acceptedStatus("concurrent");
+    });
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await Promise.all([
+      remoteSolverTick(db, engine),
+      remoteSolverTick(db, engine),
+    ]);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    const jobs = await jobsForPromise(promise.id);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ status: "submitted" });
+    expect(await resultForAoa(aoa)).toMatchObject({
+      status: "queued",
+      simJobId: jobs[0].id,
+    });
+  });
+
+  it.each([
+    ["cancelled", 906.001],
+    ["expired", 907.001],
+  ] as const)(
+    "persists and compensates an accepted engine task when its mirrored promise becomes %s in flight",
+    async (transition, aoa) => {
+      const promise = await seedMirroredPromise(`compensate-${transition}`, [
+        aoa,
+      ]);
+      stubFetch();
+      const accepted = acceptedStatus(`compensate-${transition}`);
+      const cancelJob = vi.fn(async () => accepted);
+      const submitPolar = vi.fn(async () => {
+        if (transition === "cancelled") {
+          await db
+            .update(syncSweepPromises)
+            .set({ status: "cancelled", cancelledAt: new Date() })
+            .where(eq(syncSweepPromises.id, promise.id));
+          await db
+            .update(syncSweepPromisePoints)
+            .set({ status: "cancelled" })
+            .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+        } else {
+          await db
+            .update(syncSweepPromises)
+            .set({ expiresAt: new Date(Date.now() - 1_000) })
+            .where(eq(syncSweepPromises.id, promise.id));
+        }
+        return accepted;
+      });
+      const engine = { submitPolar, cancelJob } as unknown as EngineClient;
+
+      await remoteSolverTick(db, engine);
+
+      expect(submitPolar).toHaveBeenCalledTimes(1);
+      expect(cancelJob).toHaveBeenCalledWith(accepted.job_id);
+      const [job] = await jobsForPromise(promise.id);
+      expect(job).toMatchObject({
+        status: "cancelled",
+        engineJobId: accepted.job_id,
+        engineState: "cancelled",
+      });
+      expect(job.error).toContain("compensating engine cancellation confirmed");
+      expect(await resultForAoa(aoa)).toMatchObject({
+        status: "pending",
+        simJobId: null,
+      });
+    },
+  );
+
+  it("fails closed before engine submit when a job claim is not an active AoA of its mirrored promise", async () => {
+    const promisedAoa = 908.001;
+    const wrongAoa = 908.501;
+    const promise = await seedMirroredPromise("wrong-aoa", [promisedAoa]);
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "pending",
+        totalCases: 1,
+        requestPayload: {
+          remoteSolver: true,
+          syncPromiseId: promise.id,
+          upstreamBaseUrl: UPSTREAM,
+          aoas: [wrongAoa],
+        },
+      })
+      .returning();
+    await db.insert(results).values({
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: wrongAoa,
+      status: "queued",
+      source: "queued",
+      simJobId: job.id,
+    });
+    const submitPolar = vi.fn(async () => acceptedStatus("wrong-aoa"));
+    const outcome = await submitPendingJobWithLifecycleGuard({
+      db,
+      engine: { submitPolar } as unknown as EngineClient,
+      jobId: job.id,
+      request: {
+        airfoil: { points: contour.map(({ x, y }) => [x, y]) },
+        aoa: { angles: [wrongAoa] },
+      } as PolarRequest,
+      connectionErrorPrefix: "remote engine unreachable at submit: ",
+      submitErrorPrefix: "remote engine submit failed: ",
+    });
+
+    expect(outcome.kind).toBe("lifecycle_stopped");
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect((await jobsForPromise(promise.id))[0]).toMatchObject({
+      status: "cancelled",
+      engineJobId: null,
+    });
+    expect(await resultForAoa(wrongAoa)).toMatchObject({
+      status: "pending",
+      simJobId: null,
+    });
+  });
+
+  it("fails closed before engine submit when the job names a different upstream than the mirrored promise", async () => {
+    const aoa = 909.001;
+    const promise = await seedMirroredPromise("wrong-upstream", [aoa]);
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "pending",
+        totalCases: 1,
+        requestPayload: {
+          remoteSolver: true,
+          syncPromiseId: promise.id,
+          upstreamBaseUrl: "http://different-hub.test/api/sync/v1",
+          aoas: [aoa],
+        },
+      })
+      .returning();
+    await db.insert(results).values({
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: aoa,
+      status: "queued",
+      source: "queued",
+      simJobId: job.id,
+    });
+    const submitPolar = vi.fn(async () => acceptedStatus("wrong-upstream"));
+
+    const outcome = await submitPendingJobWithLifecycleGuard({
+      db,
+      engine: { submitPolar } as unknown as EngineClient,
+      jobId: job.id,
+      request: {
+        airfoil: { points: contour.map(({ x, y }) => [x, y]) },
+        aoa: { angles: [aoa] },
+      } as PolarRequest,
+      connectionErrorPrefix: "remote engine unreachable at submit: ",
+      submitErrorPrefix: "remote engine submit failed: ",
+    });
+
+    expect(outcome.kind).toBe("lifecycle_stopped");
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(await resultForAoa(aoa)).toMatchObject({
+      status: "pending",
+      simJobId: null,
+    });
+  });
+});
+
+describe("remote-owned derived PRECALC lifecycle", () => {
+  it("submits an exact promised wave-2 child with conjunctive remote provenance and no background owner", async () => {
+    const aoa = 920.001;
+    const { promise, parent } = await seedRemoteRejectedParent(
+      "derived-active",
+      aoa,
+    );
+    const submitPolar = vi.fn(async () => acceptedStatus("derived-active"));
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await submitUransRetryForJob(db, engine, parent);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    const [child] = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+    expect(child).toMatchObject({
+      campaignId: null,
+      status: "submitted",
+      wave: 2,
+    });
+    const payload = child.requestPayload as {
+      syncPromiseId: string;
+      remoteSolver: boolean;
+      upstreamBaseUrl: string;
+      aoas: number[];
+      precalcObligationIds: string[];
+    };
+    expect(payload).toMatchObject({
+      syncPromiseId: promise.id,
+      remoteSolver: true,
+      upstreamBaseUrl: UPSTREAM,
+      aoas: [aoa],
+    });
+    expect(payload.precalcObligationIds).toHaveLength(1);
+    const [obligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, payload.precalcObligationIds[0]));
+    expect(obligation).toMatchObject({
+      airfoilId,
+      revisionId,
+      aoaDeg: aoa,
+      backgroundOwner: false,
+      state: "running",
+      attemptCount: 1,
+      latestSimJobId: child.id,
+    });
+    expect(
+      await db
+        .select()
+        .from(simPrecalcObligationAttempts)
+        .where(eq(simPrecalcObligationAttempts.obligationId, obligation.id)),
+    ).toMatchObject([
+      { simJobId: child.id, attemptNumber: 1, state: "submitted" },
+    ]);
+    expect(
+      await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.simJobId, child.id)),
+    ).toHaveLength(0);
+  });
+
+  it.each([
+    ["cancelled", 921.001],
+    ["expired", 922.001],
+  ] as const)(
+    "does not derive or resubmit wave-2 work when the remote promise is already %s",
+    async (transition, aoa) => {
+      const { promise, parent } = await seedRemoteRejectedParent(
+        `derived-before-${transition}`,
+        aoa,
+      );
+      if (transition === "cancelled") {
+        await db
+          .update(syncSweepPromises)
+          .set({ status: "cancelled", cancelledAt: new Date() })
+          .where(eq(syncSweepPromises.id, promise.id));
+        await db
+          .update(syncSweepPromisePoints)
+          .set({ status: "cancelled" })
+          .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+      } else {
+        await db
+          .update(syncSweepPromises)
+          .set({ expiresAt: new Date(Date.now() - 1_000) })
+          .where(eq(syncSweepPromises.id, promise.id));
+      }
+      const submitPolar = vi.fn(async () =>
+        acceptedStatus(`derived-before-${transition}`),
+      );
+      const engine = {
+        submitPolar,
+        cancelJob: vi.fn(),
+      } as unknown as EngineClient;
+
+      await submitUransRetryForJob(db, engine, parent);
+      await submitUransRetryForJob(db, engine, parent);
+
+      expect(submitPolar).not.toHaveBeenCalled();
+      expect(
+        await db
+          .select()
+          .from(simJobs)
+          .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2))),
+      ).toHaveLength(0);
+      expect(
+        await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.revisionId, revisionId)),
+      ).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["cancelled", 923.001],
+    ["expired", 924.001],
+  ] as const)(
+    "compensates exactly once when the remote promise becomes %s during derived wave-2 submit",
+    async (transition, aoa) => {
+      const { promise, parent } = await seedRemoteRejectedParent(
+        `derived-inflight-${transition}`,
+        aoa,
+      );
+      const accepted = acceptedStatus(`derived-inflight-${transition}`);
+      const cancelJob = vi.fn(async () => accepted);
+      const submitPolar = vi.fn(async () => {
+        if (transition === "cancelled") {
+          await db
+            .update(syncSweepPromises)
+            .set({ status: "cancelled", cancelledAt: new Date() })
+            .where(eq(syncSweepPromises.id, promise.id));
+          await db
+            .update(syncSweepPromisePoints)
+            .set({ status: "cancelled" })
+            .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+        } else {
+          await db
+            .update(syncSweepPromises)
+            .set({ expiresAt: new Date(Date.now() - 1_000) })
+            .where(eq(syncSweepPromises.id, promise.id));
+        }
+        return accepted;
+      });
+      const engine = { submitPolar, cancelJob } as unknown as EngineClient;
+
+      await submitUransRetryForJob(db, engine, parent);
+      await submitUransRetryForJob(db, engine, parent);
+
+      expect(submitPolar).toHaveBeenCalledTimes(1);
+      expect(cancelJob).toHaveBeenCalledTimes(1);
+      expect(cancelJob).toHaveBeenCalledWith(accepted.job_id);
+      const [child] = await db
+        .select()
+        .from(simJobs)
+        .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+      expect(child).toMatchObject({
+        campaignId: null,
+        status: "cancelled",
+        engineJobId: accepted.job_id,
+        engineState: "cancelled",
+      });
+      expect(child.requestPayload).toMatchObject({
+        syncPromiseId: promise.id,
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
+        aoas: [aoa],
+      });
+      const obligationIds = (
+        child.requestPayload as { precalcObligationIds: string[] }
+      ).precalcObligationIds;
+      const [obligation] = await db
+        .select()
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligationIds[0]));
+      expect(obligation).toMatchObject({
+        backgroundOwner: false,
+        state: "cancelled",
+        attemptCount: 1,
+        latestSimJobId: child.id,
+        lastOutcome: "ownerless",
+      });
+      expect(
+        await db
+          .select()
+          .from(resultAttempts)
+          .where(eq(resultAttempts.simJobId, child.id)),
+      ).toHaveLength(0);
+    },
+  );
+});
+
+describe("remote solver push validation regressions", () => {
+  it("MUST-CATCH: streams one durable completed result per tick and completes only after every delivery", async () => {
+    const job = await seedDoneRemoteJob(
+      "chunking",
+      [810.001, 811.001, 812.001],
+    );
+    const { fetchMock, pushedAtDuringPosts } = stubFetch({
+      observeJobId: job.id,
+    });
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise(
+      "push-completion",
+      [810.001, 811.001, 812.001],
+      promiseId,
+    );
+
+    await remoteSolverTick(db, {} as never);
+    await remoteSolverTick(db, {} as never);
     await remoteSolverTick(db, {} as never);
 
     const polars = requests(fetchMock, "/polars");
     expect(polars).toHaveLength(3);
     expect(polars.map((call) => call.body.results.length)).toEqual([1, 1, 1]);
-    expect(polars.map((call) => call.body.airfoilSlug)).toEqual([airfoilSlug, airfoilSlug, airfoilSlug]);
-    expect(requests(fetchMock, `/sweeps/${(job.requestPayload as { syncPromiseId: string }).syncPromiseId}/complete`)).toHaveLength(1);
-    expect(pushedAtDuringPosts.every((stamp) => stamp === undefined)).toBe(true);
-    expect((await readJobPayload(job.id)).remotePushedAt).toEqual(expect.any(String));
+    expect(polars.map((call) => call.body.airfoilSlug)).toEqual([
+      airfoilSlug,
+      airfoilSlug,
+      airfoilSlug,
+    ]);
+    expect(
+      requests(
+        fetchMock,
+        `/sweeps/${(job.requestPayload as { syncPromiseId: string }).syncPromiseId}/complete`,
+      ),
+    ).toHaveLength(1);
+    expect(pushedAtDuringPosts.every((stamp) => stamp === undefined)).toBe(
+      true,
+    );
+    expect((await readJobPayload(job.id)).remotePushedAt).toBeUndefined();
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => row.resultId),
+    ).toMatchObject([
+      { state: "delivered" },
+      { state: "delivered" },
+      { state: "delivered" },
+    ]);
+    const mirror = await readPromise(promiseId);
+    expect(mirror.promise.status).toBe("fulfilled");
+    expect(mirror.points.map((row) => row.status)).toEqual([
+      "fulfilled",
+      "fulfilled",
+      "fulfilled",
+    ]);
   });
 
-  it("leaves remotePushedAt unstamped on a mid-sequence chunk failure and retries the chunks on the next tick", async () => {
-    const job = await seedDoneRemoteJob("chunk-retry", [820.001, 821.001, 822.001]);
-    const failed = stubFetch({ failPolarIndex: 2 });
+  it("blocks a 200 response that explicitly leaves the exact AoA unfulfilled", async () => {
+    const aoaDeg = 813.001;
+    const job = await seedDoneRemoteJob("urans-evidence", [aoaDeg]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("urans-evidence", [aoaDeg], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const qualityWarning =
+      "URANS integration stopped by the wall-clock budget guard: retained 1.4 of 3 periods";
+    const frameTrack = {
+      stationary: false,
+      periods_retained: 1.4,
+      selected_frame_count: 28,
+    };
+    const steadyHistory = {
+      iterations: [100, 200],
+      cl: [0.4, 0.42],
+      cd: [0.02, 0.021],
+      cm: [-0.02, -0.021],
+      window: { start_iter: 100, end_iter: 200 },
+      mean_stable: false,
+    };
+    const historyPayload = {
+      t: [0, 1, 2],
+      cl: [0.4, 0.5, 0.4],
+      cd: [0.02, 0.03, 0.02],
+      cm: null,
+      clMean: 0.433,
+      clRms: 0.047,
+      cdMean: 0.023,
+      cdRms: 0.0047,
+      strouhal: 0.18,
+      sheddingFreqHz: 4.1,
+      sampleCount: 3,
+    };
+    await db
+      .update(results)
+      .set({
+        regime: "urans",
+        fidelity: "urans_precalc",
+        unsteady: true,
+        stalled: true,
+        clStd: 0.02,
+        cdStd: 0.001,
+        cmStd: 0.003,
+        nCells: 234_567,
+        qualityWarnings: [qualityWarning],
+        frameTrack,
+        steadyHistory,
+      })
+      .where(eq(results.id, result.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    await db
+      .update(resultAttempts)
+      .set({
+        regime: "urans",
+        unsteady: true,
+        stalled: true,
+        clStd: 0.02,
+        cdStd: 0.001,
+        cmStd: 0.003,
+        nCells: 234_567,
+        qualityWarnings: [qualityWarning],
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          quality_warnings: [qualityWarning],
+          frame_track: frameTrack,
+          steady_history: steadyHistory,
+          force_history: historyPayload,
+        },
+      })
+      .where(eq(resultAttempts.id, attempt.id));
+    await db
+      .update(resultClassifications)
+      .set({ regime: "urans" })
+      .where(eq(resultClassifications.resultAttemptId, attempt.id));
+    await db.insert(forceHistory).values({
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      ...historyPayload,
+    });
+    const [manifest] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    const video = writeMedia(
+      `jobs/${job.engineJobId}/cases/0/pressure.mp4`,
+      "urans-evidence-video",
+    );
+    await db.insert(resultMedia).values({
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      kind: "video",
+      field: "pressure_transport",
+      role: "instantaneous",
+      storageKey: video.storageKey,
+      mimeType: "video/mp4",
+      frameCount: 28,
+      durationS: 1.4,
+      evidenceSha256: manifest.sha256,
+      sha256: video.sha256,
+      byteSize: video.byteSize,
+    });
+    const { fetchMock } = stubFetch({ unfulfilledPolarIndex: 1 });
 
     await remoteSolverTick(db, {} as never);
 
-    expect(requests(failed.fetchMock, "/polars")).toHaveLength(2);
-    expect(requests(failed.fetchMock, `/sweeps/${(job.requestPayload as { syncPromiseId: string }).syncPromiseId}/complete`)).toHaveLength(0);
+    const [polar] = requests(fetchMock, "/polars");
+    expect(polar.body.results).toHaveLength(1);
+    expect(polar.body.results[0]).toMatchObject({
+      aoaDeg,
+      regime: "urans",
+      fidelity: "urans_precalc",
+      clStd: 0.02,
+      cdStd: 0.001,
+      cmStd: 0.003,
+      nCells: 234_567,
+      qualityWarnings: [qualityWarning],
+      frameTrack,
+      steadyHistory,
+      forceHistory: {
+        t: [0, 1, 2],
+        cl: [0.4, 0.5, 0.4],
+        cd: [0.02, 0.03, 0.02],
+        cm: null,
+        clMean: 0.433,
+        clRms: 0.047,
+        cdMean: 0.023,
+        cdRms: 0.0047,
+        strouhal: 0.18,
+        sheddingFreqHz: 4.1,
+        sampleCount: 3,
+      },
+    });
+    expect(polar.body.results[0].media).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "video",
+          field: "pressure_transport",
+          sha256: video.sha256,
+          byteSize: video.byteSize,
+        }),
+      ]),
+    );
+    expect(requests(fetchMock, `/sweeps/${promiseId}/complete`)).toHaveLength(
+      0,
+    );
+    const mirror = await readPromise(promiseId);
+    expect(mirror.promise.status).toBe("cancelled");
+    expect(mirror.points).toMatchObject([
+      { status: "cancelled", resultId: null },
+    ]);
     expect((await readJobPayload(job.id)).remotePushedAt).toBeUndefined();
-    const [settingsAfterFailure] = await db.select().from(syncApiSettings).where(eq(syncApiSettings.id, 1)).limit(1);
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => row.resultId),
+    ).toMatchObject([
+      {
+        state: "superseded",
+        lastHttpStatus: 200,
+        lastError: expect.stringContaining(
+          `explicitly left ${aoaDeg}° unfulfilled`,
+        ),
+      },
+    ]);
+  });
+
+  it("persists a failed point delivery and retries only undelivered results", async () => {
+    const job = await seedDoneRemoteJob(
+      "chunk-retry",
+      [820.001, 821.001, 822.001],
+    );
+    await seedMirroredPromise(
+      "chunk-retry",
+      [820.001, 821.001, 822.001],
+      (job.requestPayload as { syncPromiseId: string }).syncPromiseId,
+    );
+    const failed = stubFetch({ failPolarIndex: 2 });
+
+    await remoteSolverTick(db, {} as never);
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(failed.fetchMock, "/polars")).toHaveLength(2);
+    expect(
+      requests(
+        failed.fetchMock,
+        `/sweeps/${(job.requestPayload as { syncPromiseId: string }).syncPromiseId}/complete`,
+      ),
+    ).toHaveLength(0);
+    expect((await readJobPayload(job.id)).remotePushedAt).toBeUndefined();
+    const [settingsAfterFailure] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
     expect(settingsAfterFailure.remoteSolverLastStatus).toBe("error");
-    expect(settingsAfterFailure.remoteSolverLastError).toContain("remote polar push failed (500)");
+    expect(settingsAfterFailure.remoteSolverLastError).toContain(
+      "remote polar push failed (500)",
+    );
+
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(eq(syncRemoteResultDeliveries.state, "retry_wait"));
 
     vi.unstubAllGlobals();
     const retried = stubFetch();
     await remoteSolverTick(db, {} as never);
+    await remoteSolverTick(db, {} as never);
 
-    expect(requests(retried.fetchMock, "/polars")).toHaveLength(3);
-    expect(requests(retried.fetchMock, `/sweeps/${(job.requestPayload as { syncPromiseId: string }).syncPromiseId}/complete`)).toHaveLength(1);
-    expect((await readJobPayload(job.id)).remotePushedAt).toEqual(expect.any(String));
+    expect(requests(retried.fetchMock, "/polars")).toHaveLength(2);
+    expect(
+      requests(
+        retried.fetchMock,
+        `/sweeps/${(job.requestPayload as { syncPromiseId: string }).syncPromiseId}/complete`,
+      ),
+    ).toHaveLength(1);
+    expect((await readJobPayload(job.id)).remotePushedAt).toBeUndefined();
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => row.resultId),
+    ).toSatisfy((rows: Array<{ state: string }>) =>
+      rows.every((row) => row.state === "delivered"),
+    );
   });
 
   it("MUST-CATCH: terminal wave-2 children unblock a wave-1 parent push, while running children still delay it", async () => {
-    const unblocked = await seedDoneRemoteJob("done-child-unblocks", [830.001], 1);
+    const unblocked = await seedDoneRemoteJob(
+      "done-child-unblocks",
+      [830.001],
+      1,
+    );
+    await seedMirroredPromise(
+      "done-child-unblocks",
+      [830.001],
+      (unblocked.requestPayload as { syncPromiseId: string }).syncPromiseId,
+    );
     await db.insert(simJobs).values({
       parentJobId: unblocked.id,
       airfoilId,
@@ -413,11 +1869,23 @@ describe("remote solver push validation regressions", () => {
     await remoteSolverTick(db, {} as never);
 
     expect(requests(doneChildFetch.fetchMock, "/polars")).toHaveLength(1);
-    expect((await readJobPayload(unblocked.id)).remotePushedAt).toEqual(expect.any(String));
+    expect((await readJobPayload(unblocked.id)).remotePushedAt).toBeUndefined();
+    expect(
+      (await deliveriesForJob(unblocked.id)).filter((row) => row.resultId),
+    ).toMatchObject([{ state: "delivered" }]);
 
     vi.unstubAllGlobals();
     await cleanupRemoteRows();
-    const blocked = await seedDoneRemoteJob("running-child-blocks", [831.001], 1);
+    const blocked = await seedDoneRemoteJob(
+      "running-child-blocks",
+      [831.001],
+      1,
+    );
+    await seedMirroredPromise(
+      "running-child-blocks",
+      [831.001],
+      (blocked.requestPayload as { syncPromiseId: string }).syncPromiseId,
+    );
     await db.insert(simJobs).values({
       parentJobId: blocked.id,
       airfoilId,
@@ -439,4 +1907,710 @@ describe("remote solver push validation regressions", () => {
     expect(requests(runningChildFetch.fetchMock, "/complete")).toHaveLength(0);
     expect((await readJobPayload(blocked.id)).remotePushedAt).toBeUndefined();
   });
+
+  it("does not complete a promise after a partial job push and fulfills it only after every promised point is pushed", async () => {
+    const promiseId = randomUUID();
+    const first = await seedDoneRemoteJob(
+      "partial-first",
+      [840.001],
+      2,
+      promiseId,
+    );
+    await seedMirroredPromise(
+      "partial-coverage",
+      [840.001, 841.001],
+      promiseId,
+    );
+    const firstPush = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(firstPush.fetchMock, "/polars")).toHaveLength(1);
+    expect(
+      requests(firstPush.fetchMock, `/sweeps/${promiseId}/complete`),
+    ).toHaveLength(0);
+    expect((await readJobPayload(first.id)).remotePushedAt).toBeUndefined();
+    expect(
+      (await deliveriesForJob(first.id)).filter((row) => row.resultId),
+    ).toMatchObject([{ state: "delivered" }]);
+    const partial = await readPromise(promiseId);
+    expect(partial.promise.status).toBe("active");
+    expect(partial.points.map((row) => row.status)).toEqual([
+      "fulfilled",
+      "active",
+    ]);
+
+    vi.unstubAllGlobals();
+    const second = await seedDoneRemoteJob(
+      "partial-second",
+      [841.001],
+      2,
+      promiseId,
+    );
+    const secondPush = stubFetch();
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(secondPush.fetchMock, "/polars")).toHaveLength(1);
+    expect(
+      requests(secondPush.fetchMock, `/sweeps/${promiseId}/complete`),
+    ).toHaveLength(1);
+    expect((await readJobPayload(second.id)).remotePushedAt).toBeUndefined();
+    expect(
+      (await deliveriesForJob(second.id)).filter((row) => row.resultId),
+    ).toMatchObject([{ state: "delivered" }]);
+    const complete = await readPromise(promiseId);
+    expect(complete.promise.status).toBe("fulfilled");
+    expect(complete.points.map((row) => row.status)).toEqual([
+      "fulfilled",
+      "fulfilled",
+    ]);
+  });
+
+  it("keeps a slow progressing upload alive past multiple stall windows and aborts a stalled upload", async () => {
+    const progressing = createProgressAwareAbort({
+      stallTimeoutMs: 30,
+      absoluteTimeoutMs: 1_000,
+    });
+    for (let step = 0; step < 4; step += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      progressing.progress();
+      expect(progressing.signal.aborted).toBe(false);
+    }
+    progressing.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(progressing.signal.aborted).toBe(false);
+
+    const stalled = createProgressAwareAbort({
+      stallTimeoutMs: 20,
+      absoluteTimeoutMs: 1_000,
+    });
+    await new Promise<void>((resolve) =>
+      stalled.signal.addEventListener("abort", () => resolve(), {
+        once: true,
+      }),
+    );
+    expect(stalled.signal.aborted).toBe(true);
+    expect(String(stalled.signal.reason)).toContain(
+      "stalled without stream progress",
+    );
+    stalled.dispose();
+  });
+
+  it("renews a delivery claim that has streamed for more than 30 minutes and rejects a stale settlement token", async () => {
+    const job = await seedDoneRemoteJob("long-claim", [850.001]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("long-claim", [850.001], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    const claim = await claimResultDelivery(
+      db,
+      promiseId,
+      job,
+      result,
+      attempt,
+    );
+    expect(claim).not.toBeNull();
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({
+        claimedAt: new Date(Date.now() - 35 * 60_000),
+        claimExpiresAt: new Date(Date.now() + 60_000),
+      })
+      .where(eq(syncRemoteResultDeliveries.id, claim!.id));
+    await renewResultDeliveryClaim(db, claim!);
+    const [renewed] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, claim!.id));
+    expect(renewed.claimedAt!.getTime()).toBeLessThan(Date.now() - 30 * 60_000);
+    expect(renewed.claimExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+    await settleResultDelivery(db, claim!, { kind: "delivered" });
+
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({
+        state: "pending",
+        claimToken: null,
+        claimedAt: null,
+        claimExpiresAt: null,
+        deliveredAt: null,
+      })
+      .where(eq(syncRemoteResultDeliveries.id, claim!.id));
+    const staleClaim = await claimResultDelivery(
+      db,
+      promiseId,
+      job,
+      result,
+      attempt,
+    );
+    expect(staleClaim).not.toBeNull();
+    const replacementToken = randomUUID();
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({ claimToken: replacementToken })
+      .where(eq(syncRemoteResultDeliveries.id, staleClaim!.id));
+    await expect(
+      settleResultDelivery(db, staleClaim!, { kind: "delivered" }),
+    ).rejects.toThrow("expired or changed before settlement");
+    expect(
+      (
+        await db
+          .select()
+          .from(syncRemoteResultDeliveries)
+          .where(eq(syncRemoteResultDeliveries.id, staleClaim!.id))
+      )[0],
+    ).toMatchObject({ state: "pushing", claimToken: replacementToken });
+  });
+
+  it("keeps transient promise-heartbeat failures retryable but cancels engine work on authoritative 404/409 lease loss", async () => {
+    const seedLease = async (label: string, aoa: number) => {
+      const promise = await seedMirroredPromise(label, [aoa]);
+      await db
+        .update(syncSweepPromises)
+        .set({
+          expiresAt: new Date(Date.now() + 1_000),
+          lastHeartbeatAt: new Date(Date.now() - 3_600_000),
+        })
+        .where(eq(syncSweepPromises.id, promise.id));
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "running",
+          engineJobId: `${PREFIX}-${label}-engine`,
+          totalCases: 1,
+          completedCases: 0,
+          requestPayload: {
+            syncPromiseId: promise.id,
+            remoteSolver: true,
+            upstreamBaseUrl: UPSTREAM,
+          },
+        })
+        .returning();
+      return { promise, job };
+    };
+
+    const transient = await seedLease("heartbeat-transient", 851.001);
+    const transientCancel = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        if (String(input).includes(`/sweeps/${transient.promise.id}/heartbeat`))
+          throw new Error("temporary route timeout");
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }),
+    );
+    await remoteSolverTick(db, {
+      cancelJob: transientCancel,
+    } as unknown as EngineClient);
+    expect((await readPromise(transient.promise.id)).promise.status).toBe(
+      "active",
+    );
+    expect(
+      (
+        await db.select().from(simJobs).where(eq(simJobs.id, transient.job.id))
+      )[0].status,
+    ).toBe("running");
+    expect(transientCancel).not.toHaveBeenCalled();
+
+    for (const [status, aoa] of [
+      [404, 852.001],
+      [409, 853.001],
+    ] as const) {
+      vi.unstubAllGlobals();
+      await cleanupRemoteRows();
+      await configureRemoteSolver();
+      const authoritative = await seedLease(`heartbeat-${status}`, aoa);
+      const cancelJob = vi.fn(async () => undefined);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL) => {
+          if (
+            String(input).includes(
+              `/sweeps/${authoritative.promise.id}/heartbeat`,
+            )
+          )
+            return new Response(JSON.stringify({ error: "lease lost" }), {
+              status,
+            });
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
+      );
+      await remoteSolverTick(db, { cancelJob } as unknown as EngineClient);
+      expect(cancelJob).toHaveBeenCalledWith(authoritative.job.engineJobId);
+      expect((await readPromise(authoritative.promise.id)).promise.status).toBe(
+        "cancelled",
+      );
+      expect(
+        (
+          await db
+            .select()
+            .from(simJobs)
+            .where(eq(simJobs.id, authoritative.job.id))
+        )[0],
+      ).toMatchObject({ status: "cancelled", engineState: "cancelled" });
+    }
+  });
+
+  it("retries promoted conflicts but retires archived conflicts without re-push", async () => {
+    const aoa = 854.001;
+    const job = await seedDoneRemoteJob("conflict-reopen", [aoa]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("conflict-reopen", [aoa], promiseId);
+    const conflictId = randomUUID();
+    const blockedFetch = stubFetch({
+      conflictIdsByPolarIndex: { 1: [conflictId] },
+    });
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(blockedFetch.fetchMock, "/polars")).toHaveLength(1);
+    expect(
+      (await deliveriesForJob(job.id)).find((row) => row.resultId),
+    ).toMatchObject({
+      state: "blocked",
+      remoteConflictIds: [conflictId],
+    });
+
+    vi.unstubAllGlobals();
+    const unresolvedFetch = stubFetch({
+      conflictStatuses: { [conflictId]: "pending" },
+    });
+    await remoteSolverTick(db, {} as never);
+    expect(requests(unresolvedFetch.fetchMock, "/polars")).toHaveLength(0);
+    expect(
+      (await deliveriesForJob(job.id)).find((row) => row.resultId)?.state,
+    ).toBe("blocked");
+
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(eq(syncRemoteResultDeliveries.simJobId, job.id));
+
+    vi.unstubAllGlobals();
+    const resolvedFetch = stubFetch({
+      conflictStatuses: { [conflictId]: "archived" },
+    });
+    await remoteSolverTick(db, {} as never);
+    expect(requests(resolvedFetch.fetchMock, "/polars")).toHaveLength(0);
+    expect(
+      (await deliveriesForJob(job.id)).find((row) => row.resultId)?.state,
+    ).toBe("superseded");
+    expect((await readPromise(promiseId)).points[0]?.status).toBe("cancelled");
+  });
+
+  it("does not let more than 250 blocked or not-due jobs starve one ready result delivery", async () => {
+    const promiseId = randomUUID();
+    const aoas = Array.from({ length: 252 }, (_, index) => 860 + index / 1000);
+    await seedMirroredPromise("delivery-fairness", aoas, promiseId);
+    const jobs = [];
+    for (const [index, aoa] of aoas.entries()) {
+      jobs.push(
+        await seedDoneRemoteJob(
+          `delivery-fairness-${index}`,
+          [aoa],
+          2,
+          promiseId,
+        ),
+      );
+    }
+    for (const [index, job] of jobs.slice(0, 251).entries()) {
+      const [result] = await db
+        .select()
+        .from(results)
+        .where(eq(results.simJobId, job.id));
+      const [attempt] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.resultId, result.id));
+      await db.insert(syncRemoteResultDeliveries).values({
+        promiseId,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg: result.aoaDeg,
+        generationKey: attempt.id,
+        state: index % 2 === 0 ? "blocked" : "retry_wait",
+        nextAttemptAt: new Date(Date.now() + 3_600_000),
+        lastError: "fixture must not be selected",
+      });
+    }
+    const ready = jobs[251];
+    const readyFetch = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    const pushes = requests(readyFetch.fetchMock, "/polars");
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0].body.results).toMatchObject([{ aoaDeg: aoas[251] }]);
+    expect(
+      (await deliveriesForJob(ready.id)).find((row) => row.resultId)?.state,
+    ).toBe("delivered");
+  }, 120_000);
+
+  it("reuses accepted cached evidence for a new promise but releases rejected cached evidence for continuation", async () => {
+    const acceptedAoa = 854.101;
+    const acceptedJob = await seedDoneRemoteJob("reuse-accepted", [
+      acceptedAoa,
+    ]);
+    await db
+      .update(simJobs)
+      .set({ requestPayload: { reusableFixture: true } })
+      .where(eq(simJobs.id, acceptedJob.id));
+    const acceptedPromise = await seedMirroredPromise("reuse-accepted", [
+      acceptedAoa,
+    ]);
+    const acceptedFetch = stubFetch();
+    const submitPolar = vi.fn();
+
+    const [reusableReadiness] = (await db.execute(dsql`
+      SELECT
+        accepted_result.current_result_attempt_id IS NOT NULL AS has_pointer,
+        EXISTS (
+          SELECT 1 FROM result_classifications classification
+          WHERE classification.result_attempt_id = accepted_result.current_result_attempt_id
+            AND classification.state = 'accepted'
+        ) AS accepted,
+        EXISTS (
+          SELECT 1 FROM solver_evidence_artifacts manifest
+          WHERE manifest.result_id = accepted_result.id
+            AND manifest.result_attempt_id = accepted_result.current_result_attempt_id
+            AND manifest.kind = 'manifest'
+        ) AS has_manifest
+      FROM results accepted_result
+      WHERE accepted_result.sim_job_id = ${acceptedJob.id}
+    `)) as unknown as Array<{
+      has_pointer: boolean;
+      accepted: boolean;
+      has_manifest: boolean;
+    }>;
+    expect(reusableReadiness).toEqual({
+      has_pointer: true,
+      accepted: true,
+      has_manifest: true,
+    });
+    const [candidateCount] = (await db.execute(dsql`
+      SELECT count(*)::int AS n
+      FROM sync_sweep_promises promise
+      JOIN sync_sweep_promise_points point
+        ON point.promise_id = promise.id AND point.status = 'active'
+      JOIN results accepted_result
+        ON accepted_result.airfoil_id = point.airfoil_id
+       AND accepted_result.simulation_preset_revision_id = point.simulation_preset_revision_id
+       AND accepted_result.aoa_deg = point.aoa_deg
+       AND accepted_result.status = 'done'
+      JOIN sim_jobs accepted_job ON accepted_job.id = accepted_result.sim_job_id
+      JOIN result_attempts accepted_attempt
+        ON accepted_attempt.id = accepted_result.current_result_attempt_id
+       AND accepted_attempt.result_id = accepted_result.id
+      JOIN result_classifications classification
+        ON classification.result_attempt_id = accepted_attempt.id
+       AND classification.state = 'accepted'
+      WHERE promise.id = ${acceptedPromise.id}
+        AND promise.status = 'active'
+        AND promise.source_base_url = ${UPSTREAM}
+        AND promise.request_payload ->> 'remoteSolver' = 'true'
+    `)) as unknown as Array<{ n: number }>;
+    expect(candidateCount?.n).toBe(1);
+
+    await remoteSolverTick(db, { submitPolar } as unknown as EngineClient);
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(
+      (await deliveriesForJob(acceptedJob.id)).find((row) => row.resultId)
+        ?.state,
+    ).toBe("delivered");
+    expect(requests(acceptedFetch.fetchMock, "/polars")).toHaveLength(1);
+    expect((await readPromise(acceptedPromise.id)).points[0].status).toBe(
+      "fulfilled",
+    );
+
+    vi.unstubAllGlobals();
+    await cleanupRemoteRows();
+    await configureRemoteSolver();
+    const rejectedAoa = 854.201;
+    const rejectedJob = await seedDoneRemoteJob("reuse-rejected", [
+      rejectedAoa,
+    ]);
+    await db
+      .update(simJobs)
+      .set({ requestPayload: { reusableFixture: true } })
+      .where(eq(simJobs.id, rejectedJob.id));
+    const [rejectedResult] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, rejectedJob.id));
+    await db
+      .update(resultClassifications)
+      .set({ state: "rejected", reasons: ["fixture rejected"] })
+      .where(eq(resultClassifications.resultId, rejectedResult.id));
+    const rejectedPromise = await seedMirroredPromise("reuse-rejected", [
+      rejectedAoa,
+    ]);
+    stubFetch();
+    const continuation = acceptedStatus("reuse-rejected-continuation");
+    const submitRejected = vi.fn(async () => continuation);
+
+    await remoteSolverTick(db, {
+      submitPolar: submitRejected,
+    } as unknown as EngineClient);
+
+    expect(submitRejected).toHaveBeenCalledTimes(1);
+    expect(await resultForAoa(rejectedAoa)).toMatchObject({
+      status: "queued",
+      simJobId: expect.any(String),
+    });
+    expect((await readPromise(rejectedPromise.id)).points[0].status).toBe(
+      "active",
+    );
+  });
+
+  it("ships only the exact child attempt generation and ignores stale parent artifact, media, and extent rows", async () => {
+    const aoa = 855.001;
+    const child = await seedDoneRemoteJob("exact-child", [aoa]);
+    const promiseId = (child.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("exact-child", [aoa], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, child.id));
+    const [childAttempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    const [childManifest] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, childAttempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    const [parent] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "done",
+        engineJobId: `${PREFIX}-exact-parent`,
+        totalCases: 1,
+        completedCases: 1,
+        finishedAt: new Date(),
+      })
+      .returning();
+    await db
+      .update(simJobs)
+      .set({ parentJobId: parent.id })
+      .where(eq(simJobs.id, child.id));
+    const [parentAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: aoa,
+        simJobId: parent.id,
+        engineJobId: parent.engineJobId,
+        engineCaseSlug: "stale_parent_case",
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: true,
+        cl: result.cl,
+        cd: result.cd,
+        cm: result.cm,
+        solvedAt: new Date(),
+      })
+      .returning();
+    const staleManifest = writeMedia(
+      `jobs/${parent.engineJobId}/stale-parent-manifest.json`,
+      "stale-parent-manifest",
+    );
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: result.id,
+      resultAttemptId: parentAttempt.id,
+      airfoilId,
+      simJobId: parent.id,
+      engineJobId: parent.engineJobId,
+      engineCaseSlug: "stale_parent_case",
+      aoaDeg: aoa,
+      kind: "manifest",
+      role: "raw",
+      storageKey: staleManifest.storageKey,
+      mimeType: "application/json",
+      sha256: staleManifest.sha256,
+      byteSize: staleManifest.byteSize,
+      metadata: { generation: "stale-parent" },
+    });
+    const staleMedia = writeMedia(
+      `jobs/${parent.engineJobId}/stale-parent.png`,
+      "stale-parent-media",
+    );
+    await db.insert(resultMedia).values({
+      resultId: result.id,
+      resultAttemptId: parentAttempt.id,
+      kind: "image",
+      field: "stale_parent_field",
+      role: "instantaneous",
+      storageKey: staleMedia.storageKey,
+      mimeType: "image/png",
+      evidenceSha256: staleManifest.sha256,
+      sha256: staleMedia.sha256,
+      byteSize: staleMedia.byteSize,
+    });
+    await db.insert(resultFieldExtents).values([
+      {
+        resultId: result.id,
+        resultAttemptId: childAttempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        field: "pressure_0",
+        vmin: 0,
+        vmax: 1,
+        finiteCount: 10,
+        evidenceSha256: childManifest.sha256,
+      },
+      {
+        resultId: result.id,
+        resultAttemptId: parentAttempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        field: "stale_parent_field",
+        vmin: -9,
+        vmax: 9,
+        finiteCount: 99,
+        evidenceSha256: staleManifest.sha256,
+      },
+    ]);
+    const fetch = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    const [polar] = requests(fetch.fetchMock, "/polars");
+    expect(polar.body.results[0].evidenceArtifacts).toHaveLength(1);
+    expect(polar.body.results[0].evidenceArtifacts[0].sha256).toBe(
+      childManifest.sha256,
+    );
+    expect(polar.body.results[0].media).toHaveLength(1);
+    expect(polar.body.results[0].media[0].field).not.toBe("stale_parent_field");
+    expect(polar.body.results[0].fieldExtents).toMatchObject([
+      { field: "pressure_0", evidenceSha256: childManifest.sha256 },
+    ]);
+  });
+
+  it("rejects changed local artifact association metadata while allowing identical bytes for another owner", async () => {
+    const first = await seedDoneRemoteJob("local-association-a", [856.001]);
+    const second = await seedDoneRemoteJob("local-association-b", [856.002]);
+    const readOwner = async (jobId: string) => {
+      const [result] = await db
+        .select()
+        .from(results)
+        .where(eq(results.simJobId, jobId));
+      const [attempt] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.resultId, result.id));
+      return { result, attempt };
+    };
+    const ownerA = await readOwner(first.id);
+    const ownerB = await readOwner(second.id);
+    const bytes = Buffer.from(`${PREFIX}:shared-local-association`);
+    const artifact = {
+      kind: "log",
+      role: "raw",
+      path: "/shared/exact-association.log",
+      mime_type: "text/plain",
+      sha256: sha256(bytes),
+      byte_size: bytes.byteLength,
+      metadata: { immutable: "v1" },
+    };
+    const engine = { baseUrl: "http://engine.test" } as EngineClient;
+    const register = async (
+      job: typeof simJobs.$inferSelect,
+      owner: {
+        result: typeof results.$inferSelect;
+        attempt: typeof resultAttempts.$inferSelect;
+      },
+      metadata: Record<string, unknown>,
+    ) =>
+      registerEvidenceArtifacts({
+        db,
+        engine,
+        resultId: owner.result.id,
+        resultAttemptId: owner.attempt.id,
+        airfoilId,
+        simJobId: job.id,
+        engineJobId: job.engineJobId!,
+        point: {
+          aoa_deg: owner.result.aoaDeg,
+          case_slug: owner.result.engineCaseSlug,
+        } as never,
+        artifact: { ...artifact, metadata } as never,
+      });
+
+    await register(first, ownerA, { immutable: "v1" });
+    await expect(
+      register(first, ownerA, { immutable: "changed" }),
+    ).rejects.toThrow("changed immutable association metadata");
+    await register(second, ownerB, { immutable: "v1" });
+
+    const associations = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.sha256, artifact.sha256));
+    expect(associations).toHaveLength(2);
+    expect(new Set(associations.map((row) => row.resultAttemptId))).toEqual(
+      new Set([ownerA.attempt.id, ownerB.attempt.id]),
+    );
+  });
+
+  it.each(["running", "ingesting"] as const)(
+    "pushes incrementally ingested evidence while the producing job is still %s",
+    async (status) => {
+      const aoa = status === "running" ? 857.001 : 858.001;
+      const job = await seedDoneRemoteJob(`partial-${status}`, [aoa]);
+      const promiseId = (job.requestPayload as { syncPromiseId: string })
+        .syncPromiseId;
+      await seedMirroredPromise(`partial-${status}`, [aoa], promiseId);
+      await db
+        .update(simJobs)
+        .set({
+          status,
+          completedCases: 1,
+          totalCases: 3,
+          finishedAt: null,
+        })
+        .where(eq(simJobs.id, job.id));
+      const fetch = stubFetch();
+
+      await remoteSolverTick(db, {} as never);
+
+      expect(requests(fetch.fetchMock, "/polars")).toHaveLength(1);
+      expect(
+        (await deliveriesForJob(job.id)).find((row) => row.resultId)?.state,
+      ).toBe("delivered");
+      expect(
+        (await db.select().from(simJobs).where(eq(simJobs.id, job.id)))[0]
+          .status,
+      ).toBe(status);
+    },
+  );
 });

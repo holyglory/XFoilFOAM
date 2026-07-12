@@ -3,6 +3,7 @@ import {
   canonicalAoa,
   colorForRe,
   fRe,
+  POLAR_FIT_VERSION,
   type PolarFit,
   type Polar,
   type PolarPointData,
@@ -37,34 +38,26 @@ import {
   physicsHashForSnapshot,
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
 import { geometryFor } from "./geometry";
 import { hashtagsByAirfoilIds } from "./hashtags";
 
-type ReviewDisclosure = {
-  verdict: "waive" | "exclude";
-  note: string | null;
-  reviewer: string;
-  at: string;
-};
-
 type PublicEvidenceRole = NonNullable<PolarPointData["evidenceRole"]>;
 
 function solvedToPoint(
   r: Result,
-  classification?: {
-    state: ResultClassificationState | null;
-    region: ResultClassificationRegion | null;
+  classification: {
+    state: ResultClassificationState;
+    region: ResultClassificationRegion;
     reasons: string[] | null;
     confidence: number | null;
-    review?: ReviewDisclosure | null;
   },
-): PolarPointData & { review?: ReviewDisclosure } {
+): PolarPointData {
   const cl = r.cl ?? 0;
   const cd = r.cd ?? 0;
-  const point: PolarPointData & { review?: ReviewDisclosure } = {
+  const point: PolarPointData = {
     a: r.aoaDeg,
     cl,
     cd,
@@ -78,12 +71,11 @@ function solvedToPoint(
     cdStd: r.cdStd,
     cmStd: r.cmStd,
     resultId: r.id,
-    classificationState: classification?.state ?? "accepted",
-    classificationRegion: classification?.region ?? "attached",
-    classificationReasons: classification?.reasons ?? [],
-    classificationConfidence: classification?.confidence ?? null,
+    classificationState: classification.state,
+    classificationRegion: classification.region,
+    classificationReasons: classification.reasons ?? [],
+    classificationConfidence: classification.confidence ?? null,
   };
-  if (classification?.review) point.review = classification.review;
   return point;
 }
 
@@ -98,11 +90,10 @@ type DerivedPolarPointData = PolarPointData & {
 };
 
 type SolvedClassification = {
-  state: ResultClassificationState | null;
-  region: ResultClassificationRegion | null;
+  state: ResultClassificationState;
+  region: ResultClassificationRegion;
   reasons: string[] | null;
   confidence: number | null;
-  review?: ReviewDisclosure | null;
 };
 
 type SolvedRow = {
@@ -135,7 +126,7 @@ function effectivePhysicsHash(revision: DetailRevision): string {
 }
 
 function classificationRank(row: SolvedRow): number {
-  return (row.classification.state ?? "accepted") === "accepted" ? 2 : 1;
+  return row.classification.state === "accepted" ? 2 : 1;
 }
 
 function fidelityRank(row: SolvedRow): number {
@@ -416,65 +407,6 @@ export async function loadSimulationWorks(
   });
 }
 
-const validPolarPoint = sql<boolean>`(
-  ${results.error} IS NULL
-  AND ${results.cl} IS NOT NULL
-  AND ${results.cd} IS NOT NULL
-  AND ${results.cd} > 0
-  AND (
-    (
-      ${results.unsteady} = true
-      AND ${results.converged} = true
-      AND EXISTS (
-        SELECT 1
-        FROM force_history fh
-        WHERE fh.result_id = ${results.id}
-      )
-      AND EXISTS (
-        SELECT 1
-        FROM result_media media
-        WHERE media.result_id = ${results.id}
-          AND media.kind = 'video'
-          AND media.role = 'instantaneous'
-      )
-    )
-    OR (
-      ${results.regime} = 'rans'
-      AND ${results.converged} = true
-      AND ${results.stalled} = false
-      AND NOT EXISTS (
-        SELECT 1
-        FROM results core
-        WHERE core.airfoil_id = ${results.airfoilId}
-          AND core.simulation_preset_revision_id = ${results.simulationPresetRevisionId}
-          AND core.source = 'solved'
-          AND core.status = 'done'
-          AND core.regime = 'rans'
-          AND core.aoa_deg BETWEEN 0 AND 5
-          AND (
-            core.error IS NOT NULL
-            OR core.converged = false
-            OR core.stalled = true
-            OR core.cl IS NULL
-            OR core.cd IS NULL
-            OR core.cd <= 0
-          )
-        )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM result_attempts core_attempt
-        WHERE core_attempt.airfoil_id = ${results.airfoilId}
-          AND core_attempt.simulation_preset_revision_id = ${results.simulationPresetRevisionId}
-          AND core_attempt.source = 'solved'
-          AND core_attempt.status = 'done'
-          AND core_attempt.regime = 'rans'
-          AND core_attempt.aoa_deg BETWEEN 0 AND 5
-          AND core_attempt.valid_for_polar = false
-      )
-    )
-  )
-)`;
-
 async function loadSolvedRows(
   airfoilId: string,
   revisionIds: string[],
@@ -484,70 +416,104 @@ async function loadSolvedRows(
   const rows = await db
     .select({
       result: results,
+      attempt: resultAttempts,
       state: resultClassifications.state,
       region: resultClassifications.region,
       reasons: resultClassifications.reasons,
       confidence: resultClassifications.confidence,
-      reviewVerdict: resultReviewVerdicts.verdict,
-      reviewNote: resultReviewVerdicts.note,
-      reviewReviewer: resultReviewVerdicts.reviewer,
-      reviewCreatedAt: resultReviewVerdicts.createdAt,
     })
     .from(results)
-    .leftJoin(
+    .innerJoin(
+      resultAttempts,
+      and(
+        eq(resultAttempts.id, results.currentResultAttemptId),
+        eq(resultAttempts.resultId, results.id),
+      ),
+    )
+    .innerJoin(
       resultClassifications,
-      eq(resultClassifications.resultId, results.id),
+      eq(resultClassifications.resultAttemptId, resultAttempts.id),
     )
     .leftJoin(
       resultReviewVerdicts,
       and(
         eq(resultReviewVerdicts.resultId, results.id),
         isNull(resultReviewVerdicts.revokedAt),
-        inArray(resultReviewVerdicts.verdict, ["waive", "exclude"]),
+        eq(resultReviewVerdicts.verdict, "exclude"),
       ),
     )
     .where(
       and(
         eq(results.airfoilId, airfoilId),
         inArray(results.simulationPresetRevisionId, revisionIds),
-        eq(results.source, "solved"),
-        eq(results.status, "done"),
-        or(
-          eq(resultReviewVerdicts.verdict, "waive"),
-          and(
-            isNull(resultReviewVerdicts.id),
-            inArray(resultClassifications.state, ["accepted", "needs_urans"]),
-          ),
-          and(
-            isNull(resultReviewVerdicts.id),
-            isNull(resultClassifications.id),
-            validPolarPoint,
-          ),
-        ),
+        eq(resultAttempts.source, "solved"),
+        eq(resultAttempts.status, "done"),
+        isNotNull(resultAttempts.cl),
+        isNotNull(resultAttempts.cd),
+        isNull(resultReviewVerdicts.id),
+        inArray(resultClassifications.state, ["accepted", "needs_urans"]),
       ),
     );
   for (const row of rows) {
     const revisionId = row.result.simulationPresetRevisionId;
     if (!revisionId) continue;
+    const payload =
+      row.attempt.evidencePayload &&
+      typeof row.attempt.evidencePayload === "object" &&
+      !Array.isArray(row.attempt.evidencePayload)
+        ? (row.attempt.evidencePayload as Record<string, unknown>)
+        : {};
+    const frameTrack = payload.frame_track ?? payload.frameTrack ?? null;
+    const steadyHistory =
+      payload.steady_history ?? payload.steadyHistory ?? null;
+    const fidelity =
+      typeof payload.fidelity === "string" ? payload.fidelity : null;
+    // The result row owns the stable physical-cell identity and setup values;
+    // every solver-derived/publication value comes from its explicitly selected
+    // immutable attempt. A stale mutable projection can therefore neither
+    // replace coefficients nor keep pointer-null historical evidence public.
+    const exactResult: Result = {
+      ...row.result,
+      bcId: row.attempt.bcId,
+      status: row.attempt.status,
+      source: row.attempt.source,
+      regime: row.attempt.regime,
+      cl: row.attempt.cl,
+      cd: row.attempt.cd,
+      cm: row.attempt.cm,
+      clCd: row.attempt.clCd,
+      clStd: row.attempt.clStd,
+      cdStd: row.attempt.cdStd,
+      cmStd: row.attempt.cmStd,
+      stalled: row.attempt.stalled,
+      unsteady: row.attempt.unsteady,
+      converged: row.attempt.converged,
+      finalResidual: row.attempt.finalResidual,
+      iterations: row.attempt.iterations,
+      yPlusAvg: row.attempt.yPlusAvg,
+      yPlusMax: row.attempt.yPlusMax,
+      nCells: row.attempt.nCells,
+      firstOrderFallback: row.attempt.firstOrderFallback,
+      strouhal: row.attempt.strouhal,
+      error: row.attempt.error,
+      qualityWarnings: row.attempt.qualityWarnings,
+      frameTrack,
+      fidelity,
+      steadyHistory,
+      simJobId: row.attempt.simJobId,
+      engineJobId: row.attempt.engineJobId,
+      engineCaseSlug: row.attempt.engineCaseSlug,
+      solvedAt: row.attempt.solvedAt,
+      updatedAt: row.attempt.solvedAt ?? row.attempt.createdAt,
+    };
     const list = solvedByRevision.get(revisionId) ?? [];
     list.push({
-      result: row.result,
+      result: exactResult,
       classification: {
-        state: row.reviewVerdict === "waive" ? "accepted" : row.state,
-        region: row.reviewVerdict === "waive" ? "attached" : row.region,
-        reasons: row.reviewVerdict === "waive" ? [] : row.reasons,
+        state: row.state,
+        region: row.region,
+        reasons: row.reasons,
         confidence: row.confidence,
-        review:
-          row.reviewVerdict === "waive" &&
-          row.reviewCreatedAt &&
-          row.reviewReviewer
-            ? {
-                verdict: "waive",
-                note: row.reviewNote,
-                reviewer: row.reviewReviewer,
-                at: row.reviewCreatedAt.toISOString(),
-              }
-            : null,
       },
     });
     solvedByRevision.set(revisionId, list);
@@ -626,6 +592,7 @@ async function loadRevisionFits(
       and(
         inArray(polarFitSets.simulationPresetRevisionId, revisionIds),
         eq(polarFitSets.airfoilId, airfoilId),
+        eq(polarFitSets.fitVersion, POLAR_FIT_VERSION),
         eq(polarFitSets.isCurrent, true),
       ),
     );

@@ -31,11 +31,15 @@ function point(overrides: Partial<SolverWorkPoint>): SolverWorkPoint {
     continuable: false,
     actions: [],
     supersededBy: null,
+    reviewed: false,
+    review: null,
     ...overrides,
   };
 }
 
-function condition(overrides: Partial<SolverWorkCondition>): SolverWorkCondition {
+function condition(
+  overrides: Partial<SolverWorkCondition>,
+): SolverWorkCondition {
   return {
     presetRevisionId: "rev-1",
     reynolds: 853000,
@@ -83,7 +87,9 @@ describe("solver-work state taxonomy", () => {
       className: "solver-work-state--excluded",
     });
     for (const state of SOLVER_WORK_STATES) {
-      expect(solverWorkStateClass(state)).toBe(`solver-work-state ${SOLVER_WORK_STATE_STYLES[state].className}`);
+      expect(solverWorkStateClass(state)).toBe(
+        `solver-work-state ${SOLVER_WORK_STATE_STYLES[state].className}`,
+      );
     }
   });
 });
@@ -91,34 +97,35 @@ describe("solver-work state taxonomy", () => {
 describe("solver-work reviewed presentation", () => {
   const group = condition({ points: [] });
 
-  it("renders waived points as verified with a reviewed mark and disclosure for every user", () => {
-    const waived = point({
-      state: "verified",
-      resultId: "res-waived",
-      reviewed: {
-        verdict: "waive",
-        note: "periodic shedding accepted",
-        reviewer: "ja@vr.ae",
-        at: "2026-07-10T08:15:00.000Z",
-      },
+  it("does not mistake the API reviewed boolean for review metadata", () => {
+    const blocked = point({
+      state: "blocked",
+      resultId: "res-blocked",
+      reviewed: false,
+      review: null,
     });
-    const presentation = solverWorkPointPresentation(waived);
-    const anonView = buildSolverWorkPopoverView(group, waived, false);
-    const adminView = buildSolverWorkPopoverView(group, waived, true);
+    const presentation = solverWorkPointPresentation(blocked);
+    const anonView = buildSolverWorkPopoverView(group, blocked, false);
+    const adminView = buildSolverWorkPopoverView(group, blocked, true);
 
-    expect(presentation.visualState).toBe("verified");
-    expect(presentation.badgeMark).toBe("✓");
-    expect(anonView.stateLabel).toBe("verified · reviewed ✓");
-    expect(anonView.reviewedDisclosure).toBe("waived by ja@vr.ae 2026-07-10: periodic shedding accepted");
-    expect(anonView.actions.map((action) => action.kind)).toEqual(["open-results"]);
-    expect(adminView.actions.map((action) => action.kind)).toContain("revoke-review");
+    expect(presentation.visualState).toBe("blocked");
+    expect(presentation.badgeMark).toBeNull();
+    expect(anonView.stateLabel).toBe("blocked");
+    expect(anonView.reviewedDisclosure).toBeNull();
+    expect(anonView.actions.map((action) => action.kind)).toEqual([
+      "open-results",
+    ]);
+    expect(adminView.actions.map((action) => action.kind)).not.toContain(
+      "revoke-review",
+    );
   });
 
   it("renders excluded points in the blocked-family palette and hides revoke for anonymous users", () => {
     const excluded = point({
       state: "excluded",
       resultId: "res-excluded",
-      reviewed: {
+      reviewed: true,
+      review: {
         verdict: "exclude",
         note: "bad mesh evidence",
         reviewer: "ja@vr.ae",
@@ -135,8 +142,12 @@ describe("solver-work reviewed presentation", () => {
       border: "#7f1d1d",
     });
     expect(anonView.stateLabel).toBe("excluded · reviewed");
-    expect(anonView.reviewedDisclosure).toBe("excluded by ja@vr.ae 2026-07-10: bad mesh evidence");
-    expect(anonView.actions.some((action) => action.kind === "revoke-review")).toBe(false);
+    expect(anonView.reviewedDisclosure).toBe(
+      "excluded by ja@vr.ae 2026-07-10: bad mesh evidence",
+    );
+    expect(
+      anonView.actions.some((action) => action.kind === "revoke-review"),
+    ).toBe(false);
   });
 });
 
@@ -166,13 +177,29 @@ describe("solver-work group filters and sorting", () => {
   ];
 
   it("filters attention and solving groups", () => {
-    expect(filterSortSolverWorkConditions(groups, "attention", "re-asc").map((item) => item.presetRevisionId)).toEqual(["rev-500", "rev-900"]);
-    expect(filterSortSolverWorkConditions(groups, "solving", "re-asc").map((item) => item.presetRevisionId)).toEqual(["rev-500"]);
+    expect(
+      filterSortSolverWorkConditions(groups, "attention", "re-asc").map(
+        (item) => item.presetRevisionId,
+      ),
+    ).toEqual(["rev-500", "rev-900"]);
+    expect(
+      filterSortSolverWorkConditions(groups, "solving", "re-asc").map(
+        (item) => item.presetRevisionId,
+      ),
+    ).toEqual(["rev-500"]);
   });
 
   it("pins Re ascending and attention-first order", () => {
-    expect(filterSortSolverWorkConditions(groups, "all", "re-asc").map((item) => item.presetRevisionId)).toEqual(["rev-200", "rev-500", "rev-900"]);
-    expect(filterSortSolverWorkConditions(groups, "all", "attention-first").map((item) => item.presetRevisionId)).toEqual(["rev-500", "rev-900", "rev-200"]);
+    expect(
+      filterSortSolverWorkConditions(groups, "all", "re-asc").map(
+        (item) => item.presetRevisionId,
+      ),
+    ).toEqual(["rev-200", "rev-500", "rev-900"]);
+    expect(
+      filterSortSolverWorkConditions(groups, "all", "attention-first").map(
+        (item) => item.presetRevisionId,
+      ),
+    ).toEqual(["rev-500", "rev-900", "rev-200"]);
   });
 });
 
@@ -185,8 +212,12 @@ describe("solver-work popover assembly", () => {
     cl: 1.12,
     cd: 0.0881,
     cm: -0.041,
-    plain: "URANS stopped at the wall-clock budget before two repeatable periods were saved.",
-    gate: { name: "time budget", detail: "saved case state can continue from 14.2 s" },
+    plain:
+      "URANS stopped at the wall-clock budget before two repeatable periods were saved.",
+    gate: {
+      name: "time budget",
+      detail: "saved case state can continue from 14.2 s",
+    },
     chain: [
       { label: "RANS ✗ stall", tone: "needs_review" },
       { label: "URANS ⏱", tone: "needs_time" },
@@ -199,21 +230,34 @@ describe("solver-work popover assembly", () => {
     const view = buildSolverWorkPopoverView(group, needsTime, true);
     expect(view.title).toBe("α 20.0°");
     expect(view.plain).toContain("wall-clock budget");
-    expect(view.gate).toEqual({ name: "time budget", detail: "saved case state can continue from 14.2 s" });
+    expect(view.gate).toEqual({
+      name: "time budget",
+      detail: "saved case state can continue from 14.2 s",
+    });
     expect(view.coefficients).toEqual([
       { label: "Cl", value: "1.120" },
       { label: "Cd", value: "0.0881" },
       { label: "Cm", value: "-0.041" },
     ]);
     expect(view.provisionalNote).toBe(true);
-    expect(view.chain.map((item) => item.label)).toEqual(["RANS ✗ stall", "URANS ⏱"]);
-    expect(view.actions.map((action) => action.label)).toEqual(["full results ▸", "Continue +2h", "Continue +6h", "Continue +24h"]);
+    expect(view.chain.map((item) => item.label)).toEqual([
+      "RANS ✗ stall",
+      "URANS ⏱",
+    ]);
+    expect(view.actions.map((action) => action.label)).toEqual([
+      "full results ▸",
+      "Continue +2h",
+      "Continue +6h",
+      "Continue +24h",
+    ]);
   });
 
   it("gates all admin controls for anonymous sessions", () => {
     const view = buildSolverWorkPopoverView(group, needsTime, false);
     expect(view.actions.filter((action) => action.adminOnly)).toEqual([]);
-    expect(view.actions.map((action) => action.label)).toEqual(["full results ▸"]);
+    expect(view.actions.map((action) => action.label)).toEqual([
+      "full results ▸",
+    ]);
   });
 
   it("pins the continuation POST payload used by the shared admin endpoint", () => {
@@ -226,7 +270,11 @@ describe("solver-work popover assembly", () => {
 
 describe("solver-work result opening and group rollups", () => {
   it("builds the existing sim-modal context from a verified point resultId", () => {
-    const verified = point({ aoaDeg: 4, state: "verified", resultId: "result-42" });
+    const verified = point({
+      aoaDeg: 4,
+      state: "verified",
+      resultId: "result-42",
+    });
     const group = condition({ reynolds: 400000, points: [verified] });
     const opened: unknown[] = [];
     const ctx = solverWorkResultContext(group, verified);
@@ -246,7 +294,10 @@ describe("solver-work result opening and group rollups", () => {
         point({ state: "superseded", aoaDeg: 5, supersededBy: "result-2" }),
       ],
     });
-    const summary = buildSolverWorkConditionSummary(mixed, new Date("2026-07-10T10:00:00.000Z").getTime());
+    const summary = buildSolverWorkConditionSummary(
+      mixed,
+      new Date("2026-07-10T10:00:00.000Z").getTime(),
+    );
     expect(summary.countLabel).toBe("5/6");
     expect(summary.attentionLabel).toBe("attention 1");
     expect(summary.meta).toContain("updated 12 min ago");
@@ -259,14 +310,26 @@ describe("solver-work result opening and group rollups", () => {
       ["needs_review", 1],
     ]);
     expect(rollup[0].percent).toBeCloseTo(40);
-    expect(rollup.slice(1).map((segment) => segment.percent)).toEqual([20, 20, 20]);
+    expect(rollup.slice(1).map((segment) => segment.percent)).toEqual([
+      20, 20, 20,
+    ]);
   });
 
   it("hides superseded points by default and includes them when toggled", () => {
-    const points = [point({ state: "verified" }), point({ state: "superseded", aoaDeg: 8, supersededBy: "result-new" })];
+    const points = [
+      point({ state: "verified" }),
+      point({ state: "superseded", aoaDeg: 8, supersededBy: "result-new" }),
+    ];
     expect(solverWorkLegendStates(points, false)).toEqual(["verified"]);
-    expect(solverWorkLegendStates(points, true)).toEqual(["verified", "superseded"]);
-    expect(solverWorkRollup(points, false).map((segment) => segment.state)).toEqual(["verified"]);
-    expect(solverWorkRollup(points, true).map((segment) => segment.state)).toEqual(["verified", "superseded"]);
+    expect(solverWorkLegendStates(points, true)).toEqual([
+      "verified",
+      "superseded",
+    ]);
+    expect(
+      solverWorkRollup(points, false).map((segment) => segment.state),
+    ).toEqual(["verified"]);
+    expect(
+      solverWorkRollup(points, true).map((segment) => segment.state),
+    ).toEqual(["verified", "superseded"]);
   });
 });

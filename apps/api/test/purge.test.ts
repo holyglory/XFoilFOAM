@@ -8,25 +8,54 @@
 // and reference_geometry_profiles, results at the pinned revisions, and the
 // pw- catalog rows themselves.
 import { results } from "@aerodb/db";
+import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 
 import { db, sql as pgClient } from "../src/db";
 import { buildServer } from "../src/server";
 
-const PREFIX = `pw-purge-${Date.now().toString(36)}`;
+const PREFIX = `pw-purge-${process.pid}-${Date.now().toString(36)}`;
+const SHARED_PREFIX = `pw-shared-purge-${process.pid}-${Date.now().toString(36)}`;
 
 let app: Awaited<ReturnType<typeof buildServer>>;
 let campaignId = "";
 let symId = "";
 let asymId = "";
 let mediumId = "";
-let numerics = { boundaryProfileId: "", meshProfileId: "", solverProfileId: "", outputProfileId: "" };
+let numerics = {
+  boundaryProfileId: "",
+  meshProfileId: "",
+  solverProfileId: "",
+  outputProfileId: "",
+};
+let exclusiveObligationId = "";
+let exclusiveObligationAttemptId = "";
+let exclusivePhysicalJobId = "";
+let backgroundObligationId = "";
+let backgroundPhysicalJobId = "";
+let reusedBackgroundResultId = "";
+let cancelledOwnerCampaignId = "";
+let cancelledSharedObligationId = "";
+let cancelledSharedPhysicalJobId = "";
+let purgePromiseId = "";
+let backgroundPresetId = "";
+let backgroundGeometryId = "";
+let backgroundRevisionId = "";
+let sharedAirfoilId = "";
+let purgeCondition: {
+  id: string;
+  revision_id: string;
+  flow_condition_id: string;
+  reference_geometry_profile_id: string;
+  preset_id: string;
+  bc_id: string;
+} | null = null;
 // Unusual physics values so the launch really creates the flow/geometry rows
 // (canonical-key reuse would otherwise attribute them to an older campaign).
-const AMBIENT: [number, number] = [289.37, 100123];
-const SPEED = 13.7;
-const CHORD = 0.279;
+const AMBIENT: [number, number] = [289.37137, 100123.7];
+const SPEED = 13.7137;
+const CHORD = 0.279137;
 
 async function countRows(query: ReturnType<typeof sql>): Promise<number> {
   const [row] = (await db.execute(query)) as unknown as Array<{ n: number }>;
@@ -36,7 +65,11 @@ async function countRows(query: ReturnType<typeof sql>): Promise<number> {
 beforeAll(async () => {
   app = await buildServer();
 
-  const cat = await app.inject({ method: "POST", url: "/api/admin/categories", payload: { name: `${PREFIX} cat`, parentId: null } });
+  const cat = await app.inject({
+    method: "POST",
+    url: "/api/admin/categories",
+    payload: { name: `${PREFIX} cat`, parentId: null },
+  });
   expect(cat.statusCode).toBe(201);
   const catSlug = cat.json().slug as string;
 
@@ -45,14 +78,22 @@ beforeAll(async () => {
   const symRes = await app.inject({
     method: "POST",
     url: "/api/airfoils",
-    payload: { name: `${PREFIX} sym 0012`, categorySlug: catSlug, naca: { t: 0.12, m: 0, p: 0 } },
+    payload: {
+      name: `${PREFIX} sym 0012`,
+      categorySlug: catSlug,
+      naca: { t: 0.12, m: 0, p: 0 },
+    },
   });
   expect(symRes.statusCode).toBe(201);
   symId = symRes.json().id;
   const asymRes = await app.inject({
     method: "POST",
     url: "/api/airfoils",
-    payload: { name: `${PREFIX} asym 4415`, categorySlug: catSlug, naca: { t: 0.15, m: 0.04, p: 0.4 } },
+    payload: {
+      name: `${PREFIX} asym 4415`,
+      categorySlug: catSlug,
+      naca: { t: 0.15, m: 0.04, p: 0.4 },
+    },
   });
   expect(asymRes.statusCode).toBe(201);
   asymId = asymRes.json().id;
@@ -75,24 +116,220 @@ beforeAll(async () => {
   mediumId = medium.json().id;
 
   const profiles = await Promise.all([
-    app.inject({ method: "POST", url: "/api/admin/boundary-profiles", payload: { name: `${PREFIX} boundary` } }),
-    app.inject({ method: "POST", url: "/api/admin/mesh-profiles", payload: { name: `${PREFIX} mesh` } }),
-    app.inject({ method: "POST", url: "/api/admin/solver-profiles", payload: { name: `${PREFIX} solver` } }),
-    app.inject({ method: "POST", url: "/api/admin/output-profiles", payload: { name: `${PREFIX} output` } }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/boundary-profiles",
+      payload: { name: `${PREFIX} boundary` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/mesh-profiles",
+      payload: { name: `${PREFIX} mesh` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/solver-profiles",
+      payload: { name: `${PREFIX} solver` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/output-profiles",
+      payload: { name: `${PREFIX} output` },
+    }),
   ]);
   for (const res of profiles) expect(res.statusCode).toBe(201);
+  // Cross-runtime safety pin: an omitted Node/API value must use the same
+  // relaxed-PIMPLE Courant ceiling as SolverParams, never the historical 15.
+  expect(profiles[2].json().transientMaxCourant).toBe(4);
   numerics = {
     boundaryProfileId: profiles[0].json().id,
     meshProfileId: profiles[1].json().id,
     solverProfileId: profiles[2].json().id,
     outputProfileId: profiles[3].json().id,
   };
+
+  // An independently-owned physical obligation needs a complete non-target
+  // setup so the target-prefix purge cannot remove it indirectly through an
+  // airfoil/profile cascade. Keep this fixture under its own pw- prefix for a
+  // second, explicit cleanup call in afterAll.
+  const sharedCategory = await app.inject({
+    method: "POST",
+    url: "/api/admin/categories",
+    payload: { name: `${SHARED_PREFIX} category`, parentId: null },
+  });
+  expect(sharedCategory.statusCode).toBe(201);
+  const sharedAirfoil = await app.inject({
+    method: "POST",
+    url: "/api/airfoils",
+    payload: {
+      name: `${SHARED_PREFIX} airfoil`,
+      categorySlug: sharedCategory.json().slug,
+      naca: { t: 0.1, m: 0.02, p: 0.4 },
+    },
+  });
+  expect(sharedAirfoil.statusCode).toBe(201);
+  sharedAirfoilId = sharedAirfoil.json().id;
+  const sharedMedium = await app.inject({
+    method: "POST",
+    url: "/api/admin/mediums",
+    payload: {
+      name: `${SHARED_PREFIX} air`,
+      phase: "gas",
+      density: 1.225,
+      refTemperatureK: 288.15,
+      refPressurePa: 101325,
+      viscosityModel: "constant",
+      constantDynamicViscosity: 1.789e-5,
+      speedOfSound: 340.3,
+    },
+  });
+  expect(sharedMedium.statusCode).toBe(201);
+  const sharedProfiles = await Promise.all([
+    app.inject({
+      method: "POST",
+      url: "/api/admin/boundary-profiles",
+      payload: { name: `${SHARED_PREFIX} boundary` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/mesh-profiles",
+      payload: { name: `${SHARED_PREFIX} mesh` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/solver-profiles",
+      payload: { name: `${SHARED_PREFIX} solver` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/scheduling-profiles",
+      payload: { name: `${SHARED_PREFIX} scheduling` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/output-profiles",
+      payload: { name: `${SHARED_PREFIX} output` },
+    }),
+    app.inject({
+      method: "POST",
+      url: "/api/admin/sweep-definitions",
+      payload: {
+        name: `${SHARED_PREFIX} sweep`,
+        aoaStart: -2,
+        aoaStop: 2,
+        aoaStep: 1,
+      },
+    }),
+  ]);
+  for (const response of sharedProfiles) expect(response.statusCode).toBe(201);
+  const sharedFlow = await app.inject({
+    method: "POST",
+    url: "/api/admin/flow-conditions",
+    payload: {
+      name: `${SHARED_PREFIX} flow`,
+      mediumId: sharedMedium.json().id,
+      temperatureK: 288.15,
+      pressurePa: 101325,
+      speedMps: 19.3125,
+    },
+  });
+  expect(sharedFlow.statusCode).toBe(201);
+  const sharedGeometry = await app.inject({
+    method: "POST",
+    url: "/api/admin/reference-geometry-profiles",
+    payload: {
+      name: `${SHARED_PREFIX} geometry`,
+      referenceLengthM: 0.93125,
+      spanM: 1,
+      referenceAreaM2: 0.93125,
+    },
+  });
+  expect(sharedGeometry.statusCode).toBe(201);
+  backgroundGeometryId = sharedGeometry.json().id;
+  const sharedPreset = await app.inject({
+    method: "POST",
+    url: "/api/admin/simulation-presets",
+    payload: {
+      name: `${SHARED_PREFIX} preset`,
+      flowConditionId: sharedFlow.json().id,
+      referenceGeometryProfileId: backgroundGeometryId,
+      boundaryProfileId: sharedProfiles[0].json().id,
+      meshProfileId: sharedProfiles[1].json().id,
+      solverProfileId: sharedProfiles[2].json().id,
+      schedulingProfileId: sharedProfiles[3].json().id,
+      outputProfileId: sharedProfiles[4].json().id,
+      sweepDefinitionId: sharedProfiles[5].json().id,
+    },
+  });
+  expect(sharedPreset.statusCode).toBe(201);
+  backgroundPresetId = sharedPreset.json().id;
+  backgroundRevisionId = sharedPreset.json().currentRevisionId;
+  expect(backgroundRevisionId).toBeTruthy();
 });
 
 afterAll(async () => {
-  // Defensive teardown if an assertion failed midway; a clean run leaves
-  // nothing for this purge to find.
-  await app.inject({ method: "POST", url: "/api/admin/test-artifacts/purge", payload: { prefix: PREFIX } });
+  if (reusedBackgroundResultId) {
+    await db.execute(
+      sql`DELETE FROM results WHERE id = ${reusedBackgroundResultId}`,
+    );
+  }
+  const physicalJobIds = [
+    exclusivePhysicalJobId,
+    backgroundPhysicalJobId,
+    cancelledSharedPhysicalJobId,
+  ].filter(Boolean);
+  if (physicalJobIds.length) {
+    const ids = sql.join(
+      physicalJobIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    );
+    await db.execute(sql`DELETE FROM sim_jobs WHERE id IN (${ids})`);
+  }
+  const obligationIds = [
+    exclusiveObligationId,
+    backgroundObligationId,
+    cancelledSharedObligationId,
+  ].filter(Boolean);
+  if (obligationIds.length) {
+    const ids = sql.join(
+      obligationIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    );
+    await db.execute(
+      sql`DELETE FROM sim_precalc_obligations WHERE id IN (${ids})`,
+    );
+  }
+  if (backgroundPresetId) {
+    await db.execute(
+      sql`DELETE FROM simulation_presets WHERE id = ${backgroundPresetId}`,
+    );
+  }
+  if (backgroundGeometryId) {
+    await db.execute(
+      sql`DELETE FROM reference_geometry_profiles WHERE id = ${backgroundGeometryId}`,
+    );
+  }
+  if (cancelledOwnerCampaignId) {
+    await db.execute(
+      sql`DELETE FROM sim_campaigns WHERE id = ${cancelledOwnerCampaignId}`,
+    );
+  }
+  // Canonical campaign-graph teardown first; the purge endpoint remains the
+  // defensive cleanup for non-campaign catalog/profile rows after a failure.
+  await cleanupCampaignFixtures(db, {
+    campaignIds: [campaignId],
+    presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
+  });
+  await app.inject({
+    method: "POST",
+    url: "/api/admin/test-artifacts/purge",
+    payload: { prefix: PREFIX },
+  });
+  await app.inject({
+    method: "POST",
+    url: "/api/admin/test-artifacts/purge",
+    payload: { prefix: SHARED_PREFIX },
+  });
   await app.close();
   await pgClient.end();
 });
@@ -101,7 +338,11 @@ describe("test-artifacts purge — campaign cascade", () => {
   it("launches a campaign with symmetric planning (isSymmetric computed at creation)", async () => {
     const airfoilRows = (await db.execute(sql`
       SELECT id, is_symmetric, "symmetryCheckedAt" AS symmetry_checked_at FROM airfoils WHERE id IN (${symId}::uuid, ${asymId}::uuid)
-    `)) as unknown as Array<{ id: string; is_symmetric: boolean; symmetry_checked_at: string | null }>;
+    `)) as unknown as Array<{
+      id: string;
+      is_symmetric: boolean;
+      symmetry_checked_at: string | null;
+    }>;
     const bySelf = new Map(airfoilRows.map((r) => [r.id, r]));
     expect(bySelf.get(symId)?.is_symmetric).toBe(true);
     expect(bySelf.get(symId)?.symmetry_checked_at).toBeTruthy();
@@ -143,7 +384,9 @@ describe("test-artifacts purge — campaign cascade", () => {
       sql`SELECT count(*)::int AS n FROM sim_campaign_points WHERE campaign_id = ${campaignId} AND derived_by_symmetry`,
     );
     expect(derived).toBe(1); // symmetric airfoil at −2°
-    const lanes = await countRows(sql`SELECT count(*)::int AS n FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}`);
+    const lanes = await countRows(
+      sql`SELECT count(*)::int AS n FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}`,
+    );
     expect(lanes).toBe(4); // 2 airfoils × 1 condition × 2 objectives
   });
 
@@ -157,7 +400,12 @@ describe("test-artifacts purge — campaign cascade", () => {
       areaMode: "derived",
       excludedConditions: [],
       // Drops −2° and adds 1° while keeping ≥3 angles for the objectives.
-      baseSweep: { fromDeg: null, toDeg: null, stepDeg: null, listDeg: [0, 1, 2] },
+      baseSweep: {
+        fromDeg: null,
+        toDeg: null,
+        stepDeg: null,
+        listDeg: [0, 1, 2],
+      },
       objectives: {
         ldMax: { enabled: true, toleranceDeg: 0.1, maxRounds: 4 },
         clZero: { enabled: true, toleranceDeg: 0.05, maxRounds: 4 },
@@ -177,7 +425,11 @@ describe("test-artifacts purge — campaign cascade", () => {
     const apply = await app.inject({
       method: "POST",
       url: `/api/admin/campaigns/${campaignId}/plan/apply`,
-      payload: { plan: editedPlan, basePlanRevisionNumber: 1, diffHash: diff.diffHash },
+      payload: {
+        plan: editedPlan,
+        basePlanRevisionNumber: 1,
+        diffHash: diff.diffHash,
+      },
     });
     expect(apply.statusCode).toBe(200);
     expect(apply.json().planRevisionNumber).toBe(2);
@@ -191,23 +443,296 @@ describe("test-artifacts purge — campaign cascade", () => {
     expect(released).toBe(2);
   });
 
+  it("refuses the entire purge while an exclusively-owned physical obligation job is active", async () => {
+    const [cond] = (await db.execute(sql`
+      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id,
+             cc.flow_condition_id, cc.reference_geometry_profile_id,
+             cc.preset_id, preset.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc
+      JOIN simulation_presets preset ON preset.id = cc.preset_id
+      WHERE cc.campaign_id = ${campaignId}
+      ORDER BY cc.ord
+      LIMIT 1
+    `)) as unknown as Array<NonNullable<typeof purgeCondition>>;
+    expect(cond).toBeTruthy();
+    purgeCondition = cond;
+
+    const [exclusiveObligation] = (await db.execute(sql`
+      INSERT INTO sim_precalc_obligations
+        (airfoil_id, revision_id, aoa_deg, state, background_owner)
+      VALUES (${asymId}, ${cond.revision_id}, 1.25, 'running', false)
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    exclusiveObligationId = exclusiveObligation.id;
+    const [exclusiveJob] = (await db.execute(sql`
+      INSERT INTO sim_jobs
+        (airfoil_id, bc_ids, simulation_preset_revision_id, campaign_id,
+         job_kind, reference_chord_m, wave, status, total_cases,
+         request_payload, engine_job_id)
+      VALUES
+        (${asymId}, ${JSON.stringify([cond.bc_id])}::jsonb,
+         ${cond.revision_id}, NULL, 'targeted', ${CHORD}, 2, 'running', 1,
+         ${JSON.stringify({ precalcObligationIds: [exclusiveObligationId] })}::jsonb,
+         ${`${PREFIX}-exclusive-running`})
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    exclusivePhysicalJobId = exclusiveJob.id;
+    await db.execute(sql`
+      UPDATE sim_precalc_obligations
+      SET latest_sim_job_id = ${exclusivePhysicalJobId}, "updatedAt" = now()
+      WHERE id = ${exclusiveObligationId}
+    `);
+    const [exclusiveAttempt] = (await db.execute(sql`
+      INSERT INTO sim_precalc_obligation_attempts
+        (obligation_id, sim_job_id, attempt_number, state)
+      VALUES (${exclusiveObligationId}, ${exclusivePhysicalJobId}, 1, 'submitted')
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    exclusiveObligationAttemptId = exclusiveAttempt.id;
+    await db.execute(sql`
+      INSERT INTO sim_precalc_obligation_campaigns
+        (obligation_id, campaign_id, state)
+      VALUES (${exclusiveObligationId}, ${campaignId}, 'active')
+    `);
+
+    // A background-owned physical job names the same target campaign as a
+    // beneficiary, but its airfoil/revision are durable seeded catalog data.
+    // Purging the campaign must remove only the association, not this global
+    // obligation, job, or preset.
+    const backgroundCell = {
+      revision_id: backgroundRevisionId,
+      preset_id: backgroundPresetId,
+      airfoil_id: sharedAirfoilId,
+      reference_length_m: 0.93125,
+    };
+    const [backgroundObligation] = (await db.execute(sql`
+      INSERT INTO sim_precalc_obligations
+        (airfoil_id, revision_id, aoa_deg, state, background_owner)
+      VALUES
+        (${backgroundCell.airfoil_id}, ${backgroundCell.revision_id}, 47.125,
+         'satisfied', true)
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    backgroundObligationId = backgroundObligation.id;
+    const [backgroundJob] = (await db.execute(sql`
+      INSERT INTO sim_jobs
+        (airfoil_id, bc_ids, simulation_preset_revision_id, campaign_id,
+         job_kind, reference_chord_m, wave, status, total_cases,
+         completed_cases, request_payload, engine_job_id, "finishedAt")
+      VALUES
+        (${backgroundCell.airfoil_id}, '[]'::jsonb,
+         ${backgroundCell.revision_id}, NULL, 'targeted',
+         ${backgroundCell.reference_length_m}, 2, 'done', 1, 1,
+         ${JSON.stringify({ precalcObligationIds: [backgroundObligationId] })}::jsonb,
+         ${`${PREFIX}-background-done`}, now())
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    backgroundPhysicalJobId = backgroundJob.id;
+    await db.execute(sql`
+      UPDATE sim_precalc_obligations
+      SET latest_sim_job_id = ${backgroundPhysicalJobId}, "updatedAt" = now()
+      WHERE id = ${backgroundObligationId}
+    `);
+    await db.execute(sql`
+      INSERT INTO sim_precalc_obligation_campaigns
+        (obligation_id, campaign_id, state)
+      VALUES (${backgroundObligationId}, ${campaignId}, 'active')
+    `);
+    const [backgroundBc] = (await db.execute(sql`
+      SELECT legacy_boundary_condition_id AS id
+      FROM simulation_presets
+      WHERE id = ${backgroundPresetId}
+    `)) as unknown as Array<{ id: string }>;
+    const [reusedBackground] = await db
+      .insert(results)
+      .values({
+        airfoilId: sharedAirfoilId,
+        bcId: backgroundBc.id,
+        simulationPresetRevisionId: backgroundRevisionId,
+        aoaDeg: 49.125,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        simJobId: backgroundPhysicalJobId,
+        cl: 0.71,
+        cd: 0.031,
+        converged: true,
+        unsteady: true,
+        solvedAt: new Date(),
+      })
+      .returning({ id: results.id });
+    reusedBackgroundResultId = reusedBackground.id;
+    // A prefixed campaign may reuse global/background truth. This beneficiary
+    // link is not production provenance and must never make purge delete it.
+    await db.execute(sql`
+      INSERT INTO sim_campaign_points
+        (campaign_id, condition_id, airfoil_id, aoa_deg, revision_id,
+         plan_revision_number, state, result_id, derived_by_symmetry)
+      VALUES
+        (${campaignId}, ${cond.id}, ${sharedAirfoilId}, 49.125,
+         ${backgroundRevisionId}, 2, 'terminal', ${reusedBackgroundResultId}, false)
+      ON CONFLICT DO NOTHING
+    `);
+
+    const [cancelledOwner] = (await db.execute(sql`
+      INSERT INTO sim_campaigns
+        (slug, name, status, priority, idempotency_key)
+      VALUES
+        (${`${SHARED_PREFIX}-cancelled-owner`},
+         ${`${SHARED_PREFIX} cancelled owner`}, 'cancelled', 5,
+         ${`${SHARED_PREFIX}-cancelled-owner-key`})
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    cancelledOwnerCampaignId = cancelledOwner.id;
+    const [cancelledSharedObligation] = (await db.execute(sql`
+      INSERT INTO sim_precalc_obligations
+        (airfoil_id, revision_id, aoa_deg, state, background_owner)
+      VALUES
+        (${backgroundCell.airfoil_id}, ${backgroundCell.revision_id}, 48.125,
+         'satisfied', false)
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    cancelledSharedObligationId = cancelledSharedObligation.id;
+    const [cancelledSharedJob] = (await db.execute(sql`
+      INSERT INTO sim_jobs
+        (airfoil_id, bc_ids, simulation_preset_revision_id, campaign_id,
+         job_kind, reference_chord_m, wave, status, total_cases,
+         completed_cases, request_payload, engine_job_id, "finishedAt")
+      VALUES
+        (${backgroundCell.airfoil_id}, '[]'::jsonb,
+         ${backgroundCell.revision_id}, NULL, 'targeted',
+         ${backgroundCell.reference_length_m}, 2, 'done', 1, 1,
+         ${JSON.stringify({ precalcObligationIds: [cancelledSharedObligationId] })}::jsonb,
+         ${`${PREFIX}-cancelled-shared-done`}, now())
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    cancelledSharedPhysicalJobId = cancelledSharedJob.id;
+    await db.execute(sql`
+      UPDATE sim_precalc_obligations
+      SET latest_sim_job_id = ${cancelledSharedPhysicalJobId}, "updatedAt" = now()
+      WHERE id = ${cancelledSharedObligationId}
+    `);
+    await db.execute(sql`
+      INSERT INTO sim_precalc_obligation_campaigns
+        (obligation_id, campaign_id, state, cancelled_at)
+      VALUES
+        (${cancelledSharedObligationId}, ${campaignId}, 'active', NULL),
+        (${cancelledSharedObligationId}, ${cancelledOwnerCampaignId}, 'cancelled', now())
+    `);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/admin/test-artifacts/purge",
+      payload: { prefix: PREFIX },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toContain("solver jobs are still active");
+    expect(response.json().activeJobs).toEqual([
+      { id: exclusivePhysicalJobId, status: "running" },
+    ]);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_campaigns WHERE id = ${campaignId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_jobs WHERE id IN (${exclusivePhysicalJobId}, ${backgroundPhysicalJobId}, ${cancelledSharedPhysicalJobId})`,
+      ),
+    ).toBe(3);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_precalc_obligations WHERE id IN (${exclusiveObligationId}, ${backgroundObligationId}, ${cancelledSharedObligationId})`,
+      ),
+    ).toBe(3);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_precalc_obligation_attempts WHERE id = ${exclusiveObligationAttemptId}`,
+      ),
+    ).toBe(1);
+
+    await db.execute(sql`
+      UPDATE sim_jobs
+      SET status = 'done', engine_state = 'done', "finishedAt" = now(), "updatedAt" = now()
+      WHERE id = ${exclusivePhysicalJobId}
+    `);
+    await db.execute(sql`
+      UPDATE sim_precalc_obligations
+      SET state = 'blocked', last_outcome = 'failed',
+          last_error = 'terminal fixture', completed_at = now(), "updatedAt" = now()
+      WHERE id = ${exclusiveObligationId}
+    `);
+    await db.execute(sql`
+      UPDATE sim_precalc_obligation_attempts
+      SET state = 'failed', outcome = 'failed', error = 'terminal fixture',
+          completed_at = now(), "updatedAt" = now()
+      WHERE id = ${exclusiveObligationAttemptId}
+    `);
+  });
+
+  it("refuses pending cancellation audit without partially purging, then permits delivered cleanup", async () => {
+    const cond = purgeCondition!;
+    const [promise] = (await db.execute(sql`
+      INSERT INTO sync_sweep_promises
+        (source_instance_id, source_instance_name, source_base_url, status,
+         airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt",
+         "cancelledAt", request_payload)
+      VALUES
+        (${`${PREFIX}-remote`}, 'purge remote fixture',
+         'https://hub.example.test/api/sync/v1', 'cancelled', ${asymId},
+         ${cond.revision_id}, 1, now(), now(), '{"remoteSolver":true}'::jsonb)
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    purgePromiseId = promise.id;
+    await db.execute(sql`
+      INSERT INTO sync_remote_promise_cancellations
+        (promise_id, state, attempt_count, next_attempt_at, last_error)
+      VALUES
+        (${purgePromiseId}, 'retry_wait', 1, now(), 'fixture retry')
+    `);
+
+    const refused = await app.inject({
+      method: "POST",
+      url: "/api/admin/test-artifacts/purge",
+      payload: { prefix: PREFIX },
+    });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json()).toMatchObject({
+      undeliveredCancellationPromiseIds: [purgePromiseId],
+    });
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sync_sweep_promises WHERE id = ${purgePromiseId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sync_remote_promise_cancellations WHERE promise_id = ${purgePromiseId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM airfoils WHERE id = ${asymId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_campaigns WHERE id = ${campaignId}`,
+      ),
+    ).toBe(1);
+
+    await db.execute(sql`
+      UPDATE sync_remote_promise_cancellations
+      SET state = 'delivered', delivered_at = now(), "updatedAt" = now()
+      WHERE promise_id = ${purgePromiseId}
+    `);
+  });
+
   it("purges every campaign-family table plus results/presets/mirrors/flow/geometry", async () => {
     // Land one real solved-evidence row on a campaign point so the purge has
     // pw- results residue to remove (mirrors campaigns.test.ts's approach).
-    const [cond] = (await db.execute(sql`
-      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id, cc.flow_condition_id, cc.reference_geometry_profile_id,
-             cc.preset_id, p.legacy_boundary_condition_id AS bc_id
-      FROM sim_campaign_conditions cc
-      JOIN simulation_presets p ON p.id = cc.preset_id
-      WHERE cc.campaign_id = ${campaignId}
-    `)) as unknown as Array<{
-      id: string;
-      revision_id: string;
-      flow_condition_id: string;
-      reference_geometry_profile_id: string;
-      preset_id: string;
-      bc_id: string;
-    }>;
+    const cond = purgeCondition!;
     expect(cond).toBeTruthy();
     expect(cond.bc_id).toBeTruthy(); // §3.3 legacy bridge exists
     await db.insert(results).values({
@@ -232,36 +757,168 @@ describe("test-artifacts purge — campaign cascade", () => {
     expect(ownedGeo).toBeGreaterThan(0);
 
     // Dry run reports without deleting.
-    const dry = await app.inject({ method: "POST", url: "/api/admin/test-artifacts/purge", payload: { prefix: PREFIX, dryRun: true } });
+    const dry = await app.inject({
+      method: "POST",
+      url: "/api/admin/test-artifacts/purge",
+      payload: { prefix: PREFIX, dryRun: true },
+    });
     expect(dry.statusCode).toBe(200);
     expect(dry.json().purged.sim_campaigns).toBe(1);
-    expect(await countRows(sql`SELECT count(*)::int AS n FROM sim_campaigns WHERE id = ${campaignId}`)).toBe(1);
+    expect(dry.json().purged.campaign_sim_jobs).toBe(1);
+    expect(dry.json().purged.campaign_precalc_obligations).toBe(1);
+    expect(dry.json().purged.campaign_precalc_obligation_attempts).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_campaigns WHERE id = ${campaignId}`,
+      ),
+    ).toBe(1);
 
-    const res = await app.inject({ method: "POST", url: "/api/admin/test-artifacts/purge", payload: { prefix: PREFIX } });
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/test-artifacts/purge",
+      payload: { prefix: PREFIX },
+    });
     expect(res.statusCode).toBe(200);
     const purged = res.json().purged;
     expect(purged.sim_campaigns).toBe(1);
     expect(purged.campaign_results).toBe(1);
+    expect(purged.campaign_sim_jobs).toBe(1);
+    expect(purged.campaign_precalc_obligations).toBe(1);
+    expect(purged.campaign_precalc_obligation_attempts).toBe(1);
     expect(purged.campaign_presets).toBeGreaterThan(0);
     expect(purged.campaign_legacy_boundary_conditions).toBeGreaterThan(0);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sync_sweep_promises WHERE id = ${purgePromiseId}`,
+      ),
+    ).toBe(0);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sync_remote_promise_cancellations WHERE promise_id = ${purgePromiseId}`,
+      ),
+    ).toBe(0);
+
+    // campaign_id=NULL physical work is removed only for the exclusive owner;
+    // the background-owned graph survives and merely loses this campaign's
+    // beneficiary association.
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_jobs WHERE id = ${exclusivePhysicalJobId}`,
+      ),
+    ).toBe(0);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_precalc_obligations WHERE id = ${exclusiveObligationId}`,
+      ),
+    ).toBe(0);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_precalc_obligation_attempts WHERE id = ${exclusiveObligationAttemptId}`,
+      ),
+    ).toBe(0);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_jobs WHERE id = ${backgroundPhysicalJobId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_precalc_obligations WHERE id = ${backgroundObligationId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM results WHERE id = ${reusedBackgroundResultId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_jobs WHERE id = ${cancelledSharedPhysicalJobId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM sim_precalc_obligations WHERE id = ${cancelledSharedObligationId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(
+        sql`SELECT count(*)::int AS n FROM simulation_presets WHERE id = ${backgroundPresetId}`,
+      ),
+    ).toBe(1);
+    expect(
+      await countRows(sql`
+        SELECT count(*)::int AS n FROM sim_precalc_obligation_campaigns
+        WHERE obligation_id = ${backgroundObligationId}
+          AND campaign_id = ${campaignId}
+      `),
+    ).toBe(0);
+    expect(
+      await countRows(sql`
+        SELECT count(*)::int AS n FROM sim_precalc_obligation_campaigns
+        WHERE obligation_id = ${cancelledSharedObligationId}
+          AND campaign_id = ${campaignId}
+      `),
+    ).toBe(0);
+    expect(
+      await countRows(sql`
+        SELECT count(*)::int AS n FROM sim_precalc_obligation_campaigns
+        WHERE obligation_id = ${cancelledSharedObligationId}
+          AND campaign_id = ${cancelledOwnerCampaignId}
+          AND state = 'cancelled'
+      `),
+    ).toBe(1);
 
     // Zero residue in every campaign-family table.
     const residueQueries: Array<[string, ReturnType<typeof sql>]> = [
-      ["sim_campaigns", sql`SELECT count(*)::int AS n FROM sim_campaigns WHERE id = ${campaignId}`],
-      ["sim_campaign_airfoils", sql`SELECT count(*)::int AS n FROM sim_campaign_airfoils WHERE campaign_id = ${campaignId}`],
-      ["sim_campaign_plan_revisions", sql`SELECT count(*)::int AS n FROM sim_campaign_plan_revisions WHERE campaign_id = ${campaignId}`],
-      ["sim_campaign_conditions", sql`SELECT count(*)::int AS n FROM sim_campaign_conditions WHERE campaign_id = ${campaignId}`],
-      ["sim_campaign_points", sql`SELECT count(*)::int AS n FROM sim_campaign_points WHERE campaign_id = ${campaignId}`],
-      ["sim_campaign_progress", sql`SELECT count(*)::int AS n FROM sim_campaign_progress WHERE campaign_id = ${campaignId}`],
-      ["sim_campaign_lanes", sql`SELECT count(*)::int AS n FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}`],
-      ["sim_campaign_lane_steps", sql`SELECT count(*)::int AS n FROM sim_campaign_lane_steps WHERE campaign_id = ${campaignId}`],
-      ["campaign presets", sql`SELECT count(*)::int AS n FROM simulation_presets WHERE id = ${cond.preset_id}`],
+      [
+        "sim_campaigns",
+        sql`SELECT count(*)::int AS n FROM sim_campaigns WHERE id = ${campaignId}`,
+      ],
+      [
+        "sim_campaign_airfoils",
+        sql`SELECT count(*)::int AS n FROM sim_campaign_airfoils WHERE campaign_id = ${campaignId}`,
+      ],
+      [
+        "sim_campaign_plan_revisions",
+        sql`SELECT count(*)::int AS n FROM sim_campaign_plan_revisions WHERE campaign_id = ${campaignId}`,
+      ],
+      [
+        "sim_campaign_conditions",
+        sql`SELECT count(*)::int AS n FROM sim_campaign_conditions WHERE campaign_id = ${campaignId}`,
+      ],
+      [
+        "sim_campaign_points",
+        sql`SELECT count(*)::int AS n FROM sim_campaign_points WHERE campaign_id = ${campaignId}`,
+      ],
+      [
+        "sim_campaign_progress",
+        sql`SELECT count(*)::int AS n FROM sim_campaign_progress WHERE campaign_id = ${campaignId}`,
+      ],
+      [
+        "sim_campaign_lanes",
+        sql`SELECT count(*)::int AS n FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}`,
+      ],
+      [
+        "sim_campaign_lane_steps",
+        sql`SELECT count(*)::int AS n FROM sim_campaign_lane_steps WHERE campaign_id = ${campaignId}`,
+      ],
+      [
+        "campaign presets",
+        sql`SELECT count(*)::int AS n FROM simulation_presets WHERE id = ${cond.preset_id}`,
+      ],
       [
         "preset revisions",
         sql`SELECT count(*)::int AS n FROM simulation_preset_revisions WHERE id = ${cond.revision_id}`,
       ],
-      ["legacy bc mirrors", sql`SELECT count(*)::int AS n FROM boundary_conditions WHERE id = ${cond.bc_id}`],
-      ["campaign flow_conditions", sql`SELECT count(*)::int AS n FROM flow_conditions WHERE id = ${cond.flow_condition_id}`],
+      [
+        "legacy bc mirrors",
+        sql`SELECT count(*)::int AS n FROM boundary_conditions WHERE id = ${cond.bc_id}`,
+      ],
+      [
+        "campaign flow_conditions",
+        sql`SELECT count(*)::int AS n FROM flow_conditions WHERE id = ${cond.flow_condition_id}`,
+      ],
       [
         "campaign reference_geometry_profiles",
         sql`SELECT count(*)::int AS n FROM reference_geometry_profiles WHERE id = ${cond.reference_geometry_profile_id}`,
@@ -270,21 +927,62 @@ describe("test-artifacts purge — campaign cascade", () => {
         "results at pinned revisions",
         sql`SELECT count(*)::int AS n FROM results WHERE simulation_preset_revision_id = ${cond.revision_id}`,
       ],
-      ["pw airfoils", sql`SELECT count(*)::int AS n FROM airfoils WHERE id IN (${symId}::uuid, ${asymId}::uuid)`],
-      ["pw categories", sql`SELECT count(*)::int AS n FROM categories WHERE name ILIKE ${`${PREFIX}%`}`],
-      ["pw mediums", sql`SELECT count(*)::int AS n FROM mediums WHERE id = ${mediumId}`],
-      ["pw boundary profiles", sql`SELECT count(*)::int AS n FROM boundary_profiles WHERE id = ${numerics.boundaryProfileId}`],
-      ["pw mesh profiles", sql`SELECT count(*)::int AS n FROM mesh_profiles WHERE id = ${numerics.meshProfileId}`],
-      ["pw solver profiles", sql`SELECT count(*)::int AS n FROM solver_profiles WHERE id = ${numerics.solverProfileId}`],
-      ["pw output profiles", sql`SELECT count(*)::int AS n FROM output_profiles WHERE id = ${numerics.outputProfileId}`],
+      [
+        "pw airfoils",
+        sql`SELECT count(*)::int AS n FROM airfoils WHERE id IN (${symId}::uuid, ${asymId}::uuid)`,
+      ],
+      [
+        "pw categories",
+        sql`SELECT count(*)::int AS n FROM categories WHERE name ILIKE ${`${PREFIX}%`}`,
+      ],
+      [
+        "pw mediums",
+        sql`SELECT count(*)::int AS n FROM mediums WHERE id = ${mediumId}`,
+      ],
+      [
+        "pw boundary profiles",
+        sql`SELECT count(*)::int AS n FROM boundary_profiles WHERE id = ${numerics.boundaryProfileId}`,
+      ],
+      [
+        "pw mesh profiles",
+        sql`SELECT count(*)::int AS n FROM mesh_profiles WHERE id = ${numerics.meshProfileId}`,
+      ],
+      [
+        "pw solver profiles",
+        sql`SELECT count(*)::int AS n FROM solver_profiles WHERE id = ${numerics.solverProfileId}`,
+      ],
+      [
+        "pw output profiles",
+        sql`SELECT count(*)::int AS n FROM output_profiles WHERE id = ${numerics.outputProfileId}`,
+      ],
     ];
     for (const [label, query] of residueQueries) {
       expect(await countRows(query), `${label} should be fully purged`).toBe(0);
     }
+
+    await db.execute(
+      sql`DELETE FROM sim_jobs WHERE id = ${backgroundPhysicalJobId}`,
+    );
+    await db.execute(
+      sql`DELETE FROM sim_jobs WHERE id = ${cancelledSharedPhysicalJobId}`,
+    );
+    await db.execute(
+      sql`DELETE FROM sim_precalc_obligations WHERE id = ${backgroundObligationId}`,
+    );
+    await db.execute(
+      sql`DELETE FROM sim_precalc_obligations WHERE id = ${cancelledSharedObligationId}`,
+    );
+    await db.execute(
+      sql`DELETE FROM sim_campaigns WHERE id = ${cancelledOwnerCampaignId}`,
+    );
   });
 
   it("still refuses non pw- prefixes", async () => {
-    const res = await app.inject({ method: "POST", url: "/api/admin/test-artifacts/purge", payload: { prefix: "prod-data" } });
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/test-artifacts/purge",
+      payload: { prefix: "prod-data" },
+    });
     expect(res.statusCode).toBe(422);
   });
 });

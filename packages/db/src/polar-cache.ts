@@ -10,14 +10,14 @@ import {
   type PolarEvidenceClassification,
   type PolarEvidencePoint,
 } from "@aerodb/core";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, sql, type SQL } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
 import { activeReviewVerdicts } from "./review-verdicts";
 import {
   airfoils,
-  forceHistory,
+  polarCompatibilityFitSets,
   polarFitPoints,
   polarFitSets,
   resultAttempts,
@@ -28,14 +28,18 @@ import {
 } from "./schema";
 import {
   ensureRevisionPhysicsHash,
+  POLAR_COMPATIBILITY_VERSION,
   refreshPolarCompatibilityCache,
+  resolveRevisionPhysicsHash,
 } from "./polar-compatibility-cache";
 export * from "./polar-compatibility-cache";
 
 type EvidenceWithDbIds = PolarEvidencePoint & {
   resultId?: string | null;
   resultAttemptId?: string | null;
+  currentGenerationAttemptId?: string | null;
   simJobId?: string | null;
+  engineJobId?: string | null;
   updatedAt?: Date | null;
 };
 
@@ -49,9 +53,44 @@ export interface PolarCacheRefreshResult {
   fitStatus: string;
 }
 
+/** Deterministic transaction-observation hooks used only by DB regressions. */
+export interface PolarCacheRefreshHooks {
+  /** Runs under the revision advisory lock, before any evidence snapshot is
+   * loaded. Writers use this to CAS-promote one exact attempt and rebuild the
+   * classifications/fit in the same commit as that pointer transition. */
+  beforeEvidenceLoad?: (tx: DB) => Promise<void>;
+  /** Runs after immutable attempt evidence has been classified, while the
+   * revision advisory lock is still held, and before canonical result
+   * evidence is loaded. Exact-generation writers use it to CAS-select an
+   * eligible attempt so result classification and fit see that pointer in
+   * the same transaction. */
+  afterAttemptClassifications?: (tx: DB) => Promise<void>;
+  afterFitPointsDeleted?: () => Promise<void>;
+}
+
+/** Attempt force history is immutable evidence inside the exact attempt
+ * payload. Accept both engine snake_case and normalized camelCase envelopes,
+ * but fail closed on placeholders, JSON null, or empty coefficient arrays. */
+function hasAttemptForceHistory(payload: SQL): SQL<boolean> {
+  const normalized = sql`COALESCE(
+    NULLIF(${payload} -> 'force_history', 'null'::jsonb),
+    ${payload} -> 'forceHistory'
+  )`;
+  return sql<boolean>`(
+    jsonb_typeof(${normalized}) = 'object'
+    AND jsonb_typeof((${normalized}) -> 't') = 'array'
+    AND jsonb_typeof((${normalized}) -> 'cl') = 'array'
+    AND jsonb_typeof((${normalized}) -> 'cd') = 'array'
+    AND jsonb_array_length((${normalized}) -> 't') > 0
+    AND jsonb_array_length((${normalized}) -> 'cl') > 0
+    AND jsonb_array_length((${normalized}) -> 'cd') > 0
+  )`;
+}
+
 function toEvidence(row: {
   id?: string | null;
   attemptId?: string | null;
+  currentGenerationAttemptId?: string | null;
   aoaDeg: number;
   cl: number | null;
   cd: number | null;
@@ -73,7 +112,9 @@ function toEvidence(row: {
   frameTrack?: unknown;
   fidelity?: string | null;
   steadyHistory?: unknown;
+  qualityWarnings?: string[] | null;
   simJobId?: string | null;
+  engineJobId?: string | null;
   updatedAt?: Date | null;
 }): EvidenceWithDbIds {
   return {
@@ -81,6 +122,7 @@ function toEvidence(row: {
     resultId: row.id ?? null,
     attemptId: row.attemptId ?? null,
     resultAttemptId: row.attemptId ?? null,
+    currentGenerationAttemptId: row.currentGenerationAttemptId ?? null,
     a: row.aoaDeg,
     cl: row.cl,
     cd: row.cd,
@@ -106,7 +148,9 @@ function toEvidence(row: {
     // steady_history.mean_stable === true accepts oscillating-steady rows.
     fidelity: row.fidelity ?? null,
     steadyHistory: (row.steadyHistory ?? null) as SteadyHistoryEvidence | null,
+    qualityWarnings: row.qualityWarnings ?? null,
     simJobId: row.simJobId ?? null,
+    engineJobId: row.engineJobId ?? null,
     updatedAt: row.updatedAt ?? null,
   };
 }
@@ -116,37 +160,120 @@ async function loadResultEvidence(
   airfoilId: string,
   simulationPresetRevisionId: string,
 ): Promise<EvidenceWithDbIds[]> {
+  const currentAttemptForce = hasAttemptForceHistory(
+    sql.raw('"current_attempt"."evidence_payload"'),
+  );
   const rows = await db
     .select({
       id: results.id,
-      aoaDeg: results.aoaDeg,
-      cl: results.cl,
-      cd: results.cd,
-      cm: results.cm,
-      clCd: results.clCd,
-      status: results.status,
-      source: results.source,
-      regime: results.regime,
-      converged: results.converged,
-      stalled: results.stalled,
-      unsteady: results.unsteady,
-      error: results.error,
-      finalResidual: results.finalResidual,
-      iterations: results.iterations,
-      firstOrderFallback: results.firstOrderFallback,
-      updatedAt: results.updatedAt,
-      // NOTE: the correlated column MUST be table-qualified by hand. Drizzle
-      // renders `${results.id}` inside a sql`` fragment as unqualified "id",
-      // which Postgres scope-resolves to the SUBQUERY's own table
-      // (fh.result_id = fh.id — always false), silently reporting every
-      // result as having no force history / video (prod defect, 2026-07-05).
-      hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = "results"."id")`,
-      hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = "results"."id" and media.kind = 'video' and media.role = 'instantaneous')`,
-      frameTrack: results.frameTrack,
-      fidelity: results.fidelity,
-      steadyHistory: results.steadyHistory,
+      currentGenerationAttemptId: results.currentResultAttemptId,
+      // The canonical results row is a mutable projection. Under an explicit
+      // current-attempt pointer every classifier input and provenance value
+      // comes from that immutable attempt, never from a mixed generation.
+      // AoA remains the canonical cell key when the pointer is absent, but no
+      // solver evidence is read from the mutable result projection.  A null
+      // pointer is explicitly unavailable/repairable (DecisionHistory 0053),
+      // so the synthetic pending/null shape below fails classification closed.
+      aoaDeg: sql<number>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.aoaDeg} ELSE ${results.aoaDeg} END`,
+      cl: sql<
+        number | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cl} ELSE NULL END`,
+      cd: sql<
+        number | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cd} ELSE NULL END`,
+      cm: sql<
+        number | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cm} ELSE NULL END`,
+      clCd: sql<
+        number | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.clCd} ELSE NULL END`,
+      status: sql<string>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.status} ELSE 'pending' END`,
+      source: sql<string>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.source} ELSE 'queued' END`,
+      regime: sql<
+        "rans" | "urans" | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.regime} ELSE NULL END`,
+      converged: sql<boolean>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.converged} ELSE FALSE END`,
+      stalled: sql<boolean>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.stalled} ELSE FALSE END`,
+      unsteady: sql<boolean>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.unsteady} ELSE FALSE END`,
+      error: sql<
+        string | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.error} ELSE NULL END`,
+      finalResidual: sql<
+        number | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.finalResidual} ELSE NULL END`,
+      iterations: sql<
+        number | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.iterations} ELSE NULL END`,
+      firstOrderFallback: sql<
+        boolean | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.firstOrderFallback} ELSE NULL END`,
+      validForPolar: sql<
+        boolean | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.validForPolar} ELSE NULL END`,
+      simJobId: sql<
+        string | null
+      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.simJobId} ELSE NULL END`,
+      updatedAt: sql<Date | null>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN COALESCE(${resultAttempts.solvedAt}, ${resultAttempts.createdAt}) ELSE NULL END`,
+      // A current attempt pointer is an evidence-generation fence. Once set,
+      // result-level classification reads force/video from that exact attempt
+      // only; artifacts from an older solve of the same canonical result must
+      // not make the replacement look complete. Pointer-less rows fail closed;
+      // unscoped legacy artifacts remain historical/admin evidence only.
+      hasForceHistory: sql<boolean>`CASE
+        WHEN "results"."current_result_attempt_id" IS NOT NULL THEN EXISTS (
+          SELECT 1
+          FROM ${resultAttempts} current_attempt
+          WHERE current_attempt.id = "results"."current_result_attempt_id"
+            AND current_attempt.result_id = "results"."id"
+            AND ${currentAttemptForce}
+        )
+        ELSE FALSE
+      END`,
+      hasVideo: sql<boolean>`CASE
+        WHEN "results"."current_result_attempt_id" IS NOT NULL THEN EXISTS (
+          SELECT 1 FROM ${resultMedia} media
+          WHERE media.result_id = "results"."id"
+            AND media.result_attempt_id = "results"."current_result_attempt_id"
+            AND media.kind = 'video'
+            AND media.role = 'instantaneous'
+            AND media.mime_type LIKE 'video/%'
+            AND media.sha256 ~ '^[0-9a-fA-F]{64}$'
+            AND media.byte_size > 0
+            AND length(trim(media.storage_key)) > 0
+        )
+        ELSE FALSE
+      END`,
+      frameTrack: sql<unknown>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN COALESCE(
+          NULLIF(${resultAttempts.evidencePayload} -> 'frame_track', 'null'::jsonb),
+          ${resultAttempts.evidencePayload} -> 'frameTrack'
+        )
+        ELSE NULL
+      END`,
+      fidelity: sql<string | null>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.evidencePayload} ->> 'fidelity'
+        ELSE NULL
+      END`,
+      steadyHistory: sql<unknown>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN COALESCE(
+          NULLIF(${resultAttempts.evidencePayload} -> 'steady_history', 'null'::jsonb),
+          ${resultAttempts.evidencePayload} -> 'steadyHistory'
+        )
+        ELSE NULL
+      END`,
+      qualityWarnings: sql<string[] | null>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.qualityWarnings}
+        ELSE NULL
+      END`,
     })
     .from(results)
+    .leftJoin(
+      resultAttempts,
+      and(
+        eq(resultAttempts.id, results.currentResultAttemptId),
+        eq(resultAttempts.resultId, results.id),
+      ),
+    )
     .where(
       and(
         eq(results.airfoilId, airfoilId),
@@ -161,6 +288,9 @@ async function loadAttemptEvidence(
   airfoilId: string,
   simulationPresetRevisionId: string,
 ): Promise<EvidenceWithDbIds[]> {
+  const exactAttemptForce = hasAttemptForceHistory(
+    sql.raw('"result_attempts"."evidence_payload"'),
+  );
   const rows = await db
     .select({
       id: resultAttempts.resultId,
@@ -182,22 +312,36 @@ async function loadAttemptEvidence(
       firstOrderFallback: resultAttempts.firstOrderFallback,
       validForPolar: resultAttempts.validForPolar,
       simJobId: resultAttempts.simJobId,
-      updatedAt: resultAttempts.createdAt,
-      // Same hand-qualification rule as loadResultEvidence: an unqualified
-      // "result_id" here binds to the subquery's OWN result_id column
-      // (media.result_id = media.result_id — always true), inventing
-      // evidence for every attempt.
-      hasForceHistory: sql<boolean>`exists (select 1 from ${forceHistory} fh where fh.result_id = "result_attempts"."result_id")`,
-      hasVideo: sql<boolean>`exists (select 1 from ${resultMedia} media where media.result_id = "result_attempts"."result_id" and media.kind = 'video' and media.role = 'instantaneous')`,
+      engineJobId: resultAttempts.engineJobId,
+      updatedAt: sql<Date>`COALESCE(${resultAttempts.solvedAt}, ${resultAttempts.createdAt})`,
+      hasForceHistory: exactAttemptForce,
+      hasVideo: sql<boolean>`exists (
+        select 1 from ${resultMedia} media
+        where media.result_id = "result_attempts"."result_id"
+          and media.result_attempt_id = "result_attempts"."id"
+          and media.kind = 'video'
+          and media.role = 'instantaneous'
+          and media.mime_type LIKE 'video/%'
+          and media.sha256 ~ '^[0-9a-fA-F]{64}$'
+          and media.byte_size > 0
+          and length(trim(media.storage_key)) > 0
+      )`,
       // Attempts keep the whole engine PolarPoint as evidence_payload; the
       // frame_track key inside it feeds the same stationarity gate. JSON null
       // and key-absent both surface as SQL NULL → legacy gate.
-      frameTrack: sql<unknown>`"result_attempts"."evidence_payload" -> 'frame_track'`,
+      frameTrack: sql<unknown>`COALESCE(
+        NULLIF("result_attempts"."evidence_payload" -> 'frame_track', 'null'::jsonb),
+        "result_attempts"."evidence_payload" -> 'frameTrack'
+      )`,
       // Ladder evidence lives inside the same verbatim engine PolarPoint.
       fidelity: sql<
         string | null
       >`"result_attempts"."evidence_payload" ->> 'fidelity'`,
-      steadyHistory: sql<unknown>`"result_attempts"."evidence_payload" -> 'steady_history'`,
+      steadyHistory: sql<unknown>`COALESCE(
+        NULLIF("result_attempts"."evidence_payload" -> 'steady_history', 'null'::jsonb),
+        "result_attempts"."evidence_payload" -> 'steadyHistory'
+      )`,
+      qualityWarnings: resultAttempts.qualityWarnings,
     })
     .from(resultAttempts)
     .where(
@@ -287,6 +431,7 @@ function signatureFor(
       const e = c.evidence as EvidenceWithDbIds;
       return [
         e.resultId,
+        e.currentGenerationAttemptId ?? "",
         e.a,
         e.regime,
         c.state,
@@ -372,15 +517,19 @@ async function supersedePrecalcWithVerifiedUrans(
         "updatedAt" = now()
     FROM results r
     JOIN result_classifications vrc ON vrc.result_id = r.id
+    LEFT JOIN result_attempts current_attempt
+      ON current_attempt.id = r.current_result_attempt_id
+     AND current_attempt.result_id = r.id
     WHERE r.airfoil_id = ${airfoilId}
       AND r.simulation_preset_revision_id = ${simulationPresetRevisionId}
-      AND r.regime = 'urans'
-      AND r.fidelity = 'urans_full'
+      AND r.current_result_attempt_id IS NOT NULL
+      AND current_attempt.regime = 'urans'
+      AND current_attempt.evidence_payload ->> 'fidelity' = 'urans_full'
       AND vrc.state = 'accepted'
       AND rc.result_attempt_id IS NOT NULL
       AND rc.airfoil_id = ${airfoilId}
       AND rc.simulation_preset_revision_id = ${simulationPresetRevisionId}
-      AND rc.aoa_deg = r.aoa_deg
+      AND rc.aoa_deg = current_attempt.aoa_deg
       AND rc.regime = 'urans'
       AND rc.state IN ('accepted', 'needs_urans')
       AND EXISTS (
@@ -397,6 +546,7 @@ async function storeFit(
   simulationPresetRevisionId: string,
   classifications: PolarEvidenceClassification[],
   symmetric: boolean,
+  hooks?: PolarCacheRefreshHooks,
 ): Promise<{ fitSetId: string | null; status: string }> {
   const [revision] = await db
     .select({
@@ -514,6 +664,7 @@ async function storeFit(
 
   if (!fitSet) return { fitSetId: null, status: "insufficient" };
   await db.delete(polarFitPoints).where(eq(polarFitPoints.fitSetId, fitSet.id));
+  await hooks?.afterFitPointsDeleted?.();
   if (fit.points.length) {
     await db.insert(polarFitPoints).values(
       fit.points.map((p) => ({
@@ -533,160 +684,229 @@ export async function refreshPolarCacheForRevision(
   db: DB,
   airfoilId: string,
   simulationPresetRevisionId: string,
+  hooks?: PolarCacheRefreshHooks,
 ): Promise<PolarCacheRefreshResult> {
-  const compatibilityHash = await ensureRevisionPhysicsHash(
-    db,
-    simulationPresetRevisionId,
-  );
-  const [airfoilRow] = await db
-    .select({ isSymmetric: airfoils.isSymmetric })
-    .from(airfoils)
-    .where(eq(airfoils.id, airfoilId))
-    .limit(1);
-  const symmetric = airfoilRow?.isSymmetric ?? false;
-  const resultEvidence = await loadResultEvidence(
-    db,
-    airfoilId,
-    simulationPresetRevisionId,
-  );
-  const attemptEvidence = await loadAttemptEvidence(
-    db,
-    airfoilId,
-    simulationPresetRevisionId,
-  );
-  const resultClassified = classifyPolarEvidence(resultEvidence);
-  const attemptEvidenceByJob = new Map<string, EvidenceWithDbIds[]>();
-  for (const evidence of attemptEvidence) {
-    const key = evidence.simJobId ?? "__unscoped__";
-    const bucket = attemptEvidenceByJob.get(key);
-    if (bucket) {
-      bucket.push(evidence);
-    } else {
-      attemptEvidenceByJob.set(key, [evidence]);
-    }
-  }
-  const attemptClassifiedGroups = [...attemptEvidenceByJob.values()].map(
-    (group) => classifyPolarEvidence(group),
-  );
-  const attemptClassifications = attemptClassifiedGroups.flatMap(
-    (group) => group.classifications,
-  );
-
-  for (const c of [
-    ...resultClassified.classifications,
-    ...attemptClassifications,
-  ]) {
-    await upsertClassification(db, c, airfoilId, simulationPresetRevisionId);
-  }
-  await supersedeRansWithAcceptedUrans(
-    db,
-    airfoilId,
-    simulationPresetRevisionId,
-  );
-  await supersedePrecalcWithVerifiedUrans(
-    db,
-    airfoilId,
-    simulationPresetRevisionId,
-  );
-
-  const freshResultClassifications = await db
-    .select({
-      resultId: resultClassifications.resultId,
-      aoaDeg: resultClassifications.aoaDeg,
-      regime: resultClassifications.regime,
-      state: resultClassifications.state,
-      region: resultClassifications.region,
-      confidence: resultClassifications.confidence,
-      reasons: resultClassifications.reasons,
-      cl: results.cl,
-      cd: results.cd,
-      cm: results.cm,
-      clCd: results.clCd,
-      status: results.status,
-      source: results.source,
-      converged: results.converged,
-      stalled: results.stalled,
-      unsteady: results.unsteady,
-      error: results.error,
-      finalResidual: results.finalResidual,
-      iterations: results.iterations,
-      firstOrderFallback: results.firstOrderFallback,
-      updatedAt: results.updatedAt,
-    })
-    .from(resultClassifications)
-    .innerJoin(results, eq(results.id, resultClassifications.resultId))
-    .where(
-      and(
-        eq(resultClassifications.airfoilId, airfoilId),
-        eq(
-          resultClassifications.simulationPresetRevisionId,
-          simulationPresetRevisionId,
-        ),
-      ),
+  const refreshed = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const compatibilityHash = await resolveRevisionPhysicsHash(
+      tx,
+      simulationPresetRevisionId,
     );
-  const activeVerdicts = await activeReviewVerdicts(
-    db,
-    freshResultClassifications
-      .map((row) => row.resultId)
-      .filter((id): id is string => Boolean(id)),
-  );
-  const fitClassifications: PolarEvidenceClassification[] =
-    freshResultClassifications
-      .map((row) => ({
-        evidence: toEvidence({
-          id: row.resultId,
-          ...row,
-          hasForceHistory: true,
-          hasVideo: true,
-        }),
-        state:
-          activeVerdicts.get(row.resultId ?? "")?.verdict === "waive"
-            ? "accepted"
-            : row.state,
-        region: row.region,
-        confidence: row.confidence,
-        reasons: row.reasons,
-      }))
-      .filter((classification) => {
-        const evidence = classification.evidence as EvidenceWithDbIds;
-        return (
-          activeVerdicts.get(evidence.resultId ?? "")?.verdict !== "exclude"
-        );
-      });
-  const storedFit = await storeFit(
-    db,
-    airfoilId,
-    simulationPresetRevisionId,
-    fitClassifications,
-    symmetric,
-  );
-  if (compatibilityHash) {
-    await refreshPolarCompatibilityCache(db, airfoilId, compatibilityHash);
-  }
-  const attemptNeeds = attemptClassifiedGroups.flatMap(
-    (group) => group.needsUransAoas,
-  );
-  const resultNeeds = resultClassified.needsUransAoas;
-  const attemptRejected = attemptClassifiedGroups.flatMap(
-    (group) => group.hardRejectedAoas,
-  );
-  const resultRejected = resultClassified.hardRejectedAoas;
+    // Global lock order is compatibility aggregate -> revision -> result rows.
+    // The post-commit compatibility rebuild also starts with the aggregate
+    // lock; taking revision first here can deadlock when a concurrent refresh
+    // holds a result-row update while the prior rebuild inserts FK members.
+    if (compatibilityHash) {
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${`polar-compatibility:${POLAR_COMPATIBILITY_VERSION}:${airfoilId}:${compatibilityHash}`}, 0))`,
+      );
+    }
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtextextended(${`polar-revision:${airfoilId}:${simulationPresetRevisionId}`}, 0))`,
+    );
+    const persistedCompatibilityHash = await ensureRevisionPhysicsHash(
+      tx,
+      simulationPresetRevisionId,
+    );
+    if (persistedCompatibilityHash !== compatibilityHash) {
+      throw new Error(
+        `revision physics hash changed while acquiring ordered polar locks (${simulationPresetRevisionId})`,
+      );
+    }
+    await hooks?.beforeEvidenceLoad?.(tx);
+    const [airfoilRow] = await tx
+      .select({ isSymmetric: airfoils.isSymmetric })
+      .from(airfoils)
+      .where(eq(airfoils.id, airfoilId))
+      .limit(1);
+    const symmetric = airfoilRow?.isSymmetric ?? false;
+    const attemptEvidence = await loadAttemptEvidence(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+    );
+    const attemptEvidenceByJob = new Map<string, EvidenceWithDbIds[]>();
+    for (const evidence of attemptEvidence) {
+      // Attempt classification is scoped to the physical solver job/sweep that
+      // produced it.  Retention sets sim_job_id NULL, and remote attempts are
+      // intentionally unbound locally, so collapsing every such row into one
+      // "unscoped" sweep lets an unrelated low-AoA failure downgrade all other
+      // historical/remote attempts.  The immutable engine job is the durable
+      // fallback; a truly legacy attempt with neither id is isolated by its own
+      // attempt id rather than guessed into a shared sweep.
+      const key = evidence.simJobId
+        ? `sim:${evidence.simJobId}`
+        : evidence.engineJobId
+          ? `engine:${evidence.engineJobId}`
+          : `attempt:${evidence.resultAttemptId ?? evidence.resultId ?? "unknown"}`;
+      const bucket = attemptEvidenceByJob.get(key);
+      if (bucket) {
+        bucket.push(evidence);
+      } else {
+        attemptEvidenceByJob.set(key, [evidence]);
+      }
+    }
+    const attemptClassifiedGroups = [...attemptEvidenceByJob.values()].map(
+      (group) => classifyPolarEvidence(group),
+    );
+    const attemptClassifications = attemptClassifiedGroups.flatMap(
+      (group) => group.classifications,
+    );
 
-  return {
-    airfoilId,
-    simulationPresetRevisionId,
-    needsUransAoas: [...new Set([...attemptNeeds, ...resultNeeds])].sort(
-      (a, b) => a - b,
-    ),
-    hardRejectedAoas: [
-      ...new Set([...attemptRejected, ...resultRejected]),
-    ].sort((a, b) => a - b),
-    lowAoaFailure:
-      attemptClassifiedGroups.some((group) => group.lowAoaFailure) ||
-      resultClassified.lowAoaFailure,
-    fitSetId: storedFit.fitSetId,
-    fitStatus: storedFit.status,
-  };
+    for (const c of attemptClassifications) {
+      await upsertClassification(tx, c, airfoilId, simulationPresetRevisionId);
+    }
+    await hooks?.afterAttemptClassifications?.(tx);
+
+    // Canonical result evidence is intentionally loaded only after the exact
+    // generation-selection hook. Result classification and fit therefore
+    // observe the selected pointer from the same revision-locked transaction,
+    // never a pre-promotion snapshot.
+    const resultEvidence = await loadResultEvidence(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+    );
+    const resultClassified = classifyPolarEvidence(resultEvidence);
+    for (const c of resultClassified.classifications) {
+      await upsertClassification(tx, c, airfoilId, simulationPresetRevisionId);
+    }
+    await supersedeRansWithAcceptedUrans(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+    );
+    await supersedePrecalcWithVerifiedUrans(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+    );
+
+    const resultEvidenceById = new Map(
+      resultEvidence
+        .filter((evidence) => evidence.resultId)
+        .map((evidence) => [evidence.resultId!, evidence]),
+    );
+    const freshResultClassifications = await tx
+      .select({
+        resultId: resultClassifications.resultId,
+        state: resultClassifications.state,
+        region: resultClassifications.region,
+        confidence: resultClassifications.confidence,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultClassifications)
+      .where(
+        and(
+          eq(resultClassifications.airfoilId, airfoilId),
+          eq(
+            resultClassifications.simulationPresetRevisionId,
+            simulationPresetRevisionId,
+          ),
+          isNotNull(resultClassifications.resultId),
+        ),
+      );
+    const activeVerdicts = await activeReviewVerdicts(
+      tx,
+      freshResultClassifications
+        .map((row) => row.resultId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const fitClassifications: PolarEvidenceClassification[] =
+      freshResultClassifications
+        .map((row): PolarEvidenceClassification | null => {
+          const evidence = row.resultId
+            ? resultEvidenceById.get(row.resultId)
+            : undefined;
+          if (!evidence) return null;
+          return {
+            evidence,
+            state: row.state,
+            region: row.region,
+            confidence: row.confidence,
+            reasons: row.reasons,
+          };
+        })
+        .filter(
+          (classification): classification is PolarEvidenceClassification =>
+            classification !== null,
+        )
+        .filter((classification) => {
+          const evidence = classification.evidence as EvidenceWithDbIds;
+          return (
+            activeVerdicts.get(evidence.resultId ?? "")?.verdict !== "exclude"
+          );
+        });
+    const storedFit = await storeFit(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+      fitClassifications,
+      symmetric,
+      hooks,
+    );
+    if (compatibilityHash) {
+      // Publication is two-phase by design: make stale aggregate data
+      // unavailable in the same commit as pointer/classification/revision-fit
+      // promotion, then rebuild the aggregate from committed state below.
+      // The aggregate lock was acquired before the revision lock above, so a
+      // concurrent compatibility rebuild cannot republish the old projection
+      // in this pointer-commit window.
+      await tx
+        .update(polarCompatibilityFitSets)
+        .set({ isCurrent: false })
+        .where(
+          and(
+            eq(polarCompatibilityFitSets.airfoilId, airfoilId),
+            eq(
+              polarCompatibilityFitSets.compatibilityVersion,
+              POLAR_COMPATIBILITY_VERSION,
+            ),
+            eq(polarCompatibilityFitSets.compatibilityHash, compatibilityHash),
+            eq(polarCompatibilityFitSets.isCurrent, true),
+          ),
+        );
+    }
+    const attemptNeeds = attemptClassifiedGroups.flatMap(
+      (group) => group.needsUransAoas,
+    );
+    const resultNeeds = resultClassified.needsUransAoas;
+    const attemptRejected = attemptClassifiedGroups.flatMap(
+      (group) => group.hardRejectedAoas,
+    );
+    const resultRejected = resultClassified.hardRejectedAoas;
+
+    return {
+      compatibilityHash,
+      result: {
+        airfoilId,
+        simulationPresetRevisionId,
+        needsUransAoas: [...new Set([...attemptNeeds, ...resultNeeds])].sort(
+          (a, b) => a - b,
+        ),
+        hardRejectedAoas: [
+          ...new Set([...attemptRejected, ...resultRejected]),
+        ].sort((a, b) => a - b),
+        lowAoaFailure:
+          attemptClassifiedGroups.some((group) => group.lowAoaFailure) ||
+          resultClassified.lowAoaFailure,
+        fitSetId: storedFit.fitSetId,
+        fitStatus: storedFit.status,
+      },
+    };
+  });
+  // Compatibility aggregation owns a separate lock/transaction and must read
+  // only committed revision classification + fit state.  Keeping it outside
+  // the revision transaction avoids a pseudo-nested transaction on the same
+  // connection and preserves clear lock ordering.
+  if (refreshed.compatibilityHash) {
+    await refreshPolarCompatibilityCache(
+      db,
+      airfoilId,
+      refreshed.compatibilityHash,
+    );
+  }
+  return refreshed.result;
 }
 
 // Whole-polar URANS promotion was KILLED by the fidelity ladder (R2,

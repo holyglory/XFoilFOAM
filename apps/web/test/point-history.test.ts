@@ -65,7 +65,10 @@ describe("point filter query-param round-trip", () => {
   });
 
   it("clearing a filter removes its param instead of writing a default value", () => {
-    const withStatus = pointFiltersToSearch("?section=queue&tab=points", { ...DEFAULT_POINT_FILTERS, status: "rejected" });
+    const withStatus = pointFiltersToSearch("?section=queue&tab=points", {
+      ...DEFAULT_POINT_FILTERS,
+      status: "rejected",
+    });
     expect(withStatus).toContain("pstatus=rejected");
     const cleared = pointFiltersToSearch(withStatus, DEFAULT_POINT_FILTERS);
     expect(cleared).not.toContain("pstatus");
@@ -77,22 +80,33 @@ describe("point filter query-param round-trip", () => {
     // Includes the amendment-A split buckets the campaign gate badges /
     // needs-review chip now link to, plus the deprecated 'rejected' alias
     // old callers may still emit.
-    for (const status of ["failed", "rejected", "awaiting_urans", "needs_review"] as const) {
+    for (const status of [
+      "failed",
+      "rejected",
+      "awaiting_urans",
+      "needs_review",
+    ] as const) {
       const search = campaignPointsSearch(id, status);
       const params = new URLSearchParams(search.slice(1));
       expect(params.get("section")).toBe("queue");
       expect(params.get("tab")).toBe("points");
       // Param names come from the explorer's own round-trip — pin them so a
       // rename there cannot silently break the campaign-surface links.
-      expect(parsePointFilters(search)).toEqual({ ...DEFAULT_POINT_FILTERS, campaignId: id, status });
+      expect(parsePointFilters(search)).toEqual({
+        ...DEFAULT_POINT_FILTERS,
+        campaignId: id,
+        status,
+      });
       expect(params.get("pcampaign")).toBe(id);
       expect(params.get("pstatus")).toBe(status);
     }
   });
 
-  it("chip row replaces raw 'rejected' with the semantic split (amendment A)", () => {
+  it("chip row exposes machine-owned states but not inactive review workflows", () => {
     expect(POINT_STATUS_CHIPS).toContain("awaiting_urans");
-    expect(POINT_STATUS_CHIPS).toContain("needs_review");
+    expect(POINT_STATUS_CHIPS as readonly string[]).not.toContain(
+      "needs_review",
+    );
     expect(POINT_STATUS_CHIPS as readonly string[]).not.toContain("rejected");
   });
 
@@ -104,7 +118,9 @@ describe("point filter query-param round-trip", () => {
   });
 
   it("rejects malformed URL values (user-editable input) back to defaults", () => {
-    const parsed = parsePointFilters("?pstatus=nonsense&pregime=laminar&perr=exploded&pre=12abc");
+    const parsed = parsePointFilters(
+      "?pstatus=nonsense&pregime=laminar&perr=exploded&pre=12abc",
+    );
     expect(parsed).toEqual(DEFAULT_POINT_FILTERS);
   });
 });
@@ -117,29 +133,62 @@ describe("point filter query-param round-trip", () => {
 // ---------------------------------------------------------------------------
 describe("statusChipDisplay", () => {
   it("splits the rejected bucket by the server-derived reviewBucket", () => {
-    expect(statusChipDisplay("rejected", "awaiting_urans")).toEqual({ label: "awaiting URANS", tone: "violet" });
-    expect(statusChipDisplay("rejected", "needs_review")).toEqual({ label: "needs review", tone: "red" });
-    expect(statusChipDisplay("rejected", null)).toEqual({ label: "rejected · rescheduled", tone: "amber" });
+    expect(statusChipDisplay("rejected", "awaiting_urans")).toEqual({
+      label: "awaiting URANS",
+      tone: "violet",
+    });
+    expect(statusChipDisplay("rejected", "needs_review")).toEqual({
+      label: "unavailable",
+      tone: "red",
+    });
+    expect(statusChipDisplay("rejected", null)).toEqual({
+      label: "rejected",
+      tone: "amber",
+    });
+    expect(statusChipDisplay("rejected", null, "scheduled")).toEqual({
+      label: "rejected · rescheduled",
+      tone: "amber",
+    });
+    expect(statusChipDisplay("rejected", null, "blocked")).toEqual({
+      label: "blocked · unavailable",
+      tone: "amber",
+    });
   });
 
   it("red is strictly failed / needs-review — never the violet queue", () => {
     expect(statusChipDisplay("failed", "needs_review").tone).toBe("red");
     expect(statusChipDisplay("failed", null).tone).toBe("red");
-    expect(statusChipDisplay("rejected", "awaiting_urans").tone).not.toBe("red");
+    expect(statusChipDisplay("rejected", "awaiting_urans").tone).not.toBe(
+      "red",
+    );
   });
 
   it("keeps the untouched buckets stable", () => {
-    expect(statusChipDisplay("accepted", null)).toEqual({ label: "accepted", tone: "teal" });
-    expect(statusChipDisplay("needs_urans", null)).toEqual({ label: "needs URANS", tone: "amber" });
-    expect(statusChipDisplay("solving", null)).toEqual({ label: "solving", tone: "amber" });
-    expect(statusChipDisplay("other", null)).toEqual({ label: "other", tone: "muted" });
+    expect(statusChipDisplay("accepted", null)).toEqual({
+      label: "accepted",
+      tone: "teal",
+    });
+    expect(statusChipDisplay("needs_urans", null)).toEqual({
+      label: "needs URANS",
+      tone: "amber",
+    });
+    expect(statusChipDisplay("solving", null)).toEqual({
+      label: "solving",
+      tone: "amber",
+    });
+    expect(statusChipDisplay("other", null)).toEqual({
+      label: "other",
+      tone: "muted",
+    });
   });
 });
 
 // ---------------------------------------------------------------------------
 // STORY digest
 // ---------------------------------------------------------------------------
-const ev = (over: Partial<PointAttemptDigestEvent>): PointAttemptDigestEvent => ({
+const ev = (
+  over: Partial<PointAttemptDigestEvent>,
+): PointAttemptDigestEvent => ({
   regime: "rans",
   validForPolar: false,
   converged: false,
@@ -150,7 +199,9 @@ const ev = (over: Partial<PointAttemptDigestEvent>): PointAttemptDigestEvent => 
   ...over,
 });
 
-const item = (over: Partial<Parameters<typeof buildStoryDigest>[0]>): Parameters<typeof buildStoryDigest>[0] => ({
+const item = (
+  over: Partial<Parameters<typeof buildStoryDigest>[0]>,
+): Parameters<typeof buildStoryDigest>[0] => ({
   kind: "result",
   status: "done",
   bucket: "accepted",
@@ -169,7 +220,10 @@ describe("buildStoryDigest", () => {
         attemptCount: 4,
         attemptDigest: [
           ev({ regime: "rans", stalled: true }),
-          ev({ regime: "urans", error: "OpenFOAMError: URANS timed out after 4h" }),
+          ev({
+            regime: "urans",
+            error: "OpenFOAMError: URANS timed out after 4h",
+          }),
           ev({ regime: "urans", error: "URANS timed out again" }),
           ev({ regime: "urans", error: "solver timeout" }),
         ],
@@ -184,7 +238,13 @@ describe("buildStoryDigest", () => {
         attemptCount: 2,
         attemptDigest: [
           ev({ regime: "rans", stalled: true }),
-          ev({ regime: "urans", validForPolar: true, converged: true, unsteady: true, strouhal: null }),
+          ev({
+            regime: "urans",
+            validForPolar: true,
+            converged: true,
+            unsteady: true,
+            strouhal: null,
+          }),
         ],
       }),
     );
@@ -193,23 +253,49 @@ describe("buildStoryDigest", () => {
 
   it("labels a shedding URANS with a measured Strouhal as shedding", () => {
     const digest = buildStoryDigest(
-      item({ attemptCount: 1, attemptDigest: [ev({ regime: "urans", validForPolar: true, converged: true, unsteady: true, strouhal: 0.21 })] }),
+      item({
+        attemptCount: 1,
+        attemptDigest: [
+          ev({
+            regime: "urans",
+            validForPolar: true,
+            converged: true,
+            unsteady: true,
+            strouhal: 0.21,
+          }),
+        ],
+      }),
     );
     expect(digest).toBe("URANS ✓ shedding");
   });
 
   it("derived rows say so, with the mirror source angle", () => {
-    expect(buildStoryDigest(item({ kind: "derived", sourceAoaDeg: 4 }))).toBe("derived by symmetry — mirror of +4°");
+    expect(buildStoryDigest(item({ kind: "derived", sourceAoaDeg: 4 }))).toBe(
+      "derived by symmetry — mirror of +4°",
+    );
   });
 
   it("is honest about missing attempt records (no invented chain)", () => {
-    expect(buildStoryDigest(item({ status: "queued", bucket: "solving" }))).toBe("queued — not attempted yet");
-    expect(buildStoryDigest(item({ status: "done", bucket: "accepted" }))).toBe("solved (no attempt records)");
-    expect(buildStoryDigest(item({ status: "failed", bucket: "failed" }))).toBe("failed (no attempt records)");
+    expect(
+      buildStoryDigest(item({ status: "queued", bucket: "solving" })),
+    ).toBe("queued — not attempted yet");
+    expect(buildStoryDigest(item({ status: "done", bucket: "accepted" }))).toBe(
+      "solved (no attempt records)",
+    );
+    expect(buildStoryDigest(item({ status: "failed", bucket: "failed" }))).toBe(
+      "failed (no attempt records)",
+    );
   });
 
   it("notes truncation when more attempts exist than the digest carries", () => {
-    const digest = buildStoryDigest(item({ attemptCount: 14, attemptDigest: [ev({ regime: "rans", validForPolar: true, converged: true })] }));
+    const digest = buildStoryDigest(
+      item({
+        attemptCount: 14,
+        attemptDigest: [
+          ev({ regime: "rans", validForPolar: true, converged: true }),
+        ],
+      }),
+    );
     expect(digest).toBe("RANS ✓ (+13 more)");
   });
 });
@@ -264,6 +350,7 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
       updatedAt: "2026-07-06T12:00:00.000Z",
       fidelity: null,
       reviewBucket: null,
+      workDisposition: null,
       continuable: false,
       verify: null,
       ...(over.point ?? {}),
@@ -277,10 +364,30 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
 describe("assembleTimeline", () => {
   it("orders attempts + interruptions chronologically, then classification, then NOW", () => {
     const story = storyPayload({
-      point: { classification: { state: "rejected", reasons: ["cl_out_of_family"], confidence: 0.9, classifierVersion: "v3" } } as never,
+      point: {
+        classification: {
+          state: "rejected",
+          reasons: ["cl_out_of_family"],
+          confidence: 0.9,
+          classifierVersion: "v3",
+        },
+      } as never,
       attempts: [
-        attempt({ id: "late", regime: "urans", createdAt: "2026-07-06T11:00:00.000Z", solvedAt: "2026-07-06T11:00:00.000Z", validForPolar: true, converged: true }),
-        attempt({ id: "early", regime: "rans", createdAt: "2026-07-06T09:00:00.000Z", solvedAt: "2026-07-06T09:00:00.000Z", stalled: true }),
+        attempt({
+          id: "late",
+          regime: "urans",
+          createdAt: "2026-07-06T11:00:00.000Z",
+          solvedAt: "2026-07-06T11:00:00.000Z",
+          validForPolar: true,
+          converged: true,
+        }),
+        attempt({
+          id: "early",
+          regime: "rans",
+          createdAt: "2026-07-06T09:00:00.000Z",
+          solvedAt: "2026-07-06T09:00:00.000Z",
+          stalled: true,
+        }),
       ],
       interruptions: [
         {
@@ -294,12 +401,26 @@ describe("assembleTimeline", () => {
           finishedAt: "2026-07-06T10:00:00.000Z",
         },
       ],
-      closure: { campaignId: "c1", campaignName: "camp", conditionId: "cond1", openAirfoils: 3, totalAirfoils: 12 },
+      closure: {
+        campaignId: "c1",
+        campaignName: "camp",
+        conditionId: "cond1",
+        openAirfoils: 3,
+        totalAirfoils: 12,
+      },
     });
     const events = assembleTimeline(story);
-    expect(events.map((e) => e.kind)).toEqual(["attempt", "interruption", "attempt", "classification", "now"]);
+    expect(events.map((e) => e.kind)).toEqual([
+      "attempt",
+      "interruption",
+      "attempt",
+      "classification",
+      "now",
+    ]);
     expect(events[0].attempt?.id).toBe("early");
-    expect(events[1].title).toBe("interrupted — worker restarted mid-solve; point released");
+    expect(events[1].title).toBe(
+      "interrupted — worker restarted mid-solve; point released",
+    );
     expect(events[1].tone).toBe("amber");
     expect(events[3].title).toContain("classified rejected");
     expect(events[3].detail).toContain("cl_out_of_family");
@@ -313,9 +434,24 @@ describe("assembleTimeline", () => {
     const events = assembleTimeline(
       storyPayload({
         attempts: [
-          attempt({ id: "s", stalled: true, createdAt: "2026-07-06T09:00:00.000Z" }),
-          attempt({ id: "t", regime: "urans", error: "URANS timed out", createdAt: "2026-07-06T10:00:00.000Z" }),
-          attempt({ id: "v", regime: "urans", validForPolar: true, converged: true, createdAt: "2026-07-06T11:00:00.000Z" }),
+          attempt({
+            id: "s",
+            stalled: true,
+            createdAt: "2026-07-06T09:00:00.000Z",
+          }),
+          attempt({
+            id: "t",
+            regime: "urans",
+            error: "URANS timed out",
+            createdAt: "2026-07-06T10:00:00.000Z",
+          }),
+          attempt({
+            id: "v",
+            regime: "urans",
+            validForPolar: true,
+            converged: true,
+            createdAt: "2026-07-06T11:00:00.000Z",
+          }),
         ],
       }),
     );
@@ -329,14 +465,28 @@ describe("assembleTimeline", () => {
   it("surfaces persisted quality warnings as the attempt's why-lines", () => {
     const events = assembleTimeline(
       storyPayload({
-        attempts: [attempt({ id: "w", regime: "urans", validForPolar: true, converged: true, qualityWarnings: ["URANS shedding unmeasurable: no dominant frequency"] })],
+        attempts: [
+          attempt({
+            id: "w",
+            regime: "urans",
+            validForPolar: true,
+            converged: true,
+            qualityWarnings: [
+              "URANS shedding unmeasurable: no dominant frequency",
+            ],
+          }),
+        ],
       }),
     );
-    expect(events[0].whyLines).toEqual(["URANS shedding unmeasurable: no dominant frequency"]);
+    expect(events[0].whyLines).toEqual([
+      "URANS shedding unmeasurable: no dominant frequency",
+    ]);
   });
 
   it("a bare point (no attempts/classification) still gets an honest NOW node", () => {
-    const events = assembleTimeline(storyPayload({ point: { status: "pending" } as never }));
+    const events = assembleTimeline(
+      storyPayload({ point: { status: "pending" } as never }),
+    );
     expect(events).toHaveLength(1);
     expect(events[0].kind).toBe("now");
     expect(events[0].detail).toContain("0 attempts");
@@ -349,25 +499,49 @@ describe("assembleTimeline", () => {
 // ---------------------------------------------------------------------------
 describe("formatBulkContinueOutcome", () => {
   it("empty scope says so instead of pretending zero-of-zero was queued", () => {
-    expect(formatBulkContinueOutcome({ continuable: 0, created: 0, reused: 0, conflicted: 0 })).toBe(
-      "nothing to resume — no needs-review point in this scope has saved case state",
+    expect(
+      formatBulkContinueOutcome({
+        continuable: 0,
+        created: 0,
+        reused: 0,
+        conflicted: 0,
+      }),
+    ).toBe(
+      "nothing to resume — no unavailable point in this scope has restartable saved state",
     );
   });
 
   it("reports queued + already-open counts and the exclusion rule", () => {
-    expect(formatBulkContinueOutcome({ continuable: 12, created: 12, reused: 0, conflicted: 0 })).toBe(
-      "queued 12 · already open 0 — non-resumable rows are excluded",
-    );
+    expect(
+      formatBulkContinueOutcome({
+        continuable: 12,
+        created: 12,
+        reused: 0,
+        conflicted: 0,
+      }),
+    ).toBe("queued 12 · already open 0 — non-resumable rows are excluded");
   });
 
   it("idempotent replay shows every row as already open", () => {
-    expect(formatBulkContinueOutcome({ continuable: 5, created: 0, reused: 5, conflicted: 0 })).toBe(
-      "queued 0 · already open 5 — non-resumable rows are excluded",
-    );
+    expect(
+      formatBulkContinueOutcome({
+        continuable: 5,
+        created: 0,
+        reused: 5,
+        conflicted: 0,
+      }),
+    ).toBe("queued 0 · already open 5 — non-resumable rows are excluded");
   });
 
   it("conflicting open requests are counted honestly, never folded into queued", () => {
-    expect(formatBulkContinueOutcome({ continuable: 7, created: 4, reused: 2, conflicted: 1 })).toBe(
+    expect(
+      formatBulkContinueOutcome({
+        continuable: 7,
+        created: 4,
+        reused: 2,
+        conflicted: 1,
+      }),
+    ).toBe(
       "queued 4 · already open 2 · conflicting open request 1 — non-resumable rows are excluded",
     );
   });

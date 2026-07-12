@@ -28,6 +28,7 @@ import {
   meshProfiles,
   outputProfiles,
   referenceGeometryProfiles,
+  resultAttempts,
   resultClassifications,
   results,
   schedulingProfiles,
@@ -46,10 +47,10 @@ const PREFIX = `pw-pinned-${Date.now().toString(36)}`;
 // Deliberately non-catalog Reynolds so no enabled dev preset collides.
 const CAMPAIGN_RE = 333333;
 
-let db: typeof import("../src/db")["db"];
-let pgClient: typeof import("../src/db")["sql"];
-let assembleDetail: typeof import("../src/services/detail")["assembleDetail"];
-let app: Awaited<ReturnType<typeof import("../src/server")["buildServer"]>>;
+let db: (typeof import("../src/db"))["db"];
+let pgClient: (typeof import("../src/db"))["sql"];
+let assembleDetail: (typeof import("../src/services/detail"))["assembleDetail"];
+let app: Awaited<ReturnType<(typeof import("../src/server"))["buildServer"]>>;
 
 const cleanup = {
   resultIds: [] as string[],
@@ -72,9 +73,14 @@ const cleanup = {
 /** Campaign-style DISABLED preset + revision (campaign presets are disabled
  *  by design — the whole point of the pinned scope). */
 async function createDisabledPresetRevision(unique: string, reynolds: number) {
-  const [air] = await db.select().from(mediums).where(eq(mediums.slug, "air")).limit(1);
+  const [air] = await db
+    .select()
+    .from(mediums)
+    .where(eq(mediums.slug, "air"))
+    .limit(1);
   expect(air).toBeTruthy();
-  const speed = Math.round(reynolds * air.kinematicViscosity * 1_000_000) / 1_000_000;
+  const speed =
+    Math.round(reynolds * air.kinematicViscosity * 1_000_000) / 1_000_000;
   const [bc] = await db
     .insert(boundaryConditions)
     .values({
@@ -118,10 +124,18 @@ async function createDisabledPresetRevision(unique: string, reynolds: number) {
   cleanup.refGeoIds.push(refGeo.id);
   const [boundary] = await db
     .insert(boundaryProfiles)
-    .values({ slug: `${unique}-boundary`, name: `${unique} Boundary`, turbulenceIntensity: 0.001, viscosityRatio: 10 })
+    .values({
+      slug: `${unique}-boundary`,
+      name: `${unique} Boundary`,
+      turbulenceIntensity: 0.001,
+      viscosityRatio: 10,
+    })
     .returning({ id: boundaryProfiles.id });
   cleanup.boundaryIds.push(boundary.id);
-  const [mesh] = await db.insert(meshProfiles).values({ slug: `${unique}-mesh`, name: `${unique} Mesh` }).returning({ id: meshProfiles.id });
+  const [mesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${unique}-mesh`, name: `${unique} Mesh` })
+    .returning({ id: meshProfiles.id });
   cleanup.meshIds.push(mesh.id);
   const [solver] = await db
     .insert(solverProfiles)
@@ -140,7 +154,13 @@ async function createDisabledPresetRevision(unique: string, reynolds: number) {
   cleanup.outputIds.push(output.id);
   const [sweep] = await db
     .insert(sweepDefinitions)
-    .values({ slug: `${unique}-sweep`, name: `${unique} Sweep`, aoaStart: -8, aoaStop: 20, aoaStep: 1 })
+    .values({
+      slug: `${unique}-sweep`,
+      name: `${unique} Sweep`,
+      aoaStart: -8,
+      aoaStop: 20,
+      aoaStep: 1,
+    })
     .returning({ id: sweepDefinitions.id });
   cleanup.sweepIds.push(sweep.id);
   const [preset] = await db
@@ -163,7 +183,11 @@ async function createDisabledPresetRevision(unique: string, reynolds: number) {
   cleanup.presetIds.push(preset.id);
   const resolved = await ensureSimulationPresetRevision(db, preset.id);
   expect(resolved).toBeTruthy();
-  return { bcId: bc.id, presetId: preset.id, revisionId: resolved!.revision.id };
+  return {
+    bcId: bc.id,
+    presetId: preset.id,
+    revisionId: resolved!.revision.id,
+  };
 }
 
 let airfoilId = "";
@@ -193,7 +217,13 @@ beforeAll(async () => {
 
   const [cat] = await db
     .insert(categories)
-    .values({ slug: PREFIX, name: `${PREFIX} cat`, path: PREFIX, depth: 0, sortOrder: 997 })
+    .values({
+      slug: PREFIX,
+      name: `${PREFIX} cat`,
+      path: PREFIX,
+      depth: 0,
+      sortOrder: 997,
+    })
     .returning({ id: categories.id });
   cleanup.categoryIds.push(cat.id);
 
@@ -219,7 +249,10 @@ beforeAll(async () => {
   cleanup.airfoilIds.push(airfoil.id);
 
   const setupA = await createDisabledPresetRevision(`${PREFIX}-a`, CAMPAIGN_RE);
-  const setupB = await createDisabledPresetRevision(`${PREFIX}-b`, CAMPAIGN_RE + 111);
+  const setupB = await createDisabledPresetRevision(
+    `${PREFIX}-b`,
+    CAMPAIGN_RE + 111,
+  );
   revisionA = setupA.revisionId;
   revisionB = setupB.revisionId;
 
@@ -242,25 +275,64 @@ beforeAll(async () => {
       converged: true,
       solvedAt: new Date(),
     })
-    .returning({ id: results.id });
+    .returning();
   resultId = row.id;
   cleanup.resultIds.push(row.id);
-  const [cls] = await db
-    .insert(resultClassifications)
+  const [attempt] = await db
+    .insert(resultAttempts)
     .values({
       resultId: row.id,
       airfoilId,
+      bcId: row.bcId,
       simulationPresetRevisionId: revisionA,
-      aoaDeg: -2,
+      aoaDeg: row.aoaDeg,
+      status: "done",
+      source: "solved",
       regime: "rans",
-      classifierVersion: "test",
-      state: "accepted",
-      region: "attached",
-      confidence: 1,
-      reasons: [],
+      validForPolar: true,
+      cl: row.cl,
+      cd: row.cd,
+      cm: row.cm,
+      clCd: row.clCd,
+      converged: true,
+      evidencePayload: { fidelity: "rans" },
+      solvedAt: row.solvedAt,
     })
+    .returning({ id: resultAttempts.id });
+  await db
+    .update(results)
+    .set({ currentResultAttemptId: attempt.id })
+    .where(eq(results.id, row.id));
+  const classifications = await db
+    .insert(resultClassifications)
+    .values([
+      {
+        resultId: row.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionA,
+        aoaDeg: -2,
+        regime: "rans" as const,
+        classifierVersion: "test",
+        state: "accepted" as const,
+        region: "attached" as const,
+        confidence: 1,
+        reasons: [],
+      },
+      {
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionA,
+        aoaDeg: -2,
+        regime: "rans" as const,
+        classifierVersion: "test",
+        state: "accepted" as const,
+        region: "attached" as const,
+        confidence: 1,
+        reasons: [],
+      },
+    ])
     .returning({ id: resultClassifications.id });
-  cleanup.classificationIds.push(cls.id);
+  cleanup.classificationIds.push(...classifications.map((row) => row.id));
 
   // Finished queue jobs: one single-revision campaign job, one batched job
   // whose conditionMap spans TWO revisions (anchor = revisionA).
@@ -277,7 +349,9 @@ beforeAll(async () => {
         totalCases: 1,
         completedCases: 1,
         finishedAt: now,
-        requestPayload: { conditionMap: [{ revisionId: revisionA, reynolds: CAMPAIGN_RE }] },
+        requestPayload: {
+          conditionMap: [{ revisionId: revisionA, reynolds: CAMPAIGN_RE }],
+        },
       },
       {
         airfoilId,
@@ -304,24 +378,65 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (db) {
-    if (cleanup.jobIds.length) await db.delete(simJobs).where(inArray(simJobs.id, cleanup.jobIds));
+    if (cleanup.jobIds.length)
+      await db.delete(simJobs).where(inArray(simJobs.id, cleanup.jobIds));
     if (cleanup.classificationIds.length)
-      await db.delete(resultClassifications).where(inArray(resultClassifications.id, cleanup.classificationIds));
-    if (cleanup.resultIds.length) await db.delete(results).where(inArray(results.id, cleanup.resultIds));
-    if (cleanup.presetIds.length) await db.delete(simulationPresets).where(inArray(simulationPresets.id, cleanup.presetIds));
-    if (cleanup.bcIds.length) await db.delete(boundaryConditions).where(inArray(boundaryConditions.id, cleanup.bcIds));
-    if (cleanup.flowIds.length) await db.delete(flowConditions).where(inArray(flowConditions.id, cleanup.flowIds));
+      await db
+        .delete(resultClassifications)
+        .where(inArray(resultClassifications.id, cleanup.classificationIds));
+    if (cleanup.resultIds.length) {
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: null })
+        .where(inArray(results.id, cleanup.resultIds));
+      await db.delete(results).where(inArray(results.id, cleanup.resultIds));
+    }
+    if (cleanup.presetIds.length)
+      await db
+        .delete(simulationPresets)
+        .where(inArray(simulationPresets.id, cleanup.presetIds));
+    if (cleanup.bcIds.length)
+      await db
+        .delete(boundaryConditions)
+        .where(inArray(boundaryConditions.id, cleanup.bcIds));
+    if (cleanup.flowIds.length)
+      await db
+        .delete(flowConditions)
+        .where(inArray(flowConditions.id, cleanup.flowIds));
     if (cleanup.refGeoIds.length)
-      await db.delete(referenceGeometryProfiles).where(inArray(referenceGeometryProfiles.id, cleanup.refGeoIds));
-    if (cleanup.boundaryIds.length) await db.delete(boundaryProfiles).where(inArray(boundaryProfiles.id, cleanup.boundaryIds));
-    if (cleanup.meshIds.length) await db.delete(meshProfiles).where(inArray(meshProfiles.id, cleanup.meshIds));
-    if (cleanup.solverIds.length) await db.delete(solverProfiles).where(inArray(solverProfiles.id, cleanup.solverIds));
+      await db
+        .delete(referenceGeometryProfiles)
+        .where(inArray(referenceGeometryProfiles.id, cleanup.refGeoIds));
+    if (cleanup.boundaryIds.length)
+      await db
+        .delete(boundaryProfiles)
+        .where(inArray(boundaryProfiles.id, cleanup.boundaryIds));
+    if (cleanup.meshIds.length)
+      await db
+        .delete(meshProfiles)
+        .where(inArray(meshProfiles.id, cleanup.meshIds));
+    if (cleanup.solverIds.length)
+      await db
+        .delete(solverProfiles)
+        .where(inArray(solverProfiles.id, cleanup.solverIds));
     if (cleanup.schedulingIds.length)
-      await db.delete(schedulingProfiles).where(inArray(schedulingProfiles.id, cleanup.schedulingIds));
-    if (cleanup.outputIds.length) await db.delete(outputProfiles).where(inArray(outputProfiles.id, cleanup.outputIds));
-    if (cleanup.sweepIds.length) await db.delete(sweepDefinitions).where(inArray(sweepDefinitions.id, cleanup.sweepIds));
-    if (cleanup.airfoilIds.length) await db.delete(airfoils).where(inArray(airfoils.id, cleanup.airfoilIds));
-    if (cleanup.categoryIds.length) await db.delete(categories).where(inArray(categories.id, cleanup.categoryIds));
+      await db
+        .delete(schedulingProfiles)
+        .where(inArray(schedulingProfiles.id, cleanup.schedulingIds));
+    if (cleanup.outputIds.length)
+      await db
+        .delete(outputProfiles)
+        .where(inArray(outputProfiles.id, cleanup.outputIds));
+    if (cleanup.sweepIds.length)
+      await db
+        .delete(sweepDefinitions)
+        .where(inArray(sweepDefinitions.id, cleanup.sweepIds));
+    if (cleanup.airfoilIds.length)
+      await db.delete(airfoils).where(inArray(airfoils.id, cleanup.airfoilIds));
+    if (cleanup.categoryIds.length)
+      await db
+        .delete(categories)
+        .where(inArray(categories.id, cleanup.categoryIds));
   }
   await app?.close();
   await pgClient?.end();
@@ -352,7 +467,9 @@ describe("pinned-revision detail scope (campaign spec §11 surgical exception)",
   });
 
   it("unknown pinned revision renders honestly empty (no invented Re, no crash)", async () => {
-    const detail = await assembleDetail(airfoilSlug, { revisionId: "00000000-0000-4000-8000-000000000000" });
+    const detail = await assembleDetail(airfoilSlug, {
+      revisionId: "00000000-0000-4000-8000-000000000000",
+    });
     expect(detail).toBeTruthy();
     expect(detail!.reList).toEqual([]);
     expect(detail!.polars).toEqual([]);
@@ -361,9 +478,14 @@ describe("pinned-revision detail scope (campaign spec §11 surgical exception)",
 
 describe("admin queue payload carries the pin (AdminJob.revisionId)", () => {
   it("single-revision job exposes its revision; multi-revision batched job exposes null", async () => {
-    const res = await app.inject({ method: "GET", url: "/api/admin/queue?scope=activity" });
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/admin/queue?scope=activity",
+    });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { finishedJobs: Array<{ id: string; revisionId: string | null }> };
+    const body = res.json() as {
+      finishedJobs: Array<{ id: string; revisionId: string | null }>;
+    };
     const single = body.finishedJobs.find((j) => j.id === singleJobId);
     const batched = body.finishedJobs.find((j) => j.id === batchedJobId);
     expect(single).toBeTruthy();

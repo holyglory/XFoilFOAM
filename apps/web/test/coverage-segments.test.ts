@@ -8,7 +8,10 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { AdminCampaignConditionSummary, CampaignProgressTotals } from "../lib/admin";
+import type {
+  AdminCampaignConditionSummary,
+  CampaignProgressTotals,
+} from "../lib/admin";
 import {
   type CoverageCell,
   MIN_SEGMENT_PX,
@@ -20,13 +23,28 @@ import {
   segmentTitle,
   segmentView,
   syncPromisedCount,
+  terminalCount,
 } from "../components/admin/campaigns/coverage-segments";
 
-function cell(over: Partial<CampaignProgressTotals> = {}): CampaignProgressTotals {
-  return { requested: 31, solved: 0, failed: 0, running: 0, superseded: 0, derived: 0, rejected: 0, remaining: 31, ...over };
+function cell(
+  over: Partial<CampaignProgressTotals> = {},
+): CampaignProgressTotals {
+  return {
+    requested: 31,
+    solved: 0,
+    failed: 0,
+    running: 0,
+    superseded: 0,
+    derived: 0,
+    rejected: 0,
+    remaining: 31,
+    ...over,
+  };
 }
 
-function condition(over: Partial<AdminCampaignConditionSummary> = {}): AdminCampaignConditionSummary {
+function condition(
+  over: Partial<AdminCampaignConditionSummary> = {},
+): AdminCampaignConditionSummary {
   return {
     id: "cond-1",
     ord: 13,
@@ -59,12 +77,17 @@ describe("segmentView state derivation", () => {
   });
 
   it("requested === 0 -> empty (never divides by zero)", () => {
-    expect(segmentView(cell({ requested: 0, remaining: 0 }))).toEqual({ state: "empty", fillFraction: 0 });
+    expect(segmentView(cell({ requested: 0, remaining: 0 }))).toEqual({
+      state: "empty",
+      fillFraction: 0,
+    });
   });
 
   it("plain progress: fill = terminal fraction, running/remaining are NOT terminal", () => {
     // mid-flight condition: 20 solved + 4 derived done, 3 running, 4 pending
-    const v = segmentView(cell({ solved: 20, derived: 4, running: 3, remaining: 4 }));
+    const v = segmentView(
+      cell({ solved: 20, derived: 4, running: 3, remaining: 4 }),
+    );
     expect(v.state).toBe("progress");
     expect(v.fillFraction).toBeCloseTo(24 / 31, 10);
   });
@@ -76,27 +99,46 @@ describe("segmentView state derivation", () => {
   });
 
   it("LEGACY payload (no split counters): rejected points tint the fill amber-state 'rejected'", () => {
-    const v = segmentView(cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }));
+    const v = segmentView(
+      cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }),
+    );
     expect(v.state).toBe("rejected");
     expect(v.fillFraction).toBeCloseTo(24 / 31, 10);
   });
 
   it("any failed point wins over rejected (failed-first salience)", () => {
-    const v = segmentView(cell({ solved: 10, failed: 1, rejected: 2, remaining: 18 }));
+    const v = segmentView(
+      cell({ solved: 10, failed: 1, rejected: 2, remaining: 18 }),
+    );
     expect(v.state).toBe("failed");
     expect(v.fillFraction).toBeCloseTo(13 / 31, 10);
   });
 
   it("fill fraction clamps to [0,1] even on inconsistent counters", () => {
-    expect(segmentView(cell({ solved: 40, remaining: 0 })).fillFraction).toBe(1);
+    expect(segmentView(cell({ solved: 40, remaining: 0 })).fillFraction).toBe(
+      1,
+    );
   });
 });
 
 describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
-  const split = (over: Partial<CoverageCell> = {}): CoverageCell => ({ ...cell(), awaitingUrans: 0, needsReview: 0, ...over });
+  const split = (over: Partial<CoverageCell> = {}): CoverageCell => ({
+    ...cell(),
+    awaitingUrans: 0,
+    needsReview: 0,
+    ...over,
+  });
 
   it("awaiting-URANS cells go VIOLET-state, never red", () => {
-    const v = segmentView(split({ solved: 20, derived: 2, rejected: 2, remaining: 7, awaitingUrans: 2 }));
+    const v = segmentView(
+      split({
+        solved: 20,
+        derived: 2,
+        rejected: 2,
+        remaining: 7,
+        awaitingUrans: 2,
+      }),
+    );
     expect(v.state).toBe("awaiting_urans");
     expect(v.fillFraction).toBeCloseTo(24 / 31, 10);
     // violet is calm: renders at the terminal fraction, not solid
@@ -104,13 +146,30 @@ describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
   });
 
   it("needs-review cells go RED-state solid, winning over awaiting", () => {
-    const v = segmentView(split({ solved: 20, rejected: 3, remaining: 8, awaitingUrans: 2, needsReview: 1 }));
+    const v = segmentView(
+      split({
+        solved: 20,
+        rejected: 3,
+        remaining: 8,
+        awaitingUrans: 2,
+        needsReview: 1,
+      }),
+    );
     expect(v.state).toBe("needs_review");
     expect(segmentFillHeight(v)).toBe(1);
   });
 
   it("failed still wins over everything (crash salience)", () => {
-    const v = segmentView(split({ solved: 10, failed: 1, rejected: 2, remaining: 18, awaitingUrans: 2, needsReview: 1 }));
+    const v = segmentView(
+      split({
+        solved: 10,
+        failed: 1,
+        rejected: 2,
+        remaining: 18,
+        awaitingUrans: 2,
+        needsReview: 1,
+      }),
+    );
     expect(v.state).toBe("failed");
     expect(segmentFillHeight(v)).toBe(1);
   });
@@ -118,6 +177,24 @@ describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
   it("rejected-but-rescheduled cells (split present, both buckets 0) are plain progress", () => {
     const v = segmentView(split({ solved: 20, rejected: 2, remaining: 9 }));
     expect(v.state).toBe("progress");
+  });
+
+  it("renders an explicit machine-blocked count amber and terminal, never healthy progress", () => {
+    const blocked = split({ solved: 20, blocked: 2, remaining: 9 });
+    const view = segmentView(blocked);
+    expect(view.state).toBe("blocked");
+    expect(view.fillFraction).toBeCloseTo(22 / 31, 10);
+    expect(segmentTitle(condition(), blocked, "active")).toContain("2 blocked");
+    expect(segmentTitle(condition(), blocked, "active")).not.toContain(
+      "review",
+    );
+  });
+
+  it("keeps cached legacy payload arithmetic finite when blocked is absent", () => {
+    const legacy = cell({ solved: 20, derived: 2, remaining: 9 });
+    delete (legacy as { blocked?: number }).blocked;
+    expect(terminalCount(legacy)).toBe(22);
+    expect(segmentView(legacy).fillFraction).toBeCloseTo(22 / 31, 10);
   });
 });
 
@@ -128,45 +205,85 @@ describe("segmentFillHeight rendering rule", () => {
   });
 
   it("progress/rejected render at the terminal fraction; empty at 0", () => {
-    expect(segmentFillHeight({ state: "progress", fillFraction: 0.5 })).toBe(0.5);
-    expect(segmentFillHeight({ state: "rejected", fillFraction: 0.4 })).toBe(0.4);
+    expect(segmentFillHeight({ state: "progress", fillFraction: 0.5 })).toBe(
+      0.5,
+    );
+    expect(segmentFillHeight({ state: "rejected", fillFraction: 0.4 })).toBe(
+      0.4,
+    );
     expect(segmentFillHeight({ state: "empty", fillFraction: 0 })).toBe(0);
   });
 });
 
 describe("segmentTitle tooltip", () => {
   it("LEGACY payload keeps the raw rejected wording: 'Re 614k · #13 · 24/31 · 2 rejected'", () => {
-    const t = segmentTitle(condition(), cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }), "active");
+    const t = segmentTitle(
+      condition(),
+      cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }),
+      "active",
+    );
     expect(t).toBe("Re 614k · #13 · 24/31 · 2 rejected");
   });
 
   it("split payload replaces 'rejected' with its refined buckets", () => {
-    const awaiting = { ...cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }), awaitingUrans: 2, needsReview: 0 };
-    expect(segmentTitle(condition(), awaiting, "active")).toBe("Re 614k · #13 · 24/31 · 2 awaiting URANS");
-    // needs review includes the crash; failed stays listed so crashes remain
+    const awaiting = {
+      ...cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }),
+      awaitingUrans: 2,
+      needsReview: 0,
+    };
+    expect(segmentTitle(condition(), awaiting, "active")).toBe(
+      "Re 614k · #13 · 24/31 · 2 awaiting URANS",
+    );
+    // A rolling legacy count is labelled unavailable; failed stays distinct.
     // distinguishable from rejected-urans reviews.
-    const review = { ...cell({ solved: 12, failed: 1, rejected: 1, remaining: 17 }), awaitingUrans: 0, needsReview: 2 };
-    expect(segmentTitle(condition({ reynolds: 1_500_000, ord: 14 }), review)).toBe("Re 1.5M · #14 · 14/31 · 2 needs review · 1 failed");
+    const review = {
+      ...cell({ solved: 12, failed: 1, rejected: 1, remaining: 17 }),
+      awaitingUrans: 0,
+      needsReview: 2,
+    };
+    expect(
+      segmentTitle(condition({ reynolds: 1_500_000, ord: 14 }), review),
+    ).toBe("Re 1.5M · #14 · 14/31 · 2 unavailable · 1 failed");
     // rescheduled rejects: neither bucket — no review wording at all
-    const rescheduled = { ...cell({ solved: 20, rejected: 2, remaining: 9 }), awaitingUrans: 0, needsReview: 0 };
-    expect(segmentTitle(condition(), rescheduled, "active")).toBe("Re 614k · #13 · 22/31");
+    const rescheduled = {
+      ...cell({ solved: 20, rejected: 2, remaining: 9 }),
+      awaitingUrans: 0,
+      needsReview: 0,
+    };
+    expect(segmentTitle(condition(), rescheduled, "active")).toBe(
+      "Re 614k · #13 · 22/31",
+    );
   });
 
   it("failed condition includes the failed count (mockup row 3, Re 1.5M · #14)", () => {
-    const t = segmentTitle(condition({ reynolds: 1_500_000, ord: 14 }), cell({ solved: 12, failed: 1, remaining: 18 }));
+    const t = segmentTitle(
+      condition({ reynolds: 1_500_000, ord: 14 }),
+      cell({ solved: 12, failed: 1, remaining: 18 }),
+    );
     expect(t).toBe("Re 1.5M · #14 · 13/31 · 1 failed");
   });
 
   it("running and sync-promised counts surface when present", () => {
-    const c = { ...cell({ solved: 5, running: 2, remaining: 24 }), syncPromised: 3 };
+    const c = {
+      ...cell({ solved: 5, running: 2, remaining: 24 }),
+      syncPromised: 3,
+    };
     expect(syncPromisedCount(c)).toBe(3);
-    expect(segmentTitle(condition(), c)).toBe("Re 614k · #13 · 5/31 · 2 running · 3 sync-promised");
+    expect(segmentTitle(condition(), c)).toBe(
+      "Re 614k · #13 · 5/31 · 2 running · 3 sync-promised",
+    );
   });
 
   it("missing cell -> 'no points'; non-active display state is appended", () => {
-    expect(segmentTitle(condition(), null, "active")).toBe("Re 614k · #13 · no points");
-    expect(segmentTitle(condition(), cell({ solved: 31, remaining: 0 }), "released")).toBe("Re 614k · #13 · 31/31 · released");
-    expect(segmentTitle(condition(), cell({ solved: 4, remaining: 27 }), "kept")).toBe("Re 614k · #13 · 4/31 · kept");
+    expect(segmentTitle(condition(), null, "active")).toBe(
+      "Re 614k · #13 · no points",
+    );
+    expect(
+      segmentTitle(condition(), cell({ solved: 31, remaining: 0 }), "released"),
+    ).toBe("Re 614k · #13 · 31/31 · released");
+    expect(
+      segmentTitle(condition(), cell({ solved: 4, remaining: 27 }), "kept"),
+    ).toBe("Re 614k · #13 · 4/31 · kept");
   });
 });
 
@@ -178,8 +295,14 @@ describe("rowDoneFraction (DONE column)", () => {
     isSymmetric: false,
     perCondition: [
       { conditionId: "c1", ...cell({ solved: 31, remaining: 0 }) },
-      { conditionId: "c2", ...cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }) },
-      { conditionId: "c3", ...cell({ solved: 10, failed: 1, running: 2, remaining: 18 }) },
+      {
+        conditionId: "c2",
+        ...cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }),
+      },
+      {
+        conditionId: "c3",
+        ...cell({ solved: 10, failed: 1, running: 2, remaining: 18 }),
+      },
     ],
   };
 
@@ -187,12 +310,20 @@ describe("rowDoneFraction (DONE column)", () => {
     const all = rowDoneFraction(row, new Set(["c1", "c2", "c3"]));
     expect(all).toEqual({ done: 31 + 24 + 11, total: 93 });
     // grouped view: only one chord's conditions rendered
-    expect(rowDoneFraction(row, new Set(["c2"]))).toEqual({ done: 24, total: 31 });
+    expect(rowDoneFraction(row, new Set(["c2"]))).toEqual({
+      done: 24,
+      total: 31,
+    });
   });
 
   it("conditions the row has no cell for contribute nothing (no invented zeros in the denominator beyond real requested)", () => {
-    expect(rowDoneFraction(row, new Set(["c1", "missing"]))).toEqual({ done: 31, total: 31 });
-    expect(rowDoneFraction({ ...row, perCondition: [] }, new Set(["c1"]))).toEqual({ done: 0, total: 0 });
+    expect(rowDoneFraction(row, new Set(["c1", "missing"]))).toEqual({
+      done: 31,
+      total: 31,
+    });
+    expect(
+      rowDoneFraction({ ...row, perCondition: [] }, new Set(["c1"])),
+    ).toEqual({ done: 0, total: 0 });
   });
 });
 
@@ -229,12 +360,17 @@ describe("groupConditionsByChord", () => {
     const conds: AdminCampaignConditionSummary[] = [];
     let ord = 1;
     for (let i = 0; i < 32; i++) {
-      for (const chordM of chords) conds.push(condition({ id: `c-${ord}`, ord, chordM }));
+      for (const chordM of chords)
+        conds.push(condition({ id: `c-${ord}`, ord, chordM }));
       ord += chords.length;
     }
     const groups = groupConditionsByChord(conds);
     expect(groups.map((g) => g.key)).toEqual(["0.15", "0.3", "0.6"]);
-    expect(groups.map((g) => g.label)).toEqual(["c 0.15 m", "c 0.3 m", "c 0.6 m"]);
+    expect(groups.map((g) => g.label)).toEqual([
+      "c 0.15 m",
+      "c 0.3 m",
+      "c 0.6 m",
+    ]);
     expect(groups.every((g) => g.conditions.length === 32)).toBe(true);
     // within a group the input (ord) order is preserved
     const ords = groups[1].conditions.map((c) => c.ord);
@@ -245,7 +381,10 @@ describe("groupConditionsByChord", () => {
   });
 
   it("single shared chord -> one group (caller keeps the ungrouped rendering)", () => {
-    const groups = groupConditionsByChord([condition({ id: "a", ord: 1 }), condition({ id: "b", ord: 2 })]);
+    const groups = groupConditionsByChord([
+      condition({ id: "a", ord: 1 }),
+      condition({ id: "b", ord: 2 }),
+    ]);
     expect(groups).toHaveLength(1);
     expect(groups[0].conditions).toHaveLength(2);
   });

@@ -16,13 +16,15 @@ import type {
 } from "../../../lib/admin";
 
 /** Matrix cell payload: real counters + the optional amendment-A split. */
-export type CoverageCell = CampaignProgressTotals & Partial<CampaignReviewBuckets>;
+export type CoverageCell = CampaignProgressTotals &
+  Partial<CampaignReviewBuckets>;
 
 // Local copies of ui.tsx's formatRe/fCount: importing ui.tsx here would drag
 // the React component tree into node vitest, defeating the point of this
 // pure module.
 function formatRe(v: number): string {
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(v % 1_000_000 === 0 ? 0 : 1)}M`;
+  if (v >= 1_000_000)
+    return `${(v / 1_000_000).toFixed(v % 1_000_000 === 0 ? 0 : 1)}M`;
   if (v >= 1000) return `${Math.round(v / 1000)}k`;
   return String(Math.round(v));
 }
@@ -34,7 +36,8 @@ function fCount(v: number): string {
 /** Optional per-cell sync-promise flag: counted ONLY when the row payload
  *  actually carries it (spec §11 "when the row payload flags it"). */
 export function syncPromisedCount(cell: CampaignProgressTotals): number {
-  const v = (cell as CampaignProgressTotals & { syncPromised?: number }).syncPromised;
+  const v = (cell as CampaignProgressTotals & { syncPromised?: number })
+    .syncPromised;
   return typeof v === "number" && v > 0 ? v : 0;
 }
 
@@ -45,7 +48,14 @@ export function syncPromisedCount(cell: CampaignProgressTotals): number {
 /** 'rejected' is the LEGACY amber tint: it only appears for payloads without
  *  the amendment-A split counters. With the split, red is strictly
  *  needs-review/failed and violet is the calm awaiting-URANS queue. */
-export type SegmentState = "empty" | "progress" | "rejected" | "awaiting_urans" | "needs_review" | "failed";
+export type SegmentState =
+  | "empty"
+  | "progress"
+  | "rejected"
+  | "blocked"
+  | "awaiting_urans"
+  | "needs_review"
+  | "failed";
 
 export interface SegmentView {
   state: SegmentState;
@@ -59,7 +69,13 @@ export interface SegmentView {
  *  `running` are still open; `superseded` points were replaced and are not
  *  part of the requested denominator's terminal share. */
 export function terminalCount(cell: CampaignProgressTotals): number {
-  return cell.solved + cell.derived + cell.failed + cell.rejected;
+  return (
+    cell.solved +
+    cell.derived +
+    cell.failed +
+    cell.rejected +
+    (cell.blocked ?? 0)
+  );
 }
 
 /** Encoding (design c19fd74a): failed wins, then needs-review (both solid
@@ -68,14 +84,22 @@ export function terminalCount(cell: CampaignProgressTotals): number {
  *  buckets 0) renders as plain progress — it is back in the pipeline. The
  *  legacy amber 'rejected' state survives only when the payload has no split
  *  counters. A missing cell or requested === 0 renders empty. */
-export function segmentView(cell: CoverageCell | null | undefined): SegmentView {
+export function segmentView(
+  cell: CoverageCell | null | undefined,
+): SegmentView {
   if (!cell || cell.requested <= 0) return { state: "empty", fillFraction: 0 };
-  const fillFraction = Math.min(1, Math.max(0, terminalCount(cell) / cell.requested));
+  const fillFraction = Math.min(
+    1,
+    Math.max(0, terminalCount(cell) / cell.requested),
+  );
   const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
   if (cell.failed > 0) return { state: "failed", fillFraction };
   if (hasSplit) {
-    if ((cell.needsReview ?? 0) > 0) return { state: "needs_review", fillFraction };
-    if ((cell.awaitingUrans ?? 0) > 0) return { state: "awaiting_urans", fillFraction };
+    if ((cell.needsReview ?? 0) > 0)
+      return { state: "needs_review", fillFraction };
+    if ((cell.blocked ?? 0) > 0) return { state: "blocked", fillFraction };
+    if ((cell.awaitingUrans ?? 0) > 0)
+      return { state: "awaiting_urans", fillFraction };
     return { state: "progress", fillFraction };
   }
   if (cell.rejected > 0) return { state: "rejected", fillFraction };
@@ -86,7 +110,9 @@ export function segmentView(cell: CoverageCell | null | undefined): SegmentView 
  *  full height (mockup `.seg.fail`) so review work stays visible at any
  *  progress; every other state fills to the terminal fraction. */
 export function segmentFillHeight(view: SegmentView): number {
-  return view.state === "failed" || view.state === "needs_review" ? 1 : view.fillFraction;
+  return view.state === "failed" || view.state === "needs_review"
+    ? 1
+    : view.fillFraction;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,10 +120,8 @@ export function segmentFillHeight(view: SegmentView): number {
 // ---------------------------------------------------------------------------
 
 /** "Re 614k · #13 · 24/31 · 2 awaiting URANS" — condition label + index +
- *  real counts. With the amendment-A split the raw 'rejected' count is
- *  replaced by its refined buckets ('needs review' includes crash-failed
- *  points, which stay listed separately so crashes remain distinguishable);
- *  payloads without the split keep the legacy 'rejected' wording. `stateLabel`
+ *  real counts. Legacy nonzero needsReview payloads are described as
+ *  unavailable; payloads without the split keep the rejected wording. `stateLabel`
  *  is the ConditionStrip display state; anything other than "active" is
  *  appended so kept/blocked/retired/released stay visible without column
  *  headers. */
@@ -113,11 +137,15 @@ export function segmentTitle(
     parts.push(`${fCount(terminalCount(cell))}/${fCount(cell.requested)}`);
     const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
     if (hasSplit) {
-      if ((cell.awaitingUrans ?? 0) > 0) parts.push(`${fCount(cell.awaitingUrans ?? 0)} awaiting URANS`);
-      if ((cell.needsReview ?? 0) > 0) parts.push(`${fCount(cell.needsReview ?? 0)} needs review`);
+      if ((cell.awaitingUrans ?? 0) > 0)
+        parts.push(`${fCount(cell.awaitingUrans ?? 0)} awaiting URANS`);
+      if ((cell.needsReview ?? 0) > 0)
+        parts.push(`${fCount(cell.needsReview ?? 0)} unavailable`);
     } else if (cell.rejected > 0) {
       parts.push(`${fCount(cell.rejected)} rejected`);
     }
+    if ((cell.blocked ?? 0) > 0)
+      parts.push(`${fCount(cell.blocked ?? 0)} blocked`);
     if (cell.failed > 0) parts.push(`${fCount(cell.failed)} failed`);
     if (cell.running > 0) parts.push(`${fCount(cell.running)} running`);
     const sync = syncPromisedCount(cell);
@@ -161,9 +189,13 @@ export function rowDoneFraction(
 export const MIN_SEGMENT_PX = 4;
 export const SEGMENT_GAP_PX = 2;
 
-export function needsChordGrouping(conditionCount: number, barWidthPx: number): boolean {
+export function needsChordGrouping(
+  conditionCount: number,
+  barWidthPx: number,
+): boolean {
   if (conditionCount <= 1 || barWidthPx <= 0) return false;
-  const perSegment = (barWidthPx - (conditionCount - 1) * SEGMENT_GAP_PX) / conditionCount;
+  const perSegment =
+    (barWidthPx - (conditionCount - 1) * SEGMENT_GAP_PX) / conditionCount;
   return perSegment < MIN_SEGMENT_PX;
 }
 
@@ -183,13 +215,19 @@ function fChord(v: number): string {
  *  chord-less bucket last. Condition order within a group is preserved from
  *  the input (ord order). If every condition shares one chord the caller gets
  *  a single group and keeps the ungrouped rendering — grouping cannot help. */
-export function groupConditionsByChord(conditions: AdminCampaignConditionSummary[]): ChordGroup[] {
+export function groupConditionsByChord(
+  conditions: AdminCampaignConditionSummary[],
+): ChordGroup[] {
   const map = new Map<string, ChordGroup>();
   for (const c of conditions) {
     const key = c.chordM == null ? "none" : String(c.chordM);
     let group = map.get(key);
     if (!group) {
-      group = { key, label: c.chordM == null ? "no chord" : `c ${fChord(c.chordM)}`, conditions: [] };
+      group = {
+        key,
+        label: c.chordM == null ? "no chord" : `c ${fChord(c.chordM)}`,
+        conditions: [],
+      };
       map.set(key, group);
     }
     group.conditions.push(c);

@@ -370,7 +370,10 @@ def test_resume_restarts_from_latest_time_and_merges_both_segments(tmp_path):
     # One resumed solver run with restart mechanics and the overridden budget.
     assert calls["n"] == 1 and calls["app"] == "pimpleFoam"
     assert calls["restart"] is True
-    assert calls["timeout"] == 21600
+    # The resumed solve shares one monotonic tier deadline, so the subprocess
+    # receives the real remaining budget (a few scheduling microseconds below
+    # the nominal 21600 s), never a freshly reset full timeout per chunk.
+    assert calls["timeout"] == pytest.approx(21600, abs=0.1)
     assert "latestTime" in calls["controlDict"]
     assert re.search(r"startTime\s+0\.1;", calls["controlDict"]), calls["controlDict"]
     max_delta_t = float(re.search(r"maxDeltaT\s+([0-9.eE+-]+);", calls["controlDict"]).group(1))
@@ -638,6 +641,148 @@ def test_timed_out_transient_leaves_restartable_state_for_continuation(tmp_path,
     assert source.transient_start == 0.0
     assert source.resume_from == pytest.approx(0.05)
     assert (tmp_path / "staged" / "transient" / "0.05" / "U").is_file()
+
+
+@pytest.mark.parametrize("with_coefficients", [True, False])
+@pytest.mark.parametrize("timeout_attr", [True, False])
+def test_mpi_reconstruction_timeout_fails_without_false_continuation_marker(
+    tmp_path, monkeypatch, with_coefficients, timeout_attr
+):
+    """The common tier deadline covers MPI reconstruction too.
+
+    Real MPI writes live under ``processor*`` until reconstruction succeeds.
+    The continuation copier deliberately excludes those directories and can
+    resume only reconstructed root fields, so a reconstruction timeout is not
+    safely continuable.  It must fail truthfully without the wall-budget
+    continuation marker, even when real coefficients were already written.
+    """
+
+    class FakeCaseBuilder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def write_transient(self, *_args, **_kwargs) -> None:
+            pass
+
+    class ReconstructionTimeoutRunner:
+        def solver(self, cdir, *_args, **_kwargs):
+            if with_coefficients:
+                seg = (
+                    Path(cdir)
+                    / "postProcessing"
+                    / "forceCoeffs1"
+                    / "0"
+                    / "coefficient.dat"
+                )
+                seg.parent.mkdir(parents=True, exist_ok=True)
+                seg.write_text(_coeff_rows(0.0, 0.3, dt=0.0005))
+                # Real parallel-output shape: fields exist only in processor
+                # directories until reconstructPar publishes root times.
+                for i in range(601):
+                    time_dir = Path(cdir) / "processor0" / f"{i * 0.0005:.8g}"
+                    time_dir.mkdir(parents=True, exist_ok=True)
+                    (time_dir / "U").write_text("decomposed U")
+                    (time_dir / "p").write_text("decomposed p")
+            return SimpleNamespace(
+                ok=True,
+                returncode=0,
+                timed_out=False,
+                stdout="pimpleFoam completed",
+            )
+
+        def application(self, _cdir, app, timeout=None):
+            assert app == "reconstructPar -newTimes"
+            assert timeout is not None and timeout > 0
+            return SimpleNamespace(
+                ok=False,
+                returncode=124,
+                timed_out=timeout_attr,
+                stdout="Command timed out during reconstruction",
+            )
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+
+    def call():
+        return _run_transient_attempt(
+            tcase,
+            airfoil=None,
+            tmesh=None,
+            patches={},
+            spec=SPEC,
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(
+                force_transient=True,
+                urans_fidelity="full",
+                urans_min_periods=7,
+                transient_discard_fraction=0.0,
+            ),
+            runner=ReconstructionTimeoutRunner(),
+            n_proc=2,
+            timeout=120,
+            run_time=0.3,
+            delta_t=1e-5,
+            coeff_start_time=0.0,
+        )
+
+    with pytest.raises(OpenFOAMError, match="reconstruct") as caught:
+        call()
+    message = str(caught.value)
+    assert "not safely continuable" in message
+    assert pipeline.URANS_BUDGET_STOP_MARKER not in message
+
+
+def test_mpi_reconstruction_non_timeout_failure_remains_a_real_failure(
+    tmp_path, monkeypatch
+):
+    class FakeCaseBuilder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def write_transient(self, *_args, **_kwargs) -> None:
+            pass
+
+    class ReconstructionFailureRunner:
+        def solver(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                ok=False,
+                returncode=124,
+                timed_out=True,
+                stdout="pimpleFoam timed out",
+            )
+
+        def application(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                ok=False,
+                returncode=1,
+                timed_out=False,
+                stdout="reconstructPar parse failure",
+            )
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+
+    result = _run_transient_attempt(
+        tcase,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=SPEC,
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(force_transient=True),
+        runner=ReconstructionFailureRunner(),
+        n_proc=2,
+        timeout=120,
+        run_time=0.3,
+        delta_t=1e-5,
+        coeff_start_time=0.0,
+    )
+
+    assert result is None
 
 
 # --------------------------------------------------------------------------- #

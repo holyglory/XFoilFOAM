@@ -373,12 +373,19 @@ def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
             assert app == "pimpleFoam"
             cdir = Path(case_dir)
             latest_seen_by_pimple.append(pipeline._latest_time(cdir))
-            assert latest_seen_by_pimple[-1] == pytest.approx(0.0)
+            if len(latest_seen_by_pimple) == 1:
+                assert latest_seen_by_pimple[-1] == pytest.approx(0.0)
             assert not (cdir / "600").exists()
             assert not (cdir / "log.simpleFoam.init").exists()
-            assert transient_writes[-1]["start_time"] == pytest.approx(0.0)
+            assert transient_writes[-1]["start_time"] == pytest.approx(
+                latest_seen_by_pimple[-1]
+            )
             _write_flat_transient_coeff(
-                cdir / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat",
+                cdir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / f"{transient_writes[-1]['start_time']:.12g}"
+                / "coefficient.dat",
                 transient_writes[-1]["start_time"],
                 transient_writes[-1]["end_time"],
             )
@@ -422,16 +429,27 @@ def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
         spec.chord,
         strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
     )
+    guess_period = pipeline.physics.shedding_period(
+        spec.speed,
+        spec.chord,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    physical_horizon = pipeline._period_acquisition_horizons(params)[-1] * guess_period
     assert result is not None
-    assert calls == ["checkMesh", "potentialFoam", "pimpleFoam"]
-    assert latest_seen_by_pimple == [pytest.approx(0.0)]
+    assert result.quality.ok and result.quality.no_shedding
+    assert calls == ["checkMesh", "potentialFoam", "pimpleFoam", "pimpleFoam", "pimpleFoam"]
+    assert latest_seen_by_pimple == pytest.approx(
+        [0.0, expected_horizon, 20.0 * guess_period]
+    )
     assert transient_writes[0]["start_time"] == pytest.approx(0.0)
     assert transient_writes[0]["end_time"] == pytest.approx(expected_horizon)
     assert result.start_time == pytest.approx(0.0)
-    assert result.run_time == pytest.approx(expected_horizon)
+    assert result.run_time == pytest.approx(physical_horizon)
     assert pipeline.read_transient_start_marker(tmp_path / "case" / "transient") == pytest.approx(0.0)
     assert not (tmp_path / "case" / "transient" / "log.simpleFoam.init").exists()
-    assert "startTime 0;" in (tmp_path / "case" / "transient" / "system" / "controlDict").read_text()
+    assert f"startTime {20.0 * guess_period:.12g};" in (
+        tmp_path / "case" / "transient" / "system" / "controlDict"
+    ).read_text()
     assert any("skipping in-case short simpleFoam init" in message for message in caplog.messages)
 
 

@@ -7,6 +7,10 @@ import type {
   ResultClassificationState,
   ResultRegime,
 } from "./types";
+import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "./urans-quality";
 
 // v2: solver-stalled applies only to non-converged STEADY points; unsteady
 // rows are judged on the URANS evidence gate (converged + force history +
@@ -34,8 +38,36 @@ import type {
 // exactly that shape; every other gate still applies). Reasons stay
 // rejection-only — the oscillating-averaging note is surfaced through the
 // quality-warnings marker the ingest path persists, never through reasons.
-export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v4";
-export const POLAR_FIT_VERSION = "evidence-lowess-v3";
+// v5 (bounded continuation, 2026-07-11): a wall-budget-stopped or
+// continuation-required URANS row is incomplete evidence.  The saved case may
+// be resumed, but its partial coefficients must not enter any polar meanwhile.
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v5";
+
+/** A derived-media absence, not an aerodynamic verdict. The point remains
+ * rejected until real stored video exists, but it belongs to automatic media
+ * remediation / blocked availability rather than human coefficient review. */
+export const MISSING_URANS_VIDEO_REASON = "missing-urans-video";
+// v5 invalidates fits that could contain partial budget-stopped URANS evidence.
+export const POLAR_FIT_VERSION = "evidence-lowess-v5";
+
+/** Canonical classifier reason for restartable but incomplete URANS evidence. */
+export const INCOMPLETE_URANS_INTEGRATION_REASON =
+  "incomplete-urans-integration";
+
+/** Exact cross-runtime quality markers embedded in otherwise descriptive
+ * warnings.  Surrounding measurements may vary; the pinned marker literals do
+ * not. */
+export function hasIncompleteUransIntegrationWarning(
+  warnings: readonly string[] | null | undefined,
+): boolean {
+  return Boolean(
+    warnings?.some(
+      (warning) =>
+        warning.includes(URANS_BUDGET_STOP_MARKER) ||
+        warning.includes(URANS_CONTINUATION_REQUIRED_MARKER),
+    ),
+  );
+}
 
 /** Minimum retained shedding periods for FULL-fidelity URANS acceptance
  *  (frame-track gate). Cross-runtime parity pin: the engine's early-stop
@@ -52,8 +84,12 @@ export const FRAME_TRACK_MIN_PERIODS_PRECALC = 3;
 
 /** Minimum retained periods demanded of a frame_track given the row's
  *  fidelity tier. Unknown/legacy/absent fidelity keeps the strict full bar. */
-export function frameTrackMinPeriodsFor(fidelity: string | null | undefined): number {
-  return fidelity === "urans_precalc" ? FRAME_TRACK_MIN_PERIODS_PRECALC : FRAME_TRACK_MIN_PERIODS_FULL;
+export function frameTrackMinPeriodsFor(
+  fidelity: string | null | undefined,
+): number {
+  return fidelity === "urans_precalc"
+    ? FRAME_TRACK_MIN_PERIODS_PRECALC
+    : FRAME_TRACK_MIN_PERIODS_FULL;
 }
 
 /** Non-physical coefficient magnitude bound (|cl| / |cm| beyond this =
@@ -124,6 +160,9 @@ export interface PolarEvidencePoint {
    *  evidence despite converged=false. null/undefined = classic pointwise
    *  convergence or legacy evidence. */
   steadyHistory?: SteadyHistoryEvidence | null;
+  /** Engine non-fatal quality diagnostics.  Restartable integration markers
+   * are classification evidence, not display-only metadata. */
+  qualityWarnings?: string[] | null;
 }
 
 export interface PolarEvidenceClassification {
@@ -152,14 +191,18 @@ function ldOf(p: PolarEvidencePoint): number | null {
 }
 
 function median(values: number[], fallback: number): number {
-  const xs = values.filter((x) => Number.isFinite(x) && x > 0).sort((a, b) => a - b);
+  const xs = values
+    .filter((x) => Number.isFinite(x) && x > 0)
+    .sort((a, b) => a - b);
   if (!xs.length) return fallback;
   const mid = Math.floor(xs.length / 2);
   return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
 }
 
 function nominalStep(points: PolarEvidencePoint[]): number {
-  const xs = [...new Set(points.map((p) => p.a).filter(Number.isFinite))].sort((a, b) => a - b);
+  const xs = [...new Set(points.map((p) => p.a).filter(Number.isFinite))].sort(
+    (a, b) => a - b,
+  );
   return median(
     xs.slice(1).map((x, i) => x - xs[i]),
     1,
@@ -186,7 +229,11 @@ function linearSlope(points: PolarEvidencePoint[]): number | null {
  *  mean_stable === true. Fails closed on anything else (drifted payloads,
  *  unsteady rows, missing history). */
 export function isOscillatingSteadyStable(p: PolarEvidencePoint): boolean {
-  return !p.unsteady && p.steadyHistory != null && p.steadyHistory.mean_stable === true;
+  return (
+    !p.unsteady &&
+    p.steadyHistory != null &&
+    p.steadyHistory.mean_stable === true
+  );
 }
 
 /** Pointwise evidence gate: every rejection reason derivable from the point
@@ -199,7 +246,8 @@ export function isOscillatingSteadyStable(p: PolarEvidencePoint): boolean {
 export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   const reasons: string[] = [];
   if (p.status !== "done" || p.source !== "solved") reasons.push("not-solved");
-  if (!finite(p.cl) || !finite(p.cd) || !finite(p.cm)) reasons.push("missing-coefficients");
+  if (!finite(p.cl) || !finite(p.cd) || !finite(p.cm))
+    reasons.push("missing-coefficients");
   if (finite(p.cd) && p.cd <= 0) reasons.push("non-positive-drag");
   // Diverged-magnitude gate: catches numerically blown-up rows whose drag
   // stayed positive (so non-positive-drag is silent) — steady and unsteady
@@ -225,10 +273,14 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   // only a non-converged steady point earns it. Unsteady evidence is judged on
   // its own gate below — converged + force history + video (evidence-first
   // honesty; without this split no URANS row could ever classify accepted).
-  if (p.stalled && !p.unsteady && !oscillatingSteady) reasons.push("solver-stalled");
+  if (p.stalled && !p.unsteady && !oscillatingSteady)
+    reasons.push("solver-stalled");
   if (p.regime === "urans") {
+    if (hasIncompleteUransIntegrationWarning(p.qualityWarnings)) {
+      reasons.push(INCOMPLETE_URANS_INTEGRATION_REASON);
+    }
     if (!p.hasForceHistory) reasons.push("missing-force-history");
-    if (!p.hasVideo) reasons.push("missing-urans-video");
+    if (!p.hasVideo) reasons.push(MISSING_URANS_VIDEO_REASON);
     // Frame-track stationarity gate (v3): applies ONLY to evidence whose
     // engine version shipped frame_track (non-null). Reads fail closed — a
     // drifted payload without a literal stationary=true / numeric
@@ -240,7 +292,13 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
       if (p.frameTrack.stationary !== true) reasons.push("non-stationary");
       const periods = p.frameTrack.periods_retained;
       const minPeriods = frameTrackMinPeriodsFor(p.fidelity);
-      if (!(typeof periods === "number" && Number.isFinite(periods) && periods >= minPeriods)) {
+      if (
+        !(
+          typeof periods === "number" &&
+          Number.isFinite(periods) &&
+          periods >= minPeriods
+        )
+      ) {
         reasons.push("insufficient-periods");
       }
     }
@@ -249,26 +307,45 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
 }
 
 function acceptedForShape(c: PolarEvidenceClassification): boolean {
-  return c.state === "accepted" && c.evidence.regime === "rans" && finite(c.evidence.cl) && finite(c.evidence.cd);
+  return (
+    c.state === "accepted" &&
+    c.evidence.regime === "rans" &&
+    finite(c.evidence.cl) &&
+    finite(c.evidence.cd)
+  );
 }
 
-export function classifyPolarEvidence(points: PolarEvidencePoint[]): ClassifiedPolar {
+export function classifyPolarEvidence(
+  points: PolarEvidencePoint[],
+): ClassifiedPolar {
   const ordered = [...points].sort((a, b) => a.a - b.a);
-  const classifications: PolarEvidenceClassification[] = ordered.map((evidence) => {
-    const reasons = baseRejectionReasons(evidence);
-    const state: ResultClassificationState = reasons.length ? "rejected" : "accepted";
-    return {
-      evidence,
-      state,
-      region: state === "accepted" ? "attached" : "unknown",
-      confidence: state === "accepted" ? 0.9 : 1,
-      reasons,
-    };
-  });
+  const classifications: PolarEvidenceClassification[] = ordered.map(
+    (evidence) => {
+      const reasons = baseRejectionReasons(evidence);
+      const state: ResultClassificationState = reasons.length
+        ? "rejected"
+        : "accepted";
+      return {
+        evidence,
+        state,
+        region: state === "accepted" ? "attached" : "unknown",
+        confidence: state === "accepted" ? 0.9 : 1,
+        reasons,
+      };
+    },
+  );
 
-  const acceptedRans = classifications.filter(acceptedForShape).map((c) => c.evidence);
+  const acceptedRans = classifications
+    .filter(acceptedForShape)
+    .map((c) => c.evidence);
   const step = nominalStep(acceptedRans);
-  const lowAoaFailure = classifications.some((c) => c.evidence.regime === "rans" && c.evidence.a >= 0 && c.evidence.a <= 5 && c.state === "rejected");
+  const lowAoaFailure = classifications.some(
+    (c) =>
+      c.evidence.regime === "rans" &&
+      c.evidence.a >= 0 &&
+      c.evidence.a <= 5 &&
+      c.state === "rejected",
+  );
   if (lowAoaFailure) {
     for (const c of classifications) {
       if (c.evidence.regime === "rans" && c.state === "accepted") {
@@ -314,16 +391,33 @@ export function classifyPolarEvidence(points: PolarEvidencePoint[]): ClassifiedP
         const localSlope = (cl - (prev.cl ?? cl)) / da;
         const reasons: string[] = [];
         if (localSlope < slope * 0.35) reasons.push("lift-slope-collapse");
-        if (Number.isFinite(previousClMax) && previousClMax > 0 && (previousClMax - cl) / previousClMax > 0.05) {
+        if (
+          Number.isFinite(previousClMax) &&
+          previousClMax > 0 &&
+          (previousClMax - cl) / previousClMax > 0.05
+        ) {
           reasons.push("lift-drop-from-running-max");
         }
-        if (Number.isFinite(previousCdMin) && previousCdMin > 0 && cd / previousCdMin > 1.75) {
+        if (
+          Number.isFinite(previousCdMin) &&
+          previousCdMin > 0 &&
+          cd / previousCdMin > 1.75
+        ) {
           reasons.push("drag-acceleration");
         }
-        if (Number.isFinite(previousLdMax) && previousLdMax > 0 && ld / previousLdMax < 0.78) {
+        if (
+          Number.isFinite(previousLdMax) &&
+          previousLdMax > 0 &&
+          ld / previousLdMax < 0.78
+        ) {
           reasons.push("ld-collapse");
         }
-        if (finite(p.iterations) && p.iterations > 0 && finite(p.finalResidual) && p.finalResidual > 1e-4) {
+        if (
+          finite(p.iterations) &&
+          p.iterations > 0 &&
+          finite(p.finalResidual) &&
+          p.finalResidual > 1e-4
+        ) {
           reasons.push("weak-steady-convergence");
         }
 
@@ -391,7 +485,12 @@ function solve3(a: number[][], b: number[]): [number, number, number] | null {
   return [m[0][3], m[1][3], m[2][3]];
 }
 
-function localQuadratic(points: FitInput[], x: number, key: "cl" | "cd" | "cm", span: number): number {
+function localQuadratic(
+  points: FitInput[],
+  x: number,
+  key: "cl" | "cd" | "cm",
+  span: number,
+): number {
   const normal = [
     [0, 0, 0],
     [0, 0, 0],
@@ -417,7 +516,10 @@ function localQuadratic(points: FitInput[], x: number, key: "cl" | "cd" | "cm", 
   return solved ? solved[0] : weightedAverage / Math.max(totalWeight, 1e-9);
 }
 
-function interpolateAtClZero(points: PolarFitPoint[], key: "cd" | "cm"): number {
+function interpolateAtClZero(
+  points: PolarFitPoint[],
+  key: "cd" | "cm",
+): number {
   for (let i = 1; i < points.length; i++) {
     const a = points[i - 1];
     const b = points[i];
@@ -427,7 +529,9 @@ function interpolateAtClZero(points: PolarFitPoint[], key: "cd" | "cm"): number 
       return a[key] + t * (b[key] - a[key]);
     }
   }
-  return [...points].sort((a, b) => Math.abs(a.cl) - Math.abs(b.cl))[0]?.[key] ?? 0;
+  return (
+    [...points].sort((a, b) => Math.abs(a.cl) - Math.abs(b.cl))[0]?.[key] ?? 0
+  );
 }
 
 interface FineTargetContext {
@@ -439,7 +543,11 @@ interface FineTargetContext {
 
 const roundCenti = (x: number): number => Number(x.toFixed(2));
 
-function goldenSectionMax(f: (x: number) => number, lo: number, hi: number): number {
+function goldenSectionMax(
+  f: (x: number) => number,
+  lo: number,
+  hi: number,
+): number {
   const invPhi = (Math.sqrt(5) - 1) / 2;
   let a = lo;
   let b = hi;
@@ -484,9 +592,14 @@ function bisectRoot(f: (x: number) => number, lo: number, hi: number): number {
   return (a + b) / 2;
 }
 
-function fitMetrics(points: PolarFitPoint[], fine: FineTargetContext): PolarFitMetrics | null {
+function fitMetrics(
+  points: PolarFitPoint[],
+  fine: FineTargetContext,
+): PolarFitMetrics | null {
   if (points.length < 3) return null;
-  const finitePoints = points.filter((p) => finite(p.cl) && finite(p.cd) && finite(p.cm) && finite(p.ld));
+  const finitePoints = points.filter(
+    (p) => finite(p.cl) && finite(p.cd) && finite(p.cm) && finite(p.ld),
+  );
   if (finitePoints.length < 3) return null;
   const byLd = [...finitePoints].sort((a, b) => b.ld - a.ld)[0];
   const byCl = [...finitePoints].sort((a, b) => b.cl - a.cl)[0];
@@ -508,7 +621,10 @@ function fitMetrics(points: PolarFitPoint[], fine: FineTargetContext): PolarFitM
   // boundary — the lift curve is still rising (or falling) at the edge, so no
   // interior maximum is bracketed and predicting one would be invention.
   let alphaClmaxFine: number | null = null;
-  const clArgmaxIdx = finitePoints.reduce((best, p, i) => (p.cl > finitePoints[best].cl ? i : best), 0);
+  const clArgmaxIdx = finitePoints.reduce(
+    (best, p, i) => (p.cl > finitePoints[best].cl ? i : best),
+    0,
+  );
   if (clArgmaxIdx > 0 && clArgmaxIdx < finitePoints.length - 1) {
     alphaClmaxFine = roundCenti(
       goldenSectionMax(
@@ -532,7 +648,9 @@ function fitMetrics(points: PolarFitPoint[], fine: FineTargetContext): PolarFitM
       break;
     }
     if ((a.cl < 0 && b.cl > 0) || (a.cl > 0 && b.cl < 0)) {
-      alphaClZeroFine = roundCenti(bisectRoot((x) => fine.evaluate(x, "cl"), a.a, b.a));
+      alphaClZeroFine = roundCenti(
+        bisectRoot((x) => fine.evaluate(x, "cl"), a.a, b.a),
+      );
       break;
     }
   }
@@ -552,10 +670,18 @@ function fitMetrics(points: PolarFitPoint[], fine: FineTargetContext): PolarFitM
   };
 }
 
-export function buildPolarFit(classifications: PolarEvidenceClassification[]): PolarFit {
+export function buildPolarFit(
+  classifications: PolarEvidenceClassification[],
+): PolarFit {
   const fitInputs = classifications
     .filter((c) => c.state === "accepted" || c.state === "needs_urans")
-    .filter((c) => finite(c.evidence.cl) && finite(c.evidence.cd) && finite(c.evidence.cm) && (c.evidence.cd ?? 0) > 0)
+    .filter(
+      (c) =>
+        finite(c.evidence.cl) &&
+        finite(c.evidence.cd) &&
+        finite(c.evidence.cm) &&
+        (c.evidence.cd ?? 0) > 0,
+    )
     .map<FitInput>((c) => ({
       a: c.evidence.a,
       cl: c.evidence.cl ?? 0,
@@ -565,9 +691,15 @@ export function buildPolarFit(classifications: PolarEvidenceClassification[]): P
       regime: c.evidence.regime,
     }))
     .sort((a, b) => a.a - b.a);
-  const acceptedPointCount = classifications.filter((c) => c.state === "accepted").length;
-  const provisionalPointCount = classifications.filter((c) => c.state === "needs_urans").length;
-  const rejectedPointCount = classifications.filter((c) => c.state === "rejected" || c.state === "superseded_by_urans").length;
+  const acceptedPointCount = classifications.filter(
+    (c) => c.state === "accepted",
+  ).length;
+  const provisionalPointCount = classifications.filter(
+    (c) => c.state === "needs_urans",
+  ).length;
+  const rejectedPointCount = classifications.filter(
+    (c) => c.state === "rejected" || c.state === "superseded_by_urans",
+  ).length;
 
   if (fitInputs.length < 3) {
     return {
@@ -581,7 +713,18 @@ export function buildPolarFit(classifications: PolarEvidenceClassification[]): P
     };
   }
 
-  const step = Math.min(0.5, nominalStep(fitInputs.map((p) => ({ ...p, status: "done", source: "solved", converged: true, stalled: false }))));
+  const step = Math.min(
+    0.5,
+    nominalStep(
+      fitInputs.map((p) => ({
+        ...p,
+        status: "done",
+        source: "solved",
+        converged: true,
+        stalled: false,
+      })),
+    ),
+  );
   const minA = fitInputs[0].a;
   const maxA = fitInputs[fitInputs.length - 1].a;
   const span = Math.max(step * 6, 2.5);
@@ -596,11 +739,15 @@ export function buildPolarFit(classifications: PolarEvidenceClassification[]): P
     const cm = evaluate(a, "cm");
     samples.push({ a: Number(a.toFixed(4)), cl, cd, cm, ld: cl / cd });
   }
-  const status: PolarFitStatus = provisionalPointCount > 0 ? "provisional" : "final";
+  const status: PolarFitStatus =
+    provisionalPointCount > 0 ? "provisional" : "final";
   const confidenceBase = Math.min(0.98, 0.45 + fitInputs.length * 0.035);
   return {
     status,
-    confidence: status === "provisional" ? Math.min(confidenceBase, 0.74) : confidenceBase,
+    confidence:
+      status === "provisional"
+        ? Math.min(confidenceBase, 0.74)
+        : confidenceBase,
     metrics: fitMetrics(samples, { evaluate, stepDeg: step, minA, maxA }),
     points: samples,
     acceptedPointCount,

@@ -1,4 +1,4 @@
-import type { Point } from "@aerodb/core";
+import { DEFAULT_TRANSIENT_MAX_COURANT, type Point } from "@aerodb/core";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -15,6 +15,7 @@ import {
   pgTable,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
@@ -516,7 +517,7 @@ export const solverProfiles = pgTable("solver_profiles", {
     .default(0.4),
   transientMaxCourant: doublePrecision("transient_max_courant")
     .notNull()
-    .default(15),
+    .default(DEFAULT_TRANSIENT_MAX_COURANT),
   isSeeded: boolean("is_seeded").notNull().default(false),
   createdAt: ts().notNull().defaultNow(),
   updatedAt: ts()
@@ -640,7 +641,7 @@ export const boundaryConditions = pgTable(
       .default(0.4),
     transientMaxCourant: doublePrecision("transient_max_courant")
       .notNull()
-      .default(15),
+      .default(DEFAULT_TRANSIENT_MAX_COURANT),
     writeImages: jsonb("write_images")
       .$type<string[]>()
       .notNull()
@@ -727,6 +728,12 @@ export const simulationPresets = pgTable(
   },
   (t) => ({
     enabledIdx: index("simulation_presets_enabled_idx").on(t.enabled),
+    flowConditionIdx: index("simulation_presets_flow_condition_idx").on(
+      t.flowConditionId,
+    ),
+    referenceGeometryIdx: index("simulation_presets_reference_geometry_idx").on(
+      t.referenceGeometryProfileId,
+    ),
     legacyBcIdx: index("simulation_presets_legacy_bc_idx").on(
       t.legacyBoundaryConditionId,
     ),
@@ -800,122 +807,9 @@ export const simulationPresetRevisions = pgTable(
 );
 
 // ---------------------------------------------------------------------------
-// 5. Results — per (airfoil, preset revision, aoa) fact table. `bc_id` is
-//    retained during migration as a deprecated compatibility bridge.
-// ---------------------------------------------------------------------------
-export const results = pgTable(
-  "results",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    airfoilId: uuid("airfoil_id")
-      .notNull()
-      .references(() => airfoils.id, { onDelete: "cascade" }),
-    bcId: uuid("bc_id")
-      .notNull()
-      .references(() => boundaryConditions.id, { onDelete: "cascade" }),
-    simulationPresetRevisionId: uuid(
-      "simulation_preset_revision_id",
-    ).references(() => simulationPresetRevisions.id),
-    aoaDeg: doublePrecision("aoa_deg").notNull(),
-    status: resultStatusEnum("status").notNull().default("pending"),
-    source: dataSourceEnum("source").notNull().default("queued"),
-    regime: regimeEnum("regime"),
-    // derived operating point at solve time
-    reynolds: bigint("reynolds", { mode: "number" }),
-    speed: doublePrecision("speed"),
-    chord: doublePrecision("chord"),
-    mach: doublePrecision("mach"),
-    // PolarPoint payload
-    cl: doublePrecision("cl"),
-    cd: doublePrecision("cd"),
-    cm: doublePrecision("cm"),
-    clCd: doublePrecision("cl_cd"),
-    clStd: doublePrecision("cl_std"),
-    cdStd: doublePrecision("cd_std"),
-    cmStd: doublePrecision("cm_std"),
-    stalled: boolean("stalled").notNull().default(false),
-    unsteady: boolean("unsteady").notNull().default(false),
-    converged: boolean("converged").notNull().default(false),
-    finalResidual: doublePrecision("final_residual"),
-    iterations: integer("iterations"),
-    yPlusAvg: doublePrecision("y_plus_avg"),
-    yPlusMax: doublePrecision("y_plus_max"),
-    nCells: integer("n_cells"),
-    firstOrderFallback: boolean("first_order_fallback")
-      .notNull()
-      .default(false),
-    strouhal: doublePrecision("strouhal"),
-    error: text("error"),
-    /** Engine per-point non-fatal quality warnings (PolarPoint.quality_warnings),
-     *  persisted at ingest. NULL on pre-0030 rows — honest absence, no backfill. */
-    qualityWarnings: text("quality_warnings").array(),
-    /** URANS frame-track contract payload (PolarPoint.frame_track, migration
-     *  0032): period-locked recording window, time-weighted stats, <=120
-     *  frame samples, image_pattern. Persisted verbatim (snake_case engine
-     *  shape). NULL = steady/no-shedding point OR legacy pre-contract
-     *  evidence — the classifier's stationarity gate applies only to non-NULL
-     *  values, so history is never mass-rejected by deploy. */
-    frameTrack: jsonb("frame_track"),
-    /** Fidelity ladder tier this row's evidence was solved at (contract 3,
-     *  migration 0034): 'rans' | 'urans_precalc' | 'urans_full'. Echoed by the
-     *  engine on PolarPoint.fidelity; backfill graded pre-ladder urans rows
-     *  'urans_full' and steady rows 'rans'. NULL = unsolved row. */
-    fidelity: text("fidelity"),
-    /** Oscillating-averaged steady solve evidence (contract 2, migration
-     *  0034): { iterations[], cl[], cd[], cm[], window{start_iter,end_iter},
-     *  mean_stable, note }, <=2000 samples downsampled engine-side. NULL =
-     *  classic pointwise convergence or legacy pre-contract evidence.
-     *  result_attempts carry it inside evidence_payload (whole PolarPoint). */
-    steadyHistory: jsonb("steady_history"),
-    /** Auto-retry-once marker (migration 0036): set when the sweeper's
-     *  crash-class auto-retry requeued this cell after a failed ingest. A row
-     *  that fails AGAIN with this set escalates to needs_review instead of a
-     *  second silent retry. Deliberately NEVER written by the ingest upsert
-     *  (absent from its SET list), so it survives re-ingest of the same
-     *  failed job. NULL = never auto-retried. */
-    autoRetriedAt: timestamp("auto_retried_at", { withTimezone: true }),
-    // linkage to the engine run
-    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
-      onDelete: "set null",
-    }),
-    engineJobId: text("engine_job_id"),
-    engineCaseSlug: text("engine_case_slug"),
-    priority: integer("priority").notNull().default(0),
-    solvedAt: ts(),
-    createdAt: ts().notNull().defaultNow(),
-    updatedAt: ts()
-      .notNull()
-      .defaultNow()
-      .$onUpdate(() => new Date()),
-  },
-  (t) => ({
-    naturalUq: uniqueIndex("results_revision_natural_uq").on(
-      t.airfoilId,
-      t.simulationPresetRevisionId,
-      t.aoaDeg,
-    ),
-    airfoilBcIdx: index("results_airfoil_bc_idx").on(t.airfoilId, t.bcId),
-    bcIdx: index("results_bc_idx").on(t.bcId),
-    presetRevisionIdx: index("results_preset_revision_idx").on(
-      t.simulationPresetRevisionId,
-    ),
-    statusIdx: index("results_status_idx").on(t.status),
-    simJobIdx: index("results_sim_job_idx").on(t.simJobId),
-    catalogMetricsIdx: index("results_catalog_metrics_idx").on(
-      t.airfoilId,
-      t.simulationPresetRevisionId,
-      t.status,
-      t.source,
-      t.regime,
-      t.aoaDeg,
-    ),
-  }),
-);
-
-// ---------------------------------------------------------------------------
-// 6. Result attempts — immutable-ish solver evidence snapshots.
-//    The results table is the canonical per-airfoil/BC/AoA state. Attempts keep
-//    rejected RANS and replacement URANS outputs available for audit/exploration.
+// 5. Result attempts — immutable-ish solver evidence snapshots. Declared
+//    before results so the canonical result can express a composite
+//    (attempt_id, result_id) ownership FK without a schema-only cycle.
 // ---------------------------------------------------------------------------
 export const resultAttempts = pgTable(
   "result_attempts",
@@ -991,11 +885,193 @@ export const resultAttempts = pgTable(
       t.validForPolar,
       t.aoaDeg,
     ),
-    attemptUq: uniqueIndex("result_attempts_job_aoa_regime_uq").on(
+    attemptUq: uniqueIndex("result_attempts_job_result_aoa_regime_uq").on(
       t.simJobId,
       t.engineJobId,
+      t.resultId,
       t.aoaDeg,
       t.regime,
+    ),
+    ownerUq: unique("result_attempts_id_result_id_uq").on(t.id, t.resultId),
+    remoteAttemptUq: uniqueIndex("result_attempts_remote_engine_aoa_regime_uq")
+      .on(t.engineJobId, t.aoaDeg, t.regime)
+      .where(
+        sql`${t.simJobId} IS NULL AND ${t.engineJobId} ~ '^sync:[A-Za-z0-9._-]{1,200}:[A-Za-z0-9._-]{1,200}$'`,
+      ),
+    remoteRegimeCheck: check(
+      "result_attempts_remote_regime_required_check",
+      sql`NOT (${t.simJobId} IS NULL AND ${t.engineJobId} ~ '^sync:[A-Za-z0-9._-]{1,200}:[A-Za-z0-9._-]{1,200}$') OR ${t.regime} IS NOT NULL`,
+    ),
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// 6. Results — per (airfoil, preset revision, aoa) fact table. `bc_id` is
+//    retained during migration as a deprecated compatibility bridge.
+// ---------------------------------------------------------------------------
+export const results = pgTable(
+  "results",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    currentResultAttemptId: uuid("current_result_attempt_id"),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    bcId: uuid("bc_id")
+      .notNull()
+      .references(() => boundaryConditions.id, { onDelete: "cascade" }),
+    simulationPresetRevisionId: uuid(
+      "simulation_preset_revision_id",
+    ).references(() => simulationPresetRevisions.id),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    status: resultStatusEnum("status").notNull().default("pending"),
+    source: dataSourceEnum("source").notNull().default("queued"),
+    regime: regimeEnum("regime"),
+    // derived operating point at solve time
+    reynolds: bigint("reynolds", { mode: "number" }),
+    speed: doublePrecision("speed"),
+    chord: doublePrecision("chord"),
+    mach: doublePrecision("mach"),
+    // PolarPoint payload
+    cl: doublePrecision("cl"),
+    cd: doublePrecision("cd"),
+    cm: doublePrecision("cm"),
+    clCd: doublePrecision("cl_cd"),
+    clStd: doublePrecision("cl_std"),
+    cdStd: doublePrecision("cd_std"),
+    cmStd: doublePrecision("cm_std"),
+    stalled: boolean("stalled").notNull().default(false),
+    unsteady: boolean("unsteady").notNull().default(false),
+    converged: boolean("converged").notNull().default(false),
+    finalResidual: doublePrecision("final_residual"),
+    iterations: integer("iterations"),
+    yPlusAvg: doublePrecision("y_plus_avg"),
+    yPlusMax: doublePrecision("y_plus_max"),
+    nCells: integer("n_cells"),
+    firstOrderFallback: boolean("first_order_fallback")
+      .notNull()
+      .default(false),
+    strouhal: doublePrecision("strouhal"),
+    error: text("error"),
+    /** Engine per-point non-fatal quality warnings (PolarPoint.quality_warnings),
+     *  persisted at ingest. NULL on pre-0030 rows — honest absence, no backfill. */
+    qualityWarnings: text("quality_warnings").array(),
+    /** URANS frame-track contract payload (PolarPoint.frame_track, migration
+     *  0032): period-locked recording window, time-weighted stats, <=120
+     *  frame samples, image_pattern. Persisted verbatim (snake_case engine
+     *  shape). NULL = steady/no-shedding point OR legacy pre-contract
+     *  evidence — the classifier's stationarity gate applies only to non-NULL
+     *  values, so history is never mass-rejected by deploy. */
+    frameTrack: jsonb("frame_track"),
+    /** Fidelity ladder tier this row's evidence was solved at (contract 3,
+     *  migration 0034): 'rans' | 'urans_precalc' | 'urans_full'. Echoed by the
+     *  engine on PolarPoint.fidelity; backfill graded pre-ladder urans rows
+     *  'urans_full' and steady rows 'rans'. NULL = unsolved row. */
+    fidelity: text("fidelity"),
+    /** Oscillating-averaged steady solve evidence (contract 2, migration
+     *  0034): { iterations[], cl[], cd[], cm[], window{start_iter,end_iter},
+     *  mean_stable, note }, <=2000 samples downsampled engine-side. NULL =
+     *  classic pointwise convergence or legacy pre-contract evidence.
+     *  result_attempts carry it inside evidence_payload (whole PolarPoint). */
+    steadyHistory: jsonb("steady_history"),
+    /** Auto-retry-once marker (migration 0036): set when the sweeper's
+     *  crash-class auto-retry requeued this cell after a failed ingest. A row
+     *  that fails AGAIN with this set stays terminal/unavailable instead of a
+     *  second silent retry or a human-review chore. Deliberately NEVER written by the ingest upsert
+     *  (absent from its SET list), so it survives re-ingest of the same
+     *  failed job. NULL = never auto-retried. */
+    autoRetriedAt: timestamp("auto_retried_at", { withTimezone: true }),
+    // linkage to the engine run
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
+      onDelete: "set null",
+    }),
+    engineJobId: text("engine_job_id"),
+    engineCaseSlug: text("engine_case_slug"),
+    priority: integer("priority").notNull().default(0),
+    solvedAt: ts(),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    currentAttemptOwnerFk: foreignKey({
+      columns: [t.currentResultAttemptId, t.id],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "results_current_attempt_owner_fk",
+    }).onDelete("no action"),
+    currentAttemptIdx: index("results_current_attempt_idx").on(
+      t.currentResultAttemptId,
+    ),
+    naturalUq: uniqueIndex("results_revision_natural_uq").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.aoaDeg,
+    ),
+    airfoilBcIdx: index("results_airfoil_bc_idx").on(t.airfoilId, t.bcId),
+    bcIdx: index("results_bc_idx").on(t.bcId),
+    presetRevisionIdx: index("results_preset_revision_idx").on(
+      t.simulationPresetRevisionId,
+    ),
+    statusIdx: index("results_status_idx").on(t.status),
+    simJobIdx: index("results_sim_job_idx").on(t.simJobId),
+    catalogMetricsIdx: index("results_catalog_metrics_idx").on(
+      t.airfoilId,
+      t.simulationPresetRevisionId,
+      t.status,
+      t.source,
+      t.regime,
+      t.aoaDeg,
+    ),
+    updatedAtIdIdx: index("results_updated_at_id_idx").on(
+      sql`${t.updatedAt} DESC`,
+      sql`${t.id} DESC`,
+    ),
+  }),
+);
+
+/** Durable execution policy for answered engine submit failures. Kept
+ * separate from canonical solver results: no row here claims that OpenFOAM
+ * ran or that coefficient evidence exists. */
+export const simResultSubmitRetries = pgTable(
+  "sim_result_submit_retries",
+  {
+    resultId: uuid("result_id")
+      .primaryKey()
+      .references(() => results.id, { onDelete: "cascade" }),
+    // retry_wait | blocked
+    state: text("state").notNull(),
+    /** Number of automatic answered-5xx retries consumed (0 or 1). */
+    attemptCount: integer("attempt_count").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+    lastHttpStatus: integer("last_http_status"),
+    lastError: text("last_error").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    stateCheck: check(
+      "sim_result_submit_retries_state_check",
+      sql`${t.state} IN ('retry_wait', 'blocked')`,
+    ),
+    attemptCheck: check(
+      "sim_result_submit_retries_attempt_check",
+      sql`${t.attemptCount} BETWEEN 0 AND 1`,
+    ),
+    stateShapeCheck: check(
+      "sim_result_submit_retries_state_shape_check",
+      sql`(
+        (${t.state} = 'retry_wait' AND ${t.attemptCount} = 1 AND ${t.nextAttemptAt} IS NOT NULL)
+        OR (${t.state} = 'blocked' AND ${t.nextAttemptAt} IS NULL)
+      )`,
+    ),
+    readyIdx: index("sim_result_submit_retries_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
     ),
   }),
 );
@@ -1063,6 +1139,7 @@ export const resultFieldExtents = pgTable(
     resultId: uuid("result_id")
       .notNull()
       .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id"),
     airfoilId: uuid("airfoil_id")
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
@@ -1086,18 +1163,25 @@ export const resultFieldExtents = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_field_extents_attempt_owner_fk",
+    }).onDelete("cascade"),
     resultIdx: index("result_field_extents_result_idx").on(t.resultId),
+    attemptIdx: index("result_field_extents_attempt_idx").on(t.resultAttemptId),
     scopeIdx: index("result_field_extents_scope_idx").on(
       t.airfoilId,
       t.simulationPresetRevisionId,
       t.field,
       t.renderProfileKey,
     ),
-    uq: uniqueIndex("result_field_extents_result_field_uq").on(
-      t.resultId,
-      t.field,
-      t.renderProfileKey,
-    ),
+    attemptUq: uniqueIndex("result_field_extents_attempt_field_uq")
+      .on(t.resultAttemptId, t.field, t.renderProfileKey)
+      .where(sql`${t.resultAttemptId} IS NOT NULL`),
+    legacyResultUq: uniqueIndex("result_field_extents_legacy_result_field_uq")
+      .on(t.resultId, t.field, t.renderProfileKey)
+      .where(sql`${t.resultAttemptId} IS NULL`),
   }),
 );
 
@@ -1108,6 +1192,7 @@ export const resultMedia = pgTable(
     resultId: uuid("result_id")
       .notNull()
       .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id"),
     kind: mediaKindEnum("kind").notNull(),
     field: text("field"),
     role: mediaRoleEnum("role").notNull(),
@@ -1127,12 +1212,116 @@ export const resultMedia = pgTable(
     renderProfileKey: text("render_profile_key")
       .notNull()
       .default("default:v1:zoom2"),
+    /** Manifest checksum whose immutable fields produced this presentation
+     * artifact. NULL is legacy/unverified and never satisfies a durable
+     * default-media repair obligation. */
+    evidenceSha256: text("evidence_sha256"),
+    /** Verified artifact identity. NULL marks legacy/unverified media and
+     * cannot settle a durable repair. */
+    sha256: text("sha256"),
+    byteSize: bigint("byte_size", { mode: "number" }),
     engineUrl: text("engine_url"),
     createdAt: ts().notNull().defaultNow(),
   },
   (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_media_attempt_owner_fk",
+    }).onDelete("cascade"),
     resultIdx: index("result_media_result_idx").on(t.resultId),
-    uq: uniqueIndex("result_media_uq").on(t.resultId, t.kind, t.field, t.role),
+    attemptIdx: index("result_media_attempt_idx").on(t.resultAttemptId),
+    resultProfileEvidenceIdx: index(
+      "result_media_result_profile_evidence_idx",
+    ).on(t.resultId, t.renderProfileKey, t.evidenceSha256),
+    attemptUq: uniqueIndex("result_media_attempt_role_uq")
+      .on(
+        t.resultAttemptId,
+        t.kind,
+        sql`COALESCE(${t.field}, '')`,
+        t.role,
+        t.renderProfileKey,
+      )
+      .where(sql`${t.resultAttemptId} IS NOT NULL`),
+    legacyResultIdx: index("result_media_legacy_result_role_idx")
+      .on(t.resultId, t.kind, t.field, t.role, t.renderProfileKey)
+      .where(sql`${t.resultAttemptId} IS NULL`),
+  }),
+);
+
+/**
+ * Durable execution/output obligation for rebuilding default media from
+ * already-stored solver evidence. This is deliberately separate from
+ * `results`, `result_attempts`, and `solver_evidence_artifacts`: retry state,
+ * leases, and errors are mutable scheduler metadata, never solver evidence.
+ *
+ * One row owns the current media obligation for one canonical result. A new
+ * evidence signature may reopen a previously completed/blocked obligation;
+ * repeated discovery of the same evidence is idempotent.
+ */
+export const resultMediaRepairs = pgTable(
+  "result_media_repairs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    /** Exact immutable solver generation whose raw fields are rendered. */
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    // pending | running | retry_wait | done | blocked
+    state: text("state").notNull().default("pending"),
+    /** Engine job/case + manifest checksum for the evidence being repaired. */
+    evidenceSignature: text("evidence_signature").notNull(),
+    /** Persisted current provenance: true when the producing work has an
+     * independent background owner. It remains true if campaigns also share
+     * the result or acquire/release their own associations. */
+    backgroundOwner: boolean("background_owner").notNull().default(false),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(3),
+    /** Per-lease fencing token; stale renderers cannot settle a newer claim. */
+    claimToken: uuid("claim_token"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    lastError: text("last_error"),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    /** Written only after cache/classification/verification/campaign hooks
+     * finish. NULL makes a crash after media settlement resumable. */
+    downstreamFinalizedAt: timestamp("downstream_finalized_at", {
+      withTimezone: true,
+    }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_media_repairs_attempt_owner_fk",
+    }).onDelete("cascade"),
+    resultUq: uniqueIndex("result_media_repairs_result_uq").on(t.resultId),
+    attemptIdx: index("result_media_repairs_attempt_idx").on(t.resultAttemptId),
+    readyIdx: index("result_media_repairs_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    leaseIdx: index("result_media_repairs_lease_idx").on(
+      t.state,
+      t.claimExpiresAt,
+    ),
+    stateCheck: check(
+      "result_media_repairs_state_check",
+      sql`${t.state} IN ('pending', 'running', 'retry_wait', 'done', 'blocked')`,
+    ),
+    attemptCheck: check(
+      "result_media_repairs_attempt_check",
+      sql`${t.attemptCount} >= 0 AND ${t.maxAttempts} BETWEEN 1 AND 3 AND ${t.attemptCount} <= ${t.maxAttempts}`,
+    ),
   }),
 );
 
@@ -1174,6 +1363,11 @@ export const solverEvidenceArtifacts = pgTable(
     createdAt: ts().notNull().defaultNow(),
   },
   (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "solver_evidence_artifacts_attempt_owner_fk",
+    }).onDelete("cascade"),
     resultIdx: index("solver_evidence_artifacts_result_idx").on(t.resultId),
     attemptIdx: index("solver_evidence_artifacts_attempt_idx").on(
       t.resultAttemptId,
@@ -1182,10 +1376,32 @@ export const solverEvidenceArtifacts = pgTable(
       t.airfoilId,
       t.aoaDeg,
     ),
-    storageUq: uniqueIndex("solver_evidence_artifacts_storage_uq").on(
+    blobIdx: index("solver_evidence_artifacts_blob_idx").on(
       t.storageKey,
       t.sha256,
     ),
+    attemptContentUq: uniqueIndex(
+      "solver_evidence_artifacts_attempt_content_uq",
+    )
+      .on(
+        t.resultAttemptId,
+        t.kind,
+        sql`COALESCE(${t.field}, '')`,
+        sql`COALESCE(${t.role}, '')`,
+        t.storageKey,
+        t.sha256,
+      )
+      .where(sql`${t.resultAttemptId} IS NOT NULL`),
+    resultContentUq: uniqueIndex("solver_evidence_artifacts_result_content_uq")
+      .on(
+        t.resultId,
+        t.kind,
+        sql`COALESCE(${t.field}, '')`,
+        sql`COALESCE(${t.role}, '')`,
+        t.storageKey,
+        t.sha256,
+      )
+      .where(sql`${t.resultAttemptId} IS NULL AND ${t.resultId} IS NOT NULL`),
   }),
 );
 
@@ -1226,25 +1442,42 @@ export const fieldRenderCache = pgTable(
 // ---------------------------------------------------------------------------
 // 9. Force history — URANS Cl(t)/Cd(t) as columnar jsonb (1:1 with a result).
 // ---------------------------------------------------------------------------
-export const forceHistory = pgTable("force_history", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  resultId: uuid("result_id")
-    .notNull()
-    .unique()
-    .references(() => results.id, { onDelete: "cascade" }),
-  t: jsonb("t").$type<number[]>().notNull(),
-  cl: jsonb("cl").$type<number[]>().notNull(),
-  cd: jsonb("cd").$type<number[]>().notNull(),
-  cm: jsonb("cm").$type<number[]>(),
-  clMean: doublePrecision("cl_mean"),
-  clRms: doublePrecision("cl_rms"),
-  cdMean: doublePrecision("cd_mean"),
-  cdRms: doublePrecision("cd_rms"),
-  strouhal: doublePrecision("strouhal"),
-  sheddingFreqHz: doublePrecision("shedding_freq_hz"),
-  sampleCount: integer("sample_count"),
-  createdAt: ts().notNull().defaultNow(),
-});
+export const forceHistory = pgTable(
+  "force_history",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id"),
+    t: jsonb("t").$type<number[]>().notNull(),
+    cl: jsonb("cl").$type<number[]>().notNull(),
+    cd: jsonb("cd").$type<number[]>().notNull(),
+    cm: jsonb("cm").$type<number[]>(),
+    clMean: doublePrecision("cl_mean"),
+    clRms: doublePrecision("cl_rms"),
+    cdMean: doublePrecision("cd_mean"),
+    cdRms: doublePrecision("cd_rms"),
+    strouhal: doublePrecision("strouhal"),
+    sheddingFreqHz: doublePrecision("shedding_freq_hz"),
+    sampleCount: integer("sample_count"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "force_history_attempt_owner_fk",
+    }).onDelete("cascade"),
+    resultIdx: index("force_history_result_idx").on(t.resultId),
+    attemptUq: uniqueIndex("force_history_attempt_uq")
+      .on(t.resultAttemptId)
+      .where(sql`${t.resultAttemptId} IS NOT NULL`),
+    legacyResultUq: uniqueIndex("force_history_legacy_result_uq")
+      .on(t.resultId)
+      .where(sql`${t.resultAttemptId} IS NULL`),
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // 10. Result classifications and fitted polar cache — solver evidence stays
@@ -1293,6 +1526,11 @@ export const resultClassifications = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_classifications_attempt_owner_fk",
+    }).onDelete("cascade"),
     resultUq: uniqueIndex("result_classifications_result_uq").on(t.resultId),
     attemptUq: uniqueIndex("result_classifications_attempt_uq").on(
       t.resultAttemptId,
@@ -1385,6 +1623,9 @@ export const polarFitSets = pgTable(
       t.fitVersion,
       t.evidenceSignature,
     ),
+    currentUq: uniqueIndex("polar_fit_sets_current_uq")
+      .on(t.airfoilId, t.simulationPresetRevisionId)
+      .where(sql`${t.isCurrent}`),
     airfoilIdx: index("polar_fit_sets_airfoil_idx").on(
       t.airfoilId,
       t.isCurrent,
@@ -1614,6 +1855,16 @@ export const simJobs = pgTable(
     requestPayload: jsonb("request_payload"),
     engineState: text("engine_state"),
     error: text("error"),
+    // Exclusive, renewable evidence-ingest ownership. The token belongs to
+    // one sweeper process; expiry makes a crashed owner's job recoverable
+    // without holding a transaction across engine/media work.
+    ingestLeaseToken: text("ingest_lease_token"),
+    ingestLeaseClaimedAt: timestamp("ingest_lease_claimed_at", {
+      withTimezone: true,
+    }),
+    ingestLeaseExpiresAt: timestamp("ingest_lease_expires_at", {
+      withTimezone: true,
+    }),
     submittedAt: ts(),
     polledAt: ts(),
     ingestedAt: ts(),
@@ -1639,6 +1890,11 @@ export const simJobs = pgTable(
       t.simulationPresetRevisionId,
     ),
     campaignIdx: index("sim_jobs_campaign_idx").on(t.campaignId),
+    parentJobIdx: index("sim_jobs_parent_job_idx").on(t.parentJobId),
+    ingestLeaseIdx: index("sim_jobs_ingest_lease_idx").on(
+      t.status,
+      t.ingestLeaseExpiresAt,
+    ),
   }),
 );
 
@@ -1845,6 +2101,10 @@ export const simCampaignPoints = pgTable(
     resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
       onDelete: "set null",
     }),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "set null" },
+    ),
     // Negative-α cells of symmetric airfoils; terminal immediately when the +α
     // source is terminal (spec §9).
     derivedBySymmetry: boolean("derived_by_symmetry").notNull().default(false),
@@ -1855,6 +2115,11 @@ export const simCampaignPoints = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sim_campaign_points_attempt_owner_fk",
+    }).onDelete("no action"),
     pk: primaryKey({
       columns: [t.campaignId, t.conditionId, t.airfoilId, t.aoaDeg],
     }),
@@ -1865,6 +2130,17 @@ export const simCampaignPoints = pgTable(
       .on(t.revisionId, t.airfoilId, t.aoaDeg)
       .where(sql`${t.state} = 'requested'`),
     resultIdx: index("sim_campaign_points_result_idx").on(t.resultId),
+    resultAttemptIdx: index("sim_campaign_points_result_attempt_idx").on(
+      t.resultAttemptId,
+    ),
+    conditionAoaIdx: index("sim_campaign_points_condition_aoa_idx").on(
+      t.conditionId,
+      t.aoaDeg,
+      t.state,
+    ),
+    derivedTerminalIdx: index("sim_campaign_points_derived_terminal_idx")
+      .on(sql`${t.updatedAt} DESC`)
+      .where(sql`${t.derivedBySymmetry} AND ${t.state} = 'terminal'`),
   }),
 );
 
@@ -1893,6 +2169,11 @@ export const simCampaignProgress = pgTable(
     // evidence). Excluded from solved — surfaced like failed so a campaign
     // never books a rejected point as solved work.
     rejected: integer("rejected").notNull().default(0),
+    // Machine-owned PRECALC obligations which reached a terminal blocked
+    // state. This is deliberately disjoint from failed/rejected: a physical
+    // cell whose bounded PRECALC ledger is blocked is unavailable work, not a
+    // human review item and not an ordinary RANS retry candidate.
+    blocked: integer("blocked").notNull().default(0),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -2011,11 +2292,24 @@ export const simUransVerifyQueue = pgTable(
       .notNull()
       .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
     aoaDeg: doublePrecision("aoa_deg").notNull(),
+    /** @deprecated Migration 0043 normalizes queue ownership into
+     * sim_urans_verify_queue_campaigns plus background_owner. Retained for one
+     * expand/contract deployment so an old control plane can coexist while
+     * the migration is applied; new code must not read or write it. */
     campaignId: uuid("campaign_id").references(
       (): AnyPgColumn => simCampaigns.id,
       { onDelete: "set null" },
     ),
-    // pending | running | done | disagreed | cancelled
+    /** True when this physical verification obligation also belongs to the
+     * independent background catalog lane. Campaign ownership is many-to-many
+     * in sim_urans_verify_queue_campaigns. */
+    backgroundOwner: boolean("background_owner").notNull().default(false),
+    /** Exact currently-authorized execution owner. request_payload carries
+     * descriptive provenance only and must never authorize publication. */
+    simJobId: uuid("sim_job_id").references(() => simJobs.id, {
+      onDelete: "set null",
+    }),
+    // pending | running | done | disagreed | blocked | cancelled
     state: text("state").notNull().default("pending"),
     precalcResultId: uuid("precalc_result_id")
       .notNull()
@@ -2038,9 +2332,50 @@ export const simUransVerifyQueue = pgTable(
     openCellUq: uniqueIndex("sim_urans_verify_queue_open_cell_uq")
       .on(t.airfoilId, t.revisionId, t.aoaDeg)
       .where(sql`${t.state} IN ('pending', 'running')`),
+    simJobUq: uniqueIndex("sim_urans_verify_queue_sim_job_uq")
+      .on(t.simJobId)
+      .where(sql`${t.simJobId} IS NOT NULL`),
     stateIdx: index("sim_urans_verify_queue_state_idx").on(t.state),
     campaignIdx: index("sim_urans_verify_queue_campaign_idx").on(
       t.campaignId,
+      t.state,
+    ),
+  }),
+);
+
+/** Many-to-many owners of one global physical verification obligation.
+ * Association lifecycle is independent: cancelling one campaign marks only
+ * its row cancelled, while shared/background ownership can keep the physical
+ * queue item runnable. */
+export const simUransVerifyQueueCampaigns = pgTable(
+  "sim_urans_verify_queue_campaigns",
+  {
+    queueId: uuid("queue_id")
+      .notNull()
+      .references(() => simUransVerifyQueue.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references((): AnyPgColumn => simCampaigns.id, { onDelete: "cascade" }),
+    // active | cancelled
+    state: text("state").notNull().default("active"),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.queueId, t.campaignId] }),
+    stateCheck: check(
+      "sim_urans_verify_queue_campaigns_state_check",
+      sql`${t.state} IN ('active', 'cancelled')`,
+    ),
+    campaignStateIdx: index(
+      "sim_urans_verify_queue_campaigns_campaign_state_idx",
+    ).on(t.campaignId, t.state),
+    queueStateIdx: index("sim_urans_verify_queue_campaigns_queue_state_idx").on(
+      t.queueId,
       t.state,
     ),
   }),
@@ -2060,7 +2395,7 @@ export const simUransRequests = pgTable(
     aoaDeg: doublePrecision("aoa_deg"),
     // precalc | full (contract 1 request fidelities)
     fidelity: text("fidelity").notNull(),
-    // pending | running | done | cancelled
+    // pending | running | done | blocked | cancelled
     state: text("state").notNull().default("pending"),
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
       onDelete: "set null",
@@ -2078,7 +2413,13 @@ export const simUransRequests = pgTable(
     /** Continuation budget override [s]: replaces the fidelity-derived solver
      *  budget for the resumed run (+2h / +6h UI choices). NULL = tier default. */
     budgetOverrideS: integer("budget_override_s"),
+    /** Immutable audit provenance for the creator. Never infer current
+     * scheduling or cancellation ownership from this value. */
     requestedBy: text("requested_by"),
+    /** True when this physical request also has an independent admin/catalog
+     * owner. Campaign beneficiaries are stored separately in
+     * sim_urans_request_campaigns; requestedBy is creator provenance only. */
+    backgroundOwner: boolean("background_owner").notNull().default(false),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -2086,9 +2427,318 @@ export const simUransRequests = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    // The idempotency unique index is an EXPRESSION index (COALESCE(aoa_deg,
-    // 'NaN')) created in raw SQL by migration 0034 — drizzle cannot express it.
+    openCellUq: uniqueIndex("sim_urans_requests_open_cell_uq")
+      .on(
+        t.airfoilId,
+        t.revisionId,
+        sql`COALESCE(${t.aoaDeg}, 'NaN'::float8)`,
+        t.fidelity,
+      )
+      .where(sql`${t.state} IN ('pending', 'running')`),
     stateIdx: index("sim_urans_requests_state_idx").on(t.state),
+  }),
+);
+
+/** Many-to-many campaign beneficiaries of one physical request. Automatic
+ * continuations/fresh reused-evidence requests are campaign-owned; a covering
+ * manual/admin request may also gain associations while retaining its
+ * independent owner and global lifecycle. */
+export const simUransRequestCampaigns = pgTable(
+  "sim_urans_request_campaigns",
+  {
+    requestId: uuid("request_id")
+      .notNull()
+      .references(() => simUransRequests.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references((): AnyPgColumn => simCampaigns.id, { onDelete: "cascade" }),
+    // active | cancelled
+    state: text("state").notNull().default("active"),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.requestId, t.campaignId] }),
+    stateCheck: check(
+      "sim_urans_request_campaigns_state_check",
+      sql`${t.state} IN ('active', 'cancelled')`,
+    ),
+    campaignStateIdx: index(
+      "sim_urans_request_campaigns_campaign_state_idx",
+    ).on(t.campaignId, t.state),
+    requestStateIdx: index("sim_urans_request_campaigns_request_state_idx").on(
+      t.requestId,
+      t.state,
+    ),
+  }),
+);
+
+/** Durable answered-submit policy for full-fidelity ladder work. Exactly one
+ * physical owner is present: either an explicit full URANS request or an
+ * automatic full verification item. These rows never assert that OpenFOAM ran
+ * and therefore never substitute for results or result_attempts evidence. */
+export const simLadderSubmitRetries = pgTable(
+  "sim_ladder_submit_retries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    uransRequestId: uuid("urans_request_id").references(
+      (): AnyPgColumn => simUransRequests.id,
+      { onDelete: "cascade" },
+    ),
+    verifyQueueId: uuid("verify_queue_id").references(
+      (): AnyPgColumn => simUransVerifyQueue.id,
+      { onDelete: "cascade" },
+    ),
+    // retry_wait | blocked
+    state: text("state").notNull(),
+    /** Number of automatic answered-5xx retries consumed (0 or 1). */
+    attemptCount: integer("attempt_count").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+    latestSimJobId: uuid("latest_sim_job_id").references(
+      (): AnyPgColumn => simJobs.id,
+      { onDelete: "set null" },
+    ),
+    lastHttpStatus: integer("last_http_status"),
+    lastError: text("last_error").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    ownerXorCheck: check(
+      "sim_ladder_submit_retries_owner_xor_check",
+      sql`(${t.uransRequestId} IS NOT NULL) <> (${t.verifyQueueId} IS NOT NULL)`,
+    ),
+    stateCheck: check(
+      "sim_ladder_submit_retries_state_check",
+      sql`${t.state} IN ('retry_wait', 'blocked')`,
+    ),
+    attemptCheck: check(
+      "sim_ladder_submit_retries_attempt_check",
+      sql`${t.attemptCount} BETWEEN 0 AND 1`,
+    ),
+    stateShapeCheck: check(
+      "sim_ladder_submit_retries_state_shape_check",
+      sql`(
+        (${t.state} = 'retry_wait' AND ${t.attemptCount} = 1 AND ${t.nextAttemptAt} IS NOT NULL)
+        OR (${t.state} = 'blocked' AND ${t.nextAttemptAt} IS NULL)
+      )`,
+    ),
+    requestUq: uniqueIndex("sim_ladder_submit_retries_request_uq")
+      .on(t.uransRequestId)
+      .where(sql`${t.uransRequestId} IS NOT NULL`),
+    verifyUq: uniqueIndex("sim_ladder_submit_retries_verify_uq")
+      .on(t.verifyQueueId)
+      .where(sql`${t.verifyQueueId} IS NOT NULL`),
+    readyIdx: index("sim_ladder_submit_retries_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    latestJobIdx: index("sim_ladder_submit_retries_latest_job_idx").on(
+      t.latestSimJobId,
+    ),
+  }),
+);
+
+/** One physical preliminary-URANS obligation per compatible setup cell.
+ * Canonical result rows remain immutable evidence; scheduler attempts and
+ * terminal unavailable outcomes live here instead of rewriting accepted or
+ * needs_urans RANS coefficients into fake failed/queued evidence. */
+export const simPrecalcObligations = pgTable(
+  "sim_precalc_obligations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    revisionId: uuid("revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    sourceResultId: uuid("source_result_id").references(
+      (): AnyPgColumn => results.id,
+      { onDelete: "set null" },
+    ),
+    sourceResultAttemptId: uuid("source_result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "set null" },
+    ),
+    // pending | running | satisfied | blocked | cancelled
+    state: text("state").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(2),
+    submitFailureCount: integer("submit_failure_count").notNull().default(0),
+    nextSubmitAt: timestamp("next_submit_at", { withTimezone: true }),
+    latestSimJobId: uuid("latest_sim_job_id").references(
+      (): AnyPgColumn => simJobs.id,
+      { onDelete: "set null" },
+    ),
+    backgroundOwner: boolean("background_owner").notNull().default(false),
+    lastOutcome: text("last_outcome"),
+    lastError: text("last_error"),
+    lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    sourceAttemptOwnerFk: foreignKey({
+      columns: [t.sourceResultAttemptId, t.sourceResultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sim_precalc_obligations_source_attempt_owner_fk",
+    }).onDelete("no action"),
+    stateCheck: check(
+      "sim_precalc_obligations_state_check",
+      sql`${t.state} IN ('pending', 'running', 'satisfied', 'blocked', 'cancelled')`,
+    ),
+    attemptBoundsCheck: check(
+      "sim_precalc_obligations_attempt_bounds_check",
+      sql`${t.attemptCount} >= 0 AND ${t.maxAttempts} = 2 AND ${t.attemptCount} <= ${t.maxAttempts}`,
+    ),
+    submitFailureBoundsCheck: check(
+      "sim_precalc_obligations_submit_failure_bounds_check",
+      sql`${t.submitFailureCount} >= 0 AND ${t.submitFailureCount} <= 2`,
+    ),
+    cellUq: unique("sim_precalc_obligations_cell_uq").on(
+      t.airfoilId,
+      t.revisionId,
+      t.aoaDeg,
+    ),
+    stateIdx: index("sim_precalc_obligations_state_idx").on(
+      t.state,
+      t.updatedAt,
+    ),
+    submitDueIdx: index("sim_precalc_obligations_submit_due_idx").on(
+      t.state,
+      t.nextSubmitAt,
+    ),
+    latestJobIdx: index("sim_precalc_obligations_latest_job_idx").on(
+      t.latestSimJobId,
+    ),
+    sourceAttemptIdx: index(
+      "sim_precalc_obligations_source_result_attempt_idx",
+    ).on(t.sourceResultAttemptId),
+  }),
+);
+
+/** Immutable per-engine-submission audit rows for a bounded precalc
+ * obligation. At most two submissions are allowed: the initial solve and one
+ * retry/continuation. */
+export const simPrecalcObligationAttempts = pgTable(
+  "sim_precalc_obligation_attempts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    obligationId: uuid("obligation_id")
+      .notNull()
+      .references(() => simPrecalcObligations.id, { onDelete: "cascade" }),
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
+      onDelete: "set null",
+    }),
+    attemptNumber: integer("attempt_number").notNull(),
+    // submitted | accepted | rejected | failed | cancelled
+    state: text("state").notNull().default("submitted"),
+    outcome: text("outcome"),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "set null" },
+    ),
+    error: text("error"),
+    submittedAt: timestamp("submitted_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    stateCheck: check(
+      "sim_precalc_obligation_attempts_state_check",
+      sql`${t.state} IN ('submitted', 'accepted', 'rejected', 'failed', 'cancelled')`,
+    ),
+    numberCheck: check(
+      "sim_precalc_obligation_attempts_number_check",
+      sql`${t.attemptNumber} IN (1, 2)`,
+    ),
+    jobUq: unique("sim_precalc_obligation_attempts_job_uq").on(
+      t.obligationId,
+      t.simJobId,
+    ),
+    numberUq: unique("sim_precalc_obligation_attempts_number_uq").on(
+      t.obligationId,
+      t.attemptNumber,
+    ),
+    jobIdx: index("sim_precalc_obligation_attempts_job_idx").on(t.simJobId),
+    resultAttemptIdx: index(
+      "sim_precalc_obligation_attempts_result_attempt_idx",
+    ).on(t.resultAttemptId),
+  }),
+);
+
+/** Many-to-many campaign beneficiaries of one physical preliminary solve. */
+export const simPrecalcObligationCampaigns = pgTable(
+  "sim_precalc_obligation_campaigns",
+  {
+    obligationId: uuid("obligation_id")
+      .notNull()
+      .references(() => simPrecalcObligations.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references((): AnyPgColumn => simCampaigns.id, { onDelete: "cascade" }),
+    // active | cancelled
+    state: text("state").notNull().default("active"),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.obligationId, t.campaignId] }),
+    stateCheck: check(
+      "sim_precalc_obligation_campaigns_state_check",
+      sql`${t.state} IN ('active', 'cancelled')`,
+    ),
+    campaignStateIdx: index(
+      "sim_precalc_obligation_campaigns_campaign_state_idx",
+    ).on(t.campaignId, t.state),
+    obligationStateIdx: index(
+      "sim_precalc_obligation_campaigns_obligation_state_idx",
+    ).on(t.obligationId, t.state),
+  }),
+);
+
+/** Coverage links let a whole-polar/shared request drain several physical
+ * obligations sequentially without declaring the request done after only the
+ * first continuation settles. */
+export const simPrecalcObligationRequests = pgTable(
+  "sim_precalc_obligation_requests",
+  {
+    obligationId: uuid("obligation_id")
+      .notNull()
+      .references(() => simPrecalcObligations.id, { onDelete: "cascade" }),
+    requestId: uuid("request_id")
+      .notNull()
+      .references(() => simUransRequests.id, { onDelete: "cascade" }),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.obligationId, t.requestId] }),
+    requestIdx: index("sim_precalc_obligation_requests_request_idx").on(
+      t.requestId,
+    ),
   }),
 );
 
@@ -2211,6 +2861,10 @@ export const syncSweepPromisePoints = pgTable(
     resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
       onDelete: "set null",
     }),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "set null" },
+    ),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -2218,8 +2872,16 @@ export const syncSweepPromisePoints = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sync_sweep_promise_points_attempt_owner_fk",
+    }).onDelete("no action"),
     promiseIdx: index("sync_sweep_promise_points_promise_idx").on(t.promiseId),
     statusIdx: index("sync_sweep_promise_points_status_idx").on(t.status),
+    attemptIdx: index("sync_sweep_promise_points_attempt_idx").on(
+      t.resultAttemptId,
+    ),
     scopeIdx: index("sync_sweep_promise_points_scope_idx").on(
       t.airfoilId,
       t.simulationPresetRevisionId,
@@ -2239,6 +2901,7 @@ export const syncImportConflicts = pgTable(
     naturalKey: text("natural_key").notNull(),
     sourceInstanceId: text("source_instance_id"),
     sourceInstanceName: text("source_instance_name"),
+    fingerprint: text("fingerprint"),
     status: syncImportConflictStatusEnum("status").notNull().default("pending"),
     incomingPayload: jsonb("incoming_payload")
       .$type<Record<string, unknown>>()
@@ -2259,6 +2922,172 @@ export const syncImportConflicts = pgTable(
     naturalKeyIdx: index("sync_import_conflicts_natural_key_idx").on(
       t.dataType,
       t.naturalKey,
+    ),
+    pendingFingerprintUq: uniqueIndex(
+      "sync_import_conflicts_pending_fingerprint_uq",
+    )
+      .on(t.fingerprint)
+      .where(sql`${t.status} = 'pending' AND ${t.fingerprint} IS NOT NULL`),
+  }),
+);
+
+/** Leased process-independent byte reservations for sync-import staging. */
+export const syncUploadCapacityReservations = pgTable(
+  "sync_upload_capacity_reservations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    token: uuid("token").notNull(),
+    reservedBytes: bigint("reserved_bytes", { mode: "number" }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    bytesCheck: check(
+      "sync_upload_capacity_reservations_bytes_check",
+      sql`${t.reservedBytes} > 0`,
+    ),
+    expiryIdx: index("sync_upload_capacity_reservations_expiry_idx").on(
+      t.expiresAt,
+    ),
+    tokenUq: uniqueIndex("sync_upload_capacity_reservations_token_uq").on(
+      t.token,
+    ),
+  }),
+);
+
+/** Durable execution/delivery state for evidence pushed by a remote solver.
+ * This is deliberately separate from immutable result/attempt rows and from
+ * sim_jobs.request_payload. One promise+result row follows the current attempt
+ * generation; result_id NULL rows terminally account for empty/superseded
+ * jobs so old history cannot starve current delivery discovery. */
+export const syncRemoteResultDeliveries = pgTable(
+  "sync_remote_result_deliveries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    promiseId: uuid("promise_id")
+      .notNull()
+      .references(() => syncSweepPromises.id, { onDelete: "cascade" }),
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references((): AnyPgColumn => simJobs.id, { onDelete: "cascade" }),
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "cascade",
+    }),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "cascade" },
+    ),
+    aoaDeg: doublePrecision("aoa_deg"),
+    generationKey: text("generation_key").notNull(),
+    state: text("state").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    claimToken: uuid("claim_token"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    lastHttpStatus: integer("last_http_status"),
+    lastError: text("last_error"),
+    remoteConflictIds: jsonb("remote_conflict_ids")
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sync_remote_result_deliveries_attempt_owner_fk",
+    }).onDelete("cascade"),
+    resultUq: uniqueIndex("sync_remote_result_deliveries_result_uq")
+      .on(t.promiseId, t.resultId)
+      .where(sql`${t.resultId} IS NOT NULL`),
+    emptyJobUq: uniqueIndex("sync_remote_result_deliveries_empty_job_uq")
+      .on(t.promiseId, t.simJobId)
+      .where(sql`${t.resultId} IS NULL`),
+    readyIdx: index("sync_remote_result_deliveries_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    jobIdx: index("sync_remote_result_deliveries_job_idx").on(
+      t.simJobId,
+      t.state,
+    ),
+    attemptIdx: index("sync_remote_result_deliveries_result_attempt_idx").on(
+      t.resultAttemptId,
+    ),
+    shapeCheck: check(
+      "sync_remote_result_deliveries_shape_check",
+      sql`(
+        (${t.resultId} IS NULL AND ${t.resultAttemptId} IS NULL AND ${t.aoaDeg} IS NULL)
+        OR (${t.resultId} IS NOT NULL AND ${t.resultAttemptId} IS NOT NULL AND ${t.aoaDeg} IS NOT NULL)
+      )`,
+    ),
+    stateCheck: check(
+      "sync_remote_result_deliveries_state_check",
+      sql`${t.state} IN ('pending', 'pushing', 'retry_wait', 'delivered', 'blocked', 'superseded')`,
+    ),
+    attemptCheck: check(
+      "sync_remote_result_deliveries_attempt_count_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    claimShapeCheck: check(
+      "sync_remote_result_deliveries_claim_shape_check",
+      sql`(
+        (${t.state} = 'pushing' AND ${t.claimToken} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL)
+        OR (${t.state} <> 'pushing' AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL)
+      )`,
+    ),
+  }),
+);
+
+/** Durable, idempotent upstream lease release after local terminal failure. */
+export const syncRemotePromiseCancellations = pgTable(
+  "sync_remote_promise_cancellations",
+  {
+    promiseId: uuid("promise_id").primaryKey(),
+    state: text("state").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    lastHttpStatus: integer("last_http_status"),
+    lastError: text("last_error"),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    promiseFk: foreignKey({
+      columns: [t.promiseId],
+      foreignColumns: [syncSweepPromises.id],
+      name: "sync_remote_promise_cancellations_promise_fk",
+    }).onDelete("no action"),
+    stateCheck: check(
+      "sync_remote_promise_cancellations_state_check",
+      sql`${t.state} IN ('pending', 'retry_wait', 'delivered')`,
+    ),
+    attemptCheck: check(
+      "sync_remote_promise_cancellations_attempt_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    readyIdx: index("sync_remote_promise_cancellations_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
     ),
   }),
 );
@@ -2344,6 +3173,11 @@ export const remoteAssetReferences = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "remote_asset_references_attempt_owner_fk",
+    }).onDelete("no action"),
     storageUq: uniqueIndex("remote_asset_references_storage_uq").on(
       t.localStorageKey,
     ),
@@ -2352,6 +3186,9 @@ export const remoteAssetReferences = pgTable(
       t.localRowId,
     ),
     resultIdx: index("remote_asset_references_result_idx").on(t.resultId),
+    attemptIdx: index("remote_asset_references_result_attempt_idx").on(
+      t.resultAttemptId,
+    ),
     remoteArtifactIdx: index("remote_asset_references_remote_artifact_idx").on(
       t.sourceInstanceId,
       t.remoteArtifactId,
@@ -2429,4 +3266,16 @@ export type SimCampaignProgressRow = typeof simCampaignProgress.$inferSelect;
 export type SimCampaignLane = typeof simCampaignLanes.$inferSelect;
 export type SimCampaignLaneStep = typeof simCampaignLaneSteps.$inferSelect;
 export type SimUransVerifyQueueItem = typeof simUransVerifyQueue.$inferSelect;
+export type SimUransVerifyQueueCampaign =
+  typeof simUransVerifyQueueCampaigns.$inferSelect;
 export type SimUransRequest = typeof simUransRequests.$inferSelect;
+export type SimLadderSubmitRetry = typeof simLadderSubmitRetries.$inferSelect;
+export type SimUransRequestCampaign =
+  typeof simUransRequestCampaigns.$inferSelect;
+export type SimPrecalcObligation = typeof simPrecalcObligations.$inferSelect;
+export type SimPrecalcObligationAttempt =
+  typeof simPrecalcObligationAttempts.$inferSelect;
+export type SimPrecalcObligationCampaign =
+  typeof simPrecalcObligationCampaigns.$inferSelect;
+export type SimPrecalcObligationRequest =
+  typeof simPrecalcObligationRequests.$inferSelect;

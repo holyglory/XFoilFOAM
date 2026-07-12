@@ -2,7 +2,10 @@ import {
   airfoils,
   boundaryProfiles,
   boundaryConditions,
+  categories,
+  claimSimJobCancellation,
   createClient,
+  ensurePrecalcObligations,
   fieldColorScales,
   flowConditions,
   forceHistory,
@@ -15,22 +18,43 @@ import {
   resultAttempts,
   resultFieldExtents,
   mediums,
+  lockPrecalcCells,
   resultMedia,
   results,
+  requeueSinglePoint,
   schedulingProfiles,
   simJobs,
+  simCampaigns,
+  simCampaignConditions,
+  simCampaignPlanRevisions,
+  simCampaignPoints,
+  simPrecalcObligationAttempts,
+  simPrecalcObligationCampaigns,
+  simPrecalcObligations,
+  simUransVerifyQueue,
   simulationPresetAirfoilTargets,
   simulationPresets,
   solverEvidenceArtifacts,
   solverProfiles,
   syncSweepPromises,
   syncSweepPromisePoints,
+  syncRemotePromiseCancellations,
   sweeperState,
   sweepDefinitions,
 } from "@aerodb/db";
-import { EngineClient, EngineError, type EngineQueueState, type JobResult, type JobStatus } from "@aerodb/engine-client";
+import {
+  EngineClient,
+  EngineError,
+  WORKER_RESTART_ORPHAN_MESSAGE,
+  type EngineQueueState,
+  type JobResult,
+  type JobStatus,
+} from "@aerodb/engine-client";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { and, asc, eq, inArray, isNotNull, notIlike } from "drizzle-orm";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { buildPolarRequest } from "../src/build-request";
@@ -38,13 +62,23 @@ import { claimAoas } from "../src/claim";
 import { findGaps, firstBatch } from "../src/gaps";
 import { touchHeartbeat } from "../src/heartbeat";
 import { ingestResult, retryFailedScaleRenders } from "../src/ingest";
-import { reconcile, resetOrphans } from "../src/reconcile";
+import {
+  reconcile,
+  resetOrphans,
+  submitUransRetryForJob,
+} from "../src/reconcile";
+import { solverQueuePressure } from "../src/submit-lifecycle";
+import { withExactManifestEvidence } from "./exact-result-fixture";
 
-const { db, sql } = createClient({ max: 2 });
+const { db, sql } = createClient({ max: 4 });
 const engine = new EngineClient("http://engine.test");
 const testRunSlug = `sweeper-test-${process.pid}-${Date.now()}`;
+const mediaRoot = resolve("/tmp", testRunSlug);
+const previousMediaDir = process.env.MEDIA_DIR;
+process.env.MEDIA_DIR = mediaRoot;
 
 let airfoilId = "";
+let categoryId = "";
 let bcId = "";
 let testPresetId = "";
 let testPresetRevisionId = "";
@@ -62,12 +96,82 @@ const cleanupSchedulingProfileIds = new Set<string>();
 const cleanupOutputProfileIds = new Set<string>();
 const cleanupSweepIds = new Set<string>();
 const cleanupSyncPromiseIds = new Set<string>();
+const cleanupAirfoilIds = new Set<string>();
 let restoreSweeperEnabled: boolean | null = null;
+
+async function createTestAirfoil(label: string) {
+  if (!categoryId) {
+    const [category] = await db
+      .insert(categories)
+      .values({
+        slug: `${testRunSlug}-category`,
+        name: `${testRunSlug} category`,
+        path: `${testRunSlug}-category`,
+        depth: 0,
+      })
+      .returning({ id: categories.id });
+    categoryId = category.id;
+  }
+  const [airfoil] = await db
+    .insert(airfoils)
+    .values({
+      slug: `${testRunSlug}-${label}`,
+      name: `${testRunSlug} ${label}`,
+      categoryId,
+      source: "test-fixture",
+      pointFormat: "normalized",
+      points: [
+        { x: 1, y: 0 },
+        { x: 0.5, y: 0.08 },
+        { x: 0, y: 0 },
+        { x: 0.5, y: -0.04 },
+        { x: 1, y: 0 },
+      ],
+      isSymmetric: false,
+    })
+    .returning();
+  cleanupAirfoilIds.add(airfoil.id);
+  return airfoil;
+}
+
+function renderedMediaArtifact(args: {
+  jobId: string;
+  path: string;
+  field: string;
+  kind: "image" | "video";
+  role: "instantaneous" | "mean";
+}) {
+  const cleanPath = args.path.replace(/^\/+/, "");
+  const jobPrefix = `jobs/${args.jobId}/files/`;
+  const storageKey = cleanPath.startsWith(jobPrefix)
+    ? `jobs/${args.jobId}/${cleanPath.slice(jobPrefix.length)}`
+    : cleanPath;
+  const bytes = Buffer.from(`${testRunSlug}:${storageKey}`, "utf8");
+  const fullPath = resolve(mediaRoot, storageKey);
+  mkdirSync(dirname(fullPath), { recursive: true });
+  writeFileSync(fullPath, bytes);
+  return {
+    kind: args.kind,
+    field: args.field,
+    role: args.role,
+    path: args.path,
+    url: args.path,
+    mime_type: args.kind === "video" ? "video/mp4" : "image/png",
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    byte_size: bytes.byteLength,
+  };
+}
 
 function emptyQueue(jobIds: string[] = []): EngineQueueState {
   return {
     queue_depth: 0,
-    active: jobIds.map((job_id) => ({ worker: "test", task_id: `task-${job_id}`, name: "airfoilfoam.run_polar", job_id, redelivered: false })),
+    active: jobIds.map((job_id) => ({
+      worker: "test",
+      task_id: `task-${job_id}`,
+      name: "airfoilfoam.run_polar",
+      job_id,
+      redelivered: false,
+    })),
     reserved: [],
     scheduled: [],
     active_count: jobIds.length,
@@ -79,11 +183,248 @@ function emptyQueue(jobIds: string[] = []): EngineQueueState {
   };
 }
 
+/** Assert the 0047 physical-work contract for an accepted automatic PRECALC
+ * submission. The canonical RANS row is deliberately outside this helper:
+ * it remains immutable evidence (or its original wave-1 claim), while this
+ * exact cell ledger owns the forced-transient work. */
+async function expectBackgroundPrecalcSubmission(
+  child: typeof simJobs.$inferSelect,
+  expectedAoas: number[],
+) {
+  expect(child.campaignId).toBeNull();
+  expect(child.status).toBe("submitted");
+  expect(child.engineJobId).not.toBeNull();
+  const obligationIds = (
+    child.requestPayload as { precalcObligationIds?: string[] }
+  ).precalcObligationIds;
+  expect(obligationIds).toHaveLength(expectedAoas.length);
+  expect(new Set(obligationIds).size).toBe(expectedAoas.length);
+
+  const obligations = await db
+    .select()
+    .from(simPrecalcObligations)
+    .where(inArray(simPrecalcObligations.id, obligationIds!))
+    .orderBy(asc(simPrecalcObligations.aoaDeg));
+  expect(obligations.map((row) => row.aoaDeg)).toEqual(
+    [...expectedAoas].sort((a, b) => a - b),
+  );
+  expect(
+    obligations.every(
+      (row) =>
+        row.state === "running" &&
+        row.attemptCount === 1 &&
+        row.latestSimJobId === child.id &&
+        row.backgroundOwner,
+    ),
+  ).toBe(true);
+
+  const attempts = await db
+    .select({
+      obligationId: simPrecalcObligationAttempts.obligationId,
+      simJobId: simPrecalcObligationAttempts.simJobId,
+      attemptNumber: simPrecalcObligationAttempts.attemptNumber,
+      state: simPrecalcObligationAttempts.state,
+    })
+    .from(simPrecalcObligationAttempts)
+    .where(inArray(simPrecalcObligationAttempts.obligationId, obligationIds!));
+  expect(attempts).toHaveLength(expectedAoas.length);
+  expect(
+    attempts.every(
+      (attempt) =>
+        attempt.simJobId === child.id &&
+        attempt.attemptNumber === 1 &&
+        attempt.state === "submitted",
+    ),
+  ).toBe(true);
+  expect(
+    await db
+      .select({ campaignId: simPrecalcObligationCampaigns.campaignId })
+      .from(simPrecalcObligationCampaigns)
+      .where(
+        inArray(simPrecalcObligationCampaigns.obligationId, obligationIds!),
+      ),
+  ).toEqual([]);
+  return obligations;
+}
+
 async function firstAirfoilBc() {
-  const [a] = airfoilId ? await db.select().from(airfoils).where(eq(airfoils.id, airfoilId)).limit(1) : await db.select().from(airfoils).limit(1);
-  const [bc] = await db.select().from(boundaryConditions).where(eq(boundaryConditions.id, testBcId())).limit(1);
-  if (!a || !bc) throw new Error("seeded airfoil and boundary condition required");
-  return { a, bc, presetId: testPresetId, presetRevisionId: testPresetRevisionId };
+  const [a] = airfoilId
+    ? await db
+        .select()
+        .from(airfoils)
+        .where(eq(airfoils.id, airfoilId))
+        .limit(1)
+    : await db.select().from(airfoils).limit(1);
+  const [bc] = await db
+    .select()
+    .from(boundaryConditions)
+    .where(eq(boundaryConditions.id, testBcId()))
+    .limit(1);
+  if (!a || !bc)
+    throw new Error("seeded airfoil and boundary condition required");
+  return {
+    a,
+    bc,
+    presetId: testPresetId,
+    presetRevisionId: testPresetRevisionId,
+  };
+}
+
+/** Production-shaped owner handoff: immutable RANS attempt/classification
+ * evidence created a precalc child, and that child currently owns the
+ * canonical result row. Engine cancellation/loss must release this row as a
+ * queued/no-owner wave-2 obligation, not a generic pending RANS gap. */
+async function evidenceBackedWave2Fixture(
+  label: string,
+  aoa: number,
+  childState: "running" | "failed",
+) {
+  const { a, bc, presetRevisionId } = await firstAirfoilBc();
+  await db
+    .delete(results)
+    .where(
+      and(
+        eq(results.airfoilId, a.id),
+        eq(results.simulationPresetRevisionId, presetRevisionId),
+        eq(results.aoaDeg, aoa),
+      ),
+    );
+  const [parent] = await db
+    .insert(simJobs)
+    .values({
+      airfoilId: a.id,
+      bcIds: [bc.id],
+      simulationPresetRevisionId: presetRevisionId,
+      referenceChordM: bc.referenceChordM,
+      wave: 1,
+      status: "done",
+      jobKind: "targeted",
+      engineJobId: `${label}-parent`,
+      totalCases: 1,
+      completedCases: 1,
+      requestPayload: {
+        speedMap: [
+          { speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach },
+        ],
+        aoas: [aoa],
+      },
+      ingestedAt: new Date(),
+      finishedAt: new Date(),
+    })
+    .returning();
+  const [obligation] = await ensurePrecalcObligations(
+    db,
+    [{ airfoilId: a.id, revisionId: presetRevisionId, aoaDeg: aoa }],
+    { backgroundOwner: true },
+  );
+  const [child] = await db
+    .insert(simJobs)
+    .values({
+      parentJobId: parent.id,
+      airfoilId: a.id,
+      bcIds: [bc.id],
+      simulationPresetRevisionId: presetRevisionId,
+      referenceChordM: bc.referenceChordM,
+      wave: 2,
+      status: childState,
+      jobKind: "targeted",
+      engineJobId: `${label}-child`,
+      engineState: childState === "failed" ? "missing" : "running",
+      error: childState === "failed" ? "engine job not found (lost)" : null,
+      totalCases: 1,
+      requestPayload: {
+        speedMap: [
+          { speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach },
+        ],
+        aoas: [aoa],
+        parentJobId: parent.id,
+        uransFidelity: "precalc",
+        precalcObligationIds: [obligation.id],
+      },
+    })
+    .returning();
+  await db
+    .update(simPrecalcObligations)
+    .set({
+      state: "running",
+      attemptCount: 1,
+      latestSimJobId: child.id,
+      lastOutcome: "submitted",
+      lastAttemptAt: new Date(),
+    })
+    .where(eq(simPrecalcObligations.id, obligation.id));
+  await db.insert(simPrecalcObligationAttempts).values({
+    obligationId: obligation.id,
+    simJobId: child.id,
+    attemptNumber: 1,
+    state: "submitted",
+  });
+  const [row] = await db
+    .insert(results)
+    .values({
+      airfoilId: a.id,
+      bcId: bc.id,
+      simulationPresetRevisionId: presetRevisionId,
+      aoaDeg: aoa,
+      status: childState,
+      source: "queued",
+      regime: "rans",
+      fidelity: "rans",
+      simJobId: child.id,
+      engineJobId: child.engineJobId,
+      converged: false,
+      stalled: true,
+      error: "RANS did not converge; precalc evidence is still owed",
+    })
+    .returning();
+  const [attempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId: row.id,
+      airfoilId: a.id,
+      bcId: bc.id,
+      simulationPresetRevisionId: presetRevisionId,
+      aoaDeg: aoa,
+      simJobId: parent.id,
+      engineJobId: parent.engineJobId,
+      status: "failed",
+      source: "queued",
+      regime: "rans",
+      validForPolar: false,
+      converged: false,
+      stalled: true,
+      unsteady: false,
+      error: "RANS did not converge",
+      solvedAt: new Date(),
+    })
+    .returning();
+  await db.insert(resultClassifications).values([
+    {
+      resultId: row.id,
+      airfoilId: a.id,
+      simulationPresetRevisionId: presetRevisionId,
+      aoaDeg: aoa,
+      regime: "rans",
+      classifierVersion: "scheduler-release-test-v1",
+      state: "rejected",
+      reasons: ["RANS did not converge"],
+    },
+    {
+      resultAttemptId: attempt.id,
+      airfoilId: a.id,
+      simulationPresetRevisionId: presetRevisionId,
+      aoaDeg: aoa,
+      regime: "rans",
+      classifierVersion: "scheduler-release-test-v1",
+      state: "rejected",
+      reasons: ["RANS did not converge"],
+    },
+  ]);
+  cleanupJobIds.add(parent.id);
+  cleanupJobIds.add(child.id);
+  cleanupResultIds.add(row.id);
+  cleanupAttemptIds.add(attempt.id);
+  return { parent, child, row, obligation };
 }
 
 function testBcId(): string {
@@ -92,7 +433,9 @@ function testBcId(): string {
 }
 
 async function testGaps(limit = 10000) {
-  return (await findGaps(db, limit)).filter((gap) => gap.presetRevisionId === testPresetRevisionId);
+  return (await findGaps(db, limit)).filter(
+    (gap) => gap.presetRevisionId === testPresetRevisionId,
+  );
 }
 
 async function testBatch(limit = 500) {
@@ -100,24 +443,19 @@ async function testBatch(limit = 500) {
 }
 
 async function ensureTestSetup() {
-  const [medium] = await db.select().from(mediums).where(eq(mediums.slug, "air")).limit(1);
-  if (!medium) throw new Error("seeded air medium required");
-  // STABLE seeded-airfoil pick (cross-file race, 2026-07-07): an unordered
-  // `limit(1)` can bind this whole file to ANOTHER suite's `sw-*` fixture
-  // airfoil, whose afterAll then cascades away every row mid-run (19 tests
-  // failed on "seeded airfoil ... required" / results FK). Pick only durable
-  // catalog airfoils, deterministically.
-  const [targetAirfoil] = await db
-    .select({ id: airfoils.id })
-    .from(airfoils)
-    .where(notIlike(airfoils.slug, "sw-%"))
-    .orderBy(asc(airfoils.slug))
+  const [medium] = await db
+    .select()
+    .from(mediums)
+    .where(eq(mediums.slug, "air"))
     .limit(1);
-  if (!targetAirfoil) throw new Error("seeded airfoil required");
-  airfoilId = targetAirfoil.id;
+  if (!medium) throw new Error("seeded air medium required");
+  // This file owns its airfoil. Binding a long suite to a catalog row or to an
+  // unordered fixture from another parallel file makes cascade cleanup in the
+  // other owner capable of deleting this suite's results mid-run.
+  airfoilId = (await createTestAirfoil("main-airfoil")).id;
   const reynolds = 500_000;
   const chord = 1;
-  const speed = reynolds * medium.kinematicViscosity / chord;
+  const speed = (reynolds * medium.kinematicViscosity) / chord;
   const mach = medium.speedOfSound ? speed / medium.speedOfSound : null;
   const [legacy] = await db
     .insert(boundaryConditions)
@@ -166,14 +504,39 @@ async function ensureTestSetup() {
     })
     .returning();
   cleanupReferenceGeometryIds.add(referenceGeometry.id);
-  const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${testRunSlug}-boundary`, name: `${testRunSlug} boundary` }).returning();
-  const [mesh] = await db.insert(meshProfiles).values({ slug: `${testRunSlug}-mesh`, name: `${testRunSlug} mesh` }).returning();
-  const [solver] = await db.insert(solverProfiles).values({ slug: `${testRunSlug}-solver`, name: `${testRunSlug} solver` }).returning();
-  const [scheduling] = await db.insert(schedulingProfiles).values({ slug: `${testRunSlug}-scheduling`, name: `${testRunSlug} scheduling` }).returning();
-  const [output] = await db.insert(outputProfiles).values({ slug: `${testRunSlug}-output`, name: `${testRunSlug} output` }).returning();
+  const [boundary] = await db
+    .insert(boundaryProfiles)
+    .values({
+      slug: `${testRunSlug}-boundary`,
+      name: `${testRunSlug} boundary`,
+    })
+    .returning();
+  const [mesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${testRunSlug}-mesh`, name: `${testRunSlug} mesh` })
+    .returning();
+  const [solver] = await db
+    .insert(solverProfiles)
+    .values({ slug: `${testRunSlug}-solver`, name: `${testRunSlug} solver` })
+    .returning();
+  const [scheduling] = await db
+    .insert(schedulingProfiles)
+    .values({
+      slug: `${testRunSlug}-scheduling`,
+      name: `${testRunSlug} scheduling`,
+    })
+    .returning();
+  const [output] = await db
+    .insert(outputProfiles)
+    .values({ slug: `${testRunSlug}-output`, name: `${testRunSlug} output` })
+    .returning();
   const [sweep] = await db
     .insert(sweepDefinitions)
-    .values({ slug: `${testRunSlug}-sweep`, name: `${testRunSlug} sweep`, aoaList: [81.001, 82.001, 83.001, 91.001, 92.001, 93.001] })
+    .values({
+      slug: `${testRunSlug}-sweep`,
+      name: `${testRunSlug} sweep`,
+      aoaList: [81.001, 82.001, 83.001, 91.001, 92.001, 93.001],
+    })
     .returning();
   cleanupBoundaryProfileIds.add(boundary.id);
   cleanupMeshProfileIds.add(mesh.id);
@@ -200,7 +563,9 @@ async function ensureTestSetup() {
     })
     .returning();
   cleanupPresetIds.add(preset.id);
-  await db.insert(simulationPresetAirfoilTargets).values({ presetId: preset.id, airfoilId });
+  await db
+    .insert(simulationPresetAirfoilTargets)
+    .values({ presetId: preset.id, airfoilId });
   testPresetId = preset.id;
   const resolved = await ensureSimulationPresetRevision(db, preset.id);
   if (!resolved) throw new Error("test setup revision required");
@@ -208,7 +573,11 @@ async function ensureTestSetup() {
 }
 
 beforeAll(async () => {
-  const [state] = await db.select({ enabled: sweeperState.enabled }).from(sweeperState).where(eq(sweeperState.id, 1)).limit(1);
+  const [state] = await db
+    .select({ enabled: sweeperState.enabled })
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1))
+    .limit(1);
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
@@ -218,34 +587,123 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  if (cleanupSyncPromiseIds.size) await db.delete(syncSweepPromises).where(inArray(syncSweepPromises.id, Array.from(cleanupSyncPromiseIds)));
-  if (testPresetRevisionId) {
-    await db.delete(polarFitSets).where(eq(polarFitSets.simulationPresetRevisionId, testPresetRevisionId));
-    await db.delete(resultClassifications).where(eq(resultClassifications.simulationPresetRevisionId, testPresetRevisionId));
-    await db.delete(resultAttempts).where(eq(resultAttempts.simulationPresetRevisionId, testPresetRevisionId));
-    await db.delete(results).where(eq(results.simulationPresetRevisionId, testPresetRevisionId));
-    await db.delete(simJobs).where(eq(simJobs.simulationPresetRevisionId, testPresetRevisionId));
+  if (cleanupSyncPromiseIds.size) {
+    await db
+      .delete(syncRemotePromiseCancellations)
+      .where(
+        inArray(
+          syncRemotePromiseCancellations.promiseId,
+          Array.from(cleanupSyncPromiseIds),
+        ),
+      );
+    await db
+      .delete(syncSweepPromises)
+      .where(inArray(syncSweepPromises.id, Array.from(cleanupSyncPromiseIds)));
   }
-  if (cleanupAttemptIds.size) await db.delete(resultAttempts).where(inArray(resultAttempts.id, Array.from(cleanupAttemptIds)));
-  if (cleanupResultIds.size) await db.delete(results).where(inArray(results.id, Array.from(cleanupResultIds)));
-  if (cleanupJobIds.size) await db.delete(simJobs).where(inArray(simJobs.id, Array.from(cleanupJobIds)));
-  if (cleanupPresetIds.size) await db.delete(simulationPresets).where(inArray(simulationPresets.id, Array.from(cleanupPresetIds)));
-  if (cleanupLegacyBcIds.size) await db.delete(boundaryConditions).where(inArray(boundaryConditions.id, Array.from(cleanupLegacyBcIds)));
-  if (cleanupFlowIds.size) await db.delete(flowConditions).where(inArray(flowConditions.id, Array.from(cleanupFlowIds)));
-  if (cleanupReferenceGeometryIds.size) await db.delete(referenceGeometryProfiles).where(inArray(referenceGeometryProfiles.id, Array.from(cleanupReferenceGeometryIds)));
-  if (cleanupBoundaryProfileIds.size) await db.delete(boundaryProfiles).where(inArray(boundaryProfiles.id, Array.from(cleanupBoundaryProfileIds)));
-  if (cleanupMeshProfileIds.size) await db.delete(meshProfiles).where(inArray(meshProfiles.id, Array.from(cleanupMeshProfileIds)));
-  if (cleanupSolverProfileIds.size) await db.delete(solverProfiles).where(inArray(solverProfiles.id, Array.from(cleanupSolverProfileIds)));
-  if (cleanupSchedulingProfileIds.size) await db.delete(schedulingProfiles).where(inArray(schedulingProfiles.id, Array.from(cleanupSchedulingProfileIds)));
-  if (cleanupOutputProfileIds.size) await db.delete(outputProfiles).where(inArray(outputProfiles.id, Array.from(cleanupOutputProfileIds)));
-  if (cleanupSweepIds.size) await db.delete(sweepDefinitions).where(inArray(sweepDefinitions.id, Array.from(cleanupSweepIds)));
+  if (testPresetRevisionId) {
+    await db
+      .delete(polarFitSets)
+      .where(eq(polarFitSets.simulationPresetRevisionId, testPresetRevisionId));
+    await db
+      .delete(resultClassifications)
+      .where(
+        eq(
+          resultClassifications.simulationPresetRevisionId,
+          testPresetRevisionId,
+        ),
+      );
+    await db
+      .delete(results)
+      .where(eq(results.simulationPresetRevisionId, testPresetRevisionId));
+    await db
+      .delete(resultAttempts)
+      .where(
+        eq(resultAttempts.simulationPresetRevisionId, testPresetRevisionId),
+      );
+    await db
+      .delete(simJobs)
+      .where(eq(simJobs.simulationPresetRevisionId, testPresetRevisionId));
+  }
+  if (cleanupAttemptIds.size)
+    await db
+      .delete(resultAttempts)
+      .where(inArray(resultAttempts.id, Array.from(cleanupAttemptIds)));
+  if (cleanupResultIds.size)
+    await db
+      .delete(results)
+      .where(inArray(results.id, Array.from(cleanupResultIds)));
+  if (cleanupJobIds.size)
+    await db
+      .delete(simJobs)
+      .where(inArray(simJobs.id, Array.from(cleanupJobIds)));
+  if (cleanupPresetIds.size)
+    await db
+      .delete(simulationPresets)
+      .where(inArray(simulationPresets.id, Array.from(cleanupPresetIds)));
+  if (cleanupLegacyBcIds.size)
+    await db
+      .delete(boundaryConditions)
+      .where(inArray(boundaryConditions.id, Array.from(cleanupLegacyBcIds)));
+  if (cleanupFlowIds.size)
+    await db
+      .delete(flowConditions)
+      .where(inArray(flowConditions.id, Array.from(cleanupFlowIds)));
+  if (cleanupReferenceGeometryIds.size)
+    await db
+      .delete(referenceGeometryProfiles)
+      .where(
+        inArray(
+          referenceGeometryProfiles.id,
+          Array.from(cleanupReferenceGeometryIds),
+        ),
+      );
+  if (cleanupBoundaryProfileIds.size)
+    await db
+      .delete(boundaryProfiles)
+      .where(
+        inArray(boundaryProfiles.id, Array.from(cleanupBoundaryProfileIds)),
+      );
+  if (cleanupMeshProfileIds.size)
+    await db
+      .delete(meshProfiles)
+      .where(inArray(meshProfiles.id, Array.from(cleanupMeshProfileIds)));
+  if (cleanupSolverProfileIds.size)
+    await db
+      .delete(solverProfiles)
+      .where(inArray(solverProfiles.id, Array.from(cleanupSolverProfileIds)));
+  if (cleanupSchedulingProfileIds.size)
+    await db
+      .delete(schedulingProfiles)
+      .where(
+        inArray(schedulingProfiles.id, Array.from(cleanupSchedulingProfileIds)),
+      );
+  if (cleanupOutputProfileIds.size)
+    await db
+      .delete(outputProfiles)
+      .where(inArray(outputProfiles.id, Array.from(cleanupOutputProfileIds)));
+  if (cleanupSweepIds.size)
+    await db
+      .delete(sweepDefinitions)
+      .where(inArray(sweepDefinitions.id, Array.from(cleanupSweepIds)));
+  if (cleanupAirfoilIds.size)
+    await db
+      .delete(airfoils)
+      .where(inArray(airfoils.id, Array.from(cleanupAirfoilIds)));
+  if (categoryId)
+    await db.delete(categories).where(eq(categories.id, categoryId));
   if (restoreSweeperEnabled !== null) {
     await db
       .insert(sweeperState)
       .values({ id: 1, enabled: restoreSweeperEnabled })
-      .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: restoreSweeperEnabled } });
+      .onConflictDoUpdate({
+        target: sweeperState.id,
+        set: { enabled: restoreSweeperEnabled },
+      });
   }
   await sql.end();
+  rmSync(mediaRoot, { recursive: true, force: true });
+  if (previousMediaDir == null) delete process.env.MEDIA_DIR;
+  else process.env.MEDIA_DIR = previousMediaDir;
 });
 
 describe("sweeper: gap → claim → ingest", () => {
@@ -267,19 +725,42 @@ describe("sweeper: gap → claim → ingest", () => {
       .limit(2);
     expect(target?.id).toBeTruthy();
     expect(excluded?.id).toBeTruthy();
-    await db.delete(results).where(and(eq(results.airfoilId, target.id), eq(results.simulationPresetRevisionId, testPresetRevisionId)));
-    await db.delete(simulationPresetAirfoilTargets).where(eq(simulationPresetAirfoilTargets.presetId, testPresetId));
-    await db.update(simulationPresets).set({ targetScope: "airfoils" }).where(eq(simulationPresets.id, testPresetId));
-    await db.insert(simulationPresetAirfoilTargets).values({ presetId: testPresetId, airfoilId: target.id });
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, target.id),
+          eq(results.simulationPresetRevisionId, testPresetRevisionId),
+        ),
+      );
+    await db
+      .delete(simulationPresetAirfoilTargets)
+      .where(eq(simulationPresetAirfoilTargets.presetId, testPresetId));
+    await db
+      .update(simulationPresets)
+      .set({ targetScope: "airfoils" })
+      .where(eq(simulationPresets.id, testPresetId));
+    await db
+      .insert(simulationPresetAirfoilTargets)
+      .values({ presetId: testPresetId, airfoilId: target.id });
     try {
       const gaps = await testGaps(10000);
       expect(gaps.length).toBeGreaterThan(0);
-      expect(new Set(gaps.map((gap) => gap.airfoilId))).toEqual(new Set([target.id]));
+      expect(new Set(gaps.map((gap) => gap.airfoilId))).toEqual(
+        new Set([target.id]),
+      );
       expect(gaps.some((gap) => gap.airfoilId === excluded.id)).toBe(false);
     } finally {
-      await db.delete(simulationPresetAirfoilTargets).where(eq(simulationPresetAirfoilTargets.presetId, testPresetId));
-      await db.insert(simulationPresetAirfoilTargets).values({ presetId: testPresetId, airfoilId });
-      await db.update(simulationPresets).set({ targetScope: "airfoils" }).where(eq(simulationPresets.id, testPresetId));
+      await db
+        .delete(simulationPresetAirfoilTargets)
+        .where(eq(simulationPresetAirfoilTargets.presetId, testPresetId));
+      await db
+        .insert(simulationPresetAirfoilTargets)
+        .values({ presetId: testPresetId, airfoilId });
+      await db
+        .update(simulationPresets)
+        .set({ targetScope: "airfoils" })
+        .where(eq(simulationPresets.id, testPresetId));
     }
   }, 60000);
 
@@ -288,7 +769,11 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(gaps.length).toBeGreaterThan(1);
     const first = gaps[0];
     const promised = gaps
-      .filter((gap) => gap.airfoilId === first.airfoilId && gap.presetRevisionId === first.presetRevisionId)
+      .filter(
+        (gap) =>
+          gap.airfoilId === first.airfoilId &&
+          gap.presetRevisionId === first.presetRevisionId,
+      )
       .slice(0, 2);
     expect(promised.length).toBe(2);
 
@@ -315,13 +800,30 @@ describe("sweeper: gap → claim → ingest", () => {
 
     const hidden = await testGaps(10000);
     for (const gap of promised) {
-      expect(hidden.some((candidate) => candidate.airfoilId === gap.airfoilId && candidate.presetRevisionId === gap.presetRevisionId && candidate.aoaDeg === gap.aoaDeg)).toBe(false);
+      expect(
+        hidden.some(
+          (candidate) =>
+            candidate.airfoilId === gap.airfoilId &&
+            candidate.presetRevisionId === gap.presetRevisionId &&
+            candidate.aoaDeg === gap.aoaDeg,
+        ),
+      ).toBe(false);
     }
 
-    await db.update(syncSweepPromises).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(syncSweepPromises.id, promise.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ expiresAt: new Date(Date.now() - 1000) })
+      .where(eq(syncSweepPromises.id, promise.id));
     const released = await testGaps(10000);
     for (const gap of promised) {
-      expect(released.some((candidate) => candidate.airfoilId === gap.airfoilId && candidate.presetRevisionId === gap.presetRevisionId && candidate.aoaDeg === gap.aoaDeg)).toBe(true);
+      expect(
+        released.some(
+          (candidate) =>
+            candidate.airfoilId === gap.airfoilId &&
+            candidate.presetRevisionId === gap.presetRevisionId &&
+            candidate.aoaDeg === gap.aoaDeg,
+        ),
+      ).toBe(true);
     }
   }, 60000);
 
@@ -343,26 +845,386 @@ describe("sweeper: gap → claim → ingest", () => {
     const some = [91.001, 92.001, 93.001];
     await db
       .delete(results)
-      .where(and(eq(results.airfoilId, batch!.airfoilId), eq(results.simulationPresetRevisionId, batch!.presetRevisionId), inArray(results.aoaDeg, some)));
-    const first = await claimAoas(db, batch!.airfoilId, batch!.bcId, batch!.presetRevisionId, some, job.id);
+      .where(
+        and(
+          eq(results.airfoilId, batch!.airfoilId),
+          eq(results.simulationPresetRevisionId, batch!.presetRevisionId),
+          inArray(results.aoaDeg, some),
+        ),
+      );
+    const first = await claimAoas(
+      db,
+      batch!.airfoilId,
+      batch!.bcId,
+      batch!.presetRevisionId,
+      some,
+      job.id,
+    );
     expect(first.length).toBe(3);
     const claimedRows = await db
-      .select({ id: results.id, source: results.source, status: results.status })
+      .select({
+        id: results.id,
+        source: results.source,
+        status: results.status,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, batch!.airfoilId), eq(results.simulationPresetRevisionId, batch!.presetRevisionId), inArray(results.aoaDeg, some)));
+      .where(
+        and(
+          eq(results.airfoilId, batch!.airfoilId),
+          eq(results.simulationPresetRevisionId, batch!.presetRevisionId),
+          inArray(results.aoaDeg, some),
+        ),
+      );
     claimedRows.forEach((r) => cleanupResultIds.add(r.id));
-    expect(claimedRows.every((r) => r.source === "queued" && r.status === "queued")).toBe(true);
-    const again = await claimAoas(db, batch!.airfoilId, batch!.bcId, batch!.presetRevisionId, some, job.id);
+    expect(
+      claimedRows.every((r) => r.source === "queued" && r.status === "queued"),
+    ).toBe(true);
+    const again = await claimAoas(
+      db,
+      batch!.airfoilId,
+      batch!.bcId,
+      batch!.presetRevisionId,
+      some,
+      job.id,
+    );
     expect(again.length).toBe(0);
     await db
       .delete(results)
-      .where(and(eq(results.airfoilId, batch!.airfoilId), eq(results.simulationPresetRevisionId, batch!.presetRevisionId), inArray(results.aoaDeg, some)));
+      .where(
+        and(
+          eq(results.airfoilId, batch!.airfoilId),
+          eq(results.simulationPresetRevisionId, batch!.presetRevisionId),
+          inArray(results.aoaDeg, some),
+        ),
+      );
   }, 60000);
+
+  it("refuses ledger-owned cells at the continuous and campaign claim boundaries", async () => {
+    const batch = await testBatch(500);
+    expect(batch).not.toBeNull();
+    const freshAoa = 94.001;
+    const existingAoa = 95.001;
+    await db
+      .delete(simPrecalcObligations)
+      .where(
+        and(
+          eq(simPrecalcObligations.airfoilId, batch!.airfoilId),
+          eq(simPrecalcObligations.revisionId, batch!.presetRevisionId),
+          inArray(simPrecalcObligations.aoaDeg, [freshAoa, existingAoa]),
+        ),
+      );
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, batch!.airfoilId),
+          eq(results.simulationPresetRevisionId, batch!.presetRevisionId),
+          inArray(results.aoaDeg, [freshAoa, existingAoa]),
+        ),
+      );
+    const obligations = await ensurePrecalcObligations(
+      db,
+      [freshAoa, existingAoa].map((aoaDeg) => ({
+        airfoilId: batch!.airfoilId,
+        revisionId: batch!.presetRevisionId,
+        aoaDeg,
+      })),
+      { backgroundOwner: true },
+    );
+    expect(obligations).toHaveLength(2);
+    const [pending] = await db
+      .insert(results)
+      .values({
+        airfoilId: batch!.airfoilId,
+        bcId: batch!.bcId,
+        simulationPresetRevisionId: batch!.presetRevisionId,
+        aoaDeg: existingAoa,
+        status: "pending",
+        source: "queued",
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(pending.id);
+    const [campaign] = await db
+      .insert(simCampaigns)
+      .values({
+        slug: `${testRunSlug}-claim-lock`,
+        name: `${testRunSlug} claim lock`,
+        status: "active",
+        priority: 5,
+        idempotencyKey: `${testRunSlug}-claim-lock`,
+      })
+      .returning({ id: simCampaigns.id });
+    const jobs = await db
+      .insert(simJobs)
+      .values([
+        {
+          airfoilId: batch!.airfoilId,
+          bcIds: [batch!.bcId],
+          simulationPresetRevisionId: batch!.presetRevisionId,
+          referenceChordM: 1,
+          wave: 1,
+          status: "pending",
+        },
+        {
+          airfoilId: batch!.airfoilId,
+          bcIds: [batch!.bcId],
+          simulationPresetRevisionId: batch!.presetRevisionId,
+          campaignId: campaign.id,
+          referenceChordM: 1,
+          wave: 1,
+          status: "pending",
+        },
+      ])
+      .returning({ id: simJobs.id });
+    jobs.forEach((job) => cleanupJobIds.add(job.id));
+
+    expect(
+      await claimAoas(
+        db,
+        batch!.airfoilId,
+        batch!.bcId,
+        batch!.presetRevisionId,
+        [freshAoa],
+        jobs[0].id,
+      ),
+    ).toEqual([]);
+    const campaignClaim = await db.transaction(async (tx) => {
+      await tx
+        .select({ id: simCampaigns.id })
+        .from(simCampaigns)
+        .where(eq(simCampaigns.id, campaign.id))
+        .for("update");
+      return claimAoas(
+        tx,
+        batch!.airfoilId,
+        batch!.bcId,
+        batch!.presetRevisionId,
+        [existingAoa],
+        jobs[1].id,
+      );
+    });
+    expect(campaignClaim).toEqual([]);
+    const [unchanged] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, pending.id));
+    expect(unchanged).toEqual({ status: "pending", simJobId: null });
+    expect(
+      await db
+        .select({ id: results.id })
+        .from(results)
+        .where(
+          and(
+            eq(results.airfoilId, batch!.airfoilId),
+            eq(results.simulationPresetRevisionId, batch!.presetRevisionId),
+            eq(results.aoaDeg, freshAoa),
+          ),
+        ),
+    ).toHaveLength(0);
+
+    await db.delete(simJobs).where(
+      inArray(
+        simJobs.id,
+        jobs.map((job) => job.id),
+      ),
+    );
+    jobs.forEach((job) => cleanupJobIds.delete(job.id));
+    await db.delete(simCampaigns).where(eq(simCampaigns.id, campaign.id));
+    await db.delete(simPrecalcObligations).where(
+      inArray(
+        simPrecalcObligations.id,
+        obligations.map((obligation) => obligation.id),
+      ),
+    );
+  }, 60_000);
+
+  it("serializes obligation creation against generic requeue with no ledger-owned pending loser", async () => {
+    const batch = await testBatch(500);
+    expect(batch).not.toBeNull();
+    const aoa = 96.001;
+    await db
+      .delete(simPrecalcObligations)
+      .where(
+        and(
+          eq(simPrecalcObligations.airfoilId, batch!.airfoilId),
+          eq(simPrecalcObligations.revisionId, batch!.presetRevisionId),
+          eq(simPrecalcObligations.aoaDeg, aoa),
+        ),
+      );
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, batch!.airfoilId),
+          eq(results.simulationPresetRevisionId, batch!.presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    const [failed] = await db
+      .insert(results)
+      .values({
+        airfoilId: batch!.airfoilId,
+        bcId: batch!.bcId,
+        simulationPresetRevisionId: batch!.presetRevisionId,
+        aoaDeg: aoa,
+        status: "failed",
+        source: "queued",
+        regime: "rans",
+        error: "transient simpleFoam failure",
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(failed.id);
+    const [campaign] = await db
+      .insert(simCampaigns)
+      .values({
+        slug: `${testRunSlug}-requeue-lock-order`,
+        name: `${testRunSlug} requeue lock order`,
+        status: "active",
+        priority: 5,
+        idempotencyKey: `${testRunSlug}-requeue-lock-order`,
+      })
+      .returning({ id: simCampaigns.id });
+    const [plan] = await db
+      .insert(simCampaignPlanRevisions)
+      .values({
+        campaignId: campaign.id,
+        revisionNumber: 1,
+        kind: "initial",
+        plan: {},
+        summary: {},
+      })
+      .returning({ id: simCampaignPlanRevisions.id });
+    await db
+      .update(simCampaigns)
+      .set({ currentPlanRevisionId: plan.id })
+      .where(eq(simCampaigns.id, campaign.id));
+    const [preset] = await db
+      .select({
+        flowConditionId: simulationPresets.flowConditionId,
+        referenceGeometryProfileId:
+          simulationPresets.referenceGeometryProfileId,
+      })
+      .from(simulationPresets)
+      .where(eq(simulationPresets.id, testPresetId));
+    const [condition] = await db
+      .insert(simCampaignConditions)
+      .values({
+        campaignId: campaign.id,
+        ord: 0,
+        flowConditionId: preset.flowConditionId,
+        referenceGeometryProfileId: preset.referenceGeometryProfileId,
+        presetId: testPresetId,
+        simulationPresetRevisionId: batch!.presetRevisionId,
+        reynolds: 500_000,
+        status: "active",
+        introducedInPlanRevisionId: plan.id,
+      })
+      .returning({ id: simCampaignConditions.id });
+    await db.insert(simCampaignPoints).values({
+      campaignId: campaign.id,
+      conditionId: condition.id,
+      airfoilId: batch!.airfoilId,
+      aoaDeg: aoa,
+      revisionId: batch!.presetRevisionId,
+      planRevisionNumber: 1,
+      state: "terminal",
+      resultId: failed.id,
+      derivedBySymmetry: false,
+    });
+
+    let release!: () => void;
+    const releasePromise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let locked!: () => void;
+    const lockedPromise = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const blocker = db.transaction(async (tx) => {
+      await tx
+        .select({ id: simCampaigns.id })
+        .from(simCampaigns)
+        .where(eq(simCampaigns.id, campaign.id))
+        .for("update");
+      await lockPrecalcCells(tx, [
+        {
+          airfoilId: batch!.airfoilId,
+          revisionId: batch!.presetRevisionId,
+          aoaDeg: aoa,
+        },
+      ]);
+      locked();
+      await releasePromise;
+    });
+    await lockedPromise;
+    const obligationPromise = ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId: batch!.airfoilId,
+          revisionId: batch!.presetRevisionId,
+          aoaDeg: aoa,
+          sourceResultId: failed.id,
+        },
+      ],
+      { campaignIds: [campaign.id] },
+    );
+    const requeuePromise = requeueSinglePoint(db, failed.id);
+    release();
+    await blocker;
+    const [obligationOutcome, requeueOutcome] = await Promise.allSettled([
+      obligationPromise,
+      requeuePromise,
+    ]);
+    const [result] = await db
+      .select({ status: results.status })
+      .from(results)
+      .where(eq(results.id, failed.id));
+    const obligationRows = await db
+      .select({ id: simPrecalcObligations.id })
+      .from(simPrecalcObligations)
+      .where(
+        and(
+          eq(simPrecalcObligations.airfoilId, batch!.airfoilId),
+          eq(simPrecalcObligations.revisionId, batch!.presetRevisionId),
+          eq(simPrecalcObligations.aoaDeg, aoa),
+        ),
+      );
+    expect(obligationRows.length === 1 || result.status === "pending").toBe(
+      true,
+    );
+    expect(obligationRows.length === 1 && result.status === "pending").toBe(
+      false,
+    );
+    if (obligationRows.length === 1) {
+      expect(result.status).toBe("failed");
+      expect(requeueOutcome.status).toBe("rejected");
+    } else {
+      expect(result.status).toBe("pending");
+      expect(obligationOutcome).toMatchObject({
+        status: "fulfilled",
+        value: [],
+      });
+    }
+    if (obligationRows.length)
+      await db
+        .delete(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligationRows[0].id));
+    await db.delete(simCampaigns).where(eq(simCampaigns.id, campaign.id));
+  }, 60_000);
 
   it("ingests a JobResult idempotently and registers media", async () => {
     const batch = (await testBatch(500))!;
-    const [a] = await db.select().from(airfoils).where(eq(airfoils.id, batch.airfoilId)).limit(1);
-    const [bc] = await db.select().from(boundaryConditions).where(eq(boundaryConditions.id, batch.bcId)).limit(1);
+    const [a] = await db
+      .select()
+      .from(airfoils)
+      .where(eq(airfoils.id, batch.airfoilId))
+      .limit(1);
+    const [bc] = await db
+      .select()
+      .from(boundaryConditions)
+      .where(eq(boundaryConditions.id, batch.bcId))
+      .limit(1);
     const setup = await ensureSimulationPresetRevision(db, batch.presetId);
     airfoilId = a.id;
     bcId = bc.id;
@@ -371,9 +1233,20 @@ describe("sweeper: gap → claim → ingest", () => {
     const uransAoa = 82.001;
     await db
       .delete(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, batch.presetRevisionId), inArray(results.aoaDeg, [steadyAoa, uransAoa])));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, batch.presetRevisionId),
+          inArray(results.aoaDeg, [steadyAoa, uransAoa]),
+        ),
+      );
 
-    const { request, speed } = buildPolarRequest({ airfoil: a, setup: setup.snapshot, aoaList: [steadyAoa, uransAoa], wave: 1 });
+    const { request, speed } = buildPolarRequest({
+      airfoil: a,
+      setup: setup.snapshot,
+      aoaList: [steadyAoa, uransAoa],
+      wave: 1,
+    });
     expect(speed).toBeCloseTo(bc.speedMps, 8);
     expect(request.resources?.policy).toBe(bc.schedulingPolicy ?? "auto");
     expect(request.solver?.warm_start).toBe(true);
@@ -385,7 +1258,7 @@ describe("sweeper: gap → claim → ingest", () => {
         simulationPresetRevisionId: batch.presetRevisionId,
         referenceChordM: bc.referenceChordM,
         wave: 1,
-        status: "ingesting",
+        status: "running",
         engineJobId: "testjob",
       })
       .returning({ id: simJobs.id });
@@ -402,7 +1275,10 @@ describe("sweeper: gap → claim → ingest", () => {
     });
     const mediaEngine = {
       baseUrl: "http://engine.test",
-      computeFieldExtents: async (_jobId: string, request: { case_slug: string }) => ({
+      computeFieldExtents: async (
+        _jobId: string,
+        request: { case_slug: string },
+      ) => ({
         fields:
           request.case_slug === "c1"
             ? {
@@ -430,39 +1306,36 @@ describe("sweeper: gap → claim → ingest", () => {
         const base = `/jobs/${jobId}/files/evidence/scaled_media/${profile}/v${version}/${request.case_slug}`;
         const fields = request.fields ?? [];
         return {
-          images: fields.map((field) => ({
-            kind: "image" as const,
-            field,
-            role: "instantaneous" as const,
-            path: `${base}/${field}.png`,
-            url: `${base}/${field}.png`,
-            mime_type: "image/png",
-            sha256: `media-${request.case_slug}-${field}-instant-v${version}`,
-            byte_size: 256,
-          })),
+          images: fields.map((field) =>
+            renderedMediaArtifact({
+              jobId,
+              path: `${base}/${field}.png`,
+              field,
+              kind: "image",
+              role: "instantaneous",
+            }),
+          ),
           mean_images: request.unsteady
-            ? fields.map((field) => ({
-                kind: "image" as const,
-                field,
-                role: "mean" as const,
-                path: `${base}/${field}_mean.png`,
-                url: `${base}/${field}_mean.png`,
-                mime_type: "image/png",
-                sha256: `media-${request.case_slug}-${field}-mean-v${version}`,
-                byte_size: 256,
-              }))
+            ? fields.map((field) =>
+                renderedMediaArtifact({
+                  jobId,
+                  path: `${base}/${field}_mean.png`,
+                  field,
+                  kind: "image",
+                  role: "mean",
+                }),
+              )
             : [],
           videos: request.unsteady
-            ? fields.map((field) => ({
-                kind: "video" as const,
-                field,
-                role: "instantaneous" as const,
-                path: `${base}/${field}.mp4`,
-                url: `${base}/${field}.mp4`,
-                mime_type: "video/mp4",
-                sha256: `media-${request.case_slug}-${field}-video-v${version}`,
-                byte_size: 1024,
-              }))
+            ? fields.map((field) =>
+                renderedMediaArtifact({
+                  jobId,
+                  path: `${base}/${field}.mp4`,
+                  field,
+                  kind: "video",
+                  role: "instantaneous",
+                }),
+              )
             : [],
           window_start: null,
           window_end: null,
@@ -493,7 +1366,8 @@ describe("sweeper: gap → claim → ingest", () => {
               converged: true,
               first_order_fallback: false,
               images: {
-                velocity_magnitude: "/jobs/testjob/files/cases/c1/images/velocity_magnitude.png",
+                velocity_magnitude:
+                  "/jobs/testjob/files/cases/c1/images/velocity_magnitude.png",
                 pressure: "/jobs/testjob/files/cases/c1/images/pressure.png",
               },
               evidence_artifacts: [manifestArtifact("c1")],
@@ -508,9 +1382,12 @@ describe("sweeper: gap → claim → ingest", () => {
               cl_std: 0.08,
               cd_std: 0.02,
               unsteady: true,
-              converged: false,
+              converged: true,
               first_order_fallback: false,
-              images: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude.png" },
+              images: {
+                velocity_magnitude:
+                  "/jobs/testjob/files/cases/c2/images/velocity_magnitude.png",
+              },
               evidence_artifacts: [
                 manifestArtifact("c2"),
                 // Frame-track contract: per-frame PNG shipped as an evidence
@@ -529,7 +1406,9 @@ describe("sweeper: gap → claim → ingest", () => {
               ],
               // Engine non-fatal quality warnings (0030): ingest must persist
               // them verbatim on the results row AND the attempt evidence row.
-              quality_warnings: ["URANS window shorter than 3 shedding periods"],
+              quality_warnings: [
+                "URANS window shorter than 3 shedding periods",
+              ],
               // Frame-track contract payload (0032): must land VERBATIM on
               // results.frame_track.
               frame_track: {
@@ -548,8 +1427,14 @@ describe("sweeper: gap → claim → ingest", () => {
                 image_pattern: "frames/{field}/f{i04}.png",
               },
               strouhal: 0.21,
-              mean_images: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude_mean.png" },
-              video: { velocity_magnitude: "/jobs/testjob/files/cases/c2/images/velocity_magnitude.mp4" },
+              mean_images: {
+                velocity_magnitude:
+                  "/jobs/testjob/files/cases/c2/images/velocity_magnitude_mean.png",
+              },
+              video: {
+                velocity_magnitude:
+                  "/jobs/testjob/files/cases/c2/images/velocity_magnitude.mp4",
+              },
               force_history: {
                 t: [0, 0.1, 0.2, 0.3],
                 cl: [1.1, 1.3, 1.2, 1.25],
@@ -584,8 +1469,10 @@ describe("sweeper: gap → claim → ingest", () => {
       engineJobId: "testjob",
       simJobId: job.id,
       airfoilId: a.id,
-      speedMap: [{ speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId }],
-      result,
+      speedMap: [
+        { speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId },
+      ],
+      result: withExactManifestEvidence(result),
     });
     expect(r1.points).toBe(2);
     // Engine-shipped media register at ingest (steady: 2 images; URANS: 1
@@ -596,34 +1483,67 @@ describe("sweeper: gap → claim → ingest", () => {
     const rows = await db
       .select()
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, batch.presetRevisionId), inArray(results.aoaDeg, [steadyAoa, uransAoa])));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, batch.presetRevisionId),
+          inArray(results.aoaDeg, [steadyAoa, uransAoa]),
+        ),
+      );
     rows.forEach((r) => cleanupResultIds.add(r.id));
     expect(rows.length).toBe(2);
-    expect(rows.every((r) => r.source === "solved" && r.status === "done")).toBe(true);
+    expect(
+      rows.every((r) => r.source === "solved" && r.status === "done"),
+    ).toBe(true);
     expect(rows.find((r) => r.aoaDeg === uransAoa)?.regime).toBe("urans");
     expect(rows.find((r) => r.aoaDeg === uransAoa)?.stalled).toBe(true);
     expect(rows.find((r) => r.aoaDeg === steadyAoa)?.regime).toBe("rans");
     const attempts = await db
       .select()
       .from(resultAttempts)
-      .where(and(eq(resultAttempts.simJobId, job.id), inArray(resultAttempts.aoaDeg, [steadyAoa, uransAoa])));
+      .where(
+        and(
+          eq(resultAttempts.simJobId, job.id),
+          inArray(resultAttempts.aoaDeg, [steadyAoa, uransAoa]),
+        ),
+      );
     expect(attempts.length).toBe(3);
     expect(attempts.filter((a) => a.validForPolar).length).toBe(2);
-    expect(attempts.some((a) => a.regime === "rans" && a.validForPolar === false)).toBe(true);
+    expect(
+      attempts.some((a) => a.regime === "rans" && a.validForPolar === false),
+    ).toBe(true);
     // Quality warnings (0030) persisted verbatim on both evidence layers; the
     // steady point shipped none → honest NULL, not [].
-    expect(rows.find((r) => r.aoaDeg === uransAoa)?.qualityWarnings).toEqual(["URANS window shorter than 3 shedding periods"]);
-    expect(rows.find((r) => r.aoaDeg === steadyAoa)?.qualityWarnings).toBeNull();
-    const uransAttempt = attempts.find((a) => a.regime === "urans" && a.aoaDeg === uransAoa);
-    expect(uransAttempt?.qualityWarnings).toEqual(["URANS window shorter than 3 shedding periods"]);
+    expect(rows.find((r) => r.aoaDeg === uransAoa)?.qualityWarnings).toEqual([
+      "URANS window shorter than 3 shedding periods",
+    ]);
+    expect(
+      rows.find((r) => r.aoaDeg === steadyAoa)?.qualityWarnings,
+    ).toBeNull();
+    const uransAttempt = attempts.find(
+      (a) => a.regime === "urans" && a.aoaDeg === uransAoa,
+    );
+    expect(uransAttempt?.qualityWarnings).toEqual([
+      "URANS window shorter than 3 shedding periods",
+    ]);
 
     const r0 = rows.find((r) => r.aoaDeg === steadyAoa)!;
-    const media = await db.select().from(resultMedia).where(eq(resultMedia.resultId, r0.id));
+    const media = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, r0.id));
     expect(media.length).toBe(2);
-    expect(media.every((mm) => mm.storageKey.startsWith("jobs/testjob/"))).toBe(true);
+    expect(media.every((mm) => mm.storageKey.startsWith("jobs/testjob/"))).toBe(
+      true,
+    );
     expect(media.every((mm) => mm.colorScaleVersion === 1)).toBe(true);
-    expect(media.find((mm) => mm.field === "velocity_magnitude")?.scaleVmax).toBeCloseTo(55, 8);
-    expect(media.find((mm) => mm.field === "pressure")?.scaleVmin).toBeCloseTo(-4, 8);
+    expect(
+      media.find((mm) => mm.field === "velocity_magnitude")?.scaleVmax,
+    ).toBeCloseTo(55, 8);
+    expect(media.find((mm) => mm.field === "pressure")?.scaleVmin).toBeCloseTo(
+      -4,
+      8,
+    );
 
     // URANS point: Strouhal + animation video + time-averaged image + force history
     const r16 = rows.find((r) => r.aoaDeg === uransAoa)!;
@@ -642,30 +1562,72 @@ describe("sweeper: gap → claim → ingest", () => {
     const frameEvidence = await db
       .select()
       .from(solverEvidenceArtifacts)
-      .where(and(eq(solverEvidenceArtifacts.resultId, r16.id), eq(solverEvidenceArtifacts.kind, "frame_image")));
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, r16.id),
+          eq(solverEvidenceArtifacts.kind, "frame_image"),
+        ),
+      );
     expect(frameEvidence).toHaveLength(1);
     expect(frameEvidence[0].field).toBe("vorticity");
-    expect(frameEvidence[0].storageKey).toBe("jobs/testjob/cases/c2/frames/vorticity/f0000.png");
+    expect(frameEvidence[0].storageKey).toBe(
+      "jobs/testjob/cases/c2/frames/vorticity/f0000.png",
+    );
     expect(frameEvidence[0].metadata).toMatchObject({ frameIndex: 0 });
-    const m16 = await db.select().from(resultMedia).where(eq(resultMedia.resultId, r16.id));
-    expect(m16.some((mm) => mm.kind === "video" && mm.role === "instantaneous")).toBe(true);
-    expect(m16.some((mm) => mm.kind === "image" && mm.role === "mean")).toBe(true);
-    expect(m16.every((mm) => mm.field === "velocity_magnitude" && mm.scaleVmax === 55)).toBe(true);
-    const fh = await db.select().from(forceHistory).where(eq(forceHistory.resultId, r16.id));
+    const m16 = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, r16.id));
+    expect(
+      m16.some((mm) => mm.kind === "video" && mm.role === "instantaneous"),
+    ).toBe(true);
+    expect(m16.some((mm) => mm.kind === "image" && mm.role === "mean")).toBe(
+      true,
+    );
+    expect(
+      m16.every(
+        (mm) => mm.field === "velocity_magnitude" && mm.scaleVmax === 55,
+      ),
+    ).toBe(true);
+    const fh = await db
+      .select()
+      .from(forceHistory)
+      .where(eq(forceHistory.resultId, r16.id));
     expect(fh.length).toBe(1);
     expect(fh[0].cl.length).toBe(4);
     expect(fh[0].strouhal).toBeCloseTo(0.21, 5);
     const extents = await db
       .select()
       .from(resultFieldExtents)
-      .where(and(eq(resultFieldExtents.airfoilId, a.id), eq(resultFieldExtents.simulationPresetRevisionId, batch.presetRevisionId)));
+      .where(
+        and(
+          eq(resultFieldExtents.airfoilId, a.id),
+          eq(
+            resultFieldExtents.simulationPresetRevisionId,
+            batch.presetRevisionId,
+          ),
+        ),
+      );
     expect(extents.length).toBeGreaterThanOrEqual(3);
     const scales = await db
       .select()
       .from(fieldColorScales)
-      .where(and(eq(fieldColorScales.airfoilId, a.id), eq(fieldColorScales.simulationPresetRevisionId, batch.presetRevisionId), eq(fieldColorScales.active, true)));
-    expect(scales.find((scale) => scale.field === "velocity_magnitude")?.vmax).toBeCloseTo(55, 8);
-    expect(scales.find((scale) => scale.field === "pressure")?.vmin).toBeCloseTo(-4, 8);
+      .where(
+        and(
+          eq(fieldColorScales.airfoilId, a.id),
+          eq(
+            fieldColorScales.simulationPresetRevisionId,
+            batch.presetRevisionId,
+          ),
+          eq(fieldColorScales.active, true),
+        ),
+      );
+    expect(
+      scales.find((scale) => scale.field === "velocity_magnitude")?.vmax,
+    ).toBeCloseTo(55, 8);
+    expect(
+      scales.find((scale) => scale.field === "pressure")?.vmin,
+    ).toBeCloseTo(-4, 8);
 
     // idempotent: re-ingest produces no duplicates
     await ingestResult({
@@ -674,20 +1636,36 @@ describe("sweeper: gap → claim → ingest", () => {
       engineJobId: "testjob",
       simJobId: job.id,
       airfoilId: a.id,
-      speedMap: [{ speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId }],
-      result,
+      speedMap: [
+        { speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId },
+      ],
+      result: withExactManifestEvidence(result),
     });
     const rowsAfter = await db
       .select()
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, batch.presetRevisionId), inArray(results.aoaDeg, [steadyAoa, uransAoa])));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, batch.presetRevisionId),
+          inArray(results.aoaDeg, [steadyAoa, uransAoa]),
+        ),
+      );
     expect(rowsAfter.length).toBe(2);
-    const mediaAfter = await db.select().from(resultMedia).where(eq(resultMedia.resultId, r0.id));
+    const mediaAfter = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, r0.id));
     expect(mediaAfter.length).toBe(2);
     const attemptsAfter = await db
       .select()
       .from(resultAttempts)
-      .where(and(eq(resultAttempts.simJobId, job.id), inArray(resultAttempts.aoaDeg, [steadyAoa, uransAoa])));
+      .where(
+        and(
+          eq(resultAttempts.simJobId, job.id),
+          inArray(resultAttempts.aoaDeg, [steadyAoa, uransAoa]),
+        ),
+      );
     expect(attemptsAfter.length).toBe(3);
   }, 60000);
 
@@ -698,7 +1676,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("registers engine-shipped URANS media even when the scaled-render chain fails", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 83.001;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -707,7 +1693,7 @@ describe("sweeper: gap → claim → ingest", () => {
         simulationPresetRevisionId: presetRevisionId,
         referenceChordM: bc.referenceChordM,
         wave: 2,
-        status: "ingesting",
+        status: "running",
         engineJobId: "shipped-media-job",
       })
       .returning({ id: simJobs.id });
@@ -775,9 +1761,18 @@ describe("sweeper: gap → claim → ingest", () => {
                   metadata: { evidenceBase: "/tmp/evidence/cs1" },
                 },
               ],
-              images: { velocity_magnitude: "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude.png" },
-              mean_images: { velocity_magnitude: "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude_mean.png" },
-              video: { velocity_magnitude: "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude.mp4" },
+              images: {
+                velocity_magnitude:
+                  "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude.png",
+              },
+              mean_images: {
+                velocity_magnitude:
+                  "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude_mean.png",
+              },
+              video: {
+                velocity_magnitude:
+                  "/jobs/shipped-media-job/files/cases/cs1/images/velocity_magnitude.mp4",
+              },
               force_history: {
                 t: [0, 0.1, 0.2, 0.3],
                 cl: [1.0, 1.1, 1.05, 1.06],
@@ -799,7 +1794,7 @@ describe("sweeper: gap → claim → ingest", () => {
       simJobId: job.id,
       airfoilId: a.id,
       speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
-      result,
+      result: withExactManifestEvidence(result),
     });
     expect(r.points).toBe(1);
     expect(r.media).toBe(3); // shipped image + mean image + video, no scaled renders
@@ -807,19 +1802,37 @@ describe("sweeper: gap → claim → ingest", () => {
     const [row] = await db
       .select()
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     cleanupResultIds.add(row.id);
-    const media = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
+    const media = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, row.id));
     expect(media.length).toBe(3);
-    const video = media.find((m) => m.kind === "video" && m.role === "instantaneous");
-    expect(video?.storageKey).toBe("jobs/shipped-media-job/cases/cs1/images/velocity_magnitude.mp4");
+    const video = media.find(
+      (m) => m.kind === "video" && m.role === "instantaneous",
+    );
+    expect(video?.storageKey).toBe(
+      "jobs/shipped-media-job/cases/cs1/images/velocity_magnitude.mp4",
+    );
     expect(video?.mimeType).toBe("video/mp4");
-    expect(media.some((m) => m.kind === "image" && m.role === "mean")).toBe(true);
+    expect(media.some((m) => m.kind === "image" && m.role === "mean")).toBe(
+      true,
+    );
 
     // End-to-end D3 unlock: the ingest-shaped URANS row (stalled=true because
     // unsteady, converged, with force history + video) classifies ACCEPTED.
     await refreshPolarCacheForRevision(db, a.id, presetRevisionId);
-    const [rc] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, row.id));
+    const [rc] = await db
+      .select()
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultId, row.id));
     expect(rc?.state).toBe("accepted");
 
     // Idempotent re-ingest: still exactly 3 media rows.
@@ -830,54 +1843,37 @@ describe("sweeper: gap → claim → ingest", () => {
       simJobId: job.id,
       airfoilId: a.id,
       speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
-      result,
+      result: withExactManifestEvidence(result),
     });
-    const mediaAfter = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
+    const mediaAfter = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, row.id));
     expect(mediaAfter.length).toBe(3);
 
-    // REPLACE GUARD interplay (gate incident 2026-07-07): while the cell's
-    // stored verdict is ACCEPTED, a re-solve shipping NO video pre-classifies
-    // rejected (missing-urans-video) and must NOT clobber the accepted
-    // evidence — coefficients AND the coherent wave-1 video row stay.
+    // The same engine attempt identity is immutable. A changed replay is not
+    // a correction generation and must fail before it can remove media from
+    // the accepted attempt (new solves use a new sim/engine job identity;
+    // their replacement precedence is covered by replace-guard.test.ts).
     const noVideoResult: JobResult = JSON.parse(JSON.stringify(result));
     noVideoResult.polars[0].points[0].video = {};
-    await ingestResult({
-      db,
-      engine: failingEngine,
-      engineJobId: "shipped-media-job",
-      simJobId: job.id,
-      airfoilId: a.id,
-      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
-      result: noVideoResult,
-    });
-    const mediaGuarded = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
-    expect(mediaGuarded.some((m) => m.kind === "video")).toBe(true); // accepted evidence kept intact
+    await expect(
+      ingestResult({
+        db,
+        engine: failingEngine,
+        engineJobId: "shipped-media-job",
+        simJobId: job.id,
+        airfoilId: a.id,
+        speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+        result: noVideoResult,
+      }),
+    ).rejects.toThrow("result attempt replay changed immutable evidence");
+    const mediaGuarded = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, row.id));
+    expect(mediaGuarded.some((m) => m.kind === "video")).toBe(true);
     expect(mediaGuarded.length).toBe(3);
-
-    // MUST-CATCH (review F3): with no protective verdict on the cell
-    // (classification absent — unjudged/rejected cells replace as always), a
-    // wave-2 re-solve shipping NO video (video:{}) must not leave the wave-1
-    // video row satisfying the classifier's hasVideo gate for the NEW
-    // coefficients — ingest reconciles kind='video' rows to the current
-    // shipment, and the classification honestly drops to rejected
-    // missing-urans-video.
-    await db.delete(resultClassifications).where(eq(resultClassifications.resultId, row.id));
-    await ingestResult({
-      db,
-      engine: failingEngine,
-      engineJobId: "shipped-media-job",
-      simJobId: job.id,
-      airfoilId: a.id,
-      speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
-      result: noVideoResult,
-    });
-    const mediaNoVideo = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
-    expect(mediaNoVideo.some((m) => m.kind === "video")).toBe(false); // stale wave-1 video row is GONE
-    expect(mediaNoVideo.length).toBe(2); // shipped image + mean image survive
-    await refreshPolarCacheForRevision(db, a.id, presetRevisionId);
-    const [rcNoVideo] = await db.select().from(resultClassifications).where(eq(resultClassifications.resultId, row.id));
-    expect(rcNoVideo?.state).toBe("rejected");
-    expect(rcNoVideo?.reasons).toContain("missing-urans-video");
   }, 60000);
 
   // MUST-CATCH (live proof 2026-07-05): "[sweeper] scaled-media render FAILED
@@ -888,9 +1884,21 @@ describe("sweeper: gap → claim → ingest", () => {
   // version row once the engine responds, and (c) stop retrying at
   // MAX_SCALE_RENDER_ATTEMPTS and skip rows a newer version obsoleted.
   it("retries a failed scaled-media render (bounded) and activates the scale on recovery", async () => {
-    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const { bc, presetRevisionId } = await firstAirfoilBc();
+    // Color scales are polar-wide (airfoil + revision + field + profile), so
+    // this retry test owns a separate airfoil instead of depending on scales
+    // left by the earlier ingest test in this file.
+    const a = await createTestAirfoil("scale-retry-airfoil");
     const aoa = 87.001;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -899,11 +1907,30 @@ describe("sweeper: gap → claim → ingest", () => {
         simulationPresetRevisionId: presetRevisionId,
         referenceChordM: bc.referenceChordM,
         wave: 1,
-        status: "ingesting",
+        status: "running",
         engineJobId: "scale-retry-job",
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(job.id);
+
+    const scaleScope = and(
+      eq(fieldColorScales.airfoilId, a.id),
+      eq(fieldColorScales.simulationPresetRevisionId, presetRevisionId),
+      eq(fieldColorScales.field, "velocity_magnitude"),
+    );
+    await db.insert(fieldColorScales).values({
+      airfoilId: a.id,
+      simulationPresetRevisionId: presetRevisionId,
+      field: "velocity_magnitude",
+      renderProfileKey: "default:v1:zoom2",
+      scalePolicy: "sequential_zero",
+      vmin: 0,
+      vmax: 40,
+      evidenceSignature: `${testRunSlug}-scale-retry-baseline`,
+      status: "active",
+      version: 1,
+      active: true,
+    });
 
     // Extents compute fine; every render fetch fails — the exact transient
     // failure shape from the live campaign.
@@ -938,10 +1965,45 @@ describe("sweeper: gap → claim → ingest", () => {
               cd: 0.011,
               cm: -0.02,
               cl_cd: 45,
-              unsteady: false,
+              unsteady: true,
               converged: true,
               first_order_fallback: false,
-              images: { velocity_magnitude: "/jobs/scale-retry-job/files/cases/srt1/images/velocity_magnitude.png" },
+              fidelity: "urans_precalc",
+              frame_track: {
+                period_s: 0.25,
+                periods_retained: 3.5,
+                stationary: true,
+                drift_frac: 0.01,
+                window: { t_start: 1, t_end: 1.875 },
+                stats: {
+                  cl: { mean: 0.5, std: 0.03, min: 0.45, max: 0.55 },
+                  cd: { mean: 0.011, std: 0.001, min: 0.01, max: 0.012 },
+                  cm: { mean: -0.02, std: 0.002, min: -0.023, max: -0.017 },
+                },
+                fields: [],
+                frames: [],
+                image_pattern: "frames/{field}/f{i04}.png",
+              },
+              force_history: {
+                t: [0, 0.25, 0.5, 0.75],
+                cl: [0.48, 0.52, 0.49, 0.51],
+                cd: [0.01, 0.012, 0.011, 0.011],
+                cm: [-0.02, -0.019, -0.021, -0.02],
+                shedding_freq_hz: 4,
+                samples: 240,
+              },
+              images: {
+                velocity_magnitude:
+                  "/jobs/scale-retry-job/files/cases/srt1/images/velocity_magnitude.png",
+              },
+              mean_images: {
+                velocity_magnitude:
+                  "/jobs/scale-retry-job/files/cases/srt1/images/velocity_magnitude_mean.png",
+              },
+              video: {
+                velocity_magnitude:
+                  "/jobs/scale-retry-job/files/cases/srt1/images/velocity_magnitude.mp4",
+              },
               evidence_artifacts: [
                 {
                   kind: "manifest",
@@ -965,20 +2027,43 @@ describe("sweeper: gap → claim → ingest", () => {
       simJobId: job.id,
       airfoilId: a.id,
       speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
-      result,
+      uransFidelity: "precalc",
+      result: withExactManifestEvidence(result),
     });
     const [row] = await db
       .select()
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     cleanupResultIds.add(row.id);
 
+    // Complete engine-shipped URANS media makes the preliminary point
+    // publishable immediately. A transient failure in the optional shared
+    // color-scale render remains a retryable presentation-artifact problem;
+    // it must not demote accepted CFD evidence or create human review work.
+    await refreshPolarCacheForRevision(db, a.id, presetRevisionId);
+    const [sourceAttempt] = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.resultId, row.id),
+          eq(resultAttempts.simJobId, job.id),
+        ),
+      );
+    expect(row.currentResultAttemptId).toBe(sourceAttempt.id);
+    const [beforeScaleRepair] = await db
+      .select()
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultId, row.id));
+    expect(beforeScaleRepair).toMatchObject({ state: "accepted", reasons: [] });
+
     // (a) the failed render lands on the scale row with the attempt recorded.
-    const scaleScope = and(
-      eq(fieldColorScales.airfoilId, a.id),
-      eq(fieldColorScales.simulationPresetRevisionId, presetRevisionId),
-      eq(fieldColorScales.field, "velocity_magnitude"),
-    );
     const failedScales = await db
       .select()
       .from(fieldColorScales)
@@ -990,8 +2075,13 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(failedScale.active).toBe(false);
 
     // Engine still down on the next pass: the attempt advances, row stays failed.
-    await retryFailedScaleRenders(db, renderDownEngine);
-    const [stillFailed] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    await retryFailedScaleRenders(db, renderDownEngine, {
+      scaleIds: [failedScale.id],
+    });
+    const [stillFailed] = await db
+      .select()
+      .from(fieldColorScales)
+      .where(eq(fieldColorScales.id, failedScale.id));
     expect(stillFailed.status).toBe("failed");
     expect(stillFailed.renderAttempts).toBe(2);
 
@@ -999,28 +2089,55 @@ describe("sweeper: gap → claim → ingest", () => {
     // media registers stamped with this scale.
     const healthyEngine = {
       baseUrl: "http://engine.test",
-      computeFieldExtents: (renderDownEngine as unknown as { computeFieldExtents: unknown }).computeFieldExtents,
+      computeFieldExtents: (
+        renderDownEngine as unknown as { computeFieldExtents: unknown }
+      ).computeFieldExtents,
       renderDefaultMedia: async (
         jobId: string,
-        request: { case_slug: string; fields?: string[]; unsteady?: boolean; scale_version?: number; render_profile_key?: string },
+        request: {
+          case_slug: string;
+          fields?: string[];
+          unsteady?: boolean;
+          scale_version?: number;
+          render_profile_key?: string;
+        },
       ) => {
         const version = request.scale_version ?? 1;
         const profile = request.render_profile_key ?? "default:v1:zoom2";
         const base = `/jobs/${jobId}/files/evidence/scaled_media/${profile}/v${version}/${request.case_slug}`;
         const fields = request.fields ?? [];
         return {
-          images: fields.map((field) => ({
-            kind: "image" as const,
-            field,
-            role: "instantaneous" as const,
-            path: `${base}/${field}.png`,
-            url: `${base}/${field}.png`,
-            mime_type: "image/png",
-            sha256: `retry-${request.case_slug}-${field}-v${version}`,
-            byte_size: 256,
-          })),
-          mean_images: [],
-          videos: [],
+          images: fields.map((field) =>
+            renderedMediaArtifact({
+              jobId,
+              path: `${base}/${field}.png`,
+              field,
+              kind: "image",
+              role: "instantaneous",
+            }),
+          ),
+          mean_images: request.unsteady
+            ? fields.map((field) =>
+                renderedMediaArtifact({
+                  jobId,
+                  path: `${base}/${field}_mean.png`,
+                  field,
+                  kind: "image",
+                  role: "mean",
+                }),
+              )
+            : [],
+          videos: request.unsteady
+            ? fields.map((field) =>
+                renderedMediaArtifact({
+                  jobId,
+                  path: `${base}/${field}.mp4`,
+                  field,
+                  kind: "video",
+                  role: "instantaneous",
+                }),
+              )
+            : [],
           window_start: null,
           window_end: null,
           scale_version: version,
@@ -1028,33 +2145,93 @@ describe("sweeper: gap → claim → ingest", () => {
         };
       },
     } as unknown as EngineClient;
-    const recovered = await retryFailedScaleRenders(db, healthyEngine);
-    expect(recovered).toBeGreaterThan(0);
-    const [afterRecover] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    const recovered = await retryFailedScaleRenders(db, healthyEngine, {
+      scaleIds: [failedScale.id],
+    });
+    expect(recovered.mediaCount).toBeGreaterThan(0);
+    const [afterRecover] = await db
+      .select()
+      .from(fieldColorScales)
+      .where(eq(fieldColorScales.id, failedScale.id));
     expect(afterRecover.status).toBe("active");
     expect(afterRecover.active).toBe(true);
     expect(afterRecover.failureReason).toBeNull();
     expect(afterRecover.version).toBe(failedScale.version); // no version churn on retry
-    const activeRows = await db.select().from(fieldColorScales).where(and(scaleScope, eq(fieldColorScales.active, true)));
+    const activeRows = await db
+      .select()
+      .from(fieldColorScales)
+      .where(and(scaleScope, eq(fieldColorScales.active, true)));
     expect(activeRows.length).toBe(1); // the old active scale was deactivated
-    const media = await db.select().from(resultMedia).where(eq(resultMedia.resultId, row.id));
-    expect(media.some((m) => m.colorScaleId === failedScale.id && m.colorScaleVersion === failedScale.version)).toBe(true);
+    const media = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, row.id));
+    expect(
+      media.some(
+        (m) =>
+          m.colorScaleId === failedScale.id &&
+          m.colorScaleVersion === failedScale.version,
+      ),
+    ).toBe(true);
+    expect(
+      media.some((m) => m.kind === "video" && m.role === "instantaneous"),
+    ).toBe(true);
+    const [afterRepair] = await db
+      .select()
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultId, row.id));
+    expect(afterRepair).toMatchObject({ state: "accepted", reasons: [] });
+    const [publishedRepair] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, row.id));
+    expect(publishedRepair.currentResultAttemptId).toBe(sourceAttempt.id);
+    let verifyItems = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultId, row.id));
+    expect(verifyItems).toHaveLength(1);
+    expect(verifyItems[0].state).toBe("pending");
+
+    // Re-running the repair pass is idempotent: contract-4 owns exactly one
+    // open verification item per physical cell.
+    await retryFailedScaleRenders(db, healthyEngine, {
+      scaleIds: [failedScale.id],
+    });
+    verifyItems = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultId, row.id));
+    expect(verifyItems).toHaveLength(1);
 
     // (c) bounded: a row at the attempt cap is never re-attempted…
     await db
       .update(fieldColorScales)
-      .set({ status: "failed", active: false, renderAttempts: 3, failureReason: "fetch failed" })
+      .set({
+        status: "failed",
+        active: false,
+        renderAttempts: 3,
+        failureReason: "fetch failed",
+      })
       .where(eq(fieldColorScales.id, failedScale.id));
     const callsAtCap = renderCalls;
-    await retryFailedScaleRenders(db, renderDownEngine);
+    await retryFailedScaleRenders(db, renderDownEngine, {
+      scaleIds: [failedScale.id],
+    });
     expect(renderCalls).toBe(callsAtCap);
-    const [exhausted] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    const [exhausted] = await db
+      .select()
+      .from(fieldColorScales)
+      .where(eq(fieldColorScales.id, failedScale.id));
     expect(exhausted.status).toBe("failed");
     expect(exhausted.renderAttempts).toBe(3);
 
     // …and a failed row obsoleted by a NEWER version is dead history, skipped
     // even with attempts remaining.
-    await db.update(fieldColorScales).set({ renderAttempts: 0 }).where(eq(fieldColorScales.id, failedScale.id));
+    await db
+      .update(fieldColorScales)
+      .set({ renderAttempts: 0 })
+      .where(eq(fieldColorScales.id, failedScale.id));
     await db.insert(fieldColorScales).values({
       airfoilId: a.id,
       simulationPresetRevisionId: presetRevisionId,
@@ -1068,23 +2245,20 @@ describe("sweeper: gap → claim → ingest", () => {
       version: failedScale.version + 1,
       active: true,
     });
-    await retryFailedScaleRenders(db, renderDownEngine);
+    await retryFailedScaleRenders(db, renderDownEngine, {
+      scaleIds: [failedScale.id],
+    });
     expect(renderCalls).toBe(callsAtCap); // still zero re-attempts
-    const [obsolete] = await db.select().from(fieldColorScales).where(eq(fieldColorScales.id, failedScale.id));
+    const [obsolete] = await db
+      .select()
+      .from(fieldColorScales)
+      .where(eq(fieldColorScales.id, failedScale.id));
     expect(obsolete.status).toBe("failed");
 
-    // Restore the shared-revision evidence this test added: the whole-polar
-    // promotion test later in this file decides over REVISION-WIDE
-    // classifications, so an extra classifiable result at this scope would
-    // shift its heuristics. Deleting the result cascades its extents; the
-    // synthetic scale versions go explicitly and the pre-test active scale
-    // comes back.
+    // Remove this test-owned polar before later revision-wide heuristics run.
     await db.delete(results).where(eq(results.id, row.id));
     cleanupResultIds.delete(row.id);
-    await db
-      .delete(fieldColorScales)
-      .where(and(scaleScope, inArray(fieldColorScales.version, [failedScale.version, failedScale.version + 1])));
-    await db.update(fieldColorScales).set({ active: true }).where(and(scaleScope, eq(fieldColorScales.status, "active")));
+    await db.delete(fieldColorScales).where(scaleScope);
   }, 60000);
 
   // MUST-CATCH (prod 2026-07-06 heartbeat-under-load regression): with 7 jobs
@@ -1098,7 +2272,13 @@ describe("sweeper: gap → claim → ingest", () => {
     const aoas = [84.001, 85.001, 86.001];
     await db
       .delete(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -1107,7 +2287,7 @@ describe("sweeper: gap → claim → ingest", () => {
         simulationPresetRevisionId: presetRevisionId,
         referenceChordM: bc.referenceChordM,
         wave: 1,
-        status: "ingesting",
+        status: "running",
         engineJobId: "heartbeat-job",
       })
       .returning({ id: simJobs.id });
@@ -1167,7 +2347,10 @@ describe("sweeper: gap → claim → ingest", () => {
     await db
       .insert(sweeperState)
       .values({ id: 1, heartbeatAt: before })
-      .onConflictDoUpdate({ target: sweeperState.id, set: { heartbeatAt: before } });
+      .onConflictDoUpdate({
+        target: sweeperState.id,
+        set: { heartbeatAt: before },
+      });
     const observed: number[] = [];
     const r = await ingestResult({
       db,
@@ -1176,7 +2359,7 @@ describe("sweeper: gap → claim → ingest", () => {
       simJobId: job.id,
       airfoilId: a.id,
       speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
-      result,
+      result: withExactManifestEvidence(result),
       heartbeat: async () => {
         await touchHeartbeat(db);
         const [row] = await db
@@ -1191,7 +2374,13 @@ describe("sweeper: gap → claim → ingest", () => {
     const rows = await db
       .select({ id: results.id })
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
     rows.forEach((row) => cleanupResultIds.add(row.id));
     // At least one touch per point — the coverage that keeps a long ingest
     // from starving the heartbeat.
@@ -1211,7 +2400,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("retries only the rejected angles of an unreliable RANS sweep (no whole-polar escalation)", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoas = [130.01, 131.01, 132.01, 133.01, 134.01, 135.01];
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
     const [parent] = await db
       .insert(simJobs)
       .values({
@@ -1224,14 +2421,32 @@ describe("sweeper: gap → claim → ingest", () => {
         engineJobId: "unreliable-rans-parent",
         totalCases: aoas.length,
         completedCases: aoas.length,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }], aoas },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+          aoas,
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(parent.id);
     for (const aoa of aoas) {
       const [row] = await db
         .insert(results)
-        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: parent.id })
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "queued",
+          source: "queued",
+          simJobId: parent.id,
+        })
         .returning({ id: results.id });
       cleanupResultIds.add(row.id);
     }
@@ -1267,18 +2482,28 @@ describe("sweeper: gap → claim → ingest", () => {
         total_cases: aoas.length,
         completed_cases: aoas.length,
       }),
-      getResult: async () => unreliableResult,
+      getResult: async () => withExactManifestEvidence(unreliableResult),
       submitPolar: async (request: unknown): Promise<JobStatus> => {
         submittedRequest = request;
         // Echo the REQUEST's case count (the engine's behavior) — a hardcoded
         // count would mask a wrongly-scoped retry via the post-submit stamp.
-        const angles = (request as { aoa?: { angles?: number[] } }).aoa?.angles ?? [];
-        return { job_id: "targeted-urans-child", state: "pending", total_cases: angles.length, completed_cases: 0 };
+        const angles =
+          (request as { aoa?: { angles?: number[] } }).aoa?.angles ?? [];
+        return {
+          job_id: "targeted-urans-child",
+          state: "pending",
+          total_cases: angles.length,
+          completed_cases: 0,
+        };
       },
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
-    await reconcile(db, retryEngine, { jobIds: [parent.id], skipFailedRecovery: true });
+    await reconcile(db, retryEngine, {
+      jobIds: [parent.id],
+      skipFailedRecovery: true,
+    });
 
     const [child] = await db
       .select()
@@ -1291,32 +2516,60 @@ describe("sweeper: gap → claim → ingest", () => {
     const rejectedAoas = [130.01, 132.01, 133.01, 135.01];
     expect(child.totalCases).toBe(rejectedAoas.length);
     expect(child.jobKind).toBe("targeted");
-    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe("invalid-rans-points");
+    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe(
+      "invalid-rans-points",
+    );
     // Fidelity ladder contract 1: automatic wave-2 retries run at PRECALC.
-    expect((child.requestPayload as { uransFidelity?: string })?.uransFidelity).toBe("precalc");
-    expect((submittedRequest as { solver?: { force_transient?: boolean; urans_fidelity?: string } })?.solver?.force_transient).toBe(true);
-    expect((submittedRequest as { solver?: { urans_fidelity?: string } })?.solver?.urans_fidelity).toBe("precalc");
-    expect((submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles).toEqual(rejectedAoas);
+    expect(
+      (child.requestPayload as { uransFidelity?: string })?.uransFidelity,
+    ).toBe("precalc");
+    expect(
+      (
+        submittedRequest as {
+          solver?: { force_transient?: boolean; urans_fidelity?: string };
+        }
+      )?.solver?.force_transient,
+    ).toBe(true);
+    expect(
+      (submittedRequest as { solver?: { urans_fidelity?: string } })?.solver
+        ?.urans_fidelity,
+    ).toBe("precalc");
+    expect(
+      (submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles,
+    ).toEqual(rejectedAoas);
+    await expectBackgroundPrecalcSubmission(child, rejectedAoas);
 
-    const claimed = await db
-      .select({ aoaDeg: results.aoaDeg, status: results.status, simJobId: results.simJobId })
+    const retained = await db
+      .select({
+        aoaDeg: results.aoaDeg,
+        status: results.status,
+        simJobId: results.simJobId,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
-    // Rejected angles re-queue under the child; ACCEPTED evidence is never
-    // re-claimed (the old whole-polar path flipped all 6 rows).
-    for (const row of claimed) {
-      if (rejectedAoas.includes(row.aoaDeg)) {
-        expect(row.status).toBe("queued");
-        expect(row.simJobId).toBe(child.id);
-      } else {
-        expect(row.status).toBe("done");
-        expect(row.simJobId).toBe(parent.id);
-      }
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
+    // Accepted RANS generations remain selected. Rejected generations stay
+    // as immutable attempts and their canonical scheduling shells fail
+    // closed; only the exact obligations run under the preliminary child.
+    const rejectedSet = new Set(rejectedAoas);
+    for (const row of retained) {
+      expect(row.status).toBe(rejectedSet.has(row.aoaDeg) ? "failed" : "done");
+      expect(row.simJobId).toBe(parent.id);
     }
     const attempts = await db
       .select()
       .from(resultAttempts)
-      .where(and(eq(resultAttempts.simJobId, parent.id), inArray(resultAttempts.aoaDeg, aoas)));
+      .where(
+        and(
+          eq(resultAttempts.simJobId, parent.id),
+          inArray(resultAttempts.aoaDeg, aoas),
+        ),
+      );
     expect(attempts.length).toBe(aoas.length);
     expect(attempts.filter((a) => a.validForPolar).length).toBe(2);
     // 120 s: the FIRST reconcile() in the process pays the one-shot lane
@@ -1330,7 +2583,15 @@ describe("sweeper: gap → claim → ingest", () => {
     const validAoas = [0.011, 1.011, 2.011, 3.011, 4.011, 5.011];
     const rejectedAoas = [18.011, 19.011];
     const aoas = [...validAoas, ...rejectedAoas];
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
     const [parent] = await db
       .insert(simJobs)
       .values({
@@ -1343,14 +2604,32 @@ describe("sweeper: gap → claim → ingest", () => {
         engineJobId: "attempt-only-rans-parent",
         totalCases: aoas.length,
         completedCases: aoas.length,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }], aoas },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+          aoas,
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(parent.id);
     for (const aoa of aoas) {
       const [row] = await db
         .insert(results)
-        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: parent.id })
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "queued",
+          source: "queued",
+          simJobId: parent.id,
+        })
         .returning({ id: results.id });
       cleanupResultIds.add(row.id);
     }
@@ -1397,15 +2676,24 @@ describe("sweeper: gap → claim → ingest", () => {
         total_cases: aoas.length,
         completed_cases: aoas.length,
       }),
-      getResult: async () => completedResult,
+      getResult: async () => withExactManifestEvidence(completedResult),
       submitPolar: async (request: unknown): Promise<JobStatus> => {
         submittedRequest = request;
-        return { job_id: "attempt-only-urans-child", state: "pending", total_cases: rejectedAoas.length, completed_cases: 0 };
+        return {
+          job_id: "attempt-only-urans-child",
+          state: "pending",
+          total_cases: rejectedAoas.length,
+          completed_cases: 0,
+        };
       },
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
-    await reconcile(db, retryEngine, { jobIds: [parent.id], skipFailedRecovery: true });
+    await reconcile(db, retryEngine, {
+      jobIds: [parent.id],
+      skipFailedRecovery: true,
+    });
 
     const [child] = await db
       .select()
@@ -1415,22 +2703,58 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(child).toBeTruthy();
     cleanupJobIds.add(child.id);
     expect(child.totalCases).toBe(rejectedAoas.length);
-    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe("invalid-rans-points");
-    expect((submittedRequest as { solver?: { force_transient?: boolean }; aoa?: { angles?: number[] } })?.solver?.force_transient).toBe(true);
-    expect((submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles).toEqual(rejectedAoas);
+    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe(
+      "invalid-rans-points",
+    );
+    expect(
+      (
+        submittedRequest as {
+          solver?: { force_transient?: boolean };
+          aoa?: { angles?: number[] };
+        }
+      )?.solver?.force_transient,
+    ).toBe(true);
+    expect(
+      (submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles,
+    ).toEqual(rejectedAoas);
+    await expectBackgroundPrecalcSubmission(child, rejectedAoas);
 
-    const claimed = await db
-      .select({ aoaDeg: results.aoaDeg, status: results.status, simJobId: results.simJobId })
+    const retained = await db
+      .select({
+        aoaDeg: results.aoaDeg,
+        status: results.status,
+        simJobId: results.simJobId,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, rejectedAoas)));
-    expect(claimed.every((r) => r.status === "queued" && r.simJobId === child.id)).toBe(true);
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, rejectedAoas),
+        ),
+      );
+    expect(
+      retained.every(
+        (row) => row.status === "failed" && row.simJobId === parent.id,
+      ),
+    ).toBe(true);
     const attempts = await db
-      .select({ id: resultAttempts.id, validForPolar: resultAttempts.validForPolar })
+      .select({
+        id: resultAttempts.id,
+        validForPolar: resultAttempts.validForPolar,
+      })
       .from(resultAttempts)
-      .where(and(eq(resultAttempts.simJobId, parent.id), inArray(resultAttempts.aoaDeg, aoas)));
+      .where(
+        and(
+          eq(resultAttempts.simJobId, parent.id),
+          inArray(resultAttempts.aoaDeg, aoas),
+        ),
+      );
     attempts.forEach((attempt) => cleanupAttemptIds.add(attempt.id));
     expect(attempts.length).toBe(aoas.length);
-    expect(attempts.filter((attempt) => !attempt.validForPolar).length).toBe(rejectedAoas.length);
+    expect(attempts.filter((attempt) => !attempt.validForPolar).length).toBe(
+      rejectedAoas.length,
+    );
   }, 60000);
 
   it("marks suspicious post-stall RANS rows needs_urans and keeps them visible until URANS arrives", async () => {
@@ -1438,7 +2762,15 @@ describe("sweeper: gap → claim → ingest", () => {
     const ransAoas = Array.from({ length: 19 }, (_, i) => i + 0.021);
     const rejectedAoas = [19.021, 20.021];
     const allAoas = [...ransAoas, ...rejectedAoas];
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, allAoas)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, allAoas),
+        ),
+      );
     const [parent] = await db
       .insert(simJobs)
       .values({
@@ -1451,42 +2783,58 @@ describe("sweeper: gap → claim → ingest", () => {
         engineJobId: "ag24-like-rans-parent",
         totalCases: allAoas.length,
         completedCases: allAoas.length,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }], aoas: allAoas },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+          aoas: allAoas,
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(parent.id);
     for (const aoa of allAoas) {
       const [row] = await db
         .insert(results)
-        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: parent.id })
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "queued",
+          source: "queued",
+          simJobId: parent.id,
+        })
         .returning({ id: results.id });
       cleanupResultIds.add(row.id);
     }
 
     let submittedRequest: unknown = null;
-    const clCdByAoa = new Map(
-      [
-        [0.021, [0.3, 0.0102]],
-        [1.021, [0.41, 0.0104]],
-        [2.021, [0.51, 0.011]],
-        [3.021, [0.62, 0.012]],
-        [4.021, [0.73, 0.014]],
-        [5.021, [0.84, 0.017]],
-        [6.021, [0.95, 0.021]],
-        [7.021, [1.04, 0.027]],
-        [8.021, [1.12, 0.034]],
-        [9.021, [1.2, 0.043]],
-        [10.021, [1.27, 0.054]],
-        [11.021, [1.32, 0.066]],
-        [12.021, [1.34, 0.078]],
-        [13.021, [1.32, 0.092]],
-        [14.021, [1.19, 0.08]],
-        [15.021, [0.9, 0.145]],
-        [16.021, [0.82, 0.182]],
-        [17.021, [0.79, 0.21]],
-        [18.021, [0.78, 0.239]],
-      ] as [number, [number, number]][],
-    );
+    const clCdByAoa = new Map([
+      [0.021, [0.3, 0.0102]],
+      [1.021, [0.41, 0.0104]],
+      [2.021, [0.51, 0.011]],
+      [3.021, [0.62, 0.012]],
+      [4.021, [0.73, 0.014]],
+      [5.021, [0.84, 0.017]],
+      [6.021, [0.95, 0.021]],
+      [7.021, [1.04, 0.027]],
+      [8.021, [1.12, 0.034]],
+      [9.021, [1.2, 0.043]],
+      [10.021, [1.27, 0.054]],
+      [11.021, [1.32, 0.066]],
+      [12.021, [1.34, 0.078]],
+      [13.021, [1.32, 0.092]],
+      [14.021, [1.19, 0.08]],
+      [15.021, [0.9, 0.145]],
+      [16.021, [0.82, 0.182]],
+      [17.021, [0.79, 0.21]],
+      [18.021, [0.78, 0.239]],
+    ] as [number, [number, number]][]);
     const completedResult: JobResult = {
       job_id: "ag24-like-rans-parent",
       state: "completed",
@@ -1532,15 +2880,24 @@ describe("sweeper: gap → claim → ingest", () => {
         total_cases: allAoas.length,
         completed_cases: allAoas.length,
       }),
-      getResult: async () => completedResult,
+      getResult: async () => withExactManifestEvidence(completedResult),
       submitPolar: async (request: unknown): Promise<JobStatus> => {
         submittedRequest = request;
-        return { job_id: "ag24-like-urans-child", state: "pending", total_cases: 7, completed_cases: 0 };
+        return {
+          job_id: "ag24-like-urans-child",
+          state: "pending",
+          total_cases: 7,
+          completed_cases: 0,
+        };
       },
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
-    await reconcile(db, retryEngine, { jobIds: [parent.id], skipFailedRecovery: true });
+    await reconcile(db, retryEngine, {
+      jobIds: [parent.id],
+      skipFailedRecovery: true,
+    });
 
     const [child] = await db
       .select()
@@ -1550,38 +2907,101 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(child).toBeTruthy();
     cleanupJobIds.add(child.id);
     expect(child.totalCases).toBe(7);
-    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe("needs-urans-confirmation");
-    expect((submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles).toEqual([14.021, 15.021, 16.021, 17.021, 18.021, 19.021, 20.021]);
+    expect((child.requestPayload as { retryMode?: string })?.retryMode).toBe(
+      "needs-urans-confirmation",
+    );
+    expect(
+      (submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles,
+    ).toEqual([14.021, 15.021, 16.021, 17.021, 18.021, 19.021, 20.021]);
+    await expectBackgroundPrecalcSubmission(
+      child,
+      [14.021, 15.021, 16.021, 17.021, 18.021, 19.021, 20.021],
+    );
 
     const classified = await db
-      .select({ aoaDeg: resultClassifications.aoaDeg, state: resultClassifications.state })
+      .select({
+        aoaDeg: resultClassifications.aoaDeg,
+        state: resultClassifications.state,
+      })
       .from(resultClassifications)
       .where(
         and(
-          eq(resultClassifications.simulationPresetRevisionId, presetRevisionId),
+          eq(
+            resultClassifications.simulationPresetRevisionId,
+            presetRevisionId,
+          ),
           isNotNull(resultClassifications.resultId),
-          inArray(resultClassifications.aoaDeg, [14.021, 15.021, 16.021, 17.021, 18.021]),
+          inArray(
+            resultClassifications.aoaDeg,
+            [14.021, 15.021, 16.021, 17.021, 18.021],
+          ),
         ),
       );
-    expect(classified.map((row) => row.state).sort()).toEqual(["needs_urans", "needs_urans", "needs_urans", "needs_urans", "needs_urans"]);
+    expect(classified.map((row) => row.state).sort()).toEqual([
+      "needs_urans",
+      "needs_urans",
+      "needs_urans",
+      "needs_urans",
+      "needs_urans",
+    ]);
 
     const provisionalRows = await db
-      .select({ aoaDeg: results.aoaDeg, status: results.status, source: results.source, simJobId: results.simJobId })
+      .select({
+        aoaDeg: results.aoaDeg,
+        status: results.status,
+        source: results.source,
+        simJobId: results.simJobId,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [14.021, 15.021, 16.021, 17.021, 18.021])));
-    expect(provisionalRows.every((row) => row.status === "done" && row.source === "solved" && row.simJobId === parent.id)).toBe(true);
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [14.021, 15.021, 16.021, 17.021, 18.021]),
+        ),
+      );
+    expect(
+      provisionalRows.every(
+        (row) =>
+          row.status === "done" &&
+          row.source === "solved" &&
+          row.simJobId === parent.id,
+      ),
+    ).toBe(true);
 
-    const claimedHardRejected = await db
-      .select({ aoaDeg: results.aoaDeg, simJobId: results.simJobId })
+    const retainedHardRejected = await db
+      .select({
+        aoaDeg: results.aoaDeg,
+        status: results.status,
+        simJobId: results.simJobId,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, rejectedAoas)));
-    expect(claimedHardRejected.every((row) => row.simJobId === child.id)).toBe(true);
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, rejectedAoas),
+        ),
+      );
+    expect(
+      retainedHardRejected.every(
+        (row) => row.status === "failed" && row.simJobId === parent.id,
+      ),
+    ).toBe(true);
   }, 60000);
 
   it("does not submit a URANS retry when all RANS points are valid", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoas = [140.01, 141.01];
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
     const [parent] = await db
       .insert(simJobs)
       .values({
@@ -1594,14 +3014,32 @@ describe("sweeper: gap → claim → ingest", () => {
         engineJobId: "valid-rans-parent",
         totalCases: aoas.length,
         completedCases: aoas.length,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }], aoas },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+          aoas,
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(parent.id);
     for (const aoa of aoas) {
       const [row] = await db
         .insert(results)
-        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: parent.id })
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "queued",
+          source: "queued",
+          simJobId: parent.id,
+        })
         .returning({ id: results.id });
       cleanupResultIds.add(row.id);
     }
@@ -1637,15 +3075,24 @@ describe("sweeper: gap → claim → ingest", () => {
         total_cases: aoas.length,
         completed_cases: aoas.length,
       }),
-      getResult: async () => validResult,
+      getResult: async () => withExactManifestEvidence(validResult),
       submitPolar: async (): Promise<JobStatus> => {
         submittedRetry = true;
-        return { job_id: "unexpected-child", state: "pending", total_cases: aoas.length, completed_cases: 0 };
+        return {
+          job_id: "unexpected-child",
+          state: "pending",
+          total_cases: aoas.length,
+          completed_cases: 0,
+        };
       },
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
-    await reconcile(db, validEngine, { jobIds: [parent.id], skipFailedRecovery: true });
+    await reconcile(db, validEngine, {
+      jobIds: [parent.id],
+      skipFailedRecovery: true,
+    });
 
     expect(submittedRetry).toBe(false);
     const children = await db
@@ -1654,11 +3101,30 @@ describe("sweeper: gap → claim → ingest", () => {
       .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
     expect(children.length).toBe(0);
     const solved = await db
-      .select({ status: results.status, source: results.source, simJobId: results.simJobId, converged: results.converged })
+      .select({
+        status: results.status,
+        source: results.source,
+        simJobId: results.simJobId,
+        converged: results.converged,
+      })
       .from(results)
-      .where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
     expect(solved.length).toBe(2);
-    expect(solved.every((r) => r.status === "done" && r.source === "solved" && r.simJobId === parent.id && r.converged)).toBe(true);
+    expect(
+      solved.every(
+        (r) =>
+          r.status === "done" &&
+          r.source === "solved" &&
+          r.simJobId === parent.id &&
+          r.converged,
+      ),
+    ).toBe(true);
   }, 60000);
 
   it("solved points are no longer reported as gaps", async () => {
@@ -1676,6 +3142,19 @@ describe("sweeper: gap → claim → ingest", () => {
   it("resets queued rows that lost their sim job link", async () => {
     const batch = await testBatch(500);
     expect(batch).not.toBeNull();
+    const [parallelOwner] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: batch!.airfoilId,
+        bcIds: [batch!.bcId],
+        simulationPresetRevisionId: batch!.presetRevisionId,
+        referenceChordM: 1,
+        status: "pending",
+        totalCases: 1,
+        requestPayload: { aoas: [123.457], fixture: "parallel-owner" },
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(parallelOwner.id);
     const [row] = await db
       .insert(results)
       .values({
@@ -1688,24 +3167,123 @@ describe("sweeper: gap → claim → ingest", () => {
         simJobId: null,
       })
       .onConflictDoUpdate({
-        target: [results.airfoilId, results.simulationPresetRevisionId, results.aoaDeg],
+        target: [
+          results.airfoilId,
+          results.simulationPresetRevisionId,
+          results.aoaDeg,
+        ],
         set: { status: "queued", source: "queued", simJobId: null },
       })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
-    await resetOrphans(db);
+    // This fixture exercises only the detached result-row repair. Supply an
+    // impossible job scope as well as the exact result id so parallel test
+    // files keep ownership of their own pending submit compositions.
+    await resetOrphans(db, {
+      jobIds: [randomUUID()],
+      resultIds: [row.id],
+    });
 
-    const [got] = await db.select({ status: results.status, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+    const [got] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
     expect(got.status).toBe("pending");
     expect(got.simJobId).toBeNull();
+    expect(
+      await db
+        .select({ status: simJobs.status })
+        .from(simJobs)
+        .where(eq(simJobs.id, parallelOwner.id)),
+    ).toEqual([{ status: "pending" }]);
     await db.delete(results).where(eq(results.id, row.id));
+    await db.delete(simJobs).where(eq(simJobs.id, parallelOwner.id));
+    cleanupJobIds.delete(parallelOwner.id);
   });
+
+  it("startup recovery terminalizes an orphan pre-boundary composition so it no longer inflates solver queue pressure", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 2,
+        status: "pending",
+        engineState: "submitting",
+        totalCases: 1,
+        requestPayload: { aoas: [124.123], uransFidelity: "precalc" },
+      })
+      .returning();
+    cleanupJobIds.add(job.id);
+    const [claim] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: 124.123,
+        status: "queued",
+        source: "queued",
+        simJobId: job.id,
+      })
+      .onConflictDoUpdate({
+        target: [
+          results.airfoilId,
+          results.simulationPresetRevisionId,
+          results.aoaDeg,
+        ],
+        set: { status: "queued", source: "queued", simJobId: job.id },
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(claim.id);
+
+    expect(await solverQueuePressure(db, { jobIds: [job.id] })).toBe(1);
+    await resetOrphans(db, { jobIds: [job.id] });
+    expect(await solverQueuePressure(db, { jobIds: [job.id] })).toBe(0);
+    const [afterJob] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [afterClaim] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, claim.id));
+    expect(afterJob).toMatchObject({
+      status: "cancelled",
+      engineState: "cancelled",
+    });
+    expect(afterClaim).toMatchObject({ status: "pending", simJobId: null });
+
+    const resolved = await ensureSimulationPresetRevision(db, testPresetId);
+    if (!resolved) throw new Error("test setup revision required");
+    const { request } = buildPolarRequest({
+      airfoil: a,
+      setup: resolved.revision.snapshot as never,
+      aoaList: [124.124],
+      wave: 2,
+      uransFidelity: "precalc",
+      queuePressure: await solverQueuePressure(db, { jobIds: [job.id] }),
+      cpuSlots: 0,
+    });
+    expect(request.resources?.queue_pressure).toBe(0);
+  }, 60000);
 
   it("keeps an engine-visible job active when a status poll briefly misses it", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 124.456;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [aoa])));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [aoa]),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -1723,7 +3301,15 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "queued",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -1734,9 +3320,19 @@ describe("sweeper: gap → claim → ingest", () => {
       getQueue: async () => emptyQueue(["engine-visible-after-404"]),
     } as unknown as EngineClient;
 
-    await reconcile(db, transientMissEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, transientMissEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
-    const [got] = await db.select({ status: simJobs.status, engineState: simJobs.engineState, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
+    const [got] = await db
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        error: simJobs.error,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
     expect(got.status).toBe("running");
     expect(got.engineState).toBe("running");
     expect(got.error).toBeNull();
@@ -1745,7 +3341,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("keeps a detached worker heartbeat active even when Celery no longer lists the task", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 124.956;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [aoa])));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [aoa]),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -1764,7 +3368,15 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -1794,14 +3406,30 @@ describe("sweeper: gap → claim → ingest", () => {
         ],
       }),
       getJob: async () => {
-        throw new EngineError("GET /jobs/detached-process-after-celery-loss -> 409", 409);
+        throw new EngineError(
+          "GET /jobs/detached-process-after-celery-loss -> 409",
+          409,
+        );
       },
     } as unknown as EngineClient;
 
-    await reconcile(db, detachedEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, detachedEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
-    const [got] = await db.select({ status: simJobs.status, engineState: simJobs.engineState, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
-    const [gotResult] = await db.select({ status: results.status, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+    const [got] = await db
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        error: simJobs.error,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [gotResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
     expect(got.status).toBe("running");
     expect(got.engineState).toBe("running");
     expect(got.error).toContain("heartbeat");
@@ -1812,7 +3440,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("ingests a completed result file even when Celery no longer sees the task", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 125.156;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [aoa])));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [aoa]),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -1826,13 +3462,30 @@ describe("sweeper: gap → claim → ingest", () => {
         submittedAt: new Date(Date.now() - 60 * 60 * 1000),
         totalCases: 1,
         completedCases: 0,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }] },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -1883,27 +3536,195 @@ describe("sweeper: gap → claim → ingest", () => {
         ],
       }),
       getJob: async () => {
-        throw new EngineError("GET /jobs/completed-runtime-result-no-celery -> 409", 409);
+        throw new EngineError(
+          "GET /jobs/completed-runtime-result-no-celery -> 409",
+          409,
+        );
       },
-      getResult: async () => result,
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      getResult: async () => withExactManifestEvidence(result),
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
-    await reconcile(db, resultReadyEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, resultReadyEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
-    const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
-    const [gotResult] = await db.select({ status: results.status, source: results.source, cl: results.cl }).from(results).where(eq(results.id, row.id));
+    const [gotJob] = await db
+      .select({
+        status: simJobs.status,
+        error: simJobs.error,
+        completedCases: simJobs.completedCases,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [gotResult] = await db
+      .select({
+        status: results.status,
+        source: results.source,
+        cl: results.cl,
+      })
+      .from(results)
+      .where(eq(results.id, row.id));
     expect(gotJob.status).toBe("done");
     expect(gotJob.error).toBeNull();
+    expect(gotJob.completedCases).toBe(1);
     expect(gotResult.status).toBe("done");
     expect(gotResult.source).toBe("solved");
     expect(gotResult.cl).toBeCloseTo(0.61, 6);
   }, 60000);
 
+  it("gives cancel-versus-ingest exactly one owner so no evidence lands under cancelled ownership", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 125.206;
+    const engineJobId = `cancel-ingest-owner-${testRunSlug}`;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        submittedAt: new Date(),
+        totalCases: 1,
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+        },
+      })
+      .returning();
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+        engineJobId,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+    const completed: JobResult = {
+      job_id: engineJobId,
+      state: "completed",
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: bc.mach,
+          points: [
+            {
+              aoa_deg: aoa,
+              cl: 0.64,
+              cd: 0.0135,
+              cm: -0.03,
+              cl_cd: 47.4,
+              unsteady: false,
+              converged: true,
+              first_order_fallback: false,
+              images: {},
+            },
+          ],
+        },
+      ],
+    };
+    let cancellation: Awaited<
+      ReturnType<typeof claimSimJobCancellation>
+    > | null = null;
+    const racingEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: true,
+            cancelled: false,
+            process_count: 0,
+            status_readable: true,
+            status_state: "completed",
+            status_total_cases: 1,
+            status_completed_cases: 1,
+            result_readable: true,
+            has_result: true,
+            result_state: "completed",
+          },
+        ],
+      }),
+      getResult: async () => {
+        // Deterministic interleaving: reconciliation selected the stale active
+        // row, then admin cancellation arrives exactly after ingest claims its
+        // boundary but before evidence/media writes begin.
+        cancellation = await claimSimJobCancellation(
+          db,
+          job.id,
+          "cancelled by admin",
+        );
+        return withExactManifestEvidence(completed);
+      },
+      fileUrl: (id: string, relPath: string) =>
+        `http://engine.test/jobs/${id}/files/${relPath}`,
+    } as unknown as EngineClient;
+
+    await reconcile(db, racingEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+    expect(cancellation).toMatchObject({
+      kind: "not_cancellable",
+      status: "ingesting",
+    });
+    const [afterJob] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [afterResult] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, row.id));
+    expect(afterJob.status).toBe("done");
+    expect(afterResult).toMatchObject({
+      status: "done",
+      simJobId: job.id,
+      cl: 0.64,
+    });
+  }, 60000);
+
   it("ingests a running partial result without marking the sweep done", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 125.256;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [aoa])));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [aoa]),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -1917,13 +3738,30 @@ describe("sweeper: gap → claim → ingest", () => {
         submittedAt: new Date(Date.now() - 60 * 60 * 1000),
         totalCases: 3,
         completedCases: 0,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }] },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -1979,17 +3817,33 @@ describe("sweeper: gap → claim → ingest", () => {
         total_cases: 3,
         completed_cases: 1,
       }),
-      getResult: async () => partialResult,
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      getResult: async () => withExactManifestEvidence(partialResult),
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
-    await reconcile(db, partialEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, partialEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
     const [gotJob] = await db
-      .select({ status: simJobs.status, engineState: simJobs.engineState, completedCases: simJobs.completedCases, finishedAt: simJobs.finishedAt })
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        completedCases: simJobs.completedCases,
+        finishedAt: simJobs.finishedAt,
+      })
       .from(simJobs)
       .where(eq(simJobs.id, job.id));
-    const [gotResult] = await db.select({ status: results.status, source: results.source, cl: results.cl }).from(results).where(eq(results.id, row.id));
+    const [gotResult] = await db
+      .select({
+        status: results.status,
+        source: results.source,
+        cl: results.cl,
+      })
+      .from(results)
+      .where(eq(results.id, row.id));
     expect(gotJob.status).toBe("running");
     expect(gotJob.engineState).toBe("running");
     expect(gotJob.completedCases).toBe(1);
@@ -1997,7 +3851,15 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(gotResult.status).toBe("done");
     expect(gotResult.source).toBe("solved");
     expect(gotResult.cl).toBeCloseTo(0.67, 6);
-    const attempts = await db.select({ id: resultAttempts.id }).from(resultAttempts).where(and(eq(resultAttempts.simJobId, job.id), eq(resultAttempts.aoaDeg, aoa)));
+    const attempts = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.simJobId, job.id),
+          eq(resultAttempts.aoaDeg, aoa),
+        ),
+      );
     attempts.forEach((attempt) => cleanupAttemptIds.add(attempt.id));
     expect(attempts.length).toBe(1);
   }, 60000);
@@ -2005,7 +3867,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("re-ingests a completed engine result after a prior ingest failure", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 125.456;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [aoa])));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [aoa]),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2018,7 +3888,16 @@ describe("sweeper: gap → claim → ingest", () => {
         engineJobId: "completed-after-ingest-failure",
         totalCases: 1,
         completedCases: 1,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }] },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+        },
         error: 'ingest failed: column "scheduling_policy" does not exist',
         finishedAt: new Date(),
       })
@@ -2026,7 +3905,15 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "failed", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "failed",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -2063,15 +3950,27 @@ describe("sweeper: gap → claim → ingest", () => {
     };
     const recoveredEngine = {
       getJob: async () => status,
-      getResult: async () => result,
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      getResult: async () => withExactManifestEvidence(result),
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
-    await reconcile(db, recoveredEngine, { jobIds: [job.id], recoverFailedJobIds: [job.id] });
+    await reconcile(db, recoveredEngine, {
+      jobIds: [job.id],
+      recoverFailedJobIds: [job.id],
+    });
 
-    const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
+    const [gotJob] = await db
+      .select({ status: simJobs.status, error: simJobs.error })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
     const [gotResult] = await db
-      .select({ status: results.status, source: results.source, cl: results.cl, cd: results.cd })
+      .select({
+        status: results.status,
+        source: results.source,
+        cl: results.cl,
+        cd: results.cd,
+      })
       .from(results)
       .where(eq(results.id, row.id));
     expect(gotJob.status).toBe("done");
@@ -2085,7 +3984,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("requeues a recoverable failed job when the engine no longer has it", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 126.456;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [aoa])));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [aoa]),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2104,21 +4011,41 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "failed", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "failed",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
     const missingEngine = {
       getJob: async () => {
-        throw new EngineError("GET /jobs/really-missing-engine-job -> 404", 404);
+        throw new EngineError(
+          "GET /jobs/really-missing-engine-job -> 404",
+          404,
+        );
       },
       getQueue: async () => emptyQueue(),
     } as unknown as EngineClient;
 
-    await reconcile(db, missingEngine, { jobIds: [job.id], recoverFailedJobIds: [job.id] });
+    await reconcile(db, missingEngine, {
+      jobIds: [job.id],
+      recoverFailedJobIds: [job.id],
+    });
 
-    const [gotJob] = await db.select({ status: simJobs.status, engineState: simJobs.engineState }).from(simJobs).where(eq(simJobs.id, job.id));
-    const [gotResult] = await db.select({ status: results.status, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+    const [gotJob] = await db
+      .select({ status: simJobs.status, engineState: simJobs.engineState })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [gotResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
     expect(gotJob.status).toBe("cancelled");
     expect(gotJob.engineState).toBe("missing");
     expect(gotResult.status).toBe("pending");
@@ -2147,7 +4074,13 @@ describe("sweeper: gap → claim → ingest", () => {
       .returning({ id: simJobs.id });
     cleanupJobIds.add(job.id);
 
-    const activeTask = { worker: "test", task_id: engineJobId, name: "airfoilfoam.run_polar", job_id: engineJobId, redelivered: true };
+    const activeTask = {
+      worker: "test",
+      task_id: engineJobId,
+      name: "airfoilfoam.run_polar",
+      job_id: engineJobId,
+      redelivered: true,
+    };
     const cancelled: string[] = [];
     const redeliveredEngine = {
       getQueue: async () => ({
@@ -2163,9 +4096,19 @@ describe("sweeper: gap → claim → ingest", () => {
       },
     } as unknown as EngineClient;
 
-    await reconcile(db, redeliveredEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, redeliveredEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
-    const [gotJob] = await db.select({ status: simJobs.status, engineState: simJobs.engineState, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
+    const [gotJob] = await db
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        error: simJobs.error,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
     expect(cancelled).toEqual([engineJobId]);
     expect(gotJob.status).toBe("cancelled");
     expect(gotJob.engineState).toBe("cancelled");
@@ -2179,7 +4122,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("releases claims and marks the job cancelled when the engine reports state=cancelled", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 91.001; // in the test sweep definition, so findGaps can re-pick it
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2198,7 +4149,15 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -2218,14 +4177,26 @@ describe("sweeper: gap → claim → ingest", () => {
       },
     } as unknown as EngineClient;
 
-    await reconcile(db, cancelledEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, cancelledEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
     const [gotJob] = await db
-      .select({ status: simJobs.status, engineState: simJobs.engineState, finishedAt: simJobs.finishedAt })
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        finishedAt: simJobs.finishedAt,
+      })
       .from(simJobs)
       .where(eq(simJobs.id, job.id));
     const [gotResult] = await db
-      .select({ status: results.status, simJobId: results.simJobId, engineJobId: results.engineJobId, cl: results.cl })
+      .select({
+        status: results.status,
+        simJobId: results.simJobId,
+        engineJobId: results.engineJobId,
+        cl: results.cl,
+      })
       .from(results)
       .where(eq(results.id, row.id));
     expect(gotJob.status).toBe("cancelled");
@@ -2239,8 +4210,222 @@ describe("sweeper: gap → claim → ingest", () => {
 
     // The released point is a re-claimable gap again for the next tick.
     const gaps = await testGaps(10000);
-    expect(gaps.some((gap) => gap.airfoilId === a.id && gap.presetRevisionId === presetRevisionId && gap.aoaDeg === aoa)).toBe(true);
+    expect(
+      gaps.some(
+        (gap) =>
+          gap.airfoilId === a.id &&
+          gap.presetRevisionId === presetRevisionId &&
+          gap.aoaDeg === aoa,
+      ),
+    ).toBe(true);
     await db.delete(results).where(eq(results.id, row.id));
+  }, 60000);
+
+  it("keeps an engine-cancelled evidence-backed wave-2 point on the outgoing precalc route", async () => {
+    const aoa = 191.001;
+    const fixture = await evidenceBackedWave2Fixture(
+      `wave2-engine-cancelled-${testRunSlug}`,
+      aoa,
+      "running",
+    );
+    const cancelledEngine = {
+      getQueue: async () => emptyQueue(),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: fixture.child.engineJobId!,
+        state: "cancelled",
+        total_cases: 1,
+        completed_cases: 0,
+        message: "engine cancelled transient child",
+      }),
+    } as unknown as EngineClient;
+
+    await reconcile(db, cancelledEngine, {
+      jobIds: [fixture.child.id],
+      skipFailedRecovery: true,
+    });
+    const [released] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, fixture.row.id));
+    expect(released).toEqual({ status: "queued", simJobId: null });
+    const [releasedObligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
+    expect(releasedObligation).toMatchObject({
+      state: "pending",
+      attemptCount: 1,
+      latestSimJobId: fixture.child.id,
+      lastOutcome: "failed",
+    });
+
+    const requests: Parameters<EngineClient["submitPolar"]>[0][] = [];
+    const outgoingEngine = {
+      submitPolar: async (
+        request: Parameters<EngineClient["submitPolar"]>[0],
+      ): Promise<JobStatus> => {
+        requests.push(request);
+        return {
+          job_id: `wave2-engine-cancelled-retry-${testRunSlug}`,
+          state: "pending",
+          total_cases: 1,
+          completed_cases: 0,
+        };
+      },
+    } as unknown as EngineClient;
+    await submitUransRetryForJob(db, outgoingEngine, fixture.parent);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].aoa?.angles).toEqual([aoa]);
+    expect(requests[0].solver).toMatchObject({
+      force_transient: true,
+      urans_fidelity: "precalc",
+    });
+    const children = await db
+      .select({
+        id: simJobs.id,
+        status: simJobs.status,
+        requestPayload: simJobs.requestPayload,
+      })
+      .from(simJobs)
+      .where(
+        and(eq(simJobs.parentJobId, fixture.parent.id), eq(simJobs.wave, 2)),
+      );
+    expect(children).toHaveLength(2);
+    expect(
+      children.filter((child) => child.status === "submitted"),
+    ).toHaveLength(1);
+    const [retriedObligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
+    expect(retriedObligation).toMatchObject({
+      state: "running",
+      attemptCount: 2,
+    });
+  }, 60000);
+
+  it("keeps a lost evidence-backed wave-2 point on the outgoing precalc route", async () => {
+    const aoa = 192.001;
+    const fixture = await evidenceBackedWave2Fixture(
+      `wave2-lost-${testRunSlug}`,
+      aoa,
+      "failed",
+    );
+    const missingEngine = {
+      getQueue: async () => emptyQueue(),
+      getJob: async () => {
+        throw new EngineError(
+          `GET /jobs/${fixture.child.engineJobId} -> 404`,
+          404,
+        );
+      },
+    } as unknown as EngineClient;
+
+    await reconcile(db, missingEngine, {
+      jobIds: [fixture.child.id],
+      recoverFailedJobIds: [fixture.child.id],
+    });
+    const [released] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, fixture.row.id));
+    expect(released).toEqual({ status: "queued", simJobId: null });
+    const [releasedObligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
+    expect(releasedObligation).toMatchObject({
+      state: "pending",
+      attemptCount: 1,
+      latestSimJobId: fixture.child.id,
+      lastOutcome: "failed",
+    });
+
+    const requests: Parameters<EngineClient["submitPolar"]>[0][] = [];
+    const outgoingEngine = {
+      submitPolar: async (
+        request: Parameters<EngineClient["submitPolar"]>[0],
+      ): Promise<JobStatus> => {
+        requests.push(request);
+        return {
+          job_id: `wave2-lost-retry-${testRunSlug}`,
+          state: "pending",
+          total_cases: 1,
+          completed_cases: 0,
+        };
+      },
+    } as unknown as EngineClient;
+    await submitUransRetryForJob(db, outgoingEngine, fixture.parent);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].aoa?.angles).toEqual([aoa]);
+    expect(requests[0].solver).toMatchObject({
+      force_transient: true,
+      urans_fidelity: "precalc",
+    });
+    const [retriedObligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
+    expect(retriedObligation).toMatchObject({
+      state: "running",
+      attemptCount: 2,
+    });
+  }, 60000);
+
+  it("returns an accepted PRECALC attempt to pending after a worker-restart orphan", async () => {
+    const aoa = 193.001;
+    const fixture = await evidenceBackedWave2Fixture(
+      `wave2-worker-restart-${testRunSlug}`,
+      aoa,
+      "running",
+    );
+    const orphanEngine = {
+      getQueue: async () => emptyQueue(),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: fixture.child.engineJobId!,
+        state: "failed",
+        total_cases: 1,
+        completed_cases: 0,
+        message: WORKER_RESTART_ORPHAN_MESSAGE,
+      }),
+      getResult: async (): Promise<JobResult> => ({
+        job_id: fixture.child.engineJobId!,
+        state: "failed",
+        message: WORKER_RESTART_ORPHAN_MESSAGE,
+        polars: [],
+      }),
+    } as unknown as EngineClient;
+
+    await reconcile(db, orphanEngine, {
+      jobIds: [fixture.child.id],
+      skipFailedRecovery: true,
+    });
+    const [afterJob] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.child.id));
+    const [afterObligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
+    const [afterAttempt] = await db
+      .select()
+      .from(simPrecalcObligationAttempts)
+      .where(
+        eq(simPrecalcObligationAttempts.obligationId, fixture.obligation.id),
+      );
+    expect(afterJob).toMatchObject({
+      status: "cancelled",
+      engineState: "cancelled",
+    });
+    expect(afterObligation).toMatchObject({
+      state: "pending",
+      attemptCount: 1,
+      lastOutcome: "failed",
+    });
+    expect(afterAttempt).toMatchObject({ state: "failed", outcome: "failed" });
   }, 60000);
 
   // MUST-CATCH (G3, incident 2026-07-05): a force-recreated worker killed the
@@ -2251,7 +4436,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("cancels and requeues a lost engine job that reports running with no processes and stale progress", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 129.456;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2270,7 +4463,15 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -2312,13 +4513,24 @@ describe("sweeper: gap → claim → ingest", () => {
       },
     } as unknown as EngineClient;
 
-    await reconcile(db, zombieEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, zombieEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
     const [gotJob] = await db
-      .select({ status: simJobs.status, engineState: simJobs.engineState, error: simJobs.error, finishedAt: simJobs.finishedAt })
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        error: simJobs.error,
+        finishedAt: simJobs.finishedAt,
+      })
       .from(simJobs)
       .where(eq(simJobs.id, job.id));
-    const [gotResult] = await db.select({ status: results.status, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+    const [gotResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
     expect(engineCancels).toEqual(["zombie-after-worker-restart"]);
     expect(gotJob.status).toBe("cancelled");
     expect(gotJob.engineState).toBe("cancelled");
@@ -2335,7 +4547,15 @@ describe("sweeper: gap → claim → ingest", () => {
   it("keeps a quiet-but-recent running job untouched (lost-job grace not exceeded)", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 129.856;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2354,7 +4574,15 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupJobIds.add(job.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -2396,10 +4624,19 @@ describe("sweeper: gap → claim → ingest", () => {
       },
     } as unknown as EngineClient;
 
-    await reconcile(db, quietEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, quietEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
-    const [gotJob] = await db.select({ status: simJobs.status, engineState: simJobs.engineState }).from(simJobs).where(eq(simJobs.id, job.id));
-    const [gotResult] = await db.select({ status: results.status, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+    const [gotJob] = await db
+      .select({ status: simJobs.status, engineState: simJobs.engineState })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [gotResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
     expect(engineCancels).toEqual([]);
     expect(gotJob.status).toBe("running");
     expect(gotJob.engineState).toBe("running");
@@ -2419,7 +4656,15 @@ describe("sweeper: gap → claim → ingest", () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const MSG = "MeshError: blockMesh exited 1 (boundary layer collapse)";
     const aoas = [131.101, 132.101, 133.101];
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, aoas)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2439,7 +4684,15 @@ describe("sweeper: gap → claim → ingest", () => {
     for (const aoa of aoas) {
       const [row] = await db
         .insert(results)
-        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: job.id })
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "queued",
+          source: "queued",
+          simJobId: job.id,
+        })
         .returning({ id: results.id });
       cleanupResultIds.add(row.id);
       rowIds.push(row.id);
@@ -2455,13 +4708,25 @@ describe("sweeper: gap → claim → ingest", () => {
         message: MSG,
       }),
       // tasks.py exception path: JobResult(state=failed, message=..., polars=[]).
-      getResult: async (): Promise<JobResult> => ({ job_id: "genuine-total-failure", state: "failed", message: MSG, polars: [] }),
+      getResult: async (): Promise<JobResult> => ({
+        job_id: "genuine-total-failure",
+        state: "failed",
+        message: MSG,
+        polars: [],
+      }),
     } as unknown as EngineClient;
 
-    await reconcile(db, failedEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, failedEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
     const rows = await db
-      .select({ status: results.status, error: results.error, autoRetriedAt: results.autoRetriedAt })
+      .select({
+        status: results.status,
+        error: results.error,
+        autoRetriedAt: results.autoRetriedAt,
+      })
       .from(results)
       .where(inArray(results.id, rowIds));
     expect(rows.length).toBe(aoas.length);
@@ -2474,14 +4739,20 @@ describe("sweeper: gap → claim → ingest", () => {
       expect(row.error).toBe(MSG);
       expect((row.error ?? "").trim().length).toBeGreaterThan(0);
     }
-    const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
+    const [gotJob] = await db
+      .select({ status: simJobs.status, error: simJobs.error })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
     expect(gotJob.status).toBe("failed");
     expect(gotJob.error).toBe(MSG);
     // FALSE-POSITIVE GUARD for the all-rejected escalation path (gate incident
     // 2026-07-07): a TRUE crash — empty payload, zero points AND zero shipped
     // attempts — must keep the original terminal behavior: no attempt-evidence
     // rows and no wave-2 URANS retry child materialize out of nothing.
-    const crashAttempts = await db.select({ id: resultAttempts.id }).from(resultAttempts).where(eq(resultAttempts.simJobId, job.id));
+    const crashAttempts = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id));
     expect(crashAttempts.length).toBe(0);
     const crashChildren = await db
       .select({ id: simJobs.id })
@@ -2500,7 +4771,15 @@ describe("sweeper: gap → claim → ingest", () => {
     const MSG = "SolverCrash: pimpleFoam terminated by signal 9";
     const solvedAoa = 134.101;
     const erroredAoa = 135.101;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), inArray(results.aoaDeg, [solvedAoa, erroredAoa])));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [solvedAoa, erroredAoa]),
+        ),
+      );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2515,7 +4794,9 @@ describe("sweeper: gap → claim → ingest", () => {
         engineJobId: "genuine-partial-failure",
         submittedAt: new Date(Date.now() - 10 * 60 * 1000),
         totalCases: 2,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }] },
+        requestPayload: {
+          speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId }],
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(job.id);
@@ -2523,7 +4804,15 @@ describe("sweeper: gap → claim → ingest", () => {
     for (const aoa of [solvedAoa, erroredAoa]) {
       const [row] = await db
         .insert(results)
-        .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "running", source: "queued", simJobId: job.id })
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "running",
+          source: "queued",
+          simJobId: job.id,
+        })
         .returning({ id: results.id });
       cleanupResultIds.add(row.id);
       rowIds.push(row.id);
@@ -2539,11 +4828,46 @@ describe("sweeper: gap → claim → ingest", () => {
           chord: 1,
           reynolds: 500000,
           points: [
-            { aoa_deg: solvedAoa, cl: 0.42, cd: 0.021, cm: -0.03, cl_cd: 20, unsteady: true, converged: true, first_order_fallback: false, images: {} },
+            {
+              case_slug: "genuine-partial-solved",
+              aoa_deg: solvedAoa,
+              cl: 0.42,
+              cd: 0.021,
+              cm: -0.03,
+              cl_cd: 20,
+              // Valid oscillating-steady evidence. The terminal failed-job
+              // context belongs to the crashed sibling, not this mean-stable
+              // attempt; converged=false is deliberately waived by the exact
+              // steady_history verdict.
+              unsteady: false,
+              converged: false,
+              first_order_fallback: false,
+              fidelity: "rans",
+              images: {},
+              steady_history: {
+                iterations: [100, 200, 300, 400, 500, 600],
+                cl: [0.4, 0.44, 0.41, 0.43, 0.415, 0.425],
+                cd: [0.02, 0.022, 0.021, 0.021, 0.0205, 0.0215],
+                cm: [-0.03, -0.029, -0.031, -0.03, -0.0305, -0.0295],
+                window: { start_iter: 300, end_iter: 600 },
+                mean_stable: true,
+                note: "bounded oscillation with stable half-window means",
+              },
+            },
             // The worker died before this case wrote coefficients or an error:
             // p.error is null — exactly the shape that used to ingest as a
             // failed row with EMPTY error text.
-            { aoa_deg: erroredAoa, cl: null, cd: null, cm: null, unsteady: true, converged: false, first_order_fallback: false, images: {}, error: null },
+            {
+              aoa_deg: erroredAoa,
+              cl: null,
+              cd: null,
+              cm: null,
+              unsteady: true,
+              converged: false,
+              first_order_fallback: false,
+              images: {},
+              error: null,
+            },
           ],
         },
       ],
@@ -2557,17 +4881,50 @@ describe("sweeper: gap → claim → ingest", () => {
         completed_cases: 1,
         message: MSG,
       }),
-      getResult: async () => partialFailureResult,
+      getResult: async () => withExactManifestEvidence(partialFailureResult),
     } as unknown as EngineClient;
 
-    await reconcile(db, partialFailureEngine, { jobIds: [job.id], skipFailedRecovery: true });
+    await reconcile(db, partialFailureEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
 
-    const [solvedRow] = await db.select({ status: results.status, cl: results.cl, error: results.error }).from(results).where(eq(results.id, rowIds[0]));
+    const [solvedRow] = await db
+      .select({
+        status: results.status,
+        cl: results.cl,
+        error: results.error,
+        currentAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(eq(results.id, rowIds[0]));
     expect(solvedRow.status).toBe("done"); // real partial evidence survives the failure
     expect(solvedRow.cl).toBeCloseTo(0.42, 8);
     expect(solvedRow.error).toBeNull();
+    expect(solvedRow.currentAttemptId).toBeTruthy();
+    const [meanStableAttempt] = await db
+      .select({
+        error: resultAttempts.error,
+        state: resultClassifications.state,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultAttempts)
+      .innerJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
+      .where(eq(resultAttempts.id, solvedRow.currentAttemptId!));
+    expect(meanStableAttempt).toMatchObject({
+      error: null,
+      state: "accepted",
+      reasons: [],
+    });
     const [failedRow] = await db
-      .select({ status: results.status, error: results.error, autoRetriedAt: results.autoRetriedAt })
+      .select({
+        status: results.status,
+        error: results.error,
+        autoRetriedAt: results.autoRetriedAt,
+      })
       .from(results)
       .where(eq(results.id, rowIds[1]));
     // Amendment B: the crashed point requeues once — pending with the marker;
@@ -2575,7 +4932,10 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(failedRow.status).toBe("pending");
     expect(failedRow.autoRetriedAt).not.toBeNull();
     expect(failedRow.error).toBe(MSG); // job-level message propagated — never empty
-    const [gotJob] = await db.select({ status: simJobs.status, error: simJobs.error }).from(simJobs).where(eq(simJobs.id, job.id));
+    const [gotJob] = await db
+      .select({ status: simJobs.status, error: simJobs.error })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
     expect(gotJob.status).toBe("failed");
     expect(gotJob.error).toBe(MSG);
     await db.delete(results).where(inArray(results.id, rowIds));
@@ -2596,7 +4956,15 @@ describe("sweeper: gap → claim → ingest", () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const REAL_MSG = "All cases failed";
     const aoa = 150.201;
-    await db.delete(results).where(and(eq(results.airfoilId, a.id), eq(results.simulationPresetRevisionId, presetRevisionId), eq(results.aoaDeg, aoa)));
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
     const [parent] = await db
       .insert(simJobs)
       .values({
@@ -2609,13 +4977,31 @@ describe("sweeper: gap → claim → ingest", () => {
         engineJobId: "all-rejected-failfast",
         submittedAt: new Date(Date.now() - 5 * 60 * 1000),
         totalCases: 1,
-        requestPayload: { speedMap: [{ speed: bc.speedMps, bcId: bc.id, presetRevisionId, mach: bc.mach }], aoas: [aoa] },
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+          aoas: [aoa],
+        },
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(parent.id);
     const [row] = await db
       .insert(results)
-      .values({ airfoilId: a.id, bcId: bc.id, simulationPresetRevisionId: presetRevisionId, aoaDeg: aoa, status: "queued", source: "queued", simJobId: parent.id })
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "queued",
+        source: "queued",
+        simJobId: parent.id,
+      })
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
@@ -2702,22 +5088,40 @@ describe("sweeper: gap → claim → ingest", () => {
           },
         ],
       }),
-      getResult: async () => failedResult,
+      getResult: async () => withExactManifestEvidence(failedResult),
       submitPolar: async (request: unknown): Promise<JobStatus> => {
         submittedRequest = request;
-        const angles = (request as { aoa?: { angles?: number[] } }).aoa?.angles ?? [];
-        return { job_id: "all-rejected-urans-child", state: "pending", total_cases: angles.length, completed_cases: 0 };
+        const angles =
+          (request as { aoa?: { angles?: number[] } }).aoa?.angles ?? [];
+        return {
+          job_id: "all-rejected-urans-child",
+          state: "pending",
+          total_cases: angles.length,
+          completed_cases: 0,
+        };
       },
-      fileUrl: (jobId: string, relPath: string) => `http://engine.test/jobs/${jobId}/files/${relPath}`,
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
 
     const errorSpy = vi.spyOn(console, "error");
     const logSpy = vi.spyOn(console, "log");
     try {
-      await reconcile(db, failFastEngine, { jobIds: [parent.id], skipFailedRecovery: true });
+      await reconcile(db, failFastEngine, {
+        jobIds: [parent.id],
+        skipFailedRecovery: true,
+      });
 
       // 1. The shipped attempt ingested with its REAL force data + steady_history.
-      const attempts = await db.select().from(resultAttempts).where(and(eq(resultAttempts.simJobId, parent.id), eq(resultAttempts.aoaDeg, aoa)));
+      const attempts = await db
+        .select()
+        .from(resultAttempts)
+        .where(
+          and(
+            eq(resultAttempts.simJobId, parent.id),
+            eq(resultAttempts.aoaDeg, aoa),
+          ),
+        );
       attempts.forEach((attempt) => cleanupAttemptIds.add(attempt.id));
       expect(attempts.length).toBe(1);
       expect(attempts[0].cl).toBeCloseTo(0.5174, 8);
@@ -2725,22 +5129,42 @@ describe("sweeper: gap → claim → ingest", () => {
       expect(attempts[0].iterations).toBe(600);
       expect(attempts[0].converged).toBe(false);
       expect(attempts[0].validForPolar).toBe(false);
-      expect((attempts[0].evidencePayload as { steady_history?: { note?: string } })?.steady_history?.note).toBe("Cl half-window means differ by 29.8%");
+      expect(
+        (attempts[0].evidencePayload as { steady_history?: { note?: string } })
+          ?.steady_history?.note,
+      ).toBe("Cl half-window means differ by 29.8%");
       // 2. Evidence artifacts registered against the attempt.
       const evidence = await db
         .select()
         .from(solverEvidenceArtifacts)
-        .where(and(eq(solverEvidenceArtifacts.simJobId, parent.id), eq(solverEvidenceArtifacts.aoaDeg, aoa)));
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.simJobId, parent.id),
+            eq(solverEvidenceArtifacts.aoaDeg, aoa),
+          ),
+        );
       expect(evidence.length).toBe(1);
       expect(evidence[0].kind).toBe("manifest");
       expect(evidence[0].resultAttemptId).toBe(attempts[0].id);
       // 3. The ENGINE's real message stamped — never the generic fallback.
-      const [gotRow] = await db.select({ status: results.status, error: results.error, simJobId: results.simJobId }).from(results).where(eq(results.id, row.id));
+      const [gotRow] = await db
+        .select({
+          status: results.status,
+          error: results.error,
+          simJobId: results.simJobId,
+        })
+        .from(results)
+        .where(eq(results.id, row.id));
       expect(gotRow.error).toBe(REAL_MSG);
       // 4. Parent terminal-failed WITH the evidence-ingest stamp (the gated
       //    ladder rescan requires status='failed' AND ingested_at NOT NULL).
       const [gotParent] = await db
-        .select({ status: simJobs.status, error: simJobs.error, engineState: simJobs.engineState, ingestedAt: simJobs.ingestedAt })
+        .select({
+          status: simJobs.status,
+          error: simJobs.error,
+          engineState: simJobs.engineState,
+          ingestedAt: simJobs.ingestedAt,
+        })
         .from(simJobs)
         .where(eq(simJobs.id, parent.id));
       expect(gotParent.status).toBe("failed");
@@ -2758,19 +5182,34 @@ describe("sweeper: gap → claim → ingest", () => {
       cleanupJobIds.add(child.id);
       expect(child.status).toBe("submitted");
       expect(child.totalCases).toBe(1);
-      expect((child.requestPayload as { uransFidelity?: string })?.uransFidelity).toBe("precalc");
-      expect((submittedRequest as { solver?: { force_transient?: boolean } })?.solver?.force_transient).toBe(true);
-      expect((submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles).toEqual([aoa]);
-      expect(gotRow.status).toBe("queued"); // re-queued under the retry child
-      expect(gotRow.simJobId).toBe(child.id);
+      expect(
+        (child.requestPayload as { uransFidelity?: string })?.uransFidelity,
+      ).toBe("precalc");
+      expect(
+        (submittedRequest as { solver?: { force_transient?: boolean } })?.solver
+          ?.force_transient,
+      ).toBe(true);
+      expect(
+        (submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles,
+      ).toEqual([aoa]);
+      await expectBackgroundPrecalcSubmission(child, [aoa]);
+      // The rejected wave-1 generation remains attached to its producing
+      // job as immutable failure evidence. The exact PRECALC obligation owns
+      // the retry independently and must not rewrite this row into a gap.
+      expect(gotRow.status).toBe("failed");
+      expect(gotRow.simJobId).toBe(parent.id);
       // 6. Loud transitions: one job-failed event with the real message +
       //    verdict, one retry-submit event (the gate run logged NOTHING).
-      const failLine = errorSpy.mock.calls.map((call) => String(call[0])).find((line) => line.includes("engine job FAILED"));
+      const failLine = errorSpy.mock.calls
+        .map((call) => String(call[0]))
+        .find((line) => line.includes("engine job FAILED"));
       expect(failLine).toBeTruthy();
       expect(failLine).toContain(REAL_MSG);
       expect(failLine).toContain(parent.id);
       expect(failLine).toContain("gated URANS retry evaluated");
-      const submitLine = logSpy.mock.calls.map((call) => String(call[0])).find((line) => line.includes("URANS retry submitted"));
+      const submitLine = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .find((line) => line.includes("URANS retry submitted"));
       expect(submitLine).toBeTruthy();
       expect(submitLine).toContain("all-rejected-urans-child");
     } finally {

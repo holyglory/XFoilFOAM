@@ -72,6 +72,8 @@ from .postprocess.images import (
 from .postprocess.residuals import parse_convergence
 from .postprocess.unsteady import (
     PERIOD_AMBIGUITY_TOLERANCE,
+    PERIOD_ESTIMATE_MIN_CYCLES,
+    SHEDDING_STROUHAL_BAND,
     ChannelWindowStats,
     ForceHistory,
     PeriodEstimate,
@@ -306,13 +308,38 @@ MARCH_STOP_MARKER_FILENAME = "march_stopped.json"
 def write_march_budget_marker(case_dir: Path, end_t: float, budget_s: float, wall_start: float) -> None:
     """Arm the march-rate watchdog for the chunk about to launch."""
     case_dir.mkdir(parents=True, exist_ok=True)
-    (case_dir / MARCH_BUDGET_MARKER_FILENAME).write_text(
+    path = case_dir / MARCH_BUDGET_MARKER_FILENAME
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(
         json.dumps(
             {"end_t": float(end_t), "budget_s": float(budget_s), "wall_start": float(wall_start)},
             indent=2,
         )
         + "\n"
     )
+    os.replace(tmp, path)
+
+
+def update_march_budget_target(case_dir: Path, end_t: float) -> bool:
+    """Keep the live watchdog target aligned with a monitor-extended chunk.
+
+    The early-stop monitor may extend ``controlDict.endTime`` after measuring a
+    real period.  Preserve the armed chunk's original ``wall_start`` and
+    ``budget_s`` (therefore its original wall deadline) while atomically moving
+    only the simulated-time target.  Without this update the watchdog disarms
+    as soon as the solver crosses the stale original target, even though
+    pimpleFoam is still marching toward the longer controller-owned horizon.
+    """
+    marker = read_march_budget_marker(case_dir)
+    if marker is None:
+        return False
+    write_march_budget_marker(
+        case_dir,
+        end_t=float(end_t),
+        budget_s=marker["budget_s"],
+        wall_start=marker["wall_start"],
+    )
+    return True
 
 
 def read_march_budget_marker(case_dir: Path) -> Optional[dict]:
@@ -675,6 +702,22 @@ URANS_FRAME_WRITE_PER_CYCLE = 30.0
 URANS_ANIMATION_FRAMES = 141
 URANS_MAX_ANIMATION_FRAMES = 220
 URANS_EARLY_STOP_MARKER = "urans_early_stop.json"
+#: A flat URANS signal is not enough evidence of physically steady flow until
+#: the retained force history spans the slow edge of the plausible shedding
+#: band.  Two periods are the minimum needed to distinguish a weak, slowly
+#: emerging wake from a genuinely flat signal; the extra tenth period keeps
+#: the evidence floor clear of an exact two-cycle edge verdict.
+URANS_NO_SHEDDING_MIN_SLOW_PERIODS = 2.1
+#: The acquisition controller overshoots the evidence floor by another tenth
+#: of a slow period so
+#: discrete coefficient sampling and startup-discard rounding cannot leave a
+#: physically sufficient run a few samples short of acceptance.
+URANS_PERIOD_ACQUISITION_SLOW_PERIODS = 2.2
+#: Internal quality-reason marker for an amplitude-flat trace whose retained
+#: observation has not yet crossed the physical slow-shedding horizon. The
+#: established-oscillation grader must leave this state to the period-
+#: acquisition controller; a spurious FFT line may not bypass the horizon.
+URANS_APPARENT_FLAT_OBSERVATION_MARKER = "an apparently flat signal spans"
 #: Frame-export window pinned by the contract: last min(3, K) whole periods.
 URANS_FRAME_SPAN_PERIODS = 3
 #: Fraction of the per-attempt solver timeout the projected refined URANS pass
@@ -685,6 +728,85 @@ URANS_REFINE_BUDGET_FRACTION = 0.8
 #: not pass an explicit budget (jobs.py passes Settings.media_budget_seconds()
 #: — same default). Mirrors Settings.media_budget_fraction.
 MEDIA_BUDGET_FRACTION_DEFAULT = 0.5
+
+
+def _early_stop_retained_cycles(solver_params: Optional[SolverParams]) -> float:
+    """Tier-owned accepted-cycle target used to grade an early stop.
+
+    Precalc is deliberately the fast preliminary tier, so its established
+    oscillation needs the tier-owned three whole periods.  Full fidelity keeps
+    the existing five-period acceptance floor even though its ordinary
+    non-early-stopped horizon is seven periods.
+    """
+    if (
+        solver_params is not None
+        and solver_params.urans_fidelity == UransFidelity.precalc
+    ):
+        return float(apply_urans_fidelity(solver_params).urans_min_periods)
+    return URANS_STABLE_RETAINED_CYCLES
+
+
+def _early_stop_certification_cycles(
+    solver_params: Optional[SolverParams],
+) -> float:
+    """Total stable span required before the live monitor may stop.
+
+    The accepted tier target still owns the force-history retention bar.  The
+    live certification span additionally includes the existing stop margin and
+    must contain enough data for the period estimator's two independent halves
+    to meet their own cycle floor.  This is 4.0 periods for precalc and leaves
+    full fidelity's existing 5.5-period span unchanged.
+    """
+    return max(
+        _early_stop_retained_cycles(solver_params)
+        + URANS_STABLE_STOP_MARGIN_CYCLES,
+        2.0 * PERIOD_ESTIMATE_MIN_CYCLES,
+    )
+
+
+def _fresh_transient_cycles(solver_params: SolverParams) -> float:
+    """Guessed-period horizon for the first fresh transient chunk.
+
+    A precalc run should reach its three retained periods plus the existing
+    whole-cycle margin, then let measured-period continuation take over.  Full
+    fidelity intentionally preserves the configured ``transient_cycles``
+    horizon.
+    """
+    if solver_params.urans_fidelity != UransFidelity.precalc:
+        return float(solver_params.transient_cycles)
+    target = float(apply_urans_fidelity(solver_params).urans_min_periods)
+    retained_fraction = max(
+        1e-6,
+        1.0 - min(max(solver_params.transient_discard_fraction, 0.0), 0.95),
+    )
+    return (target + RETENTION_SAFETY_CYCLES) / retained_fraction
+
+
+def _no_shedding_min_observation_s(speed: float, chord: float) -> float:
+    """Retained time needed before URANS may certify a flat wake.
+
+    The slow side of the physical shedding band is chord based (matching
+    :func:`shedding_period_band`), so this horizon covers 2.1 complete cycles
+    at ``St=SHEDDING_STROUHAL_BAND[0]``.  Callers validate positive case speed
+    and chord before solving; an invalid value returns infinity so this safety
+    gate fails closed if it is ever called outside that boundary.
+    """
+    try:
+        u = float(speed)
+        c = float(chord)
+    except (TypeError, ValueError):
+        return math.inf
+    slow_st = float(SHEDDING_STROUHAL_BAND[0])
+    if not (
+        math.isfinite(u)
+        and math.isfinite(c)
+        and math.isfinite(slow_st)
+        and u > 0
+        and c > 0
+        and slow_st > 0
+    ):
+        return math.inf
+    return URANS_NO_SHEDDING_MIN_SLOW_PERIODS * c / (slow_st * u)
 
 
 class MediaBudget:
@@ -922,6 +1044,13 @@ def _write_early_stop_marker(
 #: here; the node fixtures pin it there).
 URANS_BUDGET_STOP_MARKER = "stopped by the wall-clock budget guard"
 
+#: A different restartable outcome from a wall-budget stop: the bounded
+#: in-process controller used all of its same-case chunks, but the measured
+#: window still needs more integration.  The control plane matches this exact
+#: marker so the saved state remains continuable; it must never be conflated
+#: with ``URANS_BUDGET_STOP_MARKER`` because no wall-clock claim is being made.
+URANS_CONTINUATION_REQUIRED_MARKER = "requires further same-case integration"
+
 #: Marker persisted in a transient case dir recording the coefficient-history
 #: start time of the transient (the steady-init history written before it must
 #: never merge into the force signal). Written when a fresh transient starts;
@@ -1139,7 +1268,11 @@ def stage_continuation_case(src_case: Path, dst_case: Path) -> ContinuationSourc
 
 
 def _make_urans_monitor(
-    tcase: Path, spec: CaseSpec, coeff_start_time: Optional[float] = None
+    tcase: Path,
+    spec: CaseSpec,
+    coeff_start_time: Optional[float] = None,
+    *,
+    solver_params: Optional[SolverParams] = None,
 ) -> Callable[[], None]:
     state: dict[str, object] = {"cadence_period": None, "target_period": None, "stop_requested": False}
 
@@ -1172,18 +1305,18 @@ def _make_urans_monitor(
                 state["cadence_period"] = period
         if result.stable and period is not None and period > 0:
             # Certification clock: retention is measured from the START of the
-            # first stable two-period window, and the stop only fires once
-            # URANS_STABLE_RETAINED_CYCLES (+ margin) periods of certified-
-            # stable data exist — never at bare detection, which retained ~2
-            # startup-adjacent periods and was rejected by the node gate.
+            # first stable two-period window. The stop only fires once both the
+            # tier target (+ margin) and the period estimator's independent-half
+            # evidence floor are present — never at bare detection, which kept
+            # startup-adjacent periods and was rejected downstream.
             stable_since = state.get("stable_since")
             if stable_since is None and result.window_start is not None:
                 stable_since = float(result.window_start)
                 state["stable_since"] = stable_since
             if stable_since is not None:
                 required_end = float(stable_since) + (
-                    URANS_STABLE_RETAINED_CYCLES + URANS_STABLE_STOP_MARGIN_CYCLES
-                ) * period
+                    _early_stop_certification_cycles(solver_params) * period
+                )
                 latest = _latest_time(tcase)
                 if result.ok and latest + 1e-9 >= required_end and not state.get("stop_requested"):
                     _write_early_stop_marker(tcase, result, retain_from=float(stable_since))
@@ -1195,13 +1328,15 @@ def _make_urans_monitor(
                 else:
                     target_period = state.get("target_period")
                     if target_period is None or abs(float(target_period) - period) / max(period, 1e-12) > 0.15:
+                        extended_end = max(required_end, latest + period)
                         _set_control_dict_entries(
                             tcase / "system" / "controlDict",
                             {
-                                "endTime": max(required_end, latest + period),
+                                "endTime": extended_end,
                                 "runTimeModifiable": True,
                             },
                         )
+                        update_march_budget_target(tcase, extended_end)
                         state["target_period"] = period
         else:
             # Stability lost (or never established): restart the certification
@@ -1218,6 +1353,7 @@ def evaluate_urans_quality(
     chord: float,
     min_cycles: float = URANS_MIN_RETAINED_CYCLES,
     min_frames_per_cycle: float = URANS_MIN_FRAMES_PER_CYCLE,
+    min_no_shedding_observation_s: Optional[float] = None,
 ) -> UransQuality:
     # No-shedding first: a symmetric airfoil at alpha~0 (or any weakly-loaded
     # point) escalated to URANS runs a physically steady transient. Its force
@@ -1229,6 +1365,38 @@ def evaluate_urans_quality(
     if history is not None and len(history.t) >= 2 and is_no_shedding(history):
         retained_start = float(history.t[0])
         retained_end = float(history.t[-1])
+        retained_span = max(0.0, retained_end - retained_start)
+        if min_no_shedding_observation_s is None:
+            required_span = _no_shedding_min_observation_s(speed, chord)
+        else:
+            try:
+                required_span = float(min_no_shedding_observation_s)
+            except (TypeError, ValueError):
+                required_span = math.inf
+        if (
+            not math.isfinite(required_span)
+            or required_span < 0
+            or retained_span + 1e-9 < required_span
+        ):
+            return UransQuality(
+                ok=False,
+                can_refine=False,
+                no_shedding=False,
+                reason=(
+                    "URANS quality could not be measured: "
+                    f"{URANS_APPARENT_FLAT_OBSERVATION_MARKER} "
+                    f"{retained_span:.6g}s, below the physical "
+                    f"slow-shedding observation horizon {required_span:.6g}s."
+                ),
+                measured_period_s=None,
+                retained_cycles=0.0,
+                retained_frame_count=_field_frame_count(
+                    case_dir, retained_start, retained_end
+                ),
+                frames_per_cycle=0.0,
+                retained_start_time=retained_start,
+                retained_end_time=retained_end,
+            )
         return UransQuality(
             ok=True,
             can_refine=False,
@@ -1287,6 +1455,189 @@ def evaluate_urans_quality(
         frames_per_cycle=frames_per_cycle,
         retained_start_time=retained_start,
         retained_end_time=retained_end,
+    )
+
+
+def _precalc_stationarity_unavailable(
+    quality: UransQuality,
+    detail: str,
+    *,
+    period_s: Optional[float] = None,
+    allow_continuation: bool = True,
+) -> UransQuality:
+    """Fail a mandatory precalc stationarity grade closed.
+
+    Preserve the force-history measurements, but authorize a corrective
+    same-case chunk only when a real measured period can size its cadence.
+    Full fidelity never reaches this helper.
+    """
+    valid_period = next(
+        (
+            float(candidate)
+            for candidate in (period_s, quality.measured_period_s)
+            if candidate is not None
+            and math.isfinite(candidate)
+            and candidate > 0
+        ),
+        None,
+    )
+    reason = (
+        "URANS established-oscillation stationarity verdict unavailable: "
+        f"{detail}"
+    )
+    if quality.reason:
+        reason = f"{reason}; prior force-history grade: {quality.reason}"
+    return UransQuality(
+        ok=False,
+        can_refine=allow_continuation and valid_period is not None,
+        reason=reason,
+        measured_period_s=valid_period,
+        retained_cycles=quality.retained_cycles,
+        retained_frame_count=quality.retained_frame_count,
+        frames_per_cycle=quality.frames_per_cycle,
+        retained_start_time=quality.retained_start_time,
+        retained_end_time=quality.retained_end_time,
+        no_shedding=quality.no_shedding,
+    )
+
+
+def _grade_precalc_established_oscillation(
+    case_dir: Path,
+    coeff_paths: list[Path],
+    spec: CaseSpec,
+    solver_params: SolverParams,
+    quality: UransQuality,
+    *,
+    early_stopped: bool,
+) -> UransQuality:
+    """Apply the final precalc stationarity contract while continuation is live.
+
+    Previously ``_run_transient_attempt`` accepted any dense three-period
+    signal, and the established-oscillation verdict was discovered only during
+    ``_finalize_outcome`` — after the controller had lost its opportunity to
+    keep integrating the same case.  Reuse the exact ``period_window_stats``
+    gate here so sparse or still-relaxing windows feed the continuation loop.
+    """
+    if (
+        solver_params.urans_fidelity != UransFidelity.precalc
+        or quality.no_shedding
+        or URANS_APPARENT_FLAT_OBSERVATION_MARKER in quality.reason.lower()
+    ):
+        # An amplitude-flat trace below the physical observation floor belongs
+        # to guessed-period acquisition. Re-running spectral stationarity here
+        # could find a tiny in-band numerical ripple and wrongly bypass that
+        # floor as an established oscillation.
+        return quality
+    if not coeff_paths:
+        return _precalc_stationarity_unavailable(
+            quality,
+            "coefficient evidence is missing",
+            allow_continuation=False,
+        )
+    period: Optional[float] = quality.measured_period_s
+    try:
+        t_all, cl_all, cd_all, cm_all = coefficient_series(coeff_paths)
+        if early_stopped:
+            t_c, cl_c, cd_c, cm_c = _early_stop_retained_series(
+                case_dir, t_all, cl_all, cd_all, cm_all
+            )
+        else:
+            t_c, cl_c, cd_c, cm_c = discard_startup(
+                t_all,
+                cl_all,
+                cd_all,
+                cm_all,
+                fraction=solver_params.transient_discard_fraction,
+            )
+        estimate = estimate_period(
+            t_c,
+            cl_c,
+            speed=spec.speed,
+            chord=spec.chord,
+            alpha_deg=spec.aoa_deg,
+        )
+        if estimate is None:
+            # `quality.measured_period_s` is the looser FFT-derived history
+            # value. It may size a corrective chunk, but it is not a
+            # corroborated period and must never be promoted to a stable
+            # established-oscillation verdict.
+            return _precalc_stationarity_unavailable(
+                quality,
+                "no corroborated shedding period",
+                period_s=quality.measured_period_s,
+            )
+        period = estimate.period_s
+        if period is None or not math.isfinite(period) or period <= 0:
+            return _precalc_stationarity_unavailable(
+                quality,
+                "no valid shedding period",
+                period_s=period,
+                allow_continuation=False,
+            )
+        stats = period_window_stats(
+            t_c,
+            cl_c,
+            cd_c,
+            cm_c,
+            period,
+            drift_tolerance=solver_params.urans_drift_tolerance,
+            established_oscillation=True,
+            period_stable=not estimate.ambiguous,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed; log retains the diagnostic
+        logger.warning(
+            "precalc established-oscillation grading failed for %s",
+            case_dir,
+            exc_info=True,
+        )
+        return _precalc_stationarity_unavailable(
+            quality,
+            f"grading error ({type(exc).__name__})",
+            period_s=period,
+        )
+    if stats is None:
+        return _precalc_stationarity_unavailable(
+            quality,
+            "no whole-period statistics",
+            period_s=period,
+        )
+
+    retained_cycles = float(stats.whole_periods)
+    # Media is published from exactly the last min(3, K) whole periods (see
+    # frame_target_times in _finalize_outcome). Grade that same real-evidence
+    # window: sparse startup states outside the published player must not
+    # permanently dilute a dense, usable tail.
+    frame_cycles = float(min(URANS_FRAME_SPAN_PERIODS, stats.whole_periods))
+    frame_start = stats.window_end - frame_cycles * stats.period_s
+    frame_count = _field_frame_count(case_dir, frame_start, stats.window_end)
+    frames_per_cycle = frame_count / frame_cycles if frame_cycles > 0 else 0.0
+    target = float(apply_urans_fidelity(solver_params).urans_min_periods)
+    eps = 1e-9
+    too_short = retained_cycles + eps < target
+    too_sparse = frames_per_cycle + eps < URANS_MIN_FRAMES_PER_CYCLE
+    parts: list[str] = []
+    if too_short:
+        parts.append(f"retained cycles {retained_cycles:.2f} < {target:.2f}")
+    if too_sparse:
+        parts.append(
+            f"frames/cycle {frames_per_cycle:.2f} < {URANS_MIN_FRAMES_PER_CYCLE:.2f}"
+        )
+    if not stats.stationary:
+        parts.append(
+            "URANS window not stationary (precalc established-oscillation test): "
+            f"{stats.stationary_reason}"
+        )
+    ok = not parts
+    return UransQuality(
+        ok=ok,
+        can_refine=not ok,
+        reason="URANS quality target met." if ok else "; ".join(parts),
+        measured_period_s=stats.period_s,
+        retained_cycles=retained_cycles,
+        retained_frame_count=frame_count,
+        frames_per_cycle=frames_per_cycle,
+        retained_start_time=stats.window_start,
+        retained_end_time=stats.window_end,
     )
 
 
@@ -1480,6 +1831,7 @@ def _run_transient_attempt(
     refined: bool = False,
     coeff_start_time: float | None = None,
     cancel_check: CancelCheck = None,
+    deadline: float | None = None,
 ) -> Optional[TransientResult]:
     _check_cancel(cancel_check)
     # Fresh attempt = fresh verdict: a marker left by a condemned earlier stage
@@ -1488,6 +1840,17 @@ def _run_transient_attempt(
     clear_march_markers(tcase)
     start_t = _latest_time(tcase)
     end_t = start_t + run_time
+    remaining_timeout = float(timeout)
+    if deadline is not None:
+        remaining_timeout = min(
+            remaining_timeout,
+            max(0.0, float(deadline) - time.monotonic()),
+        )
+    if remaining_timeout <= 0.0:
+        raise TransientTimeoutError(
+            "URANS integration stopped by the wall-clock budget guard before "
+            "the next same-case chunk could start"
+        )
     CaseBuilder(airfoil, patches, tmesh, spec, fluid, roughness, solver_params, n_proc=n_proc).write_transient(
         tcase,
         start_t,
@@ -1500,15 +1863,25 @@ def _run_transient_attempt(
     # trailing simulated-time rate against this target/budget and stops a
     # provably hopeless march early (graded below as a continuable budget
     # stop — restartable state, honest reason).
-    write_march_budget_marker(tcase, end_t=end_t, budget_s=float(timeout), wall_start=time.time())
+    write_march_budget_marker(
+        tcase,
+        end_t=end_t,
+        budget_s=remaining_timeout,
+        wall_start=time.time(),
+    )
     solve_started = time.monotonic()
     res = runner.solver(
         tcase,
         "pimpleFoam",
         n_proc,
-        timeout=timeout,
+        timeout=remaining_timeout,
         restart=True,
-        monitor=_make_urans_monitor(tcase, spec, coeff_start_time),
+        monitor=_make_urans_monitor(
+            tcase,
+            spec,
+            coeff_start_time,
+            solver_params=solver_params,
+        ),
     )
     wall_seconds = max(0.0, time.monotonic() - solve_started)
     _check_cancel(cancel_check)
@@ -1532,9 +1905,43 @@ def _run_transient_attempt(
     if not res.ok and not timed_out:
         return None
     if n_proc > 1:
-        recon_ok = runner.application(tcase, "reconstructPar -newTimes", timeout=timeout).ok
-        if not recon_ok and not timed_out:
-            return None
+        reconstruct_timeout = remaining_timeout
+        if deadline is not None:
+            reconstruct_timeout = min(
+                reconstruct_timeout,
+                max(0.0, float(deadline) - time.monotonic()),
+            )
+        if reconstruct_timeout <= 0.0:
+            _check_cancel(cancel_check)
+            raise OpenFOAMError(
+                "URANS MPI reconstruction could not start before the shared "
+                "tier deadline; decomposed processor field state was not "
+                "reconstructed and is not safely continuable"
+            )
+        else:
+            reconstruction = runner.application(
+                tcase,
+                "reconstructPar -newTimes",
+                timeout=reconstruct_timeout,
+            )
+            reconstruction_timed_out = (
+                bool(getattr(reconstruction, "timed_out", False))
+                or (
+                    not reconstruction.ok
+                    and getattr(reconstruction, "returncode", None) == 124
+                )
+            )
+            if reconstruction_timed_out:
+                _check_cancel(cancel_check)
+                raise OpenFOAMError(
+                    "URANS MPI reconstruction timed out before decomposed "
+                    "processor field state could be published; the result is "
+                    "not safely continuable"
+                )
+            elif not reconstruction.ok:
+                # A deterministic reconstruction failure is not a wall-budget
+                # outcome, even when pimpleFoam itself had already timed out.
+                return None
         _check_cancel(cancel_check)
 
     def _timeout_error() -> OpenFOAMError:
@@ -1543,7 +1950,12 @@ def _run_transient_attempt(
         if reached is None:
             reached = _latest_time(tcase) or None
         return TransientTimeoutError(
-            _transient_timeout_message(timeout, reached, end_t, _last_log_delta_t(res.stdout))
+            _transient_timeout_message(
+                remaining_timeout,
+                reached,
+                end_t,
+                _last_log_delta_t(res.stdout),
+            )
         )
 
     files = _coeff_files(tcase)
@@ -1557,9 +1969,8 @@ def _run_transient_attempt(
     early_stop = _read_early_stop_marker(tcase)
     history: Optional[ForceHistory] = None
     history_discard = 0.0 if early_stop else solver_params.transient_discard_fraction
-    target_cycles = (
-        int(URANS_STABLE_RETAINED_CYCLES) if early_stop else int(solver_params.urans_min_periods)
-    )
+    early_stop_cycles = _early_stop_retained_cycles(solver_params)
+    target_cycles = int(early_stop_cycles if early_stop else solver_params.urans_min_periods)
     try:
         history = compute_force_history(
             coeff_paths,
@@ -1593,13 +2004,27 @@ def _run_transient_attempt(
         history,
         spec.speed,
         spec.chord,
-        min_cycles=URANS_STABLE_RETAINED_CYCLES if early_stop else float(solver_params.urans_min_periods),
+        min_cycles=early_stop_cycles if early_stop else float(solver_params.urans_min_periods),
+        min_no_shedding_observation_s=_no_shedding_min_observation_s(
+            spec.speed, spec.chord
+        ),
+    )
+    quality = _grade_precalc_established_oscillation(
+        tcase,
+        list(coeff_paths),
+        spec,
+        solver_params,
+        quality,
+        early_stopped=bool(early_stop),
     )
     if early_stop and quality.ok:
         quality = UransQuality(
             ok=True,
             can_refine=False,
-            reason=f"URANS early-stop target met: {early_stop.get('reason', 'two stable periods')}",
+            reason=(
+                "URANS early-stop target met: "
+                f"{early_stop.get('reason', 'certified stable retained window')}"
+            ),
             measured_period_s=quality.measured_period_s,
             retained_cycles=quality.retained_cycles,
             retained_frame_count=quality.retained_frame_count,
@@ -1619,7 +2044,7 @@ def _run_transient_attempt(
             if march_stop
             else (
                 f"timed out at t={reached:.6g}s of {end_t:.6g}s "
-                f"(solver timeout {timeout:g}s)"
+                f"(solver timeout {remaining_timeout:g}s)"
             )
         )
         quality = UransQuality(
@@ -1659,6 +2084,31 @@ def _run_transient_attempt(
 #: converges within a couple of extensions; a drifting estimate must not loop
 #: the solver forever.
 URANS_CONTINUATION_MAX_CHUNKS = 6
+
+#: Period acquisition is staged rather than declaring a short slow-shedding
+#: URANS run terminal. The first two horizons preserve the legacy/default search
+#: points; the final horizon is derived from the slow edge of the physical
+#: shedding band and the request's startup discard.
+URANS_PERIOD_ACQUISITION_GUESSED_CYCLES = (10.0, 20.0)
+
+
+def _period_acquisition_write_interval(guessed_period_s: float) -> float:
+    """Sparse field cadence while no shedding period is measurable yet.
+
+    The slow edge of the accepted physical band spans ten St=0.5 guesses.  A
+    ``guessed_period / 30`` cadence therefore wrote roughly 300 full OpenFOAM
+    states per real slow cycle (about 1,100 through the default acquisition
+    horizon), even for truly steady/no-shedding cases that publish no frame
+    track.  Record 30 states per *slow-edge* period instead; the live monitor
+    switches immediately to ``measured_period / 30`` after a credible lock.
+    """
+    slow_st = float(SHEDDING_STROUHAL_BAND[0])
+    slow_period_in_guesses = TRANSIENT_INITIAL_STROUHAL / slow_st
+    return (
+        float(guessed_period_s)
+        * slow_period_in_guesses
+        / URANS_FRAME_WRITE_PER_CYCLE
+    )
 
 
 def _quality_with(quality: UransQuality, **updates) -> UransQuality:
@@ -1712,6 +2162,93 @@ def _quality_allows_more_integration(quality: UransQuality, target_cycles: float
     return too_short or too_sparse or not_stationary
 
 
+def _quality_needs_period_acquisition(
+    quality: UransQuality, solver_params: SolverParams
+) -> bool:
+    """Whether a short URANS run needs more guessed-period data before grading.
+
+    This is deliberately narrower than generic refinement: only a non-terminal
+    run with real-but-yet-unmeasurable shedding reaches it. No-shedding,
+    wall-budget, timeout, crash and divergence outcomes remain terminal here.
+    """
+    if (
+        quality.ok
+        or quality.no_shedding
+        or quality.measured_period_s is not None
+    ):
+        return False
+    reason = quality.reason.lower()
+    if any(
+        marker in reason
+        for marker in (
+            URANS_BUDGET_STOP_MARKER,
+            "timed out",
+            "stopped early",
+            "failed",
+            "crashed",
+            "diverged",
+        )
+    ):
+        return False
+    return "could not be measured" in reason or "missing or flat" in reason
+
+
+def _period_acquisition_horizons(solver_params: SolverParams) -> tuple[float, ...]:
+    """Cumulative initial-period horizons that cover the physical slow edge."""
+    discard = min(max(solver_params.transient_discard_fraction, 0.0), 0.95)
+    retained_fraction = max(1e-6, 1.0 - discard)
+    slow_st = float(SHEDDING_STROUHAL_BAND[0])
+    slow_period_in_guesses = TRANSIENT_INITIAL_STROUHAL / slow_st
+    # ``estimate_period`` requires two cycles. A small numerical overshoot keeps
+    # the retained span on the safe side of its exact >= comparison.
+    slow_edge_horizon = math.ceil(
+        URANS_PERIOD_ACQUISITION_SLOW_PERIODS
+        * slow_period_in_guesses
+        / retained_fraction
+    )
+    profile_horizon = min(
+        20.0,
+        max(URANS_PERIOD_ACQUISITION_GUESSED_CYCLES[0], float(solver_params.transient_cycles)),
+    )
+    return tuple(
+        sorted(
+            {
+                profile_horizon,
+                URANS_PERIOD_ACQUISITION_GUESSED_CYCLES[1],
+                float(slow_edge_horizon),
+            }
+        )
+    )
+
+
+def _period_ambiguity_detail(estimate: PeriodEstimate) -> str:
+    """Human-readable half-window diagnostic that is safe for missing halves."""
+
+    first = (
+        f"{estimate.first_half_s:.4g}s"
+        if estimate.first_half_s is not None
+        else "unavailable"
+    )
+    second = (
+        f"{estimate.second_half_s:.4g}s"
+        if estimate.second_half_s is not None
+        else "unavailable"
+    )
+    if estimate.first_half_s is None or estimate.second_half_s is None:
+        verdict = "were not both measurable"
+        usage = (
+            f"using full-window period {estimate.period_s:.4g}s "
+            "for continuation only"
+        )
+    else:
+        verdict = f"differ by >{PERIOD_AMBIGUITY_TOLERANCE:.0%}"
+        usage = f"using conservative shorter period {estimate.period_s:.4g}s"
+    return (
+        f"half-window estimates {first} / {second} {verdict}; "
+        f"{usage}"
+    )
+
+
 def _extend_transient_until_periods(
     tcase: Path,
     first: TransientResult,
@@ -1729,6 +2266,7 @@ def _extend_transient_until_periods(
     initial_delta_t: float,
     cancel_check: CancelCheck = None,
     rate_origin: Optional[float] = None,
+    deadline: Optional[float] = None,
 ) -> TransientResult:
     """Integrate until ``urans_min_periods`` WHOLE shedding periods are retained
     after startup discard, extending the SAME transient case in continuation
@@ -1736,15 +2274,14 @@ def _extend_transient_until_periods(
     + solver restart — no second continuation path). The period is tracked on
     the fly from the Cl signal by band-constrained autocorrelation
     (``estimate_period`` with the flow's plausible Strouhal window); an
-    ambiguous period (half-window estimates disagreeing) uses the conservative
-    SHORTER estimate so the budget projection is never inflated by a
-    sub-harmonic lock.
+    ambiguous period remains usable only to size another continuation chunk;
+    it cannot certify established oscillation until both half-windows agree.
 
     Stops early — grading honestly — when the wall-clock budget guard projects
     (from the measured solve rate) that the next chunk cannot fit the solver
     timeout budget: quality then carries "retained M.x of N periods (budget)".
-    The no-shedding early exit and the two-stable-period early stop are
-    respected untouched (they break the loop immediately).
+    A physically long-enough no-shedding observation and a tier-certified
+    stable early stop break the loop immediately.
     """
     target = float(solver_params.urans_min_periods)
     discard = min(max(solver_params.transient_discard_fraction, 0.0), 0.95)
@@ -1754,49 +2291,114 @@ def _extend_transient_until_periods(
     chunks = 0
     while chunks < URANS_CONTINUATION_MAX_CHUNKS:
         history = result.force_history
+        acquiring_period = _quality_needs_period_acquisition(
+            result.quality, solver_params
+        )
         can_continue = _quality_allows_more_integration(result.quality, target)
         if (
-            result.early_stopped
-            or result.quality.no_shedding
-            or not can_continue
-            or history is None
-            or len(history.t) < 8
+            result.quality.no_shedding
+            or (not can_continue and not acquiring_period)
         ):
-            break
-        estimate = estimate_period(
-            history.t, history.cl, speed=spec.speed, chord=spec.chord, alpha_deg=spec.aoa_deg
-        )
-        period = estimate.period_s if estimate is not None else None
-        period_note = ""
-        if estimate is not None and estimate.ambiguous:
-            period_note = (
-                f" (period ambiguous: half-window estimates {estimate.first_half_s:.4g}s / "
-                f"{estimate.second_half_s:.4g}s differ by >{PERIOD_AMBIGUITY_TOLERANCE:.0%}; "
-                f"using conservative shorter {estimate.period_s:.4g}s)"
-            )
-            logger.warning("URANS continuation period tracking%s", period_note)
-        if period is None:
-            period = history.period_s or result.quality.measured_period_s
-        if period is None or not math.isfinite(period) or period <= 0:
             break
         span = max(0.0, _latest_time(tcase) - transient_start)
         if span <= 0.0:
             break
-        retained = span * (1.0 - discard) / period
-        # Quality counts WHOLE retained cycles (integer sub-windows), so a
-        # span-retention of ~2.9 still grades as 2 whole cycles — prod
-        # naca-4412 −15° u=100 was rejected at exactly "retained cycles
-        # 2.00 < 3.00" twice (span ~2.8) because this break fired at the
-        # fractional target. Overshoot past the integer boundary so the
-        # loop and the gate agree.
-        if retained + 1e-6 >= target + RETENTION_SAFETY_CYCLES:
-            break
+        if acquiring_period:
+            guessed_period = initial_delta_t * 5000.0
+            guessed_cycles = span / guessed_period
+            next_horizon = next(
+                (
+                    horizon
+                    for horizon in _period_acquisition_horizons(solver_params)
+                    if horizon > guessed_cycles + 1e-6
+                ),
+                None,
+            )
+            if next_horizon is None:
+                result.quality = _quality_with(
+                    result.quality,
+                    can_refine=False,
+                    reason=(
+                        "URANS period acquisition exhausted the physical slow-shedding "
+                        f"horizon ({guessed_cycles:.1f} initial guesses); "
+                        f"{result.quality.reason}"
+                    ),
+                )
+                break
+            period = guessed_period
+            retained = result.quality.retained_cycles
+            chunk_sim = (next_horizon - guessed_cycles) * guessed_period
+            write_interval = _period_acquisition_write_interval(guessed_period)
+            period_note = (
+                f" (period acquisition: extending from {guessed_cycles:.1f} to "
+                f"{next_horizon:g} initial guesses)"
+            )
+            logger.warning("URANS continuation%s", period_note)
+        else:
+            if history is None or len(history.t) < 8:
+                break
+            estimate = estimate_period(
+                history.t,
+                history.cl,
+                speed=spec.speed,
+                chord=spec.chord,
+                alpha_deg=spec.aoa_deg,
+            )
+            period = estimate.period_s if estimate is not None else None
+            period_note = ""
+            if estimate is not None and estimate.ambiguous:
+                period_note = f" (period ambiguous: {_period_ambiguity_detail(estimate)})"
+                logger.warning("URANS continuation period tracking%s", period_note)
+            if period is None:
+                period = history.period_s or result.quality.measured_period_s
+            if period is None or not math.isfinite(period) or period <= 0:
+                break
+            retained = span * (1.0 - discard) / period
+            # Quality counts WHOLE retained cycles (integer sub-windows), so a
+            # span-retention of ~2.9 still grades as 2 whole cycles. Overshoot
+            # past the integer boundary so the loop and the gate agree.
+            target_deficit = target + RETENTION_SAFETY_CYCLES - retained
+            reason = result.quality.reason.lower()
+            precalc = solver_params.urans_fidelity == UransFidelity.precalc
+            sparse = precalc and (
+                result.quality.frames_per_cycle + 1e-9 < URANS_MIN_FRAMES_PER_CYCLE
+                or "frames/cycle" in reason
+            )
+            not_stationary = precalc and (
+                "not stationary" in reason or "established-oscillation" in reason
+            )
+            if target_deficit <= 1e-6 and not (sparse or not_stationary):
+                break
+            sparse_tail_only = (
+                sparse and target_deficit <= 1e-6 and not not_stationary
+            )
+            if sparse_tail_only:
+                # The aerodynamic retained-period target is already satisfied;
+                # only the published last-three-period FIELD tail is sparse.
+                # Three newly written measured periods replace that tail in
+                # full. Applying the global startup-retention fraction here
+                # turned this into 3/(1-discard)=5 periods at the default 40%
+                # discard, adding 67% solver/I/O work without adding evidence.
+                chunk_sim = float(URANS_FRAME_SPAN_PERIODS) * period
+            elif sparse:
+                # Replace the whole published last-three-period frame window in
+                # one dense measured-cadence chunk while also closing the real
+                # aerodynamic retained-window deficit conservatively.
+                target_deficit = max(
+                    target_deficit, float(URANS_FRAME_SPAN_PERIODS)
+                )
+            elif not_stationary:
+                target_deficit = max(target_deficit, 1.0)
+            if not sparse_tail_only:
+                chunk_sim = target_deficit * period / max(
+                    1e-6, 1.0 - discard
+                )
+            write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
         # Prod naca-4412 -15deg precalc retained 2.00/3.00 cycles at 19.5
         # frames/cycle and was not yet stationary, but still had a measurable
         # period and hours of budget. Those blockers are solved by more
         # integration; the next chunk writes at the dedicated frame cadence
         # while the budget guard below remains the honest stop condition.
-        chunk_sim = (target + RETENTION_SAFETY_CYCLES - retained) * period / max(1e-6, 1.0 - discard)
         if timeout and total_wall > 0.0:
             # Rate = THIS job's simulated progress per wall second. For a
             # cross-job continuation the retained window spans prior jobs'
@@ -1822,20 +2424,49 @@ def _extend_transient_until_periods(
                     ok=False,
                     can_refine=False,
                     reason=reason,
-                    measured_period_s=result.quality.measured_period_s or period,
+                    measured_period_s=(
+                        result.quality.measured_period_s
+                        if acquiring_period
+                        else result.quality.measured_period_s or period
+                    ),
                 )
                 break
-        write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
+        if result.early_stopped:
+            # A rejected early-stop marker belongs to the just-graded chunk.
+            # Remove it before continuing so the next attempt cannot mistake
+            # stale certification evidence for a new early stop.
+            (tcase / URANS_EARLY_STOP_MARKER).unlink(missing_ok=True)
+            result.early_stopped = False
+        remaining_timeout = float(timeout)
+        if deadline is not None:
+            remaining_timeout = min(
+                remaining_timeout,
+                max(0.0, float(deadline) - time.monotonic()),
+            )
+        if remaining_timeout <= 0.0:
+            reason = (
+                f"URANS integration {URANS_BUDGET_STOP_MARKER}: exhausted the "
+                f"{timeout / 3600.0:.1f}h tier budget before the next same-case "
+                f"chunk; {result.quality.reason}"
+            )
+            result.quality = _quality_with(
+                result.quality,
+                ok=False,
+                can_refine=False,
+                reason=reason,
+            )
+            break
         try:
             nxt = _run_transient_attempt(
                 tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params,
-                runner, n_proc, timeout,
+                runner, n_proc, remaining_timeout,
                 run_time=chunk_sim,
                 delta_t=min(initial_delta_t, period / 5000.0),
                 write_interval=write_interval,
                 max_delta_t=write_interval,
                 coeff_start_time=transient_start,
                 cancel_check=cancel_check,
+                deadline=deadline,
             )
         except OpenFOAMError as exc:
             # A chunk that timed out without gradable data must not discard the
@@ -1874,6 +2505,43 @@ def _extend_transient_until_periods(
         total_wall += max(0.0, nxt.wall_seconds)
         end_time = nxt.end_time
         result = nxt
+    if (
+        chunks >= URANS_CONTINUATION_MAX_CHUNKS
+        and solver_params.urans_fidelity == UransFidelity.precalc
+        and _quality_allows_more_integration(result.quality, target)
+    ):
+        if result.early_stopped:
+            (tcase / URANS_EARLY_STOP_MARKER).unlink(missing_ok=True)
+            result.early_stopped = False
+        reason_lower = result.quality.reason.lower()
+        needs_more_aerodynamic_evidence = (
+            result.quality.retained_cycles + 1e-9 < target
+            or "not stationary" in reason_lower
+            or "established-oscillation" in reason_lower
+        )
+        if needs_more_aerodynamic_evidence:
+            reason = (
+                f"URANS continuation {URANS_CONTINUATION_REQUIRED_MARKER}: reached the "
+                f"{URANS_CONTINUATION_MAX_CHUNKS}-chunk in-run safety cap with "
+                f"restartable saved case state; {result.quality.reason}"
+            )
+        else:
+            # Frame density is media-remediation metadata, not an aerodynamic
+            # acceptance gate in the public Node classifier.  Do not offer a
+            # human continuation merely because the recorder could not replace
+            # the full dense tail inside this run's safety cap.
+            reason = (
+                "URANS frame-recorder remediation reached the "
+                f"{URANS_CONTINUATION_MAX_CHUNKS}-chunk in-run safety cap; "
+                "coefficients remain graded from force history; "
+                f"{result.quality.reason}"
+            )
+        result.quality = _quality_with(
+            result.quality,
+            ok=False,
+            can_refine=False,
+            reason=reason,
+        )
     if chunks > 0:
         # The returned result grades the WHOLE merged transient window.
         result.start_time = transient_start
@@ -1893,8 +2561,11 @@ def _run_transient(
     urans_mesh: Optional[MeshParams] = None,
     urans_precalc_mesh: Optional[MeshParams] = None,
 ):
-    """Run URANS, extend it until enough whole periods are retained, then
-    automatically refine sparse/short transient media once.
+    """Run URANS and extend it until the tier's quality target is retained.
+
+    Precalc correctable-quality failures continue the same case in bounded,
+    measured-cadence chunks; full fidelity preserves its separate refinement
+    fallback.
 
     With ``resume`` the case dir already holds STAGED saved state from a prior
     job (cross-job continuation): mesh/steady/prepare stages are skipped, the
@@ -1903,6 +2574,7 @@ def _run_transient(
     tcase = case_dir / subdir
     initial_period = physics.shedding_period(spec.speed, spec.chord, strouhal=TRANSIENT_INITIAL_STROUHAL)
     initial_delta_t = initial_period / 5000.0
+    tier_deadline: Optional[float] = None
     if resume is not None:
         # Staged continuation: the saved state IS the case — never wipe or
         # re-prepare it. The shared mesh already sits in constant/polyMesh.
@@ -1943,6 +2615,7 @@ def _run_transient(
             "with wall budget %gs",
             tcase, resume.resume_from, transient_start, timeout,
         )
+        tier_deadline = time.monotonic() + float(timeout)
         first = _run_transient_attempt(
             tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params,
             runner, n_proc, timeout,
@@ -1951,6 +2624,7 @@ def _run_transient(
             max_delta_t=write_interval,
             coeff_start_time=transient_start,
             cancel_check=cancel_check,
+            deadline=tier_deadline,
         )
     else:
         effective_steady_field_dir = steady_field_dir
@@ -1975,18 +2649,26 @@ def _run_transient(
             urans_precalc_mesh=urans_precalc_mesh,
         )
 
-        initial_run_time = solver_params.transient_cycles * initial_period
+        initial_run_time = _fresh_transient_cycles(solver_params) * initial_period
         transient_start = _latest_time(tcase)
         _sanitize_freestream_init_time_state(tcase, initial_delta_t)
         # Persist the merge boundary so a cross-job continuation can keep
         # merging coefficient segments after this job is gone.
         write_transient_start_marker(tcase, transient_start)
+        tier_deadline = time.monotonic() + float(timeout)
+        initial_write_interval = (
+            _period_acquisition_write_interval(initial_period)
+            if solver_params.urans_fidelity == UransFidelity.precalc
+            else None
+        )
         first = _run_transient_attempt(
             tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params, runner, n_proc, timeout,
             run_time=initial_run_time, delta_t=initial_delta_t,
+            write_interval=initial_write_interval,
             max_delta_t=STARTUP_MAX_DELTA_T_FACTOR * initial_delta_t,
             coeff_start_time=transient_start,
             cancel_check=cancel_check,
+            deadline=tier_deadline,
         )
     if first is None:
         return None
@@ -1995,12 +2677,26 @@ def _run_transient(
         tcase, first, transient_start, airfoil, tmesh, patches, spec, fluid, roughness,
         solver_params, runner, n_proc, timeout, initial_delta_t, cancel_check=cancel_check,
         rate_origin=rate_origin,
+        deadline=tier_deadline,
     )
     if resume is not None:
         # The result grades the WHOLE merged transient window across jobs.
         first.start_time = transient_start
         first.end_time = max(first.end_time, _latest_time(tcase))
         first.run_time = max(0.0, first.end_time - transient_start)
+    if (
+        solver_params.urans_fidelity == UransFidelity.precalc
+        and (
+            URANS_CONTINUATION_REQUIRED_MARKER in first.quality.reason
+            or _quality_allows_more_integration(
+                first.quality, float(solver_params.urans_min_periods)
+            )
+        )
+    ):
+        # Precalc correctable-quality work is handled only by bounded same-case
+        # continuation above.  A separate copied rerun wastes the already-built
+        # trajectory and was the source of slow, terminal "review" outcomes.
+        return first
     if (
         first.quality.ok
         or not solver_params.transient_auto_refine
@@ -2077,6 +2773,24 @@ def _run_transient(
 
     refined_case = case_dir / f"{subdir}_refined"
     _copy_initialized_transient_case(tcase, refined_case, first.start_time)
+    remaining_timeout = float(timeout)
+    if tier_deadline is not None:
+        remaining_timeout = min(
+            remaining_timeout,
+            max(0.0, tier_deadline - time.monotonic()),
+        )
+    if remaining_timeout <= 0.0:
+        first.quality = _quality_with(
+            first.quality,
+            ok=False,
+            can_refine=False,
+            reason=(
+                f"URANS refinement not started: integration {URANS_BUDGET_STOP_MARKER}; "
+                f"the {timeout / 3600.0:.1f}h tier budget is exhausted; "
+                f"{first.quality.reason}"
+            ),
+        )
+        return first
     try:
         refined = _run_transient_attempt(
             refined_case,
@@ -2089,7 +2803,7 @@ def _run_transient(
             solver_params,
             runner,
             n_proc,
-            timeout,
+            remaining_timeout,
             run_time=refined_timing.run_time_s,
             delta_t=refined_timing.delta_t,
             write_interval=refined_timing.write_interval,
@@ -2097,6 +2811,7 @@ def _run_transient(
             refined=True,
             coeff_start_time=first.start_time,
             cancel_check=cancel_check,
+            deadline=tier_deadline,
         )
     except OpenFOAMError:
         # A refined pass that timed out without gradable data must not discard
@@ -2563,11 +3278,8 @@ def _finalize_outcome(
                     frame_period = frame_estimate.period_s if frame_estimate is not None else None
                     if frame_estimate is not None and frame_estimate.ambiguous:
                         outcome.quality_warnings.append(
-                            f"URANS period ambiguous: half-window estimates "
-                            f"{frame_estimate.first_half_s:.4g}s and "
-                            f"{frame_estimate.second_half_s:.4g}s differ by more than "
-                            f"{PERIOD_AMBIGUITY_TOLERANCE:.0%}; using the conservative "
-                            f"shorter period {frame_estimate.period_s:.4g}s"
+                            "URANS period ambiguous: "
+                            f"{_period_ambiguity_detail(frame_estimate)}"
                         )
                     if frame_period is None and transient.force_history is not None:
                         frame_period = transient.force_history.period_s
@@ -2584,7 +3296,8 @@ def _finalize_outcome(
                             drift_tolerance=solver_params.urans_drift_tolerance,
                             established_oscillation=precalc_tier,
                             period_stable=(
-                                frame_estimate is None or not frame_estimate.ambiguous
+                                frame_estimate is not None
+                                and not frame_estimate.ambiguous
                             ),
                         )
                         frame_series = (t_all, cl_all, cd_all, cm_all)

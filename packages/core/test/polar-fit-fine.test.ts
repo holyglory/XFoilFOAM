@@ -58,7 +58,9 @@ function clPeakEvidence(a: number): PolarEvidencePoint {
   };
 }
 
-function classify(evidence: PolarEvidencePoint[]): PolarEvidenceClassification[] {
+function classify(
+  evidence: PolarEvidencePoint[],
+): PolarEvidenceClassification[] {
   return evidence.map((e) => ({
     evidence: e,
     state: "accepted" as const,
@@ -68,11 +70,15 @@ function classify(evidence: PolarEvidencePoint[]): PolarEvidenceClassification[]
   }));
 }
 
-function acceptedClassifications(angles: number[]): PolarEvidenceClassification[] {
+function acceptedClassifications(
+  angles: number[],
+): PolarEvidenceClassification[] {
   return classify(angles.map(syntheticEvidence));
 }
 
-function clPeakClassifications(angles: number[]): PolarEvidenceClassification[] {
+function clPeakClassifications(
+  angles: number[],
+): PolarEvidenceClassification[] {
   return classify(angles.map(clPeakEvidence));
 }
 
@@ -80,7 +86,7 @@ describe("polar fit fine targets (spec §8)", () => {
   it("bumps POLAR_FIT_VERSION for the fine-target fields", () => {
     // v3 = alphaClmaxFine joined the metrics; existing fits refresh lazily on
     // the next ingest per revision (version participates in the cache key).
-    expect(POLAR_FIT_VERSION).toBe("evidence-lowess-v3");
+    expect(POLAR_FIT_VERSION).toBe("evidence-lowess-v5");
   });
 
   it("alphaLdmaxFine lands within 0.02° of the analytic L/D optimum", () => {
@@ -88,14 +94,18 @@ describe("polar fit fine targets (spec §8)", () => {
     const fit = buildPolarFit(acceptedClassifications(angles));
     expect(fit.status).toBe("final");
     expect(fit.metrics).not.toBeNull();
-    expect(Math.abs(fit.metrics!.alphaLdmaxFine - ALPHA_LDMAX)).toBeLessThanOrEqual(0.02);
+    expect(
+      Math.abs(fit.metrics!.alphaLdmaxFine - ALPHA_LDMAX),
+    ).toBeLessThanOrEqual(0.02);
   });
 
   it("alphaClZeroFine lands within 0.02° of the analytic zero-lift angle", () => {
     const angles = Array.from({ length: 26 }, (_, i) => i - 10);
     const fit = buildPolarFit(acceptedClassifications(angles));
     expect(fit.metrics!.alphaClZeroFine).not.toBeNull();
-    expect(Math.abs(fit.metrics!.alphaClZeroFine! - ALPHA0)).toBeLessThanOrEqual(0.02);
+    expect(
+      Math.abs(fit.metrics!.alphaClZeroFine! - ALPHA0),
+    ).toBeLessThanOrEqual(0.02);
   });
 
   it("alphaClZeroFine is null when Cl never crosses zero in the evidence range", () => {
@@ -108,8 +118,12 @@ describe("polar fit fine targets (spec §8)", () => {
   it("fine targets are rounded to 0.01°", () => {
     const angles = Array.from({ length: 26 }, (_, i) => i - 10);
     const metrics = buildPolarFit(acceptedClassifications(angles)).metrics!;
-    expect(metrics.alphaLdmaxFine).toBe(Number(metrics.alphaLdmaxFine.toFixed(2)));
-    expect(metrics.alphaClZeroFine).toBe(Number(metrics.alphaClZeroFine!.toFixed(2)));
+    expect(metrics.alphaLdmaxFine).toBe(
+      Number(metrics.alphaLdmaxFine.toFixed(2)),
+    );
+    expect(metrics.alphaClZeroFine).toBe(
+      Number(metrics.alphaClZeroFine!.toFixed(2)),
+    );
   });
 
   it("alphaClmaxFine lands within 0.02° of the analytic Cl peak", () => {
@@ -118,13 +132,17 @@ describe("polar fit fine targets (spec §8)", () => {
     expect(fit.status).toBe("final");
     expect(fit.metrics).not.toBeNull();
     expect(fit.metrics!.alphaClmaxFine).not.toBeNull();
-    expect(Math.abs(fit.metrics!.alphaClmaxFine! - A_CLMAX)).toBeLessThanOrEqual(0.02);
+    expect(
+      Math.abs(fit.metrics!.alphaClmaxFine! - A_CLMAX),
+    ).toBeLessThanOrEqual(0.02);
   });
 
   it("alphaClmaxFine is rounded to 0.01°", () => {
     const angles = Array.from({ length: 21 }, (_, i) => i - 2);
     const metrics = buildPolarFit(clPeakClassifications(angles)).metrics!;
-    expect(metrics.alphaClmaxFine).toBe(Number(metrics.alphaClmaxFine!.toFixed(2)));
+    expect(metrics.alphaClmaxFine).toBe(
+      Number(metrics.alphaClmaxFine!.toFixed(2)),
+    );
   });
 
   it("alphaClmaxFine is null when the Cl argmax sits on the evidence boundary (no interior max)", () => {

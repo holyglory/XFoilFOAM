@@ -1,20 +1,44 @@
-import { type AirfoilSummary, type CategoryNode, RELIST } from "@aerodb/core";
+import {
+  type AirfoilSummary,
+  type CategoryNode,
+  POLAR_FIT_VERSION,
+  RELIST,
+} from "@aerodb/core";
 import { airfoils, categories, polarFitSets } from "@aerodb/db";
-import { and, asc, desc, eq, gte, ilike, inArray, isNull, like, lte, or, sql, type SQL } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  ilike,
+  inArray,
+  isNull,
+  like,
+  lte,
+  or,
+  sql,
+  type SQL,
+} from "drizzle-orm";
 
 import { db } from "../db";
 import { hashtagsByAirfoilIds } from "./hashtags";
 
 export async function categoriesTree(): Promise<CategoryNode[]> {
-  const cats = await db.select().from(categories).orderBy(asc(categories.sortOrder));
+  const cats = await db
+    .select()
+    .from(categories)
+    .orderBy(asc(categories.sortOrder));
   const afRows = await db
     .select({ path: categories.path })
     .from(airfoils)
     .innerJoin(categories, eq(airfoils.categoryId, categories.id))
     .where(and(isNull(airfoils.archivedAt), isNull(airfoils.deletedAt)));
   const paths = afRows.map((r) => r.path);
-  const directCount = (catPath: string) => paths.filter((p) => p === catPath).length;
-  const subtreeCount = (catPath: string) => paths.filter((p) => p === catPath || p.startsWith(catPath + "/")).length;
+  const directCount = (catPath: string) =>
+    paths.filter((p) => p === catPath).length;
+  const subtreeCount = (catPath: string) =>
+    paths.filter((p) => p === catPath || p.startsWith(catPath + "/")).length;
 
   const byId = new Map<string, CategoryNode>();
   for (const c of cats) {
@@ -32,7 +56,8 @@ export async function categoriesTree(): Promise<CategoryNode[]> {
   const roots: CategoryNode[] = [];
   for (const c of cats) {
     const node = byId.get(c.id)!;
-    if (c.parentId && byId.has(c.parentId)) byId.get(c.parentId)!.children.push(node);
+    if (c.parentId && byId.has(c.parentId))
+      byId.get(c.parentId)!.children.push(node);
     else roots.push(node);
   }
   return roots;
@@ -85,13 +110,23 @@ const SORT_COLS = {
   area: airfoils.areaProfile,
 } as const;
 
-function addRange(conds: SQL[], col: Parameters<typeof gte>[0], min?: number, max?: number): void {
-  if (typeof min === "number" && Number.isFinite(min)) conds.push(gte(col, min));
-  if (typeof max === "number" && Number.isFinite(max)) conds.push(lte(col, max));
+function addRange(
+  conds: SQL[],
+  col: Parameters<typeof gte>[0],
+  min?: number,
+  max?: number,
+): void {
+  if (typeof min === "number" && Number.isFinite(min))
+    conds.push(gte(col, min));
+  if (typeof max === "number" && Number.isFinite(max))
+    conds.push(lte(col, max));
 }
 
 export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
-  const conds: SQL[] = [isNull(airfoils.archivedAt), isNull(airfoils.deletedAt)];
+  const conds: SQL[] = [
+    isNull(airfoils.archivedAt),
+    isNull(airfoils.deletedAt),
+  ];
   if (opts.category) {
     const [c] = await db
       .select({ id: categories.id, path: categories.path })
@@ -102,7 +137,10 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
       const cond =
         opts.includeSubcategories === false
           ? eq(categories.id, c.id)
-          : or(eq(categories.path, c.path), like(categories.path, c.path + "/%"));
+          : or(
+              eq(categories.path, c.path),
+              like(categories.path, c.path + "/%"),
+            );
       if (cond) conds.push(cond);
     }
   }
@@ -112,14 +150,44 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
   addRange(conds, airfoils.thicknessPct, opts.thicknessMin, opts.thicknessMax);
   addRange(conds, airfoils.areaProfile, opts.areaMin, opts.areaMax);
   addRange(conds, airfoils.areaUpper, opts.upperAreaMin, opts.upperAreaMax);
-  addRange(conds, airfoils.areaUpperPositive, opts.upperPositiveMin, opts.upperPositiveMax);
-  addRange(conds, airfoils.areaUpperNegative, opts.upperNegativeMin, opts.upperNegativeMax);
+  addRange(
+    conds,
+    airfoils.areaUpperPositive,
+    opts.upperPositiveMin,
+    opts.upperPositiveMax,
+  );
+  addRange(
+    conds,
+    airfoils.areaUpperNegative,
+    opts.upperNegativeMin,
+    opts.upperNegativeMax,
+  );
   addRange(conds, airfoils.areaLower, opts.lowerAreaMin, opts.lowerAreaMax);
-  addRange(conds, airfoils.areaLowerPositive, opts.lowerPositiveMin, opts.lowerPositiveMax);
-  addRange(conds, airfoils.areaLowerNegative, opts.lowerNegativeMin, opts.lowerNegativeMax);
+  addRange(
+    conds,
+    airfoils.areaLowerPositive,
+    opts.lowerPositiveMin,
+    opts.lowerPositiveMax,
+  );
+  addRange(
+    conds,
+    airfoils.areaLowerNegative,
+    opts.lowerNegativeMin,
+    opts.lowerNegativeMax,
+  );
   addRange(conds, airfoils.areaCamber, opts.camberAreaMin, opts.camberAreaMax);
-  addRange(conds, airfoils.areaCamberPositive, opts.camberPositiveMin, opts.camberPositiveMax);
-  addRange(conds, airfoils.areaCamberNegative, opts.camberNegativeMin, opts.camberNegativeMax);
+  addRange(
+    conds,
+    airfoils.areaCamberPositive,
+    opts.camberPositiveMin,
+    opts.camberPositiveMax,
+  );
+  addRange(
+    conds,
+    airfoils.areaCamberNegative,
+    opts.camberNegativeMin,
+    opts.camberNegativeMax,
+  );
 
   const sort = opts.sort ?? "name";
   const sortCol = SORT_COLS[sort as keyof typeof SORT_COLS] ?? airfoils.name;
@@ -128,7 +196,8 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
   // (postgres defaults DESC to NULLS FIRST, which put metric-less rows above
   // "FX 79-W-660A" at 66.39% t/c) — mirroring the solved-metric in-memory
   // sort below, which already sends missing values to the tail.
-  const nullableMetricSort = sort === "thickness" || sort === "camber" || sort === "area";
+  const nullableMetricSort =
+    sort === "thickness" || sort === "camber" || sort === "area";
   const rows = await db
     .select({
       id: airfoils.id,
@@ -200,6 +269,7 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
           and(
             inArray(polarFitSets.airfoilId, candidateIds),
             eq(polarFitSets.isCurrent, true),
+            eq(polarFitSets.fitVersion, POLAR_FIT_VERSION),
             inArray(polarFitSets.status, ["final", "provisional"]),
             sql`${polarFitSets.ldmax} IS NOT NULL`,
             sql`exists (
@@ -218,11 +288,13 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
   const metricMap = new Map<string, (typeof metricRows)[number]>();
   for (const row of metricRows) {
     const current = metricMap.get(row.airfoilId);
-    const statusRank = (status: string) => (status === "final" ? 2 : status === "provisional" ? 1 : 0);
+    const statusRank = (status: string) =>
+      status === "final" ? 2 : status === "provisional" ? 1 : 0;
     if (
       !current ||
       statusRank(row.fitStatus) > statusRank(current.fitStatus) ||
-      (statusRank(row.fitStatus) === statusRank(current.fitStatus) && row.pointCount > current.pointCount) ||
+      (statusRank(row.fitStatus) === statusRank(current.fitStatus) &&
+        row.pointCount > current.pointCount) ||
       (statusRank(row.fitStatus) === statusRank(current.fitStatus) &&
         row.pointCount === current.pointCount &&
         row.updatedAt > current.updatedAt)
@@ -235,7 +307,8 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
     const normalizedTags = tagMap.get(r.id) ?? [];
     const metric = metricMap.get(r.id);
     const polarCount = Number(metric?.pointCount ?? 0);
-    const metricsSource: AirfoilSummary["metricsSource"] = polarCount > 0 ? "solved" : "queued";
+    const metricsSource: AirfoilSummary["metricsSource"] =
+      polarCount > 0 ? "solved" : "queued";
     return {
       id: r.id,
       slug: r.slug,
@@ -259,8 +332,10 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
       areaUpperNegative: r.areaUpperNegative ?? Math.min(0, r.areaUpper ?? 0),
       areaLowerPositive: r.areaLowerPositive ?? Math.max(0, r.areaLower ?? 0),
       areaLowerNegative: r.areaLowerNegative ?? Math.min(0, r.areaLower ?? 0),
-      areaCamberPositive: r.areaCamberPositive ?? Math.max(0, r.areaCamber ?? 0),
-      areaCamberNegative: r.areaCamberNegative ?? Math.min(0, r.areaCamber ?? 0),
+      areaCamberPositive:
+        r.areaCamberPositive ?? Math.max(0, r.areaCamber ?? 0),
+      areaCamberNegative:
+        r.areaCamberNegative ?? Math.min(0, r.areaCamber ?? 0),
       camberPct: r.camberPct ?? null,
       camberPosPct: r.camberPosPct ?? null,
       reMin: RELIST[0],
@@ -294,5 +369,8 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
     });
   }
 
-  return summaries.slice(opts.offset ?? 0, (opts.offset ?? 0) + (opts.limit ?? DEFAULT_LIMIT));
+  return summaries.slice(
+    opts.offset ?? 0,
+    (opts.offset ?? 0) + (opts.limit ?? DEFAULT_LIMIT),
+  );
 }

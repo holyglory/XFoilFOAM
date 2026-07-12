@@ -6,8 +6,13 @@
 // low-frequency campaign reconciler. This module is independent of the
 // API-side launch/plan-edit code (campaigns.ts).
 
-import { canonicalAoa, canonicalSi, canonicalSiString } from "@aerodb/core";
-import { and, asc, desc, eq, sql } from "drizzle-orm";
+import {
+  canonicalAoa,
+  canonicalSi,
+  canonicalSiString,
+  POLAR_FIT_VERSION,
+} from "@aerodb/core";
+import { and, asc, desc, eq, sql, type SQLWrapper } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
@@ -37,8 +42,12 @@ export interface ScheduleCandidate {
 }
 
 /** Negative → a schedules before b. Pure so the winner-per-tick rule is unit-testable. */
-export function compareScheduleCandidates(a: ScheduleCandidate, b: ScheduleCandidate): number {
-  if (a.effectivePriority !== b.effectivePriority) return b.effectivePriority - a.effectivePriority;
+export function compareScheduleCandidates(
+  a: ScheduleCandidate,
+  b: ScheduleCandidate,
+): number {
+  if (a.effectivePriority !== b.effectivePriority)
+    return b.effectivePriority - a.effectivePriority;
   if (a.reynolds !== b.reynolds) return a.reynolds - b.reynolds;
   if (a.slug !== b.slug) return a.slug < b.slug ? -1 : 1;
   return a.aoa - b.aoa;
@@ -65,6 +74,112 @@ export function compareScheduleCandidates(a: ScheduleCandidate, b: ScheduleCandi
 
 /** Case budget per batched campaign job: speeds × angles ≤ this, min 1 speed. */
 export const CAMPAIGN_MAX_CASES_PER_JOB = 256;
+
+/** Durable wave-2 child settlement predicate.
+ *
+ * Live children and done children with no routed retry already block duplicate
+ * composition. A done, failed, OR cancelled precalc child also settles its
+ * parent when EVERY angle in that
+ * child's stored request has immutable deterministic mesh-QA evidence:
+ * replaying the same revision can only rebuild the same rejected mesh.
+ * Requiring full requested-angle coverage is important for partially-ingested
+ * cancellations: one blocked angle must not hide an unattempted/transient
+ * sibling that still deserves a precalc retry.
+ *
+ * The column arguments make this one predicate reusable with both the real
+ * sim_jobs table and an aliased correlated child table. */
+export function settledCampaignUransChildSql(columns: {
+  id: SQLWrapper;
+  status: SQLWrapper;
+  requestPayload: SQLWrapper;
+}) {
+  // A parent can drain several physical cells through sequential children.
+  // Settlement is parent-wide: inspect every obligation id carried by every
+  // sibling payload.  latest_sim_job_id is deliberately not the ownership
+  // relation here (a crash before ledger submission, or a later continuation,
+  // may leave it null/pointing elsewhere while the original payload still
+  // proves that the parent owns the cell).
+  const noOpenSiblingObligation = sql`NOT EXISTS (
+    SELECT 1
+    FROM sim_jobs current_child
+    JOIN sim_jobs sibling_child
+      ON sibling_child.parent_job_id = current_child.parent_job_id
+    CROSS JOIN LATERAL jsonb_array_elements_text(
+      CASE
+        WHEN jsonb_typeof(sibling_child.request_payload -> 'precalcObligationIds') = 'array'
+        THEN sibling_child.request_payload -> 'precalcObligationIds'
+        ELSE '[]'::jsonb
+      END
+    ) payload_obligation(id)
+    JOIN sim_precalc_obligations sibling_obligation
+      ON sibling_obligation.id = payload_obligation.id::uuid
+    WHERE current_child.id = ${columns.id}
+      AND sibling_obligation.state IN ('pending', 'running')
+  )`;
+  return sql`(
+    ${columns.status} IN ('pending', 'submitted', 'running', 'ingesting')
+    OR (
+      ${columns.status} = 'done'
+      AND (${noOpenSiblingObligation})
+      AND NOT EXISTS (
+        SELECT 1
+        FROM result_attempts routed_attempt
+        JOIN results routed_result ON routed_result.id = routed_attempt.result_id
+        WHERE routed_attempt.sim_job_id = ${columns.id}
+          AND routed_result.status = 'queued'
+          AND routed_result.sim_job_id IS NULL
+          AND routed_result.fidelity = 'urans_precalc'
+          AND routed_result.auto_retried_at IS NOT NULL
+      )
+    )
+    OR (
+      ${columns.status} IN ('done', 'failed', 'cancelled')
+      AND (${noOpenSiblingObligation})
+      AND jsonb_typeof(${columns.requestPayload} -> 'precalcObligationIds') = 'array'
+      AND jsonb_array_length(${columns.requestPayload} -> 'precalcObligationIds') > 0
+    )
+    OR (
+      ${columns.status} IN ('done', 'failed', 'cancelled')
+      AND (${noOpenSiblingObligation})
+      AND EXISTS (
+        SELECT 1 FROM sim_precalc_obligations known_obligation
+        WHERE known_obligation.latest_sim_job_id = ${columns.id}
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_precalc_obligations open_obligation
+        WHERE open_obligation.latest_sim_job_id = ${columns.id}
+          AND open_obligation.state IN ('pending', 'running')
+      )
+    )
+    OR (
+      ${columns.status} IN ('done', 'failed', 'cancelled')
+      AND (${noOpenSiblingObligation})
+      AND ${columns.requestPayload} ->> 'uransFidelity' = 'precalc'
+      AND jsonb_typeof(${columns.requestPayload} -> 'aoas') = 'array'
+      AND jsonb_array_length(${columns.requestPayload} -> 'aoas') > 0
+      AND NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements_text(${columns.requestPayload} -> 'aoas') requested_aoa(value)
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM results deterministic_result
+          WHERE deterministic_result.sim_job_id = ${columns.id}
+            AND deterministic_result.aoa_deg = requested_aoa.value::float8
+            AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(deterministic_result.error, ''))) > 0
+            AND position('max non-orthogonality' in lower(COALESCE(deterministic_result.error, ''))) > 0
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM result_attempts deterministic_attempt
+          WHERE deterministic_attempt.sim_job_id = ${columns.id}
+            AND deterministic_attempt.aoa_deg = requested_aoa.value::float8
+            AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(deterministic_attempt.error, ''))) > 0
+            AND position('max non-orthogonality' in lower(COALESCE(deterministic_attempt.error, ''))) > 0
+        )
+      )
+    )
+  )`;
+}
 
 /** Minimal structural view of the pinned revision snapshot the grouping rules
  *  read (the jsonb payload always carries these blocks). */
@@ -151,7 +266,9 @@ function stableStringify(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
 }
 
-function withoutRowIdentity(block: Record<string, unknown>): Record<string, unknown> {
+function withoutRowIdentity(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
   const { id: _id, slug: _slug, name: _name, ...values } = block ?? {};
   return values;
 }
@@ -177,7 +294,10 @@ export function campaignBatchGroupKey(snapshot: CampaignBatchSnapshot): string {
     referenceGeometry: {
       geometryType: snapshot.referenceGeometry.geometryType,
       referenceLengthKind: snapshot.referenceGeometry.referenceLengthKind,
-      chord: canonicalSiString("chordM", snapshot.referenceGeometry.referenceLengthM),
+      chord: canonicalSiString(
+        "chordM",
+        snapshot.referenceGeometry.referenceLengthM,
+      ),
       spanM: snapshot.referenceGeometry.spanM,
       referenceAreaM2: snapshot.referenceGeometry.referenceAreaM2,
     },
@@ -188,8 +308,12 @@ export function campaignBatchGroupKey(snapshot: CampaignBatchSnapshot): string {
       roughnessConstant: snapshot.boundary.roughnessConstant,
     },
     mesh: withoutRowIdentity(snapshot.mesh),
-    ...(snapshot.uransMesh ? { uransMesh: withoutRowIdentity(snapshot.uransMesh) } : {}),
-    ...(snapshot.uransPrecalcMesh ? { uransPrecalcMesh: withoutRowIdentity(snapshot.uransPrecalcMesh) } : {}),
+    ...(snapshot.uransMesh
+      ? { uransMesh: withoutRowIdentity(snapshot.uransMesh) }
+      : {}),
+    ...(snapshot.uransPrecalcMesh
+      ? { uransPrecalcMesh: withoutRowIdentity(snapshot.uransPrecalcMesh) }
+      : {}),
     solver: withoutRowIdentity(snapshot.solver),
     output: withoutRowIdentity(snapshot.output),
   };
@@ -214,7 +338,11 @@ export function groupCampaignBatchEntries(
   const headGroup = campaignBatchGroupKey(head.snapshot);
   const headAngles = angleSetKey(head.aoas);
   const entries = candidates
-    .filter((c) => campaignBatchGroupKey(c.snapshot) === headGroup && angleSetKey(c.aoas) === headAngles)
+    .filter(
+      (c) =>
+        campaignBatchGroupKey(c.snapshot) === headGroup &&
+        angleSetKey(c.aoas) === headAngles,
+    )
     .map((c) => ({
       conditionId: c.conditionId,
       revisionId: c.revisionId,
@@ -222,10 +350,21 @@ export function groupCampaignBatchEntries(
       speed: canonicalSi("speedMps", c.snapshot.flowState.speedMps),
       reynolds: Number(c.reynolds),
     }))
-    .sort((x, y) => (x.reynolds !== y.reynolds ? x.reynolds - y.reynolds : x.conditionId < y.conditionId ? -1 : 1));
+    .sort((x, y) =>
+      x.reynolds !== y.reynolds
+        ? x.reynolds - y.reynolds
+        : x.conditionId < y.conditionId
+          ? -1
+          : 1,
+    );
   return {
-    chord: canonicalSi("chordM", head.snapshot.referenceGeometry.referenceLengthM),
-    angles: [...new Set(head.aoas.map((a) => canonicalAoa(a)))].sort((x, y) => x - y),
+    chord: canonicalSi(
+      "chordM",
+      head.snapshot.referenceGeometry.referenceLengthM,
+    ),
+    angles: [...new Set(head.aoas.map((a) => canonicalAoa(a)))].sort(
+      (x, y) => x - y,
+    ),
     entries,
   };
 }
@@ -269,7 +408,10 @@ export async function findCampaignGapBatch(
 ): Promise<CampaignGapBatch | null> {
   const limit = opts.limit ?? 500;
   const campaignFilter = opts.campaignIds?.length
-    ? sql`AND p.campaign_id = ANY(${sql`ARRAY[${sql.join(opts.campaignIds.map((id) => sql`${id}::uuid`), sql`, `)}]`})`
+    ? sql`AND p.campaign_id = ANY(${sql`ARRAY[${sql.join(
+        opts.campaignIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`})`
     : sql``;
   const exclusions = sql`
       p.state = 'requested'
@@ -277,7 +419,27 @@ export async function findCampaignGapBatch(
       AND NOT (a.is_symmetric AND p.aoa_deg < 0)
       AND a."archivedAt" IS NULL
       AND a."deletedAt" IS NULL
-      AND (r.id IS NULL OR r.status IN ('pending', 'stale'))
+      AND (
+        r.id IS NULL
+        OR (
+          r.status IN ('pending', 'stale')
+          AND (
+            submit_retry.result_id IS NULL
+            OR submit_retry.state <> 'retry_wait'
+            OR submit_retry.next_attempt_at <= now()
+          )
+        )
+      )
+      AND (r.id IS NULL OR (
+        r.regime IS DISTINCT FROM 'urans'
+        AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+      ))
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_precalc_obligations obligation
+        WHERE obligation.airfoil_id = p.airfoil_id
+          AND obligation.revision_id = p.revision_id
+          AND obligation.aoa_deg = p.aoa_deg
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM sync_sweep_promise_points pp
@@ -298,6 +460,7 @@ export async function findCampaignGapBatch(
     JOIN airfoils a ON a.id = p.airfoil_id
     LEFT JOIN results r
       ON r.airfoil_id = p.airfoil_id AND r.simulation_preset_revision_id = p.revision_id AND r.aoa_deg = p.aoa_deg
+    LEFT JOIN sim_result_submit_retries submit_retry ON submit_retry.result_id = r.id
     WHERE ${exclusions}
       ${campaignFilter}
     ORDER BY camp.priority DESC, cond.reynolds ASC, a.slug ASC, p.aoa_deg ASC
@@ -305,7 +468,8 @@ export async function findCampaignGapBatch(
   `)) as unknown as CampaignGapRow[];
   if (!rows.length) return null;
   const head = rows[0];
-  const groupOf = (r: CampaignGapRow) => `${r.campaign_id}:${r.airfoil_id}:${r.revision_id}`;
+  const groupOf = (r: CampaignGapRow) =>
+    `${r.campaign_id}:${r.airfoil_id}:${r.revision_id}`;
 
   // Aggregate ALL open points of the head (campaign, airfoil) per condition —
   // never the LIMITed candidate page, so open-angle-set equality is judged on
@@ -320,6 +484,7 @@ export async function findCampaignGapBatch(
     JOIN airfoils a ON a.id = p.airfoil_id
     LEFT JOIN results r
       ON r.airfoil_id = p.airfoil_id AND r.simulation_preset_revision_id = p.revision_id AND r.aoa_deg = p.aoa_deg
+    LEFT JOIN sim_result_submit_retries submit_retry ON submit_retry.result_id = r.id
     WHERE p.campaign_id = ${head.campaign_id}
       AND p.airfoil_id = ${head.airfoil_id}
       AND ${exclusions}
@@ -333,7 +498,9 @@ export async function findCampaignGapBatch(
     aoas: (r.aoas ?? []).map(Number),
     snapshot: r.snapshot,
   }));
-  const headCandidate = candidates.find((c) => c.conditionId === head.condition_id);
+  const headCandidate = candidates.find(
+    (c) => c.conditionId === head.condition_id,
+  );
   if (!headCandidate) return null;
 
   const grouped = groupCampaignBatchEntries(headCandidate, candidates);
@@ -387,7 +554,8 @@ interface ProgressKeyRow {
 
 function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
   const seen = new Map<string, ProgressKeyRow>();
-  for (const row of rows) seen.set(`${row.campaign_id}:${row.condition_id}:${row.airfoil_id}`, row);
+  for (const row of rows)
+    seen.set(`${row.campaign_id}:${row.condition_id}:${row.airfoil_id}`, row);
   return [...seen.values()];
 }
 
@@ -398,12 +566,18 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
  *   - requested:  state <> 'released' — TOTAL obligation (the UI denominator
  *                 and deriveCampaignCompletion both read it as the whole
  *                 obligated cell count, not just still-open cells)
- *   - solved:     terminal, non-derived, result.status='done' AND the point's
- *                 classification is NOT 'rejected' (accepted / needs_urans /
- *                 superseded_by_urans / not-yet-classified all count; a
- *                 physics-REJECTED point must never book as solved work)
+ *   - solved:     terminal, non-derived, result.status='done' AND an explicit
+ *                 usable classification (accepted / needs_urans /
+ *                 superseded_by_urans); unclassified evidence fails closed
+ *   - blocked:    physical cell whose bounded PRECALC obligation is terminal
+ *                 blocked, plus terminal unclassified/unrecognized evidence;
+ *                 this bucket takes precedence over failed/rejected. While an
+ *                 exact obligation is pending/running, its retained parent
+ *                 failure/rejection stays in evidence but in none of these
+ *                 terminal attention buckets; machine remediation still owns
+ *                 the remaining work.
  *   - rejected:   terminal, non-derived, result.status='done' AND
- *                 result_classifications.state='rejected'
+ *                 result_classifications.state='rejected', unless blocked
  *   - failed:     terminal, non-derived, result.status='failed' (mirrors are
  *                 excluded like solved/rejected: a failed source's mirror is
  *                 terminal-linked to the SAME failed results row, so counting
@@ -412,10 +586,11 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
  *                 click-through list, which lists source rows only)
  *   - running:    requested AND live-cell result.status IN (queued, running)
  *   - superseded: result_classifications.state='superseded_by_urans'
- *   - derived:    terminal AND derived_by_symmetry — ALL terminal mirrors
- *                 regardless of source disposition: a failed source's mirror
- *                 sits in derived (not failed), keeping
- *                 remaining = requested - solved - derived - failed - rejected
+ *   - derived:    terminal mirror whose linked source has an explicit usable
+ *                 classification and no blocked physical PRECALC obligation
+ *   - blocked:    additionally includes terminal mirrors whose linked source
+ *                 is failed/unclassified, or whose SOURCE-cell obligation is
+ *                 blocked; rejected mirrors with open ladder work stay open
  *                 exactly balanced
  *  Do not diverge these between the incremental and whole-campaign paths — the
  *  first production campaign drifted precisely because two paths disagreed. */
@@ -424,7 +599,22 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
  *  with whole-campaign scope use recomputeProgressForCampaign instead. */
 const PROGRESS_KEY_CHUNK = 500;
 
-async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise<void> {
+/** A retained parent result may enter a terminal attention bucket only when
+ * no exact preliminary-URANS remediation is active or terminal-blocked. The
+ * explicit blocked branch owns `blocked`; pending/running obligations remain
+ * machine-owned work. NULL, satisfied, and cancelled obligations fall back to
+ * the canonical result/classification state. Keep this fragment shared by the
+ * incremental and whole-campaign aggregations. */
+const PRECALC_RESULT_TERMINAL_BUCKET_SQL = sql`
+  precalc_obligation.state IS DISTINCT FROM 'pending'
+  AND precalc_obligation.state IS DISTINCT FROM 'running'
+  AND precalc_obligation.state IS DISTINCT FROM 'blocked'
+`;
+
+async function recomputeProgressForKeys(
+  db: DB,
+  keys: ProgressKeyRow[],
+): Promise<void> {
   if (!keys.length) return;
   if (keys.length > PROGRESS_KEY_CHUNK) {
     for (let i = 0; i < keys.length; i += PROGRESS_KEY_CHUNK) {
@@ -433,24 +623,53 @@ async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise
     return;
   }
   const tuples = sql.join(
-    keys.map((k) => sql`(${k.campaign_id}::uuid, ${k.condition_id}::uuid, ${k.airfoil_id}::uuid)`),
+    keys.map(
+      (k) =>
+        sql`(${k.campaign_id}::uuid, ${k.condition_id}::uuid, ${k.airfoil_id}::uuid)`,
+    ),
     sql`, `,
   );
   await db.execute(sql`
-    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected)
+    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected, blocked)
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IS DISTINCT FROM 'rejected')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected')::int
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (
+             precalc_obligation.state = 'blocked'
+             OR (
+               (${PRECALC_RESULT_TERMINAL_BUCKET_SQL})
+               AND (
+                 (
+                   p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done'
+                   AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+                 )
+                 OR (
+                   p.state = 'terminal' AND p.derived_by_symmetry = true
+                   AND (
+                     r.status = 'failed'
+                     OR (
+                       r.status = 'done'
+                       AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+                     )
+                   )
+                 )
+               )
+             )
+           ))::int
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN results live
       ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    LEFT JOIN sim_precalc_obligations precalc_obligation
+      ON precalc_obligation.airfoil_id = p.airfoil_id
+     AND precalc_obligation.revision_id = p.revision_id
+     AND precalc_obligation.aoa_deg = CASE WHEN p.derived_by_symmetry THEN r.aoa_deg ELSE p.aoa_deg END
     WHERE (p.campaign_id, p.condition_id, p.airfoil_id) IN (${tuples})
     GROUP BY p.campaign_id, p.condition_id, p.airfoil_id
     ON CONFLICT (campaign_id, condition_id, airfoil_id) DO UPDATE SET
@@ -461,28 +680,58 @@ async function recomputeProgressForKeys(db: DB, keys: ProgressKeyRow[]): Promise
       superseded = excluded.superseded,
       derived = excluded.derived,
       rejected = excluded.rejected,
+      blocked = excluded.blocked,
       "updatedAt" = now()
   `);
 }
 
 /** Whole-campaign counter recompute, fully set-based (no key enumeration):
  *  the reconciler's heal path for campaigns whose key count can reach 10^5. */
-export async function recomputeProgressForCampaign(db: DB, campaignId: string): Promise<void> {
+export async function recomputeProgressForCampaign(
+  db: DB,
+  campaignId: string,
+): Promise<void> {
   await db.execute(sql`
-    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected)
+    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected, blocked)
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IS DISTINCT FROM 'rejected')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true)::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected')::int
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (
+             precalc_obligation.state = 'blocked'
+             OR (
+               (${PRECALC_RESULT_TERMINAL_BUCKET_SQL})
+               AND (
+                 (
+                   p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done'
+                   AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+                 )
+                 OR (
+                   p.state = 'terminal' AND p.derived_by_symmetry = true
+                   AND (
+                     r.status = 'failed'
+                     OR (
+                       r.status = 'done'
+                       AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+                     )
+                   )
+                 )
+               )
+             )
+           ))::int
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN results live
       ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    LEFT JOIN sim_precalc_obligations precalc_obligation
+      ON precalc_obligation.airfoil_id = p.airfoil_id
+     AND precalc_obligation.revision_id = p.revision_id
+     AND precalc_obligation.aoa_deg = CASE WHEN p.derived_by_symmetry THEN r.aoa_deg ELSE p.aoa_deg END
     WHERE p.campaign_id = ${campaignId}
     GROUP BY p.campaign_id, p.condition_id, p.airfoil_id
     ON CONFLICT (campaign_id, condition_id, airfoil_id) DO UPDATE SET
@@ -493,6 +742,7 @@ export async function recomputeProgressForCampaign(db: DB, campaignId: string): 
       superseded = excluded.superseded,
       derived = excluded.derived,
       rejected = excluded.rejected,
+      blocked = excluded.blocked,
       "updatedAt" = now()
   `);
 }
@@ -510,13 +760,23 @@ export async function recomputeProgressForCampaign(db: DB, campaignId: string): 
  *  block too: a lost wave-2 job resets its cell row to 'pending' (reconcile
  *  requeueLostJob) — still re-solve intent, and the sweeper re-claims pending
  *  rows, so this cannot deadlock the probe. */
-export async function probeCampaignCompletion(db: DB, campaignId: string): Promise<void> {
+export async function probeCampaignCompletion(
+  db: DB,
+  campaignId: string,
+): Promise<void> {
   const [probe] = (await db.execute(sql`
     SELECT
       EXISTS (
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'requested' AND c.status IN ('active', 'kept')
+          AND NOT EXISTS (
+            SELECT 1 FROM sim_precalc_obligations blocked_obligation
+            WHERE blocked_obligation.airfoil_id = p.airfoil_id
+              AND blocked_obligation.revision_id = p.revision_id
+              AND blocked_obligation.aoa_deg = p.aoa_deg
+              AND blocked_obligation.state = 'blocked'
+          )
       ) AS open,
       EXISTS (
         SELECT 1 FROM sim_campaign_lanes l
@@ -530,18 +790,6 @@ export async function probeCampaignCompletion(db: DB, campaignId: string): Promi
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
           AND live.status IN ('queued', 'running', 'pending', 'stale')
       ) AS in_flight,
-      EXISTS (
-        -- Done-but-not-yet-classified: the ingest-time probe fires BEFORE the
-        -- polar cache refresh classifies the fresh rows, so a campaign whose
-        -- last point just landed must wait for its verdict instead of booking
-        -- completed on unjudged evidence (the sweeper re-probes after refresh).
-        SELECT 1 FROM sim_campaign_points p
-        JOIN sim_campaign_conditions c ON c.id = p.condition_id
-        JOIN results r ON r.id = p.result_id
-        WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
-          AND p.derived_by_symmetry = false AND r.status = 'done'
-          AND NOT EXISTS (SELECT 1 FROM result_classifications rc2 WHERE rc2.result_id = r.id)
-      ) AS awaiting_verdict,
       EXISTS (
         -- Mirrors are NOT filtered out here (unlike the failed COUNTER, which
         -- excludes them): an EXISTS is truth-equivalent either way because a
@@ -557,12 +805,26 @@ export async function probeCampaignCompletion(db: DB, campaignId: string): Promi
       EXISTS (
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
-        JOIN results r ON r.id = p.result_id
-        JOIN result_classifications rc ON rc.result_id = r.id
-        WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
-          AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected'
+        LEFT JOIN results r ON r.id = p.result_id
+        LEFT JOIN result_classifications rc ON rc.result_id = r.id
+        WHERE p.campaign_id = ${campaignId} AND c.status IN ('active', 'kept')
+          AND p.derived_by_symmetry = false
+          AND (
+            (p.state = 'terminal' AND r.status = 'done' AND (
+              rc.state = 'rejected'
+              OR rc.state IS NULL
+              OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected')
+            ))
+            OR EXISTS (
+              SELECT 1 FROM sim_precalc_obligations blocked_obligation
+              WHERE blocked_obligation.airfoil_id = p.airfoil_id
+                AND blocked_obligation.revision_id = p.revision_id
+                AND blocked_obligation.aoa_deg = p.aoa_deg
+                AND blocked_obligation.state = 'blocked'
+            )
+          )
       ) AS has_rejected,
-      EXISTS (
+      (EXISTS (
         -- Fidelity ladder tier 2 (contract 7): a solved cell whose verdict is
         -- needs_urans still owes a (pre-calculation) URANS solve — the ladder
         -- submits it once the campaign's RANS gaps hit zero. Completion must
@@ -571,51 +833,129 @@ export async function probeCampaignCompletion(db: DB, campaignId: string): Promi
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN result_classifications rc ON rc.result_id = p.result_id
+        JOIN results tier_result ON tier_result.id = p.result_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
-          AND p.derived_by_symmetry = false AND rc.state = 'needs_urans'
-      ) AS precalc_open,
+          AND p.derived_by_symmetry = false
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM sim_precalc_obligations known_obligation
+              WHERE known_obligation.airfoil_id = p.airfoil_id
+                AND known_obligation.revision_id = p.revision_id
+                AND known_obligation.aoa_deg = p.aoa_deg
+            )
+            OR EXISTS (
+              SELECT 1 FROM sim_precalc_obligations open_obligation
+              WHERE open_obligation.airfoil_id = p.airfoil_id
+                AND open_obligation.revision_id = p.revision_id
+                AND open_obligation.aoa_deg = p.aoa_deg
+                AND open_obligation.state IN ('pending', 'running')
+            )
+          )
+          AND (
+            rc.state = 'needs_urans'
+            OR (
+              rc.state = 'rejected'
+              AND tier_result.status = 'done'
+              AND (
+                tier_result.fidelity = 'rans'
+                OR (
+                  tier_result.fidelity IS NULL
+                  AND tier_result.regime IS DISTINCT FROM 'urans'
+                )
+              )
+            )
+          )
+      ) OR EXISTS (
+        SELECT 1
+        FROM sim_precalc_obligation_campaigns ownership
+        JOIN sim_precalc_obligations obligation
+          ON obligation.id = ownership.obligation_id
+        WHERE ownership.campaign_id = ${campaignId}
+          AND ownership.state = 'active'
+          AND obligation.state IN ('pending', 'running')
+      ) OR EXISTS (
+        SELECT 1 FROM sim_urans_request_campaigns ownership
+        JOIN sim_urans_requests req ON req.id = ownership.request_id
+        WHERE ownership.campaign_id = ${campaignId}
+          AND ownership.state = 'active'
+          AND req.state IN ('pending', 'running')
+      ) OR EXISTS (
+        SELECT 1
+        FROM result_media_repairs repair
+        JOIN sim_campaign_points media_point ON media_point.result_id = repair.result_id
+        WHERE media_point.campaign_id = ${campaignId}
+          AND NOT media_point.derived_by_symmetry
+          AND repair.state IN ('pending', 'running', 'retry_wait')
+      )) AS precalc_open,
       EXISTS (
         -- Fidelity ladder tier 3 (contract 7): open verify-queue items block
         -- completion — the campaign is running_refinement, not done.
-        SELECT 1 FROM sim_urans_verify_queue q
-        WHERE q.campaign_id = ${campaignId} AND q.state IN ('pending', 'running')
+        SELECT 1 FROM sim_urans_verify_queue_campaigns ownership
+        JOIN sim_urans_verify_queue q ON q.id = ownership.queue_id
+        WHERE ownership.campaign_id = ${campaignId}
+          AND ownership.state = 'active'
+          AND q.state IN ('pending', 'running')
       ) AS verify_open
   `)) as unknown as {
     open: boolean;
     lanes_open: boolean;
     in_flight: boolean;
-    awaiting_verdict: boolean;
     has_failed: boolean;
     has_rejected: boolean;
     precalc_open: boolean;
     verify_open: boolean;
   }[];
-  if (!probe || probe.open || probe.lanes_open || probe.in_flight || probe.awaiting_verdict || probe.precalc_open || probe.verify_open)
+  if (
+    !probe ||
+    probe.open ||
+    probe.lanes_open ||
+    probe.in_flight ||
+    probe.precalc_open ||
+    probe.verify_open
+  )
     return;
   if (probe.has_failed || probe.has_rejected) {
     await db
       .update(simCampaigns)
       .set({ status: "attention" })
-      .where(and(eq(simCampaigns.id, campaignId), eq(simCampaigns.status, "active")));
+      .where(
+        and(eq(simCampaigns.id, campaignId), eq(simCampaigns.status, "active")),
+      );
   } else {
     await db
       .update(simCampaigns)
       .set({ status: "completed", completedAt: new Date() })
-      .where(and(eq(simCampaigns.id, campaignId), eq(simCampaigns.status, "active")));
+      .where(
+        and(
+          eq(simCampaigns.id, campaignId),
+          sql`${simCampaigns.status} IN ('active', 'attention')`,
+        ),
+      );
   }
 }
 
-async function lanesForProgressKeys(db: DB, keys: ProgressKeyRow[]): Promise<CampaignLaneKey[]> {
+async function lanesForProgressKeys(
+  db: DB,
+  keys: ProgressKeyRow[],
+): Promise<CampaignLaneKey[]> {
   if (!keys.length) return [];
   const tuples = sql.join(
-    keys.map((k) => sql`(${k.campaign_id}::uuid, ${k.airfoil_id}::uuid, ${k.condition_id}::uuid)`),
+    keys.map(
+      (k) =>
+        sql`(${k.campaign_id}::uuid, ${k.airfoil_id}::uuid, ${k.condition_id}::uuid)`,
+    ),
     sql`, `,
   );
   const rows = (await db.execute(sql`
     SELECT campaign_id, airfoil_id, condition_id, objective
     FROM sim_campaign_lanes
     WHERE (campaign_id, airfoil_id, condition_id) IN (${tuples})
-  `)) as unknown as { campaign_id: string; airfoil_id: string; condition_id: string; objective: string }[];
+  `)) as unknown as {
+    campaign_id: string;
+    airfoil_id: string;
+    condition_id: string;
+    objective: string;
+  }[];
   return rows.map((r) => ({
     campaignId: r.campaign_id,
     airfoilId: r.airfoil_id,
@@ -631,7 +971,10 @@ async function lanesForProgressKeys(db: DB, keys: ProgressKeyRow[]): Promise<Cam
  * probe, and return the dirty lane keys the caller should drain via laneTick
  * AFTER refreshing the polar fit cache for the revision.
  */
-export async function onResultIngested(db: DB, signal: ResultIngestSignal): Promise<CampaignLaneKey[]> {
+export async function onResultIngested(
+  db: DB,
+  signal: ResultIngestSignal,
+): Promise<CampaignLaneKey[]> {
   if (!signal.revisionId) return [];
   const aoa = canonicalAoa(signal.aoaDeg);
   const terminal = signal.status === "done" || signal.status === "failed";
@@ -699,11 +1042,12 @@ export async function onResultIngested(db: DB, signal: ResultIngestSignal): Prom
 // ---------------------------------------------------------------------------
 // Auto-retry-once (approved design c19fd74a, amendment B): a crash-class
 // failed point (results.status = 'failed') gets ONE automatic requeue before
-// counting as needs_review. Marker = results.auto_retried_at (migration 0036):
+// remaining failed/blocked. Marker = results.auto_retried_at (migration 0036):
 // it lives on the durable cell row so it survives re-ingest of the same failed
-// job (the ingest upsert never writes it), and the retry itself is not a
-// composed job (the row returns to 'pending' and the ordinary gap finders
-// re-claim it), so there is no retry-job payload to stamp at requeue time.
+// job (the ingest upsert never writes it). Wave-1 failures return to `pending`
+// for the ordinary gap finder. Campaign precalc failures remain on their
+// wave-2 ownership path: legacy scalar jobs are reclaimed by the parent scan,
+// while association-owned jobs reopen the same physical precalc request.
 // ---------------------------------------------------------------------------
 export interface AutoRetriedCell {
   resultId: string;
@@ -716,83 +1060,489 @@ export interface AutoRetriedCell {
 export interface AutoRetryOutcome {
   /** Cells flipped back to pending/requested — their ONE automatic retry. */
   retried: AutoRetriedCell[];
+  /** Campaign precalc failures released from their dead child but deliberately
+   *  left `queued`, not `pending`: the URANS ladder must create their next
+   *  wave-2/forced-transient job. Treating them as an ordinary campaign gap
+   *  would silently downgrade the retry to wave-1 RANS. */
+  precalcRouted: AutoRetriedCell[];
   /** Cells that failed AGAIN after their automatic retry (marker already
-   *  present): left failed = needs_review. The caller logs these loudly. */
+   *  present): left failed/blocked. The caller logs these loudly. */
   escalated: AutoRetriedCell[];
+  /** First-attempt deterministic precalc mesh-QA failures. Their campaign
+   *  revision and tier pin the same setup/mesh for the generic retry, so an
+   *  unchanged requeue cannot succeed. They stay failed/terminal with the
+   *  original attempt evidence and surface through the existing blocked /
+   *  needs-attention read models. */
+  suppressed: AutoRetriedCell[];
+  /** Ladder-scoped precalc failures that cannot be retried: every owner is
+   * terminal/cancelled, or the physical work was a bounded continuation whose
+   * engine submission already spent its one attempt. Evidence stays failed. */
+  terminalBlocked: AutoRetriedCell[];
 }
 
-/** Requeue every unmarked failed row of one sim job exactly once:
- *  result → pending (claim links cleared, marker stamped, error text kept as
- *  evidence of the crash), linked campaign points → requested, counters
- *  recomputed. Rows already carrying the marker stay failed and are returned
- *  as `escalated`. Callers MUST invoke this AFTER every polar-cache refresh of
- *  the job's ingest path — flipping a row to pending and re-refreshing would
- *  overwrite its stored at-ingest classification (prod row 741db07a). */
-export async function autoRetryCrashedResultsForJob(db: DB, simJobId: string): Promise<AutoRetryOutcome> {
-  const escalated = (await db.execute(sql`
+// Production campaign b96594a6 proved that the generic crash retry was not
+// safe for every `failed` row: the precalc checkMesh gate rejected the same
+// immutable revision 4-5 times at max non-orthogonality 88.2/88.3 degrees.
+// Scope this suppression narrowly to that deterministic engine QA class and
+// to campaign wave-2 precalc jobs whose job revision is the result revision.
+// Other mesh errors, wave-1 work, admin jobs, and transient crashes keep the
+// existing one-shot retry policy.
+const PRECALC_WAVE2_JOB_SQL = sql`
+  EXISTS (
+    SELECT 1
+    FROM sim_jobs j
+    WHERE j.id = r.sim_job_id
+      AND j.wave = 2
+      AND j.simulation_preset_revision_id = r.simulation_preset_revision_id
+      AND j.request_payload ->> 'uransFidelity' = 'precalc'
+  )
+`;
+
+/** Any ladder-scoped precalc job, including a campaign_id=NULL physical
+ * request. Historical/cancelled request ownership still counts as ladder
+ * provenance so a failed URANS row can never fall through to wave-1 RANS. */
+const LADDER_SCOPED_PRECALC_SQL = sql`
+  (${PRECALC_WAVE2_JOB_SQL})
+  AND EXISTS (
+    SELECT 1
+    FROM sim_jobs scoped_job
+    WHERE scoped_job.id = r.sim_job_id
+      AND (
+        scoped_job.campaign_id IS NOT NULL
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_requests scoped_request
+          WHERE scoped_request.id::text = scoped_job.request_payload ->> 'uransRequestId'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(scoped_job.request_payload -> 'precalcObligationIds') = 'array'
+              THEN scoped_job.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) payload_obligation(id)
+          JOIN sim_precalc_obligations obligation
+            ON obligation.id = payload_obligation.id::uuid
+          WHERE obligation.airfoil_id = r.airfoil_id
+            AND obligation.revision_id = r.simulation_preset_revision_id
+            AND obligation.aoa_deg = r.aoa_deg
+        )
+      )
+  )
+`;
+
+/** An exact preliminary-URANS obligation created for this physical cell by a
+ * different job. This is intentionally cell-scoped rather than derived from
+ * r.sim_job_id: submitUransRetryForJob creates the obligation/child for a
+ * failed wave-1 row before the generic crash-retry pass runs. Looking only at
+ * the wave-1 payload would then reopen that same cell as pending RANS and
+ * double-schedule it. A cancelled obligation only fences the cell after it
+ * spent a physical attempt; an unsubmitted cancellation does not consume the
+ * ordinary one-shot crash retry. */
+const EXACT_PRECALC_OBLIGATION_SQL = sql`
+  EXISTS (
+    SELECT 1
+    FROM sim_precalc_obligations exact_obligation
+    WHERE exact_obligation.airfoil_id = r.airfoil_id
+      AND exact_obligation.revision_id = r.simulation_preset_revision_id
+      AND exact_obligation.aoa_deg = r.aoa_deg
+      AND (
+        exact_obligation.state <> 'cancelled'
+        OR exact_obligation.attempt_count > 0
+      )
+  )
+`;
+
+/** Current owners that still authorize/freeze this work. A background owner
+ * is independent of campaign lifecycle; cancelled/archived campaign owners
+ * are deliberately absent. */
+const LIVE_LADDER_PRECALC_SQL = sql`
+  (${PRECALC_WAVE2_JOB_SQL})
+  AND EXISTS (
+    SELECT 1
+    FROM sim_jobs live_job
+    WHERE live_job.id = r.sim_job_id
+      AND (
+        EXISTS (
+          SELECT 1 FROM sim_campaigns direct_campaign
+          WHERE direct_campaign.id = live_job.campaign_id
+            AND direct_campaign.status IN ('active', 'attention', 'paused')
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_requests live_request
+          WHERE live_request.id::text = live_job.request_payload ->> 'uransRequestId'
+            AND (
+              live_request.background_owner
+              OR EXISTS (
+                SELECT 1
+                FROM sim_urans_request_campaigns live_owner
+                JOIN sim_campaigns owner_campaign
+                  ON owner_campaign.id = live_owner.campaign_id
+                WHERE live_owner.request_id = live_request.id
+                  AND live_owner.state = 'active'
+                  AND owner_campaign.status IN ('active', 'attention', 'paused')
+              )
+            )
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(live_job.request_payload -> 'precalcObligationIds') = 'array'
+              THEN live_job.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) payload_obligation(id)
+          JOIN sim_precalc_obligations obligation
+            ON obligation.id = payload_obligation.id::uuid
+          WHERE obligation.airfoil_id = r.airfoil_id
+            AND obligation.revision_id = r.simulation_preset_revision_id
+            AND obligation.aoa_deg = r.aoa_deg
+            AND obligation.state IN ('pending', 'running')
+            AND (
+              obligation.background_owner
+              OR EXISTS (
+                SELECT 1
+                FROM sim_precalc_obligation_campaigns ownership
+                JOIN sim_campaigns owner_campaign
+                  ON owner_campaign.id = ownership.campaign_id
+                WHERE ownership.obligation_id = obligation.id
+                  AND ownership.state = 'active'
+                  AND owner_campaign.status IN ('active', 'attention', 'paused')
+              )
+            )
+        )
+      )
+  )
+`;
+
+/** A continuation is already the bounded second physical attempt for its
+ * result. It must remain terminal when that engine submission fails; otherwise
+ * one request can loop forever without ever reaching campaign attention. */
+const BOUNDED_CONTINUATION_PRECALC_SQL = sql`
+  (${PRECALC_WAVE2_JOB_SQL})
+  AND EXISTS (
+    SELECT 1
+    FROM sim_jobs continuation_job
+    JOIN sim_urans_requests continuation_request
+      ON continuation_request.id::text = continuation_job.request_payload ->> 'uransRequestId'
+    WHERE continuation_job.id = r.sim_job_id
+      AND continuation_request.continue_from_result_id IS NOT NULL
+  )
+`;
+
+/** A fresh automatic precalc request may receive the normal one crash retry.
+ * Bounded same-result continuations are spent at engine submission and stay
+ * terminal on failure instead of silently receiving another continuation.
+ * The shared request is reopened only after terminal ingest has settled it to
+ * `done`; partial evidence published by a still-running engine job must not
+ * create a duplicate submission. */
+const ROUTABLE_CAMPAIGN_PRECALC_SQL = sql`
+  (${LIVE_LADDER_PRECALC_SQL})
+  AND NOT EXISTS (
+    SELECT 1
+    FROM sim_jobs ledger_job
+    CROSS JOIN LATERAL jsonb_array_elements_text(
+      CASE
+        WHEN jsonb_typeof(ledger_job.request_payload -> 'precalcObligationIds') = 'array'
+        THEN ledger_job.request_payload -> 'precalcObligationIds'
+        ELSE '[]'::jsonb
+      END
+    ) payload_obligation(id)
+    JOIN sim_precalc_obligations obligation
+      ON obligation.id = payload_obligation.id::uuid
+    WHERE ledger_job.id = r.sim_job_id
+      AND obligation.airfoil_id = r.airfoil_id
+      AND obligation.revision_id = r.simulation_preset_revision_id
+      AND obligation.aoa_deg = r.aoa_deg
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM sim_jobs routable_job
+    WHERE routable_job.id = r.sim_job_id
+      AND (
+        routable_job.campaign_id IS NOT NULL
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_requests routable_request
+          WHERE routable_request.id::text = routable_job.request_payload ->> 'uransRequestId'
+            AND routable_request.continue_from_result_id IS NULL
+            AND routable_request.state = 'done'
+        )
+      )
+  )
+`;
+
+const DETERMINISTIC_PRECALC_MESH_QA_SQL = sql`
+  (${LIVE_LADDER_PRECALC_SQL})
+  AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(r.error, ''))) > 0
+  AND position('max non-orthogonality' in lower(COALESCE(r.error, ''))) > 0
+`;
+
+/** Route every unmarked failed row of one sim job exactly once:
+ *  result → pending for wave-1 or queued-without-owner for campaign
+ *  precalc (claim links cleared, marker stamped, error text kept as evidence
+ *  of the crash), linked campaign points → requested, counters
+ *  recomputed. Deterministic identical precalc mesh-QA failures stay failed
+ *  and are returned as `suppressed`; rows already carrying the marker stay
+ *  failed and are returned as `escalated`. Callers MUST invoke this AFTER
+ *  every polar-cache refresh of the job's ingest path — flipping a row to
+ *  pending and re-refreshing would overwrite its stored at-ingest
+ *  classification (prod row 741db07a). */
+export async function autoRetryCrashedResultsForJob(
+  db: DB,
+  simJobId: string,
+): Promise<AutoRetryOutcome> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    // Serialize the route decision with pause/cancel. Once this transaction
+    // reopens a live owner's point/request, a waiting lifecycle transaction can
+    // release it normally; it can never observe a half-routed ownerless row.
+    await tx.execute(sql`
+    SELECT campaign.id
+    FROM sim_jobs job
+    JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
+    WHERE job.id = ${simJobId}
+      AND campaign.status IN ('active', 'attention', 'paused')
+    ORDER BY campaign.id
+    FOR SHARE OF campaign
+  `);
+    await tx.execute(sql`
+    SELECT campaign.id
+    FROM sim_jobs job
+    JOIN sim_urans_requests request_item
+      ON request_item.id::text = job.request_payload ->> 'uransRequestId'
+    JOIN sim_urans_request_campaigns ownership
+      ON ownership.request_id = request_item.id
+     AND ownership.state = 'active'
+    JOIN sim_campaigns campaign
+      ON campaign.id = ownership.campaign_id
+     AND campaign.status IN ('active', 'attention', 'paused')
+    WHERE job.id = ${simJobId}
+    ORDER BY campaign.id
+    FOR SHARE OF campaign
+  `);
+
+    const suppressed = (await tx.execute(sql`
+    SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+           r.aoa_deg::float8 AS aoa_deg, r.error
+    FROM results r
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NULL
+      AND r.simulation_preset_revision_id IS NOT NULL
+      AND (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+  `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      error: string | null;
+    }>;
+
+    const terminalBlocked = (await tx.execute(sql`
+    SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+           r.aoa_deg::float8 AS aoa_deg, r.error
+    FROM results r
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NULL
+      AND r.simulation_preset_revision_id IS NOT NULL
+      AND (${LADDER_SCOPED_PRECALC_SQL})
+      AND (
+        NOT (${LIVE_LADDER_PRECALC_SQL})
+        OR (${BOUNDED_CONTINUATION_PRECALC_SQL})
+      )
+      AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+  `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      error: string | null;
+    }>;
+
+    const escalated = (await tx.execute(sql`
     SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
            r.aoa_deg::float8 AS aoa_deg, r.error
     FROM results r
     WHERE r.sim_job_id = ${simJobId} AND r.status = 'failed' AND r.auto_retried_at IS NOT NULL
-  `)) as unknown as Array<{ result_id: string; airfoil_id: string; revision_id: string | null; aoa_deg: number; error: string | null }>;
+  `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      error: string | null;
+    }>;
 
-  const retried = (await db.execute(sql`
+    // A failed campaign precalc cell must never fall through the ordinary
+    // campaign gap finder: that composer is wave-1 RANS by definition. Release
+    // ownership from the dead child, retain the failed evidence/one-shot marker,
+    // and use `queued` as the durable "awaiting another wave-2 child" state.
+    // campaignHasOpenRansGaps and findCampaignGapBatch both already distinguish
+    // this from a schedulable pending/stale RANS gap; the gated parent rescan
+    // creates the actual precalc request and reclaims the row.
+    const precalcRouted = (await tx.execute(sql`
+    UPDATE results r
+    SET status = 'queued', source = 'queued', sim_job_id = NULL, engine_job_id = NULL,
+        engine_case_slug = NULL, auto_retried_at = now(), "updatedAt" = now()
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NULL
+      AND r.simulation_preset_revision_id IS NOT NULL
+      AND (${ROUTABLE_CAMPAIGN_PRECALC_SQL})
+      AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+    RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+              r.aoa_deg::float8 AS aoa_deg, r.error
+  `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      error: string | null;
+    }>;
+
+    // A ladder-scoped precalc row may be terminal-blocked, but it must never
+    // fall through to the generic pending/wave-1 path.
+    const retried = (await tx.execute(sql`
     UPDATE results r
     SET status = 'pending', source = 'queued', sim_job_id = NULL, engine_job_id = NULL,
         engine_case_slug = NULL, auto_retried_at = now(), "updatedAt" = now()
-    WHERE r.sim_job_id = ${simJobId} AND r.status = 'failed' AND r.auto_retried_at IS NULL
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NULL
+      AND NOT (${LADDER_SCOPED_PRECALC_SQL})
+      AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
+      AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
     RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
               r.aoa_deg::float8 AS aoa_deg, r.error
-  `)) as unknown as Array<{ result_id: string; airfoil_id: string; revision_id: string | null; aoa_deg: number; error: string | null }>;
+  `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      error: string | null;
+    }>;
 
-  if (retried.length) {
-    // Terminal campaign points linked to the requeued rows reopen (the same
-    // reset semantics as requeueSinglePoint, bulk + non-derived only), and the
-    // affected counters recompute idempotently.
-    const keys = (await db.execute(sql`
+    // A live association-owned fresh request retries through the same physical
+    // precalc request, never through the wave-1 campaign gap finder.
+    if (precalcRouted.length) {
+      await tx.execute(sql`
+      UPDATE sim_urans_requests request_item
+      SET state = 'pending', sim_job_id = NULL, "updatedAt" = now()
+      FROM sim_jobs failed_job
+      WHERE failed_job.id = ${simJobId}
+        AND request_item.id::text = failed_job.request_payload ->> 'uransRequestId'
+        AND request_item.continue_from_result_id IS NULL
+        AND (
+          request_item.background_owner
+          OR EXISTS (
+            SELECT 1
+            FROM sim_urans_request_campaigns ownership
+            JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+            WHERE ownership.request_id = request_item.id
+              AND ownership.state = 'active'
+              AND campaign.status IN ('active', 'attention', 'paused')
+          )
+        )
+    `);
+    }
+
+    const reopened = [...retried, ...precalcRouted];
+    if (reopened.length) {
+      // A crash retry is a fresh submit lifecycle too. This is normally a
+      // no-op because an accepted engine submission already clears the
+      // pre-submit ledger, but keeping the reset atomic prevents stale rows
+      // from stranding repaired/imported legacy cells.
+      await tx.execute(sql`
+      DELETE FROM sim_result_submit_retries
+      WHERE result_id = ANY(${sql`ARRAY[${sql.join(
+        reopened.map((r) => sql`${r.result_id}::uuid`),
+        sql`, `,
+      )}]`})
+    `);
+      // Terminal campaign points linked to the requeued rows reopen (the same
+      // reset semantics as requeueSinglePoint, bulk + non-derived only), and the
+      // affected counters recompute idempotently.
+      const keys = (await tx.execute(sql`
       UPDATE sim_campaign_points p
       SET state = 'requested', "updatedAt" = now()
-      WHERE p.result_id = ANY(${sql`ARRAY[${sql.join(retried.map((r) => sql`${r.result_id}::uuid`), sql`, `)}]`})
+      WHERE p.result_id = ANY(${sql`ARRAY[${sql.join(
+        reopened.map((r) => sql`${r.result_id}::uuid`),
+        sql`, `,
+      )}]`})
         AND p.state = 'terminal' AND NOT p.derived_by_symmetry
+        AND EXISTS (
+          SELECT 1 FROM sim_campaigns campaign
+          WHERE campaign.id = p.campaign_id
+            AND campaign.status IN ('active', 'attention', 'paused', 'completed')
+        )
       RETURNING p.campaign_id, p.condition_id, p.airfoil_id
     `)) as unknown as ProgressKeyRow[];
-    await recomputeProgressForKeys(db, dedupeProgressKeys(keys));
-    // The completion probe may have flipped the campaign to 'attention' the
-    // instant its last point terminal-failed — BEFORE this retry reopened it.
-    // An attention/completed campaign is invisible to the gap finder
-    // (camp.status = 'active'), which would strand the requeued points
-    // forever. Same re-derivation refreshCampaignCompletion performs: open
-    // requested work ⇒ active.
-    const campaignIds = [...new Set(keys.map((k) => k.campaign_id))];
-    if (campaignIds.length) {
-      await db.execute(sql`
+      await recomputeProgressForKeys(tx, dedupeProgressKeys(keys));
+      // The completion probe may have flipped the campaign to 'attention' the
+      // instant its last point terminal-failed — BEFORE this retry reopened it.
+      // An attention/completed campaign is invisible to the gap finder
+      // (camp.status = 'active'), which would strand the requeued points
+      // forever. Same re-derivation refreshCampaignCompletion performs: open
+      // requested work ⇒ active.
+      const campaignIds = [...new Set(keys.map((k) => k.campaign_id))];
+      if (campaignIds.length) {
+        await tx.execute(sql`
         UPDATE sim_campaigns c
         SET status = 'active'
-        WHERE c.id = ANY(${sql`ARRAY[${sql.join(campaignIds.map((id) => sql`${id}::uuid`), sql`, `)}]`})
+        WHERE c.id = ANY(${sql`ARRAY[${sql.join(
+          campaignIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})
           AND c.status IN ('attention', 'completed')
           AND EXISTS (SELECT 1 FROM sim_campaign_points p WHERE p.campaign_id = c.id AND p.state = 'requested')
       `);
+      }
     }
-  }
 
-  const toCell = (row: { result_id: string; airfoil_id: string; revision_id: string | null; aoa_deg: number; error: string | null }): AutoRetriedCell => ({
-    resultId: row.result_id,
-    airfoilId: row.airfoil_id,
-    revisionId: row.revision_id,
-    aoaDeg: Number(row.aoa_deg),
-    error: row.error,
+    const toCell = (row: {
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      error: string | null;
+    }): AutoRetriedCell => ({
+      resultId: row.result_id,
+      airfoilId: row.airfoil_id,
+      revisionId: row.revision_id,
+      aoaDeg: Number(row.aoa_deg),
+      error: row.error,
+    });
+    return {
+      retried: retried.map(toCell),
+      precalcRouted: precalcRouted.map(toCell),
+      escalated: escalated.map(toCell),
+      suppressed: suppressed.map(toCell),
+      terminalBlocked: terminalBlocked.map(toCell),
+    };
   });
-  return { retried: retried.map(toCell), escalated: escalated.map(toCell) };
 }
 
 // ---------------------------------------------------------------------------
 // Refinement lanes (spec §8).
 // ---------------------------------------------------------------------------
-const CONVERGED_STATES = new Set(["converged_provisional", "converged_final", "converged_window", "converged_stale"]);
+const CONVERGED_STATES = new Set([
+  "converged_provisional",
+  "converged_final",
+  "converged_window",
+  "converged_stale",
+]);
 
 /** Oscillation window (spec §8 step 4): the last 3 predictions fit inside a
  *  2·tolerance window. Pure so it is unit-testable. */
-export function isOscillationConverged(predictions: number[], toleranceDeg: number): boolean {
+export function isOscillationConverged(
+  predictions: number[],
+  toleranceDeg: number,
+): boolean {
   if (predictions.length < 3) return false;
   const last = predictions.slice(-3);
   return Math.max(...last) - Math.min(...last) <= 2 * toleranceDeg + 1e-9;
@@ -809,7 +1559,10 @@ interface PlanObjectiveConfig {
   maxRounds?: number;
 }
 
-const OBJECTIVE_DEFAULTS: Record<string, { toleranceDeg: number; maxRounds: number }> = {
+const OBJECTIVE_DEFAULTS: Record<
+  string,
+  { toleranceDeg: number; maxRounds: number }
+> = {
   ld_max: { toleranceDeg: 0.1, maxRounds: 8 },
   cl_zero: { toleranceDeg: 0.05, maxRounds: 6 },
   // Same defaults as ld_max: the Cl curve is flat near its peak, so α(Cl_max)
@@ -828,7 +1581,12 @@ const OBJECTIVE_PLAN_KEYS: Record<string, "ldMax" | "clZero" | "clMax"> = {
 async function updateLaneState(
   db: DB,
   key: CampaignLaneKey,
-  set: Partial<{ state: string; currentTargetAlpha: number | null; iterationCount: number; witnessFitSetId: string | null }>,
+  set: Partial<{
+    state: string;
+    currentTargetAlpha: number | null;
+    iterationCount: number;
+    witnessFitSetId: string | null;
+  }>,
 ): Promise<void> {
   await db
     .update(simCampaignLanes)
@@ -861,7 +1619,10 @@ const LANE_TERMINAL_STATES = new Set([
  * converges at iteration 1. Enqueued refinement points are single-angle
  * campaign points at canonical 0.01°-rounded predictions.
  */
-export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickResult | null> {
+export async function laneTick(
+  db: DB,
+  key: CampaignLaneKey,
+): Promise<LaneTickResult | null> {
   const [lane] = await db
     .select()
     .from(simCampaignLanes)
@@ -877,7 +1638,11 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
   if (!lane) return null;
   const frozen: LaneTickResult = { state: lane.state, enqueuedAoaDeg: null };
 
-  const [campaign] = await db.select().from(simCampaigns).where(eq(simCampaigns.id, key.campaignId)).limit(1);
+  const [campaign] = await db
+    .select()
+    .from(simCampaigns)
+    .where(eq(simCampaigns.id, key.campaignId))
+    .limit(1);
   // Pause/cancel semantics (§6.4): lanes only move while the campaign is active.
   if (!campaign || campaign.status !== "active") return frozen;
 
@@ -895,14 +1660,24 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
         .where(eq(simCampaignPlanRevisions.id, campaign.currentPlanRevisionId))
         .limit(1)
     : [];
-  const objectives = (planRev?.plan as { objectives?: Record<string, PlanObjectiveConfig> } | undefined)?.objectives;
-  const objectiveConfig = objectives?.[OBJECTIVE_PLAN_KEYS[key.objective] ?? "ldMax"];
+  const objectives = (
+    planRev?.plan as
+      | { objectives?: Record<string, PlanObjectiveConfig> }
+      | undefined
+  )?.objectives;
+  const objectiveConfig =
+    objectives?.[OBJECTIVE_PLAN_KEYS[key.objective] ?? "ldMax"];
   // Disabling an objective freezes its lanes at their last evidence-backed state.
   if (!objectiveConfig?.enabled) return frozen;
-  const defaults = OBJECTIVE_DEFAULTS[key.objective] ?? OBJECTIVE_DEFAULTS.ld_max;
+  const defaults =
+    OBJECTIVE_DEFAULTS[key.objective] ?? OBJECTIVE_DEFAULTS.ld_max;
   const toleranceRaw = Number(objectiveConfig.toleranceDeg);
-  const tolerance = Number.isFinite(toleranceRaw) && toleranceRaw > 0 ? toleranceRaw : defaults.toleranceDeg;
-  const maxRounds = (objectiveConfig.maxRounds ?? defaults.maxRounds) + lane.extraRoundsGranted;
+  const tolerance =
+    Number.isFinite(toleranceRaw) && toleranceRaw > 0
+      ? toleranceRaw
+      : defaults.toleranceDeg;
+  const maxRounds =
+    (objectiveConfig.maxRounds ?? defaults.maxRounds) + lane.extraRoundsGranted;
 
   const [airfoil] = await db
     .select({ isSymmetric: airfoils.isSymmetric })
@@ -914,7 +1689,10 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
   // Symmetric shortcut (§8/§9): α₀ = 0° by definition — no solve, stated as such.
   if (symmetric && key.objective === "cl_zero") {
     if (lane.state !== "symmetric_definition") {
-      await updateLaneState(db, key, { state: "symmetric_definition", currentTargetAlpha: 0 });
+      await updateLaneState(db, key, {
+        state: "symmetric_definition",
+        currentTargetAlpha: 0,
+      });
     }
     return { state: "symmetric_definition", enqueuedAoaDeg: null };
   }
@@ -927,6 +1705,7 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
       and(
         eq(polarFitSets.airfoilId, key.airfoilId),
         eq(polarFitSets.simulationPresetRevisionId, revisionId),
+        eq(polarFitSets.fitVersion, POLAR_FIT_VERSION),
         eq(polarFitSets.isCurrent, true),
       ),
     )
@@ -949,15 +1728,22 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
   const openPoints = openRows.length > 0;
 
   // Step 1: missing/insufficient fit.
-  if (!fit || fit.status === "insufficient" || rawTarget == null || !Number.isFinite(rawTarget)) {
+  if (
+    !fit ||
+    fit.status === "insufficient" ||
+    rawTarget == null ||
+    !Number.isFinite(rawTarget)
+  ) {
     // Seed-once rule: the base sweep is the seed — while any of its points are
     // still pending the lane waits; once everything is terminal and the fit is
     // still insufficient the lane parks in insufficient_evidence (the
     // lane-scoped requeue-failed affordance is the way back in — we never
     // auto-requeue a second seed).
     const nextState = openPoints ? "awaiting_seed" : "insufficient_evidence";
-    if (lane.state !== nextState) await updateLaneState(db, key, { state: nextState });
-    if (nextState === "insufficient_evidence") await probeCampaignCompletion(db, key.campaignId);
+    if (lane.state !== nextState)
+      await updateLaneState(db, key, { state: nextState });
+    if (nextState === "insufficient_evidence")
+      await probeCampaignCompletion(db, key.campaignId);
     return { state: nextState, enqueuedAoaDeg: null };
   }
 
@@ -968,12 +1754,17 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
   // Symmetric ld_max / cl_max lanes search α ≥ 0 only (§8/§9): both are real
   // nonzero-α targets on symmetric airfoils (unlike cl_zero's 0°-by-definition
   // shortcut above), and the negative side is the mirror of the positive.
-  const alphaStar = symmetric && (key.objective === "ld_max" || key.objective === "cl_max") ? Math.max(0, rawTarget) : rawTarget;
+  const alphaStar =
+    symmetric && (key.objective === "ld_max" || key.objective === "cl_max")
+      ? Math.max(0, rawTarget)
+      : rawTarget;
   const predicted = canonicalAoa(Math.round(alphaStar * 100) / 100);
   // Supersession reopen (§8 step 6): witness replaced within tolerance keeps
   // the lane converged_stale unless the machine re-confirms or re-runs.
   const reopenWithinTolerance =
-    wasConverged && lane.currentTargetAlpha != null && Math.abs(predicted - lane.currentTargetAlpha) <= tolerance + 1e-9;
+    wasConverged &&
+    lane.currentTargetAlpha != null &&
+    Math.abs(predicted - lane.currentTargetAlpha) <= tolerance + 1e-9;
 
   // Append-only step evidence maintenance: link solved outcomes first.
   await db.execute(sql`
@@ -1029,7 +1820,10 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
       })
       .onConflictDoNothing();
   }
-  const predictions = [...steps.map((s) => canonicalAoa(s.predictedAlpha)), ...(advances ? [predicted] : [])];
+  const predictions = [
+    ...steps.map((s) => canonicalAoa(s.predictedAlpha)),
+    ...(advances ? [predicted] : []),
+  ];
 
   // Step 3: CONVERGED iff (a) no in-flight/requested lane point, (b) accepted
   // evidence within tolerance of α* at the pinned revision, (c) the fit did
@@ -1050,11 +1844,18 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
   // has a step at this very α from an earlier fit. A refreshed fit id whose
   // argmax did not move must not block convergence — same-α refits no longer
   // append witness steps, so the old fit-id equality test would deadlock.
-  const fitStable = advances || (last != null && canonicalAoa(last.predictedAlpha) === predicted);
+  const fitStable =
+    advances ||
+    (last != null && canonicalAoa(last.predictedAlpha) === predicted);
 
   if (!openPoints && evidenceWithinTolerance && fitStable) {
-    const state = fit.status === "final" ? "converged_final" : "converged_provisional";
-    await updateLaneState(db, key, { state, witnessFitSetId: fit.id, currentTargetAlpha: predicted });
+    const state =
+      fit.status === "final" ? "converged_final" : "converged_provisional";
+    await updateLaneState(db, key, {
+      state,
+      witnessFitSetId: fit.id,
+      currentTargetAlpha: predicted,
+    });
     await probeCampaignCompletion(db, key.campaignId);
     return { state, enqueuedAoaDeg: null };
   }
@@ -1072,7 +1873,10 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
 
   if (duplicate) {
     let state: string;
-    if (duplicate.state === "terminal" && duplicate.result_status === "failed") {
+    if (
+      duplicate.state === "terminal" &&
+      duplicate.result_status === "failed"
+    ) {
       state = "failed";
     } else if (isOscillationConverged(predictions, tolerance)) {
       state = "converged_window";
@@ -1086,16 +1890,22 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
     await updateLaneState(db, key, {
       state,
       currentTargetAlpha: predicted,
-      ...(state === "converged_window" || state === "converged_stale" ? { witnessFitSetId: fit.id } : {}),
+      ...(state === "converged_window" || state === "converged_stale"
+        ? { witnessFitSetId: fit.id }
+        : {}),
     });
-    if (LANE_TERMINAL_STATES.has(state)) await probeCampaignCompletion(db, key.campaignId);
+    if (LANE_TERMINAL_STATES.has(state))
+      await probeCampaignCompletion(db, key.campaignId);
     return { state, enqueuedAoaDeg: null };
   }
 
   // Step 5: enqueue α* as a single-angle campaign point (targeted job at the
   // campaign priority band), bounded by maxRounds + extraRoundsGranted.
   if (lane.iterationCount >= maxRounds) {
-    await updateLaneState(db, key, { state: "stalled", currentTargetAlpha: predicted });
+    await updateLaneState(db, key, {
+      state: "stalled",
+      currentTargetAlpha: predicted,
+    });
     await probeCampaignCompletion(db, key.campaignId);
     return { state: "stalled", enqueuedAoaDeg: null };
   }
@@ -1112,7 +1922,11 @@ export async function laneTick(db: DB, key: CampaignLaneKey): Promise<LaneTickRe
     })
     .onConflictDoNothing();
   await recomputeProgressForKeys(db, [
-    { campaign_id: key.campaignId, condition_id: key.conditionId, airfoil_id: key.airfoilId },
+    {
+      campaign_id: key.campaignId,
+      condition_id: key.conditionId,
+      airfoil_id: key.airfoilId,
+    },
   ]);
   await updateLaneState(db, key, {
     state: "iterating",
@@ -1133,7 +1947,9 @@ export interface CampaignReconcileResult {
   orphanedPendingDeleted: number;
 }
 
-export async function reconcileCampaigns(db: DB): Promise<CampaignReconcileResult> {
+export async function reconcileCampaigns(
+  db: DB,
+): Promise<CampaignReconcileResult> {
   // Oldest-checked first: the campaign whose progress rows were refreshed the
   // longest ago (missing rows count as never checked).
   const [target] = (await db.execute(sql`
@@ -1207,7 +2023,12 @@ export async function reconcileCampaigns(db: DB): Promise<CampaignReconcileResul
             OR (l.state IN ('converged_provisional', 'converged_final', 'converged_window')
                 AND (f.id IS NULL OR f.is_current = false))
           )
-      `)) as unknown as { campaign_id: string; airfoil_id: string; condition_id: string; objective: string }[])
+      `)) as unknown as {
+        campaign_id: string;
+        airfoil_id: string;
+        condition_id: string;
+        objective: string;
+      }[])
     : [];
 
   return {
@@ -1230,7 +2051,10 @@ export async function reconcileCampaigns(db: DB): Promise<CampaignReconcileResul
  * the non-blocking "restore it to keep the dataset closed?" suggestion on the
  * campaign detail payload.
  */
-export async function releasedConditionsWithGainedEvidence(db: DB, campaignId: string): Promise<string[]> {
+export async function releasedConditionsWithGainedEvidence(
+  db: DB,
+  campaignId: string,
+): Promise<string[]> {
   const rows = (await db.execute(sql`
     SELECT DISTINCT cond.id
     FROM sim_campaign_conditions cond

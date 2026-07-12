@@ -93,13 +93,20 @@ SHEDDING_PROJECTED_HEIGHT_FLOOR = 0.15
 #: period (see ``estimate_period``) guard the budget math instead.
 SUBHARMONIC_PEAK_TOLERANCE = 0.8
 
-#: Half-window period estimates differing by more than this fraction (relative
-#: to the larger one) flag the period as AMBIGUOUS: the estimate is disclosed
-#: with both values and the conservative SHORTER period is used for
+#: A missing half-window estimate, or two half-window estimates differing by
+#: more than this fraction (relative to the larger one), flags the period as
+#: AMBIGUOUS. When both exist, the conservative SHORTER period is used for
 #: retained-cycle counting and budget projection (shorter period => more
 #: retained cycles => the projection can never inflate the required
-#: continuation hours off an accidental sub-harmonic lock).
+#: continuation hours off an accidental sub-harmonic lock). A lone full-window
+#: estimate may size continuation but cannot certify stationarity.
 PERIOD_AMBIGUITY_TOLERANCE = 0.30
+
+#: Minimum cycles required by each independent period estimate.  The
+#: full-window estimate and BOTH half-window corroboration estimates use this
+#: same floor, so an early-stop certification window must span at least twice
+#: this many periods before it can possibly be judged unambiguous.
+PERIOD_ESTIMATE_MIN_CYCLES = 2.0
 
 #: An in-band spectral peak is CREDIBLE only when it reaches at least this
 #: fraction of the strongest spectral magnitude anywhere in the spectrum (DC
@@ -746,7 +753,7 @@ def estimate_period(
     *,
     speed: "float | None" = None,
     chord: "float | None" = None,
-    min_cycles: float = 2.0,
+    min_cycles: float = PERIOD_ESTIMATE_MIN_CYCLES,
     corr_threshold: float = 0.2,
     ambiguity_tolerance: float = PERIOD_AMBIGUITY_TOLERANCE,
     alpha_deg: "float | None" = None,
@@ -756,13 +763,10 @@ def estimate_period(
     Wraps :func:`measure_period` with the physical Strouhal band derived from
     ``speed``/``chord`` plus optional ``alpha_deg`` (legacy unconstrained search
     when speed/chord is missing), then estimates the period independently on the
-    two halves of the analysis window. Half-window estimates differing by more than
-    ``ambiguity_tolerance`` mark the period AMBIGUOUS: both values are
-    disclosed and the conservative SHORTER estimate becomes ``period_s``, so
-    retained-cycle counting and budget projection can never be starved by an
-    accidental long-period (sub-harmonic) lock — the risk-averse choice for
-    the projection math, with the ambiguity reported as a quality warning by
-    the callers.
+    two halves of the analysis window. A missing half-window estimate, or two
+    estimates differing by more than ``ambiguity_tolerance``, marks the period
+    AMBIGUOUS.  The full-window estimate remains usable for continuation sizing,
+    but an ambiguous estimate must never certify established oscillation.
     """
     band = shedding_period_band(speed, chord, alpha_deg=alpha_deg)
     t, v = _normalise_series(times, values)
@@ -784,10 +788,20 @@ def estimate_period(
         t[second_mask], v[second_mask],
         min_cycles=min_cycles, corr_threshold=corr_threshold, period_band=band,
     )
+    # A full-window cadence is not evidence that the oscillation has settled
+    # across time.  Both independent halves must corroborate it before callers
+    # may certify an established oscillation.  Keeping ``period_s`` lets the
+    # continuation loop size a safe next chunk while the quality verdict stays
+    # fail closed.
+    if p1 is None or p2 is None:
+        return PeriodEstimate(
+            period_s=float(full),
+            ambiguous=True,
+            first_half_s=p1,
+            second_half_s=p2,
+        )
     if (
-        p1 is not None
-        and p2 is not None
-        and abs(p1 - p2) / max(p1, p2) > ambiguity_tolerance
+        abs(p1 - p2) / max(p1, p2) > ambiguity_tolerance
     ):
         return PeriodEstimate(
             period_s=float(min(p1, p2)), ambiguous=True, first_half_s=p1, second_half_s=p2
@@ -1133,6 +1147,22 @@ NO_SHEDDING_REL_TOL = 5e-3
 NO_SHEDDING_ABS_FLOOR = 1e-3
 
 
+def _no_shedding_from_stats(
+    cl_mean: float,
+    cl_rms: float,
+    cd_mean: float,
+    cd_rms: float,
+    *,
+    rel_tol: float = NO_SHEDDING_REL_TOL,
+    abs_floor: float = NO_SHEDDING_ABS_FLOOR,
+) -> bool:
+    """Amplitude-only no-shedding verdict shared by raw and stored histories."""
+    fluctuation = max(abs(cl_rms), abs(cd_rms))
+    scale = abs(cl_mean) + abs(cd_mean)
+    threshold = max(rel_tol * scale, abs_floor)
+    return fluctuation <= threshold
+
+
 def is_no_shedding(
     history: "ForceHistory | None",
     rel_tol: float = NO_SHEDDING_REL_TOL,
@@ -1151,10 +1181,14 @@ def is_no_shedding(
     """
     if history is None or history.samples < 2 or len(history.t) < 2:
         return False
-    fluctuation = max(abs(history.cl_rms), abs(history.cd_rms))
-    scale = abs(history.cl_mean) + abs(history.cd_mean)
-    threshold = max(rel_tol * scale, abs_floor)
-    return fluctuation <= threshold
+    return _no_shedding_from_stats(
+        history.cl_mean,
+        history.cl_rms,
+        history.cd_mean,
+        history.cd_rms,
+        rel_tol=rel_tol,
+        abs_floor=abs_floor,
+    )
 
 
 def force_history(
@@ -1183,21 +1217,64 @@ def force_history(
     if t_a.size == 0:
         raise ValueError(f"No usable coefficient data found in {path}")
 
-    # Physical band constraint: the FFT peak search is restricted to the
-    # plausible shedding window for this flow (St in SHEDDING_STROUHAL_BAND),
-    # so history.strouhal / period_s — the quality-evaluation period chain —
-    # can never lock onto a low-frequency sub-harmonic of a broadband
-    # post-stall signal. Without speed/chord the band is None (legacy search).
-    freq = dominant_frequency(
-        t_a, cl_a, freq_band=shedding_frequency_band(speed, chord, alpha_deg=alpha_deg)
+    # Decide amplitude-flat/no-shedding from the FULL post-discard observation
+    # before period extraction. A tiny numerical ripple can have a perfectly
+    # credible in-band FFT line; period-windowing that ripple first used to crop
+    # a physically sufficient 4.3 s observation to the last three spurious
+    # cycles (~1.5 s), making the slow-shedding safety floor impossible to
+    # satisfy. A flat trace owns the whole retained span and no invented period.
+    full_cl_mean, full_cl_rms = _time_weighted_mean_std(t_a, cl_a)
+    full_cd_mean, full_cd_rms = _time_weighted_mean_std(t_a, cd_a)
+    full_cm_mean, full_cm_rms = _time_weighted_mean_std(t_a, cm_a)
+    amplitude_flat = _no_shedding_from_stats(
+        full_cl_mean,
+        full_cl_rms,
+        full_cd_mean,
+        full_cd_rms,
     )
-    st = strouhal(freq, chord, speed)
-    period = chord / (st * speed) if st > 0 and speed > 0 and chord > 0 else None
-    window = integer_period_window(t_a, period, discard_fraction=0.0, target_cycles=target_cycles) if period else None
-    wt, wcl, wcd, wcm = _window_series(t_a, cl_a, cd_a, cm_a, window)
-    cl_mean, cl_rms = _time_weighted_mean_std(wt, wcl)
-    cd_mean, cd_rms = _time_weighted_mean_std(wt, wcd)
-    cm_mean, cm_rms = _time_weighted_mean_std(wt, wcm)
+    if amplitude_flat:
+        freq = 0.0
+        st = 0.0
+        period = None
+        window = None
+        wt, wcl, wcd, wcm = t_a, cl_a, cd_a, cm_a
+        cl_mean, cl_rms = full_cl_mean, full_cl_rms
+        cd_mean, cd_rms = full_cd_mean, full_cd_rms
+        cm_mean, cm_rms = full_cm_mean, full_cm_rms
+    else:
+        # Physical band constraint: the FFT peak search is restricted to the
+        # plausible shedding window for this flow (St in
+        # SHEDDING_STROUHAL_BAND), so history.strouhal / period_s — the
+        # quality-evaluation period chain — can never lock onto a low-frequency
+        # sub-harmonic of a broadband post-stall signal. Without speed/chord the
+        # band is None (legacy search).
+        freq = dominant_frequency(
+            t_a,
+            cl_a,
+            freq_band=shedding_frequency_band(
+                speed, chord, alpha_deg=alpha_deg
+            ),
+        )
+        st = strouhal(freq, chord, speed)
+        period = (
+            chord / (st * speed)
+            if st > 0 and speed > 0 and chord > 0
+            else None
+        )
+        window = (
+            integer_period_window(
+                t_a,
+                period,
+                discard_fraction=0.0,
+                target_cycles=target_cycles,
+            )
+            if period
+            else None
+        )
+        wt, wcl, wcd, wcm = _window_series(t_a, cl_a, cd_a, cm_a, window)
+        cl_mean, cl_rms = _time_weighted_mean_std(wt, wcl)
+        cd_mean, cd_rms = _time_weighted_mean_std(wt, wcd)
+        cm_mean, cm_rms = _time_weighted_mean_std(wt, wcm)
     return ForceHistory(
         t=_downsample(wt.tolist(), max_points),
         cl=_downsample(wcl.tolist(), max_points),

@@ -96,6 +96,7 @@ services:
       - "4000:4000"
     volumes:
       - results:/data/airfoilfoam:ro # serve CFD images/videos the Python engine writes
+      - sync_imports:/data/airfoilfoam/sync-imports
     depends_on:
       postgres:
         condition: service_healthy
@@ -103,7 +104,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "node -e \"fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+          'node -e "fetch(''http://127.0.0.1:4000/health'').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
         ]
       interval: 5s
       timeout: 3s
@@ -137,6 +138,7 @@ services:
       ENGINE_URL: http://api:8000
     volumes:
       - results:/data/airfoilfoam # ingest reads engine artifacts
+      - sync_imports:/data/airfoilfoam/sync-imports # GC crash-orphan sync uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -145,5 +147,6 @@ services:
 
 volumes:
   results:
+  sync_imports:
   pgdata:
   engine_cache: # persistent engine mesh/seed cache (survives worker image rebuilds)

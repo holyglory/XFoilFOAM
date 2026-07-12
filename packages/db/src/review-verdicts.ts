@@ -5,7 +5,11 @@ import { resultReviewVerdicts } from "./schema";
 
 export const REVIEW_VERDICTS = ["waive", "exclude", "defer"] as const;
 export type ReviewVerdictValue = (typeof REVIEW_VERDICTS)[number];
-export type ActiveReviewVerdictValue = Exclude<ReviewVerdictValue, "defer">;
+/** Historical waivers remain auditable but never act on machine evidence. */
+export type ActiveReviewVerdictValue = "exclude";
+
+export const RETIRED_REVIEW_WAIVER_ERROR =
+  "accept-with-waiver is retired; solver evidence must pass the machine classifier";
 
 export type ReviewVerdictRecord = {
   id: string;
@@ -66,7 +70,7 @@ export async function activeReviewVerdict(
       and(
         eq(resultReviewVerdicts.resultId, resultId),
         isNull(resultReviewVerdicts.revokedAt),
-        inArray(resultReviewVerdicts.verdict, ["waive", "exclude"]),
+        eq(resultReviewVerdicts.verdict, "exclude"),
       ),
     )
     .orderBy(desc(resultReviewVerdicts.createdAt))
@@ -88,7 +92,7 @@ export async function activeReviewVerdicts(
       and(
         inArray(resultReviewVerdicts.resultId, unique),
         isNull(resultReviewVerdicts.revokedAt),
-        inArray(resultReviewVerdicts.verdict, ["waive", "exclude"]),
+        eq(resultReviewVerdicts.verdict, "exclude"),
       ),
     )
     .orderBy(desc(resultReviewVerdicts.createdAt));
@@ -120,13 +124,16 @@ export async function recordReviewVerdict(
     reviewer: string;
   },
 ): Promise<ReviewVerdictRecord> {
+  if (input.verdict === "waive") {
+    throw new Error(RETIRED_REVIEW_WAIVER_ERROR);
+  }
   return db.transaction(async (rawTx) => {
     const tx = asDb(rawTx);
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`result-review-verdict:${input.resultId}`}, 0))`,
     );
 
-    if (input.verdict === "waive" || input.verdict === "exclude") {
+    if (input.verdict === "exclude") {
       await tx
         .update(resultReviewVerdicts)
         .set({ revokedAt: new Date(), revokedBy: input.reviewer })

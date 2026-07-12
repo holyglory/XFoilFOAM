@@ -18,12 +18,13 @@ import {
   sweepDefinitions,
 } from "@aerodb/db";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { db, sql } from "../src/db";
 import { assembleDetail } from "../src/services/detail";
 import { listAirfoils } from "../src/services/catalog";
+import { createExactResultAttemptFixture } from "./exact-result-fixture";
 
 const cleanupResultIds = new Set<string>();
 const cleanupClassificationIds = new Set<string>();
@@ -51,9 +52,14 @@ const symmetricPoints = [
 ];
 
 async function createTestBoundaryCondition(unique: string, reynolds = 500000) {
-  const [air] = await db.select().from(mediums).where(eq(mediums.slug, "air")).limit(1);
+  const [air] = await db
+    .select()
+    .from(mediums)
+    .where(eq(mediums.slug, "air"))
+    .limit(1);
   expect(air).toBeTruthy();
-  const speed = Math.round(reynolds * air.kinematicViscosity * 1_000_000) / 1_000_000;
+  const speed =
+    Math.round(reynolds * air.kinematicViscosity * 1_000_000) / 1_000_000;
   const [bc] = await db
     .insert(boundaryConditions)
     .values({
@@ -66,7 +72,10 @@ async function createTestBoundaryCondition(unique: string, reynolds = 500000) {
       pressurePa: air.refPressurePa,
       speedMps: speed,
     })
-    .returning({ id: boundaryConditions.id, reynolds: boundaryConditions.reynolds });
+    .returning({
+      id: boundaryConditions.id,
+      reynolds: boundaryConditions.reynolds,
+    });
   cleanupBoundaryConditionIds.add(bc.id);
 
   const [flow] = await db
@@ -135,7 +144,13 @@ async function createTestBoundaryCondition(unique: string, reynolds = 500000) {
 
   const [sweep] = await db
     .insert(sweepDefinitions)
-    .values({ slug: `${unique}-sweep`, name: `${unique} Sweep`, aoaStart: -8, aoaStop: 20, aoaStep: 1 })
+    .values({
+      slug: `${unique}-sweep`,
+      name: `${unique} Sweep`,
+      aoaStart: -8,
+      aoaStop: 20,
+      aoaStep: 1,
+    })
     .returning({ id: sweepDefinitions.id });
   cleanupSweepDefinitionIds.add(sweep.id);
 
@@ -160,49 +175,100 @@ async function createTestBoundaryCondition(unique: string, reynolds = 500000) {
 
   const resolved = await ensureSimulationPresetRevision(db, preset.id);
   expect(resolved).toBeTruthy();
-  return { ...bc, presetId: preset.id, presetRevisionId: resolved!.revision.id };
+  return {
+    ...bc,
+    presetId: preset.id,
+    presetRevisionId: resolved!.revision.id,
+  };
 }
 
 afterAll(async () => {
-  if (cleanupFitSetIds.size) await db.delete(polarFitSets).where(inArray(polarFitSets.id, Array.from(cleanupFitSetIds)));
+  if (cleanupFitSetIds.size)
+    await db
+      .delete(polarFitSets)
+      .where(inArray(polarFitSets.id, Array.from(cleanupFitSetIds)));
   if (cleanupClassificationIds.size) {
-    await db.delete(resultClassifications).where(inArray(resultClassifications.id, Array.from(cleanupClassificationIds)));
+    await db
+      .delete(resultClassifications)
+      .where(
+        inArray(resultClassifications.id, Array.from(cleanupClassificationIds)),
+      );
   }
-  if (cleanupResultIds.size) await db.delete(results).where(inArray(results.id, Array.from(cleanupResultIds)));
+  if (cleanupResultIds.size)
+    await db
+      .delete(results)
+      .where(inArray(results.id, Array.from(cleanupResultIds)));
   if (cleanupPresetIds.size) {
-    await db.delete(simulationPresets).where(inArray(simulationPresets.id, Array.from(cleanupPresetIds)));
+    await db
+      .delete(simulationPresets)
+      .where(inArray(simulationPresets.id, Array.from(cleanupPresetIds)));
   }
   if (cleanupBoundaryConditionIds.size) {
-    await db.delete(boundaryConditions).where(inArray(boundaryConditions.id, Array.from(cleanupBoundaryConditionIds)));
+    await db
+      .delete(boundaryConditions)
+      .where(
+        inArray(boundaryConditions.id, Array.from(cleanupBoundaryConditionIds)),
+      );
   }
   if (cleanupFlowConditionIds.size) {
-    await db.delete(flowConditions).where(inArray(flowConditions.id, Array.from(cleanupFlowConditionIds)));
+    await db
+      .delete(flowConditions)
+      .where(inArray(flowConditions.id, Array.from(cleanupFlowConditionIds)));
   }
   if (cleanupReferenceGeometryIds.size) {
     await db
       .delete(referenceGeometryProfiles)
-      .where(inArray(referenceGeometryProfiles.id, Array.from(cleanupReferenceGeometryIds)));
+      .where(
+        inArray(
+          referenceGeometryProfiles.id,
+          Array.from(cleanupReferenceGeometryIds),
+        ),
+      );
   }
   if (cleanupBoundaryProfileIds.size) {
-    await db.delete(boundaryProfiles).where(inArray(boundaryProfiles.id, Array.from(cleanupBoundaryProfileIds)));
+    await db
+      .delete(boundaryProfiles)
+      .where(
+        inArray(boundaryProfiles.id, Array.from(cleanupBoundaryProfileIds)),
+      );
   }
   if (cleanupMeshProfileIds.size) {
-    await db.delete(meshProfiles).where(inArray(meshProfiles.id, Array.from(cleanupMeshProfileIds)));
+    await db
+      .delete(meshProfiles)
+      .where(inArray(meshProfiles.id, Array.from(cleanupMeshProfileIds)));
   }
   if (cleanupSolverProfileIds.size) {
-    await db.delete(solverProfiles).where(inArray(solverProfiles.id, Array.from(cleanupSolverProfileIds)));
+    await db
+      .delete(solverProfiles)
+      .where(inArray(solverProfiles.id, Array.from(cleanupSolverProfileIds)));
   }
   if (cleanupSchedulingProfileIds.size) {
-    await db.delete(schedulingProfiles).where(inArray(schedulingProfiles.id, Array.from(cleanupSchedulingProfileIds)));
+    await db
+      .delete(schedulingProfiles)
+      .where(
+        inArray(schedulingProfiles.id, Array.from(cleanupSchedulingProfileIds)),
+      );
   }
   if (cleanupOutputProfileIds.size) {
-    await db.delete(outputProfiles).where(inArray(outputProfiles.id, Array.from(cleanupOutputProfileIds)));
+    await db
+      .delete(outputProfiles)
+      .where(inArray(outputProfiles.id, Array.from(cleanupOutputProfileIds)));
   }
   if (cleanupSweepDefinitionIds.size) {
-    await db.delete(sweepDefinitions).where(inArray(sweepDefinitions.id, Array.from(cleanupSweepDefinitionIds)));
+    await db
+      .delete(sweepDefinitions)
+      .where(
+        inArray(sweepDefinitions.id, Array.from(cleanupSweepDefinitionIds)),
+      );
   }
-  if (cleanupAirfoilIds.size) await db.delete(airfoils).where(inArray(airfoils.id, Array.from(cleanupAirfoilIds)));
-  if (cleanupCategoryIds.size) await db.delete(categories).where(inArray(categories.id, Array.from(cleanupCategoryIds)));
+  if (cleanupAirfoilIds.size)
+    await db
+      .delete(airfoils)
+      .where(inArray(airfoils.id, Array.from(cleanupAirfoilIds)));
+  if (cleanupCategoryIds.size)
+    await db
+      .delete(categories)
+      .where(inArray(categories.id, Array.from(cleanupCategoryIds)));
   await sql.end();
 });
 
@@ -213,7 +279,13 @@ describe("symmetric airfoil read-path derivation (spec §9.2–§9.3)", () => {
 
     const [cat] = await db
       .insert(categories)
-      .values({ slug: unique, name: "Symmetry Detail Test", path: unique, depth: 0, sortOrder: 998 })
+      .values({
+        slug: unique,
+        name: "Symmetry Detail Test",
+        path: unique,
+        depth: 0,
+        sortOrder: 998,
+      })
       .returning({ id: categories.id });
     cleanupCategoryIds.add(cat.id);
 
@@ -264,22 +336,47 @@ describe("symmetric airfoil read-path derivation (spec §9.2–§9.3)", () => {
       )
       .returning({ id: results.id, aoaDeg: results.aoaDeg });
     realRows.forEach((row) => cleanupResultIds.add(row.id));
+    for (const row of realRows) {
+      await createExactResultAttemptFixture(db, row.id, {
+        publication: "selected-eligible",
+      });
+    }
     const resultIdByAoa = new Map(realRows.map((row) => [row.aoaDeg, row.id]));
 
-    const refreshed = await refreshPolarCacheForRevision(db, airfoil.id, bc.presetRevisionId);
+    const refreshed = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
     if (refreshed.fitSetId) cleanupFitSetIds.add(refreshed.fitSetId);
     const cachedClassifications = await db
-      .select({ id: resultClassifications.id, aoaDeg: resultClassifications.aoaDeg })
+      .select({
+        id: resultClassifications.id,
+        aoaDeg: resultClassifications.aoaDeg,
+      })
       .from(resultClassifications)
-      .where(eq(resultClassifications.airfoilId, airfoil.id));
-    cachedClassifications.forEach((row) => cleanupClassificationIds.add(row.id));
+      .where(
+        and(
+          eq(resultClassifications.airfoilId, airfoil.id),
+          isNull(resultClassifications.resultAttemptId),
+        ),
+      );
+    cachedClassifications.forEach((row) =>
+      cleanupClassificationIds.add(row.id),
+    );
 
     // result_classifications rows stay real-rows-only: no rows at −4/−6.
-    expect(cachedClassifications.map((row) => row.aoaDeg).sort((a, b) => a - b)).toEqual([-2, 2, 4, 6]);
+    expect(
+      cachedClassifications.map((row) => row.aoaDeg).sort((a, b) => a - b),
+    ).toEqual([-2, 2, 4, 6]);
 
     // Fit set: counts stay real-solve-only, fit points span the mirrored side,
     // and the zero-lift angle lands near 0° for a symmetric airfoil.
-    const [fitSet] = await db.select().from(polarFitSets).where(eq(polarFitSets.id, refreshed.fitSetId!)).limit(1);
+    const [fitSet] = await db
+      .select()
+      .from(polarFitSets)
+      .where(eq(polarFitSets.id, refreshed.fitSetId!))
+      .limit(1);
     expect(fitSet.acceptedPointCount + fitSet.provisionalPointCount).toBe(4);
     expect(fitSet.aoaMin).not.toBeNull();
     expect(fitSet.aoaMin!).toBeLessThanOrEqual(-6);
@@ -287,7 +384,11 @@ describe("symmetric airfoil read-path derivation (spec §9.2–§9.3)", () => {
     expect(Math.abs(fitSet.alphaClZeroFine!)).toBeLessThan(0.5);
 
     // Browse polarCount / rankings count real solves only (4, not 6).
-    const [summary] = await listAirfoils({ q: `${unique} Airfoil`, sort: "ldmax", dir: "desc" });
+    const [summary] = await listAirfoils({
+      q: `${unique} Airfoil`,
+      sort: "ldmax",
+      dir: "desc",
+    });
     expect(summary.polarCount).toBe(4);
 
     // Detail payload: 4 real points + mirrors for +4/+6 only (real −2 wins).
@@ -299,7 +400,9 @@ describe("symmetric airfoil read-path derivation (spec §9.2–§9.3)", () => {
       derivedFromResultId?: string;
       derivedFromAoaDeg?: number;
     };
-    const derived = (points as MaybeDerived[]).filter((p) => p.derived === true);
+    const derived = (points as MaybeDerived[]).filter(
+      (p) => p.derived === true,
+    );
     expect(derived.map((p) => p.a).sort((a, b) => a - b)).toEqual([-6, -4]);
     const minusFour = derived.find((p) => p.a === -4)!;
     expect(minusFour.derivedFromResultId).toBe(resultIdByAoa.get(4));
@@ -317,15 +420,27 @@ describe("symmetric airfoil read-path derivation (spec §9.2–§9.3)", () => {
 
     // Toggling isSymmetric off refreshes the fit set (signature carries the
     // symmetry marker) and drops mirrored coverage + display points.
-    await db.update(airfoils).set({ isSymmetric: false }).where(eq(airfoils.id, airfoil.id));
-    const refreshedOff = await refreshPolarCacheForRevision(db, airfoil.id, bc.presetRevisionId);
+    await db
+      .update(airfoils)
+      .set({ isSymmetric: false })
+      .where(eq(airfoils.id, airfoil.id));
+    const refreshedOff = await refreshPolarCacheForRevision(
+      db,
+      airfoil.id,
+      bc.presetRevisionId,
+    );
     if (refreshedOff.fitSetId) cleanupFitSetIds.add(refreshedOff.fitSetId);
     expect(refreshedOff.fitSetId).not.toBe(refreshed.fitSetId);
-    const [fitSetOff] = await db.select().from(polarFitSets).where(eq(polarFitSets.id, refreshedOff.fitSetId!)).limit(1);
+    const [fitSetOff] = await db
+      .select()
+      .from(polarFitSets)
+      .where(eq(polarFitSets.id, refreshedOff.fitSetId!))
+      .limit(1);
     expect(fitSetOff.aoaMin).not.toBeNull();
     expect(fitSetOff.aoaMin!).toBeGreaterThanOrEqual(-2);
     const detailOff = await assembleDetail(unique);
-    const pointsOff = (detailOff?.polars.flatMap((polar) => polar.points) ?? []) as MaybeDerived[];
+    const pointsOff = (detailOff?.polars.flatMap((polar) => polar.points) ??
+      []) as MaybeDerived[];
     expect(pointsOff).toHaveLength(4);
     expect(pointsOff.every((p) => p.derived === undefined)).toBe(true);
   });

@@ -1,6 +1,8 @@
 import {
   buildPolarFit,
   canonicalAoa,
+  hasIncompleteUransIntegrationWarning,
+  INCOMPLETE_URANS_INTEGRATION_REASON,
   mirrorClassifiedEvidence,
   POLAR_CLASSIFIER_VERSION,
   POLAR_FIT_VERSION,
@@ -17,6 +19,7 @@ import {
   polarCompatibilityFitMembers,
   polarCompatibilityFitPoints,
   polarCompatibilityFitSets,
+  resultAttempts,
   resultClassifications,
   results,
   simulationPresetRevisions,
@@ -26,7 +29,10 @@ import {
   type SimulationSetupSnapshot,
 } from "./simulation-setup";
 
-export const POLAR_COMPATIBILITY_VERSION = "polar-compat-v1";
+// v4 makes the selected immutable attempt (including its attempt id) the
+// complete compatibility-cache evidence source. Older v3 rows can contain a
+// mutable result projection and are therefore never read as current v4 data.
+export const POLAR_COMPATIBILITY_VERSION = "polar-compat-v4";
 export const POLAR_COMPATIBILITY_MEMBER_ROLES = [
   "selected",
   "shadowed",
@@ -39,7 +45,9 @@ export function polarCompatibilitySeriesId(compatibilityHash: string): string {
   return `${POLAR_COMPATIBILITY_VERSION}:${compatibilityHash}`;
 }
 
-function physicsHashFromStoredSnapshot(snapshot: Record<string, unknown>): string | null {
+function physicsHashFromStoredSnapshot(
+  snapshot: Record<string, unknown>,
+): string | null {
   try {
     return physicsHashForSnapshot(
       snapshot as unknown as SimulationSetupSnapshot,
@@ -55,8 +63,30 @@ function physicsHashFromStoredSnapshot(snapshot: Record<string, unknown>): strin
 type CompatibilityState = PolarEvidenceClassification["state"];
 type CompatibilityRegion = PolarEvidenceClassification["region"];
 
+export function compatibilityClassificationWithQualityGate(row: {
+  state: CompatibilityState;
+  region: CompatibilityRegion;
+  reasons: string[];
+  regime: "rans" | "urans" | null;
+  qualityWarnings: string[] | null;
+}): Pick<CompatibilityEvidenceRow, "state" | "region" | "reasons"> {
+  const incompleteUrans =
+    row.regime === "urans" &&
+    hasIncompleteUransIntegrationWarning(row.qualityWarnings);
+  return incompleteUrans
+    ? {
+        state: "rejected",
+        region: "unknown",
+        reasons: [
+          ...new Set([...row.reasons, INCOMPLETE_URANS_INTEGRATION_REASON]),
+        ],
+      }
+    : { state: row.state, region: row.region, reasons: row.reasons };
+}
+
 type CompatibilityEvidenceRow = {
   resultId: string;
+  resultAttemptId: string;
   simulationPresetRevisionId: string;
   aoaDeg: number;
   state: CompatibilityState;
@@ -83,7 +113,8 @@ type CompatibilityEvidenceRow = {
   firstOrderFallback: boolean;
   resultUpdatedAt: Date;
   solvedAt: Date | null;
-  reviewVerdict: "waive" | null;
+  qualityWarnings: string[] | null;
+  reviewVerdict: null;
 };
 
 type CompatibilityCandidate = CompatibilityEvidenceRow & {
@@ -128,7 +159,9 @@ export function polarCompatibilitySelectionRank(row: {
   return classification + fidelity;
 }
 
-function asCandidate(row: CompatibilityEvidenceRow): CompatibilityCandidate | null {
+function asCandidate(
+  row: CompatibilityEvidenceRow,
+): CompatibilityCandidate | null {
   if (row.state !== "accepted" && row.state !== "needs_urans") return null;
   if (
     row.cl == null ||
@@ -184,12 +217,18 @@ export function resolvePolarCompatibilityMembers(
   const selected: CompatibilityCandidate[] = [];
   const conflictAoas: number[] = [];
   for (const [aoa, bucket] of [...byAoa.entries()].sort(([a], [b]) => a - b)) {
-    const maxRank = Math.max(...bucket.map((candidate) => candidate.selectionRank));
+    const maxRank = Math.max(
+      ...bucket.map((candidate) => candidate.selectionRank),
+    );
     const top = bucket
       .filter((candidate) => candidate.selectionRank === maxRank)
       .sort(deterministicCandidateOrder);
-    const lower = bucket.filter((candidate) => candidate.selectionRank !== maxRank);
-    const exactTie = top.every((candidate) => exactSameCoefficients(top[0], candidate));
+    const lower = bucket.filter(
+      (candidate) => candidate.selectionRank !== maxRank,
+    );
+    const exactTie = top.every((candidate) =>
+      exactSameCoefficients(top[0], candidate),
+    );
 
     if (top.length > 1 && !exactTie) {
       conflictAoas.push(aoa);
@@ -225,7 +264,8 @@ export function resolvePolarCompatibilityMembers(
       members.push({
         ...candidate,
         role: "shadowed",
-        selectionReason: "exact-equal duplicate of selected top-ranked evidence",
+        selectionReason:
+          "exact-equal duplicate of selected top-ranked evidence",
       });
     }
     for (const candidate of lower) {
@@ -239,7 +279,9 @@ export function resolvePolarCompatibilityMembers(
   return { members, selected, conflictAoas };
 }
 
-function asClassification(candidate: CompatibilityCandidate): PolarEvidenceClassification {
+function asClassification(
+  candidate: CompatibilityCandidate,
+): PolarEvidenceClassification {
   const evidence: PolarEvidencePoint = {
     id: candidate.resultId,
     a: candidate.aoaDeg,
@@ -276,6 +318,7 @@ function evidenceSignature(
   const evidence = rows
     .map((row) => [
       row.resultId,
+      row.resultAttemptId,
       row.simulationPresetRevisionId,
       canonicalAoa(row.aoaDeg),
       row.state,
@@ -287,6 +330,7 @@ function evidenceSignature(
       row.cm,
       row.clCd,
       row.reviewVerdict,
+      row.qualityWarnings,
       row.resultUpdatedAt.toISOString(),
     ])
     .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
@@ -341,9 +385,34 @@ export async function ensureRevisionPhysicsHash(
   return physicsHash;
 }
 
+/** Read/derive a revision compatibility hash without mutating the revision.
+ * Writers that need ordered aggregate/revision locks call this first solely
+ * to identify the aggregate lock, then persist through
+ * `ensureRevisionPhysicsHash` after both locks are held. */
+export async function resolveRevisionPhysicsHash(
+  db: DB,
+  simulationPresetRevisionId: string,
+): Promise<string | null> {
+  const [revision] = await db
+    .select({
+      physicsHash: simulationPresetRevisions.physicsHash,
+      snapshot: simulationPresetRevisions.snapshot,
+    })
+    .from(simulationPresetRevisions)
+    .where(eq(simulationPresetRevisions.id, simulationPresetRevisionId))
+    .limit(1);
+  if (!revision) return null;
+  return (
+    revision.physicsHash ?? physicsHashFromStoredSnapshot(revision.snapshot)
+  );
+}
+
 /** Re is only an indexed prefilter here. Every NULL legacy candidate is
  * admitted to the group solely after its immutable snapshot hashes exactly. */
-async function populateLegacyHashes(db: DB, compatibilityHash: string): Promise<void> {
+async function populateLegacyHashes(
+  db: DB,
+  compatibilityHash: string,
+): Promise<void> {
   const [anchor] = await db
     .select({ reynolds: simulationPresetRevisions.reynolds })
     .from(simulationPresetRevisions)
@@ -351,7 +420,10 @@ async function populateLegacyHashes(db: DB, compatibilityHash: string): Promise<
     .limit(1);
   if (!anchor) return;
   const legacy = await db
-    .select({ id: simulationPresetRevisions.id, snapshot: simulationPresetRevisions.snapshot })
+    .select({
+      id: simulationPresetRevisions.id,
+      snapshot: simulationPresetRevisions.snapshot,
+    })
     .from(simulationPresetRevisions)
     .where(
       and(
@@ -389,35 +461,66 @@ export async function refreshPolarCompatibilityCache(
     const rawRows = await tx
       .select({
         resultId: results.id,
+        resultAttemptId: resultAttempts.id,
         simulationPresetRevisionId: results.simulationPresetRevisionId,
-        aoaDeg: results.aoaDeg,
+        // Compatibility caches are public evidence read models. Every
+        // solver-derived value and verdict therefore comes from the one
+        // immutable attempt selected by current_result_attempt_id. A stale
+        // mutable results projection, a pointer-less historical row, or an
+        // accepted verdict belonging to another attempt must fail closed.
+        aoaDeg: resultAttempts.aoaDeg,
         state: resultClassifications.state,
         region: resultClassifications.region,
         reasons: resultClassifications.reasons,
         confidence: resultClassifications.confidence,
-        regime: results.regime,
-        fidelity: results.fidelity,
-        cl: results.cl,
-        cd: results.cd,
-        cm: results.cm,
-        clCd: results.clCd,
-        clStd: results.clStd,
-        cdStd: results.cdStd,
-        cmStd: results.cmStd,
-        status: results.status,
-        source: results.source,
-        converged: results.converged,
-        stalled: results.stalled,
-        unsteady: results.unsteady,
-        error: results.error,
-        finalResidual: results.finalResidual,
-        iterations: results.iterations,
-        firstOrderFallback: results.firstOrderFallback,
-        resultUpdatedAt: results.updatedAt,
-        solvedAt: results.solvedAt,
+        regime: resultAttempts.regime,
+        fidelity: sql<
+          string | null
+        >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+        cl: resultAttempts.cl,
+        cd: resultAttempts.cd,
+        cm: resultAttempts.cm,
+        clCd: resultAttempts.clCd,
+        clStd: resultAttempts.clStd,
+        cdStd: resultAttempts.cdStd,
+        cmStd: resultAttempts.cmStd,
+        status: resultAttempts.status,
+        source: resultAttempts.source,
+        converged: resultAttempts.converged,
+        stalled: resultAttempts.stalled,
+        unsteady: resultAttempts.unsteady,
+        error: resultAttempts.error,
+        finalResidual: resultAttempts.finalResidual,
+        iterations: resultAttempts.iterations,
+        firstOrderFallback: resultAttempts.firstOrderFallback,
+        resultUpdatedAt:
+          sql<Date>`COALESCE(${resultAttempts.solvedAt}, ${resultAttempts.createdAt})`.mapWith(
+            resultAttempts.createdAt,
+          ),
+        solvedAt: resultAttempts.solvedAt,
+        qualityWarnings: resultAttempts.qualityWarnings,
       })
-      .from(resultClassifications)
-      .innerJoin(results, eq(results.id, resultClassifications.resultId))
+      .from(results)
+      .innerJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.id, results.currentResultAttemptId),
+          eq(resultAttempts.resultId, results.id),
+        ),
+      )
+      .innerJoin(
+        resultClassifications,
+        and(
+          eq(resultClassifications.resultAttemptId, resultAttempts.id),
+          eq(resultClassifications.airfoilId, results.airfoilId),
+          eq(
+            resultClassifications.simulationPresetRevisionId,
+            results.simulationPresetRevisionId,
+          ),
+          eq(resultClassifications.aoaDeg, resultAttempts.aoaDeg),
+          sql`${resultClassifications.regime} IS NOT DISTINCT FROM ${resultAttempts.regime}`,
+        ),
+      )
       .innerJoin(
         simulationPresetRevisions,
         eq(simulationPresetRevisions.id, results.simulationPresetRevisionId),
@@ -437,18 +540,19 @@ export async function refreshPolarCompatibilityCache(
       if (!row.simulationPresetRevisionId) continue;
       const review = verdicts.get(row.resultId);
       if (review?.verdict === "exclude") continue;
+      const gated = compatibilityClassificationWithQualityGate(row);
       rows.push({
         ...row,
         simulationPresetRevisionId: row.simulationPresetRevisionId,
-        state: review?.verdict === "waive" ? "accepted" : row.state,
-        region: review?.verdict === "waive" ? "attached" : row.region,
-        reasons: review?.verdict === "waive" ? [] : row.reasons,
-        reviewVerdict: review?.verdict === "waive" ? "waive" : null,
+        ...gated,
+        reviewVerdict: null,
       });
     }
     const candidates = rows
       .map(asCandidate)
-      .filter((candidate): candidate is CompatibilityCandidate => candidate != null);
+      .filter(
+        (candidate): candidate is CompatibilityCandidate => candidate != null,
+      );
     const resolved = resolvePolarCompatibilityMembers(candidates);
     const [airfoil] = await tx
       .select({ isSymmetric: airfoils.isSymmetric })
@@ -459,7 +563,9 @@ export async function refreshPolarCompatibilityCache(
     let fitInput = resolved.selected.map(asClassification);
     if (symmetric) {
       const realAoas = new Set(
-        fitInput.map((classification) => canonicalAoa(classification.evidence.a)),
+        fitInput.map((classification) =>
+          canonicalAoa(classification.evidence.a),
+        ),
       );
       fitInput = [
         ...fitInput,
@@ -474,7 +580,10 @@ export async function refreshPolarCompatibilityCache(
     const fitAoas = fit.points.map((point) => point.a);
     const signature = evidenceSignature(rows, resolved.members, symmetric);
     const [revision] = await tx
-      .select({ reynolds: simulationPresetRevisions.reynolds, mach: simulationPresetRevisions.mach })
+      .select({
+        reynolds: simulationPresetRevisions.reynolds,
+        mach: simulationPresetRevisions.mach,
+      })
       .from(simulationPresetRevisions)
       .where(eq(simulationPresetRevisions.physicsHash, compatibilityHash))
       .limit(1);
@@ -494,7 +603,10 @@ export async function refreshPolarCompatibilityCache(
       .where(
         and(
           eq(polarCompatibilityFitSets.airfoilId, airfoilId),
-          eq(polarCompatibilityFitSets.compatibilityVersion, POLAR_COMPATIBILITY_VERSION),
+          eq(
+            polarCompatibilityFitSets.compatibilityVersion,
+            POLAR_COMPATIBILITY_VERSION,
+          ),
           eq(polarCompatibilityFitSets.compatibilityHash, compatibilityHash),
           eq(polarCompatibilityFitSets.isCurrent, true),
         ),
@@ -552,12 +664,18 @@ export async function refreshPolarCompatibilityCache(
         fitSetId: null,
         fitStatus: "insufficient",
         conflictAoas: resolved.conflictAoas,
-        selectedResultIds: resolved.selected.map((candidate) => candidate.resultId),
+        selectedResultIds: resolved.selected.map(
+          (candidate) => candidate.resultId,
+        ),
       };
     }
 
-    await tx.delete(polarCompatibilityFitPoints).where(eq(polarCompatibilityFitPoints.fitSetId, fitSet.id));
-    await tx.delete(polarCompatibilityFitMembers).where(eq(polarCompatibilityFitMembers.fitSetId, fitSet.id));
+    await tx
+      .delete(polarCompatibilityFitPoints)
+      .where(eq(polarCompatibilityFitPoints.fitSetId, fitSet.id));
+    await tx
+      .delete(polarCompatibilityFitMembers)
+      .where(eq(polarCompatibilityFitMembers.fitSetId, fitSet.id));
     if (fit.points.length) {
       await tx.insert(polarCompatibilityFitPoints).values(
         fit.points.map((point) => ({
@@ -608,7 +726,9 @@ export async function refreshPolarCompatibilityCache(
       fitSetId: fitSet.id,
       fitStatus: fit.status,
       conflictAoas: resolved.conflictAoas,
-      selectedResultIds: resolved.selected.map((candidate) => candidate.resultId),
+      selectedResultIds: resolved.selected.map(
+        (candidate) => candidate.resultId,
+      ),
     };
   });
 }

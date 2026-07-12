@@ -13,13 +13,32 @@
 // source of truth rule); the pure param round-trip + digest + timeline
 // builders live in lib/point-history (unit-tested, no React).
 
-import type { FieldId } from "@aerodb/core";
-import type { Point, SimulationDetail } from "@aerodb/core";
+import {
+  isDeterministicMeshBlockerError,
+  type FieldId,
+  type Point,
+  type SimulationDetail,
+} from "@aerodb/core";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
-import { type AdminUransRequest, bulkContinueUrans, continueUransResult, getPointHistory, getPointStory, getUransRequests, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
+import {
+  type AdminUransRequest,
+  continueUransResult,
+  getPointHistory,
+  getPointStory,
+  getUransRequests,
+  isAdminApiError,
+  requestUrans,
+  requeuePoint,
+} from "@/lib/admin";
 import { getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import {
@@ -28,7 +47,6 @@ import {
   buildStoryDigest,
   DEFAULT_POINT_FILTERS,
   fidelityChipView,
-  formatBulkContinueOutcome,
   parsePointFilters,
   type PointFilters,
   type PointHistoryCounts,
@@ -74,10 +92,24 @@ const selectStyle: CSSProperties = {
 };
 
 const toneColor = (tone: TimelineTone): string =>
-  tone === "teal" ? C.teal : tone === "amber" ? C.amber : tone === "red" ? C.redText : C.dim;
+  tone === "teal"
+    ? C.teal
+    : tone === "amber"
+      ? C.amber
+      : tone === "red"
+        ? C.redText
+        : C.dim;
 
 const toneToColor = (tone: StatusChipTone): string =>
-  tone === "teal" ? C.teal : tone === "amber" ? C.amber : tone === "red" ? C.redText : tone === "violet" ? C.violet : C.muted;
+  tone === "teal"
+    ? C.teal
+    : tone === "amber"
+      ? C.amber
+      : tone === "red"
+        ? C.redText
+        : tone === "violet"
+          ? C.violet
+          : C.muted;
 
 function statusChipStyle(active: boolean, tone: StatusChipTone): CSSProperties {
   return {
@@ -93,8 +125,8 @@ function statusChipStyle(active: boolean, tone: StatusChipTone): CSSProperties {
   };
 }
 
-// Amendment-A chip row: the raw 'rejected' chip is replaced by the calm
-// violet 'awaiting URANS' + red 'needs review' split (design c19fd74a).
+// The legacy needs_review filter is retained for rolling URL/API compatibility,
+// but it is presented as unavailable evidence, never required adjudication.
 const CHIP_TONES: Record<string, StatusChipTone> = {
   all: "muted",
   failed: "red",
@@ -109,7 +141,7 @@ const CHIP_LABELS: Record<string, string> = {
   all: "all",
   failed: "failed",
   awaiting_urans: "awaiting URANS",
-  needs_review: "needs review",
+  needs_review: "unavailable",
   accepted: "accepted",
   needs_urans: "needs URANS",
   solving: "solving",
@@ -118,23 +150,57 @@ const CHIP_LABELS: Record<string, string> = {
 function rowStatusChip(item: PointHistoryItem) {
   if (item.kind === "derived") {
     return (
-      <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+      <span
+        style={{
+          fontFamily: MONO,
+          fontSize: 9,
+          color: C.dim,
+          border: `1px solid ${C.stroke}`,
+          borderRadius: 999,
+          padding: "2px 7px",
+          whiteSpace: "nowrap",
+        }}
+      >
         derived
       </span>
     );
   }
   if (item.bucket === "other") {
     return (
-      <span style={{ fontFamily: MONO, fontSize: 9, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+      <span
+        style={{
+          fontFamily: MONO,
+          fontSize: 9,
+          color: C.muted,
+          border: `1px solid ${C.stroke}`,
+          borderRadius: 999,
+          padding: "2px 7px",
+          whiteSpace: "nowrap",
+        }}
+      >
         {item.status}
       </span>
     );
   }
   // Amendment-A recolor: rejected rows split into violet awaiting-URANS /
   // red needs-review / amber rescheduled by the server-derived reviewBucket.
-  const view = statusChipDisplay(item.bucket, item.reviewBucket ?? null);
+  const view = statusChipDisplay(
+    item.bucket,
+    item.reviewBucket ?? null,
+    item.workDisposition ?? null,
+  );
   return (
-    <span style={{ fontFamily: MONO, fontSize: 9, color: toneToColor(view.tone), border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+    <span
+      style={{
+        fontFamily: MONO,
+        fontSize: 9,
+        color: toneToColor(view.tone),
+        border: `1px solid ${C.stroke}`,
+        borderRadius: 999,
+        padding: "2px 7px",
+        whiteSpace: "nowrap",
+      }}
+    >
       {view.label}
     </span>
   );
@@ -142,13 +208,47 @@ function rowStatusChip(item: PointHistoryItem) {
 
 function classificationChip(item: PointHistoryItem) {
   if (item.kind === "derived") {
-    const src = item.sourceAoaDeg != null ? `mirror of ${item.sourceAoaDeg > 0 ? "+" : ""}${item.sourceAoaDeg}°` : "mirror";
-    return <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>{src}</span>;
+    const src =
+      item.sourceAoaDeg != null
+        ? `mirror of ${item.sourceAoaDeg > 0 ? "+" : ""}${item.sourceAoaDeg}°`
+        : "mirror";
+    return (
+      <span
+        style={{
+          fontFamily: MONO,
+          fontSize: 9,
+          color: C.dim,
+          border: `1px solid ${C.stroke}`,
+          borderRadius: 999,
+          padding: "2px 7px",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {src}
+      </span>
+    );
   }
   const state = item.classificationState;
-  const color = state === "accepted" ? C.teal : state === "needs_urans" ? C.amber : state === "rejected" ? C.redText : C.dim;
+  const color =
+    state === "accepted"
+      ? C.teal
+      : state === "needs_urans"
+        ? C.amber
+        : state === "rejected"
+          ? C.redText
+          : C.dim;
   return (
-    <span style={{ fontFamily: MONO, fontSize: 9, color, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+    <span
+      style={{
+        fontFamily: MONO,
+        fontSize: 9,
+        color,
+        border: `1px solid ${C.stroke}`,
+        borderRadius: 999,
+        padding: "2px 7px",
+        whiteSpace: "nowrap",
+      }}
+    >
       {state ? state.replaceAll("_", " ") : "unclassified"}
     </span>
   );
@@ -159,21 +259,41 @@ function classificationChip(item: PointHistoryItem) {
 function fidelityChip(fidelity: string | null, verify: PointVerifyInfo | null) {
   const view = fidelityChipView(fidelity, verify);
   if (!view) return null;
-  const color = view.tone === "teal" ? C.teal : view.tone === "amber" ? C.amber : C.redText;
-  const border = view.tone === "teal" ? C.tealBorder : view.tone === "amber" ? "rgba(245,158,11,0.45)" : "rgba(245,101,101,0.5)";
+  const color =
+    view.tone === "teal" ? C.teal : view.tone === "amber" ? C.amber : C.redText;
+  const border =
+    view.tone === "teal"
+      ? C.tealBorder
+      : view.tone === "amber"
+        ? "rgba(245,158,11,0.45)"
+        : "rgba(245,101,101,0.5)";
   return (
-    <span data-testid="point-fidelity-chip" style={{ fontFamily: MONO, fontSize: 9, color, border: `1px solid ${border}`, borderRadius: 999, padding: "2px 7px", whiteSpace: "nowrap" }}>
+    <span
+      data-testid="point-fidelity-chip"
+      style={{
+        fontFamily: MONO,
+        fontSize: 9,
+        color,
+        border: `1px solid ${border}`,
+        borderRadius: 999,
+        padding: "2px 7px",
+        whiteSpace: "nowrap",
+      }}
+    >
       {view.label}
     </span>
   );
 }
 
-const ROW_COLUMNS = "minmax(0, 1.3fr) 46px 74px 86px minmax(110px, 1fr) minmax(0, 1.5fr) 40px 74px 26px";
+const ROW_COLUMNS =
+  "minmax(0, 1.3fr) 46px 74px 86px minmax(110px, 1fr) minmax(0, 1.5fr) 40px 74px 26px";
 
 export function PointHistoryPanel() {
   const pathname = usePathname();
   const [filters, setFilters] = useState<PointFilters>(() =>
-    typeof window === "undefined" ? DEFAULT_POINT_FILTERS : parsePointFilters(window.location.search),
+    typeof window === "undefined"
+      ? DEFAULT_POINT_FILTERS
+      : parsePointFilters(window.location.search),
   );
   const [items, setItems] = useState<PointHistoryItem[]>([]);
   const [counts, setCounts] = useState<PointHistoryCounts | null>(null);
@@ -194,7 +314,9 @@ export function PointHistoryPanel() {
   const [rowMenuKey, setRowMenuKey] = useState<string | null>(null);
   const [uransBusy, setUransBusy] = useState(false);
   const [uransNotice, setUransNotice] = useState<string | null>(null);
-  const [cellRequests, setCellRequests] = useState<AdminUransRequest[] | null>(null);
+  const [cellRequests, setCellRequests] = useState<AdminUransRequest[] | null>(
+    null,
+  );
   // SimModal state (same wiring as SolvedPointsPopover).
   const [simOpen, setSimOpen] = useState(false);
   const [sim, setSim] = useState<SimulationDetail | null>(null);
@@ -219,7 +341,11 @@ export function PointHistoryPanel() {
     setLoading(true);
     setError(null);
     try {
-      const page = await getPointHistory({ ...f, limit: PAGE_LIMIT, facets: true });
+      const page = await getPointHistory({
+        ...f,
+        limit: PAGE_LIMIT,
+        facets: true,
+      });
       if (seq !== requestSeqRef.current) return; // stale response — a newer filter fetch superseded it
       setItems(page.items);
       setCounts(page.counts);
@@ -272,7 +398,11 @@ export function PointHistoryPanel() {
     const seq = requestSeqRef.current;
     setLoadingMore(true);
     try {
-      const page = await getPointHistory({ ...filtersRef.current, cursor: nextCursor, limit: PAGE_LIMIT });
+      const page = await getPointHistory({
+        ...filtersRef.current,
+        cursor: nextCursor,
+        limit: PAGE_LIMIT,
+      });
       if (seq !== requestSeqRef.current) return; // filters changed while this page was in flight
       setItems((prev) => {
         const seen = new Set(prev.map((i) => i.rowKey));
@@ -300,19 +430,22 @@ export function PointHistoryPanel() {
         if (openItemRef.current?.rowKey === item.rowKey) setStory(s);
       })
       .catch((e) => {
-        if (openItemRef.current?.rowKey === item.rowKey) setStoryError((e as Error).message);
+        if (openItemRef.current?.rowKey === item.rowKey)
+          setStoryError((e as Error).message);
       });
     // Existing request-URANS items for this cell: the panel's action buttons
     // reflect the REAL open item (idempotent replay), never a guessed state.
     if (item.revisionId) {
       getUransRequests(item.airfoilId, item.revisionId)
         .then((res) => {
-          if (openItemRef.current?.rowKey === item.rowKey) setCellRequests(res.requests);
+          if (openItemRef.current?.rowKey === item.rowKey)
+            setCellRequests(res.requests);
         })
         .catch(() => {
           // Absent list = state unknown; buttons stay enabled and the POST
           // response (created flag) remains the source of truth.
-          if (openItemRef.current?.rowKey === item.rowKey) setCellRequests(null);
+          if (openItemRef.current?.rowKey === item.rowKey)
+            setCellRequests(null);
         });
     }
   }, []);
@@ -348,7 +481,8 @@ export function PointHistoryPanel() {
     const onMouseDown = (e: MouseEvent) => {
       if (!openItemRef.current || simOpenRef.current) return;
       const panel = storyPanelRef.current;
-      if (panel && e.target instanceof Node && !panel.contains(e.target)) closeStory();
+      if (panel && e.target instanceof Node && !panel.contains(e.target))
+        closeStory();
     };
     document.addEventListener("mousedown", onMouseDown);
     return () => document.removeEventListener("mousedown", onMouseDown);
@@ -363,18 +497,32 @@ export function PointHistoryPanel() {
     setSim(null);
     setSimMessage(null);
     setPlaying(true);
-    getSim(item.airfoilSlug, item.reynolds ?? 0, item.kind === "derived" ? (item.sourceAoaDeg ?? item.aoaDeg) : item.aoaDeg, item.resultId)
+    getSim(
+      item.airfoilSlug,
+      item.reynolds ?? 0,
+      item.kind === "derived"
+        ? (item.sourceAoaDeg ?? item.aoaDeg)
+        : item.aoaDeg,
+      item.resultId,
+    )
       .then((d) => {
         if (!simOpenRef.current) return;
         setSim(d);
         setSimField((current) => {
-          if (d.status !== "solved" || d.availableFields.length === 0 || d.availableFields.includes(current)) return current;
+          if (
+            d.status !== "solved" ||
+            d.availableFields.length === 0 ||
+            d.availableFields.includes(current)
+          )
+            return current;
           return d.availableFields[0];
         });
       })
       .catch((e) => {
         if (!simOpenRef.current) return;
-        setSimMessage(`Could not load the stored OpenFOAM result (${(e as Error).message}).`);
+        setSimMessage(
+          `Could not load the stored OpenFOAM result (${(e as Error).message}).`,
+        );
       });
   }, []);
 
@@ -382,8 +530,14 @@ export function PointHistoryPanel() {
   // not in the campaign header) ----
   // Retry: crash-class failed points (any surviving failed row already
   // consumed its automatic retry or predates the feature).
-  const retryEligible = story != null && story.point.status === "failed";
-  // Continue: budget-exhausted rejected urans rows with saved case state
+  const retryEligible =
+    story != null &&
+    story.point.status === "failed" &&
+    story.point.regime !== "urans" &&
+    !(story.point.fidelity ?? "").startsWith("urans") &&
+    story.point.workDisposition == null &&
+    !isDeterministicMeshBlockerError(story.point.error);
+  // Continue: restartable rejected urans rows with saved case state
   // (server-derived `continuable` — never guessed client-side).
   const continueEligible = story != null && story.point.continuable;
   // Legacy requeue stays ONLY for red needs-review rejected rows that cannot
@@ -400,7 +554,9 @@ export function PointHistoryPanel() {
   const doRequeue = useCallback(async () => {
     const item = openItemRef.current;
     if (!item || requeueBusy) return;
-    const retry = openItemRef.current?.status === "failed" || story?.point.status === "failed";
+    const retry =
+      openItemRef.current?.status === "failed" ||
+      story?.point.status === "failed";
     const prompt = retry
       ? `Retry this point (${item.airfoilName} α ${item.aoaDeg}°)? The crashed evidence returns to the solve queue for a fresh attempt.`
       : `Requeue this point (${item.airfoilName} α ${item.aoaDeg}°)? Its rejected evidence returns to the solve queue.`;
@@ -409,7 +565,9 @@ export function PointHistoryPanel() {
     setRequeueNotice(null);
     try {
       const res = await requeuePoint(item.resultId);
-      setRequeueNotice(`requeued (${res.scope}) — the point is back in the queue`);
+      setRequeueNotice(
+        `requeued (${res.scope}) — the point is back in the queue`,
+      );
       // Refresh both surfaces the action changed: story + table page 1.
       openStory(item);
       void fetchFirstPage(filtersRef.current);
@@ -420,8 +578,8 @@ export function PointHistoryPanel() {
     }
   }, [requeueBusy, story, openStory, fetchFirstPage]);
 
-  // Continuation (amendment C): resume the budget-stopped URANS solve from
-  // its saved engine case state with an increased wall-clock budget.
+  // Continuation (amendment C): resume the URANS solve from its saved engine
+  // case state with an increased wall-clock budget.
   const [continueBusy, setContinueBusy] = useState(false);
   const doContinue = useCallback(
     async (extraHours: 2 | 6 | 24) => {
@@ -453,45 +611,13 @@ export function PointHistoryPanel() {
     [continueBusy, openStory, fetchFirstPage],
   );
 
-  // Bulk resume (needs-review toolbar): one click queues a continuation for
-  // EVERY continuable needs-review row in the current campaign scope — the
-  // server recomputes membership (staleness-safe) and excludes non-resumable
-  // rows (crashes, non-budget rejections). Same window.confirm idiom as the
-  // per-row Continue buttons.
-  const [bulkContinueBusy, setBulkContinueBusy] = useState(false);
-  const [bulkContinueNotice, setBulkContinueNotice] = useState<string | null>(null);
-  const doBulkContinue = useCallback(
-    async (extraHours: 2 | 6 | 24) => {
-      if (bulkContinueBusy) return;
-      const campaignId = filtersRef.current.campaignId || null;
-      const scope = campaignId ? "in the selected campaign" : "across ALL campaigns and background work";
-      if (
-        !window.confirm(
-          `Resume every continuable needs-review URANS solve ${scope} with a +${extraHours} h wall-clock budget each? Each one resumes from its saved case state (no work is redone) and re-enters the queue at precalc rank. Crashes and other non-resumable rows are excluded automatically.`,
-        )
-      )
-        return;
-      setBulkContinueBusy(true);
-      setBulkContinueNotice(null);
-      try {
-        const res = await bulkContinueUrans(campaignId, extraHours * 3600);
-        setBulkContinueNotice(formatBulkContinueOutcome(res));
-        void fetchFirstPage(filtersRef.current);
-      } catch (e) {
-        setBulkContinueNotice(isAdminApiError(e) ? e.message : (e as Error).message);
-      } finally {
-        setBulkContinueBusy(false);
-      }
-    },
-    [bulkContinueBusy, fetchFirstPage],
-  );
-
   // ---- request-URANS (fidelity ladder contract 6) ----
   // Close any open row overflow menu on outside click.
   useEffect(() => {
     if (!rowMenuKey) return;
     const onMouseDown = (e: MouseEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-urans-menu]")) return;
+      if (e.target instanceof Element && e.target.closest("[data-urans-menu]"))
+        return;
       setRowMenuKey(null);
     };
     document.addEventListener("mousedown", onMouseDown);
@@ -500,14 +626,28 @@ export function PointHistoryPanel() {
 
   const doRequestUrans = useCallback(
     async (
-      target: { airfoilId: string; revisionId: string; aoaDeg: number | null; label: string },
+      target: {
+        airfoilId: string;
+        revisionId: string;
+        aoaDeg: number | null;
+        label: string;
+      },
       fidelity: "precalc" | "full",
       opts?: { refreshStory?: PointHistoryItem },
     ) => {
       if (uransBusy) return;
-      const scope = target.aoaDeg == null ? "the whole polar" : `α ${f(target.aoaDeg, 2)}°`;
-      const budget = fidelity === "precalc" ? "half-resolution mesh, 3 shedding periods, 4 h budget" : "full mesh, 7 shedding periods, 12 h budget";
-      if (!window.confirm(`Queue a ${fidelity}-fidelity URANS solve for ${target.label} (${scope})? ${budget}. It runs after all RANS gaps, at precalc rank.`)) return;
+      const scope =
+        target.aoaDeg == null ? "the whole polar" : `α ${f(target.aoaDeg, 2)}°`;
+      const budget =
+        fidelity === "precalc"
+          ? "half-resolution mesh, 3 shedding periods, 4 h budget"
+          : "full mesh, 7 shedding periods, 12 h budget";
+      if (
+        !window.confirm(
+          `Queue a ${fidelity}-fidelity URANS solve for ${target.label} (${scope})? ${budget}. It runs after all RANS gaps, at precalc rank.`,
+        )
+      )
+        return;
       setUransBusy(true);
       setUransNotice(null);
       try {
@@ -522,7 +662,11 @@ export function PointHistoryPanel() {
             ? `URANS ${fidelity} requested for ${target.label} (${scope}) — scheduled after all RANS gaps`
             : `already requested — the open ${fidelity} request for ${scope} is reused (${res.request.state})`,
         );
-        if (opts?.refreshStory && openItemRef.current?.rowKey === opts.refreshStory.rowKey) openStory(opts.refreshStory);
+        if (
+          opts?.refreshStory &&
+          openItemRef.current?.rowKey === opts.refreshStory.rowKey
+        )
+          openStory(opts.refreshStory);
       } catch (e) {
         setUransNotice(isAdminApiError(e) ? e.message : (e as Error).message);
       } finally {
@@ -536,7 +680,10 @@ export function PointHistoryPanel() {
   /** Open (pending/running) request covering this point at the given
    *  fidelity: exact-angle item or a whole-polar item. */
   const openRequestFor = useCallback(
-    (aoaDeg: number, fidelity: "precalc" | "full"): AdminUransRequest | null => {
+    (
+      aoaDeg: number,
+      fidelity: "precalc" | "full",
+    ): AdminUransRequest | null => {
       if (!cellRequests) return null;
       return (
         cellRequests.find(
@@ -564,7 +711,11 @@ export function PointHistoryPanel() {
   // real status is known). A synthesized fallback (kind 'result' but still
   // carrying the derived row's status) shows NO status/class chips until the
   // story answers — never a wrong "derived" chip on a real result.
-  const storyMatchesOpen = story != null && openItem != null && openItem.kind === "result" && story.point.resultId === openItem.resultId;
+  const storyMatchesOpen =
+    story != null &&
+    openItem != null &&
+    openItem.kind === "result" &&
+    story.point.resultId === openItem.resultId;
   const headerItem: PointHistoryItem | null =
     openItem == null
       ? null
@@ -572,19 +723,34 @@ export function PointHistoryPanel() {
         ? {
             ...openItem,
             status: story.point.status,
-            bucket: bucketOfPoint(story.point.status, story.point.classification?.state ?? null),
+            bucket: bucketOfPoint(
+              story.point.status,
+              story.point.classification?.state ?? null,
+            ),
             classificationState: story.point.classification?.state ?? null,
             reviewBucket: story.point.reviewBucket,
+            workDisposition: story.point.workDisposition,
             continuable: story.point.continuable,
           }
         : openItem;
-  const headerChipsPending = openItem != null && openItem.kind === "result" && openItem.status === "derived" && !storyMatchesOpen;
+  const headerChipsPending =
+    openItem != null &&
+    openItem.kind === "result" &&
+    openItem.status === "derived" &&
+    !storyMatchesOpen;
 
   return (
     <div data-testid="point-history-panel" style={{ display: "grid", gap: 12 }}>
       {/* ---- filter bar ---- */}
       <section style={{ display: "grid", gap: 8 }}>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 6,
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
           {POINT_STATUS_CHIPS.map((k) => (
             <button
               key={k}
@@ -598,50 +764,47 @@ export function PointHistoryPanel() {
               {chipCount(k) != null ? ` ${chipCount(k)!.toLocaleString()}` : ""}
             </button>
           ))}
-          {/* Bulk resume (amendment C, bulk form): acts on the WHOLE filtered
-              needs-review set — no row selection; the server recomputes
-              membership, so a stale table is safe. Rendered only while the
-              needs-review chip filter is active. */}
-          {filters.status === "needs_review" && (
-            <span data-testid="points-bulk-resume" style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-              <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.08em" }}>RESUME ALL</span>
-              {([2, 6, 24] as const).map((h) => (
-                <button
-                  key={h}
-                  type="button"
-                  data-testid={`points-bulk-resume-${h}h`}
-                  disabled={bulkContinueBusy}
-                  title={`Resume every continuable needs-review URANS solve ${filters.campaignId ? "in the selected campaign" : "in every campaign"} from its saved case state with +${h} h of wall-clock budget — crashes and other non-resumable rows are excluded`}
-                  onClick={() => void doBulkContinue(h)}
-                  style={{ ...smallBtn, color: C.violet, borderColor: C.violetBorder, opacity: bulkContinueBusy ? 0.6 : 1 }}
-                >
-                  {bulkContinueBusy ? "queueing…" : `+${h}h`}
-                </button>
-              ))}
-            </span>
-          )}
         </div>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
           <input
             type="search"
             data-testid="points-filter-airfoil"
             placeholder="filter by airfoil…"
             value={filters.airfoil}
-            onChange={(e) => applyFilters({ ...filters, airfoil: e.target.value }, { debounceMs: 300 })}
+            onChange={(e) =>
+              applyFilters(
+                { ...filters, airfoil: e.target.value },
+                { debounceMs: 300 },
+              )
+            }
             style={{ ...selectStyle, width: 180 }}
           />
           <select
             data-testid="points-filter-campaign"
             value={filters.campaignId}
-            onChange={(e) => applyFilters({ ...filters, campaignId: e.target.value })}
+            onChange={(e) =>
+              applyFilters({ ...filters, campaignId: e.target.value })
+            }
             style={selectStyle}
           >
             <option value="">campaign: any</option>
             {/* The facet list caps at the 50 newest campaigns; a URL-provided
                 campaign outside that list must still DISPLAY as active. */}
-            {filters.campaignId && !(facets?.campaigns ?? []).some((c) => c.id === filters.campaignId) && (
-              <option value={filters.campaignId}>campaign: {filters.campaignId.slice(0, 8)}…</option>
-            )}
+            {filters.campaignId &&
+              !(facets?.campaigns ?? []).some(
+                (c) => c.id === filters.campaignId,
+              ) && (
+                <option value={filters.campaignId}>
+                  campaign: {filters.campaignId.slice(0, 8)}…
+                </option>
+              )}
             {(facets?.campaigns ?? []).map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
@@ -651,7 +814,12 @@ export function PointHistoryPanel() {
           <select
             data-testid="points-filter-regime"
             value={filters.regime}
-            onChange={(e) => applyFilters({ ...filters, regime: e.target.value as PointFilters["regime"] })}
+            onChange={(e) =>
+              applyFilters({
+                ...filters,
+                regime: e.target.value as PointFilters["regime"],
+              })
+            }
             style={selectStyle}
           >
             <option value="">regime: any</option>
@@ -661,7 +829,12 @@ export function PointHistoryPanel() {
           <select
             data-testid="points-filter-errclass"
             value={filters.errorClass}
-            onChange={(e) => applyFilters({ ...filters, errorClass: e.target.value as PointFilters["errorClass"] })}
+            onChange={(e) =>
+              applyFilters({
+                ...filters,
+                errorClass: e.target.value as PointFilters["errorClass"],
+              })
+            }
             style={selectStyle}
           >
             <option value="">error class: any</option>
@@ -674,7 +847,9 @@ export function PointHistoryPanel() {
           <select
             data-testid="points-filter-re"
             value={filters.reynolds}
-            onChange={(e) => applyFilters({ ...filters, reynolds: e.target.value })}
+            onChange={(e) =>
+              applyFilters({ ...filters, reynolds: e.target.value })
+            }
             style={selectStyle}
           >
             <option value="">Re: any</option>
@@ -687,15 +862,33 @@ export function PointHistoryPanel() {
           <select
             data-testid="points-filter-verify"
             value={filters.verify}
-            onChange={(e) => applyFilters({ ...filters, verify: e.target.value as PointFilters["verify"] })}
+            onChange={(e) =>
+              applyFilters({
+                ...filters,
+                verify: e.target.value as PointFilters["verify"],
+              })
+            }
             style={selectStyle}
           >
             <option value="">verify: any</option>
             <option value="pending">verify pending</option>
             <option value="disagreed">verify disagreed</option>
+            <option value="blocked">verify blocked</option>
           </select>
-          <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>sorted by last activity</span>
-          <button type="button" data-testid="points-refresh" disabled={loading} onClick={() => void fetchFirstPage(filters)} style={{ ...smallBtn, marginLeft: "auto", opacity: loading ? 0.6 : 1 }}>
+          <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>
+            sorted by last activity
+          </span>
+          <button
+            type="button"
+            data-testid="points-refresh"
+            disabled={loading}
+            onClick={() => void fetchFirstPage(filters)}
+            style={{
+              ...smallBtn,
+              marginLeft: "auto",
+              opacity: loading ? 0.6 : 1,
+            }}
+          >
             {loading ? "loading…" : "refresh"}
           </button>
         </div>
@@ -704,27 +897,47 @@ export function PointHistoryPanel() {
       {error && (
         <div style={{ fontFamily: MONO, fontSize: 11, color: C.redText }}>
           {error}
-          <button type="button" onClick={() => void fetchFirstPage(filters)} style={{ ...smallBtn, marginLeft: 8 }}>
+          <button
+            type="button"
+            onClick={() => void fetchFirstPage(filters)}
+            style={{ ...smallBtn, marginLeft: 8 }}
+          >
             retry
           </button>
         </div>
       )}
       {uransNotice && !openItem && (
-        <div data-testid="points-urans-notice" style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>
+        <div
+          data-testid="points-urans-notice"
+          style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}
+        >
           {uransNotice}
-        </div>
-      )}
-      {bulkContinueNotice && filters.status === "needs_review" && (
-        <div data-testid="points-bulk-resume-notice" style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>
-          {bulkContinueNotice}
         </div>
       )}
 
       {/* ---- table ---- */}
-      <section style={{ background: C.panel, border: `1px solid ${C.stroke}`, borderRadius: 10, overflow: "hidden" }}>
+      <section
+        style={{
+          background: C.panel,
+          border: `1px solid ${C.stroke}`,
+          borderRadius: 10,
+          overflow: "hidden",
+        }}
+      >
         <div style={{ overflowX: "auto" }}>
           <div style={{ minWidth: 760 }}>
-            <div style={{ display: "grid", gridTemplateColumns: ROW_COLUMNS, gap: 8, padding: "8px 12px", borderBottom: `1px solid ${C.borderSoft}`, fontFamily: MONO, fontSize: 9, color: C.dim }}>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: ROW_COLUMNS,
+                gap: 8,
+                padding: "8px 12px",
+                borderBottom: `1px solid ${C.borderSoft}`,
+                fontFamily: MONO,
+                fontSize: 9,
+                color: C.dim,
+              }}
+            >
               <span>Airfoil</span>
               <span style={{ textAlign: "right" }}>α</span>
               <span>Re</span>
@@ -736,12 +949,28 @@ export function PointHistoryPanel() {
               <span aria-hidden />
             </div>
             {!loading && items.length === 0 && !error && (
-              <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, padding: "16px 12px" }}>
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  color: C.muted,
+                  padding: "16px 12px",
+                }}
+              >
                 No points match these filters.
               </div>
             )}
             {loading && items.length === 0 && (
-              <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, padding: "16px 12px" }}>Loading points…</div>
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  color: C.muted,
+                  padding: "16px 12px",
+                }}
+              >
+                Loading points…
+              </div>
             )}
             {items.map((item) => (
               <div key={item.rowKey} style={{ position: "relative" }}>
@@ -766,25 +995,67 @@ export function PointHistoryPanel() {
                     fontFamily: MONO,
                     fontSize: 10.5,
                     padding: "8px 12px",
-                    background: openItem?.rowKey === item.rowKey ? C.rowActive : "transparent",
+                    background:
+                      openItem?.rowKey === item.rowKey
+                        ? C.rowActive
+                        : "transparent",
                     borderBottom: `1px solid ${C.borderRow}`,
                     cursor: "pointer",
                     color: C.text,
                   }}
                 >
-                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>{item.airfoilName}</span>
-                  <span style={{ textAlign: "right" }}>{f(item.aoaDeg, 1)}°</span>
-                  <span style={{ color: C.muted }}>{item.reynolds != null ? formatRe(item.reynolds) : "—"}</span>
-                  <span>{rowStatusChip(item)}</span>
-                  <span style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
-                    {classificationChip(item)}
-                    {fidelityChip(item.fidelity, item.kind === "derived" ? null : item.verify)}
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      fontWeight: 600,
+                    }}
+                  >
+                    {item.airfoilName}
                   </span>
-                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.muted }} title={buildStoryDigest(item)}>
+                  <span style={{ textAlign: "right" }}>
+                    {f(item.aoaDeg, 1)}°
+                  </span>
+                  <span style={{ color: C.muted }}>
+                    {item.reynolds != null ? formatRe(item.reynolds) : "—"}
+                  </span>
+                  <span>{rowStatusChip(item)}</span>
+                  <span
+                    style={{
+                      display: "flex",
+                      gap: 4,
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                    }}
+                  >
+                    {classificationChip(item)}
+                    {fidelityChip(
+                      item.fidelity,
+                      item.kind === "derived" ? null : item.verify,
+                    )}
+                  </span>
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      color: C.muted,
+                    }}
+                    title={buildStoryDigest(item)}
+                  >
                     {buildStoryDigest(item)}
                   </span>
-                  <span style={{ textAlign: "right", color: C.muted }}>{item.kind === "derived" ? "—" : item.attemptCount}</span>
-                  <span style={{ textAlign: "right", color: C.dim, fontSize: 9.5 }}>{ago(item.lastActivityAt)}</span>
+                  <span style={{ textAlign: "right", color: C.muted }}>
+                    {item.kind === "derived" ? "—" : item.attemptCount}
+                  </span>
+                  <span
+                    style={{ textAlign: "right", color: C.dim, fontSize: 9.5 }}
+                  >
+                    {ago(item.lastActivityAt)}
+                  </span>
                   <button
                     type="button"
                     data-testid="point-row-overflow"
@@ -793,7 +1064,9 @@ export function PointHistoryPanel() {
                     aria-expanded={rowMenuKey === item.rowKey}
                     onClick={(e) => {
                       e.stopPropagation();
-                      setRowMenuKey((k) => (k === item.rowKey ? null : item.rowKey));
+                      setRowMenuKey((k) =>
+                        k === item.rowKey ? null : item.rowKey,
+                      );
                     }}
                     style={{ ...smallBtn, padding: "2px 6px", lineHeight: 1.2 }}
                   >
@@ -804,15 +1077,30 @@ export function PointHistoryPanel() {
                   <div
                     data-urans-menu
                     data-testid="point-row-menu"
-                    style={{ position: "absolute", right: 8, top: "calc(100% - 4px)", zIndex: 30, minWidth: 230, background: C.popover, border: `1px solid ${C.stroke}`, borderRadius: 8, boxShadow: `0 12px 28px ${C.shadow}`, padding: 6, display: "grid", gap: 4 }}
+                    style={{
+                      position: "absolute",
+                      right: 8,
+                      top: "calc(100% - 4px)",
+                      zIndex: 30,
+                      minWidth: 230,
+                      background: C.popover,
+                      border: `1px solid ${C.stroke}`,
+                      borderRadius: 8,
+                      boxShadow: `0 12px 28px ${C.shadow}`,
+                      padding: 6,
+                      display: "grid",
+                      gap: 4,
+                    }}
                   >
                     {(["precalc", "full"] as const).map((fid) => {
-                      const eligible = item.kind === "result" && item.revisionId != null;
-                      const title = item.kind === "derived"
-                        ? "Derived mirror — request URANS on the +α source point instead"
-                        : item.revisionId == null
-                          ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
-                          : undefined;
+                      const eligible =
+                        item.kind === "result" && item.revisionId != null;
+                      const title =
+                        item.kind === "derived"
+                          ? "Derived mirror — request URANS on the +α source point instead"
+                          : item.revisionId == null
+                            ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
+                            : undefined;
                       return (
                         <button
                           key={fid}
@@ -822,12 +1110,29 @@ export function PointHistoryPanel() {
                           title={title}
                           onClick={() =>
                             void doRequestUrans(
-                              { airfoilId: item.airfoilId, revisionId: item.revisionId!, aoaDeg: item.aoaDeg, label: item.airfoilName },
+                              {
+                                airfoilId: item.airfoilId,
+                                revisionId: item.revisionId!,
+                                aoaDeg: item.aoaDeg,
+                                label: item.airfoilName,
+                              },
                               fid,
-                              { refreshStory: openItemRef.current?.rowKey === item.rowKey ? item : undefined },
+                              {
+                                refreshStory:
+                                  openItemRef.current?.rowKey === item.rowKey
+                                    ? item
+                                    : undefined,
+                              },
                             )
                           }
-                          style={{ ...smallBtn, width: "100%", textAlign: "left", color: eligible ? C.teal : C.dimmest, borderColor: eligible ? C.tealBorder : C.stroke, opacity: uransBusy ? 0.6 : 1 }}
+                          style={{
+                            ...smallBtn,
+                            width: "100%",
+                            textAlign: "left",
+                            color: eligible ? C.teal : C.dimmest,
+                            borderColor: eligible ? C.tealBorder : C.stroke,
+                            opacity: uransBusy ? 0.6 : 1,
+                          }}
                         >
                           {uransBusy ? "requesting…" : `request URANS · ${fid}`}
                         </button>
@@ -841,7 +1146,17 @@ export function PointHistoryPanel() {
         </div>
         {nextCursor && !error && (
           <div style={{ padding: "9px 12px" }}>
-            <button type="button" data-testid="points-load-more" disabled={loadingMore} onClick={() => void loadMore()} style={{ ...smallBtn, width: "100%", opacity: loadingMore ? 0.6 : 1 }}>
+            <button
+              type="button"
+              data-testid="points-load-more"
+              disabled={loadingMore}
+              onClick={() => void loadMore()}
+              style={{
+                ...smallBtn,
+                width: "100%",
+                opacity: loadingMore ? 0.6 : 1,
+              }}
+            >
               {loadingMore ? "loading…" : "load more"}
             </button>
           </div>
@@ -871,33 +1186,96 @@ export function PointHistoryPanel() {
           }}
         >
           {/* header */}
-          <div style={{ padding: "12px 14px", borderBottom: `1px solid ${C.borderSoft}`, display: "grid", gap: 8 }}>
+          <div
+            style={{
+              padding: "12px 14px",
+              borderBottom: `1px solid ${C.borderSoft}`,
+              display: "grid",
+              gap: 8,
+            }}
+          >
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span style={{ fontFamily: MONO, fontSize: 12, fontWeight: 700, color: C.text, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <span
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  color: C.text,
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
                 {openItem.airfoilName} · α {f(openItem.aoaDeg, 2)}°
               </span>
-              <button type="button" aria-label="Close point story" onClick={closeStory} style={{ ...smallBtn, marginLeft: "auto" }}>
+              <button
+                type="button"
+                aria-label="Close point story"
+                onClick={closeStory}
+                style={{ ...smallBtn, marginLeft: "auto" }}
+              >
                 ×
               </button>
             </div>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 6,
+                flexWrap: "wrap",
+                alignItems: "center",
+              }}
+            >
               {openItem.reynolds != null && (
-                <span style={{ fontFamily: MONO, fontSize: 9, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px" }}>
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 9,
+                    color: C.muted,
+                    border: `1px solid ${C.stroke}`,
+                    borderRadius: 999,
+                    padding: "2px 7px",
+                  }}
+                >
                   Re {formatRe(openItem.reynolds)}
                 </span>
               )}
               {openItem.regime && (
-                <span style={{ fontFamily: MONO, fontSize: 9, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px" }}>
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 9,
+                    color: C.muted,
+                    border: `1px solid ${C.stroke}`,
+                    borderRadius: 999,
+                    padding: "2px 7px",
+                  }}
+                >
                   {openItem.regime.toUpperCase()}
                 </span>
               )}
               {openItem.campaignName && (
-                <span style={{ fontFamily: MONO, fontSize: 9, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "2px 7px", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 9,
+                    color: C.muted,
+                    border: `1px solid ${C.stroke}`,
+                    borderRadius: 999,
+                    padding: "2px 7px",
+                    maxWidth: 180,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {openItem.campaignName}
                 </span>
               )}
               {!headerChipsPending && headerItem && rowStatusChip(headerItem)}
-              {!headerChipsPending && headerItem && classificationChip(headerItem)}
+              {!headerChipsPending &&
+                headerItem &&
+                classificationChip(headerItem)}
               {!headerChipsPending &&
                 headerItem &&
                 openItem.kind !== "derived" &&
@@ -908,9 +1286,8 @@ export function PointHistoryPanel() {
             </div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               {/* Repair verbs (design D): Retry for crashes, Continue for
-                  budget-exhausted continuable solves, legacy requeue only for
-                  non-continuable needs-review rejects. Calm awaiting-URANS
-                  rows show none of these. */}
+                  restartable solves, and legacy requeue only for unavailable
+                  rejected evidence. Calm awaiting-URANS rows show none. */}
               {requeueEligible && (
                 <button
                   type="button"
@@ -929,7 +1306,11 @@ export function PointHistoryPanel() {
                     opacity: requeueBusy ? 0.6 : 1,
                   }}
                 >
-                  {requeueBusy ? "requeueing…" : retryEligible ? "Retry" : "requeue point"}
+                  {requeueBusy
+                    ? "requeueing…"
+                    : retryEligible
+                      ? "Retry"
+                      : "requeue point"}
                 </button>
               )}
               {continueEligible &&
@@ -939,7 +1320,7 @@ export function PointHistoryPanel() {
                     type="button"
                     data-testid={`point-continue-${h}h`}
                     disabled={continueBusy}
-                    title={`This URANS solve was stopped by the wall-clock budget guard with its case state saved — resume it from the last written time step with +${h} h of budget`}
+                    title={`This URANS solve has restartable saved case state — resume it from the last written time step with +${h} h of budget`}
                     onClick={() => void doContinue(h)}
                     style={{
                       ...smallBtn,
@@ -951,13 +1332,32 @@ export function PointHistoryPanel() {
                     {continueBusy ? "queueing…" : `Continue +${h}h`}
                   </button>
                 ))}
-              <button type="button" data-testid="point-solver-results" onClick={openSolverResults} style={{ ...smallBtn, color: C.teal, borderColor: C.tealBorder }}>
+              <button
+                type="button"
+                data-testid="point-solver-results"
+                onClick={openSolverResults}
+                style={{
+                  ...smallBtn,
+                  color: C.teal,
+                  borderColor: C.tealBorder,
+                }}
+              >
                 solver results ▸
               </button>
               <Link
-                href={airfoilDetailHref(openItem.airfoilSlug, openItem.revisionId)}
+                href={airfoilDetailHref(
+                  openItem.airfoilSlug,
+                  openItem.revisionId,
+                )}
                 data-testid="point-detail-link"
-                style={{ ...smallBtn, color: C.teal, borderColor: C.tealBorder, textDecoration: "none", display: "inline-flex", alignItems: "center" }}
+                style={{
+                  ...smallBtn,
+                  color: C.teal,
+                  borderColor: C.tealBorder,
+                  textDecoration: "none",
+                  display: "inline-flex",
+                  alignItems: "center",
+                }}
               >
                 detail page ↗
               </Link>
@@ -965,8 +1365,24 @@ export function PointHistoryPanel() {
             {/* request-URANS (contract 6): single-point actions with
                 idempotent-aware state from the REAL open request items. */}
             {openItem.kind !== "derived" && (
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim, letterSpacing: "0.08em" }}>REQUEST URANS</span>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 6,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 9,
+                    color: C.dim,
+                    letterSpacing: "0.08em",
+                  }}
+                >
+                  REQUEST URANS
+                </span>
                 {(["precalc", "full"] as const).map((fid) => {
                   const open = openRequestFor(openItem.aoaDeg, fid);
                   const eligible = openItem.revisionId != null && !open;
@@ -987,7 +1403,12 @@ export function PointHistoryPanel() {
                       }
                       onClick={() =>
                         void doRequestUrans(
-                          { airfoilId: openItem.airfoilId, revisionId: openItem.revisionId!, aoaDeg: openItem.aoaDeg, label: openItem.airfoilName },
+                          {
+                            airfoilId: openItem.airfoilId,
+                            revisionId: openItem.revisionId!,
+                            aoaDeg: openItem.aoaDeg,
+                            label: openItem.airfoilName,
+                          },
                           fid,
                           { refreshStory: openItem },
                         )
@@ -997,36 +1418,73 @@ export function PointHistoryPanel() {
                         color: open ? C.dim : C.teal,
                         borderColor: open ? C.stroke : C.tealBorder,
                         opacity: uransBusy ? 0.6 : 1,
-                        cursor: eligible && !uransBusy ? "pointer" : "not-allowed",
+                        cursor:
+                          eligible && !uransBusy ? "pointer" : "not-allowed",
                       }}
                     >
-                      {open ? `${fid} requested (${open.state}${open.aoaDeg == null ? " · whole polar" : ""})` : fid}
+                      {open
+                        ? `${fid} requested (${open.state}${open.aoaDeg == null ? " · whole polar" : ""})`
+                        : fid}
                     </button>
                   );
                 })}
               </div>
             )}
-            {requeueNotice && <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>{requeueNotice}</div>}
-            {uransNotice && openItem && <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>{uransNotice}</div>}
+            {requeueNotice && (
+              <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>
+                {requeueNotice}
+              </div>
+            )}
+            {uransNotice && openItem && (
+              <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>
+                {uransNotice}
+              </div>
+            )}
           </div>
 
           {/* body */}
-          <div style={{ overflowY: "auto", minHeight: 0, padding: "12px 14px", display: "grid", gap: 10, alignContent: "start" }}>
+          <div
+            style={{
+              overflowY: "auto",
+              minHeight: 0,
+              padding: "12px 14px",
+              display: "grid",
+              gap: 10,
+              alignContent: "start",
+            }}
+          >
             {openItem.kind === "derived" ? (
               // Derived mirrors have no solve timeline of their own — honest
               // pointer to the +α source evidence instead.
-              <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
-                This −α point is <span style={{ color: C.text }}>derived by symmetry</span> from the solved{" "}
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  color: C.muted,
+                  lineHeight: 1.6,
+                }}
+              >
+                This −α point is{" "}
+                <span style={{ color: C.text }}>derived by symmetry</span> from
+                the solved{" "}
                 <span style={{ color: C.text }}>
-                  α {openItem.sourceAoaDeg != null ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}°` : "source"}
+                  α{" "}
+                  {openItem.sourceAoaDeg != null
+                    ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}°`
+                    : "source"}
                 </span>{" "}
-                result of the same symmetric airfoil. It has no solver timeline of its own.
+                result of the same symmetric airfoil. It has no solver timeline
+                of its own.
                 <div style={{ marginTop: 10 }}>
                   <button
                     type="button"
                     data-testid="point-open-source"
                     onClick={() => {
-                      const src = items.find((i) => i.kind === "result" && i.resultId === openItem.resultId);
+                      const src = items.find(
+                        (i) =>
+                          i.kind === "result" &&
+                          i.resultId === openItem.resultId,
+                      );
                       openStory(
                         src ?? {
                           ...openItem,
@@ -1037,63 +1495,203 @@ export function PointHistoryPanel() {
                         },
                       );
                     }}
-                    style={{ ...smallBtn, color: C.teal, borderColor: C.tealBorder }}
+                    style={{
+                      ...smallBtn,
+                      color: C.teal,
+                      borderColor: C.tealBorder,
+                    }}
                   >
-                    open source point α {openItem.sourceAoaDeg != null ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}` : ""}° ▸
+                    open source point α{" "}
+                    {openItem.sourceAoaDeg != null
+                      ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}`
+                      : ""}
+                    ° ▸
                   </button>
                 </div>
               </div>
             ) : storyError ? (
-              <div style={{ fontFamily: MONO, fontSize: 11, color: C.redText, lineHeight: 1.5 }}>
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  color: C.redText,
+                  lineHeight: 1.5,
+                }}
+              >
                 {storyError}
-                <button type="button" onClick={() => openStory(openItem)} style={{ ...smallBtn, marginLeft: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => openStory(openItem)}
+                  style={{ ...smallBtn, marginLeft: 8 }}
+                >
                   retry
                 </button>
               </div>
             ) : !story ? (
-              <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted }}>Loading point story…</div>
+              <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted }}>
+                Loading point story…
+              </div>
             ) : (
               <>
-                <div style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim, letterSpacing: "0.08em" }}>TIMELINE</div>
+                <div
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 9.5,
+                    color: C.dim,
+                    letterSpacing: "0.08em",
+                  }}
+                >
+                  TIMELINE
+                </div>
                 {timeline.map((ev, i) => (
-                  <div key={i} data-testid={`timeline-${ev.kind}`} style={{ display: "grid", gridTemplateColumns: "14px 1fr", gap: 10 }}>
-                    <div style={{ display: "grid", justifyItems: "center", gridTemplateRows: "14px 1fr", gap: 2 }}>
-                      <span style={{ width: 8, height: 8, marginTop: 3, borderRadius: "50%", background: toneColor(ev.tone) }} />
-                      {i < timeline.length - 1 && <span style={{ width: 1, background: C.borderRule, minHeight: 10 }} />}
+                  <div
+                    key={i}
+                    data-testid={`timeline-${ev.kind}`}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "14px 1fr",
+                      gap: 10,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "grid",
+                        justifyItems: "center",
+                        gridTemplateRows: "14px 1fr",
+                        gap: 2,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          marginTop: 3,
+                          borderRadius: "50%",
+                          background: toneColor(ev.tone),
+                        }}
+                      />
+                      {i < timeline.length - 1 && (
+                        <span
+                          style={{
+                            width: 1,
+                            background: C.borderRule,
+                            minHeight: 10,
+                          }}
+                        />
+                      )}
                     </div>
-                    <div style={{ display: "grid", gap: 3, paddingBottom: 8, minWidth: 0 }}>
-                      <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
-                        <span style={{ fontFamily: MONO, fontSize: 10.5, color: toneColor(ev.tone), fontWeight: ev.kind === "now" ? 700 : 600 }}>
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: 3,
+                        paddingBottom: 8,
+                        minWidth: 0,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "baseline",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontFamily: MONO,
+                            fontSize: 10.5,
+                            color: toneColor(ev.tone),
+                            fontWeight: ev.kind === "now" ? 700 : 600,
+                          }}
+                        >
                           {ev.title}
                         </span>
-                        {ev.at && <span style={{ fontFamily: MONO, fontSize: 9, color: C.dimmer }}>{ago(ev.at)}</span>}
+                        {ev.at && (
+                          <span
+                            style={{
+                              fontFamily: MONO,
+                              fontSize: 9,
+                              color: C.dimmer,
+                            }}
+                          >
+                            {ago(ev.at)}
+                          </span>
+                        )}
                         {ev.kind === "attempt" && ev.attempt?.simJob && (
-                          <span style={{ fontFamily: MONO, fontSize: 8.5, color: C.dim, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "1px 6px" }}>
-                            wave {ev.attempt.simJob.wave} · {ev.attempt.simJob.jobKind}
-                            {ev.attempt.simJob.campaignId ? " · campaign" : " · background"}
+                          <span
+                            style={{
+                              fontFamily: MONO,
+                              fontSize: 8.5,
+                              color: C.dim,
+                              border: `1px solid ${C.stroke}`,
+                              borderRadius: 999,
+                              padding: "1px 6px",
+                            }}
+                          >
+                            wave {ev.attempt.simJob.wave} ·{" "}
+                            {ev.attempt.simJob.jobKind}
+                            {ev.attempt.simJob.campaignId
+                              ? " · campaign"
+                              : " · background"}
                           </span>
                         )}
                       </div>
                       {ev.detail && (
-                        <div style={{ fontFamily: MONO, fontSize: 9.5, color: C.muted, lineHeight: 1.5, overflowWrap: "anywhere" }}>{ev.detail}</div>
+                        <div
+                          style={{
+                            fontFamily: MONO,
+                            fontSize: 9.5,
+                            color: C.muted,
+                            lineHeight: 1.5,
+                            overflowWrap: "anywhere",
+                          }}
+                        >
+                          {ev.detail}
+                        </div>
                       )}
                       {ev.whyLines.map((w) => (
-                        <div key={w} style={{ fontFamily: MONO, fontSize: 9.5, color: C.amber, lineHeight: 1.5, overflowWrap: "anywhere" }}>
+                        <div
+                          key={w}
+                          style={{
+                            fontFamily: MONO,
+                            fontSize: 9.5,
+                            color: C.amber,
+                            lineHeight: 1.5,
+                            overflowWrap: "anywhere",
+                          }}
+                        >
                           ⚠ {w}
                         </div>
                       ))}
                       {ev.kind === "attempt" && ev.attempt?.classification && (
-                        <div style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>
-                          attempt verdict: {ev.attempt.classification.state.replaceAll("_", " ")}
-                          {ev.attempt.classification.reasons.length ? ` — ${ev.attempt.classification.reasons.join(", ")}` : ""}
+                        <div
+                          style={{
+                            fontFamily: MONO,
+                            fontSize: 9,
+                            color: C.dim,
+                          }}
+                        >
+                          attempt verdict:{" "}
+                          {ev.attempt.classification.state.replaceAll("_", " ")}
+                          {ev.attempt.classification.reasons.length
+                            ? ` — ${ev.attempt.classification.reasons.join(", ")}`
+                            : ""}
                         </div>
                       )}
                     </div>
                   </div>
                 ))}
                 {timeline.length === 1 && (
-                  <div style={{ fontFamily: MONO, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
-                    No attempt records for this point yet — evidence appears here as the solver reports it.
+                  <div
+                    style={{
+                      fontFamily: MONO,
+                      fontSize: 10,
+                      color: C.dim,
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    No attempt records for this point yet — evidence appears
+                    here as the solver reports it.
                   </div>
                 )}
               </>
@@ -1108,7 +1706,10 @@ export function PointHistoryPanel() {
           open
           ctx={{
             re: openItem.reynolds ?? 0,
-            aoa: openItem.kind === "derived" ? (openItem.sourceAoaDeg ?? openItem.aoaDeg) : openItem.aoaDeg,
+            aoa:
+              openItem.kind === "derived"
+                ? (openItem.sourceAoaDeg ?? openItem.aoaDeg)
+                : openItem.aoaDeg,
             resultId: openItem.resultId,
             mirrored: false,
           }}

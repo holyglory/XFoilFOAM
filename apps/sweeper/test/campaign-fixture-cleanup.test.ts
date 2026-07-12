@@ -15,6 +15,7 @@
 
 import {
   airfoils,
+  boundaryConditions,
   boundaryProfiles,
   categories,
   createClient,
@@ -23,14 +24,21 @@ import {
   mediums,
   meshProfiles,
   outputProfiles,
+  polarCompatibilityFitSets,
   referenceGeometryProfiles,
+  refreshPolarCacheForRevision,
+  resultAttempts,
+  results,
+  simCampaignConditions,
   simCampaigns,
+  simulationPresetRevisions,
   simulationPresets,
+  solverEvidenceArtifacts,
   solverProfiles,
   sweepDefinitions,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
-import { eq, inArray, like, sql as dsql } from "drizzle-orm";
+import { and, eq, inArray, like, sql as dsql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const { db, sql } = createClient({ max: 2 });
@@ -62,7 +70,12 @@ async function launchCampaign(name: string, speed: number): Promise<string> {
       spanM: 1,
       areaMode: "derived",
       excludedConditions: [],
-      baseSweep: { fromDeg: null, toDeg: null, stepDeg: null, listDeg: [6, 7, 8] },
+      baseSweep: {
+        fromDeg: null,
+        toDeg: null,
+        stepDeg: null,
+        listDeg: [6, 7, 8],
+      },
       objectives: {
         ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
         clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
@@ -81,7 +94,12 @@ async function launchCampaign(name: string, speed: number): Promise<string> {
 beforeAll(async () => {
   const [cat] = await db
     .insert(categories)
-    .values({ slug: `${PREFIX}-cat`, name: `${PREFIX} cat`, path: `${PREFIX}-cat`, depth: 0 })
+    .values({
+      slug: `${PREFIX}-cat`,
+      name: `${PREFIX} cat`,
+      path: `${PREFIX}-cat`,
+      depth: 0,
+    })
     .returning();
   categoryId = cat.id;
   const [airfoil] = await db
@@ -116,10 +134,22 @@ beforeAll(async () => {
     })
     .returning();
   mediumId = medium.id;
-  const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` }).returning();
-  const [mesh] = await db.insert(meshProfiles).values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` }).returning();
-  const [solver] = await db.insert(solverProfiles).values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` }).returning();
-  const [output] = await db.insert(outputProfiles).values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` }).returning();
+  const [boundary] = await db
+    .insert(boundaryProfiles)
+    .values({ slug: `${PREFIX}-boundary`, name: `${PREFIX} boundary` })
+    .returning();
+  const [mesh] = await db
+    .insert(meshProfiles)
+    .values({ slug: `${PREFIX}-mesh`, name: `${PREFIX} mesh` })
+    .returning();
+  const [solver] = await db
+    .insert(solverProfiles)
+    .values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` })
+    .returning();
+  const [output] = await db
+    .insert(outputProfiles)
+    .values({ slug: `${PREFIX}-output`, name: `${PREFIX} output` })
+    .returning();
   profileIds.boundary = boundary.id;
   profileIds.mesh = mesh.id;
   profileIds.solver = solver.id;
@@ -136,22 +166,50 @@ afterAll(async () => {
     campaignIds: [campaignA, campaignB],
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
   });
-  if (profileIds.boundary) await db.delete(boundaryProfiles).where(eq(boundaryProfiles.id, profileIds.boundary));
-  if (profileIds.mesh) await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
-  if (profileIds.solver) await db.delete(solverProfiles).where(eq(solverProfiles.id, profileIds.solver));
-  if (profileIds.output) await db.delete(outputProfiles).where(eq(outputProfiles.id, profileIds.output));
+  if (profileIds.boundary)
+    await db
+      .delete(boundaryProfiles)
+      .where(eq(boundaryProfiles.id, profileIds.boundary));
+  if (profileIds.mesh)
+    await db.delete(meshProfiles).where(eq(meshProfiles.id, profileIds.mesh));
+  if (profileIds.solver)
+    await db
+      .delete(solverProfiles)
+      .where(eq(solverProfiles.id, profileIds.solver));
+  if (profileIds.output)
+    await db
+      .delete(outputProfiles)
+      .where(eq(outputProfiles.id, profileIds.output));
   if (mediumId) await db.delete(mediums).where(eq(mediums.id, mediumId));
   if (airfoilId) await db.delete(airfoils).where(eq(airfoils.id, airfoilId));
-  if (categoryId) await db.delete(categories).where(eq(categories.id, categoryId));
+  if (categoryId)
+    await db.delete(categories).where(eq(categories.id, categoryId));
   await sql.end();
 });
 
 describe("campaign fixture cleanup: shared find-or-create registry rows", () => {
   it("rejects sloppy presetSlugPrefix values before touching shared tables", async () => {
-    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: "" })).rejects.toThrow(/presetSlugPrefix/);
-    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: "campaign-%" })).rejects.toThrow(/wildcards/);
-    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: `Campaign-${PREFIX}` })).rejects.toThrow(/lowercase/);
-    await expect(cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: "campaign-ab" })).rejects.toThrow(/run-unique/);
+    await expect(
+      cleanupCampaignFixtures(db, { campaignIds: [], presetSlugPrefix: "" }),
+    ).rejects.toThrow(/presetSlugPrefix/);
+    await expect(
+      cleanupCampaignFixtures(db, {
+        campaignIds: [],
+        presetSlugPrefix: "campaign-%",
+      }),
+    ).rejects.toThrow(/wildcards/);
+    await expect(
+      cleanupCampaignFixtures(db, {
+        campaignIds: [],
+        presetSlugPrefix: `Campaign-${PREFIX}`,
+      }),
+    ).rejects.toThrow(/lowercase/);
+    await expect(
+      cleanupCampaignFixtures(db, {
+        campaignIds: [],
+        presetSlugPrefix: "campaign-ab",
+      }),
+    ).rejects.toThrow(/run-unique/);
   });
 
   it("shares ONE geometry row between the two campaigns (the flake precondition)", async () => {
@@ -177,7 +235,9 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
     // transaction so the failed statement leaves no state behind.
     await expect(
       db.transaction(async (tx) => {
-        await tx.execute(dsql`DELETE FROM reference_geometry_profiles WHERE id = ${geo.id}::uuid`);
+        await tx.execute(
+          dsql`DELETE FROM reference_geometry_profiles WHERE id = ${geo.id}::uuid`,
+        );
       }),
     ).rejects.toMatchObject({ code: "23503" });
   });
@@ -187,17 +247,121 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
       .select({ id: referenceGeometryProfiles.id })
       .from(referenceGeometryProfiles)
       .where(eq(referenceGeometryProfiles.createdByCampaignId, campaignA));
+    const [setup] = await db
+      .select({
+        revisionId: simCampaignConditions.simulationPresetRevisionId,
+        bcId: simulationPresets.legacyBoundaryConditionId,
+      })
+      .from(simCampaignConditions)
+      .innerJoin(
+        simulationPresets,
+        eq(simulationPresets.id, simCampaignConditions.presetId),
+      )
+      .where(eq(simCampaignConditions.campaignId, campaignA))
+      .limit(1);
+    expect(setup?.bcId).toBeTruthy();
+    const [evidenceResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: setup.bcId!,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg: 6,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        reynolds: Math.round((10 * CHORD) / NU),
+        speed: 10,
+        chord: CHORD,
+        cl: 0.61,
+        cd: 0.018,
+        cm: -0.02,
+        clCd: 0.61 / 0.018,
+        converged: true,
+        stalled: false,
+        fidelity: "rans",
+        solvedAt: new Date(),
+      })
+      .returning({ id: results.id });
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: evidenceResult.id,
+        airfoilId,
+        bcId: setup.bcId!,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg: 6,
+        engineJobId: `${PREFIX}-cleanup-evidence`,
+        engineCaseSlug: "a6",
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: true,
+        cl: 0.61,
+        cd: 0.018,
+        cm: -0.02,
+        clCd: 0.61 / 0.018,
+        converged: true,
+        stalled: false,
+        evidencePayload: { fidelity: "rans" },
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: evidenceResult.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      engineJobId: `${PREFIX}-cleanup-evidence`,
+      engineCaseSlug: "a6",
+      aoaDeg: 6,
+      kind: "manifest",
+      storageKey: `${PREFIX}/cleanup-evidence/manifest.json`,
+      mimeType: "application/json",
+      sha256: "a".repeat(64),
+      byteSize: 64,
+      metadata: { evidenceBase: `${PREFIX}/cleanup-evidence` },
+    });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, evidenceResult.id));
+    await refreshPolarCacheForRevision(db, airfoilId, setup.revisionId);
+    const [revision] = await db
+      .select({ physicsHash: simulationPresetRevisions.physicsHash })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, setup.revisionId));
+    expect(revision.physicsHash).toBeTruthy();
+    const currentBefore = await db
+      .select({ id: polarCompatibilityFitSets.id })
+      .from(polarCompatibilityFitSets)
+      .where(
+        and(
+          eq(polarCompatibilityFitSets.airfoilId, airfoilId),
+          eq(
+            polarCompatibilityFitSets.compatibilityHash,
+            revision.physicsHash!,
+          ),
+          eq(polarCompatibilityFitSets.isCurrent, true),
+        ),
+      );
+    expect(currentBefore).toHaveLength(1);
+
     await cleanupCampaignFixtures(db, {
       campaignIds: [campaignA],
       presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}-aaa`,
     });
     // A's graph is gone…
-    const aCampaign = await db.select({ id: simCampaigns.id }).from(simCampaigns).where(eq(simCampaigns.id, campaignA));
+    const aCampaign = await db
+      .select({ id: simCampaigns.id })
+      .from(simCampaigns)
+      .where(eq(simCampaigns.id, campaignA));
     expect(aCampaign.length).toBe(0);
     const aPresets = await db
       .select({ id: simulationPresets.id })
       .from(simulationPresets)
-      .where(like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}-aaa%`));
+      .where(
+        like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}-aaa%`),
+      );
     expect(aPresets.length).toBe(0);
     // …but the shared geometry row SURVIVES: campaign B still references it.
     const survivors = await db
@@ -205,6 +369,20 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
       .from(referenceGeometryProfiles)
       .where(eq(referenceGeometryProfiles.id, geo.id));
     expect(survivors.length).toBe(1);
+    const staleCurrent = await db
+      .select({ id: polarCompatibilityFitSets.id })
+      .from(polarCompatibilityFitSets)
+      .where(
+        and(
+          eq(polarCompatibilityFitSets.airfoilId, airfoilId),
+          eq(
+            polarCompatibilityFitSets.compatibilityHash,
+            revision.physicsHash!,
+          ),
+          eq(polarCompatibilityFitSets.isCurrent, true),
+        ),
+      );
+    expect(staleCurrent).toHaveLength(0);
   });
 
   it("suite B's helper cleanup removes the shared row via the referenced-by union (no created_by NULL leak)", async () => {
@@ -214,10 +392,35 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
     const geoBefore = await db
       .select({ id: referenceGeometryProfiles.id })
       .from(referenceGeometryProfiles)
-      .innerJoin(simulationPresets, eq(simulationPresets.referenceGeometryProfileId, referenceGeometryProfiles.id))
-      .where(like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}-bbb%`));
+      .innerJoin(
+        simulationPresets,
+        eq(
+          simulationPresets.referenceGeometryProfileId,
+          referenceGeometryProfiles.id,
+        ),
+      )
+      .where(
+        like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}-bbb%`),
+      );
     expect(geoBefore.length).toBeGreaterThan(0);
     const geoIds = [...new Set(geoBefore.map((r) => r.id))];
+
+    // MUST-CATCH for the 2026-07-11 full-suite output_profiles FK flake:
+    // campaign-condition ownership is authoritative even if a generated
+    // preset's presentation slug no longer matches the launch prefix. The old
+    // slug-only helper leaked this preset, then afterAll could not delete the
+    // file-owned output profile it still referenced.
+    const [campaignPreset] = await db
+      .select({ id: simulationPresets.id })
+      .from(simulationPresets)
+      .where(
+        like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}-bbb%`),
+      );
+    expect(campaignPreset).toBeTruthy();
+    await db
+      .update(simulationPresets)
+      .set({ slug: `${PREFIX.toLowerCase()}-renamed-preset` })
+      .where(eq(simulationPresets.id, campaignPreset.id));
 
     await cleanupCampaignFixtures(db, {
       campaignIds: [campaignB],
@@ -233,9 +436,12 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
     const leftoverPresets = await db
       .select({ id: simulationPresets.id })
       .from(simulationPresets)
-      .where(like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}%`));
+      .where(eq(simulationPresets.id, campaignPreset.id));
     expect(leftoverPresets.length).toBe(0);
-    const leftoverFlows = await db.select({ id: flowConditions.id }).from(flowConditions).where(eq(flowConditions.mediumId, mediumId));
+    const leftoverFlows = await db
+      .select({ id: flowConditions.id })
+      .from(flowConditions)
+      .where(eq(flowConditions.mediumId, mediumId));
     expect(leftoverFlows.length).toBe(0);
     const leftoverSweeps = await db
       .select({ id: sweepDefinitions.id })

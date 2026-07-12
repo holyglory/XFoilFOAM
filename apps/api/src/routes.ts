@@ -13,12 +13,13 @@ import {
   outputProfiles,
   referenceGeometryProfiles,
   remoteAssetReferences,
+  resultAttempts,
   resultMedia,
-  recordReviewVerdict,
+  RETIRED_REVIEW_WAIVER_ERROR,
   revokeActiveReviewVerdict,
   reviewVerdictHistory,
-  activeReviewVerdict,
   CONTINUABLE_SQL,
+  lockPrecalcCells,
   results,
   schedulingProfiles,
   simJobs,
@@ -40,6 +41,7 @@ import {
   desc,
   eq,
   inArray,
+  isNotNull,
   isNull,
   or,
   sql,
@@ -65,10 +67,7 @@ import {
   toMediumDTO,
 } from "./services/mediums";
 import { assembleSim } from "./services/sim";
-import {
-  assembleSolverWork,
-  solverWorkStateForPoint,
-} from "./services/solver-work";
+import { assembleSolverWork } from "./services/solver-work";
 import { readSweeperState, writeSweeperState } from "./services/sweeper-state";
 
 const nacaSchema = z.object({
@@ -174,28 +173,6 @@ async function refreshReviewResultCache(
   await refreshPolarCacheForRevision(db, ctx.airfoilId, ctx.revisionId);
 }
 
-async function isReviewableResult(
-  ctx: ReviewableResultContext,
-): Promise<boolean> {
-  const active = await activeReviewVerdict(db, ctx.id);
-  if (active) return true;
-  return (
-    solverWorkStateForPoint({
-      resultId: ctx.id,
-      status: ctx.status,
-      source: ctx.source,
-      regime: ctx.regime,
-      fidelity: ctx.fidelity,
-      classificationState: ctx.classificationState,
-      continuable: ctx.continuable,
-      openVerify: ctx.openVerify,
-      openRequest: ctx.openRequest,
-      autoRetriedAt: ctx.autoRetriedAt,
-      error: ctx.error,
-    }) === "needs_review"
-  );
-}
-
 function stableHash(value: unknown): string {
   const stable = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(stable);
@@ -284,18 +261,96 @@ async function proxyRemoteAsset(storageKey: string) {
   };
 }
 
-async function delegateRemoteRender(resultId: string, params: unknown) {
-  const [ref] = await db
+class RemoteRenderIntegrityError extends Error {
+  statusCode = 502;
+}
+
+async function delegateRemoteRender(opts: {
+  resultId: string;
+  resultAttemptId: string;
+  evidenceSha256: string;
+  params: { field: string; role: string } & Record<string, unknown>;
+}) {
+  const refs = await db
     .select()
     .from(remoteAssetReferences)
     .where(
       and(
-        eq(remoteAssetReferences.resultId, resultId),
+        eq(remoteAssetReferences.resultId, opts.resultId),
+        eq(remoteAssetReferences.resultAttemptId, opts.resultAttemptId),
         sql`${remoteAssetReferences.remoteResultId} IS NOT NULL`,
       ),
-    )
-    .limit(1);
-  if (!ref?.remoteResultId) return null;
+    );
+  const artifactRowIds = refs.flatMap((ref) =>
+    ref.localKind === "evidence_artifact" && ref.localRowId
+      ? [ref.localRowId]
+      : [],
+  );
+  const mediaRowIds = refs.flatMap((ref) =>
+    ref.localKind === "result_media" && ref.localRowId ? [ref.localRowId] : [],
+  );
+  const [artifacts, media] = await Promise.all([
+    artifactRowIds.length
+      ? db
+          .select()
+          .from(solverEvidenceArtifacts)
+          .where(inArray(solverEvidenceArtifacts.id, artifactRowIds))
+      : [],
+    mediaRowIds.length
+      ? db
+          .select()
+          .from(resultMedia)
+          .where(inArray(resultMedia.id, mediaRowIds))
+      : [],
+  ]);
+  const artifactsById = new Map(artifacts.map((row) => [row.id, row]));
+  const mediaById = new Map(media.map((row) => [row.id, row]));
+  const exactRefs = refs.filter((ref) => {
+    if (!ref.localRowId || !ref.remoteResultId) return false;
+    if (ref.localKind === "evidence_artifact") {
+      const artifact = artifactsById.get(ref.localRowId);
+      return Boolean(
+        artifact &&
+        artifact.resultId === opts.resultId &&
+        artifact.resultAttemptId === opts.resultAttemptId &&
+        artifact.kind === "manifest" &&
+        artifact.sha256 === opts.evidenceSha256 &&
+        ref.sha256 === artifact.sha256 &&
+        ref.byteSize === artifact.byteSize &&
+        ref.mimeType === artifact.mimeType,
+      );
+    }
+    if (ref.localKind === "result_media") {
+      const item = mediaById.get(ref.localRowId);
+      return Boolean(
+        item &&
+        item.resultId === opts.resultId &&
+        item.resultAttemptId === opts.resultAttemptId &&
+        item.evidenceSha256 === opts.evidenceSha256 &&
+        item.sha256 &&
+        ref.sha256 === item.sha256 &&
+        ref.byteSize === item.byteSize &&
+        ref.mimeType === item.mimeType,
+      );
+    }
+    return false;
+  });
+  const authorities = new Map<string, (typeof exactRefs)[number]>();
+  for (const ref of exactRefs) {
+    const key = `${ref.sourceInstanceId ?? ""}\0${ref.remoteResultId}`;
+    const preferred = authorities.get(key);
+    if (!preferred || ref.localKind === "evidence_artifact") {
+      authorities.set(key, ref);
+    }
+  }
+  if (!authorities.size) return null;
+  if (authorities.size !== 1) {
+    throw new RemoteRenderIntegrityError(
+      "current evidence generation has ambiguous remote render authorities",
+    );
+  }
+  const ref = [...authorities.values()][0];
+  if (!ref.remoteResultId) return null;
   const settings = await syncSettingsForRemoteProxy();
   const renderUrl = ref.remoteRenderUrl
     ? resolveRemoteUrl(ref.remoteRenderUrl, settings?.upstreamBaseUrl)
@@ -307,62 +362,143 @@ async function delegateRemoteRender(resultId: string, params: unknown) {
     method: "POST",
     headers: {
       "content-type": "application/json",
+      "x-xfoilfoam-expected-evidence-sha256": opts.evidenceSha256,
       ...(settings?.upstreamSecret
         ? { "x-xfoilfoam-sync-secret": settings.upstreamSecret }
         : {}),
     },
-    body: JSON.stringify(params ?? {}),
+    body: JSON.stringify({
+      ...opts.params,
+      expectedEvidenceSha256: opts.evidenceSha256,
+    }),
   });
   const payload = (await res.json().catch(() => null)) as null | {
     id?: string;
     url?: string;
     mimeType?: string;
+    sha256?: string;
+    byteSize?: number;
     field?: string;
     role?: string;
+    paramsHash?: string;
+    resultId?: string;
+    resultAttemptId?: string;
+    evidenceSha256?: string;
     cached?: boolean;
+    error?: unknown;
   };
-  if (!res.ok || !payload?.url)
-    throw new Error(
-      payload && "error" in payload
-        ? String((payload as { error?: unknown }).error)
+  if (!res.ok) {
+    const error = new RemoteRenderIntegrityError(
+      payload?.error
+        ? String(payload.error)
         : `remote render failed (${res.status})`,
     );
+    if (res.status >= 400 && res.status < 500) error.statusCode = 409;
+    throw error;
+  }
+  if (
+    !payload?.id ||
+    !payload.url ||
+    payload.resultId !== ref.remoteResultId ||
+    !payload.resultAttemptId ||
+    payload.evidenceSha256 !== opts.evidenceSha256 ||
+    !payload.paramsHash ||
+    payload.field !== opts.params.field ||
+    payload.role !== opts.params.role ||
+    !payload.mimeType?.trim() ||
+    !payload.sha256 ||
+    !/^[0-9a-f]{64}$/i.test(payload.sha256) ||
+    !Number.isSafeInteger(payload.byteSize) ||
+    Number(payload.byteSize) <= 0
+  ) {
+    throw new RemoteRenderIntegrityError(
+      "remote render response lacks exact generation or content identity",
+    );
+  }
   const remoteDownloadUrl = resolveRemoteUrl(
     payload.url,
     settings?.upstreamBaseUrl,
   );
-  const key = `remote/${encodeURIComponent(ref.sourceInstanceId ?? "upstream")}/renders/${createHash("sha256").update(`${resultId}:${remoteDownloadUrl}`).digest("hex")}`;
-  await db
+  const key = `remote/${encodeURIComponent(ref.sourceInstanceId ?? "upstream")}/renders/${createHash(
+    "sha256",
+  )
+    .update(
+      `${opts.resultId}:${opts.resultAttemptId}:${opts.evidenceSha256}:${payload.paramsHash}:${payload.sha256}`,
+    )
+    .digest("hex")}`;
+  const association = {
+    localKind: "field_render_cache",
+    localStorageKey: key,
+    resultId: opts.resultId,
+    resultAttemptId: opts.resultAttemptId,
+    sourceInstanceId: ref.sourceInstanceId,
+    sourceInstanceName: ref.sourceInstanceName,
+    remoteResultId: ref.remoteResultId,
+    remoteCacheId: payload.id,
+    remoteDownloadUrl,
+    remoteRenderUrl: renderUrl,
+    sha256: payload.sha256,
+    byteSize: payload.byteSize,
+    mimeType: payload.mimeType,
+    availability: "remote_only" as const,
+    metadata: {
+      field: payload.field,
+      role: payload.role,
+      paramsHash: payload.paramsHash,
+      evidenceSha256: payload.evidenceSha256,
+      remoteResultAttemptId: payload.resultAttemptId,
+    },
+  };
+  const [inserted] = await db
     .insert(remoteAssetReferences)
-    .values({
-      localKind: "field_render_cache",
-      localStorageKey: key,
-      resultId,
-      sourceInstanceId: ref.sourceInstanceId,
-      sourceInstanceName: ref.sourceInstanceName,
-      remoteResultId: ref.remoteResultId,
-      remoteCacheId: payload.id ?? null,
-      remoteDownloadUrl,
-      remoteRenderUrl: renderUrl,
-      mimeType: payload.mimeType ?? "image/png",
-      availability: "remote_only",
-      metadata: { field: payload.field ?? null, role: payload.role ?? null },
-    })
-    .onConflictDoUpdate({
-      target: remoteAssetReferences.localStorageKey,
-      set: {
-        remoteDownloadUrl,
-        remoteRenderUrl: renderUrl,
-        updatedAt: new Date(),
-      },
+    .values(association)
+    .onConflictDoNothing()
+    .returning({ id: remoteAssetReferences.id });
+  if (!inserted) {
+    const [existing] = await db
+      .select()
+      .from(remoteAssetReferences)
+      .where(eq(remoteAssetReferences.localStorageKey, key))
+      .limit(1);
+    const immutable = (row: Record<string, unknown>) => ({
+      localKind: row.localKind,
+      localStorageKey: row.localStorageKey,
+      resultId: row.resultId ?? null,
+      resultAttemptId: row.resultAttemptId ?? null,
+      sourceInstanceId: row.sourceInstanceId ?? null,
+      sourceInstanceName: row.sourceInstanceName ?? null,
+      remoteResultId: row.remoteResultId ?? null,
+      remoteCacheId: row.remoteCacheId ?? null,
+      remoteDownloadUrl: row.remoteDownloadUrl,
+      remoteRenderUrl: row.remoteRenderUrl ?? null,
+      sha256: row.sha256 ?? null,
+      byteSize: row.byteSize ?? null,
+      mimeType: row.mimeType,
+      metadata: row.metadata ?? {},
     });
+    if (
+      !existing ||
+      stableHash(immutable(existing as unknown as Record<string, unknown>)) !==
+        stableHash(immutable(association as unknown as Record<string, unknown>))
+    ) {
+      throw new RemoteRenderIntegrityError(
+        "remote render reference changed immutable identity",
+      );
+    }
+  }
   return {
-    id: payload.id ?? key,
+    id: payload.id,
     cached: Boolean(payload.cached),
     field: payload.field,
     role: payload.role,
     url: mediaStore.url(key),
-    mimeType: payload.mimeType ?? "image/png",
+    mimeType: payload.mimeType,
+    sha256: payload.sha256,
+    byteSize: payload.byteSize,
+    paramsHash: payload.paramsHash,
+    resultId: opts.resultId,
+    resultAttemptId: opts.resultAttemptId,
+    evidenceSha256: opts.evidenceSha256,
   };
 }
 
@@ -724,28 +860,19 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
       const body = reviewVerdictBody.parse(req.body);
-      const note = body.note?.trim() ?? "";
-      if ((body.verdict === "waive" || body.verdict === "exclude") && !note) {
-        return reply
-          .code(422)
-          .send({ error: "note is required for waive/exclude reviews" });
+      if (body.verdict === "waive") {
+        return reply.code(422).send({
+          error: RETIRED_REVIEW_WAIVER_ERROR,
+          code: "waiver_retired",
+        });
       }
       const ctx = await loadReviewableResultContext(id);
       if (!ctx) return reply.code(404).send({ error: "result not found" });
-      if (!(await isReviewableResult(ctx))) {
-        return reply
-          .code(409)
-          .send({ error: "result is not in a reviewable solver-work state" });
-      }
-      const reviewer = sessionEmail(req) ?? "dev-admin@local";
-      const review = await recordReviewVerdict(db, {
-        resultId: id,
-        verdict: body.verdict,
-        note,
-        reviewer,
+      return reply.code(409).send({
+        error:
+          "new review verdict creation is inactive until a genuinely adjudicable evidence-conflict workflow exists",
+        code: "review_creation_inactive",
       });
-      await refreshReviewResultCache(ctx);
-      return reply.code(201).send({ review: reviewDTO(review) });
     },
   );
 
@@ -793,25 +920,49 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       .limit(1);
     if (!a) return reply.code(404).send({ error: "airfoil not found" });
     const rows = await db
-      .select()
+      .select({
+        resultId: results.id,
+        resultAttemptId: results.currentResultAttemptId,
+        aoa: results.aoaDeg,
+        re: results.reynolds,
+        mach: results.mach,
+        regime: resultAttempts.regime,
+      })
       .from(results)
+      .innerJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.id, results.currentResultAttemptId),
+          eq(resultAttempts.resultId, results.id),
+        ),
+      )
       .where(
         and(
           eq(results.airfoilId, a.id),
-          eq(results.source, "solved"),
-          eq(results.status, "done"),
+          eq(resultAttempts.source, "solved"),
+          eq(resultAttempts.status, "done"),
+          isNotNull(results.reynolds),
           revisionId
             ? eq(results.simulationPresetRevisionId, revisionId)
             : sql`true`,
         ),
       )
       .orderBy(asc(results.aoaDeg));
-    const resultIds = rows.map((row) => row.id);
+    const resultIds = rows.map((row) => row.resultId);
     const mediaRows = resultIds.length
       ? await db
           .select()
           .from(resultMedia)
-          .where(inArray(resultMedia.resultId, resultIds))
+          .where(
+            and(
+              inArray(resultMedia.resultId, resultIds),
+              sql`EXISTS (
+                SELECT 1 FROM results current_result
+                WHERE current_result.id = ${resultMedia.resultId}
+                  AND current_result.current_result_attempt_id = ${resultMedia.resultAttemptId}
+              )`,
+            ),
+          )
       : [];
     const fieldsByResult = new Map<string, Set<string>>();
     for (const media of mediaRows) {
@@ -822,12 +973,12 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     }
     return {
       items: rows.map((row) => ({
-        resultId: row.id,
-        aoa: row.aoaDeg,
-        re: row.reynolds ?? 0,
+        resultId: row.resultId,
+        aoa: row.aoa,
+        re: row.re!,
         mach: row.mach,
         regime: row.regime,
-        fields: Array.from(fieldsByResult.get(row.id) ?? []),
+        fields: Array.from(fieldsByResult.get(row.resultId) ?? []),
       })),
     };
   });
@@ -835,15 +986,24 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/results/:resultId/media", async (req, reply) => {
     const { resultId } = req.params as { resultId: string };
     const [result] = await db
-      .select({ id: results.id })
+      .select({
+        id: results.id,
+        currentAttemptId: results.currentResultAttemptId,
+      })
       .from(results)
       .where(eq(results.id, resultId))
       .limit(1);
     if (!result) return reply.code(404).send({ error: "result not found" });
+    if (!result.currentAttemptId) return { items: [] };
     const rows = await db
       .select()
       .from(resultMedia)
-      .where(eq(resultMedia.resultId, resultId));
+      .where(
+        and(
+          eq(resultMedia.resultId, resultId),
+          eq(resultMedia.resultAttemptId, result.currentAttemptId),
+        ),
+      );
     return {
       items: rows.map((row) => ({
         id: row.id,
@@ -869,21 +1029,62 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/results/:resultId/evidence", async (req, reply) => {
     const { resultId } = req.params as { resultId: string };
     const [result] = await db
-      .select({ id: results.id })
+      .select({
+        id: results.id,
+        currentAttemptId: results.currentResultAttemptId,
+      })
       .from(results)
       .where(eq(results.id, resultId))
       .limit(1);
     if (!result) return reply.code(404).send({ error: "result not found" });
+    if (!result.currentAttemptId) {
+      return { artifacts: [], media: [], customRenders: [] };
+    }
+    const currentManifests = await db
+      .select({ sha256: solverEvidenceArtifacts.sha256 })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, resultId),
+          eq(solverEvidenceArtifacts.resultAttemptId, result.currentAttemptId),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    const currentManifest =
+      currentManifests.length === 1 ? currentManifests[0] : null;
     const [artifacts, media, renders] = await Promise.all([
       db
         .select()
         .from(solverEvidenceArtifacts)
-        .where(eq(solverEvidenceArtifacts.resultId, resultId)),
-      db.select().from(resultMedia).where(eq(resultMedia.resultId, resultId)),
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, resultId),
+            eq(
+              solverEvidenceArtifacts.resultAttemptId,
+              result.currentAttemptId,
+            ),
+          ),
+        ),
+      db
+        .select()
+        .from(resultMedia)
+        .where(
+          and(
+            eq(resultMedia.resultId, resultId),
+            eq(resultMedia.resultAttemptId, result.currentAttemptId),
+          ),
+        ),
       db
         .select()
         .from(fieldRenderCache)
-        .where(eq(fieldRenderCache.resultId, resultId)),
+        .where(
+          and(
+            eq(fieldRenderCache.resultId, resultId),
+            currentManifest
+              ? sql`${fieldRenderCache.params} ->> 'evidenceSha256' = ${currentManifest.sha256}`
+              : sql`false`,
+          ),
+        ),
     ]);
     return {
       artifacts: artifacts.map(artifactDTO),
@@ -916,47 +1117,125 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       })
       .parse(req.body);
     const [row] = await db
-      .select({ result: results, airfoil: airfoils })
+      .select({
+        result: results,
+        attempt: resultAttempts,
+        airfoil: airfoils,
+      })
       .from(results)
       .innerJoin(airfoils, eq(airfoils.id, results.airfoilId))
+      .leftJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.id, results.currentResultAttemptId),
+          eq(resultAttempts.resultId, results.id),
+        ),
+      )
       .where(eq(results.id, resultId))
       .limit(1);
     if (!row) return reply.code(404).send({ error: "result not found" });
     const result = row.result;
-    if (!result.engineJobId || !result.engineCaseSlug) {
-      const delegated = await delegateRemoteRender(resultId, body);
-      if (delegated) return delegated;
+    const attempt = row.attempt;
+    if (!result.currentResultAttemptId || !attempt) {
       return reply
         .code(409)
-        .send({ error: "result has no engine case evidence path" });
+        .send({ error: "result has no selected evidence generation" });
     }
-    if (result.engineJobId.startsWith("sync:")) {
-      const delegated = await delegateRemoteRender(resultId, body);
-      if (delegated) return delegated;
-    }
-    const [manifest] = await db
+    const manifests = await db
       .select()
       .from(solverEvidenceArtifacts)
       .where(
         and(
           eq(solverEvidenceArtifacts.resultId, resultId),
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            result.currentResultAttemptId,
+          ),
           eq(solverEvidenceArtifacts.kind, "manifest"),
         ),
-      )
-      .orderBy(desc(solverEvidenceArtifacts.createdAt))
-      .limit(1);
-    if (!manifest)
+      );
+    const manifest = manifests.length === 1 ? manifests[0] : null;
+    if (
+      !manifest ||
+      !/^[a-f0-9]{64}$/i.test(manifest.sha256) ||
+      manifest.byteSize <= 0 ||
+      !manifest.storageKey.trim() ||
+      !manifest.mimeType.trim() ||
+      manifest.airfoilId !== result.airfoilId ||
+      manifest.simJobId !== attempt.simJobId ||
+      manifest.engineJobId !== attempt.engineJobId ||
+      manifest.engineCaseSlug !== attempt.engineCaseSlug ||
+      manifest.aoaDeg !== attempt.aoaDeg
+    )
       return reply
         .code(409)
-        .send({ error: "result has no raw evidence manifest" });
+        .send({ error: "result has no unique current raw evidence manifest" });
+    const expectedAttemptHeader =
+      typeof req.headers["x-xfoilfoam-expected-result-attempt-id"] === "string"
+        ? req.headers["x-xfoilfoam-expected-result-attempt-id"]
+        : null;
+    const expectedEvidenceHeader =
+      typeof req.headers["x-xfoilfoam-expected-evidence-sha256"] === "string"
+        ? req.headers["x-xfoilfoam-expected-evidence-sha256"]
+        : null;
+    if (
+      (expectedAttemptHeader &&
+        expectedAttemptHeader !== result.currentResultAttemptId) ||
+      (expectedEvidenceHeader && expectedEvidenceHeader !== manifest.sha256)
+    ) {
+      return reply.code(409).send({
+        error: "selected evidence generation changed before render",
+      });
+    }
+    if (!attempt.engineJobId || !attempt.engineCaseSlug) {
+      const delegated = await delegateRemoteRender({
+        resultId,
+        resultAttemptId: result.currentResultAttemptId,
+        evidenceSha256: manifest.sha256,
+        params: body,
+      });
+      if (delegated) return delegated;
+      return reply
+        .code(409)
+        .send({ error: "result has no exact remote render authority" });
+    }
+    if (attempt.engineJobId.startsWith("sync:")) {
+      const delegated = await delegateRemoteRender({
+        resultId,
+        resultAttemptId: result.currentResultAttemptId,
+        evidenceSha256: manifest.sha256,
+        params: body,
+      });
+      if (delegated) return delegated;
+      return reply
+        .code(409)
+        .send({ error: "result has no exact remote render authority" });
+    }
     const manifestMetadata =
       manifest.metadata && typeof manifest.metadata === "object"
         ? (manifest.metadata as Record<string, unknown>)
         : {};
     const evidenceBase =
       typeof manifestMetadata.evidenceBase === "string"
-        ? manifestMetadata.evidenceBase
-        : "evidence";
+        ? manifestMetadata.evidenceBase.trim()
+        : "";
+    if (!evidenceBase) {
+      return reply.code(409).send({
+        error: "current evidence manifest has no stored evidence base",
+      });
+    }
+    if (
+      !Number.isFinite(result.chord) ||
+      result.chord == null ||
+      result.chord <= 0 ||
+      !Number.isFinite(result.speed) ||
+      result.speed == null ||
+      result.speed <= 0
+    ) {
+      return reply.code(409).send({
+        error: "current result has no stored reference chord or flow speed",
+      });
+    }
     let resolvedVmin = body.vmin ?? null;
     let resolvedVmax = body.vmax ?? null;
     if (body.scaleMode === "track") {
@@ -970,6 +1249,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         .where(
           and(
             eq(resultMedia.resultId, resultId),
+            eq(resultMedia.resultAttemptId, result.currentResultAttemptId),
             eq(resultMedia.field, body.field),
             eq(resultMedia.renderProfileKey, "default:v1:zoom2"),
           ),
@@ -1026,19 +1306,22 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         sha256: cached.sha256,
         byteSize: cached.byteSize,
         paramsHash: cached.paramsHash,
+        resultId,
+        resultAttemptId: result.currentResultAttemptId,
+        evidenceSha256: manifest.sha256,
       };
     }
     const points = (row.airfoil.points as Point[]).map(
       (p) => [p.x, p.y] as [number, number],
     );
     const rendered = await new EngineClient(env.engineUrl).renderField(
-      result.engineJobId,
+      attempt.engineJobId,
       {
-        case_slug: result.engineCaseSlug,
+        case_slug: attempt.engineCaseSlug,
         evidence_base: evidenceBase,
         airfoil_points: points,
-        chord: result.chord ?? 1,
-        speed: result.speed ?? 0,
+        chord: result.chord,
+        speed: result.speed,
         field: body.field as ImageFieldName,
         role: body.role,
         zoom_chords: body.zoomChords,
@@ -1052,7 +1335,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         params_hash: paramsHash,
       },
     );
-    const storageKey = `jobs/${result.engineJobId}/cases/${result.engineCaseSlug}/${rendered.path}`;
+    const storageKey = `jobs/${attempt.engineJobId}/cases/${attempt.engineCaseSlug}/${rendered.path}`;
     const [saved] = await db
       .insert(fieldRenderCache)
       .values({
@@ -1098,6 +1381,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       sha256: saved.sha256,
       byteSize: saved.byteSize,
       paramsHash: saved.paramsHash,
+      resultId,
+      resultAttemptId: result.currentResultAttemptId,
+      evidenceSha256: manifest.sha256,
     };
   });
 
@@ -1166,29 +1452,200 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         error: `simulation preset at Re ${snapped} has no compatibility boundary row`,
       });
     const aoaDeg = Math.round(aoa);
-    const [row] = await db
-      .insert(results)
-      .values({
-        airfoilId: a.id,
-        bcId,
-        simulationPresetRevisionId: setup.revision.id,
-        aoaDeg,
-        status: "pending",
-        source: "queued",
-        priority: 10,
-      })
-      .onConflictDoUpdate({
-        target: [
-          results.airfoilId,
-          results.simulationPresetRevisionId,
-          results.aoaDeg,
-        ],
-        set: { status: "pending", priority: 10 },
-      })
-      .returning({ id: results.id, status: results.status });
-    return reply
-      .code(202)
-      .send({ resultId: row.id, status: row.status, re: snapped, aoa: aoaDeg });
+    const outcome = await db.transaction(async (tx) => {
+      await lockPrecalcCells(tx, [
+        {
+          airfoilId: a.id,
+          revisionId: setup.revision.id,
+          aoaDeg,
+        },
+      ]);
+      const [existing] = (await tx.execute(sql`
+        SELECT r.id, r.status::text AS status, r.regime, r.fidelity,
+               selected_attempt.id AS selected_attempt_id,
+               selected_attempt.status::text AS selected_status,
+               selected_attempt.source::text AS selected_source,
+               selected_attempt.regime::text AS selected_regime,
+               selected_attempt.evidence_payload ->> 'fidelity' AS selected_fidelity,
+               selected_attempt.cl AS selected_cl,
+               selected_attempt.cd AS selected_cd,
+               classification.state::text AS selected_classification_state
+        FROM results r
+        LEFT JOIN result_attempts selected_attempt
+          ON selected_attempt.id = r.current_result_attempt_id
+         AND selected_attempt.result_id = r.id
+        LEFT JOIN result_classifications classification
+          ON classification.result_attempt_id = selected_attempt.id
+         AND classification.airfoil_id = r.airfoil_id
+         AND classification.simulation_preset_revision_id = r.simulation_preset_revision_id
+         AND classification.aoa_deg = selected_attempt.aoa_deg
+         AND classification.regime IS NOT DISTINCT FROM selected_attempt.regime
+        WHERE r.airfoil_id = ${a.id}
+          AND r.simulation_preset_revision_id = ${setup.revision.id}
+          AND r.aoa_deg = ${aoaDeg}
+        FOR UPDATE OF r
+      `)) as unknown as Array<{
+        id: string;
+        status: string;
+        regime: string | null;
+        fidelity: string | null;
+        selected_attempt_id: string | null;
+        selected_status: string | null;
+        selected_source: string | null;
+        selected_regime: string | null;
+        selected_fidelity: string | null;
+        selected_cl: number | null;
+        selected_cd: number | null;
+        selected_classification_state: string | null;
+      }>;
+      const [obligation] = (await tx.execute(sql`
+        SELECT id, state, source_result_id
+        FROM sim_precalc_obligations
+        WHERE airfoil_id = ${a.id}
+          AND revision_id = ${setup.revision.id}
+          AND aoa_deg = ${aoaDeg}
+        FOR UPDATE
+      `)) as unknown as Array<{
+        id: string;
+        state: string;
+        source_result_id: string | null;
+      }>;
+
+      if (
+        existing?.selected_attempt_id != null &&
+        existing.selected_status === "done" &&
+        existing.selected_source === "solved" &&
+        existing.selected_cl != null &&
+        existing.selected_cd != null &&
+        existing.selected_classification_state === "accepted"
+      ) {
+        return {
+          code: 200 as const,
+          body: {
+            resultId: existing.id,
+            status: "done",
+            re: snapped,
+            aoa: aoaDeg,
+            queued: false,
+          },
+        };
+      }
+      if (obligation) {
+        if (obligation.state === "blocked") {
+          return {
+            code: 409 as const,
+            body: {
+              error:
+                "preliminary solver work is blocked after its bounded attempts; stored evidence was retained",
+              resultId: existing?.id ?? obligation.source_result_id,
+              status: "blocked",
+              re: snapped,
+              aoa: aoaDeg,
+            },
+          };
+        }
+        if (["pending", "running"].includes(obligation.state)) {
+          return {
+            code: 202 as const,
+            body: {
+              resultId: existing?.id ?? obligation.source_result_id,
+              status: obligation.state,
+              fidelity: "precalc",
+              re: snapped,
+              aoa: aoaDeg,
+              queued: true,
+            },
+          };
+        }
+        return {
+          code: 409 as const,
+          body: {
+            error: `this point is owned by terminal preliminary solver work (${obligation.state}); ordinary RANS enqueue is unavailable`,
+            resultId: existing?.id ?? obligation.source_result_id,
+            status: obligation.state,
+            re: snapped,
+            aoa: aoaDeg,
+          },
+        };
+      }
+      if (existing) {
+        // Once a generation is selected, its immutable attempt defines the
+        // solver regime/fidelity. The mutable result projection remains only
+        // the stable scheduling cell and cannot turn stale history into a
+        // solved response (or mis-route a terminal generation).
+        const isUrans =
+          (existing.selected_attempt_id
+            ? existing.selected_regime
+            : existing.regime) === "urans" ||
+          (existing.selected_attempt_id
+            ? (existing.selected_fidelity ?? "")
+            : (existing.fidelity ?? "")
+          ).startsWith("urans");
+        if (["queued", "running"].includes(existing.status)) {
+          return {
+            code: 202 as const,
+            body: {
+              resultId: existing.id,
+              status: existing.status,
+              re: snapped,
+              aoa: aoaDeg,
+              queued: true,
+            },
+          };
+        }
+        if (["pending", "stale"].includes(existing.status) && !isUrans) {
+          await tx.execute(sql`
+            UPDATE results
+            SET priority = GREATEST(priority, 10), "updatedAt" = now()
+            WHERE id = ${existing.id}
+          `);
+          return {
+            code: 202 as const,
+            body: {
+              resultId: existing.id,
+              status: existing.status,
+              re: snapped,
+              aoa: aoaDeg,
+              queued: true,
+            },
+          };
+        }
+        return {
+          code: 409 as const,
+          body: {
+            error:
+              "stored terminal or URANS evidence cannot be replaced by an ordinary RANS enqueue",
+            resultId: existing.id,
+            status: existing.status,
+            re: snapped,
+            aoa: aoaDeg,
+          },
+        };
+      }
+      const [created] = await tx
+        .insert(results)
+        .values({
+          airfoilId: a.id,
+          bcId,
+          simulationPresetRevisionId: setup.revision.id,
+          aoaDeg,
+          status: "pending",
+          source: "queued",
+          priority: 10,
+        })
+        .returning({ id: results.id, status: results.status });
+      return {
+        code: 202 as const,
+        body: {
+          resultId: created.id,
+          status: created.status,
+          re: snapped,
+          aoa: aoaDeg,
+          queued: true,
+        },
+      };
+    });
+    return reply.code(outcome.code).send(outcome.body);
   });
 
   // ---- mediums ----

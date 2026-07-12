@@ -1,4 +1,8 @@
-import { URANS_BUDGET_STOP_MARKER, type Point } from "@aerodb/core";
+import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+  type Point,
+} from "@aerodb/core";
 import {
   airfoils,
   boundaryConditions,
@@ -9,6 +13,7 @@ import {
   meshProfiles,
   outputProfiles,
   referenceGeometryProfiles,
+  resultAttempts,
   resultClassifications,
   results,
   schedulingProfiles,
@@ -28,6 +33,7 @@ import { solverWorkStateForPoint } from "../src/services/solver-work";
 
 const PREFIX = `solver-work-${process.pid}-${Date.now().toString(36)}`;
 const BUDGET_WARNING = `URANS integration ${URANS_BUDGET_STOP_MARKER}: retained 1.4 of 3 periods (budget); marched 0.21 s of 0.46 s`;
+const CONTINUATION_WARNING = `URANS continuation ${URANS_CONTINUATION_REQUIRED_MARKER}: reached the 6-chunk in-run safety cap with restartable saved case state; URANS window not stationary (precalc established-oscillation test): cycle means trend upward monotonically`;
 
 const points: Point[] = [
   { x: 1, y: 0 },
@@ -275,13 +281,49 @@ describe("solverWorkStateForPoint", () => {
         regime: "urans",
         fidelity: "urans_full",
       }),
-    ).toBe("needs_review");
+    ).toBe("blocked");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "legacy-urans",
+        status: "done",
+        classificationState: "rejected",
+        regime: "urans",
+        fidelity: null,
+      }),
+    ).toBe("blocked");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "legacy-rans",
+        status: "done",
+        classificationState: "rejected",
+        regime: null,
+        fidelity: null,
+      }),
+    ).toBe("ladder");
     expect(
       solverWorkStateForPoint({
         resultId: "r",
         status: "failed",
         regime: "urans",
         error: "mesh degenerate at leading edge",
+      }),
+    ).toBe("blocked");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "r",
+        status: "failed",
+        regime: "urans",
+        error: "second transient solver crash",
+      }),
+    ).toBe("blocked");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "r",
+        status: "done",
+        classificationState: "rejected",
+        classificationReasons: ["missing-urans-video"],
+        regime: "urans",
+        fidelity: "urans_precalc",
       }),
     ).toBe("blocked");
     expect(
@@ -306,6 +348,57 @@ describe("solverWorkStateForPoint", () => {
         openRequest: true,
       }),
     ).toBe("verified");
+  });
+
+  it("MUST-CATCH: never verifies completed RANS or URANS evidence without a known machine classification", () => {
+    for (const row of [
+      {
+        resultId: "unclassified-rans",
+        status: "done",
+        classificationState: null,
+        regime: "rans",
+        fidelity: "rans",
+      },
+      {
+        resultId: "unclassified-urans",
+        status: "done",
+        classificationState: null,
+        regime: "urans",
+        fidelity: "urans_precalc",
+      },
+      {
+        resultId: "unknown-classification",
+        status: "done",
+        classificationState: "legacy_unknown_state",
+        regime: "urans",
+        fidelity: "urans_full",
+      },
+    ]) {
+      expect(solverWorkStateForPoint(row)).toBe("blocked");
+    }
+  });
+
+  it("never lets a legacy human waiver override the machine state", () => {
+    expect(
+      solverWorkStateForPoint({
+        resultId: "legacy-waiver",
+        status: "done",
+        classificationState: "rejected",
+        regime: "urans",
+        fidelity: "urans_full",
+        reviewVerdict: "waive",
+      }),
+    ).toBe("blocked");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "conservative-exclusion",
+        status: "done",
+        classificationState: "accepted",
+        regime: "urans",
+        fidelity: "urans_full",
+        reviewVerdict: "exclude",
+      }),
+    ).toBe("excluded");
   });
 });
 
@@ -368,7 +461,7 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         unsteady: true,
         solvedAt: new Date(),
       })
-      .returning({ id: results.id });
+      .returning();
     const [needsTime] = await db
       .insert(results)
       .values({
@@ -394,7 +487,33 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         engineCaseSlug: `${PREFIX}-case-budget`,
         solvedAt: new Date(),
       })
-      .returning({ id: results.id });
+      .returning();
+    const [needsContinuation] = await db
+      .insert(results)
+      .values({
+        airfoilId: airfoil.id,
+        bcId: conditionA.bcId,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 4,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        reynolds: conditionA.reynolds,
+        speed: conditionA.speedMps,
+        chord: conditionA.chordM,
+        mach: conditionA.mach,
+        cl: 0.82,
+        cd: 0.031,
+        cm: -0.05,
+        converged: true,
+        unsteady: true,
+        qualityWarnings: [CONTINUATION_WARNING],
+        engineJobId: `${PREFIX}-engine-continuation`,
+        engineCaseSlug: `${PREFIX}-case-continuation`,
+        solvedAt: new Date(),
+      })
+      .returning();
     const [verifiedB] = await db
       .insert(results)
       .values({
@@ -416,8 +535,60 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         converged: true,
         solvedAt: new Date(),
       })
+      .returning();
+    const [unclassifiedRans] = await db
+      .insert(results)
+      .values({
+        airfoilId: airfoil.id,
+        bcId: conditionA.bcId,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 6,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        reynolds: conditionA.reynolds,
+        speed: conditionA.speedMps,
+        chord: conditionA.chordM,
+        mach: conditionA.mach,
+        cl: 0.9,
+        cd: 0.04,
+        cm: -0.06,
+        converged: true,
+        solvedAt: new Date(),
+      })
       .returning({ id: results.id });
-    cleanup.resultIds.push(provisional.id, needsTime.id, verifiedB.id);
+    const [unclassifiedUrans] = await db
+      .insert(results)
+      .values({
+        airfoilId: airfoil.id,
+        bcId: conditionA.bcId,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 7,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        reynolds: conditionA.reynolds,
+        speed: conditionA.speedMps,
+        chord: conditionA.chordM,
+        mach: conditionA.mach,
+        cl: 0.95,
+        cd: 0.045,
+        cm: -0.065,
+        converged: true,
+        unsteady: true,
+        solvedAt: new Date(),
+      })
+      .returning({ id: results.id });
+    cleanup.resultIds.push(
+      provisional.id,
+      needsTime.id,
+      needsContinuation.id,
+      verifiedB.id,
+      unclassifiedRans.id,
+      unclassifiedUrans.id,
+    );
 
     await db.insert(resultClassifications).values([
       {
@@ -443,6 +614,17 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         confidence: 0.9,
       },
       {
+        resultId: needsContinuation.id,
+        airfoilId: airfoil.id,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 4,
+        regime: "urans",
+        classifierVersion: "test",
+        state: "rejected",
+        reasons: ["sparse-frame-track"],
+        confidence: 0.9,
+      },
+      {
         resultId: verifiedB.id,
         airfoilId: airfoil.id,
         simulationPresetRevisionId: revB,
@@ -454,6 +636,76 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         confidence: 0.95,
       },
     ]);
+
+    const exactRows = [provisional, needsTime, needsContinuation, verifiedB];
+    const exactStates = new Map([
+      [provisional.id, { state: "accepted" as const, reasons: [] }],
+      [
+        needsTime.id,
+        { state: "rejected" as const, reasons: ["insufficient-periods"] },
+      ],
+      [
+        needsContinuation.id,
+        { state: "rejected" as const, reasons: ["sparse-frame-track"] },
+      ],
+      [verifiedB.id, { state: "accepted" as const, reasons: [] }],
+    ]);
+    const exactAttempts = await db
+      .insert(resultAttempts)
+      .values(
+        exactRows.map((result) => ({
+          resultId: result.id,
+          airfoilId: result.airfoilId,
+          bcId: result.bcId,
+          simulationPresetRevisionId: result.simulationPresetRevisionId,
+          aoaDeg: result.aoaDeg,
+          status: result.status,
+          source: result.source,
+          regime: result.regime,
+          validForPolar: exactStates.get(result.id)?.state === "accepted",
+          cl: result.cl,
+          cd: result.cd,
+          cm: result.cm,
+          clCd: result.clCd,
+          converged: result.converged,
+          unsteady: result.unsteady,
+          qualityWarnings: result.qualityWarnings,
+          engineJobId: result.engineJobId,
+          engineCaseSlug: result.engineCaseSlug,
+          evidencePayload: {
+            fidelity: result.fidelity,
+            frame_track: result.frameTrack,
+          },
+          solvedAt: result.solvedAt,
+        })),
+      )
+      .returning({
+        id: resultAttempts.id,
+        resultId: resultAttempts.resultId,
+        aoaDeg: resultAttempts.aoaDeg,
+        regime: resultAttempts.regime,
+      });
+    for (const attempt of exactAttempts) {
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: attempt.id })
+        .where(eq(results.id, attempt.resultId!));
+    }
+    await db.insert(resultClassifications).values(
+      exactAttempts.map((attempt) => ({
+        resultAttemptId: attempt.id,
+        airfoilId: airfoil.id,
+        simulationPresetRevisionId: exactRows.find(
+          (result) => result.id === attempt.resultId,
+        )!.simulationPresetRevisionId!,
+        aoaDeg: attempt.aoaDeg,
+        regime: attempt.regime,
+        classifierVersion: "test",
+        state: exactStates.get(attempt.resultId!)!.state,
+        reasons: exactStates.get(attempt.resultId!)!.reasons,
+        confidence: 0.95,
+      })),
+    );
 
     const [verify] = await db
       .insert(simUransVerifyQueue)
@@ -499,6 +751,10 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     await deleteIds(simUransVerifyQueue, cleanup.verifyIds);
     if (cleanup.resultIds.length) {
       await db
+        .update(results)
+        .set({ currentResultAttemptId: null })
+        .where(inArray(results.id, cleanup.resultIds));
+      await db
         .delete(resultClassifications)
         .where(inArray(resultClassifications.resultId, cleanup.resultIds));
       await db.delete(results).where(inArray(results.id, cleanup.resultIds));
@@ -539,7 +795,13 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
           state: string;
           actions: string[];
           resultId: string | null;
+          cl: number | null;
+          cd: number | null;
+          cm: number | null;
           gate: { name: string; detail: string } | null;
+          gates: Array<{ name: string; detail: string; pass: boolean }>;
+          plain: string;
+          reviewed: boolean;
         }>;
         jobs: unknown[];
       }>;
@@ -553,7 +815,7 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     expect(conditionA.reynolds).toBeCloseTo(853000, -3); // fixture derives Re back from speed (852891)
     expect(conditionA.chordM).toBeCloseTo(0.5);
     expect(conditionA.speedMps).toBeCloseTo(25);
-    expect(conditionA.attentionCount).toBe(1);
+    expect(conditionA.attentionCount).toBe(4);
     const byAoa = new Map(conditionA.points.map((p) => [p.aoaDeg, p]));
     expect(byAoa.get(2)?.state).toBe("provisional");
     expect(byAoa.get(3)?.state).toBe("needs_time");
@@ -562,7 +824,39 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
       name: "march-rate guard",
       detail: "retained 1.4 / 3 periods · marched 0.21 s of 0.46 s",
     });
+    expect(byAoa.get(4)).toMatchObject({
+      state: "needs_time",
+      actions: ["continue"],
+      gate: { name: "stationarity gate" },
+    });
+    expect(byAoa.get(4)?.plain).toContain("needs more same-case integration");
+    expect(byAoa.get(4)?.plain).not.toContain("time budget");
     expect(byAoa.get(5)).toMatchObject({ state: "queued", resultId: null });
+    for (const aoa of [6, 7]) {
+      expect(byAoa.get(aoa)).toMatchObject({
+        state: "blocked",
+        actions: [],
+        reviewed: false,
+        cl: null,
+        cd: null,
+        cm: null,
+        gate: {
+          name: "quality gate",
+          detail:
+            "Automatic evidence classification is unavailable; this stored result is not used in the polar.",
+        },
+      });
+      expect(byAoa.get(aoa)?.plain).toContain("no human review is required");
+      expect(byAoa.get(aoa)?.plain).not.toContain("verified");
+      expect(byAoa.get(aoa)?.gates).toEqual([
+        {
+          name: "quality gate",
+          detail:
+            "Automatic evidence classification is unavailable; this stored result is not used in the polar.",
+          pass: false,
+        },
+      ]);
+    }
 
     const detail = await app.inject({
       method: "GET",

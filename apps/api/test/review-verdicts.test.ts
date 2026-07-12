@@ -9,6 +9,8 @@ import {
   meshProfiles,
   outputProfiles,
   polarFitSets,
+  activeReviewVerdict,
+  recordReviewVerdict,
   referenceGeometryProfiles,
   resultClassifications,
   resultReviewVerdicts,
@@ -22,6 +24,8 @@ import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { createExactResultAttemptFixture } from "./exact-result-fixture";
 
 const ORIGINAL_ENV = { ...process.env };
 const PREFIX = `review-verdicts-${process.pid}-${Date.now().toString(36)}`;
@@ -260,12 +264,21 @@ async function createFixture(suffix: string) {
     ])
     .returning({ id: results.id });
   cleanup.resultIds.push(left.id, right.id, review.id);
+  for (const result of [left, right]) {
+    await createExactResultAttemptFixture(db, result.id, {
+      publication: "selected-eligible",
+    });
+  }
+  const reviewAttemptId = await createExactResultAttemptFixture(db, review.id, {
+    publication: "historical-rejected",
+  });
   await refreshPolarCacheForRevision(db, airfoil.id, revisionId);
   return {
     slug: airfoil.slug,
     airfoilId: airfoil.id,
     revisionId,
     reviewResultId: review.id,
+    reviewAttemptId,
     acceptedResultId: left.id,
   };
 }
@@ -350,22 +363,21 @@ afterAll(async () => {
 }, 60_000);
 
 describe("review verdict overlay", () => {
-  it("waive marks solver-work verified, refreshes the polar cache, and discloses in detail", async () => {
-    const fixture = await createFixture("waive");
-    const res = await authed(
-      "POST",
-      `/api/admin/results/${fixture.reviewResultId}/review`,
-      {
-        verdict: "waive",
-        note: "accepted after visual review",
-      },
-    );
-    expect(res.statusCode).toBe(201);
-    expect(res.json().review).toMatchObject({
+  it("MUST-CATCH: a legacy active waiver cannot alter classifier, fit, detail, sim, or solver-work state", async () => {
+    const fixture = await createFixture("legacy-waive");
+    await db.insert(resultReviewVerdicts).values({
+      resultId: fixture.reviewResultId,
       verdict: "waive",
-      note: "accepted after visual review",
-      reviewer: ADMIN_EMAIL,
+      note: "legacy visual acceptance",
+      reviewer: "legacy-reviewer@airfoils.pro",
     });
+
+    expect(await activeReviewVerdict(db, fixture.reviewResultId)).toBeNull();
+    await refreshPolarCacheForRevision(
+      db,
+      fixture.airfoilId,
+      fixture.revisionId,
+    );
 
     const work = await app.inject({
       method: "GET",
@@ -377,44 +389,67 @@ describe("review verdict overlay", () => {
         (p: { resultId: string }) => p.resultId === fixture.reviewResultId,
       );
     expect(point).toMatchObject({
-      state: "verified",
-      reviewed: true,
-      review: { verdict: "waive", note: "accepted after visual review" },
+      state: "blocked",
+      reviewed: false,
+      review: null,
     });
-    expect(
-      point.gates.some((gate: { pass: boolean }) => gate.pass === false),
-    ).toBe(true);
 
     const fit = await currentFit(fixture.airfoilId, fixture.revisionId);
-    expect(fit?.acceptedPointCount).toBe(3);
-    expect(fit?.status).toBe("final");
+    expect(fit?.acceptedPointCount).toBe(2);
+    expect(fit?.status).toBe("insufficient");
 
     const detail = await app.inject({
       method: "GET",
       url: `/api/airfoils/${fixture.slug}?revisionId=${fixture.revisionId}`,
     });
-    const polarPoint = detail
-      .json()
-      .polars[0].points.find(
-        (p: { resultId: string }) => p.resultId === fixture.reviewResultId,
-      );
-    expect(polarPoint).toMatchObject({
-      classificationState: "accepted",
-      review: { verdict: "waive", note: "accepted after visual review" },
+    expect(
+      detail
+        .json()
+        .polars[0].points.some(
+          (p: { resultId: string }) => p.resultId === fixture.reviewResultId,
+        ),
+    ).toBe(false);
+
+    const sim = await app.inject({
+      method: "GET",
+      url: `/api/airfoils/${fixture.slug}/sim?resultId=${fixture.reviewResultId}`,
     });
+    // The rejected generation stays in immutable attempt history but never
+    // becomes the public current pointer. A legacy waiver cannot publish it.
+    expect(sim.statusCode).toBe(404);
+    const [attemptClassification] = await db
+      .select()
+      .from(resultClassifications)
+      .where(
+        eq(resultClassifications.resultAttemptId, fixture.reviewAttemptId),
+      );
+    expect(attemptClassification?.state).toBe("rejected");
+
+    const history = await authed(
+      "GET",
+      `/api/admin/results/${fixture.reviewResultId}/reviews`,
+    );
+    expect(history.json().items).toEqual([
+      expect.objectContaining({
+        verdict: "waive",
+        note: "legacy visual acceptance",
+      }),
+    ]);
   });
 
-  it("exclude marks solver-work excluded, removes the point from the fit, and keeps it listed", async () => {
+  it("exclude remains a conservative overlay and revoke restores machine state", async () => {
     const fixture = await createFixture("exclude");
-    const res = await authed(
-      "POST",
-      `/api/admin/results/${fixture.reviewResultId}/review`,
-      {
-        verdict: "exclude",
-        note: "bad retained-period evidence",
-      },
+    await recordReviewVerdict(db, {
+      resultId: fixture.reviewResultId,
+      verdict: "exclude",
+      note: "bad retained-period evidence",
+      reviewer: ADMIN_EMAIL,
+    });
+    await refreshPolarCacheForRevision(
+      db,
+      fixture.airfoilId,
+      fixture.revisionId,
     );
-    expect(res.statusCode).toBe(201);
 
     const work = await app.inject({
       method: "GET",
@@ -434,19 +469,6 @@ describe("review verdict overlay", () => {
     const fit = await currentFit(fixture.airfoilId, fixture.revisionId);
     expect(fit?.acceptedPointCount).toBe(2);
     expect(fit?.status).toBe("insufficient");
-  });
-
-  it("revoke restores the machine needs-review state and refreshes caches", async () => {
-    const fixture = await createFixture("revoke");
-    expect(
-      (
-        await authed(
-          "POST",
-          `/api/admin/results/${fixture.reviewResultId}/review`,
-          { verdict: "waive", note: "temporary waiver" },
-        )
-      ).statusCode,
-    ).toBe(201);
     expect(
       (
         await authed(
@@ -456,44 +478,38 @@ describe("review verdict overlay", () => {
       ).statusCode,
     ).toBe(204);
 
-    const work = await app.inject({
+    const revertedWork = await app.inject({
       method: "GET",
       url: `/api/airfoils/${fixture.slug}/solver-work?revision=${fixture.revisionId}`,
     });
-    const point = work
+    const revertedPoint = revertedWork
       .json()
       .conditions[0].points.find(
         (p: { resultId: string }) => p.resultId === fixture.reviewResultId,
       );
-    expect(point).toMatchObject({
-      state: "needs_review",
+    expect(revertedPoint).toMatchObject({
+      state: "blocked",
       reviewed: false,
       review: null,
     });
-    const fit = await currentFit(fixture.airfoilId, fixture.revisionId);
-    expect(fit?.acceptedPointCount).toBe(2);
+    const revertedFit = await currentFit(fixture.airfoilId, fixture.revisionId);
+    expect(revertedFit?.acceptedPointCount).toBe(2);
   });
 
-  it("re-verdict auto-revokes the previous active verdict and keeps history", async () => {
+  it("a conservative verdict revokes a legacy waiver while retaining both history rows", async () => {
     const fixture = await createFixture("reverdict");
-    expect(
-      (
-        await authed(
-          "POST",
-          `/api/admin/results/${fixture.reviewResultId}/review`,
-          { verdict: "waive", note: "first verdict" },
-        )
-      ).statusCode,
-    ).toBe(201);
-    expect(
-      (
-        await authed(
-          "POST",
-          `/api/admin/results/${fixture.reviewResultId}/review`,
-          { verdict: "exclude", note: "second verdict" },
-        )
-      ).statusCode,
-    ).toBe(201);
+    await db.insert(resultReviewVerdicts).values({
+      resultId: fixture.reviewResultId,
+      verdict: "waive",
+      note: "legacy verdict",
+      reviewer: "legacy-reviewer@airfoils.pro",
+    });
+    await recordReviewVerdict(db, {
+      resultId: fixture.reviewResultId,
+      verdict: "exclude",
+      note: "machine evidence excluded",
+      reviewer: ADMIN_EMAIL,
+    });
 
     const history = await authed(
       "GET",
@@ -509,14 +525,33 @@ describe("review verdict overlay", () => {
     expect(items[1].revokedAt).toEqual(expect.any(String));
   });
 
-  it("requires notes for waive/exclude, rejects non-reviewable points, and gates anonymous callers", async () => {
+  it("rejects new waivers and keeps all new review-verdict creation inactive", async () => {
     const fixture = await createFixture("validation");
+    const retired = await authed(
+      "POST",
+      `/api/admin/results/${fixture.reviewResultId}/review`,
+      { verdict: "waive", note: "try to override evidence" },
+    );
+    expect(retired.statusCode).toBe(422);
+    expect(retired.json()).toMatchObject({ code: "waiver_retired" });
+    await expect(
+      recordReviewVerdict(db, {
+        resultId: fixture.reviewResultId,
+        verdict: "waive",
+        note: "try to override evidence",
+        reviewer: ADMIN_EMAIL,
+      }),
+    ).rejects.toThrow("accept-with-waiver is retired");
+
     const missingNote = await authed(
       "POST",
       `/api/admin/results/${fixture.reviewResultId}/review`,
-      { verdict: "waive" },
+      { verdict: "exclude" },
     );
-    expect(missingNote.statusCode).toBe(422);
+    expect(missingNote.statusCode).toBe(409);
+    expect(missingNote.json()).toMatchObject({
+      code: "review_creation_inactive",
+    });
 
     const nonReviewable = await authed(
       "POST",
@@ -527,6 +562,9 @@ describe("review verdict overlay", () => {
       },
     );
     expect(nonReviewable.statusCode).toBe(409);
+    expect(nonReviewable.json()).toMatchObject({
+      code: "review_creation_inactive",
+    });
 
     const anonymous = await app.inject({
       method: "POST",
@@ -536,18 +574,19 @@ describe("review verdict overlay", () => {
     expect([401, 403]).toContain(anonymous.statusCode);
   });
 
-  it("MUST-CATCH: a waived point does not count in another airfoil or revision scope", async () => {
+  it("MUST-CATCH: a legacy waiver changes neither its own nor another fit scope", async () => {
     const waived = await createFixture("scope-waived");
     const other = await createFixture("scope-other");
-    expect(
-      (
-        await authed(
-          "POST",
-          `/api/admin/results/${waived.reviewResultId}/review`,
-          { verdict: "waive", note: "scope-local waiver" },
-        )
-      ).statusCode,
-    ).toBe(201);
+    await db.insert(resultReviewVerdicts).values({
+      resultId: waived.reviewResultId,
+      verdict: "waive",
+      note: "scope-local legacy waiver",
+      reviewer: "legacy-reviewer@airfoils.pro",
+    });
+    await refreshPolarCacheForRevision(db, waived.airfoilId, waived.revisionId);
+
+    const waivedFit = await currentFit(waived.airfoilId, waived.revisionId);
+    expect(waivedFit?.acceptedPointCount).toBe(2);
 
     const otherFit = await currentFit(other.airfoilId, other.revisionId);
     expect(otherFit?.acceptedPointCount).toBe(2);
@@ -562,7 +601,7 @@ describe("review verdict overlay", () => {
         (p: { resultId: string }) => p.resultId === other.reviewResultId,
       );
     expect(otherPoint).toMatchObject({
-      state: "needs_review",
+      state: "blocked",
       reviewed: false,
     });
   });
