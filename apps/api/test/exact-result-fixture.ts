@@ -7,6 +7,7 @@ import {
   solverEvidenceArtifacts,
 } from "@aerodb/db";
 import { and, eq, isNull } from "drizzle-orm";
+import { createHash } from "node:crypto";
 
 let generation = 0;
 
@@ -20,8 +21,12 @@ export type ExactFixturePublication =
  * of passing through sweeper ingestion. Public evidence readers deliberately
  * refuse mutable projection-only rows after migration 0053, so integration
  * fixtures must bind their existing force/media/artifact rows to one immutable
- * attempt. The helper never creates missing evidence and is NOT a production
- * publication path: it does not validate a manifest or run the classifier.
+ * attempt. This is NOT a production publication path and never invents solver
+ * coefficients or media. When a fixture explicitly asks to model a selected
+ * generation, the helper does create one deterministic test-only manifest
+ * association if the fixture did not supply one; exact publication now
+ * requires that sole owner-valid manifest before the classifier can expose the
+ * selected coefficients. The real classifier still decides the verdict.
  *
  * Publication intent is mandatory so a rejected fixture cannot become current
  * through permissive status/source inference:
@@ -122,7 +127,13 @@ export async function createExactResultAttemptFixture(
       evidencePayload,
       solvedAt: result.solvedAt,
     })
-    .returning({ id: resultAttempts.id });
+    .returning({
+      id: resultAttempts.id,
+      simJobId: resultAttempts.simJobId,
+      engineJobId: resultAttempts.engineJobId,
+      engineCaseSlug: resultAttempts.engineCaseSlug,
+      aoaDeg: resultAttempts.aoaDeg,
+    });
 
   await db
     .update(forceHistory)
@@ -151,6 +162,45 @@ export async function createExactResultAttemptFixture(
         isNull(solverEvidenceArtifacts.resultAttemptId),
       ),
     );
+  if (opts.publication !== "historical-rejected") {
+    const manifests = await db
+      .select({ id: solverEvidenceArtifacts.id })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, resultId),
+          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    if (manifests.length > 1) {
+      throw new Error(
+        `selected test attempt ${attempt.id} has ambiguous manifest evidence`,
+      );
+    }
+    if (manifests.length === 0) {
+      const manifestPayload = JSON.stringify({
+        fixture: "exact-result-attempt",
+        resultId,
+        resultAttemptId: attempt.id,
+      });
+      await db.insert(solverEvidenceArtifacts).values({
+        resultId,
+        resultAttemptId: attempt.id,
+        airfoilId: result.airfoilId,
+        simJobId: attempt.simJobId,
+        engineJobId: attempt.engineJobId,
+        engineCaseSlug: attempt.engineCaseSlug,
+        aoaDeg: attempt.aoaDeg,
+        kind: "manifest",
+        storageKey: `test-fixtures/${result.id}/${attempt.id}/manifest.json`,
+        mimeType: "application/json",
+        sha256: createHash("sha256").update(manifestPayload).digest("hex"),
+        byteSize: Buffer.byteLength(manifestPayload),
+        metadata: { fixture: "exact-result-attempt" },
+      });
+    }
+  }
   if (opts.publication !== "historical-rejected") {
     await db
       .update(results)

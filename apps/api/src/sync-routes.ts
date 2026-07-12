@@ -3582,6 +3582,75 @@ async function importPolarPush(
         return { kind: "conflict" as const, existing };
       }
       const attempt = attemptResolution.attempt;
+      const artifactAssociationFor = ({
+        artifact,
+        stored,
+      }: (typeof preparedArtifacts)[number]) => ({
+        resultId: existing.id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simJobId: null,
+        engineJobId: importedEngineJobId,
+        engineCaseSlug: point.engineCaseSlug ?? null,
+        aoaDeg: point.aoaDeg,
+        kind: (nullableText(artifact.kind) ?? "field_data") as never,
+        field: nullableText(artifact.field),
+        role: nullableText(artifact.role),
+        storageKey: stored.storageKey,
+        mimeType: nullableText(artifact.mimeType) ?? stored.mimeType,
+        sha256: stored.sha256,
+        byteSize: stored.byteSize,
+        metadata: {
+          ...jsonObject(artifact.metadata),
+          sourceInstanceId,
+        },
+      });
+      let replayedExistingManifest = false;
+      if (attemptResolution.kind === "existing") {
+        const storedManifests = await tx
+          .select()
+          .from(solverEvidenceArtifacts)
+          .where(
+            and(
+              eq(solverEvidenceArtifacts.resultId, existing.id),
+              eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+              eq(solverEvidenceArtifacts.kind, "manifest"),
+            ),
+          )
+          .orderBy(solverEvidenceArtifacts.id);
+        if (storedManifests.length > 1) {
+          return { kind: "conflict" as const, existing };
+        }
+        const [storedManifest] = storedManifests;
+        const [preparedManifest] = manifests;
+        if (storedManifest) {
+          if (!preparedManifest) {
+            return { kind: "conflict" as const, existing };
+          }
+          const incomingManifest = artifactAssociationFor(preparedManifest);
+          if (
+            storedManifest.resultId !== incomingManifest.resultId ||
+            storedManifest.resultAttemptId !==
+              incomingManifest.resultAttemptId ||
+            storedManifest.airfoilId !== incomingManifest.airfoilId ||
+            storedManifest.simJobId !== incomingManifest.simJobId ||
+            storedManifest.engineJobId !== incomingManifest.engineJobId ||
+            storedManifest.engineCaseSlug !== incomingManifest.engineCaseSlug ||
+            storedManifest.aoaDeg !== incomingManifest.aoaDeg ||
+            storedManifest.field !== incomingManifest.field ||
+            storedManifest.role !== incomingManifest.role ||
+            storedManifest.storageKey !== incomingManifest.storageKey ||
+            storedManifest.mimeType !== incomingManifest.mimeType ||
+            storedManifest.sha256 !== incomingManifest.sha256 ||
+            storedManifest.byteSize !== incomingManifest.byteSize ||
+            stableHash(storedManifest.metadata ?? {}) !==
+              stableHash(incomingManifest.metadata)
+          ) {
+            return { kind: "conflict" as const, existing };
+          }
+          replayedExistingManifest = true;
+        }
+      }
       const importedExtents = await importFieldExtentsForResult({
         database: tx,
         resultId: existing.id,
@@ -3590,26 +3659,11 @@ async function importPolarPush(
         simulationPresetRevisionId: revisionId,
         extents: point.fieldExtents,
       });
-      for (const { artifact, stored } of preparedArtifacts) {
-        const association = {
-          resultId: existing.id,
-          resultAttemptId: attempt.id,
-          airfoilId,
-          engineJobId: importedEngineJobId,
-          engineCaseSlug: point.engineCaseSlug ?? null,
-          aoaDeg: point.aoaDeg,
-          kind: (nullableText(artifact.kind) ?? "field_data") as never,
-          field: nullableText(artifact.field),
-          role: nullableText(artifact.role),
-          storageKey: stored.storageKey,
-          mimeType: nullableText(artifact.mimeType) ?? stored.mimeType,
-          sha256: stored.sha256,
-          byteSize: stored.byteSize,
-          metadata: {
-            ...jsonObject(artifact.metadata),
-            sourceInstanceId,
-          },
-        };
+      for (const preparedArtifact of preparedArtifacts) {
+        const association = artifactAssociationFor(preparedArtifact);
+        if (replayedExistingManifest && association.kind === "manifest") {
+          continue;
+        }
         const [insertedAssociation] = await tx
           .insert(solverEvidenceArtifacts)
           .values(association)
@@ -4247,10 +4301,13 @@ async function exactCurrentRemoteGeneration(
   if (!attempt) return null;
   const manifests = await db
     .select({
+      id: solverEvidenceArtifacts.id,
       sha256: solverEvidenceArtifacts.sha256,
       byteSize: solverEvidenceArtifacts.byteSize,
       storageKey: solverEvidenceArtifacts.storageKey,
       mimeType: solverEvidenceArtifacts.mimeType,
+      field: solverEvidenceArtifacts.field,
+      role: solverEvidenceArtifacts.role,
       airfoilId: solverEvidenceArtifacts.airfoilId,
       simJobId: solverEvidenceArtifacts.simJobId,
       engineJobId: solverEvidenceArtifacts.engineJobId,
@@ -4289,6 +4346,7 @@ async function exactCurrentRemoteGeneration(
     attempt,
     resultAttemptId: result.currentResultAttemptId,
     manifestSha256: manifest.sha256,
+    manifest,
   };
 }
 
@@ -4655,6 +4713,55 @@ async function importRemoteEvidenceReference(
   }
   const mimeType =
     nullableText(data.mimeType ?? data.mime_type) ?? "application/octet-stream";
+  if (kind === "manifest") {
+    // A selected generation already owns exactly one manifest. Generic asset
+    // sync may replay that association, but it must never create another
+    // manifest merely because the same bytes arrived under a different remote
+    // artifact/storage identity: two rows make the selected generation
+    // ambiguous and invalidate its public publication fence.
+    const incomingStorageKey = nullableText(
+      data.storageKey ?? data.storage_key,
+    );
+    const exactReplay =
+      expectedSha === exact.manifest.sha256 &&
+      expectedSize === exact.manifest.byteSize &&
+      mimeType === exact.manifest.mimeType &&
+      nullableText(data.field) === exact.manifest.field &&
+      nullableText(data.role) === exact.manifest.role &&
+      incomingStorageKey === exact.manifest.storageKey;
+    if (!exactReplay) {
+      return {
+        imported: false,
+        conflictId: await createConflict({
+          dataType: "evidence_artifacts",
+          naturalKey: remoteArtifactId,
+          incomingPayload: {
+            ...data,
+            syncImportDisposition: "selected_manifest_replay_mismatch",
+            requiredEvidence:
+              "exact replay of the selected attempt's sole manifest",
+          },
+          localSnapshot: {
+            id: exact.manifest.id,
+            resultId: exact.result.id,
+            resultAttemptId: exact.resultAttemptId,
+            kind: "manifest",
+            field: exact.manifest.field,
+            role: exact.manifest.role,
+            storageKey: exact.manifest.storageKey,
+            mimeType: exact.manifest.mimeType,
+            sha256: exact.manifest.sha256,
+            byteSize: exact.manifest.byteSize,
+          },
+          sourceInstanceId: source.sourceInstanceId,
+          sourceInstanceName: source.sourceInstanceName,
+        }),
+      };
+    }
+    // The exact row is already present and selected. Do not download bytes,
+    // insert another association, or add a second remote reference.
+    return { imported: true };
+  }
   const remoteDownloadUrl = resolveRemoteDownloadUrl(
     settings,
     data.downloadUrl,

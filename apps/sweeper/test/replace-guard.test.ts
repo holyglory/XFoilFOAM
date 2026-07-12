@@ -78,6 +78,7 @@ import {
 import {
   incomingRejectionReasons,
   ingestResult,
+  registerEvidenceArtifacts,
   REPLACE_GUARD_MARKER,
   shouldPublishGeneration,
 } from "../src/ingest";
@@ -1668,19 +1669,27 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       .select()
       .from(resultClassifications)
       .where(eq(resultClassifications.resultId, row.id));
+    const [driftedAttempt] = await db
+      .select()
+      .from(resultClassifications)
+      .where(
+        eq(resultClassifications.resultAttemptId, row.currentResultAttemptId!),
+      );
     expect(drifted?.state).toBe("rejected");
-    expect(drifted?.reasons ?? []).toContain("missing-urans-video");
-    // Honest flip, no silent resurrection: the canonical row keeps the
-    // superseding evidence; the old RANS values are attempt history only.
+    expect(driftedAttempt?.state).toBe("rejected");
+    expect(driftedAttempt?.reasons ?? []).toContain("missing-urans-video");
+    // Honest flip, no silent resurrection: exact attempt evidence remains
+    // history, while the canonical cell withdraws its ineligible pointer.
     const [rowAfter] = await db
       .select()
       .from(results)
       .where(eq(results.id, row.id));
+    expect(rowAfter.currentResultAttemptId).toBeNull();
     expect(rowAfter.fidelity).toBe("urans_precalc");
     expect(rowAfter.cl).toBeCloseTo(0.71, 9);
   }, 60000);
 
-  it("fails publication closed when one valid and one invalid manifest claim the same exact attempt", async () => {
+  it("rejects a second manifest before it can make the exact attempt ambiguous", async () => {
     await cleanCell();
     const engineJobId = `${PREFIX}-ambiguous-manifest`;
     const [job] = await db
@@ -1710,22 +1719,24 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         metadata: { evidenceBase: "/tmp/evidence/a0-other" },
       },
     ];
-    await ingestResult({
-      db,
-      engine: stubEngine(),
-      engineJobId,
-      simJobId: job.id,
-      airfoilId,
-      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
-      uransFidelity: "precalc",
-      result: jobResult(engineJobId, point),
-    });
+    await expect(
+      ingestResult({
+        db,
+        engine: stubEngine(),
+        engineJobId,
+        simJobId: job.id,
+        airfoilId,
+        speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+        uransFidelity: "precalc",
+        result: jobResult(engineJobId, point),
+      }),
+    ).rejects.toThrow("manifest replay changed immutable association");
     const [row] = await db
       .select()
       .from(results)
       .where(eq(results.simulationPresetRevisionId, revisionId));
     expect(row.currentResultAttemptId).toBeNull();
-    expect(row.status).toBe("failed");
+    expect(row.status).toBe("running");
     const attemptRows = await db
       .select()
       .from(resultAttempts)
@@ -1736,7 +1747,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         .select()
         .from(solverEvidenceArtifacts)
         .where(eq(solverEvidenceArtifacts.resultAttemptId, attemptRows[0].id)),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
   }, 60000);
 
   it("replays a crash after exact staging without duplicating evidence and then publishes", async () => {
@@ -1816,6 +1827,180 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         .from(forceHistory)
         .where(eq(forceHistory.resultId, staged.id)),
     ).toHaveLength(1);
+  }, 60000);
+
+  it("keeps selected exact media and the sole manifest immutable when terminal replay crashes before refresh", async () => {
+    await cleanCell();
+    const seeded = await seedAcceptedPrecalcCell("selected-terminal-replay");
+    const selectedAttemptId = seeded.result.currentResultAttemptId!;
+    const engineJobId = seeded.job.engineJobId!;
+    const point = acceptingPrecalcPoint();
+    const [videoBefore] = await db
+      .select()
+      .from(resultMedia)
+      .where(
+        and(
+          eq(resultMedia.resultAttemptId, selectedAttemptId),
+          eq(resultMedia.kind, "video"),
+          eq(resultMedia.role, "instantaneous"),
+          eq(resultMedia.field, "velocity_magnitude"),
+        ),
+      );
+    expect(videoBefore.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(videoBefore.byteSize).toBeGreaterThan(0);
+
+    // A scaled renderer may legitimately add fields the engine shipment did
+    // not list. Replaying the same terminal payload must not delete those
+    // exact-attempt associations merely because they are omitted from the
+    // engine-shipped role map.
+    const [derivedImage] = await db
+      .insert(resultMedia)
+      .values({
+        resultId: seeded.result.id,
+        resultAttemptId: selectedAttemptId,
+        kind: "image",
+        field: "pressure",
+        role: "instantaneous",
+        storageKey: `${PREFIX}/selected-terminal-replay-pressure.png`,
+        mimeType: "image/png",
+        renderProfileKey: "default:v1:zoom2",
+        evidenceSha256: videoBefore.evidenceSha256,
+        sha256: digest(`${PREFIX}-selected-terminal-replay-pressure`),
+        byteSize: 128,
+      })
+      .returning();
+
+    // An attempt owns one immutable manifest. A replay that changes the
+    // association cannot insert a second manifest ahead of publication.
+    const originalManifest = point.evidence_artifacts![0];
+    const [storedManifest] = await db
+      .select({ id: solverEvidenceArtifacts.id })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, selectedAttemptId),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    await expect(
+      registerEvidenceArtifacts({
+        db,
+        engine: stubEngine(),
+        resultId: seeded.result.id,
+        resultAttemptId: selectedAttemptId,
+        airfoilId,
+        simJobId: seeded.job.id,
+        engineJobId,
+        point,
+        artifact: {
+          ...originalManifest,
+          path: `/jobs/${engineJobId}/files/evidence/a0/second-manifest.json`,
+          url: `/jobs/${engineJobId}/files/evidence/a0/second-manifest.json`,
+        },
+      }),
+    ).rejects.toThrow("manifest replay changed immutable association");
+    expect(
+      await db
+        .select({ id: solverEvidenceArtifacts.id })
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultAttemptId, selectedAttemptId),
+            eq(solverEvidenceArtifacts.kind, "manifest"),
+          ),
+        ),
+    ).toEqual([{ id: storedManifest.id }]);
+
+    const classificationsBefore = await db
+      .select({
+        id: resultClassifications.id,
+        resultId: resultClassifications.resultId,
+        resultAttemptId: resultClassifications.resultAttemptId,
+        state: resultClassifications.state,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultClassifications)
+      .where(eq(resultClassifications.airfoilId, airfoilId))
+      .orderBy(resultClassifications.id);
+    const [fitBefore] = await db
+      .select({ id: polarFitSets.id })
+      .from(polarFitSets)
+      .where(
+        and(
+          eq(polarFitSets.airfoilId, airfoilId),
+          eq(polarFitSets.simulationPresetRevisionId, revisionId),
+          eq(polarFitSets.isCurrent, true),
+        ),
+      );
+    const videoPath = join(
+      mediaRoot,
+      "jobs/guard-job/cases/a0/images/velocity_magnitude.mp4",
+    );
+    await rm(videoPath, { force: true });
+    try {
+      await expect(
+        ingestResult({
+          db,
+          engine: stubEngine(),
+          engineJobId,
+          simJobId: seeded.job.id,
+          airfoilId,
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          uransFidelity: "precalc",
+          result: jobResult(engineJobId, point),
+          hooks: {
+            afterEvidenceStaged: async () => {
+              throw new Error("injected crash after selected replay staging");
+            },
+          },
+        }),
+      ).rejects.toThrow("injected crash after selected replay staging");
+    } finally {
+      await writeFile(videoPath, "exact-video");
+    }
+
+    const [videoAfter] = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.id, videoBefore.id));
+    expect(videoAfter).toEqual(videoBefore);
+    expect(
+      await db
+        .select({ id: resultMedia.id })
+        .from(resultMedia)
+        .where(eq(resultMedia.id, derivedImage.id)),
+    ).toEqual([{ id: derivedImage.id }]);
+    const [resultAfter] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, seeded.result.id));
+    expect(resultAfter.currentResultAttemptId).toBe(selectedAttemptId);
+    expect(
+      await db
+        .select({
+          id: resultClassifications.id,
+          resultId: resultClassifications.resultId,
+          resultAttemptId: resultClassifications.resultAttemptId,
+          state: resultClassifications.state,
+          reasons: resultClassifications.reasons,
+        })
+        .from(resultClassifications)
+        .where(eq(resultClassifications.airfoilId, airfoilId))
+        .orderBy(resultClassifications.id),
+    ).toEqual(classificationsBefore);
+    const [fitAfter] = await db
+      .select({ id: polarFitSets.id })
+      .from(polarFitSets)
+      .where(
+        and(
+          eq(polarFitSets.airfoilId, airfoilId),
+          eq(polarFitSets.simulationPresetRevisionId, revisionId),
+          eq(polarFitSets.isCurrent, true),
+        ),
+      );
+    expect(fitAfter.id).toBe(fitBefore.id);
   }, 60000);
 
   it("restores a queued selected projection when its correction child rejects", async () => {

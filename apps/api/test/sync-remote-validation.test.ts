@@ -65,6 +65,7 @@ const {
   outputProfiles,
   polarFitSets,
   referenceGeometryProfiles,
+  remoteAssetReferences,
   resultAttempts,
   resultClassifications,
   resultMedia,
@@ -671,6 +672,110 @@ async function resultAt(aoaDeg: number) {
   return row ?? null;
 }
 
+async function createSelectedRemoteAssetGeneration(
+  aoaDeg: number,
+  label: string,
+) {
+  const remoteResultId = `${PREFIX}-${label}-remote-result`;
+  const imported = await postPolars(
+    polarPayload([
+      makePoint(aoaDeg, {
+        engineJobId: remoteResultId,
+        evidenceArtifacts: [artifactItem(`${label}-manifest`)],
+      }),
+    ]),
+  );
+  expect(imported.statusCode, imported.body).toBe(200);
+  const result = await resultAt(aoaDeg);
+  if (!result?.currentResultAttemptId) {
+    throw new Error(`selected remote generation missing at aoa ${aoaDeg}`);
+  }
+  const manifests = await db
+    .select()
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultId, result.id),
+        eq(
+          solverEvidenceArtifacts.resultAttemptId,
+          result.currentResultAttemptId,
+        ),
+        eq(solverEvidenceArtifacts.kind, "manifest"),
+      ),
+    );
+  expect(manifests).toHaveLength(1);
+  return { remoteResultId, result, manifest: manifests[0] };
+}
+
+async function runUpstreamEvidenceExport(data: Record<string, unknown>) {
+  const [settingsBefore] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  if (!settingsBefore) throw new Error("sync settings fixture missing");
+  const upstreamBaseUrl = "https://upstream.example.test/api/sync/v1";
+  await db
+    .update(syncApiSettings)
+    .set({
+      upstreamBaseUrl,
+      upstreamSecret: `${PREFIX}-upstream-secret`,
+      updatedAt: new Date(),
+    })
+    .where(eq(syncApiSettings.id, 1));
+  const beforeFiles = mediaFilePaths();
+  const fetchMock = vi.fn(async (input: string | URL) => {
+    const url = String(input);
+    if (url === `${upstreamBaseUrl}/status`) {
+      return new Response(
+        JSON.stringify({
+          instanceId: `${PREFIX}-source`,
+          instanceName: "remote validation test",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    if (url.startsWith(`${upstreamBaseUrl}/export?`)) {
+      return new Response(
+        JSON.stringify({
+          items: [{ type: "evidence_artifacts", data }],
+          nextCursor: null,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response("unexpected asset download", { status: 500 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/admin/sync/upstream/run",
+      headers: {
+        "content-type": "application/json",
+        "x-xfoilfoam-sync-secret": SECRET,
+      },
+      payload: JSON.stringify({
+        mode: "full",
+        types: ["evidence_artifacts"],
+        limit: 25,
+      }),
+    });
+    return {
+      response,
+      urls: fetchMock.mock.calls.map(([input]) => String(input)),
+      beforeFiles,
+    };
+  } finally {
+    vi.unstubAllGlobals();
+    const { id: _id, createdAt: _createdAt, ...restore } = settingsBefore;
+    await db
+      .update(syncApiSettings)
+      .set({ ...restore, updatedAt: new Date() })
+      .where(eq(syncApiSettings.id, 1));
+  }
+}
+
 async function createPromise(
   status: "active" | "fulfilled" | "cancelled",
   aoas: number | number[],
@@ -952,6 +1057,117 @@ describe("remote solver sync validation regressions", () => {
       .where(eq(syncApiSettings.id, 1));
   });
 
+  it("replays the selected attempt's sole manifest without a second row or download", async () => {
+    const fixture = await createSelectedRemoteAssetGeneration(
+      727.001,
+      "manifest-exact-replay",
+    );
+    const refsBefore = await db
+      .select({ id: remoteAssetReferences.id })
+      .from(remoteAssetReferences)
+      .where(eq(remoteAssetReferences.localRowId, fixture.manifest.id));
+    const run = await runUpstreamEvidenceExport({
+      remoteArtifactId: `${PREFIX}-manifest-exact-replay-artifact`,
+      remoteResultId: fixture.remoteResultId,
+      remoteResultAttemptId: fixture.result.currentResultAttemptId,
+      kind: "manifest",
+      field: fixture.manifest.field,
+      role: fixture.manifest.role,
+      storageKey: fixture.manifest.storageKey,
+      mimeType: fixture.manifest.mimeType,
+      sha256: fixture.manifest.sha256,
+      byteSize: fixture.manifest.byteSize,
+      generationManifestSha256: fixture.manifest.sha256,
+      downloadUrl: "/artifacts/manifest-exact-replay/download",
+    });
+    expect(run.response.statusCode, run.response.body).toBe(200);
+    expect(run.response.json().lastRun).toMatchObject({
+      imported: 1,
+      conflicts: [],
+    });
+    expect(run.urls).toHaveLength(2);
+    expect(run.urls.some((url) => url.includes("/download"))).toBe(false);
+    expect(mediaFilePaths()).toEqual(run.beforeFiles);
+    const manifestsAfter = await db
+      .select({ id: solverEvidenceArtifacts.id })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, fixture.result.id),
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            fixture.result.currentResultAttemptId!,
+          ),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    expect(manifestsAfter).toEqual([{ id: fixture.manifest.id }]);
+    expect(
+      await db
+        .select({ id: remoteAssetReferences.id })
+        .from(remoteAssetReferences)
+        .where(eq(remoteAssetReferences.localRowId, fixture.manifest.id)),
+    ).toEqual(refsBefore);
+    expect((await resultAt(727.001))?.currentResultAttemptId).toBe(
+      fixture.result.currentResultAttemptId,
+    );
+  });
+
+  it("conflicts a same-checksum manifest with another storage identity without downloading or mutating selection", async () => {
+    const fixture = await createSelectedRemoteAssetGeneration(
+      728.001,
+      "manifest-storage-conflict",
+    );
+    const run = await runUpstreamEvidenceExport({
+      remoteArtifactId: `${PREFIX}-manifest-storage-conflict-artifact`,
+      remoteResultId: fixture.remoteResultId,
+      remoteResultAttemptId: fixture.result.currentResultAttemptId,
+      kind: "manifest",
+      field: fixture.manifest.field,
+      role: fixture.manifest.role,
+      storageKey: `${fixture.manifest.storageKey}.different-owner`,
+      mimeType: fixture.manifest.mimeType,
+      sha256: fixture.manifest.sha256,
+      byteSize: fixture.manifest.byteSize,
+      generationManifestSha256: fixture.manifest.sha256,
+      downloadUrl: "/artifacts/manifest-storage-conflict/download",
+    });
+    expect(run.response.statusCode, run.response.body).toBe(200);
+    const lastRun = run.response.json().lastRun as {
+      imported: number;
+      conflicts: string[];
+    };
+    expect(lastRun.imported).toBe(0);
+    expect(lastRun.conflicts).toHaveLength(1);
+    cleanupConflictIds.add(lastRun.conflicts[0]);
+    expect(run.urls).toHaveLength(2);
+    expect(run.urls.some((url) => url.includes("/download"))).toBe(false);
+    expect(mediaFilePaths()).toEqual(run.beforeFiles);
+    const manifestsAfter = await db
+      .select({ id: solverEvidenceArtifacts.id })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, fixture.result.id),
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            fixture.result.currentResultAttemptId!,
+          ),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    expect(manifestsAfter).toEqual([{ id: fixture.manifest.id }]);
+    expect(
+      await db
+        .select({ id: remoteAssetReferences.id })
+        .from(remoteAssetReferences)
+        .where(eq(remoteAssetReferences.localRowId, fixture.manifest.id)),
+    ).toHaveLength(0);
+    expect((await resultAt(728.001))?.currentResultAttemptId).toBe(
+      fixture.result.currentResultAttemptId,
+    );
+  });
+
   it("MUST-CATCH: /polars accepts a >1 MiB inline-media body while other sync POST routes keep the default 413 limit", async () => {
     const buf = Buffer.alloc(1_600_000, 7);
     const bigMedia = {
@@ -1071,6 +1287,84 @@ describe("remote solver sync validation regressions", () => {
       .from(resultAttempts)
       .where(eq(resultAttempts.resultId, canonical!.id));
     expect(storedAttempts).toHaveLength(1);
+  });
+
+  it("conflicts an exact-attempt replay that rebinds the sole manifest to another storage identity", async () => {
+    const aoaDeg = 703.151;
+    const manifest = artifactItem("polar-replay-manifest-storage");
+    const point = makePoint(aoaDeg, {
+      evidencePayload: { contract: "stable-polar-replay-v1" },
+      evidenceArtifacts: [manifest],
+    });
+    const first = await postPolars(polarPayload([point]));
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toMatchObject({
+      imported: 1,
+      attempts: 1,
+      conflictIds: [],
+    });
+    const canonical = await resultAt(aoaDeg);
+    if (!canonical?.currentResultAttemptId) {
+      throw new Error("selected exact replay fixture has no current attempt");
+    }
+    const [storedManifest] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, canonical.id),
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            canonical.currentResultAttemptId,
+          ),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    expect(storedManifest.storageKey).toMatch(/\.json$/);
+    const filesBeforeReplay = mediaFilePaths();
+
+    const replay = await postPolars(
+      polarPayload([
+        {
+          ...point,
+          evidenceArtifacts: [
+            {
+              ...manifest,
+              filename: "same-manifest-bytes-different-owner.txt",
+            },
+          ],
+        },
+      ]),
+    );
+    expect(replay.statusCode, replay.body).toBe(200);
+    const replayBody = replay.json() as {
+      imported: number;
+      attempts: number;
+      conflictIds: string[];
+    };
+    expect(replayBody.imported).toBe(0);
+    expect(replayBody.attempts).toBe(0);
+    expect(replayBody.conflictIds).toHaveLength(1);
+    cleanupConflictIds.add(replayBody.conflictIds[0]);
+    expect(mediaFilePaths()).toEqual(filesBeforeReplay);
+    expect(
+      await db
+        .select({ id: solverEvidenceArtifacts.id })
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, canonical.id),
+            eq(
+              solverEvidenceArtifacts.resultAttemptId,
+              canonical.currentResultAttemptId,
+            ),
+            eq(solverEvidenceArtifacts.kind, "manifest"),
+          ),
+        ),
+    ).toEqual([{ id: storedManifest.id }]);
+    expect((await resultAt(aoaDeg))?.currentResultAttemptId).toBe(
+      canonical.currentResultAttemptId,
+    );
   });
 
   it.each([

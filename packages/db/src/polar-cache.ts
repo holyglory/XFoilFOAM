@@ -418,6 +418,41 @@ async function upsertClassification(
     });
 }
 
+/**
+ * A canonical result projection may never upgrade the verdict of its selected
+ * immutable attempt. Attempt classification is intentionally scoped to the
+ * physical solver job that produced the evidence, while result classification
+ * also evaluates the assembled public polar. The latter can add a conservative
+ * downgrade, but it must not erase a job-local `needs_urans` verdict merely
+ * because the rejected sibling that caused it has been withdrawn from the
+ * public projection.
+ */
+function preserveSelectedAttemptDowngrades(
+  resultClassificationsForFit: PolarEvidenceClassification[],
+  attemptClassificationById: ReadonlyMap<string, PolarEvidenceClassification>,
+): void {
+  for (const resultClassification of resultClassificationsForFit) {
+    const resultEvidence = resultClassification.evidence as EvidenceWithDbIds;
+    const selectedAttemptId = resultEvidence.currentGenerationAttemptId;
+    if (!selectedAttemptId || resultClassification.state !== "accepted") {
+      continue;
+    }
+    const selectedAttemptClassification =
+      attemptClassificationById.get(selectedAttemptId);
+    if (selectedAttemptClassification?.state !== "needs_urans") continue;
+
+    resultClassification.state = "needs_urans";
+    resultClassification.region = selectedAttemptClassification.region;
+    resultClassification.confidence = selectedAttemptClassification.confidence;
+    resultClassification.reasons = [
+      ...new Set([
+        ...resultClassification.reasons,
+        ...selectedAttemptClassification.reasons,
+      ]),
+    ];
+  }
+}
+
 function signatureFor(
   classifications: PolarEvidenceClassification[],
   symmetryMirrored: boolean,
@@ -520,6 +555,7 @@ async function supersedePrecalcWithVerifiedUrans(
     LEFT JOIN result_attempts current_attempt
       ON current_attempt.id = r.current_result_attempt_id
      AND current_attempt.result_id = r.id
+    CROSS JOIN result_attempts precalc_attempt
     WHERE r.airfoil_id = ${airfoilId}
       AND r.simulation_preset_revision_id = ${simulationPresetRevisionId}
       AND r.current_result_attempt_id IS NOT NULL
@@ -527,17 +563,125 @@ async function supersedePrecalcWithVerifiedUrans(
       AND current_attempt.evidence_payload ->> 'fidelity' = 'urans_full'
       AND vrc.state = 'accepted'
       AND rc.result_attempt_id IS NOT NULL
+      AND precalc_attempt.id = rc.result_attempt_id
+      AND precalc_attempt.result_id = r.id
+      AND precalc_attempt.id <> current_attempt.id
+      AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
       AND rc.airfoil_id = ${airfoilId}
       AND rc.simulation_preset_revision_id = ${simulationPresetRevisionId}
       AND rc.aoa_deg = current_attempt.aoa_deg
       AND rc.regime = 'urans'
       AND rc.state IN ('accepted', 'needs_urans')
-      AND EXISTS (
-        SELECT 1 FROM result_attempts ra
-        WHERE ra.id = rc.result_attempt_id
-          AND ra.evidence_payload ->> 'fidelity' = 'urans_precalc'
-      )
   `);
+}
+
+/** Enforce the exact-generation publication invariant after every attempt
+ * classification pass. Promotion hooks run first so a newly accepted attempt
+ * can replace a previously selected generation using its observed-pointer
+ * CAS. Any pointer still lacking its own accepted/provisional verdict is then
+ * removed before result evidence or fitted read models are published.
+ *
+ * Cache retirement and pointer clearing share the revision-locked transaction;
+ * readers therefore observe either the previous complete generation or the
+ * rebuilt fail-closed generation, never a rejected pointer with a current fit.
+ */
+async function retireInvalidSelectedAttempts(
+  db: DB,
+  airfoilId: string,
+  simulationPresetRevisionId: string,
+  compatibilityHash: string | null,
+): Promise<number> {
+  const eligibleExactClassification = sql`EXISTS (
+    SELECT 1
+    FROM ${resultClassifications} selected_classification
+    JOIN ${resultAttempts} selected_attempt
+      ON selected_attempt.id = selected_classification.result_attempt_id
+     AND selected_attempt.result_id = ${results.id}
+    WHERE selected_classification.result_attempt_id = ${results.currentResultAttemptId}
+      AND selected_attempt.airfoil_id = ${results.airfoilId}
+      AND selected_attempt.simulation_preset_revision_id = ${results.simulationPresetRevisionId}
+      AND selected_attempt.aoa_deg = ${results.aoaDeg}
+      AND selected_classification.airfoil_id = ${results.airfoilId}
+      AND selected_classification.simulation_preset_revision_id = ${results.simulationPresetRevisionId}
+      AND selected_classification.aoa_deg = selected_attempt.aoa_deg
+      AND selected_classification.regime IS NOT DISTINCT FROM selected_attempt.regime
+      AND selected_classification.state IN ('accepted', 'needs_urans')
+      AND EXISTS (
+        SELECT 1
+        FROM solver_evidence_artifacts selected_manifest
+        WHERE selected_manifest.result_id = ${results.id}
+          AND selected_manifest.result_attempt_id = selected_attempt.id
+          AND selected_manifest.kind = 'manifest'
+        HAVING count(*) = 1
+          AND bool_and(
+            selected_manifest.airfoil_id = ${results.airfoilId}
+            AND selected_manifest.aoa_deg IS NOT DISTINCT FROM selected_attempt.aoa_deg
+            AND selected_manifest.sim_job_id IS NOT DISTINCT FROM selected_attempt.sim_job_id
+            AND selected_manifest.engine_job_id IS NOT DISTINCT FROM selected_attempt.engine_job_id
+            AND selected_manifest.engine_case_slug IS NOT DISTINCT FROM selected_attempt.engine_case_slug
+            AND selected_manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+            AND selected_manifest.byte_size > 0
+            AND length(trim(selected_manifest.storage_key)) > 0
+            AND length(trim(selected_manifest.mime_type)) > 0
+          )
+      )
+  )`;
+  const invalidSelected = await db
+    .select({ id: results.id })
+    .from(results)
+    .where(
+      and(
+        eq(results.airfoilId, airfoilId),
+        eq(results.simulationPresetRevisionId, simulationPresetRevisionId),
+        isNotNull(results.currentResultAttemptId),
+        sql`NOT (${eligibleExactClassification})`,
+      ),
+    )
+    .orderBy(results.id)
+    .for("update");
+  if (!invalidSelected.length) return 0;
+
+  // Retire every current version for the affected revision/hash before the
+  // pointer is removed. The normal refresh below creates the replacement fit;
+  // compatibility aggregation is rebuilt only from committed exact pointers.
+  await db
+    .update(polarFitSets)
+    .set({ isCurrent: false })
+    .where(
+      and(
+        eq(polarFitSets.airfoilId, airfoilId),
+        eq(polarFitSets.simulationPresetRevisionId, simulationPresetRevisionId),
+        eq(polarFitSets.isCurrent, true),
+      ),
+    );
+  if (compatibilityHash) {
+    await db
+      .update(polarCompatibilityFitSets)
+      .set({ isCurrent: false })
+      .where(
+        and(
+          eq(polarCompatibilityFitSets.airfoilId, airfoilId),
+          eq(polarCompatibilityFitSets.compatibilityHash, compatibilityHash),
+          eq(polarCompatibilityFitSets.isCurrent, true),
+        ),
+      );
+  }
+
+  const cleared = await db
+    .update(results)
+    .set({ currentResultAttemptId: null, updatedAt: new Date() })
+    .where(
+      and(
+        inArray(
+          results.id,
+          invalidSelected.map((row) => row.id),
+        ),
+        isNotNull(results.currentResultAttemptId),
+        sql`NOT (${eligibleExactClassification})`,
+      ),
+    )
+    .returning({ id: results.id });
+  return cleared.length;
 }
 
 async function storeFit(
@@ -752,22 +896,45 @@ export async function refreshPolarCacheForRevision(
     const attemptClassifications = attemptClassifiedGroups.flatMap(
       (group) => group.classifications,
     );
+    const attemptClassificationById = new Map(
+      attemptClassifications.flatMap((classification) => {
+        const evidence = classification.evidence as EvidenceWithDbIds;
+        return evidence.resultAttemptId
+          ? ([[evidence.resultAttemptId, classification]] as const)
+          : [];
+      }),
+    );
 
     for (const c of attemptClassifications) {
       await upsertClassification(tx, c, airfoilId, simulationPresetRevisionId);
     }
     await hooks?.afterAttemptClassifications?.(tx);
 
+    // Promotion hooks must run first because they compare against the pointer
+    // observed while staging/importing. Once a valid replacement had that
+    // opportunity, withdraw every still-selected ineligible generation before
+    // loading the canonical result projection.
+    await retireInvalidSelectedAttempts(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+      compatibilityHash,
+    );
+
     // Canonical result evidence is intentionally loaded only after the exact
     // generation-selection hook. Result classification and fit therefore
     // observe the selected pointer from the same revision-locked transaction,
     // never a pre-promotion snapshot.
-    const resultEvidence = await loadResultEvidence(
+    let resultEvidence = await loadResultEvidence(
       tx,
       airfoilId,
       simulationPresetRevisionId,
     );
-    const resultClassified = classifyPolarEvidence(resultEvidence);
+    let resultClassified = classifyPolarEvidence(resultEvidence);
+    preserveSelectedAttemptDowngrades(
+      resultClassified.classifications,
+      attemptClassificationById,
+    );
     for (const c of resultClassified.classifications) {
       await upsertClassification(tx, c, airfoilId, simulationPresetRevisionId);
     }
@@ -781,6 +948,40 @@ export async function refreshPolarCacheForRevision(
       airfoilId,
       simulationPresetRevisionId,
     );
+
+    // Supersession normally targets historical RANS/PRECALC attempts, not the
+    // selected URANS/full generation that proves the replacement. Reassert the
+    // same invariant after those derived writes anyway, so a future change to
+    // supersession cannot leave a newly ineligible exact pointer published.
+    const supersededPointerCount = await retireInvalidSelectedAttempts(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+      compatibilityHash,
+    );
+    if (supersededPointerCount > 0) {
+      // The first snapshot intentionally let supersession observe the selected
+      // generation. Once invalid pointers are retired, rebuild result-level
+      // classifications from the final pointer-null projection before fitting.
+      resultEvidence = await loadResultEvidence(
+        tx,
+        airfoilId,
+        simulationPresetRevisionId,
+      );
+      resultClassified = classifyPolarEvidence(resultEvidence);
+      preserveSelectedAttemptDowngrades(
+        resultClassified.classifications,
+        attemptClassificationById,
+      );
+      for (const c of resultClassified.classifications) {
+        await upsertClassification(
+          tx,
+          c,
+          airfoilId,
+          simulationPresetRevisionId,
+        );
+      }
+    }
 
     const resultEvidenceById = new Map(
       resultEvidence

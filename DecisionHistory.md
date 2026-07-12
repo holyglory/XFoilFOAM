@@ -1,5 +1,83 @@
 # Decision History
 
+## 2026-07-12 — Migration 0057 reasserts exact selected-result truth after every writer
+
+- Production trigger: the 0056 rollout exposed a repeatable selected-generation
+  race. Migration 0053 had selected attempts using classifications computed
+  before exact-attempt media ownership was enforced. Migration 0056 then trusted
+  those stored verdicts. When media repair later ran the stricter classifier,
+  six attempts became rejected but retained their public
+  `results.current_result_attempt_id`; a direct exact-evidence audit found 44
+  selected URANS attempts without video owned by that exact attempt. Repair
+  exposed the stale state; it did not invent or replace evidence.
+- Causal chain: the one-time cleanup checked a derived verdict instead of the
+  exact video/force/manifest facts; runtime cache refresh could tighten a
+  verdict without withdrawing the selected pointer and current caches; the old
+  migration fixture pre-labelled its bad URANS attempt rejected and therefore
+  never reproduced an accepted-to-rejected transition. Any future classifier,
+  manifest, or media change could have recreated the drift.
+- Decision: exact selected-result eligibility is a runtime invariant, not a
+  migration assumption. After every immutable-attempt classification pass,
+  revision refresh withdraws any selected attempt that lacks its own
+  accepted/provisional classification and exactly one complete, identity-matched
+  manifest. Pointer withdrawal, revision-fit retirement, and compatibility-fit
+  retirement commit under the same revision lock. The invariant is reasserted
+  after supersession too, so a later derived writer cannot publish an
+  ineligible generation.
+- Migration 0057 applies the same rule directly from evidence. Exact URANS video
+  and attempt-owned force history are required; repair work is created only for
+  a force-valid attempt with one exact manifest. Invalid selected pointers and
+  their affected current caches are retired. Pointer-null accepted,
+  `needs_urans`, and superseded result projections are removed, while rejected
+  attempt history remains available for routing and audit. Legacy
+  classifications that named both a result and an attempt are detached from
+  the mutable result projection without deleting the attempt verdict.
+- Writer closure: shipped-media replay is now insert-only for missing exact
+  associations and rejects a conflicting replay instead of weakening or
+  deleting identity. Renderer replacement retains the old complete media set
+  until the new set is durable. Corrupt-media compare-and-delete runs inside
+  the same revision refresh transaction that reclassifies evidence, withdraws
+  pointers, and retires caches. Local sync, `/polars`, and generic upstream
+  manifest paths accept an exact replay as a no-op and reject rebinding or a
+  second manifest.
+- Public projection rule: a result cache may add a conservative downgrade, but
+  may never upgrade the verdict of its exact selected attempt. If a low-angle
+  rejected RANS attempt makes surviving attempts from that same solver job
+  `needs_urans`, withdrawing the rejected pointer does not turn those survivors
+  final. The rejected evidence stays pointer-null, the surviving exact pointers
+  stay provisional, and unrelated jobs remain isolated. This also keeps the
+  revision fit consistent with the compatibility cache, which already reads
+  exact-attempt verdicts.
+- Production-clone proof used the strongly verified 13:17 UTC post-0056 dump,
+  SHA-256 `9e5174f12205e07cac2b0d103c39bab7000a87cb1a9f9a32fdaed58ddc26af18`,
+  and applied the final 0057 SQL first from a clean 0056 baseline. Selected
+  pointers changed 619→575; all 44 missing-video selections were withdrawn;
+  invalid selected pointers, selected URANS missing exact video/force,
+  pointer-null usable projections, and dual-owned usable classifications all
+  became zero. Fourteen repair obligations were inserted and 30 were retargeted
+  without changing result, attempt, artifact, media, force-history, or extent
+  content/hashes. A second migration execution produced the identical state
+  hash. Full cache backfill refreshed 47/47 scopes with zero failures; all 148
+  foreign keys and 28 checks remained validated.
+- Verification before the 0057 release commit: fresh-0057 API suite 18/18 files
+  and 218/218 tests; fresh-0057 DB suite 9/9 files and 51/51 tests; fresh-0057
+  full sweeper suite 25/25 files and 275/275 tests; focused migration upgrade
+  12/12, migration repair 4/4, media repair 23/23, replace guard 19/19, sync
+  39/39, and polar-cache atomicity 12/12. Recursive typecheck and
+  formatting/diff checks passed.
+- This is correctness remediation under the existing no-fake and exact-attempt
+  decisions, not a new datastore or orchestration choice. The simpler option—
+  trusting stored verdicts and repairing selected evidence in place—has less
+  code but can publish a rejected or mixed-generation result during a crash.
+  Keeping immutable history while atomically withdrawing ineligible public
+  truth costs more locking and regression coverage, but preserves provenance
+  and is the required safe behavior.
+- Production boundary at this entry: the campaign remains cancelled, the
+  database scheduling flag remains false, and the sweeper container is stopped.
+  Production is still on schema 0056 until the 0057 release is committed,
+  deployed with the sweeper stopped, backfilled, and audited. The OpenFOAM
+  engine remains on `prod-20260711-argate`; no controller canary is claimed.
+
 ## 2026-07-12 — Exact repair and publication authority close the selected-generation boundary
 
 - Remediation trigger: exact-generation migration 0053 made public truth point

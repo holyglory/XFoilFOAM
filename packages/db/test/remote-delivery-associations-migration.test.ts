@@ -373,7 +373,7 @@ describe("0051→0052 remote delivery and evidence-association upgrade", () => {
         delivery_table: "sync_remote_result_deliveries",
         point_attempt_column: true,
         conflict_fingerprint_column: true,
-        latest_migration: "1785715200000",
+        latest_migration: "1785801600000",
       },
     ]);
   });

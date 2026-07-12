@@ -34,6 +34,8 @@ import {
   simUransVerifyQueue,
   meshProfiles,
   outputProfiles,
+  polarCompatibilityFitSets,
+  polarFitSets,
   solverProfiles,
   solverEvidenceArtifacts,
   sweepDefinitions,
@@ -236,6 +238,7 @@ async function createSolvedResult(
     resultId: result.id,
     resultAttemptId: attempt.id,
     airfoilId,
+    simJobId: opts.simJobId ?? null,
     engineJobId,
     engineCaseSlug: caseSlug,
     aoaDeg: aoa,
@@ -642,6 +645,84 @@ describe("durable result media repair", () => {
     expect(repair.state).toBe("retry_wait");
     expect(repair.attemptCount).toBe(1);
     expect(repair.lastError).toContain("extent read failed");
+  });
+
+  it("keeps valid selected media visible until a replacement render commits", async () => {
+    const fixture = await createSolvedResult("staged-render-failure");
+    const storageKey = `jobs/${fixture.engineJobId}/scaled/${fixture.caseSlug}/velocity_magnitude-instantaneous.mp4`;
+    const bytes = Buffer.from("previous verified exact-generation video");
+    const fullPath = resolve(MEDIA_ROOT, storageKey);
+    mkdirSync(dirname(fullPath), { recursive: true });
+    writeFileSync(fullPath, bytes);
+    const [video] = await db
+      .insert(resultMedia)
+      .values({
+        resultId: fixture.resultId,
+        resultAttemptId: fixture.resultAttemptId,
+        kind: "video",
+        field: "velocity_magnitude",
+        role: "instantaneous",
+        storageKey,
+        mimeType: "video/mp4",
+        renderProfileKey: "default:v1:zoom2",
+        evidenceSha256: fixture.manifestSha,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        byteSize: bytes.byteLength,
+      })
+      .returning({ id: resultMedia.id });
+    await refreshPolarCacheForRevision(db, fixture.airfoilId, revisionId, {
+      afterAttemptClassifications: async (tx) => {
+        await tx
+          .update(results)
+          .set({ currentResultAttemptId: fixture.resultAttemptId })
+          .where(eq(results.id, fixture.resultId));
+      },
+    });
+
+    let videoVisibleDuringRender = false;
+    let pointerVisibleDuringRender = false;
+    const outcome = await resultMediaRepairTick(
+      db,
+      engineWith({
+        extents: async () => ({
+          fields: {
+            velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
+          },
+          window_start: 1,
+          window_end: 2,
+        }),
+        render: async () => {
+          const [visibleVideo] = await db
+            .select({ id: resultMedia.id })
+            .from(resultMedia)
+            .where(eq(resultMedia.id, video.id));
+          const [visibleResult] = await db
+            .select({ currentResultAttemptId: results.currentResultAttemptId })
+            .from(results)
+            .where(eq(results.id, fixture.resultId));
+          videoVisibleDuringRender = visibleVideo?.id === video.id;
+          pointerVisibleDuringRender =
+            visibleResult?.currentResultAttemptId === fixture.resultAttemptId;
+          throw new Error("replacement renderer unavailable");
+        },
+      }),
+      { resultId: fixture.resultId },
+    );
+
+    expect(outcome.retrying).toBe(1);
+    expect(videoVisibleDuringRender).toBe(true);
+    expect(pointerVisibleDuringRender).toBe(true);
+    expect(
+      await db
+        .select({ id: resultMedia.id })
+        .from(resultMedia)
+        .where(eq(resultMedia.id, video.id)),
+    ).toEqual([{ id: video.id }]);
+    const [selected] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, fixture.resultId));
+    expect(selected.currentResultAttemptId).toBe(fixture.resultAttemptId);
   });
 
   it("refuses default-media repair when stored physical scale is missing or zero", async () => {
@@ -1416,7 +1497,7 @@ describe("durable result media repair", () => {
     ).toEqual([{ id: fixture.jobId }]);
   });
 
-  it("rehashes crash-recovered bytes and reopens a missing artifact", async () => {
+  it("withdraws a selected URANS generation when crash-recovered video bytes are missing", async () => {
     const fixture = await createSolvedResult("crash-byte-loss");
     await discoverMissingResultMediaRepairs(db, { resultId: fixture.resultId });
     const claim = await claimNextResultMediaRepair(db, {
@@ -1425,7 +1506,15 @@ describe("durable result media repair", () => {
     expect(claim?.claimToken).toBeTruthy();
     await repairDefaultMediaForStoredResult({
       db,
-      engine: engineWith(),
+      engine: engineWith({
+        extents: async () => ({
+          fields: {
+            velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
+          },
+          window_start: 1,
+          window_end: 2,
+        }),
+      }),
       resultId: fixture.resultId,
       resultAttemptId: fixture.resultAttemptId,
       heartbeat: async () => undefined,
@@ -1436,11 +1525,60 @@ describe("durable result media repair", () => {
         evidenceSignature: claim!.evidenceSignature,
       },
     });
+    await refreshPolarCacheForRevision(db, fixture.airfoilId, revisionId, {
+      afterAttemptClassifications: async (tx) => {
+        await tx
+          .update(results)
+          .set({ currentResultAttemptId: fixture.resultAttemptId })
+          .where(eq(results.id, fixture.resultId));
+      },
+    });
+    const [selectedBeforeLoss] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, fixture.resultId));
+    const [classificationBeforeLoss] = await db
+      .select({ state: resultClassifications.state })
+      .from(resultClassifications)
+      .where(
+        eq(resultClassifications.resultAttemptId, fixture.resultAttemptId),
+      );
+    const [fitBeforeLoss] = await db
+      .select({ id: polarFitSets.id })
+      .from(polarFitSets)
+      .where(
+        and(
+          eq(polarFitSets.airfoilId, fixture.airfoilId),
+          eq(polarFitSets.simulationPresetRevisionId, revisionId),
+          eq(polarFitSets.isCurrent, true),
+        ),
+      );
+    const [compatibilityBeforeLoss] = await db
+      .select({ id: polarCompatibilityFitSets.id })
+      .from(polarCompatibilityFitSets)
+      .where(
+        and(
+          eq(polarCompatibilityFitSets.airfoilId, fixture.airfoilId),
+          eq(polarCompatibilityFitSets.isCurrent, true),
+        ),
+      );
+    expect(selectedBeforeLoss.currentResultAttemptId).toBe(
+      fixture.resultAttemptId,
+    );
+    expect(classificationBeforeLoss.state).toBe("accepted");
     const [stored] = await db
       .select()
       .from(resultMedia)
-      .where(eq(resultMedia.resultId, fixture.resultId))
+      .where(
+        and(
+          eq(resultMedia.resultId, fixture.resultId),
+          eq(resultMedia.resultAttemptId, fixture.resultAttemptId),
+          eq(resultMedia.kind, "video"),
+          eq(resultMedia.role, "instantaneous"),
+        ),
+      )
       .limit(1);
+    expect(stored).toBeTruthy();
     rmSync(resolve(MEDIA_ROOT, stored.storageKey), { force: true });
 
     const finalized = await finalizeSatisfiedResultMediaRepairs(db, {
@@ -1456,6 +1594,32 @@ describe("durable result media repair", () => {
     expect(
       await db.select().from(resultMedia).where(eq(resultMedia.id, stored.id)),
     ).toHaveLength(0);
+    const [withdrawn] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, fixture.resultId));
+    const [rejectedAttempt] = await db
+      .select({
+        state: resultClassifications.state,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultClassifications)
+      .where(
+        eq(resultClassifications.resultAttemptId, fixture.resultAttemptId),
+      );
+    const [retiredFit] = await db
+      .select({ isCurrent: polarFitSets.isCurrent })
+      .from(polarFitSets)
+      .where(eq(polarFitSets.id, fitBeforeLoss.id));
+    const [retiredCompatibility] = await db
+      .select({ isCurrent: polarCompatibilityFitSets.isCurrent })
+      .from(polarCompatibilityFitSets)
+      .where(eq(polarCompatibilityFitSets.id, compatibilityBeforeLoss.id));
+    expect(withdrawn.currentResultAttemptId).toBeNull();
+    expect(rejectedAttempt.state).toBe("rejected");
+    expect(rejectedAttempt.reasons).toContain("missing-urans-video");
+    expect(retiredFit.isCurrent).toBe(false);
+    expect(retiredCompatibility.isCurrent).toBe(false);
   });
 
   it("fences concurrent and stale owners, then blocks after three attempts without rediscovery", async () => {

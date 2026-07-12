@@ -38,7 +38,7 @@ import {
   type RenderedDefaultMedia,
   type UransFidelity,
 } from "@aerodb/engine-client";
-import { and, desc, eq, inArray, lt, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { constants, createReadStream } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -77,6 +77,11 @@ interface MediaRegistrationEvidence {
    * computed it directly for shipped media), so it may persist that identity
    * without a second multi-gigabyte read. */
   verifyExpectedBytes?: boolean;
+  /** Engine-shipped media belongs to the immutable attempt payload. A replay
+   * may insert a missing association, but must never mutate an existing exact
+   * row: the later scaled-render path is the only ordinary writer allowed to
+   * replace it, and always supplies a complete non-null byte identity. */
+  preserveExistingAttemptMedia?: boolean;
   repairFence?: MediaRepairWriteFence;
 }
 
@@ -380,6 +385,7 @@ async function registerMedia(
       .onConflictDoNothing()
       .returning({ id: resultMedia.id });
     if (!inserted) {
+      if (evidence?.preserveExistingAttemptMedia) return;
       await writeDb
         .update(resultMedia)
         .set({
@@ -449,16 +455,15 @@ function shippedMimeType(kind: "image" | "video", urlPath: string): string {
  *  registered at INGEST time, before any scaled-render round-trip. The
  *  classifier's hasVideo gate and the detail page read result_media, so a
  *  coefficient-complete URANS point must never lose its video row just
- *  because the later extents/render pass failed. Rows share the scaled-render
- *  path's (result, kind, field, role) upsert key, so a successful scaled
- *  render simply overwrites these with the scale-stamped versions.
+ *  because the later extents/render pass failed.
  *
- *  Every media role is additionally RECONCILED to the current shipment:
- *  upserts never delete, so a new solve that ships no still/mean/video would
- *  otherwise leave an older result_media row satisfying the classifier or
- *  repair-completeness scan for NEW coefficients. Scaled rows share the same
- *  (result, kind, field, role) key; fields the new shipment really covers are
- *  immediately upserted and later scale-stamped again. */
+ *  Exact attempts are immutable and a new solve owns a new attempt id, so an
+ *  engine-terminal replay is insert-only: omitted fields do not delete prior
+ *  exact associations, and an unavailable local file cannot weaken a stored
+ *  sha256/byte_size to NULL. A complete scaled-render artifact may replace the
+ *  shared identity later; unlike the shipped replay it always carries a full
+ *  byte identity, and durable repair replacements additionally hold the live
+ *  lease/evidence fence. */
 async function registerShippedMedia(
   db: DB,
   engine: EngineClient,
@@ -477,22 +482,6 @@ async function registerShippedMedia(
   ];
   let count = 0;
   for (const group of groups) {
-    const shippedFields = Object.entries(group.entries)
-      .filter(([, urlPath]) => Boolean(urlPath))
-      .map(([field]) => field);
-    await db
-      .delete(resultMedia)
-      .where(
-        and(
-          eq(resultMedia.resultId, resultId),
-          eq(resultMedia.resultAttemptId, resultAttemptId),
-          eq(resultMedia.kind, group.kind),
-          eq(resultMedia.role, group.role),
-          shippedFields.length
-            ? notInArray(resultMedia.field, shippedFields)
-            : undefined,
-        ),
-      );
     for (const [field, urlPath] of Object.entries(group.entries)) {
       if (!urlPath) continue;
       const storageKey = storageKeyOf(urlPath);
@@ -520,6 +509,7 @@ async function registerShippedMedia(
           evidenceSha256: evidenceShaFromPoint(p),
           expectedSha256: localIdentity?.sha256,
           expectedByteSize: localIdentity?.byteSize,
+          preserveExistingAttemptMedia: true,
         },
       );
       count++;
@@ -1020,6 +1010,47 @@ export async function registerEvidenceArtifacts(opts: {
       engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
       metadata: artifact.metadata ?? {},
     };
+    if (kind === "manifest" && resultAttemptId) {
+      const existingManifests = await writeDb
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId),
+            eq(solverEvidenceArtifacts.kind, "manifest"),
+          ),
+        )
+        .orderBy(solverEvidenceArtifacts.id);
+      if (existingManifests.length > 1) {
+        throw new Error(
+          `exact attempt ${resultAttemptId} already has ambiguous manifest evidence`,
+        );
+      }
+      const existingManifest = existingManifests[0];
+      if (existingManifest) {
+        const exactReplay =
+          existingManifest.resultId === association.resultId &&
+          existingManifest.resultAttemptId === association.resultAttemptId &&
+          existingManifest.airfoilId === association.airfoilId &&
+          existingManifest.simJobId === association.simJobId &&
+          existingManifest.engineJobId === association.engineJobId &&
+          existingManifest.engineCaseSlug === association.engineCaseSlug &&
+          existingManifest.aoaDeg === association.aoaDeg &&
+          existingManifest.field === association.field &&
+          existingManifest.role === association.role &&
+          existingManifest.storageKey === association.storageKey &&
+          existingManifest.mimeType === association.mimeType &&
+          existingManifest.sha256 === association.sha256 &&
+          existingManifest.byteSize === association.byteSize &&
+          existingManifest.engineUrl === association.engineUrl &&
+          stableHash(existingManifest.metadata ?? {}) ===
+            stableHash(association.metadata);
+        if (exactReplay) return;
+        throw new Error(
+          `manifest replay changed immutable association metadata for attempt ${resultAttemptId}`,
+        );
+      }
+    }
     const [inserted] = await writeDb
       .insert(solverEvidenceArtifacts)
       .values(association)
@@ -2040,18 +2071,11 @@ export async function repairDefaultMediaForStoredResult(opts: {
 
   const groups = new Map<ScaleGroupKey, ScaleGroup>();
   const writeFreshExtents = async (writeDb: DB) => {
-    // Remove presentation rows from the prior/incomplete render before the
-    // fresh extent signature becomes visible. Raw solver artifacts remain
-    // immutable and untouched.
-    await writeDb.delete(resultMedia).where(
-      and(
-        eq(resultMedia.resultId, result.id),
-        eq(resultMedia.resultAttemptId, currentAttemptId),
-        eq(resultMedia.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
-        sql`(${resultMedia.evidenceSha256} IS DISTINCT FROM ${manifest.sha256}
-            OR ${inArray(resultMedia.field, [...freshFields])})`,
-      ),
-    );
+    // Keep the prior valid presentation rows while the potentially long
+    // renderer pass runs. Exact-identity upserts replace them only after each
+    // new artifact's bytes verify; obsolete signatures are removed after the
+    // complete replacement set is proven below. This avoids a public
+    // accepted-pointer gap caused solely by destructive pre-render deletion.
     await writeDb
       .delete(resultFieldExtents)
       .where(
@@ -2218,6 +2242,32 @@ export async function repairDefaultMediaForStoredResult(opts: {
       }
     }
   }
+  const retireObsoleteMedia = async (writeDb: DB) => {
+    await writeDb
+      .delete(resultMedia)
+      .where(
+        and(
+          eq(resultMedia.resultId, result.id),
+          eq(resultMedia.resultAttemptId, currentAttemptId),
+          eq(resultMedia.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+          sql`${resultMedia.evidenceSha256} IS DISTINCT FROM ${manifest.sha256}`,
+        ),
+      );
+  };
+  if (opts.repairFence) {
+    await opts.db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await requireMediaRepairWriteFence(
+        tx,
+        opts.repairFence!,
+        result.id,
+        manifest.sha256,
+      );
+      await retireObsoleteMedia(tx);
+    });
+  } else {
+    await retireObsoleteMedia(opts.db);
+  }
   return { mediaCount, expectedFields: [...freshFields].sort() };
 }
 
@@ -2351,16 +2401,59 @@ export async function verifyStoredDefaultMediaForResult(
           `media verification missing identity for ${extent.field} ${expected.kind}/${expected.role}`,
         );
       }
+      const verifiedSha256 = media.sha256;
+      const verifiedByteSize = media.byteSize;
       try {
         await verifyRenderedMediaBytes(
           media.storageKey,
-          media.sha256,
-          media.byteSize,
+          verifiedSha256,
+          verifiedByteSize,
         );
       } catch (error) {
         // Mutable presentation metadata must not keep pointing at corrupt or
-        // absent bytes. Raw solver artifacts and coefficients are untouched.
-        await db.delete(resultMedia).where(eq(resultMedia.id, media.id));
+        // absent bytes. Delete this exact observed media identity inside the
+        // revision refresh transaction: attempt/result reclassification,
+        // selected-pointer withdrawal, and revision/compatibility cache
+        // retirement then commit atomically with the deletion. The identity
+        // predicates are a CAS guard against deleting a renderer's newer row.
+        try {
+          await refreshPolarCacheForRevision(
+            db,
+            result.airfoilId,
+            result.simulationPresetRevisionId,
+            {
+              beforeEvidenceLoad: async (tx) => {
+                await tx
+                  .delete(resultMedia)
+                  .where(
+                    and(
+                      eq(resultMedia.id, media.id),
+                      eq(resultMedia.resultId, resultId),
+                      eq(resultMedia.resultAttemptId, resultAttemptId),
+                      eq(
+                        resultMedia.renderProfileKey,
+                        DEFAULT_RENDER_PROFILE_KEY,
+                      ),
+                      eq(resultMedia.evidenceSha256, manifest.sha256),
+                      eq(resultMedia.storageKey, media.storageKey),
+                      eq(resultMedia.sha256, verifiedSha256),
+                      eq(resultMedia.byteSize, verifiedByteSize),
+                    ),
+                  );
+              },
+            },
+          );
+        } catch (refreshError) {
+          const mediaError =
+            error instanceof Error ? error.message : String(error);
+          const invalidationError =
+            refreshError instanceof Error
+              ? refreshError.message
+              : String(refreshError);
+          throw new Error(
+            `${mediaError}; atomic media invalidation failed: ${invalidationError}`,
+          );
+        }
         throw error;
       }
       verified++;

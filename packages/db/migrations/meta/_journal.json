@@ -400,6 +400,13 @@
       "when": 1785715200000,
       "tag": "0056_exact_media_repair_ownership",
       "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "7",
+      "when": 1785801600000,
+      "tag": "0057_reassert_exact_result_selection",
+      "breakpoints": true
     }
   ]
 }

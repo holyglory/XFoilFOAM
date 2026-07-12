@@ -27,6 +27,7 @@ import {
   schedulingProfiles,
   simulationPresets,
   simulationPresetRevisions,
+  solverEvidenceArtifacts,
   solverProfiles,
   sweepDefinitions,
 } from "../src/schema";
@@ -255,6 +256,19 @@ describe("revision polar cache transaction boundary", () => {
           solvedAt: new Date(),
         })
         .returning({ id: resultAttempts.id });
+      await db.insert(solverEvidenceArtifacts).values({
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        engineJobId: null,
+        engineCaseSlug: null,
+        aoaDeg: result.aoaDeg,
+        kind: "manifest",
+        storageKey: `${PREFIX}/base-${result.aoaDeg}/manifest.json`,
+        mimeType: "application/json",
+        sha256: (result.aoaDeg + 5).toString(16).repeat(64),
+        byteSize: 128,
+      });
       await db
         .update(results)
         .set({ currentResultAttemptId: attempt.id })
@@ -489,6 +503,17 @@ describe("revision polar cache transaction boundary", () => {
         solvedAt: new Date(),
       })
       .returning({ id: resultAttempts.id });
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: target.id,
+      resultAttemptId: replacement.id,
+      airfoilId,
+      aoaDeg: 0,
+      kind: "manifest",
+      storageKey: `${PREFIX}/replacement-atomic/manifest.json`,
+      mimeType: "application/json",
+      sha256: "a".repeat(64),
+      byteSize: 128,
+    });
     const [fitBefore] = await db
       .select({ id: polarFitSets.id })
       .from(polarFitSets)
@@ -732,21 +757,20 @@ describe("revision polar cache transaction boundary", () => {
       })
       .from(resultClassifications)
       .where(eq(resultClassifications.resultId, result.id));
+    const [pointerAfterRejectedSelection] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, result.id));
     expect(resultFirstPass.state).toBe("rejected");
-    expect(resultFirstPass.regime).toBe("urans");
+    expect(resultFirstPass.regime).toBeNull();
     expect(resultFirstPass.reasons).toEqual(
       expect.arrayContaining([
         "not-solved",
         "missing-coefficients",
-        "solver-error",
         "not-converged",
-        "incomplete-urans-integration",
-        "missing-force-history",
-        "missing-urans-video",
-        "non-stationary",
-        "insufficient-periods",
       ]),
     );
+    expect(pointerAfterRejectedSelection.currentResultAttemptId).toBeNull();
     expect(
       firstPass.find(
         (classification) => classification.resultAttemptId === olderAttempt.id,
@@ -786,6 +810,17 @@ describe("revision polar cache transaction boundary", () => {
         solvedAt: new Date(),
       })
       .returning({ id: resultAttempts.id });
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: result.id,
+      resultAttemptId: acceptedAttempt.id,
+      airfoilId,
+      aoaDeg: 8,
+      kind: "manifest",
+      storageKey: `${PREFIX}/accepted/manifest.json`,
+      mimeType: "application/json",
+      sha256: "b".repeat(64),
+      byteSize: 128,
+    });
     await db.insert(resultMedia).values({
       resultId: result.id,
       resultAttemptId: acceptedAttempt.id,
@@ -925,7 +960,606 @@ describe("revision polar cache transaction boundary", () => {
     `)) as unknown as Array<{ result_id: string }>;
     expect(wrongAttemptMembers).toHaveLength(0);
 
-    // Restore classifier truth for later shared-fixture tests.
+    // Restore classifier truth, then reproduce the production regression: an
+    // accepted selected URANS generation loses its exact video and the next
+    // classifier pass changes only that attempt to missing-urans-video.
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+    const [fitBeforeMediaLoss] = await db
+      .select({ id: polarFitSets.id })
+      .from(polarFitSets)
+      .where(
+        and(
+          eq(polarFitSets.airfoilId, airfoilId),
+          eq(polarFitSets.simulationPresetRevisionId, revisionId),
+          eq(polarFitSets.isCurrent, true),
+        ),
+      );
+    const [compatibilityBeforeMediaLoss] = await db
+      .select({ id: polarCompatibilityFitSets.id })
+      .from(polarCompatibilityFitSets)
+      .where(
+        and(
+          eq(polarCompatibilityFitSets.airfoilId, airfoilId),
+          eq(polarCompatibilityFitSets.compatibilityHash, `${PREFIX}-physics`),
+          eq(polarCompatibilityFitSets.isCurrent, true),
+        ),
+      );
+    const [unaffectedAccepted] = await db
+      .select({
+        id: results.id,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, airfoilId),
+          eq(results.simulationPresetRevisionId, revisionId),
+          eq(results.aoaDeg, -2),
+        ),
+      );
+    await db
+      .delete(resultMedia)
+      .where(eq(resultMedia.resultAttemptId, acceptedAttempt.id));
+
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+
+    const [retiredResult] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, result.id));
+    const [rejectedAttempt] = await db
+      .select({
+        state: resultClassifications.state,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultAttemptId, acceptedAttempt.id));
+    const [fitAfterMediaLoss] = await db
+      .select({ id: polarFitSets.id })
+      .from(polarFitSets)
+      .where(
+        and(
+          eq(polarFitSets.airfoilId, airfoilId),
+          eq(polarFitSets.simulationPresetRevisionId, revisionId),
+          eq(polarFitSets.isCurrent, true),
+        ),
+      );
+    const pointAfterMediaLoss = await db
+      .select({ aoaDeg: polarFitPoints.aoaDeg })
+      .from(polarFitPoints)
+      .where(
+        and(
+          eq(polarFitPoints.fitSetId, fitAfterMediaLoss.id),
+          eq(polarFitPoints.aoaDeg, 8),
+        ),
+      );
+    const compatibilityAfterMediaLoss = (await db.execute(sql`
+      SELECT member.result_id
+      FROM polar_compatibility_fit_members member
+      JOIN polar_compatibility_fit_sets fit ON fit.id = member.fit_set_id
+      WHERE fit.airfoil_id = ${airfoilId}
+        AND fit.compatibility_hash = ${`${PREFIX}-physics`}
+        AND fit.is_current = true
+        AND member.result_id = ${result.id}
+    `)) as unknown as Array<{ result_id: string }>;
+    const [retiredFit] = await db
+      .select({ isCurrent: polarFitSets.isCurrent })
+      .from(polarFitSets)
+      .where(eq(polarFitSets.id, fitBeforeMediaLoss.id));
+    const [retiredCompatibility] = await db
+      .select({ isCurrent: polarCompatibilityFitSets.isCurrent })
+      .from(polarCompatibilityFitSets)
+      .where(eq(polarCompatibilityFitSets.id, compatibilityBeforeMediaLoss.id));
+    const [unaffectedAcceptedAfter] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, unaffectedAccepted.id));
+
+    expect(rejectedAttempt).toEqual({
+      state: "rejected",
+      reasons: ["missing-urans-video"],
+    });
+    expect(retiredResult.currentResultAttemptId).toBeNull();
+    expect(retiredFit.isCurrent).toBe(false);
+    expect(retiredCompatibility.isCurrent).toBe(false);
+    expect(fitAfterMediaLoss.id).not.toBe(fitBeforeMediaLoss.id);
+    expect(pointAfterMediaLoss).toHaveLength(0);
+    expect(compatibilityAfterMediaLoss).toHaveLength(0);
+    expect(unaffectedAcceptedAfter.currentResultAttemptId).toBe(
+      unaffectedAccepted.currentResultAttemptId,
+    );
+
+    // Restore exact media and republish through the same revision transaction
+    // so subsequent shared-fixture tests start from accepted truth.
+    await db.insert(resultMedia).values({
+      resultId: result.id,
+      resultAttemptId: acceptedAttempt.id,
+      kind: "video",
+      field: "velocity_magnitude",
+      role: "instantaneous",
+      storageKey: `${PREFIX}/accepted.mp4`,
+      mimeType: "video/mp4",
+      sha256: "c".repeat(64),
+      byteSize: 123,
+    });
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
+      afterAttemptClassifications: async (tx) => {
+        await tx
+          .update(results)
+          .set({ currentResultAttemptId: acceptedAttempt.id })
+          .where(eq(results.id, result.id));
+      },
+    });
+
+    // The classifier does not inspect manifests, so the publication invariant
+    // must independently withdraw an otherwise accepted selected generation
+    // when its exact manifest becomes missing/ambiguous.
+    const [fitBeforeManifestLoss] = await db
+      .select({ id: polarFitSets.id })
+      .from(polarFitSets)
+      .where(
+        and(
+          eq(polarFitSets.airfoilId, airfoilId),
+          eq(polarFitSets.simulationPresetRevisionId, revisionId),
+          eq(polarFitSets.isCurrent, true),
+        ),
+      );
+    await db
+      .delete(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, acceptedAttempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+    const [manifestlessResult] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, result.id));
+    const [stillAcceptedAttempt] = await db
+      .select({ state: resultClassifications.state })
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultAttemptId, acceptedAttempt.id));
+    const [retiredManifestFit] = await db
+      .select({ isCurrent: polarFitSets.isCurrent })
+      .from(polarFitSets)
+      .where(eq(polarFitSets.id, fitBeforeManifestLoss.id));
+    expect(stillAcceptedAttempt.state).toBe("accepted");
+    expect(manifestlessResult.currentResultAttemptId).toBeNull();
+    expect(retiredManifestFit.isCurrent).toBe(false);
+
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: result.id,
+      resultAttemptId: acceptedAttempt.id,
+      airfoilId,
+      aoaDeg: 8,
+      kind: "manifest",
+      storageKey: `${PREFIX}/accepted/manifest.json`,
+      mimeType: "application/json",
+      sha256: "b".repeat(64),
+      byteSize: 128,
+    });
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
+      afterAttemptClassifications: async (tx) => {
+        await tx
+          .update(results)
+          .set({ currentResultAttemptId: acceptedAttempt.id })
+          .where(eq(results.id, result.id));
+      },
+    });
+  }, 60_000);
+
+  it("preserves selected accepted and needs_urans exact generations", async () => {
+    const targets = await db
+      .select({
+        id: results.id,
+        aoaDeg: results.aoaDeg,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, airfoilId),
+          eq(results.simulationPresetRevisionId, revisionId),
+          inArray(results.aoaDeg, [-4, -2]),
+        ),
+      );
+    const provisional = targets.find((row) => row.aoaDeg === -4)!;
+    const accepted = targets.find((row) => row.aoaDeg === -2)!;
+    expect(provisional.currentResultAttemptId).toBeTruthy();
+    expect(accepted.currentResultAttemptId).toBeTruthy();
+
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
+      afterAttemptClassifications: async (tx) => {
+        await tx
+          .update(resultClassifications)
+          .set({
+            state: "needs_urans",
+            region: "post_stall",
+            reasons: ["test-provisional-exact-generation"],
+          })
+          .where(
+            eq(
+              resultClassifications.resultAttemptId,
+              provisional.currentResultAttemptId!,
+            ),
+          );
+      },
+    });
+
+    const after = await db
+      .select({
+        id: results.id,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(inArray(results.id, [provisional.id, accepted.id]));
+    expect(
+      after.find((row) => row.id === provisional.id)?.currentResultAttemptId,
+    ).toBe(provisional.currentResultAttemptId);
+    expect(
+      after.find((row) => row.id === accepted.id)?.currentResultAttemptId,
+    ).toBe(accepted.currentResultAttemptId);
+
+    // Restore classifier-derived accepted state for later tests.
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+  }, 60_000);
+
+  it("keeps a selected RANS projection provisional after its rejected low-AoA sibling is withdrawn", async () => {
+    const cells = await db
+      .select({
+        id: results.id,
+        aoaDeg: results.aoaDeg,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, airfoilId),
+          eq(results.simulationPresetRevisionId, revisionId),
+          inArray(results.aoaDeg, [0, 2]),
+        ),
+      );
+    const rejectedCell = cells.find((row) => row.aoaDeg === 0)!;
+    const survivingCell = cells.find((row) => row.aoaDeg === 2)!;
+    expect(rejectedCell.currentResultAttemptId).toBeTruthy();
+    expect(survivingCell.currentResultAttemptId).toBeTruthy();
+
+    const engineJobId = `${PREFIX}-low-aoa-shared-sweep`;
+    const [rejectedAttempt, survivingAttempt] = await db
+      .insert(resultAttempts)
+      .values([
+        {
+          resultId: rejectedCell.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: 0,
+          engineJobId,
+          engineCaseSlug: "a0-rejected",
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          validForPolar: false,
+          cl: 0.02,
+          cd: 0.04,
+          cm: -0.01,
+          clCd: 0.5,
+          converged: false,
+          stalled: true,
+          evidencePayload: { fidelity: "rans" },
+        },
+        {
+          resultId: survivingCell.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: 2,
+          engineJobId,
+          engineCaseSlug: "a2-surviving",
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          validForPolar: true,
+          cl: 0.2,
+          cd: 0.014,
+          cm: -0.01,
+          clCd: 0.2 / 0.014,
+          converged: true,
+          stalled: false,
+          evidencePayload: { fidelity: "rans" },
+        },
+      ])
+      .returning({ id: resultAttempts.id });
+    await db.insert(solverEvidenceArtifacts).values([
+      {
+        resultId: rejectedCell.id,
+        resultAttemptId: rejectedAttempt.id,
+        airfoilId,
+        engineJobId,
+        engineCaseSlug: "a0-rejected",
+        aoaDeg: 0,
+        kind: "manifest" as const,
+        storageKey: `${PREFIX}/low-aoa-rejected/manifest.json`,
+        mimeType: "application/json",
+        sha256: "d".repeat(64),
+        byteSize: 128,
+      },
+      {
+        resultId: survivingCell.id,
+        resultAttemptId: survivingAttempt.id,
+        airfoilId,
+        engineJobId,
+        engineCaseSlug: "a2-surviving",
+        aoaDeg: 2,
+        kind: "manifest" as const,
+        storageKey: `${PREFIX}/low-aoa-surviving/manifest.json`,
+        mimeType: "application/json",
+        sha256: "e".repeat(64),
+        byteSize: 128,
+      },
+    ]);
+
+    try {
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: rejectedAttempt.id })
+        .where(eq(results.id, rejectedCell.id));
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: survivingAttempt.id })
+        .where(eq(results.id, survivingCell.id));
+
+      const refreshed = await refreshPolarCacheForRevision(
+        db,
+        airfoilId,
+        revisionId,
+      );
+      expect(refreshed.lowAoaFailure).toBe(true);
+      expect(refreshed.fitStatus).toBe("provisional");
+
+      const projected = await db
+        .select({
+          id: results.id,
+          currentResultAttemptId: results.currentResultAttemptId,
+          state: resultClassifications.state,
+          reasons: resultClassifications.reasons,
+        })
+        .from(results)
+        .leftJoin(
+          resultClassifications,
+          eq(resultClassifications.resultId, results.id),
+        )
+        .where(inArray(results.id, [rejectedCell.id, survivingCell.id]));
+      const rejectedProjection = projected.find(
+        (row) => row.id === rejectedCell.id,
+      );
+      const survivingProjection = projected.find(
+        (row) => row.id === survivingCell.id,
+      );
+      expect(rejectedProjection?.currentResultAttemptId).toBeNull();
+      expect(rejectedProjection?.state).toBe("rejected");
+      expect(survivingProjection?.currentResultAttemptId).toBe(
+        survivingAttempt.id,
+      );
+      expect(survivingProjection?.state).toBe("needs_urans");
+      expect(survivingProjection?.reasons).toContain("low-aoa-rans-failure");
+    } finally {
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: rejectedCell.currentResultAttemptId })
+        .where(eq(results.id, rejectedCell.id));
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: survivingCell.currentResultAttemptId })
+        .where(eq(results.id, survivingCell.id));
+      await db
+        .delete(resultClassifications)
+        .where(
+          inArray(resultClassifications.resultAttemptId, [
+            rejectedAttempt.id,
+            survivingAttempt.id,
+          ]),
+        );
+      await db
+        .delete(solverEvidenceArtifacts)
+        .where(
+          inArray(solverEvidenceArtifacts.resultAttemptId, [
+            rejectedAttempt.id,
+            survivingAttempt.id,
+          ]),
+        );
+      await db
+        .delete(resultAttempts)
+        .where(
+          inArray(resultAttempts.id, [rejectedAttempt.id, survivingAttempt.id]),
+        );
+      await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+    }
+  }, 60_000);
+
+  it("supersedes only historical precalc when selected full URANS is accepted", async () => {
+    const aoaDeg = 10;
+    const force = {
+      t: [0, 0.1, 0.2],
+      cl: [0.82, 0.84, 0.83],
+      cd: [0.04, 0.041, 0.04],
+    };
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_full",
+        cl: 0.83,
+        cd: 0.04,
+        cm: -0.05,
+        clCd: 0.83 / 0.04,
+        converged: true,
+        stalled: true,
+        unsteady: true,
+      })
+      .returning({ id: results.id });
+    const [precalcAttempt, fullAttempt] = await db
+      .insert(resultAttempts)
+      .values([
+        {
+          resultId: result.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg,
+          engineJobId: `${PREFIX}-historical-precalc`,
+          engineCaseSlug: "a10-precalc",
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          validForPolar: true,
+          cl: 0.81,
+          cd: 0.041,
+          cm: -0.05,
+          clCd: 0.81 / 0.041,
+          converged: true,
+          stalled: true,
+          unsteady: true,
+          evidencePayload: {
+            fidelity: "urans_precalc",
+            force_history: force,
+            frame_track: { stationary: true, periods_retained: 3 },
+          },
+          solvedAt: new Date(Date.now() - 1_000),
+        },
+        {
+          resultId: result.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg,
+          engineJobId: `${PREFIX}-selected-full`,
+          engineCaseSlug: "a10-full",
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          validForPolar: true,
+          cl: 0.83,
+          cd: 0.04,
+          cm: -0.05,
+          clCd: 0.83 / 0.04,
+          converged: true,
+          stalled: true,
+          unsteady: true,
+          evidencePayload: {
+            fidelity: "urans_full",
+            force_history: force,
+            frame_track: { stationary: true, periods_retained: 6 },
+          },
+          solvedAt: new Date(),
+        },
+      ])
+      .returning({ id: resultAttempts.id });
+    const precalcManifestSha = "6".repeat(64);
+    const fullManifestSha = "7".repeat(64);
+    await db.insert(solverEvidenceArtifacts).values([
+      {
+        resultId: result.id,
+        resultAttemptId: precalcAttempt.id,
+        airfoilId,
+        engineJobId: `${PREFIX}-historical-precalc`,
+        engineCaseSlug: "a10-precalc",
+        aoaDeg,
+        kind: "manifest",
+        storageKey: `${PREFIX}/historical-precalc/manifest.json`,
+        mimeType: "application/json",
+        sha256: precalcManifestSha,
+        byteSize: 128,
+      },
+      {
+        resultId: result.id,
+        resultAttemptId: fullAttempt.id,
+        airfoilId,
+        engineJobId: `${PREFIX}-selected-full`,
+        engineCaseSlug: "a10-full",
+        aoaDeg,
+        kind: "manifest",
+        storageKey: `${PREFIX}/selected-full/manifest.json`,
+        mimeType: "application/json",
+        sha256: fullManifestSha,
+        byteSize: 128,
+      },
+    ]);
+    await db.insert(resultMedia).values([
+      {
+        resultId: result.id,
+        resultAttemptId: precalcAttempt.id,
+        kind: "video",
+        field: "velocity_magnitude",
+        role: "instantaneous",
+        storageKey: `${PREFIX}/historical-precalc.mp4`,
+        mimeType: "video/mp4",
+        evidenceSha256: precalcManifestSha,
+        sha256: "8".repeat(64),
+        byteSize: 128,
+      },
+      {
+        resultId: result.id,
+        resultAttemptId: fullAttempt.id,
+        kind: "video",
+        field: "velocity_magnitude",
+        role: "instantaneous",
+        storageKey: `${PREFIX}/selected-full.mp4`,
+        mimeType: "video/mp4",
+        evidenceSha256: fullManifestSha,
+        sha256: "9".repeat(64),
+        byteSize: 128,
+      },
+    ]);
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: fullAttempt.id })
+      .where(eq(results.id, result.id));
+
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+
+    const classifications = await db
+      .select({
+        resultAttemptId: resultClassifications.resultAttemptId,
+        state: resultClassifications.state,
+      })
+      .from(resultClassifications)
+      .where(
+        inArray(resultClassifications.resultAttemptId, [
+          precalcAttempt.id,
+          fullAttempt.id,
+        ]),
+      );
+    expect(
+      classifications.find(
+        (classification) =>
+          classification.resultAttemptId === precalcAttempt.id,
+      )?.state,
+    ).toBe("superseded_by_urans");
+    expect(
+      classifications.find(
+        (classification) => classification.resultAttemptId === fullAttempt.id,
+      )?.state,
+    ).toBe("accepted");
+    const [selected] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, result.id));
+    expect(selected.currentResultAttemptId).toBe(fullAttempt.id);
+
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: null })
+      .where(eq(results.id, result.id));
+    await db.delete(results).where(eq(results.id, result.id));
     await refreshPolarCacheForRevision(db, airfoilId, revisionId);
   }, 60_000);
 
@@ -1135,6 +1769,19 @@ describe("revision polar cache transaction boundary", () => {
         solvedAt: currentAttempt.solvedAt,
       })
       .returning({ id: resultAttempts.id });
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: target.id,
+      resultAttemptId: replacement.id,
+      airfoilId,
+      engineJobId: null,
+      engineCaseSlug: null,
+      aoaDeg: currentAttempt.aoaDeg,
+      kind: "manifest",
+      storageKey: `${PREFIX}/replacement-signature/manifest.json`,
+      mimeType: "application/json",
+      sha256: "c".repeat(64),
+      byteSize: 128,
+    });
     await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
       beforeEvidenceLoad: async (tx) => {
         await tx
