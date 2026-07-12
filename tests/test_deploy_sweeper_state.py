@@ -153,6 +153,29 @@ def test_deploy_scripts_fail_closed_when_sweeper_state_is_unknown(tmp_path: Path
     assert not any(" build " in call for call in calls)
 
 
+def test_control_plane_deploy_initializes_nested_sync_mountpoint_before_node_api(tmp_path: Path) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    storage_init_index = next(
+        index for index, call in enumerate(calls) if " up --no-deps storage-init" in call
+    )
+    node_api_index = next(
+        index for index, call in enumerate(calls) if " up -d --no-deps node-api" in call
+    )
+    assert storage_init_index < node_api_index
+    assert "Initializing the nested sync-imports mountpoint" in completed.stdout
+
+
 @pytest.mark.parametrize("initial_state", ["stopped", "running"])
 def test_engine_rebuild_refusal_restores_exact_prior_sweeper_state(
     tmp_path: Path, initial_state: str

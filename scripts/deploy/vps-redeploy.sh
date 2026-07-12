@@ -115,6 +115,12 @@ main() {
   echo "Quiescing the old sweeper before database migration..."
   compose stop sweeper
 
+  # `node-api` mounts `results` read-only and `sync_imports` at a nested
+  # path. Fresh result volumes therefore need the nested mountpoint created
+  # before Docker can attach the writable volume there.
+  echo "Initializing the nested sync-imports mountpoint..."
+  compose up --no-deps storage-init
+
   echo "Restarting node-api only..."
   compose up -d --no-deps node-api
   wait_http "node-api" "http://127.0.0.1:4000/health" 90
