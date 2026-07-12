@@ -92,6 +92,13 @@
   DB 53, API 221, sweeper 303, Python 426 (1 skipped), and all workspace
   typechecks; an independent post-fix audit found no release blocker. This
   verification does not enable scheduling or authorize a campaign.
+- Production rollout: commit `8c489fb` deployed through GitHub Actions run
+  `29211670566`, migration 0058 created both normalized promotion tables, and
+  the guarded engine rebuild installed matching API/worker/Node build ID
+  `prod-20260712-rans-promotion-8c489fb` after all three idle checks. Post-cutover
+  engine/Node/web health and the pinned public NACA-0012 detail route were
+  green; scheduling remained disabled with zero active jobs/campaigns and no
+  OpenFOAM process. No campaign or policy canary was launched.
 
 ## 2026-07-12 — Production precalc canary validates logical-CPU MPI and exact evidence
 

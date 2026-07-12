@@ -21,16 +21,19 @@ snapshot in Git history. Read the 2026-07-12 and 2026-07-11 entries at the top o
 - Forty-two verification rows remain as cancelled audit history.
 - There are no active, attention, or paused campaigns. The cancelled campaign
   is the only campaign row.
-- Production is migrated through 0057 and its full 47/47 polar-cache backfill
-  completed with zero failures. Commit `3cb679b` is deployed. The resulting
-  selected-generation audit has zero violations and remains clean while media
-  repair runs.
-- Current engine build is `prod-20260712-mpi-9d3de67`. Commits `d7c78ac`
-  (logical-CPU MPI slots) and `9d3de67` (deploy-time sweeper-state preservation)
-  were pushed to `master`; GitHub Actions run `29205593733` / job `86684371758`
-  succeeded. The guarded engine rebuild completed with all three idle checks,
-  matching build IDs in API/worker/Node, and preserved the sweeper's
-  then-stopped canary state.
+- Production is migrated through 0058. Conditional whole-polar promotion commit
+  `8c489fb` deployed through GitHub Actions run `29211670566` / job
+  `86700331382`; both normalized promotion tables are present. The earlier
+  0057 full 47/47 polar-cache backfill completed with zero failures, and its
+  selected-generation audit remains clean while media repair runs.
+- Current engine build is `prod-20260712-rans-promotion-8c489fb`. The guarded
+  rebuild passed all three idle checks, recreated only the coordinated engine
+  cutover set, and reports matching build IDs from API, worker, and Node. All
+  seven containers are running; engine, Node, and web health are green; the
+  worker has no OpenFOAM/meshing process. Database scheduling remains disabled
+  with zero active jobs and zero active/attention/paused campaigns. The public
+  root and the pinned NACA-0012 detail route both return 200. No campaign or
+  solver canary was launched for this policy rollout.
 - The production Clark Y AoA 15° forced-precalc canary completed in 3 minutes
   22 seconds. It used eight bounded MPI ranks, one automatic same-case
   continuation, and no external retry. The accepted `urans_precalc` point was
@@ -202,6 +205,15 @@ repeated S1223 work was deterministic waste, not transient solver recovery.
   engine-only, terminal, and process-free. The retention API correctly refused
   deletion until its six-hour fresh-lock window expires; do not remove their
   lock files to bypass that safety guard.
+- Production 0058 rollout is complete: control-plane Actions run `29211670566`
+  succeeded, the guarded engine rebuild installed
+  `prod-20260712-rans-promotion-8c489fb`, and post-cutover checks found matching
+  build IDs, both migration tables, zero active jobs/campaigns, disabled
+  scheduling, no OpenFOAM process, and HTTP 200 on the site root and pinned
+  NACA-0012 detail route. The optional password-login stale-recovery call is
+  unavailable under the production auth configuration (401); no auth boundary
+  was weakened and direct database/process checks confirmed there was no stale
+  or active solver job to recover.
 - The default local `aerodb` database contains an obsolete, never-committed
   intermediate 0047 shape. Do not treat it as migration evidence and do not add
   compatibility SQL for it. Use a new scratch database migrated from 0000.
