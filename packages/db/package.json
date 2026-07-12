@@ -19,7 +19,7 @@
     "backfill:physics-hash": "tsx src/backfill-physics-hash.ts",
     "backfill:canonical-keys": "tsx src/backfill-canonical-keys.ts",
     "backfill:airfoil-symmetry": "tsx src/backfill-airfoil-symmetry.ts",
-    "reset": "tsx src/reset.ts && pnpm run migrate && pnpm run seed",
+    "reset": "tsx src/reset.ts && corepack pnpm run migrate && corepack pnpm run seed",
     "studio": "drizzle-kit studio",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

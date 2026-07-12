@@ -1,5 +1,33 @@
 # Decision History
 
+## 2026-07-12 — A full reset seed must be launchable, not catalog-only
+
+- Trigger: the owner requested a complete production data/evidence reset followed
+  immediately by a campaign over the seeded catalog. Rehearsing the current
+  `pnpm --filter @aerodb/db reset` command showed two concrete failures: it
+  assumed a bare `pnpm` executable even when launched through Corepack, and its
+  seed intentionally restored only catalog airfoils and media definitions while
+  omitting the boundary, mesh, solver, output, and scheduling profiles required
+  by campaign materialization.
+- Options considered: retaining the prior non-seeded production profiles would
+  contradict the requested full reset; silently constructing profiles at launch
+  would make the numerical setup implicit and unreproducible; seeding a
+  deterministic baseline from the previously deployed, known-good values keeps
+  the reset self-contained, auditable, and launchable. The latter is the
+  implementation decision.
+- Implementation: the reset script invokes the repository's declared Corepack
+  package manager. The seed now idempotently restores standard airfoil boundary,
+  C-grid mesh, k-omega SST solver, complete output-field, and automatic
+  scheduling profiles using the exact values previously deployed in production.
+  The profile seed is a numerical/setup registry, not a result or evidence
+  substitute. A scratch-database must-catch test runs the actual reset command,
+  asserts exact seeded values and singleton/idempotent ownership, then launches
+  a real small campaign from the reset output.
+- Campaign assumption made for the owner's requested dimensions: standard air
+  at 288.15 K and 101,325 Pa, with the deterministic seeded profiles. The owner
+  specified chords, speeds, and angle grid but no medium/ambient values; this
+  is the ordinary seeded baseline and is recorded rather than hidden.
+
 ## 2026-07-12 — Owner approves conditional whole-polar URANS after low-angle RANS failure
 
 - Decision context presented to the owner: the 2026-07-07 background fidelity

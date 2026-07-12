@@ -2,7 +2,11 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { deriveGeometry, parseCoordinates, type AirfoilGeometry } from "@aerodb/core";
+import {
+  deriveGeometry,
+  parseCoordinates,
+  type AirfoilGeometry,
+} from "@aerodb/core";
 import { eq } from "drizzle-orm";
 
 import { createClient } from "../src/client";
@@ -15,6 +19,7 @@ import {
   mediums,
   sweeperState,
 } from "../src/schema";
+import { seedRuntimeProfiles } from "./runtime-profiles";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const seligDir = join(here, "selig-database");
@@ -65,30 +70,119 @@ const CATEGORY_SEEDS: CategorySeed[] = [
     name: "Selig Database",
     parentSlug: null,
     sortOrder: 0,
-    description: "Airfoil coordinate files imported from the Selig/UIUC coordinate database.",
+    description:
+      "Airfoil coordinate files imported from the Selig/UIUC coordinate database.",
   },
   { slug: "naca", name: "NACA", parentSlug: "selig-database", sortOrder: 0 },
-  { slug: "naca-4-digit", name: "NACA 4-digit", parentSlug: "naca", sortOrder: 0 },
-  { slug: "naca-5-digit", name: "NACA 5-digit", parentSlug: "naca", sortOrder: 1 },
-  { slug: "naca-6-series", name: "NACA 6-series", parentSlug: "naca", sortOrder: 2 },
+  {
+    slug: "naca-4-digit",
+    name: "NACA 4-digit",
+    parentSlug: "naca",
+    sortOrder: 0,
+  },
+  {
+    slug: "naca-5-digit",
+    name: "NACA 5-digit",
+    parentSlug: "naca",
+    sortOrder: 1,
+  },
+  {
+    slug: "naca-6-series",
+    name: "NACA 6-series",
+    parentSlug: "naca",
+    sortOrder: 2,
+  },
   { slug: "naca-other", name: "NACA other", parentSlug: "naca", sortOrder: 3 },
-  { slug: "gottingen", name: "Gottingen", parentSlug: "selig-database", sortOrder: 1 },
-  { slug: "eppler", name: "Eppler", parentSlug: "selig-database", sortOrder: 2 },
-  { slug: "wortmann-fx", name: "Wortmann FX", parentSlug: "selig-database", sortOrder: 3 },
-  { slug: "drela-ag", name: "Drela AG", parentSlug: "selig-database", sortOrder: 4 },
-  { slug: "selig-series", name: "Selig series", parentSlug: "selig-database", sortOrder: 5 },
-  { slug: "selig-sd", name: "SD series", parentSlug: "selig-series", sortOrder: 0 },
-  { slug: "selig-sg", name: "SG series", parentSlug: "selig-series", sortOrder: 1 },
-  { slug: "selig-s", name: "S/SC series", parentSlug: "selig-series", sortOrder: 2 },
-  { slug: "hepperle", name: "Hepperle", parentSlug: "selig-database", sortOrder: 6 },
-  { slug: "mh-series", name: "MH series", parentSlug: "hepperle", sortOrder: 0 },
-  { slug: "hq-series", name: "HQ series", parentSlug: "hepperle", sortOrder: 1 },
-  { slug: "aircraft-and-classic", name: "Aircraft and classic", parentSlug: "selig-database", sortOrder: 7 },
-  { slug: "research", name: "Research", parentSlug: "selig-database", sortOrder: 8 },
-  { slug: "other-families", name: "Other families", parentSlug: "selig-database", sortOrder: 9 },
+  {
+    slug: "gottingen",
+    name: "Gottingen",
+    parentSlug: "selig-database",
+    sortOrder: 1,
+  },
+  {
+    slug: "eppler",
+    name: "Eppler",
+    parentSlug: "selig-database",
+    sortOrder: 2,
+  },
+  {
+    slug: "wortmann-fx",
+    name: "Wortmann FX",
+    parentSlug: "selig-database",
+    sortOrder: 3,
+  },
+  {
+    slug: "drela-ag",
+    name: "Drela AG",
+    parentSlug: "selig-database",
+    sortOrder: 4,
+  },
+  {
+    slug: "selig-series",
+    name: "Selig series",
+    parentSlug: "selig-database",
+    sortOrder: 5,
+  },
+  {
+    slug: "selig-sd",
+    name: "SD series",
+    parentSlug: "selig-series",
+    sortOrder: 0,
+  },
+  {
+    slug: "selig-sg",
+    name: "SG series",
+    parentSlug: "selig-series",
+    sortOrder: 1,
+  },
+  {
+    slug: "selig-s",
+    name: "S/SC series",
+    parentSlug: "selig-series",
+    sortOrder: 2,
+  },
+  {
+    slug: "hepperle",
+    name: "Hepperle",
+    parentSlug: "selig-database",
+    sortOrder: 6,
+  },
+  {
+    slug: "mh-series",
+    name: "MH series",
+    parentSlug: "hepperle",
+    sortOrder: 0,
+  },
+  {
+    slug: "hq-series",
+    name: "HQ series",
+    parentSlug: "hepperle",
+    sortOrder: 1,
+  },
+  {
+    slug: "aircraft-and-classic",
+    name: "Aircraft and classic",
+    parentSlug: "selig-database",
+    sortOrder: 7,
+  },
+  {
+    slug: "research",
+    name: "Research",
+    parentSlug: "selig-database",
+    sortOrder: 8,
+  },
+  {
+    slug: "other-families",
+    name: "Other families",
+    parentSlug: "selig-database",
+    sortOrder: 9,
+  },
 ];
 
-function categoryPath(slug: string, bySlug: Map<string, CategorySeed>): { path: string; depth: number } {
+function categoryPath(
+  slug: string,
+  bySlug: Map<string, CategorySeed>,
+): { path: string; depth: number } {
   const chain: string[] = [];
   let cur: string | null = slug;
   while (cur) {
@@ -159,8 +253,13 @@ function categoryForStem(stem: string): string {
   if (/^s(c)?\d/.test(stem)) return "selig-s";
   if (/^mh\d/.test(stem)) return "mh-series";
   if (/^hq\d/.test(stem)) return "hq-series";
-  if (/^(nlf|nlr|rae|tsagi|dfv|dfvlr|hsnlf|oaf|r(ae)?|ui|ls|ms)/.test(stem)) return "research";
-  if (/^(clark|raf|usa|p51|b737|kc135|curtis|supermarine|davis|davissm|hobie|boeing|dae|dga)/.test(stem)) {
+  if (/^(nlf|nlr|rae|tsagi|dfv|dfvlr|hsnlf|oaf|r(ae)?|ui|ls|ms)/.test(stem))
+    return "research";
+  if (
+    /^(clark|raf|usa|p51|b737|kc135|curtis|supermarine|davis|davissm|hobie|boeing|dae|dga)/.test(
+      stem,
+    )
+  ) {
     return "aircraft-and-classic";
   }
   return "other-families";
@@ -193,19 +292,27 @@ function spacedPrefix(stem: string): string {
 
 function titleFromFile(stem: string, parsedName: string): string {
   const firstHeaderPart = parsedName.split("|")[0]?.trim();
-  const candidate = firstHeaderPart && firstHeaderPart.toLowerCase() !== "airfoil" ? firstHeaderPart : "";
+  const candidate =
+    firstHeaderPart && firstHeaderPart.toLowerCase() !== "airfoil"
+      ? firstHeaderPart
+      : "";
   const stemName = spacedPrefix(stem);
   if (!candidate) return stemName;
 
   const upperStem = stemName.replace(/\s+/g, "");
   const headerToken = candidate.split(/\s+/).slice(0, 3).join(" ");
   const upperHeader = headerToken.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-  if (upperHeader.includes(upperStem.replace(/[^A-Za-z0-9]/g, ""))) return headerToken;
+  if (upperHeader.includes(upperStem.replace(/[^A-Za-z0-9]/g, "")))
+    return headerToken;
   return stemName;
 }
 
 function tagsFor(category: CategorySeed, geo: AirfoilGeometry): string[] {
-  const tags = ["SELIG-DATABASE", category.name.toUpperCase(), geo.camberPct > 0.5 ? "CAMBERED" : "SYMMETRIC"];
+  const tags = [
+    "SELIG-DATABASE",
+    category.name.toUpperCase(),
+    geo.camberPct > 0.5 ? "CAMBERED" : "SYMMETRIC",
+  ];
   if (geo.thicknessPct <= 8) tags.push("THIN");
   if (geo.thicknessPct >= 15) tags.push("THICK");
   return Array.from(new Set(tags));
@@ -213,19 +320,32 @@ function tagsFor(category: CategorySeed, geo: AirfoilGeometry): string[] {
 
 function seligFiles(): string[] {
   return readdirSync(seligDir)
-    .filter((file) => !file.startsWith(".") && extname(file).toLowerCase() === ".dat")
+    .filter(
+      (file) => !file.startsWith(".") && extname(file).toLowerCase() === ".dat",
+    )
     .sort((a, b) => a.localeCompare(b));
 }
 
 function mediumSeeds(): MediumSeed[] {
-  const parsed = JSON.parse(readFileSync(mediumsFile, "utf8")) as MediumSeedFile;
-  if (parsed.schemaVersion !== 1) throw new Error(`unsupported mediums seed schema ${parsed.schemaVersion}`);
+  const parsed = JSON.parse(
+    readFileSync(mediumsFile, "utf8"),
+  ) as MediumSeedFile;
+  if (parsed.schemaVersion !== 1)
+    throw new Error(`unsupported mediums seed schema ${parsed.schemaVersion}`);
   if (!Array.isArray(parsed.mediums) || parsed.mediums.length < 50) {
     throw new Error("mediums seed must contain at least 50 verified mediums");
   }
-  for (const requiredSlug of ["air", "water", "hydrogen", "nitrogen", "carbon-dioxide"]) {
+  for (const requiredSlug of [
+    "air",
+    "water",
+    "hydrogen",
+    "nitrogen",
+    "carbon-dioxide",
+  ]) {
     if (!parsed.mediums.some((medium) => medium.slug === requiredSlug)) {
-      throw new Error(`mediums seed is missing required medium ${requiredSlug}`);
+      throw new Error(
+        `mediums seed is missing required medium ${requiredSlug}`,
+      );
     }
   }
   return parsed.mediums;
@@ -276,8 +396,11 @@ async function seedMediums(db: ReturnType<typeof createClient>["db"]) {
       })
       .returning({ id: mediums.id });
 
-    await db.delete(mediumViscosityTablePoints).where(eq(mediumViscosityTablePoints.mediumId, row.id));
-    const table = medium.viscosityModel === "table" ? (medium.viscosityTable ?? []) : [];
+    await db
+      .delete(mediumViscosityTablePoints)
+      .where(eq(mediumViscosityTablePoints.mediumId, row.id));
+    const table =
+      medium.viscosityModel === "table" ? (medium.viscosityTable ?? []) : [];
     if (table.length) {
       await db.insert(mediumViscosityTablePoints).values(
         table.map((point, i) => ({
@@ -294,22 +417,41 @@ async function seedMediums(db: ReturnType<typeof createClient>["db"]) {
 
 async function main() {
   const { db, sql } = createClient({ max: 1 });
-  console.log("Seeding Airfoils.Pro from Selig coordinate files and verified medium data...");
+  console.log(
+    "Seeding Airfoils.Pro from Selig coordinate files and verified medium data...",
+  );
 
   const catBySlug = new Map(CATEGORY_SEEDS.map((c) => [c.slug, c]));
   const catId = new Map<string, string>();
   const ordered = [...CATEGORY_SEEDS].sort(
-    (a, b) => categoryPath(a.slug, catBySlug).depth - categoryPath(b.slug, catBySlug).depth || a.sortOrder - b.sortOrder,
+    (a, b) =>
+      categoryPath(a.slug, catBySlug).depth -
+        categoryPath(b.slug, catBySlug).depth || a.sortOrder - b.sortOrder,
   );
   for (const c of ordered) {
     const { path, depth } = categoryPath(c.slug, catBySlug);
-    const parentId = c.parentSlug ? catId.get(c.parentSlug) ?? null : null;
+    const parentId = c.parentSlug ? (catId.get(c.parentSlug) ?? null) : null;
     const [row] = await db
       .insert(categories)
-      .values({ slug: c.slug, name: c.name, parentId, path, depth, sortOrder: c.sortOrder, description: c.description })
+      .values({
+        slug: c.slug,
+        name: c.name,
+        parentId,
+        path,
+        depth,
+        sortOrder: c.sortOrder,
+        description: c.description,
+      })
       .onConflictDoUpdate({
         target: categories.slug,
-        set: { name: c.name, parentId, path, depth, sortOrder: c.sortOrder, description: c.description },
+        set: {
+          name: c.name,
+          parentId,
+          path,
+          depth,
+          sortOrder: c.sortOrder,
+          description: c.description,
+        },
       })
       .returning({ id: categories.id });
     catId.set(c.slug, row.id);
@@ -317,6 +459,8 @@ async function main() {
   console.log(`  ok ${CATEGORY_SEEDS.length} categories`);
 
   await seedMediums(db);
+  await seedRuntimeProfiles(db);
+  console.log("  ok campaign runtime profiles");
 
   const files = seligFiles();
   let imported = 0;
@@ -380,14 +524,19 @@ async function main() {
         .onConflictDoUpdate({ target: airfoils.slug, set: updatable })
         .returning({ id: airfoils.id });
 
-      await db.delete(airfoilHashtags).where(eq(airfoilHashtags.airfoilId, row.id));
+      await db
+        .delete(airfoilHashtags)
+        .where(eq(airfoilHashtags.airfoilId, row.id));
       for (const tag of tags) {
         const [h] = await db
           .insert(hashtags)
           .values({ slug: tagSlug(tag), name: tag })
           .onConflictDoUpdate({ target: hashtags.slug, set: { name: tag } })
           .returning({ id: hashtags.id });
-        await db.insert(airfoilHashtags).values({ airfoilId: row.id, hashtagId: h.id }).onConflictDoNothing();
+        await db
+          .insert(airfoilHashtags)
+          .values({ airfoilId: row.id, hashtagId: h.id })
+          .onConflictDoNothing();
       }
       imported += 1;
     } catch (err) {
@@ -398,7 +547,8 @@ async function main() {
   console.log(`  ok ${imported}/${files.length} airfoils imported`);
   if (errors.length) {
     console.error(errors.slice(0, 25).join("\n"));
-    if (errors.length > 25) console.error(`... ${errors.length - 25} more errors`);
+    if (errors.length > 25)
+      console.error(`... ${errors.length - 25} more errors`);
     throw new Error(`failed to import ${errors.length} Selig coordinate files`);
   }
 
@@ -406,7 +556,9 @@ async function main() {
   console.log("  ok sweeper_state");
 
   await sql.end();
-  console.log("Done. Airfoils and mediums are seeded; boundary conditions, jobs, results, and media are intentionally empty after reset.");
+  console.log(
+    "Done. Airfoils and mediums are seeded; boundary conditions, jobs, results, and media are intentionally empty after reset.",
+  );
 }
 
 main().catch((err) => {
