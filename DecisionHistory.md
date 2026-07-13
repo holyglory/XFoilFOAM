@@ -93,6 +93,20 @@
   a stale job without current obligation ownership remains quarantined. A
   production-shaped must-catch test covers successful publication; the prior
   released/stale-job false-positive suite remains mandatory.
+- Monitored-rollout correction: the first automatically recovered PRECALC job
+  also exposed a media-contract mismatch. A real transient run at AoA 1
+  measured no shedding and therefore published a steady-equivalent point; its
+  immutable engine manifest expected instantaneous stills only and retained
+  245 raw transient time directories, but the controller demanded mean images
+  and video merely because the fidelity echo remained `urans_precalc`. Three
+  impossible render retries would have turned valid preliminary evidence into
+  machine-unavailable work. Decision: default-media requirements follow the
+  measured attempt regime (`unsteady`/`urans`), not the job tier. True unsteady
+  evidence still fails closed without exact force history, mean fields, and
+  video. A no-shedding steady-equivalent attempt requires its exact manifest,
+  field extents, and instantaneous stills and must never invent or demand a
+  static video. The production-shaped false-positive guard now pins this
+  distinction alongside the existing missing-video URANS must-catch tests.
 - UI ownership: campaign polling must distinguish automatic mesh repair in
   progress from terminal machine unavailability using bounded stored counters.
   It must show the plain-language cause and real next action, expose no internal

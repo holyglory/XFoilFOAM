@@ -1588,8 +1588,13 @@ async function renderScaledMediaRows(opts: {
         `default-media render refused for result ${result.id}: stored chord and flow speed must be finite and positive`,
       );
     }
-    const requiresTransientMedia =
-      result.unsteady || result.fidelity === "urans_precalc";
+    // Media requirements follow the measured physical regime, not the job
+    // tier. A PRECALC transient that measures no shedding is published as a
+    // steady-equivalent RANS point and its immutable engine manifest truthfully
+    // expects instantaneous stills only. Requiring a video from that one-frame
+    // VTK window creates an impossible repair obligation. Truly unsteady
+    // evidence remains fail-closed on mean fields and real videos.
+    const requiresTransientMedia = result.unsteady;
     const response = await opts.engine.renderDefaultMedia(result.engineJobId, {
       case_slug: result.engineCaseSlug,
       evidence_base: manifest.evidenceBase,
@@ -1600,8 +1605,6 @@ async function renderScaledMediaRows(opts: {
       scales: {
         [opts.field]: { vmin: opts.scale.vmin, vmax: opts.scale.vmax },
       },
-      // A no-shedding precalc is represented as steady-equivalent, but its
-      // fidelity proves a transient evidence window exists and owns video.
       unsteady: requiresTransientMedia,
       zoom_chords: 2,
       scale_version: opts.scale.version,
@@ -2274,8 +2277,7 @@ export async function repairDefaultMediaForStoredResult(opts: {
         eq(resultMedia.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
       ),
     );
-  const requiresVideo =
-    attempt.unsteady || payload.fidelity === "urans_precalc";
+  const requiresVideo = attempt.unsteady;
   for (const field of freshFields) {
     const required: Array<{
       kind: "image" | "video";
@@ -2419,13 +2421,7 @@ export async function verifyStoredDefaultMediaForResult(
         eq(resultMedia.evidenceSha256, manifest.sha256),
       ),
     );
-  const fidelity = payloadField<string>(
-    attempt.evidencePayload,
-    "fidelity",
-    "fidelity",
-  );
-  const requiresTransientMedia =
-    attempt.unsteady || fidelity === "urans_precalc";
+  const requiresTransientMedia = attempt.unsteady;
   let verified = 0;
   for (const extent of extents) {
     const scale = scales.find((candidate) => candidate.field === extent.field);

@@ -1875,7 +1875,7 @@ describe("durable result media repair", () => {
     expect(firstRepair.state).toBe("pending");
   });
 
-  it("renders a steady-equivalent precalc as transient media", async () => {
+  it("FALSE-POSITIVE GUARD: a no-shedding PRECALC result needs exact stills, not an invented transient video", async () => {
     const fixture = await createSolvedResult("no-shedding", {
       unsteady: false,
       fidelity: "urans_precalc",
@@ -1894,7 +1894,7 @@ describe("durable result media repair", () => {
     );
     expect(outcome.finalized).toBe(1);
     expect(unsteadyFlags.length).toBeGreaterThan(0);
-    expect(unsteadyFlags.every(Boolean)).toBe(true);
+    expect(unsteadyFlags.every((flag) => flag === false)).toBe(true);
     const videos = await db
       .select()
       .from(resultMedia)
@@ -1904,6 +1904,6 @@ describe("durable result media repair", () => {
           eq(resultMedia.kind, "video"),
         ),
       );
-    expect(videos.length).toBeGreaterThan(0);
+    expect(videos).toHaveLength(0);
   });
 });

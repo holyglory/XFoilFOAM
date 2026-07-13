@@ -99,7 +99,7 @@ const exactAttemptMediaComplete = sql`
                 AND media.mime_type LIKE 'image/%'
             )
             OR (
-              (attempt.unsteady = true OR attempt.evidence_payload ->> 'fidelity' = 'urans_precalc')
+              attempt.unsteady = true
               AND (
                 NOT EXISTS (
                   SELECT 1 FROM result_media media
@@ -290,7 +290,7 @@ export async function discoverMissingResultMediaRepairs(
                     AND media.mime_type LIKE 'image/%'
                 )
                 OR (
-                  (candidate.unsteady = true OR candidate.evidence_payload ->> 'fidelity' = 'urans_precalc')
+                  candidate.unsteady = true
                   AND (
                     NOT EXISTS (
                       SELECT 1 FROM result_media media
