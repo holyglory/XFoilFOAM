@@ -313,8 +313,10 @@ async function remoteProvenanceForPromotionObligations(
  * A still-live ingest lease is deliberately excluded: the ingest owner that
  * recorded the event gets the first chance to compose. A crashed owner becomes
  * eligible after lease expiry, while a terminal parent is immediately safe to
- * recover. Campaign events retain the normal zero-open-RANS gate; background
- * and remote parents are recovered independently of campaign enumeration. */
+ * recover. A recorded conditional whole-polar promotion bypasses the normal
+ * campaign-wide RANS gate: its exact parent, condition, and original angle
+ * list are already immutable in the promotion ledger, so unrelated campaign
+ * cells must not delay its preliminary replacement. */
 async function submitRecordedPromotionRecovery(
   db: DB,
   engine: EngineClient,
@@ -326,53 +328,11 @@ async function submitRecordedPromotionRecovery(
   },
 ): Promise<boolean> {
   const scope = promotionRecoveryScopeSql(opts);
-  const campaignRows = (await db.execute(sql`
-    SELECT DISTINCT promotion.campaign_id
-    FROM sim_rans_polar_promotions promotion
-    JOIN sim_jobs parent ON parent.id = promotion.parent_job_id
-    JOIN sim_campaigns campaign ON campaign.id = promotion.campaign_id
-    WHERE (${scope})
-      AND promotion.owner_kind = 'campaign'
-      AND campaign.status IN ('active', 'attention')
-      AND EXISTS (
-        SELECT 1
-        FROM sim_rans_polar_promotion_points point
-        JOIN sim_precalc_obligations obligation
-          ON obligation.id = point.obligation_id
-        WHERE point.promotion_id = promotion.id
-          AND obligation.state = 'pending'
-          AND obligation.attempt_count < obligation.max_attempts
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM sim_jobs live_child
-        WHERE live_child.parent_job_id = parent.id
-          AND live_child.wave = 2
-          AND live_child.status IN ('pending', 'submitted', 'running', 'ingesting')
-      )
-    ORDER BY promotion.campaign_id
-  `)) as unknown as Array<{ campaign_id: string }>;
-  const readyCampaignIds: string[] = [];
-  for (const row of campaignRows) {
-    if (!(await campaignHasOpenRansGaps(db, row.campaign_id)))
-      readyCampaignIds.push(row.campaign_id);
-  }
-  const readyCampaignSql = readyCampaignIds.length
-    ? sql`promotion.campaign_id = ANY(${sql`ARRAY[${sql.join(
-        readyCampaignIds.map((id) => sql`${id}::uuid`),
-        sql`, `,
-      )}]`})`
-    : sql`false`;
-
   const candidates = (await db.execute(sql`
     SELECT promotion.id AS promotion_id, parent.id AS parent_job_id
     FROM sim_rans_polar_promotions promotion
     JOIN sim_jobs parent ON parent.id = promotion.parent_job_id
     WHERE (${scope})
-      AND (
-        promotion.owner_kind <> 'campaign'
-        OR (${readyCampaignSql})
-      )
       AND (
         parent.status IN ('done', 'failed', 'cancelled')
         OR (

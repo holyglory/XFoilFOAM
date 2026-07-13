@@ -28,6 +28,25 @@
   specified chords, speeds, and angle grid but no medium/ambient values; this
   is the ordinary seeded baseline and is recorded rather than hidden.
 
+## 2026-07-13 — A recorded whole-polar promotion bypasses unrelated campaign RANS work
+
+- Trigger: the owner-approved whole-polar promotion fired in the reset campaign
+  after an observed `simpleFoam` SIGFPE, but its exact preliminary-URANS
+  obligations were deferred behind every other open RANS cell in the 632,190
+  point campaign. That made the promised replacement wait for unrelated
+  airfoils and conditions instead of producing the preliminary result quickly.
+- This is not a new owner policy. The recorded owner decision below already
+  says a qualifying failure replaces the exact parent job's original requested
+  polar and cannot widen siblings. The implementation correction is therefore
+  to let only the durable, exact conditional-promotion recovery bypass the
+  campaign-wide RANS gate. Ordinary targeted retries, explicit single-angle
+  work, mesh failures, infrastructure failures, and sibling conditions retain
+  the existing gate and scopes.
+- The promotion ledger remains the authority: parent job, physical condition,
+  immutable revision, original requested angles, and per-angle obligations are
+  all revalidated transactionally before the wave-2 submission. This is not a
+  blanket URANS-priority change.
+
 ## 2026-07-12 — Owner approves conditional whole-polar URANS after low-angle RANS failure
 
 - Decision context presented to the owner: the 2026-07-07 background fidelity
