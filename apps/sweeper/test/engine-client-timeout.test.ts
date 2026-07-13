@@ -12,6 +12,7 @@ import {
   ENGINE_POLL_TIMEOUT_MS,
   ENGINE_RENDER_TIMEOUT_MS,
   ENGINE_SUBMIT_TIMEOUT_MS,
+  MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
   EngineClient,
   EngineError,
   EngineTimeoutError,
@@ -42,6 +43,20 @@ beforeAll(async () => {
     /* saturated engine: hold the request open forever */
   });
   liveServer = createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/polars") {
+      res.writeHead(409, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          detail: {
+            code: MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
+            requested_version: 1,
+            actual_version: 2,
+            message: "mesh recovery changed during rolling cutover",
+          },
+        }),
+      );
+      return;
+    }
     if (req.url?.includes("boom")) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end('{"error":"solver exploded"}');
@@ -50,7 +65,10 @@ beforeAll(async () => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end('{"job_id":"j1","state":"running","total_cases":3}');
   });
-  [hungUrl, liveUrl] = await Promise.all([listen(hungServer), listen(liveServer)]);
+  [hungUrl, liveUrl] = await Promise.all([
+    listen(hungServer),
+    listen(liveServer),
+  ]);
 });
 
 afterAll(async () => {
@@ -105,10 +123,14 @@ describe("engine-client AbortSignal timeouts", () => {
 
   it("hung render/extents calls honor the per-call override too", async () => {
     const client = new EngineClient(hungUrl);
-    await expect(client.computeFieldExtents("job-1", { fields: [] } as never, { timeoutMs: 150 })).rejects.toBeInstanceOf(
-      EngineTimeoutError,
-    );
-    await expect(client.renderDefaultMedia("job-1", {} as never, { timeoutMs: 150 })).rejects.toBeInstanceOf(EngineTimeoutError);
+    await expect(
+      client.computeFieldExtents("job-1", { fields: [] } as never, {
+        timeoutMs: 150,
+      }),
+    ).rejects.toBeInstanceOf(EngineTimeoutError);
+    await expect(
+      client.renderDefaultMedia("job-1", {} as never, { timeoutMs: 150 }),
+    ).rejects.toBeInstanceOf(EngineTimeoutError);
   });
 
   it("hung health probe resolves false (existing contract) instead of hanging or throwing", async () => {
@@ -135,6 +157,22 @@ describe("engine-client AbortSignal timeouts", () => {
     expect(caught).not.toBeInstanceOf(EngineTimeoutError);
     expect((caught as EngineError).status).toBe(500);
     // The engine ANSWERED → the sweeper's `failed` path, not release+backoff.
+    expect(isEngineConnectionFailure(caught)).toBe(false);
+  });
+
+  it("MUST-CATCH: a structured mesh-recovery cutover conflict retains its stable error code", async () => {
+    const client = new EngineClient(liveUrl);
+    let caught: unknown;
+    try {
+      await client.submitPolar({} as PolarRequest, { timeoutMs: 2_000 });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(EngineError);
+    expect(caught).toMatchObject({
+      status: 409,
+      code: MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
+    });
     expect(isEngineConnectionFailure(caught)).toBe(false);
   });
 });

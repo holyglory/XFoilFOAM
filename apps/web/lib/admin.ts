@@ -1409,6 +1409,26 @@ export interface CampaignProgressTotals {
   remaining: number;
 }
 
+export type CampaignRemediationReason =
+  | "mesh_quality"
+  | "precalc_attempts_exhausted"
+  | "engine_submit_rejected"
+  | "other_unavailable";
+
+export interface CampaignRemediationSummary {
+  /** Open automatic mesh recovery; excluded from the blocked total. */
+  repairing: number;
+  /** Exact sum of terminal remediation groups and campaign totals.blocked. */
+  blocked: number;
+  /** Bounded reason model: never carries raw errors, job ids, or batch ids. */
+  groups: Array<{
+    reason: CampaignRemediationReason;
+    state: "repairing" | "blocked";
+    owner: "system" | "operator";
+    points: number;
+  }>;
+}
+
 /** Rolling-compatibility ladder split. `awaitingUrans` is machine-owned stage-2
  *  work. `needsReview` is retained as a legacy wire key, but the canonical
  *  server predicate is empty; clients must describe any nonzero old payload as
@@ -1478,7 +1498,15 @@ export interface AdminCampaignListItem {
   updatedAt: string;
   conditionCount: number;
   airfoilCount: number;
+  excludedAirfoilCount: number;
+  latestLifecycleEvent: {
+    action: string;
+    actor: string | null;
+    reason: string | null;
+    createdAt: string;
+  } | null;
   totals: CampaignProgressTotals;
+  remediation: CampaignRemediationSummary;
   reviewBuckets?: CampaignReviewBuckets;
   automaticPrecalcOpen: number;
 }
@@ -1527,6 +1555,7 @@ export interface AdminCampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  remediation: CampaignRemediationSummary;
   /** Rolling-compatibility ladder split. Optional: older APIs omit it. */
   reviewBuckets?: CampaignReviewBuckets;
   /** Fidelity ladder per-tier open counts (contract 7). Optional: older API
@@ -1541,6 +1570,8 @@ export interface AdminCampaignSummary {
     | "completed"
     | null;
   airfoilCount: number;
+  excludedAirfoilCount: number;
+  latestLifecycleEvent: AdminCampaignListItem["latestLifecycleEvent"];
   conditions: AdminCampaignConditionSummary[];
   lanesSummary: Record<string, Record<string, number>>;
   scheduler: {

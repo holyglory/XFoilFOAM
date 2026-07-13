@@ -11,6 +11,7 @@ import {
   type AdminCampaignListItem,
   type AdminCampaignsSolverState,
   type AdminCampaignSummary,
+  campaignVerb,
   getCampaign,
   getCampaignDuplicatePrefill,
   listCampaigns,
@@ -22,7 +23,10 @@ import {
   type SolverStateName,
 } from "@/lib/solver-state";
 import type { CampaignPointsBucket } from "@/lib/point-history";
-import { gateFromSolverState } from "./campaign-status";
+import {
+  gateFromSolverState,
+  pausedCampaignStatusText,
+} from "./campaign-status";
 import { stashDuplicatePrefill } from "./wizard-draft";
 import { usePoll } from "./usePoll";
 import {
@@ -93,7 +97,10 @@ function statusLine(
   }
   if (item.status === "paused") {
     const running = scheduler?.campaignJobsRunning ?? 0;
-    return `Paused by you — no new points will be scheduled${running > 0 ? `; ${running} running job${running === 1 ? "" : "s"} will finish` : ""}.`;
+    return pausedCampaignStatusText(
+      summary?.latestLifecycleEvent ?? item.latestLifecycleEvent,
+      running,
+    );
   }
   if (item.status === "attention") {
     const automaticPrecalc = item.automaticPrecalcOpen ?? 0;
@@ -199,6 +206,9 @@ export function CampaignsHub({
     useState<AdminCampaignsSolverState | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<"duplicate" | "resume" | null>(
+    null,
+  );
   const segmentRef = useRef(segment);
   segmentRef.current = segment;
 
@@ -284,6 +294,7 @@ export function CampaignsHub({
 
   const duplicate = async (item: AdminCampaignListItem) => {
     setBusyId(item.id);
+    setBusyAction("duplicate");
     setErr(null);
     try {
       const prefill = await getCampaignDuplicatePrefill(item.id);
@@ -295,6 +306,22 @@ export function CampaignsHub({
       setErr((e as Error).message);
     } finally {
       setBusyId(null);
+      setBusyAction(null);
+    }
+  };
+
+  const resume = async (item: AdminCampaignListItem) => {
+    setBusyId(item.id);
+    setBusyAction("resume");
+    setErr(null);
+    try {
+      await campaignVerb(item.id, "resume");
+      await refresh();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
     }
   };
 
@@ -415,6 +442,8 @@ export function CampaignsHub({
             const summary = summaries[item.id];
             const totals = summary?.totals ?? item.totals;
             const blocked = totals.blocked ?? 0;
+            const repairing =
+              summary?.remediation.repairing ?? item.remediation.repairing;
             const settled = totals.solved + totals.derived;
             const progress =
               totals.requested > 0
@@ -552,21 +581,27 @@ export function CampaignsHub({
                   >
                     {priorityLabel(item.priority)}
                   </span>
-                  <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-                    <button
-                      type="button"
-                      data-testid={`campaign-duplicate-${item.slug}`}
-                      disabled={busyId === item.id}
-                      onClick={() => duplicate(item)}
-                      style={{
-                        ...ghostBtn,
-                        padding: "5px 10px",
-                        fontSize: 10,
-                        opacity: busyId === item.id ? 0.6 : 1,
-                      }}
-                    >
-                      {busyId === item.id ? "preparing…" : "Duplicate"}
-                    </button>
+                  <span
+                    className={`campaign-card-actions${item.status === "paused" ? " campaign-card-actions-paused" : ""}`}
+                    style={{ marginLeft: "auto", display: "flex", gap: 6 }}
+                  >
+                    {item.status === "paused" && (
+                      <button
+                        type="button"
+                        data-testid={`campaign-resume-${item.slug}`}
+                        disabled={busyId === item.id}
+                        onClick={() => void resume(item)}
+                        style={{
+                          ...primaryBtn(busyId === item.id),
+                          padding: "5px 14px",
+                          fontSize: 10,
+                        }}
+                      >
+                        {busyId === item.id && busyAction === "resume"
+                          ? "resuming…"
+                          : "Resume"}
+                      </button>
+                    )}
                     <button
                       type="button"
                       data-testid={`campaign-open-${item.slug}`}
@@ -581,8 +616,53 @@ export function CampaignsHub({
                     >
                       Open
                     </button>
+                    <button
+                      type="button"
+                      data-testid={`campaign-duplicate-${item.slug}`}
+                      disabled={busyId === item.id}
+                      onClick={() => duplicate(item)}
+                      style={{
+                        ...ghostBtn,
+                        padding: "5px 10px",
+                        fontSize: 10,
+                        opacity: busyId === item.id ? 0.6 : 1,
+                      }}
+                    >
+                      {busyId === item.id && busyAction === "duplicate"
+                        ? "preparing…"
+                        : "Duplicate"}
+                    </button>
                   </span>
                 </div>
+
+                {repairing > 0 && (
+                  <div
+                    data-testid={`campaign-mesh-repair-${item.slug}`}
+                    style={{
+                      display: "grid",
+                      gap: 3,
+                      padding: "8px 10px",
+                      borderRadius: 8,
+                      border: "1px solid rgba(245,158,11,0.45)",
+                      background: "rgba(245,158,11,0.06)",
+                      fontFamily: MONO,
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: C.amber,
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: "0.04em",
+                      }}
+                    >
+                      AUTOMATIC MESH REPAIR · {fCount(repairing)} POINTS
+                    </span>
+                    <span style={{ color: C.text2, fontSize: 10 }}>
+                      Trying a safer mesh automatically — no action needed.
+                    </span>
+                  </div>
+                )}
 
                 <div
                   data-testid={`campaign-status-line-${item.slug}`}
@@ -785,6 +865,13 @@ export function CampaignsHub({
                 >
                   <span>{fCount(item.airfoilCount)} airfoils</span>
                   <span>· {fCount(item.conditionCount)} conditions</span>
+                  {item.excludedAirfoilCount > 0 && (
+                    <span>
+                      · {fCount(item.excludedAirfoilCount)} incomplete source
+                      record{item.excludedAirfoilCount === 1 ? "" : "s"}{" "}
+                      excluded
+                    </span>
+                  )}
                   {reValues.slice(0, 6).map((re) => (
                     <span
                       key={re}

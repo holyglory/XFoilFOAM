@@ -37,6 +37,7 @@ import {
   simCampaignPoints,
   simJobs,
   simPrecalcObligationCampaigns,
+  simPrecalcObligationAttempts,
   simPrecalcObligations,
   simRansPolarPromotionPoints,
   simRansPolarPromotions,
@@ -808,6 +809,174 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       parentState: "done",
       conditionMapEntry: conditionMapEntryFor([4.25, 4.5]),
     });
+    const typedMeshBlockedPromotion = await seedRecovery({
+      requestedAoas: [4.26, 4.51],
+      campaignOwned: true,
+      suffix: "typed-mesh-blocked",
+      parentState: "done",
+      conditionMapEntry: conditionMapEntryFor([4.26, 4.51]),
+    });
+    const typedInfrastructurePromotion = await seedRecovery({
+      requestedAoas: [4.27, 4.52],
+      campaignOwned: true,
+      suffix: "typed-infrastructure-not-mesh",
+      parentState: "done",
+      conditionMapEntry: conditionMapEntryFor([4.27, 4.52]),
+    });
+    const typedPriorChildren = await db
+      .insert(simJobs)
+      .values(
+        [
+          {
+            promotion: meshBlockedPromotion,
+            suffix: "legacy-current-mesh-child",
+            aoas: [4.25, 4.5],
+            evidenceAoa: 4.25,
+            disposition: null,
+            error:
+              "mesh degenerate at this fidelity tier: max non-orthogonality exceeds threshold",
+          },
+          {
+            promotion: typedMeshBlockedPromotion,
+            suffix: "typed-current-mesh-child",
+            aoas: [4.26, 4.51],
+            evidenceAoa: 4.26,
+            disposition: "deterministic_mesh",
+            error: "checkMesh found negative-volume cells",
+          },
+          {
+            promotion: typedInfrastructurePromotion,
+            suffix: "typed-current-infrastructure-child",
+            aoas: [4.27, 4.52],
+            evidenceAoa: 4.27,
+            disposition: "infrastructure",
+            // Typed evidence is authoritative even if an infrastructure
+            // diagnostic quotes both legacy deterministic-mesh phrases.
+            error:
+              "mesh worker connection closed after reporting mesh degenerate at this fidelity tier and max non-orthogonality",
+          },
+        ].map(({ promotion, suffix, aoas }) => ({
+          parentJobId: promotion.parentJobId,
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          campaignId: null,
+          jobKind: "targeted" as const,
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "failed" as const,
+          engineJobId: `${PREFIX}-${suffix}`,
+          submittedAt: new Date(),
+          finishedAt: new Date(),
+          totalCases: 2,
+          requestPayload: {
+            aoas,
+            conditionId: campaignCondition!.conditionId,
+            uransFidelity: "precalc",
+            meshRecoveryVersion: 1,
+            executedMeshRecoveryVersion: 1,
+            precalcObligationIds: promotion.obligationIds,
+          },
+        })),
+      )
+      .returning();
+    await db.insert(resultAttempts).values(
+      typedPriorChildren.map((child, index) => ({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: [4.25, 4.26, 4.27][index],
+        simJobId: child.id,
+        engineJobId: child.engineJobId,
+        status: "failed" as const,
+        source: "queued" as const,
+        regime: "urans" as const,
+        validForPolar: false,
+        converged: false,
+        error: [
+          "mesh degenerate at this fidelity tier: max non-orthogonality exceeds threshold",
+          "checkMesh found negative-volume cells",
+          "mesh worker connection closed before quality checks",
+        ][index],
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          ...(index === 0
+            ? {}
+            : {
+                failure_disposition:
+                  index === 1 ? "deterministic_mesh" : "infrastructure",
+              }),
+        },
+        solvedAt: new Date(),
+      })),
+    );
+    const upgradeableMeshBlockedPromotion = await seedRecovery({
+      // The first angle is the typed whole-polar trigger and therefore must
+      // remain inside the contract's inclusive 0..5 degree range. The
+      // replacement scope itself may extend above that range.
+      requestedAoas: [4.6, 5.6],
+      campaignOwned: true,
+      suffix: "mesh-blocked-requested-v1-executed-v0",
+      parentState: "done",
+      conditionMapEntry: conditionMapEntryFor([4.6, 5.6]),
+    });
+    const [legacyMeshChild] = await db
+      .insert(simJobs)
+      .values({
+        parentJobId: upgradeableMeshBlockedPromotion.parentJobId,
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        campaignId: null,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "failed",
+        engineJobId: `${PREFIX}-requested-v1-executed-v0-mesh-child`,
+        submittedAt: new Date(),
+        finishedAt: new Date(),
+        totalCases: 2,
+        requestPayload: {
+          aoas: [4.6, 5.6],
+          conditionId: campaignCondition!.conditionId,
+          uransFidelity: "precalc",
+          // The scheduler asked for v1, but the old worker supplied no
+          // execution acknowledgement. Requested intent must never masquerade
+          // as executed provenance, so immutable attempt truth remains v0 and
+          // a real v1 repair is still eligible.
+          meshRecoveryVersion: 1,
+          executedMeshRecoveryVersion: 0,
+          precalcObligationIds: upgradeableMeshBlockedPromotion.obligationIds,
+        },
+      })
+      .returning();
+    await db.insert(simPrecalcObligationAttempts).values(
+      upgradeableMeshBlockedPromotion.obligationIds.map((obligationId) => ({
+        obligationId,
+        simJobId: legacyMeshChild.id,
+        attemptNumber: 1,
+        state: "failed" as const,
+        outcome: "deterministic_failure",
+        error: "checkMesh found negative-volume cells",
+        completedAt: new Date(),
+      })),
+    );
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "blocked",
+        attemptCount: 1,
+        latestSimJobId: legacyMeshChild.id,
+        lastOutcome: "deterministic_failure",
+        lastError: "checkMesh found negative-volume cells",
+        completedAt: new Date(),
+      })
+      .where(
+        inArray(
+          simPrecalcObligations.id,
+          upgradeableMeshBlockedPromotion.obligationIds,
+        ),
+      );
     const cancelledBackgroundPromotion = await seedRecovery({
       requestedAoas: [4.75, 5.25],
       campaignOwned: false,
@@ -925,6 +1094,11 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     const submitted: PolarRequest[] = [];
     let engineSequence = 0;
     const engine = {
+      healthDetails: async () => ({
+        status: "ok",
+        version: "test",
+        mesh_recovery_version: 1,
+      }),
       submitPolar: async (request: PolarRequest): Promise<JobStatus> => {
         submitted.push(request);
         engineSequence += 1;
@@ -984,6 +1158,9 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       backgroundPromotion.parentJobId,
       liveLeasePromotion.parentJobId,
       meshBlockedPromotion.parentJobId,
+      typedMeshBlockedPromotion.parentJobId,
+      typedInfrastructurePromotion.parentJobId,
+      upgradeableMeshBlockedPromotion.parentJobId,
       cancelledBackgroundPromotion.parentJobId,
       cancelledParentCampaignOwnedWithBackgroundCoowner.parentJobId,
       cancelDuringSubmitPromotion.parentJobId,
@@ -1063,6 +1240,18 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     // fall through to the generic gated-parent path, reinterpret the drifted
     // parent scope as a targeted retry, and compose an unbound wave-2 child.
     expect(submitted).toHaveLength(0);
+    expect(
+      await uransLadderTick(
+        db,
+        engine,
+        0,
+        recoveryScope([typedMeshBlockedPromotion.promotionId]),
+      ),
+    ).toBe(false);
+    // Typed deterministic_mesh is authoritative even when the human error text
+    // lacks both legacy markers. Typed infrastructure remains schedulable even
+    // when its diagnostic happens to contain both legacy marker phrases.
+    expect(submitted).toHaveLength(0);
     await db
       .update(simJobs)
       .set({ ingestLeaseExpiresAt: new Date(Date.now() - 1_000) })
@@ -1073,6 +1262,9 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       backgroundPromotion.promotionId,
       liveLeasePromotion.promotionId,
       meshBlockedPromotion.promotionId,
+      typedMeshBlockedPromotion.promotionId,
+      typedInfrastructurePromotion.promotionId,
+      upgradeableMeshBlockedPromotion.promotionId,
       cancelledBackgroundPromotion.promotionId,
       cancelledParentCampaignOwnedWithBackgroundCoowner.promotionId,
       cancelDuringSubmitPromotion.promotionId,
@@ -1090,7 +1282,13 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     expect(
       await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
     ).toBe(true);
-    expect(submitted).toHaveLength(4);
+    expect(
+      await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
+    ).toBe(true);
+    expect(
+      await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
+    ).toBe(true);
+    expect(submitted).toHaveLength(6);
     expect(
       submitted
         .map((request) => request.aoa?.angles)
@@ -1100,6 +1298,8 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       [2, 2.25],
       [2.5, 2.75],
       [3.75, 4],
+      [4.27, 4.52],
+      [4.6, 5.6],
     ]);
     expect(
       submitted.every(
@@ -1122,6 +1322,9 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
             backgroundPromotion.parentJobId,
             liveLeasePromotion.parentJobId,
             meshBlockedPromotion.parentJobId,
+            typedMeshBlockedPromotion.parentJobId,
+            typedInfrastructurePromotion.parentJobId,
+            upgradeableMeshBlockedPromotion.parentJobId,
             cancelledBackgroundPromotion.parentJobId,
             cancelledParentCampaignOwnedWithBackgroundCoowner.parentJobId,
             cancelDuringSubmitPromotion.parentJobId,
@@ -1132,12 +1335,68 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     const submittedChildren = children.filter(
       (child) => child.status === "submitted",
     );
-    expect(submittedChildren).toHaveLength(4);
+    expect(submittedChildren).toHaveLength(6);
+    const upgradedMeshChildren = children.filter(
+      (child) =>
+        child.parentJobId === upgradeableMeshBlockedPromotion.parentJobId,
+    );
+    expect(upgradedMeshChildren).toHaveLength(2);
+    expect(upgradedMeshChildren.map((child) => child.status).sort()).toEqual([
+      "failed",
+      "submitted",
+    ]);
+    expect(
+      upgradedMeshChildren.find((child) => child.status === "submitted")
+        ?.payload,
+    ).toMatchObject({
+      aoas: [4.6, 5.6],
+      meshRecoveryVersion: 1,
+      precalcObligationIds: upgradeableMeshBlockedPromotion.obligationIds,
+    });
+    const upgradedAttemptLedger = await db
+      .select({
+        obligationId: simPrecalcObligationAttempts.obligationId,
+        attemptNumber: simPrecalcObligationAttempts.attemptNumber,
+        state: simPrecalcObligationAttempts.state,
+      })
+      .from(simPrecalcObligationAttempts)
+      .where(
+        inArray(
+          simPrecalcObligationAttempts.obligationId,
+          upgradeableMeshBlockedPromotion.obligationIds,
+        ),
+      );
+    for (const obligationId of upgradeableMeshBlockedPromotion.obligationIds) {
+      expect(
+        upgradedAttemptLedger
+          .filter((attempt) => attempt.obligationId === obligationId)
+          .sort((left, right) => left.attemptNumber - right.attemptNumber),
+      ).toEqual([
+        { obligationId, attemptNumber: 1, state: "failed" },
+        { obligationId, attemptNumber: 2, state: "submitted" },
+      ]);
+    }
     expect(
       children.some(
-        (child) => child.parentJobId === meshBlockedPromotion.parentJobId,
+        (child) =>
+          child.parentJobId === meshBlockedPromotion.parentJobId &&
+          child.status === "submitted",
       ),
     ).toBe(false);
+    expect(
+      children.some(
+        (child) =>
+          child.parentJobId === typedMeshBlockedPromotion.parentJobId &&
+          child.status === "submitted",
+      ),
+    ).toBe(false);
+    expect(
+      children.some(
+        (child) =>
+          child.parentJobId === typedInfrastructurePromotion.parentJobId &&
+          child.status === "submitted",
+      ),
+    ).toBe(true);
     expect(
       children.some(
         (child) =>
@@ -1166,6 +1425,14 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       [backgroundPromotion.parentJobId, backgroundPromotion.promotionId],
       [liveLeasePromotion.parentJobId, liveLeasePromotion.promotionId],
       [
+        typedInfrastructurePromotion.parentJobId,
+        typedInfrastructurePromotion.promotionId,
+      ],
+      [
+        upgradeableMeshBlockedPromotion.parentJobId,
+        upgradeableMeshBlockedPromotion.promotionId,
+      ],
+      [
         cancelledParentCampaignOwnedWithBackgroundCoowner.parentJobId,
         cancelledParentCampaignOwnedWithBackgroundCoowner.promotionId,
       ],
@@ -1182,6 +1449,6 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     expect(
       await uransLadderTick(db, engine, 0, recoveryScope(promotionIds)),
     ).toBe(false);
-    expect(submitted).toHaveLength(4);
+    expect(submitted).toHaveLength(6);
   }, 240000);
 });

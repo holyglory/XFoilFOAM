@@ -961,6 +961,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       warm_start: false,
       urans_fidelity: "full",
     });
+    expect(captured[0].expected_mesh_recovery_version).toBeUndefined();
     const [afterRequest] = await db
       .select()
       .from(simUransRequests)
@@ -1042,6 +1043,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       warm_start: false,
       urans_fidelity: "precalc",
     });
+    expect(captured[0].expected_mesh_recovery_version).toBe(0);
     expect(captured[0].aoa?.angles).toEqual([REJECTED_AOA]);
     expect(captured[0].speeds).toEqual([SPEED]);
     // The node NEVER downscales the mesh: the composed request carries the
@@ -1098,6 +1100,145 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
           eq(simPrecalcObligations.aoaDeg, REJECTED_AOA),
         ),
       );
+  }, 60000);
+
+  it("CAPABILITY GATE MUST-CATCH: malformed PRECALC capability skips older PRECALC but still submits FULL admin work", async () => {
+    const precalc = await createUransRequest(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg: 41,
+      fidelity: "precalc",
+      requestedBy: `${PREFIX}-capability-precalc`,
+    });
+    const full = await createUransRequest(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg: 42,
+      fidelity: "full",
+      requestedBy: `${PREFIX}-capability-full`,
+    });
+    const captured: PolarRequest[] = [];
+    const submitted = await uransLadderTick(
+      db,
+      stubEngine(captured, `${PREFIX}-capability-full-job`),
+      0,
+      {
+        campaignIds: [],
+        parentJobIds: [],
+        promotionIds: [],
+        requestIds: [precalc.request.id, full.request.id],
+        verifyIds: [],
+        meshRecoveryVersion: null,
+      },
+    );
+    expect(submitted).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].solver?.urans_fidelity).toBe("full");
+    expect(captured[0].aoa?.angles).toEqual([42]);
+    expect(captured[0].expected_mesh_recovery_version).toBeUndefined();
+    const requests = await db
+      .select({ id: simUransRequests.id, state: simUransRequests.state })
+      .from(simUransRequests)
+      .where(
+        inArray(simUransRequests.id, [precalc.request.id, full.request.id]),
+      );
+    expect(requests).toEqual(
+      expect.arrayContaining([
+        { id: precalc.request.id, state: "pending" },
+        { id: full.request.id, state: "running" },
+      ]),
+    );
+    const [fullJob] = await db
+      .select({ id: simJobs.id })
+      .from(simJobs)
+      .where(dsql`request_payload ->> 'uransRequestId' = ${full.request.id}`);
+    if (fullJob) {
+      await db
+        .update(simJobs)
+        .set({ status: "done", ingestedAt: new Date(), finishedAt: new Date() })
+        .where(eq(simJobs.id, fullJob.id));
+    }
+    await db
+      .delete(simUransRequests)
+      .where(
+        inArray(simUransRequests.id, [precalc.request.id, full.request.id]),
+      );
+  }, 60000);
+
+  it("CAPABILITY GATE MUST-CATCH: orphan healing runs before a closed PRECALC capability gate", async () => {
+    const created = await createUransRequest(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg: 43,
+      fidelity: "precalc",
+      requestedBy: `${PREFIX}-capability-orphan`,
+    });
+    const claimed = await claimNextPendingUransRequest(db, {
+      requestIds: [created.request.id],
+    });
+    expect(claimed?.id).toBe(created.request.id);
+    const [orphanJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "pending",
+        engineState: "submitting",
+        totalCases: 1,
+        requestPayload: {
+          uransRequestId: created.request.id,
+          uransFidelity: "precalc",
+          aoas: [43],
+        },
+        updatedAt: new Date(Date.now() - 10 * 60_000),
+      })
+      .returning();
+    await db
+      .update(simUransRequests)
+      .set({
+        state: "running",
+        simJobId: orphanJob.id,
+        updatedAt: new Date(Date.now() - 10 * 60_000),
+      })
+      .where(eq(simUransRequests.id, created.request.id));
+
+    const captured: PolarRequest[] = [];
+    expect(
+      await uransLadderTick(
+        db,
+        stubEngine(captured, `${PREFIX}-must-not-submit-precalc`),
+        0,
+        {
+          campaignIds: [],
+          parentJobIds: [],
+          promotionIds: [],
+          requestIds: [created.request.id],
+          verifyIds: [],
+          meshRecoveryVersion: null,
+        },
+      ),
+    ).toBe(false);
+    expect(captured).toHaveLength(0);
+    const [healed] = await db
+      .select({
+        state: simUransRequests.state,
+        simJobId: simUransRequests.simJobId,
+      })
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, created.request.id));
+    expect(healed).toEqual({ state: "pending", simJobId: null });
+    const [cancelledJob] = await db
+      .select({ status: simJobs.status })
+      .from(simJobs)
+      .where(eq(simJobs.id, orphanJob.id));
+    expect(cancelledJob?.status).toBe("cancelled");
+    await db
+      .delete(simUransRequests)
+      .where(eq(simUransRequests.id, created.request.id));
   }, 60000);
 
   it("request-URANS is idempotent per (cell, fidelity), whole-polar included", async () => {

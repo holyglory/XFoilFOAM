@@ -103,13 +103,18 @@ The default deploy is solver-safe: it rebuilds/restarts only `node-api`, `web`,
 and `sweeper`. It does **not** restart the Python engine `api` service or the
 OpenFOAM `worker` service, so active OpenFOAM child processes keep running. The
 VPS host itself does not install OpenFOAM; OpenFOAM is provided by the Docker
-`worker` image. To update `api`/`worker`, run the same script with
-`DEPLOY_OPENFOAM_SERVICES=1`; it refuses that mode while `simpleFoam`,
-`pimpleFoam`, meshing, or related OpenFOAM processes are active.
+`worker` image. To update `api`/`worker`, use only
+`scripts/deploy/rebuild-engine.sh <build-id>`. That guarded maintenance script
+checks both the engine queue and live OpenFOAM processes before the image build
+and again before service recreation, updates the API/worker/control-plane build
+identities together, and preserves the sweeper's prior running/stopped state.
+The ordinary control-plane deploy deliberately rejects
+`DEPLOY_OPENFOAM_SERVICES=1`.
 
 The engine's persistent mesh/steady-seed cache (build `dev-20260704-batch-cache`
 and later) requires a **worker image rebuild** to pick up
-(`DEPLOY_OPENFOAM_SERVICES=1`, or `docker compose build worker` locally). The
+(`scripts/deploy/rebuild-engine.sh <build-id>` in production, or
+`docker compose build worker` locally). The
 cache itself lives on the named `engine_cache` volume (mounted at
 `/data/airfoilfoam-cache`, `AIRFOILFOAM_CACHE_DIR`), so cached meshes and
 solution seeds survive image rebuilds and container restarts; it is

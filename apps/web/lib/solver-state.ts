@@ -82,7 +82,10 @@ export interface SolverStateListPayload {
   lastTickCompletedAt: string | null;
 }
 
-export function heartbeatAgeMs(heartbeatAt: string | null, nowMs: number = Date.now()): number | null {
+export function heartbeatAgeMs(
+  heartbeatAt: string | null,
+  nowMs: number = Date.now(),
+): number | null {
   if (!heartbeatAt) return null;
   const t = new Date(heartbeatAt).getTime();
   if (!Number.isFinite(t)) return null;
@@ -93,7 +96,10 @@ export function heartbeatAgeMs(heartbeatAt: string | null, nowMs: number = Date.
  *  With the liveness/progress split this is TRUE process death: the liveness
  *  timer writes every 15 s regardless of tick work, so tick fields can never
  *  rescue (or excuse) a stale heartbeat. */
-export function isProcessDead(heartbeatAt: string | null, nowMs: number = Date.now()): boolean {
+export function isProcessDead(
+  heartbeatAt: string | null,
+  nowMs: number = Date.now(),
+): boolean {
   const age = heartbeatAgeMs(heartbeatAt, nowMs);
   return age == null || age > HEARTBEAT_STALE_MS;
 }
@@ -109,7 +115,9 @@ export function tickStalledForMs(
   if (!lastTickStartedAt) return null;
   const started = new Date(lastTickStartedAt).getTime();
   if (!Number.isFinite(started)) return null;
-  const completed = lastTickCompletedAt ? new Date(lastTickCompletedAt).getTime() : Number.NaN;
+  const completed = lastTickCompletedAt
+    ? new Date(lastTickCompletedAt).getTime()
+    : Number.NaN;
   if (Number.isFinite(completed) && completed >= started) return null; // last tick finished
   const age = nowMs - started;
   return age > TICK_STALLED_AFTER_MS ? age : null;
@@ -148,28 +156,33 @@ export function solverStateLabel(state: SolverStateName): string {
   }
 }
 
-/** Compact hub chip copy (approved mockups): "solver · running · N jobs" /
- *  "solver · paused" / "solver · process not running" / … */
-export function solverChipText(state: SolverStateName, activeJobCount?: number): string {
+/** Compact hub chip copy. Service readiness and active solve count are
+ *  separate facts: an enabled healthy scheduler with zero active jobs is
+ *  ready, not a running CFD solve. */
+export function solverChipText(
+  state: SolverStateName,
+  activeJobCount?: number,
+): string {
   switch (state) {
     case "running":
+      if (activeJobCount === 0) return "scheduler · ready · 0 active jobs";
       return activeJobCount != null
-        ? `solver · running · ${activeJobCount} job${activeJobCount === 1 ? "" : "s"}`
-        : "solver · running";
+        ? `scheduler · running · ${activeJobCount} active job${activeJobCount === 1 ? "" : "s"}`
+        : "scheduler · running";
     case "idle":
-      return "solver · idle";
+      return "scheduler · ready";
     case "paused":
-      return "solver · paused";
+      return "scheduler · paused";
     case "process_not_running":
-      return "solver · process not running";
+      return "scheduler · process not running";
     case "engine_unreachable":
-      return "solver · engine unreachable";
+      return "scheduler · engine unreachable";
     case "engine_unhealthy":
-      return "solver · engine unhealthy";
+      return "scheduler · engine unhealthy";
     case "tick_stalled":
-      return "solver · tick stalled";
+      return "scheduler · tick stalled";
     case "unknown":
-      return "solver · status unknown";
+      return "scheduler · status unknown";
   }
 }
 
@@ -186,15 +199,20 @@ export function solverChipText(state: SolverStateName, activeJobCount?: number):
  *  order matches the locked design: process death > engine unreachable >
  *  engine unhealthy > tick_stalled > healthy. engineQueueError is always
  *  secondary. */
-export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.now()): DerivedSolverState {
+export function deriveSolverState(
+  input: SolverStateInput,
+  nowMs: number = Date.now(),
+): DerivedSolverState {
   const secondary: string[] = [];
-  if (input.engineQueueError) secondary.push("celery introspection unavailable");
+  if (input.engineQueueError)
+    secondary.push("celery introspection unavailable");
 
   if (!input.fetchOk) {
     return {
       state: "unknown",
       tone: "amber",
-      headline: "Solver status unknown — the status endpoint has not responded.",
+      headline:
+        "Solver status unknown — the status endpoint has not responded.",
       detail: "No state is assumed while status is unavailable.",
       secondary,
     };
@@ -203,7 +221,9 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
   const age = heartbeatAgeMs(input.heartbeatAt, nowMs);
   if (age == null || age > HEARTBEAT_STALE_MS) {
     if (input.engineUnreachableSince) {
-      secondary.unshift(`engine also unreachable since ${timeOfDay(input.engineUnreachableSince)}`);
+      secondary.unshift(
+        `engine also unreachable since ${timeOfDay(input.engineUnreachableSince)}`,
+      );
     }
     return {
       state: "process_not_running",
@@ -227,7 +247,8 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
       state: "paused",
       tone: "amber",
       headline: "Paused — no new submissions are scheduled.",
-      detail: "Already-started OpenFOAM processes continue until they finish or are cancelled.",
+      detail:
+        "Already-started OpenFOAM processes continue until they finish or are cancelled.",
       secondary,
     };
   }
@@ -237,7 +258,8 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
       state: "engine_unreachable",
       tone: "red",
       headline: `Engine unreachable since ${timeOfDay(input.engineUnreachableSince)} — no jobs are being submitted.`,
-      detail: "Submissions are held with backoff; composed work is released, jobs are not marked failed.",
+      detail:
+        "Submissions are held with backoff; composed work is released, jobs are not marked failed.",
       secondary,
     };
   }
@@ -254,13 +276,18 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
     };
   }
 
-  const stalledForMs = tickStalledForMs(input.lastTickStartedAt ?? null, input.lastTickCompletedAt ?? null, nowMs);
+  const stalledForMs = tickStalledForMs(
+    input.lastTickStartedAt ?? null,
+    input.lastTickCompletedAt ?? null,
+    nowMs,
+  );
   if (stalledForMs != null) {
     return {
       state: "tick_stalled",
       tone: "amber",
       headline: `Tick running ${formatAge(stalledForMs)} — engine responding slowly; scheduling continues next tick.`,
-      detail: "Process heartbeat is fresh — the sweeper is alive; a slow engine call is holding the current scheduler tick.",
+      detail:
+        "Process heartbeat is fresh — the sweeper is alive; a slow engine call is holding the current scheduler tick.",
       secondary,
     };
   }
@@ -271,7 +298,8 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
       state: "idle",
       tone: "teal",
       headline: `Idle — running, nothing pending · ${heartbeat}`,
-      detail: "The next enabled sweep or campaign point will be picked up automatically.",
+      detail:
+        "The next enabled sweep or campaign point will be picked up automatically.",
       secondary,
     };
   }
@@ -292,7 +320,10 @@ export function deriveSolverState(input: SolverStateInput, nowMs: number = Date.
   return {
     state: "running",
     tone: "teal",
-    headline: jobsInFlight != null ? `Running — ${jobsInFlight} · ${heartbeat}` : `Running — ${heartbeat}`,
+    headline:
+      jobsInFlight != null
+        ? `Running — ${jobsInFlight} · ${heartbeat}`
+        : `Running — ${heartbeat}`,
     secondary,
   };
 }

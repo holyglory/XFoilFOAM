@@ -19,13 +19,34 @@ import type {
   RenderFieldResponse,
 } from "./types";
 
+export const MESH_RECOVERY_CAPABILITY_MISMATCH_CODE =
+  "mesh_recovery_version_mismatch";
+
 export class EngineError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    /** Stable machine-readable code supplied by an answered engine error.
+     * HTTP status alone is deliberately insufficient for retry policy. */
+    readonly code?: string,
   ) {
     super(message);
     this.name = "EngineError";
+  }
+}
+
+function engineErrorCode(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return undefined;
+    const detail = (parsed as { detail?: unknown }).detail;
+    if (!detail || typeof detail !== "object" || Array.isArray(detail))
+      return undefined;
+    const code = (detail as { code?: unknown }).code;
+    return typeof code === "string" && code.length > 0 ? code : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -67,17 +88,28 @@ export class EngineClient {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
-  private async json<T>(path: string, timeoutMs: number, init?: RequestInit): Promise<T> {
+  private async json<T>(
+    path: string,
+    timeoutMs: number,
+    init?: RequestInit,
+  ): Promise<T> {
     const signal = AbortSignal.timeout(timeoutMs);
     try {
       const res = await fetch(this.baseUrl + path, {
         ...init,
         signal,
-        headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+        headers: {
+          "content-type": "application/json",
+          ...(init?.headers ?? {}),
+        },
       });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
-        throw new EngineError(`${init?.method ?? "GET"} ${path} → ${res.status} ${body.slice(0, 300)}`, res.status);
+        throw new EngineError(
+          `${init?.method ?? "GET"} ${path} → ${res.status} ${body.slice(0, 300)}`,
+          res.status,
+          engineErrorCode(body),
+        );
       }
       return (await res.json()) as T;
     } catch (e) {
@@ -102,22 +134,38 @@ export class EngineClient {
   }
 
   healthDetails(opts?: EngineCallOptions): Promise<EngineHealth> {
-    return this.json<EngineHealth>("/health", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+    return this.json<EngineHealth>(
+      "/health",
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+    );
   }
 
   /** Submit a polar job → 202 with a job_id. */
-  submitPolar(request: PolarRequest, opts?: EngineCallOptions): Promise<JobStatus> {
-    return this.json<JobStatus>("/polars", opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS, {
-      method: "POST",
-      body: JSON.stringify(request),
-    });
+  submitPolar(
+    request: PolarRequest,
+    opts?: EngineCallOptions,
+  ): Promise<JobStatus> {
+    return this.json<JobStatus>(
+      "/polars",
+      opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+      {
+        method: "POST",
+        body: JSON.stringify(request),
+      },
+    );
   }
 
   getJob(jobId: string, opts?: EngineCallOptions): Promise<JobStatus> {
-    return this.json<JobStatus>(`/jobs/${encodeURIComponent(jobId)}`, opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+    return this.json<JobStatus>(
+      `/jobs/${encodeURIComponent(jobId)}`,
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+    );
   }
 
-  cancelJob(jobId: string, opts?: EngineCallOptions): Promise<{ job_id: string; cancelled: boolean }> {
+  cancelJob(
+    jobId: string,
+    opts?: EngineCallOptions,
+  ): Promise<{ job_id: string; cancelled: boolean }> {
     return this.json<{ job_id: string; cancelled: boolean }>(
       `/jobs/${encodeURIComponent(jobId)}/cancel`,
       opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
@@ -126,15 +174,25 @@ export class EngineClient {
   }
 
   getQueue(opts?: EngineCallOptions): Promise<EngineQueueState> {
-    return this.json<EngineQueueState>("/queue", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+    return this.json<EngineQueueState>(
+      "/queue",
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+    );
   }
 
   /** Mesh/seed cache stats scanned from the engine's cache volume. */
   cacheStats(opts?: EngineCallOptions): Promise<EngineCacheStats> {
-    return this.json<EngineCacheStats>("/cache/stats", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+    return this.json<EngineCacheStats>(
+      "/cache/stats",
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+    );
   }
 
-  stripJob(jobId: string, request: EngineStripJobRequest = {}, opts?: EngineCallOptions): Promise<EngineStripJobResponse> {
+  stripJob(
+    jobId: string,
+    request: EngineStripJobRequest = {},
+    opts?: EngineCallOptions,
+  ): Promise<EngineStripJobResponse> {
     return this.json<EngineStripJobResponse>(
       `/jobs/${encodeURIComponent(jobId)}/strip`,
       opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
@@ -142,34 +200,65 @@ export class EngineClient {
     );
   }
 
-  deleteJob(jobId: string, opts?: EngineCallOptions): Promise<EngineDeleteJobResponse> {
-    return this.json<EngineDeleteJobResponse>(`/jobs/${encodeURIComponent(jobId)}`, opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS, {
-      method: "DELETE",
-    });
+  deleteJob(
+    jobId: string,
+    opts?: EngineCallOptions,
+  ): Promise<EngineDeleteJobResponse> {
+    return this.json<EngineDeleteJobResponse>(
+      `/jobs/${encodeURIComponent(jobId)}`,
+      opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+      {
+        method: "DELETE",
+      },
+    );
   }
 
-  maintenanceJobs(opts?: EngineCallOptions): Promise<EngineMaintenanceJobsResponse> {
-    return this.json<EngineMaintenanceJobsResponse>("/maintenance/jobs", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+  maintenanceJobs(
+    opts?: EngineCallOptions,
+  ): Promise<EngineMaintenanceJobsResponse> {
+    return this.json<EngineMaintenanceJobsResponse>(
+      "/maintenance/jobs",
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+    );
   }
 
-  maintenanceDisk(opts?: EngineCallOptions): Promise<EngineMaintenanceDiskResponse> {
-    return this.json<EngineMaintenanceDiskResponse>("/maintenance/disk", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+  maintenanceDisk(
+    opts?: EngineCallOptions,
+  ): Promise<EngineMaintenanceDiskResponse> {
+    return this.json<EngineMaintenanceDiskResponse>(
+      "/maintenance/disk",
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+    );
   }
 
-  getJobRuntimes(jobIds: string[], opts?: EngineCallOptions): Promise<JobRuntimeResponse> {
-    return this.json<JobRuntimeResponse>("/jobs/runtime", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS, {
-      method: "POST",
-      body: JSON.stringify({ job_ids: jobIds }),
-    });
+  getJobRuntimes(
+    jobIds: string[],
+    opts?: EngineCallOptions,
+  ): Promise<JobRuntimeResponse> {
+    return this.json<JobRuntimeResponse>(
+      "/jobs/runtime",
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+      {
+        method: "POST",
+        body: JSON.stringify({ job_ids: jobIds }),
+      },
+    );
   }
 
   /** Full result (the API returns 409 until the job completes). The payload
    *  can be MBs of polar/frame evidence — budgeted like a submit, not a poll. */
   getResult(jobId: string, opts?: EngineCallOptions): Promise<JobResult> {
-    return this.json<JobResult>(`/jobs/${encodeURIComponent(jobId)}/result`, opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS);
+    return this.json<JobResult>(
+      `/jobs/${encodeURIComponent(jobId)}/result`,
+      opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+    );
   }
 
-  renderField(jobId: string, request: RenderFieldRequest, opts?: EngineCallOptions): Promise<RenderFieldResponse> {
+  renderField(
+    jobId: string,
+    request: RenderFieldRequest,
+    opts?: EngineCallOptions,
+  ): Promise<RenderFieldResponse> {
     return this.json<RenderFieldResponse>(
       `/jobs/${encodeURIComponent(jobId)}/render-field`,
       opts?.timeoutMs ?? ENGINE_RENDER_TIMEOUT_MS,
@@ -177,7 +266,11 @@ export class EngineClient {
     );
   }
 
-  computeFieldExtents(jobId: string, request: FieldExtentsRequest, opts?: EngineCallOptions): Promise<FieldExtentsResponse> {
+  computeFieldExtents(
+    jobId: string,
+    request: FieldExtentsRequest,
+    opts?: EngineCallOptions,
+  ): Promise<FieldExtentsResponse> {
     return this.json<FieldExtentsResponse>(
       `/jobs/${encodeURIComponent(jobId)}/field-extents`,
       opts?.timeoutMs ?? ENGINE_RENDER_TIMEOUT_MS,
@@ -185,7 +278,11 @@ export class EngineClient {
     );
   }
 
-  renderDefaultMedia(jobId: string, request: RenderDefaultMediaRequest, opts?: EngineCallOptions): Promise<RenderDefaultMediaResponse> {
+  renderDefaultMedia(
+    jobId: string,
+    request: RenderDefaultMediaRequest,
+    opts?: EngineCallOptions,
+  ): Promise<RenderDefaultMediaResponse> {
     return this.json<RenderDefaultMediaResponse>(
       `/jobs/${encodeURIComponent(jobId)}/render-default-media`,
       opts?.timeoutMs ?? ENGINE_RENDER_TIMEOUT_MS,

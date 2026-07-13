@@ -38,6 +38,10 @@ import {
   simUransRequests,
   simUransVerifyQueue,
 } from "@aerodb/db";
+import {
+  DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER,
+  DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER,
+} from "@aerodb/core";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { snapshotAoas } from "@aerodb/db/simulation-setup";
 import type { EngineClient, UransFidelity } from "@aerodb/engine-client";
@@ -50,12 +54,15 @@ import {
   notInArray,
   or,
   sql,
+  type SQLWrapper,
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
 import { buildPolarRequest } from "./build-request";
+import { engineMeshRecoveryVersion } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
 import { touchHeartbeat } from "./heartbeat";
+import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
 import { submitUransRetryForJob } from "./reconcile";
 import {
@@ -75,6 +82,81 @@ export function resetUransLadderMemory(): void {
 
 const GATED_PARENTS_PER_TICK = 3;
 const PROMOTION_RECOVERIES_PER_TICK = 16;
+
+function jobMeshRecoveryVersionSql(requestPayload: SQLWrapper) {
+  return sql`CASE
+    WHEN jsonb_typeof(${requestPayload} -> 'executedMeshRecoveryVersion') = 'number'
+     AND ${requestPayload} ->> 'executedMeshRecoveryVersion' ~ '^[0-9]+$'
+    THEN CASE
+      WHEN (${requestPayload} ->> 'executedMeshRecoveryVersion')::numeric <= 2147483647
+      THEN (${requestPayload} ->> 'executedMeshRecoveryVersion')::numeric::bigint
+      ELSE 0::bigint
+    END
+    ELSE 0::bigint
+  END`;
+}
+
+/** Effective execution provenance for a terminal PRECALC obligation. The
+ * immutable submission audit is authoritative and survives sim_job retention;
+ * worker-acknowledged job JSON is only a compatibility fallback for historical
+ * rows without that ledger. Requested meshRecoveryVersion is never evidence. */
+function obligationMeshRecoveryVersionSql(
+  obligationId: SQLWrapper,
+  latestSimJobId: SQLWrapper,
+) {
+  return sql`COALESCE(
+    (
+      SELECT immutable_attempt.mesh_recovery_version::bigint
+      FROM sim_precalc_obligation_attempts immutable_attempt
+      WHERE immutable_attempt.obligation_id = ${obligationId}
+      ORDER BY immutable_attempt.attempt_number DESC
+      LIMIT 1
+    ),
+    (
+      SELECT ${jobMeshRecoveryVersionSql(sql`producing_job.request_payload`)}
+      FROM sim_jobs producing_job
+      WHERE producing_job.id = ${latestSimJobId}
+    ),
+    0::bigint
+  )`;
+}
+
+function deterministicMeshEvidenceSql(
+  failureDisposition: SQLWrapper,
+  error: SQLWrapper,
+) {
+  return sql`(
+    ${failureDisposition} = 'deterministic_mesh'
+    OR (
+      ${failureDisposition} IS NULL
+      AND
+      position(${DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER} in lower(COALESCE(${error}, ''))) > 0
+      AND position(${DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER} in lower(COALESCE(${error}, ''))) > 0
+    )
+  )`;
+}
+
+const RESERVED_LADDER_PAYLOAD_KEYS = new Set([
+  "aoas",
+  "meshRecoveryVersion",
+  "resources",
+  "setupSnapshot",
+  "speedMap",
+  "uransFidelity",
+]);
+
+export function assertNoReservedLadderPayloadKeys(
+  payloadExtras: Record<string, unknown>,
+): void {
+  const conflicting = Object.keys(payloadExtras).filter((key) =>
+    RESERVED_LADDER_PAYLOAD_KEYS.has(key),
+  );
+  if (conflicting.length) {
+    throw new Error(
+      `ladder payload extras cannot override reserved execution provenance: ${conflicting.sort().join(", ")}`,
+    );
+  }
+}
 
 function promotionRecoveryScopeSql(opts: {
   campaignIds?: string[];
@@ -200,6 +282,7 @@ async function recordedPromotionHasDeterministicMeshBlocker(
     RecordedPromotionPoint,
     "promotionId" | "parentJobId" | "revisionId" | "conditionId"
   >,
+  meshRecoveryVersion: number,
 ): Promise<boolean> {
   const conditionSql = event.conditionId
     ? sql`child.request_payload ->> 'conditionId' = ${event.conditionId}`
@@ -213,16 +296,25 @@ async function recordedPromotionHasDeterministicMeshBlocker(
         ON obligation.id = point.obligation_id
       WHERE point.promotion_id = ${event.promotionId}
         AND obligation.last_outcome = 'deterministic_failure'
+        AND ${obligationMeshRecoveryVersionSql(
+          sql`obligation.id`,
+          sql`obligation.latest_sim_job_id`,
+        )} >= ${meshRecoveryVersion}
     ) OR EXISTS (
       SELECT 1
       FROM sim_jobs child
       CROSS JOIN LATERAL (
-        SELECT attempt.error
+        SELECT attempt.error,
+               attempt.evidence_payload ->> 'failure_disposition' AS failure_disposition
         FROM result_attempts attempt
         WHERE attempt.sim_job_id = child.id
         UNION ALL
-        SELECT canonical.error
+        SELECT canonical.error,
+               current_attempt.evidence_payload ->> 'failure_disposition' AS failure_disposition
         FROM results canonical
+        LEFT JOIN result_attempts current_attempt
+          ON current_attempt.id = canonical.current_result_attempt_id
+         AND current_attempt.result_id = canonical.id
         WHERE canonical.sim_job_id = child.id
       ) evidence
       WHERE child.parent_job_id = ${event.parentJobId}
@@ -230,14 +322,17 @@ async function recordedPromotionHasDeterministicMeshBlocker(
         AND child.simulation_preset_revision_id = ${event.revisionId}
         AND (${conditionSql})
         AND child.request_payload ->> 'uransFidelity' = 'precalc'
-        AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(evidence.error, ''))) > 0
-        AND position('max non-orthogonality' in lower(COALESCE(evidence.error, ''))) > 0
+        AND ${jobMeshRecoveryVersionSql(sql`child.request_payload`)} >= ${meshRecoveryVersion}
+        AND ${deterministicMeshEvidenceSql(
+          sql`evidence.failure_disposition`,
+          sql`evidence.error`,
+        )}
     )
     LIMIT 1
   `)) as unknown as unknown[];
   if (!rows.length) return false;
   console.error(
-    `[sweeper] recorded whole-polar promotion ${event.promotionId} remains blocked by deterministic shared-mesh evidence; exact obligation coverage is retained and unchanged mesh is not resubmitted`,
+    `[sweeper] recorded whole-polar promotion ${event.promotionId} remains blocked by deterministic shared-mesh evidence at mesh recovery strategy v${meshRecoveryVersion}; exact obligation coverage is retained and unchanged mesh is not resubmitted`,
   );
   return true;
 }
@@ -327,8 +422,17 @@ export async function submitRecordedPromotionRecovery(
     campaignIds?: string[];
     parentJobIds?: string[];
     promotionIds?: string[];
+    meshRecoveryVersion?: number;
   } = {},
 ): Promise<boolean> {
+  const meshRecoveryVersion =
+    opts.meshRecoveryVersion ?? (await engineMeshRecoveryVersion(engine));
+  if (meshRecoveryVersion == null) {
+    console.error(
+      "[sweeper] conditional promotion recovery deferred: engine mesh-recovery capability is unavailable or malformed",
+    );
+    return false;
+  }
   const scope = promotionRecoveryScopeSql(opts);
   const candidates = (await db.execute(sql`
     SELECT promotion.id AS promotion_id, parent.id AS parent_job_id
@@ -356,17 +460,26 @@ export async function submitRecordedPromotionRecovery(
           ON blocked_obligation.id = blocked_point.obligation_id
         WHERE blocked_point.promotion_id = promotion.id
           AND blocked_obligation.last_outcome = 'deterministic_failure'
+          AND ${obligationMeshRecoveryVersionSql(
+            sql`blocked_obligation.id`,
+            sql`blocked_obligation.latest_sim_job_id`,
+          )} >= ${meshRecoveryVersion}
       )
       AND NOT EXISTS (
         SELECT 1
         FROM sim_jobs blocked_child
         CROSS JOIN LATERAL (
-          SELECT attempt.error
+          SELECT attempt.error,
+                 attempt.evidence_payload ->> 'failure_disposition' AS failure_disposition
           FROM result_attempts attempt
           WHERE attempt.sim_job_id = blocked_child.id
           UNION ALL
-          SELECT canonical.error
+          SELECT canonical.error,
+                 current_attempt.evidence_payload ->> 'failure_disposition' AS failure_disposition
           FROM results canonical
+          LEFT JOIN result_attempts current_attempt
+            ON current_attempt.id = canonical.current_result_attempt_id
+           AND current_attempt.result_id = canonical.id
           WHERE canonical.sim_job_id = blocked_child.id
         ) blocked_evidence
         WHERE blocked_child.parent_job_id = parent.id
@@ -377,8 +490,11 @@ export async function submitRecordedPromotionRecovery(
             OR blocked_child.request_payload ->> 'conditionId' = promotion.condition_id::text
           )
           AND blocked_child.request_payload ->> 'uransFidelity' = 'precalc'
-          AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(blocked_evidence.error, ''))) > 0
-          AND position('max non-orthogonality' in lower(COALESCE(blocked_evidence.error, ''))) > 0
+          AND ${jobMeshRecoveryVersionSql(sql`blocked_child.request_payload`)} >= ${meshRecoveryVersion}
+          AND ${deterministicMeshEvidenceSql(
+            sql`blocked_evidence.failure_disposition`,
+            sql`blocked_evidence.error`,
+          )}
       )
       AND EXISTS (
         SELECT 1
@@ -502,12 +618,16 @@ export async function submitRecordedPromotionRecovery(
     const event = points[0];
     if (!event || points.length <= 1) continue;
     if (
-      await recordedPromotionHasDeterministicMeshBlocker(db, {
-        promotionId: event.promotionId,
-        parentJobId: event.parentJobId,
-        revisionId: event.revisionId,
-        conditionId: event.conditionId,
-      })
+      await recordedPromotionHasDeterministicMeshBlocker(
+        db,
+        {
+          promotionId: event.promotionId,
+          parentJobId: event.parentJobId,
+          revisionId: event.revisionId,
+          conditionId: event.conditionId,
+        },
+        meshRecoveryVersion,
+      )
     )
       continue;
     const now = Date.now();
@@ -577,6 +697,7 @@ export async function submitRecordedPromotionRecovery(
       cpuSlots,
       continueFrom,
       budgetOverrideS,
+      meshRecoveryVersion,
       recordedPromotion: {
         promotionId: event.promotionId,
         parentJobId: event.parentJobId,
@@ -605,6 +726,7 @@ export async function submitCampaignPrecalcRecoveries(
   engine: EngineClient,
   campaignIds?: string[],
   parentJobIds?: string[],
+  meshRecoveryVersion?: number,
 ): Promise<boolean> {
   const statusFilter = inArray(simCampaigns.status, ["active", "attention"]);
   const campaigns = await db
@@ -693,7 +815,9 @@ export async function submitCampaignPrecalcRecoveries(
         .select({ id: simJobs.id })
         .from(simJobs)
         .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
-      await submitUransRetryForJob(db, engine, parent);
+      await submitUransRetryForJob(db, engine, parent, {
+        meshRecoveryVersion,
+      });
       const [campaignAfterSubmit] = parent.campaignId
         ? await db
             .select({ status: simCampaigns.status })
@@ -860,6 +984,8 @@ async function submitLadderJob(
     continueFrom?: { engineJobId: string; caseSlug: string } | null;
     /** Continuation budget override [s] — replaces the tier-derived budget. */
     budgetOverrideS?: number | null;
+    /** Live engine capability stamped into PRECALC execution provenance. */
+    meshRecoveryVersion?: number;
     /** Claimed admin request linked to the composed job before submit. */
     uransRequestId?: string;
     /** Claimed automatic full-verification item. */
@@ -880,6 +1006,7 @@ async function submitLadderJob(
   connectionFailure: boolean;
   lifecycleStopped: boolean;
   submissionInProgress: boolean;
+  capabilityMismatch?: boolean;
   error?: string;
   httpStatus?: number | null;
   ladderDisposition?: "retry_wait" | "blocked" | null;
@@ -893,6 +1020,22 @@ async function submitLadderJob(
     payloadExtras,
     cpuSlots,
   } = opts;
+  const meshRecoveryVersion =
+    fidelity === "precalc"
+      ? (opts.meshRecoveryVersion ?? (await engineMeshRecoveryVersion(engine)))
+      : null;
+  if (fidelity === "precalc" && meshRecoveryVersion == null) {
+    return {
+      jobId: "",
+      submitted: false,
+      connectionFailure: true,
+      lifecycleStopped: false,
+      submissionInProgress: false,
+      error:
+        "engine mesh-recovery capability is unavailable or malformed; PRECALC submission deferred",
+    };
+  }
+  assertNoReservedLadderPayloadKeys(payloadExtras);
   const [a] = await db
     .select()
     .from(airfoils)
@@ -932,6 +1075,9 @@ async function submitLadderJob(
     force_transient: true,
     urans_fidelity: fidelity,
   };
+  if (fidelity === "precalc") {
+    request.expected_mesh_recovery_version = meshRecoveryVersion!;
+  }
   if (opts.continueFrom) {
     // Amendment C: the engine copies/links the saved case dir into the new
     // job and restarts the transient from latestTime, merging coefficient
@@ -956,6 +1102,7 @@ async function submitLadderJob(
     status: "pending",
     totalCases: aoas.length,
     requestPayload: {
+      ...payloadExtras,
       speedMap: [
         {
           speed,
@@ -966,9 +1113,11 @@ async function submitLadderJob(
       ],
       aoas,
       uransFidelity: fidelity,
+      ...(fidelity === "precalc"
+        ? { meshRecoveryVersion: meshRecoveryVersion! }
+        : {}),
       resources: request.resources,
       setupSnapshot: target.snapshot,
-      ...payloadExtras,
     },
   };
   const payloadObligationIds = Array.isArray(
@@ -1141,6 +1290,20 @@ async function submitLadderJob(
       error: submit.error,
     };
   }
+  if (submit.kind === "capability_mismatch") {
+    console.warn(
+      `[sweeper] PRECALC job ${job.id} deferred by engine capability cutover; capability will be re-probed next tick`,
+    );
+    return {
+      jobId: job.id,
+      submitted: false,
+      connectionFailure: false,
+      lifecycleStopped: false,
+      submissionInProgress: false,
+      capabilityMismatch: true,
+      error: submit.error,
+    };
+  }
   if (submit.kind === "lifecycle_stopped") {
     return {
       jobId: job.id,
@@ -1179,8 +1342,13 @@ async function consumeUransRequest(
   engine: EngineClient,
   cpuSlots: number,
   requestIds?: string[],
+  meshRecoveryVersion?: number,
+  requiredFidelity?: UransFidelity,
 ): Promise<boolean> {
-  const request = await claimNextPendingUransRequest(db, { requestIds });
+  const request = await claimNextPendingUransRequest(db, {
+    requestIds,
+    fidelity: requiredFidelity,
+  });
   if (!request) return false;
   const fidelity: UransFidelity =
     request.fidelity === "full" ? "full" : "precalc";
@@ -1337,6 +1505,7 @@ async function consumeUransRequest(
     cpuSlots,
     continueFrom,
     budgetOverrideS: effectiveBudgetOverrideS,
+    meshRecoveryVersion,
     uransRequestId: request.id,
   });
   if (outcome.submitted) {
@@ -1357,6 +1526,10 @@ async function consumeUransRequest(
     return true;
   }
   if (outcome.submissionInProgress) return true;
+  if (outcome.capabilityMismatch) {
+    await releaseClaimedUransRequest(db, request.id);
+    return false;
+  }
   if (outcome.connectionFailure || outcome.lifecycleStopped) {
     await releaseClaimedUransRequest(db, request.id);
     return false;
@@ -1469,6 +1642,11 @@ export async function uransLadderTick(
     promotionIds?: string[];
     requestIds?: string[];
     verifyIds?: string[];
+    /** Internal scheduler handoff: capability and global requeue were already
+     * prepared earlier in this same tick. */
+    /** `null` means this tick reached the engine but could not validate its
+     * PRECALC capability. Undefined means the caller has not probed yet. */
+    meshRecoveryVersion?: number | null;
   } = {},
 ): Promise<boolean> {
   const healedItems = await healOrphanedVerifyItems(db, {
@@ -1487,18 +1665,48 @@ export async function uransLadderTick(
       `[sweeper] URANS requests: ${healedRequests} orphaned running request(s) returned to pending`,
     );
 
-  if (await submitRecordedPromotionRecovery(db, engine, cpuSlots, opts))
-    return true;
+  const meshRecoveryVersion =
+    opts.meshRecoveryVersion !== undefined
+      ? opts.meshRecoveryVersion
+      : await prepareAutomaticMeshRecovery(
+          db,
+          engine,
+          opts.promotionIds !== undefined
+            ? { promotionIds: opts.promotionIds }
+            : opts.campaignIds !== undefined
+              ? { campaignIds: opts.campaignIds }
+              : {},
+        );
+
+  if (meshRecoveryVersion != null) {
+    if (
+      await submitRecordedPromotionRecovery(db, engine, cpuSlots, {
+        ...opts,
+        meshRecoveryVersion,
+      })
+    )
+      return true;
+    if (
+      await submitCampaignPrecalcRecoveries(
+        db,
+        engine,
+        opts.campaignIds,
+        opts.parentJobIds,
+        meshRecoveryVersion,
+      )
+    )
+      return true;
+  }
   if (
-    await submitCampaignPrecalcRecoveries(
+    await consumeUransRequest(
       db,
       engine,
-      opts.campaignIds,
-      opts.parentJobIds,
+      cpuSlots,
+      opts.requestIds,
+      meshRecoveryVersion ?? undefined,
+      meshRecoveryVersion == null ? "full" : undefined,
     )
   )
-    return true;
-  if (await consumeUransRequest(db, engine, cpuSlots, opts.requestIds))
     return true;
   // Verify tier is the GLOBAL LOWEST rank (contract 5): only when no campaign
   // RANS/precalc work exists machine-wide. A supplied requestIds list is a
@@ -1507,6 +1715,7 @@ export async function uransLadderTick(
     await hasOpenCampaignLadderWork(db, {
       requestIds: opts.requestIds,
       campaignIds: opts.campaignIds,
+      includePrecalc: meshRecoveryVersion != null,
     })
   )
     return false;

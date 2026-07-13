@@ -11,6 +11,7 @@ from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
 from airfoilfoam.storage import JobStore
 from airfoilfoam.pipeline import CaseOutcome
+from airfoilfoam.models import PolarRequest
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +33,7 @@ def fake_run_case(monkeypatch):
 
     def fake_prepare_mesh(mesh_dir, airfoil, resolved, chord, mesher, runner, **_kwargs):
         mesh_dir.mkdir(parents=True, exist_ok=True)
-        return SimpleNamespace(n_cells=1000, patches=[], span_chords=0.1)
+        return SimpleNamespace(n_cells=1000, patches=[], span_chords=0.1), resolved, False
 
     def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
                       mesher, runner, n_proc=1, render_images=True, solver_timeout=7200,
@@ -52,7 +53,7 @@ def fake_run_case(monkeypatch):
             final_residual=1e-6, y_plus_avg=0.8, y_plus_max=3.0, n_cells=1000, images=images,
         )
 
-    monkeypatch.setattr(jobs, "prepare_mesh", fake_prepare_mesh)
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", fake_prepare_mesh)
     monkeypatch.setattr(jobs, "run_case", fake_run_case)
     return fake_run_case
 
@@ -63,7 +64,9 @@ def client():
 
 
 def test_health_and_capabilities(client):
-    assert client.get("/health").json()["status"] == "ok"
+    health = client.get("/health").json()
+    assert health["status"] == "ok"
+    assert health["mesh_recovery_version"] == 1
     caps = client.get("/capabilities").json()
     assert "blockmesh-cgrid" in caps["meshers"]
     assert "kOmegaSST" in caps["turbulence_models"]
@@ -99,9 +102,11 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert status["state"] == "completed"
     assert status["total_cases"] == 3
     assert status["completed_cases"] == 3
+    assert status["mesh_recovery_version"] == 1
 
     result = client.get(f"/jobs/{job_id}/result").json()
     assert result["state"] == "completed"
+    assert result["mesh_recovery_version"] == 1
     assert len(result["polars"]) == 1
     polar = result["polars"][0]
     assert polar["reynolds"] == pytest.approx(50 * 1.0 / 1.5e-5)
@@ -121,6 +126,67 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert csv.status_code == 200
     assert "aoa_deg,cl,cd" in csv.text
     assert csv.text.count("\n") >= 4  # header + 3 rows
+
+
+def test_polar_submit_rejects_capability_cutover_before_queueing(
+    client, naca0012_selig_text
+):
+    response = client.post(
+        "/polars",
+        json={
+            "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
+            "aoa": {"angles": [0]},
+            "expected_mesh_recovery_version": 2,
+        },
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail == {
+        "code": "mesh_recovery_version_mismatch",
+        "requested_version": 2,
+        "actual_version": 1,
+        "message": (
+            "Engine mesh-recovery capability changed before submission: "
+            "requested v2, API is v1. Refresh capability and retry."
+        ),
+    }
+
+
+def test_worker_rejects_capability_mismatch_before_geometry_or_solver(tmp_path):
+    request = PolarRequest.model_validate(
+        {
+            "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
+            "aoa": {"angles": [0]},
+            "expected_mesh_recovery_version": 2,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="requested v2, worker is v1"):
+        jobs.execute_job(
+            "capability-mismatch",
+            request,
+            store=JobStore(),
+        )
+
+
+def test_api_queued_status_does_not_claim_worker_execution(tmp_path, naca0012_selig_text):
+    from airfoilfoam.config import Settings
+
+    store = JobStore(Settings(data_dir=tmp_path / "data"))
+    request = PolarRequest.model_validate(
+        {
+            "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
+            "aoa": {"angles": [0]},
+            "expected_mesh_recovery_version": 1,
+        }
+    )
+    store.create("queued-only", request)
+
+    status = store.read_status("queued-only")
+    assert status is not None
+    assert status.state.value == "pending"
+    assert status.mesh_recovery_version is None
 
 
 def test_multi_speed_chord_produces_multiple_polars(client, fake_run_case, naca0012_selig_text):

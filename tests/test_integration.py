@@ -5,14 +5,16 @@ Skipped automatically when Docker or the image is unavailable.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
 
 from airfoilfoam.airfoil import load_airfoil
+from airfoilfoam.case.builder import CaseBuilder
 from airfoilfoam.config import get_settings
-from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
+from airfoilfoam.meshing.blockmesh import BlockMeshCGrid, SEGMENTED_NORMAL_COUNTS
 from airfoilfoam.models import (
     AirfoilFormat,
     CaseSpec,
@@ -25,9 +27,18 @@ from airfoilfoam.models import (
     TurbulenceParams,
 )
 from airfoilfoam.openfoam.runner import DockerRunner
-from airfoilfoam.pipeline import run_case
+from airfoilfoam.pipeline import (
+    _parse_check_mesh_output,
+    prepare_mesh_with_recovery,
+    resolve_mesh_params,
+    run_case,
+    shared_mesh_qa_verified,
+    validate_shared_mesh,
+)
 
 pytestmark = pytest.mark.integration
+
+SELIG_SEED_DIR = Path(__file__).resolve().parents[1] / "packages/db/seed/selig-database"
 
 
 def _docker_image_available() -> bool:
@@ -68,6 +79,181 @@ def test_real_naca0012_case(require_docker, tmp_path, naca0012_selig_text):
     # image produced and served path recorded
     assert "velocity_magnitude" in out.images
     assert (tmp_path / "case" / out.images["velocity_magnitude"]).is_file()
+
+
+@pytest.mark.parametrize(
+    ("name", "target_y_plus"),
+    [
+        ("2032c", 40.0),  # production inverted-cell must-catch
+        ("n0012", 40.0),  # symmetric healthy false-positive guard
+        ("s1223", 1.0),  # strongly concave resolved-wall guard path
+    ],
+)
+def test_segmented_normal_cgrid_is_valid_for_real_geometry_classes(
+    require_docker, tmp_path, name, target_y_plus
+):
+    """Exercise the actual blockMesh/checkMesh failure class from production.
+
+    Increasing counts could not repair 20-32C's legacy four-block topology:
+    every speed/fidelity variant retained negative-volume cells at 93--95
+    degrees. This test uses the campaign's high-speed 0.05 m cell, where the
+    repaired half mesh must pass without weakening the 85-degree gate. NACA
+    0012 and S1223 ensure the topology does not trade one geometry class for
+    another.
+    """
+    af = load_airfoil(
+        name,
+        (SELIG_SEED_DIR / f"{name}.dat").read_text(),
+        None,
+        AirfoilFormat.auto,
+    )
+    spec = CaseSpec(chord=0.05, speed=166.0, aoa_deg=0.0)
+    fluid = FluidProperties(density=1.225, dynamic_viscosity=1.81e-5)
+    requested = MeshParams(
+        n_surface=65,
+        n_radial=40,
+        n_wake=30,
+        target_y_plus=target_y_plus,
+    )
+    mesh = resolve_mesh_params(requested, spec, fluid)
+    mesher = BlockMeshCGrid.segmented_normal(20)
+    case_dir = tmp_path / name
+    CaseBuilder(
+        af,
+        mesher.patches(mesh),
+        mesh,
+        spec,
+        fluid,
+        RoughnessParams(),
+        SolverParams(write_images=[]),
+    ).write(case_dir)
+    mesher.write_inputs(case_dir, af, mesh, spec.chord)
+    built = mesher.run_mesh(case_dir, mesh, DockerRunner())
+
+    checked = DockerRunner().application(case_dir, "checkMesh -time 0", timeout=300).check()
+    qa = _parse_check_mesh_output(checked.stdout)
+
+    assert built.n_cells == mesher.cell_count(mesh) == 7600
+    assert not qa.negative_volume
+    assert qa.max_non_ortho_deg is not None and qa.max_non_ortho_deg < 85.0
+    assert qa.failed_checks == 0 or qa.aspect_ratio_only_failure
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [None, *SEGMENTED_NORMAL_COUNTS],
+    ids=["legacy", *(f"segmented-{value}" for value in SEGMENTED_NORMAL_COUNTS)],
+)
+def test_corrected_e850_source_builds_valid_real_mesh(require_docker, tmp_path, segments):
+    """The exact UIUC E850 contour must replace stale corrupted-source verdicts.
+
+    The prior bundled file revisited LE after a spurious LE→TE traverse, so the
+    structural preflight correctly rejected it.  With the authoritative source
+    restored, both the default and every bounded recovery candidate must pass
+    the unchanged real blockMesh/checkMesh quality gate.
+    """
+    af = load_airfoil(
+        "e850",
+        (SELIG_SEED_DIR / "e850.dat").read_text(),
+        None,
+        AirfoilFormat.auto,
+    )
+    spec = CaseSpec(chord=0.05, speed=166.0, aoa_deg=0.0)
+    fluid = FluidProperties(density=1.225, dynamic_viscosity=1.81e-5)
+    requested = MeshParams(
+        n_surface=65,
+        n_radial=40,
+        n_wake=30,
+        target_y_plus=40.0,
+    )
+    mesh = resolve_mesh_params(requested, spec, fluid)
+    mesher = (
+        BlockMeshCGrid()
+        if segments is None
+        else BlockMeshCGrid.segmented_normal(segments)
+    )
+    case_dir = tmp_path / mesher.name
+    CaseBuilder(
+        af,
+        mesher.patches(mesh),
+        mesh,
+        spec,
+        fluid,
+        RoughnessParams(),
+        SolverParams(write_images=[]),
+    ).write(case_dir)
+    mesher.write_inputs(case_dir, af, mesh, spec.chord)
+    built = mesher.run_mesh(case_dir, mesh, DockerRunner())
+
+    checked = DockerRunner().application(case_dir, "checkMesh -time 0", timeout=300).check()
+    qa = _parse_check_mesh_output(checked.stdout)
+
+    assert built.n_cells == mesher.cell_count(mesh) == 7600
+    assert not qa.negative_volume
+    assert qa.max_non_ortho_deg is not None and qa.max_non_ortho_deg < 85.0
+    assert qa.failed_checks == 0 or qa.aspect_ratio_only_failure
+
+
+def test_real_2032c_low_speed_mesh_recovers_thick_wall_cell_once(require_docker, tmp_path):
+    """Production low-speed must-catch: y+40 resolves to ~0.01575c, whose
+    legacy topology and first segmented candidate both fail; the bounded
+    0.006c segmented candidate must pass the same real blockMesh/checkMesh path
+    without weakening any quality threshold."""
+    af = load_airfoil(
+        "2032c",
+        (SELIG_SEED_DIR / "2032c.dat").read_text(),
+        None,
+        AirfoilFormat.auto,
+    )
+    spec = CaseSpec(chord=0.05, speed=30.0, aoa_deg=0.0)
+    fluid = FluidProperties(density=1.225, dynamic_viscosity=1.81e-5)
+    requested = MeshParams(n_surface=65, n_radial=40, n_wake=30, target_y_plus=40.0)
+    initial = resolve_mesh_params(requested, spec, fluid)
+    mesher = BlockMeshCGrid()
+    runner = DockerRunner()
+    checked_heights: list[float] = []
+    warnings: list[str] = []
+
+    def validate(mesh_dir, actual):
+        checked_heights.append(float(actual.first_cell_height_chords))
+        return validate_shared_mesh(
+            mesh_dir,
+            af,
+            actual,
+            spec,
+            fluid,
+            RoughnessParams(),
+            SolverParams(force_transient=True, write_images=[]),
+            runner,
+            1,
+            warnings,
+        )
+
+    built, actual, recovered = prepare_mesh_with_recovery(
+        tmp_path / "2032c-low-speed",
+        af,
+        initial,
+        spec.chord,
+        mesher,
+        runner,
+        validate=validate,
+        quality_warnings=warnings,
+    )
+
+    assert checked_heights[0] > 0.015
+    assert checked_heights == pytest.approx(
+        [
+            initial.first_cell_height_chords,
+            initial.first_cell_height_chords,
+            0.006,
+        ]
+    )
+    assert recovered is True
+    assert actual.mesher == "blockmesh-cgrid-segmented-normal-20"
+    assert actual.first_cell_height_chords == pytest.approx(0.006)
+    assert built.n_cells == 7600
+    assert shared_mesh_qa_verified(tmp_path / "2032c-low-speed")
+    assert any("automatic mesh repair" in warning for warning in warnings)
 
 
 def test_mesh_once_marched_polar(require_docker, tmp_path, naca0012_selig_text):

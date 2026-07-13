@@ -10,6 +10,7 @@ from . import physics
 from .airfoil import load_airfoil
 from .cache import EngineCache
 from .cancellation import JobCancelled
+from .capabilities import MESH_RECOVERY_VERSION
 from .config import Settings, get_settings
 from .meshing.base import get_mesher
 from .models import (
@@ -30,11 +31,12 @@ from .pipeline import (
     StoredCaseOutcome,
     TransientResume,
     effective_mesh_params_for_airfoil,
-    prepare_mesh,
+    prepare_mesh_with_recovery,
     resolve_mesh_params,
     run_case,
     solve_polar_marched,
     stage_continuation_case,
+    validate_shared_mesh,
 )
 from .resources import CpuTokenPool, resolve_resources
 from .storage import JobStore
@@ -110,6 +112,15 @@ def execute_job(
 ) -> JobResult:
     settings = settings or get_settings()
     store = store or JobStore(settings)
+    if (
+        request.expected_mesh_recovery_version is not None
+        and request.expected_mesh_recovery_version != MESH_RECOVERY_VERSION
+    ):
+        raise RuntimeError(
+            "worker mesh-recovery capability mismatch: "
+            f"requested v{request.expected_mesh_recovery_version}, "
+            f"worker is v{MESH_RECOVERY_VERSION}"
+        )
     airfoil = load_airfoil(
         request.airfoil.name, request.airfoil.coordinates, request.airfoil.points,
         request.airfoil.format,
@@ -186,6 +197,7 @@ def execute_job(
                 aoa_case_count=total,
                 mesh_reuse_mode=mesh_reuse_mode,
             ),
+            mesh_recovery_version=MESH_RECOVERY_VERSION,
         )
         store.write_status(st)
         if progress:
@@ -257,13 +269,45 @@ def execute_job(
             on_wait=lambda _snapshot, c=chord: wait_for_cpu(1, f"waiting for CPU before meshing chord {c:g}"),
             on_acquired=lambda _snapshot, c=chord: cpu_acquired(1, JobPhase.meshing, f"meshing chord {c:g}"),
         ):
-            mr = prepare_mesh(
-                mesh_dir, airfoil, resolved, chord, mesher, runner,
-                cancel_check=ensure_not_cancelled, cache=cache,
+            qa_spec = CaseSpec(chord=chord, speed=max_speed, aoa_deg=0.0)
+
+            def validate(candidate_dir, candidate_resolved):
+                return validate_shared_mesh(
+                    candidate_dir,
+                    airfoil,
+                    candidate_resolved,
+                    qa_spec,
+                    request.fluid,
+                    request.roughness,
+                    request.solver,
+                    runner,
+                    plan.solver_processes,
+                    mesh_quality_warnings,
+                )
+
+            mr, resolved, _recovered = prepare_mesh_with_recovery(
+                mesh_dir,
+                airfoil,
+                resolved,
+                chord,
+                mesher,
+                runner,
+                cancel_check=ensure_not_cancelled,
+                cache=cache,
+                validate=validate,
+                quality_warnings=mesh_quality_warnings,
             )
         mesh_stats["count"] += 1
         set_status(JobState.running, "mesh ready", phase=JobPhase.waiting_cpu, cpu_tokens_waiting=0, cpu_tokens_held=0)
-        meshes[chord] = (mesh_dir, resolved, mr.n_cells)
+        # A recovery candidate is a different, fingerprinted mesher.  Carry
+        # that exact implementation into every downstream case instead of
+        # continuing to pass the request-level public/default mesher.
+        meshes[chord] = (
+            mesh_dir,
+            resolved,
+            mr.n_cells,
+            get_mesher(resolved.mesher),
+        )
 
     render_images = bool(request.solver.write_images)
     results: dict[tuple, dict[float, tuple[str, CaseOutcome]]] = {}
@@ -448,7 +492,7 @@ def execute_job(
         #     polars run concurrently. Image URLs are namespaced under the polar dir.
         def run_polar(chord: float, speed: float) -> tuple[float, float, PolarMarchResult]:
             ensure_not_cancelled()
-            mesh_dir, resolved, n_cells = meshes[chord]
+            mesh_dir, resolved, n_cells, mesh_mesher = meshes[chord]
             polar_dir = store.case_dir(job_id, polar_slug(chord, speed))
             wait_for_cpu(plan.solver_processes, f"waiting for CPU before polar U={speed:g}")
 
@@ -482,7 +526,7 @@ def execute_job(
             ):
                 march = solve_polar_marched(
                     polar_dir, mesh_dir, airfoil, chord, speed, request.fluid, request.roughness,
-                    resolved, request.solver, mesher, runner, aoas, n_cells=n_cells,
+                    resolved, request.solver, mesh_mesher, runner, aoas, n_cells=n_cells,
                     n_proc=plan.solver_processes, render_images=render_images,
                     solver_timeout=settings.solver_timeout,
                     rans_solver_timeout=settings.rans_solver_timeout,
@@ -527,7 +571,7 @@ def execute_job(
         #     reuses the prebuilt mesh; all cases run concurrently (best throughput).
         def run_one(spec: CaseSpec) -> tuple:
             ensure_not_cancelled()
-            mesh_dir, resolved, n_cells = meshes[spec.chord]
+            mesh_dir, resolved, n_cells, mesh_mesher = meshes[spec.chord]
             solver_phase = JobPhase.solving_urans if request.solver.force_transient else JobPhase.solving_rans
             solver_name = "pimpleFoam" if request.solver.force_transient else "simpleFoam"
 
@@ -568,7 +612,7 @@ def execute_job(
                 # so the cache keys fields by the mesh geometry actually in use.
                 outcome = run_case(
                     store.case_dir(job_id, spec.slug), airfoil, spec, request.fluid, request.roughness,
-                    resolved, request.solver, mesher, runner, n_proc=plan.solver_processes,
+                    resolved, request.solver, mesh_mesher, runner, n_proc=plan.solver_processes,
                     render_images=render_images,
                     solver_timeout=settings.solver_timeout,
                     rans_solver_timeout=settings.rans_solver_timeout,

@@ -122,12 +122,13 @@ const WORK_DISPOSITION_SQL = sql`CASE
 END`;
 
 const AWAITING_URANS_RESULT_SQL = sql`(
-  r.status IN ('done', 'failed') AND rc.state = 'rejected'
+  r.status = 'done' AND rc.state = 'rejected'
   AND (
     r.fidelity = 'rans'
     OR (r.fidelity IS NULL AND r.regime IS DISTINCT FROM 'urans')
   )
   AND ${SCHEDULED_WORK_SQL}
+  AND NOT ${BLOCKED_WORK_SQL}
 )`;
 
 /** Continuable (amendment C): a rejected urans_* row whose engine warning says

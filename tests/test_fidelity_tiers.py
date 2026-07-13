@@ -388,7 +388,7 @@ def _run_job_capturing_mesh(
     def fake_prepare_mesh(mesh_dir, airfoil, resolved, chord, mesher, runner, **_kwargs):
         captured["resolved"] = resolved
         mesh_dir.mkdir(parents=True, exist_ok=True)
-        return SimpleNamespace(n_cells=1000, patches=[], span_chords=0.1)
+        return SimpleNamespace(n_cells=1000, patches=[], span_chords=0.1), resolved, False
 
     def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
                       mesher, runner, **_kwargs):
@@ -398,7 +398,7 @@ def _run_job_capturing_mesh(
         captured.setdefault("case_warnings", _kwargs.get("mesh_quality_warnings"))
         return CaseOutcome(spec=spec, reynolds=1e6, cl=0.5, cd=0.01, cm=0.0, converged=True)
 
-    monkeypatch.setattr(jobs, "prepare_mesh", fake_prepare_mesh)
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", fake_prepare_mesh)
     monkeypatch.setattr(jobs, "run_case", fake_run_case)
 
     request = PolarRequest(

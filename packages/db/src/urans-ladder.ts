@@ -350,8 +350,16 @@ export async function campaignHasOpenRansGaps(
  *  admin request-URANS item, and no in-flight non-verify campaign job. */
 export async function hasOpenCampaignLadderWork(
   db: DB,
-  scope: { requestIds?: string[]; campaignIds?: string[] } = {},
+  scope: {
+    requestIds?: string[];
+    campaignIds?: string[];
+    /** When false, a temporarily unavailable PRECALC capability must not make
+     * unrelated full-fidelity verification look busy forever. Already-active
+     * jobs still retain their normal lower-tier barrier. */
+    includePrecalc?: boolean;
+  } = {},
 ): Promise<boolean> {
+  const includePrecalc = scope.includePrecalc !== false;
   const isolatedRequests = scope.requestIds !== undefined;
   const requestScope = !isolatedRequests
     ? sql``
@@ -369,8 +377,12 @@ export async function hasOpenCampaignLadderWork(
           sql`, `,
         )}]`}::text[])`
       : sql`AND false`;
-  const obligationCampaignScope =
-    scope.campaignIds === undefined
+  const requestFidelityScope = includePrecalc
+    ? sql``
+    : sql`AND req.fidelity = 'full'`;
+  const obligationCampaignScope = !includePrecalc
+    ? sql`AND false`
+    : scope.campaignIds === undefined
       ? sql``
       : scope.campaignIds.length
         ? sql`AND EXISTS (
@@ -400,6 +412,7 @@ export async function hasOpenCampaignLadderWork(
         SELECT 1 FROM sim_urans_requests req
         WHERE req.state IN ('pending', 'running')
           ${requestScope}
+          ${requestFidelityScope}
           AND (
             req.background_owner
             OR EXISTS (
@@ -1058,6 +1071,9 @@ export async function nextPendingUransRequest(
 export interface PendingUransRequestScope {
   /** Test-harness isolation for the shared dev DB. Production omits this. */
   requestIds?: string[];
+  /** Capability-aware lane selection. Undefined keeps the ordinary mixed
+   * oldest-first queue; `full` lets full work proceed while PRECALC is gated. */
+  fidelity?: "precalc" | "full";
 }
 
 /** Atomically claim one request before composition or external submit.
@@ -1079,11 +1095,15 @@ export async function claimNextPendingUransRequest(
               sql`, `,
             )}]`})`
           : sql`AND false`;
+    const fidelityScope = scope.fidelity
+      ? sql`AND req.fidelity = ${scope.fidelity}`
+      : sql``;
     const [candidate] = (await tx.execute(sql`
       SELECT req.id, req.background_owner
       FROM sim_urans_requests req
       WHERE req.state = 'pending'
         ${requestScope}
+        ${fidelityScope}
         AND NOT EXISTS (
           SELECT 1 FROM sim_ladder_submit_retries submit_retry
           WHERE submit_retry.urans_request_id = req.id

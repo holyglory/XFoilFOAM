@@ -512,7 +512,7 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
 
     monkeypatch.setattr(jobs, "stage_continuation_case", fake_stage)
     monkeypatch.setattr(jobs, "run_case", fake_run_case)
-    monkeypatch.setattr(jobs, "prepare_mesh", forbid_mesh)
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", forbid_mesh)
 
     request = _continuation_request(naca0012_selig_text)
     settings = get_settings()
@@ -545,7 +545,7 @@ def test_execute_job_continuation_missing_source_fails_honestly(monkeypatch, nac
         raise AssertionError("must not solve when the continuation source is missing")
 
     monkeypatch.setattr(jobs, "run_case", forbid)
-    monkeypatch.setattr(jobs, "prepare_mesh", forbid)
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", forbid)
 
     request = _continuation_request(
         naca0012_selig_text,

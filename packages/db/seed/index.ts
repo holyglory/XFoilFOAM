@@ -19,6 +19,10 @@ import {
   mediums,
   sweeperState,
 } from "../src/schema";
+import {
+  assertSeedCoordinateIntegrity,
+  seedSourceDisposition,
+} from "./coordinate-integrity";
 import { seedRuntimeProfiles } from "./runtime-profiles";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -479,8 +483,13 @@ async function main() {
     try {
       const text = readFileSync(join(seligDir, file), "utf8");
       const parsed = parseCoordinates(text);
+      assertSeedCoordinateIntegrity(text, file);
+      const sourceDisposition = seedSourceDisposition(file);
       const geo = deriveGeometry(parsed.points);
       const tags = tagsFor(category, geo);
+      if (!sourceDisposition.catalogEligible) {
+        tags.push("source-component", "solver-unsupported");
+      }
       const baseSlug = slugForStem(stem);
       const values = {
         slug: uniqueSlug(baseSlug, stem, usedAirfoilSlugs),
@@ -514,7 +523,12 @@ async function main() {
         refCdmin: null,
         refMetricsSource: "queued" as const,
         tags,
-        archivedAt: null,
+        // These two authoritative files are valid source records but not
+        // closed airfoils. Preserve their coordinates/provenance while keeping
+        // them out of browse and campaign selection; never synthesize closure.
+        archivedAt: sourceDisposition.catalogEligible
+          ? null
+          : new Date("2026-07-13T00:00:00.000Z"),
         deletedAt: null,
       };
       const { slug: _slug, ...updatable } = values;

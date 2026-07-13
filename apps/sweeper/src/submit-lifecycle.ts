@@ -16,6 +16,7 @@ import {
 import { releasedResultStatusSql } from "@aerodb/db/result-claim-lifecycle";
 import {
   EngineError,
+  MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
   type EngineClient,
   type JobStatus,
   type PolarRequest,
@@ -34,6 +35,7 @@ export type GuardedSubmitOutcome =
       engineCancelError: string | null;
     }
   | { kind: "connection_failure"; error: string }
+  | { kind: "capability_mismatch"; error: string }
   | {
       kind: "submit_failed";
       error: string;
@@ -893,9 +895,12 @@ async function settleAnsweredLadderFailureInTransaction(
   return disposition;
 }
 
-/** Connection-class failures never consume an answered-submit retry. Release
- * the claims exactly as before; the global engine backoff bounds frequency. */
-async function recordConnectionSubmitFailure(
+/** A transport failure or a structured rolling-cutover capability mismatch
+ * proves that this composition did not begin CFD execution. Release its claims
+ * without consuming an engine-submit or PRECALC execution attempt. Connection
+ * callers separately set global backoff; a capability mismatch is re-probed on
+ * the next scheduler tick. */
+async function recordUnexecutedTransientSubmitFailure(
   db: DB,
   jobId: string,
   error: string,
@@ -1280,7 +1285,7 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   } catch (error) {
     const message = errorMessage(error);
     if (isEngineConnectionFailure(error)) {
-      await recordConnectionSubmitFailure(
+      await recordUnexecutedTransientSubmitFailure(
         opts.db,
         opts.jobId,
         opts.connectionErrorPrefix + message,
@@ -1288,6 +1293,20 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
         opts.ladderSubmitOwner,
       );
       return { kind: "connection_failure", error: message };
+    }
+    if (
+      error instanceof EngineError &&
+      error.status === 409 &&
+      error.code === MESH_RECOVERY_CAPABILITY_MISMATCH_CODE &&
+      (opts.precalcObligationIds?.length ?? 0) > 0
+    ) {
+      await recordUnexecutedTransientSubmitFailure(
+        opts.db,
+        opts.jobId,
+        `engine capability changed before PRECALC execution: ${message}`,
+        campaignId,
+      );
+      return { kind: "capability_mismatch", error: message };
     }
     const httpStatus =
       error instanceof EngineError && typeof error.status === "number"

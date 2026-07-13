@@ -10,6 +10,8 @@ import {
   canonicalAoa,
   canonicalSi,
   canonicalSiString,
+  DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER,
+  DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER,
   POLAR_FIT_VERSION,
 } from "@aerodb/core";
 import { and, asc, desc, eq, sql, type SQLWrapper } from "drizzle-orm";
@@ -606,6 +608,9 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
  *                 failed — and the failed chip exceeds its Points-tab
  *                 click-through list, which lists source rows only)
  *   - running:    requested AND live-cell result.status IN (queued, running)
+ *                 AND its owning sim_job is submitted/running/ingesting;
+ *                 ownerless or terminal-job queue residue is waiting work,
+ *                 never an active solve
  *   - superseded: result_classifications.state='superseded_by_urans'
  *   - derived:    terminal mirror whose linked source has an explicit usable
  *                 classification and no blocked physical PRECALC obligation
@@ -620,6 +625,16 @@ function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
  *  with whole-campaign scope use recomputeProgressForCampaign instead. */
 const PROGRESS_KEY_CHUNK = 500;
 
+/** A results-row status is not execution ownership. Composition cancellation,
+ * a lost submit boundary, or an older cleanup path can leave a queued row with
+ * no sim_job (the production incident had 60). Only a live owning job may
+ * contribute to the user-visible running counter. Keep this predicate and the
+ * live_job join identical in both recompute paths. */
+const ACTIVE_LIVE_RESULT_SQL = sql`(
+  live.status IN ('queued', 'running')
+  AND live_job.status IN ('submitted', 'running', 'ingesting')
+)`;
+
 /** A retained parent result may enter a terminal attention bucket only when
  * no exact preliminary-URANS remediation is active or terminal-blocked. The
  * explicit blocked branch owns `blocked`; pending/running obligations remain
@@ -631,6 +646,110 @@ const PRECALC_RESULT_TERMINAL_BUCKET_SQL = sql`
   AND precalc_obligation.state IS DISTINCT FROM 'running'
   AND precalc_obligation.state IS DISTINCT FROM 'blocked'
 `;
+
+/** Legacy rows predate typed obligation-attempt outcomes. They qualify as a
+ * deterministic mesh blocker only when BOTH pinned engine markers are
+ * present; a generic infrastructure error which merely contains "mesh" must
+ * never enter the mesh-remediation bucket. */
+const PRECALC_LEGACY_DETERMINISTIC_MESH_SQL = sql`(
+  position(${DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER} in lower(COALESCE(precalc_obligation.last_error, ''))) > 0
+  AND position(${DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER} in lower(COALESCE(precalc_obligation.last_error, ''))) > 0
+)`;
+
+/** Typed immutable attempt evidence survives the repairing transition even
+ * after recordPrecalcObligationSubmission clears last_error. Fall back to the
+ * paired legacy markers only when no typed attempt outcome is available. */
+const PRECALC_PRIOR_DETERMINISTIC_MESH_SQL = sql`(
+  EXISTS (
+    SELECT 1
+    FROM sim_precalc_obligation_attempts mesh_attempt
+    WHERE mesh_attempt.obligation_id = precalc_obligation.id
+      AND mesh_attempt.outcome = 'deterministic_failure'
+  )
+  OR (
+    NOT EXISTS (
+      SELECT 1
+      FROM sim_precalc_obligation_attempts typed_attempt
+      WHERE typed_attempt.obligation_id = precalc_obligation.id
+        AND typed_attempt.outcome IS NOT NULL
+    )
+    AND (${PRECALC_LEGACY_DETERMINISTIC_MESH_SQL})
+  )
+)`;
+
+const PRECALC_MESH_REPAIRING_SQL = sql`(
+  precalc_obligation.state IN ('pending', 'running')
+  AND precalc_obligation.last_outcome IN ('mesh_recovery_upgrade_pending', 'composed', 'submitted')
+  AND (${PRECALC_PRIOR_DETERMINISTIC_MESH_SQL})
+  AND NOT EXISTS (
+    SELECT 1
+    FROM result_attempts accepted_attempt
+    JOIN result_classifications accepted_classification
+      ON accepted_classification.result_attempt_id = accepted_attempt.id
+     AND accepted_classification.state = 'accepted'
+    WHERE accepted_attempt.airfoil_id = precalc_obligation.airfoil_id
+      AND accepted_attempt.simulation_preset_revision_id = precalc_obligation.revision_id
+      AND accepted_attempt.aoa_deg = precalc_obligation.aoa_deg
+      AND (
+        accepted_attempt.regime = 'urans'
+        OR accepted_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      )
+  )
+)`;
+
+const PRECALC_BLOCKED_MESH_SQL = sql`(
+  precalc_obligation.state = 'blocked'
+  AND (
+    precalc_obligation.last_outcome = 'deterministic_failure'
+    OR (
+      precalc_obligation.last_outcome IS NULL
+      AND (${PRECALC_PRIOR_DETERMINISTIC_MESH_SQL})
+    )
+  )
+)`;
+
+const PRECALC_BLOCKED_EXHAUSTED_SQL = sql`(
+  precalc_obligation.state = 'blocked'
+  AND precalc_obligation.last_outcome IN ('failed_exhausted', 'rejected_exhausted', 'cancelled_exhausted')
+)`;
+
+const PRECALC_BLOCKED_ENGINE_SUBMIT_SQL = sql`(
+  precalc_obligation.state = 'blocked'
+  AND precalc_obligation.last_outcome = 'submit_blocked'
+)`;
+
+/** The canonical terminal blocked predicate is shared by the headline count
+ * and every reason group. The catch-all group below makes those groups exactly
+ * exhaustive without turning ordinary pending work into a terminal reason. */
+const CANONICAL_BLOCKED_SQL = sql`(
+  precalc_obligation.state = 'blocked'
+  OR (
+    (${PRECALC_RESULT_TERMINAL_BUCKET_SQL})
+    AND (
+      (
+        p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done'
+        AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+      )
+      OR (
+        p.state = 'terminal' AND p.derived_by_symmetry = true
+        AND (
+          r.status = 'failed'
+          OR (
+            r.status = 'done'
+            AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+          )
+        )
+      )
+    )
+  )
+)`;
+
+const PRECALC_BLOCKED_OTHER_SQL = sql`(
+  (${CANONICAL_BLOCKED_SQL})
+  AND NOT COALESCE((${PRECALC_BLOCKED_MESH_SQL}), false)
+  AND NOT COALESCE((${PRECALC_BLOCKED_EXHAUSTED_SQL}), false)
+  AND NOT COALESCE((${PRECALC_BLOCKED_ENGINE_SUBMIT_SQL}), false)
+)`;
 
 async function recomputeProgressForKeys(
   db: DB,
@@ -651,41 +770,31 @@ async function recomputeProgressForKeys(
     sql`, `,
   );
   await db.execute(sql`
-    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected, blocked)
+    INSERT INTO sim_campaign_progress (
+      campaign_id, condition_id, airfoil_id,
+      requested, solved, failed, running, superseded, derived, rejected, blocked,
+      precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
+      blocked_engine_submit, blocked_other
+    )
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
+           COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (
-             precalc_obligation.state = 'blocked'
-             OR (
-               (${PRECALC_RESULT_TERMINAL_BUCKET_SQL})
-               AND (
-                 (
-                   p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done'
-                   AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
-                 )
-                 OR (
-                   p.state = 'terminal' AND p.derived_by_symmetry = true
-                   AND (
-                     r.status = 'failed'
-                     OR (
-                       r.status = 'done'
-                       AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
-                     )
-                   )
-                 )
-               )
-             )
-           ))::int
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_EXHAUSTED_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_ENGINE_SUBMIT_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_BLOCKED_OTHER_SQL}))::int
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN results live
       ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
+    LEFT JOIN sim_jobs live_job ON live_job.id = live.sim_job_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
     LEFT JOIN sim_precalc_obligations precalc_obligation
       ON precalc_obligation.airfoil_id = p.airfoil_id
@@ -702,8 +811,49 @@ async function recomputeProgressForKeys(
       derived = excluded.derived,
       rejected = excluded.rejected,
       blocked = excluded.blocked,
+      precalc_mesh_repairing = excluded.precalc_mesh_repairing,
+      blocked_mesh_quality = excluded.blocked_mesh_quality,
+      blocked_precalc_exhausted = excluded.blocked_precalc_exhausted,
+      blocked_engine_submit = excluded.blocked_engine_submit,
+      blocked_other = excluded.blocked_other,
       "updatedAt" = now()
   `);
+}
+
+/** Recompute only progress rows whose canonical physical cell references one
+ * of the bounded PRECALC obligations. This is the requeue path's write model:
+ * it preserves the same source-result AoA symmetry rule as the canonical
+ * aggregate without rescanning every airfoil in a large campaign. */
+export async function recomputeProgressForPrecalcObligations(
+  db: DB,
+  obligationIds: string[],
+): Promise<string[]> {
+  if (!obligationIds.length) return [];
+  const keys: ProgressKeyRow[] = [];
+  for (let i = 0; i < obligationIds.length; i += PROGRESS_KEY_CHUNK) {
+    const chunk = obligationIds.slice(i, i + PROGRESS_KEY_CHUNK);
+    const idArray = sql`ARRAY[${sql.join(
+      chunk.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    )}]`;
+    const rows = (await db.execute(sql`
+      SELECT DISTINCT p.campaign_id, p.condition_id, p.airfoil_id
+      FROM sim_campaign_points p
+      LEFT JOIN results r ON r.id = p.result_id
+      JOIN sim_precalc_obligations obligation
+        ON obligation.airfoil_id = p.airfoil_id
+       AND obligation.revision_id = p.revision_id
+       AND obligation.aoa_deg = CASE
+         WHEN p.derived_by_symmetry THEN r.aoa_deg
+         ELSE p.aoa_deg
+       END
+      WHERE obligation.id = ANY(${idArray})
+    `)) as unknown as ProgressKeyRow[];
+    keys.push(...rows);
+  }
+  const deduped = dedupeProgressKeys(keys);
+  await recomputeProgressForKeys(db, deduped);
+  return [...new Set(deduped.map((row) => row.campaign_id))].sort();
 }
 
 /** Whole-campaign counter recompute, fully set-based (no key enumeration):
@@ -713,41 +863,31 @@ export async function recomputeProgressForCampaign(
   campaignId: string,
 ): Promise<void> {
   await db.execute(sql`
-    INSERT INTO sim_campaign_progress (campaign_id, condition_id, airfoil_id, requested, solved, failed, running, superseded, derived, rejected, blocked)
+    INSERT INTO sim_campaign_progress (
+      campaign_id, condition_id, airfoil_id,
+      requested, solved, failed, running, superseded, derived, rejected, blocked,
+      precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
+      blocked_engine_submit, blocked_other
+    )
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state = 'requested' AND live.status IN ('queued', 'running'))::int,
+           COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (
-             precalc_obligation.state = 'blocked'
-             OR (
-               (${PRECALC_RESULT_TERMINAL_BUCKET_SQL})
-               AND (
-                 (
-                   p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done'
-                   AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
-                 )
-                 OR (
-                   p.state = 'terminal' AND p.derived_by_symmetry = true
-                   AND (
-                     r.status = 'failed'
-                     OR (
-                       r.status = 'done'
-                       AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
-                     )
-                   )
-                 )
-               )
-             )
-           ))::int
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_EXHAUSTED_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_ENGINE_SUBMIT_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_BLOCKED_OTHER_SQL}))::int
     FROM sim_campaign_points p
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN results live
       ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
+    LEFT JOIN sim_jobs live_job ON live_job.id = live.sim_job_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
     LEFT JOIN sim_precalc_obligations precalc_obligation
       ON precalc_obligation.airfoil_id = p.airfoil_id
@@ -764,6 +904,11 @@ export async function recomputeProgressForCampaign(
       derived = excluded.derived,
       rejected = excluded.rejected,
       blocked = excluded.blocked,
+      precalc_mesh_repairing = excluded.precalc_mesh_repairing,
+      blocked_mesh_quality = excluded.blocked_mesh_quality,
+      blocked_precalc_exhausted = excluded.blocked_precalc_exhausted,
+      blocked_engine_submit = excluded.blocked_engine_submit,
+      blocked_other = excluded.blocked_other,
       "updatedAt" = now()
   `);
 }

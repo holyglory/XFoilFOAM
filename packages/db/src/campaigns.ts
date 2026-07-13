@@ -52,6 +52,7 @@ import {
   schedulingProfiles,
   simCampaignAirfoils,
   simCampaignConditions,
+  simCampaignLifecycleEvents,
   simCampaignLanes,
   simCampaignPlanRevisions,
   simCampaignPoints,
@@ -1853,6 +1854,95 @@ export interface CampaignProgressTotals {
   remaining: number;
 }
 
+export type CampaignRemediationReason =
+  | "mesh_quality"
+  | "precalc_attempts_exhausted"
+  | "engine_submit_rejected"
+  | "other_unavailable";
+
+export interface CampaignRemediationGroup {
+  reason: CampaignRemediationReason;
+  state: "repairing" | "blocked";
+  /** `system` means the work remains open and needs no user action;
+   *  `operator` means the bounded automatic path has reached a terminal
+   *  state. The payload deliberately exposes no raw error or internal id. */
+  owner: "system" | "operator";
+  points: number;
+}
+
+export interface CampaignRemediationSummary {
+  /** Open deterministic mesh recovery. Excluded from totals.blocked. */
+  repairing: number;
+  /** Exact sum of every terminal group; conserved with totals.blocked. */
+  blocked: number;
+  /** Bounded to five stable, user-facing groups and omits zero-count groups. */
+  groups: CampaignRemediationGroup[];
+}
+
+export interface CampaignRemediationCounters {
+  precalcMeshRepairing: number;
+  blockedMeshQuality: number;
+  blockedPrecalcExhausted: number;
+  blockedEngineSubmit: number;
+  blockedOther: number;
+}
+
+/** Pure wire-model builder shared by list/detail reads and unit tests. Raw
+ * errors, result ids, obligation ids, and batch internals never cross this
+ * boundary. */
+export function buildCampaignRemediationSummary(
+  counters: CampaignRemediationCounters,
+): CampaignRemediationSummary {
+  const entries: Array<CampaignRemediationGroup> = [
+    {
+      reason: "mesh_quality",
+      state: "repairing",
+      owner: "system",
+      points: counters.precalcMeshRepairing,
+    },
+    {
+      reason: "mesh_quality",
+      state: "blocked",
+      owner: "operator",
+      points: counters.blockedMeshQuality,
+    },
+    {
+      reason: "precalc_attempts_exhausted",
+      state: "blocked",
+      owner: "operator",
+      points: counters.blockedPrecalcExhausted,
+    },
+    {
+      reason: "engine_submit_rejected",
+      state: "blocked",
+      owner: "operator",
+      points: counters.blockedEngineSubmit,
+    },
+    {
+      reason: "other_unavailable",
+      state: "blocked",
+      owner: "operator",
+      points: counters.blockedOther,
+    },
+  ];
+  for (const entry of entries) {
+    if (!Number.isSafeInteger(entry.points) || entry.points < 0) {
+      throw new Error(
+        `invalid campaign remediation count for ${entry.state}:${entry.reason}`,
+      );
+    }
+  }
+  return {
+    repairing: counters.precalcMeshRepairing,
+    blocked:
+      counters.blockedMeshQuality +
+      counters.blockedPrecalcExhausted +
+      counters.blockedEngineSubmit +
+      counters.blockedOther,
+    groups: entries.filter((entry) => entry.points > 0),
+  };
+}
+
 /** Whole-campaign recompute of sim_campaign_progress (spec §3.1: written at
  *  launch/plan-edit inside the same transaction; the sweeper increments and the
  *  reconciler heals afterwards).
@@ -1874,6 +1964,8 @@ export interface CampaignProgressTotals {
  *                arithmetic and makes the failed chip exceed its Points-tab
  *                click-through list, which lists source rows only)
  *   - running:   state = 'requested' AND live-cell result.status IN (queued, running)
+ *                with a submitted/running/ingesting owning sim_job; ownerless
+ *                or terminal-job queue residue remains waiting work
  *   - superseded: result_classifications.state = 'superseded_by_urans'
  *   - derived:   terminal mirror only when its linked source classification
  *                is explicitly usable and its source obligation is not blocked
@@ -1901,10 +1993,15 @@ export async function recomputeCampaignProgress(
   await recomputeProgressForCampaign(asDb(tx), campaignId);
 }
 
-export async function campaignProgressTotals(
+interface CampaignProgressSnapshot {
+  totals: CampaignProgressTotals;
+  remediation: CampaignRemediationSummary;
+}
+
+async function campaignProgressSnapshot(
   db: DbTx,
   campaignId: string,
-): Promise<CampaignProgressTotals> {
+): Promise<CampaignProgressSnapshot> {
   const [row] = (await asDb(db).execute(sql`
     SELECT
       COALESCE(sum(requested), 0)::int AS requested,
@@ -1914,10 +2011,23 @@ export async function campaignProgressTotals(
       COALESCE(sum(superseded), 0)::int AS superseded,
       COALESCE(sum(derived), 0)::int AS derived,
       COALESCE(sum(rejected), 0)::int AS rejected,
-      COALESCE(sum(blocked), 0)::int AS blocked
+      COALESCE(sum(blocked), 0)::int AS blocked,
+      COALESCE(sum(precalc_mesh_repairing), 0)::int AS precalc_mesh_repairing,
+      COALESCE(sum(blocked_mesh_quality), 0)::int AS blocked_mesh_quality,
+      COALESCE(sum(blocked_precalc_exhausted), 0)::int AS blocked_precalc_exhausted,
+      COALESCE(sum(blocked_engine_submit), 0)::int AS blocked_engine_submit,
+      COALESCE(sum(blocked_other), 0)::int AS blocked_other
     FROM sim_campaign_progress
     WHERE campaign_id = ${campaignId}
-  `)) as unknown as Array<Omit<CampaignProgressTotals, "remaining">>;
+  `)) as unknown as Array<
+    Omit<CampaignProgressTotals, "remaining"> & {
+      precalc_mesh_repairing: number;
+      blocked_mesh_quality: number;
+      blocked_precalc_exhausted: number;
+      blocked_engine_submit: number;
+      blocked_other: number;
+    }
+  >;
   const totals = row ?? {
     requested: 0,
     solved: 0,
@@ -1927,8 +2037,13 @@ export async function campaignProgressTotals(
     derived: 0,
     rejected: 0,
     blocked: 0,
+    precalc_mesh_repairing: 0,
+    blocked_mesh_quality: 0,
+    blocked_precalc_exhausted: 0,
+    blocked_engine_submit: 0,
+    blocked_other: 0,
   };
-  return {
+  const normalizedTotals: CampaignProgressTotals = {
     requested: Number(totals.requested),
     solved: Number(totals.solved),
     failed: Number(totals.failed),
@@ -1947,6 +2062,26 @@ export async function campaignProgressTotals(
         Number(totals.blocked),
     ),
   };
+  const remediation = buildCampaignRemediationSummary({
+    precalcMeshRepairing: Number(totals.precalc_mesh_repairing),
+    blockedMeshQuality: Number(totals.blocked_mesh_quality),
+    blockedPrecalcExhausted: Number(totals.blocked_precalc_exhausted),
+    blockedEngineSubmit: Number(totals.blocked_engine_submit),
+    blockedOther: Number(totals.blocked_other),
+  });
+  if (remediation.blocked !== normalizedTotals.blocked) {
+    throw new Error(
+      `campaign ${campaignId} blocked remediation counters do not conserve the headline total`,
+    );
+  }
+  return { totals: normalizedTotals, remediation };
+}
+
+export async function campaignProgressTotals(
+  db: DbTx,
+  campaignId: string,
+): Promise<CampaignProgressTotals> {
+  return (await campaignProgressSnapshot(db, campaignId)).totals;
 }
 
 /** Completion-state derivation (spec §6.4): every obligated cell settled and
@@ -3934,7 +4069,23 @@ async function cancelStoppedSharedLadderCompositions(
   return stopped.length;
 }
 
-export async function pauseCampaign(db: DB, campaignId: string) {
+export interface CampaignLifecycleContext {
+  actor?: string | null;
+  reason?: string | null;
+}
+
+function normalizedLifecycleText(
+  value: string | null | undefined,
+): string | null {
+  const normalized = value?.trim();
+  return normalized ? normalized : null;
+}
+
+export async function pauseCampaign(
+  db: DB,
+  campaignId: string,
+  context: CampaignLifecycleContext = {},
+) {
   return db.transaction(async (tx) => {
     // Lifecycle changes and scheduler composition serialize on this row. The
     // scheduler inserts its sim_job and claims in one transaction while
@@ -3955,6 +4106,16 @@ export async function pauseCampaign(db: DB, campaignId: string) {
       .set({ status: "paused" })
       .where(eq(simCampaigns.id, campaignId))
       .returning();
+    await asDb(tx)
+      .insert(simCampaignLifecycleEvents)
+      .values({
+        campaignId,
+        action: "pause",
+        fromStatus: campaign.status,
+        toStatus: "paused",
+        actor: normalizedLifecycleText(context.actor),
+        reason: normalizedLifecycleText(context.reason),
+      });
     const verifyOwners = await asDb(tx)
       .select({ id: simUransVerifyQueueCampaigns.queueId })
       .from(simUransVerifyQueueCampaigns)
@@ -4038,7 +4199,11 @@ export async function pauseCampaign(db: DB, campaignId: string) {
   });
 }
 
-export async function resumeCampaign(db: DB, campaignId: string) {
+export async function resumeCampaign(
+  db: DB,
+  campaignId: string,
+  context: CampaignLifecycleContext = {},
+) {
   return db.transaction(async (tx) => {
     // Match pause/cancel's lifecycle boundary: a concurrent terminal action
     // must commit before this read, not between a stale validation and an
@@ -4066,6 +4231,16 @@ export async function resumeCampaign(db: DB, campaignId: string) {
         "campaign changed state while resume was being applied",
       );
     }
+    await asDb(tx)
+      .insert(simCampaignLifecycleEvents)
+      .values({
+        campaignId,
+        action: "resume",
+        fromStatus: "paused",
+        toStatus: "active",
+        actor: normalizedLifecycleText(context.actor),
+        reason: normalizedLifecycleText(context.reason),
+      });
     await refreshCampaignCompletion(tx, campaignId);
     return requireCampaign(tx, campaignId);
   });
@@ -5103,13 +5278,21 @@ export interface CampaignListItem {
   updatedAt: string;
   conditionCount: number;
   airfoilCount: number;
+  excludedAirfoilCount: number;
   totals: CampaignProgressTotals;
+  remediation: CampaignRemediationSummary;
   /** Compatibility split retained for rolling clients. `awaitingUrans` is
    *  machine-owned stage-2 work. `needsReview` is a legacy wire field whose
    *  canonical predicate is now empty; unavailable machine outcomes are
    *  reported by failed/rejected/blocked totals instead. */
   reviewBuckets: CampaignReviewBuckets;
   automaticPrecalcOpen: number;
+  latestLifecycleEvent: {
+    action: string;
+    actor: string | null;
+    reason: string | null;
+    createdAt: string;
+  } | null;
 }
 
 const isoOf = (v: Date | string | null): string | null =>
@@ -5129,8 +5312,13 @@ export async function listCampaigns(
     SELECT
       c.id, c.slug, c.name, c.status, c.priority, c.notes,
       c.closed_with_failed_count, c.closed_with_rejected_count, c."completedAt" AS completed_at, c."createdAt" AS created_at, c."updatedAt" AS updated_at,
+      lifecycle.action AS lifecycle_action,
+      lifecycle.actor AS lifecycle_actor,
+      lifecycle.reason AS lifecycle_reason,
+      lifecycle."createdAt" AS lifecycle_created_at,
       (SELECT count(*)::int FROM sim_campaign_conditions cc WHERE cc.campaign_id = c.id) AS condition_count,
-      (SELECT count(*)::int FROM sim_campaign_airfoils ca WHERE ca.campaign_id = c.id) AS airfoil_count,
+      (SELECT count(*)::int FROM sim_campaign_airfoils ca JOIN airfoils scoped_airfoil ON scoped_airfoil.id = ca.airfoil_id WHERE ca.campaign_id = c.id AND scoped_airfoil."archivedAt" IS NULL AND scoped_airfoil."deletedAt" IS NULL) AS airfoil_count,
+      (SELECT count(*)::int FROM sim_campaign_airfoils ca JOIN airfoils scoped_airfoil ON scoped_airfoil.id = ca.airfoil_id WHERE ca.campaign_id = c.id AND (scoped_airfoil."archivedAt" IS NOT NULL OR scoped_airfoil."deletedAt" IS NOT NULL)) AS excluded_airfoil_count,
       COALESCE(pr.requested, 0)::int AS requested,
       COALESCE(pr.solved, 0)::int AS solved,
       COALESCE(pr.failed, 0)::int AS failed,
@@ -5139,6 +5327,11 @@ export async function listCampaigns(
       COALESCE(pr.derived, 0)::int AS derived,
       COALESCE(pr.rejected, 0)::int AS rejected,
       COALESCE(pr.blocked, 0)::int AS blocked,
+      COALESCE(pr.precalc_mesh_repairing, 0)::int AS precalc_mesh_repairing,
+      COALESCE(pr.blocked_mesh_quality, 0)::int AS blocked_mesh_quality,
+      COALESCE(pr.blocked_precalc_exhausted, 0)::int AS blocked_precalc_exhausted,
+      COALESCE(pr.blocked_engine_submit, 0)::int AS blocked_engine_submit,
+      COALESCE(pr.blocked_other, 0)::int AS blocked_other,
       (
         SELECT count(*)::int
         FROM (
@@ -5165,9 +5358,21 @@ export async function listCampaigns(
     LEFT JOIN (
       SELECT campaign_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
              sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
-             sum(rejected) AS rejected, sum(blocked) AS blocked
+             sum(rejected) AS rejected, sum(blocked) AS blocked,
+             sum(precalc_mesh_repairing) AS precalc_mesh_repairing,
+             sum(blocked_mesh_quality) AS blocked_mesh_quality,
+             sum(blocked_precalc_exhausted) AS blocked_precalc_exhausted,
+             sum(blocked_engine_submit) AS blocked_engine_submit,
+             sum(blocked_other) AS blocked_other
       FROM sim_campaign_progress GROUP BY campaign_id
     ) pr ON pr.campaign_id = c.id
+    LEFT JOIN LATERAL (
+      SELECT event.action, event.actor, event.reason, event."createdAt"
+      FROM sim_campaign_lifecycle_events event
+      WHERE event.campaign_id = c.id
+      ORDER BY event."createdAt" DESC, event.id DESC
+      LIMIT 1
+    ) lifecycle ON true
     ${statusFilter}
     ORDER BY (c.status = 'attention') DESC, c."updatedAt" DESC
     LIMIT ${limit} OFFSET ${offset}
@@ -5198,8 +5403,18 @@ export async function listCampaigns(
       createdAt: isoOf(r.created_at as Date | string | null)!,
       updatedAt: isoOf(r.updated_at as Date | string | null)!,
       automaticPrecalcOpen: Number(r.automatic_precalc_open ?? 0),
+      latestLifecycleEvent:
+        r.lifecycle_action == null || r.lifecycle_created_at == null
+          ? null
+          : {
+              action: String(r.lifecycle_action),
+              actor: (r.lifecycle_actor as string | null) ?? null,
+              reason: (r.lifecycle_reason as string | null) ?? null,
+              createdAt: isoOf(r.lifecycle_created_at as Date | string | null)!,
+            },
       conditionCount: Number(r.condition_count),
       airfoilCount: Number(r.airfoil_count),
+      excludedAirfoilCount: Number(r.excluded_airfoil_count),
       totals: {
         requested: Number(r.requested),
         solved: Number(r.solved),
@@ -5219,6 +5434,13 @@ export async function listCampaigns(
             Number(r.blocked),
         ),
       },
+      remediation: buildCampaignRemediationSummary({
+        precalcMeshRepairing: Number(r.precalc_mesh_repairing),
+        blockedMeshQuality: Number(r.blocked_mesh_quality),
+        blockedPrecalcExhausted: Number(r.blocked_precalc_exhausted),
+        blockedEngineSubmit: Number(r.blocked_engine_submit),
+        blockedOther: Number(r.blocked_other),
+      }),
       reviewBuckets: reviewBuckets.get(String(r.id)) ?? {
         awaitingUrans: 0,
         needsReview: 0,
@@ -5271,6 +5493,7 @@ export interface CampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  remediation: CampaignRemediationSummary;
   /** Rolling-compatibility ladder split. `needsReview` remains on the wire for
    *  old clients but has an empty canonical predicate; it must not promise a
    *  routine human adjudication workflow. */
@@ -5281,6 +5504,8 @@ export interface CampaignSummary {
    *  running_refinement → completed; null for paused/cancelled/archived. */
   phase: CampaignPhase;
   airfoilCount: number;
+  excludedAirfoilCount: number;
+  latestLifecycleEvent: CampaignListItem["latestLifecycleEvent"];
   conditions: CampaignConditionSummary[];
   lanesSummary: Record<string, Record<string, number>>;
 }
@@ -5294,7 +5519,8 @@ export async function campaignSummary(
     db,
     campaignId,
   );
-  const totals = await campaignProgressTotals(db, campaignId);
+  const progress = await campaignProgressSnapshot(db, campaignId);
+  const totals = progress.totals;
   const tierCounts = await campaignOpenTierCounts(db, campaignId);
   const reviewBucketRows = await campaignReviewBucketRows(db, campaignId);
   const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
@@ -5315,9 +5541,26 @@ export async function campaignSummary(
       needsReview: prev.needsReview + row.needsReview,
     });
   }
-  const [airfoilCountRow] = (await db.execute(
-    sql`SELECT count(*)::int AS n FROM sim_campaign_airfoils WHERE campaign_id = ${campaignId}`,
-  )) as unknown as Array<{ n: number }>;
+  const [scopeRow] = (await db.execute(sql`
+    SELECT
+      count(*) FILTER (WHERE airfoil."archivedAt" IS NULL AND airfoil."deletedAt" IS NULL)::int AS active,
+      count(*) FILTER (WHERE airfoil."archivedAt" IS NOT NULL OR airfoil."deletedAt" IS NOT NULL)::int AS excluded
+    FROM sim_campaign_airfoils scope
+    JOIN airfoils airfoil ON airfoil.id = scope.airfoil_id
+    WHERE scope.campaign_id = ${campaignId}
+  `)) as unknown as Array<{ active: number; excluded: number }>;
+  const [lifecycleRow] = (await db.execute(sql`
+    SELECT action, actor, reason, "createdAt" AS created_at
+    FROM sim_campaign_lifecycle_events
+    WHERE campaign_id = ${campaignId}
+    ORDER BY "createdAt" DESC, id DESC
+    LIMIT 1
+  `)) as unknown as Array<{
+    action: string;
+    actor: string | null;
+    reason: string | null;
+    created_at: Date | string;
+  }>;
   const conditionRows = (await db.execute(sql`
     SELECT
       cc.id, cc.ord, cc.status,
@@ -5394,10 +5637,20 @@ export async function campaignSummary(
           : isoOf(revision.createdAt),
     },
     totals,
+    remediation: progress.remediation,
     reviewBuckets,
     tierCounts,
     phase: deriveCampaignPhase(campaign.status, tierCounts),
-    airfoilCount: Number(airfoilCountRow?.n ?? 0),
+    airfoilCount: Number(scopeRow?.active ?? 0),
+    excludedAirfoilCount: Number(scopeRow?.excluded ?? 0),
+    latestLifecycleEvent: lifecycleRow
+      ? {
+          action: lifecycleRow.action,
+          actor: lifecycleRow.actor,
+          reason: lifecycleRow.reason,
+          createdAt: isoOf(lifecycleRow.created_at)!,
+        }
+      : null,
     conditions: conditionRows.map((r) => ({
       id: String(r.id),
       ord: Number(r.ord),
@@ -5469,7 +5722,10 @@ export async function campaignAirfoilRows(
     SELECT af.id, af.slug, af.name, af.is_symmetric
     FROM sim_campaign_airfoils ca
     JOIN airfoils af ON af.id = ca.airfoil_id
-    WHERE ca.campaign_id = ${campaignId} ${cursorFilter}
+    WHERE ca.campaign_id = ${campaignId}
+      AND af."archivedAt" IS NULL
+      AND af."deletedAt" IS NULL
+      ${cursorFilter}
     ORDER BY af.slug ASC
     LIMIT ${limit + 1}
   `)) as unknown as Array<{

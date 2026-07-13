@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { deriveGeometry, parseCoordinates } from "@aerodb/core";
 
+import { assertSeedCoordinateIntegrity } from "./coordinate-integrity";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const dir = resolve(here, "selig-database");
 for (const file of readdirSync(dir)
@@ -14,6 +16,7 @@ for (const file of readdirSync(dir)
   const text = readFileSync(join(dir, file), "utf8");
   try {
     const parsed = parseCoordinates(text);
+    assertSeedCoordinateIntegrity(text, file);
     const xs = parsed.points.map((p) => p.x);
     const ys = parsed.points.map((p) => p.y);
     const g = deriveGeometry(parsed.points);

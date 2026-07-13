@@ -18,7 +18,7 @@ class AirfoilFormat(str, Enum):
 
 
 class FailureDisposition(str, Enum):
-    """Machine-readable reason a solver point was rejected.
+    """Machine-readable reason solver evidence or a whole job failed.
 
     Promotion policy must consume this field, never parse the user-facing
     ``error`` string.  ``hard_solver`` is reserved for aerodynamic/numerical
@@ -604,6 +604,13 @@ class PolarRequest(BaseModel):
         description="Per-job URANS wall-clock budget [s] replacing the fidelity-tier "
         "budget (continuations submit the increased budget here). Capped at 24 h.",
     )
+    expected_mesh_recovery_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Controller-required engine mesh-recovery capability. The API and "
+        "worker reject a mismatch before solving so requested capability cannot be "
+        "mistaken for execution provenance during a rolling deployment.",
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> "PolarRequest":
@@ -935,6 +942,17 @@ class JobStatus(BaseModel):
     cpu_tokens_waiting: int = 0
     cpu_tokens_held: int = 0
     scheduling: Optional[SchedulingMetadata] = None
+    mesh_recovery_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Capability acknowledged by the worker that actually executed this job. "
+        "Null while only the API has accepted/queued the request.",
+    )
+    failure_disposition: Optional[FailureDisposition] = Field(
+        default=None,
+        description="Machine-readable terminal job failure class when execution ended "
+        "before per-angle attempt evidence existed.",
+    )
 
 
 class JobResult(BaseModel):
@@ -943,3 +961,13 @@ class JobResult(BaseModel):
     polars: list[Polar] = Field(default_factory=list)
     message: Optional[str] = None
     scheduling: Optional[SchedulingMetadata] = None
+    mesh_recovery_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Capability acknowledged by the worker that produced this result.",
+    )
+    failure_disposition: Optional[FailureDisposition] = Field(
+        default=None,
+        description="Machine-readable terminal job failure class when execution ended "
+        "before per-angle attempt evidence existed.",
+    )

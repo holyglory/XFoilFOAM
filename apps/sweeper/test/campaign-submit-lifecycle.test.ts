@@ -60,6 +60,7 @@ import { URANS_BUDGET_STOP_MARKER } from "@aerodb/core";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import {
   EngineError,
+  MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
   type EngineClient,
   type JobStatus,
   type PolarRequest,
@@ -3453,6 +3454,118 @@ describe("campaign compose→submit lifecycle boundary", () => {
           inArray(resultAttempts.simJobId, [blockedJob.id, exhaustedJob.id]),
         ),
     ).toHaveLength(0);
+  }, 120000);
+
+  it("MUST-CATCH: a structured mesh-capability 409 releases PRECALC for a fresh capability probe without consuming either budget", async () => {
+    const campaignId = await launch("precalc-capability-cutover", 32.937);
+    const setup = await setupFor(campaignId);
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [{ airfoilId, revisionId: setup.revisionId, aoaDeg: ANGLES[0] }],
+      { campaignIds: [campaignId] },
+    );
+
+    const compose = async (suffix: string) => {
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [setup.bcId],
+          simulationPresetRevisionId: setup.revisionId,
+          campaignId: null,
+          jobKind: "targeted",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "pending",
+          totalCases: 1,
+          requestPayload: {
+            aoas: [ANGLES[0]],
+            uransFidelity: "precalc",
+            precalcObligationIds: [obligation.id],
+            testSuffix: suffix,
+          },
+        })
+        .returning();
+      await db
+        .update(simPrecalcObligations)
+        .set({ latestSimJobId: job.id, lastOutcome: "composed" })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      return job;
+    };
+
+    const mismatchedJob = await compose("old-api-race");
+    const mismatch = await submitPendingJobWithLifecycleGuard({
+      db,
+      engine: {
+        submitPolar: async () => {
+          throw new EngineError(
+            "requested mesh recovery v1, API is v2",
+            409,
+            MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
+          );
+        },
+      } as unknown as EngineClient,
+      jobId: mismatchedJob.id,
+      campaignId: null,
+      request: {} as PolarRequest,
+      connectionErrorPrefix: "connection: ",
+      submitErrorPrefix: "precalc submit: ",
+      precalcObligationIds: [obligation.id],
+    });
+    expect(mismatch).toMatchObject({ kind: "capability_mismatch" });
+
+    const [afterMismatch] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(afterMismatch).toMatchObject({
+      state: "pending",
+      attemptCount: 0,
+      submitFailureCount: 0,
+      lastOutcome: "composed",
+    });
+    expect(afterMismatch.nextSubmitAt).toBeNull();
+    expect(
+      await db
+        .select({ id: simPrecalcObligationAttempts.id })
+        .from(simPrecalcObligationAttempts)
+        .where(eq(simPrecalcObligationAttempts.obligationId, obligation.id)),
+    ).toHaveLength(0);
+
+    const replacementJob = await compose("fresh-capability-probe");
+    const replacement = await submitPendingJobWithLifecycleGuard({
+      db,
+      engine: {
+        submitPolar: async () =>
+          ({
+            job_id: `${PREFIX}-capability-replacement-engine`,
+            state: "pending",
+            total_cases: 1,
+            completed_cases: 0,
+          }) as JobStatus,
+      } as unknown as EngineClient,
+      jobId: replacementJob.id,
+      campaignId: null,
+      request: {} as PolarRequest,
+      connectionErrorPrefix: "connection: ",
+      submitErrorPrefix: "precalc submit: ",
+      precalcObligationIds: [obligation.id],
+    });
+    expect(replacement.kind).toBe("submitted");
+    await recordPrecalcObligationSubmission(db, replacementJob.id, [
+      obligation.id,
+    ]);
+    const [afterReplacement] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(afterReplacement).toMatchObject({
+      state: "running",
+      attemptCount: 1,
+      submitFailureCount: 0,
+      latestSimJobId: replacementJob.id,
+      lastOutcome: "submitted",
+    });
   }, 120000);
 
   it("classifies a stationary budget-stopped PRECALC window as nonpublishable and keeps its obligation continuable", async () => {

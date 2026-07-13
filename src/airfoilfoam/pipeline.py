@@ -17,6 +17,7 @@ import signal
 import shutil
 import tarfile
 import time
+import uuid
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -25,6 +26,7 @@ from typing import Callable, Optional
 from . import physics
 from .airfoil import Airfoil, max_concave_curvature
 from .cache import EngineCache, SeedHit
+from .capabilities import MESH_RECOVERY_VERSION
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
 from .meshing.base import Mesher, MeshResult, get_mesher
@@ -684,24 +686,59 @@ def _parse_check_mesh_output(output: str) -> MeshQaResult:
 
 def _run_transient_mesh_qa_gate(
     case_dir: Path, runner: Runner, quality_warnings: Optional[list[str]] = None
-) -> None:
+) -> Optional[MeshQaResult]:
     try:
         result = runner.application(case_dir, "checkMesh -time 0", timeout=MESH_CHECK_TIMEOUT_S)
-    except Exception as exc:  # noqa: BLE001 - inability to run the advisory gate is non-fatal
-        logger.warning("checkMesh gate could not run for %s: %s", case_dir, exc)
-        return
+    except InfrastructureError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - launcher/runtime plumbing
+        raise InfrastructureError(f"checkMesh could not be launched: {exc}") from exc
     output = getattr(result, "stdout", "") or ""
     try:
         (case_dir / "log.checkMesh").write_text(output)
-    except OSError:
-        logger.warning("could not write checkMesh log for %s", case_dir)
+    except OSError as exc:
+        raise InfrastructureError(
+            f"checkMesh output could not be preserved as evidence: {exc}"
+        ) from exc
     qa = _parse_check_mesh_output(output)
+    returncode = int(getattr(result, "returncode", 0) or 0)
+    process_ok = bool(getattr(result, "ok", returncode == 0)) and returncode == 0
+
+    # A timeout/process kill proves only that the QA probe was unavailable.
+    # Its partial stdout may contain an earlier, apparently healthy summary;
+    # that text must never outrank the structured process result.
+    if bool(getattr(result, "timed_out", False)) or returncode == 124:
+        raise InfrastructureError(
+            f"checkMesh timed out before producing a trustworthy verdict (return code {returncode})"
+        )
+    if returncode in {125, 126, 127, 137, 143, -9, -15}:
+        raise InfrastructureError(
+            "checkMesh was unavailable or terminated by the execution environment "
+            f"(return code {returncode})"
+        )
+    if returncode != 0 and re.search(
+        r"(?:out of memory|oom[-_ ]kill|killed process|cannot allocate memory)",
+        output,
+        re.IGNORECASE,
+    ):
+        raise InfrastructureError(
+            "checkMesh stopped because the execution environment reported an "
+            f"out-of-memory/process-kill condition (return code {returncode})"
+        )
+
+    aspect_ratio_only_waiver = (
+        qa.failed_checks > 0
+        and qa.aspect_ratio_only_failure
+        and qa.max_aspect_ratio is not None
+        and qa.high_aspect_cells is not None
+        and (process_ok or returncode == 1)
+    )
     reasons: list[str] = []
     if qa.max_non_ortho_deg is not None and qa.max_non_ortho_deg > MESH_MAX_NON_ORTHO_DEG:
         reasons.append(
             f"checkMesh max non-orthogonality exceeds {MESH_MAX_NON_ORTHO_DEG:.1f} deg"
         )
-    if qa.failed_checks > 0 and not qa.aspect_ratio_only_failure:
+    if qa.failed_checks > 0 and not aspect_ratio_only_waiver:
         reasons.append(f"checkMesh reported Failed {qa.failed_checks} mesh checks")
     if qa.negative_volume:
         reasons.append("checkMesh reported negative-volume cells")
@@ -714,10 +751,22 @@ def _run_transient_mesh_qa_gate(
         else:
             prefix = "mesh degenerate at this fidelity tier: "
         raise DeterministicMeshError(prefix + "; ".join(reasons) + "; see log.checkMesh")
+
+    # The sole intentional non-zero exception is the fully parsed production
+    # aspect-ratio-only wall-layer heuristic. Every other non-zero result is an
+    # unavailable probe, even when its partial text happens to include a benign
+    # max-nonorthogonality line. It therefore cannot write a verified marker,
+    # publish a cache entry, or advance the deterministic recovery ladder.
+    if not process_ok and not aspect_ratio_only_waiver:
+        if returncode:
+            detail = f"checkMesh exited {returncode} without a deterministic mesh verdict"
+        else:
+            detail = "checkMesh reported an unsuccessful process status without a deterministic mesh verdict"
+        raise InfrastructureError(detail)
     if qa.max_non_ortho_deg is None:
         logger.warning("checkMesh output for %s had no non-orthogonality summary; mesh QA gate skipped", case_dir)
-        return
-    if qa.failed_checks > 0 and qa.aspect_ratio_only_failure:
+        return None
+    if aspect_ratio_only_waiver:
         ar = f"{qa.max_aspect_ratio:.0f}" if qa.max_aspect_ratio is not None else "unknown"
         cells = qa.high_aspect_cells if qa.high_aspect_cells is not None else "some"
         warning = (
@@ -737,12 +786,32 @@ def _run_transient_mesh_qa_gate(
         logger.warning("%s: %s", case_dir, warning)
         if quality_warnings is not None:
             quality_warnings.append(warning)
+    return qa
 
 
 TRANSIENT_WALL_YPLUS = 40.0  # wall-function y+ for transient mesh; mirrors models.URANS_PRECALC_WALL_YPLUS
 MESH_MAX_NON_ORTHO_DEG = 85.0
 MESH_WARN_NON_ORTHO_DEG = 75.0
 MESH_CHECK_TIMEOUT_S = 300
+# Quality-driven geometry recovery remains below the wall-function layer size
+# that produced a real low-speed 20-32C skewness failure (0.01575c) and passed
+# the same real checkMesh replay at 0.006c. This is a maximum, not a replacement
+# y+ target: thinner requested/resolved layers are never enlarged.
+MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS = 0.006
+MESH_RECOVERY_PUBLIC_MESHER = "blockmesh-cgrid"
+MESH_RECOVERY_MESHER_CANDIDATES = (
+    "blockmesh-cgrid-segmented-normal-20",
+    "blockmesh-cgrid-segmented-normal-24",
+    "blockmesh-cgrid-segmented-normal-29",
+    "blockmesh-cgrid-segmented-normal-32",
+)
+SHARED_MESH_QA_MARKER = "mesh-qa-verified.json"
+SHARED_MESH_EVIDENCE_DIR = "mesh-evidence"
+SHARED_MESH_EVIDENCE_MANIFEST = "manifest.json"
+SHARED_MESH_EVIDENCE_CHECKSUM = "manifest.sha256"
+SHARED_MESH_EVIDENCE_SCHEMA_VERSION = 1
+MESH_ATTEMPT_LOG_TAIL_LINES = 80
+MESH_ATTEMPT_TEXT_MAX_CHARS = 16_384
 TRANSIENT_INIT_ITERS = 600  # short steady init before the transient
 TRANSIENT_INITIAL_STROUHAL = 0.5
 # Prod s1223 jobs 7ff36caf/0cba5e9b on the y+40 precalc mesh showed the fresh
@@ -1842,7 +1911,8 @@ def _prepare_transient_case(
     else:
         _link_mesh(tcase, shared_mesh_dir, runner)
     _check_cancel(cancel_check)
-    _run_transient_mesh_qa_gate(tcase, runner, quality_warnings)
+    if shared_mesh_dir is None or not shared_mesh_qa_verified(shared_mesh_dir):
+        _run_transient_mesh_qa_gate(tcase, runner, quality_warnings)
     _check_cancel(cancel_check)
     # Preferred warm start: continue from an ACCEPTED in-job steady RANS field
     # solved on the SAME shared mesh (URANS-only jobs run that stage first).
@@ -2984,6 +3054,7 @@ def _artifact_kind_for_role(role: str) -> str:
         "log",
         "force_coefficients",
         "mesh",
+        "mesh_evidence",
         "dictionary",
         FRAME_IMAGE_ARTIFACT_KIND,
     } else "field_data"
@@ -3030,6 +3101,13 @@ def _archive_case_evidence(
     raw_dir = evidence_dir / "openfoam"
     _copy_tree_files(case_dir / "system", raw_dir / "system", entries, "dictionary", manifest_base=evidence_dir)
     _copy_tree_files(case_dir / "constant", raw_dir / "constant", entries, "mesh", manifest_base=evidence_dir)
+    _copy_tree_files(
+        case_dir / SHARED_MESH_EVIDENCE_DIR,
+        raw_dir / "mesh_evidence",
+        entries,
+        "mesh_evidence",
+        manifest_base=evidence_dir,
+    )
     if post_dir != case_dir:
         _copy_tree_files(post_dir / "system", raw_dir / "transient" / "system", entries, "dictionary", manifest_base=evidence_dir)
         _copy_tree_files(post_dir / "constant", raw_dir / "transient" / "constant", entries, "mesh", manifest_base=evidence_dir)
@@ -3872,6 +3950,385 @@ def _write_minimal_controldict(case_dir: Path) -> None:
     )
 
 
+def write_shared_mesh_qa_marker(mesh_dir: Path, qa: MeshQaResult) -> None:
+    """Persist proof that this job's shared mesh passed the real QA gate."""
+    payload = {
+        "schemaVersion": 1,
+        "checkedAt": time.time(),
+        "maxNonOrthogonalityDeg": qa.max_non_ortho_deg,
+        "failedChecks": qa.failed_checks,
+        "negativeVolume": qa.negative_volume,
+        "aspectRatioOnlyFailure": qa.aspect_ratio_only_failure,
+        "maxAspectRatio": qa.max_aspect_ratio,
+        "highAspectCells": qa.high_aspect_cells,
+    }
+    marker = mesh_dir / SHARED_MESH_QA_MARKER
+    tmp = marker.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, marker)
+
+
+def shared_mesh_qa_verified(mesh_dir: Path) -> bool:
+    """Return true only for a complete, current shared-mesh QA marker."""
+    try:
+        payload = json.loads((mesh_dir / SHARED_MESH_QA_MARKER).read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("schemaVersion") != 1:
+        return False
+    max_non_ortho = payload.get("maxNonOrthogonalityDeg")
+    if not isinstance(max_non_ortho, (int, float)) or not math.isfinite(float(max_non_ortho)):
+        return False
+    failed_checks = payload.get("failedChecks")
+    if isinstance(failed_checks, bool) or not isinstance(failed_checks, int):
+        return False
+    return (
+        float(max_non_ortho) <= MESH_MAX_NON_ORTHO_DEG
+        and payload.get("negativeVolume") is False
+        and failed_checks >= 0
+    )
+
+
+def _bounded_mesh_text(value: str, max_chars: int = MESH_ATTEMPT_TEXT_MAX_CHARS) -> str:
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return f"[... {omitted} earlier characters omitted ...]\n{text[-max_chars:]}"
+
+
+def _mesh_file_record(base: Path, path: Path) -> dict[str, object]:
+    return {
+        "path": str(path.relative_to(base)),
+        "sha256": _sha256_file(path),
+        "byteSize": path.stat().st_size,
+    }
+
+
+def _mesh_attempt_file_diagnostic(path: Path) -> Optional[dict[str, object]]:
+    try:
+        record: dict[str, object] = {
+            "sha256": _sha256_file(path),
+            "byteSize": path.stat().st_size,
+        }
+        if path.name.startswith("log."):
+            lines = path.read_text(errors="replace").splitlines()
+            tail = "\n".join(lines[-MESH_ATTEMPT_LOG_TAIL_LINES:])
+            record["tail"] = _bounded_mesh_text(tail)
+        return record
+    except OSError:
+        return None
+
+
+def capture_mesh_attempt_diagnostic(
+    mesh_dir: Path,
+    attempt_number: int,
+    actual: MeshParams,
+    actual_mesher: Mesher,
+    exc: DeterministicMeshError,
+) -> dict[str, object]:
+    """Capture bounded, checksummed evidence before a failed candidate is removed."""
+
+    files: dict[str, dict[str, object]] = {}
+    for label, path in (
+        ("blockMeshDict", mesh_dir / "system" / "blockMeshDict"),
+        ("blockMeshLog", mesh_dir / "log.blockMesh"),
+        ("checkMeshLog", mesh_dir / "log.checkMesh"),
+    ):
+        diagnostic = _mesh_attempt_file_diagnostic(path)
+        if diagnostic is not None:
+            files[label] = diagnostic
+    return {
+        "attemptNumber": int(attempt_number),
+        "disposition": "deterministic_mesh",
+        "mesher": {
+            "name": actual_mesher.name,
+            "cacheVersion": actual_mesher.cache_version,
+        },
+        "firstCellHeightChords": actual.first_cell_height_chords,
+        "error": {
+            "type": type(exc).__name__,
+            "message": _bounded_mesh_text(str(exc)),
+        },
+        "files": files,
+    }
+
+
+def format_mesh_attempt_diagnostic(diagnostic: dict[str, object]) -> str:
+    mesher = diagnostic.get("mesher") or {}
+    error = diagnostic.get("error") or {}
+    height = diagnostic.get("firstCellHeightChords")
+    height_text = "unresolved" if height is None else f"{float(height):.12g}"
+    parts = [
+        f"attempt {diagnostic.get('attemptNumber')}: "
+        f"mesher={mesher.get('name')}; cache_version={mesher.get('cacheVersion')}; "
+        f"first_cell_height_chords={height_text}; error={error.get('message', '')}"
+    ]
+    for label, filename in (
+        ("blockMeshLog", "log.blockMesh"),
+        ("checkMeshLog", "log.checkMesh"),
+    ):
+        file_record = (diagnostic.get("files") or {}).get(label) or {}
+        tail = file_record.get("tail")
+        if tail:
+            parts.append(f"{filename} tail (real attempt output):\n{tail}")
+    return "\n".join(parts)
+
+
+def _read_current_shared_mesh_qa(mesh_dir: Path) -> Optional[dict[str, object]]:
+    if not shared_mesh_qa_verified(mesh_dir):
+        return None
+    try:
+        payload = json.loads((mesh_dir / SHARED_MESH_QA_MARKER).read_text())
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _mesh_evidence_dir_verified(evidence_dir: Path) -> bool:
+    manifest_path = evidence_dir / SHARED_MESH_EVIDENCE_MANIFEST
+    checksum_path = evidence_dir / SHARED_MESH_EVIDENCE_CHECKSUM
+    try:
+        expected = checksum_path.read_text().split()[0]
+        if expected != _sha256_file(manifest_path):
+            return False
+        payload = json.loads(manifest_path.read_text())
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schemaVersion") != SHARED_MESH_EVIDENCE_SCHEMA_VERSION
+        ):
+            return False
+        artifacts = payload.get("artifacts")
+        if not isinstance(artifacts, dict):
+            return False
+        root = evidence_dir.resolve()
+        for record in artifacts.values():
+            if record is None:
+                continue
+            if not isinstance(record, dict):
+                return False
+            path = (evidence_dir / str(record.get("path", ""))).resolve()
+            if root not in path.parents or not path.is_file():
+                return False
+            if path.stat().st_size != int(record.get("byteSize", -1)):
+                return False
+            if _sha256_file(path) != str(record.get("sha256", "")):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return False
+
+
+def shared_mesh_evidence_verified(mesh_dir: Path) -> bool:
+    return _mesh_evidence_dir_verified(mesh_dir / SHARED_MESH_EVIDENCE_DIR)
+
+
+def write_shared_mesh_evidence(
+    mesh_dir: Path,
+    resolved: MeshParams,
+    actual_mesher: Mesher,
+    chord: float,
+    mesh_result: MeshResult,
+    attempt_diagnostics: list[dict[str, object]],
+) -> Path:
+    """Persist the exact accepted mesh setup and bounded recovery history.
+
+    The evidence directory is small enough to copy into every point archive.
+    It contains the actual mesher dictionary/logs and QA verdict, while failed
+    candidates remain bounded structured diagnostics with full-file hashes and
+    real log tails. No failed candidate is represented as a solved result.
+    """
+
+    evidence_dir = mesh_dir / SHARED_MESH_EVIDENCE_DIR
+    stage = mesh_dir / f".{SHARED_MESH_EVIDENCE_DIR}.{uuid.uuid4().hex}.tmp"
+    previous = evidence_dir if evidence_dir.is_dir() else None
+    stage.mkdir(parents=True, exist_ok=False)
+    qa_payload = _read_current_shared_mesh_qa(mesh_dir)
+    artifacts: dict[str, Optional[dict[str, object]]] = {}
+
+    sources: tuple[tuple[str, Path, tuple[Path, ...]], ...] = (
+        (
+            "blockMeshDict",
+            Path("system") / "blockMeshDict",
+            (
+                mesh_dir / "system" / "blockMeshDict",
+                *((previous / "system" / "blockMeshDict",) if previous else ()),
+            ),
+        ),
+        (
+            "blockMeshLog",
+            Path("logs") / "log.blockMesh",
+            (
+                mesh_dir / "log.blockMesh",
+                *((previous / "logs" / "log.blockMesh",) if previous else ()),
+            ),
+        ),
+        (
+            "checkMeshLog",
+            Path("logs") / "log.checkMesh",
+            (
+                mesh_dir / "log.checkMesh",
+                *((previous / "logs" / "log.checkMesh",) if previous else ()),
+            ),
+        ),
+        (
+            "qaMarker",
+            Path(SHARED_MESH_QA_MARKER),
+            ((mesh_dir / SHARED_MESH_QA_MARKER,) if qa_payload is not None else ()),
+        ),
+    )
+
+    try:
+        for label, rel, candidates in sources:
+            source = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if source is None:
+                artifacts[label] = None
+                continue
+            destination = stage / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            artifacts[label] = _mesh_file_record(stage, destination)
+
+        if actual_mesher.name.startswith("blockmesh"):
+            missing = [
+                label
+                for label in ("blockMeshDict", "blockMeshLog")
+                if artifacts.get(label) is None
+            ]
+            if missing:
+                raise InfrastructureError(
+                    "accepted blockMesh evidence is incomplete: " + ", ".join(missing)
+                )
+        if qa_payload is not None and (
+            artifacts.get("checkMeshLog") is None or artifacts.get("qaMarker") is None
+        ):
+            raise InfrastructureError(
+                "verified shared mesh is missing its checkMesh log or QA marker"
+            )
+
+        extra = mesh_result.extra if isinstance(mesh_result.extra, dict) else {}
+        cache_hit = bool(extra.get("meshCacheHit", False))
+        accepted_attempt = {
+            "attemptNumber": len(attempt_diagnostics) + 1,
+            "disposition": "accepted" if qa_payload is not None else "prepared_unverified",
+            "mesher": {
+                "name": actual_mesher.name,
+                "cacheVersion": actual_mesher.cache_version,
+            },
+            "firstCellHeightChords": resolved.first_cell_height_chords,
+            "cacheHit": cache_hit,
+            "qaVerified": qa_payload is not None,
+        }
+        payload = {
+            "schemaVersion": SHARED_MESH_EVIDENCE_SCHEMA_VERSION,
+            "meshRecoveryVersion": MESH_RECOVERY_VERSION,
+            "createdAtEpochS": time.time(),
+            "status": "verified" if qa_payload is not None else "prepared_unverified",
+            "actualMesh": {
+                "chordM": float(chord),
+                "params": resolved.model_dump(mode="json"),
+                "mesher": {
+                    "name": actual_mesher.name,
+                    "cacheVersion": actual_mesher.cache_version,
+                },
+                "nCells": int(mesh_result.n_cells),
+                "spanChords": float(mesh_result.span_chords),
+            },
+            "source": {
+                "meshCacheKey": extra.get("meshCacheKey"),
+                "cacheHit": cache_hit,
+            },
+            "qaVerdict": qa_payload,
+            "attempts": [*attempt_diagnostics, accepted_attempt],
+            "artifacts": artifacts,
+        }
+        manifest_path = stage / SHARED_MESH_EVIDENCE_MANIFEST
+        manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        digest = _sha256_file(manifest_path)
+        (stage / SHARED_MESH_EVIDENCE_CHECKSUM).write_text(
+            f"{digest}  {SHARED_MESH_EVIDENCE_MANIFEST}\n"
+        )
+        if not _mesh_evidence_dir_verified(stage):
+            raise InfrastructureError("shared mesh evidence failed checksum verification")
+
+        old_dir: Optional[Path] = None
+        if evidence_dir.exists():
+            old_dir = mesh_dir / f".{SHARED_MESH_EVIDENCE_DIR}.{uuid.uuid4().hex}.old"
+            os.replace(evidence_dir, old_dir)
+        try:
+            os.replace(stage, evidence_dir)
+        except Exception:
+            if old_dir is not None and old_dir.exists() and not evidence_dir.exists():
+                os.replace(old_dir, evidence_dir)
+            raise
+        if old_dir is not None:
+            shutil.rmtree(old_dir, ignore_errors=True)
+        return evidence_dir
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def validate_shared_mesh(
+    mesh_dir: Path,
+    airfoil,
+    resolved: MeshParams,
+    spec: CaseSpec,
+    fluid: FluidProperties,
+    roughness: RoughnessParams,
+    solver_params: SolverParams,
+    runner: Runner,
+    n_proc: int,
+    quality_warnings: Optional[list[str]] = None,
+) -> bool:
+    """Run checkMesh once on a fully-described case before AoA fan-out.
+
+    ``checkMesh`` needs the case dictionaries written by :class:`CaseBuilder`,
+    not only ``constant/polyMesh``. The temporary QA case is discarded after
+    its log is copied beside the shared mesh. An unavailable/malformed probe
+    returns false: callers may solve with the existing per-case advisory gate,
+    but must not publish a fresh unverified cache entry.
+    """
+    marker = mesh_dir / SHARED_MESH_QA_MARKER
+    marker.unlink(missing_ok=True)
+    qa_dir = mesh_dir / "_mesh_qa"
+    if qa_dir.exists():
+        shutil.rmtree(qa_dir)
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    qa: Optional[MeshQaResult] = None
+    try:
+        CaseBuilder(
+            airfoil,
+            get_mesher(resolved.mesher).patches(resolved),
+            resolved,
+            spec,
+            fluid,
+            roughness,
+            solver_params,
+            n_proc=n_proc,
+        ).write(qa_dir)
+        _link_mesh(qa_dir, mesh_dir, runner)
+        qa = _run_transient_mesh_qa_gate(qa_dir, runner, quality_warnings)
+    finally:
+        qa_log = qa_dir / "log.checkMesh"
+        copy_error: Optional[OSError] = None
+        if qa_log.is_file():
+            try:
+                shutil.copy2(qa_log, mesh_dir / "log.checkMesh")
+            except OSError as exc:
+                copy_error = exc
+        shutil.rmtree(qa_dir, ignore_errors=True)
+        if copy_error is not None:
+            raise InfrastructureError(
+                "checkMesh evidence could not be retained beside the shared mesh: "
+                f"{copy_error}"
+            ) from copy_error
+    if qa is None:
+        return False
+    write_shared_mesh_qa_marker(mesh_dir, qa)
+    return True
+
+
 def _steady_rans_params(solver_params: SolverParams, rans_max_iterations: Optional[int]) -> SolverParams:
     """Worker-side steady-iteration cap, scoped to the URANS-INIT steady stage.
 
@@ -3897,6 +4354,7 @@ def _steady_rans_params(solver_params: SolverParams, rans_max_iterations: Option
 def prepare_mesh(
     mesh_dir: Path, airfoil, resolved, chord, mesher, runner,
     cancel_check: CancelCheck = None, cache: Optional[EngineCache] = None,
+    validate: Optional[Callable[[Path, MeshParams], bool]] = None,
 ):
     """Build the mesh once (blockMesh) into ``mesh_dir`` for reuse across a polar
     set (all speeds/AoAs of one airfoil at one chord share this mesh).
@@ -3906,27 +4364,211 @@ def prepare_mesh(
     re-running blockMesh; fresh builds are published back for future jobs."""
     _check_cancel(cancel_check)
     mesh_dir.mkdir(parents=True, exist_ok=True)
+    for stale_attempt_file in (
+        mesh_dir / SHARED_MESH_QA_MARKER,
+        mesh_dir / "log.blockMesh",
+        mesh_dir / "log.checkMesh",
+        mesh_dir / "system" / "blockMeshDict",
+    ):
+        stale_attempt_file.unlink(missing_ok=True)
+    shutil.rmtree(mesh_dir / SHARED_MESH_EVIDENCE_DIR, ignore_errors=True)
     mesher.write_inputs(mesh_dir, airfoil, resolved, chord)
     _write_minimal_controldict(mesh_dir)
-    mesh_key = cache.mesh_key(airfoil, chord, resolved) if cache is not None else None
+    mesh_key = (
+        cache.mesh_key(airfoil, chord, resolved, mesher=mesher)
+        if cache is not None
+        else None
+    )
     if cache is not None and mesh_key is not None:
-        manifest = cache.fetch_mesh(mesh_key, mesh_dir / "constant" / "polyMesh")
+        manifest = cache.fetch_mesh(
+            mesh_key,
+            mesh_dir / "constant" / "polyMesh",
+            mesh_dir / SHARED_MESH_EVIDENCE_DIR,
+        )
         if manifest is not None:
             _check_cancel(cancel_check)
+            if validate is not None:
+                try:
+                    validate(mesh_dir, resolved)
+                except DeterministicMeshError as exc:
+                    cache.invalidate_mesh(mesh_key, reason=str(exc))
+                    raise
             n_cells = int(manifest.get("nCells") or 0)
             if n_cells <= 0 and hasattr(mesher, "cell_count"):
                 n_cells = mesher.cell_count(resolved)
-            return MeshResult(
+            result = MeshResult(
                 patches=mesher.patches(resolved),
                 span_chords=resolved.span_chords,
                 n_cells=n_cells,
                 log=f"reused cached mesh (key {mesh_key})",
+                extra={"meshCacheKey": mesh_key, "meshCacheHit": True},
             )
+            write_shared_mesh_evidence(
+                mesh_dir, resolved, mesher, chord, result, []
+            )
+            return result
     result = mesher.run_mesh(mesh_dir, resolved, runner)
+    if mesher.name.startswith("blockmesh") and not (mesh_dir / "log.blockMesh").is_file():
+        try:
+            (mesh_dir / "log.blockMesh").write_text(result.log or "")
+        except OSError as exc:
+            raise InfrastructureError(
+                f"blockMesh output could not be preserved as evidence: {exc}"
+            ) from exc
     _check_cancel(cancel_check)
-    if cache is not None and mesh_key is not None:
-        cache.publish_mesh(mesh_key, mesh_dir / "constant" / "polyMesh", n_cells=result.n_cells)
+    verified = validate(mesh_dir, resolved) if validate is not None else True
+    _check_cancel(cancel_check)
+    result.extra.update({"meshCacheKey": mesh_key, "meshCacheHit": False})
+    evidence_dir = write_shared_mesh_evidence(
+        mesh_dir, resolved, mesher, chord, result, []
+    )
+    if cache is not None and mesh_key is not None and verified:
+        cache.publish_mesh(
+            mesh_key,
+            mesh_dir / "constant" / "polyMesh",
+            n_cells=result.n_cells,
+            evidence_dir=evidence_dir,
+        )
     return result
+
+
+def prepare_mesh_with_recovery(
+    mesh_dir: Path,
+    airfoil,
+    resolved: MeshParams,
+    chord: float,
+    mesher,
+    runner,
+    cancel_check: CancelCheck = None,
+    cache: Optional[EngineCache] = None,
+    validate: Optional[Callable[[Path, MeshParams], bool]] = None,
+    quality_warnings: Optional[list[str]] = None,
+) -> tuple[MeshResult, MeshParams, bool]:
+    """Prepare one shared mesh through a bounded, fingerprinted repair ladder.
+
+    The public/default topology is always attempted first with the exact
+    resolved request.  Only :class:`DeterministicMeshError` advances to an
+    internal segmented-normal candidate.  Each candidate first keeps the
+    resolved wall height and, if that exact attempt fails deterministically,
+    gets one bounded thinner-wall retry.  Infrastructure errors, unavailable
+    QA (``validate`` returns false), cancellation, and untyped errors stop the
+    ladder immediately.
+
+    Returned params name the topology and wall height that actually produced
+    the accepted mesh; downstream case dictionaries, seed keys, and immutable
+    evidence therefore cannot masquerade as the public/default topology.
+    """
+    deterministic_failures: list[dict[str, object]] = []
+
+    def run_attempt(actual: MeshParams, actual_mesher: Mesher) -> MeshResult:
+        return prepare_mesh(
+            mesh_dir,
+            airfoil,
+            actual,
+            chord,
+            actual_mesher,
+            runner,
+            cancel_check=cancel_check,
+            cache=cache,
+            validate=validate,
+        )
+
+    try:
+        result = run_attempt(resolved, mesher)
+        write_shared_mesh_evidence(
+            mesh_dir, resolved, mesher, chord, result, deterministic_failures
+        )
+        return result, resolved, False
+    except DeterministicMeshError as exc:
+        if resolved.mesher != MESH_RECOVERY_PUBLIC_MESHER:
+            raise
+        deterministic_failures.append(
+            capture_mesh_attempt_diagnostic(mesh_dir, 1, resolved, mesher, exc)
+        )
+
+    original_height = resolved.first_cell_height_chords
+    last_error: Optional[DeterministicMeshError] = None
+    for candidate_name in MESH_RECOVERY_MESHER_CANDIDATES:
+        candidate_mesher = get_mesher(candidate_name)
+        candidates = [resolved.model_copy(update={"mesher": candidate_name})]
+        if (
+            original_height is not None
+            and original_height > MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS + 1e-12
+        ):
+            candidates.append(
+                resolved.model_copy(
+                    update={
+                        "mesher": candidate_name,
+                        "first_cell_height_chords": (
+                            MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS
+                        ),
+                    }
+                )
+            )
+
+        for candidate in candidates:
+            shutil.rmtree(mesh_dir, ignore_errors=True)
+            _check_cancel(cancel_check)
+            try:
+                result = run_attempt(candidate, candidate_mesher)
+            except DeterministicMeshError as exc:
+                last_error = exc
+                deterministic_failures.append(
+                    capture_mesh_attempt_diagnostic(
+                        mesh_dir,
+                        len(deterministic_failures) + 1,
+                        candidate,
+                        candidate_mesher,
+                        exc,
+                    )
+                )
+                logger.warning(
+                    "%s: automatic mesh recovery candidate %s at first-cell height %s "
+                    "failed deterministically: %s",
+                    mesh_dir,
+                    candidate_name,
+                    candidate.first_cell_height_chords,
+                    exc,
+                )
+                continue
+
+            height = candidate.first_cell_height_chords
+            wall_note = (
+                "unresolved wall height"
+                if height is None
+                else f"first wall cell {height:.6g} chord"
+            )
+            warning = (
+                "automatic mesh repair: deterministic shared-mesh quality evidence "
+                f"rejected {len(deterministic_failures)} earlier attempt(s); accepted "
+                f"{candidate_name} with {wall_note}"
+            )
+            logger.warning("%s: %s", mesh_dir, warning)
+            if quality_warnings is not None:
+                quality_warnings.append(warning)
+            write_shared_mesh_evidence(
+                mesh_dir,
+                candidate,
+                candidate_mesher,
+                chord,
+                result,
+                deterministic_failures,
+            )
+            return result, candidate, True
+
+    # Every route here is backed by a typed deterministic verdict.  Keep every
+    # attempt's exception and available real log tail in the final failure so
+    # the last candidate cannot erase the diagnostic chain.
+    detail = "\n\n".join(
+        format_mesh_attempt_diagnostic(item) for item in deterministic_failures
+    )
+    exhausted = DeterministicMeshError(
+        "automatic mesh recovery exhausted after "
+        f"{len(deterministic_failures)} deterministic attempts:\n{detail}"
+    )
+    if last_error is not None:
+        raise exhausted from last_error
+    raise exhausted
 
 
 def _link_mesh(case_dir: Path, mesh_dir: Path, runner: Runner) -> None:
@@ -3935,18 +4577,36 @@ def _link_mesh(case_dir: Path, mesh_dir: Path, runner: Runner) -> None:
     (case_dir / "constant").mkdir(parents=True, exist_ok=True)
     dst = case_dir / "constant" / "polyMesh"
     # idempotent: a valid mesh already in place is reused as-is
-    if (dst / "points").exists():
-        return
-    if dst.is_symlink() or dst.exists():
-        if dst.is_dir() and not dst.is_symlink():
-            shutil.rmtree(dst)
+    if not (dst / "points").exists():
+        if dst.is_symlink() or dst.exists():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        src = (mesh_dir / "constant" / "polyMesh").resolve()
+        if runner.external_paths_visible:
+            dst.symlink_to(src, target_is_directory=True)
         else:
-            dst.unlink()
-    src = (mesh_dir / "constant" / "polyMesh").resolve()
-    if runner.external_paths_visible:
-        dst.symlink_to(src, target_is_directory=True)
-    else:
-        shutil.copytree(src, dst)
+            shutil.copytree(src, dst)
+
+    # Mesh provenance is deliberately copied, never symlinked: each point's
+    # evidence bundle must remain immutable after shared job/cache cleanup.
+    source_evidence = mesh_dir / SHARED_MESH_EVIDENCE_DIR
+    if source_evidence.is_dir():
+        if not _mesh_evidence_dir_verified(source_evidence):
+            raise InfrastructureError(
+                f"shared mesh evidence is corrupt or incomplete: {source_evidence}"
+            )
+        destination_evidence = case_dir / SHARED_MESH_EVIDENCE_DIR
+        if destination_evidence.is_symlink() or destination_evidence.is_file():
+            destination_evidence.unlink()
+        elif destination_evidence.is_dir():
+            shutil.rmtree(destination_evidence)
+        shutil.copytree(source_evidence, destination_evidence)
+        if not _mesh_evidence_dir_verified(destination_evidence):
+            raise InfrastructureError(
+                f"copied shared mesh evidence failed verification: {destination_evidence}"
+            )
 
 
 def _rewrite_carried_inlet_velocity(

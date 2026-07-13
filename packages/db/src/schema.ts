@@ -1977,6 +1977,39 @@ export const simCampaigns = pgTable(
   }),
 );
 
+// Append-only lifecycle provenance. Campaign status is the current scheduling
+// state; this ledger explains who changed it, why, and when without overwriting
+// earlier operational history. The API never asks users to infer pause/resume
+// provenance from a mutable `updatedAt` timestamp.
+export const simCampaignLifecycleEvents = pgTable(
+  "sim_campaign_lifecycle_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    action: text("action").notNull(), // pause | resume | cancel | close | archive | unarchive
+    fromStatus: text("from_status").notNull(),
+    toStatus: text("to_status").notNull(),
+    actor: text("actor"),
+    reason: text("reason"),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    campaignCreatedIdx: index(
+      "sim_campaign_lifecycle_events_campaign_created_idx",
+    ).on(t.campaignId, t.createdAt),
+    actionCheck: check(
+      "sim_campaign_lifecycle_events_action_check",
+      sql`${t.action} IN ('pause', 'resume', 'cancel', 'close', 'archive', 'unarchive')`,
+    ),
+  }),
+);
+
 // Campaign scope resolved to an explicit airfoil list at launch; growth is via
 // the Add airfoils action only.
 export const simCampaignAirfoils = pgTable(
@@ -2174,6 +2207,22 @@ export const simCampaignProgress = pgTable(
     // cell whose bounded PRECALC ledger is blocked is unavailable work, not a
     // human review item and not an ordinary RANS retry candidate.
     blocked: integer("blocked").notNull().default(0),
+    // Open work which the engine-capability reconciler has already reopened
+    // under a newer deterministic mesh-recovery strategy. This is progress,
+    // not a terminal blocked point, so it is deliberately excluded from the
+    // blocked conservation groups below.
+    precalcMeshRepairing: integer("precalc_mesh_repairing")
+      .notNull()
+      .default(0),
+    // Terminal blocked groups are mutually exclusive and exhaustive. The
+    // database check below prevents a read-model drift where the headline
+    // blocked count no longer agrees with its user-facing reasons.
+    blockedMeshQuality: integer("blocked_mesh_quality").notNull().default(0),
+    blockedPrecalcExhausted: integer("blocked_precalc_exhausted")
+      .notNull()
+      .default(0),
+    blockedEngineSubmit: integer("blocked_engine_submit").notNull().default(0),
+    blockedOther: integer("blocked_other").notNull().default(0),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -2184,6 +2233,21 @@ export const simCampaignProgress = pgTable(
     pk: primaryKey({ columns: [t.campaignId, t.conditionId, t.airfoilId] }),
     conditionIdx: index("sim_campaign_progress_condition_idx").on(
       t.conditionId,
+    ),
+    remediationNonnegativeCheck: check(
+      "sim_campaign_progress_remediation_nonnegative_check",
+      sql`${t.precalcMeshRepairing} >= 0
+        AND ${t.blockedMeshQuality} >= 0
+        AND ${t.blockedPrecalcExhausted} >= 0
+        AND ${t.blockedEngineSubmit} >= 0
+        AND ${t.blockedOther} >= 0`,
+    ),
+    blockedReasonConservationCheck: check(
+      "sim_campaign_progress_blocked_reason_conservation_check",
+      sql`${t.blocked} = ${t.blockedMeshQuality}
+        + ${t.blockedPrecalcExhausted}
+        + ${t.blockedEngineSubmit}
+        + ${t.blockedOther}`,
     ),
   }),
 );
@@ -2627,6 +2691,13 @@ export const simPrecalcObligations = pgTable(
     sourceAttemptIdx: index(
       "sim_precalc_obligations_source_result_attempt_idx",
     ).on(t.sourceResultAttemptId),
+    meshRecoveryCandidateIdx: index(
+      "sim_precalc_obligations_mesh_recovery_candidate_idx",
+    )
+      .on(t.id)
+      .where(
+        sql`${t.state} = 'blocked' AND ${t.attemptCount} = 1 AND ${t.lastOutcome} = 'deterministic_failure'`,
+      ),
   }),
 );
 
@@ -2644,6 +2715,10 @@ export const simPrecalcObligationAttempts = pgTable(
       onDelete: "set null",
     }),
     attemptNumber: integer("attempt_number").notNull(),
+    /** Effective engine mesh-recovery strategy used for this immutable
+     * submission. Stored here because producing sim_jobs are retention-
+     * eligible; default 0 is the honest legacy/pre-capability value. */
+    meshRecoveryVersion: integer("mesh_recovery_version").notNull().default(0),
     // submitted | accepted | rejected | failed | cancelled
     state: text("state").notNull().default("submitted"),
     outcome: text("outcome"),
@@ -2670,6 +2745,10 @@ export const simPrecalcObligationAttempts = pgTable(
     numberCheck: check(
       "sim_precalc_obligation_attempts_number_check",
       sql`${t.attemptNumber} IN (1, 2)`,
+    ),
+    meshRecoveryVersionCheck: check(
+      "sim_precalc_obligation_attempts_mesh_recovery_version_check",
+      sql`${t.meshRecoveryVersion} >= 0`,
     ),
     jobUq: unique("sim_precalc_obligation_attempts_job_uq").on(
       t.obligationId,

@@ -9,6 +9,7 @@ import type { AdminCampaignSummary } from "../lib/admin";
 import {
   campaignStatusLine,
   gateFromSolverState,
+  pausedCampaignStatusText,
 } from "../components/admin/campaigns/campaign-status";
 
 function summary(overrides: {
@@ -90,6 +91,34 @@ describe("campaignStatusLine — active gate", () => {
     );
     expect(line.tone).toBe("red");
     expect(line.text).toContain("Solver process is not running");
+  });
+});
+
+describe("pausedCampaignStatusText — provenance without invention", () => {
+  const NOW = Date.parse("2026-07-13T12:00:00.000Z");
+
+  it("MUST-CATCH: uses the recorded reason instead of claiming the viewer paused it", () => {
+    expect(
+      pausedCampaignStatusText(
+        {
+          action: "pause",
+          actor: null,
+          reason: "solver maintenance",
+          createdAt: "2026-07-13T08:00:00.000Z",
+        },
+        0,
+        NOW,
+      ),
+    ).toBe(
+      "Paused for solver maintenance · reason recorded 4h ago. No new points are scheduled while paused.",
+    );
+  });
+
+  it("FALSE-POSITIVE GUARD: missing history stays explicitly unknown and preserves a real finishing-job count", () => {
+    const text = pausedCampaignStatusText(null, 2, NOW);
+    expect(text).toContain("reason unavailable");
+    expect(text).toContain("2 running jobs will finish");
+    expect(text).not.toContain("by you");
   });
 });
 

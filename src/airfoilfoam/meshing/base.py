@@ -36,6 +36,13 @@ class MeshResult:
 
 class Mesher(ABC):
     name: str = "base"
+    #: Recovery-only implementations remain addressable by the engine but are
+    #: not offered as user setup choices. Their selection is quality-gated.
+    user_selectable: bool = True
+    #: Stable implementation identity included in persistent mesh/seed cache
+    #: keys. Bump whenever identical MeshParams can produce different points,
+    #: faces, topology, grading, or boundary ownership.
+    cache_version: str = "1"
 
     @abstractmethod
     def write_inputs(self, case_dir: Path, airfoil: Airfoil, params: MeshParams, chord: float) -> None:
@@ -72,5 +79,9 @@ def get_mesher(name: str) -> Mesher:
         raise KeyError(f"Unknown mesher {name!r}. Available: {sorted(_REGISTRY)}")
 
 
-def list_meshers() -> list[str]:
-    return sorted(_REGISTRY)
+def list_meshers(*, include_internal: bool = False) -> list[str]:
+    return sorted(
+        name
+        for name, mesher in _REGISTRY.items()
+        if include_internal or mesher.user_selectable
+    )

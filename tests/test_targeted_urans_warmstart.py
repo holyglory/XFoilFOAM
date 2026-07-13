@@ -30,6 +30,7 @@ from airfoilfoam.models import (
 )
 from airfoilfoam.openfoam.runner import (
     DeterministicMeshError,
+    InfrastructureError,
     OpenFOAMError,
     _run_subprocess,
 )
@@ -759,6 +760,43 @@ def test_transient_mesh_qa_gate_failed_checks_are_degenerate(tmp_path):
             )
 
     with pytest.raises(OpenFOAMError, match="Failed 1 mesh checks"):
+        pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
+
+
+def test_transient_mesh_qa_gate_nonzero_benign_summary_is_infrastructure(tmp_path):
+    """MUST-CATCH: parseable text cannot turn a failed process into proof."""
+
+    class FakeRunner:
+        def application(self, _case_dir, _cmd, *args, **kwargs):
+            return SimpleNamespace(
+                ok=False,
+                returncode=1,
+                timed_out=False,
+                stdout="Mesh non-orthogonality Max: 10 average: 1\nMesh OK.\n",
+            )
+
+    with pytest.raises(InfrastructureError, match="checkMesh exited 1"):
+        pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
+
+    assert (tmp_path / "log.checkMesh").read_text().endswith("Mesh OK.\n")
+
+
+def test_transient_mesh_qa_gate_timeout_outranks_parseable_summary(tmp_path):
+    """MUST-CATCH: a timed-out probe is unavailable, never a QA verdict."""
+
+    class FakeRunner:
+        def application(self, _case_dir, _cmd, *args, **kwargs):
+            return SimpleNamespace(
+                ok=False,
+                returncode=124,
+                timed_out=True,
+                stdout=(
+                    "Mesh non-orthogonality Max: 10 average: 1\n"
+                    "Mesh OK.\nCommand timed out after 300s\n"
+                ),
+            )
+
+    with pytest.raises(InfrastructureError, match="checkMesh timed out"):
         pipeline._run_transient_mesh_qa_gate(tmp_path, FakeRunner(), [])
 
 

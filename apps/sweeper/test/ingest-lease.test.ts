@@ -15,7 +15,10 @@ import {
   releaseIngestLeaseToRunning,
   renewIngestLease,
 } from "../src/ingest-lease";
-import { updateJobFromEngineStatus } from "../src/reconcile";
+import {
+  parsedExecutedMeshRecoveryVersion,
+  updateJobFromEngineStatus,
+} from "../src/reconcile";
 
 const { db, sql } = createClient({ max: 4 });
 const PREFIX = `ingest-lease-${process.pid}-${Date.now().toString(36)}`;
@@ -108,6 +111,97 @@ describe("durable sim-job ingest lease", () => {
     total_cases: 1,
     completed_cases: state === "completed" ? 1 : 0,
     message: state === "cancelled" ? "cancelled by engine" : null,
+  });
+
+  it.each([
+    [-1, null],
+    [1.5, null],
+    [Number.NaN, null],
+    ["1", null],
+    [null, null],
+    [undefined, null],
+    [0, 0],
+    [3, 3],
+    [2_147_483_647, 2_147_483_647],
+    [2_147_483_648, null],
+  ])(
+    "strictly parses worker mesh-recovery acknowledgement %p",
+    (value, expected) => {
+      expect(parsedExecutedMeshRecoveryVersion(value)).toBe(expected);
+    },
+  );
+
+  it("persists only worker-acknowledged mesh recovery provenance and never falls back to the requested version", async () => {
+    await db
+      .update(simJobs)
+      .set({ requestPayload: { meshRecoveryVersion: 7, untouched: "kept" } })
+      .where(eq(simJobs.id, jobId));
+    let [snapshot] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, jobId));
+
+    await updateJobFromEngineStatus(db, snapshot, engineStatus("running"));
+    let [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.requestPayload).toMatchObject({
+      meshRecoveryVersion: 7,
+      untouched: "kept",
+    });
+    expect(
+      (after.requestPayload as { executedMeshRecoveryVersion?: unknown })
+        .executedMeshRecoveryVersion,
+    ).toBeUndefined();
+
+    const staleSnapshotWithoutAcknowledgement = after;
+    snapshot = after;
+    await updateJobFromEngineStatus(db, snapshot, {
+      ...engineStatus("running"),
+      mesh_recovery_version: 2,
+    });
+    [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.requestPayload).toMatchObject({
+      meshRecoveryVersion: 7,
+      executedMeshRecoveryVersion: 2,
+      untouched: "kept",
+    });
+
+    // A late poller may still hold a snapshot taken before the valid worker
+    // acknowledgment. Its malformed response must merge against the current
+    // row, not replace the newly persisted acknowledgment with stale JSON.
+    await updateJobFromEngineStatus(db, staleSnapshotWithoutAcknowledgement, {
+      ...engineStatus("running"),
+      mesh_recovery_version: 1.5,
+    });
+    [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.requestPayload).toMatchObject({
+      executedMeshRecoveryVersion: 2,
+      untouched: "kept",
+    });
+
+    // An oversized integer is valid JSON but cannot fit the durable
+    // PostgreSQL integer provenance column. It is malformed at this boundary
+    // and must neither throw nor replace the last valid acknowledgement.
+    await updateJobFromEngineStatus(db, staleSnapshotWithoutAcknowledgement, {
+      ...engineStatus("running"),
+      mesh_recovery_version: 2_147_483_648,
+    });
+    [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.requestPayload).toMatchObject({
+      executedMeshRecoveryVersion: 2,
+      untouched: "kept",
+    });
+
+    snapshot = after;
+    await updateJobFromEngineStatus(db, snapshot, {
+      ...engineStatus("cancelled"),
+      mesh_recovery_version: 3,
+    });
+    [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.status).toBe("cancelled");
+    expect(after.requestPayload).toMatchObject({
+      executedMeshRecoveryVersion: 3,
+      untouched: "kept",
+    });
   });
 
   it("allows exactly one of two concurrent sweepers to claim ingestion", async () => {

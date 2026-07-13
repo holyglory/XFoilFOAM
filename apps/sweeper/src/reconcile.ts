@@ -38,6 +38,10 @@ import {
 } from "@aerodb/db/result-claim-lifecycle";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
+  DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER,
+  DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER,
+} from "@aerodb/core";
+import {
   EngineError,
   URANS_VERIFY_DELTA_CD_LIMIT,
   URANS_VERIFY_DELTA_CL_LIMIT,
@@ -61,9 +65,14 @@ import {
   notInArray,
   or,
   sql,
+  type SQLWrapper,
 } from "drizzle-orm";
 
 import { buildPolarRequest } from "./build-request";
+import {
+  engineMeshRecoveryVersion,
+  parsedMeshRecoveryVersion,
+} from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
 import { touchHeartbeat } from "./heartbeat";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
@@ -119,6 +128,21 @@ const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = [
   "running",
   "ingesting",
 ];
+
+function deterministicMeshEvidenceSql(
+  failureDisposition: SQLWrapper,
+  error: SQLWrapper,
+) {
+  return sql`(
+    ${failureDisposition} = 'deterministic_mesh'
+    OR (
+      ${failureDisposition} IS NULL
+      AND
+      position(${DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER} in lower(COALESCE(${error}, ''))) > 0
+      AND position(${DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER} in lower(COALESCE(${error}, ''))) > 0
+    )
+  )`;
+}
 
 // Campaign maintenance state (spec §7/§8): lane keys marked dirty by the
 // ingest hooks, drained at the end of every reconcile pass AFTER polar-fit
@@ -397,18 +421,84 @@ async function engineRuntimeMap(
   }
 }
 
-function requestPayloadWithScheduling(
-  job: SimJobRow,
-  status: JobStatus,
-): Record<string, unknown> {
-  const payload = ((job.requestPayload ?? {}) as Record<string, unknown>) ?? {};
-  return status.scheduling
-    ? { ...payload, scheduling: status.scheduling }
-    : payload;
-}
-
 function requestPayload(job: SimJobRow): Record<string, unknown> {
   return ((job.requestPayload ?? {}) as Record<string, unknown>) ?? {};
+}
+
+export function parsedExecutedMeshRecoveryVersion(
+  value: unknown,
+): number | null {
+  return parsedMeshRecoveryVersion(value);
+}
+
+type EngineRequestPayloadAcknowledgement = {
+  scheduling?: JobStatus["scheduling"];
+  mesh_recovery_version?: unknown;
+};
+
+/** Build an atomic JSONB update from engine-authored metadata. Always start
+ * from the row's current payload, not the poller's in-memory snapshot: two
+ * status pollers may race, and an older response with an absent/malformed
+ * acknowledgment must never erase a valid worker acknowledgment already
+ * persisted by the newer response. */
+function requestPayloadWithEngineAcknowledgementSql(
+  acknowledgement: EngineRequestPayloadAcknowledgement,
+) {
+  let payload = sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb)`;
+  if (acknowledgement.scheduling) {
+    payload = sql`jsonb_set(
+      ${payload},
+      '{scheduling}',
+      ${JSON.stringify(acknowledgement.scheduling)}::jsonb,
+      true
+    )`;
+  }
+  const version = parsedExecutedMeshRecoveryVersion(
+    acknowledgement.mesh_recovery_version,
+  );
+  if (version != null) {
+    payload = sql`jsonb_set(
+      ${payload},
+      '{executedMeshRecoveryVersion}',
+      to_jsonb(${version}::integer),
+      true
+    )`;
+  }
+  return payload;
+}
+
+/** Persist only an engine/worker-acknowledged strategy version. The SQL-side
+ * jsonb merge preserves scheduling and any status acknowledgment written by a
+ * newer poller. An absent/malformed result acknowledgment performs a read only,
+ * so it can never erase prior provenance or fall back to the requested value. */
+async function jobWithPersistedMeshRecoveryAcknowledgement(
+  db: DB,
+  job: SimJobRow,
+  rawVersion: unknown,
+  lease: Pick<IngestLease, "jobId" | "token">,
+): Promise<SimJobRow> {
+  const version = parsedExecutedMeshRecoveryVersion(rawVersion);
+  const [current] =
+    version == null
+      ? await db
+          .select({ requestPayload: simJobs.requestPayload })
+          .from(simJobs)
+          .where(ingestLeaseOwnedWhere(job.id, lease.token))
+          .limit(1)
+      : await db
+          .update(simJobs)
+          .set({
+            requestPayload: sql`jsonb_set(
+            COALESCE(${simJobs.requestPayload}, '{}'::jsonb),
+            '{executedMeshRecoveryVersion}',
+            to_jsonb(${version}::integer),
+            true
+          )`,
+          })
+          .where(ingestLeaseOwnedWhere(job.id, lease.token))
+          .returning({ requestPayload: simJobs.requestPayload });
+  if (!current) throw new IngestLeaseLostError(job.id);
+  return { ...job, requestPayload: current.requestPayload };
 }
 
 /** Batched campaign jobs carry a requestPayload conditionMap: one
@@ -592,11 +682,15 @@ function finiteOrNull(value: unknown): number | null {
 async function settleUransLadderForJob(
   db: DB,
   job: SimJobRow,
-  opts: { terminalError?: string | null } = {},
+  opts: {
+    terminalError?: string | null;
+    terminalFailureDisposition?: JobResult["failure_disposition"];
+  } = {},
 ): Promise<void> {
   const payload = requestPayload(job) as VerifyJobPayload;
   const precalcSettlement = await settlePrecalcObligationsForJob(db, job, {
     terminalError: opts.terminalError ?? null,
+    terminalFailureDisposition: opts.terminalFailureDisposition ?? null,
   });
   if (precalcSettlement.blocked.length) {
     console.error(
@@ -801,6 +895,7 @@ async function cancelJobAndReleaseClaims(
   job: SimJobRow,
   msg: string,
   lease?: Pick<IngestLease, "jobId" | "token">,
+  acknowledgement?: EngineRequestPayloadAcknowledgement,
 ): Promise<boolean> {
   const settlement = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
@@ -811,6 +906,12 @@ async function cancelJobAndReleaseClaims(
         engineState: "cancelled",
         error: msg,
         finishedAt: new Date(),
+        ...(acknowledgement
+          ? {
+              requestPayload:
+                requestPayloadWithEngineAcknowledgementSql(acknowledgement),
+            }
+          : {}),
         ingestLeaseToken: null,
         ingestLeaseClaimedAt: null,
         ingestLeaseExpiresAt: null,
@@ -820,13 +921,17 @@ async function cancelJobAndReleaseClaims(
           ? ingestLeaseOwnedWhere(job.id, lease.token)
           : reconcilableJobWhere(job.id),
       )
-      .returning({ id: simJobs.id });
+      .returning({ id: simJobs.id, requestPayload: simJobs.requestPayload });
     if (!stopped) return null;
     await releaseResultClaimsForJob(tx, job.id, ["queued", "running"]);
-    return settlePrecalcObligationsForJobInTransaction(tx, job, {
-      terminalError: msg,
-      cancellation: "transient",
-    });
+    return settlePrecalcObligationsForJobInTransaction(
+      tx,
+      { ...job, requestPayload: stopped.requestPayload },
+      {
+        terminalError: msg,
+        cancellation: "transient",
+      },
+    );
   });
   if (!settlement) return false;
   await refreshPrecalcSettlementCampaigns(db, settlement.campaignIds);
@@ -907,6 +1012,8 @@ export async function updateJobFromEngineStatus(
       db,
       job,
       status.message ?? "engine reported job cancelled; claims released",
+      undefined,
+      status,
     );
     return;
   }
@@ -919,7 +1026,7 @@ export async function updateJobFromEngineStatus(
       polledAt: new Date(),
       error: status.state === "failed" ? (status.message ?? job.error) : null,
       finishedAt: null,
-      requestPayload: requestPayloadWithScheduling(job, status),
+      requestPayload: requestPayloadWithEngineAcknowledgementSql(status),
       // Terminal engine state does NOT pre-claim DB ingestion. Completed
       // evidence stays on the submitted/running side until the atomic lease
       // claim wins; failed is itself a claimable recovery source. Writing a
@@ -1048,6 +1155,7 @@ async function withoutExistingPrecalcCoverage(
     airfoilId: string;
     revisionId: string;
     retry: RansRetryDecision;
+    meshRecoveryVersion: number;
   },
 ): Promise<RansRetryDecision | null> {
   if (!opts.retry.aoas.length) return null;
@@ -1057,12 +1165,19 @@ async function withoutExistingPrecalcCoverage(
       SELECT DISTINCT evidence.aoa_deg
       FROM sim_jobs child
       CROSS JOIN LATERAL (
-        SELECT attempt.aoa_deg, attempt.error
+        SELECT attempt.aoa_deg,
+               attempt.error,
+               attempt.evidence_payload ->> 'failure_disposition' AS failure_disposition
         FROM result_attempts attempt
         WHERE attempt.sim_job_id = child.id
         UNION ALL
-        SELECT canonical.aoa_deg, canonical.error
+        SELECT canonical.aoa_deg,
+               canonical.error,
+               current_attempt.evidence_payload ->> 'failure_disposition' AS failure_disposition
         FROM results canonical
+        LEFT JOIN result_attempts current_attempt
+          ON current_attempt.id = canonical.current_result_attempt_id
+         AND current_attempt.result_id = canonical.id
         WHERE canonical.sim_job_id = child.id
       ) evidence
       WHERE child.parent_job_id = ${opts.parentJobId}
@@ -1070,8 +1185,20 @@ async function withoutExistingPrecalcCoverage(
         AND child.status IN ('done', 'failed', 'cancelled')
         AND child.simulation_preset_revision_id = ${opts.revisionId}
         AND child.request_payload ->> 'uransFidelity' = 'precalc'
-        AND position('mesh degenerate at this fidelity tier' in lower(COALESCE(evidence.error, ''))) > 0
-        AND position('max non-orthogonality' in lower(COALESCE(evidence.error, ''))) > 0
+        AND CASE
+          WHEN jsonb_typeof(child.request_payload -> 'executedMeshRecoveryVersion') = 'number'
+           AND child.request_payload ->> 'executedMeshRecoveryVersion' ~ '^[0-9]+$'
+          THEN CASE
+            WHEN (child.request_payload ->> 'executedMeshRecoveryVersion')::numeric <= 2147483647
+            THEN (child.request_payload ->> 'executedMeshRecoveryVersion')::numeric::bigint
+            ELSE 0::bigint
+          END
+          ELSE 0::bigint
+        END >= ${opts.meshRecoveryVersion}
+        AND ${deterministicMeshEvidenceSql(
+          sql`evidence.failure_disposition`,
+          sql`evidence.error`,
+        )}
       UNION
       SELECT obligation.aoa_deg
       FROM sim_precalc_obligations obligation
@@ -1362,6 +1489,8 @@ export async function submitUransRetryForJob(
     /** Persist targeted PRECALC ownership from a running partial result without
      * submitting a child outside the capacity-bounded scheduler tick. */
     recordRoutesOnly?: boolean;
+    /** Live engine capability prepared by the bounded scheduler tick. */
+    meshRecoveryVersion?: number;
   } = {},
 ): Promise<void> {
   if (parent.wave !== 1 || parent.bcIds.length === 0) return;
@@ -1442,6 +1571,23 @@ export async function submitUransRetryForJob(
       `[sweeper] URANS submission for job ${parent.id} is gated: campaign ${parent.campaignId} still has open RANS gaps; durable retry routing is recorded before deferral`,
     );
   }
+  let meshRecoveryVersion = opts.meshRecoveryVersion;
+  const maySubmitNow =
+    !opts.recordPromotionsOnly && !opts.recordRoutesOnly && !campaignGated;
+  if (meshRecoveryVersion === undefined && maySubmitNow) {
+    const probed = await engineMeshRecoveryVersion(engine);
+    if (probed == null) {
+      console.error(
+        `[sweeper] URANS routing for job ${parent.id} deferred: engine mesh-recovery capability is unavailable or malformed`,
+      );
+      return;
+    }
+    meshRecoveryVersion = probed;
+  }
+  // Record-only/gated passes never cross the engine boundary. Version zero
+  // preserves the legacy terminal fence until a capacity-bounded tick probes
+  // and reopens an older structured blocker.
+  const effectiveMeshRecoveryVersion = meshRecoveryVersion ?? 0;
   if (conditionMap) {
     // Batched campaign parent: the retry plan is computed PER conditionMap
     // entry and each retrying condition gets its own single-revision child.
@@ -1451,7 +1597,7 @@ export async function submitUransRetryForJob(
       parent,
       conditionMap,
       campaignGated,
-      opts,
+      { ...opts, meshRecoveryVersion: effectiveMeshRecoveryVersion },
     );
     return;
   }
@@ -1502,6 +1648,7 @@ export async function submitUransRetryForJob(
             airfoilId: parent.airfoilId,
             revisionId,
             retry: plannedRetry,
+            meshRecoveryVersion: effectiveMeshRecoveryVersion,
           })
         : null;
   if (!retry || retry.aoas.length === 0) return;
@@ -1626,6 +1773,7 @@ export async function submitUransRetryForJob(
     queuePressure: await solverQueuePressure(db),
     cpuSlots: capacity?.cpuSlots ?? 0,
   });
+  request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;
   if (continuation) {
     request.continue_from = {
       engine_job_id: continuation.engineJobId,
@@ -1671,6 +1819,7 @@ export async function submitUransRetryForJob(
             }
           : {}),
         uransFidelity: "precalc",
+        meshRecoveryVersion: effectiveMeshRecoveryVersion,
         retryMode: retry.retryMode,
         validRansPointCount: retry.validRansPointCount,
         needsUransCount: retry.needsUransCount,
@@ -1713,6 +1862,12 @@ export async function submitUransRetryForJob(
       aoas,
     });
   }
+  if (submit.kind === "capability_mismatch") {
+    console.warn(
+      `[sweeper] PRECALC submit deferred by engine capability cutover (sim_job ${job.id}, parent ${parent.id}); capability will be re-probed next tick`,
+    );
+    return;
+  }
   if (submit.kind === "connection_failure") {
     await recordEngineUnreachable(db);
     return;
@@ -1747,6 +1902,7 @@ async function submitCampaignUransRetries(
     ransPrecalcPromotions?: IngestedRansPrecalcPromotion[];
     recordPromotionsOnly?: boolean;
     recordRoutesOnly?: boolean;
+    meshRecoveryVersion?: number;
   },
 ): Promise<void> {
   const parentPayload = requestPayload(parent);
@@ -1826,6 +1982,7 @@ async function submitCampaignUransRetries(
               airfoilId: parent.airfoilId,
               revisionId: entry.revisionId,
               retry: plannedRetry,
+              meshRecoveryVersion: opts.meshRecoveryVersion ?? 0,
             })
           : null;
     if (!retry || retry.aoas.length === 0) continue;
@@ -1928,6 +2085,7 @@ async function submitCampaignUransRetries(
       queuePressure: await solverQueuePressure(db),
       cpuSlots: capacity?.cpuSlots ?? 0,
     });
+    request.expected_mesh_recovery_version = opts.meshRecoveryVersion ?? 0;
     if (continuation) {
       request.continue_from = {
         engine_job_id: continuation.engineJobId,
@@ -1972,6 +2130,7 @@ async function submitCampaignUransRetries(
               }
             : {}),
           uransFidelity: "precalc",
+          meshRecoveryVersion: opts.meshRecoveryVersion ?? 0,
           retryMode: retry.retryMode,
           validRansPointCount: retry.validRansPointCount,
           needsUransCount: retry.needsUransCount,
@@ -2010,6 +2169,12 @@ async function submitCampaignUransRetries(
         revisionId: entry.revisionId,
         aoas: retryAoas,
       });
+    }
+    if (submit.kind === "capability_mismatch") {
+      console.warn(
+        `[sweeper] PRECALC submit deferred by engine capability cutover (sim_job ${job.id}, parent ${parent.id}, condition ${entry.conditionId}); capability will be re-probed next tick`,
+      );
+      return;
     }
     if (submit.kind === "connection_failure") {
       await recordEngineUnreachable(db);
@@ -2169,16 +2334,23 @@ async function ingestCompletedJob(
   job: SimJobRow,
 ): Promise<void> {
   if (!job.engineJobId) return;
+  const engineJobId = job.engineJobId;
   const lease = await claimJobForIngest(db, job.id);
   if (!lease) return;
   try {
-    const result = await engine.getResult(job.engineJobId);
+    const result = await engine.getResult(engineJobId);
     await renewIngestLeaseOrThrow(db, lease);
+    job = await jobWithPersistedMeshRecoveryAcknowledgement(
+      db,
+      job,
+      result.mesh_recovery_version,
+      lease,
+    );
     const speedMap = speedMapForJob(job);
     const ingested = await ingestResult({
       db,
       engine,
-      engineJobId: job.engineJobId,
+      engineJobId,
       simJobId: job.id,
       airfoilId: job.airfoilId,
       speedMap,
@@ -2244,11 +2416,12 @@ async function ingestRunningPartialJob(
   job: SimJobRow,
 ): Promise<boolean> {
   if (!job.engineJobId) return false;
+  const engineJobId = job.engineJobId;
   const lease = await claimJobForIngest(db, job.id);
   if (!lease) return false;
   let result;
   try {
-    result = await engine.getResult(job.engineJobId);
+    result = await engine.getResult(engineJobId);
   } catch {
     await releaseIngestLeaseToRunning(db, lease);
     return false;
@@ -2259,10 +2432,16 @@ async function ingestRunningPartialJob(
   }
   try {
     await renewIngestLeaseOrThrow(db, lease);
+    job = await jobWithPersistedMeshRecoveryAcknowledgement(
+      db,
+      job,
+      result.mesh_recovery_version,
+      lease,
+    );
     const ingested = await ingestResult({
       db,
       engine,
-      engineJobId: job.engineJobId,
+      engineJobId,
       simJobId: job.id,
       airfoilId: job.airfoilId,
       speedMap: speedMapForJob(job),
@@ -2465,9 +2644,11 @@ async function ingestFailedEngineJob(
   job: SimJobRow,
   msg: string,
   hooks: ReconcileOptions["testHooks"] = {},
+  statusFailureDisposition: JobStatus["failure_disposition"] = null,
 ): Promise<void> {
   const lease = await claimJobForIngest(db, job.id);
   if (!lease) return;
+  let terminalFailureDisposition = statusFailureDisposition ?? null;
   if (msg === WORKER_RESTART_ORPHAN_MESSAGE) {
     // Infrastructure interruption, not solver failure — release, never fail.
     await releaseWorkerRestartOrphan(db, engine, job, lease);
@@ -2483,17 +2664,32 @@ async function ingestFailedEngineJob(
     );
     if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
       return;
-    await settleUransLadderForJob(db, job, { terminalError: failure });
+    await settleUransLadderForJob(db, job, {
+      terminalError: failure,
+      terminalFailureDisposition,
+    });
     await autoRetryFailedPointsForJob(db, job);
     if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
       throw new IngestLeaseLostError(job.id);
     }
     return;
   }
+  const engineJobId = job.engineJobId;
   let result: JobResult;
   try {
-    result = await engine.getResult(job.engineJobId);
+    result = await engine.getResult(engineJobId);
   } catch (e) {
+    try {
+      job = await jobWithPersistedMeshRecoveryAcknowledgement(
+        db,
+        job,
+        undefined,
+        lease,
+      );
+    } catch (refreshError) {
+      if (refreshError instanceof IngestLeaseLostError) return;
+      throw refreshError;
+    }
     const failure = nonEmptyFailureMessage(job, msg);
     logEngineJobFailed(
       job,
@@ -2503,13 +2699,18 @@ async function ingestFailedEngineJob(
     );
     if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
       return;
-    await settleUransLadderForJob(db, job, { terminalError: failure });
+    await settleUransLadderForJob(db, job, {
+      terminalError: failure,
+      terminalFailureDisposition,
+    });
     await autoRetryFailedPointsForJob(db, job);
     if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
       throw new IngestLeaseLostError(job.id);
     }
     return;
   }
+  terminalFailureDisposition =
+    result.failure_disposition ?? terminalFailureDisposition;
   // The ENGINE's own failure message wins (gate incident 2026-07-07: the
   // runtime-probe dispatch passed the generic "engine job failed" fallback and
   // the real "All cases failed" never reached the evidence rows): prefer the
@@ -2522,11 +2723,17 @@ async function ingestFailedEngineJob(
       : msg,
   );
   try {
+    job = await jobWithPersistedMeshRecoveryAcknowledgement(
+      db,
+      job,
+      result.mesh_recovery_version,
+      lease,
+    );
     await renewIngestLeaseOrThrow(db, lease);
     const ingested = await ingestResult({
       db,
       engine,
-      engineJobId: job.engineJobId,
+      engineJobId,
       simJobId: job.id,
       airfoilId: job.airfoilId,
       speedMap: speedMapForJob(job),
@@ -2546,7 +2753,10 @@ async function ingestFailedEngineJob(
         // True crash: the payload shipped no evidence at all — current
         // terminal-fail behavior, now loud. The exact crash-class shape the
         // auto-retry-once amendment covers.
-        await settleUransLadderForJob(db, job, { terminalError: failure });
+        await settleUransLadderForJob(db, job, {
+          terminalError: failure,
+          terminalFailureDisposition,
+        });
         logEngineJobFailed(
           job,
           failure,
@@ -2571,7 +2781,10 @@ async function ingestFailedEngineJob(
       await refreshPolarCachesForJob(db, job, () =>
         renewIngestAndHeartbeat(db, lease),
       );
-      await settleUransLadderForJob(db, job, { terminalError: failure });
+      await settleUransLadderForJob(db, job, {
+        terminalError: failure,
+        terminalFailureDisposition,
+      });
       logEngineJobFailed(
         job,
         failure,
@@ -2607,7 +2820,10 @@ async function ingestFailedEngineJob(
       renewIngestAndHeartbeat(db, lease),
     );
     await enqueueVerificationsForJob(db, job);
-    await settleUransLadderForJob(db, job, { terminalError: failure });
+    await settleUransLadderForJob(db, job, {
+      terminalError: failure,
+      terminalFailureDisposition,
+    });
     logEngineJobFailed(
       job,
       failure,
@@ -2646,7 +2862,10 @@ async function ingestFailedEngineJob(
     );
     if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
       return;
-    await settleUransLadderForJob(db, job, { terminalError: failure });
+    await settleUransLadderForJob(db, job, {
+      terminalError: failure,
+      terminalFailureDisposition,
+    });
     await autoRetryFailedPointsForJob(db, job);
     if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
       console.error(
@@ -2679,6 +2898,8 @@ async function ingestResultFileIfReady(
       engine,
       job,
       result.message ?? failedMessage,
+      {},
+      result.failure_disposition,
     );
     return true;
   }
@@ -2689,6 +2910,8 @@ async function ingestResultFileIfReady(
       db,
       job,
       result.message ?? "engine result marks job cancelled; claims released",
+      undefined,
+      result,
     );
     return true;
   }
@@ -2840,6 +3063,8 @@ async function recoverFailedEngineJobs(
         engine,
         job,
         status.message ?? "engine job failed",
+        {},
+        status.failure_disposition,
       );
     }
   }
@@ -3142,6 +3367,7 @@ export async function reconcile(
         job,
         status.message ?? "engine job failed",
         options.testHooks,
+        status.failure_disposition,
       );
     }
   }

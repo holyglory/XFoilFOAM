@@ -37,6 +37,7 @@ import {
   markTickStarted,
   touchHeartbeat,
 } from "./heartbeat";
+import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
 import { reconcile, resetOrphans } from "./reconcile";
 import { remoteSolverTick } from "./remote-solver";
 import { retentionTick } from "./retention";
@@ -593,24 +594,34 @@ export async function tick(
         await recordEngineUnreachable(db);
       } else {
         await clearEngineUnreachable(db);
+        const meshRecoveryVersion = await prepareAutomaticMeshRecovery(
+          db,
+          engine,
+        );
         // A recorded whole-polar promotion and an exact targeted RANS
         // rejection are both normal automatic escalation work. They receive
         // the next free slot ahead of a new RANS batch; this does not preempt
         // running work and keeps the lower-priority admin/verify ladder below
         // ordinary RANS.
-        const promotedSubmitted = await submitRecordedPromotionRecovery(
-          db,
-          engine,
-          state.cpuSlots,
-        );
-        const targetedSubmitted = promotedSubmitted
-          ? false
-          : await submitCampaignPrecalcRecoveries(
-              db,
-              engine,
-              undefined,
-              undefined,
-            );
+        const promotedSubmitted =
+          meshRecoveryVersion == null
+            ? false
+            : await submitRecordedPromotionRecovery(
+                db,
+                engine,
+                state.cpuSlots,
+                { meshRecoveryVersion },
+              );
+        const targetedSubmitted =
+          promotedSubmitted || meshRecoveryVersion == null
+            ? false
+            : await submitCampaignPrecalcRecoveries(
+                db,
+                engine,
+                undefined,
+                undefined,
+                meshRecoveryVersion,
+              );
         const ransSubmitted =
           promotedSubmitted || targetedSubmitted
             ? false
@@ -624,7 +635,9 @@ export async function tick(
           !ransSubmitted &&
           (await inFlight(db)) < state.maxConcurrentJobs
         ) {
-          await uransLadderTick(db, engine, state.cpuSlots);
+          await uransLadderTick(db, engine, state.cpuSlots, {
+            meshRecoveryVersion,
+          });
         }
       }
     }

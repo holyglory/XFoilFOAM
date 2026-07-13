@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql, type SQLWrapper } from "drizzle-orm";
 import {
   AUTO_PRECALC_CONTINUATION_BUDGET_S,
   URANS_BUDGET_STOP_MARKER,
@@ -10,6 +10,7 @@ import type { DB } from "./client";
 import { lockPrecalcCells } from "./precalc-cell-lock";
 import {
   probeCampaignCompletion,
+  recomputeProgressForPrecalcObligations,
   recomputeProgressForCampaign,
 } from "./campaign-execution";
 import {
@@ -46,10 +47,10 @@ export interface PrecalcObligationOwnership {
   backgroundOwner?: boolean;
 }
 
-const liveOwnerSql = (obligationId: string) => sql`(
+const liveOwnerSql = (obligationId: string | SQLWrapper) => sql`(
   EXISTS (
-    SELECT 1 FROM sim_precalc_obligations obligation
-    WHERE obligation.id = ${obligationId} AND obligation.background_owner
+    SELECT 1 FROM sim_precalc_obligations owned_obligation
+    WHERE owned_obligation.id = ${obligationId} AND owned_obligation.background_owner
   )
   OR EXISTS (
     SELECT 1
@@ -69,18 +70,18 @@ const liveOwnerSql = (obligationId: string) => sql`(
   )
   OR EXISTS (
     SELECT 1
-    FROM sim_precalc_obligations obligation
+    FROM sim_precalc_obligations owned_obligation
     JOIN sync_sweep_promise_points promise_point
-      ON promise_point.airfoil_id = obligation.airfoil_id
-     AND promise_point.simulation_preset_revision_id = obligation.revision_id
-     AND promise_point.aoa_deg = obligation.aoa_deg
+      ON promise_point.airfoil_id = owned_obligation.airfoil_id
+     AND promise_point.simulation_preset_revision_id = owned_obligation.revision_id
+     AND promise_point.aoa_deg = owned_obligation.aoa_deg
      AND promise_point.status = 'active'
     JOIN sync_sweep_promises promise
       ON promise.id = promise_point.promise_id
      AND promise.status = 'active'
      AND promise."expiresAt" > now()
      AND promise.request_payload ->> 'remoteSolver' = 'true'
-    WHERE obligation.id = ${obligationId}
+    WHERE owned_obligation.id = ${obligationId}
   )
 )`;
 
@@ -157,7 +158,7 @@ export async function ensurePrecalcObligationsInTransaction(
     : [];
   const requestIds = liveRequestRows.map((row) => row.id);
   // Global ownership transition lock order:
-  // campaign/request/promise owner rows -> sorted natural-cell advisory
+  // campaign/promise(+point)/request owner rows -> sorted natural-cell advisory
   // locks -> result/obligation rows. Campaign claim/requeue follows the same
   // order, preventing campaign↔cell inversion under concurrent routing.
   await lockPrecalcCells(tx, cells);
@@ -394,6 +395,295 @@ export async function recordPrecalcObligationSubmission(
   });
 }
 
+export interface MeshRecoveryRequeueScope {
+  /** Test/repair closed world. An explicitly empty list matches nothing. */
+  obligationIds?: string[];
+  /** Exact conditional whole-polar event scope. */
+  promotionIds?: string[];
+  /** Scheduler closed world for shared test databases. Production omits it. */
+  campaignIds?: string[];
+}
+
+export interface MeshRecoveryRequeueResult {
+  obligationIds: string[];
+  campaignIds: string[];
+}
+
+function meshRecoveryScopeSql(scope: MeshRecoveryRequeueScope) {
+  if (scope.obligationIds !== undefined) {
+    return scope.obligationIds.length
+      ? sql`obligation.id = ANY(${sql`ARRAY[${sql.join(
+          scope.obligationIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})`
+      : sql`false`;
+  }
+  if (scope.promotionIds !== undefined) {
+    return scope.promotionIds.length
+      ? sql`EXISTS (
+          SELECT 1
+          FROM sim_rans_polar_promotion_points scoped_point
+          WHERE scoped_point.obligation_id = obligation.id
+            AND scoped_point.promotion_id = ANY(${sql`ARRAY[${sql.join(
+              scope.promotionIds.map((id) => sql`${id}::uuid`),
+              sql`, `,
+            )}]`})
+        )`
+      : sql`false`;
+  }
+  if (scope.campaignIds !== undefined) {
+    return scope.campaignIds.length
+      ? sql`EXISTS (
+          SELECT 1
+          FROM sim_precalc_obligation_campaigns scoped_ownership
+          WHERE scoped_ownership.obligation_id = obligation.id
+            AND scoped_ownership.campaign_id = ANY(${sql`ARRAY[${sql.join(
+              scope.campaignIds.map((id) => sql`${id}::uuid`),
+              sql`, `,
+            )}]`})
+        )`
+      : sql`false`;
+  }
+  return sql`true`;
+}
+
+/** Reopen only an immutable PRECALC mesh failure produced by an older engine
+ * recovery strategy. The failed submission and its result evidence remain
+ * untouched; the physical obligation keeps attempt_count=1 and may consume
+ * only its already-budgeted second submission. The effective capability
+ * version is immutable attempt evidence, so retention may purge the producing
+ * sim_job without disabling a later strategy upgrade. Infrastructure/evidence
+ * failures and ownerless work are outside this transition by construction. */
+export async function requeueDeterministicMeshObligationsForRecoveryVersion(
+  db: DB,
+  meshRecoveryVersion: number,
+  scope: MeshRecoveryRequeueScope = {},
+): Promise<MeshRecoveryRequeueResult> {
+  if (!Number.isSafeInteger(meshRecoveryVersion) || meshRecoveryVersion <= 0) {
+    return { obligationIds: [], campaignIds: [] };
+  }
+  const scopeSql = meshRecoveryScopeSql(scope);
+  const result = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const candidates = (await tx.execute(sql`
+      SELECT obligation.id,
+             obligation.airfoil_id,
+             obligation.revision_id,
+             obligation.aoa_deg::float8 AS aoa_deg
+      FROM sim_precalc_obligations obligation
+      JOIN sim_precalc_obligation_attempts immutable_attempt
+        ON immutable_attempt.obligation_id = obligation.id
+       AND immutable_attempt.attempt_number = 1
+       AND immutable_attempt.state = 'failed'
+       AND immutable_attempt.outcome = 'deterministic_failure'
+      WHERE (${scopeSql})
+        AND obligation.state = 'blocked'
+        AND obligation.attempt_count = 1
+        AND obligation.attempt_count < obligation.max_attempts
+        AND obligation.last_outcome = 'deterministic_failure'
+        AND immutable_attempt.mesh_recovery_version < ${meshRecoveryVersion}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sim_jobs active_job
+          CROSS JOIN LATERAL jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(active_job.request_payload -> 'precalcObligationIds') = 'array'
+              THEN active_job.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) active_payload_obligation(id)
+          WHERE active_payload_obligation.id = obligation.id::text
+            AND active_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM result_attempts accepted_attempt
+          JOIN result_classifications accepted_classification
+            ON accepted_classification.result_attempt_id = accepted_attempt.id
+           AND accepted_classification.state = 'accepted'
+          WHERE accepted_attempt.airfoil_id = obligation.airfoil_id
+            AND accepted_attempt.simulation_preset_revision_id = obligation.revision_id
+            AND accepted_attempt.aoa_deg = obligation.aoa_deg
+            AND (
+              accepted_attempt.regime = 'urans'
+              OR accepted_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            )
+        )
+        AND (
+          obligation.background_owner
+          OR EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligation_campaigns live_campaign_ownership
+            JOIN sim_campaigns live_campaign
+              ON live_campaign.id = live_campaign_ownership.campaign_id
+             AND live_campaign.status IN ('active', 'attention', 'paused')
+            WHERE live_campaign_ownership.obligation_id = obligation.id
+              AND live_campaign_ownership.state = 'active'
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligation_requests live_request_coverage
+            JOIN sim_urans_requests live_request
+              ON live_request.id = live_request_coverage.request_id
+             AND live_request.background_owner
+             AND live_request.state IN ('pending', 'running')
+            WHERE live_request_coverage.obligation_id = obligation.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM sync_sweep_promise_points live_promise_point
+            JOIN sync_sweep_promises live_promise
+              ON live_promise.id = live_promise_point.promise_id
+             AND live_promise.status = 'active'
+             AND live_promise."expiresAt" > now()
+             AND live_promise.request_payload ->> 'remoteSolver' = 'true'
+            WHERE live_promise_point.airfoil_id = obligation.airfoil_id
+              AND live_promise_point.simulation_preset_revision_id = obligation.revision_id
+              AND live_promise_point.aoa_deg = obligation.aoa_deg
+              AND live_promise_point.status = 'active'
+          )
+        )
+      ORDER BY obligation.id
+      LIMIT 500
+    `)) as unknown as Array<{
+      id: string;
+      airfoil_id: string;
+      revision_id: string;
+      aoa_deg: number;
+    }>;
+    if (!candidates.length) return { obligationIds: [], campaignIds: [] };
+
+    const candidateIds = candidates.map((row) => row.id);
+    const candidateIdArray = sql`ARRAY[${sql.join(
+      candidateIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    )}]`;
+    // Preserve the repository-wide campaign -> remote promise+point ->
+    // request ownership lock order before taking natural-cell advisory locks
+    // and finally updating obligation rows.
+    await tx.execute(sql`
+      SELECT campaign.id
+      FROM sim_campaigns campaign
+      JOIN sim_precalc_obligation_campaigns ownership
+        ON ownership.campaign_id = campaign.id
+      WHERE ownership.obligation_id = ANY(${candidateIdArray})
+      ORDER BY campaign.id
+      FOR SHARE OF campaign
+    `);
+    await tx.execute(sql`
+      SELECT promise.id, point.id AS point_id
+      FROM sync_sweep_promises promise
+      JOIN sync_sweep_promise_points point ON point.promise_id = promise.id
+      JOIN sim_precalc_obligations obligation
+        ON obligation.airfoil_id = point.airfoil_id
+       AND obligation.revision_id = point.simulation_preset_revision_id
+       AND obligation.aoa_deg = point.aoa_deg
+      WHERE obligation.id = ANY(${candidateIdArray})
+      ORDER BY promise.id, point.id
+      FOR SHARE OF promise, point
+    `);
+    await tx.execute(sql`
+      SELECT request.id
+      FROM sim_urans_requests request
+      JOIN sim_precalc_obligation_requests coverage
+        ON coverage.request_id = request.id
+      WHERE coverage.obligation_id = ANY(${candidateIdArray})
+      ORDER BY request.id
+      FOR SHARE OF request
+    `);
+    await lockPrecalcCells(
+      tx,
+      candidates.map((row) => ({
+        airfoilId: row.airfoil_id,
+        revisionId: row.revision_id,
+        aoaDeg: Number(row.aoa_deg),
+      })),
+    );
+
+    // Recheck every safety predicate after locks: lifecycle cancellation,
+    // accepted late evidence, or a concurrent composition may have won since
+    // the bounded candidate read above.
+    const reopened = (await tx.execute(sql`
+      UPDATE sim_precalc_obligations obligation
+      SET state = 'pending',
+          submit_failure_count = 0,
+          next_submit_at = NULL,
+          last_outcome = 'mesh_recovery_upgrade_pending',
+          completed_at = NULL,
+          "updatedAt" = now()
+      FROM sim_precalc_obligation_attempts immutable_attempt
+      WHERE obligation.id = ANY(${candidateIdArray})
+        AND immutable_attempt.obligation_id = obligation.id
+        AND immutable_attempt.attempt_number = 1
+        AND immutable_attempt.state = 'failed'
+        AND immutable_attempt.outcome = 'deterministic_failure'
+        AND obligation.state = 'blocked'
+        AND obligation.attempt_count = 1
+        AND obligation.attempt_count < obligation.max_attempts
+        AND obligation.last_outcome = 'deterministic_failure'
+        AND immutable_attempt.mesh_recovery_version < ${meshRecoveryVersion}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sim_jobs active_job
+          CROSS JOIN LATERAL jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(active_job.request_payload -> 'precalcObligationIds') = 'array'
+              THEN active_job.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) active_payload_obligation(id)
+          WHERE active_payload_obligation.id = obligation.id::text
+            AND active_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM result_attempts accepted_attempt
+          JOIN result_classifications accepted_classification
+            ON accepted_classification.result_attempt_id = accepted_attempt.id
+           AND accepted_classification.state = 'accepted'
+          WHERE accepted_attempt.airfoil_id = obligation.airfoil_id
+            AND accepted_attempt.simulation_preset_revision_id = obligation.revision_id
+            AND accepted_attempt.aoa_deg = obligation.aoa_deg
+            AND (
+              accepted_attempt.regime = 'urans'
+              OR accepted_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            )
+        )
+        AND (${liveOwnerSql(sql`obligation.id`)})
+      RETURNING obligation.id
+    `)) as unknown as Array<{ id: string }>;
+    if (!reopened.length) return { obligationIds: [], campaignIds: [] };
+    const reopenedIds = reopened.map((row) => row.id).sort();
+    const reopenedIdArray = sql`ARRAY[${sql.join(
+      reopenedIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    )}]`;
+    const campaigns = (await tx.execute(sql`
+      SELECT DISTINCT ownership.campaign_id
+      FROM sim_precalc_obligation_campaigns ownership
+      JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+      WHERE ownership.obligation_id = ANY(${reopenedIdArray})
+        AND ownership.state = 'active'
+        AND campaign.status IN ('active', 'attention', 'paused')
+      ORDER BY ownership.campaign_id
+    `)) as unknown as Array<{ campaign_id: string }>;
+    return {
+      obligationIds: reopenedIds,
+      campaignIds: campaigns.map((row) => row.campaign_id),
+    };
+  });
+  const affectedCampaignIds = await recomputeProgressForPrecalcObligations(
+    db,
+    result.obligationIds,
+  );
+  for (const campaignId of [
+    ...new Set([...result.campaignIds, ...affectedCampaignIds]),
+  ]) {
+    await probeCampaignCompletion(db, campaignId);
+  }
+  return result;
+}
+
 export interface PrecalcSettlement {
   pending: string[];
   satisfied: string[];
@@ -554,6 +844,14 @@ function hasPrecalcContinuationWarning(warnings: string[] | null): boolean {
 
 export interface PrecalcTerminalSettlementOptions {
   terminalError?: string | null;
+  /** Typed job-level failure for errors that happened before any per-angle
+   * attempt existed. A present typed value is authoritative over legacy text. */
+  terminalFailureDisposition?:
+    | "none"
+    | "hard_solver"
+    | "deterministic_mesh"
+    | "infrastructure"
+    | null;
   /** Explicit cancellation records a cancelled attempt. A lost engine task,
    * worker restart, or stale recovery is transient infrastructure failure. */
   cancellation?: "transient" | "explicit";
@@ -578,7 +876,15 @@ export async function settlePrecalcObligationsForJobInTransaction(
   const payload = (job.requestPayload ?? {}) as {
     precalcObligationIds?: unknown;
     uransFidelity?: unknown;
+    executedMeshRecoveryVersion?: unknown;
   };
+  const acknowledgedMeshRecoveryVersion =
+    typeof payload.executedMeshRecoveryVersion === "number" &&
+    Number.isSafeInteger(payload.executedMeshRecoveryVersion) &&
+    payload.executedMeshRecoveryVersion >= 0 &&
+    payload.executedMeshRecoveryVersion <= 2_147_483_647
+      ? payload.executedMeshRecoveryVersion
+      : 0;
   const obligationIds = Array.isArray(payload.precalcObligationIds)
     ? payload.precalcObligationIds.filter(
         (id): id is string => typeof id === "string",
@@ -678,6 +984,9 @@ export async function settlePrecalcObligationsForJobInTransaction(
         fidelity: sql<
           string | null
         >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+        failureDisposition: sql<
+          string | null
+        >`${resultAttempts.evidencePayload} ->> 'failure_disposition'`,
         classification: resultClassifications.state,
         reasons: resultClassifications.reasons,
       })
@@ -700,16 +1009,24 @@ export async function settlePrecalcObligationsForJobInTransaction(
     // Accepted/rejected PRECALC candidates must carry actual URANS-tier
     // evidence. A same-job RANS-shaped row is not preliminary evidence and
     // can never satisfy the obligation merely because the payload named the
-    // cell. The sole fallback is a deterministic mesh/setup failure: it can
-    // happen before pimpleFoam starts and therefore honestly echo RANS. The
-    // exact payload plus the sim_job/airfoil/revision/AoA query above fences
-    // that fallback to this physical submission.
+    // cell. A failure before pimpleFoam starts can honestly echo RANS, so exact
+    // same-job typed execution failures remain eligible for retry policy; the
+    // legacy text fallback remains limited to its paired deterministic mesh
+    // markers. The exact payload plus the sim_job/airfoil/revision/AoA query
+    // above fences both paths to this physical submission, and any typed
+    // disposition remains authoritative over legacy error wording.
     const precalcEvidence = evidence.filter(
       (row) => row.fidelity === "urans_precalc" || row.regime === "urans",
     );
-    const deterministicRansFallback = exactPrecalcJob
-      ? (evidence.find((row) => isDeterministicMeshBlockerError(row.error)) ??
-        null)
+    const exactPrecalcFailureFallback = exactPrecalcJob
+      ? (evidence.find(
+          (row) =>
+            row.status === "failed" &&
+            ((row.failureDisposition != null &&
+              row.failureDisposition !== "none") ||
+              (row.failureDisposition == null &&
+                isDeterministicMeshBlockerError(row.error))),
+        ) ?? null)
       : null;
     const accepted = precalcEvidence.find(
       (row) =>
@@ -720,10 +1037,15 @@ export async function settlePrecalcObligationsForJobInTransaction(
       accepted ??
       precalcEvidence.find((row) => row.classification != null) ??
       precalcEvidence[0] ??
-      deterministicRansFallback ??
+      exactPrecalcFailureFallback ??
       null;
     const error = judged?.error ?? opts.terminalError ?? null;
-    const deterministic = isDeterministicMeshBlockerError(error);
+    const failureDisposition =
+      judged?.failureDisposition ?? opts.terminalFailureDisposition ?? null;
+    const deterministic = Boolean(
+      failureDisposition === "deterministic_mesh" ||
+      (failureDisposition == null && isDeterministicMeshBlockerError(error)),
+    );
     const restartable = Boolean(
       judged?.engineJobId &&
       judged.engineCaseSlug &&
@@ -798,6 +1120,13 @@ export async function settlePrecalcObligationsForJobInTransaction(
         .set({
           state: attemptState,
           outcome: lastOutcome,
+          // First acknowledged execution truth wins. Submission-time desired
+          // capability is not evidence; old workers therefore remain v0.
+          meshRecoveryVersion: sql`CASE
+            WHEN ${simPrecalcObligationAttempts.meshRecoveryVersion} = 0
+            THEN ${acknowledgedMeshRecoveryVersion}
+            ELSE ${simPrecalcObligationAttempts.meshRecoveryVersion}
+          END`,
           resultAttemptId: judged?.id ?? null,
           error,
           completedAt: new Date(),

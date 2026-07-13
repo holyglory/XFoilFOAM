@@ -144,6 +144,9 @@ export interface PolarRequest {
   /** Amendment C: increased wall-clock solver budget [s] for the continuation
    *  (+2h/+6h UI choices); replaces the fidelity-derived tier budget. */
   budget_override_s?: number | null;
+  /** Required worker mesh-repair strategy for this submission. PRECALC callers
+   * set it from a live capability probe; API and worker reject mismatches. */
+  expected_mesh_recovery_version?: number | null;
 }
 
 export type JobState =
@@ -212,6 +215,12 @@ export interface JobStatus {
   cpu_tokens_waiting?: number;
   cpu_tokens_held?: number;
   scheduling?: SchedulingMetadata | null;
+  /** Capability acknowledged by the worker executing this job; absent/null
+   * while only queued by the API or when produced by a legacy worker. */
+  mesh_recovery_version?: number | null;
+  /** Typed terminal failure when execution ended before per-angle attempt
+   * evidence existed. Null/absent on non-terminal and legacy jobs. */
+  failure_disposition?: FailureDisposition | null;
 }
 
 export interface EngineHealth {
@@ -219,6 +228,10 @@ export interface EngineHealth {
   version: string;
   build_id?: string | null;
   package_file?: string | null;
+  /** Monotonic engine-side automatic PRECALC mesh-repair strategy. Missing
+   * means the legacy strategy (0); malformed/unreachable health is unknown
+   * and must never authorize reopening deterministic blockers. */
+  mesh_recovery_version?: number;
 }
 
 /** GET /cache/stats — disk truth about the engine mesh/seed cache. */
@@ -531,4 +544,9 @@ export interface JobResult {
   polars: Polar[];
   message?: string | null;
   scheduling?: SchedulingMetadata | null;
+  /** Capability acknowledged by the worker that produced this result. */
+  mesh_recovery_version?: number | null;
+  /** Typed terminal failure when execution ended before per-angle attempt
+   * evidence existed. Null/absent on non-terminal and legacy results. */
+  failure_disposition?: FailureDisposition | null;
 }

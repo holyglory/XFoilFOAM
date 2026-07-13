@@ -56,7 +56,10 @@ describe("deriveSolverState gate precedence", () => {
     // Shaped like the real 2026-07-05 incident: sweeper_state.enabled=true,
     // heartbeat days old, engine healthy — the old UI showed "sweeper
     // running" and prescribed Resume.
-    const d = deriveSolverState({ ...healthy, heartbeatAt: iso(3 * 86_400_000) }, NOW);
+    const d = deriveSolverState(
+      { ...healthy, heartbeatAt: iso(3 * 86_400_000) },
+      NOW,
+    );
     expect(d.state).toBe("process_not_running");
     expect(d.tone).toBe("red");
     expect(d.headline).toMatch(/last heartbeat 3d ago/);
@@ -64,9 +67,15 @@ describe("deriveSolverState gate precedence", () => {
   });
 
   it("boundary: exactly 90s old heartbeat is still alive; 90s+1ms is dead", () => {
-    const alive = deriveSolverState({ ...healthy, heartbeatAt: iso(HEARTBEAT_STALE_MS) }, NOW);
+    const alive = deriveSolverState(
+      { ...healthy, heartbeatAt: iso(HEARTBEAT_STALE_MS) },
+      NOW,
+    );
     expect(alive.state).toBe("running");
-    const dead = deriveSolverState({ ...healthy, heartbeatAt: iso(HEARTBEAT_STALE_MS + 1) }, NOW);
+    const dead = deriveSolverState(
+      { ...healthy, heartbeatAt: iso(HEARTBEAT_STALE_MS + 1) },
+      NOW,
+    );
     expect(dead.state).toBe("process_not_running");
   });
 
@@ -76,13 +85,20 @@ describe("deriveSolverState gate precedence", () => {
   });
 
   it("process dead wins over paused (dead + disabled is NOT 'paused')", () => {
-    const d = deriveSolverState({ ...healthy, heartbeatAt: null, enabled: false }, NOW);
+    const d = deriveSolverState(
+      { ...healthy, heartbeatAt: null, enabled: false },
+      NOW,
+    );
     expect(d.state).toBe("process_not_running");
   });
 
   it("process dead wins over engine unreachable", () => {
     const d = deriveSolverState(
-      { ...healthy, heartbeatAt: iso(10 * 60_000), engineUnreachableSince: iso(60_000) },
+      {
+        ...healthy,
+        heartbeatAt: iso(10 * 60_000),
+        engineUnreachableSince: iso(60_000),
+      },
       NOW,
     );
     expect(d.state).toBe("process_not_running");
@@ -96,13 +112,25 @@ describe("deriveSolverState gate precedence", () => {
   });
 
   it("compound paused + engine down -> secondary chip 'engine also unreachable … backoff'", () => {
-    const d = deriveSolverState({ ...healthy, enabled: false, engineUnreachableSince: iso(120_000) }, NOW);
+    const d = deriveSolverState(
+      { ...healthy, enabled: false, engineUnreachableSince: iso(120_000) },
+      NOW,
+    );
     expect(d.state).toBe("paused");
-    expect(d.secondary.some((s) => s.includes("engine also unreachable since") && s.includes("resuming will hold in backoff"))).toBe(true);
+    expect(
+      d.secondary.some(
+        (s) =>
+          s.includes("engine also unreachable since") &&
+          s.includes("resuming will hold in backoff"),
+      ),
+    ).toBe(true);
   });
 
   it("alive + enabled + engine unreachable -> engine_unreachable (red) with backoff honesty", () => {
-    const d = deriveSolverState({ ...healthy, engineUnreachableSince: iso(300_000) }, NOW);
+    const d = deriveSolverState(
+      { ...healthy, engineUnreachableSince: iso(300_000) },
+      NOW,
+    );
     expect(d.state).toBe("engine_unreachable");
     expect(d.tone).toBe("red");
     expect(d.headline).toMatch(/no jobs are being submitted/i);
@@ -128,7 +156,9 @@ describe("deriveSolverState gate precedence", () => {
     expect(d.tone).toBe("teal");
     // Without a points total in the payload the job count carries its own
     // unit label — "engine jobs" — so it can never be misread as points.
-    expect(d.headline).toBe("Running — 3 engine jobs in flight · heartbeat 5s ago");
+    expect(d.headline).toBe(
+      "Running — 3 engine jobs in flight · heartbeat 5s ago",
+    );
   });
 
   it("singular job count reads '1 engine job in flight'", () => {
@@ -137,19 +167,28 @@ describe("deriveSolverState gate precedence", () => {
   });
 
   it("idle only when 0 jobs AND backlog closed", () => {
-    const d = deriveSolverState({ ...healthy, activeJobCount: 0, backlogOpen: false }, NOW);
+    const d = deriveSolverState(
+      { ...healthy, activeJobCount: 0, backlogOpen: false },
+      NOW,
+    );
     expect(d.state).toBe("idle");
     expect(d.tone).toBe("teal");
     expect(d.headline).toMatch(/^Idle — running, nothing pending/);
   });
 
   it("0 jobs with backlog still open is running (work pending, not idle)", () => {
-    const d = deriveSolverState({ ...healthy, activeJobCount: 0, backlogOpen: true }, NOW);
+    const d = deriveSolverState(
+      { ...healthy, activeJobCount: 0, backlogOpen: true },
+      NOW,
+    );
     expect(d.state).toBe("running");
   });
 
   it("unknown backlog (undefined) never claims idle", () => {
-    const d = deriveSolverState({ ...healthy, activeJobCount: 0, backlogOpen: undefined }, NOW);
+    const d = deriveSolverState(
+      { ...healthy, activeJobCount: 0, backlogOpen: undefined },
+      NOW,
+    );
     expect(d.state).toBe("running");
   });
 });
@@ -160,8 +199,13 @@ describe("deriveSolverState gate precedence", () => {
 // contradiction on a healthy system.
 describe("running headline unit labels (jobs vs points)", () => {
   it("payload carries the campaign points total -> both units, side by side", () => {
-    const d = deriveSolverState({ ...healthy, activeJobCount: 7, campaignPointsSolving: 14 }, NOW);
-    expect(d.headline).toBe("Running — 7 jobs in flight · 14 points solving · heartbeat 5s ago");
+    const d = deriveSolverState(
+      { ...healthy, activeJobCount: 7, campaignPointsSolving: 14 },
+      NOW,
+    );
+    expect(d.headline).toBe(
+      "Running — 7 jobs in flight · 14 points solving · heartbeat 5s ago",
+    );
   });
 
   it("singular point count reads '1 point solving'", () => {
@@ -170,14 +214,21 @@ describe("running headline unit labels (jobs vs points)", () => {
   });
 
   it("points total ABSENT from the payload -> jobs relabelled 'engine jobs', no invented points count", () => {
-    const d = deriveSolverState({ ...healthy, campaignPointsSolving: null }, NOW);
-    expect(d.headline).toBe("Running — 3 engine jobs in flight · heartbeat 5s ago");
+    const d = deriveSolverState(
+      { ...healthy, campaignPointsSolving: null },
+      NOW,
+    );
+    expect(d.headline).toBe(
+      "Running — 3 engine jobs in flight · heartbeat 5s ago",
+    );
     expect(d.headline).not.toMatch(/points solving/);
   });
 
   it("zero campaign points is treated as absent (background gap-fill jobs DO solve non-campaign points — '0 points solving' would be a false number)", () => {
     const d = deriveSolverState({ ...healthy, campaignPointsSolving: 0 }, NOW);
-    expect(d.headline).toBe("Running — 3 engine jobs in flight · heartbeat 5s ago");
+    expect(d.headline).toBe(
+      "Running — 3 engine jobs in flight · heartbeat 5s ago",
+    );
     expect(d.headline).not.toMatch(/0 points/);
   });
 });
@@ -186,8 +237,18 @@ describe("engineQueueError is always a secondary chip, never primary", () => {
   const states: Array<[string, SolverStateInput]> = [
     ["running", { ...healthy, engineQueueError: true }],
     ["paused", { ...healthy, enabled: false, engineQueueError: true }],
-    ["process_not_running", { ...healthy, heartbeatAt: null, engineQueueError: true }],
-    ["engine_unreachable", { ...healthy, engineUnreachableSince: iso(60_000), engineQueueError: true }],
+    [
+      "process_not_running",
+      { ...healthy, heartbeatAt: null, engineQueueError: true },
+    ],
+    [
+      "engine_unreachable",
+      {
+        ...healthy,
+        engineUnreachableSince: iso(60_000),
+        engineQueueError: true,
+      },
+    ],
   ];
   for (const [expected, input] of states) {
     it(`stays ${expected} with the celery chip in secondary`, () => {
@@ -198,7 +259,9 @@ describe("engineQueueError is always a secondary chip, never primary", () => {
     });
   }
   it("no celery chip when introspection works", () => {
-    expect(deriveSolverState(healthy, NOW).secondary).not.toContain("celery introspection unavailable");
+    expect(deriveSolverState(healthy, NOW).secondary).not.toContain(
+      "celery introspection unavailable",
+    );
   });
 });
 
@@ -220,12 +283,23 @@ describe("helpers", () => {
 
   it("state labels + hub chip copy match the approved mockups", () => {
     expect(solverStateLabel("process_not_running")).toBe("PROCESS NOT RUNNING");
-    expect(solverChipText("running", 4)).toBe("solver · running · 4 jobs");
-    expect(solverChipText("running", 1)).toBe("solver · running · 1 job");
-    expect(solverChipText("paused")).toBe("solver · paused");
-    expect(solverChipText("process_not_running")).toBe("solver · process not running");
-    expect(solverChipText("engine_unreachable")).toBe("solver · engine unreachable");
-    expect(solverChipText("idle")).toBe("solver · idle");
+    expect(solverChipText("running", 4)).toBe(
+      "scheduler · running · 4 active jobs",
+    );
+    expect(solverChipText("running", 1)).toBe(
+      "scheduler · running · 1 active job",
+    );
+    expect(solverChipText("running", 0)).toBe(
+      "scheduler · ready · 0 active jobs",
+    );
+    expect(solverChipText("paused")).toBe("scheduler · paused");
+    expect(solverChipText("process_not_running")).toBe(
+      "scheduler · process not running",
+    );
+    expect(solverChipText("engine_unreachable")).toBe(
+      "scheduler · engine unreachable",
+    );
+    expect(solverChipText("idle")).toBe("scheduler · ready");
   });
 });
 
@@ -248,13 +322,18 @@ describe("tick_stalled (liveness/progress split)", () => {
     expect(d.state).toBe("tick_stalled");
     expect(d.tone).toBe("amber");
     expect(d.tone).not.toBe("red");
-    expect(d.headline).toBe("Tick running 6m — engine responding slowly; scheduling continues next tick.");
+    expect(d.headline).toBe(
+      "Tick running 6m — engine responding slowly; scheduling continues next tick.",
+    );
   });
 
   it("MUST-CATCH: stale heartbeat -> red process_not_running regardless of tick fields", () => {
     // Even a tick pair that LOOKS stalled cannot excuse (or repaint) true
     // process death — liveness is independent now.
-    const d = deriveSolverState({ ...stalled, heartbeatAt: iso(HEARTBEAT_STALE_MS + 1) }, NOW);
+    const d = deriveSolverState(
+      { ...stalled, heartbeatAt: iso(HEARTBEAT_STALE_MS + 1) },
+      NOW,
+    );
     expect(d.state).toBe("process_not_running");
     expect(d.tone).toBe("red");
     const never = deriveSolverState({ ...stalled, heartbeatAt: null }, NOW);
@@ -262,51 +341,90 @@ describe("tick_stalled (liveness/progress split)", () => {
   });
 
   it("tick below the 5 min threshold stays running (no premature stall)", () => {
-    const d = deriveSolverState({ ...stalled, lastTickStartedAt: iso(4 * 60_000) }, NOW);
+    const d = deriveSolverState(
+      { ...stalled, lastTickStartedAt: iso(4 * 60_000) },
+      NOW,
+    );
     expect(d.state).toBe("running");
   });
 
   it("completed >= started means the last tick finished — running, not stalled", () => {
-    const d = deriveSolverState({ ...stalled, lastTickCompletedAt: iso(6 * 60_000 - 1) }, NOW);
+    const d = deriveSolverState(
+      { ...stalled, lastTickCompletedAt: iso(6 * 60_000 - 1) },
+      NOW,
+    );
     expect(d.state).toBe("running");
   });
 
   it("payload without tick fields (pre-migration) never derives tick_stalled", () => {
     const d = deriveSolverState({ ...healthy }, NOW);
     expect(d.state).toBe("running");
-    const nulls = deriveSolverState({ ...healthy, lastTickStartedAt: null, lastTickCompletedAt: null }, NOW);
+    const nulls = deriveSolverState(
+      { ...healthy, lastTickStartedAt: null, lastTickCompletedAt: null },
+      NOW,
+    );
     expect(nulls.state).toBe("running");
   });
 
   it("precedence pins: process death > engine unreachable > engine unhealthy > tick_stalled > healthy", () => {
     // process death beats everything (pinned above too)
-    expect(deriveSolverState({ ...stalled, heartbeatAt: null, engineUnreachableSince: iso(60_000) }, NOW).state).toBe(
-      "process_not_running",
-    );
+    expect(
+      deriveSolverState(
+        { ...stalled, heartbeatAt: null, engineUnreachableSince: iso(60_000) },
+        NOW,
+      ).state,
+    ).toBe("process_not_running");
     // engine unreachable beats tick_stalled
-    expect(deriveSolverState({ ...stalled, engineUnreachableSince: iso(60_000) }, NOW).state).toBe("engine_unreachable");
+    expect(
+      deriveSolverState(
+        { ...stalled, engineUnreachableSince: iso(60_000) },
+        NOW,
+      ).state,
+    ).toBe("engine_unreachable");
     // engine unhealthy beats tick_stalled
-    expect(deriveSolverState({ ...stalled, engineHealthy: false }, NOW).state).toBe("engine_unhealthy");
-    expect(deriveSolverState({ ...stalled, engineBuildMismatch: true }, NOW).state).toBe("engine_unhealthy");
+    expect(
+      deriveSolverState({ ...stalled, engineHealthy: false }, NOW).state,
+    ).toBe("engine_unhealthy");
+    expect(
+      deriveSolverState({ ...stalled, engineBuildMismatch: true }, NOW).state,
+    ).toBe("engine_unhealthy");
     // tick_stalled beats running/idle
-    expect(deriveSolverState({ ...stalled, activeJobCount: 0, backlogOpen: false }, NOW).state).toBe("tick_stalled");
+    expect(
+      deriveSolverState(
+        { ...stalled, activeJobCount: 0, backlogOpen: false },
+        NOW,
+      ).state,
+    ).toBe("tick_stalled");
     // paused keeps its pinned position (disabled sweeper outranks the stall:
     // "scheduling continues next tick" would be a false line while paused)
-    expect(deriveSolverState({ ...stalled, enabled: false }, NOW).state).toBe("paused");
+    expect(deriveSolverState({ ...stalled, enabled: false }, NOW).state).toBe(
+      "paused",
+    );
     // fetch failed still wins over everything
-    expect(deriveSolverState({ ...stalled, fetchOk: false }, NOW).state).toBe("unknown");
+    expect(deriveSolverState({ ...stalled, fetchOk: false }, NOW).state).toBe(
+      "unknown",
+    );
   });
 
   it("false-positive guard: fast tick churn (started advancing, completed lagging) is not a stall", () => {
     // Crash-looping or briskly-cycling ticks keep re-stamping started; the
     // young started timestamp must not read as a 5-min stall.
-    const d = deriveSolverState({ ...healthy, lastTickStartedAt: iso(2_000), lastTickCompletedAt: iso(20 * 60_000) }, NOW);
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        lastTickStartedAt: iso(2_000),
+        lastTickCompletedAt: iso(20 * 60_000),
+      },
+      NOW,
+    );
     expect(d.state).toBe("running");
   });
 
   it("tickStalledForMs boundaries + unparsable stamps", () => {
     expect(tickStalledForMs(iso(TICK_STALLED_AFTER_MS), null, NOW)).toBeNull(); // exactly 5m: not yet stalled
-    expect(tickStalledForMs(iso(TICK_STALLED_AFTER_MS + 1), null, NOW)).toBe(TICK_STALLED_AFTER_MS + 1);
+    expect(tickStalledForMs(iso(TICK_STALLED_AFTER_MS + 1), null, NOW)).toBe(
+      TICK_STALLED_AFTER_MS + 1,
+    );
     expect(tickStalledForMs(null, null, NOW)).toBeNull();
     expect(tickStalledForMs("not-a-date", null, NOW)).toBeNull(); // never invent a stall
     expect(tickStalledForMs(iso(600_000), "not-a-date", NOW)).toBe(600_000); // bad completed = not completed
@@ -315,6 +433,6 @@ describe("tick_stalled (liveness/progress split)", () => {
 
   it("label + chip copy for the new state", () => {
     expect(solverStateLabel("tick_stalled")).toBe("TICK STALLED");
-    expect(solverChipText("tick_stalled")).toBe("solver · tick stalled");
+    expect(solverChipText("tick_stalled")).toBe("scheduler · tick stalled");
   });
 });

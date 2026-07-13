@@ -158,3 +158,21 @@ a {
 .mono {
   font-family: "IBM Plex Mono", monospace;
 }
+
+.campaign-card-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+@media (max-width: 640px) {
+  .campaign-card-actions-paused {
+    width: 100%;
+    margin-left: 0 !important;
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .campaign-card-actions-paused > button:first-child {
+    grid-column: 1 / -1;
+  }
+}

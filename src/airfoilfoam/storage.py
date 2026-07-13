@@ -73,6 +73,10 @@ class JobStore:
         previous = self.read_status(status.job_id)
         if previous:
             status.task_id = status.task_id or previous.task_id
+            if status.mesh_recovery_version is None:
+                status.mesh_recovery_version = previous.mesh_recovery_version
+            if status.failure_disposition is None:
+                status.failure_disposition = previous.failure_disposition
             status.queued_at = status.queued_at or previous.queued_at
             status.started_at = status.started_at or previous.started_at
             if status.phase == previous.phase and status.phase_started_at is None:
@@ -113,6 +117,16 @@ class JobStore:
 
     def write_result(self, result: JobResult) -> None:
         path = self.job_dir(result.job_id) / "result.json"
+        if (
+            result.mesh_recovery_version is None
+            or result.failure_disposition is None
+        ):
+            status = self.read_status(result.job_id)
+            if status is not None:
+                if result.mesh_recovery_version is None:
+                    result.mesh_recovery_version = status.mesh_recovery_version
+                if result.failure_disposition is None:
+                    result.failure_disposition = status.failure_disposition
         self._write_json_atomic(path, result.model_dump_json(indent=2))
 
     def read_result(self, job_id: str) -> Optional[JobResult]:

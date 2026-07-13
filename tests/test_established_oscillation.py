@@ -568,10 +568,14 @@ def test_engine_publishes_condition_promotion_before_sibling_speed_finishes(
 
     monkeypatch.setattr(
         jobs,
-        "prepare_mesh",
-        lambda mesh_dir, *_args, **_kwargs: (
-            mesh_dir.mkdir(parents=True, exist_ok=True)
-            or SimpleNamespace(n_cells=100, patches=[], span_chords=0.1)
+        "prepare_mesh_with_recovery",
+        lambda mesh_dir, _airfoil, resolved, *_args, **_kwargs: (
+            (
+                mesh_dir.mkdir(parents=True, exist_ok=True)
+                or SimpleNamespace(n_cells=100, patches=[], span_chords=0.1)
+            ),
+            resolved,
+            False,
         ),
     )
 

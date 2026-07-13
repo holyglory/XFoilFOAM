@@ -46,6 +46,39 @@ export interface CampaignStatusView {
   tone: "teal" | "amber" | "red" | "dim" | "violet";
 }
 
+export type CampaignLifecycleEventView =
+  AdminCampaignSummary["latestLifecycleEvent"];
+
+/** Plain-language pause provenance shared by hub and detail. Missing legacy
+ *  history stays explicitly unknown; it is never attributed to the viewer. */
+export function pausedCampaignStatusText(
+  event: CampaignLifecycleEventView,
+  runningJobs: number,
+  nowMs: number = Date.now(),
+): string {
+  let provenance =
+    "Paused — reason unavailable (this pause predates lifecycle history)";
+  if (event?.action === "pause") {
+    const parsed = Date.parse(event.createdAt);
+    const age =
+      Number.isFinite(parsed) && nowMs >= parsed
+        ? ` ${formatAge(nowMs - parsed)} ago`
+        : "";
+    if (event.reason) {
+      provenance = `Paused for ${event.reason} · reason recorded${age}`;
+    } else if (event.actor) {
+      provenance = `Paused by ${event.actor}${age}`;
+    } else {
+      provenance = `Paused · reason unavailable${age}`;
+    }
+  }
+  const finishing =
+    runningJobs > 0
+      ? ` ${fCount(runningJobs)} running job${runningJobs === 1 ? "" : "s"} will finish.`
+      : "";
+  return `${provenance}. No new points are scheduled while paused.${finishing}`;
+}
+
 /** Gate badge from the GLOBAL solver derivation (lib/solver-state) — used by
  *  surfaces that only carry the shared list payload (hub cards before their
  *  per-card summary arrives, the Solver page backlog strip). Same precedence
@@ -290,7 +323,11 @@ export function campaignStatusLine(
       return {
         gate: null,
         lifecycle,
-        text: `Paused by you — no new points will be scheduled${jobs > 0 ? `; ${fCount(jobs)} running job${jobs === 1 ? "" : "s"} will finish` : ""}.`,
+        text: pausedCampaignStatusText(
+          s.latestLifecycleEvent ?? null,
+          jobs,
+          nowMs,
+        ),
         tone: "amber",
       };
     default: {

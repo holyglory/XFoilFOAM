@@ -10,7 +10,8 @@ import pytest
 from airfoilfoam import physics
 from airfoilfoam.airfoil import load_airfoil
 from airfoilfoam.cache import MANIFEST_NAME, EngineCache
-from airfoilfoam.meshing.base import BoundaryPatch, Mesher, MeshResult
+from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
+from airfoilfoam.meshing.base import BoundaryPatch, Mesher, MeshResult, get_mesher
 from airfoilfoam.models import (
     AirfoilFormat,
     CaseSpec,
@@ -132,6 +133,48 @@ def test_mesh_key_changes_with_chord_params_and_geometry(naca0012_selig_text, na
     # resolved first-cell height (sized from y+/speed) is part of the key
     finer = _resolved(speed=25.0)
     assert EngineCache.mesh_key(af, 1.0, finer) != base
+
+
+def test_mesh_key_changes_with_mesher_topology_version(naca0012_selig_text):
+    """Legacy four-block meshes/seeds must not cross into repaired topology.
+
+    The params and real geometry are intentionally byte-identical: only a
+    mesher implementation version bump differentiates the cached evidence.
+    """
+    af = _airfoil(naca0012_selig_text)
+    resolved = _resolved()
+    legacy = BlockMeshCGrid()
+    next_version = BlockMeshCGrid()
+    next_version.cache_version = "must-catch-next-topology"
+    base_mesh = EngineCache.mesh_key(af, 1.0, resolved, mesher=legacy)
+    base_seed = EngineCache.seed_key(base_mesh, FLUID, 50.0)
+
+    repaired_mesh = EngineCache.mesh_key(af, 1.0, resolved, mesher=next_version)
+    repaired_seed = EngineCache.seed_key(repaired_mesh, FLUID, 50.0)
+
+    assert repaired_mesh != base_mesh
+    assert repaired_seed != base_seed
+
+
+def test_mesh_key_uses_actual_mesher_even_when_params_still_name_public_default(
+    naca0012_selig_text,
+):
+    """A recovery build must never inherit the request mesher's cache identity."""
+    af = _airfoil(naca0012_selig_text)
+    request_level = _resolved()
+    public = get_mesher("blockmesh-cgrid")
+    recovery_20 = get_mesher("blockmesh-cgrid-segmented-normal-20")
+    recovery_24 = get_mesher("blockmesh-cgrid-segmented-normal-24")
+
+    public_key = EngineCache.mesh_key(af, 1.0, request_level, mesher=public)
+    recovery_20_key = EngineCache.mesh_key(
+        af, 1.0, request_level, mesher=recovery_20
+    )
+    recovery_24_key = EngineCache.mesh_key(
+        af, 1.0, request_level, mesher=recovery_24
+    )
+
+    assert len({public_key, recovery_20_key, recovery_24_key}) == 3
 
 
 def test_seed_key_scopes_fluid_and_speed(naca0012_selig_text):

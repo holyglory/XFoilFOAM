@@ -1,5 +1,149 @@
 # Decision History
 
+## 2026-07-13 — Campaign lifecycle status carries real provenance and direct recovery
+
+- Trigger and owner context: the admin hub showed `solver · running · 0 jobs`,
+  a campaign card said `Paused by you`, and the only resume action was hidden
+  behind the detail page. The owner asked why it was paused, how to resume it,
+  and why the same card still reported 78 blocked points.
+- Decision: scheduler-process health, active-job count, and campaign lifecycle
+  are separate facts. A healthy enabled scheduler with zero active jobs is
+  `ready`, not a running solve. Paused campaign cards expose the ordinary
+  `Resume` action in place, while the detail page remains available for deeper
+  inspection. Machine-owned mesh remediation is presented separately from
+  terminal unavailable work.
+- Provenance: pause/resume now writes an append-only lifecycle event containing
+  the transition, authenticated actor when available, optional plain-language
+  reason, and timestamp. Missing historical context stays null; the UI must not
+  invent `by you`. This is more schema and query work than simply removing the
+  phrase, but it answers future operational questions without overwriting
+  history or relying on a mutable `updatedAt` timestamp. The owner authorized
+  implementation after being told that the proper alternative was append-only
+  lifecycle history and the cheaper alternative would permanently lose why.
+- Runtime boundary: lifecycle HTTP actions remain short transactions. Resume
+  changes durable scheduling state only; the sweeper/engine performs the long
+  CFD work asynchronously.
+
+## 2026-07-13 — Deterministic mesh blockers are repaired automatically by a versioned engine capability
+
+- Trigger and owner context: the reset campaign showed 78 `blocked` points with
+  no useful explanation or executable user remedy. Production evidence tied all
+  78 to three 26-angle preliminary-URANS sweeps for 20-32C at one chord and
+  three speeds. Real `checkMesh` replay found 93–95° non-orthogonality,
+  negative-volume cells, and folded four-block C-grid cells before any URANS
+  attempt. The owner stated the product rule in plain language: calculation may
+  take longer, but a machine-repairable mesh problem must not silently stop the
+  calculation or be handed to the user as unexplained work.
+- Options presented in owner-visible language: (1) keep tuning resolution and
+  wall spacing on the four large surface blocks; this is cheap but the measured
+  12-variant replay showed the same fold at coarse/full resolution and y+ 1/40,
+  so it cannot fix the topology; (2) split each airfoil surface into many short,
+  connected body-fitted blocks whose outer edges follow the local wall normal;
+  this adds generator and regression work but keeps exact imported geometry,
+  cell budgeting, boundary names, and the established OpenFOAM solver path;
+  (3) introduce a separate unstructured/elliptic mesher; this is the broadest
+  long-term capability but adds a second numerical profile, dependency,
+  evidence identity, and validation program and is not required by the measured
+  incident. Recommendation and owner-directed implementation: option 2 now,
+  with the meshing interface left open for option 3 if measured geometries still
+  defeat the repaired body-fitted topology.
+- The 2026-07-11 rule that an unchanged deterministic mesh failure is terminal
+  remains correct for identical engine capability, but its statement that only
+  a new immutable user setup may reopen work is superseded. A monotonic engine
+  `mesh_recovery_version` is also a meaningful changed capability. The Node
+  controller may reopen an older deterministic-mesh obligation exactly once
+  when it observes a newer capability, preserves the failed attempt as immutable
+  evidence, consumes only the obligation's remaining bounded attempt, and never
+  reopens infrastructure, hard-solver, cancelled, satisfied, or already-current
+  blockers.
+- Rolling-deploy provenance: a controller's requested recovery version is not
+  evidence that the worker executed that version. PRECALC requests carry the
+  expected version and both the engine API and worker reject a mismatch before
+  solving. The worker separately acknowledges its executed version in status
+  and result payloads; only that acknowledgement is copied into the immutable
+  obligation attempt. Missing or malformed acknowledgement remains honest
+  legacy version 0. This keeps API/worker cutovers and retained-job purges from
+  either suppressing a needed repair or reopening an unchanged failure.
+- Cache and execution invariant: the mesher implementation version is part of
+  both mesh and seed cache identity. A shared production mesh must pass the real
+  `checkMesh` gate once before cache publication and before its AoA fan-out; a
+  cached mesh is rechecked once in each consuming job. Deterministic rejection
+  evicts that mesh and cannot launch 26 identical per-angle failures. Failure to
+  launch the diagnostic is infrastructure/unknown, not proof of a bad mesh and
+  never triggers a numerical fallback.
+- Bounded geometric recovery: if an otherwise repaired low-speed wall-function
+  mesh fails because the y+-derived first cell is geometrically too thick, the
+  same engine request retries mesh construction once with a documented maximum
+  first-cell height of 0.006 chord. The actual resolved mesh and its quality
+  warning travel with the job evidence and cache key. Quality limits are not
+  weakened. If this repaired topology and bounded spacing correction both fail,
+  the outcome remains machine-owned `mesh unavailable`; it is the measurement
+  trigger for the separate robust-mesher decision, not a request for a user to
+  edit internal batch data.
+- UI ownership: campaign polling must distinguish automatic mesh repair in
+  progress from terminal machine unavailability using bounded stored counters.
+  It must show the plain-language cause and real next action, expose no internal
+  job/batch/version identifiers, and must not add a repair button until an
+  executable workflow exists.
+- Adversarial catalog correction before rollout: applying the segmented-normal
+  topology globally is rejected. A full 1,621-seed corner/Jacobian scan and real
+  OpenFOAM replay found 19 risk profiles: 13 failed `blockMesh`, two failed
+  `checkMesh`, and only four passed. The legacy four-block generator therefore
+  remains the fast public default. Segmented-normal topologies are internal,
+  explicitly fingerprinted recovery candidates selected only after typed QA
+  failure; each candidate must pass structural Jacobian preflight and real
+  `checkMesh` before cache publication. This preserves the measured 20-32C
+  repair without moving failures onto previously working profiles.
+- The deferred alternate-mesher trigger has fired. Several valid but difficult
+  sharp/blunt profiles defeat both direct-circle structured mappings, while
+  `ua79sfm` is a truncated multi-element component and `naca1` is an open cowl
+  curve rather than a complete closed airfoil. The owner was shown three
+  choices in plain language: continue accumulating custom structured-grid
+  special cases (smaller image, recurring topology risk); add a standard Gmsh
+  boundary-layer fallback after the fast grid fails (larger dependency and
+  validation program, genuinely different robust recovery path); or leave the
+  rows unavailable (honest but contrary to the requested automatic campaign).
+  Agent recommendation is Gmsh if the versioned structured recovery records a
+  new valid-geometry exhaustion during the monitored rollout. The owner
+  authorized automatic reaction to new blockers, but this deploy does not
+  claim an unmeasured alternate-mesher success. Missing source surface
+  coordinates will never be invented by either mesher: those records require
+  trusted re-import or explicit exclusion from airfoil campaigns.
+- Source-data audit correction: the bundled `e850.dat` had both lost its first
+  two upper trailing-edge coordinates and retained a spurious three-record
+  LE→TE→LE wrap in the middle of the contour. It is replaced verbatim by the
+  current 67-row UIUC Selig-format record (checked 2026-07-13), and a seed gate
+  now rejects multiple leading-edge visits and material wrong-way traversal
+  while preserving legitimate blunt trailing edges and Lednicer duplicate-LE
+  records. Real OpenFOAM on the corrected source passes the unchanged gate for
+  the legacy mesh and segmented 20/24/29/32 candidates (0 failed checks,
+  45.46°–76.10° maximum non-orthogonality), so E850 is no longer an
+  alternate-mesher case. The bundled `naca23015.dat` also contained malformed
+  numeric-looking records and a detached `100,0` endpoint; it is replaced by
+  the current 35-row UIUC record. The shared seed gate now rejects both defect
+  classes before they can become catalog geometry. The current authoritative
+  `ua79sfm.dat` is an open main-element component and `naca1.dat` is a one-sided
+  cowl curve; neither has a missing closed exterior surface that can be
+  truthfully inferred.
+- Geometry history remains a separate owner decision rather than an
+  agent-assumed migration. The owner was shown that in-place source correction
+  is safe for E850 and NACA 23015 only because they still have no solver
+  evidence. The durable recommendation remains immutable geometry revisions
+  with source URL/hash and an explicit geometry role. The current incident does
+  not introduce a partial mutable revision system: the two authoritative open
+  components are archived through the existing catalog lifecycle, their
+  coordinates remain preserved, and their untouched campaign cells are
+  released only behind a migration guard that aborts if solver evidence exists.
+  This removes non-airfoil records from `all seeded airfoils` without inventing
+  their missing surfaces.
+- Production containment: all four source-audit rows (`e850`, `naca-1`,
+  `naca-23015`, `ua79sfm`) still had zero jobs and results in the active
+  campaign when the audit found them. New claims were paused through the normal
+  campaign lifecycle API while the two already-running OpenFOAM jobs continue.
+  This preserves the clean pre-solve correction window; resume is required only
+  after corrected source rows and an explicit unsupported-geometry policy are
+  deployed.
+
 ## 2026-07-13 — A stalled RANS point automatically queues targeted preliminary URANS
 
 - Trigger: the owner observed a live AG04 10° campaign point whose RANS attempt

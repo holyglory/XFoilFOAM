@@ -35,12 +35,14 @@ from typing import Optional
 
 from .airfoil import Airfoil
 from .config import Settings
+from .meshing.base import Mesher, get_mesher
 from .models import FluidProperties, MeshParams, RoughnessParams, SolverParams
 
 logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "manifest.json"
 MESH_PAYLOAD_DIR = "polyMesh"
+MESH_EVIDENCE_PAYLOAD_DIR = "meshEvidence"
 SEED_PAYLOAD_DIR = "fields"
 _STALE_TMP_AGE_S = 24 * 3600
 
@@ -95,14 +97,33 @@ class EngineCache:
 
     # -- keys ---------------------------------------------------------------- #
     @staticmethod
-    def mesh_key(airfoil: Airfoil, chord: float, resolved_mesh: MeshParams) -> str:
-        """Key over (normalized contour as meshed, canonical chord, resolved mesh params)."""
+    def mesh_key(
+        airfoil: Airfoil,
+        chord: float,
+        resolved_mesh: MeshParams,
+        *,
+        mesher: Optional[Mesher] = None,
+    ) -> str:
+        """Key the geometry produced by the *actual* mesher implementation.
+
+        Most callers can omit ``mesher`` because the immutable resolved params
+        name the implementation that produced the mesh.  Mesh construction
+        passes it explicitly so an internal recovery candidate (and tests or a
+        future adapter whose object is selected before params are persisted)
+        can never collide with the registry entry named by stale/request-level
+        params.
+        """
+        actual_mesher = mesher or get_mesher(resolved_mesh.mesher)
         contour = "\n".join(f"{x:.12g} {y:.12g}" for x, y in airfoil.contour)
         payload = json.dumps(
             {
                 "airfoil": contour,
                 "chord": _canon(chord),
                 "mesh": json.loads(resolved_mesh.model_dump_json()),
+                "actualMesher": {
+                    "name": actual_mesher.name,
+                    "cacheVersion": actual_mesher.cache_version,
+                },
             },
             sort_keys=True,
         )
@@ -144,7 +165,12 @@ class EngineCache:
         return _sha256_text(payload)[:16]
 
     # -- mesh store ---------------------------------------------------------- #
-    def fetch_mesh(self, key: str, dest_polymesh_dir: Path) -> Optional[dict]:
+    def fetch_mesh(
+        self,
+        key: str,
+        dest_polymesh_dir: Path,
+        dest_evidence_dir: Optional[Path] = None,
+    ) -> Optional[dict]:
         """Materialize a cached polyMesh into ``dest_polymesh_dir``. None on miss."""
         entry_dir = self.mesh_root / key
         try:
@@ -158,6 +184,14 @@ class EngineCache:
             elif dest_polymesh_dir.is_dir():
                 shutil.rmtree(dest_polymesh_dir)
             shutil.copytree(payload, dest_polymesh_dir)
+            if dest_evidence_dir is not None:
+                if dest_evidence_dir.is_symlink() or dest_evidence_dir.is_file():
+                    dest_evidence_dir.unlink()
+                elif dest_evidence_dir.is_dir():
+                    shutil.rmtree(dest_evidence_dir)
+                cached_evidence = entry_dir / MESH_EVIDENCE_PAYLOAD_DIR
+                if cached_evidence.is_dir():
+                    shutil.copytree(cached_evidence, dest_evidence_dir)
             self._touch(entry_dir)
             logger.info(
                 "mesh cache hit key=%s size=%dB files=%d",
@@ -168,7 +202,13 @@ class EngineCache:
             logger.warning("mesh cache fetch failed key=%s: %s", key, exc)
             return None
 
-    def publish_mesh(self, key: str, polymesh_dir: Path, n_cells: int) -> bool:
+    def publish_mesh(
+        self,
+        key: str,
+        polymesh_dir: Path,
+        n_cells: int,
+        evidence_dir: Optional[Path] = None,
+    ) -> bool:
         """Atomically publish a built ``constant/polyMesh`` under ``key``."""
         try:
             if not polymesh_dir.is_dir():
@@ -177,9 +217,17 @@ class EngineCache:
             if (entry_dir / MANIFEST_NAME).exists():
                 return False  # already published by a concurrent job
             extra = {"nCells": int(n_cells)}
+            evidence_files = (
+                [
+                    (src, Path(MESH_EVIDENCE_PAYLOAD_DIR) / rel)
+                    for src, rel in self._payload_files(evidence_dir)
+                ]
+                if evidence_dir is not None and evidence_dir.is_dir()
+                else []
+            )
             ok = self._publish_entry(
                 entry_dir, MESH_PAYLOAD_DIR, self._payload_files(polymesh_dir),
-                kind="mesh", key=key, extra=extra,
+                kind="mesh", key=key, extra=extra, sidecar_files=evidence_files,
             )
             if ok:
                 self.evict_to_cap()
@@ -187,6 +235,20 @@ class EngineCache:
         except Exception as exc:  # noqa: BLE001
             logger.warning("mesh cache publish failed key=%s: %s", key, exc)
             return False
+
+    def invalidate_mesh(self, key: str, *, reason: str) -> None:
+        """Remove a mesh after deterministic quality evidence rejects it.
+
+        This is intentionally separate from ordinary cache misses/corruption:
+        the manifest can be byte-perfect while the represented OpenFOAM mesh is
+        geometrically invalid. Removal is atomic with respect to readers via
+        the same rename-to-trash primitive used by eviction.
+        """
+        entry_dir = self.mesh_root / key
+        if not entry_dir.exists():
+            return
+        logger.warning("mesh cache invalidated key=%s reason=%s", key, reason)
+        self._remove_entry(entry_dir)
 
     # -- seed store ---------------------------------------------------------- #
     def find_seed(
@@ -446,6 +508,7 @@ class EngineCache:
         key: str,
         extra: dict,
         replace: bool = False,
+        sidecar_files: Optional[list[tuple[Path, Path]]] = None,
     ) -> bool:
         if not files:
             return False
@@ -463,6 +526,15 @@ class EngineCache:
                 total += size
                 manifest_files.append(
                     {"path": str(Path(payload_dirname) / rel), "sha256": _sha256_file(dst), "byteSize": size}
+                )
+            for src, rel in sidecar_files or []:
+                dst = stage / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst, follow_symlinks=True)
+                size = dst.stat().st_size
+                total += size
+                manifest_files.append(
+                    {"path": str(rel), "sha256": _sha256_file(dst), "byteSize": size}
                 )
             manifest = {
                 "schemaVersion": 1,

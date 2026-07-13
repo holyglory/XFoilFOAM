@@ -17,11 +17,23 @@ from typing import Optional
 from celery.signals import worker_ready
 
 from .cancellation import JobCancelled
+from .capabilities import MESH_RECOVERY_VERSION
 from .celery_app import celery_app
 from .config import Settings, get_settings
 from .jobs import execute_job
-from .models import JobPhase, JobResult, JobState, JobStatus, PolarRequest
-from .openfoam.runner import install_subprocess_signal_handlers
+from .models import (
+    FailureDisposition,
+    JobPhase,
+    JobResult,
+    JobState,
+    JobStatus,
+    PolarRequest,
+)
+from .openfoam.runner import (
+    DeterministicMeshError,
+    InfrastructureError,
+    install_subprocess_signal_handlers,
+)
 from .pipeline import (
     read_divergence_condemnation,
     read_march_budget_marker,
@@ -810,6 +822,16 @@ def _active_process(processes: list[dict]) -> dict | None:
     return processes[0] if processes else None
 
 
+def _terminal_failure_disposition(
+    exc: Exception,
+) -> Optional[FailureDisposition]:
+    if isinstance(exc, DeterministicMeshError):
+        return FailureDisposition.deterministic_mesh
+    if isinstance(exc, InfrastructureError):
+        return FailureDisposition.infrastructure
+    return None
+
+
 @celery_app.task(name="airfoilfoam.run_polar", bind=True)
 def run_polar(self, job_id: str, request_json: str) -> dict:
     install_subprocess_signal_handlers()
@@ -837,6 +859,10 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
         if status:
             status.task_id = getattr(self.request, "id", None) or status.task_id
             status.state = JobState.running
+            # This is the worker-executed capability acknowledgement. The API's
+            # earlier pending status intentionally leaves it null so a rolling
+            # deployment cannot claim that queued work ran newer code.
+            status.mesh_recovery_version = MESH_RECOVERY_VERSION
             store.write_status(status)
         stop_heartbeat, heartbeat_thread = _start_runtime_heartbeat(store, job_id, settings)
         try:
@@ -851,11 +877,22 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
             store.write_result(result)
             return {"job_id": job_id, "state": "cancelled"}
         except Exception as exc:  # noqa: BLE001
+            failure_disposition = _terminal_failure_disposition(exc)
             store.write_status(
-                JobStatus(job_id=job_id, state=JobState.failed, message=f"{type(exc).__name__}: {exc}")
+                JobStatus(
+                    job_id=job_id,
+                    state=JobState.failed,
+                    message=f"{type(exc).__name__}: {exc}",
+                    failure_disposition=failure_disposition,
+                )
             )
             store.write_result(
-                JobResult(job_id=job_id, state=JobState.failed, message=f"{type(exc).__name__}: {exc}")
+                JobResult(
+                    job_id=job_id,
+                    state=JobState.failed,
+                    message=f"{type(exc).__name__}: {exc}",
+                    failure_disposition=failure_disposition,
+                )
             )
             raise
         finally:

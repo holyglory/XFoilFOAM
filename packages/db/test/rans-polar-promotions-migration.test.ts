@@ -29,6 +29,15 @@ let admin: ReturnType<typeof postgres> | null = null;
 let client: ReturnType<typeof postgres> | null = null;
 let through57 = "";
 
+function latestMigrationTimestamp(): string {
+  const journal = JSON.parse(
+    readFileSync(join(migrations, "meta/_journal.json"), "utf8"),
+  ) as { entries: Array<{ when: number }> };
+  const latest = journal.entries.at(-1)?.when;
+  if (latest === undefined) throw new Error("migration journal is empty");
+  return String(latest);
+}
+
 function makeMigrationFolder(upTo: number): string {
   const dir = mkdtempSync(join(tmpdir(), `aerodb-migrations-00${upTo}-`));
   mkdirSync(join(dir, "meta"));
@@ -87,7 +96,7 @@ describe("0058 conditional RANS whole-polar promotion ledger", () => {
     expect(tables[0]).toEqual({
       promotion: "sim_rans_polar_promotions",
       points: "sim_rans_polar_promotion_points",
-      latest: "1785888000000",
+      latest: latestMigrationTimestamp(),
     });
   });
 

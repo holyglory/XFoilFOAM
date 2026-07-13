@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from .. import __version__, physics
 from ..airfoil import load_airfoil
 from ..cache import EngineCache
+from ..capabilities import MESH_RECOVERY_VERSION
 from ..config import get_settings
 from ..meshing.base import list_meshers
 from ..models import (
@@ -205,6 +206,7 @@ def create_app() -> FastAPI:
             "status": "ok",
             "version": __version__,
             "build_id": settings.build_id,
+            "mesh_recovery_version": MESH_RECOVERY_VERSION,
             "package_file": __file__,
         }
 
@@ -242,6 +244,23 @@ def create_app() -> FastAPI:
 
     @app.post("/polars", response_model=JobStatus, status_code=202)
     def submit_polar(request: PolarRequest) -> JobStatus:
+        if (
+            request.expected_mesh_recovery_version is not None
+            and request.expected_mesh_recovery_version != MESH_RECOVERY_VERSION
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "mesh_recovery_version_mismatch",
+                    "requested_version": request.expected_mesh_recovery_version,
+                    "actual_version": MESH_RECOVERY_VERSION,
+                    "message": (
+                        "Engine mesh-recovery capability changed before submission: "
+                        f"requested v{request.expected_mesh_recovery_version}, "
+                        f"API is v{MESH_RECOVERY_VERSION}. Refresh capability and retry."
+                    ),
+                },
+            )
         # validate airfoil up-front so bad geometry fails fast with 422
         try:
             load_airfoil(
