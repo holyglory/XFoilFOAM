@@ -80,6 +80,19 @@
   the outcome remains machine-owned `mesh unavailable`; it is the measurement
   trigger for the separate robust-mesher decision, not a request for a user to
   edit internal batch data.
+- Monitored-rollout correction: the first repaired production case completed
+  and archived its real evidence, but the controller kept it as attempt history
+  because the old canonical result shell was `queued` with no `sim_job_id`.
+  The recovered PRECALC obligation already named the replacement job as its
+  exact current running owner; the generic released-cell guard nevertheless
+  treated the missing shell owner as proof that the output was stale. Decision:
+  a live ingest may atomically reclaim only an unowned
+  `pending|queued|stale` shell with no selected attempt, and only when the
+  ingest lease/engine identity plus the exact running PRECALC obligation both
+  name that job. Terminal or selected generations remain correction-only, and
+  a stale job without current obligation ownership remains quarantined. A
+  production-shaped must-catch test covers successful publication; the prior
+  released/stale-job false-positive suite remains mandatory.
 - UI ownership: campaign polling must distinguish automatic mesh repair in
   progress from terminal machine unavailability using bounded stored counters.
   It must show the plain-language cause and real next action, expose no internal

@@ -3126,7 +3126,7 @@ async function ensureIngestCell(opts: {
       status: results.status,
       simJobId: results.simJobId,
     });
-  const row =
+  let row =
     created ??
     (
       await opts.db
@@ -3150,12 +3150,9 @@ async function ensureIngestCell(opts: {
     )[0];
   if (!row)
     throw new Error(`failed to allocate ingest cell at a=${opts.aoaDeg}`);
-  const differentOwner = row.simJobId !== opts.simJobId;
-  const authorizedCorrection =
-    differentOwner &&
-    (row.status === "done" || row.status === "failed") &&
-    (
-      await incomingJobPublicationAuthority(opts.db, {
+  let differentOwner = row.simJobId !== opts.simJobId;
+  const publicationAuthority = differentOwner
+    ? await incomingJobPublicationAuthority(opts.db, {
         simJobId: opts.simJobId,
         engineJobId: opts.engineJobId,
         ingestLeaseToken: opts.ingestLeaseToken,
@@ -3164,7 +3161,75 @@ async function ensureIngestCell(opts: {
         bcId: opts.bcId,
         aoaDeg: opts.aoaDeg,
       })
-    ).correctionAuthority;
+    : null;
+
+  // Capability recovery may resume a durable PRECALC obligation whose old
+  // scheduling shell was released before the replacement child was composed.
+  // The shell has no solver truth and no owner, but INSERT ... DO NOTHING
+  // cannot attach the live job to it. Reclaim that shell only when the exact
+  // obligation ledger says this ingesting job is its current running owner.
+  // The CAS keeps a stale/replayed job from stealing a concurrently claimed
+  // cell, while terminal or selected generations remain correction-only.
+  const reclaimableReleasedShell =
+    differentOwner &&
+    row.simJobId === null &&
+    row.currentAttemptId === null &&
+    ["pending", "queued", "stale"].includes(row.status) &&
+    publicationAuthority?.jobValid === true &&
+    publicationAuthority.correctionAuthority === true;
+  if (reclaimableReleasedShell) {
+    const [claimed] = await opts.db
+      .update(results)
+      .set({
+        bcId: opts.bcId,
+        status: "running",
+        source: "queued",
+        simJobId: opts.simJobId,
+        engineJobId: opts.engineJobId,
+        reynolds: opts.reynolds,
+        speed: opts.speed,
+        chord: opts.chord,
+        mach: opts.mach,
+        priority: 0,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(results.id, row.id),
+          sql`${results.simJobId} IS NULL`,
+          sql`${results.currentResultAttemptId} IS NULL`,
+          inArray(results.status, ["pending", "queued", "stale"]),
+        ),
+      )
+      .returning({
+        id: results.id,
+        currentAttemptId: results.currentResultAttemptId,
+        status: results.status,
+        simJobId: results.simJobId,
+      });
+    if (claimed) return { ...claimed, quarantined: false };
+
+    // A concurrent scheduler/publication won the CAS. Re-read and apply the
+    // ordinary owner/correction guard to that actual state.
+    const [reloaded] = await opts.db
+      .select({
+        id: results.id,
+        currentAttemptId: results.currentResultAttemptId,
+        status: results.status,
+        simJobId: results.simJobId,
+      })
+      .from(results)
+      .where(eq(results.id, row.id))
+      .limit(1);
+    if (!reloaded)
+      throw new Error(`ingest cell disappeared at a=${opts.aoaDeg}`);
+    row = reloaded;
+    differentOwner = row.simJobId !== opts.simJobId;
+  }
+  const authorizedCorrection =
+    differentOwner &&
+    (row.status === "done" || row.status === "failed") &&
+    publicationAuthority?.correctionAuthority === true;
   return {
     ...row,
     // Late output from a job that no longer owns the cell remains exact

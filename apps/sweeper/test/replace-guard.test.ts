@@ -38,6 +38,7 @@ import {
   results,
   schedulingProfiles,
   simJobs,
+  simPrecalcObligations,
   simulationPresetAirfoilTargets,
   simulationPresets,
   simUransRequests,
@@ -671,6 +672,106 @@ async function seedAcceptedPrecalcCell(label: string): Promise<{
 }
 
 describe("ingest replace guard (gate incident 2026-07-07)", () => {
+  it("MUST-CATCH: a live PRECALC obligation reclaims its released queued shell and publishes completed evidence", async () => {
+    await cleanCell();
+    const [shell] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: GATE_AOA,
+        status: "queued",
+        source: "queued",
+        regime: "rans",
+        reynolds,
+        speed: SPEED,
+        chord: CHORD,
+        mach,
+        simJobId: null,
+        currentResultAttemptId: null,
+      })
+      .returning({ id: results.id });
+    const engineJobId = `${PREFIX}-released-precalc-owner`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "running",
+        engineJobId,
+        totalCases: 1,
+        completedCases: 1,
+        requestPayload: {
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas: [GATE_AOA],
+          uransFidelity: "precalc",
+        },
+      })
+      .returning();
+    const [obligation] = await db
+      .insert(simPrecalcObligations)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: GATE_AOA,
+        state: "running",
+        attemptCount: 1,
+        latestSimJobId: job.id,
+        lastOutcome: "submitted",
+      })
+      .returning({ id: simPrecalcObligations.id });
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas: [GATE_AOA],
+          uransFidelity: "precalc",
+          precalcObligationIds: [obligation.id],
+        },
+      })
+      .where(eq(simJobs.id, job.id));
+
+    const errorSpy = vi.spyOn(console, "error");
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      uransFidelity: "precalc",
+      result: jobResult(engineJobId, acceptingPrecalcPoint()),
+    });
+
+    const [published] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, shell.id));
+    expect(published).toMatchObject({
+      status: "done",
+      source: "solved",
+      regime: "urans",
+      fidelity: "urans_precalc",
+      simJobId: job.id,
+    });
+    expect(published.currentResultAttemptId).toBeTruthy();
+    expect(
+      errorSpy.mock.calls.some((call) =>
+        String(call[0]).includes("RELEASED-CELL GUARD"),
+      ),
+    ).toBe(false);
+  });
+
   it("MUST-CATCH incident shape: a rejected precalc URANS never clobbers the accepted RANS cell; attempt + evidence ingested, request settled, loud line", async () => {
     await cleanCell();
     const keptId = await seedAcceptedRansCell();
