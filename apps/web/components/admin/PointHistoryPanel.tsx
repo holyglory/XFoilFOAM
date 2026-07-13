@@ -229,8 +229,12 @@ function classificationChip(item: PointHistoryItem) {
     );
   }
   const state = item.classificationState;
-  const color =
-    state === "accepted"
+  const uransQueued =
+    item.reviewBucket === "awaiting_urans" &&
+    item.workDisposition === "scheduled";
+  const color = uransQueued
+    ? C.violet
+    : state === "accepted"
       ? C.teal
       : state === "needs_urans"
         ? C.amber
@@ -249,7 +253,11 @@ function classificationChip(item: PointHistoryItem) {
         whiteSpace: "nowrap",
       }}
     >
-      {state ? state.replaceAll("_", " ") : "unclassified"}
+      {uransQueued
+        ? "URANS next"
+        : state
+          ? state.replaceAll("_", " ")
+          : "unclassified"}
     </span>
   );
 }
@@ -659,7 +667,7 @@ export function PointHistoryPanel() {
         });
         setUransNotice(
           res.created
-            ? `URANS ${fidelity} requested for ${target.label} (${scope}) — scheduled after all RANS gaps`
+            ? `URANS ${fidelity} requested for ${target.label} (${scope}) — queued automatically`
             : `already requested — the open ${fidelity} request for ${scope} is reused (${res.request.state})`,
         );
         if (
