@@ -3732,6 +3732,7 @@ describe("sweeper: gap → claim → ingest", () => {
   it("ingests a running partial result without marking the sweep done", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 125.256;
+    const stalledAoa = 126.256;
     await db
       .delete(results)
       .where(
@@ -3763,6 +3764,11 @@ describe("sweeper: gap → claim → ingest", () => {
               mach: bc.mach,
             },
           ],
+          aoas: [aoa, stalledAoa],
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: [aoa, stalledAoa],
+          },
         },
       })
       .returning({ id: simJobs.id });
@@ -3800,6 +3806,21 @@ describe("sweeper: gap → claim → ingest", () => {
               unsteady: false,
               converged: true,
               first_order_fallback: false,
+              images: {},
+            },
+          ],
+          attempts: [
+            {
+              aoa_deg: stalledAoa,
+              cl: null,
+              cd: null,
+              cm: null,
+              cl_cd: null,
+              unsteady: false,
+              converged: false,
+              first_order_fallback: false,
+              failure_disposition: "hard_solver",
+              error: "RANS residuals remained stalled",
               images: {},
             },
           ],
@@ -3878,6 +3899,31 @@ describe("sweeper: gap → claim → ingest", () => {
       );
     attempts.forEach((attempt) => cleanupAttemptIds.add(attempt.id));
     expect(attempts.length).toBe(1);
+    const [precalcRoute] = await db
+      .select({
+        state: simPrecalcObligations.state,
+        backgroundOwner: simPrecalcObligations.backgroundOwner,
+      })
+      .from(simPrecalcObligations)
+      .where(
+        and(
+          eq(simPrecalcObligations.airfoilId, a.id),
+          eq(simPrecalcObligations.revisionId, presetRevisionId),
+          eq(simPrecalcObligations.aoaDeg, stalledAoa),
+        ),
+      );
+    // MUST-CATCH: partial RANS failure owns a real preliminary-URANS route
+    // immediately, but partial ingest does not submit outside scheduler limits.
+    expect(precalcRoute).toMatchObject({
+      state: "pending",
+      backgroundOwner: true,
+    });
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(and(eq(simJobs.parentJobId, job.id), eq(simJobs.wave, 2))),
+    ).toHaveLength(0);
   }, 60000);
 
   it("MUST-CATCH: running partial ingest durably records a typed whole-polar promotion before terminal sibling work", async () => {

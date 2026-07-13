@@ -1,5 +1,32 @@
 # Decision History
 
+## 2026-07-13 — A stalled RANS point automatically queues targeted preliminary URANS
+
+- Trigger: the owner observed a live AG04 10° campaign point whose RANS attempt
+  was correctly retained as non-converged/stalled evidence but whose public
+  admin state said `failed · rejected` and offered a manual “Request URANS”
+  control. There was no open preliminary-URANS obligation while the producing
+  batch was still running. The owner clarified the intended normal flow in
+  plain language: “when RANS do not converge - calculate URANS.”
+- Applied behavior: a partial ingest of RANS evidence now creates the exact,
+  durable targeted preliminary-URANS obligation immediately. It does not start
+  an unbounded second job from the ingest worker. After the source RANS batch
+  reaches a terminal state, that recovery receives the next available scheduler
+  slot ahead of a newly composed RANS batch; it never preempts running work or
+  races the parent over its shared mesh. Full-polar promotion remains the
+  separately owner-approved 0°–5° hard-failure policy. Deterministic mesh and
+  infrastructure outcomes remain excluded from this route.
+- Operator presentation: retained RANS evidence remains auditable, but an open
+  preliminary obligation renders as “URANS queued” and explains the automatic
+  next calculation. It is not described as a human rejection or a failed final
+  result. A terminal blocked preliminary obligation remains explicitly
+  unavailable rather than being relabelled as queued.
+- Implementation decision: targeted recovery is serialized through the existing
+  durable obligation ledger and one-winner scheduler tick. This avoids a
+  second in-memory priority queue, preserves restart safety and capacity
+  accounting, and prevents a partial-ingest callback from overfilling the
+  worker.
+
 ## 2026-07-12 — A full reset seed must be launchable, not catalog-only
 
 - Trigger: the owner requested a complete production data/evidence reset followed

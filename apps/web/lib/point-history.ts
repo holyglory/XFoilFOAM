@@ -483,6 +483,8 @@ export function statusChipDisplay(
 ): StatusChipDisplay {
   switch (bucket) {
     case "failed":
+      if (reviewBucket === "awaiting_urans" && workDisposition === "scheduled")
+        return { label: "URANS queued", tone: "violet" };
       return { label: "failed", tone: "red" };
     case "rejected":
       if (workDisposition === "blocked")
@@ -672,9 +674,13 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
 
   const events = [...timed];
   const cls = story.point.classification;
+  const uransQueued =
+    story.point.reviewBucket === "awaiting_urans" &&
+    story.point.workDisposition === "scheduled";
   if (cls) {
-    const tone: TimelineTone =
-      cls.state === "accepted"
+    const tone: TimelineTone = uransQueued
+      ? "amber"
+      : cls.state === "accepted"
         ? "teal"
         : cls.state === "rejected"
           ? "red"
@@ -683,8 +689,14 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
       kind: "classification",
       at: null,
       tone,
-      title: `classified ${cls.state.replaceAll("_", " ")} (confidence ${Math.round(cls.confidence * 100)}%)`,
-      detail: cls.reasons.length ? cls.reasons.join(", ") : null,
+      title: uransQueued
+        ? "RANS did not converge — preliminary URANS queued"
+        : `classified ${cls.state.replaceAll("_", " ")} (confidence ${Math.round(cls.confidence * 100)}%)`,
+      detail: uransQueued
+        ? "the steady-solver evidence is retained; targeted preliminary URANS is the next automatic calculation"
+        : cls.reasons.length
+          ? cls.reasons.join(", ")
+          : null,
       whyLines: [],
     });
   }
@@ -729,8 +741,9 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     });
   }
 
-  const bucketTone: TimelineTone =
-    story.point.status === "failed"
+  const bucketTone: TimelineTone = uransQueued
+    ? "amber"
+    : story.point.status === "failed"
       ? "red"
       : cls?.state === "rejected"
         ? "red"
@@ -749,7 +762,9 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     kind: "now",
     at: story.point.updatedAt,
     tone: bucketTone,
-    title: `NOW: ${story.point.status}${cls ? ` · ${cls.state.replaceAll("_", " ")}` : ""}`,
+    title: uransQueued
+      ? "NOW: preliminary URANS queued"
+      : `NOW: ${story.point.status}${cls ? ` · ${cls.state.replaceAll("_", " ")}` : ""}`,
     detail: [evidence, closureLine].filter(Boolean).join(" — "),
     whyLines: story.point.qualityWarnings,
   });

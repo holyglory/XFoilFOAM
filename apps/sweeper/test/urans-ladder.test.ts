@@ -1,6 +1,6 @@
 // URANS fidelity-ladder integration (contracts 3–7, migration 0034):
-// schema pin, ladder gating (RANS gap present ⇒ no precalc submit), gated
-// wave-2 re-attempt at precalc fidelity, idempotent verify-queue enqueue,
+// schema pin, durable partial-route recording, wave-2 re-attempt at precalc
+// fidelity, idempotent verify-queue enqueue,
 // tier ordering (pending admin request ⇒ no verify consume), verify solve +
 // disagreement path, request-URANS idempotency, phase derivation and
 // completion blocking. Live shared-DB pattern (scoped rows, full cleanup).
@@ -404,7 +404,7 @@ describe("migration 0034 schema pin", () => {
 });
 
 describe("fidelity ladder end-to-end (gating → precalc retry → verify queue → completion)", () => {
-  it("LADDER GATE MUST-CATCH: open RANS gaps block the campaign's precalc URANS retry", async () => {
+  it("MUST-CATCH: open RANS gaps defer inline submission but persist the campaign's precalc route", async () => {
     // Parent: a done wave-1 campaign job whose only evidence is a REJECTED
     // RANS attempt at REJECTED_AOA (single-revision path).
     const [parent] = await db
@@ -457,7 +457,8 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     });
 
     // Campaign points are all still 'requested' with no results rows — open
-    // RANS gaps. The inline retry must DEFER (no wave-2 child).
+    // RANS gaps. The inline path must not start a child outside scheduler
+    // capacity, but it must persist the exact preliminary route.
     expect(await campaignHasOpenRansGaps(db, campaignId)).toBe(true);
     const requests: PolarRequest[] = [];
     await submitUransRetryForJob(
@@ -471,13 +472,25 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       .from(simJobs)
       .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
     expect(children.length).toBe(0);
+    expect(
+      await db
+        .select({ id: simPrecalcObligations.id })
+        .from(simPrecalcObligations)
+        .where(
+          and(
+            eq(simPrecalcObligations.airfoilId, airfoilId),
+            eq(simPrecalcObligations.revisionId, revisionId),
+            eq(simPrecalcObligations.aoaDeg, REJECTED_AOA),
+          ),
+        ),
+    ).toHaveLength(1);
 
     const tiers = await campaignOpenTierCounts(db, campaignId);
     expect(tiers.ransOpen).toBe(ANGLES.length);
     expect(deriveCampaignPhase("active", tiers)).toBe("running_rans");
   }, 60000);
 
-  it("gates open ⇒ the ladder tick submits the deferred wave-2 retry at PRECALC fidelity", async () => {
+  it("the ladder tick submits the deferred wave-2 retry at PRECALC fidelity", async () => {
     // Terminal-close every campaign point (the RANS tier is settled).
     await db
       .update(simCampaignPoints)

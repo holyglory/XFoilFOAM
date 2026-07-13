@@ -1359,6 +1359,9 @@ export async function submitUransRetryForJob(
      * composition waits for terminal parent state or stale-lease recovery, so
      * sibling RANS work keeps its resource priority. */
     recordPromotionsOnly?: boolean;
+    /** Persist targeted PRECALC ownership from a running partial result without
+     * submitting a child outside the capacity-bounded scheduler tick. */
+    recordRoutesOnly?: boolean;
   } = {},
 ): Promise<void> {
   if (parent.wave !== 1 || parent.bcIds.length === 0) return;
@@ -1582,6 +1585,7 @@ export async function submitUransRetryForJob(
       syncPromiseIds: remoteProvenance ? [remoteProvenance.syncPromiseId] : [],
     },
   );
+  if (opts.recordRoutesOnly) return;
   if (campaignGated) return;
   const schedulableByAoa = new Map(
     obligations
@@ -1742,6 +1746,7 @@ async function submitCampaignUransRetries(
     ingestLeaseToken?: string;
     ransPrecalcPromotions?: IngestedRansPrecalcPromotion[];
     recordPromotionsOnly?: boolean;
+    recordRoutesOnly?: boolean;
   },
 ): Promise<void> {
   const parentPayload = requestPayload(parent);
@@ -1888,6 +1893,7 @@ async function submitCampaignUransRetries(
           : [],
       },
     );
+    if (opts.recordRoutesOnly) continue;
     if (campaignGated) continue;
     const schedulableByAoa = new Map(
       obligations
@@ -2283,6 +2289,15 @@ async function ingestRunningPartialJob(
       });
     }
     if (ingested.points > 0) {
+      // Non-converged/stalled RANS evidence is normal fidelity-ladder input,
+      // not a terminal campaign outcome. Persist its exact targeted PRECALC
+      // route during partial ingestion; external submission remains bounded
+      // by the sweeper tick rather than exceeding worker capacity here.
+      await renewIngestLeaseOrThrow(db, lease);
+      await submitUransRetryForJob(db, engine, job, {
+        ingestLeaseToken: lease.token,
+        recordRoutesOnly: true,
+      });
       // Amendment B, live gap 2026-07-08 (campaign 495d78e0, s1223 −5°): a
       // divergence-condemned case terminalizes its point MID-RUN. The
       // one-shot retry runs after the at-ingest classification refresh.

@@ -122,7 +122,7 @@ const WORK_DISPOSITION_SQL = sql`CASE
 END`;
 
 const AWAITING_URANS_RESULT_SQL = sql`(
-  r.status = 'done' AND rc.state = 'rejected'
+  r.status IN ('done', 'failed') AND rc.state = 'rejected'
   AND (
     r.fidelity = 'rans'
     OR (r.fidelity IS NULL AND r.regime IS DISTINCT FROM 'urans')

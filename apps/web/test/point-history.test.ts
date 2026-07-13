@@ -163,6 +163,13 @@ describe("statusChipDisplay", () => {
     );
   });
 
+  it("MUST-CATCH: a stalled RANS row with durable PRECALC work is shown as queued, not failed", () => {
+    expect(statusChipDisplay("failed", "awaiting_urans", "scheduled")).toEqual({
+      label: "URANS queued",
+      tone: "violet",
+    });
+  });
+
   it("keeps the untouched buckets stable", () => {
     expect(statusChipDisplay("accepted", null)).toEqual({
       label: "accepted",
@@ -362,6 +369,30 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
 }
 
 describe("assembleTimeline", () => {
+  it("MUST-CATCH: a rejected stalled RANS row with scheduled PRECALC tells the operator the automatic next step", () => {
+    const events = assembleTimeline(
+      storyPayload({
+        point: {
+          status: "failed",
+          reviewBucket: "awaiting_urans",
+          workDisposition: "scheduled",
+          classification: {
+            state: "rejected",
+            reasons: ["not-converged", "solver-stalled"],
+            confidence: 1,
+            classifierVersion: "v3",
+          },
+        } as never,
+        attempts: [attempt({ stalled: true })],
+      }),
+    );
+    expect(events.at(-2)?.title).toBe(
+      "RANS did not converge — preliminary URANS queued",
+    );
+    expect(events.at(-1)?.title).toBe("NOW: preliminary URANS queued");
+    expect(events.at(-1)?.tone).toBe("amber");
+  });
+
   it("orders attempts + interruptions chronologically, then classification, then NOW", () => {
     const story = storyPayload({
       point: {

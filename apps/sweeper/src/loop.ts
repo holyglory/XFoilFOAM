@@ -22,6 +22,7 @@ import { count, eq, inArray, sql } from "drizzle-orm";
 import { buildPolarRequest } from "./build-request";
 import { claimAoas } from "./claim";
 import {
+  submitCampaignPrecalcRecoveries,
   submitRecordedPromotionRecovery,
   uransLadderTick,
 } from "./urans-ladder";
@@ -592,23 +593,37 @@ export async function tick(
         await recordEngineUnreachable(db);
       } else {
         await clearEngineUnreachable(db);
-        // A recorded conditional whole-polar promotion is an owner-approved,
-        // exact replacement for a failed attached-flow sweep. It must not be
-        // starved behind an unbounded campaign's ordinary RANS backlog. The
-        // broader URANS ladder remains below RANS; only this durable ledger
-        // recovery is considered first.
+        // A recorded whole-polar promotion and an exact targeted RANS
+        // rejection are both normal automatic escalation work. They receive
+        // the next free slot ahead of a new RANS batch; this does not preempt
+        // running work and keeps the lower-priority admin/verify ladder below
+        // ordinary RANS.
         const promotedSubmitted = await submitRecordedPromotionRecovery(
           db,
           engine,
           state.cpuSlots,
         );
-        const ransSubmitted = promotedSubmitted
+        const targetedSubmitted = promotedSubmitted
           ? false
-          : await submitOneBatch(db, engine, state.cpuSlots);
-        // Fidelity ladder (contract 5): precalc-rank and verify work run ONLY
-        // when the RANS branch submitted nothing this tick and capacity
-        // remains — one existing priority scale, RANS always first.
-        if (!ransSubmitted && (await inFlight(db)) < state.maxConcurrentJobs) {
+          : await submitCampaignPrecalcRecoveries(
+              db,
+              engine,
+              undefined,
+              undefined,
+            );
+        const ransSubmitted =
+          promotedSubmitted || targetedSubmitted
+            ? false
+            : await submitOneBatch(db, engine, state.cpuSlots);
+        // Admin-request PRECALC and verification remain below newly composed
+        // RANS work. Exact campaign recovery was handled above because it is
+        // the normal continuation of an already-rejected RANS attempt.
+        if (
+          !promotedSubmitted &&
+          !targetedSubmitted &&
+          !ransSubmitted &&
+          (await inFlight(db)) < state.maxConcurrentJobs
+        ) {
           await uransLadderTick(db, engine, state.cpuSlots);
         }
       }

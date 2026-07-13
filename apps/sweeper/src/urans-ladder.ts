@@ -1,14 +1,14 @@
 // URANS fidelity-ladder tick (pinned contracts 4–6, spec: single existing
-// priority scale — no second scale). Runs INSIDE the submit-capacity branch of
-// the sweeper tick, and only when the RANS branch (submitOneBatch) submitted
-// nothing this tick — so RANS work always outranks precalc-rank work by
-// construction, and verify work additionally requires zero campaign
-// RANS/precalc work machine-wide. At most ONE submission per tick (the same
-// one-winner-per-tick discipline as the RANS branch).
+// priority scale — no second scale). Runs inside the submit-capacity branch of
+// the sweeper tick. Exact campaign RANS→PRECALC recoveries take the next free
+// slot; new RANS work then outranks admin-request PRECALC and verification.
+// Verify work additionally requires zero campaign RANS/precalc work
+// machine-wide. At most ONE submission wins each scheduler tick.
 //
 // Tier 2 (precalc rank):
-//   a) gated campaign wave-2 URANS retries — parents whose inline retry was
-//      deferred because their campaign still had open RANS gaps;
+//   a) campaign wave-2 URANS retries — a rejected RANS attempt is normal
+//      escalation input and receives the next free worker slot ahead of new
+//      RANS work, while the parent remains terminal before shared-mesh reuse;
 //   b) admin request-URANS work items (contract 6).
 // Tier 3 (global lowest): verify-queue items (contract 4) — one cell re-solved
 //   at FULL fidelity; deltas recorded at ingest (reconcile settle path).
@@ -16,7 +16,6 @@
 import {
   airfoils,
   activeCampaignOwnersForUransRequest,
-  campaignHasOpenRansGaps,
   claimNextPendingUransRequest,
   claimNextPendingVerifyItem,
   type DB,
@@ -597,9 +596,11 @@ export async function submitRecordedPromotionRecovery(
   return false;
 }
 
-/** Tier-2a: re-attempt gated campaign wave-2 retries for campaigns whose RANS
- *  gaps have hit zero. Returns true when a submission happened. */
-async function submitGatedCampaignRetries(
+/** Tier-2a: submit one durable campaign PRECALC recovery. A rejected RANS
+ *  attempt is normal escalation work, so the loop gives it the next free slot
+ *  ahead of a newly-composed RANS batch. The source wave-1 parent must still
+ *  be terminal: URANS never races the parent over its shared mesh. */
+export async function submitCampaignPrecalcRecoveries(
   db: DB,
   engine: EngineClient,
   campaignIds?: string[],
@@ -615,7 +616,6 @@ async function submitGatedCampaignRetries(
         : statusFilter,
     );
   for (const campaign of campaigns) {
-    if (await campaignHasOpenRansGaps(db, campaign.id)) continue;
     // STARVATION GUARD (adversarial review 2026-07-07): parents whose retry
     // plan is empty never grow a wave-2 child, so they never leave the
     // NOT-EXISTS filter. They MUST also be excluded from the SQL window —
@@ -1448,9 +1448,10 @@ async function consumeVerifyItem(
 }
 
 /** One ladder pass: heal orphans, then submit AT MOST one piece of work in
- *  tier order (gated campaign retries → admin requests → verify queue). The
- *  caller (loop.tick) invokes this only when the RANS branch submitted nothing
- *  and in-flight capacity remains. Exported cpuSlots plumbed from
+ *  tier order (campaign PRECALC recovery → admin requests → verify queue).
+ *  The main loop gives durable campaign recovery a pre-RANS pass; this
+ *  fallback preserves recovery when the RANS branch leaves capacity unused.
+ *  Exported cpuSlots plumbed from
  *  sweeper_state like the RANS branch. */
 export async function uransLadderTick(
   db: DB,
@@ -1489,7 +1490,7 @@ export async function uransLadderTick(
   if (await submitRecordedPromotionRecovery(db, engine, cpuSlots, opts))
     return true;
   if (
-    await submitGatedCampaignRetries(
+    await submitCampaignPrecalcRecoveries(
       db,
       engine,
       opts.campaignIds,
