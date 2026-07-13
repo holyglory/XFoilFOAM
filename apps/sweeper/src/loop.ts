@@ -21,7 +21,10 @@ import { count, eq, inArray, sql } from "drizzle-orm";
 
 import { buildPolarRequest } from "./build-request";
 import { claimAoas } from "./claim";
-import { uransLadderTick } from "./urans-ladder";
+import {
+  submitRecordedPromotionRecovery,
+  uransLadderTick,
+} from "./urans-ladder";
 import {
   clearEngineUnreachable,
   engineBackoffActive,
@@ -589,7 +592,19 @@ export async function tick(
         await recordEngineUnreachable(db);
       } else {
         await clearEngineUnreachable(db);
-        const ransSubmitted = await submitOneBatch(db, engine, state.cpuSlots);
+        // A recorded conditional whole-polar promotion is an owner-approved,
+        // exact replacement for a failed attached-flow sweep. It must not be
+        // starved behind an unbounded campaign's ordinary RANS backlog. The
+        // broader URANS ladder remains below RANS; only this durable ledger
+        // recovery is considered first.
+        const promotedSubmitted = await submitRecordedPromotionRecovery(
+          db,
+          engine,
+          state.cpuSlots,
+        );
+        const ransSubmitted = promotedSubmitted
+          ? false
+          : await submitOneBatch(db, engine, state.cpuSlots);
         // Fidelity ladder (contract 5): precalc-rank and verify work run ONLY
         // when the RANS branch submitted nothing this tick and capacity
         // remains — one existing priority scale, RANS always first.

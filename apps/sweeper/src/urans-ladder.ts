@@ -317,7 +317,10 @@ async function remoteProvenanceForPromotionObligations(
  * campaign-wide RANS gate: its exact parent, condition, and original angle
  * list are already immutable in the promotion ledger, so unrelated campaign
  * cells must not delay its preliminary replacement. */
-async function submitRecordedPromotionRecovery(
+/** Submit one exact, durable conditional whole-polar promotion. This is the
+ * sole ladder path allowed ahead of ordinary RANS: the owner already approved
+ * the promoted replacement, and its scope is immutable in the ledger. */
+export async function submitRecordedPromotionRecovery(
   db: DB,
   engine: EngineClient,
   cpuSlots: number,
@@ -325,7 +328,7 @@ async function submitRecordedPromotionRecovery(
     campaignIds?: string[];
     parentJobIds?: string[];
     promotionIds?: string[];
-  },
+  } = {},
 ): Promise<boolean> {
   const scope = promotionRecoveryScopeSql(opts);
   const candidates = (await db.execute(sql`
