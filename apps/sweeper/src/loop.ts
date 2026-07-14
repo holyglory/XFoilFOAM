@@ -144,7 +144,6 @@ async function submitContinuousBatch(
   db: DB,
   engine: EngineClient,
   batch: ContinuousBatch,
-  queuePressure: number,
   cpuSlots: number,
 ): Promise<boolean> {
   const [a] = await db
@@ -169,7 +168,6 @@ async function submitContinuousBatch(
       retryScope.origin === "continuous-polar"
         ? "abort_for_precalc"
         : "continue",
-    queuePressure,
     cpuSlots,
   });
 
@@ -338,9 +336,14 @@ export async function submitCampaignBatch(
   db: DB,
   engine: EngineClient,
   batch: CampaignGapBatch,
-  queuePressure: number,
-  cpuSlots: number,
+  cpuSlotsOrLegacyQueuePressure: number,
+  legacyCpuSlots?: number,
 ): Promise<boolean> {
+  // Retain the former five-argument helper shape for deterministic scheduler
+  // fixtures while making the legacy logical-backlog argument inert. Production
+  // calls pass cpuSlots as the fourth argument; older callers pass
+  // (queuePressure, cpuSlots), where only the final CPU cap is meaningful.
+  const cpuSlots = legacyCpuSlots ?? cpuSlotsOrLegacyQueuePressure;
   const [a] = await db
     .select()
     .from(airfoils)
@@ -363,7 +366,6 @@ export async function submitCampaignBatch(
       retryScope.origin === "continuous-polar"
         ? "abort_for_precalc"
         : "continue",
-    queuePressure,
     cpuSlots,
     speeds: entries.map((e) => e.speed),
   });
@@ -514,16 +516,6 @@ export async function submitOneBatch(
   await touchHeartbeat(db);
   if (!continuous && !campaign) return false;
 
-  const continuousGroups = new Set(gaps.map((g) => `${g.airfoilId}:${g.bcId}`))
-    .size;
-  const queuePressure = Math.max(
-    0,
-    continuousGroups +
-      (campaign?.openGroupCount ?? 0) -
-      1 +
-      (await inFlight(db)),
-  );
-
   let winner: "continuous" | "campaign";
   if (continuous && campaign) {
     winner =
@@ -548,18 +540,11 @@ export async function submitOneBatch(
   }
 
   return winner === "campaign"
-    ? submitCampaignBatch(
-        db,
-        engine,
-        campaign as CampaignGapBatch,
-        queuePressure,
-        cpuSlots,
-      )
+    ? submitCampaignBatch(db, engine, campaign as CampaignGapBatch, cpuSlots)
     : submitContinuousBatch(
         db,
         engine,
         continuous as ContinuousBatch,
-        queuePressure,
         cpuSlots,
       );
 }

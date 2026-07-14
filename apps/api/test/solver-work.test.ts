@@ -313,6 +313,17 @@ describe("solverWorkStateForPoint", () => {
         resultId: "r",
         status: "failed",
         regime: "urans",
+        fidelity: "urans_precalc",
+        classificationState: "rejected",
+        classificationReasons: ["missing-urans-video"],
+        mediaRepairState: "retry_wait",
+      }),
+    ).toBe("ladder");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "r",
+        status: "failed",
+        regime: "urans",
         error: "second transient solver crash",
       }),
     ).toBe("blocked");

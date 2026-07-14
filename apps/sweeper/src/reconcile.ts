@@ -98,10 +98,7 @@ import {
   ransRetryPlanForJobScoped,
   type RansRetryDecision,
 } from "./retry-plan";
-import {
-  solverQueuePressure,
-  submitPendingJobWithLifecycleGuard,
-} from "./submit-lifecycle";
+import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
 export { touchHeartbeat } from "./heartbeat";
 
@@ -1770,7 +1767,6 @@ export async function submitUransRetryForJob(
     aoaList: aoas,
     wave: 2,
     uransFidelity: "precalc",
-    queuePressure: await solverQueuePressure(db),
     cpuSlots: capacity?.cpuSlots ?? 0,
   });
   request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;
@@ -2082,7 +2078,6 @@ async function submitCampaignUransRetries(
       aoaList: retryAoas,
       wave: 2,
       uransFidelity: "precalc",
-      queuePressure: await solverQueuePressure(db),
       cpuSlots: capacity?.cpuSlots ?? 0,
     });
     request.expected_mesh_recovery_version = opts.meshRecoveryVersion ?? 0;
@@ -2274,8 +2269,9 @@ export async function settleCampaignAfterRefresh(
 }
 
 /** Auto-retry-once (amendment B): requeue this job's unmarked crash-class
- *  failed rows exactly once and log all three directions loudly — retry,
- *  deterministic mesh-QA suppression, and exhausted escalation. Runs AFTER
+ *  failed rows exactly once and log every terminal direction loudly — retry,
+ *  output-only media repair deferral, deterministic mesh-QA suppression, and
+ *  exhausted escalation. Runs AFTER
  *  every polar-cache refresh of the terminal ingest path (flipping a row to
  *  pending before a refresh would overwrite its stored at-ingest
  *  classification — prod row 741db07a) and AFTER the wave-2 retry submit
@@ -2296,6 +2292,11 @@ async function autoRetryFailedPointsForJob(
     for (const cell of outcome.precalcRouted) {
       console.error(
         `[sweeper] AUTO-RETRY: precalc crash routed ONCE to the wave-2 ladder (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — queued for another forced-transient precalc child; never downgraded to a wave-1 campaign gap`,
+      );
+    }
+    for (const cell of outcome.mediaRepairDeferred) {
+      console.log(
+        `[sweeper] MEDIA REPAIR: completed solver evidence awaits its default URANS video (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}) — bounded media repair owns this; no duplicate CFD solve will be submitted`,
       );
     }
     for (const cell of outcome.suppressed) {

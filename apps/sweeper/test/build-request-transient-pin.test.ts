@@ -93,7 +93,6 @@ describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)",
       aoaList: [-5, 0, 5, 10],
       wave: 1,
       ransFailurePolicy: "abort_for_precalc",
-      queuePressure: 2,
       cpuSlots: 8,
       speeds: [10, 25],
     });
@@ -114,10 +113,16 @@ describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)",
     // The flags must SURVIVE JSON serialization (what the engine receives).
     const wire = JSON.parse(JSON.stringify(request)) as {
       solver: Record<string, unknown>;
+      resources: Record<string, unknown>;
     };
     expect(wire.solver.transient_fallback).toBe(false);
     expect(wire.solver.force_transient).toBe(false);
     expect(wire.solver.rans_failure_policy).toBe("abort_for_precalc");
+    // Campaign backlog is a controller concern, not evidence that the engine
+    // worker is busy. Forwarding it serializes independent speed branches and
+    // leaves CPU idle; the engine now resolves `auto` from its real queue and
+    // local token pressure only.
+    expect(wire.resources).not.toHaveProperty("queue_pressure");
   });
 
   it("continuous/public (non-campaign) wave-1 sweep shape ships the same flags — it shares the gated-ladder escalation path (targeted wave-2 retry in reconcile.ts)", () => {
@@ -127,13 +132,13 @@ describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)",
       aoaList: [0, 4, 8],
       wave: 1,
       ransFailurePolicy: "abort_for_precalc",
-      queuePressure: 0,
     });
     expect(request.solver?.transient_fallback).toBe(false);
     expect(request.solver?.force_transient).toBe(false);
     expect(request.solver?.rans_failure_policy).toBe("abort_for_precalc");
     expect(request.solver).not.toHaveProperty("urans_fidelity");
     expect(request.solver?.warm_start).toBe(true);
+    expect(request.resources).not.toHaveProperty("queue_pressure");
   });
 
   it("explicit single-angle wave-1 work cannot widen and ships continue", () => {

@@ -17,6 +17,7 @@ import {
   resultClassifications,
   resultAttempts,
   resultFieldExtents,
+  resultMediaRepairs,
   mediums,
   lockPrecalcCells,
   resultMedia,
@@ -43,6 +44,7 @@ import {
   syncRemotePromiseCancellations,
   sweeperState,
   sweepDefinitions,
+  discoverMissingResultMediaRepairs,
 } from "@aerodb/db";
 import {
   EngineClient,
@@ -1276,6 +1278,7 @@ describe("sweeper: gap → claim → ingest", () => {
       byte_size: 128,
       metadata: { evidenceBase: `/tmp/evidence/${caseSlug}` },
     });
+    let defaultRenderCalls = 0;
     const mediaEngine = {
       baseUrl: "http://engine.test",
       computeFieldExtents: async (
@@ -1304,6 +1307,7 @@ describe("sweeper: gap → claim → ingest", () => {
           render_profile_key?: string;
         },
       ) => {
+        defaultRenderCalls++;
         const version = request.scale_version ?? 1;
         const profile = request.render_profile_key ?? "default:v1:zoom2";
         const base = `/jobs/${jobId}/files/evidence/scaled_media/${profile}/v${version}/${request.case_slug}`;
@@ -1373,7 +1377,22 @@ describe("sweeper: gap → claim → ingest", () => {
                   "/jobs/testjob/files/cases/c1/images/velocity_magnitude.png",
                 pressure: "/jobs/testjob/files/cases/c1/images/pressure.png",
               },
-              evidence_artifacts: [manifestArtifact("c1")],
+              evidence_artifacts: [
+                manifestArtifact("c1"),
+                {
+                  // Engine shared-mesh evidence has a more specific wire kind
+                  // than the current DB enum. Ingest must retain it as mesh
+                  // evidence with its original kind in provenance, never skip
+                  // an immutable artifact because the enum is coarser.
+                  kind: "mesh_evidence",
+                  path: "/jobs/testjob/files/evidence/c1/openfoam/mesh_evidence/manifest.json",
+                  url: "/jobs/testjob/files/evidence/c1/openfoam/mesh_evidence/manifest.json",
+                  mime_type: "application/json",
+                  sha256: "f".repeat(64),
+                  byte_size: 128,
+                  metadata: { topology: "shared-cgrid" },
+                },
+              ],
             },
             {
               case_slug: "c2",
@@ -1478,10 +1497,11 @@ describe("sweeper: gap → claim → ingest", () => {
       result: withExactManifestEvidence(result),
     });
     expect(r1.points).toBe(2);
-    // Engine-shipped media register at ingest (steady: 2 images; URANS: 1
-    // image + 1 mean + 1 video = 5) and the scaled-render pass upserts the
-    // same 5 (result, kind, field, role) tuples with scale info = 10 writes.
-    expect(r1.media).toBe(10);
+    // Completed-job ingestion preserves engine-shipped media but never blocks
+    // scheduler capacity on full default-media rendering. The bounded repair
+    // queue owns scaled rendering after the job is terminal.
+    expect(r1.media).toBe(5);
+    expect(defaultRenderCalls).toBe(0);
 
     const rows = await db
       .select()
@@ -1539,14 +1559,6 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(media.every((mm) => mm.storageKey.startsWith("jobs/testjob/"))).toBe(
       true,
     );
-    expect(media.every((mm) => mm.colorScaleVersion === 1)).toBe(true);
-    expect(
-      media.find((mm) => mm.field === "velocity_magnitude")?.scaleVmax,
-    ).toBeCloseTo(55, 8);
-    expect(media.find((mm) => mm.field === "pressure")?.scaleVmin).toBeCloseTo(
-      -4,
-      8,
-    );
 
     // URANS point: Strouhal + animation video + time-averaged image + force history
     const r16 = rows.find((r) => r.aoaDeg === uransAoa)!;
@@ -1577,6 +1589,23 @@ describe("sweeper: gap → claim → ingest", () => {
       "jobs/testjob/cases/c2/frames/vorticity/f0000.png",
     );
     expect(frameEvidence[0].metadata).toMatchObject({ frameIndex: 0 });
+    const meshEvidence = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, r0.id),
+          eq(solverEvidenceArtifacts.kind, "mesh"),
+        ),
+      );
+    expect(meshEvidence).toHaveLength(1);
+    expect(meshEvidence[0].storageKey).toBe(
+      "jobs/testjob/evidence/c1/openfoam/mesh_evidence/manifest.json",
+    );
+    expect(meshEvidence[0].metadata).toMatchObject({
+      topology: "shared-cgrid",
+      engineArtifactKind: "mesh_evidence",
+    });
     const m16 = await db
       .select()
       .from(resultMedia)
@@ -1587,11 +1616,7 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(m16.some((mm) => mm.kind === "image" && mm.role === "mean")).toBe(
       true,
     );
-    expect(
-      m16.every(
-        (mm) => mm.field === "velocity_magnitude" && mm.scaleVmax === 55,
-      ),
-    ).toBe(true);
+    expect(m16.every((mm) => mm.field === "velocity_magnitude")).toBe(true);
     const fh = await db
       .select()
       .from(forceHistory)
@@ -1612,26 +1637,6 @@ describe("sweeper: gap → claim → ingest", () => {
         ),
       );
     expect(extents.length).toBeGreaterThanOrEqual(3);
-    const scales = await db
-      .select()
-      .from(fieldColorScales)
-      .where(
-        and(
-          eq(fieldColorScales.airfoilId, a.id),
-          eq(
-            fieldColorScales.simulationPresetRevisionId,
-            batch.presetRevisionId,
-          ),
-          eq(fieldColorScales.active, true),
-        ),
-      );
-    expect(
-      scales.find((scale) => scale.field === "velocity_magnitude")?.vmax,
-    ).toBeCloseTo(55, 8);
-    expect(
-      scales.find((scale) => scale.field === "pressure")?.vmin,
-    ).toBeCloseTo(-4, 8);
-
     // idempotent: re-ingest produces no duplicates
     await ingestResult({
       db,
@@ -1670,6 +1675,7 @@ describe("sweeper: gap → claim → ingest", () => {
         ),
       );
     expect(attemptsAfter.length).toBe(3);
+    expect(defaultRenderCalls).toBe(0);
   }, 60000);
 
   // MUST-CATCH (prod "missing-urans-video" regression): engine-shipped media
@@ -3282,10 +3288,9 @@ describe("sweeper: gap → claim → ingest", () => {
       aoaList: [124.124],
       wave: 2,
       uransFidelity: "precalc",
-      queuePressure: await solverQueuePressure(db, { jobIds: [job.id] }),
       cpuSlots: 0,
     });
-    expect(request.resources?.queue_pressure).toBe(0);
+    expect(request.resources).not.toHaveProperty("queue_pressure");
   }, 60000);
 
   it("keeps an engine-visible job active when a status poll briefly misses it", async () => {
@@ -3589,6 +3594,223 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(gotResult.status).toBe("done");
     expect(gotResult.source).toBe("solved");
     expect(gotResult.cl).toBeCloseTo(0.61, 6);
+  }, 60000);
+
+  it("terminalizes completed URANS evidence when default media is incomplete and defers only the bounded repair", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 125.181;
+    const engineJobId = `completed-urans-missing-video-${testRunSlug}`;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 2,
+        status: "running",
+        engineJobId,
+        submittedAt: new Date(Date.now() - 60 * 60 * 1000),
+        totalCases: 1,
+        requestPayload: {
+          uransFidelity: "precalc",
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+        },
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+        engineJobId,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+
+    const result: JobResult = {
+      job_id: engineJobId,
+      state: "completed",
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: bc.mach,
+          points: [
+            {
+              case_slug: "urans-missing-video",
+              aoa_deg: aoa,
+              cl: 0.72,
+              cd: 0.028,
+              cm: -0.035,
+              cl_cd: 25.7,
+              cl_std: 0.03,
+              cd_std: 0.002,
+              unsteady: true,
+              converged: true,
+              first_order_fallback: false,
+              fidelity: "urans_precalc",
+              frame_track: {
+                period_s: 0.25,
+                periods_retained: 4,
+                stationary: true,
+                drift_frac: 0.01,
+                window: { t_start: 1, t_end: 2 },
+                stats: {
+                  cl: { mean: 0.72, std: 0.03, min: 0.67, max: 0.77 },
+                  cd: { mean: 0.028, std: 0.002, min: 0.025, max: 0.031 },
+                  cm: {
+                    mean: -0.035,
+                    std: 0.002,
+                    min: -0.038,
+                    max: -0.032,
+                  },
+                },
+                fields: ["velocity_magnitude"],
+                frames: [],
+                image_pattern: "frames/{field}/f{i04}.png",
+              },
+              force_history: {
+                t: [1, 1.25, 1.5, 1.75, 2],
+                cl: [0.7, 0.74, 0.71, 0.73, 0.72],
+                cd: [0.027, 0.029, 0.028, 0.028, 0.028],
+                cm: [-0.034, -0.036, -0.035, -0.035, -0.035],
+                shedding_freq_hz: 4,
+                samples: 200,
+              },
+              images: {
+                velocity_magnitude: `/jobs/${engineJobId}/files/cases/urans-missing-video/images/velocity_magnitude.png`,
+              },
+              mean_images: {
+                velocity_magnitude: `/jobs/${engineJobId}/files/cases/urans-missing-video/images/velocity_magnitude_mean.png`,
+              },
+              // Intentionally no video: only a durable repair may attempt to
+              // create it; it cannot hold this completed engine job open.
+              video: {},
+            },
+          ],
+        },
+      ],
+    };
+    const incompleteMediaEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: true,
+            cancelled: false,
+            process_count: 0,
+            status_readable: true,
+            status_state: "completed",
+            status_total_cases: 1,
+            status_completed_cases: 1,
+            result_readable: true,
+            has_result: true,
+            result_state: "completed",
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: "completed",
+        total_cases: 1,
+        completed_cases: 1,
+      }),
+      getResult: async () => withExactManifestEvidence(result),
+      computeFieldExtents: async () => ({
+        fields: {
+          velocity_magnitude: { min: 0, max: 44, finite_count: 100 },
+        },
+        window_start: 1,
+        window_end: 2,
+      }),
+      renderDefaultMedia: async () => {
+        return { images: [], mean_images: [], videos: [] };
+      },
+      fileUrl: (id: string, relPath: string) =>
+        `http://engine.test/jobs/${id}/files/${relPath}`,
+    } as unknown as EngineClient;
+
+    await reconcile(db, incompleteMediaEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+
+    const [completedJob] = await db
+      .select({ status: simJobs.status, error: simJobs.error })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    expect(completedJob).toEqual({ status: "done", error: null });
+    const [completedResult] = await db
+      .select({
+        status: results.status,
+        simJobId: results.simJobId,
+        autoRetriedAt: results.autoRetriedAt,
+      })
+      .from(results)
+      .where(eq(results.id, row.id));
+    // Missing only default media is an output-repair obligation. It must not
+    // be requeued as another OpenFOAM solve by the generic failed-result path.
+    expect(completedResult).toEqual({
+      status: "failed",
+      simJobId: job.id,
+      autoRetriedAt: null,
+    });
+    const [classification] = await db
+      .select({
+        state: resultClassifications.state,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultClassifications)
+      .innerJoin(
+        resultAttempts,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
+      .where(
+        and(
+          eq(resultAttempts.resultId, row.id),
+          eq(resultAttempts.simJobId, job.id),
+        ),
+      );
+    expect(classification).toEqual({
+      state: "rejected",
+      reasons: ["missing-urans-video"],
+    });
+
+    await discoverMissingResultMediaRepairs(db, { resultId: row.id });
+    const [repair] = await db
+      .select({
+        state: resultMediaRepairs.state,
+        resultAttemptId: resultMediaRepairs.resultAttemptId,
+      })
+      .from(resultMediaRepairs)
+      .where(eq(resultMediaRepairs.resultId, row.id));
+    expect(repair?.resultAttemptId).toBeTruthy();
+    expect(["pending", "retry_wait", "blocked"]).toContain(repair?.state);
   }, 60000);
 
   it("gives cancel-versus-ingest exactly one owner so no evidence lands under cancelled ownership", async () => {

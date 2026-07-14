@@ -65,10 +65,7 @@ import { touchHeartbeat } from "./heartbeat";
 import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
 import { submitUransRetryForJob } from "./reconcile";
-import {
-  solverQueuePressure,
-  submitPendingJobWithLifecycleGuard,
-} from "./submit-lifecycle";
+import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
 /** Parents whose gated retry was already re-attempted this process lifetime —
  *  a parent whose retry plan is empty must not be re-planned every tick
@@ -1057,7 +1054,6 @@ async function submitLadderJob(
     aoaList: aoas,
     wave: 2,
     uransFidelity: fidelity,
-    queuePressure: await solverQueuePressure(db),
     cpuSlots,
   });
   // Ladder jobs are URANS-BY-DEFINITION: the in-job steady stage is only the

@@ -1220,7 +1220,6 @@ async function composeRemotePromiseJob(
       wave: 1,
       ransFailurePolicy:
         state.requestedAoas.length > 1 ? "abort_for_precalc" : "continue",
-      queuePressure: 0,
     });
     request.resources = {
       ...(request.resources ?? {}),

@@ -28,7 +28,6 @@ export function buildPolarRequest(opts: {
   /** Wave-1 low-AoA policy. Continuous production polars use
    * abort_for_precalc; explicit targeted work uses continue. */
   ransFailurePolicy?: RansFailurePolicy;
-  queuePressure?: number;
   /** Global solver capacity (sweeper_state.cpuSlots). >0 → cpu_budget cap;
    *  0 → auto: omit cpu_budget so the engine resolves its own worker budget;
    *  undefined → legacy behavior (scheduling-profile snapshot value). */
@@ -45,7 +44,6 @@ export function buildPolarRequest(opts: {
     wave,
     uransFidelity,
     ransFailurePolicy,
-    queuePressure,
     cpuSlots,
     speeds,
   } = opts;
@@ -128,7 +126,6 @@ export function buildPolarRequest(opts: {
       cpu_budget: cpuBudget,
       case_concurrency: setup.scheduling.caseConcurrency ?? undefined,
       solver_processes: setup.scheduling.solverProcesses ?? undefined,
-      queue_pressure: queuePressure ?? undefined,
     },
   };
   return { request, speed, nu };

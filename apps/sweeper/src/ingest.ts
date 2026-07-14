@@ -1043,7 +1043,14 @@ export async function registerEvidenceArtifacts(opts: {
     // Per-frame URANS PNGs (frame-track contract, FRAME_IMAGE_ARTIFACT_KIND).
     "frame_image",
   ] as const;
-  const kind = knownKinds.find((k) => k === artifact.kind);
+  // The engine's shared-mesh bundle is genuine, immutable mesh evidence. The
+  // database currently has the broader `mesh` enum rather than a separate
+  // `mesh_evidence` enum, so retain it under that truthful parent kind and
+  // preserve the engine's exact label in metadata for provenance.
+  const originalKind = artifact.kind;
+  const normalizedKind =
+    originalKind === "mesh_evidence" ? "mesh" : originalKind;
+  const kind = knownKinds.find((k) => k === normalizedKind);
   if (!kind) {
     // Loud skip instead of a pg enum error that would abort the WHOLE ingest:
     // one unknown artifact kind from a newer engine must not cost the point's
@@ -1070,7 +1077,10 @@ export async function registerEvidenceArtifacts(opts: {
       sha256: artifact.sha256,
       byteSize: artifact.byte_size,
       engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
-      metadata: artifact.metadata ?? {},
+      metadata:
+        originalKind === normalizedKind
+          ? (artifact.metadata ?? {})
+          : { ...(artifact.metadata ?? {}), engineArtifactKind: originalKind },
     };
     if (kind === "manifest" && resultAttemptId) {
       const existingManifests = await writeDb
@@ -1278,7 +1288,6 @@ async function computeAndStoreFieldExtents(opts: {
   speed: number;
   chord: number;
   airfoilPoints: [number, number][];
-  groups: Map<ScaleGroupKey, ScaleGroup>;
 }): Promise<void> {
   const {
     db,
@@ -1292,7 +1301,6 @@ async function computeAndStoreFieldExtents(opts: {
     speed,
     chord,
     airfoilPoints,
-    groups,
   } = opts;
   if (!presetRevisionId || !point.case_slug || failedForPoint(point)) return;
   const evidenceBase = evidenceBaseFromPoint(point);
@@ -1368,15 +1376,6 @@ async function computeAndStoreFieldExtents(opts: {
           updatedAt: new Date(),
         },
       });
-    const key = scaleGroupKey(airfoilId, presetRevisionId, rawField);
-    const group = groups.get(key) ?? {
-      airfoilId,
-      presetRevisionId,
-      field: rawField,
-      changedResultIds: new Set<string>(),
-    };
-    group.changedResultIds.add(resultId);
-    groups.set(key, group);
   }
 }
 
@@ -3928,7 +3927,6 @@ export async function ingestResult(opts: {
   // true crash with an empty payload.
   let attempts = 0;
   const airfoilPoints = await airfoilContourPoints(db, airfoilId);
-  const scaleGroups = new Map<ScaleGroupKey, ScaleGroup>();
   const dirtyLanes = new Map<string, CampaignLaneKey>();
   const candidatesByRevision = new Map<string, StagedPoint[]>();
   const legacyCandidates: StagedPoint[] = [];
@@ -4040,7 +4038,6 @@ export async function ingestResult(opts: {
         speed: input.speed,
         chord: input.chord,
         airfoilPoints,
-        groups: scaleGroups,
       });
     }
     return {
@@ -4213,17 +4210,12 @@ export async function ingestResult(opts: {
       finalizedByResult.set(failed.resultId, failed as FinalizedPoint);
   }
 
-  // Finish the presentation rows produced by this ingest before campaign
-  // consumers observe the newly selected generation.
-  if (airfoilPoints && scaleGroups.size) {
-    media += await rebalanceFieldScales({
-      db,
-      engine,
-      groups: scaleGroups,
-      airfoilPoints,
-      heartbeat,
-    });
-  }
+  // Default-media rendering is deliberately outside the completed-job ingest
+  // transaction. Immutable solver evidence, shipped media and field extents
+  // are staged above; the bounded, leased result-media repair queue owns
+  // expensive rendering and its retries. A missing URANS video therefore
+  // remains rejected/unavailable, but cannot leave an engine-complete job
+  // permanently `ingesting` and consume a scheduler slot.
   // Campaign and obligation state observe only committed selected evidence (or
   // a pointer-null machine failure). A rejected child of an existing public
   // generation settles against the kept current row returned above.

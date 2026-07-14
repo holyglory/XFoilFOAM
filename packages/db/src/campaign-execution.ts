@@ -1244,6 +1244,10 @@ export interface AutoRetryOutcome {
    * terminal/cancelled, or the physical work was a bounded continuation whose
    * engine submission already spent its one attempt. Evidence stays failed. */
   terminalBlocked: AutoRetriedCell[];
+  /** A completed evidence row whose only rejection is missing URANS video.
+   * This is output-repair work, not a CFD crash: the bounded media-repair
+   * queue owns it and generic solver retry must not submit a duplicate solve. */
+  mediaRepairDeferred: AutoRetriedCell[];
 }
 
 // Production campaign b96594a6 proved that the generic crash retry was not
@@ -1475,6 +1479,41 @@ const CURRENT_HARD_SOLVER_ATTEMPT_SQL = sql`EXISTS (
     )
 )`;
 
+/** A completed exact attempt can be unavailable solely because default URANS
+ * video has not yet been rendered. That classification is deliberately
+ * pointer-null, which also leaves the durable cell in `failed` until media
+ * repair re-publishes the same immutable evidence. It is not a solver failure:
+ * the result-media repair queue has the bounded, token-fenced retry budget.
+ *
+ * Read only the latest exact attempt from this job. A later actual CFD crash
+ * for the same cell must still receive the normal one-shot retry even if an
+ * earlier attempt from this job once awaited media repair. */
+const MEDIA_REPAIR_OWNED_SQL = sql`EXISTS (
+  SELECT 1
+  FROM result_attempts media_attempt
+  JOIN result_classifications media_classification
+    ON media_classification.result_attempt_id = media_attempt.id
+  WHERE media_attempt.result_id = r.id
+    AND media_attempt.sim_job_id = r.sim_job_id
+    AND media_attempt.status = 'done'
+    AND media_attempt.source = 'solved'
+    AND media_classification.state = 'rejected'
+    AND media_classification.reasons = ARRAY['missing-urans-video']::text[]
+    AND NOT EXISTS (
+      SELECT 1
+      FROM result_attempts newer_attempt
+      WHERE newer_attempt.result_id = media_attempt.result_id
+        AND newer_attempt.sim_job_id = media_attempt.sim_job_id
+        AND (
+          newer_attempt."createdAt" > media_attempt."createdAt"
+          OR (
+            newer_attempt."createdAt" = media_attempt."createdAt"
+            AND newer_attempt.id > media_attempt.id
+          )
+        )
+    )
+)`;
+
 /** Route every generic crash-class unmarked failed row of one sim job exactly once:
  *  result → pending for wave-1 or queued-without-owner for campaign
  *  precalc (claim links cleared, marker stamped, error text kept as evidence
@@ -1531,6 +1570,7 @@ export async function autoRetryCrashedResultsForJob(
       AND r.auto_retried_at IS NULL
       AND r.simulation_preset_revision_id IS NOT NULL
       AND (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
   `)) as unknown as Array<{
       result_id: string;
       airfoil_id: string;
@@ -1553,6 +1593,7 @@ export async function autoRetryCrashedResultsForJob(
         OR (${BOUNDED_CONTINUATION_PRECALC_SQL})
       )
       AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
   `)) as unknown as Array<{
       result_id: string;
       airfoil_id: string;
@@ -1565,7 +1606,10 @@ export async function autoRetryCrashedResultsForJob(
     SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
            r.aoa_deg::float8 AS aoa_deg, r.error
     FROM results r
-    WHERE r.sim_job_id = ${simJobId} AND r.status = 'failed' AND r.auto_retried_at IS NOT NULL
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NOT NULL
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
   `)) as unknown as Array<{
       result_id: string;
       airfoil_id: string;
@@ -1591,6 +1635,7 @@ export async function autoRetryCrashedResultsForJob(
       AND r.simulation_preset_revision_id IS NOT NULL
       AND (${ROUTABLE_CAMPAIGN_PRECALC_SQL})
       AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
     RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
               r.aoa_deg::float8 AS aoa_deg, r.error
   `)) as unknown as Array<{
@@ -1614,6 +1659,7 @@ export async function autoRetryCrashedResultsForJob(
       AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
       AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
       AND NOT (${CURRENT_HARD_SOLVER_ATTEMPT_SQL})
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
     RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
               r.aoa_deg::float8 AS aoa_deg, r.error
   `)) as unknown as Array<{
@@ -1714,12 +1760,28 @@ export async function autoRetryCrashedResultsForJob(
       aoaDeg: Number(row.aoa_deg),
       error: row.error,
     });
+    const mediaRepairDeferred = (await tx.execute(sql`
+    SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+           r.aoa_deg::float8 AS aoa_deg, r.error
+    FROM results r
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NULL
+      AND (${MEDIA_REPAIR_OWNED_SQL})
+  `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string | null;
+      aoa_deg: number;
+      error: string | null;
+    }>;
     return {
       retried: retried.map(toCell),
       precalcRouted: precalcRouted.map(toCell),
       escalated: escalated.map(toCell),
       suppressed: suppressed.map(toCell),
       terminalBlocked: terminalBlocked.map(toCell),
+      mediaRepairDeferred: mediaRepairDeferred.map(toCell),
     };
   });
 }

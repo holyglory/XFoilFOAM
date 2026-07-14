@@ -1,5 +1,11 @@
 # Decision History
 
+## Direction
+
+- Confirmed intent: production campaigns should use real available compute while
+  preserving trustworthy solver evidence and automatic recovery rather than
+  handing repairable pipeline work to users. [D-2026-07-14-campaign-capacity]
+
 ## 2026-07-14 — Low-angle alternate RANS branches receive targeted preliminary URANS
 
 - Trigger and evidence: the owner reported that the A18 (smoothed) public
@@ -4492,3 +4498,10 @@ mean).
 - Owner decision status: not yet confirmed. The owner should be shown the
   storage-growth versus permanent-audit tradeoff above; until then the safer
   no-data-loss policy remains in force.
+
+## D-2026-07-14-campaign-capacity — Engine-observed capacity and bounded media completion
+
+Detail: [DecisionDetails/D-2026-07-14-campaign-capacity.md](DecisionDetails/D-2026-07-14-campaign-capacity.md)
+
+- Decision: local sweeper submissions omit controller backlog from engine resource requests; completed-job ingest stages immutable evidence and then terminalizes, while the existing fenced media-repair queue owns expensive default-media rendering and retries. Shared `mesh_evidence` artifacts are retained as `mesh` with their original engine kind preserved in provenance.
+- Why: keeping logical campaign backlog as engine pressure serialized independent speed branches despite an idle worker; forcing parallel OpenFOAM processes or changing continuous AoA marching would broaden numerical risk. Engine queue/token observation provides the real capacity signal, while bounded post-terminal repair preserves fail-closed media truth without holding scheduler slots indefinitely.

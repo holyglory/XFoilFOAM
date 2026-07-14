@@ -1,5 +1,13 @@
 # Completion Ledger
 
+- **Campaign capacity and media finalization:** Deploy the control-plane change
+  that stops forwarding logical campaign backlog as engine pressure, terminalizes
+  completed solver jobs after immutable evidence staging, and moves costly
+  default-media work to the bounded repair queue. Verify on the VPS that the
+  stuck completed job becomes terminal, the next submitted multi-speed sweep
+  resolves against real engine capacity, and no missing URANS video is
+  published as an accepted polar point.
+
 - **A18 low-angle alternate-branch correction:** The control-plane classifier,
   cache reset, affected-cell preliminary-URANS requests, campaign-evidence
   public anchor, and accepted-only chart line gate must be deployed and

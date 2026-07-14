@@ -144,15 +144,19 @@ export function solverWorkStateForPoint(
     return "ladder";
   if (row.precalcObligationState === "blocked") return "blocked";
 
+  // A completed attempt can be temporarily pointer-null while the bounded
+  // media-repair queue reconstructs its default URANS media. The durable cell
+  // deliberately remains `failed` until that exact evidence is republished,
+  // but this is automatic output work, not a user-actionable solver block.
+  if (["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? ""))
+    return "ladder";
+  if (row.mediaRepairState === "blocked") return "blocked";
+
   if (row.status === "queued" || row.status === "running") return "solving";
   if (!row.resultId || row.status === "pending" || row.status === "stale")
     return "queued";
 
   if (row.status === "failed") return "blocked";
-
-  if (["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? ""))
-    return "ladder";
-  if (row.mediaRepairState === "blocked") return "blocked";
 
   if (row.continuable) return "needs_time";
   if (row.status === "done" && row.error) return "blocked";
