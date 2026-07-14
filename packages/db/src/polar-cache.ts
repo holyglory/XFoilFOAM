@@ -945,7 +945,14 @@ export async function refreshPolarCacheForRevision(
       airfoilId,
       simulationPresetRevisionId,
     );
-    let resultClassified = classifyPolarEvidence(resultEvidence);
+    // Result rows can assemble the current public polar from several solver
+    // jobs. The alternate low-angle branch detector is meaningful only within
+    // one immutable marched attempt group, so it runs above on attempts and is
+    // propagated through preserveSelectedAttemptDowngrades below. Keep the
+    // established composite post-stall assessment for result-level fitting.
+    let resultClassified = classifyPolarEvidence(resultEvidence, {
+      detectLowAngleAttachedBranch: false,
+    });
     preserveSelectedAttemptDowngrades(
       resultClassified.classifications,
       attemptClassificationById,
@@ -983,7 +990,9 @@ export async function refreshPolarCacheForRevision(
         airfoilId,
         simulationPresetRevisionId,
       );
-      resultClassified = classifyPolarEvidence(resultEvidence);
+      resultClassified = classifyPolarEvidence(resultEvidence, {
+        detectLowAngleAttachedBranch: false,
+      });
       preserveSelectedAttemptDowngrades(
         resultClassified.classifications,
         attemptClassificationById,

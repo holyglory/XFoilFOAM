@@ -243,6 +243,26 @@ describe("RANS→URANS retry scoping: conditional whole-polar preliminary URANS"
     expect(decision!.queueCanonicalAoas).toEqual([]);
   });
 
+  it("MUST-CATCH: low-angle alternate-branch confirmations remain exact-angle work", () => {
+    const decision = decideRansRetry({
+      scope: {
+        origin: "continuous-polar",
+        requestedAoas: [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5],
+      },
+      jobRows: [
+        { aoaDeg: -5, state: "needs_urans" },
+        { aoaDeg: -4, state: "needs_urans" },
+        { aoaDeg: -3, state: "accepted" },
+        { aoaDeg: 0, state: "accepted" },
+        { aoaDeg: 5, state: "accepted" },
+      ],
+    });
+    expect(decision).not.toBeNull();
+    expect(decision!.retryMode).toBe("needs-urans-confirmation");
+    expect(decision!.aoas).toEqual([-5, -4]);
+    expect(decision!.queueCanonicalAoas).toEqual([]);
+  });
+
   it.each(["infrastructure", "deterministic_mesh"] as const)(
     "FALSE-POSITIVE GUARD: %s rejection neither promotes nor routes to URANS",
     (failureDisposition) => {

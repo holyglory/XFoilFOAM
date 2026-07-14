@@ -86,7 +86,7 @@ describe("polar fit fine targets (spec §8)", () => {
   it("bumps POLAR_FIT_VERSION for the fine-target fields", () => {
     // v3 = alphaClmaxFine joined the metrics; existing fits refresh lazily on
     // the next ingest per revision (version participates in the cache key).
-    expect(POLAR_FIT_VERSION).toBe("evidence-lowess-v5");
+    expect(POLAR_FIT_VERSION).toBe("evidence-lowess-v6");
   });
 
   it("alphaLdmaxFine lands within 0.02° of the analytic L/D optimum", () => {

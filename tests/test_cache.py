@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from airfoilfoam import cache as cache_module
 from airfoilfoam import physics
 from airfoilfoam.airfoil import load_airfoil
 from airfoilfoam.cache import MANIFEST_NAME, EngineCache
@@ -190,7 +191,7 @@ def test_seed_key_scopes_fluid_and_speed(naca0012_selig_text):
     assert EngineCache.seed_key(mesh_key, same, 50.0) == base
 
 
-def test_solver_signature_tracks_bc_relevant_fields():
+def test_solver_signature_tracks_bc_relevant_fields(monkeypatch):
     base = EngineCache.solver_signature(SolverParams(), RoughnessParams())
     other_model = SolverParams(turbulence=TurbulenceParams(model=TurbulenceModel.spalart_allmaras))
     assert EngineCache.solver_signature(other_model, RoughnessParams()) != base
@@ -199,6 +200,10 @@ def test_solver_signature_tracks_bc_relevant_fields():
     # iteration/scheme knobs do not change the 0/ boundary conditions
     more_iters = SolverParams(n_iterations=5000, momentum_scheme="upwind")
     assert EngineCache.solver_signature(more_iters, RoughnessParams()) == base
+    # A solver-march policy change invalidates old accepted-looking fields: a
+    # cache entry can be byte-perfect yet come from the alternate A18 branch.
+    monkeypatch.setattr(cache_module, "STEADY_RANS_MARCHER_SEED_VERSION", "legacy-march")
+    assert EngineCache.solver_signature(SolverParams(), RoughnessParams()) != base
 
 
 # --------------------------------------------------------------------------- #
@@ -352,6 +357,49 @@ def test_seed_apply_misses_beyond_two_degrees(tmp_path, naca0012_selig_text):
         case_dir, af, 1.0, resolved, spec, FLUID, RoughnessParams(), SolverParams(), runner, cache
     )
     assert (case_dir / "0" / "U").read_text() == "builder U\n"
+    assert runner.commands == []
+
+
+def test_negative_steady_seed_is_not_published_or_consumed(tmp_path, naca0012_selig_text):
+    """MUST-CATCH A18: a numerically accepted negative branch is not reusable."""
+    af = _airfoil(naca0012_selig_text)
+    resolved = _resolved()
+    cache = _cache(tmp_path)
+    donor = tmp_path / "negative-donor"
+    donor_time = _fake_time_dir(donor)
+    negative_spec = CaseSpec(chord=1.0, speed=50.0, aoa_deg=-1.0)
+
+    # Production code refuses to admit the negative state at all.
+    _publish_steady_seed(
+        cache, donor, af, 1.0, resolved, negative_spec, FLUID, RoughnessParams(), SolverParams()
+    )
+    mesh_key = EngineCache.mesh_key(af, 1.0, resolved)
+    seed_key = EngineCache.seed_key(mesh_key, FLUID, 50.0)
+    signature = EngineCache.solver_signature(SolverParams(), RoughnessParams())
+    assert cache.find_seed(seed_key, -1.0, signature) is None
+
+    # Defensive read-side gate: even a manually retained/current-signature
+    # negative entry must not be consumed by a fresh case.
+    assert cache.publish_seed(
+        seed_key, -1.0, signature, donor_time, solver="simpleFoam", speed=50.0, fluid=FLUID
+    )
+    runner = FakeRunner()
+    target = tmp_path / "target"
+    (target / "0").mkdir(parents=True)
+    (target / "0" / "U").write_text("cold field\n")
+    assert not _try_seed_initial_field(
+        target,
+        af,
+        1.0,
+        resolved,
+        CaseSpec(chord=1.0, speed=50.0, aoa_deg=-1.0),
+        FLUID,
+        RoughnessParams(),
+        SolverParams(),
+        runner,
+        cache,
+    )
+    assert (target / "0" / "U").read_text() == "cold field\n"
     assert runner.commands == []
 
 

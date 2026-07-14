@@ -46,6 +46,12 @@ MESH_EVIDENCE_PAYLOAD_DIR = "meshEvidence"
 SEED_PAYLOAD_DIR = "fields"
 _STALE_TMP_AGE_S = 24 * 3600
 
+# A steady seed is only compatible with the marcher that produced it.  Version
+# this independently from mesh topology: an older seed may be byte-perfect yet
+# encode the alternate low-negative-angle branch that the zero-anchored
+# marcher deliberately avoids.
+STEADY_RANS_MARCHER_SEED_VERSION = "zero-anchored-v1"
+
 
 def _canon(value: float) -> str:
     """Canonical text form of a float (stable across trailing-zero variants)."""
@@ -147,9 +153,10 @@ class EngineCache:
 
     @staticmethod
     def solver_signature(solver_params: SolverParams, roughness: RoughnessParams) -> str:
-        """Fields whose 0/-file boundary conditions must match between donor and case."""
+        """Fields and marching policy that must match between donor and case."""
         payload = json.dumps(
             {
+                "steadyRansMarcher": STEADY_RANS_MARCHER_SEED_VERSION,
                 "turbulence": {
                     "model": solver_params.turbulence.model.value,
                     "intensity": _canon(solver_params.turbulence.intensity),

@@ -1,5 +1,44 @@
 # Decision History
 
+## 2026-07-14 — Low-angle alternate RANS branches receive targeted preliminary URANS
+
+- Trigger and evidence: the owner reported that the A18 (smoothed) public
+  polar showed positive lift at −5°/−4° while the adjacent −3°/−2° branch was
+  strongly negative. Immutable production force histories confirmed a
+  cold-start/warm-march alternate steady-RANS branch at Re≈102k and Re≈307k;
+  the identical mesh, force-direction checks, and smooth Re≈566k branch rule
+  out a chart sign error, geometry substitution, or an angle-specific mesh
+  swap.
+- Options considered: leave apparently converged RANS rows published until a
+  person notices them (not acceptable: it exposes an incoherent polar);
+  promote every low-angle anomaly to a full-polar URANS sweep (not authorized
+  by the existing 0°–5° hard-failure policy and spends unnecessary transient
+  work); or identify only a high-confidence alternate attached-flow branch
+  and request preliminary URANS for its exact affected cells. The owner asked
+  to apply the correction, so the third option is the implementation decision.
+- Rule and boundaries: only an accepted RANS run from −6° to <0° can be
+  downgraded when a linear, positive-slope 0°–5° attached baseline has at
+  least four stable samples, the run has a large same-sign baseline residual,
+  and its right edge makes a large opposite-direction jump to a coherent
+  adjacent point. The exact run becomes `needs_urans`; no coefficients are
+  synthesized, no RANS evidence is deleted, and `lowAoaFailure`/the
+  whole-polar 0°–5° policy is unchanged. Classification remains scoped to the
+  producing solver job; a mixed public result lane cannot create this verdict.
+- Operations: historic A18 rows require a normal polar-cache reclassification
+  followed by the supported exact-angle preliminary-URANS requests. They
+  retain the existing campaign RANS priority gate: this decision does not
+  authorize a new global or targeted priority bypass.
+- Engine corrective control: primary steady RANS sweeps that contain 0° now
+  run from that attached-flow anchor toward positive AoA, then restore the
+  immutable-in-job 0° fields before marching outward through negative AoA.
+  Every accepted steady point gets a private latest-field/dictionary checkpoint;
+  a rejected point restores the last accepted checkpoint and never becomes a
+  warm-start donor. The cross-job seed signature includes this marcher policy,
+  invalidating prior seed entries, and negative steady states are neither
+  admitted to nor read from the shared seed cache. This preserves mesh reuse
+  and normal positive-branch cache performance while keeping unverified
+  low-negative branches local until evidence classification.
+
 ## 2026-07-13 — Campaign lifecycle status carries real provenance and direct recovery
 
 - Trigger and owner context: the admin hub showed `solver · running · 0 jobs`,

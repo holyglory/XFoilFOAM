@@ -1379,6 +1379,208 @@ describe("revision polar cache transaction boundary", () => {
     }
   }, 60_000);
 
+  it("propagates a job-scoped low-angle alternate-branch verdict to only its selected A18-like cells", async () => {
+    const branchEngineJobId = `${PREFIX}-a18-branch-march`;
+    const branchValues = new Map<number, number>([
+      [-5, 0.25],
+      [-4, 0.24],
+      [-3, -0.3],
+      [-2, -0.2],
+      [-1, -0.1],
+      [0, 0],
+      [1, 0.1],
+      [2, 0.2],
+      [3, 0.3],
+      [4, 0.4],
+      [5, 0.5],
+    ]);
+    const angles = [...branchValues.keys()];
+    const existing = await db
+      .select({
+        id: results.id,
+        aoaDeg: results.aoaDeg,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, airfoilId),
+          eq(results.simulationPresetRevisionId, revisionId),
+          inArray(results.aoaDeg, angles),
+        ),
+      );
+    const resultByAoa = new Map(existing.map((row) => [row.aoaDeg, row]));
+    const createdResultIds: string[] = [];
+    for (const aoaDeg of angles) {
+      if (resultByAoa.has(aoaDeg)) continue;
+      const cl = branchValues.get(aoaDeg)!;
+      const [created] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          fidelity: "rans",
+          cl,
+          cd: 0.02,
+          cm: -0.05,
+          clCd: cl / 0.02,
+          converged: true,
+          stalled: false,
+          solvedAt: new Date(),
+        })
+        .returning({ id: results.id, aoaDeg: results.aoaDeg });
+      resultByAoa.set(created.aoaDeg, {
+        ...created,
+        currentResultAttemptId: null,
+      });
+      createdResultIds.push(created.id);
+    }
+
+    const branchAttempts = await db
+      .insert(resultAttempts)
+      .values(
+        angles.map((aoaDeg) => {
+          const cl = branchValues.get(aoaDeg)!;
+          return {
+            resultId: resultByAoa.get(aoaDeg)!.id,
+            airfoilId,
+            bcId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg,
+            engineJobId: branchEngineJobId,
+            engineCaseSlug: `a${aoaDeg}`,
+            status: "done" as const,
+            source: "solved" as const,
+            regime: "rans" as const,
+            validForPolar: true,
+            cl,
+            cd: 0.02,
+            cm: -0.05,
+            clCd: cl / 0.02,
+            converged: true,
+            stalled: false,
+            evidencePayload: { fidelity: "rans" },
+            solvedAt: new Date(),
+          };
+        }),
+      )
+      .returning({
+        id: resultAttempts.id,
+        resultId: resultAttempts.resultId,
+        aoaDeg: resultAttempts.aoaDeg,
+      });
+    const attemptByAoa = new Map(
+      branchAttempts.map((attempt) => [attempt.aoaDeg, attempt]),
+    );
+    await db.insert(solverEvidenceArtifacts).values(
+      branchAttempts.map((attempt) => ({
+        resultId: attempt.resultId,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        engineJobId: branchEngineJobId,
+        engineCaseSlug: `a${attempt.aoaDeg}`,
+        aoaDeg: attempt.aoaDeg,
+        kind: "manifest" as const,
+        storageKey: `${PREFIX}/a18-branch/${attempt.aoaDeg}/manifest.json`,
+        mimeType: "application/json",
+        sha256: `${Math.round(attempt.aoaDeg + 10)}`.padStart(64, "b"),
+        byteSize: 128,
+      })),
+    );
+
+    try {
+      await Promise.all(
+        angles.map((aoaDeg) =>
+          db
+            .update(results)
+            .set({ currentResultAttemptId: attemptByAoa.get(aoaDeg)!.id })
+            .where(eq(results.id, resultByAoa.get(aoaDeg)!.id)),
+        ),
+      );
+
+      const refreshed = await refreshPolarCacheForRevision(
+        db,
+        airfoilId,
+        revisionId,
+      );
+      expect(refreshed.lowAoaFailure).toBe(false);
+      expect(refreshed.needsUransAoas).toEqual([-5, -4]);
+
+      const verdicts = await db
+        .select({
+          aoaDeg: results.aoaDeg,
+          state: resultClassifications.state,
+          reasons: resultClassifications.reasons,
+        })
+        .from(results)
+        .innerJoin(
+          resultClassifications,
+          eq(resultClassifications.resultId, results.id),
+        )
+        .where(
+          inArray(
+            results.id,
+            angles.map((aoaDeg) => resultByAoa.get(aoaDeg)!.id),
+          ),
+        );
+      const verdictByAoa = new Map(verdicts.map((row) => [row.aoaDeg, row]));
+      expect(verdictByAoa.get(-5)?.state).toBe("needs_urans");
+      expect(verdictByAoa.get(-4)?.state).toBe("needs_urans");
+      expect(verdictByAoa.get(-4)?.reasons).toContain(
+        "low-aoa-attached-branch-discontinuity",
+      );
+      expect(verdictByAoa.get(-3)?.state).toBe("accepted");
+      expect(verdictByAoa.get(5)?.state).toBe("accepted");
+    } finally {
+      await Promise.all(
+        existing.map((row) =>
+          db
+            .update(results)
+            .set({ currentResultAttemptId: row.currentResultAttemptId })
+            .where(eq(results.id, row.id)),
+        ),
+      );
+      if (createdResultIds.length) {
+        await db
+          .update(results)
+          .set({ currentResultAttemptId: null })
+          .where(inArray(results.id, createdResultIds));
+      }
+      await db.delete(resultClassifications).where(
+        inArray(
+          resultClassifications.resultAttemptId,
+          branchAttempts.map((attempt) => attempt.id),
+        ),
+      );
+      if (createdResultIds.length) {
+        await db
+          .delete(resultClassifications)
+          .where(inArray(resultClassifications.resultId, createdResultIds));
+      }
+      await db.delete(solverEvidenceArtifacts).where(
+        inArray(
+          solverEvidenceArtifacts.resultAttemptId,
+          branchAttempts.map((attempt) => attempt.id),
+        ),
+      );
+      await db.delete(resultAttempts).where(
+        inArray(
+          resultAttempts.id,
+          branchAttempts.map((attempt) => attempt.id),
+        ),
+      );
+      if (createdResultIds.length) {
+        await db.delete(results).where(inArray(results.id, createdResultIds));
+      }
+      await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+    }
+  }, 60_000);
+
   it("supersedes only historical precalc when selected full URANS is accepted", async () => {
     const aoaDeg = 10;
     const force = {

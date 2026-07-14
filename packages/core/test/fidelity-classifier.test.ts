@@ -1,4 +1,4 @@
-// Fidelity-ladder classifier gates (POLAR_CLASSIFIER_VERSION fidelity-ladder-v5):
+// Fidelity-ladder classifier gates (POLAR_CLASSIFIER_VERSION fidelity-ladder-v6):
 //   1. FIDELITY-AWARE frame-track period bar — urans_precalc accepts at >= 3
 //      retained periods, urans_full / legacy keeps the strict >= 5 bar.
 //   2. Oscillating-steady acceptance — a STEADY row with converged=false but
@@ -78,9 +78,9 @@ const oscillatingSteadyRow: PolarEvidencePoint = {
   steadyHistory,
 };
 
-describe("fidelity-aware frame-track period bar (v5)", () => {
+describe("fidelity-aware frame-track period bar (v6)", () => {
   it("pins the version stamp and the per-tier bars", () => {
-    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v5");
+    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v6");
     expect(FRAME_TRACK_MIN_PERIODS_PRECALC).toBe(3);
     expect(FRAME_TRACK_MIN_PERIODS_FULL).toBe(5);
     expect(FRAME_TRACK_MIN_PERIODS).toBe(FRAME_TRACK_MIN_PERIODS_FULL);

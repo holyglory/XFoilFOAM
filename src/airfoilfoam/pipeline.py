@@ -4650,6 +4650,18 @@ def _try_seed_initial_field(
         )
         if hit is None:
             return False
+        if hit.aoa_deg < 0:
+            # A negative steady point can sit on an alternate branch even when
+            # it passed a local residual gate.  Only the in-polar zero-anchored
+            # marcher may carry fields toward negative AoA; shared cache seeds
+            # deliberately start from 0/positive attached-flow evidence.
+            logger.info(
+                "seed cache skip key=%s aoa=%g negative donor=%g",
+                seed_key,
+                spec.aoa_deg,
+                hit.aoa_deg,
+            )
+            return False
         if stage.exists():
             shutil.rmtree(stage)
         copied = cache.materialize_seed(hit, stage)
@@ -4682,6 +4694,12 @@ def _publish_steady_seed(
     """Publish the latest-time fields of an ACCEPTED steady solve so later jobs
     at the same (mesh, fluid, speed) can seed nearby angles from them."""
     if cache is None:
+        return
+    if spec.aoa_deg < 0:
+        # Never make an unverified negative branch a cross-job initial state.
+        # The primary polar marcher has its own retained 0-degree anchor for
+        # negative AoA continuation; direct/single-angle work starts cold or
+        # from a non-negative cache donor instead.
         return
     try:
         lt_dir = _latest_time_dir(case_dir)
@@ -4757,6 +4775,138 @@ def _solve_warm(polar_dir, spec, solver_params, runner, solver_timeout, n_proc=1
     res = runner.solver(polar_dir, "simpleFoam", n_proc, timeout=solver_timeout)
     _check_cancel(cancel_check)
     return res
+
+
+_STEADY_MARCH_STATE_DIR = ".steady-march-state"
+
+
+def _primary_rans_march_plan(sorted_aoas: list[float]) -> list[tuple[int, float]]:
+    """Return the execution order for a primary steady polar.
+
+    A polar containing 0° starts on the attached-flow anchor, moves upward,
+    then restores that anchor before moving down through negative angles.  The
+    tuple retains the *sorted-request* index, so output/evidence names remain
+    stable even though execution is intentionally not monotonic in AoA.
+
+    Sweeps without an exact 0° retain their requested ascending order: there
+    is no physical anchor from which to safely split the branches.
+    """
+    indexed = list(enumerate(sorted_aoas))
+    zeroes = [(i, aoa) for i, aoa in indexed if aoa == 0.0]
+    if not zeroes:
+        return indexed
+    positive = [(i, aoa) for i, aoa in indexed if aoa > 0.0]
+    negative = [(i, aoa) for i, aoa in indexed if aoa < 0.0]
+    return [*zeroes, *positive, *reversed(negative)]
+
+
+def _clear_steady_march_working_state(polar_dir: Path) -> None:
+    """Drop mutable solver state before a safe cold restart of one march.
+
+    Per-AoA evidence lives under ``a*/`` and has already been archived before
+    this is called.  Only numeric time directories, decomposed processor
+    directories, and mutable post-processing output are removed.
+    """
+    if not polar_dir.exists():
+        return
+    for child in polar_dir.iterdir():
+        numeric = False
+        try:
+            float(child.name)
+            numeric = True
+        except ValueError:
+            pass
+        if numeric or (child.is_dir() and re.fullmatch(r"processor\d+", child.name)):
+            shutil.rmtree(child, ignore_errors=True)
+    for name in ("postProcessing", "VTK", "_seed_stage"):
+        path = polar_dir / name
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink(missing_ok=True)
+    clear_march_markers(polar_dir)
+
+
+def _snapshot_steady_march_state(polar_dir: Path, name: str) -> Optional[Path]:
+    """Copy the latest accepted field for safe continuation or branch reset.
+
+    The copy is ephemeral and removed when the polar exits.  If it cannot be
+    retained, the caller cold-starts rather than carrying a rejected or
+    opposite-branch field into the next solve.
+    """
+    latest = _latest_time_dir(polar_dir)
+    if latest is None or float(latest.name) <= 0:
+        logger.warning("cannot checkpoint steady march state in %s: no solved field", polar_dir)
+        return None
+    root = polar_dir / _STEADY_MARCH_STATE_DIR
+    checkpoint = root / name
+    stage = root / f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.copytree(latest, stage / latest.name)
+        # A cold retry may have switched the mutable dictionaries to its
+        # first-order fallback.  Keep the accepted dictionaries with the
+        # fields so a later warm continuation cannot inherit that rejected
+        # numerical branch.  The shared mesh lives under constant/polyMesh and
+        # is deliberately not copied here.
+        system = polar_dir / "system"
+        if system.is_dir():
+            shutil.copytree(system, stage / "system")
+        if checkpoint.exists():
+            shutil.rmtree(checkpoint)
+        os.replace(stage, checkpoint)
+        return checkpoint
+    except OSError as exc:
+        logger.warning("failed to checkpoint steady march state in %s: %s", polar_dir, exc)
+        shutil.rmtree(stage, ignore_errors=True)
+        return None
+
+
+def _restore_steady_march_state(polar_dir: Path, checkpoint: Path) -> bool:
+    """Restore an ephemeral accepted-field checkpoint for the next branch."""
+    try:
+        fields = [
+            child
+            for child in checkpoint.iterdir()
+            if child.is_dir() and _is_numeric_time_dir(child)
+        ]
+        checkpoint_system = checkpoint / "system"
+        if not fields or not checkpoint_system.is_dir():
+            return False
+        _clear_steady_march_working_state(polar_dir)
+        destination_system = polar_dir / "system"
+        if destination_system.is_dir():
+            shutil.rmtree(destination_system)
+        elif destination_system.exists():
+            destination_system.unlink()
+        shutil.copytree(checkpoint_system, destination_system)
+        for source in fields:
+            shutil.copytree(source, polar_dir / source.name)
+        return True
+    except OSError as exc:
+        logger.warning("failed to restore steady march checkpoint %s: %s", checkpoint, exc)
+        return False
+
+
+def _is_numeric_time_dir(path: Path) -> bool:
+    try:
+        float(path.name)
+        return path.is_dir()
+    except ValueError:
+        return False
+
+
+def _unattempted_march_aoas(sorted_aoas: list[float], attempts: list[StoredCaseOutcome]) -> list[float]:
+    """Original requested values that were not attempted, preserving duplicates."""
+    remaining = list(sorted_aoas)
+    for item in attempts:
+        try:
+            remaining.remove(item.outcome.spec.aoa_deg)
+        except ValueError:
+            # Defensive only: attempts are constructed from this exact plan.
+            logger.warning("march attempt AoA %g was not in requested scope", item.outcome.spec.aoa_deg)
+    return remaining
 
 
 RANS_CORE_ABORT_AOA_MIN = 0.0
@@ -4890,7 +5040,12 @@ def solve_polar_marched(
     mesh_quality_warnings: Optional[list[str]] = None,
 ) -> PolarMarchResult:
     """Run one polar (fixed chord+speed) over the AoA sweep, reusing ``mesh_dir``
-    and warm-starting each AoA from the previous converged field (marching).
+    and warm-starting each AoA from an accepted field (marching).
+
+    Primary steady RANS sweeps that include 0° are deliberately zero-anchored:
+    they solve 0° upward, then restore the accepted 0° field before proceeding
+    outward through negative AoA.  That prevents a cold low-negative solution
+    branch from becoming the initial state for the entire attached range.
     Returns final accepted points plus any rejected RANS attempts."""
     polar_dir.mkdir(parents=True, exist_ok=True)
     patches = mesher.patches(resolved)
@@ -4907,153 +5062,219 @@ def solve_polar_marched(
         # stages only (see _steady_rans_params — 2026-07-07 gate incident:
         # profile n_iterations=3000 ran with controlDict endTime 600).
     steady_timeout = solver_timeout if solver_params.force_transient else min(solver_timeout, rans_solver_timeout or solver_timeout)
-    for i, aoa in enumerate(sorted_aoas):
-        _check_cancel(cancel_check)
-        spec = CaseSpec(chord=chord, speed=speed, aoa_deg=aoa)
-        if phase_progress:
-            phase_progress(
-                JobPhase.solving_urans if solver_params.force_transient else JobPhase.solving_rans,
-                aoa,
-                f"{polar_dir.name}/a{i}",
-                "pimpleFoam" if solver_params.force_transient else "simpleFoam",
-            )
-        outcome = CaseOutcome(
-            spec=spec, reynolds=physics.reynolds(speed, chord, fluid.nu), n_cells=n_cells
-        )
-        if mesh_quality_warnings:
-            outcome.quality_warnings.extend(mesh_quality_warnings)
-        try:
-            if i == 0:
-                res = _solve_cold_marched(
-                    polar_dir, mesh_dir, airfoil, patches, resolved, spec, fluid, roughness,
-                    rans_solver, runner, steady_timeout, outcome, n_proc=n_proc,
-                    cancel_check=cancel_check, cache=cache,
-                )
-            else:
-                res = _solve_warm(
-                    polar_dir, spec, rans_solver, runner, steady_timeout, n_proc=n_proc,
-                    cancel_check=cancel_check,
-                )
+    primary_steady_rans = not solver_params.force_transient
+    execution_plan = (
+        _primary_rans_march_plan(sorted_aoas)
+        if primary_steady_rans
+        else list(enumerate(sorted_aoas))
+    )
+    zero_anchored = primary_steady_rans and any(aoa == 0.0 for aoa in sorted_aoas)
+    zero_checkpoint: Optional[Path] = None
+    last_accepted_checkpoint: Optional[Path] = None
+    live_steady_state_accepted = False
+    previous_execution_aoa: Optional[float] = None
+
+    try:
+        for execution_index, (case_index, aoa) in enumerate(execution_plan):
             _check_cancel(cancel_check)
-            log = _checked_solver_result(polar_dir, res).stdout
-            (polar_dir / f"log.a{i}").write_text(log)
-            conv = parse_convergence(log)
-            outcome.converged = conv.converged
-            # iterations relative to this segment (a warm continuation reports the
-            # absolute time, so count the timesteps actually taken instead)
-            outcome.iterations = log.count("\nTime = ") or conv.iterations
-            outcome.final_residual = conv.final_residual
-            _finalize_outcome(
-                polar_dir, outcome, airfoil, resolved, spec, fluid, roughness, rans_solver,
-                runner, n_proc, render_images, solver_timeout,
-                transient_subdir=f"transient_a{i}", image_subdir=f"a{i}", shared_mesh_dir=mesh_dir,
-                cancel_check=cancel_check,
-                phase_progress=phase_progress,
-                case_slug=f"{polar_dir.name}/a{i}",
-                media_budget_s=media_budget_s,
+            spec = CaseSpec(chord=chord, speed=speed, aoa_deg=aoa)
+            if phase_progress:
+                phase_progress(
+                    JobPhase.solving_urans if solver_params.force_transient else JobPhase.solving_rans,
+                    aoa,
+                    f"{polar_dir.name}/a{case_index}",
+                    "pimpleFoam" if solver_params.force_transient else "simpleFoam",
+                )
+            outcome = CaseOutcome(
+                spec=spec, reynolds=physics.reynolds(speed, chord, fluid.nu), n_cells=n_cells
             )
-        except JobCancelled:
-            raise
-        except (OpenFOAMError, Exception) as exc:  # noqa: BLE001
-            _record_outcome_failure(outcome, exc)
-        _record_unexceptional_rans_rejection(outcome)
-        stored = StoredCaseOutcome(slug=polar_dir.name, outcome=outcome)
-        attempts.append(stored)
-        if outcome_progress:
-            outcome_progress(stored, False)
-        if progress:
-            progress()
-        _check_cancel(cancel_check)
-        # The policy separates the numerical decision from execution ownership:
-        # Node-managed production sweeps stop immediately and emit a typed
-        # external-PRECALC signal; direct multi-angle API sweeps may replace
-        # in-job, but only at preliminary fidelity. Explicit targeted work uses
-        # `continue` and never widens. Infrastructure/mesh errors cannot reach
-        # this block because the predicate requires hard_solver provenance.
-        qualifying_core_failure = (
-            not solver_params.force_transient
-            and should_abort_rans_sweep_for_urans(aoa, outcome)
-        )
-        if (
-            qualifying_core_failure
-            and solver_params.rans_failure_policy == RansFailurePolicy.abort_for_precalc
-        ):
-            reason = (
-                f"RANS rejected at {aoa:g} deg inside the {RANS_CORE_ABORT_AOA_MIN:g}-"
-                f"{RANS_CORE_ABORT_AOA_MAX:g} deg attached-range check; remaining RANS stopped "
-                "for external preliminary URANS."
+            if mesh_quality_warnings:
+                outcome.quality_warnings.extend(mesh_quality_warnings)
+
+            # A rejected steady solve leaves its mutable latestTime unsuitable
+            # for the next angle.  Restore only a private copy of the most
+            # recent accepted fields (or cold-start if that copy is unavailable)
+            # instead of ever calling _solve_warm on rejected state.
+            use_cold_start = execution_index == 0
+            if primary_steady_rans:
+                entering_negative_branch = (
+                    zero_anchored
+                    and aoa < 0.0
+                    and (previous_execution_aoa is None or previous_execution_aoa >= 0.0)
+                )
+                if entering_negative_branch:
+                    restored = (
+                        zero_checkpoint is not None
+                        and _restore_steady_march_state(polar_dir, zero_checkpoint)
+                    )
+                    if restored:
+                        live_steady_state_accepted = True
+                        last_accepted_checkpoint = zero_checkpoint
+                    else:
+                        _clear_steady_march_working_state(polar_dir)
+                        live_steady_state_accepted = False
+                elif not live_steady_state_accepted:
+                    restored = (
+                        last_accepted_checkpoint is not None
+                        and _restore_steady_march_state(polar_dir, last_accepted_checkpoint)
+                    )
+                    if restored:
+                        live_steady_state_accepted = True
+                    else:
+                        _clear_steady_march_working_state(polar_dir)
+                use_cold_start = not live_steady_state_accepted
+
+            try:
+                if use_cold_start:
+                    res = _solve_cold_marched(
+                        polar_dir, mesh_dir, airfoil, patches, resolved, spec, fluid, roughness,
+                        rans_solver, runner, steady_timeout, outcome, n_proc=n_proc,
+                        cancel_check=cancel_check, cache=cache,
+                    )
+                else:
+                    res = _solve_warm(
+                        polar_dir, spec, rans_solver, runner, steady_timeout, n_proc=n_proc,
+                        cancel_check=cancel_check,
+                    )
+                _check_cancel(cancel_check)
+                log = _checked_solver_result(polar_dir, res).stdout
+                (polar_dir / f"log.a{case_index}").write_text(log)
+                conv = parse_convergence(log)
+                outcome.converged = conv.converged
+                # iterations relative to this segment (a warm continuation reports the
+                # absolute time, so count the timesteps actually taken instead)
+                outcome.iterations = log.count("\nTime = ") or conv.iterations
+                outcome.final_residual = conv.final_residual
+                _finalize_outcome(
+                    polar_dir, outcome, airfoil, resolved, spec, fluid, roughness, rans_solver,
+                    runner, n_proc, render_images, solver_timeout,
+                    transient_subdir=f"transient_a{case_index}", image_subdir=f"a{case_index}", shared_mesh_dir=mesh_dir,
+                    cancel_check=cancel_check,
+                    phase_progress=phase_progress,
+                    case_slug=f"{polar_dir.name}/a{case_index}",
+                    media_budget_s=media_budget_s,
+                )
+            except JobCancelled:
+                raise
+            except (OpenFOAMError, Exception) as exc:  # noqa: BLE001
+                _record_outcome_failure(outcome, exc)
+            _record_unexceptional_rans_rejection(outcome)
+            stored = StoredCaseOutcome(slug=polar_dir.name, outcome=outcome)
+            attempts.append(stored)
+            if outcome_progress:
+                outcome_progress(stored, False)
+            if progress:
+                progress()
+            _check_cancel(cancel_check)
+            previous_execution_aoa = aoa
+            # The policy separates the numerical decision from execution ownership:
+            # Node-managed production sweeps stop immediately and emit a typed
+            # external-PRECALC signal; direct multi-angle API sweeps may replace
+            # in-job, but only at preliminary fidelity. Explicit targeted work uses
+            # `continue` and never widens. Infrastructure/mesh errors cannot reach
+            # this block because the predicate requires hard_solver provenance.
+            qualifying_core_failure = (
+                primary_steady_rans
+                and should_abort_rans_sweep_for_urans(aoa, outcome)
             )
-            return PolarMarchResult(
-                points=final_points,
-                attempts=attempts,
-                promoted_to_urans=False,
-                abort_reason=reason,
-                precalc_promotion=RansPrecalcPromotion(
-                    trigger_aoa_deg=aoa,
-                    attempted_aoas=[item.outcome.spec.aoa_deg for item in attempts],
-                    intentionally_omitted_aoas=sorted_aoas[i + 1 :],
-                ),
-            )
-        if (
-            qualifying_core_failure
-            and solver_params.rans_failure_policy == RansFailurePolicy.replace_precalc
-            and solver_params.transient_fallback
-            and len(sorted_aoas) > 1
-        ):
-            reason = (
-                f"RANS rejected at {aoa:g} deg inside the {RANS_CORE_ABORT_AOA_MIN:g}-"
-                f"{RANS_CORE_ABORT_AOA_MAX:g} deg attached-range check; switching the whole polar to URANS."
-            )
-            remaining_progress = max(0, len(sorted_aoas) - len(attempts))
-            urans_points = _run_full_urans_replacement(
-                polar_dir,
-                mesh_dir,
-                airfoil,
-                chord,
-                speed,
-                fluid,
-                roughness,
-                resolved,
-                solver_params,
-                mesher,
-                runner,
-                sorted_aoas,
-                n_cells=n_cells,
-                n_proc=n_proc,
-                render_images=render_images,
-                solver_timeout=solver_timeout,
-                progress=progress,
-                phase_progress=phase_progress,
-                outcome_progress=outcome_progress,
-                progress_budget=remaining_progress,
-                cancel_check=cancel_check,
-                media_budget_s=media_budget_s,
-                mesh_quality_warnings=mesh_quality_warnings,
-            )
-            return PolarMarchResult(
-                points=urans_points,
-                attempts=attempts,
-                promoted_to_urans=True,
-                abort_reason=reason,
-            )
-        if not solver_params.force_transient and rans_outcome_rejected_for_polar(outcome):
-            if not steady_outcome_shippable(outcome):
-                # True crash (error set / no force data at all): evidence-only
-                # attempt; the point is honestly ABSENT from the polar.
+            if (
+                qualifying_core_failure
+                and solver_params.rans_failure_policy == RansFailurePolicy.abort_for_precalc
+            ):
+                reason = (
+                    f"RANS rejected at {aoa:g} deg inside the {RANS_CORE_ABORT_AOA_MIN:g}-"
+                    f"{RANS_CORE_ABORT_AOA_MAX:g} deg attached-range check; remaining RANS stopped "
+                    "for external preliminary URANS."
+                )
+                return PolarMarchResult(
+                    points=sorted(final_points, key=lambda item: item.outcome.spec.aoa_deg),
+                    attempts=attempts,
+                    promoted_to_urans=False,
+                    abort_reason=reason,
+                    precalc_promotion=RansPrecalcPromotion(
+                        trigger_aoa_deg=aoa,
+                        attempted_aoas=[item.outcome.spec.aoa_deg for item in attempts],
+                        intentionally_omitted_aoas=_unattempted_march_aoas(sorted_aoas, attempts),
+                    ),
+                )
+            if (
+                qualifying_core_failure
+                and solver_params.rans_failure_policy == RansFailurePolicy.replace_precalc
+                and solver_params.transient_fallback
+                and len(sorted_aoas) > 1
+            ):
+                reason = (
+                    f"RANS rejected at {aoa:g} deg inside the {RANS_CORE_ABORT_AOA_MIN:g}-"
+                    f"{RANS_CORE_ABORT_AOA_MAX:g} deg attached-range check; switching the whole polar to URANS."
+                )
+                remaining_progress = max(0, len(sorted_aoas) - len(attempts))
+                # The transient replacement does not need the private RANS
+                # branch checkpoint, and it must not archive it as evidence.
+                shutil.rmtree(polar_dir / _STEADY_MARCH_STATE_DIR, ignore_errors=True)
+                urans_points = _run_full_urans_replacement(
+                    polar_dir,
+                    mesh_dir,
+                    airfoil,
+                    chord,
+                    speed,
+                    fluid,
+                    roughness,
+                    resolved,
+                    solver_params,
+                    mesher,
+                    runner,
+                    sorted_aoas,
+                    n_cells=n_cells,
+                    n_proc=n_proc,
+                    render_images=render_images,
+                    solver_timeout=solver_timeout,
+                    progress=progress,
+                    phase_progress=phase_progress,
+                    outcome_progress=outcome_progress,
+                    progress_budget=remaining_progress,
+                    cancel_check=cancel_check,
+                    media_budget_s=media_budget_s,
+                    mesh_quality_warnings=mesh_quality_warnings,
+                )
+                return PolarMarchResult(
+                    points=urans_points,
+                    attempts=attempts,
+                    promoted_to_urans=True,
+                    abort_reason=reason,
+                )
+            if primary_steady_rans and rans_outcome_rejected_for_polar(outcome):
+                live_steady_state_accepted = False
+                if not steady_outcome_shippable(outcome):
+                    # True crash (error set / no force data at all): evidence-only
+                    # attempt; the point is honestly ABSENT from the polar.
+                    continue
+                # HONEST NON-CONVERGED (or otherwise rejected-with-data) POINT:
+                # ship it with converged=false so the node-side ladder classifier
+                # can reject + escalate. It never publishes a warm-start seed.
+                final_points.append(stored)
+                if outcome_progress:
+                    outcome_progress(stored, True)
                 continue
-            # HONEST NON-CONVERGED (or otherwise rejected-with-data) POINT:
-            # ship it with converged=false so the node-side ladder classifier
-            # can reject + escalate. It never publishes a warm-start seed.
+            if primary_steady_rans:
+                live_steady_state_accepted = True
+                if zero_anchored and aoa == 0.0:
+                    zero_checkpoint = _snapshot_steady_march_state(polar_dir, "zero")
+                    last_accepted_checkpoint = zero_checkpoint
+                else:
+                    last_accepted_checkpoint = _snapshot_steady_march_state(polar_dir, "last")
+                if aoa >= 0.0:
+                    # Accepted non-negative steady points may seed later jobs;
+                    # negative points stay in-polar until their branch is
+                    # validated by the normal evidence classifier.
+                    _publish_steady_seed(
+                        cache, polar_dir, airfoil, chord, resolved, spec, fluid, roughness, rans_solver,
+                    )
             final_points.append(stored)
             if outcome_progress:
                 outcome_progress(stored, True)
-            continue
-        if not solver_params.force_transient:
-            # Accepted steady point: its converged field becomes a cross-job seed.
-            _publish_steady_seed(
-                cache, polar_dir, airfoil, chord, resolved, spec, fluid, roughness, rans_solver,
-            )
-        final_points.append(stored)
-        if outcome_progress:
-            outcome_progress(stored, True)
-    return PolarMarchResult(points=final_points, attempts=attempts)
+        return PolarMarchResult(
+            points=sorted(final_points, key=lambda item: item.outcome.spec.aoa_deg),
+            attempts=attempts,
+        )
+    finally:
+        shutil.rmtree(polar_dir / _STEADY_MARCH_STATE_DIR, ignore_errors=True)

@@ -196,6 +196,28 @@ describe("polar chart evidence gating", () => {
 });
 
 describe("RANS stall classification and fitted polar", () => {
+  const steadyRans = (
+    a: number,
+    cl: number,
+    opts: {
+      cd?: number;
+      converged?: boolean;
+      stalled?: boolean;
+      failureDisposition?: "none" | "hard_solver";
+    } = {},
+  ) => ({
+    a,
+    cl,
+    cd: opts.cd ?? 0.02,
+    cm: -0.05,
+    status: "done",
+    source: "solved",
+    regime: "rans" as const,
+    converged: opts.converged ?? true,
+    stalled: opts.stalled ?? false,
+    failureDisposition: opts.failureDisposition ?? "none",
+  });
+
   const ag24Like = [
     [-7, -0.45, 0.02],
     [-6, -0.34, 0.017],
@@ -290,6 +312,127 @@ describe("RANS stall classification and fitted polar", () => {
     expect(finalFit.provisionalPointCount).toBe(0);
     expect(finalFit.points.every((p) => p.a < 14)).toBe(true);
   });
+
+  it("MUST-CATCH: routes the A18 Re102k alternate −5°/−4° branch to targeted URANS", () => {
+    const classified = classifyPolarEvidence([
+      steadyRans(-5, 0.2561),
+      steadyRans(-4, 0.2409),
+      steadyRans(-3, -0.4145, {
+        converged: false,
+        stalled: true,
+        failureDisposition: "hard_solver",
+      }),
+      steadyRans(-2, -0.394),
+      steadyRans(-1, -0.31),
+      steadyRans(0, -0.22),
+      steadyRans(1, -0.13),
+      steadyRans(2, -0.04),
+      steadyRans(3, 0.05),
+      steadyRans(4, 0.14),
+      steadyRans(5, 0.23),
+    ]);
+    const stateByAoa = new Map(
+      classified.classifications.map((row) => [row.evidence.a, row]),
+    );
+
+    expect(classified.lowAoaFailure).toBe(false);
+    expect(classified.needsUransAoas).toEqual([-5, -4]);
+    expect(classified.hardRejectedAoas).toEqual([-3]);
+    expect(stateByAoa.get(-5)?.state).toBe("needs_urans");
+    expect(stateByAoa.get(-4)?.state).toBe("needs_urans");
+    expect(stateByAoa.get(-5)?.reasons).toContain(
+      "low-aoa-attached-branch-discontinuity",
+    );
+    expect(stateByAoa.get(-2)?.state).toBe("accepted");
+    expect(stateByAoa.get(5)?.state).toBe("accepted");
+  });
+
+  it("MUST-CATCH: routes the A18 Re307k alternate branch without whole-polar promotion", () => {
+    const classified = classifyPolarEvidence([
+      steadyRans(-5, 0.2479),
+      steadyRans(-4, 0.2514),
+      steadyRans(-3, -0.4889),
+      steadyRans(-2, -0.4456),
+      steadyRans(-1, -0.36),
+      steadyRans(0, -0.27),
+      steadyRans(1, -0.18),
+      steadyRans(2, -0.09),
+      steadyRans(3, 0),
+      steadyRans(4, 0.09),
+      steadyRans(5, 0.18),
+    ]);
+    const stateByAoa = new Map(
+      classified.classifications.map((row) => [row.evidence.a, row.state]),
+    );
+
+    expect(classified.lowAoaFailure).toBe(false);
+    expect(classified.hardRejectedAoas).toEqual([]);
+    expect(classified.needsUransAoas).toEqual([-5, -4]);
+    expect(stateByAoa.get(-5)).toBe("needs_urans");
+    expect(stateByAoa.get(-4)).toBe("needs_urans");
+    expect(stateByAoa.get(-3)).toBe("accepted");
+    expect(stateByAoa.get(5)).toBe("accepted");
+  });
+
+  it.each([
+    [
+      "the smooth A18 Re566k negative branch",
+      [
+        [-5, -0.562],
+        [-4, -0.524],
+        [-3, -0.499],
+        [-2, -0.453],
+        [-1, -0.4],
+        [0, -0.35],
+        [1, -0.3],
+        [2, -0.25],
+        [3, -0.2],
+        [4, -0.15],
+        [5, -0.1],
+      ],
+    ],
+    [
+      "a noisy attached baseline",
+      [
+        [-5, 0.26],
+        [-4, 0.24],
+        [-3, -0.49],
+        [-2, -0.4],
+        [-1, -0.32],
+        [0, -0.24],
+        [1, -0.02],
+        [2, -0.18],
+        [3, 0.26],
+        [4, 0.08],
+        [5, 0.46],
+      ],
+    ],
+    [
+      "the A63-like 0°/1° irregularity",
+      [
+        [-2, -0.16],
+        [-1, -0.08],
+        [0, 0],
+        [1, -0.0186],
+        [2, 0.12],
+        [3, 0.22],
+        [4, 0.32],
+        [5, 0.42],
+      ],
+    ],
+  ] as const)(
+    "FALSE-POSITIVE GUARD: does not flag %s as a low-angle alternate branch",
+    (_label, rows) => {
+      const classified = classifyPolarEvidence(
+        rows.map(([a, cl]) => steadyRans(a, cl)),
+      );
+      expect(classified.lowAoaFailure).toBe(false);
+      expect(classified.needsUransAoas).toEqual([]);
+      expect(
+        classified.classifications.every((row) => row.state === "accepted"),
+      ).toBe(true);
+    },
+  );
 
   it("detects low-AoA failure for whole-polar URANS promotion", () => {
     const classified = classifyPolarEvidence([

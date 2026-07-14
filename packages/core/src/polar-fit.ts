@@ -41,14 +41,19 @@ import {
 // v5 (bounded continuation, 2026-07-11): a wall-budget-stopped or
 // continuation-required URANS row is incomplete evidence.  The saved case may
 // be resumed, but its partial coefficients must not enter any polar meanwhile.
-export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v5";
+// v6 (low-angle branch coherence, 2026-07-14): a converged steady-RANS row
+// can still be an alternate numerical branch. A narrowly bounded attached
+// baseline + discontinuity check routes only the incoherent low-angle run to
+// preliminary URANS; it never invents replacement coefficients.
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v6";
 
 /** A derived-media absence, not an aerodynamic verdict. The point remains
  * rejected until real stored video exists, but it belongs to automatic media
  * remediation / blocked availability rather than human coefficient review. */
 export const MISSING_URANS_VIDEO_REASON = "missing-urans-video";
-// v5 invalidates fits that could contain partial budget-stopped URANS evidence.
-export const POLAR_FIT_VERSION = "evidence-lowess-v5";
+// v6 invalidates fits whose selected RANS evidence may contain an alternate
+// low-angle branch that now requires preliminary URANS confirmation.
+export const POLAR_FIT_VERSION = "evidence-lowess-v6";
 
 /** Canonical classifier reason for restartable but incomplete URANS evidence. */
 export const INCOMPLETE_URANS_INTEGRATION_REASON =
@@ -217,7 +222,13 @@ function nominalStep(points: PolarEvidencePoint[]): number {
   );
 }
 
-function linearSlope(points: PolarEvidencePoint[]): number | null {
+interface LinearFit {
+  slope: number;
+  intercept: number;
+  maxResidual: number;
+}
+
+function linearFit(points: PolarEvidencePoint[]): LinearFit | null {
   const usable = points.filter((p) => finite(p.a) && finite(p.cl));
   if (usable.length < 2) return null;
   const mx = usable.reduce((sum, p) => sum + p.a, 0) / usable.length;
@@ -229,7 +240,13 @@ function linearSlope(points: PolarEvidencePoint[]): number | null {
     num += dx * ((p.cl ?? 0) - my);
     den += dx * dx;
   }
-  return den > 0 ? num / den : null;
+  if (den <= 0) return null;
+  const slope = num / den;
+  const intercept = my - slope * mx;
+  const maxResidual = Math.max(
+    ...usable.map((p) => Math.abs((p.cl ?? 0) - (intercept + slope * p.a))),
+  );
+  return { slope, intercept, maxResidual };
 }
 
 /** Oscillating-steady acceptance shape (v4): a STEADY row whose solve settled
@@ -340,8 +357,115 @@ export function isHardRansFailureEvidence(
   );
 }
 
+export interface PolarEvidenceClassifierOptions {
+  /**
+   * The alternate-low-angle branch check requires a single marched solver
+   * lane. It is enabled for immutable attempt groups by default. Callers that
+   * intentionally assemble selected evidence from several jobs must rely on
+   * the selected-attempt downgrade instead of treating that composite as one
+   * physical march.
+   */
+  detectLowAngleAttachedBranch?: boolean;
+}
+
+/**
+ * Detect an alternate steady-RANS branch at the negative attached-flow end of
+ * a polar. A normal post-stall signal is not enough: the candidate run has to
+ * disagree strongly with a stable 0..5° attached baseline AND reconnect to a
+ * coherent neighboring point through a large opposite-direction jump. This
+ * catches a cold-start/warm-march branch switch without assuming symmetry or
+ * turning an ordinary negative-angle failure into a whole-polar promotion.
+ */
+function markLowAngleAttachedBranchDiscontinuities(
+  classifications: PolarEvidenceClassification[],
+  nominalAoaStep: number,
+): void {
+  const acceptedRans = classifications
+    .filter(acceptedForShape)
+    .map((c) => c.evidence)
+    .sort((a, b) => a.a - b.a);
+  const baseline = acceptedRans.filter((p) => p.a >= 0 && p.a <= 5);
+  if (baseline.length < 4) return;
+
+  const fit = linearFit(baseline);
+  // A noisy/nonlinear baseline must never become a speculative classifier for
+  // the other side of the polar. These values are deliberately much tighter
+  // than the observed A18 discontinuity (0.83..0.94 Cl residual, 0.41..0.83
+  // Cl/deg slope mismatch), leaving a substantial false-positive margin.
+  if (!fit || fit.slope < 0.03 || fit.maxResidual > 0.06) return;
+
+  const residualFloor = Math.max(0.25, fit.maxResidual * 5);
+  const candidateResiduals = new Map<PolarEvidencePoint, number>();
+  for (const point of acceptedRans) {
+    if (point.a < -6 || point.a >= 0 || !finite(point.cl)) continue;
+    const predicted = fit.intercept + fit.slope * point.a;
+    const residual = point.cl - predicted;
+    if (Math.abs(predicted) >= 0.15 && Math.abs(residual) >= residualFloor) {
+      candidateResiduals.set(point, residual);
+    }
+  }
+  if (!candidateResiduals.size) return;
+
+  const maximumAdjacentGap = Math.max(1, nominalAoaStep) * 2.5 + 1e-9;
+  const slopeMismatchFloor = Math.max(0.25, fit.slope * 3);
+  const marked = new Set<PolarEvidencePoint>();
+
+  for (
+    let rightmostIndex = 0;
+    rightmostIndex < acceptedRans.length - 1;
+    rightmostIndex += 1
+  ) {
+    const rightmost = acceptedRans[rightmostIndex]!;
+    const residual = candidateResiduals.get(rightmost);
+    if (residual === undefined) continue;
+    const next = acceptedRans[rightmostIndex + 1]!;
+    // A run is only anomalous when it reconnects to a coherent attached point
+    // nearby. This permits one rejected/missing 1° point (A18 Re102 −3°)
+    // without treating arbitrary isolated samples as a branch.
+    if (candidateResiduals.has(next) || rightmost.a >= 0 || next.a > 0) {
+      continue;
+    }
+    const da = next.a - rightmost.a;
+    if (da <= 0 || da > maximumAdjacentGap) continue;
+    const localSlope = ((next.cl ?? 0) - (rightmost.cl ?? 0)) / da;
+    if (fit.slope - localSlope < slopeMismatchFloor) continue;
+
+    const residualSign = Math.sign(residual);
+    let firstIndex = rightmostIndex;
+    while (firstIndex > 0) {
+      const previous = acceptedRans[firstIndex - 1]!;
+      const previousResidual = candidateResiduals.get(previous);
+      const gap = acceptedRans[firstIndex]!.a - previous.a;
+      if (
+        previousResidual === undefined ||
+        Math.sign(previousResidual) !== residualSign ||
+        gap > maximumAdjacentGap
+      ) {
+        break;
+      }
+      firstIndex -= 1;
+    }
+    for (let index = firstIndex; index <= rightmostIndex; index += 1) {
+      marked.add(acceptedRans[index]!);
+    }
+  }
+
+  for (const point of marked) {
+    const target = classifications.find((c) => c.evidence === point);
+    if (!target) continue;
+    target.state = "needs_urans";
+    target.region = "unknown";
+    target.confidence = 0.95;
+    target.reasons = [
+      "low-aoa-attached-branch-discontinuity",
+      "attached-baseline-residual",
+    ];
+  }
+}
+
 export function classifyPolarEvidence(
   points: PolarEvidencePoint[],
+  options: PolarEvidenceClassifierOptions = {},
 ): ClassifiedPolar {
   const ordered = [...points].sort((a, b) => a.a - b.a);
   const classifications: PolarEvidenceClassification[] = ordered.map(
@@ -360,10 +484,10 @@ export function classifyPolarEvidence(
     },
   );
 
-  const acceptedRans = classifications
+  const initialAcceptedRans = classifications
     .filter(acceptedForShape)
     .map((c) => c.evidence);
-  const step = nominalStep(acceptedRans);
+  const initialStep = nominalStep(initialAcceptedRans);
   const lowAoaFailure = classifications.some(
     (c) =>
       c.evidence.regime === "rans" &&
@@ -383,10 +507,21 @@ export function classifyPolarEvidence(
     }
   }
 
+  if (!lowAoaFailure && options.detectLowAngleAttachedBranch !== false) {
+    markLowAngleAttachedBranchDiscontinuities(classifications, initialStep);
+  }
+
+  // Low-angle branch candidates must not remain input to the independent
+  // post-stall heuristic. Recompute after all attached-flow downgrades.
+  const acceptedRans = classifications
+    .filter(acceptedForShape)
+    .map((c) => c.evidence);
+  const step = nominalStep(acceptedRans);
   if (!lowAoaFailure && acceptedRans.length >= 5) {
     const baseline = acceptedRans.filter((p) => p.a >= 0 && p.a <= 5);
     const fallback = acceptedRans.filter((p) => p.a >= -4 && p.a <= 6);
-    const slope = linearSlope(baseline.length >= 3 ? baseline : fallback);
+    const fit = linearFit(baseline.length >= 3 ? baseline : fallback);
+    const slope = fit?.slope ?? null;
     if (slope !== null && slope > 0.005) {
       let peak = acceptedRans[0];
       for (const p of acceptedRans) {

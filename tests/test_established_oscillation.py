@@ -521,7 +521,7 @@ def test_wave1_conditional_policy_aborts_remaining_rans_for_external_precalc(
             write_images=[],
         ),
         never_promote,
-        aoas=[0.0, 2.0, 4.0],
+        aoas=[-2.0, 0.0, 2.0, 4.0],
         seen_aoas=seen,
     )
 
@@ -529,7 +529,10 @@ def test_wave1_conditional_policy_aborts_remaining_rans_for_external_precalc(
     assert not result.promoted_to_urans
     assert result.precalc_promotion is not None
     assert result.precalc_promotion.trigger_aoa_deg == 2.0
-    assert result.precalc_promotion.intentionally_omitted_aoas == [4.0]
+    # The march is zero-anchored, so the untouched negative branch is also
+    # omitted.  This must be requested scope minus actual attempts, not a
+    # slice of the execution order.
+    assert result.precalc_promotion.intentionally_omitted_aoas == [-2.0, 4.0]
     assert [item.outcome.spec.aoa_deg for item in result.attempts] == [0.0, 2.0]
 
 

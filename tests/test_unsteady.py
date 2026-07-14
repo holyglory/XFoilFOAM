@@ -813,7 +813,7 @@ def test_marched_core_rans_failure_stops_rans_and_promotes_full_urans(tmp_path, 
 
     def fake_warm(_polar_dir, spec, *_args, **_kwargs):
         rans_aoas.append(spec.aoa_deg)
-        if spec.aoa_deg == 0.0:
+        if spec.aoa_deg == 2.0:
             return FakeRunResult("Time = 2\n")
         return FakeRunResult("Time = 2\nSIMPLE solution converged in 1 iterations\n")
 
@@ -876,12 +876,150 @@ def test_marched_core_rans_failure_stops_rans_and_promotes_full_urans(tmp_path, 
         render_images=False,
     )
 
-    assert rans_aoas == [-1.0, 0.0]
+    # The primary RANS sweep starts at the 0-degree attached-flow anchor;
+    # the +2-degree hard failure still promotes the exact original request.
+    assert rans_aoas == [0.0, 1.0, 2.0]
     assert result.promoted_to_urans
     assert "switching the whole polar to URANS" in result.abort_reason
-    assert [p.outcome.spec.aoa_deg for p in result.attempts] == [-1.0, 0.0]
+    assert [p.outcome.spec.aoa_deg for p in result.attempts] == [0.0, 1.0, 2.0]
     assert [p.outcome.spec.aoa_deg for p in result.points] == sorted(requested_aoas)
     assert all(p.outcome.unsteady for p in result.points)
+
+
+def test_primary_rans_zero_anchor_restores_only_accepted_fields(tmp_path, monkeypatch):
+    """MUST-CATCH A18: branch order and rejected-state recovery are explicit.
+
+    The first negative point starts from the saved 0-degree fields.  When -2
+    is rejected, -3 restores the last accepted negative field (-1), rather
+    than continuing the rejected latestTime.  Stable output labels still use
+    the original sorted-AoA positions.
+    """
+    from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
+
+    class FakeMesher:
+        def patches(self, resolved):
+            return {}
+
+    class FakeRunResult:
+        ok = True
+
+        def __init__(self, stdout: str):
+            self.stdout = stdout
+
+        def check(self):
+            return self
+
+    calls = []
+    restores = []
+    phases = []
+    published = []
+
+    def fake_cold(*args, **_kwargs):
+        calls.append(("cold", args[5].aoa_deg))
+        return FakeRunResult("Time = 1\nSIMPLE solution converged in 1 iterations\n")
+
+    def fake_warm(_polar_dir, spec, *_args, **_kwargs):
+        calls.append(("warm", spec.aoa_deg))
+        stdout = "Time = 2\n"
+        if spec.aoa_deg != -2.0:
+            stdout += "SIMPLE solution converged in 1 iterations\n"
+        return FakeRunResult(stdout)
+
+    def fake_finalize(_case_dir, outcome, *_args, **_kwargs):
+        outcome.cl = 0.1 * outcome.spec.aoa_deg
+        outcome.cd = 0.02
+        outcome.cm = 0.0
+        outcome.cl_cd = outcome.cl / outcome.cd
+
+    monkeypatch.setattr(pipeline, "_solve_cold_marched", fake_cold)
+    monkeypatch.setattr(pipeline, "_solve_warm", fake_warm)
+    monkeypatch.setattr(pipeline, "_finalize_outcome", fake_finalize)
+    monkeypatch.setattr(
+        pipeline,
+        "_snapshot_steady_march_state",
+        lambda _polar_dir, name: Path(name),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_restore_steady_march_state",
+        lambda _polar_dir, checkpoint: restores.append(checkpoint.name) or True,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_publish_steady_seed",
+        lambda *_args: published.append(_args[5].aoa_deg),
+    )
+
+    result = solve_polar_marched(
+        tmp_path / "polar",
+        tmp_path / "mesh",
+        airfoil=None,
+        chord=1.0,
+        speed=10.0,
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        resolved=MeshParams(),
+        solver_params=SolverParams(transient_fallback=False, write_images=[]),
+        mesher=FakeMesher(),
+        runner=None,
+        aoas=[-3.0, -2.0, -1.0, 0.0, 1.0, 2.0],
+        render_images=False,
+        phase_progress=lambda _phase, aoa, slug, *_args: phases.append((aoa, slug)),
+    )
+
+    assert calls == [
+        ("cold", 0.0),
+        ("warm", 1.0),
+        ("warm", 2.0),
+        ("warm", -1.0),
+        ("warm", -2.0),
+        ("warm", -3.0),
+    ]
+    assert restores == ["zero", "last"]
+    # Only non-negative accepted steady points may enter the shared seed cache.
+    assert published == [0.0, 1.0, 2.0]
+    assert phases == [
+        (0.0, "polar/a3"),
+        (1.0, "polar/a4"),
+        (2.0, "polar/a5"),
+        (-1.0, "polar/a2"),
+        (-2.0, "polar/a1"),
+        (-3.0, "polar/a0"),
+    ]
+    assert [item.outcome.spec.aoa_deg for item in result.attempts] == [0.0, 1.0, 2.0, -1.0, -2.0, -3.0]
+    assert [item.outcome.spec.aoa_deg for item in result.points] == [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
+    assert not next(item.outcome for item in result.points if item.outcome.spec.aoa_deg == -2.0).converged
+
+
+def test_steady_march_checkpoint_restores_accepted_case_without_touching_evidence(tmp_path):
+    """A checkpoint replaces mutable fields/dictionaries, never archived AoA evidence."""
+    polar_dir = tmp_path / "polar"
+    (polar_dir / "300").mkdir(parents=True)
+    (polar_dir / "300" / "U").write_text("accepted U\n")
+    (polar_dir / "system").mkdir()
+    (polar_dir / "system" / "controlDict").write_text("accepted dictionaries\n")
+    evidence = polar_dir / "a3" / "evidence"
+    evidence.mkdir(parents=True)
+    (evidence / "manifest.json").write_text("immutable evidence\n")
+
+    checkpoint = pipeline._snapshot_steady_march_state(polar_dir, "last")
+    assert checkpoint is not None
+
+    (polar_dir / "300" / "U").write_text("rejected U\n")
+    (polar_dir / "600").mkdir()
+    (polar_dir / "600" / "U").write_text("rejected later U\n")
+    (polar_dir / "system" / "controlDict").write_text("rejected fallback dictionaries\n")
+    (polar_dir / "postProcessing").mkdir()
+    (polar_dir / "postProcessing" / "stale").write_text("stale\n")
+    (polar_dir / "processor0").mkdir()
+
+    assert pipeline._restore_steady_march_state(polar_dir, checkpoint)
+    assert (polar_dir / "300" / "U").read_text() == "accepted U\n"
+    assert not (polar_dir / "600").exists()
+    assert (polar_dir / "system" / "controlDict").read_text() == "accepted dictionaries\n"
+    assert not (polar_dir / "postProcessing").exists()
+    assert not (polar_dir / "processor0").exists()
+    assert (evidence / "manifest.json").read_text() == "immutable evidence\n"
 
 
 def test_marched_primary_rans_honors_profile_iterations_and_short_timeout(tmp_path, monkeypatch):
