@@ -14,7 +14,7 @@ function asFit(points: { a: number; cl: number; cd: number; cm: number; ld: numb
 }
 
 function pt(a: number, over: Partial<PolarPointData> = {}): PolarPointData {
-  return { a, cl: 0.1 * a, cd: 0.02 + 0.0005 * a * a, cm: -0.01, ld: 10, stalled: false, source: "solved", resultId: `r${a}`, ...over };
+  return { a, cl: 0.1 * a, cd: 0.02 + 0.0005 * a * a, cm: -0.01, ld: 10, stalled: false, source: "solved", resultId: `r${a}`, classificationState: "accepted", ...over };
 }
 
 function fitSample(a: number, over: Partial<{ cl: number; cd: number; cm: number; ld: number }> = {}) {

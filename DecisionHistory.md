@@ -38,6 +38,12 @@
   admitted to nor read from the shared seed cache. This preserves mesh reuse
   and normal positive-branch cache performance while keeping unverified
   low-negative branches local until evidence classification.
+- Public-polar presentation: an accepted primary result is the only evidence
+  that may support a solid measured line, fit support interval, or cursor
+  interpolation. `needs_urans`, unclassified, and conflict-only evidence stays
+  visible and clickable with its provisional styling, but forms a hard curve
+  gap. This prevents a visible line from asserting that a retained provisional
+  result is already a valid polar measurement.
 
 ## 2026-07-14 — Completed campaign evidence is public polar evidence
 

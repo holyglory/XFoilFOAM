@@ -151,9 +151,17 @@ function isPrimaryEvidence(point: PolarPointData): boolean {
   return point.evidenceRole == null || point.evidenceRole === "primary";
 }
 
-/** Build measured-line segments from primary evidence only. A conflict-only
- * angle is an explicit break: the chart keeps every contradictory result as a
- * clickable marker without drawing a line through an unresolved measurement. */
+/** Only accepted primary evidence is allowed to support a solid public curve.
+ * A point that is still provisional is real, clickable evidence, but it is not
+ * a valid polar measurement yet. */
+function isAcceptedPrimaryEvidence(point: PolarPointData): boolean {
+  return isPrimaryEvidence(point) && point.classificationState === "accepted";
+}
+
+/** Build solid measured-line segments from accepted primary evidence only.
+ * A conflict-only or provisional angle is an explicit break: the chart keeps
+ * every stored result as a clickable marker without drawing a public polar
+ * through evidence that has not been accepted. */
 export function measuredEvidenceSegments(
   points: PolarPointData[],
 ): PolarPointData[][] {
@@ -166,13 +174,13 @@ export function measuredEvidenceSegments(
   const segments: PolarPointData[][] = [];
   let current: PolarPointData[] = [];
   for (const bucket of byAoa.values()) {
-    const primary = bucket.filter(isPrimaryEvidence);
-    if (primary.length === 0) {
+    const acceptedPrimary = bucket.filter(isAcceptedPrimaryEvidence);
+    if (acceptedPrimary.length === 0) {
       if (current.length) segments.push(current);
       current = [];
       continue;
     }
-    current.push(...primary);
+    current.push(...acceptedPrimary);
   }
   if (current.length) segments.push(current);
   return segments;
@@ -714,7 +722,7 @@ const FIT_BRIDGE_GAP_FACTOR = 2;
 
 export function measuredAlphas(points: PolarPointData[]): number[] {
   return points
-    .filter(isPrimaryEvidence)
+    .filter(isAcceptedPrimaryEvidence)
     .map((p) => p.a)
     .filter((a) => Number.isFinite(a));
 }
