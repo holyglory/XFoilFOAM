@@ -26,6 +26,7 @@ import {
   polarFitSets,
   resultAttempts,
   results,
+  simCampaignConditions,
   simJobs,
   simulationPresetRevisions,
   simulationPresets,
@@ -763,10 +764,12 @@ export async function assembleDetail(
   const geo = geometryFor(a);
 
   // Public curves are grouped by physics/numerics compatibility, never by a
-  // batch/revision name and never by rounded Reynolds alone. Enabled air
-  // revisions anchor which compatibility hashes are public; once anchored,
-  // accepted evidence from every equivalent immutable revision participates.
-  // A pinned admin journey remains scoped to exactly the requested revision.
+  // batch/revision name and never by rounded Reynolds alone. Enabled library
+  // revisions and immutable air campaign conditions anchor which compatibility
+  // hashes are public; once anchored, accepted evidence from every equivalent
+  // immutable revision participates. Campaign presets intentionally stay
+  // disabled so this read-only inclusion must never imply scheduling. A pinned
+  // admin journey remains scoped to exactly the requested revision.
   const revisionSelection = {
     id: simulationPresetRevisions.id,
     reynolds: simulationPresetRevisions.reynolds,
@@ -797,24 +800,46 @@ export async function assembleDetail(
       .where(eq(mediums.slug, "air"))
       .limit(1);
     if (air) {
-      const anchorRows = await db
-        .select(revisionSelection)
-        .from(simulationPresets)
-        .innerJoin(
-          flowConditions,
-          eq(flowConditions.id, simulationPresets.flowConditionId),
-        )
-        .innerJoin(
-          simulationPresetRevisions,
-          eq(simulationPresetRevisions.presetId, simulationPresets.id),
-        )
-        .where(
-          and(
-            eq(flowConditions.mediumId, air.id),
-            eq(simulationPresets.enabled, true),
+      const [libraryAnchorRows, campaignAnchorRows] = await Promise.all([
+        db
+          .select(revisionSelection)
+          .from(simulationPresets)
+          .innerJoin(
+            flowConditions,
+            eq(flowConditions.id, simulationPresets.flowConditionId),
+          )
+          .innerJoin(
+            simulationPresetRevisions,
+            eq(simulationPresetRevisions.presetId, simulationPresets.id),
+          )
+          .where(
+            and(
+              eq(flowConditions.mediumId, air.id),
+              eq(simulationPresets.enabled, true),
+            ),
           ),
-        );
-      for (const row of anchorRows) {
+        // A campaign condition is an immutable public-physics anchor even
+        // though its generated preset is disabled by design. Do not filter on
+        // campaign lifecycle or condition status: those control scheduling,
+        // not the validity of already stored solver evidence. Drafts without
+        // evidence remain omitted below, so this never invents a polar.
+        db
+          .select(revisionSelection)
+          .from(simCampaignConditions)
+          .innerJoin(
+            flowConditions,
+            eq(flowConditions.id, simCampaignConditions.flowConditionId),
+          )
+          .innerJoin(
+            simulationPresetRevisions,
+            eq(
+              simulationPresetRevisions.id,
+              simCampaignConditions.simulationPresetRevisionId,
+            ),
+          )
+          .where(eq(flowConditions.mediumId, air.id)),
+      ]);
+      for (const row of [...libraryAnchorRows, ...campaignAnchorRows]) {
         if (Math.round(row.reynolds) <= 0) continue;
         const hash = effectivePhysicsHash(row);
         const anchors = anchorsByHash.get(hash) ?? [];

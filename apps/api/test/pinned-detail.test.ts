@@ -1,15 +1,13 @@
-// Pinned-revision detail scope — the production-reported broken admin
-// journey (2026-07-05): a finished campaign job's "Detail" link landed on the
-// UNPINNED public /airfoils/<slug> page, which builds polars from ENABLED
-// presets only; campaign presets are disabled by design, so a campaign-only
-// database rendered zero polar groups (live repro: clarky α=-2 accepted in
-// the DB, GET /api/airfoils/clarky → reList:[], polars:{}).
+// Pinned-revision detail scope — campaign presets are disabled by design so
+// that they cannot schedule work independently, but their immutable campaign
+// conditions still anchor real evidence on the unpinned public Detail page.
+// This also preserves the admin journey's exact pinned-revision view.
 //
 // MUST-CATCH #1: assembleDetail(slug, { revisionId }) must surface the
 // disabled-preset campaign evidence — this test fails if the pinned scope
 // regresses (e.g. the scoped branch starts honoring preset.enabled again).
-// The unpinned assertions DOCUMENT the enabled-only public design; they are
-// not a defect.
+// The unpinned assertion guards the public campaign-evidence contract without
+// leaking campaign/preset metadata as polar labels.
 //
 // MUST-CATCH #2: the admin queue payload must carry the job's setup revision
 // (AdminJob.revisionId) so admin evidence links can pin it — single-revision
@@ -32,6 +30,9 @@ import {
   resultClassifications,
   results,
   schedulingProfiles,
+  simCampaignConditions,
+  simCampaignPlanRevisions,
+  simCampaigns,
   simJobs,
   simulationPresetRevisions,
   simulationPresets,
@@ -56,6 +57,7 @@ const cleanup = {
   resultIds: [] as string[],
   classificationIds: [] as string[],
   jobIds: [] as string[],
+  campaignIds: [] as string[],
   presetIds: [] as string[],
   bcIds: [] as string[],
   flowIds: [] as string[],
@@ -185,6 +187,8 @@ async function createDisabledPresetRevision(unique: string, reynolds: number) {
   expect(resolved).toBeTruthy();
   return {
     bcId: bc.id,
+    flowConditionId: flow.id,
+    referenceGeometryProfileId: refGeo.id,
     presetId: preset.id,
     revisionId: resolved!.revision.id,
   };
@@ -255,6 +259,47 @@ beforeAll(async () => {
   );
   revisionA = setupA.revisionId;
   revisionB = setupB.revisionId;
+
+  // Campaign-generated presets are disabled execution records, not private
+  // polar visibility. Their immutable condition pin is the public anchor;
+  // the campaign itself is already completed so no scheduling can result from
+  // this read-path fixture.
+  const [campaign] = await db
+    .insert(simCampaigns)
+    .values({
+      slug: `${PREFIX}-campaign`,
+      name: `${PREFIX} campaign`,
+      status: "completed",
+      priority: 5,
+      idempotencyKey: `${PREFIX}-campaign`,
+    })
+    .returning({ id: simCampaigns.id });
+  cleanup.campaignIds.push(campaign.id);
+  const [plan] = await db
+    .insert(simCampaignPlanRevisions)
+    .values({
+      campaignId: campaign.id,
+      revisionNumber: 1,
+      kind: "initial",
+      plan: {},
+      summary: {},
+    })
+    .returning({ id: simCampaignPlanRevisions.id });
+  await db
+    .update(simCampaigns)
+    .set({ currentPlanRevisionId: plan.id })
+    .where(eq(simCampaigns.id, campaign.id));
+  await db.insert(simCampaignConditions).values({
+    campaignId: campaign.id,
+    ord: 0,
+    flowConditionId: setupA.flowConditionId,
+    referenceGeometryProfileId: setupA.referenceGeometryProfileId,
+    presetId: setupA.presetId,
+    simulationPresetRevisionId: revisionA,
+    reynolds: CAMPAIGN_RE,
+    status: "active",
+    introducedInPlanRevisionId: plan.id,
+  });
 
   // Campaign-solved ACCEPTED evidence at α=-2 under the DISABLED revision —
   // the exact shape of the production clarky row.
@@ -380,6 +425,10 @@ afterAll(async () => {
   if (db) {
     if (cleanup.jobIds.length)
       await db.delete(simJobs).where(inArray(simJobs.id, cleanup.jobIds));
+    if (cleanup.campaignIds.length)
+      await db
+        .delete(simCampaigns)
+        .where(inArray(simCampaigns.id, cleanup.campaignIds));
     if (cleanup.classificationIds.length)
       await db
         .delete(resultClassifications)
@@ -444,12 +493,18 @@ afterAll(async () => {
 }, 30_000);
 
 describe("pinned-revision detail scope (campaign spec §11 surgical exception)", () => {
-  it("unpinned detail hides disabled-preset campaign evidence (enabled-only public design, documented)", async () => {
+  it("MUST-CATCH: unpinned detail publishes evidence from a disabled campaign preset without exposing campaign metadata", async () => {
     const detail = await assembleDetail(airfoilSlug);
     expect(detail).toBeTruthy();
-    expect(detail!.reList).not.toContain(CAMPAIGN_RE);
+    expect(detail!.reList).toContain(CAMPAIGN_RE);
     const allPoints = detail!.polars.flatMap((p) => p.points);
-    expect(allPoints.some((p) => p.resultId === resultId)).toBe(false);
+    expect(allPoints.some((p) => p.resultId === resultId)).toBe(true);
+    const polar = detail!.polars.find((p) => p.re === CAMPAIGN_RE);
+    expect(polar?.label).toMatch(
+      new RegExp(`^Re ${Math.round(CAMPAIGN_RE / 1000)}k(?: · M \\d+\\.\\d+)?$`),
+    );
+    expect(polar?.label).not.toContain("campaign");
+    expect(polar?.label).not.toContain("Preset");
   });
 
   it("MUST-CATCH: pinned scope surfaces the accepted campaign point under the disabled revision", async () => {

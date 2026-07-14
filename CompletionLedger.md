@@ -1,11 +1,11 @@
 # Completion Ledger
 
-- **A18 low-angle alternate-branch correction:** Deploy the job-scoped
-  classifier guard and zero-anchored RANS marcher (including cache seed
-  compatibility reset), reclassify stored evidence, queue the affected cells
-  for targeted preliminary URANS, and verify the deployed public/admin
-  projections. This prevents a converged but physically incoherent steady-RANS
-  branch from being presented as verified evidence or reused as solver state.
-  Verification: focused classifier/retry/march tests, production backup + cache
-  refresh audit, guarded idle-worker engine rebuild, exact request/obligation
-  audit, and browser-route check.
+- **A18 low-angle alternate-branch correction:** The control-plane classifier,
+  cache reset, affected-cell preliminary-URANS requests, and campaign-evidence
+  public-anchor fix must be deployed and verified together. The engine-side
+  zero-anchored RANS marcher remains inactive until the production worker is
+  genuinely idle; its guarded rebuild must not interrupt the active campaign.
+  Once the guard permits it, rebuild through `scripts/deploy/rebuild-engine.sh`,
+  then verify that the five exact A18 requests progress through preliminary
+  URANS and that the public Detail route shows real campaign evidence while
+  excluding the rejected alternate branch.

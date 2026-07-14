@@ -39,6 +39,29 @@
   and normal positive-branch cache performance while keeping unverified
   low-negative branches local until evidence classification.
 
+## 2026-07-14 — Completed campaign evidence is public polar evidence
+
+- Trigger and evidence: while verifying the A18 correction, the public Detail
+  API returned zero polars even though Solver Work showed completed RANS
+  evidence. The only three relevant immutable revisions belonged to the
+  standard campaign; their generated presets were intentionally disabled to
+  prevent independent scheduling, and the former public read model incorrectly
+  treated that execution control as a visibility control.
+- Options considered: enable campaign presets after completion (would change
+  scheduling semantics and risk re-submission); expose every disabled library
+  preset (would publish unrelated dormant setup-library experiments); or use
+  an immutable campaign condition as a public physical-setup anchor while
+  retaining ordinary disabled-preset exclusion. The owner previously required
+  public users to see all real polars without reasoning about batches, so the
+  third option is the implementation decision.
+- Decision and boundaries: public Detail compatibility groups now anchor on
+  either enabled air-library revisions or air revisions pinned by
+  `sim_campaign_conditions`, regardless of campaign lifecycle state. This is
+  read-only; it neither enables a preset, schedules work, exposes campaign or
+  revision identifiers in labels, nor fabricates a curve for evidence-free
+  drafts. Existing physics-hash compatibility grouping and exact-evidence
+  acceptance remain unchanged.
+
 ## 2026-07-13 — Campaign lifecycle status carries real provenance and direct recovery
 
 - Trigger and owner context: the admin hub showed `solver · running · 0 jobs`,
