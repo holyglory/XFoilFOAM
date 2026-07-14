@@ -1424,7 +1424,9 @@ export interface CampaignRemediationSummary {
   groups: Array<{
     reason: CampaignRemediationReason;
     state: "repairing" | "blocked";
-    owner: "system" | "operator";
+    /** Campaign recovery is always system-owned; terminal means unavailable,
+     * never that a user must alter an internal solver setup. */
+    owner: "system";
     points: number;
   }>;
 }

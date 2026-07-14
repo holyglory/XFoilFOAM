@@ -290,7 +290,7 @@ export function RefinementBoard({
         if (scoped.retryableTotal === 0) {
           setNotice(
             scoped.total > 0
-              ? "failed points in this lane are blocked by the current setup — change the mesh/setup before retrying"
+              ? "failed points in this lane are not eligible for an unchanged retry — open the cell for their automatic-recovery state"
               : "no failed points in this lane's cell — the fit is missing evidence for another reason (see the cell panel)",
           );
           setRequeueState(null);

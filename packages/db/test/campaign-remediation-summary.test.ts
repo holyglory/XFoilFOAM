@@ -374,25 +374,25 @@ describe("campaign remediation summary", () => {
         {
           reason: "mesh_quality",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 3,
         },
         {
           reason: "precalc_attempts_exhausted",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 2,
         },
         {
           reason: "engine_submit_rejected",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 1,
         },
         {
           reason: "other_unavailable",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 4,
         },
       ],
@@ -549,7 +549,7 @@ describe("campaign remediation summary", () => {
         {
           reason: "mesh_quality",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 78,
         },
       ],
@@ -751,7 +751,7 @@ describe("campaign remediation summary", () => {
       {
         reason: "mesh_quality",
         state: "blocked",
-        owner: "operator",
+        owner: "system",
         points: 2,
       },
     ]);
@@ -853,25 +853,25 @@ describe("campaign remediation summary", () => {
         {
           reason: "mesh_quality",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 1,
         },
         {
           reason: "precalc_attempts_exhausted",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 1,
         },
         {
           reason: "engine_submit_rejected",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 1,
         },
         {
           reason: "other_unavailable",
           state: "blocked",
-          owner: "operator",
+          owner: "system",
           points: 1,
         },
       ],

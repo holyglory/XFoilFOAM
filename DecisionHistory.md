@@ -6,7 +6,25 @@
   preserving trustworthy solver evidence and automatic recovery rather than
   handing repairable pipeline work to users. The single visible CPU-capacity
   control must be the actual admission limit; an undocumented job cap must not
-  strand worker tokens. [D-2026-07-14-campaign-capacity]
+  strand worker tokens. A no-shedding preliminary URANS result remains
+  preliminary evidence even when its physical regime is steady, and terminal
+  automatic outcomes must not be presented as user repair tasks.
+  [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
+
+## D-2026-07-14-no-shedding-preliminary-urans — Fidelity controls preliminary-URANS provenance
+
+Detail: [DecisionDetails/D-2026-07-14-no-shedding-preliminary-urans.md](DecisionDetails/D-2026-07-14-no-shedding-preliminary-urans.md)
+
+- Decision: classify a steady no-shedding result with `fidelity=urans_precalc`
+  as preliminary-URANS evidence rather than fresh RANS; use that accepted
+  evidence to settle its exact automatic-preliminary obligation. Present
+  terminal automatic outcomes as unavailable evidence, while separately
+  presenting active automatic mesh recovery.
+- Why: physical `regime=rans` is required to avoid inventing unsteady media,
+  but using it as numerical provenance sent completed preliminary work back to
+  RANS heuristics and falsely exhausted its recovery ledger. Fidelity is the
+  immutable tier provenance; manual setup actions would expose an internal
+  recovery failure without a real user remedy.
 
 ## D-2026-07-14-auto-job-admission — Auto admission follows the worker token budget
 

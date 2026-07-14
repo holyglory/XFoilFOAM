@@ -1863,10 +1863,10 @@ export type CampaignRemediationReason =
 export interface CampaignRemediationGroup {
   reason: CampaignRemediationReason;
   state: "repairing" | "blocked";
-  /** `system` means the work remains open and needs no user action;
-   *  `operator` means the bounded automatic path has reached a terminal
-   *  state. The payload deliberately exposes no raw error or internal id. */
-  owner: "system" | "operator";
+  /** The system owns both open recovery and terminal unavailability. A
+   * terminal automatic outcome is not a request for an operator to change an
+   * internal setup. The payload deliberately exposes no raw error or id. */
+  owner: "system";
   points: number;
 }
 
@@ -1903,25 +1903,25 @@ export function buildCampaignRemediationSummary(
     {
       reason: "mesh_quality",
       state: "blocked",
-      owner: "operator",
+      owner: "system",
       points: counters.blockedMeshQuality,
     },
     {
       reason: "precalc_attempts_exhausted",
       state: "blocked",
-      owner: "operator",
+      owner: "system",
       points: counters.blockedPrecalcExhausted,
     },
     {
       reason: "engine_submit_rejected",
       state: "blocked",
-      owner: "operator",
+      owner: "system",
       points: counters.blockedEngineSubmit,
     },
     {
       reason: "other_unavailable",
       state: "blocked",
-      owner: "operator",
+      owner: "system",
       points: counters.blockedOther,
     },
   ];

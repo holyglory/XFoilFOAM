@@ -944,7 +944,7 @@ export function CellSidePanel({
                       color: C.amber,
                     }}
                   >
-                    setup change required
+                    automatic recovery status below
                   </span>
                 )}
               </div>
@@ -969,7 +969,7 @@ export function CellSidePanel({
                     </span>
                     {!s.retryable && (
                       <span style={{ color: C.amber }}>
-                        blocked · no unchanged retry
+                        unchanged retry unavailable
                       </span>
                     )}
                     {s.error && (

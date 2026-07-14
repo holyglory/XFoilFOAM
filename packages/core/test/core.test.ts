@@ -277,6 +277,31 @@ describe("RANS stall classification and fitted polar", () => {
     expect(classified.hardRejectedAoas).toEqual([]);
   });
 
+  it("MUST-CATCH: keeps a completed no-shedding preliminary URANS result out of the RANS retry heuristic", () => {
+    const classified = classifyPolarEvidence(
+      ag24Like.map(([a, cl, cd]) => ({
+        a,
+        cl,
+        cd,
+        cm: -0.05,
+        ld: cl / cd,
+        status: "done" as const,
+        source: "solved" as const,
+        // No shedding is physically steady, but the fidelity is immutable
+        // evidence that this point came from the automatic URANS tier.
+        regime: "rans" as const,
+        fidelity: "urans_precalc",
+        converged: true,
+        stalled: false,
+      })),
+    );
+
+    expect(classified.needsUransAoas).toEqual([]);
+    expect(
+      classified.classifications.every((row) => row.state === "accepted"),
+    ).toBe(true);
+  });
+
   it("keeps provisional rows in the fit until URANS supersedes them", () => {
     const classified = classifyPolarEvidence(
       ag24Like.map(([a, cl, cd]) => ({

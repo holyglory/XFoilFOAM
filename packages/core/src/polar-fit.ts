@@ -334,16 +334,30 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
 function acceptedForShape(c: PolarEvidenceClassification): boolean {
   return (
     c.state === "accepted" &&
-    c.evidence.regime === "rans" &&
+    isSteadyRansEvidence(c.evidence) &&
     finite(c.evidence.cl) &&
     finite(c.evidence.cd)
+  );
+}
+
+/** A no-shedding URANS run is intentionally represented with the physical
+ * `rans` regime so downstream media does not fabricate unsteady artifacts.
+ * Its fidelity still proves that the solver executed the preliminary/full
+ * URANS tier.  It must therefore never be used as a new steady-RANS branch
+ * for the shape heuristics, or that completed preliminary evidence is routed
+ * back into `needs_urans` and exhausts the recovery ledger. */
+function isSteadyRansEvidence(evidence: PolarEvidencePoint): boolean {
+  return (
+    evidence.regime === "rans" &&
+    evidence.fidelity !== "urans_precalc" &&
+    evidence.fidelity !== "urans_full"
   );
 }
 
 export function isHardRansFailureEvidence(
   evidence: PolarEvidencePoint,
 ): boolean {
-  if (evidence.regime !== "rans") return false;
+  if (!isSteadyRansEvidence(evidence)) return false;
   if (evidence.failureDisposition === "hard_solver") return true;
   if (evidence.failureDisposition != null) return false;
   // Pre-contract compatibility: a finite/error-free RANS point that actually
@@ -490,7 +504,7 @@ export function classifyPolarEvidence(
   const initialStep = nominalStep(initialAcceptedRans);
   const lowAoaFailure = classifications.some(
     (c) =>
-      c.evidence.regime === "rans" &&
+      isSteadyRansEvidence(c.evidence) &&
       c.evidence.a >= 0 &&
       c.evidence.a <= 5 &&
       c.state === "rejected" &&
@@ -498,7 +512,7 @@ export function classifyPolarEvidence(
   );
   if (lowAoaFailure) {
     for (const c of classifications) {
-      if (c.evidence.regime === "rans" && c.state === "accepted") {
+      if (isSteadyRansEvidence(c.evidence) && c.state === "accepted") {
         c.state = "needs_urans";
         c.region = "unknown";
         c.confidence = 0.9;

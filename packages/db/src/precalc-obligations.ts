@@ -1250,7 +1250,7 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
   db: DB,
   resultId: string,
 ): Promise<PrecalcRepairSatisfaction | null> {
-  return db.transaction(async (rawTx) => {
+  const satisfaction = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     const [accepted] = await tx
       .select({
@@ -1288,7 +1288,11 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
           eq(results.id, resultId),
           eq(results.status, "done"),
           eq(results.fidelity, "urans_precalc"),
-          eq(results.regime, "urans"),
+          // A no-shedding preliminary URANS run is physically steady and is
+          // deliberately stored with `regime = rans` so downstream media does
+          // not claim unsteady fields that do not exist.  Fidelity, the exact
+          // accepted attempt, and the continuation guards above are the proof
+          // that this is still completed PRECALC evidence.
           sql`NOT EXISTS (
             SELECT 1
             FROM unnest(COALESCE(${results.qualityWarnings}, ARRAY[]::text[])) warning
@@ -1365,6 +1369,18 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       changed,
     };
   });
+  if (!satisfaction?.changed) return satisfaction;
+
+  // The result classification above changed a campaign-visible cell.  Keep
+  // the stored progress rows truthful for callers outside the normal sweeper
+  // ingest path too (for example the deliberately scoped cache backfill).
+  const campaignIds = await recomputeProgressForPrecalcObligations(db, [
+    satisfaction.obligationId,
+  ]);
+  for (const campaignId of campaignIds) {
+    await probeCampaignCompletion(db, campaignId);
+  }
+  return satisfaction;
 }
 
 export async function activeCampaignOwnersForUransRequest(

@@ -54,6 +54,7 @@ import { ConditionStrip, nextUpConditionId } from "./ConditionStrip";
 import { CoverageMatrix } from "./CoverageMatrix";
 import { PlanEditDialogs, type PlanEditMode } from "./PlanEditDialogs";
 import { RefinementBoard } from "./RefinementBoard";
+import { campaignRemediationCopy } from "./campaign-remediation";
 import { fCount, ghostBtn, primaryBtn } from "./ui";
 import { usePoll } from "./usePoll";
 
@@ -369,6 +370,7 @@ export function CampaignDetail({
   const reviewBuckets = summary.reviewBuckets ?? null;
   const needsReview = reviewBuckets?.needsReview ?? 0;
   const blocked = totals.blocked ?? 0;
+  const remediationCopy = campaignRemediationCopy(summary.remediation);
   const pipeline = assemblePipelineModel({
     tierCounts: summary.tierCounts ?? null,
     reviewBuckets,
@@ -649,10 +651,12 @@ export function CampaignDetail({
             unavailable · {fCount(needsReview)}
           </button>
         )}
-        {blocked > 0 && (
-          <span
+        {blocked > 0 && remediationCopy && (
+          <button
+            type="button"
             data-testid="campaign-blocked-chip"
-            title="Bounded automatic preliminary work is exhausted or deterministically blocked; no human review is required"
+            title={remediationCopy.title}
+            onClick={() => setDetailsOpen(() => true)}
             style={{
               fontFamily: MONO,
               fontSize: 10,
@@ -663,10 +667,11 @@ export function CampaignDetail({
               border: "1px solid rgba(245,158,11,0.45)",
               borderRadius: 999,
               padding: "3px 10px",
+              cursor: "pointer",
             }}
           >
-            blocked · {fCount(blocked)}
-          </span>
+            {remediationCopy.label} · {fCount(blocked)}
+          </button>
         )}
       </div>
 
@@ -1022,11 +1027,21 @@ export function CampaignDetail({
               {fCount(barSegments.awaitingCount)} awaiting URANS
             </button>
           )}
-          {barSegments.blockedCount > 0 && (
-            <span
+          {barSegments.blockedCount > 0 && remediationCopy && (
+            <button
+              type="button"
               data-testid="campaign-blocked-count"
-              title="Machine-owned bounded preliminary work is unavailable; this is not a review queue"
-              style={{ color: C.amber }}
+              title={remediationCopy.title}
+              onClick={() => setDetailsOpen(() => true)}
+              style={{
+                color: C.amber,
+                fontFamily: MONO,
+                fontSize: 10.5,
+                background: "transparent",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+              }}
             >
               <span
                 aria-hidden
@@ -1040,8 +1055,8 @@ export function CampaignDetail({
                   verticalAlign: -1,
                 }}
               />
-              {fCount(barSegments.blockedCount)} blocked
-            </span>
+              {fCount(barSegments.blockedCount)} {remediationCopy.label}
+            </button>
           )}
           <span>
             <span
@@ -1151,6 +1166,27 @@ export function CampaignDetail({
                 conditions
               </span>
             </div>
+            {remediationCopy && (
+              <div
+                data-testid="campaign-remediation-detail"
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10.5,
+                  color: C.text2,
+                  border: "1px solid rgba(245,158,11,0.38)",
+                  background: "rgba(245,158,11,0.06)",
+                  borderRadius: 8,
+                  padding: "8px 10px",
+                  lineHeight: 1.5,
+                }}
+              >
+                <span style={{ color: C.amber, fontWeight: 700 }}>
+                  {fCount(blocked)} {remediationCopy.label}
+                </span>
+                {" — "}
+                {remediationCopy.detail}
+              </div>
+            )}
             {tiersLine && (
               <div
                 data-testid="campaign-tier-counts"

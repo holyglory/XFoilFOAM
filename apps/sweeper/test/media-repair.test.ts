@@ -41,6 +41,7 @@ import {
   sweepDefinitions,
   type DB,
   refreshPolarCacheForRevision,
+  satisfyPrecalcObligationFromAcceptedResult,
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
@@ -363,6 +364,86 @@ async function createBlockedPrecalcFixture(
     ...fixture,
     jobId: job.id,
     resultAttemptId: attempt.id,
+    obligationId: obligation.id,
+  };
+}
+
+async function createNoSheddingBlockedPrecalcFixture(
+  label: string,
+): Promise<BlockedPrecalcFixture> {
+  const airfoilId = await createAirfoil(label);
+  const aoaDeg = 6;
+  const engineJobId = `${PREFIX}-${label}-job`;
+  const [job] = await db
+    .insert(simJobs)
+    .values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      campaignId: null,
+      referenceChordM: 0.15,
+      wave: 2,
+      status: "done",
+      engineJobId,
+      totalCases: 1,
+      completedCases: 1,
+      ingestedAt: new Date(),
+      finishedAt: new Date(),
+      requestPayload: {
+        aoas: [aoaDeg],
+        uransFidelity: "precalc",
+      },
+    })
+    .returning();
+  const fixture = await createSolvedResult(label, {
+    airfoilId,
+    aoa: aoaDeg,
+    unsteady: false,
+    simJobId: job.id,
+  });
+  // createSolvedResult promotes the exact attempt after its first refresh;
+  // refresh once more so the canonical result classification sees that newly
+  // selected no-shedding PRECALC generation.
+  await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+  const [classification] = await db
+    .select({ state: resultClassifications.state })
+    .from(resultClassifications)
+    .where(eq(resultClassifications.resultAttemptId, fixture.resultAttemptId));
+  if (classification?.state !== "accepted") {
+    throw new Error(
+      `no-shedding PRECALC fixture must begin accepted, got ${classification?.state ?? "none"}`,
+    );
+  }
+  const [obligation] = await db
+    .insert(simPrecalcObligations)
+    .values({
+      airfoilId,
+      revisionId,
+      aoaDeg,
+      state: "blocked",
+      attemptCount: 2,
+      maxAttempts: 2,
+      latestSimJobId: job.id,
+      sourceResultId: fixture.resultId,
+      sourceResultAttemptId: fixture.resultAttemptId,
+      lastOutcome: "rejected_exhausted",
+      lastError: "stale classification from before no-shedding PRECALC support",
+      completedAt: new Date(),
+    })
+    .returning();
+  await db.insert(simPrecalcObligationAttempts).values({
+    obligationId: obligation.id,
+    simJobId: job.id,
+    attemptNumber: 2,
+    state: "rejected",
+    outcome: "rejected_exhausted",
+    resultAttemptId: fixture.resultAttemptId,
+    error: "stale classification from before no-shedding PRECALC support",
+    completedAt: new Date(),
+  });
+  return {
+    ...fixture,
+    jobId: job.id,
     obligationId: obligation.id,
   };
 }
@@ -1472,6 +1553,33 @@ describe("durable result media repair", () => {
           eq(simPrecalcObligationAttempts.obligationId, fixture.obligationId),
         ),
     ).toHaveLength(1);
+  });
+
+  it("MUST-CATCH: satisfies a no-shedding preliminary URANS obligation stored with the physical RANS regime", async () => {
+    const fixture = await createNoSheddingBlockedPrecalcFixture(
+      "no-shedding-precalc-settlement",
+    );
+
+    const satisfaction = await satisfyPrecalcObligationFromAcceptedResult(
+      db,
+      fixture.resultId,
+    );
+    expect(satisfaction).toMatchObject({
+      obligationId: fixture.obligationId,
+      resultAttemptId: fixture.resultAttemptId,
+      changed: true,
+    });
+    const [obligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligationId));
+    expect(obligation).toMatchObject({
+      state: "satisfied",
+      sourceResultId: fixture.resultId,
+      sourceResultAttemptId: fixture.resultAttemptId,
+      lastOutcome: "accepted",
+      lastError: null,
+    });
   });
 
   it("keeps the physical PRECALC obligation blocked when media repair exhausts", async () => {
