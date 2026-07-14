@@ -39,3 +39,15 @@ prevents oversubscription.
 - With open campaign work, the sweeper submits enough independent polar jobs
   to fill available worker tokens while no job reports a synthetic
   `queue_pressure` value.
+
+## Rollout verification
+
+Control-plane deployment run `29370730713` succeeded on 2026-07-14. Migration
+0062 left production `max_concurrent_jobs=0` with database default `0`; the
+new sweeper received `AIRFOILFOAM_WORKER_CPU_BUDGET=8`. The deployed scheduler
+admitted eight active engine tasks with zero queued, reserved, scheduled,
+duplicate, or redelivered tasks. Seven newly admitted jobs carried only
+`{"policy":"auto"}`; the one remaining `queue_pressure` job predated the
+fix. The existing worker container remained up throughout, campaign points
+reported zero blocked, and an exact query returned zero accepted unsteady
+attempts without an instantaneous video.
