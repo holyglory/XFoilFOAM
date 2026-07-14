@@ -157,6 +157,9 @@ services:
       ENGINE_URL: ${ENGINE_URL}
       MEDIA_DIR: ${MEDIA_DIR}
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+      # Keep Node admission in the same logical-CPU units as the worker's
+      # durable token pool. sweeper_state max_concurrent_jobs=0 means auto.
+      AIRFOILFOAM_WORKER_CPU_BUDGET: ${AIRFOILFOAM_WORKER_CPU_BUDGET:-8}
     volumes:
       - results:/data/airfoilfoam
       - sync_imports:/data/airfoilfoam/sync-imports # GC crash-orphan sync uploads

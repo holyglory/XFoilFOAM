@@ -27,7 +27,10 @@ export interface SweeperStateRow {
 export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
   id: 1,
   enabled: false,
-  maxConcurrentJobs: 2,
+  // 0 = auto. The sweeper resolves it to the engine worker's CPU-token
+  // capacity (or the visible cpuSlots cap), so this legacy field can no
+  // longer silently limit the only user-facing capacity control.
+  maxConcurrentJobs: 0,
   cpuSlots: 0,
   pollIntervalMs: 5000,
   submitIntervalMs: 15000,
@@ -103,6 +106,7 @@ export async function readSweeperState(): Promise<SweeperStateRow | null> {
 
 export interface SweeperStatePatch {
   enabled?: boolean;
+  /** 0 = auto; positive values are an explicit API-only admission override. */
   maxConcurrentJobs?: number;
   cpuSlots?: number;
   pollIntervalMs?: number;

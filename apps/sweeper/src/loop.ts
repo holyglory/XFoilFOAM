@@ -52,6 +52,30 @@ interface SweeperConfig {
   submitIntervalMs: number;
 }
 
+/**
+ * `max_concurrent_jobs` predates the single "OpenFOAM CPU slots" control and
+ * was never exposed in the admin UI.  A legacy value of two therefore became
+ * an invisible hard ceiling: once a second job existed, engine auto-mode
+ * quite correctly selected one CPU per job and left the remaining worker
+ * tokens idle.  Zero means that the visible global capacity control owns the
+ * admission limit too.  The Node services receive the same worker budget as
+ * the engine through compose; retain a conservative fallback for unusual
+ * local/development deployments that do not set it.
+ */
+export function effectiveMaxConcurrentJobs(
+  configuredMax: number | null | undefined,
+  cpuSlots: number | null | undefined,
+  workerBudget = Number(process.env.AIRFOILFOAM_WORKER_CPU_BUDGET ?? 2),
+): number {
+  if (Number.isInteger(configuredMax) && (configuredMax ?? 0) > 0)
+    return configuredMax as number;
+  if (Number.isInteger(cpuSlots) && (cpuSlots ?? 0) > 0)
+    return cpuSlots as number;
+  return Number.isInteger(workerBudget) && workerBudget > 0
+    ? workerBudget
+    : 2;
+}
+
 export async function getState(db: DB): Promise<SweeperConfig> {
   // Projected select (not select()) so the sweeper keeps working while the
   // 0026 engineUnreachableSince column has not been applied yet.
@@ -68,7 +92,13 @@ export async function getState(db: DB): Promise<SweeperConfig> {
     .limit(1);
   return {
     enabled: s?.enabled ?? false,
-    maxConcurrentJobs: s?.maxConcurrentJobs ?? 2,
+    // 0 = auto: admit up to the same CPU-token capacity the engine owns.
+    // A positive value remains an explicit API-only override for installations
+    // that deliberately want fewer concurrent polar jobs.
+    maxConcurrentJobs: effectiveMaxConcurrentJobs(
+      s?.maxConcurrentJobs,
+      s?.cpuSlots,
+    ),
     // 0 = auto: submit without a cpu_budget cap (the pre-campaign behavior).
     cpuSlots: s?.cpuSlots ?? 0,
     pollIntervalMs: s?.pollIntervalMs ?? 5000,

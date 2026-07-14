@@ -1904,12 +1904,16 @@ export const simJobs = pgTable(
 export const sweeperState = pgTable("sweeper_state", {
   id: integer("id").primaryKey().default(1),
   enabled: boolean("enabled").notNull().default(false),
-  maxConcurrentJobs: integer("max_concurrent_jobs").notNull().default(2),
+  // 0 = auto: derive concurrent polar-job admission from the worker token
+  // budget (or the visible cpuSlots cap). A positive value is an explicit
+  // API-only override; it must never remain an invisible legacy ceiling.
+  maxConcurrentJobs: integer("max_concurrent_jobs").notNull().default(0),
   // THE single global solver-capacity setting ("OpenFOAM CPU slots").
   // 0 = auto: submit jobs without a cpu_budget cap so the engine resolves its
   // own worker budget — exactly the pre-campaign effective behavior (scheduling
   // profiles defaulted cpuBudget to NULL). Job building passes a positive value
-  // into the engine `resources` block; maxConcurrentJobs is subordinate to it.
+  // into the engine `resources` block, and auto job admission follows this
+  // same capacity instead of a separate hidden ceiling.
   cpuSlots: integer("cpu_slots").notNull().default(0),
   // Engine-down backoff (spec §7): set when a submit-path probe/submit fails
   // with a connection error, cleared on the first successful probe/submit.

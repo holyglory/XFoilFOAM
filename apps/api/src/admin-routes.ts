@@ -3896,7 +3896,10 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     const b = z
       .object({
         enabled: z.boolean().optional(),
-        maxConcurrentJobs: z.number().int().positive().max(64).optional(),
+        // 0 = auto: follow the same engine CPU capacity represented by the
+        // visible cpuSlots control. Positive values remain a deliberate
+        // API-only admission override.
+        maxConcurrentJobs: z.number().int().min(0).max(64).optional(),
         // 0 = auto (see sweeperResponse); capped to keep budgets sane.
         cpuSlots: z.number().int().min(0).max(512).optional(),
         pollIntervalMs: z.number().int().min(1000).optional(),

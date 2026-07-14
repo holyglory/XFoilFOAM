@@ -15,7 +15,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { airfoils, categories, simJobs } from "@aerodb/db";
+import { airfoils, categories, simJobs, sweeperState } from "@aerodb/db";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -306,5 +306,32 @@ describe("admin login validation", () => {
       payload: { email: ADMIN_EMAIL, password: "wrong" },
     });
     expect(res.statusCode).toBe(401);
+  });
+});
+
+describe("automatic scheduler admission", () => {
+  it("accepts zero as the explicit auto admission setting", async () => {
+    const [original] = await db
+      .select({ maxConcurrentJobs: sweeperState.maxConcurrentJobs })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1);
+    try {
+      const res = await app.inject({
+        method: "PATCH",
+        url: "/api/admin/sweeper",
+        headers: { cookie: adminCookie },
+        payload: { maxConcurrentJobs: 0 },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().maxConcurrentJobs).toBe(0);
+    } finally {
+      if (original) {
+        await db
+          .update(sweeperState)
+          .set({ maxConcurrentJobs: original.maxConcurrentJobs })
+          .where(eq(sweeperState.id, 1));
+      }
+    }
   });
 });

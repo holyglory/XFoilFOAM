@@ -4,7 +4,26 @@
 
 - Confirmed intent: production campaigns should use real available compute while
   preserving trustworthy solver evidence and automatic recovery rather than
-  handing repairable pipeline work to users. [D-2026-07-14-campaign-capacity]
+  handing repairable pipeline work to users. The single visible CPU-capacity
+  control must be the actual admission limit; an undocumented job cap must not
+  strand worker tokens. [D-2026-07-14-campaign-capacity]
+
+## D-2026-07-14-auto-job-admission — Auto admission follows the worker token budget
+
+Detail: [DecisionDetails/D-2026-07-14-auto-job-admission.md](DecisionDetails/D-2026-07-14-auto-job-admission.md)
+
+- Decision: `sweeper_state.max_concurrent_jobs=0` means automatic admission,
+  resolved from the visible OpenFOAM CPU-slot cap when set or otherwise from
+  the worker's logical CPU-token budget. The migration converts the historic
+  default of two to auto, while a positive value remains an explicit API-only
+  override for deployments that deliberately want fewer simultaneous polars.
+- Why: after logical campaign backlog was removed from engine requests, the
+  remaining hidden cap of two still limited an eight-token worker to two
+  serial polar branches whenever the real engine queue was nonempty. A
+  one-off VPS edit would regress on reset/deploy; changing MPI or the numerical
+  marching policy would change solver behavior. Automatic job admission uses
+  the existing token guard and aligns runtime behavior with the sole user
+  capacity control.
 
 ## 2026-07-14 — Low-angle alternate RANS branches receive targeted preliminary URANS
 
