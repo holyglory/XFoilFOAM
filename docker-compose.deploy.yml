@@ -168,6 +168,31 @@ services:
       storage-init:
         condition: service_completed_successfully
 
+  # Default-media rendering is durable output work. It intentionally has its
+  # own control-plane process so large VTK/animation renders cannot delay the
+  # scheduler from submitting independent CFD work to otherwise-idle cores.
+  media-repair:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    restart: unless-stopped
+    command: sh -c "pnpm --filter @aerodb/sweeper media-repair"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      ENGINE_URL: ${ENGINE_URL}
+      MEDIA_DIR: ${MEDIA_DIR}
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+    volumes:
+      - results:/data/airfoilfoam
+      - sync_imports:/data/airfoilfoam/sync-imports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-api:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+
 volumes:
   results:
   sync_imports:

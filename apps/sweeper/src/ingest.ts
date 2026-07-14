@@ -1276,109 +1276,6 @@ async function airfoilContourPoints(
   return points.map((p) => [p.x, p.y]);
 }
 
-async function computeAndStoreFieldExtents(opts: {
-  db: DB;
-  engine: EngineClient;
-  engineJobId: string;
-  airfoilId: string;
-  presetRevisionId: string | null;
-  resultId: string;
-  resultAttemptId: string;
-  point: PolarPoint;
-  speed: number;
-  chord: number;
-  airfoilPoints: [number, number][];
-}): Promise<void> {
-  const {
-    db,
-    engine,
-    engineJobId,
-    airfoilId,
-    presetRevisionId,
-    resultId,
-    resultAttemptId,
-    point,
-    speed,
-    chord,
-    airfoilPoints,
-  } = opts;
-  if (!presetRevisionId || !point.case_slug || failedForPoint(point)) return;
-  const evidenceBase = evidenceBaseFromPoint(point);
-  if (!evidenceBase) {
-    // Loud, never silent: without an evidence base the point can never get
-    // scaled media, and downstream that reads as "missing-urans-video".
-    console.error(
-      `[sweeper] field extents skipped: no evidence base in manifest (job ${engineJobId}, case ${point.case_slug}, aoa ${point.aoa_deg}, result ${resultId})`,
-    );
-    return;
-  }
-  let response;
-  try {
-    response = await engine.computeFieldExtents(engineJobId, {
-      case_slug: point.case_slug,
-      evidence_base: evidenceBase,
-      airfoil_points: airfoilPoints,
-      chord,
-      speed,
-      fields: ALL_IMAGE_FIELDS,
-      zoom_chords: 2,
-      max_frames: 220,
-    });
-  } catch (error) {
-    // Loud, never silent: a swallowed extents failure is exactly how prod
-    // points ended up coefficient-complete but "missing-urans-video".
-    console.error(
-      `[sweeper] computeFieldExtents FAILED (job ${engineJobId}, case ${point.case_slug}, aoa ${point.aoa_deg}, result ${resultId}): ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    return;
-  }
-  const evidenceSha256 = evidenceShaFromPoint(point);
-  for (const [rawField, extent] of Object.entries(response.fields)) {
-    if (!isImageFieldName(rawField) || !extent) continue;
-    if (
-      !Number.isFinite(extent.min) ||
-      !Number.isFinite(extent.max) ||
-      extent.finite_count <= 0
-    )
-      continue;
-    await db
-      .insert(resultFieldExtents)
-      .values({
-        resultId,
-        resultAttemptId,
-        airfoilId,
-        simulationPresetRevisionId: presetRevisionId,
-        field: rawField,
-        renderProfileKey: DEFAULT_RENDER_PROFILE_KEY,
-        vmin: extent.min,
-        vmax: extent.max,
-        finiteCount: extent.finite_count,
-        sourceTimeStart: response.window_start ?? null,
-        sourceTimeEnd: response.window_end ?? null,
-        evidenceSha256,
-      })
-      .onConflictDoUpdate({
-        target: [
-          resultFieldExtents.resultAttemptId,
-          resultFieldExtents.field,
-          resultFieldExtents.renderProfileKey,
-        ],
-        targetWhere: sql`${resultFieldExtents.resultAttemptId} IS NOT NULL`,
-        set: {
-          vmin: extent.min,
-          vmax: extent.max,
-          finiteCount: extent.finite_count,
-          sourceTimeStart: response.window_start ?? null,
-          sourceTimeEnd: response.window_end ?? null,
-          evidenceSha256,
-          updatedAt: new Date(),
-        },
-      });
-  }
-}
-
 async function manifestForResult(
   db: DB,
   resultId: string,
@@ -3926,7 +3823,6 @@ export async function ingestResult(opts: {
   // the failed-job ingest path must be able to tell "evidence shipped" from a
   // true crash with an empty payload.
   let attempts = 0;
-  const airfoilPoints = await airfoilContourPoints(db, airfoilId);
   const dirtyLanes = new Map<string, CampaignLaneKey>();
   const candidatesByRevision = new Map<string, StagedPoint[]>();
   const legacyCandidates: StagedPoint[] = [];
@@ -4025,21 +3921,12 @@ export async function ingestResult(opts: {
       );
     }
     await stageForceHistory(db, cell.id, resultAttemptId, p);
-    if (airfoilPoints) {
-      await computeAndStoreFieldExtents({
-        db,
-        engine,
-        engineJobId,
-        airfoilId,
-        presetRevisionId: input.presetRevisionId,
-        resultId: cell.id,
-        resultAttemptId,
-        point: p,
-        speed: input.speed,
-        chord: input.chord,
-        airfoilPoints,
-      });
-    }
+    // Field extents and scaled default media belong to the separate, durable
+    // media-repair worker. Calling the renderer while a continuous sweep is
+    // publishing partial evidence makes the scheduler wait on I/O instead of
+    // submitting the next independent polar. Shipped media and immutable raw
+    // evidence above remain immediately available; the repair worker derives
+    // extents only after the producing engine job is terminal.
     return {
       airfoilId,
       bcId: input.bcId,

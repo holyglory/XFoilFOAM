@@ -4503,5 +4503,5 @@ mean).
 
 Detail: [DecisionDetails/D-2026-07-14-campaign-capacity.md](DecisionDetails/D-2026-07-14-campaign-capacity.md)
 
-- Decision: local sweeper submissions omit controller backlog from engine resource requests; completed-job ingest stages immutable evidence and then terminalizes, while the existing fenced media-repair queue owns expensive default-media rendering and retries. Shared `mesh_evidence` artifacts are retained as `mesh` with their original engine kind preserved in provenance.
+- Decision: local sweeper submissions omit controller backlog from engine resource requests; completed-job ingest stages immutable evidence and then terminalizes, while a separate fenced media-repair control-plane service owns expensive default-media rendering and retries. Shared `mesh_evidence` artifacts are retained as `mesh` with their original engine kind preserved in provenance.
 - Why: keeping logical campaign backlog as engine pressure serialized independent speed branches despite an idle worker; forcing parallel OpenFOAM processes or changing continuous AoA marching would broaden numerical risk. Engine queue/token observation provides the real capacity signal, while bounded post-terminal repair preserves fail-closed media truth without holding scheduler slots indefinitely.

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
+    "media-repair": "tsx src/media-repair-worker.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "verify:queue": "tsx src/verify-queue.ts"

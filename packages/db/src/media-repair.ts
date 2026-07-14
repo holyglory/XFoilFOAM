@@ -248,6 +248,13 @@ export async function discoverMissingResultMediaRepairs(
       ) manifest ON true
       LEFT JOIN sim_jobs producing_job ON producing_job.id = candidate.sim_job_id
       WHERE r.simulation_preset_revision_id IS NOT NULL
+        -- Default-media rendering is output work, not part of the active
+        -- solver march. Hold it until the producing job is terminal so one
+        -- expensive render cannot stall partial-evidence scheduling.
+        AND (
+          producing_job.id IS NULL
+          OR producing_job.status IN ('done', 'failed', 'cancelled')
+        )
         AND (${opts.resultId ?? null}::uuid IS NULL OR r.id = ${opts.resultId ?? null}::uuid)
         AND (${opts.airfoilId ?? null}::uuid IS NULL OR r.airfoil_id = ${opts.airfoilId ?? null}::uuid)
         AND (
@@ -436,12 +443,18 @@ export async function claimNextResultMediaRepair(
     WITH candidate AS (
       SELECT repair.id
       FROM result_media_repairs repair
+      JOIN result_attempts attempt ON attempt.id = repair.result_attempt_id
+      LEFT JOIN sim_jobs producing_job ON producing_job.id = attempt.sim_job_id
       WHERE repair.state IN ('pending', 'retry_wait')
         AND (${opts.resultId ?? null}::uuid IS NULL OR repair.result_id = ${opts.resultId ?? null}::uuid)
+        AND (
+          producing_job.id IS NULL
+          OR producing_job.status IN ('done', 'failed', 'cancelled')
+        )
         AND repair.next_attempt_at <= ${nowIso}::timestamptz
         AND repair.attempt_count < repair.max_attempts
       ORDER BY repair.next_attempt_at, repair."createdAt", repair.id
-      FOR UPDATE SKIP LOCKED
+      FOR UPDATE OF repair SKIP LOCKED
       LIMIT 1
     )
     UPDATE result_media_repairs repair

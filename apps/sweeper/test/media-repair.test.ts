@@ -625,6 +625,50 @@ afterAll(async () => {
 });
 
 describe("durable result media repair", () => {
+  it("MUST-CATCH: defers default-media rendering while its producing CFD job is still running", async () => {
+    const airfoilId = await createAirfoil("active-producer");
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: 0.15,
+        wave: 2,
+        status: "running",
+        engineJobId: `${PREFIX}-active-producer-job`,
+        totalCases: 1,
+        completedCases: 1,
+      })
+      .returning();
+    const fixture = await createSolvedResult("active-producer", {
+      airfoilId,
+      simJobId: job.id,
+    });
+
+    expect(
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      }),
+    ).toBe(0);
+    expect(
+      await claimNextResultMediaRepair(db, { resultId: fixture.resultId }),
+    ).toBeNull();
+
+    await db
+      .update(simJobs)
+      .set({ status: "done", finishedAt: new Date() })
+      .where(eq(simJobs.id, job.id));
+    expect(
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      }),
+    ).toBe(1);
+    expect(
+      await claimNextResultMediaRepair(db, { resultId: fixture.resultId }),
+    ).toMatchObject({ resultId: fixture.resultId, state: "running" });
+  });
+
   it("records an extent failure as a bounded retry instead of losing the obligation", async () => {
     const fixture = await createSolvedResult("extent-failure");
     const outcome = await resultMediaRepairTick(

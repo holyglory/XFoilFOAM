@@ -92,7 +92,6 @@ import {
   releaseIngestLeaseToRunning,
   renewIngestLeaseOrThrow,
 } from "./ingest-lease";
-import { resultMediaRepairTick } from "./media-repair";
 import {
   parseRansRetryScope,
   ransRetryPlanForJobScoped,
@@ -147,14 +146,9 @@ function deterministicMeshEvidenceSql(
 // low-frequency campaign reconciler.
 const LANE_SAFETY_SWEEP_MS = 60_000;
 const CAMPAIGN_RECONCILE_MS = 5 * 60_000;
-// Durable per-result media obligations replace unclaimed field-scale retries.
-// One expensive render is claimed per pass; the first boot pass waits a full
-// interval so short-lived commands/tests do not unexpectedly start rendering.
-const RESULT_MEDIA_REPAIR_MS = 60_000;
 const pendingDirtyLanes = new Map<string, CampaignLaneKey>();
 let lastLaneSweepAt = 0;
 let lastCampaignReconcileAt = 0;
-let lastResultMediaRepairAt = Date.now();
 
 function collectDirtyLanes(keys: CampaignLaneKey[]): void {
   for (const key of keys) pendingDirtyLanes.set(laneKeyId(key), key);
@@ -3374,36 +3368,6 @@ export async function reconcile(
   }
 
   await drainCampaignMaintenance(db);
-
-  // Durable, token-fenced default-media repair. The old unclaimed
-  // field_color_scales retry loop is intentionally not called here: a crashed
-  // or slow scale renderer had no lease/fencing generation and could overwrite
-  // a newer success. Result obligations are the sole production repair owner.
-  const now = Date.now();
-  if (now - lastResultMediaRepairAt >= RESULT_MEDIA_REPAIR_MS) {
-    lastResultMediaRepairAt = now;
-    try {
-      const outcome = await resultMediaRepairTick(db, engine);
-      collectDirtyLanes(outcome.dirtyLanes);
-      if (
-        outcome.discovered ||
-        outcome.finalized ||
-        outcome.claimed ||
-        outcome.blocked
-      ) {
-        console.log(
-          `[sweeper] media-repair pass: discovered ${outcome.discovered}, ` +
-            `finalized ${outcome.finalized}, rendered ${outcome.repairedMedia}, ` +
-            `retrying ${outcome.retrying}, blocked ${outcome.blocked}`,
-        );
-      }
-    } catch (e) {
-      console.error(
-        "[sweeper] result-media repair pass failed:",
-        errorMessage(e),
-      );
-    }
-  }
 }
 
 /** Per-tick cap on dirty-lane processing. A dual-objective campaign dirties

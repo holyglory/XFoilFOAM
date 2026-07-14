@@ -104,16 +104,19 @@ main() {
   compose config >/tmp/airfoils-pro-compose-config.yml
 
   echo "Building control-plane images..."
-  compose build node-api web sweeper
+  compose build node-api web sweeper media-repair
 
   # The node-api runs database migrations during startup.  Stop the old
-  # sweeper before that cutover so an older writer cannot ingest evidence into
-  # a newly migrated schema between the migration commit and restoring the
-  # sweeper's prior running/stopped state. This stops only control-plane
-  # scheduling/ingest; api, worker, and any live OpenFOAM child processes
-  # remain untouched.
-  echo "Quiescing the old sweeper before database migration..."
+  # scheduler and media-repair writers before that cutover so an older writer
+  # cannot ingest evidence into a newly migrated schema between the migration
+  # commit and restoring control-plane services. This stops only Node control
+  # plane scheduling/derived media work; api, worker, and live OpenFOAM child
+  # processes remain untouched.
+  echo "Quiescing old control-plane writers before database migration..."
   compose stop sweeper
+  # The service is introduced after the first deployment of this change; its
+  # absence on an older stack is expected, but never hide a sweeper stop error.
+  compose stop media-repair || true
 
   # `node-api` mounts `results` read-only and `sync_imports` at a nested
   # path. Fresh result volumes therefore need the nested mountpoint created
@@ -128,6 +131,8 @@ main() {
   echo "Restarting web..."
   compose up -d --no-deps web
   restore_sweeper_state "$sweeper_initial_state"
+  echo "Starting durable media repair worker..."
+  compose up -d --no-deps media-repair
   wait_http "web" "http://127.0.0.1:3100/health" 90
 
   echo "Skipping api/worker redeploy. Engine maintenance is available only through scripts/deploy/rebuild-engine.sh."

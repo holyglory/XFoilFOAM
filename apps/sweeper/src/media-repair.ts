@@ -20,7 +20,6 @@ import {
 import type { EngineClient } from "@aerodb/engine-client";
 import { eq, sql } from "drizzle-orm";
 
-import { touchHeartbeat } from "./heartbeat";
 import {
   publishRepairedResultAttempt,
   repairDefaultMediaForStoredResult,
@@ -201,6 +200,10 @@ export async function resultMediaRepairTick(
     discoveryLimit?: number;
     finalizeLimit?: number;
     resultId?: string;
+    /** The scheduler owns sweeper liveness. A dedicated media-repair process
+     * deliberately leaves it untouched, while still renewing its own durable
+     * repair lease around each expensive engine operation. */
+    heartbeat?: () => Promise<void>;
   } = {},
 ): Promise<ResultMediaRepairTickOutcome> {
   const dirty = new Map<string, CampaignLaneKey>();
@@ -241,7 +244,7 @@ export async function resultMediaRepairTick(
       throw new Error("claimed result media repair has no ownership token");
     }
     const heartbeat = async () => {
-      await touchHeartbeat(db);
+      await opts.heartbeat?.();
       if (!(await renewResultMediaRepairClaim(db, claim))) {
         throw new Error("result media repair lease lost to another renderer");
       }

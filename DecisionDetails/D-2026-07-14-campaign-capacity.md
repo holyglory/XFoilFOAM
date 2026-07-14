@@ -25,12 +25,12 @@ same renderer before it could mark the job done.
    is not needed to correct the measured scheduler fault.
 3. Let the engine use its actual Redis queue and worker CPU-token pressure,
    retain serial angle marching within each polar, and run presentation-media
-   rendering only via its durable repair owner after job finalization.
+   rendering only after job finalization in a separate durable repair service.
 
-Option 3 was selected. It is reversible at the local request-builder boundary,
-keeps the existing engine's automatic congestion behavior, and preserves the
-normal evidence gate: missing URANS media remains rejected until a real,
-checksummed repair artifact is stored.
+Option 3 was selected. It is reversible in the Node control plane without an
+engine rebuild, keeps the existing engine's automatic congestion behavior, and
+preserves the normal evidence gate: missing URANS media remains rejected until
+a real, checksummed repair artifact is stored.
 
 ## Scope and verification
 
@@ -46,5 +46,8 @@ checksummed repair artifact is stored.
   bounded media ledger rather than launching duplicate CFD work. While that
   repair is pending, Solver Work reports automatic repair rather than a user
   actionable block.
+- `media-repair` is a separately deployed Node control-plane service. It
+  claims one leased repair at a time only after the producing CFD job is
+  terminal; scheduler ingest never calls field-extents or default-render APIs.
 - Production deployment must update Node control-plane services only. It must
   not recreate the active OpenFOAM worker or API services.

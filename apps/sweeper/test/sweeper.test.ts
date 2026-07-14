@@ -1278,25 +1278,29 @@ describe("sweeper: gap → claim → ingest", () => {
       byte_size: 128,
       metadata: { evidenceBase: `/tmp/evidence/${caseSlug}` },
     });
+    let extentCalls = 0;
     let defaultRenderCalls = 0;
     const mediaEngine = {
       baseUrl: "http://engine.test",
       computeFieldExtents: async (
         _jobId: string,
         request: { case_slug: string },
-      ) => ({
-        fields:
-          request.case_slug === "c1"
-            ? {
-                velocity_magnitude: { min: 0, max: 42, finite_count: 100 },
-                pressure: { min: -2, max: 4, finite_count: 100 },
-              }
-            : {
-                velocity_magnitude: { min: 0, max: 55, finite_count: 100 },
-              },
-        window_start: null,
-        window_end: null,
-      }),
+      ) => {
+        extentCalls++;
+        return {
+          fields:
+            request.case_slug === "c1"
+              ? {
+                  velocity_magnitude: { min: 0, max: 42, finite_count: 100 },
+                  pressure: { min: -2, max: 4, finite_count: 100 },
+                }
+              : {
+                  velocity_magnitude: { min: 0, max: 55, finite_count: 100 },
+                },
+          window_start: null,
+          window_end: null,
+        };
+      },
       renderDefaultMedia: async (
         jobId: string,
         request: {
@@ -1501,6 +1505,7 @@ describe("sweeper: gap → claim → ingest", () => {
     // scheduler capacity on full default-media rendering. The bounded repair
     // queue owns scaled rendering after the job is terminal.
     expect(r1.media).toBe(5);
+    expect(extentCalls).toBe(0);
     expect(defaultRenderCalls).toBe(0);
 
     const rows = await db
@@ -1636,7 +1641,10 @@ describe("sweeper: gap → claim → ingest", () => {
           ),
         ),
       );
-    expect(extents.length).toBeGreaterThanOrEqual(3);
+    // Ingest never performs VTK extent scans. Those CPU/I/O-heavy derived
+    // media operations are owned by the independent durable repair service,
+    // so partial solver progress cannot stall scheduling.
+    expect(extents).toHaveLength(0);
     // idempotent: re-ingest produces no duplicates
     await ingestResult({
       db,
@@ -1675,6 +1683,7 @@ describe("sweeper: gap → claim → ingest", () => {
         ),
       );
     expect(attemptsAfter.length).toBe(3);
+    expect(extentCalls).toBe(0);
     expect(defaultRenderCalls).toBe(0);
   }, 60000);
 
@@ -3741,15 +3750,11 @@ describe("sweeper: gap → claim → ingest", () => {
         completed_cases: 1,
       }),
       getResult: async () => withExactManifestEvidence(result),
-      computeFieldExtents: async () => ({
-        fields: {
-          velocity_magnitude: { min: 0, max: 44, finite_count: 100 },
-        },
-        window_start: 1,
-        window_end: 2,
-      }),
+      computeFieldExtents: async () => {
+        throw new Error("scheduler ingest must not calculate field extents");
+      },
       renderDefaultMedia: async () => {
-        return { images: [], mean_images: [], videos: [] };
+        throw new Error("scheduler ingest must not render default media");
       },
       fileUrl: (id: string, relPath: string) =>
         `http://engine.test/jobs/${id}/files/${relPath}`,
