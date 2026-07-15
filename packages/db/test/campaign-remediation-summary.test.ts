@@ -587,7 +587,7 @@ describe("campaign remediation summary", () => {
             SELECT obligation.id
             FROM sim_precalc_obligations obligation
             WHERE obligation.state = 'blocked'
-              AND obligation.attempt_count = 1
+              AND obligation.attempt_count < obligation.max_attempts
               AND obligation.last_outcome = 'deterministic_failure'
             ORDER BY obligation.id
             LIMIT 500
@@ -620,6 +620,8 @@ describe("campaign remediation summary", () => {
       obligations.map((obligation) => ({
         obligationId: obligation.id,
         attemptNumber: 1,
+        solverAttemptNumber: null,
+        consumesSolverAttempt: false,
         state: "failed",
         outcome: "deterministic_failure",
         meshRecoveryVersion: 0,
@@ -1013,7 +1015,7 @@ describe("campaign remediation summary", () => {
         FROM pg_indexes
         WHERE indexname = 'sim_precalc_obligations_mesh_recovery_candidate_idx'
       `;
-    expect(index.indexdef).toContain("attempt_count = 1");
+    expect(index.indexdef).toContain("attempt_count < max_attempts");
     expect(index.indexdef).toContain("last_outcome = 'deterministic_failure'");
   }, 120_000);
 
@@ -1034,7 +1036,7 @@ describe("campaign remediation summary", () => {
           revisionId,
           aoaDeg: 0,
           state: "blocked",
-          attemptCount: 1,
+          attemptCount: 0,
           lastOutcome: "deterministic_failure",
           lastError: meshError,
         },
@@ -1044,6 +1046,8 @@ describe("campaign remediation summary", () => {
     await db.insert(simPrecalcObligationAttempts).values({
       obligationId: obligation.id,
       attemptNumber: 1,
+      solverAttemptNumber: null,
+      consumesSolverAttempt: false,
       state: "failed",
       outcome: "deterministic_failure",
       meshRecoveryVersion: 0,

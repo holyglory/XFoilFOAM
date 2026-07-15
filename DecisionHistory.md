@@ -13,6 +13,32 @@
   evidence ingestion remain live and the UI states the measured reason.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
+  [D-2026-07-15-precalc-physical-attempt-budget]
+
+## D-2026-07-15-precalc-physical-attempt-budget — PRECALC limits physical CFD attempts, not infrastructure submissions
+
+Detail: [DecisionDetails/D-2026-07-15-precalc-physical-attempt-budget.md](DecisionDetails/D-2026-07-15-precalc-physical-attempt-budget.md)
+
+- Decision: retain a monotonic immutable sequence for every engine-accepted
+  PRECALC submission, but count only submissions that publish or execute an
+  actual CFD attempt against the two-attempt physical budget. Typed
+  infrastructure loss and deterministic mesh/setup failure release their
+  reserved physical ordinal; unchanged mesh failures remain blocked until a
+  newer recovery capability exists, while infrastructure loss returns to
+  automatic scheduling after a bounded backoff. A real accepted, rejected, or
+  failed CFD window still consumes its physical attempt even if its containing
+  job later disappears.
+- Why: the production disk incident left 21 A20-32C cells falsely exhausted by
+  lost worker tasks, while seven other cells had spent the old submission
+  allowance on mesh setup before their first real preliminary-URANS window
+  requested same-case continuation. Raising the attempt limit would remain
+  exhaustible by infrastructure and permit extra physical solves; deleting or
+  resetting attempt rows would destroy audit evidence; manual requeue would
+  turn recoverable machine work into a user task. Separating submission audit
+  order from physical CFD budget preserves evidence, the two-solve bound, and
+  automatic recovery. This supersedes the 2026-07-11 wording that bounded
+  `engine-accepted submissions`; the durable limit remains two physical CFD
+  attempts.
 
 ## D-2026-07-15-disk-admission — Storage reserves gate new solver jobs
 

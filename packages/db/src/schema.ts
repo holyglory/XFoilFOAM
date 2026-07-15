@@ -2713,14 +2713,15 @@ export const simPrecalcObligations = pgTable(
     )
       .on(t.id)
       .where(
-        sql`${t.state} = 'blocked' AND ${t.attemptCount} = 1 AND ${t.lastOutcome} = 'deterministic_failure'`,
+        sql`${t.state} = 'blocked' AND ${t.attemptCount} < ${t.maxAttempts} AND ${t.lastOutcome} = 'deterministic_failure'`,
       ),
   }),
 );
 
 /** Immutable per-engine-submission audit rows for a bounded precalc
- * obligation. At most two submissions are allowed: the initial solve and one
- * retry/continuation. */
+ * obligation. Solver-attempt numbers remain limited to the initial solve and
+ * one correction; non-CFD infrastructure/setup submissions retain a monotonic
+ * audit sequence without consuming that physical budget. */
 export const simPrecalcObligationAttempts = pgTable(
   "sim_precalc_obligation_attempts",
   {
@@ -2731,7 +2732,17 @@ export const simPrecalcObligationAttempts = pgTable(
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
       onDelete: "set null",
     }),
+    /** Monotonic engine-submission sequence. Infrastructure/setup failures
+     * remain immutable audit rows and therefore still need their own sequence
+     * even though they do not consume one of the two physical CFD attempts. */
     attemptNumber: integer("attempt_number").notNull(),
+    /** Physical CFD-attempt ordinal. Null means the submission ended in
+     * infrastructure or deterministic setup/mesh work before usable CFD
+     * evidence and therefore did not consume the bounded solver budget. */
+    solverAttemptNumber: integer("solver_attempt_number"),
+    consumesSolverAttempt: boolean("consumes_solver_attempt")
+      .notNull()
+      .default(true),
     /** Effective engine mesh-recovery strategy used for this immutable
      * submission. Stored here because producing sim_jobs are retention-
      * eligible; default 0 is the honest legacy/pre-capability value. */
@@ -2761,7 +2772,11 @@ export const simPrecalcObligationAttempts = pgTable(
     ),
     numberCheck: check(
       "sim_precalc_obligation_attempts_number_check",
-      sql`${t.attemptNumber} IN (1, 2)`,
+      sql`${t.attemptNumber} > 0`,
+    ),
+    solverNumberCheck: check(
+      "sim_precalc_obligation_attempts_solver_number_check",
+      sql`${t.solverAttemptNumber} IS NULL OR ${t.solverAttemptNumber} IN (1, 2)`,
     ),
     meshRecoveryVersionCheck: check(
       "sim_precalc_obligation_attempts_mesh_recovery_version_check",
@@ -2775,6 +2790,11 @@ export const simPrecalcObligationAttempts = pgTable(
       t.obligationId,
       t.attemptNumber,
     ),
+    solverNumberUq: uniqueIndex(
+      "sim_precalc_obligation_attempts_solver_number_uq",
+    )
+      .on(t.obligationId, t.solverAttemptNumber)
+      .where(sql`${t.solverAttemptNumber} IS NOT NULL`),
     jobIdx: index("sim_precalc_obligation_attempts_job_idx").on(t.simJobId),
     resultAttemptIdx: index(
       "sim_precalc_obligation_attempts_result_attempt_idx",

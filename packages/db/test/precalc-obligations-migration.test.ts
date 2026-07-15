@@ -650,4 +650,124 @@ describe("0043→0047 PRECALC upgrade data", () => {
       if (through0047) rmSync(through0047, { recursive: true, force: true });
     }
   }, 180_000);
+
+  it("reconciles 0063 submission counts into compact physical CFD ordinals", async () => {
+    const upgradeDbName = `aerodb_precalc_0064_${process.pid}_${Date.now()}`;
+    const upgradeUrl = new URL(baseUrl);
+    upgradeUrl.pathname = `/${upgradeDbName}`;
+    const upgradeAdmin = postgres(adminUrl.toString(), { max: 1 });
+    let upgradeClient: ReturnType<typeof postgres> | null = null;
+    let through0042 = "";
+    let through0063 = "";
+
+    try {
+      await upgradeAdmin.unsafe(`CREATE DATABASE "${upgradeDbName}"`);
+      through0042 = makeMigrationFolder(42);
+      through0063 = makeMigrationFolder(63);
+      upgradeClient = postgres(upgradeUrl.toString(), { max: 1 });
+      const upgradeDb = drizzle(upgradeClient);
+      await migrate(upgradeDb, { migrationsFolder: through0042 });
+      await upgradeClient.unsafe(fixtureSql);
+      await migrate(upgradeDb, { migrationsFolder: through0063 });
+
+      await upgradeClient.unsafe(`
+        INSERT INTO sim_precalc_obligations
+          (id, airfoil_id, revision_id, aoa_deg, state,
+           attempt_count, max_attempts, background_owner, last_outcome,
+           last_error, completed_at)
+        VALUES
+          ('62000000-0000-0000-0000-000000000100', '${ID.airfoil}', '${ID.revision}', 16,
+           'blocked', 2, 2, true, 'failed_exhausted',
+           'engine reports running but no OpenFOAM process exists; task lost', now()),
+          ('62000000-0000-0000-0000-000000000101', '${ID.airfoil}', '${ID.revision}', 17,
+           'blocked', 2, 2, true, 'rejected_exhausted',
+           'requires further same-case integration', now());
+
+        INSERT INTO sim_precalc_obligation_attempts
+          (id, obligation_id, attempt_number, state, outcome, error, completed_at)
+        VALUES
+          ('63000000-0000-0000-0000-000000000100', '62000000-0000-0000-0000-000000000100', 1,
+           'failed', 'failed', 'engine reports running but no OpenFOAM process exists; task lost', now()),
+          ('63000000-0000-0000-0000-000000000101', '62000000-0000-0000-0000-000000000100', 2,
+           'failed', 'failed_exhausted', 'engine reports running but no OpenFOAM process exists; task lost', now()),
+          ('63000000-0000-0000-0000-000000000102', '62000000-0000-0000-0000-000000000101', 1,
+           'failed', 'deterministic_failure', 'checkMesh found negative-volume cells', now()),
+          ('63000000-0000-0000-0000-000000000103', '62000000-0000-0000-0000-000000000101', 2,
+           'rejected', 'rejected_exhausted', 'requires further same-case integration', now());
+      `);
+
+      await migrate(upgradeDb, { migrationsFolder: migrations });
+
+      const obligations = (await upgradeClient.unsafe(`
+        SELECT aoa_deg::float8 AS aoa, state, attempt_count, last_outcome
+        FROM sim_precalc_obligations
+        WHERE id IN (
+          '62000000-0000-0000-0000-000000000100',
+          '62000000-0000-0000-0000-000000000101'
+        )
+        ORDER BY aoa_deg
+      `)) as unknown as Array<{
+        aoa: number;
+        state: string;
+        attempt_count: number;
+        last_outcome: string;
+      }>;
+      expect(obligations).toEqual([
+        {
+          aoa: 16,
+          state: "pending",
+          attempt_count: 0,
+          last_outcome: "attempt_budget_reconciled",
+        },
+        {
+          aoa: 17,
+          state: "pending",
+          attempt_count: 1,
+          last_outcome: "attempt_budget_reconciled",
+        },
+      ]);
+
+      const ledger = (await upgradeClient.unsafe(`
+        SELECT obligation.aoa_deg::float8 AS aoa,
+               array_agg(attempt.attempt_number ORDER BY attempt.attempt_number) AS submission_numbers,
+               jsonb_agg(attempt.solver_attempt_number ORDER BY attempt.attempt_number) AS solver_numbers,
+               array_agg(attempt.consumes_solver_attempt ORDER BY attempt.attempt_number) AS consumes
+        FROM sim_precalc_obligation_attempts attempt
+        JOIN sim_precalc_obligations obligation ON obligation.id = attempt.obligation_id
+        WHERE obligation.id IN (
+          '62000000-0000-0000-0000-000000000100',
+          '62000000-0000-0000-0000-000000000101'
+        )
+        GROUP BY obligation.aoa_deg
+        ORDER BY obligation.aoa_deg
+      `)) as unknown as Array<{
+        aoa: number;
+        submission_numbers: number[];
+        solver_numbers: Array<number | null>;
+        consumes: boolean[];
+      }>;
+      expect(ledger).toEqual([
+        {
+          aoa: 16,
+          submission_numbers: [1, 2],
+          solver_numbers: [null, null],
+          consumes: [false, false],
+        },
+        {
+          aoa: 17,
+          submission_numbers: [1, 2],
+          solver_numbers: [null, 1],
+          consumes: [false, true],
+        },
+      ]);
+    } finally {
+      if (upgradeClient) await upgradeClient.end();
+      await upgradeAdmin.unsafe(
+        `DROP DATABASE IF EXISTS "${upgradeDbName}" WITH (FORCE)`,
+      );
+      await upgradeAdmin.end();
+      if (through0042) rmSync(through0042, { recursive: true, force: true });
+      if (through0063) rmSync(through0063, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

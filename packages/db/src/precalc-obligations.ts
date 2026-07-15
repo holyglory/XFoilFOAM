@@ -330,8 +330,30 @@ export async function ensurePrecalcObligations(
   );
 }
 
+async function nextPrecalcSubmissionSequence(
+  tx: DB,
+  obligationId: string,
+): Promise<number> {
+  const [row] = await tx
+    .select({
+      next: sql<number>`COALESCE(MAX(${simPrecalcObligationAttempts.attemptNumber}), 0)::int + 1`,
+    })
+    .from(simPrecalcObligationAttempts)
+    .where(eq(simPrecalcObligationAttempts.obligationId, obligationId));
+  const next = Number(row?.next ?? 1);
+  if (!Number.isSafeInteger(next) || next <= 0) {
+    throw new Error(
+      `precalc obligation ${obligationId} has an invalid submission sequence`,
+    );
+  }
+  return next;
+}
+
 /** Record only an engine-accepted submission. A cancelled composition or
- * connection failure consumes no attempt. Idempotent by (obligation, job). */
+ * connection failure consumes no attempt. Engine-accepted infrastructure or
+ * setup work is initially reserved against the physical budget, then released
+ * transactionally if terminal settlement proves that no CFD attempt occurred.
+ * Idempotent by (obligation, job). */
 export async function recordPrecalcObligationSubmission(
   db: DB,
   simJobId: string,
@@ -370,18 +392,24 @@ export async function recordPrecalcObligationSubmission(
           `precalc obligation ${obligation.id} is leased to ${obligation.latestSimJobId ?? "no composition"}, not ${simJobId}`,
         );
       }
-      const attemptNumber = obligation.attemptCount + 1;
+      const attemptNumber = await nextPrecalcSubmissionSequence(
+        tx as unknown as DB,
+        obligation.id,
+      );
+      const solverAttemptNumber = obligation.attemptCount + 1;
       await tx.insert(simPrecalcObligationAttempts).values({
         obligationId: obligation.id,
         simJobId,
         attemptNumber,
+        solverAttemptNumber,
+        consumesSolverAttempt: true,
         state: "submitted",
       });
       await tx
         .update(simPrecalcObligations)
         .set({
           state: "running",
-          attemptCount: attemptNumber,
+          attemptCount: solverAttemptNumber,
           latestSimJobId: simJobId,
           lastOutcome: "submitted",
           lastError: null,
@@ -449,11 +477,11 @@ function meshRecoveryScopeSql(scope: MeshRecoveryRequeueScope) {
 
 /** Reopen only an immutable PRECALC mesh failure produced by an older engine
  * recovery strategy. The failed submission and its result evidence remain
- * untouched; the physical obligation keeps attempt_count=1 and may consume
- * only its already-budgeted second submission. The effective capability
- * version is immutable attempt evidence, so retention may purge the producing
- * sim_job without disabling a later strategy upgrade. Infrastructure/evidence
- * failures and ownerless work are outside this transition by construction. */
+ * untouched, but deterministic setup work does not consume the two-attempt CFD
+ * budget. The effective capability version is immutable attempt evidence, so
+ * retention may purge the producing sim_job without disabling a later strategy
+ * upgrade. Infrastructure/evidence failures and ownerless work are outside
+ * this transition by construction. */
 export async function requeueDeterministicMeshObligationsForRecoveryVersion(
   db: DB,
   meshRecoveryVersion: number,
@@ -471,17 +499,19 @@ export async function requeueDeterministicMeshObligationsForRecoveryVersion(
              obligation.revision_id,
              obligation.aoa_deg::float8 AS aoa_deg
       FROM sim_precalc_obligations obligation
-      JOIN sim_precalc_obligation_attempts immutable_attempt
-        ON immutable_attempt.obligation_id = obligation.id
-       AND immutable_attempt.attempt_number = 1
-       AND immutable_attempt.state = 'failed'
-       AND immutable_attempt.outcome = 'deterministic_failure'
       WHERE (${scopeSql})
         AND obligation.state = 'blocked'
-        AND obligation.attempt_count = 1
         AND obligation.attempt_count < obligation.max_attempts
         AND obligation.last_outcome = 'deterministic_failure'
-        AND immutable_attempt.mesh_recovery_version < ${meshRecoveryVersion}
+        AND EXISTS (
+          SELECT 1
+          FROM sim_precalc_obligation_attempts immutable_attempt
+          WHERE immutable_attempt.obligation_id = obligation.id
+            AND immutable_attempt.state = 'failed'
+            AND immutable_attempt.outcome = 'deterministic_failure'
+            AND NOT immutable_attempt.consumes_solver_attempt
+            AND immutable_attempt.mesh_recovery_version < ${meshRecoveryVersion}
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM sim_jobs active_job
@@ -611,17 +641,19 @@ export async function requeueDeterministicMeshObligationsForRecoveryVersion(
           last_outcome = 'mesh_recovery_upgrade_pending',
           completed_at = NULL,
           "updatedAt" = now()
-      FROM sim_precalc_obligation_attempts immutable_attempt
       WHERE obligation.id = ANY(${candidateIdArray})
-        AND immutable_attempt.obligation_id = obligation.id
-        AND immutable_attempt.attempt_number = 1
-        AND immutable_attempt.state = 'failed'
-        AND immutable_attempt.outcome = 'deterministic_failure'
         AND obligation.state = 'blocked'
-        AND obligation.attempt_count = 1
         AND obligation.attempt_count < obligation.max_attempts
         AND obligation.last_outcome = 'deterministic_failure'
-        AND immutable_attempt.mesh_recovery_version < ${meshRecoveryVersion}
+        AND EXISTS (
+          SELECT 1
+          FROM sim_precalc_obligation_attempts immutable_attempt
+          WHERE immutable_attempt.obligation_id = obligation.id
+            AND immutable_attempt.state = 'failed'
+            AND immutable_attempt.outcome = 'deterministic_failure'
+            AND NOT immutable_attempt.consumes_solver_attempt
+            AND immutable_attempt.mesh_recovery_version < ${meshRecoveryVersion}
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM sim_jobs active_job
@@ -730,6 +762,7 @@ export async function precalcRequestStateFromObligations(
 }
 
 const ANSWERED_SUBMIT_RETRY_BACKOFF_MS = 30_000;
+const INFRASTRUCTURE_RETRY_BACKOFF_MS = 30_000;
 
 export interface PrecalcSubmitFailureSettlement {
   retryWait: string[];
@@ -942,9 +975,13 @@ export async function settlePrecalcObligationsForJobInTransaction(
       ownsCompositionLease &&
       (job.engineJobId || job.submittedAt)
     ) {
-      const attemptNumber = Math.min(
+      const solverAttemptNumber = Math.min(
         obligation.maxAttempts,
         obligation.attemptCount + 1,
+      );
+      const attemptNumber = await nextPrecalcSubmissionSequence(
+        tx,
+        obligation.id,
       );
       [submission] = await tx
         .insert(simPrecalcObligationAttempts)
@@ -952,6 +989,8 @@ export async function settlePrecalcObligationsForJobInTransaction(
           obligationId: obligation.id,
           simJobId: job.id,
           attemptNumber,
+          solverAttemptNumber,
+          consumesSolverAttempt: true,
           state: "submitted",
         })
         .onConflictDoNothing()
@@ -960,14 +999,17 @@ export async function settlePrecalcObligationsForJobInTransaction(
         await tx
           .update(simPrecalcObligations)
           .set({
-            attemptCount: Math.max(obligation.attemptCount, attemptNumber),
+            attemptCount: Math.max(
+              obligation.attemptCount,
+              solverAttemptNumber,
+            ),
             latestSimJobId: job.id,
             lastAttemptAt: new Date(),
           })
           .where(eq(simPrecalcObligations.id, obligation.id));
         obligation.attemptCount = Math.max(
           obligation.attemptCount,
-          attemptNumber,
+          solverAttemptNumber,
         );
       }
     }
@@ -1059,9 +1101,27 @@ export async function settlePrecalcObligationsForJobInTransaction(
     const transientFailure = Boolean(
       error && !deterministic && (!judged || judged.status === "failed"),
     );
+    const infrastructure = Boolean(
+      failureDisposition === "infrastructure" ||
+      (opts.cancellation === "transient" && !judged),
+    );
     const [owner] = (await tx.execute(sql`
         SELECT (${liveOwnerSql(obligation.id)}) AS live
       `)) as unknown as Array<{ live: boolean }>;
+
+    // Engine acceptance proves a submission happened, not that a physical CFD
+    // attempt happened. Release the reserved solver ordinal only for typed
+    // infrastructure or deterministic setup/mesh outcomes. The completed
+    // submission row remains immutable audit and future submissions advance
+    // attempt_number while reusing the still-available physical ordinal.
+    const releasesSolverAttempt = Boolean(
+      submission?.consumesSolverAttempt &&
+      !accepted &&
+      (infrastructure || deterministic),
+    );
+    if (releasesSolverAttempt) {
+      obligation.attemptCount = Math.max(0, obligation.attemptCount - 1);
+    }
 
     let state: "pending" | "satisfied" | "blocked" | "cancelled";
     let attemptState: "accepted" | "rejected" | "failed" | "cancelled";
@@ -1074,6 +1134,10 @@ export async function settlePrecalcObligationsForJobInTransaction(
       state = "cancelled";
       attemptState = "cancelled";
       lastOutcome = "ownerless";
+    } else if (infrastructure) {
+      state = "pending";
+      attemptState = "cancelled";
+      lastOutcome = "infrastructure_retry_wait";
     } else if (deterministic) {
       state = "blocked";
       attemptState = "failed";
@@ -1130,6 +1194,12 @@ export async function settlePrecalcObligationsForJobInTransaction(
           resultAttemptId: judged?.id ?? null,
           error,
           completedAt: new Date(),
+          ...(releasesSolverAttempt
+            ? {
+                consumesSolverAttempt: false,
+                solverAttemptNumber: null,
+              }
+            : {}),
         })
         .where(eq(simPrecalcObligationAttempts.id, submission.id));
     }
@@ -1163,9 +1233,14 @@ export async function settlePrecalcObligationsForJobInTransaction(
       .update(simPrecalcObligations)
       .set({
         state,
+        attemptCount: obligation.attemptCount,
         latestSimJobId: job.id,
         lastOutcome,
         lastError: error,
+        nextSubmitAt:
+          state === "pending" && lastOutcome === "infrastructure_retry_wait"
+            ? new Date(Date.now() + INFRASTRUCTURE_RETRY_BACKOFF_MS)
+            : null,
         completedAt: state === "pending" ? null : new Date(),
       })
       .where(eq(simPrecalcObligations.id, obligation.id));

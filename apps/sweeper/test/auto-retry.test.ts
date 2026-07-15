@@ -955,6 +955,8 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
         obligationId,
         simJobId: legacyMeshChild.id,
         attemptNumber: 1,
+        solverAttemptNumber: null,
+        consumesSolverAttempt: false,
         state: "failed" as const,
         outcome: "deterministic_failure",
         error: "checkMesh found negative-volume cells",
@@ -965,7 +967,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       .update(simPrecalcObligations)
       .set({
         state: "blocked",
-        attemptCount: 1,
+        attemptCount: 0,
         latestSimJobId: legacyMeshChild.id,
         lastOutcome: "deterministic_failure",
         lastError: "checkMesh found negative-volume cells",

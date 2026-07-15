@@ -27,6 +27,7 @@ import {
   requeueDeterministicMeshObligationsForRecoveryVersion,
   results,
   simCampaignPoints,
+  simCampaignConditions,
   simCampaigns,
   simJobs,
   simPrecalcObligationAttempts,
@@ -651,8 +652,8 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
 
     // Cancellation after partial ingest retains both immutable result
     // attempts. Settle the accepted engine submission into the 0047 physical
-    // ledger: angle 15 blocks deterministically, while angle 20 is the only
-    // obligation eligible for its second and final PRECALC submission.
+    // ledger: angle 15 blocks until a safer mesh strategy exists without
+    // spending CFD budget, while angle 20 spent one real transient attempt.
     const [cancelledChild] = await db
       .update(simJobs)
       .set({
@@ -674,7 +675,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
     expect(settled[0]).toMatchObject({
       aoaDeg: 15,
       state: "blocked",
-      attemptCount: 1,
+      attemptCount: 0,
       latestSimJobId: childJobId,
       lastOutcome: "deterministic_failure",
       lastError: MESH_QA_ERROR,
@@ -700,6 +701,9 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         obligationId: simPrecalcObligationAttempts.obligationId,
         simJobId: simPrecalcObligationAttempts.simJobId,
         attemptNumber: simPrecalcObligationAttempts.attemptNumber,
+        solverAttemptNumber: simPrecalcObligationAttempts.solverAttemptNumber,
+        consumesSolverAttempt:
+          simPrecalcObligationAttempts.consumesSolverAttempt,
         state: simPrecalcObligationAttempts.state,
         outcome: simPrecalcObligationAttempts.outcome,
       })
@@ -711,6 +715,8 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
     ).toMatchObject({
       simJobId: childJobId,
       attemptNumber: 1,
+      solverAttemptNumber: null,
+      consumesSolverAttempt: false,
       state: "failed",
       outcome: "deterministic_failure",
     });
@@ -824,7 +830,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
     expect(retriedObligations[0]).toMatchObject({
       aoaDeg: 15,
       state: "running",
-      attemptCount: 2,
+      attemptCount: 1,
       latestSimJobId: childrenAfterRetry[1].id,
       lastOutcome: "submitted",
     });
@@ -840,6 +846,9 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         obligationId: simPrecalcObligationAttempts.obligationId,
         simJobId: simPrecalcObligationAttempts.simJobId,
         attemptNumber: simPrecalcObligationAttempts.attemptNumber,
+        solverAttemptNumber: simPrecalcObligationAttempts.solverAttemptNumber,
+        consumesSolverAttempt:
+          simPrecalcObligationAttempts.consumesSolverAttempt,
         state: simPrecalcObligationAttempts.state,
       })
       .from(simPrecalcObligationAttempts)
@@ -854,6 +863,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         asc(simPrecalcObligationAttempts.attemptNumber),
       );
     for (const obligation of retriedObligations) {
+      const firstConsumedSolverAttempt = obligation.aoaDeg === 20;
       expect(
         retryLedger.filter((attempt) => attempt.obligationId === obligation.id),
       ).toEqual([
@@ -861,12 +871,16 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           obligationId: obligation.id,
           simJobId: childJobId,
           attemptNumber: 1,
+          solverAttemptNumber: firstConsumedSolverAttempt ? 1 : null,
+          consumesSolverAttempt: firstConsumedSolverAttempt,
           state: "failed",
         },
         {
           obligationId: obligation.id,
           simJobId: childrenAfterRetry[1].id,
           attemptNumber: 2,
+          solverAttemptNumber: firstConsumedSolverAttempt ? 2 : 1,
+          consumesSolverAttempt: true,
           state: "submitted",
         },
       ]);
@@ -946,6 +960,8 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           obligationId: obligation.id,
           simJobId: jobs[index].id,
           attemptNumber: 1,
+          solverAttemptNumber: index === 1 ? 1 : null,
+          consumesSolverAttempt: index === 1,
           state: "failed",
           // Immutable worker-executed truth: the desired request version on
           // jobs[0] alone must not decide whether this evidence is obsolete.
@@ -964,7 +980,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         .update(simPrecalcObligations)
         .set({
           state: "blocked",
-          attemptCount: 1,
+          attemptCount: 0,
           completedAt: new Date(),
         })
         .where(
@@ -973,6 +989,10 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
             obligations.map((row) => row.id),
           ),
         );
+      await db
+        .update(simPrecalcObligations)
+        .set({ attemptCount: 1 })
+        .where(eq(simPrecalcObligations.id, obligations[1].id));
       await db
         .update(simPrecalcObligations)
         .set({
@@ -1031,7 +1051,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         {
           id: obligations[0].id,
           state: "blocked",
-          attemptCount: 1,
+          attemptCount: 0,
           lastOutcome: "deterministic_failure",
         },
         {
@@ -1043,13 +1063,13 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         {
           id: obligations[2].id,
           state: "blocked",
-          attemptCount: 1,
+          attemptCount: 0,
           lastOutcome: "deterministic_failure",
         },
         {
           id: obligations[3].id,
           state: "pending",
-          attemptCount: 1,
+          attemptCount: 0,
           lastOutcome: "mesh_recovery_upgrade_pending",
         },
       ]);
@@ -1148,7 +1168,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         .where(eq(simPrecalcObligations.id, obligation.id));
       expect(blocked).toMatchObject({
         state: "blocked",
-        attemptCount: 1,
+        attemptCount: 0,
         lastOutcome: "deterministic_failure",
         lastError: "checkMesh found negative-volume cells",
       });
@@ -1163,7 +1183,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         .where(eq(simPrecalcObligations.id, obligation.id));
       expect(reopened).toMatchObject({
         state: "pending",
-        attemptCount: 1,
+        attemptCount: 0,
         latestSimJobId: job.id,
         lastOutcome: "mesh_recovery_upgrade_pending",
       });
@@ -1176,6 +1196,8 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         attemptNumber: 1,
         state: "failed",
         outcome: "deterministic_failure",
+        solverAttemptNumber: null,
+        consumesSolverAttempt: false,
         resultAttemptId: attempt.id,
       });
     } finally {
@@ -1198,7 +1220,8 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           failure_disposition: "infrastructure",
         },
         expectedState: "pending",
-        expectedOutcome: "failed",
+        expectedOutcome: "infrastructure_retry_wait",
+        expectedAttemptState: "cancelled",
       },
       {
         aoaDeg: 37,
@@ -1206,6 +1229,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         evidencePayload: { fidelity: "rans" },
         expectedState: "blocked",
         expectedOutcome: "deterministic_failure",
+        expectedAttemptState: "failed",
       },
     ] as const;
     const obligations = await ensurePrecalcObligations(
@@ -1282,7 +1306,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           .where(eq(simPrecalcObligations.id, obligation.id));
         expect(settled).toMatchObject({
           state: fixture.expectedState,
-          attemptCount: 1,
+          attemptCount: 0,
           lastOutcome: fixture.expectedOutcome,
           lastError: MESH_QA_ERROR,
         });
@@ -1291,8 +1315,10 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           .from(simPrecalcObligationAttempts)
           .where(eq(simPrecalcObligationAttempts.obligationId, obligation.id));
         expect(ledger).toMatchObject({
-          state: "failed",
+          state: fixture.expectedAttemptState,
           outcome: fixture.expectedOutcome,
+          solverAttemptNumber: null,
+          consumesSolverAttempt: false,
           resultAttemptId: attempt.id,
         });
       }
@@ -1334,6 +1360,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         failureDisposition: "deterministic_mesh" as const,
         expectedState: "blocked",
         expectedOutcome: "deterministic_failure",
+        expectedAttemptState: "failed",
       },
       {
         aoaDeg: 39,
@@ -1343,7 +1370,8 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         message: MESH_QA_ERROR,
         failureDisposition: "infrastructure" as const,
         expectedState: "pending",
-        expectedOutcome: "failed",
+        expectedOutcome: "infrastructure_retry_wait",
+        expectedAttemptState: "cancelled",
       },
     ] as const;
     const obligations = await ensurePrecalcObligations(
@@ -1427,7 +1455,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           .where(eq(simPrecalcObligations.id, obligation.id));
         expect(settled).toMatchObject({
           state: fixture.expectedState,
-          attemptCount: 1,
+          attemptCount: 0,
           lastOutcome: fixture.expectedOutcome,
           lastError: fixture.message,
         });
@@ -1437,9 +1465,11 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
           .where(eq(simPrecalcObligationAttempts.obligationId, obligation.id));
         expect(ledger).toMatchObject({
           simJobId: job.id,
-          state: "failed",
+          state: fixture.expectedAttemptState,
           outcome: fixture.expectedOutcome,
           resultAttemptId: null,
+          solverAttemptNumber: null,
+          consumesSolverAttempt: false,
         });
         const pointAttempts = await db
           .select({ id: resultAttempts.id })
@@ -1582,6 +1612,194 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
         await db.delete(resultAttempts).where(eq(resultAttempts.id, attemptId));
       }
       await db.delete(simJobs).where(eq(simJobs.id, job.id));
+    }
+  }, 60000);
+
+  it("MUST-CATCH: repeated infrastructure losses do not exhaust physical PRECALC attempts", async () => {
+    const aoaDeg = 31;
+    const [condition] = await db
+      .select({
+        revisionId: simCampaignConditions.simulationPresetRevisionId,
+      })
+      .from(simCampaignConditions)
+      .where(eq(simCampaignConditions.campaignId, campaignId))
+      .limit(1);
+    expect(condition).toBeDefined();
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [{ airfoilId, revisionId: condition.revisionId, aoaDeg }],
+      { backgroundOwner: true },
+    );
+    const jobs = [];
+    let physicalResultAttemptId = "";
+    try {
+      for (const sequence of [1, 2]) {
+        const [job] = await db
+          .insert(simJobs)
+          .values({
+            airfoilId,
+            bcIds: [],
+            simulationPresetRevisionId: condition.revisionId,
+            campaignId: null,
+            jobKind: "targeted",
+            referenceChordM: CHORD,
+            wave: 2,
+            status: "cancelled",
+            engineJobId: `${PREFIX}-infrastructure-loss-${sequence}`,
+            submittedAt: new Date(),
+            finishedAt: new Date(),
+            totalCases: 1,
+            completedCases: 0,
+            requestPayload: {
+              aoas: [aoaDeg],
+              uransFidelity: "precalc",
+              precalcObligationIds: [obligation.id],
+            },
+          })
+          .returning();
+        jobs.push(job);
+        await db
+          .update(simPrecalcObligations)
+          .set({ latestSimJobId: job.id, lastOutcome: "composed" })
+          .where(eq(simPrecalcObligations.id, obligation.id));
+        await recordPrecalcObligationSubmission(db, job.id, [obligation.id]);
+        await settlePrecalcObligationsForJob(db, job, {
+          terminalError: "worker task lost before CFD evidence was published",
+          terminalFailureDisposition: "infrastructure",
+          cancellation: "transient",
+        });
+
+        const [afterLoss] = await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, obligation.id));
+        expect(afterLoss).toMatchObject({
+          state: "pending",
+          attemptCount: 0,
+          lastOutcome: "infrastructure_retry_wait",
+        });
+      }
+
+      const [solverJob] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [],
+          simulationPresetRevisionId: condition.revisionId,
+          campaignId: null,
+          jobKind: "targeted",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "submitted",
+          engineJobId: `${PREFIX}-after-infrastructure-losses`,
+          submittedAt: new Date(),
+          totalCases: 1,
+          completedCases: 0,
+          requestPayload: {
+            aoas: [aoaDeg],
+            uransFidelity: "precalc",
+            precalcObligationIds: [obligation.id],
+          },
+        })
+        .returning();
+      jobs.push(solverJob);
+      await db
+        .update(simPrecalcObligations)
+        .set({ latestSimJobId: solverJob.id, lastOutcome: "composed" })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      await expect(
+        recordPrecalcObligationSubmission(db, solverJob.id, [obligation.id]),
+      ).resolves.toBeUndefined();
+
+      const attempts = await db
+        .select()
+        .from(simPrecalcObligationAttempts)
+        .where(eq(simPrecalcObligationAttempts.obligationId, obligation.id))
+        .orderBy(asc(simPrecalcObligationAttempts.attemptNumber));
+      expect(attempts.map((attempt) => attempt.attemptNumber)).toEqual([
+        1, 2, 3,
+      ]);
+      expect(attempts.slice(0, 2).map((attempt) => attempt.state)).toEqual([
+        "cancelled",
+        "cancelled",
+      ]);
+
+      // A transient job cancellation must not erase physical work that this
+      // exact angle already published. The continuable rejected URANS window
+      // consumes solver attempt 1 and remains eligible only for attempt 2.
+      const [physicalResultAttempt] = await db
+        .insert(resultAttempts)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: condition.revisionId,
+          aoaDeg,
+          simJobId: solverJob.id,
+          engineJobId: solverJob.engineJobId,
+          engineCaseSlug: `${PREFIX}-physical-window`,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          validForPolar: false,
+          unsteady: true,
+          qualityWarnings: ["requires further same-case integration"],
+          evidencePayload: { fidelity: "urans_precalc" },
+          solvedAt: new Date(),
+        })
+        .returning();
+      physicalResultAttemptId = physicalResultAttempt.id;
+      await db.insert(resultClassifications).values({
+        resultAttemptId: physicalResultAttempt.id,
+        airfoilId,
+        simulationPresetRevisionId: condition.revisionId,
+        aoaDeg,
+        regime: "urans",
+        classifierVersion: "physical-attempt-budget-guard-v1",
+        state: "rejected",
+        region: "post_stall",
+        confidence: 1,
+        reasons: ["continuation required"],
+      });
+      await settlePrecalcObligationsForJob(db, solverJob, {
+        terminalError: "worker disappeared after publishing this angle",
+        cancellation: "transient",
+      });
+      const [afterPhysicalWindow] = await db
+        .select()
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      expect(afterPhysicalWindow).toMatchObject({
+        state: "pending",
+        attemptCount: 1,
+        lastOutcome: "rejected",
+      });
+      const physicalLedger = await db
+        .select()
+        .from(simPrecalcObligationAttempts)
+        .where(eq(simPrecalcObligationAttempts.obligationId, obligation.id))
+        .orderBy(asc(simPrecalcObligationAttempts.attemptNumber));
+      expect(physicalLedger[2]).toMatchObject({
+        attemptNumber: 3,
+        solverAttemptNumber: 1,
+        consumesSolverAttempt: true,
+        state: "rejected",
+        resultAttemptId: physicalResultAttempt.id,
+      });
+    } finally {
+      await db
+        .delete(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      if (physicalResultAttemptId) {
+        await db
+          .delete(resultAttempts)
+          .where(eq(resultAttempts.id, physicalResultAttemptId));
+      }
+      await db.delete(simJobs).where(
+        inArray(
+          simJobs.id,
+          jobs.map((job) => job.id),
+        ),
+      );
     }
   }, 60000);
 });
