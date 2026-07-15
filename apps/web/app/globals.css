@@ -164,7 +164,447 @@ a {
   justify-content: flex-end;
 }
 
+/* ================= campaign detail · instrument cluster =================
+   The selected direction keeps one headline, one operational message and one
+   progress instrument before the existing condition collection. */
+.campaign-instrument-title-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.campaign-instrument-title {
+  margin: 0;
+  min-width: 0;
+  color: var(--aero-text);
+  font-size: clamp(19px, 2.2vw, 30px);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+}
+
+.campaign-instrument-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.campaign-instrument-icon-button {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  color: var(--aero-muted);
+  background: transparent;
+  border: 1px solid var(--aero-stroke);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.campaign-instrument-icon-button:hover,
+.campaign-instrument-icon-button:focus-visible {
+  color: var(--aero-text);
+  border-color: var(--aero-teal-border);
+  outline: none;
+}
+
+.campaign-instrument-status {
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 11px 15px;
+  border: 1px solid var(--aero-stroke);
+  border-radius: 8px;
+  background: var(--aero-panel2);
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.campaign-instrument-status-amber {
+  color: var(--aero-amber);
+  border-color: color-mix(in srgb, var(--aero-amber) 42%, transparent);
+  background: color-mix(in srgb, var(--aero-amber) 7%, var(--aero-panel2));
+}
+
+.campaign-instrument-status-red {
+  color: var(--aero-red-text);
+  border-color: color-mix(in srgb, var(--aero-red) 42%, transparent);
+  background: color-mix(in srgb, var(--aero-red) 7%, var(--aero-panel2));
+}
+
+.campaign-instrument-status-teal {
+  color: var(--aero-teal);
+  border-color: var(--aero-teal-border);
+  background: var(--aero-teal-fill);
+}
+
+.campaign-instrument-status-violet {
+  color: var(--aero-violet);
+  border-color: var(--aero-violet-border);
+  background: var(--aero-violet-fill);
+}
+
+.campaign-instrument-status-dim {
+  color: var(--aero-muted);
+}
+
+.campaign-instrument-status-copy {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.campaign-instrument-status-copy strong {
+  font-size: 12px;
+  color: currentColor;
+}
+
+.campaign-instrument-status-copy span {
+  color: var(--aero-text2);
+}
+
+.campaign-instrument-hero {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 18px 2px 0;
+}
+
+.campaign-instrument-gauge {
+  width: min(540px, 92vw);
+  height: 385px;
+  position: relative;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  color: var(--aero-stroke);
+}
+
+.campaign-instrument-gauge > svg {
+  width: 500px;
+  height: 500px;
+  max-width: 90vw;
+  color: var(--aero-stroke);
+  filter: drop-shadow(
+    0 0 14px color-mix(in srgb, var(--aero-teal) 9%, transparent)
+  );
+}
+
+.campaign-instrument-gauge-value {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  padding-top: 58px;
+  font-family: "IBM Plex Mono", monospace;
+  text-align: center;
+}
+
+.campaign-instrument-gauge-value strong {
+  color: var(--aero-teal);
+  font-size: clamp(38px, 6vw, 68px);
+  font-weight: 500;
+  letter-spacing: -0.045em;
+  line-height: 1;
+}
+
+.campaign-instrument-gauge-value span {
+  margin-top: 6px;
+  color: var(--aero-teal);
+  font-size: 15px;
+}
+
+.campaign-instrument-gauge-value small {
+  margin-top: 15px;
+  padding-top: 10px;
+  min-width: 118px;
+  color: var(--aero-muted);
+  border-top: 1px solid var(--aero-stroke);
+  font-size: 12px;
+}
+
+.campaign-instrument-gauge-value b {
+  margin-top: 8px;
+  color: var(--aero-teal);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.campaign-instrument-progress {
+  appearance: none;
+  width: min(480px, 82vw);
+  height: 4px;
+  margin-top: -41px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 99px;
+  background: var(--aero-panel3);
+}
+
+.campaign-instrument-progress::-webkit-progress-bar {
+  background: var(--aero-panel3);
+  border-radius: 99px;
+}
+
+.campaign-instrument-progress::-webkit-progress-value {
+  background: var(--aero-teal);
+  border-radius: 99px;
+}
+
+.campaign-instrument-progress::-moz-progress-bar {
+  background: var(--aero-teal);
+  border-radius: 99px;
+}
+
+.campaign-instrument-stage-rail {
+  width: min(900px, 100%);
+  display: flex;
+  align-items: flex-start;
+  margin-top: 28px;
+}
+
+.campaign-instrument-stage-wrap {
+  min-width: 0;
+  flex: 1 1 0;
+  display: flex;
+  align-items: flex-start;
+}
+
+.campaign-instrument-stage-arrow {
+  flex: 0 0 auto;
+  margin: 8px 7px 0;
+  color: var(--aero-dimmer);
+}
+
+.campaign-instrument-stage {
+  min-width: 0;
+  flex: 1 1 0;
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  color: var(--aero-dim);
+  text-align: center;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.campaign-instrument-stage.is-active {
+  color: var(--aero-teal);
+}
+
+.campaign-instrument-stage.is-settled:not(.is-active) {
+  color: var(--aero-teal-dim);
+}
+
+.campaign-instrument-stage strong {
+  min-height: 29px;
+  color: currentColor;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.campaign-instrument-stage span {
+  color: var(--aero-muted);
+  font-size: 10px;
+}
+
+.campaign-instrument-lower {
+  display: grid;
+  gap: 7px;
+  padding: 18px 0 4px;
+  border-top: 1px solid var(--aero-border-rule);
+}
+
+.campaign-instrument-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  justify-content: center;
+  color: var(--aero-muted);
+}
+
+.campaign-instrument-metric {
+  min-width: 0;
+  min-height: 65px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 7px 16px;
+  color: var(--aero-muted);
+  font-family: "IBM Plex Mono", monospace;
+  text-align: left;
+  background: transparent;
+  border: 0;
+}
+
+.campaign-instrument-metric + .campaign-instrument-metric {
+  border-left: 1px solid var(--aero-border-rule);
+}
+
+.campaign-instrument-metric > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.campaign-instrument-metric strong {
+  color: var(--aero-text);
+  font-size: 23px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.campaign-instrument-metric small,
+.campaign-instrument-metric em {
+  color: var(--aero-muted);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
+.campaign-instrument-metric-amber > svg {
+  color: var(--aero-amber);
+}
+
+.campaign-instrument-metric-violet > svg {
+  color: var(--aero-violet);
+}
+
+.campaign-instrument-metric-teal > svg {
+  color: var(--aero-teal);
+}
+
+.campaign-instrument-metric-red > svg {
+  color: var(--aero-red-text);
+}
+
+.campaign-instrument-metric.is-action {
+  cursor: pointer;
+}
+
+.campaign-instrument-metric.is-action:hover,
+.campaign-instrument-metric.is-action:focus-visible {
+  background: var(--aero-panel2);
+  outline: none;
+}
+
+.campaign-instrument-details-toggle {
+  justify-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 8px;
+  color: var(--aero-muted);
+  background: transparent;
+  border: 0;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.campaign-instrument-details-toggle:hover,
+.campaign-instrument-details-toggle:focus-visible {
+  color: var(--aero-teal);
+  outline: none;
+}
+
+.campaign-instrument-details {
+  display: grid;
+  gap: 7px;
+  padding: 9px 0 4px;
+  border-top: 1px solid var(--aero-border-row);
+}
+
+.campaign-instrument-detail-strip {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  color: var(--aero-muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+}
+
 @media (max-width: 640px) {
+  .campaign-instrument-title-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .campaign-instrument-actions {
+    grid-column: 1 / -1;
+    justify-self: end;
+  }
+
+  .campaign-instrument-status {
+    align-items: flex-start;
+    padding: 10px 12px;
+  }
+
+  .campaign-instrument-status-copy {
+    display: grid;
+    gap: 2px;
+  }
+
+  .campaign-instrument-gauge {
+    height: 235px;
+  }
+
+  .campaign-instrument-gauge > svg {
+    width: 280px;
+    height: 280px;
+  }
+
+  .campaign-instrument-gauge-value {
+    padding-top: 32px;
+  }
+
+  .campaign-instrument-hero {
+    padding-top: 4px;
+  }
+
+  .campaign-instrument-progress {
+    margin-top: -27px;
+  }
+
+  .campaign-instrument-stage-rail {
+    margin-top: 20px;
+  }
+
+  .campaign-instrument-stage-arrow {
+    width: 15px;
+    margin-inline: 2px;
+  }
+
+  .campaign-instrument-stage strong {
+    min-height: 36px;
+    font-size: 9px;
+  }
+
+  .campaign-instrument-stage span {
+    font-size: 9px;
+  }
+
+  .campaign-instrument-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .campaign-instrument-metric {
+    min-height: 54px;
+    justify-content: flex-start;
+    padding-inline: 10px;
+  }
+
+  .campaign-instrument-metric + .campaign-instrument-metric {
+    border-left: 0;
+    border-top: 1px solid var(--aero-border-row);
+  }
+
   .campaign-card-actions-paused {
     width: 100%;
     margin-left: 0 !important;

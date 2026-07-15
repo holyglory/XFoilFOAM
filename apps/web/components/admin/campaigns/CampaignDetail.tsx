@@ -16,6 +16,24 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import {
+  ArrowRight,
+  CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Circle,
+  CircleDot,
+  Clock3,
+  Gauge,
+  MoreHorizontal,
+  Pause,
+  Play,
+  ShieldAlert,
+  ShieldCheck,
+  TrendingUp,
+  Wrench,
+} from "lucide-react";
 
 import {
   type AdminCampaignAirfoilRow,
@@ -33,17 +51,15 @@ import {
   restoreCondition,
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
-import { PROCESS_NOT_RUNNING_DETAIL, isProcessDead } from "@/lib/solver-state";
+import { isProcessDead } from "@/lib/solver-state";
 import type { CampaignPointsBucket } from "@/lib/point-history";
 import {
-  campaignPhaseBadge,
+  campaignInstrumentStatus,
   campaignStatusLine,
-  tierCountsLine,
 } from "./campaign-status";
 export { campaignStatusLine };
 import { AddAirfoilsDialog } from "./AddAirfoilsDialog";
 import {
-  PIPELINE_STAGE_NOTES,
   assemblePipelineModel,
   progressBarSegments,
   stageEta,
@@ -62,15 +78,6 @@ const PRIORITY_LABEL: Record<number, string> = {
   0: "Background",
   5: "Standard",
   8: "High",
-};
-
-const STATUS_CHIP_COLOR: Record<string, { color: string; border: string }> = {
-  active: { color: "var(--aero-teal)", border: "var(--aero-teal-border)" },
-  paused: { color: "var(--aero-amber)", border: "rgba(245,158,11,0.45)" },
-  attention: { color: "var(--aero-red-text)", border: "rgba(245,101,101,0.5)" },
-  completed: { color: "var(--aero-teal)", border: "var(--aero-teal-border)" },
-  cancelled: { color: "var(--aero-muted)", border: "var(--aero-stroke)" },
-  archived: { color: "var(--aero-dim)", border: "var(--aero-stroke)" },
 };
 
 interface CellPanelState {
@@ -344,22 +351,7 @@ export function CampaignDetail({
   const { campaign, totals, scheduler, rate, conditions } = summary;
   const status = campaign.status;
   const line = campaignStatusLine(summary);
-  const lineColor =
-    line.tone === "teal"
-      ? C.teal
-      : line.tone === "amber"
-        ? C.amber
-        : line.tone === "red"
-          ? C.redText
-          : line.tone === "violet"
-            ? C.violet
-            : C.dim;
-  const statusChip = STATUS_CHIP_COLOR[status] ?? STATUS_CHIP_COLOR.active;
-  // Fidelity ladder phase (contract 7): rendered only while nothing blocks —
-  // the liveness-split gate badge always outranks the phase.
-  const phaseBadge = campaignPhaseBadge(summary.phase, status, line.gate);
-  const tiersLine = tierCountsLine(summary.tierCounts);
-
+  const instrumentStatus = campaignInstrumentStatus(summary, line);
   const objectives = campaign.plan.objectives;
   const editable = ["active", "paused", "attention", "completed"].includes(
     status,
@@ -378,6 +370,17 @@ export function CampaignDetail({
     jobsRunning: scheduler.campaignJobsRunning,
   });
   const barSegments = progressBarSegments(totals, reviewBuckets);
+  const completionPercent =
+    totals.requested > 0
+      ? Math.min(100, (barSegments.doneCount / totals.requested) * 100)
+      : 0;
+  const completionPercentLabel =
+    completionPercent > 0 && completionPercent < 0.01
+      ? "<0.01%"
+      : `${completionPercent < 1 ? completionPercent.toFixed(2) : completionPercent.toFixed(1)}%`;
+  const throughputPerHour = rate
+    ? Math.round(rate.pointsLast24h / rate.windowHours)
+    : null;
   const eta = stageEta({
     phase: summary.phase,
     stageOpenByPhase: summary.tierCounts
@@ -515,25 +518,24 @@ export function CampaignDetail({
           : {}),
         padding: "6px 12px",
         fontSize: 11,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: fullWidth ? "flex-start" : "center",
+        gap: 6,
         opacity: busyAction != null ? 0.6 : 1,
         ...(fullWidth ? { width: "100%", textAlign: "left" as const } : {}),
       }}
     >
+      {!fullWidth && a.key === "pause" && <Pause size={13} aria-hidden />}
+      {!fullWidth && a.key === "resume" && <Play size={13} aria-hidden />}
       {a.label}
     </button>
   );
 
   return (
     <div data-testid="campaign-detail" style={{ display: "grid", gap: 14 }}>
-      {/* ---- header row 1: identity ---- */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          flexWrap: "wrap",
-        }}
-      >
+      {/* One identity line: campaign name is the only headline. */}
+      <div className="campaign-instrument-title-row">
         <button
           type="button"
           data-testid="campaign-back"
@@ -544,202 +546,12 @@ export function CampaignDetail({
             if (cellPanel) setCellPanel(null);
             else onBack();
           }}
-          style={{ ...ghostBtn, padding: "5px 10px" }}
+          className="campaign-instrument-icon-button"
         >
-          ←
+          <ChevronLeft size={18} aria-hidden />
         </button>
-        <h2
-          style={{
-            margin: 0,
-            fontSize: 19,
-            fontWeight: 700,
-            letterSpacing: "-0.01em",
-            color: C.text,
-          }}
-        >
-          {campaign.name}
-        </h2>
-        {/* Gate badge is PRIMARY while a scheduler gate blocks work (mockup
-            fec7b453 screen 3): never an "Active" headline next to a
-            contradictory red line — the lifecycle demotes to a small chip. */}
-        {line.gate && (
-          <span
-            data-testid="campaign-gate-badge"
-            style={{
-              fontFamily: MONO,
-              fontSize: 10,
-              fontWeight: 700,
-              letterSpacing: "0.06em",
-              color: line.gate.tone === "red" ? C.redText : C.amber,
-              background:
-                line.gate.tone === "red"
-                  ? "rgba(245,101,101,0.08)"
-                  : "rgba(245,158,11,0.08)",
-              border: `1px solid ${line.gate.tone === "red" ? "rgba(245,101,101,0.5)" : "rgba(245,158,11,0.45)"}`,
-              borderRadius: 999,
-              padding: "3px 10px",
-            }}
-          >
-            {line.gate.text}
-          </span>
-        )}
-        <span
-          data-testid="campaign-status-chip"
-          style={
-            line.gate
-              ? {
-                  fontFamily: MONO,
-                  fontSize: 9,
-                  fontWeight: 600,
-                  letterSpacing: "0.06em",
-                  color: C.dim,
-                  border: `1px solid ${C.stroke}`,
-                  borderRadius: 999,
-                  padding: "2px 8px",
-                }
-              : {
-                  fontFamily: MONO,
-                  fontSize: 10,
-                  fontWeight: 600,
-                  letterSpacing: "0.06em",
-                  color: statusChip.color,
-                  border: `1px solid ${statusChip.border}`,
-                  borderRadius: 999,
-                  padding: "3px 9px",
-                }
-          }
-        >
-          {status.toUpperCase()}
-        </span>
-        {phaseBadge && (
-          <span
-            data-testid="campaign-phase-badge"
-            style={{
-              fontFamily: MONO,
-              fontSize: 10,
-              fontWeight: 600,
-              letterSpacing: "0.06em",
-              color: phaseBadge.tone === "amber" ? C.amber : C.teal,
-              border: `1px solid ${phaseBadge.tone === "amber" ? "rgba(245,158,11,0.45)" : "var(--aero-teal-border)"}`,
-              borderRadius: 999,
-              padding: "3px 10px",
-            }}
-          >
-            {phaseBadge.label}
-          </span>
-        )}
-        {/* The legacy needsReview wire count is rendered as unavailable evidence.
-            It never promises a routine human-adjudication workflow. */}
-        {needsReview > 0 && (
-          <button
-            type="button"
-            data-testid="campaign-needs-review-chip"
-            title="Open unavailable evidence in the Points explorer"
-            onClick={() => onOpenPoints("needs_review")}
-            style={{
-              fontFamily: MONO,
-              fontSize: 10,
-              fontWeight: 700,
-              letterSpacing: "0.04em",
-              color: C.redText,
-              background: "rgba(245,101,101,0.08)",
-              border: "1px solid rgba(245,101,101,0.5)",
-              borderRadius: 999,
-              padding: "3px 10px",
-              cursor: "pointer",
-            }}
-          >
-            unavailable · {fCount(needsReview)}
-          </button>
-        )}
-        {blocked > 0 && remediationCopy && (
-          <button
-            type="button"
-            data-testid="campaign-blocked-chip"
-            title={remediationCopy.title}
-            onClick={() => setDetailsOpen(() => true)}
-            style={{
-              fontFamily: MONO,
-              fontSize: 10,
-              fontWeight: 700,
-              letterSpacing: "0.04em",
-              color: C.amber,
-              background: "rgba(245,158,11,0.08)",
-              border: "1px solid rgba(245,158,11,0.45)",
-              borderRadius: 999,
-              padding: "3px 10px",
-              cursor: "pointer",
-            }}
-          >
-            {remediationCopy.label} · {fCount(blocked)}
-          </button>
-        )}
-      </div>
-
-      {/* ---- header row 2: truthful status + actions ---- */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          flexWrap: "wrap",
-        }}
-      >
-        <span
-          data-testid="campaign-status-line"
-          style={{ fontFamily: MONO, fontSize: 11.5, color: lineColor }}
-        >
-          {line.text}
-        </span>
-        {/* Enabling the sweeper flag while the process is dead would be a
-            fake control — guidance text renders instead (approved design). */}
-        {status === "active" && isProcessDead(scheduler.heartbeatAt) && (
-          <span
-            data-testid="campaign-solver-guidance"
-            style={{ fontFamily: MONO, fontSize: 10, color: C.redText }}
-          >
-            {PROCESS_NOT_RUNNING_DETAIL}
-          </span>
-        )}
-        {status === "active" &&
-          !isProcessDead(scheduler.heartbeatAt) &&
-          !scheduler.sweeperEnabled &&
-          !scheduler.engineUnreachableSince && (
-            <button
-              type="button"
-              data-testid="campaign-enable-sweeper"
-              disabled={enablingSweeper}
-              onClick={async () => {
-                setEnablingSweeper(true);
-                try {
-                  await patchSweeper({ enabled: true });
-                  await refresh();
-                } catch {
-                  // refresh() surfaces state truthfully on the next poll; the
-                  // button re-enables so the action can be retried.
-                } finally {
-                  setEnablingSweeper(false);
-                }
-              }}
-              style={{
-                ...ghostBtn,
-                color: C.amber,
-                borderColor: "rgba(245,165,36,.45)",
-                padding: "3px 9px",
-                fontSize: 10,
-              }}
-            >
-              {enablingSweeper ? "enabling…" : "enable sweeper"}
-            </button>
-          )}
-        <span
-          style={{
-            marginLeft: "auto",
-            display: "flex",
-            alignItems: "center",
-            gap: 7,
-          }}
-        >
+        <h2 className="campaign-instrument-title">{campaign.name}</h2>
+        <span className="campaign-instrument-actions">
           {primaryAction && actionButton(primaryAction)}
           <span
             style={{ position: "relative", display: "inline-block" }}
@@ -755,9 +567,9 @@ export function CampaignDetail({
               aria-label="More campaign actions"
               aria-expanded={overflowOpen}
               onClick={() => setOverflowOpen((v) => !v)}
-              style={{ ...ghostBtn, padding: "6px 12px", fontSize: 11 }}
+              className="campaign-instrument-icon-button"
             >
-              ⋯
+              <MoreHorizontal size={18} aria-hidden />
             </button>
             {overflowOpen && (
               <span
@@ -783,6 +595,51 @@ export function CampaignDetail({
         </span>
       </div>
 
+      {/* One operational ribbon replaces lifecycle, gate and phase badge
+          repetition. The precise measured reason remains in the title. */}
+      <div
+        className={`campaign-instrument-status campaign-instrument-status-${instrumentStatus.tone}`}
+        role="status"
+        title={line.text}
+      >
+        <span data-testid={line.gate ? "campaign-gate-badge" : undefined}>
+          {instrumentStatus.tone === "teal" ? (
+            <ShieldCheck size={22} aria-hidden />
+          ) : (
+            <ShieldAlert size={22} aria-hidden />
+          )}
+        </span>
+        <span className="campaign-instrument-status-copy">
+          <strong data-testid="campaign-status-chip">
+            {instrumentStatus.title}
+          </strong>
+          <span data-testid="campaign-status-line">
+            {instrumentStatus.detail}
+          </span>
+        </span>
+        {instrumentStatus.action === "enable_sweeper" && (
+          <button
+            type="button"
+            data-testid="campaign-enable-sweeper"
+            disabled={enablingSweeper}
+            onClick={async () => {
+              setEnablingSweeper(true);
+              try {
+                await patchSweeper({ enabled: true });
+                await refresh();
+              } catch {
+                // The next poll surfaces the unchanged state truthfully.
+              } finally {
+                setEnablingSweeper(false);
+              }
+            }}
+            style={{ ...ghostBtn, marginLeft: "auto", whiteSpace: "nowrap" }}
+          >
+            {enablingSweeper ? "enabling…" : "Enable scheduling"}
+          </button>
+        )}
+      </div>
+
       {notice && (
         <div
           data-testid="campaign-notice"
@@ -797,337 +654,192 @@ export function CampaignDetail({
         </div>
       )}
 
-      {/* ---- 3-stage pipeline hero (approved design c19fd74a) ---- */}
-      {pipeline && (
-        <div
-          data-testid="campaign-pipeline"
-          style={{
-            background: C.panel,
-            border: `1px solid ${C.border}`,
-            borderRadius: 12,
-            padding: "12px 14px",
-            display: "flex",
-            gap: 8,
-            alignItems: "stretch",
-            flexWrap: "wrap",
-          }}
-        >
-          {pipeline.stages.map((stage, i) => (
-            <div
-              key={stage.key}
-              style={{
-                display: "flex",
-                alignItems: "stretch",
-                gap: 8,
-                flex: "1 1 180px",
-                minWidth: 0,
-              }}
-            >
-              {i > 0 && (
-                <span
-                  aria-hidden
-                  style={{
-                    alignSelf: "center",
-                    fontFamily: MONO,
-                    fontSize: 12,
-                    color: C.dimmer,
-                  }}
-                >
-                  →
-                </span>
-              )}
-              <div
-                data-testid={`campaign-stage-${stage.key}`}
-                style={{
-                  flex: 1,
-                  minWidth: 0,
-                  border: `1px solid ${stage.active ? "var(--aero-teal-border)" : C.borderSoft}`,
-                  background: stage.active ? C.tealFill : "transparent",
-                  borderRadius: 9,
-                  padding: "8px 10px",
-                  display: "grid",
-                  gap: 3,
-                  alignContent: "start",
-                  opacity: stage.settled && !stage.active ? 0.65 : 1,
-                }}
-              >
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 9.5,
-                    letterSpacing: "0.08em",
-                    color: stage.active ? C.teal : C.dim,
-                  }}
-                >
-                  {stage.title.toUpperCase()}
-                </span>
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 12.5,
-                    fontWeight: 700,
-                    color: stage.settled || stage.open === 0 ? C.dim : C.text,
-                  }}
-                >
-                  {/* "—" = not started (upstream stages still feed this one);
-                      "settled ✓" only when nothing can arrive any more. */}
-                  {stage.settled
-                    ? "settled ✓"
-                    : stage.open === 0
-                      ? "—"
-                      : (stage.detail ?? `${fCount(stage.open)} open`)}
-                </span>
-                {stage.active && pipeline.jobsRunning > 0 && (
-                  <span
-                    style={{ fontFamily: MONO, fontSize: 9.5, color: C.amber }}
-                  >
-                    {fCount(pipeline.jobsRunning)} job
-                    {pipeline.jobsRunning === 1 ? "" : "s"} solving now
-                  </span>
-                )}
-                {PIPELINE_STAGE_NOTES[stage.key] && (
-                  <span
-                    style={{ fontFamily: MONO, fontSize: 9, color: C.dimmest }}
-                  >
-                    {PIPELINE_STAGE_NOTES[stage.key]}
-                  </span>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* ---- ONE progress bar + one-line stats + details disclosure ---- */}
-      <div
-        style={{
-          background: C.panel,
-          border: `1px solid ${C.border}`,
-          borderRadius: 12,
-          padding: "12px 14px",
-          display: "grid",
-          gap: 8,
-        }}
+      {/* The gauge icon is from the product icon library; the native progress
+          element carries the real completion value and accessible semantics. */}
+      <section
+        className="campaign-instrument-hero"
+        aria-label="Campaign progress"
       >
-        <div
-          data-testid="campaign-progress-bar"
-          style={{
-            height: 8,
-            background: C.panel3,
-            borderRadius: 5,
-            overflow: "hidden",
-            display: "flex",
-          }}
-          aria-hidden
-        >
-          <span
-            style={{
-              width: `${barSegments.done * 100}%`,
-              background: C.teal,
-              display: "block",
-            }}
-          />
-          <span
-            style={{
-              width: `${barSegments.solving * 100}%`,
-              background: C.amber,
-              display: "block",
-            }}
-          />
-          <span
-            style={{
-              width: `${barSegments.awaitingUrans * 100}%`,
-              background: C.violet,
-              display: "block",
-            }}
-          />
-          <span
-            style={{
-              width: `${barSegments.blocked * 100}%`,
-              background: C.amber,
-              display: "block",
-            }}
-          />
-          {/* remainder of the track = open work (panel background) */}
+        <div className="campaign-instrument-gauge">
+          <Gauge size={320} strokeWidth={0.7} aria-hidden />
+          <div className="campaign-instrument-gauge-value">
+            <strong>{fCount(barSegments.doneCount)}</strong>
+            <span>{totals.derived > 0 ? "points complete" : "solved"}</span>
+            <small>of {fCount(totals.requested)}</small>
+            <b>{completionPercentLabel} complete</b>
+          </div>
         </div>
+        <progress
+          data-testid="campaign-progress-bar"
+          className="campaign-instrument-progress"
+          max={Math.max(1, totals.requested)}
+          value={barSegments.doneCount}
+          aria-label={`${fCount(barSegments.doneCount)} of ${fCount(totals.requested)} campaign points complete`}
+        />
+
+        {pipeline && (
+          <div
+            data-testid="campaign-pipeline"
+            className="campaign-instrument-stage-rail"
+          >
+            {pipeline.stages.map((stage, i) => (
+              <div className="campaign-instrument-stage-wrap" key={stage.key}>
+                {i > 0 && (
+                  <ArrowRight
+                    className="campaign-instrument-stage-arrow"
+                    size={22}
+                    aria-hidden
+                  />
+                )}
+                <div
+                  data-testid={`campaign-stage-${stage.key}`}
+                  className={`campaign-instrument-stage ${stage.active ? "is-active" : ""} ${stage.settled ? "is-settled" : ""}`}
+                >
+                  {stage.active ? (
+                    <CircleDot size={38} strokeWidth={1.6} aria-hidden />
+                  ) : stage.settled ? (
+                    <CheckCircle2 size={38} strokeWidth={1.4} aria-hidden />
+                  ) : (
+                    <Circle size={38} strokeWidth={1.4} aria-hidden />
+                  )}
+                  <strong
+                    data-testid={
+                      stage.active ? "campaign-phase-badge" : undefined
+                    }
+                  >
+                    {stage.key === "steady"
+                      ? "RANS"
+                      : stage.key === "unsteady"
+                        ? "PRELIMINARY URANS"
+                        : "VERIFY"}
+                  </strong>
+                  <span>
+                    {stage.settled
+                      ? "settled"
+                      : stage.open === 0
+                        ? "waiting"
+                        : (stage.detail ?? `${fCount(stage.open)} open`)}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Compact live readouts replace the repeated stats wall. */}
+      <div className="campaign-instrument-lower">
         <div
           data-testid="campaign-counts-line"
-          style={{
-            fontFamily: MONO,
-            fontSize: 10.5,
-            color: C.muted,
-            display: "flex",
-            gap: 14,
-            flexWrap: "wrap",
-            alignItems: "center",
-          }}
+          className="campaign-instrument-metrics"
         >
-          <span style={{ color: C.teal }}>
-            <span
-              aria-hidden
-              style={{
-                display: "inline-block",
-                width: 7,
-                height: 7,
-                borderRadius: 2,
-                background: C.teal,
-                marginRight: 4,
-                verticalAlign: -1,
-              }}
-            />
-            {fCount(barSegments.doneCount)} done
-          </span>
-          {barSegments.solvingCount > 0 && (
-            <span style={{ color: C.amber }}>
-              <span
-                aria-hidden
-                style={{
-                  display: "inline-block",
-                  width: 7,
-                  height: 7,
-                  borderRadius: 2,
-                  background: C.amber,
-                  marginRight: 4,
-                  verticalAlign: -1,
-                }}
-              />
-              {fCount(barSegments.solvingCount)} solving
+          <div className="campaign-instrument-metric campaign-instrument-metric-amber">
+            <Clock3 size={30} strokeWidth={1.6} aria-hidden />
+            <span>
+              <strong>{fCount(barSegments.solvingCount)}</strong>
+              <small>processing</small>
             </span>
-          )}
-          {/* Calm violet stage-2 queue link (never red, no repair verbs):
-              opens Solver ▸ Points filtered to awaiting_urans. */}
+          </div>
+          <div className="campaign-instrument-metric campaign-instrument-metric-violet">
+            <Wrench size={30} strokeWidth={1.6} aria-hidden />
+            <span>
+              <strong>{fCount(summary.remediation.repairing)}</strong>
+              <small>auto-repair</small>
+            </span>
+          </div>
+          <div className="campaign-instrument-metric campaign-instrument-metric-teal">
+            <TrendingUp size={30} strokeWidth={1.6} aria-hidden />
+            <span>
+              <strong>
+                {throughputPerHour == null ? "—" : fCount(throughputPerHour)}
+              </strong>
+              <small>solver pts / h · 24 h avg</small>
+              {eta && (
+                <em
+                  data-testid="campaign-eta"
+                  title="From the measured trailing-24h ingest rate"
+                >
+                  ETA {eta.label} · stage {eta.stage}
+                </em>
+              )}
+            </span>
+          </div>
           {barSegments.awaitingCount > 0 && (
             <button
               type="button"
               data-testid="campaign-awaiting-urans-link"
-              title="Tier-1 rejects queued for the unsteady re-solve — open them in the Points explorer"
+              className="campaign-instrument-metric campaign-instrument-metric-violet is-action"
+              title="Open preliminary URANS work in the Points explorer"
               onClick={() => onOpenPoints("awaiting_urans")}
-              style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.violet,
-                background: "transparent",
-                border: "none",
-                padding: 0,
-                cursor: "pointer",
-                textDecoration: "underline",
-              }}
             >
-              <span
-                aria-hidden
-                style={{
-                  display: "inline-block",
-                  width: 7,
-                  height: 7,
-                  borderRadius: 2,
-                  background: C.violet,
-                  marginRight: 4,
-                  verticalAlign: -1,
-                }}
-              />
-              {fCount(barSegments.awaitingCount)} awaiting URANS
+              <CircleDot size={30} strokeWidth={1.6} aria-hidden />
+              <span>
+                <strong>{fCount(barSegments.awaitingCount)}</strong>
+                <small>awaiting URANS</small>
+              </span>
             </button>
           )}
           {barSegments.blockedCount > 0 && remediationCopy && (
             <button
               type="button"
               data-testid="campaign-blocked-count"
+              className="campaign-instrument-metric campaign-instrument-metric-amber is-action"
               title={remediationCopy.title}
               onClick={() => setDetailsOpen(() => true)}
-              style={{
-                color: C.amber,
-                fontFamily: MONO,
-                fontSize: 10.5,
-                background: "transparent",
-                border: "none",
-                padding: 0,
-                cursor: "pointer",
-              }}
             >
-              <span
-                aria-hidden
-                style={{
-                  display: "inline-block",
-                  width: 7,
-                  height: 7,
-                  borderRadius: 2,
-                  background: C.amber,
-                  marginRight: 4,
-                  verticalAlign: -1,
-                }}
-              />
-              {fCount(barSegments.blockedCount)} {remediationCopy.label}
+              <ShieldAlert size={30} strokeWidth={1.6} aria-hidden />
+              <span>
+                <strong>{fCount(barSegments.blockedCount)}</strong>
+                <small>{remediationCopy.label}</small>
+              </span>
             </button>
           )}
-          <span>
-            <span
-              aria-hidden
-              style={{
-                display: "inline-block",
-                width: 7,
-                height: 7,
-                borderRadius: 2,
-                background: C.panel3,
-                border: `1px solid ${C.stroke}`,
-                marginRight: 4,
-                verticalAlign: -1,
-              }}
-            />
-            {fCount(barSegments.openCount)} open of {fCount(totals.requested)}
-          </span>
-          {eta && (
-            <span
-              data-testid="campaign-eta"
-              style={{ color: C.dim }}
-              title="From the measured trailing-24h ingest rate — hidden while the rate is unstable"
+          {needsReview > 0 && (
+            <button
+              type="button"
+              data-testid="campaign-needs-review-chip"
+              className="campaign-instrument-metric campaign-instrument-metric-red is-action"
+              title="Open unavailable evidence in the Points explorer"
+              onClick={() => onOpenPoints("needs_review")}
             >
-              {eta.label} to finish stage {eta.stage}
-            </span>
+              <ShieldAlert size={30} strokeWidth={1.6} aria-hidden />
+              <span>
+                <strong>{fCount(needsReview)}</strong>
+                <small>unavailable evidence</small>
+              </span>
+            </button>
           )}
-          <button
-            type="button"
-            data-testid="campaign-details-toggle"
-            aria-expanded={detailsOpen}
-            onClick={() => setDetailsOpen((v) => !v)}
-            style={{
-              fontFamily: MONO,
-              fontSize: 10.5,
-              color: C.teal,
-              background: "transparent",
-              border: "none",
-              padding: 0,
-              cursor: "pointer",
-            }}
-          >
-            {detailsOpen ? "▾ details" : "▸ details"}
-          </button>
         </div>
+        <button
+          type="button"
+          data-testid="campaign-details-toggle"
+          aria-expanded={detailsOpen}
+          onClick={() => setDetailsOpen((v) => !v)}
+          className="campaign-instrument-details-toggle"
+        >
+          {detailsOpen ? (
+            <ChevronDown size={15} aria-hidden />
+          ) : (
+            <ChevronRight size={15} aria-hidden />
+          )}
+          Campaign details
+        </button>
         {detailsOpen && (
           <div
             data-testid="campaign-details"
-            style={{
-              display: "grid",
-              gap: 7,
-              borderTop: `1px solid ${C.borderRow}`,
-              paddingTop: 8,
-            }}
+            className="campaign-instrument-details"
           >
-            <div
-              style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.muted,
-                display: "flex",
-                gap: 14,
-                flexWrap: "wrap",
-              }}
-            >
-              <span style={{ color: C.teal }}>
-                {fCount(totals.solved)} solved
+            <div className="campaign-instrument-detail-strip">
+              <span>
+                {fCount(summary.airfoilCount)} airfoils ·{" "}
+                {fCount(
+                  conditions.filter((c) => c.status !== "released").length,
+                )}{" "}
+                conditions
               </span>
               {totals.derived > 0 && (
                 <span title="derived by symmetry — not solver runs">
-                  ◌ {fCount(totals.derived)} derived
+                  {fCount(totals.derived)} symmetry-derived
                 </span>
               )}
               {totals.failed > 0 && (
@@ -1138,7 +850,7 @@ export function CampaignDetail({
                   onClick={() => onOpenPoints("failed")}
                   style={{
                     fontFamily: MONO,
-                    fontSize: 10.5,
+                    fontSize: 10,
                     color: C.redText,
                     background: "transparent",
                     border: "none",
@@ -1150,22 +862,6 @@ export function CampaignDetail({
                   {fCount(totals.failed)} failed
                 </button>
               )}
-              {totals.superseded > 0 && (
-                <span style={{ color: C.dim }}>
-                  {fCount(totals.superseded)} superseded
-                </span>
-              )}
-              <span>
-                {fCount(totals.remaining)} remaining of{" "}
-                {fCount(totals.requested)} points
-              </span>
-              <span style={{ color: C.dim }}>
-                {fCount(summary.airfoilCount)} airfoils ·{" "}
-                {fCount(
-                  conditions.filter((c) => c.status !== "released").length,
-                )}{" "}
-                conditions
-              </span>
             </div>
             {remediationCopy && (
               <div
@@ -1186,25 +882,6 @@ export function CampaignDetail({
                 </span>
                 {" — "}
                 {remediationCopy.detail}
-              </div>
-            )}
-            {tiersLine && (
-              <div
-                data-testid="campaign-tier-counts"
-                style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}
-                title="Fidelity ladder: RANS gaps, then precalc URANS, then full-fidelity verification"
-              >
-                {tiersLine}
-              </div>
-            )}
-            {rate && (
-              <div
-                data-testid="campaign-rate-line"
-                style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}
-              >
-                measured ingest: {fCount(rate.pointsLast24h)} solver points in
-                the trailing 24 h · {fCount(rate.remainingPoints)} solver points
-                of work remain
               </div>
             )}
             <div

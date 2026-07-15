@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AdminCampaignSummary } from "../lib/admin";
 import {
+  campaignInstrumentStatus,
   campaignStatusLine,
   gateFromSolverState,
   pausedCampaignStatusText,
@@ -216,6 +217,55 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
     expect(
       campaignStatusLine(summary({ status: "attention", failed: 1 })).gate,
     ).toBeNull();
+  });
+});
+
+describe("campaignInstrumentStatus — one truthful hero message", () => {
+  it("MUST-CATCH: folds the storage gate and active lifecycle into one automatic safeguard message", () => {
+    const s = summary({
+      jobs: 8,
+      diskAdmissionBlocked: true,
+      diskAdmissionReason:
+        "Storage admission stopped: 93.0% used; 21.0 GiB free; 68.0 GiB required.",
+    });
+    const view = campaignInstrumentStatus(s);
+    expect(view).toEqual({
+      title: "Capacity safeguard",
+      detail:
+        "8 active jobs continue; new work resumes automatically when capacity returns",
+      tone: "amber",
+      action: null,
+    });
+    expect(`${view.title} ${view.detail}`).not.toContain("ACTIVE");
+    expect(`${view.title} ${view.detail}`).not.toContain("BLOCKED");
+  });
+
+  it("FALSE-POSITIVE GUARD: a disabled sweeper remains directly actionable", () => {
+    const view = campaignInstrumentStatus(summary({ sweeperEnabled: false }));
+    expect(view.title).toBe("Scheduling is off");
+    expect(view.action).toBe("enable_sweeper");
+    expect(view.detail).toContain("Enable scheduling");
+  });
+
+  it("FALSE-POSITIVE GUARD: healthy active work reports live jobs once", () => {
+    const view = campaignInstrumentStatus(
+      summary({ jobs: 4, remaining: 631_000 }),
+    );
+    expect(view).toEqual({
+      title: "Campaign running",
+      detail: "4 active jobs · 631,000 points remain",
+      tone: "teal",
+      action: null,
+    });
+  });
+
+  it("MUST-CATCH: service failure copy does not repeat the same sentence", () => {
+    const view = campaignInstrumentStatus(
+      summary({ heartbeatAt: "2026-07-01T00:00:00Z" }),
+    );
+    expect(view.title).toBe("Solver unavailable");
+    expect(view.detail).toContain("resumes after");
+    expect(view.detail).not.toContain("not running");
   });
 });
 

@@ -46,6 +46,156 @@ export interface CampaignStatusView {
   tone: "teal" | "amber" | "red" | "dim" | "violet";
 }
 
+/** One concise operational message for the instrument-cluster campaign hero.
+ * The lifecycle, scheduler gate and explanatory status line are deliberately
+ * folded into one title/detail pair so the UI never repeats ACTIVE/BLOCKED/
+ * phase badges around the same state. The full measured status line remains
+ * available to renderers as a tooltip when the concise detail is used. */
+export interface CampaignInstrumentStatus {
+  title: string;
+  detail: string;
+  tone: CampaignStatusView["tone"];
+  /** The only banner-level recovery action currently exposed. */
+  action: "enable_sweeper" | null;
+}
+
+export function campaignInstrumentStatus(
+  s: AdminCampaignSummary,
+  line: CampaignStatusView = campaignStatusLine(s),
+): CampaignInstrumentStatus {
+  const { campaign, scheduler, totals } = s;
+  const jobs = scheduler.campaignJobsRunning;
+  const remaining = fCount(totals.remaining);
+
+  if (campaign.status === "active" && scheduler.diskAdmissionBlocked) {
+    return {
+      title: "Capacity safeguard",
+      detail:
+        jobs > 0
+          ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new work resumes automatically when capacity returns`
+          : "New work resumes automatically when storage capacity returns",
+      tone: "amber",
+      action: null,
+    };
+  }
+
+  if (
+    campaign.status === "active" &&
+    !isProcessDead(scheduler.heartbeatAt) &&
+    !scheduler.sweeperEnabled &&
+    !scheduler.engineUnreachableSince
+  ) {
+    return {
+      title: "Scheduling is off",
+      detail: "Enable scheduling to continue this campaign",
+      tone: "amber",
+      action: "enable_sweeper",
+    };
+  }
+
+  if (line.gate) {
+    if (line.gate.text.includes("solver process not running")) {
+      return {
+        title: "Solver unavailable",
+        detail: "Campaign scheduling resumes after the solver service restarts",
+        tone: "red",
+        action: null,
+      };
+    }
+    if (line.gate.text.includes("engine unreachable")) {
+      return {
+        title: "Solver engine unreachable",
+        detail:
+          "Campaign scheduling resumes automatically after connectivity returns",
+        tone: "red",
+        action: null,
+      };
+    }
+    if (line.gate.text.includes("engine unhealthy")) {
+      return {
+        title: "Solver engine unhealthy",
+        detail:
+          "Campaign scheduling is waiting for the engine health check to recover",
+        tone: "red",
+        action: null,
+      };
+    }
+    if (line.gate.text.startsWith("SLOW")) {
+      return {
+        title: "Scheduler responding slowly",
+        detail: "The current tick is still running; no action is required",
+        tone: "amber",
+        action: null,
+      };
+    }
+    const title = line.gate.text.replace(/^BLOCKED\s*[—-]\s*/i, "");
+    return {
+      title: title.charAt(0).toUpperCase() + title.slice(1),
+      detail: line.text,
+      tone: line.tone,
+      action: null,
+    };
+  }
+
+  switch (campaign.status) {
+    case "active":
+      return {
+        title: "Campaign running",
+        detail:
+          jobs > 0
+            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} · ${remaining} points remain`
+            : `${remaining} points remain · ready for the next scheduler tick`,
+        tone: "teal",
+        action: null,
+      };
+    case "paused":
+      return {
+        title: "Campaign paused",
+        detail: "No new points are being scheduled",
+        tone: "amber",
+        action: null,
+      };
+    case "completed":
+      return {
+        title: "Campaign complete",
+        detail: line.text.replace(/^Completed\s*[—-]\s*/i, ""),
+        tone: line.tone,
+        action: null,
+      };
+    case "cancelled":
+      return {
+        title: "Campaign cancelled",
+        detail:
+          line.text.replace(/^Cancelled\.?\s*/i, "") ||
+          "Solved evidence is retained",
+        tone: "dim",
+        action: null,
+      };
+    case "archived":
+      return {
+        title: "Campaign archived",
+        detail: "Read-only",
+        tone: "dim",
+        action: null,
+      };
+    case "attention":
+      return {
+        title:
+          line.tone === "violet" ? "Unsteady recovery" : "Automatic recovery",
+        detail: line.text,
+        tone: line.tone,
+        action: null,
+      };
+    default:
+      return {
+        title: campaign.status,
+        detail: line.text,
+        tone: line.tone,
+        action: null,
+      };
+  }
+}
+
 export type CampaignLifecycleEventView =
   AdminCampaignSummary["latestLifecycleEvent"];
 

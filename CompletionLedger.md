@@ -1,5 +1,10 @@
 # Completion Ledger
 
+- **Campaign instrument overview rollout:** The selected campaign-detail
+  instrument cluster is implemented and locally verified. Commit, push, normal
+  control-plane deployment, and a production route check remain before this UI
+  change is ready.
+
 - **Production evidence capacity:** The owner expanded the VPS disk from 300 to
   500 GiB. After terminal-job retention, active solver work currently leaves
   about 236 GiB free, approximately equal to the measured admission reserve.

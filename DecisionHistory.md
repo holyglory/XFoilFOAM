@@ -11,9 +11,30 @@
   automatic outcomes must not be presented as user repair tasks.
   Storage pressure must stop only new job admission while reconciliation and
   evidence ingestion remain live and the UI states the measured reason.
+  Campaign-detail overviews should prioritize one operational message and a
+  live instrument cluster over repeated badges, cards, borders, or pipeline
+  prose; secondary setup and evidence detail remains progressively disclosed.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
+  [D-2026-07-15-campaign-instrument-overview]
+
+## D-2026-07-15-campaign-instrument-overview — Campaign progress is an instrument, not a status wall
+
+Detail: [DecisionDetails/D-2026-07-15-campaign-instrument-overview.md](DecisionDetails/D-2026-07-15-campaign-instrument-overview.md)
+
+- Decision: use the selected instrument-cluster direction for campaign detail:
+  one campaign headline and action cluster, one truthful operational ribbon,
+  one dominant live completion instrument, a three-stage solver rail, and
+  compact processing, automatic-repair, and measured-throughput readouts.
+  Move setup metadata and exceptional evidence into progressive disclosure;
+  keep condition cards and coverage as the next substantial content.
+- Why: the prior card-and-badge dashboard repeated lifecycle, gate, phase,
+  counts, and recovery state in several bordered regions, making the first
+  viewport noisy and unclear. A compact-summary option remained text-heavy,
+  and a flow-diagram option emphasized internal scheduling over user progress.
+  The owner explicitly selected the instrument-cluster option because it makes
+  campaign state immediately legible without requiring solver internals.
 
 ## D-2026-07-15-precalc-physical-attempt-budget — PRECALC limits physical CFD attempts, not infrastructure submissions
 
