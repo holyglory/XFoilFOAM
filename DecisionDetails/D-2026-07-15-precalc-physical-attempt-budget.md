@@ -53,3 +53,15 @@ URANS window still consumes attempt 1 even when the job later receives a
 transient cancellation. Full deterministic-mesh recovery, durable whole-polar
 promotion, URANS ladder, migration, campaign remediation/query-plan, and DB
 type-check suites are required before production deployment.
+
+## Production rollout
+
+Commit `8351844` deployed through GitHub Actions run `29411217404`. Migration
+0064 preserved the old attempt rows and reopened exactly 28 live obligations:
+21 now have zero physical attempts spent and seven retain one real solver
+attempt. The campaign progress cache refreshed from 28 blocked to zero while
+the campaign remained active. Eight existing engine tasks continued across the
+control-plane-only deployment, and subsequent engine status showed completed
+case counters advancing. The scheduler heartbeat remained current and the disk
+admission measurement remained live; no engine API or worker restart was part
+of this rollout.
