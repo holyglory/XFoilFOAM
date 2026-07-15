@@ -4815,6 +4815,12 @@ function QueueDashboard({
     // a false red PROCESS NOT RUNNING (2026-07-06 prod incident).
     lastTickStartedAt: sw?.lastTickStartedAt ?? null,
     lastTickCompletedAt: sw?.lastTickCompletedAt ?? null,
+    diskAdmissionBlocked: sw?.diskAdmissionBlocked ?? false,
+    diskAdmissionReason: sw?.diskAdmissionReason ?? null,
+    diskUsedPct: sw?.diskUsedPct ?? null,
+    diskFreeBytes: sw?.diskFreeBytes ?? null,
+    diskRequiredFreeBytes: sw?.diskRequiredFreeBytes ?? null,
+    diskCheckedAt: sw?.diskCheckedAt ?? null,
   });
   const processDead = solver.state === "process_not_running";
   const toneColor =

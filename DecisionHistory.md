@@ -9,7 +9,32 @@
   strand worker tokens. A no-shedding preliminary URANS result remains
   preliminary evidence even when its physical regime is steady, and terminal
   automatic outcomes must not be presented as user repair tasks.
+  Storage pressure must stop only new job admission while reconciliation and
+  evidence ingestion remain live and the UI states the measured reason.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
+  [D-2026-07-15-disk-admission]
+
+## D-2026-07-15-disk-admission — Storage reserves gate new solver jobs
+
+Detail: [DecisionDetails/D-2026-07-15-disk-admission.md](DecisionDetails/D-2026-07-15-disk-admission.md)
+
+- Decision: every sweeper tick measures the engine results volume and blocks
+  only new solver-job admission at 80% use or when free capacity cannot cover
+  the 20 GiB system floor, the measured worst-case growth reserve for every
+  active job, and one next job. Persist the measurement, required headroom and
+  plain-language reason so admin surfaces show `storage blocked`; keep
+  reconciliation, partial ingestion, retention and heartbeats running. Retain
+  terminal jobs as soon as their OS advisory lock is actually released, and
+  terminalize any cancelled partial result so a stale `running` marker cannot
+  pin live case state forever.
+- Why: a warning-only probe allowed terminal evidence and live case state to
+  fill the VPS root disk, which made PostgreSQL crash-loop in recovery. Merely
+  lowering CPU use still admits unbounded work; deleting immutable evidence
+  violates the evidence contract; disabling the whole sweeper prevents the
+  automatic recovery needed to free space; a six-hour lock-file timestamp
+  delayed safe cleanup long after processes exited. Admission backpressure plus
+  exact live-lock retention protects the database without misclassifying CFD
+  work or hiding the operational cause.
 
 ## D-2026-07-14-no-shedding-preliminary-urans — Fidelity controls preliminary-URANS provenance
 

@@ -11,7 +11,7 @@ from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
 from airfoilfoam.storage import JobStore
 from airfoilfoam.pipeline import CaseOutcome
-from airfoilfoam.models import PolarRequest
+from airfoilfoam.models import JobResult, JobState, PolarRequest
 
 
 @pytest.fixture(autouse=True)
@@ -207,6 +207,31 @@ def test_multi_speed_chord_produces_multiple_polars(client, fake_run_case, naca0
 
 def test_job_not_found(client):
     assert client.get("/jobs/doesnotexist").status_code == 404
+
+
+def test_cancel_terminalizes_partial_result_without_discarding_polars():
+    store = JobStore()
+    job_id = "cancel-partial-result"
+    store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
+    store.write_result(JobResult(job_id=job_id, state=JobState.running, polars=[]))
+
+    changed = store.terminalize_cancelled_result(job_id, "worker lost")
+
+    result = store.read_result(job_id)
+    assert changed is True
+    assert result is not None
+    assert result.state is JobState.cancelled
+    assert result.message == "worker lost"
+
+
+def test_cancel_does_not_overwrite_terminal_result():
+    store = JobStore()
+    job_id = "cancel-completed-result"
+    store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
+    store.write_result(JobResult(job_id=job_id, state=JobState.completed, polars=[]))
+
+    assert store.terminalize_cancelled_result(job_id) is False
+    assert store.read_result(job_id).state is JobState.completed
 
 
 def test_runtime_endpoint_reports_unreadable_status(client):

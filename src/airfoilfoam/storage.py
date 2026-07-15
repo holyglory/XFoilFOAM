@@ -66,6 +66,29 @@ class JobStore:
     def is_cancelled(self, job_id: str) -> bool:
         return (self.job_dir(job_id) / "cancelled").exists()
 
+    def terminalize_cancelled_result(self, job_id: str, reason: str = "cancelled") -> bool:
+        """Make a partial running result terminal after cancellation.
+
+        Incremental publication intentionally writes ``result.json`` while a
+        job is running. If the worker disappears before its task catches the
+        cancellation marker, status becomes cancelled but that partial result
+        used to remain ``running`` forever, which truthfully blocked retention
+        and leaked the complete live case directory. Preserve every published
+        polar and change only the lifecycle state/message.
+        """
+
+        result = self.read_result(job_id)
+        if result is None or result.state in {
+            JobState.completed,
+            JobState.failed,
+            JobState.cancelled,
+        }:
+            return False
+        result.state = JobState.cancelled
+        result.message = reason
+        self.write_result(result)
+        return True
+
     def write_status(self, status: JobStatus) -> None:
         path = self.job_dir(status.job_id) / "status.json"
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -150,6 +150,41 @@ describe("deriveSolverState gate precedence", () => {
     expect(d.headline).toMatch(/build mismatch/i);
   });
 
+  it("enabled scheduler with measured disk pressure -> storage_blocked with the real admission reason", () => {
+    const reason =
+      "Storage admission stopped: 93.0% used; 21.0 GiB free; 68.0 GiB required.";
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        diskAdmissionBlocked: true,
+        diskAdmissionReason: reason,
+        diskUsedPct: 93,
+        diskFreeBytes: 21 * 1024 ** 3,
+        diskRequiredFreeBytes: 68 * 1024 ** 3,
+      },
+      NOW,
+    );
+    expect(d.state).toBe("storage_blocked");
+    expect(d.tone).toBe("amber");
+    expect(d.headline).toMatch(/no new solver jobs/i);
+    expect(d.detail).toBe(reason);
+  });
+
+  it("manual pause and process death keep precedence over storage admission", () => {
+    expect(
+      deriveSolverState(
+        { ...healthy, enabled: false, diskAdmissionBlocked: true },
+        NOW,
+      ).state,
+    ).toBe("paused");
+    expect(
+      deriveSolverState(
+        { ...healthy, heartbeatAt: null, diskAdmissionBlocked: true },
+        NOW,
+      ).state,
+    ).toBe("process_not_running");
+  });
+
   it("false-positive guard: healthy input -> running with jobs-in-flight + heartbeat age", () => {
     const d = deriveSolverState(healthy, NOW);
     expect(d.state).toBe("running");
@@ -299,6 +334,10 @@ describe("helpers", () => {
     expect(solverChipText("engine_unreachable")).toBe(
       "scheduler · engine unreachable",
     );
+    expect(solverStateLabel("storage_blocked")).toBe("STORAGE BLOCKED");
+    expect(solverChipText("storage_blocked")).toBe(
+      "scheduler · storage blocked",
+    );
     expect(solverChipText("idle")).toBe("scheduler · ready");
   });
 });
@@ -366,7 +405,7 @@ describe("tick_stalled (liveness/progress split)", () => {
     expect(nulls.state).toBe("running");
   });
 
-  it("precedence pins: process death > engine unreachable > engine unhealthy > tick_stalled > healthy", () => {
+  it("precedence pins: process death > engine unreachable > storage blocked > engine unhealthy > tick_stalled > healthy", () => {
     // process death beats everything (pinned above too)
     expect(
       deriveSolverState(
@@ -381,6 +420,14 @@ describe("tick_stalled (liveness/progress split)", () => {
         NOW,
       ).state,
     ).toBe("engine_unreachable");
+    // Measured storage pressure is a real admission gate, so it outranks the
+    // advisory engine-unhealthy state and a slow tick.
+    expect(
+      deriveSolverState(
+        { ...stalled, engineHealthy: false, diskAdmissionBlocked: true },
+        NOW,
+      ).state,
+    ).toBe("storage_blocked");
     // engine unhealthy beats tick_stalled
     expect(
       deriveSolverState({ ...stalled, engineHealthy: false }, NOW).state,

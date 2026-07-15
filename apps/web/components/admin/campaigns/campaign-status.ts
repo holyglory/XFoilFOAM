@@ -94,6 +94,8 @@ export function gateFromSolverState(
       return { text: "BLOCKED — engine unreachable", tone: "red" };
     case "engine_unhealthy":
       return { text: "BLOCKED — engine unhealthy", tone: "red" };
+    case "storage_blocked":
+      return { text: "BLOCKED — storage reserve reached", tone: "amber" };
     case "paused":
       return { text: "BLOCKED — sweeper disabled", tone: "amber" };
     case "tick_stalled":
@@ -357,6 +359,19 @@ export function campaignStatusLine(
           gate: { text: "BLOCKED — sweeper disabled", tone: "amber" },
           lifecycle,
           text: "Sweeper disabled — nothing is being scheduled.",
+          tone: "amber",
+        };
+      }
+      if (scheduler.diskAdmissionBlocked) {
+        return {
+          gate: {
+            text: "BLOCKED — storage reserve reached",
+            tone: "amber",
+          },
+          lifecycle,
+          text:
+            scheduler.diskAdmissionReason ??
+            "Storage reserve reached — existing evidence remains available, but no new jobs are being submitted.",
           tone: "amber",
         };
       }

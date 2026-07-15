@@ -261,6 +261,12 @@ export function CampaignsHub({
           activeJobCount: solverPayload.activeJobCount,
           lastTickStartedAt: solverPayload.lastTickStartedAt ?? null,
           lastTickCompletedAt: solverPayload.lastTickCompletedAt ?? null,
+          diskAdmissionBlocked: solverPayload.diskAdmissionBlocked,
+          diskAdmissionReason: solverPayload.diskAdmissionReason,
+          diskUsedPct: solverPayload.diskUsedPct,
+          diskFreeBytes: solverPayload.diskFreeBytes,
+          diskRequiredFreeBytes: solverPayload.diskRequiredFreeBytes,
+          diskCheckedAt: solverPayload.diskCheckedAt,
         }
       : {
           fetchOk: false,

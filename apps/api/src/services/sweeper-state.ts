@@ -22,6 +22,12 @@ export interface SweeperStateRow {
    *  the web then simply never derives tick_stalled. */
   lastTickStartedAt: Date | string | null;
   lastTickCompletedAt: Date | string | null;
+  diskAdmissionBlocked: boolean;
+  diskAdmissionReason: string | null;
+  diskUsedPct: number | null;
+  diskFreeBytes: number | null;
+  diskRequiredFreeBytes: number | null;
+  diskCheckedAt: Date | string | null;
 }
 
 export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
@@ -39,12 +45,19 @@ export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
   engineUnreachableSince: null,
   lastTickStartedAt: null,
   lastTickCompletedAt: null,
+  diskAdmissionBlocked: false,
+  diskAdmissionReason: null,
+  diskUsedPct: null,
+  diskFreeBytes: null,
+  diskRequiredFreeBytes: null,
+  diskCheckedAt: null,
 };
 
 let engineUnreachableColumnExists: boolean | null = null;
 
 async function hasEngineUnreachableColumn(): Promise<boolean> {
-  if (engineUnreachableColumnExists != null) return engineUnreachableColumnExists;
+  if (engineUnreachableColumnExists != null)
+    return engineUnreachableColumnExists;
   const rows = (await db.execute(sql`
     SELECT 1 AS present FROM information_schema.columns
     WHERE table_name = 'sweeper_state' AND column_name = 'engineUnreachableSince'
@@ -68,9 +81,23 @@ async function hasTickProgressColumns(): Promise<boolean> {
   return tickProgressColumnsExist;
 }
 
+let diskAdmissionColumnsExist: boolean | null = null;
+
+async function hasDiskAdmissionColumns(): Promise<boolean> {
+  if (diskAdmissionColumnsExist != null) return diskAdmissionColumnsExist;
+  const rows = (await db.execute(sql`
+    SELECT 1 AS present FROM information_schema.columns
+    WHERE table_name = 'sweeper_state' AND column_name = 'disk_admission_blocked'
+    LIMIT 1
+  `)) as unknown as unknown[];
+  diskAdmissionColumnsExist = rows.length > 0;
+  return diskAdmissionColumnsExist;
+}
+
 export async function readSweeperState(): Promise<SweeperStateRow | null> {
   const withUnreachable = await hasEngineUnreachableColumn();
   const withTickProgress = await hasTickProgressColumns();
+  const withDiskAdmission = await hasDiskAdmissionColumns();
   const rows = (await db.execute(sql`
     SELECT
       id,
@@ -87,6 +114,21 @@ export async function readSweeperState(): Promise<SweeperStateRow | null> {
           ? sql`, "lastTickStartedAt", "lastTickCompletedAt"`
           : sql`, NULL::timestamptz AS "lastTickStartedAt", NULL::timestamptz AS "lastTickCompletedAt"`
       }
+      ${
+        withDiskAdmission
+          ? sql`, disk_admission_blocked AS "diskAdmissionBlocked",
+                  disk_admission_reason AS "diskAdmissionReason",
+                  disk_used_pct AS "diskUsedPct",
+                  disk_free_bytes AS "diskFreeBytes",
+                  disk_required_free_bytes AS "diskRequiredFreeBytes",
+                  disk_checked_at AS "diskCheckedAt"`
+          : sql`, false AS "diskAdmissionBlocked",
+                  NULL::text AS "diskAdmissionReason",
+                  NULL::double precision AS "diskUsedPct",
+                  NULL::bigint AS "diskFreeBytes",
+                  NULL::bigint AS "diskRequiredFreeBytes",
+                  NULL::timestamptz AS "diskCheckedAt"`
+      }
     FROM sweeper_state
     WHERE id = 1
     LIMIT 1
@@ -101,6 +143,13 @@ export async function readSweeperState(): Promise<SweeperStateRow | null> {
     cpuSlots: Number(row.cpuSlots ?? 0),
     pollIntervalMs: Number(row.pollIntervalMs),
     submitIntervalMs: Number(row.submitIntervalMs),
+    diskAdmissionBlocked: Boolean(row.diskAdmissionBlocked),
+    diskUsedPct: row.diskUsedPct == null ? null : Number(row.diskUsedPct),
+    diskFreeBytes: row.diskFreeBytes == null ? null : Number(row.diskFreeBytes),
+    diskRequiredFreeBytes:
+      row.diskRequiredFreeBytes == null
+        ? null
+        : Number(row.diskRequiredFreeBytes),
   };
 }
 
@@ -115,14 +164,27 @@ export interface SweeperStatePatch {
 
 /** Upsert the singleton row without touching (or returning) columns that may
  *  not exist yet on this database. */
-export async function writeSweeperState(patch: SweeperStatePatch): Promise<SweeperStateRow> {
+export async function writeSweeperState(
+  patch: SweeperStatePatch,
+): Promise<SweeperStateRow> {
   const existing = await readSweeperState();
   const next = {
-    enabled: patch.enabled ?? existing?.enabled ?? SWEEPER_STATE_DEFAULTS.enabled,
-    maxConcurrentJobs: patch.maxConcurrentJobs ?? existing?.maxConcurrentJobs ?? SWEEPER_STATE_DEFAULTS.maxConcurrentJobs,
-    cpuSlots: patch.cpuSlots ?? existing?.cpuSlots ?? SWEEPER_STATE_DEFAULTS.cpuSlots,
-    pollIntervalMs: patch.pollIntervalMs ?? existing?.pollIntervalMs ?? SWEEPER_STATE_DEFAULTS.pollIntervalMs,
-    submitIntervalMs: patch.submitIntervalMs ?? existing?.submitIntervalMs ?? SWEEPER_STATE_DEFAULTS.submitIntervalMs,
+    enabled:
+      patch.enabled ?? existing?.enabled ?? SWEEPER_STATE_DEFAULTS.enabled,
+    maxConcurrentJobs:
+      patch.maxConcurrentJobs ??
+      existing?.maxConcurrentJobs ??
+      SWEEPER_STATE_DEFAULTS.maxConcurrentJobs,
+    cpuSlots:
+      patch.cpuSlots ?? existing?.cpuSlots ?? SWEEPER_STATE_DEFAULTS.cpuSlots,
+    pollIntervalMs:
+      patch.pollIntervalMs ??
+      existing?.pollIntervalMs ??
+      SWEEPER_STATE_DEFAULTS.pollIntervalMs,
+    submitIntervalMs:
+      patch.submitIntervalMs ??
+      existing?.submitIntervalMs ??
+      SWEEPER_STATE_DEFAULTS.submitIntervalMs,
   };
   await db.execute(sql`
     INSERT INTO sweeper_state (id, enabled, max_concurrent_jobs, cpu_slots, poll_interval_ms, submit_interval_ms)

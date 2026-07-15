@@ -23,6 +23,8 @@ function summary(overrides: {
   engineUnreachableSince?: string | null;
   lastTickStartedAt?: string | null;
   lastTickCompletedAt?: string | null;
+  diskAdmissionBlocked?: boolean;
+  diskAdmissionReason?: string | null;
   failed?: number;
   rejected?: number;
   blocked?: number;
@@ -63,6 +65,8 @@ function summary(overrides: {
         overrides.heartbeatAt === undefined ? now : overrides.heartbeatAt,
       lastTickStartedAt: overrides.lastTickStartedAt ?? null,
       lastTickCompletedAt: overrides.lastTickCompletedAt ?? null,
+      diskAdmissionBlocked: overrides.diskAdmissionBlocked ?? false,
+      diskAdmissionReason: overrides.diskAdmissionReason ?? null,
     } as AdminCampaignSummary["scheduler"],
   } as AdminCampaignSummary;
 }
@@ -165,6 +169,22 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
     expect(line.text).not.toMatch(/^Active/);
   });
 
+  it("storage reserve → amber gate with the measured scheduler reason", () => {
+    const reason =
+      "Storage admission stopped: 93.0% used; 21.0 GiB free; 68.0 GiB required.";
+    const line = campaignStatusLine(
+      summary({
+        diskAdmissionBlocked: true,
+        diskAdmissionReason: reason,
+      }),
+    );
+    expect(line.gate).toEqual({
+      text: "BLOCKED — storage reserve reached",
+      tone: "amber",
+    });
+    expect(line.text).toBe(reason);
+  });
+
   it("dead process outranks every other gate (precedence)", () => {
     const line = campaignStatusLine(
       summary({
@@ -200,7 +220,7 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
 });
 
 describe("gateFromSolverState — hub/backlog gate from the global derivation", () => {
-  it("maps the four blocking solver states to gate badges", () => {
+  it("maps the blocking solver states to gate badges", () => {
     expect(gateFromSolverState("process_not_running")).toEqual({
       text: "BLOCKED — solver process not running",
       tone: "red",
@@ -215,6 +235,10 @@ describe("gateFromSolverState — hub/backlog gate from the global derivation", 
     });
     expect(gateFromSolverState("paused")).toEqual({
       text: "BLOCKED — sweeper disabled",
+      tone: "amber",
+    });
+    expect(gateFromSolverState("storage_blocked")).toEqual({
+      text: "BLOCKED — storage reserve reached",
       tone: "amber",
     });
   });

@@ -446,6 +446,7 @@ def create_app() -> FastAPI:
         status.phase = JobPhase.cancelled
         status.message = "cancelled"
         store.write_status(status)
+        store.terminalize_cancelled_result(job_id)
         return {"job_id": job_id, "cancelled": True, "reaper": reaper_results}
 
     @app.post("/jobs/{job_id}/strip")

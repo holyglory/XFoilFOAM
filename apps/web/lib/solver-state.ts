@@ -29,6 +29,7 @@ export type SolverStateName =
   | "paused"
   | "engine_unreachable"
   | "engine_unhealthy"
+  | "storage_blocked"
   | "tick_stalled"
   | "idle"
   | "running";
@@ -61,6 +62,12 @@ export interface SolverStateInput {
    *  columns, or pre-migration DB) simply never derives tick_stalled. */
   lastTickStartedAt?: string | null;
   lastTickCompletedAt?: string | null;
+  diskAdmissionBlocked?: boolean;
+  diskAdmissionReason?: string | null;
+  diskUsedPct?: number | null;
+  diskFreeBytes?: number | null;
+  diskRequiredFreeBytes?: number | null;
+  diskCheckedAt?: string | null;
 }
 
 export interface DerivedSolverState {
@@ -80,6 +87,12 @@ export interface SolverStateListPayload {
   activeJobCount: number;
   lastTickStartedAt: string | null;
   lastTickCompletedAt: string | null;
+  diskAdmissionBlocked?: boolean;
+  diskAdmissionReason?: string | null;
+  diskUsedPct?: number | null;
+  diskFreeBytes?: number | null;
+  diskRequiredFreeBytes?: number | null;
+  diskCheckedAt?: string | null;
 }
 
 export function heartbeatAgeMs(
@@ -147,6 +160,8 @@ export function solverStateLabel(state: SolverStateName): string {
       return "ENGINE UNREACHABLE";
     case "engine_unhealthy":
       return "ENGINE UNHEALTHY";
+    case "storage_blocked":
+      return "STORAGE BLOCKED";
     case "tick_stalled":
       return "TICK STALLED";
     case "idle":
@@ -179,6 +194,8 @@ export function solverChipText(
       return "scheduler · engine unreachable";
     case "engine_unhealthy":
       return "scheduler · engine unhealthy";
+    case "storage_blocked":
+      return "scheduler · storage blocked";
     case "tick_stalled":
       return "scheduler · tick stalled";
     case "unknown":
@@ -206,6 +223,8 @@ export function deriveSolverState(
   const secondary: string[] = [];
   if (input.engineQueueError)
     secondary.push("celery introspection unavailable");
+  if (input.diskAdmissionBlocked)
+    secondary.push("new-job admission stopped by storage reserve");
 
   if (!input.fetchOk) {
     return {
@@ -261,6 +280,21 @@ export function deriveSolverState(
       detail:
         "Submissions are held with backoff; composed work is released, jobs are not marked failed.",
       secondary,
+    };
+  }
+
+  if (input.diskAdmissionBlocked) {
+    return {
+      state: "storage_blocked",
+      tone: "amber",
+      headline:
+        "Storage reserve reached — existing evidence is safe; no new solver jobs are being submitted.",
+      detail:
+        input.diskAdmissionReason ??
+        "Free storage before resuming job admission. Reconciliation and evidence ingestion continue automatically.",
+      secondary: secondary.filter(
+        (item) => item !== "new-job admission stopped by storage reserve",
+      ),
     };
   }
 

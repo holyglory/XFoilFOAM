@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import fcntl
 from pathlib import Path
 
 import pytest
@@ -188,12 +189,22 @@ def test_unknown_case_entries_are_retained_and_reported(tmp_path: Path):
 def test_running_guard_refuses_strip_and_delete(tmp_path: Path):
     job_root = tmp_path / "job-running"
     _make_realistic_job(job_root)
-    _write(job_root / ".execute.lock", b"locked")
+    with (job_root / ".execute.lock").open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(JobRetentionRefused):
+            strip_job_dir(job_root)
+        with pytest.raises(JobRetentionRefused):
+            delete_job_dir(job_root)
 
-    with pytest.raises(JobRetentionRefused):
-        strip_job_dir(job_root)
-    with pytest.raises(JobRetentionRefused):
-        delete_job_dir(job_root)
+
+def test_released_fresh_lock_does_not_delay_terminal_retention(tmp_path: Path):
+    job_root = tmp_path / "job-released-lock"
+    _make_realistic_job(job_root)
+    _write(job_root / ".execute.lock", b"released moments ago")
+
+    report = strip_job_dir(job_root)
+
+    assert report.bytes_freed > 0
 
 
 def test_api_strip_preserves_served_media_and_reports_maintenance():
@@ -231,10 +242,10 @@ def test_api_running_guard_and_delete_status_codes():
     running_id = "retention-api-running"
     running_root = _clean_store_job(running_id)
     _make_realistic_job(running_root)
-    _write(running_root / ".execute.lock", b"locked")
-
-    assert client.post(f"/jobs/{running_id}/strip", json={}).status_code == 409
-    assert client.delete(f"/jobs/{running_id}").status_code == 409
+    with (running_root / ".execute.lock").open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert client.post(f"/jobs/{running_id}/strip", json={}).status_code == 409
+        assert client.delete(f"/jobs/{running_id}").status_code == 409
 
     delete_id = "retention-api-delete"
     delete_root = _clean_store_job(delete_id)

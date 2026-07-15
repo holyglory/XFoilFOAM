@@ -118,13 +118,11 @@ function sendCampaignError(reply: FastifyReply, e: unknown): FastifyReply {
   if (e instanceof CampaignError) {
     const status =
       e.code === "not_found" ? 404 : e.code === "validation" ? 422 : 409; // conflict | invalid_state | drift
-    return reply
-      .code(status)
-      .send({
-        error: e.message,
-        code: e.code,
-        ...(e.details ? { details: e.details } : {}),
-      });
+    return reply.code(status).send({
+      error: e.message,
+      code: e.code,
+      ...(e.details ? { details: e.details } : {}),
+    });
   }
   throw e;
 }
@@ -216,6 +214,12 @@ export async function registerCampaignRoutes(
         // state instead of a false red while a tick crawls on a slow engine.
         lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
         lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
+        diskAdmissionBlocked: Boolean(sweeper?.diskAdmissionBlocked),
+        diskAdmissionReason: sweeper?.diskAdmissionReason ?? null,
+        diskUsedPct: sweeper?.diskUsedPct ?? null,
+        diskFreeBytes: sweeper?.diskFreeBytes ?? null,
+        diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
+        diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
       },
     };
   });
@@ -283,6 +287,12 @@ export async function registerCampaignRoutes(
             // Tick-progress pair (liveness/progress split, migration 0033).
             lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
             lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
+            diskAdmissionBlocked: Boolean(sweeper?.diskAdmissionBlocked),
+            diskAdmissionReason: sweeper?.diskAdmissionReason ?? null,
+            diskUsedPct: sweeper?.diskUsedPct ?? null,
+            diskFreeBytes: sweeper?.diskFreeBytes ?? null,
+            diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
+            diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
           },
           rate,
         };
@@ -482,12 +492,10 @@ export async function registerCampaignRoutes(
         if (b.mode === "preview")
           return await previewAddCampaignAirfoils(db, id, b.airfoilIds);
         if (!b.diffHash)
-          return reply
-            .code(422)
-            .send({
-              error: "diffHash is required to apply",
-              code: "validation",
-            });
+          return reply.code(422).send({
+            error: "diffHash is required to apply",
+            code: "validation",
+          });
         const result = await addCampaignAirfoils(
           db,
           id,

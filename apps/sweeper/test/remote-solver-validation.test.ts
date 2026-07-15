@@ -1126,6 +1126,23 @@ afterAll(async () => {
 });
 
 describe("remote solver submit lifecycle", () => {
+  it("keeps remote reconciliation live but does not submit an engine job while storage admission is blocked", async () => {
+    const aoa = 900.501;
+    const promise = await seedMirroredPromise("storage-blocked", [aoa]);
+    stubFetch();
+    const submitPolar = vi.fn(async () => acceptedStatus("must-not-submit"));
+
+    await remoteSolverTick(
+      db,
+      { submitPolar, cancelJob: vi.fn() } as unknown as EngineClient,
+      false,
+    );
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(await jobsForPromise(promise.id)).toEqual([]);
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+  });
+
   it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {
     const aoa = 901.001;
     const promise = await seedMirroredPromise("connection", [aoa]);

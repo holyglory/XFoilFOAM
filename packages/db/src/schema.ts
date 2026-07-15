@@ -1933,6 +1933,19 @@ export const sweeperState = pgTable("sweeper_state", {
   // one hung engine HTTP call starved the in-tick heartbeat writes).
   lastTickStartedAt: ts(),
   lastTickCompletedAt: ts(),
+  // Storage admission is a scheduler gate, not a campaign lifecycle state.
+  // Persist the last real engine measurement so Queue/campaign surfaces can
+  // explain why an enabled scheduler is intentionally not submitting work.
+  diskAdmissionBlocked: boolean("disk_admission_blocked")
+    .notNull()
+    .default(false),
+  diskAdmissionReason: text("disk_admission_reason"),
+  diskUsedPct: doublePrecision("disk_used_pct"),
+  diskFreeBytes: bigint("disk_free_bytes", { mode: "number" }),
+  diskRequiredFreeBytes: bigint("disk_required_free_bytes", {
+    mode: "number",
+  }),
+  diskCheckedAt: timestamp("disk_checked_at", { withTimezone: true }),
   updatedAt: ts()
     .notNull()
     .defaultNow()

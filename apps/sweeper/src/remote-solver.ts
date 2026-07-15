@@ -2962,6 +2962,7 @@ async function reopenResolvedConflictDeliveries(
 export async function remoteSolverTick(
   db: DB,
   engine: EngineClient,
+  allowEngineSubmission = true,
 ): Promise<void> {
   const [settings] = await db
     .select()
@@ -3021,6 +3022,14 @@ export async function remoteSolverTick(
     );
     if (await processReusablePromiseEvidence(db, settings)) return;
     if (active.length === 0) {
+      if (!allowEngineSubmission) {
+        await setStatus(
+          db,
+          "idle",
+          "storage admission is blocked; remote reconciliation continues but no new engine job will be submitted",
+        );
+        return;
+      }
       const mirrored = await mirroredRemotePromiseIds(db, settings);
       if (mirrored.length) {
         await submitMirroredRemotePromise(db, engine, settings, mirrored[0]);

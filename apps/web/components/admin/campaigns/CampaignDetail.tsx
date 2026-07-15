@@ -400,6 +400,7 @@ export function CampaignDetail({
       !isProcessDead(scheduler.heartbeatAt) &&
       scheduler.sweeperEnabled &&
       scheduler.engineHealthy &&
+      !scheduler.diskAdmissionBlocked &&
       !scheduler.engineUnreachableSince,
   );
   const hasLanes = Object.keys(summary.lanesSummary).length > 0;

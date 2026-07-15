@@ -120,6 +120,12 @@ export interface SweeperState {
    *  the sweeper loop at tick begin/end; null pre-migration. */
   lastTickStartedAt: string | null;
   lastTickCompletedAt: string | null;
+  diskAdmissionBlocked?: boolean;
+  diskAdmissionReason?: string | null;
+  diskUsedPct?: number | null;
+  diskFreeBytes?: number | null;
+  diskRequiredFreeBytes?: number | null;
+  diskCheckedAt?: string | null;
 }
 export interface AdminJob {
   id: string;
@@ -1588,6 +1594,12 @@ export interface AdminCampaignSummary {
     /** Tick-progress pair (liveness/progress split, migration 0033). */
     lastTickStartedAt: string | null;
     lastTickCompletedAt: string | null;
+    diskAdmissionBlocked?: boolean;
+    diskAdmissionReason?: string | null;
+    diskUsedPct?: number | null;
+    diskFreeBytes?: number | null;
+    diskRequiredFreeBytes?: number | null;
+    diskCheckedAt?: string | null;
   };
   rate: {
     pointsLast24h: number;
@@ -1853,6 +1865,12 @@ export interface AdminCampaignsSolverState {
   /** Tick-progress pair (liveness/progress split, migration 0033). */
   lastTickStartedAt: string | null;
   lastTickCompletedAt: string | null;
+  diskAdmissionBlocked?: boolean;
+  diskAdmissionReason?: string | null;
+  diskUsedPct?: number | null;
+  diskFreeBytes?: number | null;
+  diskRequiredFreeBytes?: number | null;
+  diskCheckedAt?: string | null;
 }
 
 export const listCampaigns = (params?: {

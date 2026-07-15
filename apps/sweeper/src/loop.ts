@@ -21,6 +21,7 @@ import { count, eq, inArray, sql } from "drizzle-orm";
 
 import { buildPolarRequest } from "./build-request";
 import { claimAoas } from "./claim";
+import { refreshDiskAdmission } from "./disk-admission";
 import {
   submitCampaignPrecalcRecoveries,
   submitRecordedPromotionRecovery,
@@ -71,9 +72,7 @@ export function effectiveMaxConcurrentJobs(
     return configuredMax as number;
   if (Number.isInteger(cpuSlots) && (cpuSlots ?? 0) > 0)
     return cpuSlots as number;
-  return Number.isInteger(workerBudget) && workerBudget > 0
-    ? workerBudget
-    : 2;
+  return Number.isInteger(workerBudget) && workerBudget > 0 ? workerBudget : 2;
 }
 
 export async function getState(db: DB): Promise<SweeperConfig> {
@@ -594,9 +593,24 @@ export async function tick(
   // liveness itself is the independent index.ts timer.
   await markTickStarted(db);
   await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
-  await remoteSolverTick(db, engine);
   await retentionTick(db, engine);
-  if (state.enabled && (await inFlight(db)) < state.maxConcurrentJobs) {
+  let inFlightJobs = await inFlight(db);
+  // Disk pressure blocks admission only. Reconciliation, partial ingestion,
+  // retention and heartbeat progress above remain live so the system can
+  // recover automatically instead of turning storage pressure into fake job
+  // failures or a PostgreSQL outage.
+  let diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
+  await remoteSolverTick(db, engine, diskAdmission.allowed);
+  const afterRemoteInFlight = await inFlight(db);
+  if (afterRemoteInFlight !== inFlightJobs) {
+    inFlightJobs = afterRemoteInFlight;
+    diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
+  }
+  if (
+    state.enabled &&
+    diskAdmission.allowed &&
+    inFlightJobs < state.maxConcurrentJobs
+  ) {
     // Engine-down backoff (§7): check the cached engine probe before composing.
     if (!engineBackoffActive()) {
       let healthy = false;

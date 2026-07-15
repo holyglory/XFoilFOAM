@@ -38,17 +38,17 @@ deleted by a broad "everything not in the keep set" rule.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
-import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-FRESH_LOCK_SECONDS = 6 * 60 * 60
 STRIP_MARKER = ".stripped.json"
 
 _ROOT_JSON_KEEP = {"request.json", "result.json", "status.json", "runtime.json"}
@@ -121,38 +121,37 @@ def strip_job_dir(job_root: Path, keep_case_state: bool = False) -> StripReport:
     job_root = Path(job_root)
     if not job_root.is_dir():
         raise FileNotFoundError(job_root)
-    _refuse_if_running(job_root)
+    with _job_retention_guard(job_root):
+        marker = job_root / STRIP_MARKER
+        requested_strength = _mode_strength(keep_case_state)
+        existing_mode = _read_marker_mode(marker)
+        if existing_mode is not None and _mode_strength(existing_mode) >= requested_strength:
+            return StripReport(
+                job_id=job_root.name,
+                kept_case_state=existing_mode,
+                no_op=True,
+                marker_path=str(marker),
+            )
 
-    marker = job_root / STRIP_MARKER
-    requested_strength = _mode_strength(keep_case_state)
-    existing_mode = _read_marker_mode(marker)
-    if existing_mode is not None and _mode_strength(existing_mode) >= requested_strength:
-        return StripReport(
-            job_id=job_root.name,
-            kept_case_state=existing_mode,
-            no_op=True,
-            marker_path=str(marker),
-        )
+        report = StripReport(job_id=job_root.name, kept_case_state=keep_case_state, marker_path=str(marker))
 
-    report = StripReport(job_id=job_root.name, kept_case_state=keep_case_state, marker_path=str(marker))
+        # Job-root meshes/ is the shared-mesh store; prod cases SYMLINK their
+        # constant/polyMesh into it (jobs.py mesh_reuse_mode="symlink"), and a
+        # dangling shared-mesh symlink makes a saved case "not restartable"
+        # (pipeline continuation staging). Case-state-preserving strips must
+        # therefore keep meshes/ alive alongside the case dirs.
+        if not keep_case_state:
+            meshes = job_root / "meshes"
+            if meshes.exists() or meshes.is_symlink():
+                _remove_path(meshes, report)
 
-    # Job-root meshes/ is the shared-mesh store; prod cases SYMLINK their
-    # constant/polyMesh into it (jobs.py mesh_reuse_mode="symlink"), and a
-    # dangling shared-mesh symlink makes a saved case "not restartable"
-    # (pipeline continuation staging). Case-state-preserving strips must
-    # therefore keep meshes/ alive alongside the case dirs.
-    if not keep_case_state:
-        meshes = job_root / "meshes"
-        if meshes.exists() or meshes.is_symlink():
-            _remove_path(meshes, report)
+        cases_root = job_root / "cases"
+        if cases_root.is_dir():
+            for case_dir in sorted(p for p in cases_root.iterdir() if p.is_dir()):
+                _strip_case_dir(job_root, case_dir, report, keep_case_state=keep_case_state)
 
-    cases_root = job_root / "cases"
-    if cases_root.is_dir():
-        for case_dir in sorted(p for p in cases_root.iterdir() if p.is_dir()):
-            _strip_case_dir(job_root, case_dir, report, keep_case_state=keep_case_state)
-
-    _write_marker(marker, keep_case_state, report)
-    return report
+        _write_marker(marker, keep_case_state, report)
+        return report
 
 
 def delete_job_dir(job_root: Path) -> DeleteReport:
@@ -161,15 +160,15 @@ def delete_job_dir(job_root: Path) -> DeleteReport:
     job_root = Path(job_root)
     if not job_root.is_dir():
         raise FileNotFoundError(job_root)
-    _refuse_if_running(job_root)
-    measured = _measure_path(job_root)
-    _remove_tree_unchecked(job_root)
-    return DeleteReport(
-        job_id=job_root.name,
-        bytes_freed=measured["bytes"],
-        files_removed=measured["files"],
-        dirs_removed=measured["dirs"],
-    )
+    with _job_retention_guard(job_root):
+        measured = _measure_path(job_root)
+        _remove_tree_unchecked(job_root)
+        return DeleteReport(
+            job_id=job_root.name,
+            bytes_freed=measured["bytes"],
+            files_removed=measured["files"],
+            dirs_removed=measured["dirs"],
+        )
 
 
 def _mode_strength(keep_case_state: bool) -> int:
@@ -199,30 +198,47 @@ def _write_marker(marker: Path, keep_case_state: bool, report: StripReport) -> N
     marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _refuse_if_running(job_root: Path) -> None:
-    lock = job_root / ".execute.lock"
-    now = time.time()
-    if lock.exists():
-        try:
-            age = now - lock.stat().st_mtime
-        except OSError as exc:
-            raise JobRetentionRefused(f"cannot stat execution lock: {exc}") from exc
-        if age < FRESH_LOCK_SECONDS:
-            raise JobRetentionRefused(".execute.lock is fresh; job may still be executing")
+@contextmanager
+def _job_retention_guard(job_root: Path):
+    """Hold the same advisory lock as ``run_polar`` during retention.
 
-    for name in ("status.json", "result.json"):
-        path = job_root / name
-        if not path.exists():
-            continue
+    A lock file's mtime records when a long batch started, not whether its
+    process still owns the lock. The previous six-hour timestamp heuristic
+    retained tens of GiB for hours after completed jobs and contributed to the
+    production disk exhaustion. An OS-held flock is exact and remains held for
+    the complete strip/delete operation, closing the check-then-delete race.
+    """
+
+    lock = job_root / ".execute.lock"
+    try:
+        lock_file = lock.open("a+")
+    except OSError as exc:
+        raise JobRetentionRefused(f"cannot open execution lock: {exc}") from exc
+    try:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            if name == "status.json":
-                raise JobRetentionRefused(f"cannot read {name}: {exc}") from exc
-            continue
-        state = data.get("state") if isinstance(data, dict) else None
-        if state in {"pending", "running"}:
-            raise JobRetentionRefused(f"{name} state is {state}; job may still be executing")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise JobRetentionRefused(".execute.lock is held; job is executing") from exc
+
+        for name in ("status.json", "result.json"):
+            path = job_root / name
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                if name == "status.json":
+                    raise JobRetentionRefused(f"cannot read {name}: {exc}") from exc
+                continue
+            state = data.get("state") if isinstance(data, dict) else None
+            if state in {"pending", "running"}:
+                raise JobRetentionRefused(f"{name} state is {state}; job may still be executing")
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def _strip_case_dir(job_root: Path, case_dir: Path, report: StripReport, *, keep_case_state: bool) -> None:
@@ -365,4 +381,3 @@ def _remove_tree_unchecked(path: Path) -> None:
         path.unlink()
     elif path.is_dir():
         shutil.rmtree(path)
-
