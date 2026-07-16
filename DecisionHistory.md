@@ -19,11 +19,38 @@
   evidence records and infrastructure submissions, and use the pinned real
   airfoil geometry in both the dialog identity and an inspectable profile view.
   Foreground dialogs own scroll and keyboard focus until they close.
+  Remote solvers must advance continuously through authoritative hub work:
+  active mirrored leases are reported as active, bounded preliminary recovery
+  completes before any new RANS claim, and an exhausted cell returns exact
+  terminal evidence without being published as an accepted polar point.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
+  [D-2026-07-16-remote-terminal-handoff]
+
+## D-2026-07-16-remote-terminal-handoff — Remote terminal evidence advances the feed without fake fulfillment
+
+Detail: [DecisionDetails/D-2026-07-16-remote-terminal-handoff.md](DecisionDetails/D-2026-07-16-remote-terminal-handoff.md)
+
+- Decision: make remote promise work state preliminary-obligation-aware;
+  recover its second bounded preliminary attempt, publish accepted historical
+  URANS generations even when a stale provisional pointer remains, and publish
+  exhausted rejected generations as typed terminal evidence. The hub stores
+  the exact attempt and artifacts, keeps the point cancelled and out of valid
+  polars, and continues to reserve `fulfilled` promises for all-accepted
+  coverage. A mixed promise is durably cancelled only after every point is
+  accepted or terminally evidenced. Heartbeats count mirrored leases and their
+  active angles, not only currently running engine jobs.
+- Why: accepted-only delivery plus an obligation-unaware RANS composer created
+  a live zero-CPU loop that repeatedly attempted to claim cells already owned
+  by preliminary recovery. Fake-accepting rejected CFD would corrupt public
+  polars; plain cancellation immediately reissued the same absent hub gaps;
+  permanent solver-specific exclusions would hide evidence and strand work;
+  unbounded CFD retries would discard the two-attempt reliability bound. Exact
+  evidence handoff plus bounded recovery preserves provenance, acceptance
+  semantics, and continuous progress to the next airfoil.
 
 ## D-2026-07-16-campaign-cell-evidence-dialog — Campaign cells explain automatic recovery without calling it failure
 

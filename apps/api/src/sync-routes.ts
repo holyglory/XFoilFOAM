@@ -3098,6 +3098,7 @@ async function importPolarPush(
   conflictIds: string[];
   promiseId: string | null;
   fulfilledAoas: number[];
+  terminalAoas: number[];
   unfulfilledAoas: number[];
 }> {
   await expirePromises();
@@ -3109,6 +3110,7 @@ async function importPolarPush(
   let fieldExtents = 0;
   let importedFieldColorScales = 0;
   const fulfilledAoas: number[] = [];
+  const terminalAoas: number[] = [];
   const unfulfilledAoas: number[] = [];
   let airfoilId: string | null = null;
   let revisionId: string | null = null;
@@ -3186,6 +3188,7 @@ async function importPolarPush(
       conflictIds,
       promiseId: payload.promiseId ?? null,
       fulfilledAoas,
+      terminalAoas,
       unfulfilledAoas,
     };
   }
@@ -3231,6 +3234,7 @@ async function importPolarPush(
       conflictIds,
       promiseId: payload.promiseId ?? null,
       fulfilledAoas,
+      terminalAoas,
       unfulfilledAoas,
     };
   }
@@ -3269,6 +3273,11 @@ async function importPolarPush(
             "active",
             "expired",
             "fulfilled",
+            // An evidence-backed terminal outcome uses the existing cancelled
+            // point state. The promise itself remains active/fulfilled, so an
+            // exact replay (or a later accepted URANS continuation) must still
+            // be able to prove ownership of this point.
+            "cancelled",
           ]),
         ),
       );
@@ -3572,19 +3581,26 @@ async function importPolarPush(
           existing.cdStd,
           existing.cmStd,
         ].every((value) => value == null);
-        if (ownedContinuation) {
+        if (ownedContinuation || exactReplayAttempt) {
           // The same authoritative promise may legitimately continue from an
           // already-delivered RANS generation to changed-value URANS/full
           // evidence. Once a URANS generation owns the point, a different
           // generation is not another continuation; exact replay is handled
-          // separately above. Unrelated/direct imports still conflict below.
+          // separately above. A rejected exact replay also differs from the
+          // deliberately pointer-less failed canonical projection, so its
+          // immutable attempt identity—not projection equality—is the proof.
+          // Unrelated/direct imports still conflict below.
           kind = "equivalent";
         }
         const scheduledPlaceholder =
           existing.currentResultAttemptId == null &&
           ["pending", "stale"].includes(existing.status) &&
           noCoefficientTruth;
-        if (!ownedContinuation && !scheduledPlaceholder) {
+        if (
+          !ownedContinuation &&
+          !exactReplayAttempt &&
+          !scheduledPlaceholder
+        ) {
           return { kind: "conflict" as const, existing };
         }
       }
@@ -4039,15 +4055,42 @@ async function importPolarPush(
                 AND canonical.current_result_attempt_id = ${committed.attemptId}
                 AND classification.state = 'accepted'
             ) AS result_accepted,
-            EXISTS (
-              SELECT 1
+            (
+              SELECT classification.state
               FROM result_attempts attempt
               JOIN result_classifications classification
                 ON classification.result_attempt_id = attempt.id
-               AND classification.state = 'accepted'
               WHERE attempt.id = ${committed.attemptId}
                 AND attempt.result_id = ${committed.resultId}
-            ) AS attempt_accepted,
+              ORDER BY CASE classification.state
+                WHEN 'accepted' THEN 4
+                WHEN 'needs_urans' THEN 3
+                WHEN 'rejected' THEN 2
+                ELSE 1
+              END DESC,
+              classification."updatedAt" DESC
+              LIMIT 1
+            ) AS attempt_state,
+            (
+              SELECT canonical.current_result_attempt_id
+              FROM results canonical
+              WHERE canonical.id = ${committed.resultId}
+            ) AS current_attempt_id,
+            (
+              SELECT current_classification.state
+              FROM results canonical
+              JOIN result_classifications current_classification
+                ON current_classification.result_attempt_id = canonical.current_result_attempt_id
+              WHERE canonical.id = ${committed.resultId}
+              ORDER BY CASE current_classification.state
+                WHEN 'accepted' THEN 4
+                WHEN 'needs_urans' THEN 3
+                WHEN 'rejected' THEN 2
+                ELSE 1
+              END DESC,
+              current_classification."updatedAt" DESC
+              LIMIT 1
+            ) AS current_state,
             (
               SELECT count(*) = 1
                  AND count(*) FILTER (
@@ -4091,19 +4134,81 @@ async function importPolarPush(
             ) AS extents_bound
         `)) as unknown as Array<{
           result_accepted: boolean;
-          attempt_accepted: boolean;
+          attempt_state:
+            | "accepted"
+            | "needs_urans"
+            | "superseded_by_urans"
+            | "rejected"
+            | null;
+          current_attempt_id: string | null;
+          current_state:
+            | "accepted"
+            | "needs_urans"
+            | "superseded_by_urans"
+            | "rejected"
+            | null;
           exact_manifest: boolean;
           media_bound: boolean;
           extents_bound: boolean;
         }>;
-        if (
-          !classified?.result_accepted ||
-          !classified.attempt_accepted ||
-          !classified.exact_manifest ||
-          !classified.media_bound ||
-          !classified.extents_bound
-        ) {
+        const exactEvidence = Boolean(
+          classified?.exact_manifest &&
+          classified.media_bound &&
+          classified.extents_bound,
+        );
+        const acceptedOutcome = Boolean(
+          classified?.result_accepted &&
+          classified.attempt_state === "accepted" &&
+          exactEvidence,
+        );
+        const terminalState =
+          exactEvidence &&
+          (classified?.attempt_state === "needs_urans" ||
+            classified?.attempt_state === "rejected")
+            ? classified.attempt_state
+            : null;
+        if (!acceptedOutcome && !terminalState) {
           return false;
+        }
+        if (
+          terminalState === "needs_urans" &&
+          classified?.current_attempt_id !== committed.attemptId
+        ) {
+          // needs_urans is a provisional selected generation, not a failed
+          // attempt. It is terminal for this solver only when the canonical
+          // pointer names this exact evidence generation.
+          return false;
+        }
+        let settlementAttemptId = committed.attemptId;
+        if (terminalState === "rejected") {
+          // Rejected evidence must remain addressable through its attempt but
+          // must never become the canonical polar pointer. A failed result
+          // status is the existing durable gap-suppression primitive; the
+          // exact attempt + manifest below prove that this is not a synthetic
+          // cancellation marker.
+          if (classified?.current_attempt_id == null) {
+            const failed = await tx
+              .update(results)
+              .set({ status: "failed", updatedAt: new Date() })
+              .where(
+                and(
+                  eq(results.id, committed.resultId),
+                  isNull(results.currentResultAttemptId),
+                  inArray(results.status, ["pending", "stale", "failed"]),
+                ),
+              )
+              .returning({ id: results.id });
+            if (failed.length !== 1) return false;
+          } else if (classified.current_state === "needs_urans") {
+            // A failed URANS continuation does not erase the selected
+            // provisional RANS generation. The child attempt is retained as
+            // immutable history, while the promise point continues to name
+            // the exact needs_urans generation that truthfully describes the
+            // unresolved cell.
+            settlementAttemptId = classified.current_attempt_id;
+          } else {
+            return false;
+          }
         }
         // A marched remote RANS job can publish early siblings before a typed
         // low-angle hard failure promotes its exact polar to preliminary
@@ -4121,12 +4226,41 @@ async function importPolarPush(
                   AND prior_attempt.regime = 'rans'
               )`
             : sql`false`;
+        const replayedPoint = and(
+          eq(syncSweepPromisePoints.resultId, committed.resultId),
+          eq(syncSweepPromisePoints.resultAttemptId, settlementAttemptId),
+        );
+        const pointOwnership = acceptedOutcome
+          ? or(
+              inArray(syncSweepPromisePoints.status, ["active", "expired"]),
+              and(
+                inArray(syncSweepPromisePoints.status, [
+                  "fulfilled",
+                  "cancelled",
+                ]),
+                eq(syncSweepPromisePoints.resultId, committed.resultId),
+                or(
+                  eq(
+                    syncSweepPromisePoints.resultAttemptId,
+                    committed.attemptId,
+                  ),
+                  acceptedUransUpgrade,
+                ),
+              ),
+            )
+          : or(
+              inArray(syncSweepPromisePoints.status, ["active", "expired"]),
+              and(
+                eq(syncSweepPromisePoints.status, "cancelled"),
+                replayedPoint,
+              ),
+            );
         const settled = await tx
           .update(syncSweepPromisePoints)
           .set({
-            status: "fulfilled",
+            status: acceptedOutcome ? "fulfilled" : "cancelled",
             resultId: committed.resultId,
-            resultAttemptId: committed.attemptId,
+            resultAttemptId: settlementAttemptId,
             updatedAt: new Date(),
           })
           .where(
@@ -4135,26 +4269,18 @@ async function importPolarPush(
               eq(syncSweepPromisePoints.airfoilId, airfoilId),
               eq(syncSweepPromisePoints.simulationPresetRevisionId, revisionId),
               eq(syncSweepPromisePoints.aoaDeg, committed.aoaDeg),
-              or(
-                inArray(syncSweepPromisePoints.status, ["active", "expired"]),
-                and(
-                  eq(syncSweepPromisePoints.status, "fulfilled"),
-                  eq(syncSweepPromisePoints.resultId, committed.resultId),
-                  or(
-                    eq(
-                      syncSweepPromisePoints.resultAttemptId,
-                      committed.attemptId,
-                    ),
-                    acceptedUransUpgrade,
-                  ),
-                ),
-              ),
+              pointOwnership,
             ),
           )
           .returning({ id: syncSweepPromisePoints.id });
-        return settled.length > 0;
+        return settled.length > 0
+          ? acceptedOutcome
+            ? ("fulfilled" as const)
+            : ("terminal" as const)
+          : false;
       });
-      if (pointSettled) fulfilledAoas.push(committed.aoaDeg);
+      if (pointSettled === "fulfilled") fulfilledAoas.push(committed.aoaDeg);
+      else if (pointSettled === "terminal") terminalAoas.push(committed.aoaDeg);
       else unfulfilledAoas.push(committed.aoaDeg);
     }
     const committedAoas = new Set(
@@ -4175,6 +4301,7 @@ async function importPolarPush(
     conflictIds,
     promiseId: payload.promiseId ?? null,
     fulfilledAoas: [...new Set(fulfilledAoas)].sort((a, b) => a - b),
+    terminalAoas: [...new Set(terminalAoas)].sort((a, b) => a - b),
     unfulfilledAoas: [...new Set(unfulfilledAoas)].sort((a, b) => a - b),
   };
 }
