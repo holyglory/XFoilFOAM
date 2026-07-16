@@ -14,6 +14,7 @@ import {
   campaignFailures,
   campaignLaneDetail,
   campaignLanes,
+  campaignPreliminaryOutcomes,
   campaignRate,
   campaignRejected,
   campaignSummary,
@@ -343,6 +344,26 @@ export async function registerCampaignRoutes(
         const failures = await campaignFailures(db, id, scope);
         const rejected = await campaignRejected(db, id, scope);
         return { ...failures, rejected };
+      } catch (e) {
+        return sendCampaignError(reply, e);
+      }
+    },
+  );
+
+  // ---- exact cell-level automatic preliminary recovery outcomes ----
+  app.get(
+    "/api/admin/campaigns/:id/preliminary-outcomes",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+      const q = z
+        .object({
+          conditionId: z.string().uuid(),
+          airfoilId: z.string().uuid(),
+        })
+        .parse(req.query);
+      try {
+        return await campaignPreliminaryOutcomes(db, id, q);
       } catch (e) {
         return sendCampaignError(reply, e);
       }

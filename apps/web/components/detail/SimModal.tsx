@@ -11,6 +11,7 @@ import {
 } from "@aerodb/core";
 import {
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type RefObject,
   useCallback,
@@ -57,6 +58,7 @@ import {
 } from "@/lib/steady-history";
 import { buildSolverWorkPopoverView } from "@/lib/solver-work";
 import { C, MONO, VIZ } from "@/lib/tokens";
+import { useModalLayer } from "@/lib/use-modal-layer";
 
 const FIELDS: FieldId[] = [
   "velocity_magnitude",
@@ -149,6 +151,9 @@ export function SimModal(props: {
   playing: boolean;
   onTogglePlay: () => void;
   onClose: () => void;
+  /** Explicit opener for nested modal stacks whose lower layer becomes inert
+   * before this dialog's focus effect runs. */
+  restoreFocusTo?: HTMLElement | null;
   unavailableMessage?: string | null;
   review?: SimModalReviewContext | null;
 }) {
@@ -165,10 +170,16 @@ export function SimModal(props: {
     playing,
     onTogglePlay,
     onClose,
+    restoreFocusTo,
     unavailableMessage,
     review,
   } = props;
 
+  useModalLayer(open);
+
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
   const clMonRef = useRef<HTMLCanvasElement>(null);
   const cdMonRef = useRef<HTMLCanvasElement>(null);
   const ldMonRef = useRef<HTMLCanvasElement>(null);
@@ -219,6 +230,71 @@ export function SimModal(props: {
   const playerSimTimeRef = useRef(0);
   const chartDragRef = useRef(false);
   const preloadImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+
+  useEffect(() => {
+    if (!open) return;
+    restoreFocusRef.current = restoreFocusTo?.isConnected
+      ? restoreFocusTo
+      : document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const frame = requestAnimationFrame(() => {
+      closeButtonRef.current?.focus({ preventScroll: true });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      const trigger = restoreFocusRef.current;
+      if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+    };
+  }, [open, restoreFocusTo]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      const dialogs = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          '[role="dialog"][aria-modal="true"]:not([aria-hidden="true"])',
+        ),
+      );
+      if (dialogs.at(-1) !== dialogRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [open, onClose]);
+
+  const trapDialogFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Tab") return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (element) =>
+        element.tabIndex >= 0 &&
+        element.getClientRects().length > 0 &&
+        !element.closest('[inert], [aria-hidden="true"]'),
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   const stalled = sim?.regime === "stalled";
   // Engine-recorded frame track → player model; null = steady, no-shedding,
@@ -2148,15 +2224,25 @@ export function SimModal(props: {
         }
       `}</style>
       <div
+        ref={dialogRef}
+        data-testid="sim-modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${name} simulation evidence`}
+        tabIndex={-1}
         style={{
           width: reviewLayerVisible ? "min(1160px,94vw)" : "min(900px,94vw)",
           maxHeight: "92vh",
           overflow: "auto",
+          overscrollBehavior: "contain",
+          touchAction: "pan-y",
+          WebkitOverflowScrolling: "touch",
           background: C.modalBg,
           border: `1px solid ${C.stroke}`,
           borderRadius: 14,
           boxShadow: `0 30px 80px ${C.shadow}`,
         }}
+        onKeyDown={trapDialogFocus}
         onClick={(e) => e.stopPropagation()}
       >
         {/* header */}
@@ -2249,7 +2335,9 @@ export function SimModal(props: {
             {qualityChips()}
           </div>
           <button
+            ref={closeButtonRef}
             type="button"
+            aria-label="Close simulation evidence"
             onClick={onClose}
             style={{
               marginLeft: "auto",

@@ -1639,6 +1639,40 @@ export interface AdminCampaignFailureGroup {
   }>;
 }
 
+export type AdminCampaignPreliminaryOutcomeKind =
+  | "recovering"
+  | "evidence_unavailable"
+  | "continuation_unavailable"
+  | "mesh_unavailable"
+  | "submit_unavailable"
+  | "recovery_unavailable";
+
+export interface AdminCampaignPreliminaryOutcome {
+  aoaDeg: number;
+  affectedAoaDegs: number[];
+  affectedPointCount: number;
+  state: "pending" | "running" | "blocked";
+  outcome: AdminCampaignPreliminaryOutcomeKind;
+  physicalAttemptsUsed: number;
+  physicalAttemptsMax: number;
+  recoverySubmissions: number;
+  nonPhysicalSubmissions: number;
+  interruptedPhysicalRuns: number;
+  ransEvidenceRuns: number;
+  preliminaryEvidenceRuns: number;
+  fullUransEvidenceRuns: number;
+  legacyUransEvidenceRuns: number;
+  evidenceReasons: string[];
+  updatedAt: string;
+}
+
+export interface AdminCampaignPreliminaryOutcomes {
+  total: number;
+  recovering: number;
+  unavailable: number;
+  items: AdminCampaignPreliminaryOutcome[];
+}
+
 export interface AdminCampaignRejectedSample {
   resultId: string;
   conditionId: string;
@@ -1919,6 +1953,19 @@ export const getCampaignFailures = (
     groups: AdminCampaignFailureGroup[];
     rejected: AdminCampaignRejected;
   }>(`/api/admin/campaigns/${encodeURIComponent(id)}/failures${suffix}`);
+};
+
+export const getCampaignPreliminaryOutcomes = (
+  id: string,
+  opts: { conditionId: string; airfoilId: string },
+) => {
+  const qs = new URLSearchParams({
+    conditionId: opts.conditionId,
+    airfoilId: opts.airfoilId,
+  });
+  return aj<AdminCampaignPreliminaryOutcomes>(
+    `/api/admin/campaigns/${encodeURIComponent(id)}/preliminary-outcomes?${qs.toString()}`,
+  );
 };
 
 export const getCampaignLanes = (

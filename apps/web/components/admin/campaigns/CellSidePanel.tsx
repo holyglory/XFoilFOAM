@@ -18,15 +18,24 @@ import {
   projectChart,
   type SimulationDetail,
 } from "@aerodb/core";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import {
   type AdminCampaignConditionSummary,
   type AdminCampaignFailureGroup,
+  type AdminCampaignPreliminaryOutcomes,
   type AdminUransRequest,
   type AdminUransVerifyItem,
   type CampaignProgressTotals,
   getCampaignFailures,
+  getCampaignPreliminaryOutcomes,
   getUransRequests,
   isAdminApiError,
   requestUrans,
@@ -40,9 +49,13 @@ import {
   toggleSeriesVisibility,
 } from "@/lib/polar-series";
 import { C, MONO } from "@/lib/tokens";
+import { useModalLayer } from "@/lib/use-modal-layer";
+import { AirfoilGlyph } from "../../AirfoilGlyph";
+import { AirfoilProfilePlot } from "../../AirfoilProfilePlot";
 import type { HoverState } from "../../detail/DetailIsland";
 import { PolarViewer } from "../../detail/PolarViewer";
 import { SimModal } from "../../detail/SimModal";
+import { PreliminaryOutcomePanel } from "./PreliminaryOutcomePanel";
 import { fCount, formatRe, ghostBtn } from "./ui";
 
 export interface CellPanelAirfoil {
@@ -82,16 +95,22 @@ export function CellSidePanel({
   const [detail, setDetail] = useState<AirfoilDetailPayload | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [chartType, setChartType] = useState<ChartType>("cla");
+  const [profileActive, setProfileActive] = useState(false);
   const [visibleSeries, setVisibleSeries] = useState<Record<string, boolean>>(
     {},
   );
   const [hover, setHover] = useState<HoverState | null>(null);
   // zoom/pan window; null = zoom-to-fit (resets when the chart type switches)
   const [chartDomain, setChartDomain] = useState<ChartDomain | null>(null);
-  const changeChartType = useCallback((t: ChartType) => {
-    setChartType(t);
-    setChartDomain(null);
-  }, []);
+  const changeChartType = useCallback(
+    (t: ChartType) => {
+      setProfileActive(false);
+      setHover(null);
+      if (t !== chartType) setChartDomain(null);
+      setChartType(t);
+    },
+    [chartType],
+  );
 
   const [failures, setFailures] = useState<{
     total: number;
@@ -99,6 +118,11 @@ export function CellSidePanel({
     groups: AdminCampaignFailureGroup[];
   } | null>(null);
   const [failuresError, setFailuresError] = useState<string | null>(null);
+  const [preliminaryOutcomes, setPreliminaryOutcomes] =
+    useState<AdminCampaignPreliminaryOutcomes | null>(null);
+  const [preliminaryOutcomesError, setPreliminaryOutcomesError] = useState<
+    string | null
+  >(null);
   // Fidelity ladder state for this cell: verify-queue items + open admin
   // request-URANS items (idempotent-aware whole-polar action).
   const [ladder, setLadder] = useState<{
@@ -126,27 +150,88 @@ export function CellSidePanel({
   const [simField, setSimField] = useState<FieldId>("vorticity");
   const [simTrack, setSimTrack] = useState<FieldTrackPoint[]>([]);
   const [playing, setPlaying] = useState(true);
+  const panelRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const simTriggerRef = useRef<HTMLElement | null>(null);
 
-  // Escape closes the evidence modal first, then the panel (spec §11 routing
-  // order). Capture phase so the page-level Escape handler never races it.
+  useModalLayer(true);
+
+  useEffect(() => {
+    restoreFocusRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const frame = requestAnimationFrame(() => {
+      closeButtonRef.current?.focus({ preventScroll: true });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      const trigger = restoreFocusRef.current;
+      if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+    };
+  }, []);
+
+  // A stacked evidence modal owns Escape while it is present. Otherwise this
+  // panel closes before any page-level Escape handler can race it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      // A modal dialog stacked above the panel wins its own Escape.
-      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      // An unrelated modal stacked above this panel owns its own Escape.
+      if (
+        Array.from(
+          document.querySelectorAll<HTMLElement>(
+            '[role="dialog"][aria-modal="true"]',
+          ),
+        ).some((dialog) => dialog !== panelRef.current)
+      )
+        return;
+      e.preventDefault();
       e.stopPropagation();
-      if (simOpen) setSimOpen(false);
-      else onClose();
+      onClose();
     };
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
-  }, [simOpen, onClose]);
+  }, [onClose]);
+
+  const trapPanelFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Tab" || simOpen) return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const focusable = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (element) =>
+        element.tabIndex >= 0 &&
+        element.getClientRects().length > 0 &&
+        !element.hasAttribute("hidden") &&
+        element.getAttribute("aria-hidden") !== "true" &&
+        !element.closest('[inert], [aria-hidden="true"]'),
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      panel.focus();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   // ---- pinned-revision detail payload ----
   useEffect(() => {
     let cancelled = false;
     setDetail(null);
     setDetailError(null);
+    setProfileActive(false);
     getAirfoilDetail(airfoil.slug, condition.revisionId)
       .then((d) => {
         if (cancelled) return;
@@ -183,6 +268,24 @@ export function CellSidePanel({
   useEffect(() => {
     void loadFailures();
   }, [loadFailures]);
+
+  const loadPreliminaryOutcomes = useCallback(async () => {
+    setPreliminaryOutcomesError(null);
+    try {
+      setPreliminaryOutcomes(
+        await getCampaignPreliminaryOutcomes(campaignId, {
+          conditionId: condition.id,
+          airfoilId: airfoil.airfoilId,
+        }),
+      );
+    } catch (e) {
+      setPreliminaryOutcomesError((e as Error).message);
+    }
+  }, [campaignId, condition.id, airfoil.airfoilId]);
+
+  useEffect(() => {
+    void loadPreliminaryOutcomes();
+  }, [loadPreliminaryOutcomes]);
 
   // ---- fidelity ladder items for this cell ----
   const loadLadder = useCallback(async () => {
@@ -280,6 +383,10 @@ export function CellSidePanel({
 
   const onPointClick = useCallback((vm: ChartPointVM) => {
     if (vm.point.source !== "solved" || !vm.point.resultId) return;
+    simTriggerRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : panelRef.current;
     const derived = derivedBySymmetryInfo(vm.point);
     setSimCtx({
       re: vm.re,
@@ -361,7 +468,7 @@ export function CellSidePanel({
         expectedCount,
       });
       setNotice(
-        `requeued ${res.requeued} failed point${res.requeued === 1 ? "" : "s"}`,
+        `requeued ${res.requeued} RANS interruption${res.requeued === 1 ? "" : "s"}`,
       );
       setConfirmKey(null);
       await loadFailures();
@@ -409,13 +516,26 @@ export function CellSidePanel({
   return (
     <>
       <div
-        style={{ position: "fixed", inset: 0, zIndex: 44 }}
+        data-testid="cell-side-panel-backdrop"
+        style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 44,
+          touchAction: "none",
+        }}
         onClick={onClose}
         aria-hidden
       />
       <aside
+        ref={panelRef}
         data-testid="cell-side-panel"
-        aria-label={`${airfoil.name} at Re ${formatRe(condition.reynolds)}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="cell-side-panel-title"
+        aria-hidden={simOpen ? "true" : undefined}
+        inert={simOpen}
+        tabIndex={-1}
+        onKeyDown={trapPanelFocus}
         style={{
           position: "fixed",
           top: 0,
@@ -423,12 +543,20 @@ export function CellSidePanel({
           bottom: 0,
           zIndex: 45,
           width: "min(780px, 100vw)",
+          height: "100dvh",
+          maxHeight: "100dvh",
+          minHeight: 0,
+          boxSizing: "border-box",
           background: C.bg,
           borderLeft: `1px solid ${C.border}`,
           boxShadow: `-24px 0 60px ${C.shadow}`,
           overflowY: "auto",
+          overscrollBehaviorY: "contain",
+          touchAction: "pan-y",
+          WebkitOverflowScrolling: "touch",
           padding: 16,
           display: "grid",
+          gridAutoRows: "max-content",
           gap: 12,
           alignContent: "start",
         }}
@@ -441,9 +569,62 @@ export function CellSidePanel({
             flexWrap: "wrap",
           }}
         >
-          <span style={{ fontWeight: 700, fontSize: 15, color: C.text }}>
-            {airfoil.name}
-          </span>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 9,
+              minWidth: 0,
+            }}
+          >
+            <span
+              data-testid="cell-airfoil-thumbnail"
+              style={{
+                width: 62,
+                height: 30,
+                flex: "0 0 auto",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: C.panel2,
+                border: `1px solid ${C.borderSoft}`,
+                borderRadius: 7,
+              }}
+            >
+              <AirfoilGlyph
+                points={detail?.geometry.contour ?? []}
+                width={56}
+                height={24}
+              />
+            </span>
+            <span
+              id="cell-side-panel-title"
+              style={{
+                fontWeight: 700,
+                fontSize: 15,
+                color: C.text,
+                minWidth: 0,
+              }}
+            >
+              {airfoil.name}
+              <span
+                style={{
+                  position: "absolute",
+                  width: 1,
+                  height: 1,
+                  padding: 0,
+                  margin: -1,
+                  overflow: "hidden",
+                  clip: "rect(0, 0, 0, 0)",
+                  whiteSpace: "nowrap",
+                  border: 0,
+                }}
+              >
+                {" "}
+                at Re {formatRe(condition.reynolds)}
+              </span>
+            </span>
+          </div>
           <span style={chip(C.muted, C.stroke)}>
             Re {formatRe(condition.reynolds)} · #{condition.ord}
           </span>
@@ -463,6 +644,7 @@ export function CellSidePanel({
             open detail page ↗
           </a>
           <button
+            ref={closeButtonRef}
             type="button"
             aria-label="Close cell panel"
             onClick={onClose}
@@ -496,6 +678,20 @@ export function CellSidePanel({
             hover={hover}
             onHover={setHover}
             onPointClick={onPointClick}
+            profileView={{
+              active: profileActive,
+              onActivate: () => {
+                setProfileActive(true);
+                setHover(null);
+              },
+              content: (
+                <AirfoilProfilePlot
+                  geometry={detail.geometry}
+                  name={detail.name}
+                  showMetrics
+                />
+              ),
+            }}
           />
         ) : detailError ? (
           <div
@@ -552,10 +748,10 @@ export function CellSidePanel({
             {(counters.blocked ?? 0) > 0 && (
               <span
                 data-testid="cell-counter-blocked"
-                title="Machine-owned bounded preliminary work is unavailable; no review action is required"
-                style={{ color: C.amber }}
+                title="Automatic preliminary recovery finished without a publishable result; no user action is required"
+                style={chip(C.amber, "rgba(245,158,11,0.45)")}
               >
-                {fCount(counters.blocked ?? 0)} blocked
+                {fCount(counters.blocked ?? 0)} results unavailable
               </span>
             )}
             <span style={chip(C.muted, C.stroke)}>
@@ -834,174 +1030,175 @@ export function CellSidePanel({
             )}
         </div>
 
-        {/* failed list + scoped requeue */}
-        <div
-          style={{
-            background: C.panel,
-            border: `1px solid ${C.border}`,
-            borderRadius: 10,
-            overflow: "hidden",
-          }}
-        >
-          <div
+        <PreliminaryOutcomePanel
+          outcomes={preliminaryOutcomes}
+          error={preliminaryOutcomesError}
+        />
+
+        {/* Ordinary RANS interruptions only. PRECALC-owned terminal outcomes
+            live in the separate preliminary panel above. */}
+        {(failuresError || (failures && failures.total > 0)) && (
+          <section
+            aria-labelledby="cell-solver-interruptions-title"
             style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              padding: "9px 12px",
-              borderBottom: `1px solid ${C.borderSoft}`,
+              background: C.panel,
+              border: `1px solid ${C.border}`,
+              borderRadius: 10,
+              overflow: "hidden",
             }}
           >
-            <span
-              style={{
-                fontFamily: MONO,
-                fontSize: 10,
-                letterSpacing: "0.1em",
-                color: C.dim,
-              }}
-            >
-              FAILED POINTS
-            </span>
-            <span
-              style={{
-                fontFamily: MONO,
-                fontSize: 10,
-                color: failures && failures.total > 0 ? C.redText : C.dim,
-              }}
-            >
-              {failures ? fCount(failures.total) : "…"}
-            </span>
-            {failures && failures.retryableTotal > 0 && (
-              <span style={{ marginLeft: "auto" }}>
-                {requeueButton("all", failures.retryableTotal)}
-              </span>
-            )}
-          </div>
-          {failuresError && (
             <div
               style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.red,
-                padding: "8px 12px",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "9px 12px",
+                borderBottom: `1px solid ${C.borderSoft}`,
+                flexWrap: "wrap",
               }}
             >
-              {failuresError}
-            </div>
-          )}
-          {failures && failures.total === 0 && !failuresError && (
-            <div
-              style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.dim,
-                padding: "10px 12px",
-              }}
-            >
-              no failed points in this cell
-            </div>
-          )}
-          {failures?.groups.map((group) => (
-            <div
-              key={group.errorClass}
-              style={{ borderBottom: `1px solid ${C.borderRow}` }}
-            >
-              <div
+              <span
+                id="cell-solver-interruptions-title"
                 style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "7px 12px",
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  letterSpacing: "0.1em",
+                  color: C.dim,
                 }}
               >
-                <span
+                RANS INTERRUPTIONS
+              </span>
+              <span
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  color: failures && failures.total > 0 ? C.redText : C.dim,
+                }}
+              >
+                {failures ? fCount(failures.total) : "…"}
+              </span>
+              {failures && failures.retryableTotal > 0 && (
+                <span style={{ marginLeft: "auto" }}>
+                  {requeueButton("all", failures.retryableTotal)}
+                </span>
+              )}
+            </div>
+            <div
+              style={{
+                padding: "8px 12px",
+                fontFamily: MONO,
+                fontSize: 10,
+                lineHeight: 1.5,
+                color: C.muted,
+                borderBottom: `1px solid ${C.borderRow}`,
+              }}
+            >
+              These ordinary RANS runs ended before producing usable evidence
+              and have not entered the preliminary URANS recovery ladder.
+            </div>
+            {failuresError && (
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10.5,
+                  color: C.red,
+                  padding: "8px 12px",
+                }}
+              >
+                {failuresError}
+              </div>
+            )}
+            {failures?.groups.map((group) => (
+              <div
+                key={group.errorClass}
+                style={{ borderBottom: `1px solid ${C.borderRow}` }}
+              >
+                <div
                   style={{
-                    fontFamily: MONO,
-                    fontSize: 10.5,
-                    color: C.redText,
-                    fontWeight: 600,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "7px 12px",
                   }}
                 >
-                  {group.errorClass}
-                </span>
-                <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
-                  {fCount(group.count)} point{group.count === 1 ? "" : "s"}
-                </span>
-                {group.retryableCount > 0 ? (
-                  <span style={{ marginLeft: "auto" }}>
-                    {requeueButton(
-                      `class-${group.errorClass}`,
-                      group.retryableCount,
-                      [group.errorClass],
-                    )}
-                  </span>
-                ) : (
                   <span
                     style={{
-                      marginLeft: "auto",
                       fontFamily: MONO,
-                      fontSize: 9.5,
-                      color: C.amber,
+                      fontSize: 10.5,
+                      color: C.redText,
+                      fontWeight: 600,
                     }}
                   >
-                    automatic recovery status below
+                    RANS · {group.errorClass}
                   </span>
-                )}
-              </div>
-              <div style={{ display: "grid", gap: 2, padding: "0 12px 8px" }}>
-                {group.samples.map((s) => (
-                  <div
-                    key={s.resultId}
-                    style={{
-                      display: "flex",
-                      gap: 10,
-                      alignItems: "baseline",
-                      fontFamily: MONO,
-                      fontSize: 10,
-                      color: C.muted,
-                    }}
+                  <span
+                    style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}
                   >
-                    <span style={{ color: C.text, minWidth: 52 }}>
-                      α {f1(s.aoaDeg)}°
+                    {fCount(group.count)} point{group.count === 1 ? "" : "s"}
+                  </span>
+                  {group.retryableCount > 0 && (
+                    <span style={{ marginLeft: "auto" }}>
+                      {requeueButton(
+                        `class-${group.errorClass}`,
+                        group.retryableCount,
+                        [group.errorClass],
+                      )}
                     </span>
-                    <span style={{ color: s.attempts >= 3 ? C.amber : C.dim }}>
-                      {s.attempts} attempt{s.attempts === 1 ? "" : "s"}
-                    </span>
-                    {!s.retryable && (
-                      <span style={{ color: C.amber }}>
-                        unchanged retry unavailable
+                  )}
+                </div>
+                <div style={{ display: "grid", gap: 5, padding: "0 12px 9px" }}>
+                  {group.samples.map((sample) => (
+                    <div
+                      key={sample.resultId}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "52px minmax(130px, auto) 1fr",
+                        gap: 10,
+                        alignItems: "baseline",
+                        fontFamily: MONO,
+                        fontSize: 10,
+                        color: C.muted,
+                      }}
+                    >
+                      <span style={{ color: C.text }}>
+                        α {f1(sample.aoaDeg)}°
                       </span>
-                    )}
-                    {s.error && (
+                      <span style={{ color: C.dim }}>
+                        {sample.attempts} solver evidence record
+                        {sample.attempts === 1 ? "" : "s"}
+                      </span>
                       <span
+                        title={sample.error ?? undefined}
                         style={{
-                          color: C.dimmest,
+                          color: sample.retryable ? C.teal : C.amber,
                           overflow: "hidden",
                           textOverflow: "ellipsis",
                           whiteSpace: "nowrap",
                         }}
                       >
-                        {s.error}
+                        {sample.retryable
+                          ? "retry available"
+                          : "unchanged automatic retry unavailable"}
                       </span>
-                    )}
-                  </div>
-                ))}
-                {group.count > group.samples.length && (
-                  <span
-                    style={{
-                      fontFamily: MONO,
-                      fontSize: 9.5,
-                      color: C.dimmest,
-                    }}
-                  >
-                    + {fCount(group.count - group.samples.length)} more in this
-                    class
-                  </span>
-                )}
+                    </div>
+                  ))}
+                  {group.count > group.samples.length && (
+                    <span
+                      style={{
+                        fontFamily: MONO,
+                        fontSize: 9.5,
+                        color: C.dimmest,
+                      }}
+                    >
+                      + {fCount(group.count - group.samples.length)} more in
+                      this class
+                    </span>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </section>
+        )}
 
         {/* provenance disclosure */}
         <div>
@@ -1099,6 +1296,7 @@ export function CellSidePanel({
         playing={playing}
         onTogglePlay={() => setPlaying((v) => !v)}
         onClose={() => setSimOpen(false)}
+        restoreFocusTo={simTriggerRef.current}
         unavailableMessage={simMessage}
       />
     </>

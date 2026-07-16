@@ -33,6 +33,7 @@ import {
   results,
   simCampaigns,
   simCampaignPoints,
+  simPrecalcObligationAttempts,
   simPrecalcObligations,
   simResultSubmitRetries,
   simulationPresetRevisions,
@@ -2490,6 +2491,460 @@ describe("machine-blocked campaign counters and symmetry conservation", () => {
       .from(simCampaigns)
       .where(eq(simCampaigns.id, campaignId));
     expect(campaign.status).toBe("attention");
+  });
+});
+
+describe("cell preliminary outcomes stay separate from ordinary RANS failures", () => {
+  it("MUST-CATCH: reports the physical URANS budget, typed evidence, and an evidence-less continuation interruption", async () => {
+    const speedMps = 27.25 + FILE_SPEED_OFFSET_MPS;
+    const launched = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} preliminary outcome`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-preliminary-outcome-key`,
+        airfoilIds: [asymId],
+        plan: planBody({
+          chordsM: [PRIMARY_CHORD_M],
+          speedsMps: [speedMps],
+          baseSweep: {
+            fromDeg: null,
+            toDeg: null,
+            stepDeg: null,
+            listDeg: [10],
+          },
+          objectives: {
+            ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+            clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+            clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+          },
+        }),
+      },
+    });
+    expect(launched.statusCode).toBe(201);
+    const campaignId = launched.json().campaign.id as string;
+    cleanupCampaignIds.push(campaignId);
+
+    const [condition] = (await db.execute(sql`
+      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id,
+             preset.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc
+      JOIN simulation_presets preset ON preset.id = cc.preset_id
+      WHERE cc.campaign_id = ${campaignId}
+    `)) as unknown as Array<{
+      id: string;
+      revision_id: string;
+      bc_id: string;
+    }>;
+
+    const [failedResult] = await db
+      .insert(results)
+      .values({
+        airfoilId: asymId,
+        bcId: condition.bc_id,
+        simulationPresetRevisionId: condition.revision_id,
+        aoaDeg: 10,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        error:
+          "solver evidence rejected: incomplete-urans-integration, non-stationary",
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.push(failedResult.id);
+
+    const attempts = await db
+      .insert(resultAttempts)
+      .values([
+        {
+          resultId: failedResult.id,
+          airfoilId: asymId,
+          bcId: condition.bc_id,
+          simulationPresetRevisionId: condition.revision_id,
+          aoaDeg: 10,
+          status: "failed",
+          source: "solved",
+          regime: "rans",
+          error: "InfrastructureError: steady solve interrupted",
+          evidencePayload: { fidelity: "rans" },
+        },
+        {
+          resultId: failedResult.id,
+          airfoilId: asymId,
+          bcId: condition.bc_id,
+          simulationPresetRevisionId: condition.revision_id,
+          aoaDeg: 10,
+          status: "failed",
+          source: "solved",
+          regime: "rans",
+          error:
+            "DeterministicMeshError: mesh degenerate at this fidelity tier",
+          evidencePayload: { fidelity: "rans" },
+        },
+        {
+          resultId: failedResult.id,
+          airfoilId: asymId,
+          bcId: condition.bc_id,
+          simulationPresetRevisionId: condition.revision_id,
+          aoaDeg: 10,
+          status: "done",
+          source: "solved",
+          // A no-shedding preliminary run has steady physical regime but
+          // remains preliminary URANS by immutable fidelity provenance.
+          regime: "rans",
+          evidencePayload: { fidelity: "urans_precalc" },
+        },
+        {
+          resultId: failedResult.id,
+          airfoilId: asymId,
+          bcId: condition.bc_id,
+          simulationPresetRevisionId: condition.revision_id,
+          aoaDeg: 10,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          evidencePayload: {},
+        },
+      ])
+      .returning({ id: resultAttempts.id });
+    await db.insert(resultClassifications).values({
+      resultId: failedResult.id,
+      resultAttemptId: attempts[2].id,
+      airfoilId: asymId,
+      simulationPresetRevisionId: condition.revision_id,
+      aoaDeg: 10,
+      regime: "rans",
+      classifierVersion: "preliminary-outcome-test-v1",
+      state: "rejected",
+      reasons: ["incomplete-urans-integration", "non-stationary"],
+    });
+
+    await onResultIngested(db, {
+      airfoilId: asymId,
+      revisionId: condition.revision_id,
+      aoaDeg: 10,
+      resultId: failedResult.id,
+      status: "failed",
+      regime: "urans",
+    });
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId: asymId,
+          revisionId: condition.revision_id,
+          aoaDeg: 10,
+          sourceResultId: failedResult.id,
+        },
+      ],
+      { campaignIds: [campaignId] },
+    );
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "blocked",
+        attemptCount: 2,
+        lastOutcome: "failed_exhausted",
+        lastError:
+          "continuation failed: saved transient has no time directories; nothing to restart from",
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await db.insert(simPrecalcObligationAttempts).values([
+      {
+        obligationId: obligation.id,
+        attemptNumber: 1,
+        solverAttemptNumber: null,
+        consumesSolverAttempt: false,
+        state: "failed",
+        outcome: "deterministic_failure",
+        resultAttemptId: attempts[1].id,
+      },
+      {
+        obligationId: obligation.id,
+        attemptNumber: 2,
+        solverAttemptNumber: 1,
+        consumesSolverAttempt: true,
+        state: "rejected",
+        outcome: "rejected_exhausted",
+        resultAttemptId: attempts[2].id,
+      },
+      {
+        obligationId: obligation.id,
+        attemptNumber: 3,
+        solverAttemptNumber: 2,
+        consumesSolverAttempt: true,
+        state: "failed",
+        outcome: "failed_exhausted",
+        resultAttemptId: null,
+        error:
+          "continuation failed: saved transient has no time directories; nothing to restart from",
+      },
+    ]);
+    await db.transaction((tx) => recomputeCampaignProgress(tx, campaignId));
+
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals).toMatchObject({
+      requested: 1,
+      failed: 0,
+      blocked: 1,
+      remaining: 0,
+    });
+
+    const failures = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/failures?conditionId=${condition.id}&airfoilId=${asymId}`,
+    });
+    expect(failures.statusCode).toBe(200);
+    expect(failures.json().total).toBe(0);
+
+    const outcomes = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/preliminary-outcomes?conditionId=${condition.id}&airfoilId=${asymId}`,
+    });
+    expect(outcomes.statusCode).toBe(200);
+    expect(outcomes.json()).toMatchObject({
+      total: 1,
+      recovering: 0,
+      unavailable: 1,
+      items: [
+        {
+          aoaDeg: 10,
+          affectedAoaDegs: [10],
+          affectedPointCount: 1,
+          state: "blocked",
+          outcome: "continuation_unavailable",
+          physicalAttemptsUsed: 2,
+          physicalAttemptsMax: 2,
+          recoverySubmissions: 3,
+          nonPhysicalSubmissions: 1,
+          interruptedPhysicalRuns: 1,
+          ransEvidenceRuns: 2,
+          preliminaryEvidenceRuns: 1,
+          fullUransEvidenceRuns: 0,
+          legacyUransEvidenceRuns: 1,
+          evidenceReasons: ["incomplete-urans-integration", "non-stationary"],
+        },
+      ],
+    });
+
+    // MUST-CATCH: an accepted engine submission is active, not an
+    // "interrupted run before evidence", while its evidence pointer is null.
+    await db
+      .update(simPrecalcObligationAttempts)
+      .set({
+        state: "submitted",
+        outcome: null,
+        error: null,
+        completedAt: null,
+      })
+      .where(
+        and(
+          eq(simPrecalcObligationAttempts.obligationId, obligation.id),
+          eq(simPrecalcObligationAttempts.attemptNumber, 3),
+        ),
+      );
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "running",
+        attemptCount: 1,
+        lastOutcome: null,
+        lastError: null,
+        completedAt: null,
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    const active = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/preliminary-outcomes?conditionId=${condition.id}&airfoilId=${asymId}`,
+    });
+    expect(active.statusCode).toBe(200);
+    expect(active.json()).toMatchObject({
+      total: 1,
+      recovering: 1,
+      unavailable: 0,
+      items: [
+        {
+          state: "running",
+          outcome: "recovering",
+          physicalAttemptsUsed: 1,
+          interruptedPhysicalRuns: 0,
+        },
+      ],
+    });
+
+    // FALSE-POSITIVE GUARD: if the evidence-less run came first and the later
+    // run produced the incomplete evidence, the sequence does not prove that
+    // a corrective continuation failed to restart.
+    await db
+      .update(simPrecalcObligationAttempts)
+      .set({
+        state: "failed",
+        outcome: "failed_exhausted",
+        resultAttemptId: null,
+        error: "worker ended before evidence",
+        completedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(simPrecalcObligationAttempts.obligationId, obligation.id),
+          eq(simPrecalcObligationAttempts.attemptNumber, 2),
+        ),
+      );
+    await db
+      .update(simPrecalcObligationAttempts)
+      .set({
+        state: "failed",
+        outcome: "failed_exhausted",
+        resultAttemptId: attempts[2].id,
+        error: "solver evidence rejected: incomplete-urans-integration",
+        completedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(simPrecalcObligationAttempts.obligationId, obligation.id),
+          eq(simPrecalcObligationAttempts.attemptNumber, 3),
+        ),
+      );
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "blocked",
+        attemptCount: 2,
+        lastOutcome: "failed_exhausted",
+        lastError: "solver evidence rejected: incomplete-urans-integration",
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    const reversed = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/preliminary-outcomes?conditionId=${condition.id}&airfoilId=${asymId}`,
+    });
+    expect(reversed.statusCode).toBe(200);
+    expect(reversed.json()).toMatchObject({
+      items: [
+        {
+          state: "blocked",
+          outcome: "recovery_unavailable",
+          interruptedPhysicalRuns: 1,
+          preliminaryEvidenceRuns: 1,
+        },
+      ],
+    });
+  });
+
+  it("MUST-CATCH: one blocked symmetric source conserves both affected campaign points", async () => {
+    const speedMps = 28.25 + FILE_SPEED_OFFSET_MPS;
+    const launched = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} symmetric preliminary outcome`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-symmetric-preliminary-outcome-key`,
+        airfoilIds: [symId],
+        plan: planBody({
+          chordsM: [PRIMARY_CHORD_M],
+          speedsMps: [speedMps],
+          baseSweep: {
+            fromDeg: null,
+            toDeg: null,
+            stepDeg: null,
+            listDeg: [-3, 3],
+          },
+          objectives: {
+            ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+            clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+            clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+          },
+        }),
+      },
+    });
+    expect(launched.statusCode).toBe(201);
+    const campaignId = launched.json().campaign.id as string;
+    cleanupCampaignIds.push(campaignId);
+
+    const [condition] = (await db.execute(sql`
+      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id,
+             preset.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc
+      JOIN simulation_presets preset ON preset.id = cc.preset_id
+      WHERE cc.campaign_id = ${campaignId}
+    `)) as unknown as Array<{
+      id: string;
+      revision_id: string;
+      bc_id: string;
+    }>;
+    const [failedResult] = await db
+      .insert(results)
+      .values({
+        airfoilId: symId,
+        bcId: condition.bc_id,
+        simulationPresetRevisionId: condition.revision_id,
+        aoaDeg: 3,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        error: "solver evidence rejected: non-stationary",
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.push(failedResult.id);
+    await onResultIngested(db, {
+      airfoilId: symId,
+      revisionId: condition.revision_id,
+      aoaDeg: 3,
+      resultId: failedResult.id,
+      status: "failed",
+      regime: "urans",
+    });
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId: symId,
+          revisionId: condition.revision_id,
+          aoaDeg: 3,
+          sourceResultId: failedResult.id,
+        },
+      ],
+      { campaignIds: [campaignId] },
+    );
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "blocked",
+        attemptCount: 2,
+        lastOutcome: "rejected_exhausted",
+        lastError: "solver evidence rejected: non-stationary",
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await db.transaction((tx) => recomputeCampaignProgress(tx, campaignId));
+
+    const totals = await campaignProgressTotals(db, campaignId);
+    expect(totals).toMatchObject({ requested: 2, blocked: 2, remaining: 0 });
+    const outcomes = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/preliminary-outcomes?conditionId=${condition.id}&airfoilId=${symId}`,
+    });
+    expect(outcomes.statusCode).toBe(200);
+    expect(outcomes.json()).toMatchObject({
+      total: 2,
+      recovering: 0,
+      unavailable: 2,
+      items: [
+        {
+          aoaDeg: 3,
+          affectedAoaDegs: [-3, 3],
+          affectedPointCount: 2,
+          state: "blocked",
+          outcome: "evidence_unavailable",
+        },
+      ],
+    });
   });
 });
 

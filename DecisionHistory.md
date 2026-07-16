@@ -14,10 +14,37 @@
   Campaign-detail overviews should prioritize one operational message and a
   live instrument cluster over repeated badges, cards, borders, or pipeline
   prose; secondary setup and evidence detail remains progressively disclosed.
+  Cell detail must distinguish ordinary RANS interruptions from automatic
+  preliminary-URANS outcomes, describe physical CFD attempts separately from
+  evidence records and infrastructure submissions, and use the pinned real
+  airfoil geometry in both the dialog identity and an inspectable profile view.
+  Foreground dialogs own scroll and keyboard focus until they close.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
   [D-2026-07-15-campaign-instrument-overview]
+  [D-2026-07-16-campaign-cell-evidence-dialog]
+
+## D-2026-07-16-campaign-cell-evidence-dialog — Campaign cells explain automatic recovery without calling it failure
+
+Detail: [DecisionDetails/D-2026-07-16-campaign-cell-evidence-dialog.md](DecisionDetails/D-2026-07-16-campaign-cell-evidence-dialog.md)
+
+- Decision: keep ordinary RANS interruptions and automatic preliminary-URANS
+  outcomes as separate read models and panels. Report the bounded physical CFD
+  attempt budget independently from preliminary evidence records,
+  non-physical submissions, and terminal interrupted continuations. Infer an
+  interrupted continuation only from the exact ordered obligation sequence.
+  Campaign cell detail is a true modal layer with scroll/focus ownership and
+  nested-dialog behavior; its identity and Airfoil tab use the pinned revision's
+  stored geometry.
+- Why: relabeling the former `FAILED POINTS` heading would still combine normal
+  RANS escalation, preliminary URANS, setup loss, and evidence rows into one
+  ambiguous count. Removing the history would hide immutable evidence, while
+  exposing raw classifications would require users to decode solver internals.
+  The separate domain read model preserves audit truth and explains automatic
+  recovery in user terms. A drawer without modal ownership allowed the
+  background to move and lose context; placeholder or reconstructed geometry
+  would violate the evidence contract.
 
 ## D-2026-07-15-campaign-instrument-overview — Campaign progress is an instrument, not a status wall
 

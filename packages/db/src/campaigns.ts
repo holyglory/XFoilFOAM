@@ -4892,6 +4892,7 @@ function failedResultsWhere(
     AND NOT p.derived_by_symmetry
     AND r.id = p.result_id
     AND r.status = 'failed'
+    AND ${GENERIC_RANS_REQUEUE_ELIGIBLE_SQL}
     ${filters.conditionId ? sql`AND p.condition_id = ${filters.conditionId}` : sql``}
     ${filters.airfoilId ? sql`AND p.airfoil_id = ${filters.airfoilId}` : sql``}
   `;
@@ -5104,6 +5105,271 @@ export async function campaignFailures(
     });
   }
   return { total, retryableTotal, groups: [...groups.values()] };
+}
+
+export type CampaignPreliminaryOutcomeKind =
+  | "recovering"
+  | "evidence_unavailable"
+  | "continuation_unavailable"
+  | "mesh_unavailable"
+  | "submit_unavailable"
+  | "recovery_unavailable";
+
+export interface CampaignPreliminaryOutcome {
+  aoaDeg: number;
+  affectedAoaDegs: number[];
+  affectedPointCount: number;
+  state: "pending" | "running" | "blocked";
+  outcome: CampaignPreliminaryOutcomeKind;
+  physicalAttemptsUsed: number;
+  physicalAttemptsMax: number;
+  recoverySubmissions: number;
+  nonPhysicalSubmissions: number;
+  interruptedPhysicalRuns: number;
+  ransEvidenceRuns: number;
+  preliminaryEvidenceRuns: number;
+  fullUransEvidenceRuns: number;
+  legacyUransEvidenceRuns: number;
+  evidenceReasons: string[];
+  updatedAt: string;
+}
+
+/**
+ * Bounded cell-level read model for machine-owned preliminary URANS work.
+ *
+ * This is deliberately separate from campaignFailures(): an ordinary RANS
+ * failure that can be requeued and a terminal PRECALC obligation whose
+ * automatic physical budget is exhausted are different domain outcomes. The
+ * latter must never be relabeled as a failed RANS point or a user review task.
+ */
+export async function campaignPreliminaryOutcomes(
+  db: DB,
+  campaignId: string,
+  scope: { conditionId: string; airfoilId: string },
+): Promise<{
+  total: number;
+  recovering: number;
+  unavailable: number;
+  items: CampaignPreliminaryOutcome[];
+}> {
+  await requireCampaign(db, campaignId);
+  const rows = (await db.execute(sql`
+    SELECT
+      obligation.aoa_deg::float8 AS aoa_deg,
+      obligation.state,
+      obligation.attempt_count,
+      obligation.max_attempts,
+      obligation.last_outcome,
+      obligation."updatedAt" AS updated_at,
+      ARRAY(
+        SELECT point.aoa_deg::float8
+        FROM sim_campaign_points point
+        LEFT JOIN results source_result ON source_result.id = point.result_id
+        WHERE point.campaign_id = ${campaignId}
+          AND point.condition_id = ${scope.conditionId}
+          AND point.airfoil_id = obligation.airfoil_id
+          AND point.state <> 'released'
+          AND CASE
+                WHEN point.derived_by_symmetry THEN source_result.aoa_deg
+                ELSE point.aoa_deg
+              END = obligation.aoa_deg
+        ORDER BY point.aoa_deg ASC
+      ) AS affected_aoa_degs,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        WHERE submission.obligation_id = obligation.id
+      ) AS recovery_submissions,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        WHERE submission.obligation_id = obligation.id
+          AND NOT submission.consumes_solver_attempt
+      ) AS non_physical_submissions,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        WHERE submission.obligation_id = obligation.id
+          AND submission.consumes_solver_attempt
+          AND submission.result_attempt_id IS NULL
+          AND submission.state IN ('rejected', 'failed', 'cancelled')
+      ) AS interrupted_physical_runs,
+      COALESCE((
+        SELECT (
+          latest_submission.result_attempt_id IS NULL
+          AND latest_submission.state IN ('rejected', 'failed', 'cancelled')
+          AND EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligation_attempts earlier_submission
+            JOIN result_attempts earlier_attempt
+              ON earlier_attempt.id = earlier_submission.result_attempt_id
+            JOIN result_classifications earlier_classification
+              ON earlier_classification.result_attempt_id = earlier_attempt.id
+            WHERE earlier_submission.obligation_id = obligation.id
+              AND earlier_submission.consumes_solver_attempt
+              AND earlier_submission.attempt_number < latest_submission.attempt_number
+              AND earlier_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+              AND 'incomplete-urans-integration' = ANY(
+                COALESCE(
+                  earlier_classification.reasons,
+                  ARRAY[]::text[]
+                )
+              )
+          )
+        )
+        FROM sim_precalc_obligation_attempts latest_submission
+        WHERE latest_submission.obligation_id = obligation.id
+          AND latest_submission.consumes_solver_attempt
+        ORDER BY latest_submission.attempt_number DESC
+        LIMIT 1
+      ), false) AS continuation_interrupted,
+      (
+        SELECT count(*)::int
+        FROM result_attempts attempt
+        WHERE attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND (
+            attempt.evidence_payload ->> 'fidelity' = 'rans'
+            OR (
+              attempt.regime = 'rans'
+              AND COALESCE(attempt.evidence_payload ->> 'fidelity', '') NOT LIKE 'urans%'
+            )
+          )
+      ) AS rans_evidence_runs,
+      (
+        SELECT count(*)::int
+        FROM result_attempts attempt
+        WHERE attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      ) AS preliminary_evidence_runs,
+      (
+        SELECT count(*)::int
+        FROM result_attempts attempt
+        WHERE attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+      ) AS full_urans_evidence_runs,
+      (
+        SELECT count(*)::int
+        FROM result_attempts attempt
+        WHERE attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.regime = 'urans'
+          AND COALESCE(attempt.evidence_payload ->> 'fidelity', '')
+            NOT IN ('rans', 'urans_precalc', 'urans_full')
+      ) AS legacy_urans_evidence_runs,
+      ARRAY(
+        SELECT DISTINCT reason
+        FROM result_attempts attempt
+        JOIN result_classifications classification
+          ON classification.result_attempt_id = attempt.id
+        CROSS JOIN LATERAL unnest(
+          COALESCE(classification.reasons, ARRAY[]::text[])
+        ) reason
+        WHERE attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        ORDER BY reason
+      ) AS evidence_reasons
+    FROM sim_precalc_obligations obligation
+    JOIN sim_precalc_obligation_campaigns ownership
+      ON ownership.obligation_id = obligation.id
+     AND ownership.campaign_id = ${campaignId}
+     AND ownership.state = 'active'
+    JOIN sim_campaign_conditions condition
+      ON condition.id = ${scope.conditionId}
+     AND condition.campaign_id = ${campaignId}
+     AND condition.simulation_preset_revision_id = obligation.revision_id
+    WHERE obligation.airfoil_id = ${scope.airfoilId}
+      AND obligation.state IN ('pending', 'running', 'blocked')
+      AND EXISTS (
+        SELECT 1
+        FROM sim_campaign_points point
+        LEFT JOIN results source_result ON source_result.id = point.result_id
+        WHERE point.campaign_id = ${campaignId}
+          AND point.condition_id = ${scope.conditionId}
+          AND point.airfoil_id = obligation.airfoil_id
+          AND point.state <> 'released'
+          AND CASE
+                WHEN point.derived_by_symmetry THEN source_result.aoa_deg
+                ELSE point.aoa_deg
+              END = obligation.aoa_deg
+      )
+    ORDER BY obligation.aoa_deg ASC
+  `)) as unknown as Array<{
+    aoa_deg: number;
+    state: "pending" | "running" | "blocked";
+    attempt_count: number;
+    max_attempts: number;
+    last_outcome: string | null;
+    updated_at: Date | string;
+    affected_aoa_degs: Array<number | string>;
+    recovery_submissions: number;
+    non_physical_submissions: number;
+    interrupted_physical_runs: number;
+    continuation_interrupted: boolean;
+    rans_evidence_runs: number;
+    preliminary_evidence_runs: number;
+    full_urans_evidence_runs: number;
+    legacy_urans_evidence_runs: number;
+    evidence_reasons: string[] | null;
+  }>;
+
+  const items = rows.map((row): CampaignPreliminaryOutcome => {
+    const evidenceReasons = row.evidence_reasons ?? [];
+    const affectedAoaDegs = row.affected_aoa_degs.map(Number);
+    let outcome: CampaignPreliminaryOutcomeKind;
+    if (row.state === "pending" || row.state === "running") {
+      outcome = "recovering";
+    } else if (row.last_outcome === "rejected_exhausted") {
+      outcome = "evidence_unavailable";
+    } else if (
+      row.last_outcome === "failed_exhausted" &&
+      Boolean(row.continuation_interrupted)
+    ) {
+      outcome = "continuation_unavailable";
+    } else if (row.last_outcome === "deterministic_failure") {
+      outcome = "mesh_unavailable";
+    } else if (row.last_outcome === "submit_blocked") {
+      outcome = "submit_unavailable";
+    } else {
+      outcome = "recovery_unavailable";
+    }
+    return {
+      aoaDeg: Number(row.aoa_deg),
+      affectedAoaDegs,
+      affectedPointCount: affectedAoaDegs.length,
+      state: row.state,
+      outcome,
+      physicalAttemptsUsed: Number(row.attempt_count),
+      physicalAttemptsMax: Number(row.max_attempts),
+      recoverySubmissions: Number(row.recovery_submissions),
+      nonPhysicalSubmissions: Number(row.non_physical_submissions),
+      interruptedPhysicalRuns: Number(row.interrupted_physical_runs),
+      ransEvidenceRuns: Number(row.rans_evidence_runs),
+      preliminaryEvidenceRuns: Number(row.preliminary_evidence_runs),
+      fullUransEvidenceRuns: Number(row.full_urans_evidence_runs),
+      legacyUransEvidenceRuns: Number(row.legacy_urans_evidence_runs),
+      evidenceReasons,
+      updatedAt: isoOf(row.updated_at)!,
+    };
+  });
+  return {
+    total: items.reduce((sum, item) => sum + item.affectedPointCount, 0),
+    recovering: items
+      .filter((item) => item.state !== "blocked")
+      .reduce((sum, item) => sum + item.affectedPointCount, 0),
+    unavailable: items
+      .filter((item) => item.state === "blocked")
+      .reduce((sum, item) => sum + item.affectedPointCount, 0),
+    items,
+  };
 }
 
 /** Scoped maintenance requeue with exact expected-count verification (409 on
