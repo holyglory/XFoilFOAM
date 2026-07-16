@@ -259,6 +259,210 @@ test.describe.serial("simulation campaigns: wizard, plan edits, routing, refinem
     expect(preview.totalSolverRuns).toBe(10);
   });
 
+  test("campaign instrument matches the approved option-3 geometry contract", async ({
+    page,
+    request,
+  }) => {
+    const launched = await launchCampaign(
+      request,
+      `${state.stamp} instrument contract`,
+      planBody({ speedsMps: [10] }),
+    );
+    const renderedProgress = {
+      solved: 1_010,
+      requested: 631_410,
+      remaining: 630_400,
+    };
+    await page.route(
+      `**/api/admin/campaigns/${launched.campaign.id}`,
+      async (route) => {
+        const response = await route.fetch();
+        const payload = (await response.json()) as {
+          totals: Record<string, number>;
+        };
+        await route.fulfill({
+          response,
+          json: {
+            ...payload,
+            totals: { ...payload.totals, ...renderedProgress },
+          },
+        });
+      },
+    );
+    await page.setViewportSize({ width: 1297, height: 1212 });
+    await page.goto(`/admin?campaign=${launched.campaign.id}`);
+    await expect(page.getByTestId("campaign-detail")).toBeVisible();
+
+    const hero = page.getByTestId("campaign-instrument-hero");
+    const gauge = page.getByTestId("campaign-progress-gauge");
+    const rail = page.getByTestId("campaign-stage-rail");
+    const metrics = page.getByTestId("campaign-counts-line");
+    await expect(hero).toBeVisible();
+    await expect(gauge).toBeVisible();
+    await expect(
+      hero.getByRole("progressbar", { name: "Campaign completion" }),
+    ).toBeVisible();
+    await expect(gauge).toHaveAttribute("role", "progressbar");
+    await expect(gauge).toHaveAttribute("aria-valuemin", "0");
+    await expect(gauge).toHaveAttribute(
+      "aria-valuenow",
+      String(renderedProgress.solved),
+    );
+    await expect(gauge).toHaveAttribute(
+      "aria-valuemax",
+      String(renderedProgress.requested),
+    );
+    await expect(gauge).toHaveAttribute(
+      "aria-valuetext",
+      "1,010 of 631,410, 0.16% complete",
+    );
+
+    // The approved artifact is a live semicircle without a speedometer needle
+    // or a second visible completion bar.
+    const dialCanvas = gauge.getByTestId("campaign-progress-dial-canvas");
+    await expect(dialCanvas).toBeVisible();
+    const countPaintedProgressPixels = () =>
+      dialCanvas.evaluate((node) => {
+        const canvas = node as HTMLCanvasElement;
+        const context = canvas.getContext("2d");
+        if (!context) return 0;
+        const pixels = context.getImageData(
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        ).data;
+        let cyanCorePixels = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          const red = pixels[index] ?? 0;
+          const green = pixels[index + 1] ?? 0;
+          const blue = pixels[index + 2] ?? 0;
+          const alpha = pixels[index + 3] ?? 0;
+          if (
+            green > 150 &&
+            blue > 140 &&
+            green - red > 70 &&
+            blue - red > 60 &&
+            alpha > 180
+          ) {
+            cyanCorePixels += 1;
+          }
+        }
+        return cyanCorePixels / Math.max(1, window.devicePixelRatio ** 2);
+      });
+    await expect.poll(countPaintedProgressPixels).toBeGreaterThan(2);
+    expect(await countPaintedProgressPixels()).toBeLessThan(250);
+    await expect(gauge.getByTestId("campaign-progress-needle")).toHaveCount(0);
+    await expect(page.getByTestId("campaign-progress-bar")).toHaveCount(0);
+
+    // One continuous numbered rail, followed by the three unboxed operational
+    // readouts, all belong to the same primary instrument.
+    await expect(rail.getByTestId("campaign-stage-node-steady")).toHaveText(
+      "1",
+    );
+    await expect(rail.getByTestId("campaign-stage-node-unsteady")).toHaveText(
+      "2",
+    );
+    await expect(rail.getByTestId("campaign-stage-node-verify")).toHaveText(
+      "3",
+    );
+    await expect(rail.locator('[aria-current="step"]')).toHaveCount(1);
+    await expect(rail.getByTestId("campaign-stage-connector")).toBeVisible();
+    await expect(hero.getByTestId("campaign-counts-line")).toBeVisible();
+    await expect(metrics.locator(":scope > *")).toHaveCount(3);
+    await expect(
+      metrics.getByTestId("campaign-metric-processing"),
+    ).toBeVisible();
+    await expect(
+      metrics.getByTestId("campaign-metric-auto-repair"),
+    ).toBeVisible();
+    await expect(
+      metrics.getByTestId("campaign-metric-throughput"),
+    ).toBeVisible();
+
+    const nodes = [
+      rail.getByTestId("campaign-stage-node-steady"),
+      rail.getByTestId("campaign-stage-node-unsteady"),
+      rail.getByTestId("campaign-stage-node-verify"),
+    ];
+    const [gaugeBox, railBox, connectorBox, metricsBox, ...nodeBoxes] =
+      await Promise.all([
+        gauge.boundingBox(),
+        rail.boundingBox(),
+        rail.getByTestId("campaign-stage-connector").boundingBox(),
+        metrics.boundingBox(),
+        ...nodes.map((node) => node.boundingBox()),
+      ]);
+    expect(gaugeBox).not.toBeNull();
+    expect(railBox).not.toBeNull();
+    expect(connectorBox).not.toBeNull();
+    expect(metricsBox).not.toBeNull();
+    expect(nodeBoxes.every(Boolean)).toBe(true);
+    expect(gaugeBox!.width / gaugeBox!.height).toBeGreaterThan(1.65);
+    expect(gaugeBox!.width / gaugeBox!.height).toBeLessThan(2.05);
+    expect(gaugeBox!.width).toBeGreaterThan(440);
+    expect(railBox!.width).toBeGreaterThan(gaugeBox!.width * 1.15);
+    expect(railBox!.y).toBeGreaterThan(gaugeBox!.y + gaugeBox!.height - 20);
+    expect(railBox!.y).toBeLessThan(gaugeBox!.y + gaugeBox!.height + 110);
+    expect(metricsBox!.y).toBeGreaterThan(railBox!.y + 90);
+    expect(metricsBox!.y).toBeLessThan(railBox!.y + 200);
+    expect(connectorBox!.height).toBeLessThanOrEqual(3);
+    const nodeCenters = nodeBoxes.map((box) => ({
+      x: box!.x + box!.width / 2,
+      y: box!.y + box!.height / 2,
+    }));
+    expect(
+      Math.max(...nodeCenters.map((node) => node.y)) -
+        Math.min(...nodeCenters.map((node) => node.y)),
+    ).toBeLessThan(1);
+    expect(Math.abs(connectorBox!.x - nodeCenters[0]!.x)).toBeLessThan(2);
+    expect(
+      Math.abs(connectorBox!.x + connectorBox!.width - nodeCenters[2]!.x),
+    ).toBeLessThan(2);
+
+    // The artifact stays one horizontal instrument on narrow screens: no
+    // rail collapse, vertical status-list substitution or page overflow.
+    await page.setViewportSize({ width: 390, height: 844 });
+    const [narrowGauge, narrowHero, ...narrowBoxes] = await Promise.all([
+      gauge.boundingBox(),
+      hero.boundingBox(),
+      ...nodes.map((node) => node.boundingBox()),
+      ...[
+        metrics.getByTestId("campaign-metric-processing"),
+        metrics.getByTestId("campaign-metric-auto-repair"),
+        metrics.getByTestId("campaign-metric-throughput"),
+      ].map((metric) => metric.boundingBox()),
+    ]);
+    expect(narrowGauge).not.toBeNull();
+    expect(narrowHero).not.toBeNull();
+    expect(narrowGauge!.width / narrowGauge!.height).toBeGreaterThan(1.8);
+    const narrowNodeBoxes = narrowBoxes.slice(0, 3);
+    const narrowMetricBoxes = narrowBoxes.slice(3);
+    expect(narrowNodeBoxes.every(Boolean)).toBe(true);
+    expect(narrowMetricBoxes.every(Boolean)).toBe(true);
+    expect(
+      Math.max(...narrowNodeBoxes.map((box) => box!.y)) -
+        Math.min(...narrowNodeBoxes.map((box) => box!.y)),
+    ).toBeLessThan(1);
+    expect(
+      Math.max(...narrowMetricBoxes.map((box) => box!.y)) -
+        Math.min(...narrowMetricBoxes.map((box) => box!.y)),
+    ).toBeLessThan(1);
+    const overflow = await page.evaluate(() => ({
+      document:
+        document.documentElement.scrollWidth -
+        document.documentElement.clientWidth,
+      hero: (() => {
+        const element = document.querySelector<HTMLElement>(
+          '[data-testid="campaign-instrument-hero"]',
+        );
+        return element ? element.scrollWidth - element.clientWidth : 1;
+      })(),
+    }));
+    expect(overflow.document).toBeLessThanOrEqual(0);
+    expect(overflow.hero).toBeLessThanOrEqual(0);
+  });
+
   test("edit-conditions dialog previews and applies a real removal diff", async ({ page, request }) => {
     const launched = await launchCampaign(request, `${state.stamp} edit target`, planBody());
     expect(launched.totals.requested).toBe(12);

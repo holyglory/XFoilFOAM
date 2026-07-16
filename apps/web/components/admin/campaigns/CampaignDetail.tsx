@@ -6,9 +6,9 @@
 // else (Requeue-rejected is GONE from the header — repair verbs live on the
 // Points tab per point), legacy unavailable-evidence compatibility count
 // linking to Points filtered needs_review, the 3-stage pipeline hero
-// (steady → unsteady → verify), ONE progress bar (teal done / amber solving /
-// violet awaiting-URANS / empty open) with an honest measured-rate ETA, the
-// stats wall collapsed to one line + a "details" disclosure, restore
+// (steady → unsteady → verify), one live semicircular completion dial with
+// an honest measured-rate ETA, the stats wall collapsed to three operational
+// readouts + a "details" disclosure, restore
 // suggestion, condition strip, virtualized coverage matrix, cell side panel,
 // refinement board and the plan-edit / add-airfoils dialogs. Every number
 // rendered here is a real counter from the API — no projections beyond the
@@ -17,15 +17,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
-  ArrowRight,
-  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Circle,
   CircleDot,
   Clock3,
-  Gauge,
   MoreHorizontal,
   Pause,
   Play,
@@ -71,6 +67,7 @@ import { CoverageMatrix } from "./CoverageMatrix";
 import { PlanEditDialogs, type PlanEditMode } from "./PlanEditDialogs";
 import { RefinementBoard } from "./RefinementBoard";
 import { campaignRemediationCopy } from "./campaign-remediation";
+import { CampaignProgressGauge } from "./CampaignProgressGauge";
 import { fCount, ghostBtn, primaryBtn } from "./ui";
 import { usePoll } from "./usePoll";
 
@@ -369,6 +366,9 @@ export function CampaignDetail({
     phase: summary.phase,
     jobsRunning: scheduler.campaignJobsRunning,
   });
+  const stageRailProgress = pipeline
+    ? Math.min(2, pipeline.stages.filter((stage) => stage.settled).length)
+    : 0;
   const barSegments = progressBarSegments(totals, reviewBuckets);
   const completionPercent =
     totals.requested > 0
@@ -654,100 +654,101 @@ export function CampaignDetail({
         </div>
       )}
 
-      {/* The gauge icon is from the product icon library; the native progress
-          element carries the real completion value and accessible semantics. */}
+      {/* The approved instrument is a real completion dial: exact arc fraction,
+          calibrated ticks, no speedometer needle and no duplicate linear bar. */}
       <section
+        data-testid="campaign-instrument-hero"
         className="campaign-instrument-hero"
         aria-label="Campaign progress"
       >
-        <div className="campaign-instrument-gauge">
-          <Gauge size={320} strokeWidth={0.7} aria-hidden />
-          <div className="campaign-instrument-gauge-value">
-            <strong>{fCount(barSegments.doneCount)}</strong>
-            <span>{totals.derived > 0 ? "points complete" : "solved"}</span>
-            <small>of {fCount(totals.requested)}</small>
-            <b>{completionPercentLabel} complete</b>
-          </div>
-        </div>
-        <progress
-          data-testid="campaign-progress-bar"
-          className="campaign-instrument-progress"
-          max={Math.max(1, totals.requested)}
+        <CampaignProgressGauge
           value={barSegments.doneCount}
-          aria-label={`${fCount(barSegments.doneCount)} of ${fCount(totals.requested)} campaign points complete`}
+          max={totals.requested}
+          valueLabel={fCount(barSegments.doneCount)}
+          stateLabel={totals.derived > 0 ? "points complete" : "solved"}
+          totalLabel={fCount(totals.requested)}
+          percentLabel={completionPercentLabel}
         />
 
         {pipeline && (
-          <div
-            data-testid="campaign-pipeline"
+          <ol
+            data-testid="campaign-stage-rail"
             className="campaign-instrument-stage-rail"
           >
-            {pipeline.stages.map((stage, i) => (
-              <div className="campaign-instrument-stage-wrap" key={stage.key}>
-                {i > 0 && (
-                  <ArrowRight
-                    className="campaign-instrument-stage-arrow"
-                    size={22}
-                    aria-hidden
-                  />
-                )}
-                <div
-                  data-testid={`campaign-stage-${stage.key}`}
-                  className={`campaign-instrument-stage ${stage.active ? "is-active" : ""} ${stage.settled ? "is-settled" : ""}`}
+            <progress
+              data-testid="campaign-stage-connector"
+              className="campaign-instrument-stage-connector"
+              max={2}
+              value={stageRailProgress}
+              aria-hidden="true"
+            />
+            {pipeline.stages.map((stage, index) => (
+              <li
+                key={stage.key}
+                data-testid={`campaign-stage-${stage.key}`}
+                className={`campaign-instrument-stage ${stage.active ? "is-active" : ""} ${stage.settled ? "is-settled" : ""}`}
+                aria-current={stage.active ? "step" : undefined}
+              >
+                <span
+                  data-testid={`campaign-stage-node-${stage.key}`}
+                  className="campaign-instrument-stage-node"
+                  aria-hidden="true"
                 >
-                  {stage.active ? (
-                    <CircleDot size={38} strokeWidth={1.6} aria-hidden />
-                  ) : stage.settled ? (
-                    <CheckCircle2 size={38} strokeWidth={1.4} aria-hidden />
-                  ) : (
-                    <Circle size={38} strokeWidth={1.4} aria-hidden />
-                  )}
-                  <strong
-                    data-testid={
-                      stage.active ? "campaign-phase-badge" : undefined
-                    }
-                  >
-                    {stage.key === "steady"
-                      ? "RANS"
-                      : stage.key === "unsteady"
-                        ? "PRELIMINARY URANS"
-                        : "VERIFY"}
-                  </strong>
-                  <span>
-                    {stage.settled
-                      ? "settled"
-                      : stage.open === 0
-                        ? "waiting"
-                        : (stage.detail ?? `${fCount(stage.open)} open`)}
-                  </span>
-                </div>
-              </div>
+                  {index + 1}
+                </span>
+                <strong
+                  data-testid={
+                    stage.active ? "campaign-phase-badge" : undefined
+                  }
+                >
+                  {stage.key === "steady"
+                    ? "RANS"
+                    : stage.key === "unsteady"
+                      ? "PRELIMINARY URANS"
+                      : "VERIFY"}
+                </strong>
+                <span>
+                  {stage.settled
+                    ? "settled"
+                    : stage.open === 0
+                      ? "waiting"
+                      : (stage.detail ?? `${fCount(stage.open)} open`)}
+                </span>
+              </li>
             ))}
-          </div>
+          </ol>
         )}
-      </section>
 
-      {/* Compact live readouts replace the repeated stats wall. */}
-      <div className="campaign-instrument-lower">
+        {/* Exactly three live readouts finish the primary instrument. Recovery
+            and unavailable-evidence actions remain reachable in Details. */}
         <div
           data-testid="campaign-counts-line"
           className="campaign-instrument-metrics"
         >
-          <div className="campaign-instrument-metric campaign-instrument-metric-amber">
+          <div
+            data-testid="campaign-metric-processing"
+            className="campaign-instrument-metric campaign-instrument-metric-amber"
+          >
             <Clock3 size={30} strokeWidth={1.6} aria-hidden />
             <span>
               <strong>{fCount(barSegments.solvingCount)}</strong>
               <small>processing</small>
             </span>
           </div>
-          <div className="campaign-instrument-metric campaign-instrument-metric-violet">
+          <div
+            data-testid="campaign-metric-auto-repair"
+            className="campaign-instrument-metric campaign-instrument-metric-violet"
+          >
             <Wrench size={30} strokeWidth={1.6} aria-hidden />
             <span>
               <strong>{fCount(summary.remediation.repairing)}</strong>
               <small>auto-repair</small>
             </span>
           </div>
-          <div className="campaign-instrument-metric campaign-instrument-metric-teal">
+          <div
+            data-testid="campaign-metric-throughput"
+            className="campaign-instrument-metric campaign-instrument-metric-teal"
+          >
             <TrendingUp size={30} strokeWidth={1.6} aria-hidden />
             <span>
               <strong>
@@ -764,56 +765,16 @@ export function CampaignDetail({
               )}
             </span>
           </div>
-          {barSegments.awaitingCount > 0 && (
-            <button
-              type="button"
-              data-testid="campaign-awaiting-urans-link"
-              className="campaign-instrument-metric campaign-instrument-metric-violet is-action"
-              title="Open preliminary URANS work in the Points explorer"
-              onClick={() => onOpenPoints("awaiting_urans")}
-            >
-              <CircleDot size={30} strokeWidth={1.6} aria-hidden />
-              <span>
-                <strong>{fCount(barSegments.awaitingCount)}</strong>
-                <small>awaiting URANS</small>
-              </span>
-            </button>
-          )}
-          {barSegments.blockedCount > 0 && remediationCopy && (
-            <button
-              type="button"
-              data-testid="campaign-blocked-count"
-              className="campaign-instrument-metric campaign-instrument-metric-amber is-action"
-              title={remediationCopy.title}
-              onClick={() => setDetailsOpen(() => true)}
-            >
-              <ShieldAlert size={30} strokeWidth={1.6} aria-hidden />
-              <span>
-                <strong>{fCount(barSegments.blockedCount)}</strong>
-                <small>{remediationCopy.label}</small>
-              </span>
-            </button>
-          )}
-          {needsReview > 0 && (
-            <button
-              type="button"
-              data-testid="campaign-needs-review-chip"
-              className="campaign-instrument-metric campaign-instrument-metric-red is-action"
-              title="Open unavailable evidence in the Points explorer"
-              onClick={() => onOpenPoints("needs_review")}
-            >
-              <ShieldAlert size={30} strokeWidth={1.6} aria-hidden />
-              <span>
-                <strong>{fCount(needsReview)}</strong>
-                <small>unavailable evidence</small>
-              </span>
-            </button>
-          )}
         </div>
+        <div className="campaign-instrument-closing-rule" aria-hidden="true" />
+      </section>
+
+      <div className="campaign-instrument-lower">
         <button
           type="button"
           data-testid="campaign-details-toggle"
           aria-expanded={detailsOpen}
+          aria-controls="campaign-instrument-details"
           onClick={() => setDetailsOpen((v) => !v)}
           className="campaign-instrument-details-toggle"
         >
@@ -824,70 +785,134 @@ export function CampaignDetail({
           )}
           Campaign details
         </button>
-        {detailsOpen && (
-          <div
-            data-testid="campaign-details"
-            className="campaign-instrument-details"
-          >
-            <div className="campaign-instrument-detail-strip">
-              <span>
-                {fCount(summary.airfoilCount)} airfoils ·{" "}
-                {fCount(
-                  conditions.filter((c) => c.status !== "released").length,
-                )}{" "}
-                conditions
+        <div
+          id="campaign-instrument-details"
+          data-testid="campaign-details"
+          className="campaign-instrument-details"
+          hidden={!detailsOpen}
+        >
+          <div className="campaign-instrument-detail-strip">
+            <span>
+              {fCount(summary.airfoilCount)} airfoils ·{" "}
+              {fCount(conditions.filter((c) => c.status !== "released").length)}{" "}
+              conditions
+            </span>
+            {totals.derived > 0 && (
+              <span title="derived by symmetry — not solver runs">
+                {fCount(totals.derived)} symmetry-derived
               </span>
-              {totals.derived > 0 && (
-                <span title="derived by symmetry — not solver runs">
-                  {fCount(totals.derived)} symmetry-derived
-                </span>
-              )}
-              {totals.failed > 0 && (
+            )}
+            {totals.failed > 0 && (
+              <button
+                type="button"
+                data-testid="campaign-failed-link"
+                title="Crash-class failures (after the automatic retry) — open them in the Points explorer"
+                onClick={() => onOpenPoints("failed")}
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  color: C.redText,
+                  background: "transparent",
+                  border: "none",
+                  padding: 0,
+                  cursor: "pointer",
+                  textDecoration: "underline",
+                }}
+              >
+                {fCount(totals.failed)} failed
+              </button>
+            )}
+          </div>
+          {(barSegments.awaitingCount > 0 ||
+            (barSegments.blockedCount > 0 && remediationCopy) ||
+            needsReview > 0) && (
+            <div
+              data-testid="campaign-exception-actions"
+              className="campaign-instrument-exceptions"
+            >
+              {barSegments.awaitingCount > 0 && (
                 <button
                   type="button"
-                  data-testid="campaign-failed-link"
-                  title="Crash-class failures (after the automatic retry) — open them in the Points explorer"
-                  onClick={() => onOpenPoints("failed")}
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 10,
-                    color: C.redText,
-                    background: "transparent",
-                    border: "none",
-                    padding: 0,
-                    cursor: "pointer",
-                    textDecoration: "underline",
-                  }}
+                  data-testid="campaign-awaiting-urans-link"
+                  className="campaign-instrument-exception-action is-violet"
+                  title="Open preliminary URANS work in the Points explorer"
+                  onClick={() => onOpenPoints("awaiting_urans")}
                 >
-                  {fCount(totals.failed)} failed
+                  <CircleDot size={18} strokeWidth={1.6} aria-hidden />
+                  <span>
+                    <strong>{fCount(barSegments.awaitingCount)}</strong>
+                    <small>awaiting URANS</small>
+                  </span>
+                </button>
+              )}
+              {barSegments.blockedCount > 0 && remediationCopy && (
+                <div
+                  data-testid="campaign-blocked-count"
+                  className="campaign-instrument-exception-action is-amber"
+                  title={remediationCopy.title}
+                >
+                  <ShieldAlert size={18} strokeWidth={1.6} aria-hidden />
+                  <span>
+                    <strong>{fCount(barSegments.blockedCount)}</strong>
+                    <small>{remediationCopy.label}</small>
+                  </span>
+                </div>
+              )}
+              {needsReview > 0 && (
+                <button
+                  type="button"
+                  data-testid="campaign-needs-review-chip"
+                  className="campaign-instrument-exception-action is-red"
+                  title="Open unavailable evidence in the Points explorer"
+                  onClick={() => onOpenPoints("needs_review")}
+                >
+                  <ShieldAlert size={18} strokeWidth={1.6} aria-hidden />
+                  <span>
+                    <strong>{fCount(needsReview)}</strong>
+                    <small>unavailable evidence</small>
+                  </span>
                 </button>
               )}
             </div>
-            {remediationCopy && (
-              <div
-                data-testid="campaign-remediation-detail"
-                style={{
-                  fontFamily: MONO,
-                  fontSize: 10.5,
-                  color: C.text2,
-                  border: "1px solid rgba(245,158,11,0.38)",
-                  background: "rgba(245,158,11,0.06)",
-                  borderRadius: 8,
-                  padding: "8px 10px",
-                  lineHeight: 1.5,
-                }}
-              >
-                <span style={{ color: C.amber, fontWeight: 700 }}>
-                  {fCount(blocked)} {remediationCopy.label}
-                </span>
-                {" — "}
-                {remediationCopy.detail}
-              </div>
-            )}
+          )}
+          {remediationCopy && (
             <div
-              data-testid="campaign-plan-chips"
-              style={{ display: "flex", gap: 6, flexWrap: "wrap" }}
+              data-testid="campaign-remediation-detail"
+              style={{
+                fontFamily: MONO,
+                fontSize: 10.5,
+                color: C.text2,
+                border: "1px solid rgba(245,158,11,0.38)",
+                background: "rgba(245,158,11,0.06)",
+                borderRadius: 8,
+                padding: "8px 10px",
+                lineHeight: 1.5,
+              }}
             >
+              <span style={{ color: C.amber, fontWeight: 700 }}>
+                {fCount(blocked)} {remediationCopy.label}
+              </span>
+              {" — "}
+              {remediationCopy.detail}
+            </div>
+          )}
+          <div
+            data-testid="campaign-plan-chips"
+            style={{ display: "flex", gap: 6, flexWrap: "wrap" }}
+          >
+            <span
+              style={{
+                fontFamily: MONO,
+                fontSize: 10,
+                color: C.muted,
+                border: `1px solid ${C.stroke}`,
+                borderRadius: 999,
+                padding: "3px 9px",
+              }}
+            >
+              polar sweep
+            </span>
+            {sweepChip && (
               <span
                 style={{
                   fontFamily: MONO,
@@ -898,80 +923,66 @@ export function CampaignDetail({
                   padding: "3px 9px",
                 }}
               >
-                polar sweep
+                {sweepChip}
               </span>
-              {sweepChip && (
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 10,
-                    color: C.muted,
-                    border: `1px solid ${C.stroke}`,
-                    borderRadius: 999,
-                    padding: "3px 9px",
-                  }}
-                >
-                  {sweepChip}
-                </span>
-              )}
-              {objectives.ldMax.enabled && (
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 10,
-                    color: C.muted,
-                    border: `1px solid ${C.stroke}`,
-                    borderRadius: 999,
-                    padding: "3px 9px",
-                  }}
-                >
-                  max L/D ±{objectives.ldMax.toleranceDeg}°
-                </span>
-              )}
-              {objectives.clZero.enabled && (
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 10,
-                    color: C.muted,
-                    border: `1px solid ${C.stroke}`,
-                    borderRadius: 999,
-                    padding: "3px 9px",
-                  }}
-                >
-                  α₀ ±{objectives.clZero.toleranceDeg}°
-                </span>
-              )}
-              {objectives.clMax?.enabled && (
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 10,
-                    color: C.muted,
-                    border: `1px solid ${C.stroke}`,
-                    borderRadius: 999,
-                    padding: "3px 9px",
-                  }}
-                >
-                  Cl_max ±{objectives.clMax.toleranceDeg}°
-                </span>
-              )}
+            )}
+            {objectives.ldMax.enabled && (
               <span
                 style={{
                   fontFamily: MONO,
                   fontSize: 10,
-                  color: C.dim,
+                  color: C.muted,
                   border: `1px solid ${C.stroke}`,
                   borderRadius: 999,
                   padding: "3px 9px",
                 }}
               >
-                {PRIORITY_LABEL[campaign.priority] ??
-                  `priority ${campaign.priority}`}
+                max L/D ±{objectives.ldMax.toleranceDeg}°
               </span>
-            </div>
+            )}
+            {objectives.clZero.enabled && (
+              <span
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  color: C.muted,
+                  border: `1px solid ${C.stroke}`,
+                  borderRadius: 999,
+                  padding: "3px 9px",
+                }}
+              >
+                α₀ ±{objectives.clZero.toleranceDeg}°
+              </span>
+            )}
+            {objectives.clMax?.enabled && (
+              <span
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  color: C.muted,
+                  border: `1px solid ${C.stroke}`,
+                  borderRadius: 999,
+                  padding: "3px 9px",
+                }}
+              >
+                Cl_max ±{objectives.clMax.toleranceDeg}°
+              </span>
+            )}
+            <span
+              style={{
+                fontFamily: MONO,
+                fontSize: 10,
+                color: C.dim,
+                border: `1px solid ${C.stroke}`,
+                borderRadius: 999,
+                padding: "3px 9px",
+              }}
+            >
+              {PRIORITY_LABEL[campaign.priority] ??
+                `priority ${campaign.priority}`}
+            </span>
           </div>
-        )}
+        </div>
         {gainedEvidence.length > 0 && (
           <button
             type="button"
