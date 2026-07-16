@@ -124,8 +124,8 @@ describe("fidelityChipView", () => {
         verifyInfo({ state: "blocked", submitError: "HTTP 422" }),
       ),
     ).toEqual({
-      label: "precalc · verify blocked",
-      tone: "amber",
+      label: "final URANS · critical",
+      tone: "red",
     });
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "done" })),

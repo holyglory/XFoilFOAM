@@ -12,8 +12,10 @@ import {
   laneKeyId,
   onResultIngested,
   probeCampaignCompletion,
+  reconcileBlockedFinalMediaRepairVerifications,
   resultMediaRepairs,
   renewResultMediaRepairClaim,
+  settleFinalUransVerificationAfterMediaRepair,
   satisfyPrecalcObligationFromAcceptedResult,
   satisfiedResultMediaRepairs,
 } from "@aerodb/db";
@@ -129,6 +131,12 @@ export async function finalizeSatisfiedResultMediaRepairs(
       }
       continue;
     }
+    if (repair.fidelity === "urans_full") {
+      await settleFinalUransVerificationAfterMediaRepair(
+        db,
+        repair.resultAttemptId,
+      );
+    }
     // Missing media can be the sole reason an otherwise-real PRECALC attempt
     // was rejected and its physical obligation became blocked. Project the
     // refreshed accepted truth back into that exact obligation ledger before
@@ -218,6 +226,17 @@ export async function resultMediaRepairTick(
   });
   for (const lane of pre.dirtyLanes) dirty.set(laneKeyId(lane), lane);
 
+  // Older releases could persist a blocked repair before projecting that
+  // terminal state into the exact final-verification owner. Reconcile that
+  // bounded crash window before accepting new renderer work.
+  const reconciledBlocked = await reconcileBlockedFinalMediaRepairVerifications(
+    db,
+    {
+      limit: opts.finalizeLimit,
+      resultId: opts.resultId,
+    },
+  );
+
   // A media-complete running row was finalized above; only genuinely
   // incomplete expired owners consume another bounded attempt here.
   const healed = await healExpiredResultMediaRepairClaims(db);
@@ -231,14 +250,14 @@ export async function resultMediaRepairTick(
       claimed: false,
       repairedMedia: 0,
       retrying: healed.retrying,
-      blocked: healed.blocked,
+      blocked: reconciledBlocked + healed.blocked,
       dirtyLanes: [...dirty.values()],
     };
   }
 
   let repairedMedia = 0;
   let retrying = healed.retrying;
-  let blocked = healed.blocked;
+  let blocked = reconciledBlocked + healed.blocked;
   try {
     if (!claim.claimToken) {
       throw new Error("claimed result media repair has no ownership token");
@@ -294,7 +313,9 @@ export async function resultMediaRepairTick(
       errorMessage(error),
     );
     if (state === "retry_wait") retrying++;
-    if (state === "blocked") blocked++;
+    if (state === "blocked") {
+      blocked++;
+    }
     console.error(
       `[sweeper] result media repair ${state ?? "lost ownership"} ` +
         `(repair ${claim.id}, result ${claim.resultId}, attempt ${claim.attemptCount}/${claim.maxAttempts}): ${errorMessage(error)}`,

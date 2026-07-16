@@ -179,14 +179,19 @@ describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
     expect(v.state).toBe("progress");
   });
 
-  it("renders an explicit machine-blocked count amber and terminal, never healthy progress", () => {
+  it("MUST-CATCH: renders exhausted recovery as critical and terminal, never a normal blocked queue", () => {
     const blocked = split({ solved: 20, blocked: 2, remaining: 9 });
     const view = segmentView(blocked);
     expect(view.state).toBe("blocked");
     expect(view.fillFraction).toBeCloseTo(22 / 31, 10);
-    expect(segmentTitle(condition(), blocked, "active")).toContain("2 blocked");
+    expect(segmentTitle(condition(), blocked, "active")).toContain(
+      "2 critical failures",
+    );
     expect(segmentTitle(condition(), blocked, "active")).not.toContain(
       "review",
+    );
+    expect(segmentTitle(condition(), blocked, "active")).not.toContain(
+      "blocked",
     );
   });
 
@@ -202,6 +207,10 @@ describe("segmentFillHeight rendering rule", () => {
   it("failed renders SOLID (full height) regardless of progress", () => {
     expect(segmentFillHeight({ state: "failed", fillFraction: 0.1 })).toBe(1);
     expect(segmentFillHeight({ state: "failed", fillFraction: 0 })).toBe(1);
+  });
+
+  it("critical recovery failures render SOLID for immediate salience", () => {
+    expect(segmentFillHeight({ state: "blocked", fillFraction: 0.1 })).toBe(1);
   });
 
   it("progress/rejected render at the terminal fraction; empty at 0", () => {

@@ -28,6 +28,13 @@ describe("GET /api/admin/health", () => {
       expect(body.averages24h.memoryUsedPct).toEqual(expect.any(Number));
       expect(Array.isArray(body.history)).toBe(true);
       expect(body.current.storage || body.current.storageError).toBeTruthy();
+      expect(body.solverIncidents).toMatchObject({
+        threshold: expect.any(Number),
+        occurrenceCount: expect.any(Number),
+        openCount: expect.any(Number),
+        criticalGroupCount: expect.any(Number),
+        groups: expect.any(Array),
+      });
     } finally {
       await app.close();
     }
@@ -41,7 +48,9 @@ describe("GET /api/admin/health", () => {
     try {
       const res = await app.inject({ method: "GET", url: "/api/admin/health" });
       expect(res.statusCode).toBe(401);
-      expect(res.json()).toMatchObject({ error: "admin authentication required" });
+      expect(res.json()).toMatchObject({
+        error: "admin authentication required",
+      });
     } finally {
       await app.close();
     }

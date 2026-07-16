@@ -232,7 +232,7 @@ export function SolverWorkPanel({
         optimisticFlip(condition, point, res.request.state === "running" ? "solving" : "queued");
         setActionNotice(
           res.created
-            ? `continuation queued (+${hours} h) — resumes from the saved case state after all RANS gaps`
+            ? `continuation queued (+${hours} h) — resumes the saved URANS state automatically`
             : `already queued — the open continuation request is reused (${res.request.state})`,
         );
         void refresh({ quiet: true });
@@ -272,7 +272,7 @@ export function SolverWorkPanel({
       if (busyAction) return false;
       if (
         !window.confirm(
-          `Queue a full-fidelity URANS solve for α ${formatAoa(point.aoaDeg)}? Full mesh, 7 shedding periods, 12 h budget. It runs after all RANS gaps, at precalc rank.`,
+          `Request final URANS verification for α ${formatAoa(point.aoaDeg)}? If a fast preliminary result is not available yet, that stage runs first; final URANS then refines it automatically.`,
         )
       )
         return false;
@@ -288,8 +288,8 @@ export function SolverWorkPanel({
         optimisticFlip(condition, point, res.request.state === "running" ? "solving" : "queued");
         setActionNotice(
           res.created
-            ? "URANS full requested — scheduled after all RANS gaps"
-            : `already requested — the open full request is reused (${res.request.state})`,
+            ? "final verification requested — fast URANS runs first when needed"
+            : `already requested — the open final-verification request is reused (${res.request.state})`,
         );
         void refresh({ quiet: true });
         return true;

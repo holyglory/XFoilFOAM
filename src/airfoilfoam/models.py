@@ -137,6 +137,13 @@ class FailureDisposition(str, Enum):
     infrastructure = "infrastructure"
 
 
+class ContinuationFailureKind(str, Enum):
+    """Whether retrying the same immutable continuation address can recover."""
+
+    transient = "transient"
+    permanent = "permanent"
+
+
 class RansFailurePolicy(str, Enum):
     """Action after a qualifying low-AoA hard RANS failure in a marched polar."""
 
@@ -715,6 +722,14 @@ class PolarRequest(BaseModel):
         "worker reject a mismatch before solving so requested capability cannot be "
         "mistaken for execution provenance during a rolling deployment.",
     )
+    expected_urans_recovery_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Controller-required durable URANS recovery contract. Set only for "
+        "automatic same-case continuation or corrective final-URANS recovery. The "
+        "API and worker reject a mismatch before CFD so a legacy engine cannot "
+        "consume newly reopened recovery work during a rolling deployment.",
+    )
     expected_engine: Optional[EngineIdentity] = Field(
         default=None,
         description="Exact logical solver implementation required by the controller. "
@@ -1101,6 +1116,11 @@ class JobStatus(BaseModel):
         description="Machine-readable terminal job failure class when execution ended "
         "before per-angle attempt evidence existed.",
     )
+    continuation_failure_kind: Optional[ContinuationFailureKind] = Field(
+        default=None,
+        description="For continuation-stage failures, whether the same immutable "
+        "source may recover after an operational change or is permanently invalid.",
+    )
 
 
 class JobResult(BaseModel):
@@ -1142,4 +1162,9 @@ class JobResult(BaseModel):
         default=None,
         description="Machine-readable terminal job failure class when execution ended "
         "before per-angle attempt evidence existed.",
+    )
+    continuation_failure_kind: Optional[ContinuationFailureKind] = Field(
+        default=None,
+        description="For continuation-stage failures, whether the same immutable "
+        "source may recover after an operational change or is permanently invalid.",
     )

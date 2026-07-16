@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from .. import __version__, physics
 from ..airfoil import load_airfoil
 from ..cache import EngineCache
-from ..capabilities import MESH_RECOVERY_VERSION
+from ..capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
 from ..config import get_settings
 from ..evidence_runtime import (
     ARCHIVE_MIME_TYPE,
@@ -392,6 +392,7 @@ def create_app() -> FastAPI:
             "version": __version__,
             "build_id": settings.build_id,
             "mesh_recovery_version": MESH_RECOVERY_VERSION,
+            "urans_recovery_version": URANS_RECOVERY_VERSION,
             "package_file": __file__,
             # A gateway advertises logical routing targets only. Exact runtime
             # provenance appears solely on worker-acknowledged status/results.
@@ -520,6 +521,23 @@ def create_app() -> FastAPI:
                         "Engine mesh-recovery capability changed before submission: "
                         f"requested v{request.expected_mesh_recovery_version}, "
                         f"API is v{MESH_RECOVERY_VERSION}. Refresh capability and retry."
+                    ),
+                },
+            )
+        if (
+            request.expected_urans_recovery_version is not None
+            and request.expected_urans_recovery_version != URANS_RECOVERY_VERSION
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "urans_recovery_version_mismatch",
+                    "requested_version": request.expected_urans_recovery_version,
+                    "actual_version": URANS_RECOVERY_VERSION,
+                    "message": (
+                        "Engine URANS-recovery capability changed before submission: "
+                        f"requested v{request.expected_urans_recovery_version}, "
+                        f"API is v{URANS_RECOVERY_VERSION}. Refresh capability and retry."
                     ),
                 },
             )
@@ -787,11 +805,31 @@ def create_app() -> FastAPI:
                     "status_active_aoa_deg": status.active_aoa_deg if status else None,
                     "status_cpu_tokens_waiting": status.cpu_tokens_waiting if status else None,
                     "status_cpu_tokens_held": status.cpu_tokens_held if status else None,
+                    "status_failure_disposition": (
+                        status.failure_disposition.value
+                        if status and status.failure_disposition
+                        else None
+                    ),
+                    "status_continuation_failure_kind": (
+                        status.continuation_failure_kind.value
+                        if status and status.continuation_failure_kind
+                        else None
+                    ),
                     "result_readable": result is not None,
                     "result_error": result_error,
                     "has_result": result is not None,
                     "result_state": result.state.value if result else None,
                     "result_message": result.message if result else None,
+                    "result_failure_disposition": (
+                        result.failure_disposition.value
+                        if result and result.failure_disposition
+                        else None
+                    ),
+                    "result_continuation_failure_kind": (
+                        result.continuation_failure_kind.value
+                        if result and result.continuation_failure_kind
+                        else None
+                    ),
                 }
             )
         return {"jobs": rows}

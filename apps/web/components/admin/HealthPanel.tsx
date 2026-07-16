@@ -3,8 +3,13 @@
 import { Activity, Cpu, HardDrive, MemoryStick, RefreshCw } from "lucide-react";
 import { type ReactNode, useCallback, useRef, useState } from "react";
 
-import { type AdminHealth, type AdminHealthSample, getAdminHealth } from "@/lib/admin";
+import {
+  type AdminHealth,
+  type AdminHealthSample,
+  getAdminHealth,
+} from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
+import { SolverIncidentPanel } from "./SolverIncidentPanel";
 import { usePoll } from "./campaigns/usePoll";
 
 const EMPTY = "--";
@@ -44,7 +49,11 @@ function formatAge(seconds: number): string {
 
 function formatTime(iso: string | null | undefined): string {
   if (!iso) return EMPTY;
-  return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(iso));
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(iso));
 }
 
 function chartSeries(
@@ -57,7 +66,9 @@ function chartSeries(
   });
 }
 
-function lastRealPoint(values: Array<number | null>): { index: number; value: number } | null {
+function lastRealPoint(
+  values: Array<number | null>,
+): { index: number; value: number } | null {
   for (let index = values.length - 1; index >= 0; index -= 1) {
     const value = values[index];
     if (isReal(value)) return { index, value };
@@ -86,8 +97,13 @@ function MetricChart({
   const plotWidth = width - pad.left - pad.right;
   const plotHeight = height - pad.top - pad.bottom;
 
-  const xFor = (index: number) => pad.left + (values.length <= 1 ? plotWidth : (index / (values.length - 1)) * plotWidth);
-  const yFor = (value: number) => pad.top + ((maxValue - value) / span) * plotHeight;
+  const xFor = (index: number) =>
+    pad.left +
+    (values.length <= 1
+      ? plotWidth
+      : (index / (values.length - 1)) * plotWidth);
+  const yFor = (value: number) =>
+    pad.top + ((maxValue - value) / span) * plotHeight;
 
   const segments: string[] = [];
   let current = "";
@@ -104,35 +120,118 @@ function MetricChart({
   const latest = lastRealPoint(values);
 
   return (
-    <div className="health-chart" data-testid={`health-chart-${label.toLowerCase()}`}>
-      <svg role="img" aria-label={`${label} recent stats`} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+    <div
+      className="health-chart"
+      data-testid={`health-chart-${label.toLowerCase()}`}
+    >
+      <svg
+        role="img"
+        aria-label={`${label} recent stats`}
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+      >
         <title>{label} recent stats</title>
-        <rect x="0" y="0" width={width} height={height} rx="8" fill={C.panel2} />
-        <line x1={pad.left} x2={width - pad.right} y1={pad.top} y2={pad.top} stroke={C.grid} strokeWidth="1" />
-        <line x1={pad.left} x2={width - pad.right} y1={pad.top + plotHeight / 2} y2={pad.top + plotHeight / 2} stroke={C.grid} strokeWidth="1" />
-        <line x1={pad.left} x2={width - pad.right} y1={height - pad.bottom} y2={height - pad.bottom} stroke={C.axis} strokeWidth="1" />
-        <text x="10" y={pad.top + 4} fill={C.dim} fontFamily={MONO} fontSize="10">
+        <rect
+          x="0"
+          y="0"
+          width={width}
+          height={height}
+          rx="8"
+          fill={C.panel2}
+        />
+        <line
+          x1={pad.left}
+          x2={width - pad.right}
+          y1={pad.top}
+          y2={pad.top}
+          stroke={C.grid}
+          strokeWidth="1"
+        />
+        <line
+          x1={pad.left}
+          x2={width - pad.right}
+          y1={pad.top + plotHeight / 2}
+          y2={pad.top + plotHeight / 2}
+          stroke={C.grid}
+          strokeWidth="1"
+        />
+        <line
+          x1={pad.left}
+          x2={width - pad.right}
+          y1={height - pad.bottom}
+          y2={height - pad.bottom}
+          stroke={C.axis}
+          strokeWidth="1"
+        />
+        <text
+          x="10"
+          y={pad.top + 4}
+          fill={C.dim}
+          fontFamily={MONO}
+          fontSize="10"
+        >
           {formatPct(maxValue, maxValue >= 100 ? 0 : 1)}
         </text>
-        <text x="10" y={height - pad.bottom + 4} fill={C.dim} fontFamily={MONO} fontSize="10">
+        <text
+          x="10"
+          y={height - pad.bottom + 4}
+          fill={C.dim}
+          fontFamily={MONO}
+          fontSize="10"
+        >
           0%
         </text>
         {segments.length > 0 ? (
           segments.map((points, index) => (
-            <polyline key={index} points={points} fill="none" stroke={color} strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+            <polyline
+              key={index}
+              points={points}
+              fill="none"
+              stroke={color}
+              strokeWidth="2.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           ))
         ) : (
-          <text x={width / 2} y={height / 2} textAnchor="middle" fill={C.dim} fontFamily={MONO} fontSize="11">
+          <text
+            x={width / 2}
+            y={height / 2}
+            textAnchor="middle"
+            fill={C.dim}
+            fontFamily={MONO}
+            fontSize="11"
+          >
             No samples yet
           </text>
         )}
         {latest && (
-          <circle cx={xFor(latest.index)} cy={yFor(latest.value)} r="3.5" fill={color} stroke={C.panel2} strokeWidth="2" />
+          <circle
+            cx={xFor(latest.index)}
+            cy={yFor(latest.value)}
+            r="3.5"
+            fill={color}
+            stroke={C.panel2}
+            strokeWidth="2"
+          />
         )}
-        <text x={pad.left} y={height - 8} fill={C.dim} fontFamily={MONO} fontSize="10">
+        <text
+          x={pad.left}
+          y={height - 8}
+          fill={C.dim}
+          fontFamily={MONO}
+          fontSize="10"
+        >
           recent
         </text>
-        <text x={width - pad.right} y={height - 8} textAnchor="end" fill={C.dim} fontFamily={MONO} fontSize="10">
+        <text
+          x={width - pad.right}
+          y={height - 8}
+          textAnchor="end"
+          fill={C.dim}
+          fontFamily={MONO}
+          fontSize="10"
+        >
           now
         </text>
       </svg>
@@ -201,7 +300,10 @@ export function HealthPanel() {
   const sampleCount = averages?.sampleCount ?? 0;
   const cpuValues = chartSeries(samples, (sample) => sample.cpu.loadPct);
   const memoryValues = chartSeries(samples, (sample) => sample.memory.usedPct);
-  const storageValues = chartSeries(samples, (sample) => sample.storage?.usedPct ?? null);
+  const storageValues = chartSeries(
+    samples,
+    (sample) => sample.storage?.usedPct ?? null,
+  );
   const cpuDomainMax = Math.max(100, ...cpuValues.filter(isReal));
 
   return (
@@ -311,6 +413,9 @@ export function HealthPanel() {
           font-size: 11px;
           color: ${C.red};
         }
+        .health-incidents {
+          margin-bottom: 12px;
+        }
         @media (max-width: 980px) {
           .health-grid {
             grid-template-columns: minmax(0, 1fr);
@@ -327,12 +432,29 @@ export function HealthPanel() {
               : "Loading host stats"}
           </div>
         </div>
-        <button type="button" className="health-refresh" aria-label="Refresh health" title="Refresh health" disabled={busy} onClick={() => void refresh()}>
+        <button
+          type="button"
+          className="health-refresh"
+          aria-label="Refresh health"
+          title="Refresh health"
+          disabled={busy}
+          onClick={() => void refresh()}
+        >
           <RefreshCw size={15} />
         </button>
       </div>
 
       {err && <div className="health-error">{err}</div>}
+
+      {health && (
+        <div className="health-incidents">
+          <SolverIncidentPanel
+            summary={health.solverIncidents}
+            surface="health"
+            showClear
+          />
+        </div>
+      )}
 
       <div className="health-grid">
         <MetricCard
@@ -351,7 +473,12 @@ export function HealthPanel() {
               : "24h avg waiting"
           }
         >
-          <MetricChart label="CPU" values={cpuValues} color={C.teal} domainMax={cpuDomainMax} />
+          <MetricChart
+            label="CPU"
+            values={cpuValues}
+            color={C.teal}
+            domainMax={cpuDomainMax}
+          />
         </MetricCard>
 
         <MetricCard
@@ -364,7 +491,11 @@ export function HealthPanel() {
               ? `${formatBytes(current.memory.usedBytes)} used / ${formatBytes(current.memory.totalBytes)} total`
               : "Waiting for host sample"
           }
-          average={averages ? `24h avg ${formatPct(averages.memoryUsedPct, 0)}` : "24h avg waiting"}
+          average={
+            averages
+              ? `24h avg ${formatPct(averages.memoryUsedPct, 0)}`
+              : "24h avg waiting"
+          }
         >
           <MetricChart label="Memory" values={memoryValues} color={C.amber} />
         </MetricCard>
@@ -381,15 +512,34 @@ export function HealthPanel() {
                 ? current.storageError
                 : "Waiting for host sample"
           }
-          average={current?.storage ? `Path ${current.storage.path}` : "Path unavailable"}
+          average={
+            current?.storage
+              ? `Path ${current.storage.path}`
+              : "Path unavailable"
+          }
         >
-          <MetricChart label="Storage" values={storageValues} color={C.redText} />
+          <MetricChart
+            label="Storage"
+            values={storageValues}
+            color={C.redText}
+          />
         </MetricCard>
       </div>
 
-      <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8, fontFamily: MONO, fontSize: 10.5, color: C.dim }}>
+      <div
+        style={{
+          marginTop: 12,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          fontFamily: MONO,
+          fontSize: 10.5,
+          color: C.dim,
+        }}
+      >
         <Activity size={13} />
-        CPU percentage is the 1-minute load average divided by available CPU count.
+        CPU percentage is the 1-minute load average divided by available CPU
+        count.
       </div>
     </div>
   );

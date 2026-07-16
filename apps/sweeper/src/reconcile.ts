@@ -6,6 +6,8 @@ import {
   type DB,
   enqueuePrecalcVerifications,
   ensurePrecalcObligations,
+  FINAL_URANS_OUTCOMES,
+  FINAL_URANS_RETRY_BACKOFF_MS,
   inspectParentRansPolarPromotions,
   laneKeyId,
   laneTick,
@@ -16,10 +18,15 @@ import {
   recomputeProgressForCampaign,
   recordRansPolarPromotion,
   recordPrecalcObligationSubmission,
+  recordSolverIncidentInTransaction,
+  refreshFullUransRequestState,
+  refreshFullUransRequestsForVerifyQueueInTransaction,
   refreshPrecalcSettlementCampaigns,
   refreshPolarCacheForRevision,
   resultAttempts,
+  resultClassifications,
   results,
+  resolveSolverIncidentsForOwnerInTransaction,
   settlePrecalcObligationsForJob,
   settlePrecalcObligationsForJobInTransaction,
   simCampaignLanes,
@@ -29,7 +36,9 @@ import {
   syncSweepPromises,
   simUransRequests,
   simUransVerifyQueue,
+  solverIncidentReason,
   sweeperState,
+  URANS_RECOVERY_REMEDIATION_VERSION,
 } from "@aerodb/db";
 import {
   EVIDENCE_BACKED_WAVE2_RESULT_SQL,
@@ -40,6 +49,9 @@ import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
   DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER,
   DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER,
+  MISSING_URANS_VIDEO_REASON,
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
 } from "@aerodb/core";
 import {
   EngineError,
@@ -58,6 +70,7 @@ import {
 } from "@aerodb/engine-client";
 import {
   and,
+  desc,
   eq,
   inArray,
   isNotNull,
@@ -75,7 +88,9 @@ import {
 } from "./build-request";
 import {
   engineMeshRecoveryVersion,
+  engineUransRecoveryVersion,
   parsedMeshRecoveryVersion,
+  supportsDurableUransRecovery,
 } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
 import {
@@ -589,12 +604,19 @@ export async function enqueueVerificationsForJob(
   if (!cells.length) return;
 
   let requestOwners: Array<string | null> | null = null;
+  let fullRequestId: string | null = null;
   if (!job.campaignId && typeof payload.uransRequestId === "string") {
     const [request] = await db
-      .select({ backgroundOwner: simUransRequests.backgroundOwner })
+      .select({
+        backgroundOwner: simUransRequests.backgroundOwner,
+        fidelity: simUransRequests.fidelity,
+      })
       .from(simUransRequests)
       .where(eq(simUransRequests.id, payload.uransRequestId))
       .limit(1);
+    if (request?.fidelity === "full") {
+      fullRequestId = payload.uransRequestId;
+    }
     const owners = (await db.execute(sql`
       SELECT ownership.campaign_id
       FROM sim_urans_request_campaigns ownership
@@ -604,8 +626,12 @@ export async function enqueueVerificationsForJob(
         AND campaign.status IN ('active', 'attention', 'paused')
       ORDER BY ownership.campaign_id
     `)) as unknown as Array<{ campaign_id: string }>;
-    requestOwners = owners.map((owner) => owner.campaign_id);
-    if (request?.backgroundOwner) requestOwners.push(null);
+    requestOwners =
+      request?.fidelity === "full"
+        ? []
+        : owners.map((owner) => owner.campaign_id);
+    if (request?.fidelity !== "full" && request?.backgroundOwner)
+      requestOwners.push(null);
     // A missing request row cannot prove campaign provenance; preserve the
     // pre-existing fail-safe behavior and create an independent obligation.
     if (!request) requestOwners.push(null);
@@ -655,6 +681,27 @@ export async function enqueueVerificationsForJob(
   );
 
   for (const cell of cells) {
+    if (fullRequestId) {
+      try {
+        const enqueued = await enqueuePrecalcVerifications(db, {
+          airfoilId: job.airfoilId,
+          revisionId: cell.revisionId,
+          requestId: fullRequestId,
+          aoaDeg: cell.aoaDeg,
+        });
+        if (enqueued > 0) {
+          console.log(
+            `[sweeper] verify queue: enqueued ${enqueued} request-owned preliminary point(s) (job ${job.id}, request ${fullRequestId}, revision ${cell.revisionId}, aoa ${cell.aoaDeg})`,
+          );
+        }
+      } catch (e) {
+        console.error(
+          `[sweeper] request-owned verify enqueue FAILED (job ${job.id}, request ${fullRequestId}, revision ${cell.revisionId}, aoa ${cell.aoaDeg}): ${errorMessage(e)}`,
+        );
+        throw e;
+      }
+      continue;
+    }
     const verificationOwners = job.campaignId
       ? [job.campaignId]
       : (requestOwners ??
@@ -693,7 +740,12 @@ interface VerifyJobPayload {
   uransRequestId?: string;
   uransFidelity?: string;
   precalcObligationIds?: string[];
+  finalRecoveryMode?: "fresh" | "continuation";
+  continueFromResultAttemptId?: string;
 }
+
+const PRECALC_CONTINUATION_PERMANENT_INCIDENT_SIGNATURE =
+  "precalc-continuation-permanent-v1";
 
 function finiteOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -706,42 +758,37 @@ function finiteOrNull(value: unknown): number | null {
  *    classification stays on the VERIFIED row (it IS the results row now);
  *    the machine disagreement is surfaced by the queue state and deltas
  *    without mutating immutable solver-attempt warnings. A failed verify solve
- *    cancels the item loudly (the failure evidence remains in attempt history).
- *  - admin request jobs (payload.uransRequestId): flip the request done. */
+ *    enters bounded automatic recovery or becomes critically blocked (the
+ *    failure evidence remains in attempt history).
+ *  - full admin requests are aggregate projections of their preliminary and
+ *    final per-point children; no job flips the aggregate directly to done. */
 async function settleUransLadderForJob(
   db: DB,
   job: SimJobRow,
   opts: {
     terminalError?: string | null;
     terminalFailureDisposition?: JobResult["failure_disposition"];
+    terminalContinuationFailureKind?: JobResult["continuation_failure_kind"];
   } = {},
 ): Promise<void> {
   const payload = requestPayload(job) as VerifyJobPayload;
   const precalcSettlement = await settlePrecalcObligationsForJob(db, job, {
     terminalError: opts.terminalError ?? null,
     terminalFailureDisposition: opts.terminalFailureDisposition ?? null,
+    terminalContinuationFailureKind:
+      opts.terminalContinuationFailureKind ?? null,
   });
   if (precalcSettlement.blocked.length) {
+    const continuationIncident =
+      precalcSettlement.continuationPermanent.length > 0
+        ? `; ${precalcSettlement.continuationPermanent.length} permanent continuation source incident(s); incident_signature=${PRECALC_CONTINUATION_PERMANENT_INCIDENT_SIGNATURE}`
+        : "";
     console.error(
-      `[sweeper] PRECALC OBLIGATION BLOCKED (job ${job.id}): ${precalcSettlement.blocked.length} physical cell(s) exhausted or deterministic; canonical evidence retained and no human review assigned`,
+      `[sweeper] PRECALC OBLIGATION BLOCKED (job ${job.id}): ${precalcSettlement.blocked.length} physical cell(s) exhausted, deterministic, or permanently unrestorable; canonical evidence retained and no human review assigned${continuationIncident}`,
     );
   }
   if (payload.uransRequestId) {
-    const physicalPrecalcRequest =
-      payload.uransFidelity === "precalc" &&
-      Array.isArray(payload.precalcObligationIds) &&
-      payload.precalcObligationIds.length > 0;
-    if (!physicalPrecalcRequest) {
-      await db
-        .update(simUransRequests)
-        .set({ state: "done", simJobId: job.id })
-        .where(
-          and(
-            eq(simUransRequests.id, payload.uransRequestId),
-            eq(simUransRequests.state, "running"),
-          ),
-        );
-    }
+    await refreshFullUransRequestState(db, payload.uransRequestId);
   }
   if (!payload.verifyQueueItemId) return;
   await db.transaction(async (rawTx) => {
@@ -761,7 +808,7 @@ async function settleUransLadderForJob(
 
     const [verified] = await tx
       .select({
-        id: results.id,
+        resultId: resultAttempts.resultId,
         attemptId: resultAttempts.id,
         attemptSimJobId: resultAttempts.simJobId,
         status: resultAttempts.status,
@@ -772,40 +819,79 @@ async function settleUransLadderForJob(
         cl: resultAttempts.cl,
         cd: resultAttempts.cd,
         cm: resultAttempts.cm,
+        engineJobId: resultAttempts.engineJobId,
+        engineCaseSlug: resultAttempts.engineCaseSlug,
+        solverImplementationId: resultAttempts.solverImplementationId,
+        error: resultAttempts.error,
+        qualityWarnings: resultAttempts.qualityWarnings,
+        failureDisposition: sql<
+          string | null
+        >`${resultAttempts.evidencePayload} ->> 'failure_disposition'`,
+        classification: resultClassifications.state,
+        classificationReasons: resultClassifications.reasons,
       })
-      .from(results)
-      .innerJoin(
-        resultAttempts,
-        and(
-          eq(resultAttempts.id, results.currentResultAttemptId),
-          eq(resultAttempts.resultId, results.id),
-        ),
+      .from(resultAttempts)
+      .leftJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
       )
       .where(
         and(
-          eq(results.airfoilId, item.airfoilId),
-          eq(results.simulationPresetRevisionId, item.revisionId),
-          eq(results.aoaDeg, item.aoaDeg),
+          eq(resultAttempts.simJobId, job.id),
+          eq(resultAttempts.airfoilId, item.airfoilId),
+          eq(resultAttempts.simulationPresetRevisionId, item.revisionId),
+          eq(resultAttempts.aoaDeg, item.aoaDeg),
+          sql`${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_full'`,
         ),
       )
+      .orderBy(desc(resultAttempts.createdAt), desc(resultAttempts.id))
       .limit(1);
-    // The selected immutable attempt is the judge. A partially-failed job whose
-    // own verify angle solved can complete the item; another generation at the
-    // same cell can never stand in for this job.
+    // The exact immutable attempt is the judge even when the replace guard
+    // correctly leaves the accepted preliminary generation selected. Another
+    // generation at the same cell can never stand in for this job.
     const verifiedSolved = Boolean(
       verified &&
       verified.attemptSimJobId === job.id &&
       verified.status === "done" &&
       verified.source === "solved" &&
-      verified.fidelity === "urans_full",
+      verified.fidelity === "urans_full" &&
+      verified.classification === "accepted" &&
+      verified.resultId,
     );
-    if (!verifiedSolved || !verified) {
-      console.error(
-        `[sweeper] URANS verify solve did not complete with this job's selected full-fidelity attempt (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}) — item cancelled; immutable attempt/job evidence is retained`,
-      );
+    const precalc = payload.verifyPrecalc ?? {};
+    const deltaOf = (a: unknown, b: number | null): number | null => {
+      const pa = finiteOrNull(a);
+      return pa !== null && b !== null ? b - pa : null;
+    };
+    if (verifiedSolved && verified?.resultId) {
+      const deltaCl = deltaOf(precalc.cl, finiteOrNull(verified.cl));
+      const deltaCd = deltaOf(precalc.cd, finiteOrNull(verified.cd));
+      const deltaCm = deltaOf(precalc.cm, finiteOrNull(verified.cm));
+      const disagreed =
+        (deltaCl !== null && Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
+        (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
+      const isContinuation =
+        payload.finalRecoveryMode === "continuation" ||
+        typeof payload.continueFromResultAttemptId === "string";
       await tx
         .update(simUransVerifyQueue)
-        .set({ state: "cancelled", verifyResultId: null })
+        .set({
+          state: disagreed ? "disagreed" : "done",
+          simJobId: job.id,
+          verifyResultId: verified.resultId,
+          deltaCl,
+          deltaCd,
+          deltaCm,
+          freshAttemptCount: item.freshAttemptCount + (isContinuation ? 0 : 1),
+          continuationAttemptCount:
+            item.continuationAttemptCount + (isContinuation ? 1 : 0),
+          latestResultAttemptId: verified.attemptId,
+          nextSubmitAt: null,
+          lastOutcome: disagreed
+            ? FINAL_URANS_OUTCOMES.disagreed
+            : FINAL_URANS_OUTCOMES.accepted,
+          lastError: null,
+        })
         .where(
           and(
             eq(simUransVerifyQueue.id, item.id),
@@ -813,27 +899,150 @@ async function settleUransLadderForJob(
             eq(simUransVerifyQueue.simJobId, job.id),
           ),
         );
+      await resolveSolverIncidentsForOwnerInTransaction(tx, {
+        verifyQueueId: item.id,
+      });
+      await refreshFullUransRequestsForVerifyQueueInTransaction(tx, item.id);
+      if (disagreed) {
+        console.error(
+          `[sweeper] urans-verify-disagreement: full-fidelity verification differs from precalc beyond bounds ` +
+            `(ΔCl=${deltaCl?.toFixed(4) ?? "n/a"}, ΔCd=${deltaCd?.toFixed(5) ?? "n/a"}; limits ${URANS_VERIFY_DELTA_CL_LIMIT}/${URANS_VERIFY_DELTA_CD_LIMIT}) — machine disagreement retained on queue item ${item.id}, selected attempt ${verified.attemptId}`,
+        );
+      }
       return;
     }
-    const precalc = payload.verifyPrecalc ?? {};
-    const deltaOf = (a: unknown, b: number | null): number | null => {
-      const pa = finiteOrNull(a);
-      return pa !== null && b !== null ? b - pa : null;
-    };
-    const deltaCl = deltaOf(precalc.cl, finiteOrNull(verified.cl));
-    const deltaCd = deltaOf(precalc.cd, finiteOrNull(verified.cd));
-    const deltaCm = deltaOf(precalc.cm, finiteOrNull(verified.cm));
-    const disagreed =
-      (deltaCl !== null && Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
-      (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
+
+    const [owner] = (await tx.execute(sql`
+      SELECT (
+        q.background_owner
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue_campaigns ownership
+          JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+          WHERE ownership.queue_id = q.id
+            AND ownership.state = 'active'
+            AND campaign.status IN ('active', 'attention', 'paused')
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue_requests coverage
+          JOIN sim_urans_requests request ON request.id = coverage.request_id
+          WHERE coverage.queue_id = q.id
+            AND request.fidelity = 'full'
+            AND request.state IN ('pending', 'running')
+            AND (
+              request.background_owner
+              OR EXISTS (
+                SELECT 1
+                FROM sim_urans_request_campaigns request_ownership
+                JOIN sim_campaigns campaign
+                  ON campaign.id = request_ownership.campaign_id
+                WHERE request_ownership.request_id = request.id
+                  AND request_ownership.state = 'active'
+                  AND campaign.status IN ('active', 'attention', 'paused')
+              )
+            )
+        )
+      ) AS live
+      FROM sim_urans_verify_queue q
+      WHERE q.id = ${item.id}
+    `)) as unknown as Array<{ live: boolean }>;
+    const isContinuation =
+      payload.finalRecoveryMode === "continuation" ||
+      typeof payload.continueFromResultAttemptId === "string";
+    const continuationFailureKind = isContinuation
+      ? (opts.terminalContinuationFailureKind ?? null)
+      : null;
+    const failureDisposition =
+      verified?.failureDisposition ?? opts.terminalFailureDisposition ?? null;
+    const infrastructure =
+      continuationFailureKind === "transient" ||
+      failureDisposition === "infrastructure";
+    const deterministic = failureDisposition === "deterministic_mesh";
+    const consumesRecoveryAttempt = Boolean(
+      !infrastructure &&
+      !deterministic &&
+      (verified || job.submittedAt || job.engineJobId),
+    );
+    const freshAttemptCount =
+      item.freshAttemptCount +
+      (!isContinuation && consumesRecoveryAttempt ? 1 : 0);
+    const continuationAttemptCount =
+      item.continuationAttemptCount +
+      (isContinuation && consumesRecoveryAttempt ? 1 : 0);
+    const restartable = Boolean(
+      verified?.engineJobId &&
+      verified.engineCaseSlug &&
+      (verified.qualityWarnings ?? []).some(
+        (warning) =>
+          warning.includes(URANS_BUDGET_STOP_MARKER) ||
+          warning.includes(URANS_CONTINUATION_REQUIRED_MARKER),
+      ),
+    );
+    const mediaOnly =
+      verified?.classification === "rejected" &&
+      verified.classificationReasons?.length === 1 &&
+      verified.classificationReasons[0] === MISSING_URANS_VIDEO_REASON;
+    const lastError =
+      verified?.error?.trim() ||
+      verified?.classificationReasons?.join(", ") ||
+      opts.terminalError?.trim() ||
+      "full URANS completed without publishable evidence";
+
+    let state: "pending" | "blocked" | "cancelled";
+    let lastOutcome: string;
+    let nextSubmitAt: Date | null = null;
+    if (!owner?.live) {
+      state = "cancelled";
+      lastOutcome = FINAL_URANS_OUTCOMES.ownerless;
+    } else if (mediaOnly && verified) {
+      state = "pending";
+      lastOutcome = FINAL_URANS_OUTCOMES.mediaRepairPending;
+    } else if (infrastructure) {
+      state = "pending";
+      lastOutcome = isContinuation
+        ? FINAL_URANS_OUTCOMES.continuationRetryWait
+        : FINAL_URANS_OUTCOMES.infrastructureRetryWait;
+      nextSubmitAt = new Date(Date.now() + FINAL_URANS_RETRY_BACKOFF_MS);
+    } else if (deterministic) {
+      state = "blocked";
+      lastOutcome = FINAL_URANS_OUTCOMES.deterministicFailure;
+    } else if (
+      continuationFailureKind === "permanent" &&
+      freshAttemptCount < item.maxFreshAttempts
+    ) {
+      state = "pending";
+      lastOutcome = FINAL_URANS_OUTCOMES.freshRetryPending;
+    } else if (
+      continuationFailureKind === "permanent" &&
+      freshAttemptCount >= item.maxFreshAttempts
+    ) {
+      state = "blocked";
+      lastOutcome = FINAL_URANS_OUTCOMES.continuationPermanentFailure;
+    } else if (restartable && continuationAttemptCount < freshAttemptCount) {
+      state = "pending";
+      lastOutcome = FINAL_URANS_OUTCOMES.continuationPending;
+    } else if (freshAttemptCount < item.maxFreshAttempts) {
+      state = "pending";
+      lastOutcome = FINAL_URANS_OUTCOMES.freshRetryPending;
+    } else {
+      state = "blocked";
+      lastOutcome = FINAL_URANS_OUTCOMES.recoveryExhausted;
+    }
+
     await tx
       .update(simUransVerifyQueue)
       .set({
-        state: disagreed ? "disagreed" : "done",
-        verifyResultId: verified.id,
-        deltaCl,
-        deltaCd,
-        deltaCm,
+        state,
+        simJobId: state === "pending" ? null : job.id,
+        verifyResultId: null,
+        freshAttemptCount,
+        continuationAttemptCount,
+        latestResultAttemptId:
+          verified?.attemptId ?? item.latestResultAttemptId,
+        nextSubmitAt,
+        lastOutcome,
+        lastError,
       })
       .where(
         and(
@@ -842,10 +1051,64 @@ async function settleUransLadderForJob(
           eq(simUransVerifyQueue.simJobId, job.id),
         ),
       );
-    if (disagreed) {
+    if (owner?.live && state !== "cancelled") {
+      let solverImplementationId =
+        verified?.solverImplementationId ?? job.solverImplementationId;
+      if (!solverImplementationId) {
+        const [revision] = await tx
+          .select({
+            solverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+          })
+          .from(simulationPresetRevisions)
+          .where(eq(simulationPresetRevisions.id, item.revisionId))
+          .limit(1);
+        solverImplementationId = revision?.solverImplementationId ?? null;
+      }
+      if (!solverImplementationId) {
+        throw new Error(
+          `final verify item ${item.id} has no solver implementation for incident attribution`,
+        );
+      }
+      const reason = solverIncidentReason(
+        verified?.classificationReasons,
+        continuationFailureKind === "permanent"
+          ? "continuation-source-unavailable"
+          : failureDisposition && failureDisposition !== "none"
+            ? failureDisposition
+            : mediaOnly
+              ? MISSING_URANS_VIDEO_REASON
+              : "non-publishable-evidence",
+      );
+      await recordSolverIncidentInTransaction(tx, {
+        stage: "final",
+        reason,
+        severity: state === "blocked" ? "critical" : "warning",
+        owner: { verifyQueueId: item.id },
+        solverImplementationId,
+        occurrenceKey: `final:${item.id}:${verified?.attemptId ?? job.id}:${lastOutcome}`,
+        remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+        simJobId: job.id,
+        resultAttemptId: verified?.attemptId ?? null,
+        metadata: {
+          lastOutcome,
+          classificationReasons: verified?.classificationReasons ?? [],
+          failureDisposition,
+          continuationFailureKind,
+          freshAttemptCount,
+          maxFreshAttempts: item.maxFreshAttempts,
+          continuationAttemptCount,
+        },
+      });
+    }
+    await refreshFullUransRequestsForVerifyQueueInTransaction(tx, item.id);
+    if (state === "blocked") {
       console.error(
-        `[sweeper] urans-verify-disagreement: full-fidelity verification differs from precalc beyond bounds ` +
-          `(ΔCl=${deltaCl?.toFixed(4) ?? "n/a"}, ΔCd=${deltaCd?.toFixed(5) ?? "n/a"}; limits ${URANS_VERIFY_DELTA_CL_LIMIT}/${URANS_VERIFY_DELTA_CD_LIMIT}) — machine disagreement retained on queue item ${item.id}, selected attempt ${verified.attemptId}`,
+        `[sweeper] FINAL URANS CRITICAL (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}): ${lastOutcome}; ${lastError}. Accepted preliminary evidence remains selected.`,
+      );
+    } else if (state === "pending") {
+      console.log(
+        `[sweeper] final URANS recovery queued (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}): ${lastOutcome}; fresh ${freshAttemptCount}/${item.maxFreshAttempts}, continuation ${continuationAttemptCount}/${freshAttemptCount}`,
       );
     }
   });
@@ -1521,6 +1784,13 @@ export async function submitUransRetryForJob(
     recordRoutesOnly?: boolean;
     /** Live engine capability prepared by the bounded scheduler tick. */
     meshRecoveryVersion?: number;
+    /** Live durable cross-job URANS recovery contract. Legacy engines may
+     * still run fresh work, but cannot consume continuation recovery. */
+    uransRecoveryVersion?: number | null;
+    /** The capacity-bounded scheduler may admit this exact terminal-parent
+     * escalation while unrelated campaign RANS gaps remain. Direct ingest
+     * callers omit it and remain route-only. */
+    capacityScheduledEscalation?: boolean;
   } = {},
 ): Promise<void> {
   if (parent.wave !== 1 || parent.bcIds.length === 0) return;
@@ -1590,18 +1860,23 @@ export async function submitUransRetryForJob(
   } else if (!conditionMap && !parent.simulationPresetRevisionId) {
     return;
   }
-  // Fidelity ladder gate (contract 5): within a campaign, URANS (precalc)
-  // work is gated until the campaign has ZERO open RANS gaps. Gated parents
-  // are re-attempted by the sweeper's ladder tick once the gaps close.
-  const campaignGated = Boolean(
+  // Direct ingest never starts a child outside scheduler capacity. The
+  // capacity-bounded ladder may, however, admit the exact rejected angle from
+  // this terminal parent without waiting for unrelated campaign RANS cells.
+  // Its caller alternates with ordinary RANS admission so neither tier
+  // starves. Conditional whole-polar widening remains ledger-authorized only.
+  const campaignHasRansBacklog = Boolean(
     parent.campaignId && (await campaignHasOpenRansGaps(db, parent.campaignId)),
   );
+  const campaignGated =
+    campaignHasRansBacklog && !opts.capacityScheduledEscalation;
   if (campaignGated) {
     console.log(
-      `[sweeper] URANS submission for job ${parent.id} is gated: campaign ${parent.campaignId} still has open RANS gaps; durable retry routing is recorded before deferral`,
+      `[sweeper] URANS submission for job ${parent.id} is route-only during ingest: campaign ${parent.campaignId} still has open RANS gaps; the capacity scheduler will admit its exact preliminary angle`,
     );
   }
   let meshRecoveryVersion = opts.meshRecoveryVersion;
+  let uransRecoveryVersion = opts.uransRecoveryVersion;
   const maySubmitNow =
     !opts.recordPromotionsOnly && !opts.recordRoutesOnly && !campaignGated;
   if (meshRecoveryVersion === undefined && maySubmitNow) {
@@ -1613,6 +1888,9 @@ export async function submitUransRetryForJob(
       return;
     }
     meshRecoveryVersion = probed;
+  }
+  if (uransRecoveryVersion === undefined && maySubmitNow) {
+    uransRecoveryVersion = await engineUransRecoveryVersion(engine);
   }
   // Record-only/gated passes never cross the engine boundary. Version zero
   // preserves the legacy terminal fence until a capacity-bounded tick probes
@@ -1627,7 +1905,11 @@ export async function submitUransRetryForJob(
       parent,
       conditionMap,
       campaignGated,
-      { ...opts, meshRecoveryVersion: effectiveMeshRecoveryVersion },
+      {
+        ...opts,
+        meshRecoveryVersion: effectiveMeshRecoveryVersion,
+        uransRecoveryVersion,
+      },
     );
     return;
   }
@@ -1764,12 +2046,25 @@ export async function submitUransRetryForJob(
   );
   if (opts.recordRoutesOnly) return;
   if (campaignGated) return;
+  const continuations = await precalcContinuationsForObligations(
+    db,
+    obligations
+      .filter((obligation) => obligation.state === "pending")
+      .map((obligation) => obligation.id),
+  );
+  const continuationIds = new Set(
+    continuations.map((continuation) => continuation.obligationId),
+  );
+  const durableRecoveryAvailable =
+    supportsDurableUransRecovery(uransRecoveryVersion);
   const schedulableByAoa = new Map(
     obligations
       .filter(
         (obligation) =>
           obligation.state === "pending" &&
-          obligation.attemptCount < obligation.maxAttempts &&
+          (continuationIds.has(obligation.id)
+            ? durableRecoveryAvailable
+            : obligation.attemptCount < obligation.maxAttempts) &&
           (!obligation.nextSubmitAt ||
             new Date(obligation.nextSubmitAt).getTime() <= Date.now()),
       )
@@ -1778,11 +2073,11 @@ export async function submitUransRetryForJob(
   let aoas = retry.aoas.filter((aoa) => schedulableByAoa.has(aoa));
   if (!aoas.length) return;
   let obligationIds = aoas.map((aoa) => schedulableByAoa.get(aoa)!.id);
-  const continuations = await precalcContinuationsForObligations(
-    db,
-    obligationIds,
-  );
-  const continuation = continuations[0] ?? null;
+  const continuation = durableRecoveryAvailable
+    ? continuations.find((candidate) =>
+        obligationIds.includes(candidate.obligationId),
+      )
+    : undefined;
   if (continuation) {
     // One engine request can resume one saved case. Remaining cells stay
     // pending and are composed on later ladder ticks.
@@ -1815,6 +2110,7 @@ export async function submitUransRetryForJob(
   request.expected_execution_pool = executionPool.routingKey;
   request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;
   if (continuation) {
+    request.expected_urans_recovery_version = uransRecoveryVersion!;
     request.continue_from = {
       engine_job_id: continuation.engineJobId,
       case_slug: continuation.engineCaseSlug,
@@ -1859,6 +2155,7 @@ export async function submitUransRetryForJob(
           ? {
               continueFromResultAttemptId: continuation.resultAttemptId,
               budgetOverrideS: continuation.budgetOverrideS,
+              uransRecoveryVersion,
             }
           : {}),
         uransFidelity: "precalc",
@@ -1946,6 +2243,7 @@ async function submitCampaignUransRetries(
     recordPromotionsOnly?: boolean;
     recordRoutesOnly?: boolean;
     meshRecoveryVersion?: number;
+    uransRecoveryVersion?: number | null;
   },
 ): Promise<void> {
   const parentPayload = requestPayload(parent);
@@ -2095,12 +2393,26 @@ async function submitCampaignUransRetries(
     );
     if (opts.recordRoutesOnly) continue;
     if (campaignGated) continue;
+    const continuations = await precalcContinuationsForObligations(
+      db,
+      obligations
+        .filter((obligation) => obligation.state === "pending")
+        .map((obligation) => obligation.id),
+    );
+    const continuationIds = new Set(
+      continuations.map((continuation) => continuation.obligationId),
+    );
+    const durableRecoveryAvailable = supportsDurableUransRecovery(
+      opts.uransRecoveryVersion,
+    );
     const schedulableByAoa = new Map(
       obligations
         .filter(
           (obligation) =>
             obligation.state === "pending" &&
-            obligation.attemptCount < obligation.maxAttempts &&
+            (continuationIds.has(obligation.id)
+              ? durableRecoveryAvailable
+              : obligation.attemptCount < obligation.maxAttempts) &&
             (!obligation.nextSubmitAt ||
               new Date(obligation.nextSubmitAt).getTime() <= Date.now()),
         )
@@ -2109,11 +2421,11 @@ async function submitCampaignUransRetries(
     let retryAoas = retry.aoas.filter((aoa) => schedulableByAoa.has(aoa));
     if (!retryAoas.length) continue;
     let obligationIds = retryAoas.map((aoa) => schedulableByAoa.get(aoa)!.id);
-    const continuations = await precalcContinuationsForObligations(
-      db,
-      obligationIds,
-    );
-    const continuation = continuations[0] ?? null;
+    const continuation = durableRecoveryAvailable
+      ? continuations.find((candidate) =>
+          obligationIds.includes(candidate.obligationId),
+        )
+      : undefined;
     if (continuation) {
       retryAoas = [continuation.aoaDeg];
       obligationIds = [continuation.obligationId];
@@ -2140,6 +2452,7 @@ async function submitCampaignUransRetries(
     request.expected_execution_pool = executionPool.routingKey;
     request.expected_mesh_recovery_version = opts.meshRecoveryVersion ?? 0;
     if (continuation) {
+      request.expected_urans_recovery_version = opts.uransRecoveryVersion!;
       request.continue_from = {
         engine_job_id: continuation.engineJobId,
         case_slug: continuation.engineCaseSlug,
@@ -2183,6 +2496,7 @@ async function submitCampaignUransRetries(
             ? {
                 continueFromResultAttemptId: continuation.resultAttemptId,
                 budgetOverrideS: continuation.budgetOverrideS,
+                uransRecoveryVersion: opts.uransRecoveryVersion,
               }
             : {}),
           uransFidelity: "precalc",
@@ -2213,9 +2527,13 @@ async function submitCampaignUransRetries(
       console.log(
         `[sweeper] URANS retry submitted → engine ${submit.status.job_id} (sim_job ${job.id}, parent ${parent.id}, campaign ${parent.campaignId ?? "-"}, airfoil ${parent.airfoilId}, condition ${entry.conditionId}, precalc, angles [${retryAoas.join(", ")}])`,
       );
-      continue;
+      // One capacity-bounded ladder pass may admit only one physical child.
+      // A batched parent can contain many independently retryable conditions;
+      // continuing this loop would jump past maxConcurrentJobs and skip the
+      // promised RANS/PRECALC fairness handoff.
+      return;
     }
-    if (submit.kind === "submission_in_progress") continue;
+    if (submit.kind === "submission_in_progress") return;
     if (
       submit.kind !== "lifecycle_stopped" ||
       (await campaignIsPaused(db, parent.campaignId))
@@ -2283,7 +2601,17 @@ export async function settleCampaignAfterRefresh(
     ? sql`SELECT campaign_id FROM sim_urans_request_campaigns WHERE request_id::text = ${requestId}`
     : sql`SELECT NULL::uuid AS campaign_id WHERE false`;
   const verifyOwners = verifyQueueItemId
-    ? sql`SELECT campaign_id FROM sim_urans_verify_queue_campaigns WHERE queue_id::text = ${verifyQueueItemId}`
+    ? sql`
+        SELECT campaign_id
+        FROM sim_urans_verify_queue_campaigns
+        WHERE queue_id::text = ${verifyQueueItemId}
+        UNION
+        SELECT request_ownership.campaign_id
+        FROM sim_urans_verify_queue_requests coverage
+        JOIN sim_urans_request_campaigns request_ownership
+          ON request_ownership.request_id = coverage.request_id
+        WHERE coverage.queue_id::text = ${verifyQueueItemId}
+      `
     : sql`SELECT NULL::uuid AS campaign_id WHERE false`;
   // Association rows are authoritative. The physical-cell fallback also
   // catches a campaign attached after a background/shared solve was already
@@ -2362,7 +2690,7 @@ async function autoRetryFailedPointsForJob(
     }
     for (const cell of outcome.suppressed) {
       console.error(
-        `[sweeper] AUTO-RETRY SUPPRESSED: deterministic mesh QA blocker on immutable precalc setup (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — unchanged retry would reproduce the same mesh; evidence retained, point stays blocked until the mesh setup is repaired`,
+        `[sweeper] AUTO-RETRY SUPPRESSED: deterministic mesh QA blocker on immutable solver setup (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — unchanged retry would reproduce the same mesh; evidence retained, point stays blocked until automatic mesh recovery or a setup correction is available`,
       );
     }
     for (const cell of outcome.terminalBlocked) {
@@ -2722,10 +3050,12 @@ async function ingestFailedEngineJob(
   msg: string,
   hooks: ReconcileOptions["testHooks"] = {},
   statusFailureDisposition: JobStatus["failure_disposition"] = null,
+  statusContinuationFailureKind: JobStatus["continuation_failure_kind"] = null,
 ): Promise<void> {
   const lease = await claimJobForIngest(db, job.id);
   if (!lease) return;
   let terminalFailureDisposition = statusFailureDisposition ?? null;
+  let terminalContinuationFailureKind = statusContinuationFailureKind ?? null;
   if (msg === WORKER_RESTART_ORPHAN_MESSAGE) {
     // Infrastructure interruption, not solver failure — release, never fail.
     await releaseWorkerRestartOrphan(db, engine, job, lease);
@@ -2744,6 +3074,7 @@ async function ingestFailedEngineJob(
     await settleUransLadderForJob(db, job, {
       terminalError: failure,
       terminalFailureDisposition,
+      terminalContinuationFailureKind,
     });
     await autoRetryFailedPointsForJob(db, job);
     if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
@@ -2783,6 +3114,7 @@ async function ingestFailedEngineJob(
     await settleUransLadderForJob(db, job, {
       terminalError: failure,
       terminalFailureDisposition,
+      terminalContinuationFailureKind,
     });
     await autoRetryFailedPointsForJob(db, job);
     if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
@@ -2792,6 +3124,8 @@ async function ingestFailedEngineJob(
   }
   terminalFailureDisposition =
     result.failure_disposition ?? terminalFailureDisposition;
+  terminalContinuationFailureKind =
+    result.continuation_failure_kind ?? terminalContinuationFailureKind;
   // The ENGINE's own failure message wins (gate incident 2026-07-07: the
   // runtime-probe dispatch passed the generic "engine job failed" fallback and
   // the real "All cases failed" never reached the evidence rows): prefer the
@@ -2838,6 +3172,7 @@ async function ingestFailedEngineJob(
         await settleUransLadderForJob(db, job, {
           terminalError: failure,
           terminalFailureDisposition,
+          terminalContinuationFailureKind,
         });
         logEngineJobFailed(
           job,
@@ -2866,6 +3201,7 @@ async function ingestFailedEngineJob(
       await settleUransLadderForJob(db, job, {
         terminalError: failure,
         terminalFailureDisposition,
+        terminalContinuationFailureKind,
       });
       logEngineJobFailed(
         job,
@@ -2905,6 +3241,7 @@ async function ingestFailedEngineJob(
     await settleUransLadderForJob(db, job, {
       terminalError: failure,
       terminalFailureDisposition,
+      terminalContinuationFailureKind,
     });
     logEngineJobFailed(
       job,
@@ -2951,6 +3288,7 @@ async function ingestFailedEngineJob(
     await settleUransLadderForJob(db, job, {
       terminalError: failure,
       terminalFailureDisposition,
+      terminalContinuationFailureKind,
     });
     await autoRetryFailedPointsForJob(db, job);
     if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
@@ -2989,6 +3327,7 @@ async function ingestResultFileIfReady(
       result.message ?? failedMessage,
       {},
       result.failure_disposition,
+      result.continuation_failure_kind,
     );
     return true;
   }
@@ -3157,6 +3496,7 @@ async function recoverFailedEngineJobs(
         status.message ?? "engine job failed",
         {},
         status.failure_disposition,
+        status.continuation_failure_kind,
       );
     }
   }
@@ -3211,6 +3551,13 @@ async function handlePollMiss(
         engine,
         job,
         runtime.result_message ?? runtime.status_message ?? "engine job failed",
+        {},
+        runtime.result_failure_disposition ??
+          runtime.status_failure_disposition ??
+          null,
+        runtime.result_continuation_failure_kind ??
+          runtime.status_continuation_failure_kind ??
+          null,
       );
     } else if (
       runtime.result_state === "running" &&
@@ -3389,6 +3736,12 @@ export async function reconcile(
             runtime.status_message ??
             "engine job failed",
           options.testHooks,
+          runtime.result_failure_disposition ??
+            runtime.status_failure_disposition ??
+            null,
+          runtime.result_continuation_failure_kind ??
+            runtime.status_continuation_failure_kind ??
+            null,
         );
         continue;
       } else if (
@@ -3463,6 +3816,7 @@ export async function reconcile(
         status.message ?? "engine job failed",
         options.testHooks,
         status.failure_disposition,
+        status.continuation_failure_kind,
       );
     }
   }

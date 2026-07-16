@@ -582,6 +582,14 @@ describe("campaign remediation summary", () => {
     const plans = await db.transaction(async (tx) => {
       await tx.execute(sql`SET LOCAL enable_seqscan = off`);
       return {
+        recoveryIndex: await tx.execute(sql`
+          SELECT indexdef
+          FROM pg_indexes
+          WHERE schemaname = 'public'
+            AND tablename = 'sim_precalc_obligations'
+            AND indexname =
+              'sim_precalc_obligations_mesh_recovery_candidate_idx'
+        `),
         recovery: await tx.execute(sql`
             EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, FORMAT JSON)
             SELECT obligation.id
@@ -606,10 +614,21 @@ describe("campaign remediation summary", () => {
           `),
       };
     });
-    const recoveryPlan = JSON.stringify(plans.recovery);
-    expect(recoveryPlan).toContain(
-      "sim_precalc_obligations_mesh_recovery_candidate_idx",
+    expect(plans.recoveryIndex).toHaveLength(1);
+    expect(JSON.stringify(plans.recoveryIndex)).toContain(
+      "last_outcome = 'deterministic_failure'",
     );
+    const recoveryPlan = JSON.stringify(plans.recovery);
+    // PostgreSQL may legitimately choose the broader submit-due index for a
+    // small, fully blocked fixture. The durable contract is that the dedicated
+    // The planner may choose either a direct Index Scan or a Bitmap Index Scan
+    // as table statistics change. Pin the exact partial index and reject a
+    // sequential scan instead of overfitting to one valid indexed plan shape.
+    expect(recoveryPlan).toContain(
+      '"Index Name":"sim_precalc_obligations_mesh_recovery_candidate_idx"',
+    );
+    expect(recoveryPlan).toContain('"Relation Name":"sim_precalc_obligations"');
+    expect(recoveryPlan).not.toContain('"Node Type":"Seq Scan"');
     const pollPlan = JSON.stringify(plans.poll);
     expect(pollPlan).toContain("sim_campaign_progress");
     expect(pollPlan).not.toContain("sim_precalc_obligations");
@@ -782,7 +801,7 @@ describe("campaign remediation summary", () => {
       airfoilId: asymId,
       speeds: [53.333],
       from: 0,
-      to: 7,
+      to: 8,
     });
     const revisionId = conditions[0]!.revisionId;
     await insertObligations(campaignId, asymId, [
@@ -844,13 +863,22 @@ describe("campaign remediation summary", () => {
         lastOutcome: "cancelled",
         lastError: meshError,
       },
+      {
+        revisionId,
+        aoaDeg: 8,
+        state: "blocked",
+        attemptCount: 1,
+        lastOutcome: "continuation_permanent_failure",
+        lastError:
+          "continuation_source_permanent: immutable archive checksum mismatch",
+      },
     ]);
     await recompute(campaignId);
     const summary = await campaignSummary(db, campaignId);
-    expect(summary.totals.blocked).toBe(4);
+    expect(summary.totals.blocked).toBe(5);
     expect(summary.remediation).toEqual({
       repairing: 0,
-      blocked: 4,
+      blocked: 5,
       groups: [
         {
           reason: "mesh_quality",
@@ -862,7 +890,7 @@ describe("campaign remediation summary", () => {
           reason: "precalc_attempts_exhausted",
           state: "blocked",
           owner: "system",
-          points: 1,
+          points: 2,
         },
         {
           reason: "engine_submit_rejected",

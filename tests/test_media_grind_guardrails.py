@@ -282,6 +282,66 @@ def test_render_animations_reads_each_vtu_once_for_all_fields(tmp_path, monkeypa
             assert (tmp_path / "img" / name).stat().st_size > 0
 
 
+def test_render_animations_missing_ffmpeg_fails_loud_before_vtu_io(tmp_path, monkeypatch):
+    """A missing host encoder is unavailable evidence, not a silent empty map."""
+    from matplotlib.animation import FFMpegWriter
+
+    monkeypatch.setattr(FFMpegWriter, "isAvailable", lambda: False)
+
+    def unexpected_vtu_read(*_args, **_kwargs):
+        raise AssertionError("ffmpeg preflight must run before VTU discovery or reads")
+
+    monkeypatch.setattr(images, "find_all_vtus", unexpected_vtu_read)
+    fields = [ImageField.velocity_magnitude, ImageField.vorticity]
+
+    batch = render_animations(
+        tmp_path,
+        tmp_path / "img",
+        _CONTOUR,
+        1.0,
+        fields,
+        freestream_speed=10.0,
+    )
+
+    assert batch.videos == {}
+    assert batch.budget_skipped == []
+    assert batch.errors == {
+        "velocity_magnitude": "ffmpeg executable is unavailable on PATH",
+        "vorticity": "ffmpeg executable is unavailable on PATH",
+    }
+
+
+def test_render_animations_available_ffmpeg_does_not_report_false_errors(tmp_path, monkeypatch):
+    """The dependency preflight must not suppress the normal encode path."""
+    from matplotlib.animation import FFMpegWriter
+
+    times = [0.00, 0.01, 0.02]
+    _write_vtu_sequence(tmp_path, times)
+    monkeypatch.setattr(FFMpegWriter, "isAvailable", lambda: True)
+
+    def write_stub(path, _draw, _n_frames, **_kwargs):
+        path.write_bytes(b"real-encoder-path-was-selected")
+        return path
+
+    monkeypatch.setattr(images, "write_animation_mp4", write_stub)
+
+    batch = render_animations(
+        tmp_path,
+        tmp_path / "img",
+        _CONTOUR,
+        1.0,
+        [ImageField.velocity_magnitude],
+        freestream_speed=10.0,
+    )
+
+    assert batch.errors == {}
+    assert batch.budget_skipped == []
+    assert batch.videos == {"velocity_magnitude": "velocity_magnitude.mp4"}
+    assert (tmp_path / "img" / "velocity_magnitude.mp4").read_bytes() == (
+        b"real-encoder-path-was-selected"
+    )
+
+
 def test_render_animations_expired_deadline_reports_budget_skips(tmp_path):
     times = [0.00, 0.01, 0.02]
     _write_vtu_sequence(tmp_path, times)

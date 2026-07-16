@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import errno
+import hashlib
 import json
 import os
 import shutil
@@ -19,17 +20,22 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .config import Settings
 from .evidence_store import (
     ARCHIVE_MIME_TYPE,
     ArchiveRecord,
+    EvidenceCapacityError,
     EvidenceObjectStore,
     EvidenceHydrationError,
+    EvidenceIntegrityError,
     EvidenceStoreError,
+    EvidenceUnavailableError,
+    MAX_EVIDENCE_MANIFEST_BYTES,
     RemoteEvidencePointer,
     create_tar_zst,
+    extract_verified_evidence_archive,
     inspect_tar_zst,
     manifest_bundle_member_set_sha256,
     read_remote_pointer,
@@ -41,6 +47,18 @@ EVIDENCE_POINTER_NAME = "engine_evidence.remote.json"
 EVIDENCE_FINALIZATION_ACK_NAME = "storage_finalization.database.json"
 EVIDENCE_FINALIZATION_RECEIPT_NAME = "storage_finalization.json"
 PACKAGED_RAW_DIRS = ("openfoam", "time_directories", "VTK")
+LEGACY_EVIDENCE_ARCHIVE_NAMES = (
+    "openfoam_evidence.tar.gz",
+    "engine_evidence.tar.gz",
+)
+CONTINUATION_EVIDENCE_PREFIXES = (
+    "openfoam/system",
+    "openfoam/constant",
+    "openfoam/transient",
+    "openfoam/postProcessing",
+    "openfoam/logs",
+    "time_directories",
+)
 
 
 class EvidenceCleanupError(RuntimeError):
@@ -156,6 +174,283 @@ def evidence_pointer_path(evidence_dir: Path) -> Path:
 
 def evidence_archive_path(evidence_dir: Path) -> Path:
     return Path(evidence_dir) / EVIDENCE_ARCHIVE_NAME
+
+
+def restore_verified_continuation_evidence(
+    evidence_dir: Path,
+    destination: Path,
+    settings: Settings,
+    *,
+    validate: Callable[[Path], None] | None = None,
+    expected_archive_name: str | None = None,
+    expected_archive_sha256: str | None = None,
+    expected_archive_size: int | None = None,
+) -> str:
+    """Restore exact restart inputs from a local, remote, or legacy bundle.
+
+    Raw evidence directories are deliberately not a source here: retention may
+    remove them independently, while the immutable archive is the durable
+    continuation contract.  Each candidate is fully manifest-verified before
+    this function returns; a failed candidate leaves no partial destination.
+    """
+
+    evidence_dir = Path(evidence_dir)
+    destination = Path(destination)
+    if expected_archive_name is not None and (
+        not expected_archive_name
+        or "/" in expected_archive_name
+        or "\\" in expected_archive_name
+    ):
+        raise EvidenceIntegrityError(
+            f"unsafe recorded evidence archive name: {expected_archive_name!r}"
+        )
+    if expected_archive_sha256 is not None and (
+        len(expected_archive_sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in expected_archive_sha256
+        )
+    ):
+        raise EvidenceIntegrityError(
+            "recorded evidence archive SHA-256 is invalid"
+        )
+    if expected_archive_size is not None and expected_archive_size < 0:
+        raise EvidenceIntegrityError("recorded evidence archive size is invalid")
+    manifest_path = evidence_dir / "evidence_manifest.json"
+    expected_manifest: bytes | None = None
+    if manifest_path.exists() or manifest_path.is_symlink():
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise EvidenceIntegrityError(
+                f"local evidence manifest is not a safe regular file: {manifest_path}"
+            )
+        try:
+            with manifest_path.open("rb") as source:
+                expected_manifest = source.read(MAX_EVIDENCE_MANIFEST_BYTES + 1)
+        except OSError as exc:
+            raise EvidenceUnavailableError(
+                f"local evidence manifest cannot be read: {exc}"
+            ) from exc
+        if len(expected_manifest) > MAX_EVIDENCE_MANIFEST_BYTES:
+            raise EvidenceIntegrityError(
+                "local evidence manifest exceeds the "
+                f"{MAX_EVIDENCE_MANIFEST_BYTES}-byte limit"
+            )
+
+    attempted: list[str] = []
+    had_transient_failure = False
+
+    def record_attempt(label: str, exc: Exception | None = None) -> None:
+        nonlocal had_transient_failure
+        if isinstance(exc, (EvidenceUnavailableError, EvidenceCapacityError)):
+            had_transient_failure = True
+        attempted.append(label if exc is None else f"{label}: {exc}")
+
+    pointer_path = evidence_pointer_path(evidence_dir)
+    pointer: RemoteEvidencePointer | None = None
+    if pointer_path.exists() or pointer_path.is_symlink():
+        if not pointer_path.is_file() or pointer_path.is_symlink():
+            raise EvidenceIntegrityError("unsafe remote evidence pointer")
+        try:
+            pointer = read_remote_pointer(pointer_path)
+        except (OSError, ValueError, EvidenceStoreError) as exc:
+            raise EvidenceIntegrityError(
+                f"durable remote evidence pointer is invalid: {exc}"
+            ) from exc
+    if (
+        pointer is not None
+        and expected_archive_name == EVIDENCE_ARCHIVE_NAME
+        and (
+            (
+                expected_archive_sha256 is not None
+                and pointer.stored_sha256.lower()
+                != expected_archive_sha256.lower()
+            )
+            or (
+                expected_archive_size is not None
+                and pointer.stored_size != expected_archive_size
+            )
+        )
+    ):
+        raise EvidenceIntegrityError(
+            "durable remote pointer does not match the archive identity recorded "
+            "for the continuation source result"
+        )
+
+    def archive_is_recorded(path: Path) -> bool:
+        if expected_archive_name is not None and path.name != expected_archive_name:
+            return False
+        if expected_archive_size is not None:
+            try:
+                if path.stat().st_size != expected_archive_size:
+                    raise EvidenceIntegrityError(
+                        f"{path.name} size does not match the source result record"
+                    )
+            except OSError as exc:
+                raise EvidenceUnavailableError(
+                    f"cannot stat recorded archive {path}: {exc}"
+                ) from exc
+        if expected_archive_sha256 is not None:
+            digest = hashlib.sha256()
+            try:
+                with path.open("rb") as source:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            except OSError as exc:
+                raise EvidenceUnavailableError(
+                    f"cannot read recorded archive {path}: {exc}"
+                ) from exc
+            if digest.hexdigest().lower() != expected_archive_sha256.lower():
+                raise EvidenceIntegrityError(
+                    f"{path.name} SHA-256 does not match the source result record"
+                )
+        return True
+
+    def accept_candidate(label: str) -> str:
+        if validate is None:
+            return label
+        try:
+            validate(destination)
+        except EvidenceStoreError:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            shutil.rmtree(destination, ignore_errors=True)
+            raise EvidenceHydrationError(
+                f"restored archive is not restartable: {exc}"
+            ) from exc
+        return label
+
+    local_archive = evidence_archive_path(evidence_dir)
+    if (
+        (local_archive.exists() or local_archive.is_symlink())
+        and (
+            expected_archive_name is None
+            or expected_archive_name == local_archive.name
+        )
+    ):
+        if not local_archive.is_file() or local_archive.is_symlink():
+            record_attempt(f"{local_archive.name}: unsafe local archive")
+        else:
+            try:
+                archive_is_recorded(local_archive)
+                extract_verified_evidence_archive(
+                    local_archive,
+                    destination,
+                    compression="zstd",
+                    include_prefixes=CONTINUATION_EVIDENCE_PREFIXES,
+                    pointer=pointer,
+                    expected_manifest=expected_manifest,
+                )
+                return accept_candidate(f"local:{local_archive.name}")
+            except EvidenceStoreError as exc:
+                shutil.rmtree(destination, ignore_errors=True)
+                record_attempt(local_archive.name, exc)
+
+    def try_legacy_candidates() -> str | None:
+        for name in LEGACY_EVIDENCE_ARCHIVE_NAMES:
+            if expected_archive_name is not None and expected_archive_name != name:
+                continue
+            legacy_archive = evidence_dir / name
+            if not (legacy_archive.exists() or legacy_archive.is_symlink()):
+                continue
+            if not legacy_archive.is_file() or legacy_archive.is_symlink():
+                record_attempt(f"{name}: unsafe local archive")
+                continue
+            try:
+                archive_is_recorded(legacy_archive)
+                extract_verified_evidence_archive(
+                    legacy_archive,
+                    destination,
+                    compression="gzip",
+                    include_prefixes=CONTINUATION_EVIDENCE_PREFIXES,
+                    # A migration pointer authenticates the canonical tar.zst
+                    # generation.  It can never authenticate the distinct
+                    # gzip container or its uncompressed tar digest.
+                    pointer=None,
+                    expected_manifest=expected_manifest,
+                )
+                return accept_candidate(f"legacy-local:{name}")
+            except EvidenceStoreError as exc:
+                shutil.rmtree(destination, ignore_errors=True)
+                record_attempt(name, exc)
+        return None
+
+    if expected_archive_name in LEGACY_EVIDENCE_ARCHIVE_NAMES:
+        accepted_legacy = try_legacy_candidates()
+        if accepted_legacy is not None:
+            return accepted_legacy
+
+    if pointer is not None:
+        try:
+            store = evidence_object_store(settings)
+            if store is None:
+                raise EvidenceUnavailableError(
+                    "remote evidence pointer exists but object storage is not configured"
+                )
+            with store.archive_source(pointer) as remote_archive:
+                try:
+                    extract_verified_evidence_archive(
+                        remote_archive,
+                        destination,
+                        compression="zstd",
+                        include_prefixes=CONTINUATION_EVIDENCE_PREFIXES,
+                        pointer=pointer,
+                        expected_manifest=expected_manifest,
+                    )
+                except (
+                    EvidenceCapacityError,
+                    EvidenceIntegrityError,
+                    EvidenceUnavailableError,
+                ):
+                    raise
+                except EvidenceStoreError as exc:
+                    # Once a generation-pinned archive has been obtained,
+                    # extraction/manifest failures describe immutable bytes,
+                    # not a retryable provider outage.
+                    raise EvidenceIntegrityError(str(exc)) from exc
+            return accept_candidate(
+                f"remote:gs://{pointer.bucket}/{pointer.object_key}"
+                f"#{pointer.generation}"
+            )
+        except (
+            EvidenceCapacityError,
+            EvidenceIntegrityError,
+            EvidenceUnavailableError,
+        ) as exc:
+            shutil.rmtree(destination, ignore_errors=True)
+            record_attempt(pointer_path.name, exc)
+        except (EvidenceStoreError, OSError, ValueError) as exc:
+            shutil.rmtree(destination, ignore_errors=True)
+            unavailable = EvidenceUnavailableError(
+                f"remote evidence storage is unavailable: {exc}"
+            )
+            record_attempt(pointer_path.name, unavailable)
+
+    if expected_archive_name not in LEGACY_EVIDENCE_ARCHIVE_NAMES:
+        accepted_legacy = try_legacy_candidates()
+        if accepted_legacy is not None:
+            return accepted_legacy
+
+    if expected_archive_name is not None and not attempted and pointer is None:
+        record_attempt(
+            f"{expected_archive_name}: archive recorded by the source result is unavailable"
+        )
+    if not attempted:
+        raise EvidenceIntegrityError(
+            f"no immutable continuation evidence archive found under {evidence_dir}"
+        )
+    error_type = (
+        EvidenceUnavailableError
+        if had_transient_failure
+        else EvidenceIntegrityError
+    )
+    raise error_type(
+        "no continuation evidence archive could be restored: "
+        + " | ".join(attempted)
+    )
 
 
 def publish_evidence_directory(

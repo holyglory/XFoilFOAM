@@ -1,10 +1,10 @@
 "use client";
 
 // Campaign matrix cell side panel (spec §11): the pinned-revision PolarViewer
-// comes FIRST (stored artifact before controls), then status chips, the real
-// failed list with scoped requeue, and a provenance disclosure. Evidence
-// click-through opens SimModal by resultId; derived-by-symmetry points open
-// the +α SOURCE result with the mirrored flag (spec §9.3).
+// comes FIRST (stored artifact before controls), then one per-angle automatic
+// solver flow and a provenance disclosure. Evidence click-through opens
+// SimModal by resultId; derived-by-symmetry points open the +α SOURCE result
+// with the mirrored flag (spec §9.3).
 
 import {
   type AirfoilDetailPayload,
@@ -12,37 +12,47 @@ import {
   type ChartPointVM,
   type ChartType,
   derivedBySymmetryInfo,
-  f1,
   type FieldId,
   type FieldTrackPoint,
   projectChart,
   type SimulationDetail,
 } from "@aerodb/core";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import {
   type AdminCampaignConditionSummary,
-  type AdminCampaignFailureGroup,
+  type AdminCampaignPreliminaryOutcomes,
   type AdminUransRequest,
-  type AdminUransVerifyItem,
   type CampaignProgressTotals,
-  getCampaignFailures,
+  getCampaignPreliminaryOutcomes,
   getUransRequests,
   isAdminApiError,
   requestUrans,
-  requeueCampaignFailed,
 } from "@/lib/admin";
 import { getAirfoilDetail, getFieldTrack, getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
-import { disagreedDeltaLabel, verifyPointsSearch } from "@/lib/point-history";
 import {
   initialSeriesVisibility,
   toggleSeriesVisibility,
 } from "@/lib/polar-series";
 import { C, MONO } from "@/lib/tokens";
+import { useModalLayer } from "@/lib/use-modal-layer";
+import { AirfoilGlyph } from "../../AirfoilGlyph";
+import { AirfoilProfilePlot } from "../../AirfoilProfilePlot";
 import type { HoverState } from "../../detail/DetailIsland";
 import { PolarViewer } from "../../detail/PolarViewer";
 import { SimModal } from "../../detail/SimModal";
+import {
+  PreliminaryOutcomePanel,
+  type PreliminaryResultTarget,
+} from "./PreliminaryOutcomePanel";
 import { fCount, formatRe, ghostBtn } from "./ui";
 
 export interface CellPanelAirfoil {
@@ -61,6 +71,9 @@ const chip = (color: string, border: string) => ({
   padding: "4px 9px",
   whiteSpace: "nowrap" as const,
 });
+
+const PRELIMINARY_OUTCOMES_POLL_INTERVAL_MS = 2_000;
+const PRELIMINARY_OUTCOMES_REQUEST_TIMEOUT_MS = 7_500;
 
 export function CellSidePanel({
   campaignId,
@@ -82,35 +95,36 @@ export function CellSidePanel({
   const [detail, setDetail] = useState<AirfoilDetailPayload | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [chartType, setChartType] = useState<ChartType>("cla");
+  const [profileActive, setProfileActive] = useState(false);
   const [visibleSeries, setVisibleSeries] = useState<Record<string, boolean>>(
     {},
   );
   const [hover, setHover] = useState<HoverState | null>(null);
   // zoom/pan window; null = zoom-to-fit (resets when the chart type switches)
   const [chartDomain, setChartDomain] = useState<ChartDomain | null>(null);
-  const changeChartType = useCallback((t: ChartType) => {
-    setChartType(t);
-    setChartDomain(null);
-  }, []);
+  const changeChartType = useCallback(
+    (t: ChartType) => {
+      setProfileActive(false);
+      setHover(null);
+      if (t !== chartType) setChartDomain(null);
+      setChartType(t);
+    },
+    [chartType],
+  );
 
-  const [failures, setFailures] = useState<{
-    total: number;
-    retryableTotal: number;
-    groups: AdminCampaignFailureGroup[];
-  } | null>(null);
-  const [failuresError, setFailuresError] = useState<string | null>(null);
-  // Fidelity ladder state for this cell: verify-queue items + open admin
-  // request-URANS items (idempotent-aware whole-polar action).
+  const [preliminaryOutcomes, setPreliminaryOutcomes] =
+    useState<AdminCampaignPreliminaryOutcomes | null>(null);
+  const [preliminaryOutcomesError, setPreliminaryOutcomesError] = useState<
+    string | null
+  >(null);
+  // Idempotent whole-polar request state. Per-angle automatic ladder status is
+  // rendered from the campaign-scoped preliminary outcome read model below.
   const [ladder, setLadder] = useState<{
     requests: AdminUransRequest[];
-    verifyItems: AdminUransVerifyItem[];
   } | null>(null);
   const [ladderError, setLadderError] = useState<string | null>(null);
   const [uransBusy, setUransBusy] = useState(false);
   const [uransNotice, setUransNotice] = useState<string | null>(null);
-  const [requeueBusy, setRequeueBusy] = useState(false);
-  const [confirmKey, setConfirmKey] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [provenanceOpen, setProvenanceOpen] = useState(false);
 
   const [simOpen, setSimOpen] = useState(false);
@@ -126,27 +140,88 @@ export function CellSidePanel({
   const [simField, setSimField] = useState<FieldId>("vorticity");
   const [simTrack, setSimTrack] = useState<FieldTrackPoint[]>([]);
   const [playing, setPlaying] = useState(true);
+  const panelRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const simTriggerRef = useRef<HTMLElement | null>(null);
 
-  // Escape closes the evidence modal first, then the panel (spec §11 routing
-  // order). Capture phase so the page-level Escape handler never races it.
+  useModalLayer(true);
+
+  useEffect(() => {
+    restoreFocusRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const frame = requestAnimationFrame(() => {
+      closeButtonRef.current?.focus({ preventScroll: true });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      const trigger = restoreFocusRef.current;
+      if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+    };
+  }, []);
+
+  // A stacked evidence modal owns Escape while it is present. Otherwise this
+  // panel closes before any page-level Escape handler can race it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      // A modal dialog stacked above the panel wins its own Escape.
-      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      // An unrelated modal stacked above this panel owns its own Escape.
+      if (
+        Array.from(
+          document.querySelectorAll<HTMLElement>(
+            '[role="dialog"][aria-modal="true"]',
+          ),
+        ).some((dialog) => dialog !== panelRef.current)
+      )
+        return;
+      e.preventDefault();
       e.stopPropagation();
-      if (simOpen) setSimOpen(false);
-      else onClose();
+      onClose();
     };
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
-  }, [simOpen, onClose]);
+  }, [onClose]);
+
+  const trapPanelFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Tab" || simOpen) return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const focusable = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (element) =>
+        element.tabIndex >= 0 &&
+        element.getClientRects().length > 0 &&
+        !element.hasAttribute("hidden") &&
+        element.getAttribute("aria-hidden") !== "true" &&
+        !element.closest('[inert], [aria-hidden="true"]'),
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      panel.focus();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   // ---- pinned-revision detail payload ----
   useEffect(() => {
     let cancelled = false;
     setDetail(null);
     setDetailError(null);
+    setProfileActive(false);
     getAirfoilDetail(airfoil.slug, condition.revisionId)
       .then((d) => {
         if (cancelled) return;
@@ -165,26 +240,91 @@ export function CellSidePanel({
     };
   }, [airfoil.slug, condition.revisionId]);
 
-  // ---- scoped failures ----
-  const loadFailures = useCallback(async () => {
-    setFailuresError(null);
-    try {
-      setFailures(
-        await getCampaignFailures(campaignId, {
+  // A point can move from queued → running → accepted/critical while this
+  // panel remains open. Poll serially (next request is scheduled only after
+  // the previous one settles), cap each request, pause in hidden tabs, and
+  // abort on unmount so stale responses cannot overwrite a newly opened cell.
+  // The first request is scheduled on the next task so React Strict Mode can
+  // cancel its setup probe before that probe starts network work.
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    let pollTimer: number | null = null;
+    let timeoutTimer: number | null = null;
+    let controller: AbortController | null = null;
+
+    const clearPollTimer = () => {
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+    };
+    const schedule = (
+      delayMs = PRELIMINARY_OUTCOMES_POLL_INTERVAL_MS,
+    ): void => {
+      if (disposed) return;
+      clearPollTimer();
+      pollTimer = window.setTimeout(() => void poll(), delayMs);
+    };
+    const poll = async (): Promise<void> => {
+      if (disposed || inFlight) return;
+      if (document.hidden) {
+        schedule();
+        return;
+      }
+
+      inFlight = true;
+      controller = new AbortController();
+      timeoutTimer = window.setTimeout(
+        () => controller?.abort(),
+        PRELIMINARY_OUTCOMES_REQUEST_TIMEOUT_MS,
+      );
+      try {
+        const next = await getCampaignPreliminaryOutcomes(campaignId, {
           conditionId: condition.id,
           airfoilId: airfoil.airfoilId,
-        }),
-      );
-    } catch (e) {
-      setFailuresError((e as Error).message);
-    }
+          signal: controller.signal,
+        });
+        if (!disposed) {
+          setPreliminaryOutcomes(next);
+          setPreliminaryOutcomesError(null);
+        }
+      } catch (error) {
+        if (!disposed) {
+          setPreliminaryOutcomesError(
+            error instanceof Error && error.name === "AbortError"
+              ? "status refresh timed out"
+              : (error as Error).message,
+          );
+        }
+      } finally {
+        if (timeoutTimer !== null) {
+          window.clearTimeout(timeoutTimer);
+          timeoutTimer = null;
+        }
+        controller = null;
+        inFlight = false;
+        schedule();
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden || disposed || inFlight) return;
+      clearPollTimer();
+      void poll();
+    };
+
+    schedule(0);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      disposed = true;
+      clearPollTimer();
+      if (timeoutTimer !== null) window.clearTimeout(timeoutTimer);
+      controller?.abort();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [campaignId, condition.id, airfoil.airfoilId]);
 
-  useEffect(() => {
-    void loadFailures();
-  }, [loadFailures]);
-
-  // ---- fidelity ladder items for this cell ----
+  // ---- optional whole-polar requests for this cell ----
   const loadLadder = useCallback(async () => {
     setLadderError(null);
     try {
@@ -202,13 +342,17 @@ export function CellSidePanel({
 
   const doRequestUrans = async (fidelity: "precalc" | "full") => {
     if (uransBusy) return;
-    const budget =
+    const tierLabel =
       fidelity === "precalc"
-        ? "half-resolution mesh, 3 shedding periods, 4 h budget per point"
-        : "full mesh, 7 shedding periods, 12 h budget per point";
+        ? "Preliminary URANS (fast)"
+        : "Verified URANS (final)";
+    const requestMeaning =
+      fidelity === "precalc"
+        ? "Fast results will be calculated for every angle."
+        : "Missing fast results will be calculated first; final verification follows automatically.";
     if (
       !window.confirm(
-        `Queue ${fidelity}-fidelity URANS solves for the WHOLE polar of ${airfoil.name} at Re ${formatRe(condition.reynolds)}? ${budget}. Work schedules after all RANS gaps, at precalc rank.`,
+        `Queue ${tierLabel} for the whole polar of ${airfoil.name} at Re ${formatRe(condition.reynolds)}? ${requestMeaning}`,
       )
     )
       return;
@@ -222,8 +366,8 @@ export function CellSidePanel({
       });
       setUransNotice(
         res.created
-          ? `URANS ${fidelity} requested for the whole polar — scheduled after all RANS gaps`
-          : `already requested — the open whole-polar ${fidelity} request is reused (${res.request.state})`,
+          ? `${tierLabel} requested for the whole polar.`
+          : `${tierLabel} already ${res.request.state}; the existing request is reused.`,
       );
       await loadLadder();
       onChanged();
@@ -280,6 +424,10 @@ export function CellSidePanel({
 
   const onPointClick = useCallback((vm: ChartPointVM) => {
     if (vm.point.source !== "solved" || !vm.point.resultId) return;
+    simTriggerRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : panelRef.current;
     const derived = derivedBySymmetryInfo(vm.point);
     setSimCtx({
       re: vm.re,
@@ -295,6 +443,28 @@ export function CellSidePanel({
     setPlaying(true);
     setSimOpen(true);
   }, []);
+
+  const onPreliminaryResultClick = useCallback(
+    (target: PreliminaryResultTarget) => {
+      simTriggerRef.current =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : panelRef.current;
+      const mirrored = target.aoaDeg !== target.sourceAoaDeg;
+      setSimCtx({
+        re: condition.reynolds,
+        aoa: target.aoaDeg,
+        resultId: target.resultId,
+        mirrored,
+        mirroredFromAoaDeg: mirrored ? target.sourceAoaDeg : null,
+      });
+      setSimDetail(null);
+      setSimMessage(null);
+      setPlaying(true);
+      setSimOpen(true);
+    },
+    [condition.reynolds],
+  );
 
   useEffect(() => {
     if (!simOpen || !simCtx) return;
@@ -342,80 +512,31 @@ export function CellSidePanel({
     };
   }, [simOpen, airfoil.slug, condition.revisionId]);
 
-  const requeue = async (
-    key: string,
-    errorClasses: AdminCampaignFailureGroup["errorClass"][] | undefined,
-    expectedCount: number,
-  ) => {
-    if (confirmKey !== key) {
-      setConfirmKey(key);
-      return;
-    }
-    setRequeueBusy(true);
-    setNotice(null);
-    try {
-      const res = await requeueCampaignFailed(campaignId, {
-        errorClasses,
-        conditionId: condition.id,
-        airfoilId: airfoil.airfoilId,
-        expectedCount,
-      });
-      setNotice(
-        `requeued ${res.requeued} failed point${res.requeued === 1 ? "" : "s"}`,
-      );
-      setConfirmKey(null);
-      await loadFailures();
-      onChanged();
-    } catch (e) {
-      // drift 409 → the server message carries the real counts; refresh the list
-      setNotice((e as Error).message);
-      setConfirmKey(null);
-      await loadFailures();
-    } finally {
-      setRequeueBusy(false);
-    }
-  };
-
-  const requeueButton = (
-    key: string,
-    count: number,
-    errorClasses?: AdminCampaignFailureGroup["errorClass"][],
-  ) => (
-    <button
-      type="button"
-      disabled={requeueBusy}
-      data-testid={`cell-requeue-${key}`}
-      onClick={() => void requeue(key, errorClasses, count)}
-      style={{
-        ...ghostBtn,
-        padding: "4px 9px",
-        fontSize: 10,
-        color: confirmKey === key ? C.tealInk : C.amber,
-        background: confirmKey === key ? C.teal : C.panel3,
-        borderColor: confirmKey === key ? C.teal : C.stroke,
-        opacity: requeueBusy ? 0.6 : 1,
-      }}
-    >
-      {requeueBusy && confirmKey === key
-        ? "requeueing…"
-        : confirmKey === key
-          ? `confirm requeue ${count}`
-          : `requeue ${count}`}
-    </button>
-  );
-
   const counters = cell ?? null;
 
   return (
     <>
       <div
-        style={{ position: "fixed", inset: 0, zIndex: 44 }}
+        data-testid="cell-side-panel-backdrop"
+        style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 44,
+          touchAction: "none",
+        }}
         onClick={onClose}
         aria-hidden
       />
       <aside
+        ref={panelRef}
         data-testid="cell-side-panel"
-        aria-label={`${airfoil.name} at Re ${formatRe(condition.reynolds)}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="cell-side-panel-title"
+        aria-hidden={simOpen ? "true" : undefined}
+        inert={simOpen}
+        tabIndex={-1}
+        onKeyDown={trapPanelFocus}
         style={{
           position: "fixed",
           top: 0,
@@ -423,12 +544,20 @@ export function CellSidePanel({
           bottom: 0,
           zIndex: 45,
           width: "min(780px, 100vw)",
+          height: "100dvh",
+          maxHeight: "100dvh",
+          minHeight: 0,
+          boxSizing: "border-box",
           background: C.bg,
           borderLeft: `1px solid ${C.border}`,
           boxShadow: `-24px 0 60px ${C.shadow}`,
           overflowY: "auto",
+          overscrollBehaviorY: "contain",
+          touchAction: "pan-y",
+          WebkitOverflowScrolling: "touch",
           padding: 16,
           display: "grid",
+          gridAutoRows: "max-content",
           gap: 12,
           alignContent: "start",
         }}
@@ -441,9 +570,62 @@ export function CellSidePanel({
             flexWrap: "wrap",
           }}
         >
-          <span style={{ fontWeight: 700, fontSize: 15, color: C.text }}>
-            {airfoil.name}
-          </span>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 9,
+              minWidth: 0,
+            }}
+          >
+            <span
+              data-testid="cell-airfoil-thumbnail"
+              style={{
+                width: 62,
+                height: 30,
+                flex: "0 0 auto",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: C.panel2,
+                border: `1px solid ${C.borderSoft}`,
+                borderRadius: 7,
+              }}
+            >
+              <AirfoilGlyph
+                points={detail?.geometry.contour ?? []}
+                width={56}
+                height={24}
+              />
+            </span>
+            <span
+              id="cell-side-panel-title"
+              style={{
+                fontWeight: 700,
+                fontSize: 15,
+                color: C.text,
+                minWidth: 0,
+              }}
+            >
+              {airfoil.name}
+              <span
+                style={{
+                  position: "absolute",
+                  width: 1,
+                  height: 1,
+                  padding: 0,
+                  margin: -1,
+                  overflow: "hidden",
+                  clip: "rect(0, 0, 0, 0)",
+                  whiteSpace: "nowrap",
+                  border: 0,
+                }}
+              >
+                {" "}
+                at Re {formatRe(condition.reynolds)}
+              </span>
+            </span>
+          </div>
           <span style={chip(C.muted, C.stroke)}>
             Re {formatRe(condition.reynolds)} · #{condition.ord}
           </span>
@@ -463,6 +645,7 @@ export function CellSidePanel({
             open detail page ↗
           </a>
           <button
+            ref={closeButtonRef}
             type="button"
             aria-label="Close cell panel"
             onClick={onClose}
@@ -496,6 +679,20 @@ export function CellSidePanel({
             hover={hover}
             onHover={setHover}
             onPointClick={onPointClick}
+            profileView={{
+              active: profileActive,
+              onActivate: () => {
+                setProfileActive(true);
+                setHover(null);
+              },
+              content: (
+                <AirfoilProfilePlot
+                  geometry={detail.geometry}
+                  name={detail.name}
+                  showMetrics
+                />
+              ),
+            }}
           />
         ) : detailError ? (
           <div
@@ -544,20 +741,6 @@ export function CellSidePanel({
                 {fCount(counters.running)} running
               </span>
             )}
-            {counters.failed > 0 && (
-              <span style={chip(C.redText, "rgba(245,101,101,0.5)")}>
-                {fCount(counters.failed)} failed
-              </span>
-            )}
-            {(counters.blocked ?? 0) > 0 && (
-              <span
-                data-testid="cell-counter-blocked"
-                title="Machine-owned bounded preliminary work is unavailable; no review action is required"
-                style={{ color: C.amber }}
-              >
-                {fCount(counters.blocked ?? 0)} blocked
-              </span>
-            )}
             <span style={chip(C.muted, C.stroke)}>
               {fCount(counters.remaining)} remaining of{" "}
               {fCount(counters.requested)}
@@ -565,442 +748,90 @@ export function CellSidePanel({
           </div>
         )}
 
-        {notice && (
-          <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}>
-            {notice}
-          </div>
-        )}
+        <PreliminaryOutcomePanel
+          outcomes={preliminaryOutcomes}
+          error={preliminaryOutcomesError}
+          onOpenResult={onPreliminaryResultClick}
+        />
 
-        {/* fidelity ladder: verify-queue chips + whole-polar request-URANS */}
         <div
-          data-testid="cell-fidelity-ladder"
+          data-testid="cell-urans-request-controls"
           style={{
-            background: C.panel,
-            border: `1px solid ${C.border}`,
-            borderRadius: 10,
-            overflow: "hidden",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            gap: 6,
+            flexWrap: "wrap",
+            minHeight: 34,
           }}
         >
-          <div
+          <span
             style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              padding: "9px 12px",
-              borderBottom: `1px solid ${C.borderSoft}`,
-              flexWrap: "wrap",
+              marginRight: 2,
+              fontFamily: MONO,
+              fontSize: 9.5,
+              color: C.dim,
             }}
           >
-            <span
-              style={{
-                fontFamily: MONO,
-                fontSize: 10,
-                letterSpacing: "0.1em",
-                color: C.dim,
-              }}
-            >
-              URANS FIDELITY
-            </span>
-            {ladder &&
-              (() => {
-                const pending = ladder.verifyItems.filter(
-                  (v) => v.state === "pending" || v.state === "running",
-                );
-                const done = ladder.verifyItems.filter(
-                  (v) => v.state === "done",
-                );
-                const disagreed = ladder.verifyItems.filter(
-                  (v) => v.state === "disagreed",
-                );
-                const blocked = ladder.verifyItems.filter(
-                  (v) => v.state === "blocked",
-                );
-                if (
-                  pending.length === 0 &&
-                  done.length === 0 &&
-                  disagreed.length === 0 &&
-                  blocked.length === 0
-                ) {
-                  return (
-                    <span
-                      style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}
-                    >
-                      no verify-queue items for this cell
-                    </span>
-                  );
+            Whole-polar request
+          </span>
+          {(["precalc", "full"] as const).map((fidelity) => {
+            const open = ladder?.requests.find(
+              (request) =>
+                request.aoaDeg == null &&
+                request.fidelity === fidelity &&
+                (request.state === "pending" || request.state === "running"),
+            );
+            const label = fidelity === "precalc" ? "Fast URANS" : "Final URANS";
+            return (
+              <button
+                key={fidelity}
+                type="button"
+                data-testid={`cell-request-urans-${fidelity}`}
+                disabled={uransBusy || !!open}
+                title={
+                  open
+                    ? `${label} whole-polar request is ${open.state}.`
+                    : fidelity === "precalc"
+                      ? "Request fast preliminary URANS for every angle."
+                      : "Request final verified URANS for every angle."
                 }
-                return (
-                  <>
-                    {pending.length > 0 && (
-                      <a
-                        href={`/admin${verifyPointsSearch(airfoil.slug, "pending")}`}
-                        data-testid="cell-chip-verify-pending"
-                        title="precalc URANS evidence awaiting the full-fidelity verification re-solve — open these points"
-                        style={{
-                          ...chip(C.amber, "rgba(245,158,11,0.45)"),
-                          textDecoration: "none",
-                        }}
-                      >
-                        {fCount(pending.length)} precalc · verify pending
-                      </a>
-                    )}
-                    {done.length > 0 && (
-                      <span
-                        data-testid="cell-chip-verified"
-                        style={chip(C.teal, C.tealBorder)}
-                      >
-                        {fCount(done.length)} verified
-                      </span>
-                    )}
-                    {disagreed.length > 0 && (
-                      <a
-                        href={`/admin${verifyPointsSearch(airfoil.slug, "disagreed")}`}
-                        data-testid="cell-chip-verify-disagreed"
-                        title="Full-fidelity verification disagreed with the precalc solve — open these points' stories"
-                        style={{
-                          ...chip(C.redText, "rgba(245,101,101,0.5)"),
-                          textDecoration: "none",
-                        }}
-                      >
-                        {fCount(disagreed.length)} verify disagreed
-                      </a>
-                    )}
-                    {blocked.length > 0 && (
-                      <span
-                        data-testid="cell-chip-verify-blocked"
-                        title="The full-fidelity submit was rejected after its bounded automatic retry; accepted preliminary evidence is retained"
-                        style={chip(C.amber, "rgba(245,158,11,0.5)")}
-                      >
-                        {fCount(blocked.length)} verify blocked
-                      </span>
-                    )}
-                  </>
-                );
-              })()}
-            {!ladder && !ladderError && (
-              <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
-                …
-              </span>
-            )}
-            <span
-              style={{
-                marginLeft: "auto",
-                display: "flex",
-                gap: 6,
-                alignItems: "center",
-              }}
-            >
-              <span style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>
-                request URANS (whole polar)
-              </span>
-              {(["precalc", "full"] as const).map((fid) => {
-                const open = ladder?.requests.find(
-                  (r) =>
-                    r.aoaDeg == null &&
-                    r.fidelity === fid &&
-                    (r.state === "pending" || r.state === "running"),
-                );
-                return (
-                  <button
-                    key={fid}
-                    type="button"
-                    data-testid={`cell-request-urans-${fid}`}
-                    disabled={uransBusy || !!open}
-                    title={
-                      open
-                        ? `An open whole-polar ${fid} request already exists (${open.state}) — requests are idempotent`
-                        : fid === "precalc"
-                          ? "Half-resolution mesh, 3 shedding periods, 4 h budget per point"
-                          : "Full mesh, 7 shedding periods, 12 h budget per point"
-                    }
-                    onClick={() => void doRequestUrans(fid)}
-                    style={{
-                      ...ghostBtn,
-                      padding: "4px 9px",
-                      fontSize: 10,
-                      color: open ? C.dim : C.teal,
-                      borderColor: open ? C.stroke : C.tealBorder,
-                      opacity: uransBusy ? 0.6 : 1,
-                      cursor: uransBusy || open ? "not-allowed" : "pointer",
-                    }}
-                  >
-                    {open ? `${fid} requested (${open.state})` : fid}
-                  </button>
-                );
-              })}
+                onClick={() => void doRequestUrans(fidelity)}
+                style={{
+                  ...ghostBtn,
+                  padding: "4px 9px",
+                  fontSize: 10,
+                  color: open ? C.dim : C.teal,
+                  borderColor: open ? C.stroke : C.tealBorder,
+                  opacity: uransBusy ? 0.6 : 1,
+                  cursor: uransBusy || open ? "not-allowed" : "pointer",
+                }}
+              >
+                {open ? `${label} · ${open.state}` : label}
+              </button>
+            );
+          })}
+          {!ladder && !ladderError && (
+            <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
+              …
             </span>
-          </div>
+          )}
           {ladderError && (
-            <div
-              style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.red,
-                padding: "8px 12px",
-              }}
+            <span
+              role="alert"
+              style={{ fontFamily: MONO, fontSize: 10, color: C.red }}
             >
-              couldn&apos;t load the cell&apos;s fidelity-ladder items:{" "}
-              {ladderError}
-            </div>
+              Couldn&apos;t load request state.
+            </span>
           )}
           {uransNotice && (
-            <div
-              style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.amber,
-                padding: "8px 12px",
-              }}
+            <span
+              role="status"
+              style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}
             >
               {uransNotice}
-            </div>
-          )}
-          {ladder &&
-            [
-              ...ladder.verifyItems
-                .filter((item) => item.state === "blocked")
-                .map((item) => ({
-                  key: `verify-${item.id}`,
-                  label: `verify α ${f1(item.aoaDeg)}°`,
-                  retry: item.submitRetry,
-                })),
-              ...ladder.requests
-                .filter((item) => item.state === "blocked")
-                .map((item) => ({
-                  key: `request-${item.id}`,
-                  label: `${item.fidelity} request${item.aoaDeg == null ? " · whole polar" : ` · α ${f1(item.aoaDeg)}°`}`,
-                  retry: item.submitRetry,
-                })),
-            ].map(({ key, label, retry }) => (
-              <div
-                key={key}
-                data-testid="cell-ladder-submit-blocked"
-                style={{
-                  display: "flex",
-                  gap: 8,
-                  alignItems: "baseline",
-                  padding: "6px 12px",
-                  borderTop: `1px solid ${C.borderSoft}`,
-                  fontFamily: MONO,
-                  fontSize: 10,
-                  color: C.muted,
-                }}
-              >
-                <span style={{ color: C.amber }}>{label} blocked</span>
-                <span style={{ color: C.dimmest }}>
-                  {retry?.lastHttpStatus
-                    ? `HTTP ${retry.lastHttpStatus} · `
-                    : ""}
-                  {retry?.lastError ??
-                    "engine rejected the full-fidelity submit"}
-                </span>
-              </div>
-            ))}
-          {ladder &&
-            ladder.verifyItems.some((v) => v.state === "disagreed") && (
-              <div style={{ display: "grid", gap: 2, padding: "6px 12px 9px" }}>
-                {ladder.verifyItems
-                  .filter((v) => v.state === "disagreed")
-                  .map((v) => (
-                    <div
-                      key={v.id}
-                      style={{
-                        display: "flex",
-                        gap: 10,
-                        alignItems: "baseline",
-                        fontFamily: MONO,
-                        fontSize: 10,
-                        color: C.muted,
-                      }}
-                    >
-                      <span style={{ color: C.text, minWidth: 52 }}>
-                        α {f1(v.aoaDeg)}°
-                      </span>
-                      <span style={{ color: C.redText }}>
-                        {disagreedDeltaLabel({
-                          state: v.state,
-                          deltaCl: v.deltaCl,
-                          deltaCd: v.deltaCd,
-                          deltaCm: v.deltaCm,
-                        }) || "deltas not recorded"}
-                      </span>
-                      <span style={{ color: C.dimmest }}>
-                        classification stays on the verified row — flagged for
-                        review
-                      </span>
-                    </div>
-                  ))}
-              </div>
-            )}
-        </div>
-
-        {/* failed list + scoped requeue */}
-        <div
-          style={{
-            background: C.panel,
-            border: `1px solid ${C.border}`,
-            borderRadius: 10,
-            overflow: "hidden",
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              padding: "9px 12px",
-              borderBottom: `1px solid ${C.borderSoft}`,
-            }}
-          >
-            <span
-              style={{
-                fontFamily: MONO,
-                fontSize: 10,
-                letterSpacing: "0.1em",
-                color: C.dim,
-              }}
-            >
-              FAILED POINTS
             </span>
-            <span
-              style={{
-                fontFamily: MONO,
-                fontSize: 10,
-                color: failures && failures.total > 0 ? C.redText : C.dim,
-              }}
-            >
-              {failures ? fCount(failures.total) : "…"}
-            </span>
-            {failures && failures.retryableTotal > 0 && (
-              <span style={{ marginLeft: "auto" }}>
-                {requeueButton("all", failures.retryableTotal)}
-              </span>
-            )}
-          </div>
-          {failuresError && (
-            <div
-              style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.red,
-                padding: "8px 12px",
-              }}
-            >
-              {failuresError}
-            </div>
           )}
-          {failures && failures.total === 0 && !failuresError && (
-            <div
-              style={{
-                fontFamily: MONO,
-                fontSize: 10.5,
-                color: C.dim,
-                padding: "10px 12px",
-              }}
-            >
-              no failed points in this cell
-            </div>
-          )}
-          {failures?.groups.map((group) => (
-            <div
-              key={group.errorClass}
-              style={{ borderBottom: `1px solid ${C.borderRow}` }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "7px 12px",
-                }}
-              >
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 10.5,
-                    color: C.redText,
-                    fontWeight: 600,
-                  }}
-                >
-                  {group.errorClass}
-                </span>
-                <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
-                  {fCount(group.count)} point{group.count === 1 ? "" : "s"}
-                </span>
-                {group.retryableCount > 0 ? (
-                  <span style={{ marginLeft: "auto" }}>
-                    {requeueButton(
-                      `class-${group.errorClass}`,
-                      group.retryableCount,
-                      [group.errorClass],
-                    )}
-                  </span>
-                ) : (
-                  <span
-                    style={{
-                      marginLeft: "auto",
-                      fontFamily: MONO,
-                      fontSize: 9.5,
-                      color: C.amber,
-                    }}
-                  >
-                    automatic recovery status below
-                  </span>
-                )}
-              </div>
-              <div style={{ display: "grid", gap: 2, padding: "0 12px 8px" }}>
-                {group.samples.map((s) => (
-                  <div
-                    key={s.resultId}
-                    style={{
-                      display: "flex",
-                      gap: 10,
-                      alignItems: "baseline",
-                      fontFamily: MONO,
-                      fontSize: 10,
-                      color: C.muted,
-                    }}
-                  >
-                    <span style={{ color: C.text, minWidth: 52 }}>
-                      α {f1(s.aoaDeg)}°
-                    </span>
-                    <span style={{ color: s.attempts >= 3 ? C.amber : C.dim }}>
-                      {s.attempts} attempt{s.attempts === 1 ? "" : "s"}
-                    </span>
-                    {!s.retryable && (
-                      <span style={{ color: C.amber }}>
-                        unchanged retry unavailable
-                      </span>
-                    )}
-                    {s.error && (
-                      <span
-                        style={{
-                          color: C.dimmest,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {s.error}
-                      </span>
-                    )}
-                  </div>
-                ))}
-                {group.count > group.samples.length && (
-                  <span
-                    style={{
-                      fontFamily: MONO,
-                      fontSize: 9.5,
-                      color: C.dimmest,
-                    }}
-                  >
-                    + {fCount(group.count - group.samples.length)} more in this
-                    class
-                  </span>
-                )}
-              </div>
-            </div>
-          ))}
         </div>
 
         {/* provenance disclosure */}
@@ -1099,6 +930,7 @@ export function CellSidePanel({
         playing={playing}
         onTogglePlay={() => setPlaying((v) => !v)}
         onClose={() => setSimOpen(false)}
+        restoreFocusTo={simTriggerRef.current}
         unavailableMessage={simMessage}
       />
     </>

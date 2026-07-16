@@ -393,7 +393,7 @@ describe("campaignStatusLine — tick_stalled (fresh heartbeat, slow tick)", () 
 });
 
 describe("campaignStatusLine — honest close record (completed branch)", () => {
-  it("keeps the failed-only copy when the close recorded only failed points", () => {
+  it("does not expose internal attempt labels when the close recorded unavailable results", () => {
     const line = campaignStatusLine(
       summary({
         status: "completed",
@@ -401,7 +401,8 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
         closedWithRejectedCount: 0,
       }),
     );
-    expect(line.text).toBe("Completed — closed with 2 failed points.");
+    expect(line.text).toBe("Completed — 2 unavailable results.");
+    expect(line.tone).toBe("red");
   });
 
   it("names both buckets when the close recorded failed AND rejected points", () => {
@@ -412,9 +413,8 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
         closedWithRejectedCount: 3,
       }),
     );
-    expect(line.text).toBe(
-      "Completed — closed with 1 failed point · 3 rejected.",
-    );
+    expect(line.text).toBe("Completed — 4 unavailable results.");
+    expect(line.text).not.toContain("rejected");
   });
 
   it("never renders 'closed with 0 failed points' for a rejected-only close", () => {
@@ -425,8 +425,9 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
         closedWithRejectedCount: 3,
       }),
     );
-    expect(line.text).toBe("Completed — closed with 3 rejected points.");
+    expect(line.text).toBe("Completed — 3 unavailable results.");
     expect(line.text).not.toContain("0 failed");
+    expect(line.text).not.toContain("rejected");
   });
 
   it("falls back to the clean-completion copy when both close counts are 0/null", () => {
@@ -446,24 +447,20 @@ describe("campaignStatusLine — attention covers rejected points (legacy payloa
     const line = campaignStatusLine(
       summary({ status: "attention", rejected: 3, failed: 0 }),
     );
-    expect(line.tone).toBe("amber");
-    expect(line.text).toBe(
-      "All obligated work is terminal — 3 unavailable results. No human review is required.",
-    );
+    expect(line.tone).toBe("red");
+    expect(line.text).toBe("3 unavailable results; system recovery required.");
   });
 
   it("conserves the combined unavailable count when both kinds exist", () => {
     const line = campaignStatusLine(
       summary({ status: "attention", rejected: 2, failed: 1 }),
     );
-    expect(line.text).toBe(
-      "All obligated work is terminal — 3 unavailable results. No human review is required.",
-    );
+    expect(line.text).toBe("3 unavailable results; system recovery required.");
   });
 });
 
-describe("campaignStatusLine — machine-owned blocked work", () => {
-  it("names blocked work as unavailable without a review obligation", () => {
+describe("campaignStatusLine — exhausted automatic recovery", () => {
+  it("MUST-CATCH: names the state as critical, never as a normal blocked queue", () => {
     const line = campaignStatusLine(
       summary({
         status: "attention",
@@ -471,9 +468,10 @@ describe("campaignStatusLine — machine-owned blocked work", () => {
         reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
       }),
     );
-    expect(line.tone).toBe("amber");
-    expect(line.text).toContain("3 machine-blocked");
-    expect(line.text).toContain("No human review is required");
+    expect(line.tone).toBe("red");
+    expect(line.text).toContain("3 critical result failures");
+    expect(line.text).toContain("system recovery required");
+    expect(line.text).not.toContain("machine-blocked");
   });
 });
 
@@ -491,9 +489,7 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
       }),
     );
     expect(line.tone).toBe("violet");
-    expect(line.text).toBe(
-      "Preliminary URANS work is queued or running for 1 point; no human review is required.",
-    );
+    expect(line.text).toBe("Fast URANS · 1 queued or running.");
   });
 
   it("legacy nonzero needsReview payload is unavailable, never human work", () => {
@@ -507,7 +503,7 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
     );
     expect(line.tone).toBe("red");
     expect(line.text).toBe(
-      "All obligated work is terminal — 2 unavailable results · 3 awaiting URANS. No human review is required.",
+      "2 unavailable results · 3 awaiting URANS; system investigation required.",
     );
   });
 
@@ -521,9 +517,7 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
       }),
     );
     expect(line.tone).toBe("violet");
-    expect(line.text).toBe(
-      "All obligated work is terminal — 3 points awaiting URANS.",
-    );
+    expect(line.text).toBe("Fast URANS · 3 queued.");
     expect(line.text).not.toContain("review");
   });
 
@@ -536,7 +530,7 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
       }),
     );
     expect(line.text).toBe(
-      "All obligated work is terminal — 1 unavailable result. No human review is required.",
+      "1 unavailable result; system investigation required.",
     );
   });
 
@@ -548,9 +542,7 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
         reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
       }),
     );
-    expect(line.tone).toBe("amber");
-    expect(line.text).toBe(
-      "All obligated work is terminal — 2 unavailable results. No human review is required.",
-    );
+    expect(line.tone).toBe("red");
+    expect(line.text).toBe("2 unavailable results; system recovery required.");
   });
 });

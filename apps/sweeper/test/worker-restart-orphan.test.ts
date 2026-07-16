@@ -13,10 +13,10 @@
 // campaign failed counter stays 0, and the sim_job terminates 'cancelled'
 // with a truthful message.
 //
-// Scenario B (genuine failure): the same batched shape but a REAL engine
-// failure message must still terminal-fail the rows — WITH the message
-// stamped into results.error, so the campaign failures endpoint classifies
-// it by text instead of 'unknown'.
+// Scenario B (genuine repeated failure): the same batched shape but a REAL
+// engine failure must retain the failed evidence and message. After the one
+// automatic retry is exhausted it becomes a grouped critical screening
+// incident, not a user-terminal failed point or manual-requeue item.
 //
 // Follows the campaign-batching.test.ts live-DB pattern (scoped rows, full
 // cleanup in afterAll).
@@ -38,6 +38,7 @@ import {
   simCampaignPoints,
   simCampaignProgress,
   simJobs,
+  solverIncidentSummary,
   solverProfiles,
   sweeperState,
 } from "@aerodb/db";
@@ -424,7 +425,7 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
     expect(rebatch!.angles).toEqual(ANGLES.slice(1));
   }, 120000);
 
-  it("still terminal-fails a GENUINE engine failure — with the message stamped, classing by text (not 'unknown')", async () => {
+  it("retains a repeated genuine engine failure as a grouped critical screening incident", async () => {
     const MSG = "MeshError: snappyHexMesh exited 1 during layer addition";
     genuineCampaignId = await launchCampaign(
       `${PREFIX} genuine campaign`,
@@ -519,16 +520,31 @@ describe("worker-restart orphan: interrupted campaign points release, never fail
           eq(simCampaignProgress.airfoilId, airfoilId),
         ),
       );
-    expect(progress.failed).toBe(ANGLES.length);
+    // RANS execution failure is not a user-terminal aerodynamic result. The
+    // points stay visibly critical in the machine-owned blocked bucket.
+    expect(progress.failed).toBe(0);
+    expect(progress.blocked).toBe(ANGLES.length);
 
-    // Failures endpoint: classified by the stamped text ('mesh'), NOT 'unknown'.
+    // The legacy failure/requeue surface remains URANS-only.
     const failures = await campaignFailures(db, genuineCampaignId);
-    expect(failures.total).toBe(ANGLES.length);
-    expect(failures.groups.length).toBe(1);
-    expect(failures.groups[0].errorClass).toBe("mesh");
-    expect(failures.groups[0].errorClass).not.toBe("unknown");
-    for (const sample of failures.groups[0].samples) {
-      expect((sample.error ?? "").trim().length).toBeGreaterThan(0);
-    }
+    expect(failures.total).toBe(0);
+
+    // Three same-signature occurrences cross the investigation threshold.
+    const incidents = await solverIncidentSummary(db, {
+      campaignId: genuineCampaignId,
+    });
+    expect(incidents.occurrenceCount).toBe(ANGLES.length);
+    expect(incidents.openCount).toBe(ANGLES.length);
+    expect(incidents.criticalGroupCount).toBe(1);
+    expect(incidents.groups).toEqual([
+      expect.objectContaining({
+        stage: "rans",
+        reason: "solver-execution-failed",
+        occurrenceCount: ANGLES.length,
+        openCount: ANGLES.length,
+        openCriticalCount: ANGLES.length,
+        requiresInvestigation: true,
+      }),
+    ]);
   }, 120000);
 });

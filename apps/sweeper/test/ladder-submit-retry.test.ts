@@ -81,6 +81,8 @@ async function createOwner(
         airfoilId,
         revisionId,
         aoaDeg,
+        // Explicit full requests are aggregate owners of PRECALC + verify
+        // children and must never compose a direct full-fidelity job.
         fidelity: "full",
         state,
         backgroundOwner: true,
@@ -505,8 +507,23 @@ afterAll(async () => {
   await sql.end();
 });
 
-describe.sequential("durable full-ladder submit retry", () => {
-  for (const kind of ["request", "verify"] as const) {
+describe.sequential("durable final-verification submit retry", () => {
+  it("MUST-CATCH: an explicit full request cannot own a direct solver job", async () => {
+    const owner = await createOwner("request", "running");
+
+    await expect(composeJob(owner)).rejects.toThrow(
+      /sim_jobs_no_direct_full_request_check/,
+    );
+    expect(await ownerState(owner)).toMatchObject({
+      state: "running",
+      simJobId: null,
+    });
+  });
+
+  // Fast preliminary submissions use the physical PRECALC-obligation ledger,
+  // whose answered/transport failure policy is covered by
+  // campaign-submit-lifecycle.test.ts. This ledger is now final-verify only.
+  for (const kind of ["verify"] as const) {
     it(`${kind}: deterministic 422 blocks immediately without solver evidence`, async () => {
       const owner = await createOwner(kind, "running");
       const jobId = await composeJob(owner);
@@ -523,7 +540,7 @@ describe.sequential("durable full-ladder submit retry", () => {
       });
       expect(await ownerState(owner)).toMatchObject({
         state: "blocked",
-        simJobId: kind === "request" ? jobId : null,
+        simJobId: null,
       });
       expect(await retryRow(owner)).toMatchObject({
         state: "blocked",
@@ -566,10 +583,9 @@ describe.sequential("durable full-ladder submit retry", () => {
       });
       expect(delayed?.nextAttemptAt?.getTime()).toBeGreaterThan(Date.now());
 
-      const early =
-        kind === "request"
-          ? await claimNextPendingUransRequest(db, { requestIds: [owner.id] })
-          : await claimNextPendingVerifyItem(db, { verifyIds: [owner.id] });
+      const early = await claimNextPendingVerifyItem(db, {
+        verifyIds: [owner.id],
+      });
       expect(early).toBeNull();
       expect(calls).toBe(1);
 
@@ -588,7 +604,7 @@ describe.sequential("durable full-ladder submit retry", () => {
       expect(calls).toBe(2);
       expect(await ownerState(owner)).toMatchObject({
         state: "blocked",
-        simJobId: kind === "request" ? secondJobId : null,
+        simJobId: null,
       });
       expect(await retryRow(owner)).toMatchObject({
         state: "blocked",
@@ -678,19 +694,11 @@ describe.sequential("durable full-ladder submit retry", () => {
           RETURN NEW;
         END $$
       `);
-      if (kind === "request") {
-        await db.execute(dsql`
-          CREATE TRIGGER ladder_retry_test_fail
-          BEFORE UPDATE ON sim_urans_requests
-          FOR EACH ROW EXECUTE FUNCTION ladder_retry_test_fail()
-        `);
-      } else {
-        await db.execute(dsql`
-          CREATE TRIGGER ladder_retry_test_fail
-          BEFORE UPDATE ON sim_urans_verify_queue
-          FOR EACH ROW EXECUTE FUNCTION ladder_retry_test_fail()
-        `);
-      }
+      await db.execute(dsql`
+        CREATE TRIGGER ladder_retry_test_fail
+        BEFORE UPDATE ON sim_urans_verify_queue
+        FOR EACH ROW EXECUTE FUNCTION ladder_retry_test_fail()
+      `);
 
       await expect(
         submit(owner, jobId, {
@@ -720,9 +728,7 @@ describe.sequential("durable full-ladder submit retry", () => {
       const owner = await createOwner(kind, "running");
       const staleJobId = await composeJob(owner);
       await db.insert(simLadderSubmitRetries).values({
-        ...(kind === "request"
-          ? { uransRequestId: owner.id }
-          : { verifyQueueId: owner.id }),
+        verifyQueueId: owner.id,
         state: "retry_wait",
         attemptCount: 1,
         nextAttemptAt: new Date(Date.now() - 1_000),

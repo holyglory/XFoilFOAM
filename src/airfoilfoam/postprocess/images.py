@@ -717,6 +717,17 @@ def render_animations(
     field's encode once the media wall budget is exhausted; skipped fields are
     reported in ``budget_skipped``."""
     result = AnimationBatchResult(videos={}, errors={}, budget_skipped=[])
+    # The production worker image owns this system dependency, while direct
+    # pipeline/integration runs encode on the host.  Detect a missing encoder
+    # before loading a potentially multi-gigabyte VTU series and report the
+    # unavailable artifact for every requested field.  Returning an empty map
+    # here used to make a missing ffmpeg binary look like a successful render.
+    from matplotlib.animation import FFMpegWriter
+
+    if not FFMpegWriter.isAvailable():
+        detail = "ffmpeg executable is unavailable on PATH"
+        result.errors = {field.value: detail for field in fields}
+        return result
     vtus = select_vtus(find_all_vtus(case_dir), start_time, end_time, min(max_frames, 220))
     if len(vtus) < 2:
         return result

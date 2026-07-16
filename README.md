@@ -573,7 +573,7 @@ kOmegaSSTLM`. Transition is very sensitive to the freestream turbulence — set
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 pytest -m "not integration"     # fast unit tests, no Docker
-pytest -m integration           # real OpenFOAM runs (needs Docker + the image)
+pytest -m integration           # real OpenFOAM/media runs (needs Docker, the image, and host ffmpeg)
 docker compose config >/dev/null
 docker compose --profile foundation14 config >/dev/null
 docker compose --profile foundation14 build worker-foundation14

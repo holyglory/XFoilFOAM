@@ -18,7 +18,16 @@ import { and, asc, desc, eq, sql, type SQLWrapper } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
+import { lockPrecalcCells } from "./precalc-cell-lock";
 import {
+  RANS_RECOVERY_REMEDIATION_VERSION,
+  ransMeshRecoveryRemediationVersion,
+  recordSolverIncidentInTransaction,
+  resolveOlderRansMeshIncidentsInTransaction,
+  resolveSolverIncidentsForAcceptedResultsInTransaction,
+} from "./solver-incidents";
+import {
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_SNAPSHOT,
   type SolverImplementationSnapshot,
 } from "./solver-implementations";
@@ -463,7 +472,7 @@ export async function findCampaignGapBatch(
       )
       AND (r.id IS NULL OR (
         r.regime IS DISTINCT FROM 'urans'
-        AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+        AND COALESCE(r.fidelity::text, '') NOT LIKE 'urans%'
       ))
       AND NOT EXISTS (
         SELECT 1 FROM sim_precalc_obligations obligation
@@ -672,6 +681,183 @@ const PRECALC_RESULT_TERMINAL_BUCKET_SQL = sql`
   AND precalc_obligation.state IS DISTINCT FROM 'blocked'
 `;
 
+/** Operator-facing failure/rejection is a terminal URANS outcome only.
+ * Steady RANS rejection is normal ladder input and remains unfinished work,
+ * even if its canonical result projection is `failed`. The correlated
+ * obligation exclusion keeps the progress counters and failure/rejection
+ * drawers exactly disjoint from machine-owned pending/running/blocked work.
+ *
+ * This fragment deliberately uses the canonical `p` / `r` aliases shared by
+ * the progress queries and campaigns.ts failure-list queries. */
+export const USER_TERMINAL_CAMPAIGN_RESULT_SQL = sql`(
+  (
+    COALESCE(r.regime::text, '') = 'urans'
+    OR COALESCE(r.fidelity::text, '') LIKE 'urans%'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM sim_precalc_obligations user_terminal_obligation
+    WHERE user_terminal_obligation.airfoil_id = p.airfoil_id
+      AND user_terminal_obligation.revision_id = p.revision_id
+      AND user_terminal_obligation.aoa_deg = p.aoa_deg
+      AND user_terminal_obligation.state IN ('pending', 'running', 'blocked')
+  )
+)`;
+
+const USER_TERMINAL_URANS_FIDELITY_SQL = sql`(
+  COALESCE(r.regime::text, '') = 'urans'
+  OR COALESCE(r.fidelity::text, '') LIKE 'urans%'
+)`;
+
+const NON_URANS_RESULT_SQL = sql`(
+  NOT (${USER_TERMINAL_URANS_FIDELITY_SQL})
+)`;
+
+/** Exact immutable RANS evidence that owns the normal automatic handoff.
+ *
+ * Rejected attempts are deliberately allowed to be pointer-null, so this
+ * predicate cannot rely on results.current_result_attempt_id or the
+ * result-scoped classification projection. It fences the latest attempt to
+ * the canonical result AND exact producing job/cell. Typed hard_solver
+ * evidence is authoritative. The pre-contract fallback is intentionally much
+ * narrower: only a completed, solved, error-free RANS attempt with an
+ * aerodynamic rejection reason may enter the ladder. Failed/queued shells are
+ * infrastructure-shaped even when a legacy classifier happened to stamp
+ * "not-converged".
+ *
+ * This fragment uses the canonical `r` alias shared by both progress paths and
+ * the completion probe. */
+const AUTOMATIC_RANS_HANDOFF_RESULT_SQL = sql`(
+  (${NON_URANS_RESULT_SQL})
+  AND EXISTS (
+    SELECT 1
+    FROM result_attempts handoff_attempt
+    JOIN result_classifications handoff_classification
+      ON handoff_classification.result_attempt_id = handoff_attempt.id
+    WHERE handoff_attempt.result_id = r.id
+      AND handoff_attempt.airfoil_id = r.airfoil_id
+      AND handoff_attempt.simulation_preset_revision_id
+            IS NOT DISTINCT FROM r.simulation_preset_revision_id
+      AND handoff_attempt.aoa_deg = r.aoa_deg
+      AND handoff_attempt.sim_job_id IS NOT DISTINCT FROM r.sim_job_id
+      AND handoff_attempt.regime = 'rans'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM result_attempts newer_handoff_attempt
+        WHERE newer_handoff_attempt.result_id = handoff_attempt.result_id
+          AND newer_handoff_attempt.sim_job_id
+                IS NOT DISTINCT FROM handoff_attempt.sim_job_id
+          AND (
+            newer_handoff_attempt."createdAt" > handoff_attempt."createdAt"
+            OR (
+              newer_handoff_attempt."createdAt" = handoff_attempt."createdAt"
+              AND newer_handoff_attempt.id > handoff_attempt.id
+            )
+          )
+      )
+      AND (
+        handoff_classification.state = 'needs_urans'
+        OR (
+          handoff_classification.state = 'rejected'
+          AND (
+            handoff_attempt.evidence_payload ->> 'failure_disposition' = 'hard_solver'
+            OR (
+              handoff_attempt.evidence_payload ->> 'failure_disposition' IS NULL
+              AND handoff_attempt.status = 'done'
+              AND handoff_attempt.source = 'solved'
+              AND NULLIF(btrim(handoff_attempt.error), '') IS NULL
+              AND handoff_classification.reasons
+                    && ARRAY['not-converged', 'solver-stalled']::text[]
+            )
+          )
+        )
+      )
+  )
+)`;
+
+/** Deterministic RANS mesh/setup evidence is terminal without consuming the
+ * generic crash retry. Typed disposition wins over text. Only when the latest
+ * exact attempt predates typed dispositions (or no attempt exists at all) may
+ * the paired legacy markers classify the result as mesh-quality work. */
+const TERMINAL_RANS_DETERMINISTIC_MESH_SQL = sql`(
+  (${NON_URANS_RESULT_SQL})
+  AND COALESCE(
+    (
+      SELECT CASE
+        WHEN deterministic_attempt.evidence_payload ->> 'failure_disposition' = 'deterministic_mesh'
+          THEN true
+        WHEN deterministic_attempt.evidence_payload ->> 'failure_disposition' IS NULL
+          THEN (
+            position(${DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER} in lower(COALESCE(deterministic_attempt.error, ''))) > 0
+            AND position(${DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER} in lower(COALESCE(deterministic_attempt.error, ''))) > 0
+          )
+        ELSE false
+      END
+      FROM result_attempts deterministic_attempt
+      WHERE deterministic_attempt.result_id = r.id
+        AND deterministic_attempt.airfoil_id = r.airfoil_id
+        AND deterministic_attempt.simulation_preset_revision_id
+              IS NOT DISTINCT FROM r.simulation_preset_revision_id
+        AND deterministic_attempt.aoa_deg = r.aoa_deg
+        AND deterministic_attempt.sim_job_id IS NOT DISTINCT FROM r.sim_job_id
+        AND deterministic_attempt.regime = 'rans'
+      ORDER BY deterministic_attempt."createdAt" DESC, deterministic_attempt.id DESC
+      LIMIT 1
+    ),
+    (
+      position(${DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER} in lower(COALESCE(r.error, ''))) > 0
+      AND position(${DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER} in lower(COALESCE(r.error, ''))) > 0
+    )
+  )
+)`;
+
+const RESULT_SUBMIT_BLOCKED_SQL = sql`EXISTS (
+  SELECT 1
+  FROM sim_result_submit_retries submit_retry
+  WHERE submit_retry.result_id = r.id
+    AND submit_retry.state = 'blocked'
+)`;
+
+/** A non-aerodynamic RANS terminal becomes a user-visible critical blocker
+ * only after machine recovery is genuinely terminal:
+ *   - deterministic mesh/setup evidence has no unchanged retry;
+ *   - an answered engine submission is durably blocked; or
+ *   - the one generic crash retry was already consumed.
+ *
+ * The first untyped/infrastructure-shaped crash remains transient between
+ * partial ingest and autoRetryCrashedResultsForJob; otherwise fast polling can
+ * flash a false critical state before the retry transaction reopens it. A
+ * done-but-rejected RANS row that is not exact handoff evidence has no retry
+ * owner and is therefore also terminal unavailable evidence. */
+const TERMINAL_RANS_MACHINE_BLOCKER_SQL = sql`(
+  (${NON_URANS_RESULT_SQL})
+  AND NOT (${AUTOMATIC_RANS_HANDOFF_RESULT_SQL})
+  AND (
+    (${RESULT_SUBMIT_BLOCKED_SQL})
+    OR (
+      r.status = 'failed'
+      AND (
+        r.auto_retried_at IS NOT NULL
+        OR (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
+      )
+    )
+    OR (
+      r.status = 'done'
+      AND rc.state = 'rejected'
+    )
+  )
+)`;
+
+/** Temporary visibility guard for the narrow ingest→generic-retry boundary.
+ * This state is still machine-owned open work, never a failed/rejected point
+ * and never a critical blocker until retry exhaustion is persisted. */
+const TRANSIENT_RANS_MACHINE_RECOVERY_SQL = sql`(
+  r.status = 'failed'
+  AND (${NON_URANS_RESULT_SQL})
+  AND NOT (${AUTOMATIC_RANS_HANDOFF_RESULT_SQL})
+  AND NOT (${TERMINAL_RANS_MACHINE_BLOCKER_SQL})
+)`;
+
 /** Legacy rows predate typed obligation-attempt outcomes. They qualify as a
  * deterministic mesh blocker only when BOTH pinned engine markers are
  * present; a generic infrastructure error which merely contains "mesh" must
@@ -723,24 +909,44 @@ const PRECALC_MESH_REPAIRING_SQL = sql`(
 )`;
 
 const PRECALC_BLOCKED_MESH_SQL = sql`(
-  precalc_obligation.state = 'blocked'
-  AND (
-    precalc_obligation.last_outcome = 'deterministic_failure'
-    OR (
-      precalc_obligation.last_outcome IS NULL
-      AND (${PRECALC_PRIOR_DETERMINISTIC_MESH_SQL})
+  (
+    precalc_obligation.state = 'blocked'
+    AND (
+      precalc_obligation.last_outcome = 'deterministic_failure'
+      OR (
+        precalc_obligation.last_outcome IS NULL
+        AND (${PRECALC_PRIOR_DETERMINISTIC_MESH_SQL})
+      )
     )
+  )
+  OR (
+    (${TERMINAL_RANS_MACHINE_BLOCKER_SQL})
+    AND (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
   )
 )`;
 
 const PRECALC_BLOCKED_EXHAUSTED_SQL = sql`(
   precalc_obligation.state = 'blocked'
-  AND precalc_obligation.last_outcome IN ('failed_exhausted', 'rejected_exhausted', 'cancelled_exhausted')
+  AND precalc_obligation.last_outcome IN (
+    'failed_exhausted',
+    'rejected_exhausted',
+    'cancelled_exhausted',
+    'continuation_permanent_failure',
+    'continuation_no_progress_exhausted',
+    'continuation_segment_exhausted'
+  )
 )`;
 
 const PRECALC_BLOCKED_ENGINE_SUBMIT_SQL = sql`(
-  precalc_obligation.state = 'blocked'
-  AND precalc_obligation.last_outcome = 'submit_blocked'
+  (
+    precalc_obligation.state = 'blocked'
+    AND precalc_obligation.last_outcome = 'submit_blocked'
+  )
+  OR (
+    (${TERMINAL_RANS_MACHINE_BLOCKER_SQL})
+    AND (${RESULT_SUBMIT_BLOCKED_SQL})
+    AND NOT (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
+  )
 )`;
 
 /** The canonical terminal blocked predicate is shared by the headline count
@@ -752,13 +958,20 @@ const CANONICAL_BLOCKED_SQL = sql`(
     (${PRECALC_RESULT_TERMINAL_BUCKET_SQL})
     AND (
       (
-        p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done'
-        AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+        p.state = 'terminal' AND p.derived_by_symmetry = false
+        AND (
+          (${TERMINAL_RANS_MACHINE_BLOCKER_SQL})
+          OR (
+            r.status = 'done'
+            AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
+          )
+        )
       )
       OR (
         p.state = 'terminal' AND p.derived_by_symmetry = true
         AND (
-          r.status = 'failed'
+          (${TERMINAL_RANS_MACHINE_BLOCKER_SQL})
+          OR (r.status = 'failed' AND (${USER_TERMINAL_URANS_FIDELITY_SQL}))
           OR (
             r.status = 'done'
             AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
@@ -804,11 +1017,11 @@ async function recomputeProgressForKeys(
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
@@ -897,11 +1110,11 @@ export async function recomputeProgressForCampaign(
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${PRECALC_RESULT_TERMINAL_BUCKET_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
@@ -1003,7 +1216,38 @@ export async function probeCampaignCompletion(
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
           AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND r.status = 'failed'
+          AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL})
       ) AS has_failed,
+      EXISTS (
+        -- Exact aerodynamic RANS handoff stays open until PRECALC owns or
+        -- settles it. A first generic crash also stays machine-open only
+        -- across the narrow ingest→auto-retry boundary. Exhausted crashes,
+        -- deterministic mesh/setup evidence and blocked submit policy are
+        -- canonical critical blockers instead of an infinite "remaining"
+        -- fallback.
+        SELECT 1
+        FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN results r ON r.id = p.result_id
+        LEFT JOIN result_classifications rc ON rc.result_id = r.id
+        WHERE p.campaign_id = ${campaignId}
+          AND p.state = 'terminal'
+          AND NOT p.derived_by_symmetry
+          AND c.status IN ('active', 'kept')
+          AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
+          AND (
+            (${AUTOMATIC_RANS_HANDOFF_RESULT_SQL})
+            OR (${TRANSIENT_RANS_MACHINE_RECOVERY_SQL})
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligations terminal_recovery
+            WHERE terminal_recovery.airfoil_id = p.airfoil_id
+              AND terminal_recovery.revision_id = p.revision_id
+              AND terminal_recovery.aoa_deg = p.aoa_deg
+              AND terminal_recovery.state = 'blocked'
+          )
+      ) AS automatic_recovery_open,
       EXISTS (
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
@@ -1013,7 +1257,7 @@ export async function probeCampaignCompletion(
           AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND p.derived_by_symmetry = false
           AND (
-            (p.state = 'terminal' AND r.status = 'done' AND (
+            (p.state = 'terminal' AND r.status = 'done' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}) AND (
               rc.state = 'rejected'
               OR rc.state IS NULL
               OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected')
@@ -1023,23 +1267,39 @@ export async function probeCampaignCompletion(
               WHERE blocked_obligation.airfoil_id = p.airfoil_id
                 AND blocked_obligation.revision_id = p.revision_id
                 AND blocked_obligation.aoa_deg = p.aoa_deg
-                AND blocked_obligation.state = 'blocked'
+              AND blocked_obligation.state = 'blocked'
             )
           )
       ) AS has_rejected,
+      EXISTS (
+        SELECT 1
+        FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN results r ON r.id = p.result_id
+        LEFT JOIN result_classifications rc ON rc.result_id = r.id
+        LEFT JOIN sim_precalc_obligations precalc_obligation
+          ON precalc_obligation.airfoil_id = p.airfoil_id
+         AND precalc_obligation.revision_id = p.revision_id
+         AND precalc_obligation.aoa_deg = CASE
+           WHEN p.derived_by_symmetry THEN r.aoa_deg
+           ELSE p.aoa_deg
+         END
+        WHERE p.campaign_id = ${campaignId}
+          AND c.status IN ('active', 'kept')
+          AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
+          AND (${CANONICAL_BLOCKED_SQL})
+      ) AS has_blocked,
       (EXISTS (
-        -- Fidelity ladder tier 2 (contract 7): a solved cell whose verdict is
-        -- needs_urans still owes a (pre-calculation) URANS solve — the ladder
-        -- submits it once the campaign's RANS gaps hit zero. Completion must
-        -- wait for the verdict to be superseded/replaced, not book the RANS
-        -- provisional point as final.
+        -- Fidelity ladder tier 2: exact immutable aerodynamic RANS evidence
+        -- owns the preliminary handoff. The exact-evidence predicate excludes
+        -- queued/failed legacy shells and non-aerodynamic dispositions.
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
-        JOIN result_classifications rc ON rc.result_id = p.result_id
-        JOIN results tier_result ON tier_result.id = p.result_id
+        JOIN results r ON r.id = p.result_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
           AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND p.derived_by_symmetry = false
+          AND (${AUTOMATIC_RANS_HANDOFF_RESULT_SQL})
           AND (
             NOT EXISTS (
               SELECT 1 FROM sim_precalc_obligations known_obligation
@@ -1053,20 +1313,6 @@ export async function probeCampaignCompletion(
                 AND open_obligation.revision_id = p.revision_id
                 AND open_obligation.aoa_deg = p.aoa_deg
                 AND open_obligation.state IN ('pending', 'running')
-            )
-          )
-          AND (
-            rc.state = 'needs_urans'
-            OR (
-              rc.state = 'rejected'
-              AND tier_result.status = 'done'
-              AND (
-                tier_result.fidelity = 'rans'
-                OR (
-                  tier_result.fidelity IS NULL
-                  AND tier_result.regime IS DISTINCT FROM 'urans'
-                )
-              )
             )
           )
       ) OR EXISTS (
@@ -1111,7 +1357,9 @@ export async function probeCampaignCompletion(
     lanes_open: boolean;
     in_flight: boolean;
     has_failed: boolean;
+    automatic_recovery_open: boolean;
     has_rejected: boolean;
+    has_blocked: boolean;
     precalc_open: boolean;
     verify_open: boolean;
   }[];
@@ -1120,11 +1368,12 @@ export async function probeCampaignCompletion(
     probe.open ||
     probe.lanes_open ||
     probe.in_flight ||
+    probe.automatic_recovery_open ||
     probe.precalc_open ||
     probe.verify_open
   )
     return;
-  if (probe.has_failed || probe.has_rejected) {
+  if (probe.has_failed || probe.has_rejected || probe.has_blocked) {
     await db
       .update(simCampaigns)
       .set({ status: "attention" })
@@ -1235,6 +1484,28 @@ export async function onResultIngested(
         AND aoa_deg = ${aoa} AND state = 'requested'
     `)) as unknown as ProgressKeyRow[];
     affected.push(...runningKeys);
+  }
+
+  // Result-owned RANS incidents close only when the canonical classifier has
+  // selected real accepted evidence for this exact result. Merely requeueing,
+  // receiving another failed attempt, or handing RANS to PRECALC must not make
+  // a critical incident disappear.
+  if (terminal && signal.status === "done") {
+    const accepted = (await db.execute(sql`
+      SELECT 1
+      FROM results accepted_result
+      JOIN result_classifications accepted_classification
+        ON accepted_classification.result_id = accepted_result.id
+       AND accepted_classification.state = 'accepted'
+      WHERE accepted_result.id = ${signal.resultId}
+        AND accepted_result.status = 'done'
+      LIMIT 1
+    `)) as unknown as unknown[];
+    if (accepted.length) {
+      await resolveSolverIncidentsForAcceptedResultsInTransaction(db, [
+        signal.resultId,
+      ]);
+    }
   }
 
   const keys = dedupeProgressKeys(affected);
@@ -1558,6 +1829,43 @@ const MEDIA_REPAIR_OWNED_SQL = sql`EXISTS (
     )
 )`;
 
+type ExhaustedRansIncidentRow = {
+  result_id: string;
+  airfoil_id: string;
+  revision_id: string | null;
+  aoa_deg: number;
+  error: string | null;
+  result_attempt_id: string | null;
+  failure_disposition: string | null;
+  solver_implementation_id: string;
+  mesh_recovery_version?: number;
+};
+
+function exhaustedRansIncidentReason(
+  row: Pick<ExhaustedRansIncidentRow, "error" | "failure_disposition">,
+): string {
+  const error = (row.error ?? "").toLowerCase();
+  if (
+    row.failure_disposition === "deterministic_mesh" ||
+    (error.includes(DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER) &&
+      error.includes(DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER))
+  ) {
+    return "mesh-quality-failure";
+  }
+  if (
+    row.failure_disposition === "infrastructure" ||
+    /\b(engine|worker|container|openmpi|mpi|queue|database|storage|disk)\b/.test(
+      error,
+    ) ||
+    /\b(connection refused|http 5\d\d|no space left|out of memory|oom[- ]killed)\b/.test(
+      error,
+    )
+  ) {
+    return "engine-infrastructure-failure";
+  }
+  return "solver-execution-failed";
+}
+
 /** Route every generic crash-class unmarked failed row of one sim job exactly once:
  *  result → pending for wave-1 or queued-without-owner for campaign
  *  precalc (claim links cleared, marker stamped, error text kept as evidence
@@ -1613,7 +1921,10 @@ export async function autoRetryCrashedResultsForJob(
       AND r.status = 'failed'
       AND r.auto_retried_at IS NULL
       AND r.simulation_preset_revision_id IS NOT NULL
-      AND (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+      AND (
+        (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+        OR (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
+      )
       AND NOT (${MEDIA_REPAIR_OWNED_SQL})
   `)) as unknown as Array<{
       result_id: string;
@@ -1662,6 +1973,243 @@ export async function autoRetryCrashedResultsForJob(
       error: string | null;
     }>;
 
+    // A second non-aerodynamic steady-RANS crash is not the normal
+    // RANS->preliminary handoff. Record it as a critical result-owned solver
+    // incident in the same transaction that observes the exhausted retry.
+    //
+    // Do not derive this set from `escalated` in application code: that broad
+    // return list intentionally also contains exhausted wave-2 rows. Those are
+    // already owned by preliminary/final recovery ledgers and must not acquire
+    // a duplicate, misleading RANS incident.
+    const exhaustedRansIncidents = (await tx.execute(sql`
+    SELECT
+      r.id AS result_id,
+      r.airfoil_id,
+      r.simulation_preset_revision_id AS revision_id,
+      r.aoa_deg::float8 AS aoa_deg,
+      COALESCE(latest.error, r.error) AS error,
+      latest.id AS result_attempt_id,
+      latest.failure_disposition,
+      COALESCE(
+        latest.solver_implementation_id,
+        r.solver_implementation_id,
+        job.solver_implementation_id,
+        revision.solver_implementation_id,
+        ${LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID}::uuid
+      ) AS solver_implementation_id
+    FROM results r
+    JOIN sim_jobs job ON job.id = r.sim_job_id
+    LEFT JOIN simulation_preset_revisions revision
+      ON revision.id = r.simulation_preset_revision_id
+    LEFT JOIN LATERAL (
+      SELECT
+        attempt.id,
+        attempt.error,
+        attempt.regime,
+        attempt.solver_implementation_id,
+        attempt.evidence_payload ->> 'fidelity' AS fidelity,
+        attempt.evidence_payload ->> 'failure_disposition'
+          AS failure_disposition
+      FROM result_attempts attempt
+      WHERE attempt.result_id = r.id
+        AND attempt.sim_job_id = r.sim_job_id
+      ORDER BY attempt."createdAt" DESC, attempt.id DESC
+      LIMIT 1
+    ) latest ON true
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NOT NULL
+      AND job.wave = 1
+      AND COALESCE(job.request_payload ->> 'uransFidelity', 'rans') = 'rans'
+      AND COALESCE(latest.regime::text, r.regime::text, 'rans') = 'rans'
+      AND COALESCE(latest.fidelity, r.fidelity::text, 'rans') = 'rans'
+      AND COALESCE(latest.failure_disposition, '') <> 'hard_solver'
+      AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
+  `)) as unknown as ExhaustedRansIncidentRow[];
+    for (const incident of exhaustedRansIncidents) {
+      await recordSolverIncidentInTransaction(tx, {
+        stage: "rans",
+        reason: exhaustedRansIncidentReason(incident),
+        severity: "critical",
+        owner: { resultId: incident.result_id },
+        solverImplementationId: incident.solver_implementation_id,
+        occurrenceKey: `rans:${incident.result_id}:${simJobId}:auto-retry-exhausted`,
+        remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
+        simJobId,
+        resultAttemptId: incident.result_attempt_id,
+        metadata: {
+          airfoilId: incident.airfoil_id,
+          revisionId: incident.revision_id,
+          aoaDeg: Number(incident.aoa_deg),
+          error: incident.error,
+          failureDisposition: incident.failure_disposition,
+          recovery: "auto-retry-exhausted",
+        },
+      });
+    }
+    const deterministicRansIncidents = (await tx.execute(sql`
+    SELECT
+      r.id AS result_id,
+      r.airfoil_id,
+      r.simulation_preset_revision_id AS revision_id,
+      r.aoa_deg::float8 AS aoa_deg,
+      COALESCE(latest.error, r.error) AS error,
+      latest.id AS result_attempt_id,
+      latest.failure_disposition,
+      CASE
+        WHEN latest.mesh_recovery_version ~ '^[0-9]+$'
+        THEN latest.mesh_recovery_version::int
+        WHEN job.request_payload ->> 'executedMeshRecoveryVersion'
+               ~ '^[0-9]+$'
+        THEN (job.request_payload ->> 'executedMeshRecoveryVersion')::int
+        ELSE 0
+      END AS mesh_recovery_version,
+      COALESCE(
+        latest.solver_implementation_id,
+        r.solver_implementation_id,
+        job.solver_implementation_id,
+        revision.solver_implementation_id,
+        ${LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID}::uuid
+      ) AS solver_implementation_id
+    FROM results r
+    JOIN sim_jobs job ON job.id = r.sim_job_id
+    LEFT JOIN simulation_preset_revisions revision
+      ON revision.id = r.simulation_preset_revision_id
+    LEFT JOIN LATERAL (
+      SELECT
+        attempt.id,
+        attempt.error,
+        attempt.regime,
+        attempt.solver_implementation_id,
+        attempt.evidence_payload ->> 'fidelity' AS fidelity,
+        attempt.evidence_payload ->> 'mesh_recovery_version'
+          AS mesh_recovery_version,
+        attempt.evidence_payload ->> 'failure_disposition'
+          AS failure_disposition
+      FROM result_attempts attempt
+      WHERE attempt.result_id = r.id
+        AND attempt.sim_job_id = r.sim_job_id
+      ORDER BY attempt."createdAt" DESC, attempt.id DESC
+      LIMIT 1
+    ) latest ON true
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'failed'
+      AND r.auto_retried_at IS NULL
+      AND job.wave = 1
+      AND COALESCE(job.request_payload ->> 'uransFidelity', 'rans') = 'rans'
+      AND COALESCE(latest.regime::text, r.regime::text, 'rans') = 'rans'
+      AND COALESCE(latest.fidelity, r.fidelity::text, 'rans') = 'rans'
+      AND (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
+      AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
+  `)) as unknown as ExhaustedRansIncidentRow[];
+    for (const incident of deterministicRansIncidents) {
+      await recordSolverIncidentInTransaction(tx, {
+        stage: "rans",
+        reason: "mesh-quality-failure",
+        severity: "critical",
+        owner: { resultId: incident.result_id },
+        solverImplementationId: incident.solver_implementation_id,
+        occurrenceKey: `rans:${incident.result_id}:${simJobId}:deterministic-mesh:v${incident.mesh_recovery_version ?? 0}`,
+        remediationVersion: ransMeshRecoveryRemediationVersion(
+          incident.mesh_recovery_version ?? 0,
+        ),
+        simJobId,
+        resultAttemptId: incident.result_attempt_id,
+        metadata: {
+          airfoilId: incident.airfoil_id,
+          revisionId: incident.revision_id,
+          aoaDeg: Number(incident.aoa_deg),
+          error: incident.error,
+          failureDisposition:
+            incident.failure_disposition ?? "deterministic_mesh",
+          recovery: "deterministic-mesh",
+          meshRecoveryVersion: incident.mesh_recovery_version ?? 0,
+        },
+      });
+    }
+    // A completed RANS evidence row can still fail the canonical publication
+    // classifier for a non-aerodynamic reason (for example, malformed or
+    // incomplete evidence). Ordinary non-convergence/stall evidence is
+    // excluded by AUTOMATIC_RANS_HANDOFF_RESULT_SQL and remains normal
+    // RANS→preliminary-URANS input. Everything selected here has no automatic
+    // fidelity owner and is therefore a critical machine incident, not a
+    // user-review task.
+    const rejectedRansIncidents = (await tx.execute(sql`
+    SELECT
+      r.id AS result_id,
+      r.airfoil_id,
+      r.simulation_preset_revision_id AS revision_id,
+      r.aoa_deg::float8 AS aoa_deg,
+      COALESCE(latest.error, r.error) AS error,
+      latest.id AS result_attempt_id,
+      latest.failure_disposition,
+      result_classification.reasons AS classification_reasons,
+      COALESCE(
+        latest.solver_implementation_id,
+        r.solver_implementation_id,
+        job.solver_implementation_id,
+        revision.solver_implementation_id,
+        ${LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID}::uuid
+      ) AS solver_implementation_id
+    FROM results r
+    JOIN sim_jobs job ON job.id = r.sim_job_id
+    JOIN result_classifications result_classification
+      ON result_classification.result_id = r.id
+     AND result_classification.state = 'rejected'
+    LEFT JOIN simulation_preset_revisions revision
+      ON revision.id = r.simulation_preset_revision_id
+    LEFT JOIN LATERAL (
+      SELECT
+        attempt.id,
+        attempt.error,
+        attempt.regime,
+        attempt.solver_implementation_id,
+        attempt.evidence_payload ->> 'fidelity' AS fidelity,
+        attempt.evidence_payload ->> 'failure_disposition'
+          AS failure_disposition
+      FROM result_attempts attempt
+      WHERE attempt.result_id = r.id
+        AND attempt.sim_job_id = r.sim_job_id
+      ORDER BY attempt."createdAt" DESC, attempt.id DESC
+      LIMIT 1
+    ) latest ON true
+    WHERE r.sim_job_id = ${simJobId}
+      AND r.status = 'done'
+      AND job.wave = 1
+      AND COALESCE(job.request_payload ->> 'uransFidelity', 'rans') = 'rans'
+      AND COALESCE(latest.regime::text, r.regime::text, 'rans') = 'rans'
+      AND COALESCE(latest.fidelity, r.fidelity::text, 'rans') = 'rans'
+      AND NOT (${AUTOMATIC_RANS_HANDOFF_RESULT_SQL})
+      AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
+      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
+  `)) as unknown as Array<
+      ExhaustedRansIncidentRow & { classification_reasons: string[] }
+    >;
+    for (const incident of rejectedRansIncidents) {
+      await recordSolverIncidentInTransaction(tx, {
+        stage: "rans",
+        reason: "non-publishable-rans-evidence",
+        severity: "critical",
+        owner: { resultId: incident.result_id },
+        solverImplementationId: incident.solver_implementation_id,
+        occurrenceKey: `rans:${incident.result_id}:${simJobId}:evidence-rejected`,
+        remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
+        simJobId,
+        resultAttemptId: incident.result_attempt_id,
+        metadata: {
+          airfoilId: incident.airfoil_id,
+          revisionId: incident.revision_id,
+          aoaDeg: Number(incident.aoa_deg),
+          error: incident.error,
+          failureDisposition: incident.failure_disposition,
+          classificationReasons: incident.classification_reasons,
+          recovery: "evidence-rejected",
+        },
+      });
+    }
+
     // A failed campaign precalc cell must never fall through the ordinary
     // campaign gap finder: that composer is wave-1 RANS by definition. Release
     // ownership from the dead child, retain the failed evidence/one-shot marker,
@@ -1702,6 +2250,7 @@ export async function autoRetryCrashedResultsForJob(
       AND NOT (${LADDER_SCOPED_PRECALC_SQL})
       AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
       AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
+      AND NOT (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
       AND NOT (${CURRENT_HARD_SOLVER_ATTEMPT_SQL})
       AND NOT (${MEDIA_REPAIR_OWNED_SQL})
     RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
@@ -1827,6 +2376,277 @@ export async function autoRetryCrashedResultsForJob(
       terminalBlocked: terminalBlocked.map(toCell),
       mediaRepairDeferred: mediaRepairDeferred.map(toCell),
     };
+  });
+}
+
+export interface RansMeshRecoveryRequeueScope {
+  /** Test/repair closed world. An explicitly empty list matches nothing. */
+  resultIds?: string[];
+  /** Scheduler closed world for shared test databases. */
+  campaignIds?: string[];
+  /** Bounded production scan; deliberately capped even for manual repair. */
+  limit?: number;
+}
+
+export interface RansMeshRecoveryRequeueResult {
+  resultIds: string[];
+  campaignIds: string[];
+}
+
+/**
+ * Reopen deterministic wave-1 RANS mesh failures only when the live engine
+ * advertises a strictly newer recovery strategy than the immutable attempt
+ * that failed.
+ *
+ * The failed result attempt and incident remain historical evidence. The
+ * canonical result/point ownership moves back to ordinary RANS scheduling in
+ * one transaction, older mesh incidents resolve in that same transaction, and
+ * a same-version pass is a no-op. Campaign lifecycle locks precede natural-cell
+ * advisory locks so concurrent pause/cancel/composition cannot create an
+ * ownerless or duplicate retry.
+ */
+export async function requeueDeterministicRansMeshFailuresForRecoveryVersion(
+  db: DB,
+  meshRecoveryVersion: number,
+  scope: RansMeshRecoveryRequeueScope = {},
+): Promise<RansMeshRecoveryRequeueResult> {
+  const empty: RansMeshRecoveryRequeueResult = {
+    resultIds: [],
+    campaignIds: [],
+  };
+  if (!Number.isSafeInteger(meshRecoveryVersion) || meshRecoveryVersion <= 0) {
+    return empty;
+  }
+  const limit = Math.min(Math.max(scope.limit ?? 500, 1), 500);
+  const resultScopeSql =
+    scope.resultIds === undefined
+      ? sql`true`
+      : scope.resultIds.length
+        ? sql`r.id = ANY(${sql`ARRAY[${sql.join(
+            scope.resultIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )}]`})`
+        : sql`false`;
+  const campaignScopeSql =
+    scope.campaignIds === undefined
+      ? sql`true`
+      : scope.campaignIds.length
+        ? sql`owner_campaign.id = ANY(${sql`ARRAY[${sql.join(
+            scope.campaignIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )}]`})`
+        : sql`false`;
+  const sourceMeshVersionSql = sql`COALESCE(
+    (
+      SELECT CASE
+        WHEN immutable_attempt.evidence_payload ->> 'mesh_recovery_version'
+               ~ '^[0-9]+$'
+         AND (
+           immutable_attempt.evidence_payload ->> 'mesh_recovery_version'
+         )::numeric <= 2147483647
+        THEN (
+          immutable_attempt.evidence_payload ->> 'mesh_recovery_version'
+        )::numeric::bigint
+        ELSE NULL
+      END
+      FROM result_attempts immutable_attempt
+      WHERE immutable_attempt.result_id = r.id
+        AND immutable_attempt.airfoil_id = r.airfoil_id
+        AND immutable_attempt.simulation_preset_revision_id
+              IS NOT DISTINCT FROM r.simulation_preset_revision_id
+        AND immutable_attempt.aoa_deg = r.aoa_deg
+        AND immutable_attempt.sim_job_id IS NOT DISTINCT FROM r.sim_job_id
+        AND immutable_attempt.regime = 'rans'
+      ORDER BY immutable_attempt."createdAt" DESC, immutable_attempt.id DESC
+      LIMIT 1
+    ),
+    (
+      SELECT CASE
+        WHEN source_job.request_payload ->> 'executedMeshRecoveryVersion'
+               ~ '^[0-9]+$'
+         AND (
+           source_job.request_payload ->> 'executedMeshRecoveryVersion'
+         )::numeric <= 2147483647
+        THEN (
+          source_job.request_payload ->> 'executedMeshRecoveryVersion'
+        )::numeric::bigint
+        ELSE NULL
+      END
+      FROM sim_jobs source_job
+      WHERE source_job.id = r.sim_job_id
+    ),
+    0::bigint
+  )`;
+  const liveOwnerSql = sql`EXISTS (
+    SELECT 1
+    FROM sim_campaign_points owner_point
+    JOIN sim_campaigns owner_campaign
+      ON owner_campaign.id = owner_point.campaign_id
+    JOIN sim_campaign_conditions owner_condition
+      ON owner_condition.id = owner_point.condition_id
+     AND owner_condition.campaign_id = owner_campaign.id
+    WHERE owner_point.result_id = r.id
+      AND owner_point.state = 'terminal'
+      AND owner_point.revision_id = r.simulation_preset_revision_id
+      AND owner_campaign.status IN ('active', 'attention')
+      AND owner_condition.generation =
+            owner_campaign.current_condition_generation
+      AND owner_condition.status IN ('active', 'kept')
+      AND (${campaignScopeSql})
+  )`;
+  const noPrecalcOwnerSql = sql`NOT EXISTS (
+    SELECT 1
+    FROM sim_precalc_obligations existing_precalc
+    WHERE existing_precalc.airfoil_id = r.airfoil_id
+      AND existing_precalc.revision_id = r.simulation_preset_revision_id
+      AND existing_precalc.aoa_deg = r.aoa_deg
+  )`;
+  const noActiveSourceJobSql = sql`NOT EXISTS (
+    SELECT 1
+    FROM sim_jobs active_source_job
+    WHERE active_source_job.id = r.sim_job_id
+      AND active_source_job.status IN (
+        'pending', 'submitted', 'running', 'ingesting'
+      )
+  )`;
+
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const candidates = (await tx.execute(sql`
+      SELECT DISTINCT
+        r.id AS result_id,
+        r.airfoil_id,
+        r.simulation_preset_revision_id AS revision_id,
+        r.aoa_deg::float8 AS aoa_deg
+      FROM results r
+      WHERE (${resultScopeSql})
+        AND r.status = 'failed'
+        AND r.simulation_preset_revision_id IS NOT NULL
+        AND (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
+        AND (${sourceMeshVersionSql}) < ${meshRecoveryVersion}
+        AND (${noPrecalcOwnerSql})
+        AND (${noActiveSourceJobSql})
+        AND (${liveOwnerSql})
+      ORDER BY r.id
+      LIMIT ${limit}
+    `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string;
+      aoa_deg: number;
+    }>;
+    if (!candidates.length) return empty;
+
+    const candidateIds = candidates.map((row) => row.result_id);
+    const candidateIdArray = sql`ARRAY[${sql.join(
+      candidateIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    )}]`;
+
+    // Repository-wide order: campaign lifecycle owner first, then natural cell.
+    await tx.execute(sql`
+      SELECT campaign.id
+      FROM sim_campaigns campaign
+      JOIN sim_campaign_points point ON point.campaign_id = campaign.id
+      WHERE point.result_id = ANY(${candidateIdArray})
+        AND campaign.status IN ('active', 'attention', 'paused')
+      ORDER BY campaign.id
+      FOR SHARE OF campaign
+    `);
+    await lockPrecalcCells(
+      tx,
+      candidates.map((row) => ({
+        airfoilId: row.airfoil_id,
+        revisionId: row.revision_id,
+        aoaDeg: Number(row.aoa_deg),
+      })),
+    );
+
+    // Recheck after both locks. A lifecycle edit, accepted late evidence, or
+    // concurrent PRECALC handoff may have won since the bounded read.
+    const reopened = (await tx.execute(sql`
+      UPDATE results r
+      SET status = 'pending',
+          source = 'queued',
+          sim_job_id = NULL,
+          engine_job_id = NULL,
+          engine_case_slug = NULL,
+          "updatedAt" = now()
+      WHERE r.id = ANY(${candidateIdArray})
+        AND r.status = 'failed'
+        AND r.simulation_preset_revision_id IS NOT NULL
+        AND (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
+        AND (${sourceMeshVersionSql}) < ${meshRecoveryVersion}
+        AND (${noPrecalcOwnerSql})
+        AND (${noActiveSourceJobSql})
+        AND (${liveOwnerSql})
+      RETURNING
+        r.id AS result_id,
+        r.airfoil_id,
+        r.simulation_preset_revision_id AS revision_id,
+        r.aoa_deg::float8 AS aoa_deg
+    `)) as unknown as Array<{
+      result_id: string;
+      airfoil_id: string;
+      revision_id: string;
+      aoa_deg: number;
+    }>;
+    if (!reopened.length) return empty;
+
+    const reopenedIds = reopened.map((row) => row.result_id).sort();
+    const reopenedIdArray = sql`ARRAY[${sql.join(
+      reopenedIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    )}]`;
+    await tx.execute(sql`
+      DELETE FROM sim_result_submit_retries
+      WHERE result_id = ANY(${reopenedIdArray})
+    `);
+
+    const keys = (await tx.execute(sql`
+      UPDATE sim_campaign_points point
+      SET state = 'requested', "updatedAt" = now()
+      FROM sim_campaigns campaign, sim_campaign_conditions condition
+      WHERE point.result_id = ANY(${reopenedIdArray})
+        AND point.state = 'terminal'
+        AND campaign.id = point.campaign_id
+        AND campaign.status IN ('active', 'attention', 'paused')
+        AND condition.id = point.condition_id
+        AND condition.campaign_id = campaign.id
+        AND condition.generation = campaign.current_condition_generation
+        AND condition.status IN ('active', 'kept')
+      RETURNING point.campaign_id, point.condition_id, point.airfoil_id
+    `)) as unknown as ProgressKeyRow[];
+
+    await resolveOlderRansMeshIncidentsInTransaction(
+      tx,
+      reopenedIds,
+      meshRecoveryVersion,
+    );
+    const dedupedKeys = dedupeProgressKeys(keys);
+    await recomputeProgressForKeys(tx, dedupedKeys);
+
+    const campaignIds = [
+      ...new Set(dedupedKeys.map((row) => row.campaign_id)),
+    ].sort();
+    if (campaignIds.length) {
+      await tx.execute(sql`
+        UPDATE sim_campaigns campaign
+        SET status = 'active', "completedAt" = NULL, "updatedAt" = now()
+        WHERE campaign.id = ANY(${sql`ARRAY[${sql.join(
+          campaignIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})
+          AND campaign.status = 'attention'
+          AND EXISTS (
+            SELECT 1
+            FROM sim_campaign_points point
+            WHERE point.campaign_id = campaign.id
+              AND point.state = 'requested'
+          )
+      `);
+    }
+    return { resultIds: reopenedIds, campaignIds };
   });
 }
 

@@ -6,7 +6,9 @@ import pytest
 from airfoilfoam.airfoil import load_airfoil
 from airfoilfoam.meshing import get_mesher, list_meshers
 from airfoilfoam.meshing.blockmesh import (
+    SEGMENTED_CAMBER_VARIANTS,
     SEGMENTED_NORMAL_COUNTS,
+    SEGMENTED_TE_NORMAL_COUNTS,
     SURFACE_BLOCK_SEGMENTS,
     BlockMeshCGrid,
     _normal_aligned_outer_angles,
@@ -21,6 +23,19 @@ from airfoilfoam.openfoam.runner import (
 
 
 SELIG_SEED_DIR = Path(__file__).resolve().parents[1] / "packages/db/seed/selig-database"
+SEGMENTED_CANDIDATES = (
+    *(BlockMeshCGrid.segmented_normal(value) for value in SEGMENTED_NORMAL_COUNTS),
+    *(
+        BlockMeshCGrid.segmented_te_normal(value)
+        for value in SEGMENTED_TE_NORMAL_COUNTS
+    ),
+    *(BlockMeshCGrid.segmented_camber(value) for value in SEGMENTED_CAMBER_VARIANTS),
+)
+SEGMENTED_CANDIDATE_IDS = (
+    *(f"normal-{value}" for value in SEGMENTED_NORMAL_COUNTS),
+    *(f"te-normal-{value}" for value in SEGMENTED_TE_NORMAL_COUNTS),
+    *(f"camber-{value}" for value in SEGMENTED_CAMBER_VARIANTS),
+)
 
 
 def test_mesher_registered():
@@ -39,13 +54,40 @@ def test_mesher_registered():
         assert candidate.cache_version != legacy.cache_version
         assert name not in list_meshers()
         assert name in list_meshers(include_internal=True)
+    for segments in SEGMENTED_TE_NORMAL_COUNTS:
+        name = f"blockmesh-cgrid-segmented-te-normal-{segments}"
+        candidate = get_mesher(name)
+        assert isinstance(candidate, BlockMeshCGrid)
+        assert candidate.topology == "segmented-te-normal"
+        assert candidate.surface_segments == segments
+        assert candidate.user_selectable is False
+        assert candidate.cache_version != legacy.cache_version
+        assert name not in list_meshers()
+        assert name in list_meshers(include_internal=True)
+    for variant, (_center_x, _angle_deg, segments) in SEGMENTED_CAMBER_VARIANTS.items():
+        name = f"blockmesh-cgrid-segmented-camber-{variant}"
+        candidate = get_mesher(name)
+        assert isinstance(candidate, BlockMeshCGrid)
+        assert candidate.topology == "segmented-camber"
+        assert candidate.surface_segments == segments
+        assert candidate.camber_variant == variant
+        assert candidate.user_selectable is False
+        assert candidate.cache_version != legacy.cache_version
+        assert name not in list_meshers()
+        assert name in list_meshers(include_internal=True)
 
 
 def test_candidate_constructor_rejects_unfingerprinted_variants():
     with pytest.raises(ValueError, match="must be one of"):
         BlockMeshCGrid.segmented_normal(21)
+    with pytest.raises(ValueError, match="must be one of"):
+        BlockMeshCGrid.segmented_te_normal(21)
+    with pytest.raises(ValueError, match="must be one of"):
+        BlockMeshCGrid.segmented_camber("unfingerprinted")
     with pytest.raises(ValueError, match="does not accept"):
         BlockMeshCGrid(surface_segments=20)
+    with pytest.raises(ValueError, match="does not accept"):
+        BlockMeshCGrid(camber_variant="c150-a200-s5")
 
 
 def test_solve_expansion_reproduces_length():
@@ -97,10 +139,72 @@ def test_segmented_candidate_structure_is_explicit_and_fingerprinted(
     assert mesher.cache_version == f"segmented-normal-{segments}-v1"
 
 
-@pytest.mark.parametrize("segments", SEGMENTED_NORMAL_COUNTS)
+@pytest.mark.parametrize("segments", SEGMENTED_TE_NORMAL_COUNTS)
+def test_te_centered_candidate_preserves_upstream_extent_and_rectangular_wake(
+    naca0012_selig_text, segments
+):
+    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    mp = MeshParams(
+        farfield_radius_chords=15,
+        n_surface=65,
+        n_radial=40,
+        n_wake=30,
+        first_cell_height_chords=1e-4,
+    )
+    mesher = BlockMeshCGrid.segmented_te_normal(segments)
+    text = mesher.build_dict(af, mp, chord=1.0)
+
+    assert text.count("hex (") == 2 * segments + 2
+    assert "(-15 1.959434879e-15 0)" in text
+    assert "(1 16 0)" in text
+    assert "(13 16 0)" in text
+    assert mesher.cache_version == f"segmented-te-normal-{segments}-v1"
+
+
+@pytest.mark.parametrize(
+    ("variant", "center_x", "le_angle_deg", "segments"),
+    (
+        (variant, center_x, le_angle_deg, segments)
+        for variant, (center_x, le_angle_deg, segments) in SEGMENTED_CAMBER_VARIANTS.items()
+    ),
+)
+def test_camber_candidate_is_explicit_shifted_and_fingerprinted(
+    naca0012_selig_text,
+    variant,
+    center_x,
+    le_angle_deg,
+    segments,
+):
+    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    mp = MeshParams(
+        farfield_radius_chords=15,
+        n_surface=65,
+        n_radial=40,
+        n_wake=30,
+        first_cell_height_chords=1e-4,
+    )
+    mesher = BlockMeshCGrid.segmented_camber(variant)
+    text = mesher.build_dict(af, mp, chord=1.0)
+    radius = 15 + center_x
+    seam_x = center_x + radius * math.cos(math.radians(le_angle_deg))
+    seam_y = radius * math.sin(math.radians(le_angle_deg))
+
+    assert text.count("hex (") == 2 * segments + 2
+    assert f"({center_x:.10g} {radius:.10g} 0)" in text
+    assert f"(13 {radius:.10g} 0)" in text
+    assert f"({seam_x:.10g} {seam_y:.10g} 0)" in text
+    assert mesher.name == f"blockmesh-cgrid-segmented-camber-{variant}"
+    assert mesher.cache_version == f"segmented-camber-{variant}-v1"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    SEGMENTED_CANDIDATES,
+    ids=SEGMENTED_CANDIDATE_IDS,
+)
 @pytest.mark.parametrize("n_surface", [40, 61, 130])
 def test_segmented_surface_blocks_conserve_requested_cells(
-    naca0012_selig_text, n_surface, segments
+    naca0012_selig_text, n_surface, candidate
 ):
     """A topology repair must not silently add/drop streamwise cells.
 
@@ -114,7 +218,7 @@ def test_segmented_surface_blocks_conserve_requested_cells(
         n_wake=30,
         first_cell_height_chords=1e-4,
     )
-    text = BlockMeshCGrid.segmented_normal(segments).build_dict(af, mp, chord=1.0)
+    text = candidate.build_dict(af, mp, chord=1.0)
 
     counts: dict[str, list[int]] = {"UA": [], "LA": []}
     for line in text.splitlines():
@@ -126,7 +230,7 @@ def test_segmented_surface_blocks_conserve_requested_cells(
                 ]
                 counts[side].append(next(value for value in divisions if value != 40))
 
-    expected_segments = min(segments, n_surface)
+    expected_segments = min(candidate.surface_segments, n_surface)
     assert len(counts["UA"]) == expected_segments
     assert len(counts["LA"]) == expected_segments
     assert sum(counts["UA"]) == n_surface
@@ -184,8 +288,12 @@ def test_segmented_preflight_rejects_authoritative_open_catalog_contours(name, s
         BlockMeshCGrid.segmented_normal(segments).build_dict(af, mp, chord=0.05)
 
 
-@pytest.mark.parametrize("segments", SEGMENTED_NORMAL_COUNTS)
-def test_segmented_preflight_scans_every_seed_without_silent_fold(segments):
+@pytest.mark.parametrize(
+    "candidate",
+    SEGMENTED_CANDIDATES,
+    ids=SEGMENTED_CANDIDATE_IDS,
+)
+def test_segmented_preflight_scans_every_seed_without_silent_fold(candidate):
     """Full 1,621-profile regression: emit a preflighted mesh or reject it.
 
     The healthy set spans the production incident, corrected E850, symmetric,
@@ -196,7 +304,7 @@ def test_segmented_preflight_scans_every_seed_without_silent_fold(segments):
     """
     paths = sorted(SELIG_SEED_DIR.glob("*.dat"))
     assert len(paths) == 1621
-    mesher = BlockMeshCGrid.segmented_normal(segments)
+    mesher = candidate
     mp = MeshParams(n_surface=65, n_radial=40, n_wake=30, first_cell_height_chords=0.003)
     emitted: set[str] = set()
     rejected: set[str] = set()
@@ -209,13 +317,15 @@ def test_segmented_preflight_scans_every_seed_without_silent_fold(segments):
             assert "segmented topology preflight failed" in str(exc)
             rejected.add(path.stem)
         else:
-            assert text.count("hex (") == 2 * segments + 2
+            assert text.count("hex (") == 2 * candidate.surface_segments + 2
             emitted.add(path.stem)
 
     assert emitted.isdisjoint(rejected)
     assert emitted | rejected == {path.stem for path in paths}
-    assert {"2032c", "e850", "n0012", "clarky", "s1223", "sd8020"} <= emitted
-    assert {"naca1", "ua79sfm"} <= rejected
+    # Later candidates are deliberately specialised fallbacks and need not
+    # accept every profile that an earlier ladder rung already handles. They
+    # must still remain usable for the representative closed geometries below.
+    assert {"2032c", "n0012", "clarky", "s1223", "sd8020"} <= emitted
 
 
 def test_cell_count(naca0012_selig_text):

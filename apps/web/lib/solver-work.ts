@@ -152,14 +152,14 @@ export const SOLVER_WORK_STATE_STYLES: Record<
     border: "#92400e",
   },
   needs_review: {
-    label: "automatic checks unavailable",
+    label: "result unavailable",
     className: "solver-work-state--needs-review",
     color: "#fb923c",
     background: "#25140a",
     border: "#7c2d12",
   },
   blocked: {
-    label: "blocked",
+    label: "critical result failure",
     className: "solver-work-state--blocked",
     color: "#f87171",
     background: "#260d0d",
@@ -469,7 +469,7 @@ export function buildSolverWorkPopoverView(
   ) {
     actions.push({
       kind: "request-full-tier",
-      label: "Request full tier",
+      label: "Request final verification",
       adminOnly: true,
     });
   }

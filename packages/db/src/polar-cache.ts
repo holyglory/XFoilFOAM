@@ -32,6 +32,7 @@ import {
   refreshPolarCompatibilityCache,
   resolveRevisionMethodCompatibilityHash,
 } from "./polar-compatibility-cache";
+import { resolveSolverIncidentsForAcceptedResultsInTransaction } from "./solver-incidents";
 export * from "./polar-compatibility-cache";
 
 type EvidenceWithDbIds = PolarEvidencePoint & {
@@ -1032,6 +1033,12 @@ export async function refreshPolarCacheForRevision(
           isNotNull(resultClassifications.resultId),
         ),
       );
+    await resolveSolverIncidentsForAcceptedResultsInTransaction(
+      tx,
+      freshResultClassifications
+        .filter((row) => row.state === "accepted" && row.resultId)
+        .map((row) => row.resultId!),
+    );
     const activeVerdicts = await activeReviewVerdicts(
       tx,
       freshResultClassifications

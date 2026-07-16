@@ -18,8 +18,8 @@ describe("campaign remediation copy", () => {
         ],
       }),
     ).toMatchObject({
-      label: "preliminary unavailable",
-      detail: expect.stringContaining("no user action is required"),
+      label: "critical preliminary failure",
+      detail: expect.stringContaining("system must preserve the evidence"),
     });
   });
 

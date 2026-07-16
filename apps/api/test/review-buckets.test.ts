@@ -479,8 +479,10 @@ describe("campaign payloads: awaitingUrans / needsReview derived from the canoni
     // The split partitions consistently with the legacy counters it refines:
     // One rejected parent is under an active exact PRECALC obligation, so it
     // remains machine-owned work rather than a terminal rejected/review count.
+    // The failed RANS screening row is also machine-owned automatic handoff:
+    // it must never inflate the campaign's user-terminal failure counter.
     expect(summary.totals.rejected).toBe(5);
-    expect(summary.totals.failed).toBe(1);
+    expect(summary.totals.failed).toBe(0);
   });
 
   it("campaignAirfoilRows (coverage matrix) carries the per-cell split", async () => {

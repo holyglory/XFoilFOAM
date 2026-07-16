@@ -5209,7 +5209,7 @@ function QueueDashboard({
                     fontSize: 11,
                   }}
                 >
-                  {failed.toLocaleString()} failed or blocked point
+                  {failed.toLocaleString()} failed result
                   {failed === 1 ? "" : "s"} · inspect evidence
                 </button>
               )}
@@ -5998,7 +5998,7 @@ function CampaignBacklogStrip({
                 <button
                   type="button"
                   data-testid={`backlog-failed-link-${c.slug}`}
-                  title="Open these failed points in the Points explorer"
+                  title="Open these solver failures in the Points explorer"
                   onClick={() => onOpenPoints(c.id, "failed")}
                   style={{
                     fontFamily: MONO,
@@ -6017,10 +6017,10 @@ function CampaignBacklogStrip({
               {(c.blockedPoints ?? 0) > 0 && (
                 <span
                   data-testid={`backlog-blocked-${c.slug}`}
-                  title="Machine-owned preliminary work exhausted its bounded attempts; no human review is required"
-                  style={{ color: C.amber }}
+                  title="Automatic URANS recovery exhausted; this is a critical system incident requiring investigation"
+                  style={{ color: C.redText }}
                 >
-                  {(c.blockedPoints ?? 0).toLocaleString()} blocked
+                  {(c.blockedPoints ?? 0).toLocaleString()} critical
                 </span>
               )}
               {c.status !== "active" && (

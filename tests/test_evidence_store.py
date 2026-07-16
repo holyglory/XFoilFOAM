@@ -16,6 +16,7 @@ import google_crc32c
 import pytest
 import zstandard
 
+from airfoilfoam import evidence_store
 from airfoilfoam.evidence_store import (
     ARCHIVE_FORMAT,
     ArchiveRecord,
@@ -25,6 +26,7 @@ from airfoilfoam.evidence_store import (
     EvidenceUploadError,
     RemoteEvidencePointer,
     create_tar_zst,
+    extract_verified_evidence_archive,
     inspect_tar_zst,
     manifest_bundle_member_set_sha256,
     read_remote_pointer,
@@ -849,3 +851,241 @@ def test_generic_member_hydration_rejects_unmanifested_and_unsafe_paths(tmp_path
         store.materialize_member(pointer, "openfoam/logs/not-in-manifest")
     with pytest.raises(EvidenceHydrationError, match="unsafe archive path"):
         store.materialize_member(pointer, "../outside")
+
+
+@pytest.mark.parametrize(
+    "unsafe_member",
+    [
+        tarfile.TarInfo("../escape"),
+        tarfile.TarInfo("/absolute"),
+        tarfile.TarInfo("openfoam/system/duplicate"),
+        tarfile.TarInfo("openfoam/system/link"),
+        tarfile.TarInfo("openfoam/system/hardlink"),
+        tarfile.TarInfo("openfoam/system/fifo"),
+        tarfile.TarInfo("openfoam/system/device"),
+    ],
+)
+def test_verified_archive_extractor_rejects_unsafe_member_types_and_paths(
+    tmp_path: Path,
+    unsafe_member: tarfile.TarInfo,
+) -> None:
+    manifest = _valid_manifest({})
+    members: list[tuple[tarfile.TarInfo, bytes | None]] = [
+        (tarfile.TarInfo("evidence_manifest.json"), manifest),
+    ]
+    if unsafe_member.name.endswith("duplicate"):
+        members.extend(
+            [
+                (unsafe_member, b"first"),
+                (tarfile.TarInfo(unsafe_member.name), b"second"),
+            ]
+        )
+    elif unsafe_member.name.endswith("hardlink"):
+        unsafe_member.type = tarfile.LNKTYPE
+        unsafe_member.linkname = "evidence_manifest.json"
+        members.append((unsafe_member, None))
+    elif unsafe_member.name.endswith("link"):
+        unsafe_member.type = tarfile.SYMTYPE
+        unsafe_member.linkname = "../target"
+        members.append((unsafe_member, None))
+    elif unsafe_member.name.endswith("fifo"):
+        unsafe_member.type = tarfile.FIFOTYPE
+        members.append((unsafe_member, None))
+    elif unsafe_member.name.endswith("device"):
+        unsafe_member.type = tarfile.CHRTYPE
+        members.append((unsafe_member, None))
+    else:
+        members.append((unsafe_member, b"unsafe"))
+    archive = tmp_path / "unsafe.tar.zst"
+    _record_from_tar_bytes(archive, _tar_with_members(members))
+    destination = tmp_path / "restored"
+
+    with pytest.raises(EvidenceHydrationError):
+        extract_verified_evidence_archive(
+            archive,
+            destination,
+            compression="zstd",
+            include_prefixes=("openfoam",),
+        )
+
+    assert not destination.exists()
+    assert not (tmp_path / "escape").exists()
+
+
+def test_verified_archive_extractor_rejects_unmanifested_member_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    manifest = _valid_manifest({})
+    archive = tmp_path / "unmanifested.tar.zst"
+    _record_from_tar_bytes(
+        archive,
+        _tar_with_members(
+            [
+                (tarfile.TarInfo("evidence_manifest.json"), manifest),
+                (tarfile.TarInfo("openfoam/system/controlDict"), b"unregistered"),
+            ]
+        ),
+    )
+    destination = tmp_path / "restored"
+
+    with pytest.raises(EvidenceHydrationError, match="missing from manifest"):
+        extract_verified_evidence_archive(
+            archive,
+            destination,
+            compression="zstd",
+            include_prefixes=("openfoam",),
+        )
+
+    assert not destination.exists()
+
+
+def test_verified_archive_extractor_rejects_manifest_excluded_member_even_if_listed(
+    tmp_path: Path,
+) -> None:
+    payload = b"must never be bundled or extracted"
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "bundleExcludes": ["openfoam"],
+            "files": [
+                {
+                    "path": "openfoam/system/controlDict",
+                    "byteSize": len(payload),
+                    # The old extractor skipped this hash because the root was
+                    # excluded, yet still wrote the attacker-controlled bytes.
+                    "sha256": "0" * 64,
+                }
+            ],
+        }
+    ).encode()
+    archive = tmp_path / "excluded-member.tar.zst"
+    _record_from_tar_bytes(
+        archive,
+        _tar_with_members(
+            [
+                (tarfile.TarInfo("evidence_manifest.json"), manifest),
+                (tarfile.TarInfo("openfoam/system/controlDict"), payload),
+            ]
+        ),
+    )
+    destination = tmp_path / "restored"
+
+    with pytest.raises(
+        EvidenceHydrationError,
+        match="member under manifest bundleExcludes",
+    ):
+        extract_verified_evidence_archive(
+            archive,
+            destination,
+            compression="zstd",
+            include_prefixes=("openfoam",),
+        )
+
+    assert not destination.exists()
+
+
+def test_verified_archive_extractor_reserves_free_space_before_selected_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    payload = b"x" * 128
+    manifest = _valid_manifest({"openfoam/system/controlDict": payload})
+    archive = tmp_path / "capacity.tar.zst"
+    _record_from_tar_bytes(
+        archive,
+        _tar_with_members(
+            [
+                (tarfile.TarInfo("evidence_manifest.json"), manifest),
+                (tarfile.TarInfo("openfoam/system/controlDict"), payload),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        evidence_store,
+        "_safe_extraction_capacity",
+        lambda _destination: len(manifest) + 32,
+    )
+    destination = tmp_path / "capacity-restored"
+
+    with pytest.raises(
+        EvidenceHydrationError,
+        match="exceed safe local restore capacity",
+    ):
+        extract_verified_evidence_archive(
+            archive,
+            destination,
+            compression="zstd",
+            include_prefixes=("openfoam",),
+        )
+
+    assert not destination.exists()
+
+
+def test_verified_archive_extractor_rejects_unbounded_remote_pointer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifest = _valid_manifest({})
+    archive = tmp_path / "remote-bounded.tar.zst"
+    record = _record_from_tar_bytes(
+        archive,
+        _tar_with_members(
+            [(tarfile.TarInfo("evidence_manifest.json"), manifest)]
+        ),
+    )
+    client = _FakeStorageClient()
+    _store, pointer = _publish_record(tmp_path, record, client)
+    monkeypatch.setattr(
+        evidence_store,
+        "_MAX_LOCAL_EVIDENCE_TAR_BYTES",
+        pointer.tar_size - 1,
+    )
+
+    with pytest.raises(
+        EvidenceHydrationError,
+        match="remote evidence pointer declares an uncompressed tar larger",
+    ):
+        extract_verified_evidence_archive(
+            archive,
+            tmp_path / "remote-pointer-limit",
+            compression="zstd",
+            pointer=pointer,
+        )
+    assert not (tmp_path / "remote-pointer-limit").exists()
+
+
+def test_verified_archive_extractor_bounds_local_tar_and_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifest = _valid_manifest({})
+    archive = tmp_path / "bounded.tar.zst"
+    _record_from_tar_bytes(
+        archive,
+        _tar_with_members(
+            [(tarfile.TarInfo("evidence_manifest.json"), manifest)]
+        ),
+    )
+
+    monkeypatch.setattr(evidence_store, "_MAX_LOCAL_EVIDENCE_TAR_BYTES", 512)
+    with pytest.raises(EvidenceHydrationError, match="uncompressed tar exceeds"):
+        extract_verified_evidence_archive(
+            archive,
+            tmp_path / "tar-limit",
+            compression="zstd",
+        )
+    assert not (tmp_path / "tar-limit").exists()
+
+    monkeypatch.setattr(
+        evidence_store,
+        "_MAX_LOCAL_EVIDENCE_TAR_BYTES",
+        1024 * 1024,
+    )
+    monkeypatch.setattr(evidence_store, "MAX_EVIDENCE_MANIFEST_BYTES", 16)
+    with pytest.raises(EvidenceHydrationError, match="manifest exceeds"):
+        extract_verified_evidence_archive(
+            archive,
+            tmp_path / "manifest-limit",
+            compression="zstd",
+        )
+    assert not (tmp_path / "manifest-limit").exists()

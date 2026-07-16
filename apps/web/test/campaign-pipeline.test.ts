@@ -153,7 +153,7 @@ describe("progressBarSegments", () => {
     expect(seg.awaitingCount).toBe(0);
   });
 
-  it("machine-blocked points are an amber terminal segment, not open work", () => {
+  it("critical recovery failures are terminal, not ordinary open work", () => {
     const seg = progressBarSegments(totals({ blocked: 7, remaining: 503 }), {
       awaitingUrans: 0,
       needsReview: 0,
@@ -161,7 +161,7 @@ describe("progressBarSegments", () => {
     expect(seg.blockedCount).toBe(7);
     expect(seg.blocked).toBeCloseTo(7 / 1750, 10);
     expect(seg.openCount).toBe(1750 - 1240 - 7);
-    expect(progressSummaryLine(seg, 1750)).toContain("7 blocked");
+    expect(progressSummaryLine(seg, 1750)).toContain("7 critical");
   });
 
   it("requested = 0 never divides by zero; open never goes negative", () => {

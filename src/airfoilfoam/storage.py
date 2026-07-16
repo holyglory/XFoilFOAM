@@ -124,6 +124,10 @@ class JobStore:
                 status.execution_pool = previous.execution_pool
             if status.failure_disposition is None:
                 status.failure_disposition = previous.failure_disposition
+            if status.continuation_failure_kind is None:
+                status.continuation_failure_kind = (
+                    previous.continuation_failure_kind
+                )
             status.queued_at = status.queued_at or previous.queued_at
             status.started_at = status.started_at or previous.started_at
             if status.phase == previous.phase and status.phase_started_at is None:
@@ -171,6 +175,7 @@ class JobStore:
             or result.engine is None
             or result.execution_pool is None
             or result.failure_disposition is None
+            or result.continuation_failure_kind is None
         ):
             status = self.read_status(result.job_id)
             if status is not None:
@@ -186,6 +191,10 @@ class JobStore:
                     result.execution_pool = status.execution_pool
                 if result.failure_disposition is None:
                     result.failure_disposition = status.failure_disposition
+                if result.continuation_failure_kind is None:
+                    result.continuation_failure_kind = (
+                        status.continuation_failure_kind
+                    )
         self._write_json_atomic(path, result.model_dump_json(indent=2))
 
     def read_result(self, job_id: str) -> Optional[JobResult]:

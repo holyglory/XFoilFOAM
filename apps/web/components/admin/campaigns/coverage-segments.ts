@@ -106,11 +106,13 @@ export function segmentView(
   return { state: "progress", fillFraction };
 }
 
-/** Rendered fill height (0..1). Failed/needs-review segments render SOLID at
- *  full height (mockup `.seg.fail`) so review work stays visible at any
- *  progress; every other state fills to the terminal fraction. */
+/** Rendered fill height (0..1). Critical/failed/needs-review segments render
+ *  SOLID so recovery incidents stay visible at any progress; every other
+ *  state fills to the terminal fraction. */
 export function segmentFillHeight(view: SegmentView): number {
-  return view.state === "failed" || view.state === "needs_review"
+  return view.state === "failed" ||
+    view.state === "needs_review" ||
+    view.state === "blocked"
     ? 1
     : view.fillFraction;
 }
@@ -123,7 +125,7 @@ export function segmentFillHeight(view: SegmentView): number {
  *  real counts. Legacy nonzero needsReview payloads are described as
  *  unavailable; payloads without the split keep the rejected wording. `stateLabel`
  *  is the ConditionStrip display state; anything other than "active" is
- *  appended so kept/blocked/retired/released stay visible without column
+ *  appended so kept/critical/retired/released stay visible without column
  *  headers. */
 export function segmentTitle(
   condition: Pick<AdminCampaignConditionSummary, "reynolds" | "ord">,
@@ -144,8 +146,12 @@ export function segmentTitle(
     } else if (cell.rejected > 0) {
       parts.push(`${fCount(cell.rejected)} rejected`);
     }
-    if ((cell.blocked ?? 0) > 0)
-      parts.push(`${fCount(cell.blocked ?? 0)} blocked`);
+    if ((cell.blocked ?? 0) > 0) {
+      const critical = cell.blocked ?? 0;
+      parts.push(
+        `${fCount(critical)} critical failure${critical === 1 ? "" : "s"}`,
+      );
+    }
     if (cell.failed > 0) parts.push(`${fCount(cell.failed)} failed`);
     if (cell.running > 0) parts.push(`${fCount(cell.running)} running`);
     const sync = syncPromisedCount(cell);

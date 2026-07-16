@@ -2,6 +2,7 @@ import {
   type DB,
   type MeshRecoveryRequeueScope,
   requeueDeterministicMeshObligationsForRecoveryVersion,
+  requeueDeterministicRansMeshFailuresForRecoveryVersion,
 } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 
@@ -32,6 +33,23 @@ export async function prepareAutomaticMeshRecovery(
   if (reopened.obligationIds.length) {
     console.log(
       `[sweeper] reopened ${reopened.obligationIds.length} deterministic PRECALC mesh obligation(s) for engine mesh recovery strategy v${meshRecoveryVersion}; original attempt evidence retained`,
+    );
+  }
+  const ransScope =
+    scope.campaignIds !== undefined
+      ? { campaignIds: scope.campaignIds }
+      : Object.keys(scope).length
+        ? { resultIds: [] }
+        : {};
+  const reopenedRans =
+    await requeueDeterministicRansMeshFailuresForRecoveryVersion(
+      db,
+      meshRecoveryVersion,
+      ransScope,
+    );
+  if (reopenedRans.resultIds.length) {
+    console.log(
+      `[sweeper] reopened ${reopenedRans.resultIds.length} deterministic wave-1 RANS mesh result(s) for engine mesh recovery strategy v${meshRecoveryVersion}; original attempt evidence retained`,
     );
   }
   return meshRecoveryVersion;

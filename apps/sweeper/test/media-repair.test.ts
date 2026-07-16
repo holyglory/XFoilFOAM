@@ -3,6 +3,7 @@ import {
   airfoils,
   boundaryProfiles,
   boundaryConditions,
+  blockFinalUransVerificationAfterMediaRepair,
   categories,
   claimNextResultMediaRepair,
   completeSatisfiedResultMediaRepair,
@@ -31,6 +32,7 @@ import {
   simJobs,
   simPrecalcObligationAttempts,
   simPrecalcObligations,
+  simSolverIncidents,
   simUransVerifyQueue,
   meshProfiles,
   outputProfiles,
@@ -1478,6 +1480,293 @@ describe("durable result media repair", () => {
       .from(simUransVerifyQueue)
       .where(eq(simUransVerifyQueue.precalcResultId, fixture.resultId));
     expect(verifyRows).toHaveLength(1);
+  });
+
+  it("MUST-CATCH: late trusted media publishes the exact blocked FULL attempt behind the PRECALC replace guard", async () => {
+    const fixture = await createSolvedResult("final-replace-guard", {
+      fidelity: "urans_precalc",
+    });
+    const preliminaryRepair = await resultMediaRepairTick(db, engineWith(), {
+      resultId: fixture.resultId,
+    });
+    expect(preliminaryRepair.finalized).toBe(1);
+    const [verify] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultId, fixture.resultId));
+    expect(verify).toBeTruthy();
+    const [selectedPreliminary] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, fixture.resultId));
+    expect(selectedPreliminary.currentResultAttemptId).toBe(
+      fixture.resultAttemptId,
+    );
+
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: fixture.airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        campaignId: null,
+        jobKind: "verify",
+        referenceChordM: 0.15,
+        wave: 2,
+        status: "done",
+        engineJobId: `${PREFIX}-final-replace-guard-job`,
+        totalCases: 1,
+        completedCases: 1,
+        submittedAt: new Date(),
+        finishedAt: new Date(),
+        requestPayload: {
+          aoas: [6],
+          uransFidelity: "full",
+          verifyQueueItemId: verify.id,
+          verifyPrecalc: { cl: 0.81, cd: 0.041, cm: -0.032 },
+        },
+      })
+      .returning();
+
+    const insertFullAttempt = async (
+      label: string,
+      coefficients: { cl: number; cd: number; cm: number },
+    ) => {
+      const engineJobId = `${PREFIX}-${label}-job`;
+      const engineCaseSlug = `${label}-case`;
+      const manifestSha = createHash("sha256")
+        .update(`${PREFIX}:${label}:manifest`)
+        .digest("hex");
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: fixture.resultId,
+          airfoilId: fixture.airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: 6,
+          simJobId: job.id,
+          engineJobId,
+          engineCaseSlug,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          validForPolar: false,
+          ...coefficients,
+          clCd: coefficients.cl / coefficients.cd,
+          clStd: 0.02,
+          cdStd: 0.002,
+          cmStd: 0.001,
+          stalled: true,
+          unsteady: true,
+          converged: true,
+          strouhal: 0.17,
+          evidencePayload: {
+            fidelity: "urans_full",
+            frame_track: frameTrack,
+            force_history: {
+              t: [0, 0.1, 0.2, 0.3],
+              cl: [
+                coefficients.cl - 0.01,
+                coefficients.cl + 0.01,
+                coefficients.cl - 0.005,
+                coefficients.cl + 0.005,
+              ],
+              cd: [
+                coefficients.cd - 0.001,
+                coefficients.cd + 0.001,
+                coefficients.cd - 0.0005,
+                coefficients.cd + 0.0005,
+              ],
+              cm: [
+                coefficients.cm - 0.001,
+                coefficients.cm + 0.001,
+                coefficients.cm - 0.0005,
+                coefficients.cm + 0.0005,
+              ],
+            },
+          },
+          solvedAt: new Date(),
+        })
+        .returning();
+      await db.insert(solverEvidenceArtifacts).values({
+        resultId: fixture.resultId,
+        resultAttemptId: attempt.id,
+        airfoilId: fixture.airfoilId,
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug,
+        aoaDeg: 6,
+        kind: "manifest",
+        storageKey: `${PREFIX}/${label}/manifest.json`,
+        mimeType: "application/json",
+        sha256: manifestSha,
+        byteSize: 512,
+        metadata: { evidenceBase: `evidence/${label}` },
+      });
+      await db.insert(forceHistory).values({
+        resultId: fixture.resultId,
+        resultAttemptId: attempt.id,
+        t: [0, 0.1, 0.2, 0.3],
+        cl: [
+          coefficients.cl - 0.01,
+          coefficients.cl + 0.01,
+          coefficients.cl - 0.005,
+          coefficients.cl + 0.005,
+        ],
+        cd: [
+          coefficients.cd - 0.001,
+          coefficients.cd + 0.001,
+          coefficients.cd - 0.0005,
+          coefficients.cd + 0.0005,
+        ],
+        cm: [
+          coefficients.cm - 0.001,
+          coefficients.cm + 0.001,
+          coefficients.cm - 0.0005,
+          coefficients.cm + 0.0005,
+        ],
+      });
+      return attempt;
+    };
+
+    const target = await insertFullAttempt("final-replace-guard-target", {
+      cl: 0.82,
+      cd: 0.042,
+      cm: -0.033,
+    });
+    const unrelated = await insertFullAttempt("final-replace-guard-unrelated", {
+      cl: 0.9,
+      cd: 0.06,
+      cm: -0.04,
+    });
+    await refreshPolarCacheForRevision(
+      db,
+      fixture.airfoilId,
+      revisionId,
+    );
+    const rejected = await db
+      .select({
+        id: resultClassifications.resultAttemptId,
+        state: resultClassifications.state,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultClassifications)
+      .where(
+        inArray(resultClassifications.resultAttemptId, [
+          target.id,
+          unrelated.id,
+        ]),
+      );
+    expect(rejected).toHaveLength(2);
+    expect(
+      rejected.every(
+        (row) =>
+          row.state === "rejected" &&
+          row.reasons.includes("missing-urans-video"),
+      ),
+    ).toBe(true);
+    await db
+      .update(simUransVerifyQueue)
+      .set({
+        state: "pending",
+        simJobId: null,
+        freshAttemptCount: 1,
+        continuationAttemptCount: 0,
+        latestResultAttemptId: target.id,
+        lastOutcome: "media_repair_pending",
+        lastError: "missing-urans-video",
+      })
+      .where(eq(simUransVerifyQueue.id, verify.id));
+
+    expect(
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      }),
+    ).toBe(1);
+    const [exactRepair] = await db
+      .select()
+      .from(resultMediaRepairs)
+      .where(eq(resultMediaRepairs.resultId, fixture.resultId));
+    expect(exactRepair).toMatchObject({
+      resultAttemptId: target.id,
+      state: "pending",
+    });
+    await db
+      .update(resultMediaRepairs)
+      .set({
+        state: "blocked",
+        attemptCount: 3,
+        maxAttempts: 3,
+        lastError: "automatic render recovery exhausted",
+      })
+      .where(eq(resultMediaRepairs.id, exactRepair.id));
+    expect(
+      await blockFinalUransVerificationAfterMediaRepair(
+        db,
+        target.id,
+        "automatic render recovery exhausted",
+      ),
+    ).toBe(1);
+    const [blockedVerify] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, verify.id));
+    expect(blockedVerify).toMatchObject({
+      state: "blocked",
+      lastOutcome: "final_recovery_exhausted",
+    });
+
+    // A later trusted artifact import/render can complete the exact immutable
+    // attempt without consuming another automatic renderer claim.
+    await repairDefaultMediaForStoredResult({
+      db,
+      engine: engineWith(),
+      resultId: fixture.resultId,
+      resultAttemptId: target.id,
+      heartbeat: async () => undefined,
+    });
+
+    const outcome = await resultMediaRepairTick(db, engineWith(), {
+      resultId: fixture.resultId,
+    });
+    expect(outcome.finalized).toBe(1);
+    const [selectedFinal] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, fixture.resultId));
+    expect(selectedFinal.currentResultAttemptId).toBe(target.id);
+    const [settledVerify] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, verify.id));
+    expect(settledVerify).toMatchObject({
+      state: "done",
+      verifyResultId: fixture.resultId,
+      latestResultAttemptId: target.id,
+      lastOutcome: "accepted",
+      lastError: null,
+    });
+    const [resolvedIncident] = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(eq(simSolverIncidents.verifyQueueId, verify.id));
+    expect(resolvedIncident).toMatchObject({
+      status: "resolved",
+      resultAttemptId: target.id,
+    });
+    expect(resolvedIncident.resolvedAt).toBeInstanceOf(Date);
+    expect(
+      await db
+        .select({ id: resultMedia.id })
+        .from(resultMedia)
+        .where(eq(resultMedia.resultAttemptId, unrelated.id)),
+    ).toHaveLength(0);
+    expect(
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      }),
+    ).toBe(0);
   });
 
   it("satisfies a blocked PRECALC obligation after verified media makes its real attempt accepted", async () => {

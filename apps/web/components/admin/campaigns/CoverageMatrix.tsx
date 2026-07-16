@@ -52,7 +52,7 @@ interface PageState {
   rows: AdminCampaignAirfoilRow[];
 }
 
-/** Attention weight for the blocked-first sort. Failed solver/setup outcomes
+/** Attention weight for the critical-first sort. Failed solver/setup outcomes
  * remain unavailable evidence, not human coefficient-review assignments. */
 function rowBlocked(row: AdminCampaignAirfoilRow): number {
   return row.perCondition.reduce(
@@ -352,7 +352,7 @@ export function CoverageMatrix({
             borderColor: blockedFirst ? C.tealBorder : C.stroke,
           }}
         >
-          blocked first
+          critical first
         </button>
         {releasedConditions.length > 0 && (
           <button
@@ -473,11 +473,10 @@ export function CoverageMatrix({
             textOverflow: "ellipsis",
           }}
         >
-          CONDITIONS → fill = angles done ·{" "}
-          <span style={{ color: C.violet }}>violet</span> = awaiting URANS ·{" "}
-          <span style={{ color: C.amber }}>amber</span> = machine-blocked ·{" "}
-          <span style={{ color: C.redText }}>red</span> = failed · hover for
-          detail · click opens the cell panel
+          CONDITIONS → fill = completed angles ·{" "}
+          <span style={{ color: C.violet }}>violet</span> = fast URANS ·{" "}
+          <span style={{ color: C.redText }}>red</span> = critical · hover for
+          detail · click opens the point flow
         </span>
       </div>
 
@@ -586,12 +585,14 @@ export function CoverageMatrix({
                     // failed; violet = calm awaiting-URANS; amber only for
                     // legacy payloads without the split counters.
                     const red =
-                      view.state === "failed" || view.state === "needs_review";
+                      view.state === "failed" ||
+                      view.state === "needs_review" ||
+                      view.state === "blocked";
                     const fillColor = red
                       ? C.red
                       : view.state === "awaiting_urans"
                         ? C.violet
-                        : view.state === "blocked" || view.state === "rejected"
+                        : view.state === "rejected"
                           ? C.amber
                           : C.teal;
                     return (

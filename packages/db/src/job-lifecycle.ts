@@ -7,6 +7,10 @@ import {
 } from "./precalc-obligations";
 import { releaseResultClaimsForJob } from "./result-claim-lifecycle";
 import { simJobs, simUransRequests, simUransVerifyQueue } from "./schema";
+import {
+  refreshFullUransRequestStateInTransaction,
+  refreshFullUransRequestsForVerifyQueueInTransaction,
+} from "./urans-ladder";
 
 /** Compatibility grace for `ingesting` rows created before migration 0045.
  *
@@ -90,29 +94,76 @@ export async function claimSimJobCancellation(
         verifyQueueItemId?: unknown;
       };
       if (typeof payload.uransRequestId === "string") {
-        const cancelledOwner = await tx
-          .update(simUransRequests)
-          .set({ state: "cancelled", simJobId: claimed.id })
-          .where(
-            and(
-              eq(simUransRequests.id, payload.uransRequestId),
-              eq(simUransRequests.state, "running"),
-              eq(simUransRequests.simJobId, claimed.id),
-            ),
-          )
-          .returning({ id: simUransRequests.id });
-        if (cancelledOwner.length) {
-          await tx.execute(sql`
-            DELETE FROM sim_ladder_submit_retries
-            WHERE urans_request_id = ${payload.uransRequestId}
-              AND (latest_sim_job_id IS NULL OR latest_sim_job_id = ${claimed.id})
-          `);
+        const [request] = await tx
+          .select({ fidelity: simUransRequests.fidelity })
+          .from(simUransRequests)
+          .where(eq(simUransRequests.id, payload.uransRequestId))
+          .limit(1);
+        if (request?.fidelity !== "full") {
+          const cancelledOwner = await tx
+            .update(simUransRequests)
+            .set({ state: "cancelled", simJobId: claimed.id })
+            .where(
+              and(
+                eq(simUransRequests.id, payload.uransRequestId),
+                eq(simUransRequests.state, "running"),
+                eq(simUransRequests.simJobId, claimed.id),
+              ),
+            )
+            .returning({ id: simUransRequests.id });
+          if (cancelledOwner.length) {
+            await tx.execute(sql`
+              DELETE FROM sim_ladder_submit_retries
+              WHERE urans_request_id = ${payload.uransRequestId}
+                AND (latest_sim_job_id IS NULL OR latest_sim_job_id = ${claimed.id})
+            `);
+          }
         }
       }
       if (typeof payload.verifyQueueItemId === "string") {
         const cancelledOwner = await tx
           .update(simUransVerifyQueue)
-          .set({ state: "cancelled", simJobId: null })
+          .set({
+            state: sql`CASE
+              WHEN ${simUransVerifyQueue.backgroundOwner} THEN 'pending'
+              WHEN EXISTS (
+                SELECT 1
+                FROM sim_urans_verify_queue_campaigns ownership
+                JOIN sim_campaigns campaign
+                  ON campaign.id = ownership.campaign_id
+                WHERE ownership.queue_id = ${simUransVerifyQueue.id}
+                  AND ownership.state = 'active'
+                  AND campaign.status IN (
+                    'active', 'attention', 'paused'
+                  )
+              ) THEN 'pending'
+              WHEN EXISTS (
+                SELECT 1
+                FROM sim_urans_verify_queue_requests coverage
+                JOIN sim_urans_requests request_owner
+                  ON request_owner.id = coverage.request_id
+                WHERE coverage.queue_id = ${simUransVerifyQueue.id}
+                  AND request_owner.fidelity = 'full'
+                  AND request_owner.state IN ('pending', 'running')
+                  AND (
+                    request_owner.background_owner
+                    OR EXISTS (
+                      SELECT 1
+                      FROM sim_urans_request_campaigns request_ownership
+                      JOIN sim_campaigns campaign
+                        ON campaign.id = request_ownership.campaign_id
+                      WHERE request_ownership.request_id = request_owner.id
+                        AND request_ownership.state = 'active'
+                        AND campaign.status IN (
+                          'active', 'attention', 'paused'
+                        )
+                    )
+                  )
+              ) THEN 'pending'
+              ELSE 'cancelled'
+            END`,
+            simJobId: null,
+          })
           .where(
             and(
               eq(simUransVerifyQueue.id, payload.verifyQueueItemId),
@@ -132,6 +183,10 @@ export async function claimSimJobCancellation(
             WHERE verify_queue_id = ${payload.verifyQueueItemId}
               AND (latest_sim_job_id IS NULL OR latest_sim_job_id = ${claimed.id})
           `);
+          await refreshFullUransRequestsForVerifyQueueInTransaction(
+            tx,
+            payload.verifyQueueItemId,
+          );
         }
       }
       const settlement = await settlePrecalcObligationsForJobInTransaction(
@@ -139,6 +194,12 @@ export async function claimSimJobCancellation(
         claimed,
         { terminalError: reason, cancellation: "explicit" },
       );
+      if (typeof payload.uransRequestId === "string") {
+        await refreshFullUransRequestStateInTransaction(
+          tx,
+          payload.uransRequestId,
+        );
+      }
       return {
         claim: {
           kind: "cancelled" as const,

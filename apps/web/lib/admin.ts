@@ -92,6 +92,34 @@ export interface AdminHealthSample {
   } | null;
   storageError: string | null;
 }
+
+export type AdminSolverIncidentStage = "rans" | "preliminary" | "final";
+export type AdminSolverIncidentSeverity = "warning" | "critical";
+
+export interface AdminSolverIncidentGroup {
+  stage: AdminSolverIncidentStage;
+  reason: string;
+  solverImplementationId: string;
+  solverImplementationKey: string;
+  remediationVersion: string;
+  occurrenceCount: number;
+  openCount: number;
+  openCriticalCount: number;
+  firstOccurredAt: string;
+  lastOccurredAt: string;
+  requiresInvestigation: boolean;
+  effectiveSeverity: AdminSolverIncidentSeverity;
+}
+
+export interface AdminSolverIncidentSummary {
+  /** Repeated physical incidents at or above this count require investigation. */
+  threshold: number;
+  occurrenceCount: number;
+  openCount: number;
+  criticalGroupCount: number;
+  groups: AdminSolverIncidentGroup[];
+}
+
 export interface AdminHealth {
   asOf: string;
   sampleIntervalSeconds: number;
@@ -106,6 +134,9 @@ export interface AdminHealth {
     memoryUsedPct: number | null;
   };
   history: AdminHealthSample[];
+  /** Durable screening/preliminary/final solver reliability incidents.
+   * Normal aerodynamic RANS handoff is deliberately absent from this model. */
+  solverIncidents: AdminSolverIncidentSummary;
 }
 export interface SweeperState {
   enabled: boolean;
@@ -1647,6 +1678,8 @@ export interface AdminCampaignSummary {
     | "running_refinement"
     | "completed"
     | null;
+  /** Campaign-scoped screening/preliminary/final reliability incidents. */
+  solverIncidents: AdminSolverIncidentSummary;
   airfoilCount: number;
   excludedAirfoilCount: number;
   latestLifecycleEvent: AdminCampaignListItem["latestLifecycleEvent"];
@@ -1707,6 +1740,87 @@ export interface AdminCampaignFailureGroup {
     attempts: number;
     retryable: boolean;
   }>;
+}
+
+export type AdminCampaignPreliminaryOutcomeKind =
+  | "accepted"
+  | "recovering"
+  | "evidence_unavailable"
+  | "continuation_unavailable"
+  | "mesh_unavailable"
+  | "submit_unavailable"
+  | "recovery_unavailable";
+
+export type AdminCampaignPreliminaryFastState =
+  | "not_started"
+  | "queued"
+  | "running"
+  | "accepted"
+  | "critical";
+
+export type AdminCampaignPreliminaryRansStage =
+  | "screened"
+  | "polar_handoff"
+  | "skipped"
+  | "not_started";
+
+export type AdminCampaignPreliminaryFinalState =
+  | "not_started"
+  | "queued"
+  | "running"
+  | "accepted"
+  | "critical";
+
+export type AdminCampaignPreliminaryFinalActivityState =
+  | "queued"
+  | "running"
+  | "critical";
+
+export interface AdminCampaignPreliminaryOutcome {
+  aoaDeg: number;
+  sourceAoaDeg: number;
+  derivedBySymmetry: boolean;
+  affectedAoaDegs: number[];
+  affectedPointCount: number;
+  state: "pending" | "running" | "satisfied" | "blocked";
+  outcome: AdminCampaignPreliminaryOutcomeKind;
+  ransStage: AdminCampaignPreliminaryRansStage;
+  fastState: AdminCampaignPreliminaryFastState;
+  finalState: AdminCampaignPreliminaryFinalState;
+  finalActivityState: AdminCampaignPreliminaryFinalActivityState | null;
+  finalComparison: "within_tolerance" | "disagreed" | null;
+  finalDeltaCl: number | null;
+  finalDeltaCd: number | null;
+  finalDeltaCm: number | null;
+  finalSource: "verify" | "full_request" | null;
+  criticalStage: "preflight" | "fast" | "final" | null;
+  fastResultId: string | null;
+  fastResultAttemptId: string | null;
+  finalResultId: string | null;
+  finalResultAttemptId: string | null;
+  finalEvidenceReasons: string[];
+  finalSubmitError: string | null;
+  finalSubmitHttpStatus: number | null;
+  physicalAttemptsUsed: number;
+  physicalAttemptsMax: number;
+  recoverySubmissions: number;
+  nonPhysicalSubmissions: number;
+  interruptedPhysicalRuns: number;
+  ransEvidenceRuns: number;
+  preliminaryEvidenceRuns: number;
+  fullUransEvidenceRuns: number;
+  legacyUransEvidenceRuns: number;
+  evidenceReasons: string[];
+  updatedAt: string;
+}
+
+export interface AdminCampaignPreliminaryOutcomes {
+  total: number;
+  recovering: number;
+  critical: number;
+  unavailable: number;
+  verified: number;
+  items: AdminCampaignPreliminaryOutcome[];
 }
 
 export interface AdminCampaignRejectedSample {
@@ -1989,6 +2103,24 @@ export const getCampaignFailures = (
     groups: AdminCampaignFailureGroup[];
     rejected: AdminCampaignRejected;
   }>(`/api/admin/campaigns/${encodeURIComponent(id)}/failures${suffix}`);
+};
+
+export const getCampaignPreliminaryOutcomes = (
+  id: string,
+  opts: {
+    conditionId: string;
+    airfoilId: string;
+    signal?: AbortSignal;
+  },
+) => {
+  const qs = new URLSearchParams({
+    conditionId: opts.conditionId,
+    airfoilId: opts.airfoilId,
+  });
+  return aj<AdminCampaignPreliminaryOutcomes>(
+    `/api/admin/campaigns/${encodeURIComponent(id)}/preliminary-outcomes?${qs.toString()}`,
+    { signal: opts.signal },
+  );
 };
 
 export const getCampaignLanes = (

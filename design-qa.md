@@ -115,3 +115,192 @@ correction, not a fidelity regression.
   exercised through browser automation. No application page error was reported.
 
 final result: passed
+
+---
+
+# Campaign Cell Evidence Dialog — Historical deployed baseline
+
+This section records the previously deployed evidence-dialog correction. Its
+`results unavailable` presentation is superseded by the three-stage solver-flow
+contract below; the modal, pinned-geometry, scroll-lock, and evidence-disclosure
+findings remain applicable.
+
+- Live route:
+  `https://airfoils.pro/admin?campaign=c24047fa-743f-4ae5-bcd6-f3071ff79fb4`.
+- Same-state production source:
+  `/home/holyglory/XFoilFOAM-cell-modal/.codex-artifacts/design-qa/campaign-cell-modal/before-1100x900.png`
+  (1100×900, SHA-256
+  `95d8abbd4b79f22f0f720c173bb476749f29cc08dc975b73c2eae175b50dc7e5`).
+- Deployed production result:
+  `/home/holyglory/XFoilFOAM-cell-modal/.codex-artifacts/design-qa/campaign-cell-modal/after-1100x900.png`
+  (1100×900, SHA-256
+  `4bf94980188c1ecff841981cab884af683609dcde311d81982dcbf0375fb0269`).
+- Combined same-input comparison:
+  `/home/holyglory/XFoilFOAM-cell-modal/.codex-artifacts/design-qa/campaign-cell-modal/before-after-2200x940.png`
+  (2200×940, SHA-256
+  `1ea587a99add000bc0d392ce0a91942b69f0efde56c2f727009e8f13d87862cf`).
+- Deployed Airfoil view:
+  `/home/holyglory/XFoilFOAM-cell-modal/.codex-artifacts/design-qa/campaign-cell-modal/airfoil-tab-1100x900.png`.
+- Deployed narrow Airfoil view:
+  `/home/holyglory/XFoilFOAM-cell-modal/.codex-artifacts/design-qa/campaign-cell-modal/airfoil-tab-390x844.png`.
+
+## Correction and prevention
+
+The annotated production panel looked and behaved like a modal but let wheel
+input move the hidden campaign page. Its `FAILED POINTS` panel also combined
+steady-RANS evidence, preliminary-URANS evidence, infrastructure/setup
+submissions, and physical CFD attempts into one unlabeled `attempts` count.
+Raw `solver evidence rejected` diagnostics required users to infer whether
+RANS had handed off normally, URANS had run, or the automatic path had ended.
+The airfoil identity contained only text and offered no profile view.
+
+The prevention layer is a separate preliminary-outcome read model, sequence-
+scoped continuation classification, physical-budget versus evidence-record
+tests, and a browser regression that exercises the modal through the exact
+user journey. It proves document scroll/focus ownership, nested modal reference
+counting, real pinned geometry, wide/narrow containment, and the absence of the
+misleading copy.
+
+## Same-input comparison result
+
+The 1100×900 production source and deployed result were opened together in one
+comparison input at the same route, cell, chart, theme, and scroll state.
+
+- The selected cell remains the dominant right-side surface and preserves the
+  existing chart scale, toolbar, fidelity controls, and provenance access.
+- A compact real airfoil contour now precedes the airfoil name without
+  increasing header height or displacing the primary chart.
+- The new Airfoil tab sits before the four established polar tabs. It renders
+  the pinned stored profile, camber and chord references, and real maximum
+  thickness, maximum camber, trailing-edge, and profile-area values.
+- `7 blocked` is replaced by `7 results unavailable`. The former dense
+  `FAILED POINTS` table is replaced by one `PRELIMINARY URANS` explanation and
+  per-angle outcome rows with a consistent three-part hierarchy: outcome,
+  physical-run budget, then evidence history/diagnosis.
+- The exact production rows show α2°/3° as two of two physical runs with two
+  preliminary evidence records, and α10°/15°/16°/19°/20° as two of two with
+  one preliminary record plus one evidence-less interrupted continuation.
+  Every row reports zero full-URANS evidence. No raw `solver evidence rejected`
+  or bare mixed `3 attempts`/`4 attempts` copy remains.
+- The narrow 390×844 result keeps the thumbnail, identity, all five tabs,
+  profile, metrics, status controls, and preliminary explanation contained.
+  Measured document and panel horizontal overflow are both zero.
+
+## Production interaction verification
+
+- The exact preliminary-outcomes request returned HTTP 200 and seven rows for
+  20-32C/Re≈102k.
+- While open, the body was fixed with hidden overflow. A real wheel event
+  inside the panel advanced its scroll position by 700 px while page scroll
+  stayed zero; the same event over the backdrop moved neither layer. At the
+  panel's lower bound, further wheel input remained contained.
+- Closing at an unchanged viewport restored the exact 410 px campaign scroll
+  position, cleared all body lock styles, and restored focus to
+  `Re 102k · #0 · 26/26 · 7 blocked`.
+- The 1100×900 profile and 390×844 profile both used non-empty stored surface
+  and camber paths. The browser regression additionally compares the thumbnail
+  and profile paths against the pinned detail API geometry exactly.
+- The production document and panel each measured zero horizontal overflow.
+  No browser page error was observed.
+
+## Release evidence
+
+- Focused production-shaped Playwright journey: 1/1 passed.
+- Web unit suite: 295/295 passed.
+- Campaign API/DB suite: 48/48 passed.
+- Preliminary copy helpers: 4/4 passed.
+- DB, API, and web typechecks passed; the production web build and deploy
+  script syntax check passed.
+- GitHub Actions control-plane deploy run `29497137489` succeeded. The engine
+  API and worker retained their exact pre-deploy container IDs and start times
+  while live `simpleFoam` work continued; only Node control-plane services were
+  replaced.
+
+## Findings
+
+- No open P0, P1, or P2 findings.
+- Accepted P3: the narrow header wraps the external detail-page action onto its
+  own line. It remains visible in the first viewport, preserves the airfoil
+  identity, and avoids truncation or horizontal overflow.
+
+final result: passed
+
+---
+
+# Three-stage per-point solver flow — Release QA
+
+## User-visible contract
+
+Every angle is presented as one compact sequence:
+
+1. RANS screening — normal handoff when not publishable;
+2. Preliminary URANS — fast result;
+3. Verified URANS — final result.
+
+RANS rejection or non-convergence is a normal automatic handoff and never a
+failed or blocked point. Only exhausted automatic pre-solver mesh/runtime
+repair or exhausted preliminary/final URANS recovery is a red critical system
+incident. It is surfaced for investigation and algorithm or runtime
+correction, not as a normal retry, review, or setup-change task for the user.
+Primary rows show the current stage and result; physical attempts, evidence
+history, and classifier diagnostics stay behind the information disclosure.
+
+## Prevention and deterministic verification
+
+- The read model emits mutually exclusive current-state totals and exactly one
+  current stage per angle.
+- Serial polling has a bounded timeout, never overlaps, pauses in hidden tabs,
+  and stops when the modal closes.
+- Accepted final evidence remains the canonical teal result while a newer
+  final rerun is visibly queued, running, or critical.
+- Campaign summaries, condition cards, coverage cells, and point chips use
+  `critical`/`result unavailable` for exhausted recovery; the word `blocked`
+  remains reserved for real scheduler or infrastructure admission gates.
+- Repeated preliminary/final incidents are grouped by stage, cause, solver
+  implementation, and remediation version. Three occurrences promote the
+  pattern to the user-visible `CRITICAL · SYSTEM OWNED` state and the internal
+  investigation queue; resolved recurrence remains historical on Health and
+  does not displace the campaign instrument.
+- The mixed-version recovery gate keeps continuation/final recovery pending
+  unless the engine advertises the exact `urans_recovery_version` pinned by the
+  request. Legacy version 0 may continue ordinary RANS and first-pass
+  preliminary URANS, but it cannot execute version-1 recovery semantics.
+- Wide and narrow browser contracts cover the full per-point transition,
+  modal scroll ownership, rail containment, polling teardown, and incident
+  presentation.
+
+Local release verification on 2026-07-16:
+
+- the complete campaign/incident browser journey passed 7/7 tests, including
+  one request at a time under React Strict Mode, exact fast/final evidence
+  opening by stable result id, nested-modal focus and scroll ownership,
+  collapsed diagnostics, and the 390 px layout with no rail or page overflow;
+- the focused modal journey passed independently (1/1);
+- formal UI verification checked the affected route at 390×844 and 1440×900,
+  passed its coverage gate, and reported zero critical geometry, visibility,
+  clipping, overlap, or text-fit findings. Its non-blocking warnings were
+  limited to contrast that cannot be computed through translucent backgrounds
+  and the intentional narrow navigation scroller;
+- all JavaScript/TypeScript suites passed: web 323, API 260, and sweeper 435
+  tests (1,018 total), together with all 108 database tests, workspace
+  typechecks, and the production web build;
+- all 930 non-integration Python tests passed. The complete Python run proved
+  948 integration/unit cases and skipped one unavailable optional case; its
+  only failure was the host media canary because `ffmpeg` was absent. The
+  encoder dependency now fails before expensive CFD, the render path reports
+  explicit per-field unavailable-media evidence instead of a silent empty
+  result, and focused missing/available-encoder regressions pass. After
+  installing the same encoder already present in the production worker image,
+  the retained canary fields were replayed without another CFD solve into a
+  1,129,980-byte H.264 MP4 (900×600, 20 fps, 89 frames, 4.45 s); `ffprobe`
+  inspected it successfully and a full `ffmpeg` decode returned no errors.
+
+The running production engine remains OpenCFD 2406. The new control-plane
+release, its mixed-version gate, and version-1 recovery path have not completed
+production verification. Production route capture, same-input visual
+comparison, exact mixed-version behavior verification, the guarded OpenCFD
+2606 canaries, recovered-result monitoring, and a repeat formal geometry pass
+remain mandatory post-deploy release gates; none is inferred from these local
+checks.
+
+final result: pending production verification

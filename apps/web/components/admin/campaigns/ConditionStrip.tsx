@@ -2,7 +2,7 @@
 
 // Campaign condition summary strip (spec §11): one card per condition with
 // Re label, real progress counters, failed count, next-up marker from the
-// real candidate order, ⚑ kept badge, red blocked badge and the neutral
+// real candidate order, ⚑ kept badge, red critical badge and the neutral
 // "retired · complete" state. Released conditions appear only when they
 // gained evidence after release (restore affordance) — the full released set
 // lives behind the matrix "Show released" toggle.
@@ -113,7 +113,7 @@ export function ConditionStrip({
               flex: "0 0 auto",
               width: 216,
               background: C.panel,
-              border: `1px solid ${state === "blocked" ? (blocked > 0 ? "rgba(245,158,11,0.45)" : "rgba(245,101,101,0.45)") : state === "kept" ? "rgba(245,158,11,0.4)" : C.border}`,
+              border: `1px solid ${state === "blocked" ? "rgba(245,101,101,0.5)" : state === "kept" ? "rgba(245,158,11,0.4)" : C.border}`,
               borderRadius: 10,
               padding: "10px 12px",
               opacity: dimmed ? 0.62 : 1,
@@ -159,21 +159,14 @@ export function ConditionStrip({
               )}
               {state === "blocked" && (
                 <span
-                  style={
-                    blocked > 0
-                      ? badge(
-                          C.amber,
-                          "rgba(245,158,11,0.45)",
-                          "rgba(245,158,11,0.08)",
-                        )
-                      : badge(
-                          C.redText,
-                          "rgba(245,101,101,0.5)",
-                          "rgba(245,101,101,0.08)",
-                        )
-                  }
+                  title="Critical automatic recovery failure; system investigation is required"
+                  style={badge(
+                    C.redText,
+                    "rgba(245,101,101,0.5)",
+                    "rgba(245,101,101,0.08)",
+                  )}
                 >
-                  blocked
+                  critical
                 </span>
               )}
               {state === "retired" && (
@@ -233,7 +226,7 @@ export function ConditionStrip({
                 <span
                   style={{
                     width: `${Math.min(100, (blocked / c.counters.requested) * 100)}%`,
-                    background: C.amber,
+                    background: C.red,
                     display: "block",
                   }}
                 />
@@ -268,8 +261,8 @@ export function ConditionStrip({
                 </span>
               )}
               {blocked > 0 && (
-                <span style={{ color: C.amber }}>
-                  {fCount(blocked)} blocked
+                <span style={{ color: C.redText }}>
+                  {fCount(blocked)} critical
                 </span>
               )}
             </div>
@@ -291,7 +284,7 @@ export function ConditionStrip({
                   opacity: busy ? 0.6 : 1,
                 }}
               >
-                {busy ? "releasing…" : "force-release…"}
+                {busy ? "excluding…" : "exclude condition…"}
               </button>
             )}
             {state === "released" && c.gainedEvidenceAfterRelease && (

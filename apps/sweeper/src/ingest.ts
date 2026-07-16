@@ -7,6 +7,7 @@ import {
   forceHistory,
   laneKeyId,
   onResultIngested,
+  onResultIngestedWithAutomaticPrecalcHandoff,
   type DB,
   type ResultInsert,
   resultAttempts,
@@ -414,10 +415,7 @@ function parseVerifiedGcsEvidenceBundle(
     "uncompressedTarByteSize",
   );
   requirePositiveSafeInteger(artifact.byte_size, "artifact byte_size");
-  const zstdLevel = requirePositiveSafeInteger(
-    metadata.zstdLevel,
-    "zstdLevel",
-  );
+  const zstdLevel = requirePositiveSafeInteger(metadata.zstdLevel, "zstdLevel");
   if (zstdLevel > 22) {
     throw new Error("GCS evidence metadata zstdLevel must be at most 22");
   }
@@ -1188,6 +1186,10 @@ async function insertResultAttempt(opts: {
   engineJobId: string;
   runtime: ResolvedEngineRuntime | null;
   point: PolarPoint;
+  /** Worker-acknowledged mesh-recovery strategy for the physical job. This is
+   * immutable execution evidence; the requested version alone is not proof
+   * that a worker actually ran that strategy. */
+  meshRecoveryVersion?: number | null;
   derived?: {
     fidelity: PointFidelity;
     frameTrack: unknown;
@@ -1225,6 +1227,7 @@ async function insertResultAttempt(opts: {
     frame_track: derived?.frameTrack ?? p.frame_track ?? null,
     steady_history: derived?.steadyHistory ?? p.steady_history ?? null,
     quality_warnings: qualityWarningsForPoint(p) ?? [],
+    mesh_recovery_version: opts.meshRecoveryVersion ?? null,
   };
   const [inserted] = await db
     .insert(resultAttempts)
@@ -2040,9 +2043,12 @@ async function validateRemoteEvidenceCleanupCoverage(
           solverEvidenceArtifactMembers.artifactId,
         ),
       )
-      .where(eq(solverEvidenceArtifactMembers.archiveId, association.archiveId));
+      .where(
+        eq(solverEvidenceArtifactMembers.archiveId, association.archiveId),
+      );
     const manifestRows = memberRows.filter(
-      (row) => row.kind === "manifest" && row.memberPath === "evidence_manifest.json",
+      (row) =>
+        row.kind === "manifest" && row.memberPath === "evidence_manifest.json",
     );
     if (manifestRows.length !== 1) {
       throw new Error(
@@ -2055,7 +2061,9 @@ async function validateRemoteEvidenceCleanupCoverage(
       .where(eq(solverEvidenceArtifacts.id, manifestRows[0]!.artifactId))
       .limit(1);
     if (!manifestArtifact) {
-      throw new Error("cleanup manifest artifact disappeared during validation");
+      throw new Error(
+        "cleanup manifest artifact disappeared during validation",
+      );
     }
     const manifestPath = await localMediaPath(manifestArtifact.storageKey);
     if (!manifestPath) {
@@ -2121,7 +2129,8 @@ async function validateRemoteEvidenceCleanupCoverage(
         );
       for (const excluded of parsed.excluded) {
         const matches = allAttemptArtifacts.filter((artifact) => {
-          if (artifact.metadata?.evidenceBase !== cleanup.evidenceBase) return false;
+          if (artifact.metadata?.evidenceBase !== cleanup.evidenceBase)
+            return false;
           try {
             return (
               archiveMemberPathFromStoredArtifact(
@@ -2188,28 +2197,28 @@ async function acknowledgeTerminalRemoteEvidenceCleanups(
     )) {
       await validateRemoteEvidenceCleanupCoverage(db, cleanup);
       const response = await engine.finalizeRemoteEvidence(engineJobId, {
-      case_slug: cleanup.caseSlug,
-      evidence_base: cleanup.evidenceBase,
-      remote: cleanup.pointer,
-      database_associations: cleanup.associations.map((association) => {
-        if (
-          association.memberAssociationCount == null ||
-          !association.memberAssociationsSha256 ||
-          !association.manifestMemberSetSha256
-        ) {
-          throw new Error("cleanup member coverage was not attested");
-        }
-        return {
-          result_id: association.resultId,
-          result_attempt_id: association.resultAttemptId,
-          source_artifact_id: association.sourceArtifactId,
-          archive_id: association.archiveId,
-          member_association_count: association.memberAssociationCount,
-          member_associations_sha256: association.memberAssociationsSha256,
-          manifest_member_set_sha256: association.manifestMemberSetSha256,
-        };
-      }),
-    });
+        case_slug: cleanup.caseSlug,
+        evidence_base: cleanup.evidenceBase,
+        remote: cleanup.pointer,
+        database_associations: cleanup.associations.map((association) => {
+          if (
+            association.memberAssociationCount == null ||
+            !association.memberAssociationsSha256 ||
+            !association.manifestMemberSetSha256
+          ) {
+            throw new Error("cleanup member coverage was not attested");
+          }
+          return {
+            result_id: association.resultId,
+            result_attempt_id: association.resultAttemptId,
+            source_artifact_id: association.sourceArtifactId,
+            archive_id: association.archiveId,
+            member_association_count: association.memberAssociationCount,
+            member_associations_sha256: association.memberAssociationsSha256,
+            manifest_member_set_sha256: association.manifestMemberSetSha256,
+          };
+        }),
+      });
       if (
         !["complete", "no_local_bytes"].includes(response.state) ||
         response.evidence_base !== cleanup.evidenceBase ||
@@ -3792,6 +3801,8 @@ type FinalizedPoint = {
   aoaDeg: number;
   status: "done" | "failed";
   regime: "rans" | "urans" | null;
+  resultAttemptId: string | null;
+  simJobId: string | null;
 };
 
 function fidelityRank(value: unknown): number {
@@ -4201,6 +4212,8 @@ async function currentTerminalState(
       aoaDeg: results.aoaDeg,
       status: results.status,
       regime: results.regime,
+      resultAttemptId: results.currentResultAttemptId,
+      simJobId: results.simJobId,
     })
     .from(results)
     .where(eq(results.id, resultId))
@@ -4434,6 +4447,8 @@ async function publishStagedPoints(
               aoaDeg: results.aoaDeg,
               status: results.status,
               regime: results.regime,
+              resultAttemptId: results.currentResultAttemptId,
+              simJobId: results.simJobId,
             });
           if (published && published.status === "done") {
             finalized.set(published.resultId, published as FinalizedPoint);
@@ -4512,12 +4527,15 @@ async function publishStagedPoints(
               aoaDeg: results.aoaDeg,
               status: results.status,
               regime: results.regime,
+              resultAttemptId: results.currentResultAttemptId,
+              simJobId: results.simJobId,
             });
           if (failedProjection) {
-            finalized.set(
-              failedProjection.resultId,
-              failedProjection as FinalizedPoint,
-            );
+            finalized.set(failedProjection.resultId, {
+              ...failedProjection,
+              resultAttemptId: candidate.resultAttemptId,
+              simJobId: candidate.simJobId,
+            } as FinalizedPoint);
           }
           continue;
         }
@@ -4596,6 +4614,8 @@ async function publishStagedPoints(
                 aoaDeg: results.aoaDeg,
                 status: results.status,
                 regime: results.regime,
+                resultAttemptId: results.currentResultAttemptId,
+                simJobId: results.simJobId,
               });
             if (restored && restored.status === "done") {
               terminal = restored as FinalizedPoint;
@@ -4611,8 +4631,11 @@ async function publishStagedPoints(
 
 /** Publish an exact media-repair owner only after its repaired attempt has
  * reclassified accepted/provisional inside the revision-locked cache refresh.
- * A concurrent different current generation always wins; media repair is
- * presentation recovery, not authority to replace newer solver truth. */
+ * A concurrent different current generation normally wins. The sole
+ * exception is an exact final-verification media repair, either still pending
+ * or incident-fenced after bounded repair exhaustion: accepted PRECALC
+ * intentionally remains current while the FULL attempt lacks media, and may
+ * be replaced only after that exact FULL attempt becomes accepted. */
 export async function publishRepairedResultAttempt(opts: {
   db: DB;
   resultId: string;
@@ -4648,11 +4671,63 @@ export async function publishRepairedResultAttempt(opts: {
           .limit(1);
         if (
           !cell ||
-          ["pending", "queued", "running", "stale"].includes(cell.status) ||
-          (cell.currentAttemptId !== null &&
-            cell.currentAttemptId !== opts.resultAttemptId)
+          ["pending", "queued", "running", "stale"].includes(cell.status)
         ) {
           return;
+        }
+        let exactFinalRepairReplacement = false;
+        if (
+          cell.currentAttemptId !== null &&
+          cell.currentAttemptId !== opts.resultAttemptId
+        ) {
+          const [authorization] = (await tx.execute(sql`
+            SELECT verify_item.id
+            FROM sim_urans_verify_queue verify_item
+            JOIN result_attempts repaired_attempt
+              ON repaired_attempt.id = verify_item.latest_result_attempt_id
+             AND repaired_attempt.id = ${opts.resultAttemptId}
+             AND repaired_attempt.result_id = ${opts.resultId}
+             AND repaired_attempt.status = 'done'
+             AND repaired_attempt.source = 'solved'
+             AND repaired_attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+            JOIN result_attempts current_attempt
+              ON current_attempt.id = ${cell.currentAttemptId}
+             AND current_attempt.result_id = ${opts.resultId}
+             AND current_attempt.status = 'done'
+             AND current_attempt.source = 'solved'
+             AND current_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            JOIN result_classifications current_classification
+              ON current_classification.result_attempt_id = current_attempt.id
+             AND current_classification.state = 'accepted'
+            WHERE verify_item.precalc_result_id = ${opts.resultId}
+              AND (
+                (
+                  verify_item.state = 'pending'
+                  AND verify_item.last_outcome = 'media_repair_pending'
+                )
+                OR (
+                  verify_item.state = 'blocked'
+                  AND verify_item.last_outcome = 'final_recovery_exhausted'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM sim_solver_incidents incident
+                    WHERE incident.verify_queue_id = verify_item.id
+                      AND incident.result_attempt_id = repaired_attempt.id
+                      AND incident.occurrence_key = concat_ws(
+                        ':',
+                        'final',
+                        verify_item.id::text,
+                        repaired_attempt.id::text,
+                        'final_recovery_exhausted'
+                      )
+                  )
+                )
+              )
+            LIMIT 1
+            FOR UPDATE OF verify_item
+          `)) as unknown as Array<{ id: string }>;
+          if (!authorization) return;
+          exactFinalRepairReplacement = true;
         }
         const [repair] = await tx
           .select({
@@ -4697,7 +4772,11 @@ export async function publishRepairedResultAttempt(opts: {
         if (
           !attempt ||
           !manifest ||
-          !["accepted", "needs_urans"].includes(classification?.state ?? "") ||
+          !(
+            classification?.state === "accepted" ||
+            (!exactFinalRepairReplacement &&
+              classification?.state === "needs_urans")
+          ) ||
           `${attempt.engineJobId ?? ""}:${attempt.engineCaseSlug ?? ""}:${manifest.sha256}` !==
             opts.evidenceSignature
         ) {
@@ -4910,6 +4989,7 @@ export async function ingestResult(opts: {
       engineJobId,
       runtime,
       point: p,
+      meshRecoveryVersion: result.mesh_recovery_version ?? null,
       derived,
       extraQualityWarnings,
     });
@@ -5129,6 +5209,8 @@ export async function ingestResult(opts: {
         aoaDeg: results.aoaDeg,
         status: results.status,
         regime: results.regime,
+        resultAttemptId: results.currentResultAttemptId,
+        simJobId: results.simJobId,
       });
     if (failed)
       finalizedByResult.set(failed.resultId, failed as FinalizedPoint);
@@ -5147,13 +5229,15 @@ export async function ingestResult(opts: {
     const candidate = [...candidatesByRevision.values(), legacyCandidates]
       .flat()
       .find((item) => item.resultId === finalized.resultId);
-    const laneKeys = await onResultIngested(db, {
+    const laneKeys = await onResultIngestedWithAutomaticPrecalcHandoff(db, {
       airfoilId,
       revisionId: candidate?.presetRevisionId ?? null,
       aoaDeg: finalized.aoaDeg,
       resultId: finalized.resultId,
       status: finalized.status,
       regime: finalized.regime,
+      resultAttemptId: finalized.resultAttemptId,
+      simJobId: finalized.simJobId,
     });
     for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
   }

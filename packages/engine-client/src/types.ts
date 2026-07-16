@@ -79,6 +79,7 @@ export interface EngineCapabilities {
   openfoam_image?: string | null;
   runner?: string | null;
   mesh_recovery_version?: number;
+  urans_recovery_version?: number;
 }
 
 export type AirfoilFormat = "auto" | "selig" | "lednicer";
@@ -230,6 +231,9 @@ export interface PolarRequest {
   /** Required worker mesh-repair strategy for this submission. PRECALC callers
    * set it from a live capability probe; API and worker reject mismatches. */
   expected_mesh_recovery_version?: number | null;
+  /** Required durable URANS recovery contract. Automatic continuation and
+   * corrective final recovery callers pin the exact live version. */
+  expected_urans_recovery_version?: number | null;
 }
 
 export type JobState =
@@ -304,6 +308,11 @@ export interface JobStatus {
   /** Typed terminal failure when execution ended before per-angle attempt
    * evidence existed. Null/absent on non-terminal and legacy jobs. */
   failure_disposition?: FailureDisposition | null;
+  /** Continuation-stage failure policy. `transient` means the same immutable
+   * source may recover after storage/provider capacity returns; `permanent`
+   * means unchanged continuation is invalid and must become a critical,
+   * non-physical control-plane outcome. */
+  continuation_failure_kind?: ContinuationFailureKind | null;
   /** Runtime acknowledgement. Missing only on historical responses from the
    * retired OpenCFD-v2406 runtime. */
   engine?: EngineRuntimeIdentity | null;
@@ -324,6 +333,9 @@ export interface EngineHealth {
    * means the legacy strategy (0); malformed/unreachable health is unknown
    * and must never authorize reopening deterministic blockers. */
   mesh_recovery_version?: number;
+  /** Durable cross-job URANS recovery contract. Missing means legacy version
+   * zero and must not authorize continuation or corrective final recovery. */
+  urans_recovery_version?: number;
   /** Structured engine/runtime identity. Top-level version/build_id remain for
    * legacy control-plane and operator compatibility during rollout. */
   engine?: EngineRuntimeIdentity | null;
@@ -524,11 +536,15 @@ export interface JobRuntimeSummary {
   status_active_aoa_deg?: number | null;
   status_cpu_tokens_waiting?: number | null;
   status_cpu_tokens_held?: number | null;
+  status_failure_disposition?: FailureDisposition | null;
+  status_continuation_failure_kind?: ContinuationFailureKind | null;
   result_readable: boolean;
   result_error?: string | null;
   has_result: boolean;
   result_state?: JobState | null;
   result_message?: string | null;
+  result_failure_disposition?: FailureDisposition | null;
+  result_continuation_failure_kind?: ContinuationFailureKind | null;
 }
 
 export interface JobRuntimeResponse {
@@ -591,6 +607,8 @@ export type FailureDisposition =
   | "hard_solver"
   | "deterministic_mesh"
   | "infrastructure";
+
+export type ContinuationFailureKind = "transient" | "permanent";
 
 export interface EngineEvidenceArtifact {
   kind: string;
@@ -739,6 +757,9 @@ export interface JobResult {
   /** Typed terminal failure when execution ended before per-angle attempt
    * evidence existed. Null/absent on non-terminal and legacy results. */
   failure_disposition?: FailureDisposition | null;
+  /** Continuation-stage failure policy, emitted only when staging the exact
+   * saved source failed before CFD began. */
+  continuation_failure_kind?: ContinuationFailureKind | null;
   /** Exact runtime acknowledged by the worker that produced this result. */
   engine?: EngineRuntimeIdentity | null;
   requested_engine?: EngineIdentity | null;

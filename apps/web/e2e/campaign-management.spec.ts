@@ -5,6 +5,11 @@
 // POST /api/admin/test-artifacts/purge (which these tests also verify leaves
 // zero campaign residue). The sweeper must be disabled for the whole run —
 // nothing here may solve; the spec asserts sweeper state is untouched.
+import {
+  makePath,
+  profilePaths,
+  type AirfoilDetailPayload,
+} from "@aerodb/core";
 import { expect, test, type APIRequestContext } from "@playwright/test";
 
 const apiURL = process.env.PLAYWRIGHT_API_URL ?? "http://127.0.0.1:4000";
@@ -391,6 +396,740 @@ test.describe
     expect(preview.status).toBe("ok");
     expect(preview.totalPoints).toBe(12);
     expect(preview.totalSolverRuns).toBe(10);
+  });
+
+  test("campaign cell modal locks the page and exposes the real airfoil profile", async ({
+    page,
+    request,
+  }) => {
+    const launched = await launchCampaign(
+      request,
+      `${state.stamp} cell modal contract`,
+      planBody({
+        speedsMps: [10],
+        baseSweep: { fromDeg: 0, toDeg: 0, stepDeg: 1, listDeg: null },
+      }),
+    );
+    const summary = await json<{
+      conditions: Array<{
+        id: string;
+        ord: number;
+        revisionId: string;
+        reynolds: number;
+        mach: number | null;
+      }>;
+    }>(request, "get", `/api/admin/campaigns/${launched.campaign.id}`);
+    const condition = summary.conditions[0]!;
+    const pinnedDetail = await json<AirfoilDetailPayload>(
+      request,
+      "get",
+      `/api/airfoils/${state.camAirfoil.slug}?revisionId=${encodeURIComponent(condition.revisionId)}`,
+    );
+    const expectedProfile = profilePaths(pinnedDetail.geometry);
+    const expectedThumbnail = makePath(
+      pinnedDetail.geometry.contour,
+      5,
+      Math.round(24 * 0.56),
+      46,
+      true,
+    );
+    const detailWithEvidence: AirfoilDetailPayload = {
+      ...pinnedDetail,
+      polars: [
+        {
+          seriesId: `${state.stamp}-modal-series`,
+          label: `Re ${Math.round(condition.reynolds)}`,
+          re: condition.reynolds,
+          mach: condition.mach ?? undefined,
+          color: "#22d3ee",
+          source: "solved",
+          points: [
+            {
+              a: 0,
+              cl: 0.12,
+              cd: 0.01,
+              cm: -0.01,
+              ld: 12,
+              stalled: false,
+              source: "solved",
+              resultId: `${state.stamp}-modal-result`,
+              classificationState: "accepted",
+            },
+          ],
+        },
+      ],
+    };
+    await page.route(
+      `**/api/airfoils/${state.camAirfoil.slug}?revisionId=*`,
+      async (route) => {
+        await route.fulfill({ json: detailWithEvidence });
+      },
+    );
+    let solverFlowPhase:
+      | "rans-critical"
+      | "queued"
+      | "running"
+      | "fast-critical"
+      | "final-critical"
+      | "accepted"
+      | "accepted-with-running-rerun"
+      | "accepted-with-critical-rerun" = "rans-critical";
+    let solverFlowRequestCount = 0;
+    let activeSolverFlowRequests = 0;
+    let maxConcurrentSolverFlowRequests = 0;
+    await page.route(
+      `**/api/admin/campaigns/${launched.campaign.id}/preliminary-outcomes?*`,
+      async (route) => {
+        solverFlowRequestCount += 1;
+        activeSolverFlowRequests += 1;
+        maxConcurrentSolverFlowRequests = Math.max(
+          maxConcurrentSolverFlowRequests,
+          activeSolverFlowRequests,
+        );
+        const ransCritical = solverFlowPhase === "rans-critical";
+        const queued = solverFlowPhase === "queued";
+        const running = solverFlowPhase === "running";
+        const fastCritical = solverFlowPhase === "fast-critical";
+        const finalCritical = solverFlowPhase === "final-critical";
+        const accepted =
+          solverFlowPhase === "accepted" ||
+          solverFlowPhase === "accepted-with-running-rerun" ||
+          solverFlowPhase === "accepted-with-critical-rerun";
+        const runningRerun = solverFlowPhase === "accepted-with-running-rerun";
+        const criticalRerun =
+          solverFlowPhase === "accepted-with-critical-rerun";
+        const fastAccepted = accepted || finalCritical;
+        try {
+          // Longer than the poll interval: a setInterval implementation would
+          // overlap this request, while the serial poller must not.
+          if (running)
+            await new Promise((resolve) => setTimeout(resolve, 2_200));
+          await route.fulfill({
+            json: {
+              total: 1,
+              // These evidence facets are intentionally overlapping/stale-looking.
+              // The UI header must derive mutually exclusive CURRENT totals from
+              // the item state below instead of presenting these as one partition.
+              recovering: running || queued ? 1 : 0,
+              critical:
+                ransCritical || fastCritical || finalCritical || criticalRerun
+                  ? 1
+                  : 0,
+              unavailable:
+                ransCritical || fastCritical || finalCritical || criticalRerun
+                  ? 1
+                  : 0,
+              verified: accepted ? 1 : 0,
+              items: [
+                {
+                  aoaDeg: 0,
+                  sourceAoaDeg: 0,
+                  derivedBySymmetry: false,
+                  affectedAoaDegs: [0],
+                  affectedPointCount: 1,
+                  state:
+                    ransCritical || fastCritical
+                      ? "blocked"
+                      : finalCritical
+                        ? "satisfied"
+                        : queued
+                          ? "pending"
+                          : running
+                            ? "running"
+                            : "satisfied",
+                  outcome: ransCritical
+                    ? "recovery_unavailable"
+                    : fastCritical
+                      ? "evidence_unavailable"
+                      : finalCritical
+                        ? "accepted"
+                        : queued || running
+                          ? "recovering"
+                          : "accepted",
+                  ransStage: ransCritical ? "not_started" : "screened",
+                  fastState: ransCritical
+                    ? "not_started"
+                    : fastCritical
+                      ? "critical"
+                      : queued
+                        ? "queued"
+                        : running
+                          ? "running"
+                          : "accepted",
+                  finalState: finalCritical
+                    ? "critical"
+                    : accepted
+                      ? "accepted"
+                      : "not_started",
+                  finalActivityState: criticalRerun
+                    ? "critical"
+                    : runningRerun
+                      ? "running"
+                      : null,
+                  finalComparison: accepted ? "within_tolerance" : null,
+                  finalDeltaCl: accepted ? 0.004 : null,
+                  finalDeltaCd: accepted ? 0.0002 : null,
+                  finalDeltaCm: null,
+                  finalSource: accepted || finalCritical ? "verify" : null,
+                  criticalStage: ransCritical
+                    ? "preflight"
+                    : fastCritical
+                      ? "fast"
+                      : finalCritical
+                        ? "final"
+                        : criticalRerun
+                          ? "final"
+                          : null,
+                  fastResultId: fastAccepted
+                    ? `${state.stamp}-fast-result`
+                    : null,
+                  fastResultAttemptId: fastAccepted
+                    ? `${state.stamp}-fast-attempt`
+                    : null,
+                  finalResultId: accepted
+                    ? `${state.stamp}-final-result`
+                    : null,
+                  finalResultAttemptId: accepted
+                    ? `${state.stamp}-final-attempt`
+                    : null,
+                  finalEvidenceReasons:
+                    criticalRerun || finalCritical ? ["non-stationary"] : [],
+                  finalSubmitError:
+                    criticalRerun || finalCritical
+                      ? "final run exhausted automatic recovery"
+                      : null,
+                  finalSubmitHttpStatus:
+                    criticalRerun || finalCritical ? 422 : null,
+                  physicalAttemptsUsed:
+                    queued || ransCritical ? 0 : fastCritical ? 2 : 1,
+                  physicalAttemptsMax: 2,
+                  recoverySubmissions: queued ? 0 : 1,
+                  nonPhysicalSubmissions: 0,
+                  interruptedPhysicalRuns: 0,
+                  ransEvidenceRuns: ransCritical ? 1 : 2,
+                  preliminaryEvidenceRuns: fastCritical
+                    ? 2
+                    : fastAccepted || running
+                      ? 1
+                      : 0,
+                  fullUransEvidenceRuns: accepted || finalCritical ? 1 : 0,
+                  legacyUransEvidenceRuns: 0,
+                  evidenceReasons: ransCritical
+                    ? ["mesh-quality-failure"]
+                    : fastCritical
+                      ? ["non-stationary"]
+                      : [],
+                  updatedAt: "2026-07-16T00:00:00.000Z",
+                },
+              ],
+            },
+          });
+        } finally {
+          activeSolverFlowRequests -= 1;
+        }
+      },
+    );
+    await page.route(
+      new RegExp(`/api/admin/campaigns/${launched.campaign.id}(?:\\?.*)?$`),
+      async (route) => {
+        const response = await route.fetch();
+        const body = (await response.json()) as Record<string, unknown>;
+        await route.fulfill({
+          response,
+          json: {
+            ...body,
+            solverIncidents: {
+              threshold: 3,
+              occurrenceCount: 7,
+              openCount: 2,
+              criticalGroupCount: 2,
+              groups: [
+                {
+                  stage: "preliminary",
+                  reason: "continuation-no-progress",
+                  solverImplementationId: `${state.stamp}-solver`,
+                  solverImplementationKey: "openfoam-2606",
+                  remediationVersion: "urans-recovery-2026-07-16-v1",
+                  occurrenceCount: 3,
+                  openCount: 2,
+                  openCriticalCount: 1,
+                  firstOccurredAt: "2026-07-16T00:00:00.000Z",
+                  lastOccurredAt: "2026-07-16T02:00:00.000Z",
+                  requiresInvestigation: true,
+                  effectiveSeverity: "critical",
+                },
+                {
+                  stage: "final",
+                  reason: "media-repair-exhausted",
+                  solverImplementationId: `${state.stamp}-solver`,
+                  solverImplementationKey: "openfoam-2606",
+                  remediationVersion: "urans-recovery-2026-07-16-v1",
+                  occurrenceCount: 4,
+                  openCount: 0,
+                  openCriticalCount: 0,
+                  firstOccurredAt: "2026-07-15T00:00:00.000Z",
+                  lastOccurredAt: "2026-07-15T04:00:00.000Z",
+                  requiresInvestigation: true,
+                  effectiveSeverity: "critical",
+                },
+              ],
+            },
+          },
+        });
+      },
+    );
+
+    await page.setViewportSize({ width: 1200, height: 360 });
+    await page.goto(`/admin?campaign=${launched.campaign.id}`);
+    await expect(page.getByTestId("campaign-detail")).toBeVisible();
+    const incidentRail = page.getByTestId("solver-incidents-campaign");
+    await expect(incidentRail).toBeVisible();
+    await expect(incidentRail).toContainText("FAST URANS");
+    await expect(incidentRail).toContainText("continuation made no progress");
+    await expect(incidentRail).toContainText("×3 · 2 active");
+    await expect(incidentRail).toContainText("CRITICAL");
+    await expect(incidentRail).toContainText("SYSTEM OWNED");
+    await expect(incidentRail).toContainText("System investigation required");
+    await expect(incidentRail).not.toContainText(
+      "urans-recovery-2026-07-16-v1",
+    );
+    await expect(incidentRail).not.toContainText("FINAL URANS");
+    await expect(incidentRail).not.toContainText("media recovery exhausted");
+    await expect(
+      incidentRail.getByTestId("solver-incident-group-0"),
+    ).toHaveAttribute("data-status", "critical");
+
+    const trigger = page.getByTestId(
+      `matrix-cell-${state.camAirfoil.slug}-${condition.ord}`,
+    );
+    await trigger.scrollIntoViewIfNeeded();
+    await trigger.focus();
+    await expect(trigger).toBeFocused();
+    const originalScrollY = await page.evaluate(() => {
+      window.scrollTo(0, Math.max(1, document.documentElement.scrollHeight));
+      return window.scrollY;
+    });
+    expect(originalScrollY).toBeGreaterThan(0);
+    await page.keyboard.press("Enter");
+
+    const panel = page.getByTestId("cell-side-panel");
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveAttribute("role", "dialog");
+    await expect(panel).toHaveAttribute("aria-modal", "true");
+    await expect(panel).toHaveAccessibleName(
+      new RegExp(
+        `${state.stamp} cam 4415 at Re ${Math.round(condition.reynolds / 1000)}k`,
+        "i",
+      ),
+    );
+    await expect
+      .poll(() => page.evaluate(() => document.body.style.position))
+      .toBe("fixed");
+    await expect
+      .poll(() =>
+        panel.evaluate(
+          (element) => getComputedStyle(element).overscrollBehaviorY,
+        ),
+      )
+      .toBe("contain");
+    await expect
+      .poll(() =>
+        panel.evaluate((element) => element.contains(document.activeElement)),
+      )
+      .toBe(true);
+
+    const thumbnail = page.getByTestId("cell-airfoil-thumbnail");
+    await expect(thumbnail.locator("svg path")).toHaveAttribute(
+      "d",
+      expectedThumbnail,
+    );
+    const preliminary = panel.getByTestId("cell-preliminary-outcomes");
+    const handoffRail = preliminary.getByTestId(
+      "cell-preliminary-handoff-rail",
+    );
+    await expect(handoffRail).toContainText("RANS screening");
+    await expect(handoffRail).toContainText("non-convergence → fast");
+    await expect(handoffRail).toContainText("Preliminary URANS");
+    await expect(handoffRail).toContainText("fast usable result");
+    await expect(handoffRail).toContainText("Verified URANS");
+    await expect(handoffRail).toContainText("final result");
+    await expect(
+      handoffRail.getByText("RANS screening", { exact: true }),
+    ).toHaveCount(1);
+    await expect(
+      handoffRail.getByText("Preliminary URANS", { exact: true }),
+    ).toHaveCount(1);
+    await expect(
+      handoffRail.getByText("Verified URANS", { exact: true }),
+    ).toHaveCount(1);
+    const pointTrack = preliminary.getByTestId("cell-preliminary-track-0");
+    const pointRow = preliminary.getByTestId("cell-preliminary-outcome-0");
+    const currentCounts = preliminary.getByTestId(
+      "cell-preliminary-current-counts",
+    );
+
+    // A non-aerodynamic screening recovery incident stays in this same row.
+    // It is not relabeled as normal RANS handoff and does not invent a fast run.
+    await expect(
+      preliminary.getByTestId("cell-preliminary-rans-0"),
+    ).toHaveClass(/not_started/);
+    await expect(
+      preliminary.getByTestId("cell-preliminary-rans-0"),
+    ).toHaveAttribute("aria-current", "step");
+    await expect(
+      preliminary.getByTestId("cell-preliminary-fast-0"),
+    ).toHaveClass(/not_started/);
+    await expect(preliminary).toContainText("Pre-solver repair critical");
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+    );
+
+    // The open dialog revalidates this point without page interaction. Each
+    // snapshot owns exactly one current stage.
+    solverFlowPhase = "queued";
+    await expect(
+      preliminary.getByTestId("cell-preliminary-fast-0"),
+    ).toHaveClass(/queued/, { timeout: 8_000 });
+    await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
+    await expect(
+      preliminary.getByTestId("cell-preliminary-fast-0"),
+    ).toHaveAttribute("aria-current", "step");
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 1 active, 0 fast ready, 0 verified, 0 critical",
+    );
+
+    solverFlowPhase = "running";
+    await expect(
+      preliminary.getByTestId("cell-preliminary-fast-0"),
+    ).toHaveClass(/running/, { timeout: 8_000 });
+    await expect(preliminary).toContainText("Fast running");
+    await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
+
+    solverFlowPhase = "fast-critical";
+    await expect(
+      preliminary.getByTestId("cell-preliminary-fast-0"),
+    ).toHaveClass(/critical/, { timeout: 8_000 });
+    await expect(preliminary).toContainText("Fast critical");
+    await expect(
+      preliminary.getByTestId("cell-preliminary-rans-0"),
+    ).toHaveClass(/screened/);
+    await expect(pointTrack).toHaveAccessibleName(/RANS screened/i);
+    await expect(preliminary).not.toContainText("RANS failure");
+    await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+    );
+
+    solverFlowPhase = "accepted";
+    await expect(
+      preliminary.getByTestId("cell-preliminary-final-0"),
+    ).toContainText("Verified", { timeout: 8_000 });
+    await expect(preliminary).toContainText("Final verified");
+    await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
+    await expect(
+      preliminary.getByTestId("cell-preliminary-final-0"),
+    ).toHaveAttribute("aria-current", "step");
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 0 active, 0 fast ready, 1 verified, 0 critical",
+    );
+
+    const exactFinalResultRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return (
+        url.pathname.endsWith(`/api/airfoils/${state.camAirfoil.slug}/sim`) &&
+        url.searchParams.get("resultId") === `${state.stamp}-final-result`
+      );
+    });
+    await preliminary.getByTestId("cell-preliminary-final-0").click();
+    const finalResultRequest = new URL((await exactFinalResultRequest).url());
+    expect(finalResultRequest.searchParams.get("aoa")).toBe("0");
+    await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
+    await expect(
+      preliminary.getByTestId("cell-preliminary-final-0"),
+    ).toBeFocused();
+
+    solverFlowPhase = "final-critical";
+    await expect(
+      preliminary.getByTestId("cell-preliminary-final-0"),
+    ).toHaveClass(/critical/, { timeout: 8_000 });
+    await expect(preliminary).toContainText("Final critical");
+    await expect(
+      preliminary.getByTestId("cell-preliminary-fast-0"),
+    ).toHaveClass(/accepted/);
+    await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+    );
+
+    solverFlowPhase = "accepted";
+    await expect(
+      preliminary.getByTestId("cell-preliminary-final-0"),
+    ).toHaveClass(/accepted/, { timeout: 8_000 });
+
+    solverFlowPhase = "accepted-with-running-rerun";
+    const finalStage = preliminary.getByTestId("cell-preliminary-final-0");
+    await expect(finalStage.locator(".activity-mark.running")).toBeVisible({
+      timeout: 8_000,
+    });
+    await expect(finalStage.locator(".accepted-mark")).toBeVisible();
+    await expect(preliminary).toContainText("Verified · rerun running");
+    await expect(pointRow).toHaveClass(/is-active/);
+    await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 1 active, 0 fast ready, 0 verified, 0 critical",
+    );
+
+    solverFlowPhase = "accepted-with-critical-rerun";
+    await expect(finalStage).toHaveClass(/critical/, { timeout: 8_000 });
+    await expect(preliminary).toContainText("Verified · rerun critical");
+    await expect(finalStage.locator(".accepted-mark")).toBeVisible();
+    await expect(finalStage.locator(".activity-mark.critical")).toBeVisible();
+    await expect(pointRow).toHaveClass(/is-critical/);
+    await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+    );
+    expect(maxConcurrentSolverFlowRequests).toBe(1);
+
+    await expect(
+      preliminary.getByTestId("cell-preliminary-rans-0"),
+    ).toHaveClass(/screened/);
+    await expect(pointTrack).toHaveAccessibleName(/RANS screened/i);
+    await expect(pointTrack.locator(".connector").first()).toHaveClass(
+      /complete/,
+    );
+    await expect(preliminary).not.toContainText("RANS failure");
+    await expect(preliminary).not.toContainText("no action required");
+    await expect(preliminary).not.toContainText("solver evidence rejected");
+    await expect(panel.locator(".cell-fidelity-ladder")).toHaveCount(0);
+    await expect(panel.getByText("Whole-polar request")).toBeVisible();
+    await expect(
+      panel.getByRole("button", { name: "Fast URANS" }),
+    ).toBeVisible();
+    await expect(
+      panel.getByRole("button", { name: "Final URANS" }),
+    ).toBeVisible();
+    await expect(panel.getByText("FAILED POINTS", { exact: true })).toHaveCount(
+      0,
+    );
+    await expect(
+      panel.getByText("RANS INTERRUPTIONS", { exact: true }),
+    ).toHaveCount(0);
+    const diagnostics = preliminary.getByTestId(
+      "cell-preliminary-diagnostics-0",
+    );
+    await expect(diagnostics).not.toHaveAttribute("open", "");
+    await diagnostics.getByLabel("Diagnostics for α 0.0°").click();
+    await expect(diagnostics).toHaveAttribute("open", "");
+    await expect(diagnostics).toContainText("RANS handed off automatically");
+    await expect(diagnostics).toContainText("Stored evidence: 2 RANS");
+    await expect(diagnostics).toContainText("1 fast URANS");
+    await expect(diagnostics).toContainText("1 final URANS");
+    await expect(diagnostics).toContainText("Fast URANS physical runs: 1 of 2");
+    await expect(diagnostics).toContainText(
+      "newer final run ended critically and requires automatic investigation",
+    );
+
+    const lockedScrollY = await page.evaluate(() => window.scrollY);
+    await expect
+      .poll(() =>
+        panel.evaluate(
+          (element) => element.scrollHeight - element.clientHeight,
+        ),
+      )
+      .toBeGreaterThan(0);
+    const panelBox = await panel.boundingBox();
+    expect(panelBox).not.toBeNull();
+    await page.mouse.move(panelBox!.x + panelBox!.width - 10, panelBox!.y + 80);
+    await page.mouse.wheel(0, 500);
+    await expect
+      .poll(() => panel.evaluate((element) => element.scrollTop))
+      .toBeGreaterThan(0);
+    await expect
+      .poll(() => page.evaluate(() => window.scrollY))
+      .toBe(lockedScrollY);
+
+    await panel.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await page.mouse.wheel(0, -500);
+    await expect
+      .poll(() => page.evaluate(() => window.scrollY))
+      .toBe(lockedScrollY);
+
+    await panel.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+    });
+    await page.mouse.wheel(0, 500);
+    await expect
+      .poll(() => page.evaluate(() => window.scrollY))
+      .toBe(lockedScrollY);
+
+    await page.mouse.move(20, 180);
+    await page.mouse.wheel(0, 500);
+    await expect
+      .poll(() => page.evaluate(() => window.scrollY))
+      .toBe(lockedScrollY);
+
+    const panelFocusable = panel.locator(
+      'a[href]:visible, button:not([disabled]):visible, input:not([disabled]):visible, select:not([disabled]):visible, textarea:not([disabled]):visible, [tabindex]:not([tabindex="-1"]):visible',
+    );
+    const firstPanelControl = panelFocusable.first();
+    const lastPanelControl = panelFocusable.last();
+    await lastPanelControl.focus();
+    await page.keyboard.press("Tab");
+    await expect(firstPanelControl).toBeFocused();
+    await firstPanelControl.focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect(lastPanelControl).toBeFocused();
+
+    await panel.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    const clCdTab = panel.getByRole("tab", { name: "Cl–Cd" });
+    await clCdTab.click();
+    await expect(clCdTab).toHaveAttribute("aria-selected", "true");
+    await panel.getByTestId("polar-zoom-in").click();
+    await expect(panel.getByTestId("polar-chart-panel")).toHaveAttribute(
+      "data-domain-active",
+      "true",
+    );
+    const airfoilTab = panel.getByRole("tab", { name: "Airfoil" });
+    await airfoilTab.click();
+    await expect(airfoilTab).toHaveAttribute("aria-selected", "true");
+    const profile = panel.getByTestId("polar-profile-panel");
+    await expect(profile).toBeVisible();
+    await expect(
+      profile.getByRole("img", {
+        name: new RegExp(`${state.stamp} cam 4415 airfoil profile`, "i"),
+      }),
+    ).toBeVisible();
+    await expect(
+      profile.getByTestId("airfoil-profile-surface"),
+    ).toHaveAttribute("d", expectedProfile.profilePath);
+    await expect(profile.getByTestId("airfoil-profile-camber")).toHaveAttribute(
+      "d",
+      expectedProfile.camberPath,
+    );
+    await clCdTab.click();
+    await expect(clCdTab).toHaveAttribute("aria-selected", "true");
+    await expect(panel.getByTestId("polar-chart-panel")).toHaveAttribute(
+      "data-domain-active",
+      "true",
+    );
+
+    const evidencePoint = panel
+      .getByTestId("polar-chart-svg")
+      .locator('circle[role="button"]')
+      .first();
+    await evidencePoint.focus();
+    await evidencePoint.click();
+    const simDialog = page.getByTestId("sim-modal-dialog");
+    await expect(simDialog).toBeVisible();
+    await expect(panel).toHaveAttribute("aria-hidden", "true");
+    await expect(panel).toHaveAttribute("inert", "");
+    await expect
+      .poll(() =>
+        simDialog.evaluate((element) =>
+          element.contains(document.activeElement),
+        ),
+      )
+      .toBe(true);
+    expect(await page.evaluate(() => document.body.style.position)).toBe(
+      "fixed",
+    );
+
+    const simFocusable = simDialog.locator(
+      'a[href]:visible, button:not([disabled]):visible, input:not([disabled]):visible, select:not([disabled]):visible, textarea:not([disabled]):visible, [tabindex]:not([tabindex="-1"]):visible',
+    );
+    const firstSimControl = simFocusable.first();
+    const lastSimControl = simFocusable.last();
+    await lastSimControl.focus();
+    await page.keyboard.press("Tab");
+    await expect(firstSimControl).toBeFocused();
+    await firstSimControl.focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect(lastSimControl).toBeFocused();
+
+    await page.keyboard.press("Escape");
+    await expect(simDialog).toHaveCount(0);
+    await expect(panel).not.toHaveAttribute("aria-hidden", "true");
+    await expect
+      .poll(() =>
+        panel.evaluate((element) => element.contains(document.activeElement)),
+      )
+      .toBe(true);
+    expect(await page.evaluate(() => document.body.style.position)).toBe(
+      "fixed",
+    );
+
+    await page.keyboard.press("Escape");
+    await expect(panel).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await expect
+      .poll(() => page.evaluate(() => window.scrollY))
+      .toBe(originalScrollY);
+    expect(await page.evaluate(() => document.body.style.position)).toBe("");
+    await page.waitForTimeout(100);
+    const requestsAfterClose = solverFlowRequestCount;
+    await page.waitForTimeout(2_300);
+    expect(solverFlowRequestCount).toBe(requestsAfterClose);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await trigger.scrollIntoViewIfNeeded();
+    await trigger.focus();
+    const narrowOriginalScrollY = await page.evaluate(() => window.scrollY);
+    await page.keyboard.press("Enter");
+    await expect(panel).toBeVisible();
+    await panel.getByRole("tab", { name: "Cm–α" }).scrollIntoViewIfNeeded();
+    await panel.getByRole("tab", { name: "Airfoil" }).click();
+    await expect(profile).toBeVisible();
+    await expect(
+      profile.getByTestId("airfoil-profile-surface"),
+    ).toHaveAttribute("d", expectedProfile.profilePath);
+    const narrowTrack = preliminary.getByTestId("cell-preliminary-track-0");
+    await expect(narrowTrack).toBeVisible();
+    await expect(handoffRail.getByText("non-convergence → fast")).toBeVisible();
+    await expect(narrowTrack).toHaveAccessibleName(/RANS screened/i);
+    const narrowConnectors = narrowTrack.locator(".connector");
+    await expect(narrowConnectors).toHaveCount(2);
+    await expect(narrowConnectors.nth(0)).toBeVisible();
+    await expect(narrowConnectors.nth(1)).toBeVisible();
+    expect(
+      await narrowTrack.evaluate((element) => element.scrollWidth),
+    ).toBeLessThanOrEqual(
+      await narrowTrack.evaluate((element) => element.clientWidth),
+    );
+
+    const overflow = await page.evaluate(() => {
+      const panelElement = document.querySelector<HTMLElement>(
+        '[data-testid="cell-side-panel"]',
+      );
+      const profileElement = document.querySelector<HTMLElement>(
+        '[data-testid="airfoil-profile-plot"]',
+      );
+      return {
+        document: document.documentElement.scrollWidth - window.innerWidth,
+        panel: panelElement
+          ? panelElement.scrollWidth - panelElement.clientWidth
+          : Number.POSITIVE_INFINITY,
+        profile: profileElement
+          ? profileElement.scrollWidth - profileElement.clientWidth
+          : Number.POSITIVE_INFINITY,
+      };
+    });
+    expect(overflow.document).toBeLessThanOrEqual(0);
+    expect(overflow.panel).toBeLessThanOrEqual(0);
+    expect(overflow.profile).toBeLessThanOrEqual(0);
+
+    await page.keyboard.press("Escape");
+    await expect(panel).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await expect
+      .poll(() => page.evaluate(() => window.scrollY))
+      .toBe(narrowOriginalScrollY);
   });
 
   test("campaign instrument matches the approved option-3 geometry contract", async ({

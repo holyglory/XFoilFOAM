@@ -184,6 +184,48 @@ export async function stripTerminalJobs(
               OR (j.engine_job_id IS NOT NULL AND attempt.engine_job_id = j.engine_job_id)
             )
         ) AS has_live_precalc_continuation
+        ,
+        EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue verify
+          JOIN result_attempts attempt
+            ON attempt.id = verify.latest_result_attempt_id
+          WHERE verify.state IN ('pending', 'running')
+            AND verify.last_outcome IN (
+              'continuation_pending',
+              'continuation_retry_wait'
+            )
+            AND attempt.engine_job_id IS NOT NULL
+            AND attempt.engine_case_slug IS NOT NULL
+            AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+            AND (
+              attempt.sim_job_id = j.id
+              OR (
+                j.engine_job_id IS NOT NULL
+                AND attempt.engine_job_id = j.engine_job_id
+              )
+            )
+        ) AS has_live_final_continuation,
+        EXISTS (
+          SELECT 1
+          FROM result_attempts attempt
+          WHERE attempt.engine_job_id IS NOT NULL
+            AND attempt.engine_case_slug IS NOT NULL
+            AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            AND EXISTS (
+              SELECT 1
+              FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+              WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+                 OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+            )
+            AND (
+              attempt.sim_job_id = j.id
+              OR (
+                j.engine_job_id IS NOT NULL
+                AND attempt.engine_job_id = j.engine_job_id
+              )
+            )
+        ) AS has_attempt_continuable
       FROM sim_jobs j
       WHERE j.status IN ('done', 'failed', 'cancelled')
         AND j.engine_job_id IS NOT NULL
@@ -198,12 +240,19 @@ export async function stripTerminalJobs(
           AND strip_report ->> 'kept_case_state' = 'true'
           AND NOT has_live_continuation
           AND NOT has_live_precalc_continuation
+          AND NOT has_live_final_continuation
           AND (
-            NOT has_continuable
+            NOT (has_continuable OR has_attempt_continuable)
             OR terminal_at <= ${now.toISOString()}::timestamptz - (${config.retentionContinuableDays}::double precision * interval '1 day')
           )
           THEN false
-        ELSE (has_continuable OR has_live_continuation OR has_live_precalc_continuation)
+        ELSE (
+          has_continuable
+          OR has_attempt_continuable
+          OR has_live_continuation
+          OR has_live_precalc_continuation
+          OR has_live_final_continuation
+        )
       END AS keep_case_state
     FROM candidates
     WHERE stripped_at IS NULL
@@ -211,8 +260,9 @@ export async function stripTerminalJobs(
         strip_report ->> 'kept_case_state' = 'true'
         AND NOT has_live_continuation
         AND NOT has_live_precalc_continuation
+        AND NOT has_live_final_continuation
         AND (
-          NOT has_continuable
+          NOT (has_continuable OR has_attempt_continuable)
           OR terminal_at <= ${now.toISOString()}::timestamptz - (${config.retentionContinuableDays}::double precision * interval '1 day')
         )
       )

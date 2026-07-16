@@ -110,7 +110,7 @@ describe("solver-work reviewed presentation", () => {
 
     expect(presentation.visualState).toBe("blocked");
     expect(presentation.badgeMark).toBeNull();
-    expect(anonView.stateLabel).toBe("blocked");
+    expect(anonView.stateLabel).toBe("critical result failure");
     expect(anonView.reviewedDisclosure).toBeNull();
     expect(anonView.actions.map((action) => action.kind)).toEqual([
       "open-results",

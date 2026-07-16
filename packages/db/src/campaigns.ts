@@ -25,9 +25,16 @@ import {
 } from "@aerodb/core";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 
-import { recomputeProgressForCampaign } from "./campaign-execution";
+import {
+  recomputeProgressForCampaign,
+  USER_TERMINAL_CAMPAIGN_RESULT_SQL,
+} from "./campaign-execution";
 import type { DB } from "./client";
 import { lockPrecalcCells } from "./precalc-cell-lock";
+import {
+  solverIncidentSummary,
+  type SolverIncidentSummary,
+} from "./solver-incidents";
 import {
   campaignOpenTierCounts,
   type CampaignPhase,
@@ -2053,6 +2060,8 @@ export function buildCampaignRemediationSummary(
  *   - rejected:  state = 'terminal' AND NOT derived AND result.status = 'done'
  *                AND result_classifications.state = 'rejected'
  *   - failed:    state = 'terminal' AND NOT derived AND result.status = 'failed'
+ *                for terminal URANS evidence only; rejected/failed steady RANS
+ *                remains unfinished automatic-handoff work
  *                (a failed source's mirror is counted in `derived`, NOT here —
  *                counting it in both double-books the cell in the remaining
  *                arithmetic and makes the failed chip exceed its Points-tab
@@ -3899,10 +3908,29 @@ async function lockCampaignSharedLadderItems(
   await asDb(tx).execute(sql`
     SELECT q.id
     FROM sim_urans_verify_queue q
-    JOIN sim_urans_verify_queue_campaigns ownership ON ownership.queue_id = q.id
-    WHERE ownership.campaign_id = ${campaignId}
-      AND ownership.state = 'active'
-      AND q.state IN ('pending', 'running')
+    WHERE q.state IN ('pending', 'running')
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue_campaigns ownership
+          WHERE ownership.queue_id = q.id
+            AND ownership.campaign_id = ${campaignId}
+            AND ownership.state = 'active'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue_requests coverage
+          JOIN sim_urans_requests request_owner
+            ON request_owner.id = coverage.request_id
+           AND request_owner.fidelity = 'full'
+           AND request_owner.state IN ('pending', 'running')
+          JOIN sim_urans_request_campaigns ownership
+            ON ownership.request_id = request_owner.id
+          WHERE coverage.queue_id = q.id
+            AND ownership.campaign_id = ${campaignId}
+            AND ownership.state = 'active'
+        )
+      )
     ORDER BY q.id
     FOR UPDATE OF q
   `);
@@ -4017,6 +4045,27 @@ async function cancelStoppedSharedLadderCompositions(
               WHERE ownership.queue_id = q.id
                 AND ownership.state = 'active'
                 AND owner_campaign.status IN ('active', 'attention')
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_requests coverage
+              JOIN sim_urans_requests request_owner
+                ON request_owner.id = coverage.request_id
+               AND request_owner.fidelity = 'full'
+               AND request_owner.state IN ('pending', 'running')
+              WHERE coverage.queue_id = q.id
+                AND (
+                  request_owner.background_owner
+                  OR EXISTS (
+                    SELECT 1
+                    FROM sim_urans_request_campaigns ownership
+                    JOIN sim_campaigns owner_campaign
+                      ON owner_campaign.id = ownership.campaign_id
+                    WHERE ownership.request_id = request_owner.id
+                      AND ownership.state = 'active'
+                      AND owner_campaign.status IN ('active', 'attention')
+                  )
+                )
             )
         )
       )`
@@ -4141,6 +4190,28 @@ async function cancelStoppedSharedLadderCompositions(
               WHERE ownership.queue_id = q.id
                 AND ownership.state = 'active'
                 AND owner_campaign.status IN ('active', 'attention', 'paused')
+            ) OR EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_requests coverage
+              JOIN sim_urans_requests request_owner
+                ON request_owner.id = coverage.request_id
+               AND request_owner.fidelity = 'full'
+               AND request_owner.state IN ('pending', 'running')
+              WHERE coverage.queue_id = q.id
+                AND (
+                  request_owner.background_owner
+                  OR EXISTS (
+                    SELECT 1
+                    FROM sim_urans_request_campaigns ownership
+                    JOIN sim_campaigns owner_campaign
+                      ON owner_campaign.id = ownership.campaign_id
+                    WHERE ownership.request_id = request_owner.id
+                      AND ownership.state = 'active'
+                      AND owner_campaign.status IN (
+                        'active', 'attention', 'paused'
+                      )
+                  )
+                )
             ) THEN 'pending'
             ELSE 'cancelled'
           END,
@@ -4227,15 +4298,31 @@ export async function pauseCampaign(
         actor: normalizedLifecycleText(context.actor),
         reason: normalizedLifecycleText(context.reason),
       });
-    const verifyOwners = await asDb(tx)
-      .select({ id: simUransVerifyQueueCampaigns.queueId })
-      .from(simUransVerifyQueueCampaigns)
-      .where(
-        and(
-          eq(simUransVerifyQueueCampaigns.campaignId, campaignId),
-          eq(simUransVerifyQueueCampaigns.state, "active"),
-        ),
-      );
+    const verifyOwners = (await asDb(tx).execute(sql`
+      SELECT queue.id
+      FROM sim_urans_verify_queue queue
+      WHERE EXISTS (
+        SELECT 1
+        FROM sim_urans_verify_queue_campaigns ownership
+        WHERE ownership.queue_id = queue.id
+          AND ownership.campaign_id = ${campaignId}
+          AND ownership.state = 'active'
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM sim_urans_verify_queue_requests coverage
+        JOIN sim_urans_requests request_owner
+          ON request_owner.id = coverage.request_id
+         AND request_owner.fidelity = 'full'
+         AND request_owner.state IN ('pending', 'running')
+        JOIN sim_urans_request_campaigns ownership
+          ON ownership.request_id = request_owner.id
+        WHERE coverage.queue_id = queue.id
+          AND ownership.campaign_id = ${campaignId}
+          AND ownership.state = 'active'
+      )
+      ORDER BY queue.id
+    `)) as unknown as Array<{ id: string }>;
     const requestOwners = await asDb(tx)
       .select({ id: simUransRequestCampaigns.requestId })
       .from(simUransRequestCampaigns)
@@ -4286,6 +4373,15 @@ export async function pauseCampaign(
             SELECT 1 FROM sim_urans_verify_queue_campaigns ownership
             WHERE ownership.campaign_id = ${campaignId}
               AND ownership.queue_id::text = job.request_payload ->> 'verifyQueueItemId'
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests coverage
+            JOIN sim_urans_request_campaigns ownership
+              ON ownership.request_id = coverage.request_id
+            WHERE ownership.campaign_id = ${campaignId}
+              AND coverage.queue_id::text =
+                job.request_payload ->> 'verifyQueueItemId'
           )
           OR EXISTS (
             SELECT 1
@@ -4387,7 +4483,32 @@ export async function cancelCampaign(db: DB, campaignId: string) {
     // Cancel only this campaign's ownership. A shared/background physical
     // item survives; an ownerless pending item terminates, while submitted
     // work retains the spec's finish-and-ingest semantics.
-    const cancelledVerifyRows = await asDb(tx)
+    const campaignVerifyRows = (await asDb(tx).execute(sql`
+      SELECT queue.id
+      FROM sim_urans_verify_queue queue
+      WHERE EXISTS (
+        SELECT 1
+        FROM sim_urans_verify_queue_campaigns ownership
+        WHERE ownership.queue_id = queue.id
+          AND ownership.campaign_id = ${campaignId}
+          AND ownership.state = 'active'
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM sim_urans_verify_queue_requests coverage
+        JOIN sim_urans_requests request_owner
+          ON request_owner.id = coverage.request_id
+         AND request_owner.fidelity = 'full'
+         AND request_owner.state IN ('pending', 'running')
+        JOIN sim_urans_request_campaigns ownership
+          ON ownership.request_id = request_owner.id
+        WHERE coverage.queue_id = queue.id
+          AND ownership.campaign_id = ${campaignId}
+          AND ownership.state = 'active'
+      )
+      ORDER BY queue.id
+    `)) as unknown as Array<{ id: string }>;
+    await asDb(tx)
       .update(simUransVerifyQueueCampaigns)
       .set({ state: "cancelled", cancelledAt: new Date() })
       .where(
@@ -4397,37 +4518,6 @@ export async function cancelCampaign(db: DB, campaignId: string) {
         ),
       )
       .returning({ id: simUransVerifyQueueCampaigns.queueId });
-    if (cancelledVerifyRows.length) {
-      await asDb(tx).execute(sql`
-        UPDATE sim_urans_verify_queue q
-        SET state = 'cancelled', "updatedAt" = now()
-        WHERE q.id = ANY(${sql`ARRAY[${sql.join(
-          cancelledVerifyRows.map((row) => sql`${row.id}::uuid`),
-          sql`, `,
-        )}]`})
-          AND q.state = 'pending'
-          AND q.background_owner = false
-          AND NOT EXISTS (
-            SELECT 1
-            FROM sim_urans_verify_queue_campaigns owner
-            JOIN sim_campaigns owner_campaign
-              ON owner_campaign.id = owner.campaign_id
-            WHERE owner.queue_id = q.id
-              AND owner.state = 'active'
-              AND owner_campaign.status IN ('active', 'attention', 'paused')
-          )
-      `);
-      await asDb(tx).execute(sql`
-        DELETE FROM sim_ladder_submit_retries retry
-        USING sim_urans_verify_queue q
-        WHERE retry.verify_queue_id = q.id
-          AND q.id = ANY(${sql`ARRAY[${sql.join(
-            cancelledVerifyRows.map((row) => sql`${row.id}::uuid`),
-            sql`, `,
-          )}]`})
-          AND q.state = 'cancelled'
-      `);
-    }
     const cancelledRequestRows = await asDb(tx)
       .update(simUransRequestCampaigns)
       .set({ state: "cancelled", cancelledAt: new Date() })
@@ -4446,7 +4536,14 @@ export async function cancelCampaign(db: DB, campaignId: string) {
           cancelledRequestRows.map((row) => sql`${row.id}::uuid`),
           sql`, `,
         )}]`})
-          AND req.state = 'pending'
+          AND (
+            req.state = 'pending'
+            OR (
+              req.fidelity = 'full'
+              AND req.state = 'running'
+              AND req.sim_job_id IS NULL
+            )
+          )
           AND req.background_owner = false
           AND NOT EXISTS (
             SELECT 1
@@ -4467,6 +4564,60 @@ export async function cancelCampaign(db: DB, campaignId: string) {
             sql`, `,
           )}]`})
           AND req.state = 'cancelled'
+      `);
+    }
+    if (campaignVerifyRows.length) {
+      await asDb(tx).execute(sql`
+        UPDATE sim_urans_verify_queue q
+        SET state = 'cancelled', "updatedAt" = now()
+        WHERE q.id = ANY(${sql`ARRAY[${sql.join(
+          campaignVerifyRows.map((row) => sql`${row.id}::uuid`),
+          sql`, `,
+        )}]`})
+          AND q.state = 'pending'
+          AND q.background_owner = false
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_campaigns owner
+            JOIN sim_campaigns owner_campaign
+              ON owner_campaign.id = owner.campaign_id
+            WHERE owner.queue_id = q.id
+              AND owner.state = 'active'
+              AND owner_campaign.status IN ('active', 'attention', 'paused')
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests coverage
+            JOIN sim_urans_requests request_owner
+              ON request_owner.id = coverage.request_id
+             AND request_owner.fidelity = 'full'
+             AND request_owner.state IN ('pending', 'running')
+            WHERE coverage.queue_id = q.id
+              AND (
+                request_owner.background_owner
+                OR EXISTS (
+                  SELECT 1
+                  FROM sim_urans_request_campaigns owner
+                  JOIN sim_campaigns owner_campaign
+                    ON owner_campaign.id = owner.campaign_id
+                  WHERE owner.request_id = request_owner.id
+                    AND owner.state = 'active'
+                    AND owner_campaign.status IN (
+                      'active', 'attention', 'paused'
+                    )
+                )
+              )
+          )
+      `);
+      await asDb(tx).execute(sql`
+        DELETE FROM sim_ladder_submit_retries retry
+        USING sim_urans_verify_queue q
+        WHERE retry.verify_queue_id = q.id
+          AND q.id = ANY(${sql`ARRAY[${sql.join(
+            campaignVerifyRows.map((row) => sql`${row.id}::uuid`),
+            sql`, `,
+          )}]`})
+          AND q.state = 'cancelled'
       `);
     }
     const cancelledPrecalcRows = await asDb(tx)
@@ -4521,7 +4672,7 @@ export async function cancelCampaign(db: DB, campaignId: string) {
     const cancelledSharedPendingJobs =
       await cancelStoppedSharedLadderCompositions(
         tx,
-        cancelledVerifyRows.map((row) => row.id),
+        campaignVerifyRows.map((row) => row.id),
         cancelledRequestRows.map((row) => row.id),
         cancelledPrecalcRows.map((row) => row.id),
         "last runnable campaign owner cancelled before engine submission",
@@ -4536,15 +4687,18 @@ export async function cancelCampaign(db: DB, campaignId: string) {
     // A running retry owner can become physically cancelled only after its
     // pending composition is stopped above. Remove scheduling-only retry state
     // then; shared/background survivors remain pending/running and retain it.
-    await asDb(tx).execute(sql`
-      DELETE FROM sim_ladder_submit_retries retry
-      USING sim_urans_verify_queue verify_item,
-            sim_urans_verify_queue_campaigns ownership
-      WHERE retry.verify_queue_id = verify_item.id
-        AND ownership.queue_id = verify_item.id
-        AND ownership.campaign_id = ${campaignId}
-        AND verify_item.state = 'cancelled'
-    `);
+    if (campaignVerifyRows.length) {
+      await asDb(tx).execute(sql`
+        DELETE FROM sim_ladder_submit_retries retry
+        USING sim_urans_verify_queue verify_item
+        WHERE retry.verify_queue_id = verify_item.id
+          AND verify_item.id = ANY(${sql`ARRAY[${sql.join(
+            campaignVerifyRows.map((row) => sql`${row.id}::uuid`),
+            sql`, `,
+          )}]`})
+          AND verify_item.state = 'cancelled'
+      `);
+    }
     await asDb(tx).execute(sql`
       DELETE FROM sim_ladder_submit_retries retry
       USING sim_urans_requests request_item,
@@ -4574,6 +4728,15 @@ export async function cancelCampaign(db: DB, campaignId: string) {
           )
           OR EXISTS (
             SELECT 1
+            FROM sim_urans_verify_queue_requests coverage
+            JOIN sim_urans_request_campaigns ownership
+              ON ownership.request_id = coverage.request_id
+            WHERE ownership.campaign_id = ${campaignId}
+              AND coverage.queue_id::text =
+                job.request_payload ->> 'verifyQueueItemId'
+          )
+          OR EXISTS (
+            SELECT 1
             FROM jsonb_array_elements_text(
               CASE
                 WHEN jsonb_typeof(job.request_payload -> 'precalcObligationIds') = 'array'
@@ -4598,7 +4761,7 @@ export async function cancelCampaign(db: DB, campaignId: string) {
       releasedPoints: releasedRows.length,
       deletedPendingResults: cleanup.deleted,
       staledPendingResults: cleanup.staled,
-      cancelledPendingVerifications: cancelledVerifyRows.length,
+      cancelledPendingVerifications: campaignVerifyRows.length,
       cancelledPendingUransRequests: cancelledRequestRows.length,
       cancelledPendingPrecalcObligations: cancelledPrecalcRows.length,
       cancelledPendingJobs,
@@ -5008,12 +5171,12 @@ export const ERROR_CLASS_SQL = sql`CASE
   ELSE 'solver'
 END`;
 
-// A failed campaign point is TERMINAL with its authoritative results row
-// (r.id = p.result_id) at status='failed' — NOT state='requested' with a
-// cell-key join. Failed points are terminal-linked at ingest (onResultIngested
-// sets state='terminal', result_id=<failed result>), so the failures list,
-// counters, and requeue must all match on the terminal model and join by
-// result_id. Callers MUST join `results r ON r.id = p.result_id`.
+// A user-visible failed campaign point is TERMINAL URANS evidence with its
+// authoritative results row (r.id = p.result_id) at status='failed'. RANS
+// rejection/non-convergence is automatic ladder input, not a failure drawer or
+// manual requeue item. The shared predicate also excludes machine-owned open or
+// blocked PRECALC cells so list/count/progress remain exactly coherent.
+// Callers MUST join `results r ON r.id = p.result_id`.
 function failedResultsWhere(
   campaignId: string,
   filters: { conditionId?: string; airfoilId?: string },
@@ -5024,6 +5187,7 @@ function failedResultsWhere(
     AND NOT p.derived_by_symmetry
     AND r.id = p.result_id
     AND r.status = 'failed'
+    AND ${USER_TERMINAL_CAMPAIGN_RESULT_SQL}
     AND EXISTS (
       SELECT 1
       FROM sim_campaign_conditions actionable_condition
@@ -5050,7 +5214,7 @@ const DETERMINISTIC_MESH_BLOCKER_SQL = sql`(
  * requeue must never downgrade it back to a wave-1 solve. */
 const GENERIC_RANS_REQUEUE_ELIGIBLE_SQL = sql`(
   r.regime IS DISTINCT FROM 'urans'
-  AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+  AND COALESCE(r.fidelity::text, '') NOT LIKE 'urans%'
   AND NOT EXISTS (
     SELECT 1 FROM sim_precalc_obligations obligation
     WHERE obligation.airfoil_id = p.airfoil_id
@@ -5059,11 +5223,9 @@ const GENERIC_RANS_REQUEUE_ELIGIBLE_SQL = sql`(
   )
 )`;
 
-// A rejected campaign point is TERMINAL with its authoritative results row
-// DONE but classified 'rejected' (physics-invalid evidence) — the same
-// terminal+result_id model as failedResultsWhere, with the classification
-// join matching the canonical counter (rc.result_id = p.result_id,
-// rc.state='rejected'). Callers MUST join `results r ON r.id = p.result_id`.
+// A user-visible rejected campaign point is terminal URANS evidence classified
+// physics-invalid. Rejected RANS remains automatic-handoff work, matching the
+// canonical progress counter and never entering the manual requeue surface.
 function rejectedResultsWhere(
   campaignId: string,
   filters: { conditionId?: string; airfoilId?: string },
@@ -5074,6 +5236,7 @@ function rejectedResultsWhere(
     AND NOT p.derived_by_symmetry
     AND r.id = p.result_id
     AND r.status = 'done'
+    AND ${USER_TERMINAL_CAMPAIGN_RESULT_SQL}
     AND EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected')
     AND EXISTS (
       SELECT 1
@@ -5101,10 +5264,10 @@ export interface CampaignRejectedSample {
   attempts: number;
 }
 
-/** Rejected (done-but-physics-rejected) points in scope, for the requeue
- *  dialog: exact total plus bounded samples. Shares rejectedResultsWhere with
- *  requeueCampaignFailed so the dialog count and the requeue predicate can
- *  never disagree (same coherence rule as failures/requeue). */
+/** Critical rejected (done-but-physics-rejected) URANS points in scope:
+ *  exact total plus bounded diagnostic samples. This is an outcome read model,
+ *  not a promise that the legacy ordinary-RANS requeue endpoint may downgrade
+ *  these cells back to wave 1. */
 export async function campaignRejected(
   db: DB,
   campaignId: string,
@@ -5129,7 +5292,6 @@ export async function campaignRejected(
       JOIN airfoils af ON af.id = p.airfoil_id
       JOIN result_classifications rc ON rc.result_id = r.id
       WHERE ${rejectedResultsWhere(campaignId, filters)}
-        AND ${GENERIC_RANS_REQUEUE_ELIGIBLE_SQL}
     ) ranked
     WHERE rn <= 20
     ORDER BY rn ASC
@@ -5258,13 +5420,1196 @@ export async function campaignFailures(
   return { total, retryableTotal, groups: [...groups.values()] };
 }
 
-/** Scoped maintenance requeue with exact expected-count verification (409 on
- *  drift). Covers eligible ordinary-RANS terminal failures and, when
- *  includeRejected is set, eligible ordinary-RANS terminal rejected evidence.
- *  PRECALC-ledger and URANS rows are deliberately excluded: their automatic
- *  ladder owns recovery, and this endpoint must never downgrade them to RANS.
- *  Each class carries its own expected count so a stale dialog cannot silently
- *  requeue more (or fewer) points than the operator confirmed. */
+export type CampaignPreliminaryOutcomeKind =
+  | "accepted"
+  | "recovering"
+  | "evidence_unavailable"
+  | "continuation_unavailable"
+  | "mesh_unavailable"
+  | "submit_unavailable"
+  | "recovery_unavailable";
+
+export type CampaignPreliminaryFastState =
+  | "not_started"
+  | "queued"
+  | "running"
+  | "accepted"
+  | "critical";
+
+export type CampaignPreliminaryRansStage =
+  | "screened"
+  | "polar_handoff"
+  | "skipped"
+  | "not_started";
+
+export type CampaignPreliminaryFinalState =
+  | "not_started"
+  | "queued"
+  | "running"
+  | "accepted"
+  | "critical";
+
+export type CampaignPreliminaryFinalActivityState =
+  | "queued"
+  | "running"
+  | "critical";
+
+export type CampaignPreliminaryFinalComparison =
+  | "within_tolerance"
+  | "disagreed";
+
+export type CampaignPreliminaryFinalSource = "verify" | "full_request";
+
+export interface CampaignPreliminaryOutcome {
+  /** Requested campaign point shown by this row. */
+  aoaDeg: number;
+  /** Exact solver/source angle. It differs from aoaDeg only for a
+   * symmetry-derived campaign point. */
+  sourceAoaDeg: number;
+  derivedBySymmetry: boolean;
+  affectedAoaDegs: number[];
+  affectedPointCount: number;
+  state: "pending" | "running" | "satisfied" | "blocked";
+  outcome: CampaignPreliminaryOutcomeKind;
+  ransStage: CampaignPreliminaryRansStage;
+  fastState: CampaignPreliminaryFastState;
+  finalState: CampaignPreliminaryFinalState;
+  finalActivityState: CampaignPreliminaryFinalActivityState | null;
+  finalComparison: CampaignPreliminaryFinalComparison | null;
+  finalDeltaCl: number | null;
+  finalDeltaCd: number | null;
+  finalDeltaCm: number | null;
+  finalSource: CampaignPreliminaryFinalSource | null;
+  criticalStage: "preflight" | "fast" | "final" | null;
+  fastResultId: string | null;
+  fastResultAttemptId: string | null;
+  finalResultId: string | null;
+  finalResultAttemptId: string | null;
+  finalEvidenceReasons: string[];
+  finalSubmitError: string | null;
+  finalSubmitHttpStatus: number | null;
+  physicalAttemptsUsed: number;
+  physicalAttemptsMax: number;
+  recoverySubmissions: number;
+  nonPhysicalSubmissions: number;
+  interruptedPhysicalRuns: number;
+  ransEvidenceRuns: number;
+  preliminaryEvidenceRuns: number;
+  fullUransEvidenceRuns: number;
+  legacyUransEvidenceRuns: number;
+  evidenceReasons: string[];
+  updatedAt: string;
+}
+
+/**
+ * Bounded cell-level read model for machine-owned preliminary URANS work.
+ *
+ * This is deliberately separate from campaignFailures(): an ordinary RANS
+ * failure that can be requeued and a terminal PRECALC obligation whose
+ * automatic physical budget is exhausted are different domain outcomes. The
+ * latter must never be relabeled as a failed RANS point or a user review task.
+ */
+export async function campaignPreliminaryOutcomes(
+  db: DB,
+  campaignId: string,
+  scope: { conditionId: string; airfoilId: string },
+): Promise<{
+  total: number;
+  recovering: number;
+  critical: number;
+  unavailable: number;
+  verified: number;
+  items: CampaignPreliminaryOutcome[];
+}> {
+  await requireCampaign(db, campaignId);
+  const rows = (await db.execute(sql`
+    SELECT
+      obligation.aoa_deg::float8 AS aoa_deg,
+      obligation.state,
+      obligation.source_result_id,
+      obligation.source_result_attempt_id,
+      obligation.attempt_count,
+      obligation.max_attempts,
+      obligation.last_outcome,
+      obligation."updatedAt" AS updated_at,
+      promotion_origin.promotion_id,
+      source_rans_attempt.id AS source_rans_attempt_id,
+      lineage_rans_attempt.id AS lineage_rans_attempt_id,
+      fast_evidence.result_id AS fast_result_id,
+      fast_evidence.result_attempt_id AS fast_result_attempt_id,
+      latest_verify.id AS verify_id,
+      latest_verify.state AS verify_state,
+      latest_verify.sim_job_id AS verify_sim_job_id,
+      latest_verify.verify_result_id,
+      latest_verify.delta_cl::float8 AS verify_delta_cl,
+      latest_verify.delta_cd::float8 AS verify_delta_cd,
+      latest_verify.delta_cm::float8 AS verify_delta_cm,
+      latest_verify.classification_reasons AS verify_latest_evidence_reasons,
+      latest_verify.submit_error AS verify_submit_error,
+      latest_verify.submit_http_status AS verify_submit_http_status,
+      latest_verify."createdAt" AS verify_created_at,
+      latest_verify."updatedAt" AS verify_updated_at,
+      verify_evidence.result_id AS verify_final_result_id,
+      verify_evidence.result_attempt_id AS verify_final_result_attempt_id,
+      verify_evidence.classification_state AS verify_final_classification_state,
+      verify_evidence.classification_reasons AS verify_final_classification_reasons,
+      verify_evidence.attempt_created_at AS verify_final_created_at,
+      verify_evidence.owner_id AS verify_final_owner_id,
+      verify_evidence.owner_state AS verify_final_owner_state,
+      verify_evidence.owner_created_at AS verify_final_owner_created_at,
+      verify_evidence.delta_cl::float8 AS verify_final_delta_cl,
+      verify_evidence.delta_cd::float8 AS verify_final_delta_cd,
+      verify_evidence.delta_cm::float8 AS verify_final_delta_cm,
+      latest_full_request.id AS full_request_id,
+      latest_full_request.state AS full_request_state,
+      latest_full_request.sim_job_id AS full_request_sim_job_id,
+      latest_full_request.classification_reasons AS request_latest_evidence_reasons,
+      latest_full_request.submit_error AS full_request_submit_error,
+      latest_full_request.submit_http_status AS full_request_submit_http_status,
+      latest_full_request."createdAt" AS full_request_created_at,
+      latest_full_request."updatedAt" AS full_request_updated_at,
+      request_evidence.result_id AS request_final_result_id,
+      request_evidence.result_attempt_id AS request_final_result_attempt_id,
+      request_evidence.classification_state AS request_final_classification_state,
+      request_evidence.classification_reasons AS request_final_classification_reasons,
+      request_evidence.attempt_created_at AS request_final_created_at,
+      request_evidence.owner_id AS request_final_owner_id,
+      request_evidence.owner_state AS request_final_owner_state,
+      request_evidence.owner_created_at AS request_final_owner_created_at,
+      ARRAY(
+        SELECT point.aoa_deg::float8
+        FROM sim_campaign_points point
+        LEFT JOIN results source_result ON source_result.id = point.result_id
+        WHERE point.campaign_id = ${campaignId}
+          AND point.condition_id = ${scope.conditionId}
+          AND point.airfoil_id = obligation.airfoil_id
+          AND point.state <> 'released'
+          AND CASE
+                WHEN point.derived_by_symmetry THEN source_result.aoa_deg
+                ELSE point.aoa_deg
+              END = obligation.aoa_deg
+        ORDER BY point.aoa_deg ASC
+      ) AS affected_aoa_degs,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        WHERE submission.obligation_id = obligation.id
+      ) AS recovery_submissions,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        WHERE submission.obligation_id = obligation.id
+          AND NOT submission.consumes_solver_attempt
+      ) AS non_physical_submissions,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        WHERE submission.obligation_id = obligation.id
+          AND submission.consumes_solver_attempt
+          AND submission.result_attempt_id IS NULL
+          AND submission.state IN ('rejected', 'failed', 'cancelled')
+      ) AS interrupted_physical_runs,
+      COALESCE((
+        SELECT (
+          latest_submission.result_attempt_id IS NULL
+          AND latest_submission.state IN ('rejected', 'failed', 'cancelled')
+          AND EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligation_attempts earlier_submission
+            JOIN result_attempts earlier_attempt
+              ON earlier_attempt.id = earlier_submission.result_attempt_id
+            JOIN result_classifications earlier_classification
+              ON earlier_classification.result_attempt_id = earlier_attempt.id
+            WHERE earlier_submission.obligation_id = obligation.id
+              AND earlier_submission.consumes_solver_attempt
+              AND earlier_submission.attempt_number < latest_submission.attempt_number
+              AND earlier_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+              AND 'incomplete-urans-integration' = ANY(
+                COALESCE(
+                  earlier_classification.reasons,
+                  ARRAY[]::text[]
+                )
+              )
+          )
+        )
+        FROM sim_precalc_obligation_attempts latest_submission
+        WHERE latest_submission.obligation_id = obligation.id
+          AND latest_submission.consumes_solver_attempt
+        ORDER BY latest_submission.attempt_number DESC
+        LIMIT 1
+      ), false) AS continuation_interrupted,
+      (
+        SELECT count(*)::int
+        FROM result_attempts attempt
+        WHERE attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND (
+            attempt.id = source_rans_attempt.id
+            OR attempt.sim_job_id = promotion_origin.parent_job_id
+            OR attempt.sim_job_id IN (
+              SELECT child.parent_job_id
+              FROM sim_precalc_obligation_attempts submission
+              JOIN sim_jobs child ON child.id = submission.sim_job_id
+              WHERE submission.obligation_id = obligation.id
+                AND child.parent_job_id IS NOT NULL
+            )
+          )
+          AND (
+            attempt.evidence_payload ->> 'fidelity' = 'rans'
+            OR (
+              attempt.regime = 'rans'
+              AND COALESCE(attempt.evidence_payload ->> 'fidelity', '') NOT LIKE 'urans%'
+            )
+          )
+      ) AS rans_evidence_runs,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        JOIN result_attempts attempt
+          ON attempt.id = submission.result_attempt_id
+        WHERE submission.obligation_id = obligation.id
+          AND attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      ) AS preliminary_evidence_runs,
+      (
+        SELECT count(DISTINCT attempt.id)::int
+        FROM result_attempts attempt
+        WHERE attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue queue
+              WHERE queue.airfoil_id = obligation.airfoil_id
+                AND queue.revision_id = obligation.revision_id
+                AND queue.aoa_deg = obligation.aoa_deg
+                AND queue.sim_job_id = attempt.sim_job_id
+                AND (
+                  EXISTS (
+                    SELECT 1
+                    FROM sim_urans_verify_queue_campaigns queue_owner
+                    WHERE queue_owner.queue_id = queue.id
+                      AND queue_owner.campaign_id = ${campaignId}
+                      AND queue_owner.state = 'active'
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM sim_urans_verify_queue_requests coverage
+                    JOIN sim_urans_request_campaigns request_owner
+                      ON request_owner.request_id = coverage.request_id
+                    WHERE coverage.queue_id = queue.id
+                      AND request_owner.campaign_id = ${campaignId}
+                      AND request_owner.state = 'active'
+                  )
+                )
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM sim_urans_requests request
+              JOIN sim_urans_request_campaigns request_owner
+                ON request_owner.request_id = request.id
+               AND request_owner.campaign_id = ${campaignId}
+               AND request_owner.state = 'active'
+              WHERE request.airfoil_id = obligation.airfoil_id
+                AND request.revision_id = obligation.revision_id
+                AND request.fidelity = 'full'
+                AND (
+                  request.aoa_deg = obligation.aoa_deg
+                  OR request.aoa_deg IS NULL
+                )
+                AND request.sim_job_id = attempt.sim_job_id
+            )
+          )
+      ) AS full_urans_evidence_runs,
+      (
+        SELECT count(*)::int
+        FROM sim_precalc_obligation_attempts submission
+        JOIN result_attempts attempt
+          ON attempt.id = submission.result_attempt_id
+        WHERE submission.obligation_id = obligation.id
+          AND attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.regime = 'urans'
+          AND COALESCE(attempt.evidence_payload ->> 'fidelity', '')
+            NOT IN ('rans', 'urans_precalc', 'urans_full')
+      ) AS legacy_urans_evidence_runs,
+      ARRAY(
+        SELECT DISTINCT reason
+        FROM sim_precalc_obligation_attempts submission
+        JOIN result_attempts attempt
+          ON attempt.id = submission.result_attempt_id
+        JOIN result_classifications classification
+          ON classification.result_attempt_id = attempt.id
+         AND classification.airfoil_id = attempt.airfoil_id
+         AND classification.simulation_preset_revision_id =
+             attempt.simulation_preset_revision_id
+         AND classification.aoa_deg = attempt.aoa_deg
+         AND classification.regime IS NOT DISTINCT FROM attempt.regime
+        CROSS JOIN LATERAL unnest(
+          COALESCE(classification.reasons, ARRAY[]::text[])
+        ) reason
+        WHERE submission.obligation_id = obligation.id
+          AND attempt.airfoil_id = obligation.airfoil_id
+          AND attempt.simulation_preset_revision_id = obligation.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        ORDER BY reason
+      ) AS evidence_reasons
+    FROM sim_precalc_obligations obligation
+    JOIN sim_precalc_obligation_campaigns ownership
+      ON ownership.obligation_id = obligation.id
+     AND ownership.campaign_id = ${campaignId}
+     AND ownership.state = 'active'
+    JOIN sim_campaign_conditions condition
+      ON condition.id = ${scope.conditionId}
+     AND condition.campaign_id = ${campaignId}
+     AND condition.simulation_preset_revision_id = obligation.revision_id
+    LEFT JOIN result_attempts source_rans_attempt
+      ON source_rans_attempt.id = obligation.source_result_attempt_id
+     AND source_rans_attempt.result_id = obligation.source_result_id
+     AND source_rans_attempt.airfoil_id = obligation.airfoil_id
+     AND source_rans_attempt.simulation_preset_revision_id = obligation.revision_id
+     AND source_rans_attempt.aoa_deg = obligation.aoa_deg
+     AND (
+       source_rans_attempt.evidence_payload ->> 'fidelity' = 'rans'
+       OR (
+         source_rans_attempt.regime = 'rans'
+         AND COALESCE(
+           source_rans_attempt.evidence_payload ->> 'fidelity',
+           ''
+         ) NOT LIKE 'urans%'
+       )
+     )
+    LEFT JOIN LATERAL (
+      SELECT
+        promotion.id AS promotion_id,
+        promotion.parent_job_id
+      FROM sim_rans_polar_promotion_points promotion_point
+      JOIN sim_rans_polar_promotions promotion
+        ON promotion.id = promotion_point.promotion_id
+       AND promotion.owner_kind = 'campaign'
+       AND promotion.campaign_id = ${campaignId}
+       AND promotion.airfoil_id = obligation.airfoil_id
+       AND promotion.revision_id = obligation.revision_id
+      WHERE promotion_point.obligation_id = obligation.id
+      ORDER BY promotion."createdAt" DESC, promotion.id DESC
+      LIMIT 1
+    ) promotion_origin ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT parent_attempt.id
+      FROM sim_precalc_obligation_attempts submission
+      JOIN sim_jobs child
+        ON child.id = submission.sim_job_id
+       AND child.parent_job_id IS NOT NULL
+      JOIN result_attempts parent_attempt
+        ON parent_attempt.sim_job_id = child.parent_job_id
+       AND parent_attempt.airfoil_id = obligation.airfoil_id
+       AND parent_attempt.simulation_preset_revision_id = obligation.revision_id
+       AND parent_attempt.aoa_deg = obligation.aoa_deg
+       AND (
+         parent_attempt.evidence_payload ->> 'fidelity' = 'rans'
+         OR (
+           parent_attempt.regime = 'rans'
+           AND COALESCE(
+             parent_attempt.evidence_payload ->> 'fidelity',
+             ''
+           ) NOT LIKE 'urans%'
+         )
+       )
+      WHERE submission.obligation_id = obligation.id
+      ORDER BY submission.attempt_number ASC, parent_attempt."createdAt" ASC
+      LIMIT 1
+    ) lineage_rans_attempt ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        queue.id,
+        queue.state,
+        queue.sim_job_id,
+        queue.verify_result_id,
+        queue.delta_cl,
+        queue.delta_cd,
+        queue.delta_cm,
+        latest_attempt.classification_reasons,
+        submit_retry.last_error AS submit_error,
+        submit_retry.last_http_status AS submit_http_status,
+        queue."createdAt",
+        queue."updatedAt"
+      FROM sim_urans_verify_queue queue
+      LEFT JOIN sim_ladder_submit_retries submit_retry
+        ON submit_retry.verify_queue_id = queue.id
+      LEFT JOIN LATERAL (
+        SELECT classification.reasons AS classification_reasons
+        FROM result_attempts attempt
+        JOIN result_classifications classification
+          ON classification.result_attempt_id = attempt.id
+         AND classification.airfoil_id = attempt.airfoil_id
+         AND classification.simulation_preset_revision_id =
+             attempt.simulation_preset_revision_id
+         AND classification.aoa_deg = attempt.aoa_deg
+         AND classification.regime IS NOT DISTINCT FROM attempt.regime
+        WHERE queue.sim_job_id IS NOT NULL
+          AND attempt.sim_job_id = queue.sim_job_id
+          AND attempt.airfoil_id = queue.airfoil_id
+          AND attempt.simulation_preset_revision_id = queue.revision_id
+          AND attempt.aoa_deg = queue.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+        ORDER BY
+          COALESCE(attempt."solvedAt", attempt."createdAt") DESC,
+          attempt.id DESC
+        LIMIT 1
+      ) latest_attempt ON TRUE
+      WHERE queue.airfoil_id = obligation.airfoil_id
+        AND queue.revision_id = obligation.revision_id
+        AND queue.aoa_deg = obligation.aoa_deg
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_campaigns queue_owner
+            WHERE queue_owner.queue_id = queue.id
+              AND queue_owner.campaign_id = ${campaignId}
+              AND queue_owner.state = 'active'
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests coverage
+            JOIN sim_urans_request_campaigns request_owner
+              ON request_owner.request_id = coverage.request_id
+            WHERE coverage.queue_id = queue.id
+              AND request_owner.campaign_id = ${campaignId}
+              AND request_owner.state = 'active'
+          )
+        )
+      ORDER BY queue."createdAt" DESC, queue.id DESC
+      LIMIT 1
+    ) latest_verify ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        attempt.result_id,
+        attempt.id AS result_attempt_id
+      FROM result_attempts attempt
+      JOIN result_classifications classification
+        ON classification.result_attempt_id = attempt.id
+       AND classification.airfoil_id = attempt.airfoil_id
+       AND classification.simulation_preset_revision_id =
+           attempt.simulation_preset_revision_id
+       AND classification.aoa_deg = attempt.aoa_deg
+       AND classification.regime IS NOT DISTINCT FROM attempt.regime
+       AND classification.state IN ('accepted', 'superseded_by_urans')
+      WHERE obligation.state = 'satisfied'
+        AND attempt.airfoil_id = obligation.airfoil_id
+        AND attempt.simulation_preset_revision_id = obligation.revision_id
+        AND attempt.aoa_deg = obligation.aoa_deg
+        AND attempt.status = 'done'
+        AND attempt.source = 'solved'
+        AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        AND obligation.source_result_attempt_id IS NOT NULL
+        AND attempt.id = obligation.source_result_attempt_id
+      LIMIT 1
+    ) fast_evidence ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        request.id,
+        request.state,
+        request.sim_job_id,
+        latest_attempt.classification_reasons,
+        submit_retry.last_error AS submit_error,
+        submit_retry.last_http_status AS submit_http_status,
+        request."createdAt",
+        request."updatedAt"
+      FROM sim_urans_requests request
+      JOIN sim_urans_request_campaigns request_owner
+        ON request_owner.request_id = request.id
+       AND request_owner.campaign_id = ${campaignId}
+       AND request_owner.state = 'active'
+      LEFT JOIN sim_ladder_submit_retries submit_retry
+        ON submit_retry.urans_request_id = request.id
+      LEFT JOIN LATERAL (
+        SELECT classification.reasons AS classification_reasons
+        FROM result_attempts attempt
+        JOIN result_classifications classification
+          ON classification.result_attempt_id = attempt.id
+         AND classification.airfoil_id = attempt.airfoil_id
+         AND classification.simulation_preset_revision_id =
+             attempt.simulation_preset_revision_id
+         AND classification.aoa_deg = attempt.aoa_deg
+         AND classification.regime IS NOT DISTINCT FROM attempt.regime
+        WHERE request.sim_job_id IS NOT NULL
+          AND attempt.sim_job_id = request.sim_job_id
+          AND attempt.airfoil_id = request.airfoil_id
+          AND attempt.simulation_preset_revision_id = request.revision_id
+          AND attempt.aoa_deg = obligation.aoa_deg
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+        ORDER BY
+          COALESCE(attempt."solvedAt", attempt."createdAt") DESC,
+          attempt.id DESC
+        LIMIT 1
+      ) latest_attempt ON TRUE
+      WHERE request.airfoil_id = obligation.airfoil_id
+        AND request.revision_id = obligation.revision_id
+        AND request.fidelity = 'full'
+        AND (
+          request.aoa_deg = obligation.aoa_deg
+          OR request.aoa_deg IS NULL
+        )
+      ORDER BY
+        request."createdAt" DESC,
+        (request.aoa_deg IS NOT NULL) DESC,
+        request.id DESC
+      LIMIT 1
+    ) latest_full_request ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        attempt.result_id,
+        attempt.id AS result_attempt_id,
+        classification.state AS classification_state,
+        classification.reasons AS classification_reasons,
+        attempt."createdAt" AS attempt_created_at,
+        queue.id AS owner_id,
+        queue.state AS owner_state,
+        queue."createdAt" AS owner_created_at,
+        queue.delta_cl,
+        queue.delta_cd,
+        queue.delta_cm
+      FROM sim_urans_verify_queue queue
+      JOIN result_attempts attempt
+        ON attempt.sim_job_id = queue.sim_job_id
+       AND attempt.airfoil_id = obligation.airfoil_id
+       AND attempt.simulation_preset_revision_id = obligation.revision_id
+       AND attempt.aoa_deg = obligation.aoa_deg
+      JOIN result_classifications classification
+        ON classification.result_attempt_id = attempt.id
+       AND classification.airfoil_id = attempt.airfoil_id
+       AND classification.simulation_preset_revision_id =
+           attempt.simulation_preset_revision_id
+       AND classification.aoa_deg = attempt.aoa_deg
+       AND classification.regime IS NOT DISTINCT FROM attempt.regime
+       AND classification.state = 'accepted'
+      WHERE queue.airfoil_id = obligation.airfoil_id
+        AND queue.revision_id = obligation.revision_id
+        AND queue.aoa_deg = obligation.aoa_deg
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_campaigns queue_owner
+            WHERE queue_owner.queue_id = queue.id
+              AND queue_owner.campaign_id = ${campaignId}
+              AND queue_owner.state = 'active'
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests coverage
+            JOIN sim_urans_request_campaigns request_owner
+              ON request_owner.request_id = coverage.request_id
+            WHERE coverage.queue_id = queue.id
+              AND request_owner.campaign_id = ${campaignId}
+              AND request_owner.state = 'active'
+          )
+        )
+        AND queue.sim_job_id IS NOT NULL
+        AND (
+          queue.verify_result_id IS NULL
+          OR queue.verify_result_id = attempt.result_id
+        )
+        AND attempt.status = 'done'
+        AND attempt.source = 'solved'
+        AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+      ORDER BY
+        COALESCE(attempt."solvedAt", attempt."createdAt") DESC,
+        attempt.id DESC
+      LIMIT 1
+    ) verify_evidence ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        attempt.result_id,
+        attempt.id AS result_attempt_id,
+        classification.state AS classification_state,
+        classification.reasons AS classification_reasons,
+        attempt."createdAt" AS attempt_created_at,
+        request.id AS owner_id,
+        request.state AS owner_state,
+        request."createdAt" AS owner_created_at
+      FROM sim_urans_requests request
+      JOIN sim_urans_request_campaigns request_owner
+        ON request_owner.request_id = request.id
+       AND request_owner.campaign_id = ${campaignId}
+       AND request_owner.state = 'active'
+      JOIN result_attempts attempt
+        ON attempt.sim_job_id = request.sim_job_id
+       AND attempt.airfoil_id = obligation.airfoil_id
+       AND attempt.simulation_preset_revision_id = obligation.revision_id
+       AND attempt.aoa_deg = obligation.aoa_deg
+      JOIN result_classifications classification
+        ON classification.result_attempt_id = attempt.id
+       AND classification.airfoil_id = attempt.airfoil_id
+       AND classification.simulation_preset_revision_id =
+           attempt.simulation_preset_revision_id
+       AND classification.aoa_deg = attempt.aoa_deg
+       AND classification.regime IS NOT DISTINCT FROM attempt.regime
+       AND classification.state = 'accepted'
+      WHERE request.airfoil_id = obligation.airfoil_id
+        AND request.revision_id = obligation.revision_id
+        AND request.fidelity = 'full'
+        AND (
+          request.aoa_deg = obligation.aoa_deg
+          OR request.aoa_deg IS NULL
+        )
+        AND request.sim_job_id IS NOT NULL
+        AND attempt.status = 'done'
+        AND attempt.source = 'solved'
+        AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+      ORDER BY
+        COALESCE(attempt."solvedAt", attempt."createdAt") DESC,
+        attempt.id DESC
+      LIMIT 1
+    ) request_evidence ON TRUE
+    WHERE obligation.airfoil_id = ${scope.airfoilId}
+      AND obligation.state IN ('pending', 'running', 'satisfied', 'blocked')
+      AND EXISTS (
+        SELECT 1
+        FROM sim_campaign_points point
+        LEFT JOIN results source_result ON source_result.id = point.result_id
+        WHERE point.campaign_id = ${campaignId}
+          AND point.condition_id = ${scope.conditionId}
+          AND point.airfoil_id = obligation.airfoil_id
+          AND point.state <> 'released'
+          AND CASE
+                WHEN point.derived_by_symmetry THEN source_result.aoa_deg
+                ELSE point.aoa_deg
+              END = obligation.aoa_deg
+      )
+    ORDER BY obligation.aoa_deg ASC
+  `)) as unknown as Array<{
+    aoa_deg: number;
+    state: "pending" | "running" | "satisfied" | "blocked";
+    source_result_id: string | null;
+    source_result_attempt_id: string | null;
+    attempt_count: number;
+    max_attempts: number;
+    last_outcome: string | null;
+    updated_at: Date | string;
+    promotion_id: string | null;
+    source_rans_attempt_id: string | null;
+    lineage_rans_attempt_id: string | null;
+    fast_result_id: string | null;
+    fast_result_attempt_id: string | null;
+    verify_id: string | null;
+    verify_state: string | null;
+    verify_sim_job_id: string | null;
+    verify_result_id: string | null;
+    verify_delta_cl: number | null;
+    verify_delta_cd: number | null;
+    verify_delta_cm: number | null;
+    verify_latest_evidence_reasons: string[] | null;
+    verify_submit_error: string | null;
+    verify_submit_http_status: number | null;
+    verify_created_at: Date | string | null;
+    verify_updated_at: Date | string | null;
+    verify_final_result_id: string | null;
+    verify_final_result_attempt_id: string | null;
+    verify_final_classification_state: string | null;
+    verify_final_classification_reasons: string[] | null;
+    verify_final_created_at: Date | string | null;
+    verify_final_owner_id: string | null;
+    verify_final_owner_state: string | null;
+    verify_final_owner_created_at: Date | string | null;
+    verify_final_delta_cl: number | null;
+    verify_final_delta_cd: number | null;
+    verify_final_delta_cm: number | null;
+    full_request_id: string | null;
+    full_request_state: string | null;
+    full_request_sim_job_id: string | null;
+    request_latest_evidence_reasons: string[] | null;
+    full_request_submit_error: string | null;
+    full_request_submit_http_status: number | null;
+    full_request_created_at: Date | string | null;
+    full_request_updated_at: Date | string | null;
+    request_final_result_id: string | null;
+    request_final_result_attempt_id: string | null;
+    request_final_classification_state: string | null;
+    request_final_classification_reasons: string[] | null;
+    request_final_created_at: Date | string | null;
+    request_final_owner_id: string | null;
+    request_final_owner_state: string | null;
+    request_final_owner_created_at: Date | string | null;
+    affected_aoa_degs: Array<number | string>;
+    recovery_submissions: number;
+    non_physical_submissions: number;
+    interrupted_physical_runs: number;
+    continuation_interrupted: boolean;
+    rans_evidence_runs: number;
+    preliminary_evidence_runs: number;
+    full_urans_evidence_runs: number;
+    legacy_urans_evidence_runs: number;
+    evidence_reasons: string[] | null;
+  }>;
+
+  // A preflight incident has no PRECALC obligation by definition: automatic
+  // mesh/runtime repair exhausted before aerodynamic RANS screening could
+  // execute. Surface it in the same per-point journey model, but never label
+  // it as RANS non-convergence or imply a fast-URANS physical-attempt budget.
+  const ransIncidentRows = (await db.execute(sql`
+    WITH latest_incident AS (
+      SELECT DISTINCT ON (incident.result_id)
+        incident.result_id,
+        incident.reason,
+        incident.metadata,
+        incident."updatedAt" AS updated_at
+      FROM sim_solver_incidents incident
+      JOIN sim_solver_incident_campaigns incident_owner
+        ON incident_owner.incident_id = incident.id
+       AND incident_owner.campaign_id = ${campaignId}
+      WHERE incident.stage = 'rans'
+        AND incident.status = 'open'
+        AND incident.severity = 'critical'
+        AND incident.result_id IS NOT NULL
+      ORDER BY
+        incident.result_id,
+        incident.occurred_at DESC,
+        incident.id DESC
+    )
+    SELECT
+      r.id AS result_id,
+      r.aoa_deg::float8 AS aoa_deg,
+      latest_incident.reason,
+      latest_incident.metadata,
+      latest_incident.updated_at,
+      ARRAY(
+        SELECT point.aoa_deg::float8
+        FROM sim_campaign_points point
+        WHERE point.campaign_id = ${campaignId}
+          AND point.condition_id = ${scope.conditionId}
+          AND point.airfoil_id = ${scope.airfoilId}
+          AND point.result_id = r.id
+          AND point.state = 'terminal'
+        ORDER BY point.aoa_deg ASC
+      ) AS affected_aoa_degs,
+      (
+        SELECT count(*)::int
+        FROM result_attempts attempt
+        WHERE attempt.result_id = r.id
+          AND attempt.sim_job_id IS NOT DISTINCT FROM r.sim_job_id
+          AND attempt.regime = 'rans'
+      ) AS rans_evidence_runs
+    FROM latest_incident
+    JOIN results r ON r.id = latest_incident.result_id
+    JOIN sim_campaigns campaign ON campaign.id = ${campaignId}
+    JOIN sim_campaign_conditions scoped_condition
+      ON scoped_condition.id = ${scope.conditionId}
+     AND scoped_condition.campaign_id = campaign.id
+    WHERE r.airfoil_id = ${scope.airfoilId}
+      AND r.status = 'failed'
+      AND scoped_condition.generation = campaign.current_condition_generation
+      AND scoped_condition.status IN ('active', 'kept')
+      AND EXISTS (
+        SELECT 1
+        FROM sim_campaign_points scoped_point
+        WHERE scoped_point.campaign_id = campaign.id
+          AND scoped_point.condition_id = scoped_condition.id
+          AND scoped_point.airfoil_id = r.airfoil_id
+          AND scoped_point.result_id = r.id
+          AND scoped_point.state = 'terminal'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_precalc_obligations obligation
+        WHERE obligation.airfoil_id = r.airfoil_id
+          AND obligation.revision_id = r.simulation_preset_revision_id
+          AND obligation.aoa_deg = r.aoa_deg
+      )
+    ORDER BY r.aoa_deg ASC
+  `)) as unknown as Array<{
+    result_id: string;
+    aoa_deg: number;
+    reason: string;
+    metadata: Record<string, unknown> | null;
+    updated_at: Date | string;
+    affected_aoa_degs: Array<number | string>;
+    rans_evidence_runs: number;
+  }>;
+
+  const timestampMs = (value: Date | string | null): number => {
+    if (value instanceof Date) return value.getTime();
+    if (!value) return 0;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
+  const obligationItems = rows.map((row): CampaignPreliminaryOutcome => {
+    const evidenceReasons = row.evidence_reasons ?? [];
+    const affectedAoaDegs = row.affected_aoa_degs.map(Number);
+    const ransStage: CampaignPreliminaryRansStage =
+      row.source_rans_attempt_id !== null ||
+      row.lineage_rans_attempt_id !== null
+        ? "screened"
+        : row.promotion_id !== null
+          ? "polar_handoff"
+          : "skipped";
+    const hasAcceptedFastEvidence = Boolean(
+      row.fast_result_id && row.fast_result_attempt_id,
+    );
+    const fastState: CampaignPreliminaryFastState =
+      row.state === "pending"
+        ? "queued"
+        : row.state === "running"
+          ? "running"
+          : row.state === "satisfied" && hasAcceptedFastEvidence
+            ? "accepted"
+            : "critical";
+    let outcome: CampaignPreliminaryOutcomeKind;
+    if (row.state === "pending" || row.state === "running") {
+      outcome = "recovering";
+    } else if (row.state === "satisfied" && hasAcceptedFastEvidence) {
+      outcome = "accepted";
+    } else if (row.state === "satisfied") {
+      // A mutable obligation flag alone cannot invent a publishable fast
+      // result. Exact accepted/superseded attempt evidence is mandatory.
+      outcome = "evidence_unavailable";
+    } else if (row.last_outcome === "rejected_exhausted") {
+      outcome = "evidence_unavailable";
+    } else if (
+      row.last_outcome === "continuation_permanent_failure" ||
+      row.last_outcome === "continuation_no_progress_exhausted" ||
+      row.last_outcome === "continuation_segment_exhausted" ||
+      (row.last_outcome === "failed_exhausted" &&
+        Boolean(row.continuation_interrupted))
+    ) {
+      outcome = "continuation_unavailable";
+    } else if (row.last_outcome === "deterministic_failure") {
+      outcome = "mesh_unavailable";
+    } else if (row.last_outcome === "submit_blocked") {
+      outcome = "submit_unavailable";
+    } else {
+      outcome = "recovery_unavailable";
+    }
+
+    type AcceptedFinalEvidence = {
+      source: CampaignPreliminaryFinalSource;
+      ownerId: string;
+      ownerState: string | null;
+      ownerCreatedAt: Date | string | null;
+      resultId: string;
+      resultAttemptId: string;
+      reasons: string[];
+      createdAt: Date | string | null;
+      deltaCl: number | null;
+      deltaCd: number | null;
+      deltaCm: number | null;
+    };
+    const acceptedEvidenceCandidates: Array<AcceptedFinalEvidence | null> = [
+      row.verify_final_result_id &&
+      row.verify_final_result_attempt_id &&
+      row.verify_final_owner_id &&
+      row.verify_final_classification_state === "accepted"
+        ? {
+            source: "verify" as const,
+            ownerId: row.verify_final_owner_id,
+            ownerState: row.verify_final_owner_state,
+            ownerCreatedAt: row.verify_final_owner_created_at,
+            resultId: row.verify_final_result_id,
+            resultAttemptId: row.verify_final_result_attempt_id,
+            reasons: row.verify_final_classification_reasons ?? [],
+            createdAt: row.verify_final_created_at,
+            deltaCl: row.verify_final_delta_cl,
+            deltaCd: row.verify_final_delta_cd,
+            deltaCm: row.verify_final_delta_cm,
+          }
+        : null,
+      row.request_final_result_id &&
+      row.request_final_result_attempt_id &&
+      row.request_final_owner_id &&
+      row.request_final_classification_state === "accepted"
+        ? {
+            source: "full_request" as const,
+            ownerId: row.request_final_owner_id,
+            ownerState: row.request_final_owner_state,
+            ownerCreatedAt: row.request_final_owner_created_at,
+            resultId: row.request_final_result_id,
+            resultAttemptId: row.request_final_result_attempt_id,
+            reasons: row.request_final_classification_reasons ?? [],
+            createdAt: row.request_final_created_at,
+            deltaCl: null,
+            deltaCd: null,
+            deltaCm: null,
+          }
+        : null,
+    ];
+    const acceptedEvidence = acceptedEvidenceCandidates
+      .filter(
+        (candidate): candidate is AcceptedFinalEvidence => candidate !== null,
+      )
+      .sort((a, b) => timestampMs(b.createdAt) - timestampMs(a.createdAt))[0];
+
+    const finalWork = [
+      row.verify_id
+        ? {
+            source: "verify" as const,
+            ownerId: row.verify_id,
+            state: row.verify_state,
+            createdAt: row.verify_created_at,
+            updatedAt: row.verify_updated_at,
+            submitError: row.verify_submit_error,
+            submitHttpStatus: row.verify_submit_http_status,
+          }
+        : null,
+      row.full_request_id
+        ? {
+            source: "full_request" as const,
+            ownerId: row.full_request_id,
+            state: row.full_request_state,
+            createdAt: row.full_request_created_at,
+            updatedAt: row.full_request_updated_at,
+            submitError: row.full_request_submit_error,
+            submitHttpStatus: row.full_request_submit_http_status,
+          }
+        : null,
+    ]
+      .filter(
+        (
+          candidate,
+        ): candidate is {
+          source: CampaignPreliminaryFinalSource;
+          ownerId: string;
+          state: string | null;
+          createdAt: Date | string | null;
+          updatedAt: Date | string | null;
+          submitError: string | null;
+          submitHttpStatus: number | null;
+        } => candidate !== null,
+      )
+      .sort(
+        (a, b) =>
+          timestampMs(b.createdAt) - timestampMs(a.createdAt) ||
+          timestampMs(b.updatedAt) - timestampMs(a.updatedAt),
+      )[0];
+
+    let finalState: CampaignPreliminaryFinalState = "not_started";
+    if (acceptedEvidence) {
+      finalState = "accepted";
+    } else if (finalWork?.state === "pending") {
+      finalState = "queued";
+    } else if (finalWork?.state === "running") {
+      finalState = "running";
+    } else if (finalWork) {
+      // done/disagreed without an exact accepted selected full attempt is not
+      // a final result. blocked/cancelled are terminal machine incidents too.
+      finalState = "critical";
+    }
+
+    let finalActivityState: CampaignPreliminaryFinalActivityState | null = null;
+    if (acceptedEvidence && finalWork) {
+      const sameOwner =
+        acceptedEvidence.source === finalWork.source &&
+        acceptedEvidence.ownerId === finalWork.ownerId;
+      const newerOwner =
+        !sameOwner &&
+        timestampMs(finalWork.createdAt) >=
+          timestampMs(acceptedEvidence.ownerCreatedAt);
+      if (sameOwner || newerOwner) {
+        if (finalWork.state === "pending") {
+          finalActivityState = "queued";
+        } else if (finalWork.state === "running") {
+          finalActivityState = "running";
+        } else if (
+          !sameOwner ||
+          (finalWork.state !== "done" && finalWork.state !== "disagreed")
+        ) {
+          finalActivityState = "critical";
+        }
+      }
+    }
+
+    const finalComparison: CampaignPreliminaryFinalComparison | null =
+      acceptedEvidence?.source === "verify"
+        ? acceptedEvidence.ownerState === "disagreed"
+          ? "disagreed"
+          : acceptedEvidence.ownerState === "done"
+            ? "within_tolerance"
+            : null
+        : null;
+    const criticalStage =
+      finalComparison === "disagreed" ||
+      finalState === "critical" ||
+      finalActivityState === "critical"
+        ? ("final" as const)
+        : fastState === "critical"
+          ? ("fast" as const)
+          : null;
+    const selectedFinalReasons =
+      finalState === "critical" || finalActivityState === "critical"
+        ? finalWork?.source === "verify"
+          ? (row.verify_latest_evidence_reasons ?? [])
+          : finalWork?.source === "full_request"
+            ? (row.request_latest_evidence_reasons ?? [])
+            : []
+        : (acceptedEvidence?.reasons ?? []);
+
+    return {
+      aoaDeg: Number(row.aoa_deg),
+      sourceAoaDeg: Number(row.aoa_deg),
+      derivedBySymmetry: false,
+      affectedAoaDegs,
+      affectedPointCount: affectedAoaDegs.length,
+      state: row.state,
+      outcome,
+      ransStage,
+      fastState,
+      finalState,
+      finalActivityState,
+      finalComparison,
+      finalDeltaCl: acceptedEvidence?.deltaCl ?? null,
+      finalDeltaCd: acceptedEvidence?.deltaCd ?? null,
+      finalDeltaCm: acceptedEvidence?.deltaCm ?? null,
+      finalSource: acceptedEvidence?.source ?? finalWork?.source ?? null,
+      criticalStage,
+      fastResultId: row.fast_result_id,
+      fastResultAttemptId: row.fast_result_attempt_id,
+      finalResultId: acceptedEvidence?.resultId ?? null,
+      finalResultAttemptId: acceptedEvidence?.resultAttemptId ?? null,
+      finalEvidenceReasons: selectedFinalReasons,
+      finalSubmitError: finalWork?.submitError ?? null,
+      finalSubmitHttpStatus: finalWork?.submitHttpStatus ?? null,
+      physicalAttemptsUsed: Number(row.attempt_count),
+      physicalAttemptsMax: Number(row.max_attempts),
+      recoverySubmissions: Number(row.recovery_submissions),
+      nonPhysicalSubmissions: Number(row.non_physical_submissions),
+      interruptedPhysicalRuns: Number(row.interrupted_physical_runs),
+      ransEvidenceRuns: Number(row.rans_evidence_runs),
+      preliminaryEvidenceRuns: Number(row.preliminary_evidence_runs),
+      fullUransEvidenceRuns: Number(row.full_urans_evidence_runs),
+      legacyUransEvidenceRuns: Number(row.legacy_urans_evidence_runs),
+      evidenceReasons,
+      updatedAt: isoOf(row.updated_at)!,
+    };
+  });
+  const ransIncidentItems = ransIncidentRows.map(
+    (row): CampaignPreliminaryOutcome => {
+      const affectedAoaDegs = row.affected_aoa_degs.map(Number);
+      const metadataReasons = Array.isArray(row.metadata?.classificationReasons)
+        ? row.metadata.classificationReasons.filter(
+            (value): value is string => typeof value === "string",
+          )
+        : [];
+      const evidenceReasons = [...new Set([row.reason, ...metadataReasons])];
+      return {
+        aoaDeg: Number(row.aoa_deg),
+        sourceAoaDeg: Number(row.aoa_deg),
+        derivedBySymmetry: false,
+        affectedAoaDegs,
+        affectedPointCount: affectedAoaDegs.length,
+        state: "blocked",
+        outcome:
+          row.reason === "mesh-quality-failure"
+            ? "mesh_unavailable"
+            : "recovery_unavailable",
+        ransStage: "not_started",
+        fastState: "not_started",
+        finalState: "not_started",
+        finalActivityState: null,
+        finalComparison: null,
+        finalDeltaCl: null,
+        finalDeltaCd: null,
+        finalDeltaCm: null,
+        finalSource: null,
+        criticalStage: "preflight",
+        fastResultId: null,
+        fastResultAttemptId: null,
+        finalResultId: null,
+        finalResultAttemptId: null,
+        finalEvidenceReasons: [],
+        finalSubmitError: null,
+        finalSubmitHttpStatus: null,
+        physicalAttemptsUsed: 0,
+        physicalAttemptsMax: 0,
+        recoverySubmissions: 0,
+        nonPhysicalSubmissions: 0,
+        interruptedPhysicalRuns: 0,
+        ransEvidenceRuns: Number(row.rans_evidence_runs),
+        preliminaryEvidenceRuns: 0,
+        fullUransEvidenceRuns: 0,
+        legacyUransEvidenceRuns: 0,
+        evidenceReasons,
+        updatedAt: isoOf(row.updated_at)!,
+      };
+    },
+  );
+  // The list is conceptually per requested campaign point, not per shared
+  // solver obligation. Symmetry may let ±AoA points share one immutable
+  // source result, but each requested point still owns one visible row and one
+  // count. Stable source ids and sourceAoaDeg preserve the exact evidence
+  // relationship without collapsing the user-facing journey.
+  const items = [...obligationItems, ...ransIncidentItems]
+    .flatMap((item) => {
+      const requestedAoaDegs = [
+        ...new Set(
+          (item.affectedAoaDegs.length
+            ? item.affectedAoaDegs
+            : [item.aoaDeg]
+          ).map(Number),
+        ),
+      ].sort((left, right) => left - right);
+      return requestedAoaDegs.map(
+        (requestedAoaDeg): CampaignPreliminaryOutcome => ({
+          ...item,
+          aoaDeg: requestedAoaDeg,
+          sourceAoaDeg: item.aoaDeg,
+          derivedBySymmetry: requestedAoaDeg !== item.aoaDeg,
+          affectedAoaDegs: [requestedAoaDeg],
+          affectedPointCount: 1,
+        }),
+      );
+    })
+    .sort((left, right) => {
+      const aoaOrder = left.aoaDeg - right.aoaDeg;
+      if (aoaOrder !== 0) return aoaOrder;
+      if (left.criticalStage === right.criticalStage) return 0;
+      if (left.criticalStage === "preflight") return -1;
+      if (right.criticalStage === "preflight") return 1;
+      return 0;
+    });
+  return {
+    total: items.reduce((sum, item) => sum + item.affectedPointCount, 0),
+    recovering: items
+      .filter(
+        (item) =>
+          item.fastState === "queued" ||
+          item.fastState === "running" ||
+          item.finalState === "queued" ||
+          item.finalState === "running" ||
+          item.finalActivityState === "queued" ||
+          item.finalActivityState === "running",
+      )
+      .reduce((sum, item) => sum + item.affectedPointCount, 0),
+    critical: items
+      .filter((item) => item.criticalStage !== null)
+      .reduce((sum, item) => sum + item.affectedPointCount, 0),
+    unavailable: items
+      .filter(
+        (item) =>
+          item.criticalStage === "preflight" ||
+          item.fastState === "critical" ||
+          item.finalState === "critical",
+      )
+      .reduce((sum, item) => sum + item.affectedPointCount, 0),
+    verified: items
+      .filter((item) => item.finalState === "accepted")
+      .reduce((sum, item) => sum + item.affectedPointCount, 0),
+    items,
+  };
+}
+
+/** Legacy scoped maintenance endpoint with exact expected-count verification
+ *  (409 on drift). Operator-facing failures/rejections are terminal URANS
+ *  outcomes, while ordinary RANS trouble is owned by the automatic fidelity
+ *  ladder; consequently neither class may be downgraded to a wave-1 retry here.
+ *  The retained endpoint remains concurrency-safe for rolling clients and
+ *  proves the confirmed eligible count is zero unless a future, explicitly
+ *  modeled maintenance class is introduced. */
 export async function requeueCampaignFailed(
   db: DB,
   campaignId: string,
@@ -5493,16 +6838,34 @@ export async function listCampaigns(
           WHERE ownership.campaign_id = c.id
             AND ownership.state = 'active'
             AND req.state IN ('pending', 'running')
+            AND req.fidelity = 'precalc'
 
           UNION
 
           SELECT obligation.airfoil_id, obligation.revision_id, obligation.aoa_deg
-          FROM sim_precalc_obligation_campaigns obligation_owner
-          JOIN sim_precalc_obligations obligation
-            ON obligation.id = obligation_owner.obligation_id
-          WHERE obligation_owner.campaign_id = c.id
-            AND obligation_owner.state = 'active'
-            AND obligation.state IN ('pending', 'running')
+          FROM sim_precalc_obligations obligation
+          WHERE obligation.state IN ('pending', 'running')
+            AND (
+              EXISTS (
+                SELECT 1
+                FROM sim_precalc_obligation_campaigns obligation_owner
+                WHERE obligation_owner.obligation_id = obligation.id
+                  AND obligation_owner.campaign_id = c.id
+                  AND obligation_owner.state = 'active'
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sim_precalc_obligation_requests coverage
+                JOIN sim_urans_request_campaigns request_owner
+                  ON request_owner.request_id = coverage.request_id
+                JOIN sim_urans_requests request
+                  ON request.id = coverage.request_id
+                 AND request.state IN ('pending', 'running')
+                WHERE coverage.obligation_id = obligation.id
+                  AND request_owner.campaign_id = c.id
+                  AND request_owner.state = 'active'
+              )
+            )
         ) automatic_precalc_cells
       ) AS automatic_precalc_open,
       count(*) OVER ()::int AS total
@@ -5659,6 +7022,9 @@ export interface CampaignSummary {
   /** Derived ladder phase (contract 7): running_rans → running_precalc →
    *  running_refinement → completed; null for paused/cancelled/archived. */
   phase: CampaignPhase;
+  /** Durable preliminary/final URANS recurrence and critical-exhaustion
+   *  groups for this campaign. */
+  solverIncidents: SolverIncidentSummary;
   airfoilCount: number;
   excludedAirfoilCount: number;
   latestLifecycleEvent: CampaignListItem["latestLifecycleEvent"];
@@ -5678,6 +7044,7 @@ export async function campaignSummary(
   const progress = await campaignProgressSnapshot(db, campaignId);
   const totals = progress.totals;
   const tierCounts = await campaignOpenTierCounts(db, campaignId);
+  const solverIncidents = await solverIncidentSummary(db, { campaignId });
   const reviewBucketRows = await campaignReviewBucketRows(db, campaignId);
   const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
     (acc, row) => ({
@@ -5803,6 +7170,7 @@ export async function campaignSummary(
     reviewBuckets,
     tierCounts,
     phase: deriveCampaignPhase(campaign.status, tierCounts),
+    solverIncidents,
     airfoilCount: Number(scopeRow?.active ?? 0),
     excludedAirfoilCount: Number(scopeRow?.excluded ?? 0),
     latestLifecycleEvent: lifecycleRow

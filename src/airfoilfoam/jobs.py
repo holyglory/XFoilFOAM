@@ -10,11 +10,13 @@ from . import physics
 from .airfoil import load_airfoil
 from .cache import EngineCache
 from .cancellation import JobCancelled
-from .capabilities import MESH_RECOVERY_VERSION
+from .capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
 from .config import Settings, get_settings
 from .meshing.base import get_mesher
 from .models import (
     CaseSpec,
+    ContinuationFailureKind,
+    FailureDisposition,
     ForceHistory,
     JobPhase,
     JobResult,
@@ -28,6 +30,7 @@ from .openfoam.runner import EngineIdentityMismatch, OpenFOAMError, get_runner
 from .openfoam.dialects import OPENCFD_2606_IDENTITY, get_openfoam_dialect
 from .pipeline import (
     CaseOutcome,
+    ContinuationPermanentError,
     PolarMarchResult,
     StoredCaseOutcome,
     TransientResume,
@@ -147,6 +150,15 @@ def execute_job(
             f"requested v{request.expected_mesh_recovery_version}, "
             f"worker is v{MESH_RECOVERY_VERSION}"
         )
+    if (
+        request.expected_urans_recovery_version is not None
+        and request.expected_urans_recovery_version != URANS_RECOVERY_VERSION
+    ):
+        raise RuntimeError(
+            "worker URANS-recovery capability mismatch: "
+            f"requested v{request.expected_urans_recovery_version}, "
+            f"worker is v{URANS_RECOVERY_VERSION}"
+        )
     airfoil = load_airfoil(
         request.airfoil.name, request.airfoil.coordinates, request.airfoil.points,
         request.airfoil.format,
@@ -199,6 +211,8 @@ def execute_job(
         active_aoa_deg: Optional[float] = None,
         cpu_tokens_waiting: Optional[int] = None,
         cpu_tokens_held: Optional[int] = None,
+        failure_disposition: Optional[FailureDisposition] = None,
+        continuation_failure_kind: Optional[ContinuationFailureKind] = None,
     ) -> None:
         if state == JobState.running:
             ensure_not_cancelled()
@@ -236,6 +250,8 @@ def execute_job(
             engine=runtime_engine,
             execution_pool=settings.celery_queue,
             mesh_recovery_version=MESH_RECOVERY_VERSION,
+            failure_disposition=failure_disposition,
+            continuation_failure_kind=continuation_failure_kind,
         )
         store.write_status(st)
         if progress:
@@ -454,8 +470,23 @@ def execute_job(
             phase=JobPhase.waiting_cpu,
         )
         try:
-            source = stage_continuation_case(src_case, dst_case)
+            source = stage_continuation_case(
+                src_case,
+                dst_case,
+                settings=settings,
+                aoa_deg=spec.aoa_deg,
+                expected_engine=expected_engine,
+            )
         except OpenFOAMError as exc:
+            permanent = isinstance(exc, ContinuationPermanentError)
+            failure_disposition = (
+                None if permanent else FailureDisposition.infrastructure
+            )
+            continuation_failure_kind = (
+                ContinuationFailureKind.permanent
+                if permanent
+                else ContinuationFailureKind.transient
+            )
             message = f"continuation failed: {exc}"
             logger.error(
                 "continuation: job %s cannot resume %s/%s — %s",
@@ -472,6 +503,8 @@ def execute_job(
                 engine=runtime_engine,
                 execution_pool=settings.celery_queue,
                 method_keys=method_keys(build_polars()),
+                failure_disposition=failure_disposition,
+                continuation_failure_kind=continuation_failure_kind,
             )
             store.write_result(result)
             set_status(
@@ -480,6 +513,8 @@ def execute_job(
                 phase=JobPhase.failed,
                 cpu_tokens_waiting=0,
                 cpu_tokens_held=0,
+                failure_disposition=failure_disposition,
+                continuation_failure_kind=continuation_failure_kind,
             )
             return result
         resume = TransientResume(

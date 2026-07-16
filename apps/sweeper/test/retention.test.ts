@@ -513,7 +513,7 @@ describe("terminal strip reaper", () => {
     ]);
   });
 
-  it("keeps replace-guard PRECALC case state through the exact live obligation attempt", async () => {
+  it("keeps replace-guard PRECALC case state through live and blocked repair states", async () => {
     const canonicalJob = await insertTerminalJob(
       `${PREFIX}-replace-guard-rans`,
     );
@@ -618,6 +618,40 @@ describe("terminal strip reaper", () => {
       jobId: `${PREFIX}-replace-guard-precalc`,
       keepCaseState: true,
     });
+    expect((await readJob(precalcJob.id)).stripReport).toMatchObject({
+      kept_case_state: true,
+    });
+
+    // A repair capability can arrive after an obligation was temporarily
+    // exhausted. The immutable rejected PRECALC attempt is still a valid
+    // restart checkpoint, so the retention reaper must not destroy it merely
+    // because the current scheduler state is `blocked`.
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "blocked",
+        attemptCount: 2,
+        lastOutcome: "failed_exhausted",
+        completedAt: NOW,
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+
+    await stripTerminalJobs(db, engine, {
+      now: new Date(NOW.getTime() + 60_000),
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(
+      own(engine.stripCalls).filter(
+        (call) => call.jobId === `${PREFIX}-replace-guard-precalc`,
+      ),
+    ).toEqual([
+      {
+        jobId: `${PREFIX}-replace-guard-precalc`,
+        keepCaseState: true,
+      },
+    ]);
     expect((await readJob(precalcJob.id)).stripReport).toMatchObject({
       kept_case_state: true,
     });

@@ -284,13 +284,68 @@ describe("RANS→URANS retry scoping: conditional whole-polar preliminary URANS"
   it("FALSE-POSITIVE GUARD: legacy error-free rejected evidence stays targeted and cannot widen the polar", () => {
     const decision = decideRansRetry({
       scope: { origin: "continuous-polar", requestedAoas: [0, 2, 4, 8] },
-      jobRows: [{ aoaDeg: 2, state: "rejected", error: null }],
+      jobRows: [
+        {
+          aoaDeg: 2,
+          state: "rejected",
+          reasons: ["not-converged", "solver-stalled"],
+          error: null,
+        },
+      ],
     });
     expect(decision?.retryMode).toBe("invalid-rans-points");
     expect(decision?.aoas).toEqual([2]);
     expect(decision?.queueCanonicalAoas).toEqual([2]);
     expect(decision?.hardRejectedCount).toBe(0);
   });
+
+  it.each([
+    {
+      label: "untyped mesh-shaped rejection",
+      failureDisposition: null,
+      reasons: ["missing-coefficients"],
+      error: "mesh failed before coefficients were available",
+    },
+    {
+      label: "untyped infrastructure-shaped rejection",
+      failureDisposition: null,
+      reasons: ["missing-coefficients"],
+      error: "engine connection lost before coefficients were available",
+    },
+    {
+      label: "typed deterministic mesh rejection",
+      failureDisposition: "deterministic_mesh" as const,
+      reasons: ["not-converged", "solver-stalled"],
+      error: null,
+    },
+    {
+      label: "typed infrastructure rejection",
+      failureDisposition: "infrastructure" as const,
+      reasons: ["not-converged", "solver-stalled"],
+      error: null,
+    },
+  ])(
+    "FALSE-POSITIVE GUARD: $label does not enter the RANS→PRECALC route",
+    ({ failureDisposition, reasons, error }) => {
+      expect(
+        decideRansRetry({
+          scope: {
+            origin: "continuous-polar",
+            requestedAoas: [0, 2, 4, 8],
+          },
+          jobRows: [
+            {
+              aoaDeg: 2,
+              state: "rejected",
+              failureDisposition,
+              reasons,
+              error,
+            },
+          ],
+        }),
+      ).toBeNull();
+    },
+  );
 
   it("FALSE-POSITIVE GUARD: sparse/tiny evidence alone never widens a high-angle retry", () => {
     const decision = decideRansRetry({

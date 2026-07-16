@@ -254,7 +254,7 @@ export function progressSummaryLine(
   if (seg.solvingCount > 0) parts.push(`${fCount(seg.solvingCount)} solving`);
   if (seg.awaitingCount > 0)
     parts.push(`${fCount(seg.awaitingCount)} awaiting URANS`);
-  if (seg.blockedCount > 0) parts.push(`${fCount(seg.blockedCount)} blocked`);
+  if (seg.blockedCount > 0) parts.push(`${fCount(seg.blockedCount)} critical`);
   parts.push(`${fCount(seg.openCount)} open of ${fCount(requested)}`);
   return parts.join(" · ");
 }

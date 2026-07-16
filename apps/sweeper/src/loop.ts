@@ -27,6 +27,7 @@ import { claimAoas } from "./claim";
 import { refreshDiskAdmission } from "./disk-admission";
 import {
   submitCampaignPrecalcRecoveries,
+  submitInterleavedVerifyIfDue,
   submitRecordedPromotionRecovery,
   uransLadderTick,
 } from "./urans-ladder";
@@ -35,6 +36,7 @@ import {
   engineBackoffActive,
   recordEngineUnreachable,
 } from "./engine-backoff";
+import { engineUransRecoveryVersion } from "./engine-capabilities";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
 import {
@@ -178,6 +180,7 @@ async function submitContinuousBatch(
   engine: EngineClient,
   batch: ContinuousBatch,
   cpuSlots: number,
+  meshRecoveryVersion: number,
 ): Promise<boolean> {
   const [a] = await db
     .select()
@@ -205,6 +208,7 @@ async function submitContinuousBatch(
     cpuSlots,
   });
   request.expected_execution_pool = executionPool.routingKey;
+  request.expected_mesh_recovery_version = meshRecoveryVersion;
 
   // The job row and all result ownership become visible in one commit. An
   // admin cancel can therefore see either no composition or the complete
@@ -234,6 +238,7 @@ async function submitContinuousBatch(
           ],
           aoas: batch.aoas,
           ransRetryScope: retryScope,
+          meshRecoveryVersion,
           resources: request.resources,
           setupSnapshot: setup.snapshot,
         },
@@ -336,6 +341,7 @@ function campaignJobPayload(
   jobKind: string,
   resources: unknown,
   anchorSnapshot: SimulationSetupSnapshot,
+  meshRecoveryVersion: number,
 ): Record<string, unknown> {
   return {
     speedMap: entries.map((e) => ({
@@ -347,6 +353,7 @@ function campaignJobPayload(
     aoas,
     campaignId: batch.campaignId,
     jobKind,
+    meshRecoveryVersion,
     // Speed→condition ingest mapping (canonical speeds) + per-condition
     // revision/bc stamping for the batched job's results rows.
     conditionMap: entries.map((e) => ({
@@ -376,6 +383,7 @@ export async function submitCampaignBatch(
   batch: CampaignGapBatch,
   cpuSlotsOrLegacyQueuePressure: number,
   legacyCpuSlots?: number,
+  meshRecoveryVersion = 0,
 ): Promise<boolean> {
   // Retain the former five-argument helper shape for deterministic scheduler
   // fixtures while making the legacy logical-backlog argument inert. Production
@@ -409,6 +417,7 @@ export async function submitCampaignBatch(
     speeds: entries.map((e) => e.speed),
   });
   request.expected_execution_pool = executionPool.routingKey;
+  request.expected_mesh_recovery_version = meshRecoveryVersion;
   const totalCases = entries.length * batch.angles.length;
   const jobKind = totalCases <= 3 ? "targeted" : "sweep";
 
@@ -453,6 +462,7 @@ export async function submitCampaignBatch(
           jobKind,
           request.resources,
           snapshot,
+          meshRecoveryVersion,
         ),
       })
       .returning({ id: simJobs.id });
@@ -517,6 +527,7 @@ export async function submitCampaignBatch(
             finalKind,
             request.resources,
             snapshot,
+            meshRecoveryVersion,
           ),
         })
         .where(eq(simJobs.id, job.id));
@@ -548,6 +559,7 @@ export async function submitOneBatch(
   db: DB,
   engine: EngineClient,
   cpuSlots = 0,
+  meshRecoveryVersion = 0,
 ): Promise<boolean> {
   await ensureEnabledSimulationPresetRevisions(db);
   const gaps = await findGaps(db, 500);
@@ -583,12 +595,20 @@ export async function submitOneBatch(
   }
 
   return winner === "campaign"
-    ? submitCampaignBatch(db, engine, campaign as CampaignGapBatch, cpuSlots)
+    ? submitCampaignBatch(
+        db,
+        engine,
+        campaign as CampaignGapBatch,
+        cpuSlots,
+        undefined,
+        meshRecoveryVersion,
+      )
     : submitContinuousBatch(
         db,
         engine,
         continuous as ContinuousBatch,
         cpuSlots,
+        meshRecoveryVersion,
       );
 }
 
@@ -641,11 +661,14 @@ export async function tick(
           db,
           engine,
         );
+        const uransRecoveryVersion =
+          await engineUransRecoveryVersion(engine);
         // A recorded whole-polar promotion and an exact targeted RANS
         // rejection are both normal automatic escalation work. They receive
-        // the next free slot ahead of a new RANS batch; this does not preempt
-        // running work and keeps the lower-priority admin/verify ladder below
-        // ordinary RANS.
+        // the next free slot ahead of a new RANS batch. Once those higher
+        // priorities are quiet, durable DB history gives one pending final
+        // verification the next eligible slot after at most eight newly
+        // admitted wave-1 RANS jobs; a sweeper restart cannot reset the bound.
         const promotedSubmitted =
           meshRecoveryVersion == null
             ? false
@@ -653,7 +676,7 @@ export async function tick(
                 db,
                 engine,
                 state.cpuSlots,
-                { meshRecoveryVersion },
+                { meshRecoveryVersion, uransRecoveryVersion },
               );
         const targetedSubmitted =
           promotedSubmitted || meshRecoveryVersion == null
@@ -664,22 +687,36 @@ export async function tick(
                 undefined,
                 undefined,
                 meshRecoveryVersion,
+                uransRecoveryVersion,
               );
-        const ransSubmitted =
+        const interleavedVerifySubmitted =
           promotedSubmitted || targetedSubmitted
             ? false
-            : await submitOneBatch(db, engine, state.cpuSlots);
-        // Admin-request PRECALC and verification remain below newly composed
-        // RANS work. Exact campaign recovery was handled above because it is
-        // the normal continuation of an already-rejected RANS attempt.
+            : await submitInterleavedVerifyIfDue(db, engine, state.cpuSlots, {
+                uransRecoveryVersion,
+              });
+        const ransSubmitted =
+          promotedSubmitted || targetedSubmitted || interleavedVerifySubmitted
+            ? false
+            : await submitOneBatch(
+                db,
+                engine,
+                state.cpuSlots,
+                meshRecoveryVersion ?? 0,
+              );
+        // Admin-request PRECALC and the ordinary verify fallback remain below
+        // newly composed RANS work. Exact campaign recovery and the bounded
+        // final-verification share were handled above.
         if (
           !promotedSubmitted &&
           !targetedSubmitted &&
+          !interleavedVerifySubmitted &&
           !ransSubmitted &&
           (await inFlight(db)) < state.maxConcurrentJobs
         ) {
           await uransLadderTick(db, engine, state.cpuSlots, {
             meshRecoveryVersion,
+            uransRecoveryVersion,
           });
         }
       }

@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
 from . import physics
@@ -28,20 +28,28 @@ from .cache import EngineCache, SeedHit
 from .capabilities import MESH_RECOVERY_VERSION
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
-from .config import get_settings
+from .config import Settings, get_settings
 from .evidence_runtime import (
     create_local_evidence_archive,
     publish_evidence_archive,
     remove_verified_local_raw_evidence,
+    restore_verified_continuation_evidence,
     verify_remote_evidence_restore,
 )
-from .evidence_store import ARCHIVE_MIME_TYPE, EvidenceStoreError
+from .evidence_store import (
+    ARCHIVE_MIME_TYPE,
+    EvidenceCapacityError,
+    EvidenceIntegrityError,
+    EvidenceStoreError,
+    EvidenceUnavailableError,
+)
 from .meshing.base import Mesher, MeshResult, get_mesher
 from .models import (
     FRAME_IMAGE_ARTIFACT_KIND,
     PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
     CaseSpec,
     EvidenceArtifact,
+    EngineIdentity,
     EngineRuntimeIdentity,
     FailureDisposition,
     FluidProperties,
@@ -75,6 +83,9 @@ from .openfoam.runner import (
     Runner,
 )
 from .openfoam.dialects import (
+    FOUNDATION_14_IDENTITY,
+    OPENCFD_2406_IDENTITY,
+    OPENCFD_2606_IDENTITY,
     dialect_for_runner,
     find_force_coefficient_files,
 )
@@ -810,12 +821,26 @@ MESH_CHECK_TIMEOUT_S = 300
 # the same real checkMesh replay at 0.006c. This is a maximum, not a replacement
 # y+ target: thinner requested/resolved layers are never enlarged.
 MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS = 0.006
+MESH_RECOVERY_FINE_FIRST_CELL_HEIGHT_CHORDS = 0.003
 MESH_RECOVERY_PUBLIC_MESHER = "blockmesh-cgrid"
 MESH_RECOVERY_MESHER_CANDIDATES = (
     "blockmesh-cgrid-segmented-normal-20",
     "blockmesh-cgrid-segmented-normal-24",
     "blockmesh-cgrid-segmented-normal-29",
     "blockmesh-cgrid-segmented-normal-32",
+    "blockmesh-cgrid-segmented-te-normal-20",
+    "blockmesh-cgrid-segmented-te-normal-24",
+    "blockmesh-cgrid-segmented-camber-c150-a200-s5",
+    "blockmesh-cgrid-segmented-camber-c300-a200-s10",
+    "blockmesh-cgrid-segmented-camber-c150-a195-s12",
+    "blockmesh-cgrid-segmented-camber-c300-a195-s26",
+    "cartesian2d-external-boundary-layer",
+)
+MESH_RECOVERY_FINE_WALL_MESHERS = frozenset(
+    {
+        "blockmesh-cgrid-segmented-camber-c300-a195-s26",
+        "cartesian2d-external-boundary-layer",
+    }
 )
 SHARED_MESH_QA_MARKER = "mesh-qa-verified.json"
 SHARED_MESH_EVIDENCE_DIR = "mesh-evidence"
@@ -1271,6 +1296,13 @@ URANS_BUDGET_STOP_MARKER = "stopped by the wall-clock budget guard"
 #: with ``URANS_BUDGET_STOP_MARKER`` because no wall-clock claim is being made.
 URANS_CONTINUATION_REQUIRED_MARKER = "requires further same-case integration"
 
+#: Stable machine-readable prefixes for failures before continuation CFD starts.
+#: ``permanent`` means the same immutable source address cannot become valid by
+#: retrying it unchanged; ``transient`` means capacity or storage reachability
+#: may recover without changing the source evidence.
+CONTINUATION_PERMANENT_FAILURE_MARKER = "continuation_source_permanent"
+CONTINUATION_TRANSIENT_FAILURE_MARKER = "continuation_source_transient"
+
 #: Marker persisted in a transient case dir recording the coefficient-history
 #: start time of the transient (the steady-init history written before it must
 #: never merge into the force signal). Written when a fresh transient starts;
@@ -1282,6 +1314,14 @@ TRANSIENT_START_MARKER = "transient_start.json"
 #: solve, VTK frames are re-converted by foamToVTK, and stale decompositions
 #: are re-created by the runner's ``decomposePar -latestTime -force``.
 CONTINUATION_SKIP_DIRS = frozenset({"evidence", "images", "frames", "VTK", "custom_renders", "_seed_stage"})
+
+
+class ContinuationPermanentError(OpenFOAMError):
+    """The immutable continuation source is incompatible, corrupt, or absent."""
+
+
+class ContinuationTransientError(InfrastructureError):
+    """Continuation is valid in principle but storage/capacity is unavailable."""
 
 
 @dataclass
@@ -1303,6 +1343,442 @@ class ContinuationSource:
     transient_subdir: str
     transient_start: float
     resume_from: float
+
+
+@dataclass(frozen=True)
+class ContinuationEvidenceLocation:
+    """Exact archive address recorded for one source solver point."""
+
+    evidence_dir: Path
+    archive_name: str | None = None
+    archive_sha256: str | None = None
+    archive_size: int | None = None
+
+
+@dataclass(frozen=True)
+class ContinuationJobMetadata:
+    """Canonical source-job metadata relevant to one continuation address."""
+
+    case_slug: str | None
+    engine: EngineIdentity | None
+    result: dict[str, object] | None
+    has_canonical_metadata: bool
+
+
+_CONTINUATION_METADATA_MAX_BYTES = 64 * 1024**2
+_KNOWN_CONTINUATION_ENGINES = (
+    OPENCFD_2406_IDENTITY,
+    OPENCFD_2606_IDENTITY,
+    FOUNDATION_14_IDENTITY,
+)
+
+
+def _continuation_permanent(message: str) -> ContinuationPermanentError:
+    return ContinuationPermanentError(
+        f"{CONTINUATION_PERMANENT_FAILURE_MARKER}: {message}"
+    )
+
+
+def _continuation_transient(message: str) -> ContinuationTransientError:
+    return ContinuationTransientError(
+        f"{CONTINUATION_TRANSIENT_FAILURE_MARKER}: {message}"
+    )
+
+
+def _continuation_cases_root(src_case: Path) -> Path | None:
+    return next(
+        (
+            parent
+            for parent in (src_case, *src_case.parents)
+            if parent.name == "cases"
+        ),
+        None,
+    )
+
+
+def _read_continuation_metadata_file(
+    path: Path,
+    *,
+    label: str,
+) -> dict[str, object] | None:
+    if not (path.exists() or path.is_symlink()):
+        return None
+    if not path.is_file() or path.is_symlink():
+        raise _continuation_permanent(
+            f"source {label} is not a safe regular file: {path}"
+        )
+    try:
+        byte_size = path.stat().st_size
+    except OSError as exc:
+        raise _continuation_transient(
+            f"cannot stat source {label} {path}: {exc}"
+        ) from exc
+    if byte_size > _CONTINUATION_METADATA_MAX_BYTES:
+        raise _continuation_permanent(
+            f"source {label} exceeds the "
+            f"{_CONTINUATION_METADATA_MAX_BYTES}-byte safety limit"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise _continuation_transient(
+            f"cannot read source {label} {path}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise _continuation_permanent(
+            f"source {label} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _continuation_permanent(f"source {label} is not a JSON object")
+    return payload
+
+
+def _logical_engine_identity(
+    value: object,
+    *,
+    label: str,
+) -> EngineIdentity | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise _continuation_permanent(f"{label} engine identity is not an object")
+    try:
+        return EngineIdentity.model_validate(value)
+    except ValueError as exc:
+        raise _continuation_permanent(
+            f"{label} engine identity is invalid: {exc}"
+        ) from exc
+
+
+def _known_engine_for_namespace(
+    namespace: str,
+    *,
+    label: str,
+) -> EngineIdentity:
+    matches = [
+        identity
+        for identity in _KNOWN_CONTINUATION_ENGINES
+        if identity.compatibility_key == namespace
+    ]
+    if len(matches) != 1:
+        raise _continuation_permanent(
+            f"{label} names unknown or ambiguous engine namespace {namespace!r}"
+        )
+    return matches[0]
+
+
+def _collect_result_engine_metadata(
+    payload: dict[str, object],
+    identities: list[tuple[str, EngineIdentity]],
+    namespaces: list[tuple[str, str]],
+) -> None:
+    for key in ("requested_engine", "engine"):
+        identity = _logical_engine_identity(
+            payload.get(key),
+            label=f"source result {key}",
+        )
+        if identity is not None:
+            identities.append((f"source result {key}", identity))
+    polars = payload.get("polars")
+    if polars is None:
+        return
+    if not isinstance(polars, list):
+        raise _continuation_permanent("source result polars is not a list")
+    for polar_index, polar in enumerate(polars):
+        if not isinstance(polar, dict):
+            raise _continuation_permanent(
+                f"source result polar {polar_index} is not an object"
+            )
+        for collection_name in ("points", "attempts"):
+            rows = polar.get(collection_name, [])
+            if not isinstance(rows, list):
+                raise _continuation_permanent(
+                    f"source result polar {polar_index} {collection_name} is not a list"
+                )
+            for row_index, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    raise _continuation_permanent(
+                        "source result "
+                        f"{collection_name}[{row_index}] is not an object"
+                    )
+                row_label = (
+                    f"source result polar {polar_index} "
+                    f"{collection_name}[{row_index}]"
+                )
+                identity = _logical_engine_identity(
+                    row.get("engine"),
+                    label=row_label,
+                )
+                if identity is not None:
+                    identities.append((row_label, identity))
+                artifacts = row.get("evidence_artifacts", [])
+                if not isinstance(artifacts, list):
+                    raise _continuation_permanent(
+                        f"{row_label} evidence_artifacts is not a list"
+                    )
+                for artifact_index, artifact in enumerate(artifacts):
+                    if not isinstance(artifact, dict):
+                        raise _continuation_permanent(
+                            f"{row_label} artifact {artifact_index} is not an object"
+                        )
+                    metadata = artifact.get("metadata")
+                    if not isinstance(metadata, dict):
+                        continue
+                    namespace = metadata.get("engineNamespace")
+                    if namespace is None:
+                        continue
+                    if not isinstance(namespace, str) or not namespace:
+                        raise _continuation_permanent(
+                            f"{row_label} artifact {artifact_index} has an invalid "
+                            "engineNamespace"
+                        )
+                    namespaces.append(
+                        (
+                            f"{row_label} artifact {artifact_index}",
+                            namespace,
+                        )
+                    )
+
+
+def _load_continuation_job_metadata(src_case: Path) -> ContinuationJobMetadata:
+    cases_root = _continuation_cases_root(src_case)
+    if cases_root is None:
+        return ContinuationJobMetadata(None, None, None, False)
+    try:
+        case_slug = src_case.relative_to(cases_root).as_posix()
+    except ValueError:
+        return ContinuationJobMetadata(None, None, None, False)
+    job_root = cases_root.parent
+    documents = {
+        name: _read_continuation_metadata_file(
+            job_root / f"{name}.json",
+            label=f"{name}.json",
+        )
+        for name in ("request", "status", "result")
+    }
+    identities: list[tuple[str, EngineIdentity]] = []
+    namespaces: list[tuple[str, str]] = []
+    request = documents["request"]
+    if request is not None:
+        identity = _logical_engine_identity(
+            request.get("expected_engine"),
+            label="source request",
+        )
+        if identity is not None:
+            identities.append(("source request", identity))
+    status = documents["status"]
+    if status is not None:
+        for key in ("requested_engine", "engine"):
+            identity = _logical_engine_identity(
+                status.get(key),
+                label=f"source status {key}",
+            )
+            if identity is not None:
+                identities.append((f"source status {key}", identity))
+    result = documents["result"]
+    if result is not None:
+        _collect_result_engine_metadata(result, identities, namespaces)
+
+    identity_values = {identity.handshake_key: identity for _, identity in identities}
+    if len(identity_values) > 1:
+        details = ", ".join(
+            f"{label}={identity.handshake_key}"
+            for label, identity in identities
+        )
+        raise _continuation_permanent(
+            f"source job records conflicting engine identities: {details}"
+        )
+    namespace_values = set(namespace for _, namespace in namespaces)
+    if len(namespace_values) > 1:
+        details = ", ".join(
+            f"{label}={namespace}"
+            for label, namespace in namespaces
+        )
+        raise _continuation_permanent(
+            f"source job records conflicting engine namespaces: {details}"
+        )
+
+    engine = next(iter(identity_values.values()), None)
+    if namespace_values:
+        namespace = next(iter(namespace_values))
+        namespace_engine = _known_engine_for_namespace(
+            namespace,
+            label="source job",
+        )
+        if engine is not None and engine.compatibility_key != namespace:
+            raise _continuation_permanent(
+                "source job engine namespace disagrees with its exact identity: "
+                f"{namespace!r} vs {engine.handshake_key}"
+            )
+        engine = engine or namespace_engine
+    has_metadata = any(document is not None for document in documents.values())
+    if engine is None and has_metadata:
+        # The pre-cutover engine did not persist identity fields.  The durable
+        # cutover decision pins genuine omission to OpenCFD 2406; it must never
+        # be reinterpreted as the current default.
+        engine = OPENCFD_2406_IDENTITY
+    return ContinuationJobMetadata(
+        case_slug=case_slug,
+        engine=engine,
+        result=result,
+        has_canonical_metadata=has_metadata,
+    )
+
+
+def _require_same_continuation_engine(
+    source: EngineIdentity,
+    expected: EngineIdentity,
+    *,
+    source_label: str,
+) -> None:
+    if source != expected:
+        raise _continuation_permanent(
+            f"{source_label} uses {source.handshake_key}, but continuation "
+            f"requires {expected.handshake_key}; cross-engine field/history "
+            "merging is forbidden"
+        )
+
+
+def _require_exact_source_result_point(
+    metadata: ContinuationJobMetadata,
+    aoa_deg: float | None,
+) -> None:
+    if aoa_deg is None or metadata.result is None or metadata.case_slug is None:
+        return
+    polars = metadata.result.get("polars")
+    if not isinstance(polars, list):
+        raise _continuation_permanent(
+            "source result cannot prove the requested continuation point"
+        )
+    matching_case_seen = False
+    for polar in polars:
+        if not isinstance(polar, dict):
+            continue
+        for collection_name in ("points", "attempts"):
+            rows = polar.get(collection_name, [])
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("case_slug") != metadata.case_slug:
+                    continue
+                matching_case_seen = True
+                point_aoa = row.get("aoa_deg")
+                if (
+                    isinstance(point_aoa, (int, float))
+                    and math.isfinite(float(point_aoa))
+                    and math.isclose(
+                        float(point_aoa),
+                        float(aoa_deg),
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                ):
+                    return
+    if matching_case_seen:
+        raise _continuation_permanent(
+            f"source result case {metadata.case_slug!r} has no point at exact "
+            f"AoA {aoa_deg:g}"
+        )
+    raise _continuation_permanent(
+        f"source result does not contain continuation case "
+        f"{metadata.case_slug!r} at AoA {aoa_deg:g}"
+    )
+
+
+def _restored_manifest_payload(restored: Path) -> dict[str, object]:
+    path = restored / "evidence_manifest.json"
+    if not path.is_file() or path.is_symlink():
+        raise EvidenceIntegrityError(
+            "restored continuation evidence has no safe evidence_manifest.json"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise EvidenceIntegrityError(
+            f"restored continuation evidence manifest is invalid: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise EvidenceIntegrityError(
+            "restored continuation evidence manifest is not an object"
+        )
+    return payload
+
+
+def _manifest_continuation_engine(
+    manifest: dict[str, object],
+) -> EngineIdentity:
+    raw_engine = manifest.get("engine")
+    namespace = manifest.get("engineNamespace")
+    if namespace is not None and (not isinstance(namespace, str) or not namespace):
+        raise EvidenceIntegrityError(
+            "continuation evidence manifest has an invalid engineNamespace"
+        )
+    try:
+        engine = _logical_engine_identity(
+            raw_engine,
+            label="continuation evidence manifest",
+        )
+    except ContinuationPermanentError as exc:
+        raise EvidenceIntegrityError(str(exc)) from exc
+    if engine is None and isinstance(namespace, str):
+        try:
+            engine = _known_engine_for_namespace(
+                namespace,
+                label="continuation evidence manifest",
+            )
+        except ContinuationPermanentError as exc:
+            raise EvidenceIntegrityError(str(exc)) from exc
+    if engine is None:
+        # Historical evidence omitted engine provenance; omission remains the
+        # exact legacy OpenCFD 2406 identity rather than inheriting the caller's
+        # current default.
+        engine = OPENCFD_2406_IDENTITY
+    if isinstance(namespace, str) and engine.compatibility_key != namespace:
+        raise EvidenceIntegrityError(
+            "continuation evidence manifest engineNamespace disagrees with "
+            f"its exact identity: {namespace!r} vs {engine.handshake_key}"
+        )
+    return engine
+
+
+def _validate_restored_continuation_identity(
+    restored: Path,
+    *,
+    aoa_deg: float | None,
+    source_engine: EngineIdentity | None,
+    expected_engine: EngineIdentity | None,
+) -> None:
+    manifest = _restored_manifest_payload(restored)
+    manifest_aoa = manifest.get("aoaDeg")
+    if aoa_deg is not None:
+        if (
+            not isinstance(manifest_aoa, (int, float))
+            or not math.isfinite(float(manifest_aoa))
+            or not math.isclose(
+                float(manifest_aoa),
+                float(aoa_deg),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise EvidenceIntegrityError(
+                "continuation evidence manifest AoA does not match the requested "
+                f"point: manifest={manifest_aoa!r}, requested={aoa_deg:g}"
+            )
+    manifest_engine = _manifest_continuation_engine(manifest)
+    if source_engine is not None and manifest_engine != source_engine:
+        raise EvidenceIntegrityError(
+            "continuation evidence manifest engine disagrees with source job: "
+            f"{manifest_engine.handshake_key} vs {source_engine.handshake_key}"
+        )
+    if expected_engine is not None and manifest_engine != expected_engine:
+        raise EvidenceIntegrityError(
+            "continuation evidence engine is incompatible with the requested "
+            f"runtime: {manifest_engine.handshake_key} vs "
+            f"{expected_engine.handshake_key}"
+        )
 
 
 def write_transient_start_marker(tcase: Path, transient_start: float) -> None:
@@ -1422,17 +1898,9 @@ def _copy_case_tree(src_case: Path, dst_case: Path) -> None:
             shutil.copy2(src, dst, follow_symlinks=True)
 
 
-def stage_continuation_case(src_case: Path, dst_case: Path) -> ContinuationSource:
-    """Validate + copy a prior job's saved case for continuation.
+def _validate_restartable_continuation_case(src_case: Path) -> str:
+    """Return the exact restartable transient subdir or fail truthfully."""
 
-    Raises a truthful ``OpenFOAMError`` when the source is missing, cleaned,
-    or not restartable (no latestTime fields / no mesh / no controlDict) —
-    the caller fails the job honestly instead of solving from nothing."""
-    if not src_case.is_dir():
-        raise OpenFOAMError(
-            f"continuation source case directory not found: {src_case} "
-            f"(job files cleaned from the engine volume, or wrong job id/slug)"
-        )
     transient_subdir = _find_continuable_transient(src_case)
     src_t = src_case / transient_subdir
     latest = _latest_time_dir(src_t)
@@ -1457,7 +1925,249 @@ def stage_continuation_case(src_case: Path, dst_case: Path) -> ContinuationSourc
             f"saved transient {src_case.name}/{transient_subdir} mesh is missing "
             f"(constant/polyMesh cleaned or its shared-mesh symlink dangles); not restartable"
         )
-    _copy_case_tree(src_case, dst_case)
+    if not _coeff_files(src_t):
+        raise OpenFOAMError(
+            f"saved transient {src_case.name}/{transient_subdir} has no force "
+            "coefficient history; continuation cannot preserve the measured trajectory"
+        )
+    return transient_subdir
+
+
+def _materialize_archived_continuation_case(
+    restored_evidence: Path,
+    staged_case: Path,
+) -> None:
+    """Map immutable evidence layout back to one restartable OpenFOAM case."""
+
+    openfoam = restored_evidence / "openfoam"
+    archived_transient = openfoam / "transient"
+    staged_transient = staged_case / "transient"
+    staged_case.mkdir(parents=True, exist_ok=True)
+
+    def copy_tree(source: Path, destination: Path) -> bool:
+        if not source.is_dir():
+            return False
+        shutil.copytree(source, destination, dirs_exist_ok=True, copy_function=shutil.copy2)
+        return True
+
+    # Preserve the outer case dictionaries when present, then reconstruct the
+    # actual transient from its archived immutable dictionaries and fields.
+    copy_tree(openfoam / "system", staged_case / "system")
+    copy_tree(openfoam / "constant", staged_case / "constant")
+    if not copy_tree(archived_transient / "system", staged_transient / "system"):
+        copy_tree(openfoam / "system", staged_transient / "system")
+    if not copy_tree(archived_transient / "constant", staged_transient / "constant"):
+        copy_tree(openfoam / "constant", staged_transient / "constant")
+    copy_tree(openfoam / "postProcessing", staged_transient / "postProcessing")
+    copy_tree(restored_evidence / "time_directories", staged_transient)
+
+    # Logs are not required to restart, but the transient initialization log
+    # disambiguates the original coefficient-history start for old evidence
+    # created before the explicit marker existed.
+    logs = openfoam / "logs"
+    if logs.is_dir():
+        for log in sorted(logs.rglob("log.simpleFoam.init")):
+            if log.is_file():
+                shutil.copy2(log, staged_transient / log.name)
+                break
+
+
+def _safe_continuation_evidence_base(src_case: Path, value: str) -> Path:
+    if not value or "\\" in value:
+        raise InfrastructureError(f"unsafe continuation evidence path: {value!r}")
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise InfrastructureError(f"unsafe continuation evidence path: {value!r}")
+    candidate = src_case.joinpath(*relative.parts)
+    try:
+        candidate.resolve(strict=False).relative_to(src_case.resolve(strict=False))
+    except ValueError as exc:
+        raise InfrastructureError(
+            f"continuation evidence path escapes its case: {value!r}"
+        ) from exc
+    return candidate
+
+
+def _result_continuation_evidence_dir(
+    src_case: Path,
+    aoa_deg: float | None,
+) -> ContinuationEvidenceLocation | None:
+    """Resolve the exact point archive recorded in the source job result."""
+
+    cases_root = next(
+        (parent for parent in (src_case, *src_case.parents) if parent.name == "cases"),
+        None,
+    )
+    if cases_root is None:
+        return None
+    try:
+        case_slug = src_case.relative_to(cases_root).as_posix()
+    except ValueError:
+        return None
+    result_path = cases_root.parent / "result.json"
+    if not result_path.is_file() or result_path.is_symlink():
+        return None
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    polars = payload.get("polars") if isinstance(payload, dict) else None
+    if not isinstance(polars, list):
+        return None
+
+    candidates: set[ContinuationEvidenceLocation] = set()
+    for polar in polars:
+        if not isinstance(polar, dict):
+            continue
+        for collection_name in ("points", "attempts"):
+            points = polar.get(collection_name)
+            if not isinstance(points, list):
+                continue
+            for point in points:
+                if not isinstance(point, dict) or point.get("case_slug") != case_slug:
+                    continue
+                point_aoa = point.get("aoa_deg")
+                if (
+                    aoa_deg is not None
+                    and (
+                        not isinstance(point_aoa, (int, float))
+                        or not math.isclose(
+                            float(point_aoa),
+                            float(aoa_deg),
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                    )
+                ):
+                    continue
+                artifacts = point.get("evidence_artifacts")
+                if not isinstance(artifacts, list):
+                    continue
+                for artifact in artifacts:
+                    if (
+                        not isinstance(artifact, dict)
+                        or artifact.get("kind")
+                        not in {"engine_bundle", "openfoam_bundle"}
+                    ):
+                        continue
+                    artifact_path = artifact.get("path")
+                    metadata = artifact.get("metadata")
+                    evidence_base = (
+                        metadata.get("evidenceBase")
+                        if isinstance(metadata, dict)
+                        else None
+                    )
+                    archive_name: str | None = None
+                    if isinstance(artifact_path, str):
+                        archived_file = _safe_continuation_evidence_base(
+                            src_case,
+                            artifact_path,
+                        )
+                        archive_name = archived_file.name
+                        resolved_evidence_dir = archived_file.parent
+                    elif isinstance(evidence_base, str):
+                        resolved_evidence_dir = _safe_continuation_evidence_base(
+                            src_case,
+                            evidence_base,
+                        )
+                    else:
+                        continue
+                    raw_sha256 = artifact.get("sha256")
+                    if raw_sha256 is None:
+                        archive_sha256 = None
+                    elif isinstance(raw_sha256, str) and re.fullmatch(
+                        r"[0-9a-fA-F]{64}",
+                        raw_sha256,
+                    ):
+                        archive_sha256 = raw_sha256
+                    else:
+                        raise _continuation_permanent(
+                            "source result records an invalid evidence archive "
+                            f"SHA-256 for {case_slug} at AoA {point_aoa!r}"
+                        )
+                    raw_size = artifact.get("byte_size")
+                    if raw_size is None:
+                        archive_size = None
+                    elif type(raw_size) is int and raw_size >= 0:
+                        archive_size = raw_size
+                    else:
+                        raise _continuation_permanent(
+                            "source result records an invalid evidence archive "
+                            f"byte size for {case_slug} at AoA {point_aoa!r}"
+                        )
+                    candidates.add(
+                        ContinuationEvidenceLocation(
+                            evidence_dir=resolved_evidence_dir,
+                            archive_name=archive_name,
+                            archive_sha256=archive_sha256,
+                            archive_size=archive_size,
+                        )
+                    )
+    if len(candidates) > 1:
+        raise InfrastructureError(
+            "source result identifies multiple evidence archives for the exact "
+            f"continuation point {case_slug} at AoA {aoa_deg!r}"
+        )
+    return next(iter(candidates), None)
+
+
+def _manifest_aoa(evidence_dir: Path) -> float | None:
+    manifest = evidence_dir / "evidence_manifest.json"
+    if not manifest.is_file() or manifest.is_symlink():
+        return None
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        value = payload.get("aoaDeg") if isinstance(payload, dict) else None
+        return float(value) if isinstance(value, (int, float)) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _continuation_evidence_dir(
+    src_case: Path,
+    aoa_deg: float | None,
+) -> ContinuationEvidenceLocation:
+    recorded = _result_continuation_evidence_dir(src_case, aoa_deg)
+    if recorded is not None:
+        return recorded
+    direct = src_case / "evidence"
+    if direct.is_dir():
+        return ContinuationEvidenceLocation(evidence_dir=direct)
+    if src_case.is_dir() and aoa_deg is not None:
+        matches = [
+            child / "evidence"
+            for child in sorted(src_case.iterdir())
+            if child.is_dir()
+            and (child / "evidence").is_dir()
+            and (
+                (manifest_aoa := _manifest_aoa(child / "evidence")) is not None
+                and math.isclose(
+                    manifest_aoa,
+                    float(aoa_deg),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+        ]
+        if len(matches) > 1:
+            raise InfrastructureError(
+                "multiple archived evidence directories match the requested "
+                f"continuation AoA {aoa_deg:g}"
+            )
+        if matches:
+            return ContinuationEvidenceLocation(evidence_dir=matches[0])
+    return ContinuationEvidenceLocation(evidence_dir=direct)
+
+
+def _finish_staged_continuation(
+    src_case: Path,
+    dst_case: Path,
+    transient_subdir: str,
+    *,
+    source_description: str,
+) -> ContinuationSource:
     dst_t = dst_case / transient_subdir
     transient_start = read_transient_start_marker(dst_t)
     if transient_start is None:
@@ -1465,15 +2175,16 @@ def stage_continuation_case(src_case: Path, dst_case: Path) -> ContinuationSourc
         write_transient_start_marker(dst_t, transient_start)
         logger.warning(
             "continuation: %s has no %s marker; inferred transient start t=%g from the "
-            "segment layout",
-            src_t,
+            "exact coefficient segment layout",
+            dst_t,
             TRANSIENT_START_MARKER,
             transient_start,
         )
     resume_from = _latest_time(dst_t)
     logger.warning(
-        "continuation: staged saved case %s -> %s (transient %s, start t=%g, resume from "
+        "continuation: staged %s %s -> %s (transient %s, start t=%g, resume from "
         "latestTime t=%g)",
+        source_description,
         src_case,
         dst_case,
         transient_subdir,
@@ -1484,6 +2195,141 @@ def stage_continuation_case(src_case: Path, dst_case: Path) -> ContinuationSourc
         transient_subdir=transient_subdir,
         transient_start=transient_start,
         resume_from=resume_from,
+    )
+
+
+def stage_continuation_case(
+    src_case: Path,
+    dst_case: Path,
+    *,
+    settings: Settings | None = None,
+    aoa_deg: float | None = None,
+    expected_engine: EngineIdentity | None = None,
+) -> ContinuationSource:
+    """Stage a prior trajectory from live state or exact immutable evidence.
+
+    Retention is allowed to remove the mutable OpenFOAM case after publishing
+    its authenticated evidence archive.  A stripped case is therefore rebuilt
+    only from that archive (local canonical tar.zst, pinned remote generation,
+    or legacy tar.gz).  Capacity and provider reachability are retryable;
+    missing, corrupt, or incompatible immutable evidence is permanent.
+    Continuation never falls back to meshing or a fresh solve.  A caller that
+    will execute CFD must pass ``expected_engine`` so source-job, archive, and
+    runtime identities are proven equal before any trajectory is copied or
+    merged.
+    """
+
+    src_case = Path(src_case)
+    dst_case = Path(dst_case)
+    metadata = _load_continuation_job_metadata(src_case)
+    if expected_engine is not None:
+        if metadata.engine is not None:
+            _require_same_continuation_engine(
+                metadata.engine,
+                expected_engine,
+                source_label="source job",
+            )
+        elif src_case.exists() or metadata.has_canonical_metadata:
+            raise _continuation_permanent(
+                "source job has no exact engine identity; continuation cannot "
+                "inherit the current runtime implicitly"
+            )
+        if (
+            aoa_deg is not None
+            and metadata.case_slug is not None
+            and metadata.result is None
+            and (src_case.exists() or metadata.has_canonical_metadata)
+        ):
+            raise _continuation_permanent(
+                "source job has no result.json proving the exact continuation "
+                f"case and AoA {aoa_deg:g}"
+            )
+    _require_exact_source_result_point(metadata, aoa_deg)
+
+    live_error: OpenFOAMError
+    if src_case.is_dir():
+        try:
+            transient_subdir = _validate_restartable_continuation_case(src_case)
+        except OpenFOAMError as exc:
+            live_error = exc
+        else:
+            try:
+                _copy_case_tree(src_case, dst_case)
+            except OSError as exc:
+                raise _continuation_transient(
+                    f"cannot stage live saved case {src_case}: {exc}"
+                ) from exc
+            return _finish_staged_continuation(
+                src_case,
+                dst_case,
+                transient_subdir,
+                source_description="live saved case",
+            )
+    else:
+        live_error = InfrastructureError(
+            f"continuation source case directory not found: {src_case} "
+            f"(job files cleaned from the engine volume, or wrong job id/slug)"
+        )
+
+    stage_root = dst_case.parent / f".{dst_case.name}.continuation-{uuid.uuid4().hex}"
+    restored_evidence = stage_root / "evidence"
+    staged_case = stage_root / "case"
+    transient_subdir: str | None = None
+
+    def validate_restored_evidence(restored: Path) -> None:
+        nonlocal transient_subdir
+        shutil.rmtree(staged_case, ignore_errors=True)
+        _validate_restored_continuation_identity(
+            restored,
+            aoa_deg=aoa_deg,
+            source_engine=metadata.engine,
+            expected_engine=expected_engine,
+        )
+        _materialize_archived_continuation_case(restored, staged_case)
+        transient_subdir = _validate_restartable_continuation_case(staged_case)
+
+    try:
+        evidence_location = _continuation_evidence_dir(src_case, aoa_deg)
+        source_description = restore_verified_continuation_evidence(
+            evidence_location.evidence_dir,
+            restored_evidence,
+            settings or get_settings(),
+            validate=validate_restored_evidence,
+            expected_archive_name=evidence_location.archive_name,
+            expected_archive_sha256=evidence_location.archive_sha256,
+            expected_archive_size=evidence_location.archive_size,
+        )
+        if transient_subdir is None:  # pragma: no cover - validation contract
+            raise InfrastructureError(
+                "restored evidence validation did not identify a transient"
+            )
+        if dst_case.exists() or dst_case.is_symlink():
+            if dst_case.is_dir() and not dst_case.is_symlink():
+                shutil.rmtree(dst_case)
+            else:
+                dst_case.unlink()
+        dst_case.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staged_case, dst_case)
+    except (ContinuationPermanentError, ContinuationTransientError):
+        raise
+    except (EvidenceCapacityError, EvidenceUnavailableError, OSError) as exc:
+        raise _continuation_transient(
+            f"continuation source is not restartable ({live_error}); "
+            f"immutable evidence restore failed: {exc}"
+        ) from exc
+    except (EvidenceIntegrityError, EvidenceStoreError, OpenFOAMError) as exc:
+        raise _continuation_permanent(
+            f"continuation source is not restartable ({live_error}); "
+            f"immutable evidence restore failed: {exc}"
+        ) from exc
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
+    return _finish_staged_continuation(
+        src_case,
+        dst_case,
+        transient_subdir,
+        source_description=source_description,
     )
 
 
@@ -2333,10 +3179,16 @@ def _run_transient_attempt(
     )
 
 
-#: Safety cap on URANS continuation chunks: the period estimate normally
-#: converges within a couple of extensions; a drifting estimate must not loop
-#: the solver forever.
-URANS_CONTINUATION_MAX_CHUNKS = 6
+#: Emergency guard only. Real runs are bounded by one monotonic tier deadline
+#: and the measured wall-rate projection below. The old six-chunk terminal cap
+#: rejected slowly relaxing but healthy trajectories before they had enough
+#: same-case evidence to settle.
+URANS_CONTINUATION_MAX_CHUNKS = 24
+
+#: A nonstationary preliminary window is not remediated by repeatedly adding a
+#: single period. Add a meaningful measured tail so a relaxing signal can
+#: actually expose stable, phase-repeatable cycles on the next grade.
+URANS_NONSTATIONARY_EXTENSION_PERIODS = 3.0
 
 #: Period acquisition is staged rather than declaring a short slow-shedding
 #: URANS run terminal. The first two horizons preserve the legacy/default search
@@ -2622,9 +3474,7 @@ def _extend_transient_until_periods(
             )
             if target_deficit <= 1e-6 and not (sparse or not_stationary):
                 break
-            sparse_tail_only = (
-                sparse and target_deficit <= 1e-6 and not not_stationary
-            )
+            sparse_tail_only = sparse and target_deficit <= 1e-6 and not not_stationary
             if sparse_tail_only:
                 # The aerodynamic retained-period target is already satisfied;
                 # only the published last-three-period FIELD tail is sparse.
@@ -2633,19 +3483,24 @@ def _extend_transient_until_periods(
                 # turned this into 3/(1-discard)=5 periods at the default 40%
                 # discard, adding 67% solver/I/O work without adding evidence.
                 chunk_sim = float(URANS_FRAME_SPAN_PERIODS) * period
-            elif sparse:
-                # Replace the whole published last-three-period frame window in
-                # one dense measured-cadence chunk while also closing the real
-                # aerodynamic retained-window deficit conservatively.
-                target_deficit = max(
-                    target_deficit, float(URANS_FRAME_SPAN_PERIODS)
-                )
-            elif not_stationary:
-                target_deficit = max(target_deficit, 1.0)
-            if not sparse_tail_only:
+            else:
                 chunk_sim = target_deficit * period / max(
                     1e-6, 1.0 - discard
                 )
+                if sparse:
+                    # Replace the full published last-three-period field tail
+                    # in one measured-cadence chunk.
+                    chunk_sim = max(
+                        chunk_sim,
+                        float(URANS_FRAME_SPAN_PERIODS) * period,
+                    )
+                if not_stationary:
+                    # Relaxation/trend diagnostics need several newly measured
+                    # periods, not another one-period sample of the same tail.
+                    chunk_sim = max(
+                        chunk_sim,
+                        URANS_NONSTATIONARY_EXTENSION_PERIODS * period,
+                    )
             write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
         # Prod naca-4412 -15deg precalc retained 2.00/3.00 cycles at 19.5
         # frames/cycle and was not yet stationary, but still had a measurable
@@ -2775,7 +3630,7 @@ def _extend_transient_until_periods(
         if needs_more_aerodynamic_evidence:
             reason = (
                 f"URANS continuation {URANS_CONTINUATION_REQUIRED_MARKER}: reached the "
-                f"{URANS_CONTINUATION_MAX_CHUNKS}-chunk in-run safety cap with "
+                f"{URANS_CONTINUATION_MAX_CHUNKS}-chunk emergency safety cap with "
                 f"restartable saved case state; {result.quality.reason}"
             )
         else:
@@ -2785,7 +3640,7 @@ def _extend_transient_until_periods(
             # the full dense tail inside this run's safety cap.
             reason = (
                 "URANS frame-recorder remediation reached the "
-                f"{URANS_CONTINUATION_MAX_CHUNKS}-chunk in-run safety cap; "
+                f"{URANS_CONTINUATION_MAX_CHUNKS}-chunk emergency safety cap; "
                 "coefficients remain graded from force history; "
                 f"{result.quality.reason}"
             )
@@ -4248,6 +5103,7 @@ def _write_minimal_controldict(case_dir: Path) -> None:
             "application": "blockMesh", "startFrom": "startTime", "startTime": 0,
             "stopAt": "endTime", "endTime": 1, "deltaT": 1,
             "writeControl": "timeStep", "writeInterval": 1,
+            "writeFormat": "ascii",
         },
     )
 
@@ -4334,7 +5190,10 @@ def capture_mesh_attempt_diagnostic(
     files: dict[str, dict[str, object]] = {}
     for label, path in (
         ("blockMeshDict", mesh_dir / "system" / "blockMeshDict"),
+        ("meshDict", mesh_dir / "system" / "meshDict"),
+        ("surfaceGeometry", mesh_dir / "airfoil-external.fms"),
         ("blockMeshLog", mesh_dir / "log.blockMesh"),
+        ("cartesian2DMeshLog", mesh_dir / "log.cartesian2DMesh"),
         ("checkMeshLog", mesh_dir / "log.checkMesh"),
     ):
         diagnostic = _mesh_attempt_file_diagnostic(path)
@@ -4368,6 +5227,7 @@ def format_mesh_attempt_diagnostic(diagnostic: dict[str, object]) -> str:
     ]
     for label, filename in (
         ("blockMeshLog", "log.blockMesh"),
+        ("cartesian2DMeshLog", "log.cartesian2DMesh"),
         ("checkMeshLog", "log.checkMesh"),
     ):
         file_record = (diagnostic.get("files") or {}).get(label) or {}
@@ -4477,6 +5337,38 @@ def write_shared_mesh_evidence(
             ),
         ),
         (
+            "meshDict",
+            Path("system") / "meshDict",
+            (
+                mesh_dir / "system" / "meshDict",
+                *((previous / "system" / "meshDict",) if previous else ()),
+            ),
+        ),
+        (
+            "surfaceGeometry",
+            Path("geometry") / "airfoil-external.fms",
+            (
+                mesh_dir / "airfoil-external.fms",
+                *(
+                    (previous / "geometry" / "airfoil-external.fms",)
+                    if previous
+                    else ()
+                ),
+            ),
+        ),
+        (
+            "cartesian2DMeshLog",
+            Path("logs") / "log.cartesian2DMesh",
+            (
+                mesh_dir / "log.cartesian2DMesh",
+                *(
+                    (previous / "logs" / "log.cartesian2DMesh",)
+                    if previous
+                    else ()
+                ),
+            ),
+        ),
+        (
             "checkMeshLog",
             Path("logs") / "log.checkMesh",
             (
@@ -4511,6 +5403,17 @@ def write_shared_mesh_evidence(
             if missing:
                 raise InfrastructureError(
                     "accepted blockMesh evidence is incomplete: " + ", ".join(missing)
+                )
+        if actual_mesher.name.startswith("cartesian2d"):
+            missing = [
+                label
+                for label in ("meshDict", "surfaceGeometry", "cartesian2DMeshLog")
+                if artifacts.get(label) is None
+            ]
+            if missing:
+                raise InfrastructureError(
+                    "accepted cartesian2DMesh evidence is incomplete: "
+                    + ", ".join(missing)
                 )
         if qa_payload is not None and (
             artifacts.get("checkMeshLog") is None or artifacts.get("qaMarker") is None
@@ -4672,19 +5575,22 @@ def prepare_mesh(
     cancel_check: CancelCheck = None, cache: Optional[EngineCache] = None,
     validate: Optional[Callable[[Path, MeshParams], bool]] = None,
 ):
-    """Build the mesh once (blockMesh) into ``mesh_dir`` for reuse across a polar
-    set (all speeds/AoAs of one airfoil at one chord share this mesh).
+    """Build the mesh once into ``mesh_dir`` for reuse across a polar set.
 
     With a ``cache``, a mesh whose (airfoil geometry, chord, resolved params) was
     built by a previous job is copied from the persistent cache instead of
-    re-running blockMesh; fresh builds are published back for future jobs."""
+    re-running the registered mesher; fresh builds are published back for
+    future jobs."""
     _check_cancel(cancel_check)
     mesh_dir.mkdir(parents=True, exist_ok=True)
     for stale_attempt_file in (
         mesh_dir / SHARED_MESH_QA_MARKER,
         mesh_dir / "log.blockMesh",
+        mesh_dir / "log.cartesian2DMesh",
         mesh_dir / "log.checkMesh",
         mesh_dir / "system" / "blockMeshDict",
+        mesh_dir / "system" / "meshDict",
+        mesh_dir / "airfoil-external.fms",
     ):
         stale_attempt_file.unlink(missing_ok=True)
     shutil.rmtree(mesh_dir / SHARED_MESH_EVIDENCE_DIR, ignore_errors=True)
@@ -4783,12 +5689,17 @@ def prepare_mesh_with_recovery(
     """Prepare one shared mesh through a bounded, fingerprinted repair ladder.
 
     The public/default topology is always attempted first with the exact
-    resolved request.  Only :class:`DeterministicMeshError` advances to an
-    internal segmented-normal candidate.  Each candidate first keeps the
-    resolved wall height and, if that exact attempt fails deterministically,
-    gets one bounded thinner-wall retry.  Infrastructure errors, unavailable
-    QA (``validate`` returns false), cancellation, and untyped errors stop the
-    ladder immediately.
+    resolved request.  Only :class:`DeterministicMeshError` advances through
+    the fingerprinted recovery candidates: the version-1 leading-edge-centred
+    segmented C-grids, then the version-2 trailing-edge-centred and camber-aware
+    candidates that repair thick-profile TE/wake and strongly cambered
+    leading-edge passages. A final source-preserving ``cartesian2DMesh`` rung
+    handles valid sharp-concave and extreme-thickness contours that cannot map
+    cleanly onto a structured C-grid. Each candidate first keeps the resolved
+    wall height. All candidates may retry at the evidence-backed 0.006c cap;
+    the high-segmentation camber and cartesian fallbacks may additionally retry
+    at 0.003c. Infrastructure errors, unavailable QA (``validate`` returns
+    false), cancellation, and untyped errors stop the ladder immediately.
 
     Returned params name the topology and wall height that actually produced
     the accepted mesh; downstream case dictionaries, seed keys, and immutable
@@ -4826,21 +5737,29 @@ def prepare_mesh_with_recovery(
     last_error: Optional[DeterministicMeshError] = None
     for candidate_name in MESH_RECOVERY_MESHER_CANDIDATES:
         candidate_mesher = get_mesher(candidate_name)
-        candidates = [resolved.model_copy(update={"mesher": candidate_name})]
-        if (
-            original_height is not None
-            and original_height > MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS + 1e-12
-        ):
-            candidates.append(
-                resolved.model_copy(
-                    update={
-                        "mesher": candidate_name,
-                        "first_cell_height_chords": (
-                            MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS
-                        ),
-                    }
+        heights: list[float | None] = [original_height]
+        caps = [MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS]
+        if candidate_name in MESH_RECOVERY_FINE_WALL_MESHERS:
+            caps.append(MESH_RECOVERY_FINE_FIRST_CELL_HEIGHT_CHORDS)
+        for cap in caps:
+            if (
+                original_height is not None
+                and original_height > cap + 1e-12
+                and all(
+                    height is None or abs(height - cap) > 1e-12
+                    for height in heights
                 )
+            ):
+                heights.append(cap)
+        candidates = [
+            resolved.model_copy(
+                update={
+                    "mesher": candidate_name,
+                    "first_cell_height_chords": height,
+                }
             )
+            for height in heights
+        ]
 
         for candidate in candidates:
             shutil.rmtree(mesh_dir, ignore_errors=True)

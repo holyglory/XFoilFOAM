@@ -3,12 +3,11 @@
 // reads the tier counts for the campaign summary payload.
 //
 // Ladder (contract 5, ONE priority scale — no second scale):
-//   1. RANS work (continuous + campaign gaps)         — existing submit branch
-//   2. precalc-rank work                              — gated wave-2 URANS
-//      (per campaign: only once that campaign has ZERO open RANS gaps) and
-//      admin request-URANS items (contract 6)
-//   3. verify-queue items (contract 4)                — ONLY when no campaign
-//      RANS/precalc work exists machine-wide
+//   1. automatic PRECALC recovery                     — promotion / targeted
+//   2. RANS work                                      — existing submit branch
+//      with one final verification interleaved after at most eight newly
+//      admitted wave-1 jobs while a schedulable verify item remains pending
+//   3. admin request-URANS items and idle verify fallback
 
 import {
   AUTO_PRECALC_CONTINUATION_BUDGET_S,
@@ -17,15 +16,40 @@ import {
   URANS_BUDGET_STOP_MARKER,
   URANS_CONTINUATION_REQUIRED_MARKER,
 } from "@aerodb/core";
-import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  eq,
+  inArray,
+  isNull,
+  or,
+  sql,
+  type SQLWrapper,
+} from "drizzle-orm";
 
 import type { DB } from "./client";
 import {
+  ensurePrecalcObligationsInTransaction,
+  type PrecalcObligationCell,
+} from "./precalc-obligations";
+import {
+  recordSolverIncidentInTransaction,
+  resolveSolverIncidentsForOwnerInTransaction,
+  URANS_RECOVERY_REMEDIATION_VERSION,
+} from "./solver-incidents";
+import {
+  resultAttempts,
+  resultClassifications,
   results,
   simCampaigns,
+  simJobs,
+  simPrecalcObligationRequests,
   simPrecalcObligations,
+  simUransRequestCampaigns,
   simUransRequests,
   simUransVerifyQueue,
+  simUransVerifyQueueRequests,
+  type SimPrecalcObligation,
   type SimUransRequest,
   type SimUransVerifyQueueItem,
 } from "./schema";
@@ -41,6 +65,30 @@ export {
   AUTO_PRECALC_CONTINUATION_BUDGET_S,
   AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
 };
+
+/** Final verification gets one corrective fresh trajectory. Each fresh
+ * trajectory may first consume one same-case continuation when its immutable
+ * attempt proves restartable state. */
+export const FINAL_URANS_MAX_FRESH_ATTEMPTS = 2;
+export const FINAL_URANS_CONTINUATION_BUDGET_S = 6 * 60 * 60;
+export const FINAL_URANS_RETRY_BACKOFF_MS = 30_000;
+
+export const FINAL_URANS_OUTCOMES = {
+  continuationPending: "continuation_pending",
+  continuationRetryWait: "continuation_retry_wait",
+  freshRetryPending: "fresh_retry_pending",
+  infrastructureRetryWait: "infrastructure_retry_wait",
+  mediaRepairPending: "media_repair_pending",
+  accepted: "accepted",
+  disagreed: "disagreed",
+  recoveryExhausted: "final_recovery_exhausted",
+  deterministicFailure: "deterministic_failure",
+  continuationPermanentFailure: "continuation_permanent_failure",
+  ownerless: "ownerless",
+} as const;
+
+export type FinalUransOutcome =
+  (typeof FINAL_URANS_OUTCOMES)[keyof typeof FINAL_URANS_OUTCOMES];
 
 /** Queue one bounded same-result continuation for a campaign precalc result.
  *
@@ -182,6 +230,69 @@ async function enqueueAutomaticPrecalcContinuations(
   });
 }
 
+/** Preserve the semantics of the legacy "continue this full result" action
+ * while routing it through the ordinary final-verification controller. The
+ * accepted preliminary baseline is still mandatory; once its queue row
+ * exists, the exact saved full attempt becomes that row's next continuation
+ * source instead of bypassing the queue with a direct full submit. */
+async function seedFinalContinuationFromRequestInTransaction(
+  tx: DB,
+  input: {
+    requestId: string;
+    queueId: string;
+    airfoilId: string;
+    revisionId: string;
+    aoaDeg: number;
+  },
+): Promise<void> {
+  const [request] = await tx
+    .select({
+      fidelity: simUransRequests.fidelity,
+      continueFromResultId: simUransRequests.continueFromResultId,
+      budgetOverrideS: simUransRequests.budgetOverrideS,
+    })
+    .from(simUransRequests)
+    .where(eq(simUransRequests.id, input.requestId))
+    .limit(1);
+  if (request?.fidelity !== "full" || !request.continueFromResultId) return;
+
+  const [source] = (await tx.execute(sql`
+    SELECT attempt.id
+    FROM result_attempts attempt
+    WHERE attempt.airfoil_id = ${input.airfoilId}
+      AND attempt.simulation_preset_revision_id = ${input.revisionId}
+      AND attempt.aoa_deg = ${input.aoaDeg}
+      AND attempt.result_id = ${request.continueFromResultId}
+      AND attempt.source = 'solved'
+      AND attempt.engine_job_id IS NOT NULL
+      AND attempt.engine_case_slug IS NOT NULL
+      AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+    ORDER BY attempt."createdAt" DESC, attempt.id DESC
+    LIMIT 1
+  `)) as unknown as Array<{ id: string }>;
+  if (!source) return;
+
+  await tx.execute(sql`
+    UPDATE sim_urans_verify_queue queue
+    SET latest_result_attempt_id = ${source.id},
+        fresh_attempt_count = GREATEST(queue.fresh_attempt_count, 1),
+        continuation_budget_override_s = CASE
+          WHEN ${request.budgetOverrideS ?? null}::int IS NULL
+            THEN queue.continuation_budget_override_s
+          ELSE GREATEST(
+            COALESCE(queue.continuation_budget_override_s, 0),
+            ${request.budgetOverrideS ?? null}::int
+          )
+        END,
+        last_outcome = ${FINAL_URANS_OUTCOMES.continuationPending},
+        last_error = NULL,
+        next_submit_at = NULL,
+        "updatedAt" = now()
+    WHERE queue.id = ${input.queueId}
+      AND queue.state = 'pending'
+  `);
+}
+
 export async function enqueuePrecalcVerifications(
   db: DB,
   opts: {
@@ -189,6 +300,9 @@ export async function enqueuePrecalcVerifications(
     revisionId: string;
     campaignId?: string | null;
     aoaDeg?: number | null;
+    /** Explicit final-fidelity request that owns the per-point verification.
+     * Request ownership is distinct from an autonomous background owner. */
+    requestId?: string | null;
   },
 ): Promise<number> {
   await enqueueAutomaticPrecalcContinuations(db, opts);
@@ -238,7 +352,8 @@ export async function enqueuePrecalcVerifications(
           precalc_result_id
         ) VALUES (
           ${candidate.airfoil_id}, ${candidate.simulation_preset_revision_id},
-          ${candidate.aoa_deg}, ${!opts.campaignId}, 'pending', ${candidate.id}
+          ${candidate.aoa_deg}, ${!opts.campaignId && !opts.requestId}, 'pending',
+          ${candidate.id}
         )
         ON CONFLICT (airfoil_id, revision_id, aoa_deg)
           WHERE state IN ('pending', 'running') DO NOTHING
@@ -256,27 +371,580 @@ export async function enqueuePrecalcVerifications(
             ORDER BY "createdAt" ASC LIMIT 1
           `)) as unknown as Array<{ id: string }>);
       if (!physical?.id) continue;
-      if (!opts.campaignId) {
+      if (!opts.campaignId && !opts.requestId) {
         await tx.execute(sql`
           UPDATE sim_urans_verify_queue
           SET background_owner = true, "updatedAt" = now()
           WHERE id = ${physical.id}
         `);
       }
-      await tx.execute(sql`
-        INSERT INTO sim_urans_verify_queue_campaigns (queue_id, campaign_id, state)
-        SELECT DISTINCT ${physical.id}::uuid, campaign.id, 'active'
-        FROM sim_campaign_points point
-        JOIN sim_campaigns campaign ON campaign.id = point.campaign_id
-        WHERE point.result_id = ${candidate.id}
-          AND point.derived_by_symmetry = false
-          AND campaign.status IN ('active', 'attention', 'paused')
-        ON CONFLICT (queue_id, campaign_id) DO UPDATE
-          SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
-      `);
+      if (opts.requestId) {
+        await tx
+          .insert(simUransVerifyQueueRequests)
+          .values({ queueId: physical.id, requestId: opts.requestId })
+          .onConflictDoNothing();
+        await seedFinalContinuationFromRequestInTransaction(
+          tx as unknown as DB,
+          {
+            requestId: opts.requestId,
+            queueId: physical.id,
+            airfoilId: candidate.airfoil_id,
+            revisionId: candidate.simulation_preset_revision_id,
+            aoaDeg: candidate.aoa_deg,
+          },
+        );
+      }
+      if (!opts.requestId) {
+        await tx.execute(sql`
+          INSERT INTO sim_urans_verify_queue_campaigns (
+            queue_id, campaign_id, state
+          )
+          SELECT DISTINCT ${physical.id}::uuid, campaign.id, 'active'
+          FROM sim_campaign_points point
+          JOIN sim_campaigns campaign ON campaign.id = point.campaign_id
+          WHERE point.result_id = ${candidate.id}
+            AND point.derived_by_symmetry = false
+            AND campaign.status IN ('active', 'attention', 'paused')
+          ON CONFLICT (queue_id, campaign_id) DO UPDATE
+            SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
+        `);
+      }
     }
     return created;
   });
+}
+
+export interface FullUransRequestCoverage {
+  requestId: string;
+  totalCells: number;
+  precalcObligations: SimPrecalcObligation[];
+  verifyQueueIds: string[];
+}
+
+/** A full request may be temporarily unable to take ownership of one natural
+ * cell because an ordinary queue mutation already owns it. No partial request
+ * coverage is committed: the sweeper releases the request claim and retries
+ * after that physical cell settles. */
+export class FullUransRequestCoverageIncompleteError extends Error {
+  constructor(
+    readonly requestId: string,
+    readonly missingCells: PrecalcObligationCell[],
+  ) {
+    super(
+      `full URANS request ${requestId} could not materialize ${missingCells.length} cell(s)`,
+    );
+    this.name = "FullUransRequestCoverageIncompleteError";
+  }
+}
+
+function uniqueSortedCoverageCells(
+  cells: PrecalcObligationCell[],
+): PrecalcObligationCell[] {
+  const byKey = new Map<string, PrecalcObligationCell>();
+  for (const cell of cells) {
+    if (!Number.isFinite(cell.aoaDeg)) {
+      throw new Error("full URANS request coverage requires finite AoA values");
+    }
+    byKey.set(
+      `${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`,
+      cell,
+    );
+  }
+  return [...byKey.values()].sort(
+    (a, b) =>
+      a.airfoilId.localeCompare(b.airfoilId) ||
+      a.revisionId.localeCompare(b.revisionId) ||
+      a.aoaDeg - b.aoaDeg,
+  );
+}
+
+/** Materialize the one truthful per-point sequence for an explicit final
+ * request:
+ *
+ *   accepted preliminary evidence -> final verify queue
+ *   otherwise                      -> preliminary obligation
+ *
+ * Existing successful or critically blocked final queue rows are linked
+ * rather than reopened. Accepted exact final evidence from the removed direct
+ * path is projected into a terminal queue record without inventing solver
+ * evidence. The transaction either covers every requested cell or rolls back.
+ */
+export async function ensureFullUransRequestCoverage(
+  db: DB,
+  input: {
+    requestId: string;
+    cells: PrecalcObligationCell[];
+  },
+): Promise<FullUransRequestCoverage> {
+  const cells = uniqueSortedCoverageCells(input.cells);
+  if (!cells.length) {
+    throw new FullUransRequestCoverageIncompleteError(input.requestId, []);
+  }
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [request] = await tx
+      .select()
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, input.requestId))
+      .limit(1);
+    if (!request || request.fidelity !== "full") {
+      throw new Error(
+        `full URANS request ${input.requestId} is missing or has the wrong fidelity`,
+      );
+    }
+    if (!["pending", "running"].includes(request.state)) {
+      throw new Error(
+        `full URANS request ${input.requestId} is already ${request.state}`,
+      );
+    }
+    const mismatched = cells.filter(
+      (cell) =>
+        cell.airfoilId !== request.airfoilId ||
+        cell.revisionId !== request.revisionId ||
+        (request.aoaDeg != null &&
+          Number(cell.aoaDeg) !== Number(request.aoaDeg)),
+    );
+    if (mismatched.length) {
+      throw new Error(
+        `full URANS request ${input.requestId} coverage does not match its immutable scope`,
+      );
+    }
+
+    const campaignRows = (await tx.execute(sql`
+      SELECT ownership.campaign_id
+      FROM sim_urans_request_campaigns ownership
+      JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+      WHERE ownership.request_id = ${input.requestId}
+        AND ownership.state = 'active'
+        AND campaign.status IN ('active', 'attention', 'paused')
+      ORDER BY ownership.campaign_id
+    `)) as unknown as Array<{ campaign_id: string }>;
+    const campaignIds = campaignRows.map((row) => row.campaign_id);
+    if (!request.backgroundOwner && !campaignIds.length) {
+      await tx
+        .update(simUransRequests)
+        .set({ state: "cancelled", simJobId: null })
+        .where(eq(simUransRequests.id, request.id));
+      throw new Error(`full URANS request ${request.id} has no live owner`);
+    }
+
+    const verifyQueueIds: string[] = [];
+    const missingPrecalc: PrecalcObligationCell[] = [];
+    for (const cell of cells) {
+      // Serialize terminal-queue projection for legacy accepted final rows.
+      // Ordinary pending inserts remain protected by their partial unique
+      // index; every coverage caller takes these locks in the same sort order.
+      await tx.execute(sql`
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(
+            ${`full-urans-coverage:${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`},
+            0
+          )
+        )
+      `);
+
+      const [accepted] = (await tx.execute(sql`
+        SELECT result.id, result.fidelity
+        FROM results result
+        JOIN result_classifications classification
+          ON classification.result_id = result.id
+         AND classification.state = 'accepted'
+        WHERE result.airfoil_id = ${cell.airfoilId}
+          AND result.simulation_preset_revision_id = ${cell.revisionId}
+          AND result.aoa_deg = ${cell.aoaDeg}
+          AND result.status = 'done'
+          AND result.fidelity IN ('urans_precalc', 'urans_full')
+        ORDER BY CASE result.fidelity
+          WHEN 'urans_full' THEN 0
+          ELSE 1
+        END
+        LIMIT 1
+      `)) as unknown as Array<{ id: string; fidelity: string }>;
+      const queues = (await tx.execute(sql`
+        SELECT queue.id, queue.state
+        FROM sim_urans_verify_queue queue
+        WHERE queue.airfoil_id = ${cell.airfoilId}
+          AND queue.revision_id = ${cell.revisionId}
+          AND queue.aoa_deg = ${cell.aoaDeg}
+          AND queue.state IN (
+            'pending', 'running', 'done', 'disagreed', 'blocked'
+          )
+        ORDER BY
+          CASE
+            WHEN queue.state IN ('done', 'disagreed') THEN 0
+            WHEN queue.state IN ('pending', 'running') THEN 1
+            ELSE 2
+          END,
+          queue."updatedAt" DESC,
+          queue.id
+      `)) as unknown as Array<{ id: string; state: string }>;
+
+      let queueId =
+        queues.find((queue) => ["done", "disagreed"].includes(queue.state))
+          ?.id ?? null;
+      if (!queueId && accepted?.fidelity === "urans_full") {
+        const [terminal] = (await tx.execute(sql`
+          INSERT INTO sim_urans_verify_queue (
+            airfoil_id, revision_id, aoa_deg, background_owner, state,
+            precalc_result_id, verify_result_id, delta_cl, delta_cd, delta_cm,
+            last_outcome
+          ) VALUES (
+            ${cell.airfoilId}, ${cell.revisionId}, ${cell.aoaDeg}, false,
+            'done', ${accepted.id}, ${accepted.id}, 0, 0, 0,
+            ${FINAL_URANS_OUTCOMES.accepted}
+          )
+          RETURNING id
+        `)) as unknown as Array<{ id: string }>;
+        queueId = terminal?.id ?? null;
+      }
+      queueId ??=
+        queues.find((queue) => ["pending", "running"].includes(queue.state))
+          ?.id ?? null;
+      queueId ??= queues.find((queue) => queue.state === "blocked")?.id ?? null;
+      if (!queueId && accepted?.fidelity === "urans_precalc") {
+        const [inserted] = (await tx.execute(sql`
+          INSERT INTO sim_urans_verify_queue (
+            airfoil_id, revision_id, aoa_deg, background_owner, state,
+            precalc_result_id
+          ) VALUES (
+            ${cell.airfoilId}, ${cell.revisionId}, ${cell.aoaDeg}, false,
+            'pending', ${accepted.id}
+          )
+          ON CONFLICT (airfoil_id, revision_id, aoa_deg)
+            WHERE state IN ('pending', 'running') DO NOTHING
+          RETURNING id
+        `)) as unknown as Array<{ id: string }>;
+        queueId = inserted?.id ?? null;
+        if (!queueId) {
+          const [raced] = (await tx.execute(sql`
+            SELECT id
+            FROM sim_urans_verify_queue
+            WHERE airfoil_id = ${cell.airfoilId}
+              AND revision_id = ${cell.revisionId}
+              AND aoa_deg = ${cell.aoaDeg}
+              AND state IN ('pending', 'running')
+            ORDER BY "createdAt", id
+            LIMIT 1
+          `)) as unknown as Array<{ id: string }>;
+          queueId = raced?.id ?? null;
+        }
+      }
+
+      if (!queueId) {
+        missingPrecalc.push({
+          airfoilId: cell.airfoilId,
+          revisionId: cell.revisionId,
+          aoaDeg: cell.aoaDeg,
+        });
+        continue;
+      }
+      await tx
+        .insert(simUransVerifyQueueRequests)
+        .values({ queueId, requestId: request.id })
+        .onConflictDoNothing();
+      await seedFinalContinuationFromRequestInTransaction(tx, {
+        requestId: request.id,
+        queueId,
+        airfoilId: cell.airfoilId,
+        revisionId: cell.revisionId,
+        aoaDeg: cell.aoaDeg,
+      });
+      verifyQueueIds.push(queueId);
+    }
+
+    let precalcObligations: SimPrecalcObligation[] = [];
+    if (missingPrecalc.length) {
+      precalcObligations = await ensurePrecalcObligationsInTransaction(
+        tx,
+        missingPrecalc,
+        {
+          campaignIds,
+          requestIds: [request.id],
+        },
+      );
+    }
+
+    const coveredCells = (await tx.execute(sql`
+      SELECT obligation.airfoil_id,
+             obligation.revision_id,
+             obligation.aoa_deg::float8 AS aoa_deg
+      FROM sim_precalc_obligation_requests coverage
+      JOIN sim_precalc_obligations obligation
+        ON obligation.id = coverage.obligation_id
+      WHERE coverage.request_id = ${request.id}
+      UNION
+      SELECT queue.airfoil_id,
+             queue.revision_id,
+             queue.aoa_deg::float8 AS aoa_deg
+      FROM sim_urans_verify_queue_requests coverage
+      JOIN sim_urans_verify_queue queue ON queue.id = coverage.queue_id
+      WHERE coverage.request_id = ${request.id}
+    `)) as unknown as Array<{
+      airfoil_id: string;
+      revision_id: string;
+      aoa_deg: number;
+    }>;
+    const coveredKeys = new Set(
+      coveredCells.map(
+        (cell) =>
+          `${cell.airfoil_id}:${cell.revision_id}:${Number(cell.aoa_deg)}`,
+      ),
+    );
+    const uncovered = cells.filter(
+      (cell) =>
+        !coveredKeys.has(
+          `${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`,
+        ),
+    );
+    if (uncovered.length) {
+      throw new FullUransRequestCoverageIncompleteError(request.id, uncovered);
+    }
+
+    const linkedObligations = await tx
+      .select({ obligation: simPrecalcObligations })
+      .from(simPrecalcObligationRequests)
+      .innerJoin(
+        simPrecalcObligations,
+        eq(simPrecalcObligations.id, simPrecalcObligationRequests.obligationId),
+      )
+      .where(
+        and(
+          eq(simPrecalcObligationRequests.requestId, request.id),
+          sql`NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests final_coverage
+            JOIN sim_urans_verify_queue queue
+              ON queue.id = final_coverage.queue_id
+            WHERE final_coverage.request_id = ${request.id}
+              AND queue.airfoil_id = ${simPrecalcObligations.airfoilId}
+              AND queue.revision_id = ${simPrecalcObligations.revisionId}
+              AND queue.aoa_deg = ${simPrecalcObligations.aoaDeg}
+          )`,
+        ),
+      );
+    const linkedQueueRows = await tx
+      .select({ queueId: simUransVerifyQueueRequests.queueId })
+      .from(simUransVerifyQueueRequests)
+      .where(eq(simUransVerifyQueueRequests.requestId, request.id));
+    return {
+      requestId: request.id,
+      totalCells: cells.length,
+      precalcObligations: linkedObligations.map((row) => row.obligation),
+      verifyQueueIds: linkedQueueRows.map((row) => row.queueId),
+    };
+  });
+}
+
+export type FullUransRequestProjectedState =
+  | "pending"
+  | "running"
+  | "done"
+  | "blocked"
+  | "cancelled";
+
+/** Project an aggregate full request from its per-point child ledgers. A
+ * satisfied preliminary cell is not complete until a linked final queue row
+ * exists. Open children outrank blocked siblings so all recoverable points
+ * continue before the aggregate becomes critically blocked. */
+export async function fullUransRequestStateFromCoverage(
+  tx: DB,
+  requestId: string,
+): Promise<FullUransRequestProjectedState> {
+  const [summary] = (await tx.execute(sql`
+    SELECT
+      request.background_owner
+      OR EXISTS (
+        SELECT 1
+        FROM sim_urans_request_campaigns ownership
+        JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+        WHERE ownership.request_id = request.id
+          AND ownership.state = 'active'
+          AND campaign.status IN ('active', 'attention', 'paused')
+      ) AS owner_live,
+      EXISTS (
+        SELECT 1
+        FROM sim_precalc_obligation_requests coverage
+        JOIN sim_precalc_obligations obligation
+          ON obligation.id = coverage.obligation_id
+        WHERE coverage.request_id = request.id
+          AND obligation.state IN ('pending', 'running')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests verify_coverage
+            JOIN sim_urans_verify_queue queue
+              ON queue.id = verify_coverage.queue_id
+            WHERE verify_coverage.request_id = request.id
+              AND queue.airfoil_id = obligation.airfoil_id
+              AND queue.revision_id = obligation.revision_id
+              AND queue.aoa_deg = obligation.aoa_deg
+          )
+      ) AS preliminary_open,
+      EXISTS (
+        SELECT 1
+        FROM sim_precalc_obligation_requests coverage
+        JOIN sim_precalc_obligations obligation
+          ON obligation.id = coverage.obligation_id
+        WHERE coverage.request_id = request.id
+          AND obligation.state = 'blocked'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests verify_coverage
+            JOIN sim_urans_verify_queue queue
+              ON queue.id = verify_coverage.queue_id
+            WHERE verify_coverage.request_id = request.id
+              AND queue.airfoil_id = obligation.airfoil_id
+              AND queue.revision_id = obligation.revision_id
+              AND queue.aoa_deg = obligation.aoa_deg
+          )
+      ) AS preliminary_blocked,
+      EXISTS (
+        SELECT 1
+        FROM sim_precalc_obligation_requests coverage
+        JOIN sim_precalc_obligations obligation
+          ON obligation.id = coverage.obligation_id
+        WHERE coverage.request_id = request.id
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue_requests verify_coverage
+            JOIN sim_urans_verify_queue queue
+              ON queue.id = verify_coverage.queue_id
+            WHERE verify_coverage.request_id = request.id
+              AND queue.airfoil_id = obligation.airfoil_id
+              AND queue.revision_id = obligation.revision_id
+              AND queue.aoa_deg = obligation.aoa_deg
+          )
+      ) AS preliminary_without_final,
+      COALESCE(bool_or(queue.state IN ('pending', 'running')), false)
+        AS final_open,
+      COALESCE(bool_or(queue.state = 'blocked'), false) AS final_blocked,
+      COALESCE(bool_or(queue.state = 'cancelled'), false) AS final_cancelled,
+      count(queue.id)::int AS final_count,
+      count(queue.id) FILTER (
+        WHERE queue.state IN ('done', 'disagreed')
+      )::int AS final_success_count
+    FROM sim_urans_requests request
+    LEFT JOIN sim_urans_verify_queue_requests final_coverage
+      ON final_coverage.request_id = request.id
+    LEFT JOIN sim_urans_verify_queue queue
+      ON queue.id = final_coverage.queue_id
+    WHERE request.id = ${requestId}
+      AND request.fidelity = 'full'
+    GROUP BY request.id
+  `)) as unknown as Array<{
+    owner_live: boolean;
+    preliminary_open: boolean;
+    preliminary_blocked: boolean;
+    preliminary_without_final: boolean;
+    final_open: boolean;
+    final_blocked: boolean;
+    final_cancelled: boolean;
+    final_count: number;
+    final_success_count: number;
+  }>;
+  if (!summary?.owner_live) return "cancelled";
+  if (summary.preliminary_open) return "pending";
+  if (summary.final_open) return "running";
+  if (summary.preliminary_blocked || summary.final_blocked) return "blocked";
+  if (summary.preliminary_without_final) return "pending";
+  if (
+    summary.final_count > 0 &&
+    summary.final_success_count === summary.final_count
+  ) {
+    return "done";
+  }
+  if (summary.final_cancelled) return "pending";
+  return "pending";
+}
+
+/** Transaction-safe aggregate projection for queue settlement/media-repair
+ * paths. Queue transitions lock queue before request throughout the existing
+ * lifecycle, so this helper deliberately takes no request lock before reading
+ * child state and performs only the final fenced request update. */
+export async function refreshFullUransRequestStateInTransaction(
+  tx: DB,
+  requestId: string,
+): Promise<FullUransRequestProjectedState | null> {
+  const [request] = await tx
+    .select({
+      fidelity: simUransRequests.fidelity,
+      state: simUransRequests.state,
+      simJobId: simUransRequests.simJobId,
+    })
+    .from(simUransRequests)
+    .where(eq(simUransRequests.id, requestId))
+    .limit(1);
+  if (!request || request.fidelity !== "full") return null;
+  if (request.state === "cancelled") return "cancelled";
+  const state = await fullUransRequestStateFromCoverage(tx, requestId);
+  const [activePhysicalJob] =
+    state === "pending" && request.simJobId
+      ? ((await tx.execute(sql`
+          SELECT job.id
+          FROM sim_jobs job
+          WHERE job.id = ${request.simJobId}
+            AND job.status IN ('pending', 'submitted', 'running', 'ingesting')
+          LIMIT 1
+        `)) as unknown as Array<{ id: string }>)
+      : [];
+  const projectedState = activePhysicalJob ? "running" : state;
+  await tx
+    .update(simUransRequests)
+    .set({
+      state: projectedState,
+      simJobId: activePhysicalJob ? activePhysicalJob.id : null,
+    })
+    .where(
+      and(
+        eq(simUransRequests.id, requestId),
+        eq(simUransRequests.fidelity, "full"),
+        sql`${simUransRequests.state} <> 'cancelled'`,
+      ),
+    );
+  return projectedState;
+}
+
+export async function refreshFullUransRequestState(
+  db: DB,
+  requestId: string,
+): Promise<FullUransRequestProjectedState | null> {
+  return db.transaction((rawTx) =>
+    refreshFullUransRequestStateInTransaction(
+      rawTx as unknown as DB,
+      requestId,
+    ),
+  );
+}
+
+export async function refreshFullUransRequestsForVerifyQueueInTransaction(
+  tx: DB,
+  queueId: string,
+): Promise<string[]> {
+  const links = await tx
+    .select({ requestId: simUransVerifyQueueRequests.requestId })
+    .from(simUransVerifyQueueRequests)
+    .where(eq(simUransVerifyQueueRequests.queueId, queueId))
+    .orderBy(asc(simUransVerifyQueueRequests.requestId));
+  const refreshed: string[] = [];
+  for (const link of links) {
+    const state = await refreshFullUransRequestStateInTransaction(
+      tx,
+      link.requestId,
+    );
+    if (state) refreshed.push(link.requestId);
+  }
+  return refreshed;
+}
+
+export async function refreshFullUransRequestsForVerifyQueue(
+  db: DB,
+  queueId: string,
+): Promise<string[]> {
+  return db.transaction((rawTx) =>
+    refreshFullUransRequestsForVerifyQueueInTransaction(
+      rawTx as unknown as DB,
+      queueId,
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +1013,10 @@ export async function campaignHasOpenRansGaps(
   return rows.length > 0;
 }
 
-/** Machine-wide verify gate: verify-queue items schedule ONLY when no campaign
- *  RANS/precalc work exists anywhere — no open campaign gap, no pending
- *  admin request-URANS item, and no in-flight non-verify campaign job. */
+/** Idle-capacity verify gate: outside the bounded eight-RANS interleave,
+ * verify-queue items schedule only when no campaign RANS/PRECALC work exists
+ * anywhere — no open campaign gap, no pending admin request-URANS item, and no
+ * in-flight non-verify campaign job. */
 export async function hasOpenCampaignLadderWork(
   db: DB,
   scope: {
@@ -377,9 +1046,7 @@ export async function hasOpenCampaignLadderWork(
           sql`, `,
         )}]`}::text[])`
       : sql`AND false`;
-  const requestFidelityScope = includePrecalc
-    ? sql``
-    : sql`AND req.fidelity = 'full'`;
+  const requestFidelityScope = includePrecalc ? sql`` : sql`AND false`;
   const obligationCampaignScope = !includePrecalc
     ? sql`AND false`
     : scope.campaignIds === undefined
@@ -413,6 +1080,36 @@ export async function hasOpenCampaignLadderWork(
         WHERE req.state IN ('pending', 'running')
           ${requestScope}
           ${requestFidelityScope}
+          AND NOT (
+            req.fidelity = 'full'
+            AND req.sim_job_id IS NULL
+            AND EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_requests final_coverage
+              JOIN sim_urans_verify_queue queue
+                ON queue.id = final_coverage.queue_id
+              WHERE final_coverage.request_id = req.id
+                AND queue.state IN ('pending', 'running')
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_precalc_obligation_requests preliminary_coverage
+              JOIN sim_precalc_obligations obligation
+                ON obligation.id = preliminary_coverage.obligation_id
+              WHERE preliminary_coverage.request_id = req.id
+                AND obligation.state IN ('pending', 'running')
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM sim_urans_verify_queue_requests covered_final
+                  JOIN sim_urans_verify_queue covered_queue
+                    ON covered_queue.id = covered_final.queue_id
+                  WHERE covered_final.request_id = req.id
+                    AND covered_queue.airfoil_id = obligation.airfoil_id
+                    AND covered_queue.revision_id = obligation.revision_id
+                    AND covered_queue.aoa_deg = obligation.aoa_deg
+                )
+            )
+          )
           AND (
             req.background_owner
             OR EXISTS (
@@ -609,6 +1306,7 @@ export async function campaignOpenTierCounts(
            AND request_point.derived_by_symmetry = false
           WHERE ownership.campaign_id = ${campaignId}
             AND ownership.state = 'active'
+            AND req.fidelity = 'precalc'
             AND req.state IN ('pending', 'running')
 
           UNION
@@ -623,10 +1321,9 @@ export async function campaignOpenTierCounts(
         ) physical_precalc_cell
       ) AS precalc_open,
       (
-        SELECT count(*) FROM sim_urans_verify_queue_campaigns ownership
-        JOIN sim_urans_verify_queue q ON q.id = ownership.queue_id
-        WHERE ownership.campaign_id = ${campaignId}
-          AND ownership.state = 'active'
+        SELECT count(DISTINCT q.id)
+        FROM sim_urans_verify_queue q
+        WHERE ${verifyQueueCampaignScopeSql(sql`q.id`, [campaignId])}
           AND q.state IN ('pending', 'running')
       )::int AS verify_open
   `)) as unknown as {
@@ -827,6 +1524,93 @@ export function deriveCampaignPhase(
 // ---------------------------------------------------------------------------
 // Queue/request accessors used by the sweeper ladder tick.
 // ---------------------------------------------------------------------------
+function linkedFullRequestOwnerSql(
+  queueId: string | SQLWrapper,
+  includePaused = false,
+) {
+  const campaignStates = includePaused
+    ? sql`('active', 'attention', 'paused')`
+    : sql`('active', 'attention')`;
+  return sql`EXISTS (
+    SELECT 1
+    FROM sim_urans_verify_queue_requests coverage
+    JOIN sim_urans_requests request ON request.id = coverage.request_id
+    WHERE coverage.queue_id = ${queueId}
+      AND request.fidelity = 'full'
+      AND request.state IN ('pending', 'running')
+      AND (
+        request.background_owner
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_request_campaigns ownership
+          JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+          WHERE ownership.request_id = request.id
+            AND ownership.state = 'active'
+            AND campaign.status IN ${campaignStates}
+        )
+      )
+  )`;
+}
+
+function verifyQueueLiveOwnerSql(
+  queueId: string | SQLWrapper,
+  includePaused = false,
+) {
+  const campaignStates = includePaused
+    ? sql`('active', 'attention', 'paused')`
+    : sql`('active', 'attention')`;
+  return sql`(
+    EXISTS (
+      SELECT 1
+      FROM sim_urans_verify_queue owned_queue
+      WHERE owned_queue.id = ${queueId}
+        AND owned_queue.background_owner
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM sim_urans_verify_queue_campaigns ownership
+      JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+      WHERE ownership.queue_id = ${queueId}
+        AND ownership.state = 'active'
+        AND campaign.status IN ${campaignStates}
+    )
+    OR ${linkedFullRequestOwnerSql(queueId, includePaused)}
+  )`;
+}
+
+function verifyQueueCampaignScopeSql(
+  queueId: string | SQLWrapper,
+  campaignIds: string[],
+  requireOpenRequest = true,
+) {
+  if (!campaignIds.length) return sql`false`;
+  const ids = sql`ARRAY[${sql.join(
+    campaignIds.map((id) => sql`${id}::uuid`),
+    sql`, `,
+  )}]`;
+  return sql`(
+    EXISTS (
+      SELECT 1
+      FROM sim_urans_verify_queue_campaigns scoped_owner
+      WHERE scoped_owner.queue_id = ${queueId}
+        AND scoped_owner.state = 'active'
+        AND scoped_owner.campaign_id = ANY(${ids})
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM sim_urans_verify_queue_requests coverage
+      JOIN sim_urans_requests request ON request.id = coverage.request_id
+      JOIN sim_urans_request_campaigns scoped_owner
+        ON scoped_owner.request_id = request.id
+      WHERE coverage.queue_id = ${queueId}
+        AND request.fidelity = 'full'
+        ${requireOpenRequest ? sql`AND request.state IN ('pending', 'running')` : sql``}
+        AND scoped_owner.state = 'active'
+        AND scoped_owner.campaign_id = ANY(${ids})
+    )
+  )`;
+}
+
 export interface PendingVerifyScope {
   /** Test-harness isolation for the shared dev DB. Production omits this and
    *  considers the global queue. */
@@ -834,25 +1618,61 @@ export interface PendingVerifyScope {
   /** Test-only physical-item scope for background-owned rows, which have no
    * campaign association to isolate parallel files. Production omits this. */
   verifyIds?: string[];
+  /** Rolling engine cutover gate. False keeps newly reopened continuation and
+   * corrective-fresh recovery pending while still allowing an initial final
+   * verification (and an ordinary transport retry) to be scheduled. */
+  allowAutomaticRecovery?: boolean;
 }
 
-export async function nextPendingVerifyItem(
+function verifyRecoveryScopeSql(scope: PendingVerifyScope) {
+  return scope.allowAutomaticRecovery === false
+    ? sql`AND q.fresh_attempt_count = 0
+      AND q.continuation_attempt_count = 0
+      AND COALESCE(q.last_outcome, '') NOT IN (
+          ${FINAL_URANS_OUTCOMES.continuationPending},
+          ${FINAL_URANS_OUTCOMES.continuationRetryWait},
+          ${FINAL_URANS_OUTCOMES.freshRetryPending}
+        )`
+    : sql``;
+}
+
+/** A pending final-verification item cannot sit behind an unbounded wave-1
+ * backlog. The scheduler admits at most this many new RANS jobs after the
+ * oldest schedulable pending item (or the latest successfully admitted verify,
+ * whichever is newer) before final verification owns the next eligible slot. */
+export const MAX_WAVE1_ADMISSIONS_BEFORE_VERIFY = 8;
+
+export interface VerifyInterleaveScope extends PendingVerifyScope {
+  /** Test-only closed history for files sharing one live dev database.
+   * Production omits this and counts every successfully admitted wave-1 job. */
+  wave1JobIds?: string[];
+}
+
+export interface VerifyInterleaveDecision {
+  due: boolean;
+  pendingSince: Date | null;
+  latestVerifySubmittedAt: Date | null;
+  opportunitySince: Date | null;
+  wave1AdmissionsSinceOpportunity: number;
+}
+
+/** Restart-safe final-verification fairness derived entirely from durable DB
+ * history. No process-local counter is authoritative: after a restart, the
+ * oldest runnable verify item, latest accepted verify submission, and wave-1
+ * submittedAt history reconstruct the exact same decision.
+ *
+ * Only successful engine admissions count. Pending compositions and answered
+ * submit failures have submittedAt=NULL and therefore cannot spend the bounded
+ * RANS allowance. The bounded subquery stops once the threshold is reached. */
+export async function finalVerifyInterleaveDecision(
   db: DB,
-  scope: PendingVerifyScope = {},
-): Promise<SimUransVerifyQueueItem | null> {
-  const scopeSql =
+  scope: VerifyInterleaveScope = {},
+): Promise<VerifyInterleaveDecision> {
+  const campaignScopeSql =
     scope.campaignIds === undefined
       ? sql``
       : scope.campaignIds.length
-        ? sql`AND EXISTS (
-        SELECT 1 FROM sim_urans_verify_queue_campaigns scoped_owner
-        WHERE scoped_owner.queue_id = q.id
-          AND scoped_owner.state = 'active'
-          AND scoped_owner.campaign_id = ANY(${sql`ARRAY[${sql.join(
-            scope.campaignIds.map((id) => sql`${id}::uuid`),
-            sql`, `,
-          )}]`})
-      )`
+        ? sql`AND ${verifyQueueCampaignScopeSql(sql`q.id`, scope.campaignIds)}`
         : sql`AND false`;
   const verifyScopeSql =
     scope.verifyIds === undefined
@@ -863,10 +1683,158 @@ export async function nextPendingVerifyItem(
             sql`, `,
           )}]`})`
         : sql`AND false`;
+  const latestVerifyScopeSql =
+    scope.verifyIds === undefined
+      ? scope.campaignIds === undefined
+        ? sql``
+        : scope.campaignIds.length
+          ? sql`AND ${verifyQueueCampaignScopeSql(
+              sql`(verify_job.request_payload ->> 'verifyQueueItemId')::uuid`,
+              scope.campaignIds,
+              false,
+            )}`
+          : sql`AND false`
+      : scope.verifyIds.length
+        ? sql`AND verify_job.request_payload ->> 'verifyQueueItemId' =
+          ANY(${sql`ARRAY[${sql.join(
+            scope.verifyIds.map((id) => sql`${id}`),
+            sql`, `,
+          )}]`}::text[])`
+        : sql`AND false`;
+  const wave1ScopeSql =
+    scope.wave1JobIds === undefined
+      ? scope.campaignIds === undefined
+        ? sql``
+        : scope.campaignIds.length
+          ? sql`AND wave1.campaign_id = ANY(${sql`ARRAY[${sql.join(
+              scope.campaignIds.map((id) => sql`${id}::uuid`),
+              sql`, `,
+            )}]`})`
+          : sql`AND false`
+      : scope.wave1JobIds.length
+        ? sql`AND wave1.id = ANY(${sql`ARRAY[${sql.join(
+            scope.wave1JobIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )}]`})`
+        : sql`AND false`;
+
+  const recoveryScopeSql = verifyRecoveryScopeSql(scope);
+  const [row] = (await db.execute(sql`
+    WITH oldest_pending AS (
+      SELECT MIN(q."createdAt") AS pending_since
+      FROM sim_urans_verify_queue q
+      WHERE q.state = 'pending'
+        AND (q.next_submit_at IS NULL OR q.next_submit_at <= now())
+        AND COALESCE(q.last_outcome, '') <> ${FINAL_URANS_OUTCOMES.mediaRepairPending}
+        ${recoveryScopeSql}
+        ${campaignScopeSql}
+        ${verifyScopeSql}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sim_ladder_submit_retries submit_retry
+          WHERE submit_retry.verify_queue_id = q.id
+            AND (
+              submit_retry.state = 'blocked'
+              OR submit_retry.next_attempt_at > now()
+            )
+        )
+        AND ${verifyQueueLiveOwnerSql(sql`q.id`)}
+    ),
+    latest_verify AS (
+      SELECT MAX(verify_job."submittedAt") AS latest_verify_submitted_at
+      FROM sim_jobs verify_job
+      WHERE verify_job.job_kind = 'verify'
+        AND verify_job."submittedAt" IS NOT NULL
+        ${latestVerifyScopeSql}
+    ),
+    opportunity AS (
+      SELECT
+        oldest_pending.pending_since,
+        latest_verify.latest_verify_submitted_at,
+        CASE
+          WHEN oldest_pending.pending_since IS NULL THEN NULL
+          ELSE GREATEST(
+            oldest_pending.pending_since,
+            COALESCE(
+              latest_verify.latest_verify_submitted_at,
+              oldest_pending.pending_since
+            )
+          )
+        END AS opportunity_since
+      FROM oldest_pending
+      CROSS JOIN latest_verify
+    ),
+    bounded_wave1_admissions AS (
+      SELECT COUNT(*)::int AS admission_count
+      FROM (
+        SELECT 1
+        FROM sim_jobs wave1
+        CROSS JOIN opportunity
+        WHERE opportunity.opportunity_since IS NOT NULL
+          AND wave1.wave = 1
+          AND wave1.job_kind <> 'verify'
+          AND wave1."submittedAt" IS NOT NULL
+          AND wave1."submittedAt" > opportunity.opportunity_since
+          ${wave1ScopeSql}
+        LIMIT ${MAX_WAVE1_ADMISSIONS_BEFORE_VERIFY}
+      ) admitted
+    )
+    SELECT
+      opportunity.pending_since,
+      opportunity.latest_verify_submitted_at,
+      opportunity.opportunity_since,
+      bounded_wave1_admissions.admission_count
+    FROM opportunity
+    CROSS JOIN bounded_wave1_admissions
+  `)) as unknown as Array<{
+    pending_since: Date | string | null;
+    latest_verify_submitted_at: Date | string | null;
+    opportunity_since: Date | string | null;
+    admission_count: number;
+  }>;
+
+  const asDate = (value: Date | string | null | undefined) =>
+    value == null ? null : value instanceof Date ? value : new Date(value);
+  const wave1AdmissionsSinceOpportunity = Number(row?.admission_count ?? 0);
+  const pendingSince = asDate(row?.pending_since);
+  return {
+    due:
+      pendingSince != null &&
+      wave1AdmissionsSinceOpportunity >= MAX_WAVE1_ADMISSIONS_BEFORE_VERIFY,
+    pendingSince,
+    latestVerifySubmittedAt: asDate(row?.latest_verify_submitted_at),
+    opportunitySince: asDate(row?.opportunity_since),
+    wave1AdmissionsSinceOpportunity,
+  };
+}
+
+export async function nextPendingVerifyItem(
+  db: DB,
+  scope: PendingVerifyScope = {},
+): Promise<SimUransVerifyQueueItem | null> {
+  const scopeSql =
+    scope.campaignIds === undefined
+      ? sql``
+      : scope.campaignIds.length
+        ? sql`AND ${verifyQueueCampaignScopeSql(sql`q.id`, scope.campaignIds)}`
+        : sql`AND false`;
+  const verifyScopeSql =
+    scope.verifyIds === undefined
+      ? sql``
+      : scope.verifyIds.length
+        ? sql`AND q.id = ANY(${sql`ARRAY[${sql.join(
+            scope.verifyIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )}]`})`
+        : sql`AND false`;
+  const recoveryScopeSql = verifyRecoveryScopeSql(scope);
   const [candidate] = (await db.execute(sql`
     SELECT q.id
     FROM sim_urans_verify_queue q
     WHERE q.state = 'pending'
+      AND (q.next_submit_at IS NULL OR q.next_submit_at <= now())
+      AND COALESCE(q.last_outcome, '') <> ${FINAL_URANS_OUTCOMES.mediaRepairPending}
+      ${recoveryScopeSql}
       ${scopeSql}
       ${verifyScopeSql}
       AND NOT EXISTS (
@@ -877,17 +1845,7 @@ export async function nextPendingVerifyItem(
             OR submit_retry.next_attempt_at > now()
           )
       )
-      AND (
-        q.background_owner
-        OR EXISTS (
-          SELECT 1
-          FROM sim_urans_verify_queue_campaigns ownership
-          JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
-          WHERE ownership.queue_id = q.id
-            AND ownership.state = 'active'
-            AND campaign.status IN ('active', 'attention')
-        )
-      )
+      AND ${verifyQueueLiveOwnerSql(sql`q.id`)}
     ORDER BY q."createdAt" ASC
     LIMIT 1
   `)) as unknown as Array<{ id: string }>;
@@ -913,15 +1871,10 @@ export async function claimNextPendingVerifyItem(
       scope.campaignIds === undefined
         ? sql``
         : scope.campaignIds.length
-          ? sql`AND EXISTS (
-          SELECT 1 FROM sim_urans_verify_queue_campaigns scoped_owner
-          WHERE scoped_owner.queue_id = q.id
-            AND scoped_owner.state = 'active'
-            AND scoped_owner.campaign_id = ANY(${sql`ARRAY[${sql.join(
-              scope.campaignIds.map((id) => sql`${id}::uuid`),
-              sql`, `,
-            )}]`})
-        )`
+          ? sql`AND ${verifyQueueCampaignScopeSql(
+              sql`q.id`,
+              scope.campaignIds,
+            )}`
           : sql`AND false`;
     const verifyScopeSql =
       scope.verifyIds === undefined
@@ -932,10 +1885,14 @@ export async function claimNextPendingVerifyItem(
               sql`, `,
             )}]`})`
           : sql`AND false`;
+    const recoveryScopeSql = verifyRecoveryScopeSql(scope);
     const [candidate] = (await tx.execute(sql`
       SELECT q.id
       FROM sim_urans_verify_queue q
       WHERE q.state = 'pending'
+        AND (q.next_submit_at IS NULL OR q.next_submit_at <= now())
+        AND COALESCE(q.last_outcome, '') <> ${FINAL_URANS_OUTCOMES.mediaRepairPending}
+        ${recoveryScopeSql}
         ${scopeSql}
         ${verifyScopeSql}
         AND NOT EXISTS (
@@ -946,17 +1903,7 @@ export async function claimNextPendingVerifyItem(
               OR submit_retry.next_attempt_at > now()
             )
         )
-        AND (
-          q.background_owner
-          OR EXISTS (
-            SELECT 1
-            FROM sim_urans_verify_queue_campaigns ownership
-            JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
-            WHERE ownership.queue_id = q.id
-              AND ownership.state = 'active'
-              AND campaign.status IN ('active', 'attention')
-          )
-        )
+        AND ${verifyQueueLiveOwnerSql(sql`q.id`)}
       ORDER BY q."createdAt" ASC
       LIMIT 1
     `)) as unknown as Array<{ id: string }>;
@@ -966,10 +1913,23 @@ export async function claimNextPendingVerifyItem(
     // owner before the conditional state transition.
     await tx.execute(sql`
       SELECT campaign.id
-      FROM sim_urans_verify_queue_campaigns ownership
-      JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
-      WHERE ownership.queue_id = ${candidate.id}
-        AND ownership.state = 'active'
+      FROM sim_campaigns campaign
+      WHERE campaign.id IN (
+        SELECT ownership.campaign_id
+        FROM sim_urans_verify_queue_campaigns ownership
+        WHERE ownership.queue_id = ${candidate.id}
+          AND ownership.state = 'active'
+        UNION
+        SELECT request_ownership.campaign_id
+        FROM sim_urans_verify_queue_requests coverage
+        JOIN sim_urans_requests request ON request.id = coverage.request_id
+        JOIN sim_urans_request_campaigns request_ownership
+          ON request_ownership.request_id = request.id
+        WHERE coverage.queue_id = ${candidate.id}
+          AND request.fidelity = 'full'
+          AND request.state IN ('pending', 'running')
+          AND request_ownership.state = 'active'
+      )
         AND campaign.status IN ('active', 'attention')
       ORDER BY campaign.id
       FOR SHARE OF campaign
@@ -983,6 +1943,22 @@ export async function claimNextPendingVerifyItem(
         and(
           eq(simUransVerifyQueue.id, candidate.id),
           eq(simUransVerifyQueue.state, "pending"),
+          or(
+            isNull(simUransVerifyQueue.nextSubmitAt),
+            sql`${simUransVerifyQueue.nextSubmitAt} <= now()`,
+          ),
+          sql`COALESCE(${simUransVerifyQueue.lastOutcome}, '') <> ${FINAL_URANS_OUTCOMES.mediaRepairPending}`,
+          ...(scope.allowAutomaticRecovery === false
+            ? [
+                sql`${simUransVerifyQueue.freshAttemptCount} = 0`,
+                sql`${simUransVerifyQueue.continuationAttemptCount} = 0`,
+                sql`COALESCE(${simUransVerifyQueue.lastOutcome}, '') NOT IN (
+                    ${FINAL_URANS_OUTCOMES.continuationPending},
+                    ${FINAL_URANS_OUTCOMES.continuationRetryWait},
+                    ${FINAL_URANS_OUTCOMES.freshRetryPending}
+                  )`,
+              ]
+            : []),
           ...(scope.verifyIds === undefined
             ? []
             : scope.verifyIds.length
@@ -996,17 +1972,7 @@ export async function claimNextPendingVerifyItem(
                 OR submit_retry.next_attempt_at > now()
               )
           )`,
-          sql`(
-            ${simUransVerifyQueue.backgroundOwner}
-            OR EXISTS (
-              SELECT 1
-              FROM sim_urans_verify_queue_campaigns ownership
-              JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
-              WHERE ownership.queue_id = ${simUransVerifyQueue.id}
-                AND ownership.state = 'active'
-                AND campaign.status IN ('active', 'attention')
-            )
-          )`,
+          verifyQueueLiveOwnerSql(simUransVerifyQueue.id),
         ),
       )
       .returning();
@@ -1018,15 +1984,7 @@ export async function claimNextPendingVerifyItem(
  *  failure. Paused work freezes as pending for resume; terminal campaign work
  *  becomes cancelled instead of being resurrected into a hidden pending row. */
 const VERIFY_CLAIM_RELEASE_STATE_SQL = sql`CASE
-  WHEN q.background_owner THEN 'pending'
-  WHEN EXISTS (
-    SELECT 1
-    FROM sim_urans_verify_queue_campaigns ownership
-    JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
-    WHERE ownership.queue_id = q.id
-      AND ownership.state = 'active'
-      AND campaign.status IN ('active', 'attention', 'paused')
-  ) THEN 'pending'
+  WHEN ${verifyQueueLiveOwnerSql(sql`q.id`, true)} THEN 'pending'
   ELSE 'cancelled'
 END`;
 
@@ -1050,13 +2008,16 @@ export async function nextPendingUransRequest(
     SELECT req.id
     FROM sim_urans_requests req
     WHERE req.state = 'pending'
-      AND NOT EXISTS (
-        SELECT 1 FROM sim_ladder_submit_retries submit_retry
-        WHERE submit_retry.urans_request_id = req.id
-          AND (
-            submit_retry.state = 'blocked'
-            OR submit_retry.next_attempt_at > now()
-          )
+      AND (
+        req.fidelity = 'full'
+        OR NOT EXISTS (
+          SELECT 1 FROM sim_ladder_submit_retries submit_retry
+          WHERE submit_retry.urans_request_id = req.id
+            AND (
+              submit_retry.state = 'blocked'
+              OR submit_retry.next_attempt_at > now()
+            )
+        )
       )
       AND (
         req.background_owner
@@ -1117,13 +2078,16 @@ export async function claimNextPendingUransRequest(
       WHERE req.state = 'pending'
         ${requestScope}
         ${fidelityScope}
-        AND NOT EXISTS (
-          SELECT 1 FROM sim_ladder_submit_retries submit_retry
-          WHERE submit_retry.urans_request_id = req.id
-            AND (
-              submit_retry.state = 'blocked'
-              OR submit_retry.next_attempt_at > now()
-            )
+        AND (
+          req.fidelity = 'full'
+          OR NOT EXISTS (
+            SELECT 1 FROM sim_ladder_submit_retries submit_retry
+            WHERE submit_retry.urans_request_id = req.id
+              AND (
+                submit_retry.state = 'blocked'
+                OR submit_retry.next_attempt_at > now()
+              )
+          )
         )
         AND (
           req.background_owner
@@ -1159,13 +2123,16 @@ export async function claimNextPendingUransRequest(
         and(
           eq(simUransRequests.id, candidate.id),
           eq(simUransRequests.state, "pending"),
-          sql`NOT EXISTS (
-            SELECT 1 FROM sim_ladder_submit_retries submit_retry
-            WHERE submit_retry.urans_request_id = ${simUransRequests.id}
-              AND (
-                submit_retry.state = 'blocked'
-                OR submit_retry.next_attempt_at > now()
-              )
+          sql`(
+            ${simUransRequests.fidelity} = 'full'
+            OR NOT EXISTS (
+              SELECT 1 FROM sim_ladder_submit_retries submit_retry
+              WHERE submit_retry.urans_request_id = ${simUransRequests.id}
+                AND (
+                  submit_retry.state = 'blocked'
+                  OR submit_retry.next_attempt_at > now()
+                )
+            )
           )`,
           sql`(
             ${simUransRequests.backgroundOwner}
@@ -1222,15 +2189,7 @@ export async function healOrphanedVerifyItems(
     scope.campaignIds === undefined
       ? sql``
       : scope.campaignIds.length
-        ? sql`AND EXISTS (
-        SELECT 1 FROM sim_urans_verify_queue_campaigns scoped_owner
-        WHERE scoped_owner.queue_id = q.id
-          AND scoped_owner.state = 'active'
-          AND scoped_owner.campaign_id = ANY(${sql`ARRAY[${sql.join(
-            scope.campaignIds.map((id) => sql`${id}::uuid`),
-            sql`, `,
-          )}]`})
-      )`
+        ? sql`AND ${verifyQueueCampaignScopeSql(sql`q.id`, scope.campaignIds)}`
         : sql`AND false`;
   const verifyScopeSql =
     scope.verifyIds === undefined
@@ -1254,15 +2213,7 @@ export async function healOrphanedVerifyItems(
       WHERE q.state = 'pending'
         ${scopeSql}
         ${verifyScopeSql}
-        AND q.background_owner = false
-        AND NOT EXISTS (
-          SELECT 1
-          FROM sim_urans_verify_queue_campaigns ownership
-          JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
-          WHERE ownership.queue_id = q.id
-            AND ownership.state = 'active'
-            AND campaign.status IN ('active', 'attention', 'paused')
-        )
+        AND NOT ${verifyQueueLiveOwnerSql(sql`q.id`, true)}
       ORDER BY q."createdAt", q.id
       LIMIT 100
       FOR UPDATE OF q, source_result SKIP LOCKED
@@ -1277,15 +2228,7 @@ export async function healOrphanedVerifyItems(
           sql`, `,
         )}]`})
           AND q.state = 'pending'
-          AND q.background_owner = false
-          AND NOT EXISTS (
-            SELECT 1
-            FROM sim_urans_verify_queue_campaigns ownership
-            JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
-            WHERE ownership.queue_id = q.id
-              AND ownership.state = 'active'
-              AND campaign.status IN ('active', 'attention', 'paused')
-          )
+          AND NOT ${verifyQueueLiveOwnerSql(sql`q.id`, true)}
         RETURNING q.id
       `)) as unknown as Array<{ id: string }>;
       pendingCancelled = cancelled.length;
@@ -1419,6 +2362,7 @@ export async function healOrphanedUransRequests(
       FROM sim_jobs j
       WHERE req.state = 'running'
         ${requestScope}
+        AND req.fidelity = 'precalc'
         AND (
           j.id = req.sim_job_id
           OR j.request_payload ->> 'uransRequestId' = req.id::text
@@ -1460,7 +2404,23 @@ export async function healOrphanedUransRequests(
         AND req."updatedAt" < now() - interval '5 minutes'
       RETURNING req.id
     `)) as unknown as { id: string }[];
-    return ownerlessRows.length + terminalRows.length + rows.length;
+    const fullRows = (await tx.execute(sql`
+      SELECT req.id
+      FROM sim_urans_requests req
+      WHERE req.fidelity = 'full'
+        AND req.state <> 'cancelled'
+        ${requestScope}
+      ORDER BY req.id
+    `)) as unknown as Array<{ id: string }>;
+    for (const request of fullRows) {
+      await refreshFullUransRequestStateInTransaction(
+        tx as unknown as DB,
+        request.id,
+      );
+    }
+    return (
+      ownerlessRows.length + terminalRows.length + rows.length + fullRows.length
+    );
   });
 }
 
@@ -1656,4 +2616,278 @@ export async function precalcSnapshotForVerifyItem(
   if (!row || row.status !== "done" || row.fidelity !== "urans_precalc")
     return null;
   return { cl: row.cl, cd: row.cd, cm: row.cm };
+}
+
+export type FinalUransRecoveryPlan =
+  | { mode: "fresh" }
+  | {
+      mode: "continuation";
+      resultAttemptId: string;
+      engineJobId: string;
+      engineCaseSlug: string;
+      solverImplementationId: string | null;
+      budgetOverrideS: number;
+    }
+  | { mode: "media_repair" }
+  | { mode: "exhausted"; reason: string };
+
+/** A final verification can become terminal before a new sim_job exists:
+ * either its durable retry ledger is already exhausted, or the only saved
+ * continuation checkpoint is incompatible with the target implementation.
+ * Fence the running claim and write the matching critical incident in the
+ * same transaction so scheduler replays cannot create alert-only ghosts. */
+export async function blockFinalUransVerificationBeforeSubmit(
+  db: DB,
+  input: {
+    verifyQueueId: string;
+    reason: string;
+    incidentReason: string;
+    targetSolverImplementationId: string;
+    metadata?: Record<string, unknown>;
+  },
+): Promise<boolean> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const rows = (await tx.execute(sql`
+      UPDATE sim_urans_verify_queue q
+      SET state = 'blocked',
+          sim_job_id = NULL,
+          last_outcome = ${FINAL_URANS_OUTCOMES.recoveryExhausted},
+          last_error = ${input.reason},
+          next_submit_at = NULL,
+          "updatedAt" = now()
+      WHERE q.id = ${input.verifyQueueId}
+        AND q.state = 'running'
+        AND q.sim_job_id IS NULL
+      RETURNING
+        q.id,
+        q.latest_result_attempt_id,
+        q.fresh_attempt_count,
+        q.max_fresh_attempts,
+        q.continuation_attempt_count
+    `)) as unknown as Array<{
+      id: string;
+      latest_result_attempt_id: string | null;
+      fresh_attempt_count: number;
+      max_fresh_attempts: number;
+      continuation_attempt_count: number;
+    }>;
+    const row = rows[0];
+    if (!row) return false;
+
+    const [attempt] = row.latest_result_attempt_id
+      ? await tx
+          .select({
+            id: resultAttempts.id,
+            simJobId: resultAttempts.simJobId,
+            solverImplementationId: resultAttempts.solverImplementationId,
+            classificationReasons: resultClassifications.reasons,
+          })
+          .from(resultAttempts)
+          .leftJoin(
+            resultClassifications,
+            eq(resultClassifications.resultAttemptId, resultAttempts.id),
+          )
+          .where(eq(resultAttempts.id, row.latest_result_attempt_id))
+          .limit(1)
+      : [];
+    const solverImplementationId =
+      attempt?.solverImplementationId ?? input.targetSolverImplementationId;
+    await recordSolverIncidentInTransaction(tx, {
+      stage: "final",
+      reason: input.incidentReason,
+      severity: "critical",
+      owner: { verifyQueueId: row.id },
+      solverImplementationId,
+      occurrenceKey: `final:${row.id}:${attempt?.id ?? row.id}:${FINAL_URANS_OUTCOMES.recoveryExhausted}`,
+      remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+      simJobId: attempt?.simJobId ?? null,
+      resultAttemptId: attempt?.id ?? null,
+      metadata: {
+        lastOutcome: FINAL_URANS_OUTCOMES.recoveryExhausted,
+        schedulerReason: input.reason,
+        classificationReasons: attempt?.classificationReasons ?? [],
+        freshAttemptCount: row.fresh_attempt_count,
+        maxFreshAttempts: row.max_fresh_attempts,
+        continuationAttemptCount: row.continuation_attempt_count,
+        targetSolverImplementationId: input.targetSolverImplementationId,
+        ...input.metadata,
+      },
+    });
+    await refreshFullUransRequestsForVerifyQueueInTransaction(tx, row.id);
+    return true;
+  });
+}
+
+/** Resolve the next full-fidelity action from the durable queue ledger.
+ *
+ * The latest immutable attempt is authoritative even when the accepted
+ * preliminary result remains the selected canonical generation. One
+ * same-case continuation is allowed per fresh trajectory; after that, only
+ * the single corrective fresh trajectory remains. */
+export async function finalUransRecoveryPlanForVerifyItem(
+  db: DB,
+  item: SimUransVerifyQueueItem,
+): Promise<FinalUransRecoveryPlan> {
+  if (item.lastOutcome === FINAL_URANS_OUTCOMES.mediaRepairPending) {
+    return { mode: "media_repair" };
+  }
+  const continuationRequested =
+    item.lastOutcome === FINAL_URANS_OUTCOMES.continuationPending ||
+    item.lastOutcome === FINAL_URANS_OUTCOMES.continuationRetryWait;
+  if (
+    continuationRequested &&
+    item.continuationAttemptCount < item.freshAttemptCount &&
+    item.latestResultAttemptId
+  ) {
+    const [source] = await db
+      .select({
+        id: resultAttempts.id,
+        airfoilId: resultAttempts.airfoilId,
+        revisionId: resultAttempts.simulationPresetRevisionId,
+        aoaDeg: resultAttempts.aoaDeg,
+        engineJobId: resultAttempts.engineJobId,
+        engineCaseSlug: resultAttempts.engineCaseSlug,
+        solverImplementationId: resultAttempts.solverImplementationId,
+        fidelity: sql<
+          string | null
+        >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+      })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.id, item.latestResultAttemptId))
+      .limit(1);
+    if (
+      source &&
+      source.airfoilId === item.airfoilId &&
+      source.revisionId === item.revisionId &&
+      Number(source.aoaDeg) === Number(item.aoaDeg) &&
+      source.fidelity === "urans_full" &&
+      source.engineJobId &&
+      source.engineCaseSlug
+    ) {
+      return {
+        mode: "continuation",
+        resultAttemptId: source.id,
+        engineJobId: source.engineJobId,
+        engineCaseSlug: source.engineCaseSlug,
+        solverImplementationId: source.solverImplementationId,
+        budgetOverrideS:
+          item.continuationBudgetOverrideS ?? FINAL_URANS_CONTINUATION_BUDGET_S,
+      };
+    }
+  }
+  if (item.freshAttemptCount < item.maxFreshAttempts) {
+    return { mode: "fresh" };
+  }
+  return {
+    mode: "exhausted",
+    reason:
+      "full URANS automatic recovery exhausted its fresh-start and same-case continuation allowances",
+  };
+}
+
+/** Media repair can make the exact rejected full attempt publishable without
+ * another CFD solve. Complete the waiting verification from that repaired
+ * immutable attempt; this is idempotent and exact-attempt fenced. */
+export async function settleFinalUransVerificationAfterMediaRepair(
+  db: DB,
+  resultAttemptId: string,
+): Promise<number> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [attempt] = await tx
+      .select({
+        id: resultAttempts.id,
+        resultId: resultAttempts.resultId,
+        simJobId: resultAttempts.simJobId,
+        cl: resultAttempts.cl,
+        cd: resultAttempts.cd,
+        cm: resultAttempts.cm,
+        classification: resultClassifications.state,
+      })
+      .from(resultAttempts)
+      .leftJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
+      .where(eq(resultAttempts.id, resultAttemptId))
+      .limit(1);
+    if (!attempt?.resultId || attempt.classification !== "accepted") {
+      return 0;
+    }
+    const [job] = attempt.simJobId
+      ? ((await tx.execute(sql`
+          SELECT request_payload -> 'verifyPrecalc' AS verify_precalc
+          FROM sim_jobs
+          WHERE id = ${attempt.simJobId}
+            AND request_payload ->> 'verifyQueueItemId' IS NOT NULL
+          LIMIT 1
+        `)) as unknown as Array<{
+          verify_precalc: {
+            cl?: number | null;
+            cd?: number | null;
+            cm?: number | null;
+          } | null;
+        }>)
+      : [];
+    const precalc = job?.verify_precalc ?? {};
+    const delta = (before: number | null | undefined, after: number | null) =>
+      typeof before === "number" &&
+      Number.isFinite(before) &&
+      typeof after === "number" &&
+      Number.isFinite(after)
+        ? after - before
+        : null;
+    const deltaCl = delta(precalc.cl, attempt.cl);
+    const deltaCd = delta(precalc.cd, attempt.cd);
+    const deltaCm = delta(precalc.cm, attempt.cm);
+    const disagreed =
+      (deltaCl !== null && Math.abs(deltaCl) > 0.05) ||
+      (deltaCd !== null && Math.abs(deltaCd) > 0.01);
+    const rows = (await tx.execute(sql`
+      UPDATE sim_urans_verify_queue q
+      SET state = ${disagreed ? "disagreed" : "done"},
+          verify_result_id = ${attempt.resultId},
+          delta_cl = ${deltaCl},
+          delta_cd = ${deltaCd},
+          delta_cm = ${deltaCm},
+          last_outcome = ${disagreed ? FINAL_URANS_OUTCOMES.disagreed : FINAL_URANS_OUTCOMES.accepted},
+          last_error = NULL,
+          next_submit_at = NULL,
+          "updatedAt" = now()
+      WHERE q.latest_result_attempt_id = ${attempt.id}
+        AND (
+          (
+            q.state = 'pending'
+            AND q.last_outcome = ${FINAL_URANS_OUTCOMES.mediaRepairPending}
+          )
+          OR (
+            q.state = 'blocked'
+            AND q.last_outcome = ${FINAL_URANS_OUTCOMES.recoveryExhausted}
+            AND EXISTS (
+              SELECT 1
+              FROM sim_solver_incidents incident
+              WHERE incident.verify_queue_id = q.id
+                AND incident.result_attempt_id = ${attempt.id}
+                AND incident.occurrence_key =
+                  concat_ws(
+                    ':',
+                    'final',
+                    q.id::text,
+                    ${attempt.id}::uuid::text,
+                    ${FINAL_URANS_OUTCOMES.recoveryExhausted}::text
+                  )
+            )
+          )
+        )
+      RETURNING q.id
+    `)) as unknown as Array<{ id: string }>;
+    for (const row of rows) {
+      await resolveSolverIncidentsForOwnerInTransaction(tx, {
+        verifyQueueId: row.id,
+      });
+      await refreshFullUransRequestsForVerifyQueueInTransaction(tx, row.id);
+    }
+    return rows.length;
+  });
 }

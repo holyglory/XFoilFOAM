@@ -50,8 +50,17 @@ WAKE_EXPANSION = 50.0  # last/first cell ratio along the wake
 # every segment owns at least one real streamwise cell.
 SURFACE_BLOCK_SEGMENTS = 20
 SEGMENTED_NORMAL_COUNTS = (20, 24, 29, 32)
+SEGMENTED_TE_NORMAL_COUNTS = (20, 24)
+SEGMENTED_CAMBER_VARIANTS = {
+    "c150-a200-s5": (1.5, 200.0, 5),
+    "c300-a200-s10": (3.0, 200.0, 10),
+    "c150-a195-s12": (1.5, 195.0, 12),
+    "c300-a195-s26": (3.0, 195.0, 26),
+}
 LEGACY_TOPOLOGY = "legacy"
 SEGMENTED_NORMAL_TOPOLOGY = "segmented-normal"
+SEGMENTED_TE_NORMAL_TOPOLOGY = "segmented-te-normal"
+SEGMENTED_CAMBER_TOPOLOGY = "segmented-camber"
 _SEGMENTED_PREFLIGHT_EPSILON = 1e-10
 _PROCESS_KILL_RETURN_CODES = frozenset({137, 143, -9, -15})
 _LAUNCH_FAILURE_RETURN_CODES = frozenset({125, 126, 127})
@@ -61,34 +70,36 @@ _OOM_OUTPUT_RE = re.compile(
 )
 
 
-def _blockmesh_infrastructure_reason(result: RunResult) -> str | None:
-    """Return a structured execution failure that must not repair geometry.
+def _mesher_infrastructure_reason(
+    result: RunResult,
+    command: str,
+) -> str | None:
+    """Return a structured mesher execution failure that is not geometry.
 
-    ``blockMesh`` uses ordinary non-zero exits for deterministic dictionary or
-    topology rejection, so those remain eligible for the recovery ladder. A
-    timeout, process signal, container kill, or explicit OOM record instead
+    OpenFOAM meshers use ordinary non-zero exits for deterministic dictionary
+    or topology rejection, so those remain eligible for the recovery ladder.
+    A timeout, process signal, container kill, or explicit OOM record instead
     proves only that the execution environment failed; classifying it as a
-    geometry verdict would make every recovery candidate repeat the same
-    infrastructure incident and eventually mislabel the airfoil as blocked.
+    geometry verdict would eventually mislabel a valid airfoil as exhausted.
     """
 
     returncode = int(getattr(result, "returncode", 0) or 0)
     if bool(getattr(result, "timed_out", False)) or returncode == 124:
-        return "blockMesh timed out before producing a trustworthy mesh verdict"
+        return f"{command} timed out before producing a trustworthy mesh verdict"
     if returncode in _PROCESS_KILL_RETURN_CODES:
         return (
-            "blockMesh was terminated by the execution environment "
+            f"{command} was terminated by the execution environment "
             f"(return code {returncode})"
         )
     if returncode in _LAUNCH_FAILURE_RETURN_CODES:
         return (
-            "blockMesh was unavailable in the execution environment "
+            f"{command} was unavailable in the execution environment "
             f"(return code {returncode})"
         )
     output = str(getattr(result, "stdout", "") or "")
     if returncode != 0 and _OOM_OUTPUT_RE.search(output):
         return (
-            "blockMesh stopped because the execution environment reported an "
+            f"{command} stopped because the execution environment reported an "
             f"out-of-memory/process-kill condition (return code {returncode})"
         )
     return None
@@ -228,6 +239,7 @@ def _preflight_segmented_passage(
     outer_angles: list[float],
     radius: float,
     *,
+    center_x: float = 0.0,
     passage: str,
 ) -> None:
     """Reject a folded segmented passage before emitting/running blockMesh.
@@ -251,7 +263,13 @@ def _preflight_segmented_passage(
         )
 
     outer = [
-        np.asarray((radius * math.cos(angle), radius * math.sin(angle)), dtype=float)
+        np.asarray(
+            (
+                center_x + radius * math.cos(angle),
+                radius * math.sin(angle),
+            ),
+            dtype=float,
+        )
         for angle in outer_angles
     ]
     for segment, (start, stop) in enumerate(zip(cuts, cuts[1:])):
@@ -285,17 +303,28 @@ class BlockMeshCGrid(Mesher):
         *,
         topology: str = LEGACY_TOPOLOGY,
         surface_segments: int | None = None,
+        camber_variant: str | None = None,
     ) -> None:
-        if topology not in {LEGACY_TOPOLOGY, SEGMENTED_NORMAL_TOPOLOGY}:
+        if topology not in {
+            LEGACY_TOPOLOGY,
+            SEGMENTED_NORMAL_TOPOLOGY,
+            SEGMENTED_TE_NORMAL_TOPOLOGY,
+            SEGMENTED_CAMBER_TOPOLOGY,
+        }:
             raise ValueError(f"unknown blockMesh C-grid topology {topology!r}")
         if topology == LEGACY_TOPOLOGY:
             if surface_segments is not None:
                 raise ValueError("legacy blockMesh C-grid does not accept surface_segments")
+            if camber_variant is not None:
+                raise ValueError("legacy blockMesh C-grid does not accept camber_variant")
             self.name = "blockmesh-cgrid"
             self.cache_version = "legacy-four-block-v1"
             self.surface_segments = None
+            self.camber_variant = None
             self.user_selectable = True
-        else:
+        elif topology == SEGMENTED_NORMAL_TOPOLOGY:
+            if camber_variant is not None:
+                raise ValueError("segmented-normal does not accept camber_variant")
             if surface_segments not in SEGMENTED_NORMAL_COUNTS:
                 raise ValueError(
                     "segmented-normal surface_segments must be one of "
@@ -304,12 +333,52 @@ class BlockMeshCGrid(Mesher):
             self.name = f"blockmesh-cgrid-segmented-normal-{surface_segments}"
             self.cache_version = f"segmented-normal-{surface_segments}-v1"
             self.surface_segments = int(surface_segments)
+            self.camber_variant = None
+            self.user_selectable = False
+        elif topology == SEGMENTED_TE_NORMAL_TOPOLOGY:
+            if camber_variant is not None:
+                raise ValueError("segmented-te-normal does not accept camber_variant")
+            if surface_segments not in SEGMENTED_TE_NORMAL_COUNTS:
+                raise ValueError(
+                    "segmented-te-normal surface_segments must be one of "
+                    f"{SEGMENTED_TE_NORMAL_COUNTS}, got {surface_segments!r}"
+                )
+            self.name = f"blockmesh-cgrid-segmented-te-normal-{surface_segments}"
+            self.cache_version = f"segmented-te-normal-{surface_segments}-v1"
+            self.surface_segments = int(surface_segments)
+            self.camber_variant = None
+            self.user_selectable = False
+        else:
+            if surface_segments is not None:
+                raise ValueError("segmented-camber does not accept surface_segments")
+            if camber_variant not in SEGMENTED_CAMBER_VARIANTS:
+                raise ValueError(
+                    "segmented-camber camber_variant must be one of "
+                    f"{tuple(SEGMENTED_CAMBER_VARIANTS)}, got {camber_variant!r}"
+                )
+            _center_x, _angle_deg, segments = SEGMENTED_CAMBER_VARIANTS[camber_variant]
+            self.name = f"blockmesh-cgrid-segmented-camber-{camber_variant}"
+            self.cache_version = f"segmented-camber-{camber_variant}-v1"
+            self.surface_segments = int(segments)
+            self.camber_variant = camber_variant
             self.user_selectable = False
         self.topology = topology
 
     @classmethod
     def segmented_normal(cls, surface_segments: int = SURFACE_BLOCK_SEGMENTS) -> "BlockMeshCGrid":
         return cls(topology=SEGMENTED_NORMAL_TOPOLOGY, surface_segments=surface_segments)
+
+    @classmethod
+    def segmented_te_normal(
+        cls, surface_segments: int = SURFACE_BLOCK_SEGMENTS
+    ) -> "BlockMeshCGrid":
+        return cls(topology=SEGMENTED_TE_NORMAL_TOPOLOGY, surface_segments=surface_segments)
+
+    @classmethod
+    def segmented_camber(
+        cls, variant: str = "c150-a200-s5"
+    ) -> "BlockMeshCGrid":
+        return cls(topology=SEGMENTED_CAMBER_TOPOLOGY, camber_variant=variant)
 
     # -- public API --------------------------------------------------------- #
     def patches(self, params: MeshParams) -> list[BoundaryPatch]:
@@ -341,7 +410,7 @@ class BlockMeshCGrid(Mesher):
                 f"blockMesh output could not be preserved as evidence: {exc}"
             ) from exc
 
-        infrastructure_reason = _blockmesh_infrastructure_reason(res)
+        infrastructure_reason = _mesher_infrastructure_reason(res, "blockMesh")
         if infrastructure_reason is not None:
             raise InfrastructureError(infrastructure_reason)
 
@@ -485,13 +554,49 @@ class BlockMeshCGrid(Mesher):
 
     def _build_segmented_dict(self, airfoil: Airfoil, params: MeshParams, chord: float) -> str:
         R = params.farfield_radius_chords
+        # The v1 recovery arc is centred on the leading edge.  Its upper/lower
+        # TE connector therefore runs diagonally from (1, 0) to (0, +/-R),
+        # which folds the first segmented block on sufficiently thick real
+        # profiles.  The v2-only topology centres the arc on the trailing edge
+        # and increases its radius by one chord.  That preserves the exact
+        # requested upstream extent (-R), makes the TE connector wall-normal,
+        # and keeps the authoritative airfoil contour and requested cell
+        # counts unchanged.
+        if self.topology == SEGMENTED_TE_NORMAL_TOPOLOGY:
+            outer_center_x = 1.0
+            le_outer_angle = math.pi
+        elif self.topology == SEGMENTED_CAMBER_TOPOLOGY:
+            # Strongly cambered profiles can have a lower-surface tangent that
+            # leaves the geometric LE upward.  Forcing their shared outer LE
+            # vertex to 180 degrees makes every lower nose block non-convex.
+            # Bounded 195--200-degree seams follow the real outward-normal
+            # cone; each forward-shifted circle still crosses x=-R, so the
+            # requested upstream extent and authoritative contour are
+            # preserved.
+            if self.camber_variant is None:  # constructor invariant
+                raise RuntimeError("segmented-camber topology has no configured variant")
+            outer_center_x, le_outer_angle_deg, _segments = (
+                SEGMENTED_CAMBER_VARIANTS[self.camber_variant]
+            )
+            le_outer_angle = math.radians(le_outer_angle_deg)
+        else:
+            outer_center_x = 0.0
+            le_outer_angle = math.pi
+        outer_radius = R + outer_center_x
         Xo = 1.0 + params.wake_length_chords
         span = params.span_chords
         n_surf = params.n_surface
         n_rad = params.n_radial
         n_wake = params.n_wake
 
-        rad_grading = solve_expansion(params.first_cell_height_chords, R, n_rad)
+        # Size the v2 grading against its longest TE connector so the bounded
+        # recovery wall height remains a true maximum.  The shorter upstream
+        # connectors become slightly finer; no wall cell is enlarged.
+        rad_grading = solve_expansion(
+            params.first_cell_height_chords,
+            outer_radius,
+            n_rad,
+        )
         wake_grading = f"{WAKE_EXPANSION}"
 
         # --- segmented surface paths -------------------------------------- #
@@ -514,23 +619,25 @@ class BlockMeshCGrid(Mesher):
         upper_path = upper[::-1]  # TE -> LE
         lower_path = lower  # LE -> TE
         upper_outer_angles = _normal_aligned_outer_angles(
-            upper_path, cuts, math.pi / 2, math.pi
+            upper_path, cuts, math.pi / 2, le_outer_angle
         )
         lower_outer_angles = _normal_aligned_outer_angles(
-            lower_path, cuts, math.pi, 3 * math.pi / 2
+            lower_path, cuts, le_outer_angle, 3 * math.pi / 2
         )
         _preflight_segmented_passage(
             upper_path,
             cuts,
             upper_outer_angles,
-            R,
+            outer_radius,
+            center_x=outer_center_x,
             passage="upper",
         )
         _preflight_segmented_passage(
             lower_path,
             cuts,
             lower_outer_angles,
-            R,
+            outer_radius,
+            center_x=outer_center_x,
             passage="lower",
         )
 
@@ -546,19 +653,29 @@ class BlockMeshCGrid(Mesher):
 
         upper_inner = [add(upper_path[index]) for index in cuts]
         upper_outer = [
-            add((R * math.cos(angle), R * math.sin(angle)))
+            add(
+                (
+                    outer_center_x + outer_radius * math.cos(angle),
+                    outer_radius * math.sin(angle),
+                )
+            )
             for angle in upper_outer_angles
         ]
         # LE and inlet-front vertices are shared between the two passages.
         lower_inner = [upper_inner[-1]] + [add(lower_path[index]) for index in cuts[1:]]
         lower_outer = [upper_outer[-1]] + [
-            add((R * math.cos(angle), R * math.sin(angle)))
+            add(
+                (
+                    outer_center_x + outer_radius * math.cos(angle),
+                    outer_radius * math.sin(angle),
+                )
+            )
             for angle in lower_outer_angles[1:]
         ]
-        outlet_top = add((Xo, R))
+        outlet_top = add((Xo, outer_radius))
         outlet_wake_top = add((Xo, 0.0))
         outlet_wake_bottom = add((Xo, 0.0))
-        outlet_bottom = add((Xo, -R))
+        outlet_bottom = add((Xo, -outer_radius))
 
         # --- vertices (z=0 then z=span) ------------------------------------ #
         vert_lines = []
@@ -594,7 +711,8 @@ class BlockMeshCGrid(Mesher):
                     mid_theta = 0.5 * (outer_angles[j] + outer_angles[j + 1])
                     edge_lines.append(
                         f"    arc {outer[j] + offset} {outer[j + 1] + offset} "
-                        f"({R * math.cos(mid_theta):.8g} {R * math.sin(mid_theta):.8g} {z:.8g})"
+                        f"({outer_center_x + outer_radius * math.cos(mid_theta):.8g} "
+                        f"{outer_radius * math.sin(mid_theta):.8g} {z:.8g})"
                     )
 
         # --- blocks -------------------------------------------------------- #
@@ -750,3 +868,7 @@ class BlockMeshCGrid(Mesher):
 register_mesher(BlockMeshCGrid())
 for _segments in SEGMENTED_NORMAL_COUNTS:
     register_mesher(BlockMeshCGrid.segmented_normal(_segments))
+for _segments in SEGMENTED_TE_NORMAL_COUNTS:
+    register_mesher(BlockMeshCGrid.segmented_te_normal(_segments))
+for _variant in SEGMENTED_CAMBER_VARIANTS:
+    register_mesher(BlockMeshCGrid.segmented_camber(_variant))

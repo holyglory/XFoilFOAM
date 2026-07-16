@@ -11,7 +11,13 @@ import { sql } from "drizzle-orm";
 
 import type { DB } from "./client";
 import { acquireResultEvidenceLock } from "./result-evidence-lock";
+import {
+  recordSolverIncidentInTransaction,
+  solverIncidentReason,
+  URANS_RECOVERY_REMEDIATION_VERSION,
+} from "./solver-incidents";
 import { resultMediaRepairs } from "./schema";
+import { refreshFullUransRequestsForVerifyQueueInTransaction } from "./urans-ladder";
 
 export const MAX_RESULT_MEDIA_REPAIR_ATTEMPTS = 3;
 export const RESULT_MEDIA_REPAIR_LEASE_MS = 10 * 60_000;
@@ -26,6 +32,123 @@ export interface SatisfiedResultMediaRepair extends ResultMediaRepair {
   status: string;
   regime: string | null;
   fidelity: string | null;
+}
+
+const FINAL_MEDIA_REPAIR_PENDING_OUTCOME = "media_repair_pending";
+const FINAL_MEDIA_REPAIR_EXHAUSTED_OUTCOME = "final_recovery_exhausted";
+
+/**
+ * Atomically project an exhausted exact-attempt media repair into the final
+ * verification ledger and its critical incident. Callers that transition the
+ * repair row to blocked use this helper inside the same transaction, so a
+ * process crash cannot leave an unclaimable repair beside a forever-pending
+ * verification item.
+ */
+export async function blockFinalUransVerificationAfterMediaRepairInTransaction(
+  tx: DB,
+  resultAttemptId: string,
+  error: string,
+): Promise<number> {
+  const [attempt] = (await tx.execute(sql`
+    SELECT
+      attempt.id,
+      attempt.sim_job_id,
+      COALESCE(
+        attempt.solver_implementation_id,
+        job.solver_implementation_id,
+        revision.solver_implementation_id
+      ) AS solver_implementation_id,
+      classification.reasons AS classification_reasons
+    FROM result_attempts attempt
+    LEFT JOIN result_classifications classification
+      ON classification.result_attempt_id = attempt.id
+    LEFT JOIN sim_jobs job
+      ON job.id = attempt.sim_job_id
+    LEFT JOIN simulation_preset_revisions revision
+      ON revision.id = attempt.simulation_preset_revision_id
+    WHERE attempt.id = ${resultAttemptId}
+    LIMIT 1
+  `)) as unknown as Array<{
+    id: string;
+    sim_job_id: string | null;
+    solver_implementation_id: string | null;
+    classification_reasons: string[] | null;
+  }>;
+  if (!attempt) return 0;
+
+  const reason =
+    error.trim().slice(0, 2_000) ||
+    "automatic media repair exhausted without an error message";
+  const rows = (await tx.execute(sql`
+    UPDATE sim_urans_verify_queue q
+    SET state = 'blocked',
+        last_outcome = ${FINAL_MEDIA_REPAIR_EXHAUSTED_OUTCOME},
+        last_error = ${reason},
+        next_submit_at = NULL,
+        "updatedAt" = now()
+    WHERE q.latest_result_attempt_id = ${resultAttemptId}
+      AND q.state = 'pending'
+      AND q.last_outcome = ${FINAL_MEDIA_REPAIR_PENDING_OUTCOME}
+    RETURNING
+      q.id,
+      q.fresh_attempt_count,
+      q.max_fresh_attempts,
+      q.continuation_attempt_count
+  `)) as unknown as Array<{
+    id: string;
+    fresh_attempt_count: number;
+    max_fresh_attempts: number;
+    continuation_attempt_count: number;
+  }>;
+  if (!rows.length) return 0;
+  if (!attempt.solver_implementation_id) {
+    throw new Error(
+      `final media repair attempt ${resultAttemptId} has no solver implementation for incident attribution`,
+    );
+  }
+
+  for (const row of rows) {
+    await recordSolverIncidentInTransaction(tx, {
+      stage: "final",
+      reason: solverIncidentReason(
+        attempt.classification_reasons,
+        "media-repair-exhausted",
+      ),
+      severity: "critical",
+      owner: { verifyQueueId: row.id },
+      solverImplementationId: attempt.solver_implementation_id,
+      occurrenceKey: `final:${row.id}:${attempt.id}:${FINAL_MEDIA_REPAIR_EXHAUSTED_OUTCOME}`,
+      remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+      simJobId: attempt.sim_job_id,
+      resultAttemptId: attempt.id,
+      metadata: {
+        lastOutcome: FINAL_MEDIA_REPAIR_EXHAUSTED_OUTCOME,
+        classificationReasons: attempt.classification_reasons ?? [],
+        freshAttemptCount: row.fresh_attempt_count,
+        maxFreshAttempts: row.max_fresh_attempts,
+        continuationAttemptCount: row.continuation_attempt_count,
+        mediaRepairError: reason,
+      },
+    });
+    await refreshFullUransRequestsForVerifyQueueInTransaction(tx, row.id);
+  }
+  return rows.length;
+}
+
+/** Exhausted media repair is a final-stage reliability incident. The accepted
+ * preliminary generation remains selected and visible. */
+export async function blockFinalUransVerificationAfterMediaRepair(
+  db: DB,
+  resultAttemptId: string,
+  error: string,
+): Promise<number> {
+  return db.transaction((rawTx) =>
+    blockFinalUransVerificationAfterMediaRepairInTransaction(
+      rawTx as unknown as DB,
+      resultAttemptId,
+      error,
+    ),
+  );
 }
 
 /** Exact-attempt completeness proof shared by crash recovery and settlement.
@@ -205,7 +328,16 @@ export async function discoverMissingResultMediaRepairs(
         ) AS evidence_signature
       FROM results r
       JOIN LATERAL (
-        SELECT attempt.*
+        SELECT
+          attempt.*,
+          EXISTS (
+            SELECT 1
+            FROM sim_urans_verify_queue verify_item
+            WHERE verify_item.latest_result_attempt_id = attempt.id
+              AND verify_item.precalc_result_id = r.id
+              AND verify_item.state = 'pending'
+              AND verify_item.last_outcome = 'media_repair_pending'
+          ) AS final_media_repair_owner
         FROM result_attempts attempt
         LEFT JOIN result_classifications classification
           ON classification.result_attempt_id = attempt.id
@@ -215,12 +347,32 @@ export async function discoverMissingResultMediaRepairs(
           AND (
             attempt.id = r.current_result_attempt_id
             OR (
-              r.current_result_attempt_id IS NULL
-              AND classification.state = 'rejected'
+              classification.state = 'rejected'
               AND classification.reasons = ARRAY['missing-urans-video']::text[]
+              AND (
+                r.current_result_attempt_id IS NULL
+                OR EXISTS (
+                  SELECT 1
+                  FROM sim_urans_verify_queue verify_item
+                  WHERE verify_item.latest_result_attempt_id = attempt.id
+                    AND verify_item.precalc_result_id = r.id
+                    AND verify_item.state = 'pending'
+                    AND verify_item.last_outcome = 'media_repair_pending'
+                )
+              )
             )
           )
         ORDER BY
+          (
+            EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue verify_item
+              WHERE verify_item.latest_result_attempt_id = attempt.id
+                AND verify_item.precalc_result_id = r.id
+                AND verify_item.state = 'pending'
+                AND verify_item.last_outcome = 'media_repair_pending'
+            )
+          ) DESC,
           (attempt.id = r.current_result_attempt_id) DESC,
           CASE attempt.evidence_payload ->> 'fidelity'
             WHEN 'urans_full' THEN 3
@@ -258,6 +410,8 @@ export async function discoverMissingResultMediaRepairs(
         AND (${opts.resultId ?? null}::uuid IS NULL OR r.id = ${opts.resultId ?? null}::uuid)
         AND (${opts.airfoilId ?? null}::uuid IS NULL OR r.airfoil_id = ${opts.airfoilId ?? null}::uuid)
         AND (
+          candidate.final_media_repair_owner
+          OR
           NOT EXISTS (
             SELECT 1 FROM result_field_extents extent
             WHERE extent.result_id = r.id
@@ -499,31 +653,46 @@ export async function healExpiredResultMediaRepairClaims(
 ): Promise<{ retrying: number; blocked: number }> {
   const now = opts.now ?? new Date();
   const nowIso = now.toISOString();
-  const rows = (await db.execute(sql`
-    UPDATE result_media_repairs repair
-    SET state = CASE
-          WHEN repair.attempt_count >= repair.max_attempts THEN 'blocked'
-          ELSE 'retry_wait'
-        END,
-        claim_token = NULL,
-        claimed_at = NULL,
-        claim_expires_at = NULL,
-        next_attempt_at = ${nowIso}::timestamptz,
-        last_error = CASE
-          WHEN repair.attempt_count >= repair.max_attempts
-            THEN 'automatic media repair exhausted after renderer claim expired'
-          ELSE 'renderer claim expired before completion; retry scheduled'
-        END,
-        "updatedAt" = ${nowIso}::timestamptz
-    WHERE repair.state = 'running'
-      AND repair.claim_expires_at IS NOT NULL
-      AND repair.claim_expires_at <= ${nowIso}::timestamptz
-    RETURNING state
-  `)) as unknown as Array<{ state: string }>;
-  return {
-    retrying: rows.filter((row) => row.state === "retry_wait").length,
-    blocked: rows.filter((row) => row.state === "blocked").length,
-  };
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const rows = (await tx.execute(sql`
+      UPDATE result_media_repairs repair
+      SET state = CASE
+            WHEN repair.attempt_count >= repair.max_attempts THEN 'blocked'
+            ELSE 'retry_wait'
+          END,
+          claim_token = NULL,
+          claimed_at = NULL,
+          claim_expires_at = NULL,
+          next_attempt_at = ${nowIso}::timestamptz,
+          last_error = CASE
+            WHEN repair.attempt_count >= repair.max_attempts
+              THEN 'automatic media repair exhausted after renderer claim expired'
+            ELSE 'renderer claim expired before completion; retry scheduled'
+          END,
+          "updatedAt" = ${nowIso}::timestamptz
+      WHERE repair.state = 'running'
+        AND repair.claim_expires_at IS NOT NULL
+        AND repair.claim_expires_at <= ${nowIso}::timestamptz
+      RETURNING state, result_attempt_id, last_error
+    `)) as unknown as Array<{
+      state: "retry_wait" | "blocked";
+      result_attempt_id: string;
+      last_error: string;
+    }>;
+    for (const row of rows) {
+      if (row.state !== "blocked") continue;
+      await blockFinalUransVerificationAfterMediaRepairInTransaction(
+        tx,
+        row.result_attempt_id,
+        row.last_error,
+      );
+    }
+    return {
+      retrying: rows.filter((row) => row.state === "retry_wait").length,
+      blocked: rows.filter((row) => row.state === "blocked").length,
+    };
+  });
 }
 
 /** Token-fenced lease renewal for long multi-field render passes. */
@@ -584,21 +753,83 @@ export async function failClaimedResultMediaRepair(
   const reason =
     error.trim().slice(0, 2_000) ||
     "automatic media repair failed without an error message";
-  const rows = (await db.execute(sql`
-    UPDATE result_media_repairs
-    SET state = ${exhausted ? "blocked" : "retry_wait"},
-        claim_token = NULL,
-        claimed_at = NULL,
-        claim_expires_at = NULL,
-        next_attempt_at = ${exhausted ? nowIso : nextIso}::timestamptz,
-        last_error = ${reason},
-        "updatedAt" = ${nowIso}::timestamptz
-    WHERE id = ${repair.id}
-      AND state = 'running'
-      AND claim_token = ${repair.claimToken}::uuid
-    RETURNING state
-  `)) as unknown as Array<{ state: "retry_wait" | "blocked" }>;
-  return rows[0]?.state ?? null;
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const rows = (await tx.execute(sql`
+      UPDATE result_media_repairs
+      SET state = ${exhausted ? "blocked" : "retry_wait"},
+          claim_token = NULL,
+          claimed_at = NULL,
+          claim_expires_at = NULL,
+          next_attempt_at = ${exhausted ? nowIso : nextIso}::timestamptz,
+          last_error = ${reason},
+          "updatedAt" = ${nowIso}::timestamptz
+      WHERE id = ${repair.id}
+        AND state = 'running'
+        AND claim_token = ${repair.claimToken}::uuid
+      RETURNING state, result_attempt_id
+    `)) as unknown as Array<{
+      state: "retry_wait" | "blocked";
+      result_attempt_id: string;
+    }>;
+    const state = rows[0]?.state ?? null;
+    if (state === "blocked") {
+      await blockFinalUransVerificationAfterMediaRepairInTransaction(
+        tx,
+        rows[0]!.result_attempt_id,
+        reason,
+      );
+    }
+    return state;
+  });
+}
+
+/**
+ * Close the historical crash window from releases where the repair row could
+ * become blocked before the final verification queue and incident were
+ * updated. This never retries CFD or media work; it only projects an already
+ * durable blocked state to the exact waiting owner.
+ */
+export async function reconcileBlockedFinalMediaRepairVerifications(
+  db: DB,
+  opts: { limit?: number; resultId?: string } = {},
+): Promise<number> {
+  const limit = Math.max(1, Math.min(opts.limit ?? 100, 1_000));
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const rows = (await tx.execute(sql`
+      SELECT
+        repair.result_attempt_id,
+        repair.last_error
+      FROM result_media_repairs repair
+      JOIN sim_urans_verify_queue queue
+        ON queue.latest_result_attempt_id = repair.result_attempt_id
+       AND queue.state = 'pending'
+       AND queue.last_outcome = ${FINAL_MEDIA_REPAIR_PENDING_OUTCOME}
+      WHERE repair.state = 'blocked'
+        AND (
+          ${opts.resultId ?? null}::uuid IS NULL
+          OR repair.result_id = ${opts.resultId ?? null}::uuid
+        )
+      ORDER BY repair."updatedAt", repair.id
+      LIMIT ${limit}
+      FOR UPDATE OF repair, queue SKIP LOCKED
+    `)) as unknown as Array<{
+      result_attempt_id: string;
+      last_error: string | null;
+    }>;
+    let reconciled = 0;
+    for (const row of rows) {
+      reconciled +=
+        await blockFinalUransVerificationAfterMediaRepairInTransaction(
+          tx,
+          row.result_attempt_id,
+          row.last_error ??
+            "automatic media repair was already exhausted before final verification settlement",
+        );
+    }
+    return reconciled;
+  });
 }
 
 /**
@@ -755,22 +986,33 @@ export async function invalidateSatisfiedResultMediaRepair(
   const nowIso = now.toISOString();
   const reason =
     error.trim().slice(0, 2_000) || "stored media byte verification failed";
-  const rows = (await db.execute(sql`
-    UPDATE result_media_repairs
-    SET state = CASE WHEN attempt_count >= max_attempts THEN 'blocked' ELSE 'retry_wait' END,
-        claim_token = NULL,
-        claimed_at = NULL,
-        claim_expires_at = NULL,
-        next_attempt_at = ${nowIso}::timestamptz,
-        last_error = ${reason},
-        completed_at = NULL,
-        downstream_finalized_at = NULL,
-        "updatedAt" = ${nowIso}::timestamptz
-    WHERE id = ${repairId}
-      AND result_attempt_id = ${resultAttemptId}
-      AND evidence_signature = ${evidenceSignature}
-      AND downstream_finalized_at IS NULL
-    RETURNING state
-  `)) as unknown as Array<{ state: "retry_wait" | "blocked" }>;
-  return rows[0]?.state ?? null;
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const rows = (await tx.execute(sql`
+      UPDATE result_media_repairs
+      SET state = CASE WHEN attempt_count >= max_attempts THEN 'blocked' ELSE 'retry_wait' END,
+          claim_token = NULL,
+          claimed_at = NULL,
+          claim_expires_at = NULL,
+          next_attempt_at = ${nowIso}::timestamptz,
+          last_error = ${reason},
+          completed_at = NULL,
+          downstream_finalized_at = NULL,
+          "updatedAt" = ${nowIso}::timestamptz
+      WHERE id = ${repairId}
+        AND result_attempt_id = ${resultAttemptId}
+        AND evidence_signature = ${evidenceSignature}
+        AND downstream_finalized_at IS NULL
+      RETURNING state
+    `)) as unknown as Array<{ state: "retry_wait" | "blocked" }>;
+    const state = rows[0]?.state ?? null;
+    if (state === "blocked") {
+      await blockFinalUransVerificationAfterMediaRepairInTransaction(
+        tx,
+        resultAttemptId,
+        reason,
+      );
+    }
+    return state;
+  });
 }

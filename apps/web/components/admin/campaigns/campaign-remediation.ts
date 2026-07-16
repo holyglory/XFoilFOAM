@@ -23,36 +23,36 @@ export function campaignRemediationCopy(
   const reasons = new Set(remediation.groups.map((group) => group.reason));
   if (reasons.size === 1 && reasons.has("precalc_attempts_exhausted")) {
     return {
-      label: "preliminary unavailable",
+      label: "critical preliminary failure",
       title:
-        "Automatic preliminary recovery ended without usable evidence. This is not RANS work waiting for URANS and it is not a review task.",
+        "Preliminary URANS ended without a publishable result. This is a solver reliability incident, not normal RANS handoff or a review task.",
       detail:
-        "Automatic preliminary recovery finished without publishable evidence. The campaign continues around these unavailable points; no user action is required.",
+        "Required preliminary results are missing. The system must preserve the evidence, resume with corrected recovery capability, and investigate repeated incidents.",
     };
   }
   if (reasons.size === 1 && reasons.has("mesh_quality")) {
     return {
-      label: "mesh unavailable",
+      label: "critical mesh failure",
       title:
-        "Automatic safer-mesh recovery did not produce a usable mesh. This is not a review task.",
+        "Automatic safer-mesh recovery did not produce a usable mesh. This is a system reliability incident, not a review task.",
       detail:
-        "Automatic mesh recovery finished without a usable mesh. The campaign continues around these unavailable points; no user action is required.",
+        "Required preliminary results are missing. The system must adjust or repair the mesh path automatically and investigate recurrence.",
     };
   }
   if (reasons.size === 1 && reasons.has("engine_submit_rejected")) {
     return {
-      label: "engine unavailable",
+      label: "critical engine failure",
       title:
-        "The engine did not accept the bounded automatic preliminary submission. This is not a review task.",
+        "The engine did not accept automatic preliminary recovery. This is a system reliability incident, not a review task.",
       detail:
-        "The automatic preliminary submission was not accepted after its bounded retry. The campaign continues around these unavailable points; no user action is required.",
+        "Required preliminary results are missing. The system must recover engine admission and investigate repeated submission failures.",
     };
   }
   return {
-    label: "results unavailable",
+    label: "critical recovery failure",
     title:
-      "Automatic recovery ended without usable evidence. This is not a review task.",
+      "Automatic recovery ended without a publishable result. This is a system reliability incident, not a review task.",
     detail:
-      "Automatic recovery finished without publishable evidence. The campaign continues around these unavailable points; no user action is required.",
+      "Required results are missing. Automatic recovery and evidence-led investigation are required.",
   };
 }

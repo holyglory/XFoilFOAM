@@ -34,6 +34,7 @@ export interface RetryEvidenceRow {
   resultAttemptId?: string;
   aoaDeg: number;
   state: "accepted" | "needs_urans" | "rejected" | "superseded_by_urans";
+  reasons?: string[];
   /** Structured engine provenance. Absent legacy attempts may remain eligible
    * for targeted repair when they are coefficient-bearing and error-free, but
    * they can never authorize whole-polar promotion. */
@@ -120,7 +121,10 @@ function isHardSolverRejection(row: RetryEvidenceRow): boolean {
 function isTargetableRansRejection(row: RetryEvidenceRow): boolean {
   if (isHardSolverRejection(row)) return true;
   if (row.state !== "rejected" || row.failureDisposition) return false;
-  return row.error == null || row.error.trim() === "";
+  const reasons = row.reasons ?? [];
+  const aerodynamicTrouble =
+    reasons.includes("not-converged") || reasons.includes("solver-stalled");
+  return aerodynamicTrouble && (row.error == null || row.error.trim() === "");
 }
 
 /**
@@ -209,6 +213,7 @@ export async function ransRetryPlanForJobScoped(
       resultAttemptId: resultAttempts.id,
       aoaDeg: resultAttempts.aoaDeg,
       state: resultClassifications.state,
+      reasons: resultClassifications.reasons,
       error: resultAttempts.error,
       failureDisposition: sql<RansFailureDisposition | null>`
         CASE

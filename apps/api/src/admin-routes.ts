@@ -41,6 +41,8 @@ import {
   simUransRequestCampaigns,
   simUransVerifyQueue,
   simUransVerifyQueueCampaigns,
+  simUransVerifyQueueRequests,
+  solverIncidentSummary,
   syncLegacyBoundaryConditionForPreset as syncLegacyBoundaryConditionForPresetDb,
 } from "@aerodb/db";
 import { DEFAULT_TRANSIENT_MAX_COURANT } from "@aerodb/core";
@@ -1936,9 +1938,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
-  app.get("/api/admin/health", { preHandler: requireAdmin }, async () =>
-    systemHealthSnapshot(),
-  );
+  app.get("/api/admin/health", { preHandler: requireAdmin }, async () => {
+    const [system, solverIncidents] = await Promise.all([
+      systemHealthSnapshot(),
+      solverIncidentSummary(db, {
+        since: new Date(Date.now() - 24 * 60 * 60 * 1000),
+      }),
+    ]);
+    return { ...system, solverIncidents };
+  });
 
   // ---- mediums + setup state (protected writes) ----
   app.get("/api/admin/mediums", { preHandler: requireAdmin }, async () => {
@@ -4239,10 +4247,14 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  // Admin request-URANS (fidelity ladder contract 6): creates a work item the
-  // sweeper schedules at PRECALC rank (after all RANS gaps, before the verify
-  // queue). aoaDeg absent = whole polar. Idempotent per (cell, fidelity) —
-  // replaying returns the existing open request with created=false.
+  // Admin request-URANS (fidelity ladder contract 6): creates an owner for the
+  // same per-point sequence used by automatic recovery. PRECALC requests enter
+  // the fast-URANS queue; FULL requests first ensure that preliminary coverage
+  // exists, then own the ordinary final-verification queue. Targeted PRECALC
+  // admission alternates with open RANS work, while final verification has its
+  // bounded interleave/fallback. aoaDeg absent = whole polar. Idempotent per
+  // (cell, fidelity) — replaying returns the existing open request with
+  // created=false.
   //
   // CONTINUATION mode (amendment C): { continueFromResultId, budgetOverrideS? }
   // resumes a budget-stopped URANS solve from its saved engine case state with
@@ -4528,6 +4540,20 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
               ),
             )
         : [];
+      const verifyRequestOwners = verifyRows.length
+        ? await db
+            .select({
+              queueId: simUransVerifyQueueRequests.queueId,
+              requestId: simUransVerifyQueueRequests.requestId,
+            })
+            .from(simUransVerifyQueueRequests)
+            .where(
+              inArray(
+                simUransVerifyQueueRequests.queueId,
+                verifyRows.map((item) => item.id),
+              ),
+            )
+        : [];
       const requestRetries = requests.length
         ? await db
             .select()
@@ -4554,8 +4580,14 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         ...request,
         independentOwner: request.backgroundOwner,
         submitRetry:
-          requestRetries.find((retry) => retry.uransRequestId === request.id) ??
-          null,
+          request.fidelity === "full"
+            ? null
+            : (requestRetries.find(
+                (retry) => retry.uransRequestId === request.id,
+              ) ?? null),
+        finalCoverage: verifyRequestOwners
+          .filter((owner) => owner.requestId === request.id)
+          .map(({ queueId }) => ({ queueId })),
         campaignOwners: requestOwners
           .filter((owner) => owner.requestId === request.id)
           .map(({ campaignId, state }) => ({ campaignId, state })),
@@ -4569,6 +4601,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
           campaignOwners: verifyOwners
             .filter((owner) => owner.queueId === item.id)
             .map(({ campaignId, state }) => ({ campaignId, state })),
+          requestIds: verifyRequestOwners
+            .filter((owner) => owner.queueId === item.id)
+            .map((owner) => owner.requestId),
         }),
       );
       return { requests: requestsWithOwners, verifyItems };

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -42,16 +43,21 @@ __all__ = [
     "DEFAULT_CACHE_MAX_BYTES",
     "DEFAULT_CACHE_TTL_SECONDS",
     "DEFAULT_OBJECT_PREFIX",
+    "MAX_EVIDENCE_MANIFEST_BYTES",
     "POINTER_SCHEMA_VERSION",
     "ArchiveRecord",
     "CacheCleanupReport",
     "EvidenceArchiveError",
+    "EvidenceCapacityError",
     "EvidenceHydrationError",
+    "EvidenceIntegrityError",
     "EvidenceObjectStore",
     "EvidenceStoreError",
+    "EvidenceUnavailableError",
     "EvidenceUploadError",
     "RemoteEvidencePointer",
     "create_tar_zst",
+    "extract_verified_evidence_archive",
     "inspect_tar_zst",
     "manifest_bundle_member_set_sha256",
     "read_remote_pointer",
@@ -68,6 +74,12 @@ DEFAULT_CACHE_MAX_BYTES = 100 * 1024**3
 _BUFFER_SIZE = 1024 * 1024
 _HYDRATION_MARKER = ".hydrated.json"
 _LOCK_STRIPES = 4096
+_MAX_LOCAL_EVIDENCE_TAR_BYTES = 256 * 1024**3
+_MAX_REMOTE_EVIDENCE_STORED_BYTES = 256 * 1024**3
+_MAX_EVIDENCE_EXTRACTED_BYTES = 256 * 1024**3
+_MIN_FREE_SPACE_RESERVE_BYTES = 4 * 1024**3
+_FREE_SPACE_RESERVE_FRACTION = 0.10
+MAX_EVIDENCE_MANIFEST_BYTES = 64 * 1024**2
 
 
 class EvidenceStoreError(RuntimeError):
@@ -84,6 +96,18 @@ class EvidenceUploadError(EvidenceStoreError):
 
 class EvidenceHydrationError(EvidenceStoreError):
     """Raised when remote or archived evidence cannot be hydrated safely."""
+
+
+class EvidenceIntegrityError(EvidenceHydrationError):
+    """Immutable evidence metadata or bytes are internally inconsistent."""
+
+
+class EvidenceCapacityError(EvidenceHydrationError):
+    """Evidence is valid in principle but cannot fit safely on this filesystem."""
+
+
+class EvidenceUnavailableError(EvidenceHydrationError):
+    """Required storage or object-store bytes are temporarily unreachable."""
 
 
 @dataclass(frozen=True)
@@ -240,6 +264,52 @@ class _DigestReader:
 
     def hexdigest(self) -> str:
         return self.digest.hexdigest()
+
+
+def _nearest_existing_parent(path: Path) -> Path:
+    candidate = Path(path)
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate
+
+
+def _safe_extraction_capacity(destination: Path) -> int:
+    """Bytes that may be materialized while retaining an operational reserve."""
+
+    existing = _nearest_existing_parent(Path(destination).parent)
+    try:
+        usage = shutil.disk_usage(existing)
+    except OSError as exc:
+        raise EvidenceCapacityError(
+            f"cannot inspect evidence restore capacity at {existing}: {exc}"
+        ) from exc
+    reserve = max(
+        _MIN_FREE_SPACE_RESERVE_BYTES,
+        int(usage.total * _FREE_SPACE_RESERVE_FRACTION),
+    )
+    return max(
+        0,
+        min(
+            _MAX_EVIDENCE_EXTRACTED_BYTES,
+            int(usage.free) - reserve,
+        ),
+    )
+
+
+def _require_remote_pointer_bounds(pointer: RemoteEvidencePointer) -> None:
+    if pointer.tar_size > _MAX_LOCAL_EVIDENCE_TAR_BYTES:
+        raise EvidenceIntegrityError(
+            "remote evidence pointer declares an uncompressed tar larger than "
+            f"the {_MAX_LOCAL_EVIDENCE_TAR_BYTES}-byte safety limit"
+        )
+    if pointer.stored_size > _MAX_REMOTE_EVIDENCE_STORED_BYTES:
+        raise EvidenceIntegrityError(
+            "remote evidence pointer declares a stored archive larger than "
+            f"the {_MAX_REMOTE_EVIDENCE_STORED_BYTES}-byte safety limit"
+        )
 
 
 def create_tar_zst(
@@ -531,8 +601,16 @@ class EvidenceObjectStore:
 
         pointer = self._coerce_pointer(pointer)
         self._require_own_bucket(pointer)
+        _require_remote_pointer_bounds(pointer)
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        available = _safe_extraction_capacity(destination)
+        if pointer.stored_size > available:
+            raise EvidenceCapacityError(
+                "insufficient safe free space for the pinned evidence archive: "
+                f"requires {pointer.stored_size} bytes, {available} bytes available "
+                "after the filesystem reserve"
+            )
         temporary = _temporary_sibling(destination)
         try:
             blob = self.client.bucket(pointer.bucket).blob(pointer.object_key)
@@ -546,9 +624,13 @@ class EvidenceObjectStore:
             )
             actual_size, actual_sha256 = _size_and_sha256(temporary)
             if actual_size != pointer.stored_size or actual_sha256 != pointer.stored_sha256:
-                raise EvidenceHydrationError("downloaded archive size or SHA-256 does not match pointer")
+                raise EvidenceIntegrityError(
+                    "downloaded archive size or SHA-256 does not match pointer"
+                )
             if _crc32c_file(temporary) != pointer.crc32c:
-                raise EvidenceHydrationError("downloaded archive CRC32C does not match pointer")
+                raise EvidenceIntegrityError(
+                    "downloaded archive CRC32C does not match pointer"
+                )
             os.replace(temporary, destination)
             _fsync_directory(destination.parent)
             return destination
@@ -556,7 +638,11 @@ class EvidenceObjectStore:
             temporary.unlink(missing_ok=True)
             if isinstance(exc, EvidenceHydrationError):
                 raise
-            raise EvidenceHydrationError(
+            if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                raise EvidenceCapacityError(
+                    f"evidence archive download exhausted safe local storage: {exc}"
+                ) from exc
+            raise EvidenceUnavailableError(
                 f"could not materialize gs://{pointer.bucket}/{pointer.object_key}: {exc}"
             ) from exc
 
@@ -1171,6 +1257,7 @@ def _verify_archive_manifest_members(
 ) -> int:
     """Stream-authenticate one archive and every file named by its manifest."""
 
+    _require_remote_pointer_bounds(pointer)
     seen_archive_paths: set[str] = set()
     actual_files: dict[str, tuple[int, str]] = {}
     restored_manifest: bytes | None = None
@@ -1231,6 +1318,11 @@ def _verify_archive_manifest_members(
                                     f"archive member exceeds its header size: {normalized}"
                                 )
                             if manifest_chunks is not None:
+                                if member_size > MAX_EVIDENCE_MANIFEST_BYTES:
+                                    raise EvidenceIntegrityError(
+                                        "evidence manifest exceeds the "
+                                        f"{MAX_EVIDENCE_MANIFEST_BYTES}-byte limit"
+                                    )
                                 manifest_chunks.append(chunk)
                         if member_size != member.size:
                             raise EvidenceHydrationError(
@@ -1264,6 +1356,15 @@ def _verify_archive_manifest_members(
         )
     expected_files = _manifest_expected_files_payload(restored_manifest)
     excluded_roots = _manifest_bundle_excludes_payload(restored_manifest)
+    excluded_members = _manifest_excluded_archive_members(
+        seen_archive_paths,
+        excluded_roots,
+    )
+    if excluded_members:
+        raise EvidenceIntegrityError(
+            "archive contains a member under manifest bundleExcludes: "
+            f"{excluded_members[0]}"
+        )
     bundled_expected_files = {
         relative: expected
         for relative, expected in expected_files.items()
@@ -1279,7 +1380,295 @@ def _verify_archive_manifest_members(
             raise EvidenceHydrationError(
                 f"archive member failed manifest verification: {relative}"
             )
+    unmanifested = sorted(
+        set(actual_files) - set(expected_files) - {"evidence_manifest.json"}
+    )
+    if unmanifested:
+        raise EvidenceIntegrityError(
+            "archive member is missing from manifest: "
+            f"{unmanifested[0]}"
+        )
     return len(bundled_expected_files)
+
+
+def extract_verified_evidence_archive(
+    archive_path: Path,
+    destination: Path,
+    *,
+    compression: str,
+    include_prefixes: Sequence[str] = (),
+    pointer: RemoteEvidencePointer | None = None,
+    expected_manifest: bytes | None = None,
+    verify_stored_pointer: bool = True,
+) -> int:
+    """Safely extract selected evidence while authenticating the whole bundle.
+
+    Every regular archive member is streamed and hashed, even when it is not
+    selected for extraction.  The archive's manifest must account for every
+    bundled evidence file and each size/SHA-256 must match.  Remote archives
+    additionally have their full uncompressed-tar size and digest checked
+    against the immutable generation pointer.
+
+    ``destination`` must not already exist.  On any error it is removed so a
+    caller can never mistake a partial extraction for restartable evidence.
+    """
+
+    archive_path = Path(archive_path)
+    destination = Path(destination)
+    if pointer is not None:
+        _require_remote_pointer_bounds(pointer)
+    if pointer is not None and verify_stored_pointer:
+        try:
+            stored_size, stored_sha256 = _size_and_sha256(archive_path)
+        except OSError as exc:
+            raise EvidenceUnavailableError(
+                f"cannot read evidence archive {archive_path}: {exc}"
+            ) from exc
+        if (
+            stored_size != pointer.stored_size
+            or stored_sha256 != pointer.stored_sha256
+        ):
+            raise EvidenceIntegrityError(
+                "stored archive size or SHA-256 does not match pointer"
+            )
+    if destination.exists() or destination.is_symlink():
+        raise EvidenceIntegrityError(
+            f"evidence extraction destination already exists: {destination}"
+        )
+    normalized_prefixes = tuple(
+        _safe_tar_path(prefix.rstrip("/")).as_posix()
+        for prefix in include_prefixes
+    )
+
+    def selected(relative: str) -> bool:
+        return (
+            relative == "evidence_manifest.json"
+            or not normalized_prefixes
+            or any(
+                relative == prefix or relative.startswith(f"{prefix}/")
+                for prefix in normalized_prefixes
+            )
+        )
+
+    extraction_capacity = _safe_extraction_capacity(destination)
+    if extraction_capacity <= 0:
+        raise EvidenceCapacityError(
+            "insufficient safe free space to restore evidence: "
+            f"{extraction_capacity} bytes available after the filesystem reserve"
+        )
+    try:
+        destination.mkdir(parents=True, mode=0o700)
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            raise EvidenceCapacityError(
+                f"cannot create evidence restore destination without exhausting "
+                f"storage: {exc}"
+            ) from exc
+        raise EvidenceUnavailableError(
+            f"cannot create evidence restore destination {destination}: {exc}"
+        ) from exc
+    seen_archive_paths: set[str] = set()
+    actual_files: dict[str, tuple[int, str]] = {}
+    restored_manifest: bytes | None = None
+    selected_declared_bytes = 0
+    maximum_tar_size = (
+        pointer.tar_size
+        if pointer is not None
+        else _MAX_LOCAL_EVIDENCE_TAR_BYTES
+    )
+    try:
+        with archive_path.open("rb") as compressed:
+            if compression == "zstd":
+                raw_context = zstandard.ZstdDecompressor().stream_reader(
+                    compressed,
+                    read_across_frames=True,
+                )
+            elif compression == "gzip":
+                raw_context = gzip.GzipFile(fileobj=compressed, mode="rb")
+            else:
+                raise EvidenceHydrationError(
+                    f"unsupported evidence archive compression: {compression}"
+                )
+            with raw_context as raw_tar:
+                digest_reader = _DigestReader(
+                    raw_tar,
+                    max_size=maximum_tar_size,
+                )
+                with tarfile.open(fileobj=digest_reader, mode="r|") as archive:
+                    for member in archive:
+                        member_path = _safe_tar_path(member.name)
+                        normalized = member_path.as_posix()
+                        if normalized in seen_archive_paths:
+                            raise EvidenceHydrationError(
+                                f"duplicate archive member: {normalized}"
+                            )
+                        seen_archive_paths.add(normalized)
+                        if (
+                            member.issym()
+                            or member.islnk()
+                            or member.isdev()
+                            or member.isfifo()
+                        ):
+                            raise EvidenceHydrationError(
+                                f"unsafe archive member type: {normalized}"
+                            )
+                        if member.isdir():
+                            if selected(normalized):
+                                destination.joinpath(*member_path.parts).mkdir(
+                                    parents=True,
+                                    exist_ok=True,
+                                    mode=0o700,
+                                )
+                            continue
+                        if not member.isfile():
+                            raise EvidenceHydrationError(
+                                f"unsupported archive member type: {normalized}"
+                            )
+                        if member.size > maximum_tar_size:
+                            raise EvidenceHydrationError(
+                                "archive member exceeds the permitted tar size: "
+                                f"{normalized}"
+                            )
+                        source = archive.extractfile(member)
+                        if source is None:
+                            raise EvidenceHydrationError(
+                                f"cannot read archive member: {normalized}"
+                            )
+                        output = None
+                        destination_file = destination.joinpath(*member_path.parts)
+                        if selected(normalized):
+                            selected_declared_bytes += member.size
+                            if selected_declared_bytes > extraction_capacity:
+                                raise EvidenceCapacityError(
+                                    "selected evidence members exceed safe local "
+                                    "restore capacity: "
+                                    f"{selected_declared_bytes} bytes declared, "
+                                    f"{extraction_capacity} bytes available after "
+                                    "the filesystem reserve"
+                                )
+                            destination_file.parent.mkdir(
+                                parents=True,
+                                exist_ok=True,
+                                mode=0o700,
+                            )
+                            output = destination_file.open("xb")
+                        member_digest = hashlib.sha256()
+                        member_size = 0
+                        manifest_chunks: list[bytes] | None = (
+                            [] if normalized == "evidence_manifest.json" else None
+                        )
+                        try:
+                            while True:
+                                chunk = source.read(_BUFFER_SIZE)
+                                if not chunk:
+                                    break
+                                member_digest.update(chunk)
+                                member_size += len(chunk)
+                                if member_size > member.size:
+                                    raise EvidenceHydrationError(
+                                        "archive member exceeds its header size: "
+                                        f"{normalized}"
+                                    )
+                                if output is not None:
+                                    output.write(chunk)
+                                if manifest_chunks is not None:
+                                    if (
+                                        member_size
+                                        > MAX_EVIDENCE_MANIFEST_BYTES
+                                    ):
+                                        raise EvidenceHydrationError(
+                                            "evidence manifest exceeds the "
+                                            f"{MAX_EVIDENCE_MANIFEST_BYTES}-byte limit"
+                                        )
+                                    manifest_chunks.append(chunk)
+                        finally:
+                            if output is not None:
+                                output.close()
+                        if member_size != member.size:
+                            raise EvidenceHydrationError(
+                                f"archive member size does not match its header: {normalized}"
+                            )
+                        if output is not None:
+                            os.chmod(destination_file, 0o600)
+                        actual_files[normalized] = (
+                            member_size,
+                            member_digest.hexdigest(),
+                        )
+                        if manifest_chunks is not None:
+                            restored_manifest = b"".join(manifest_chunks)
+                while digest_reader.read(_BUFFER_SIZE):
+                    pass
+                tar_size = digest_reader.size
+                tar_sha256 = digest_reader.hexdigest()
+    except EvidenceHydrationError:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    except OSError as exc:
+        shutil.rmtree(destination, ignore_errors=True)
+        if exc.errno == errno.ENOSPC:
+            raise EvidenceCapacityError(
+                f"evidence extraction exhausted safe local storage: {exc}"
+            ) from exc
+        raise EvidenceUnavailableError(
+            f"cannot access {compression} evidence archive {archive_path}: {exc}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(destination, ignore_errors=True)
+        raise EvidenceIntegrityError(
+            f"cannot extract {compression} evidence archive {archive_path}: {exc}"
+        ) from exc
+
+    try:
+        if pointer is not None and (
+            tar_size != pointer.tar_size or tar_sha256 != pointer.tar_sha256
+        ):
+            raise EvidenceIntegrityError(
+                "uncompressed tar size or SHA-256 does not match pointer"
+            )
+        if restored_manifest is None:
+            raise EvidenceIntegrityError("archive has no evidence_manifest.json")
+        if expected_manifest is not None and restored_manifest != expected_manifest:
+            raise EvidenceIntegrityError(
+                "restored evidence manifest does not match local manifest"
+            )
+        expected_files = _manifest_expected_files_payload(restored_manifest)
+        excluded_roots = _manifest_bundle_excludes_payload(restored_manifest)
+        excluded_members = _manifest_excluded_archive_members(
+            seen_archive_paths,
+            excluded_roots,
+        )
+        if excluded_members:
+            raise EvidenceIntegrityError(
+                "archive contains a member under manifest bundleExcludes: "
+                f"{excluded_members[0]}"
+            )
+        bundled_expected_files = {
+            relative: expected
+            for relative, expected in expected_files.items()
+            if relative.split("/", 1)[0] not in excluded_roots
+        }
+        for relative, expected in bundled_expected_files.items():
+            actual = actual_files.get(relative)
+            if actual is None:
+                raise EvidenceIntegrityError(
+                    f"manifest member missing from archive: {relative}"
+                )
+            if actual != expected:
+                raise EvidenceIntegrityError(
+                    f"archive member failed manifest verification: {relative}"
+                )
+        unmanifested = sorted(
+            set(actual_files) - set(expected_files) - {"evidence_manifest.json"}
+        )
+        if unmanifested:
+            raise EvidenceIntegrityError(
+                "archive member is missing from manifest: "
+                f"{unmanifested[0]}"
+            )
+        return len(bundled_expected_files)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
 
 
 def _manifest_expected_files(root: Path) -> dict[str, tuple[int, str]]:
@@ -1341,6 +1730,17 @@ def _manifest_bundle_excludes_payload(payload: bytes) -> set[str]:
             )
         excluded.add(normalized)
     return excluded
+
+
+def _manifest_excluded_archive_members(
+    archive_paths: set[str],
+    excluded_roots: set[str],
+) -> list[str]:
+    return sorted(
+        relative
+        for relative in archive_paths
+        if relative.split("/", 1)[0] in excluded_roots
+    )
 
 
 def manifest_bundle_member_set_sha256(payload: bytes) -> tuple[int, str]:

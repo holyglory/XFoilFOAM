@@ -1578,7 +1578,7 @@ def test_continuation_extends_underretained_sparse_nonstationary_window(tmp_path
             "URANS window not stationary (precalc established-oscillation test): "
             "cycle means trend upward monotonically",
             30.0,
-            1.0,
+            3.0,
         ),
     ],
 )
@@ -1624,7 +1624,13 @@ def test_precalc_continues_same_case_after_period_target_for_sparse_or_nonstatio
         )
         end = spans[min(k, len(spans) - 1)]
         (tcase / f"{end:.10g}").mkdir(exist_ok=True)
-        ok = k >= 1
+        # The relaxing signal clears only after a meaningful newly measured
+        # tail. The former one-period extension must not pass this must-catch.
+        ok = (
+            k >= 1
+            and float(run_time or 0.0)
+            >= 0.99 * expected_chunk_periods * period
+        )
         return TransientResult(
             avg=SimpleNamespace(
                 cl=0.7,
@@ -1773,7 +1779,10 @@ def test_precalc_same_case_continuation_is_bounded_without_copied_refine(
         not expects_continuation
     )
     assert pipeline.URANS_BUDGET_STOP_MARKER not in result.quality.reason
-    assert "6-chunk in-run safety cap" in result.quality.reason
+    assert (
+        f"{pipeline.URANS_CONTINUATION_MAX_CHUNKS}-chunk emergency safety cap"
+        in result.quality.reason
+    )
 
 
 def test_continuation_chunk_timeout_keeps_grade_and_marks_continuable(tmp_path, monkeypatch):

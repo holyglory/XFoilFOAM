@@ -10,7 +10,8 @@
 // MUST-CATCH suite, shaped like the incident (real DB rows, real classifier
 // refresh, reconcile through the same ingest path prod ran):
 //   1. accepted-rans cell + rejected-shaped precalc payload → canonical row
-//      UNCHANGED, attempt + evidence ingested, request settled, loud line;
+//      UNCHANGED, attempt + evidence ingested, automatic recovery retained,
+//      loud line;
 //   2. accepted-rans cell + ACCEPTING precalc payload → replaced (urans_precalc);
 //   3. rejected cell + rejected payload → replaced (no guard);
 //   4. empty cell → normal ingest;
@@ -24,6 +25,7 @@ import {
   categories,
   createClient,
   createUransRequest,
+  ensurePrecalcObligations,
   flowConditions,
   forceHistory,
   mediums,
@@ -31,6 +33,7 @@ import {
   outputProfiles,
   polarFitSets,
   referenceGeometryProfiles,
+  recordPrecalcObligationSubmission,
   refreshPolarCacheForRevision,
   resultAttempts,
   resultClassifications,
@@ -39,6 +42,7 @@ import {
   schedulingProfiles,
   simJobs,
   simPrecalcObligations,
+  simSolverIncidents,
   simulationPresetAirfoilTargets,
   simulationPresets,
   simUransRequests,
@@ -59,7 +63,7 @@ import type {
   JobStatus,
   PolarPoint,
 } from "@aerodb/engine-client";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -411,6 +415,12 @@ function stubEngine(result?: JobResult): EngineClient {
 }
 
 async function cleanCell(): Promise<void> {
+  // Preliminary obligations are natural-keyed by this exact test cell. Keep
+  // scenarios independent so a prior test's running lease cannot be mistaken
+  // for the next scenario's request-owned recovery.
+  await db
+    .delete(simPrecalcObligations)
+    .where(eq(simPrecalcObligations.revisionId, revisionId));
   await db
     .update(results)
     .set({ currentResultAttemptId: null })
@@ -772,7 +782,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     ).toBe(false);
   });
 
-  it("MUST-CATCH incident shape: a rejected precalc URANS never clobbers the accepted RANS cell; attempt + evidence ingested, request settled, loud line", async () => {
+  it("MUST-CATCH incident shape: a rejected precalc URANS never clobbers the accepted RANS cell; attempt + evidence are retained and the request stays in automatic recovery", async () => {
     await cleanCell();
     const keptId = await seedAcceptedRansCell();
     // Real classifier verdict, not a hand stamp: the oscillating-steady RANS
@@ -793,6 +803,17 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       fidelity: "precalc",
       requestedBy: "test@airfoils.pro",
     });
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId,
+          revisionId,
+          aoaDeg: GATE_AOA,
+        },
+      ],
+      { requestIds: [request.id] },
+    );
     const engineJobId = `${PREFIX}-incident-job`;
     const [job] = await db
       .insert(simJobs)
@@ -813,9 +834,15 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
           aoas: [GATE_AOA],
           uransFidelity: "precalc",
           uransRequestId: request.id,
+          precalcObligationIds: [obligation.id],
         },
       })
       .returning();
+    await db
+      .update(simPrecalcObligations)
+      .set({ latestSimJobId: job.id, lastOutcome: "composed" })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await recordPrecalcObligationSubmission(db, job.id, [obligation.id]);
     await db
       .update(simUransRequests)
       .set({ state: "running", simJobId: job.id })
@@ -912,12 +939,23 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     expect(artifacts).toHaveLength(1);
     expect(artifacts[0].resultId).toBe(keptId);
 
-    // 4. Request + job settle done WITHOUT touching the canonical row.
+    // 4. The job settles without touching the canonical row, while the
+    //    rejected preliminary attempt returns its durable request/obligation
+    //    to automatic recovery instead of falsely declaring success.
     const [settledRequest] = await db
       .select()
       .from(simUransRequests)
       .where(eq(simUransRequests.id, request.id));
-    expect(settledRequest.state).toBe("done");
+    expect(settledRequest.state).toBe("pending");
+    expect(settledRequest.simJobId).toBeNull();
+    const [settledObligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(settledObligation).toMatchObject({
+      state: "pending",
+      attemptCount: 1,
+    });
     const [settledJob] = await db
       .select()
       .from(simJobs)
@@ -1305,12 +1343,11 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     expect(artifacts[0].resultAttemptId).not.toBeNull();
   }, 60000);
 
-  it("REJECTED verify solve: guard keeps the accepted precalc row and reconcile cancels the queue item (never silently supersedes)", async () => {
+  it("MUST-CATCH: rejected FULL evidence preserves accepted PRECALC and becomes critical only after continuation plus one corrective fresh start", async () => {
     // Interaction pinned here because no other suite exercises it: a FULL
     // verify solve that would fail the evidence gate must not replace the
-    // accepted precalc row (guard), and the verify item must settle
-    // terminally via reconcile's verified-row-is-the-judge check (kept row
-    // is not urans_full → cancelled loudly, canonical untouched).
+    // accepted precalc row. The exact rejected attempt drives automatic
+    // recovery even though it is not the selected canonical generation.
     await cleanCell();
     // Accepted PRECALC cell with REAL evidence rows (video + force history)
     // so the v4 classifier accepts it through the urans gate.
@@ -1431,6 +1468,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         aoaDeg: GATE_AOA,
         state: "running",
         precalcResultId: keptId,
+        backgroundOwner: true,
       })
       .returning();
     const engineJobId = `${PREFIX}-verify-cancel`;
@@ -1495,27 +1533,380 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       .where(eq(resultClassifications.resultId, keptId));
     expect(after?.state).toBe("accepted");
 
-    // Verify item settled terminally. The kept precalc generation did not come
-    // from this verify job, so it must not be mislabeled as the failed verify
-    // result.
+    // The kept precalc generation did not come from this verify job, so it
+    // must not be mislabeled as the rejected verify result. Its restartable
+    // full attempt opens same-case continuation.
     const [settledItem] = await db
       .select()
       .from(simUransVerifyQueue)
       .where(eq(simUransVerifyQueue.id, item.id));
-    expect(settledItem.state).toBe("cancelled");
+    expect(settledItem).toMatchObject({
+      state: "pending",
+      freshAttemptCount: 1,
+      continuationAttemptCount: 0,
+      lastOutcome: "continuation_pending",
+    });
     expect(settledItem.verifyResultId).toBeNull();
+    expect(settledItem.latestResultAttemptId).toBeTruthy();
+    const firstIncidents = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(eq(simSolverIncidents.verifyQueueId, item.id));
+    expect(firstIncidents).toHaveLength(1);
+    expect(firstIncidents[0]).toMatchObject({
+      stage: "final",
+      severity: "warning",
+      status: "open",
+      verifyQueueId: item.id,
+      simJobId: job.id,
+      resultAttemptId: settledItem.latestResultAttemptId,
+    });
+    expect(firstIncidents[0].occurrenceKey).toBe(
+      `final:${item.id}:${settledItem.latestResultAttemptId}:continuation_pending`,
+    );
     const [settledJob] = await db
       .select()
       .from(simJobs)
       .where(eq(simJobs.id, job.id));
     expect(settledJob.status).toBe("done");
 
-    // Loud on both sides: the guard line AND the verify-cancel line.
+    // The guard is loud, but this recoverable stage is not critical.
     const lines = errorSpy.mock.calls.map((c) => c.join(" "));
     expect(lines.some((l) => l.includes("REPLACE GUARD"))).toBe(true);
-    expect(lines.some((l) => l.includes("verify solve did not complete"))).toBe(
-      true,
+    expect(lines.some((l) => l.includes("FINAL URANS CRITICAL"))).toBe(false);
+
+    const nonRestartableFull = {
+      ...rejectedFull,
+      quality_warnings: [],
+    } as PolarPoint;
+    const continuationEngineJobId = `${PREFIX}-verify-continuation-rejected`;
+    const [continuationJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "verify",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "submitted",
+        engineJobId: continuationEngineJobId,
+        totalCases: 1,
+        submittedAt: new Date(),
+        requestPayload: {
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas: [GATE_AOA],
+          uransFidelity: "full",
+          verifyQueueItemId: item.id,
+          verifyPrecalc: { cl: 0.7, cd: 0.2, cm: -0.03 },
+          finalRecoveryMode: "continuation",
+          continueFromResultAttemptId: settledItem.latestResultAttemptId,
+        },
+      })
+      .returning();
+    await db
+      .update(simUransVerifyQueue)
+      .set({ state: "running", simJobId: continuationJob.id })
+      .where(eq(simUransVerifyQueue.id, item.id));
+    await reconcile(
+      db,
+      stubEngine(jobResult(continuationEngineJobId, nonRestartableFull)),
+      {
+        jobIds: [continuationJob.id],
+        skipFailedRecovery: true,
+      },
     );
+    const [afterContinuation] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, item.id));
+    expect(afterContinuation).toMatchObject({
+      state: "pending",
+      freshAttemptCount: 1,
+      continuationAttemptCount: 1,
+      lastOutcome: "fresh_retry_pending",
+    });
+    const recoveryIncidents = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(eq(simSolverIncidents.verifyQueueId, item.id));
+    expect(
+      recoveryIncidents.map((incident) => incident.severity).sort(),
+    ).toEqual(["warning", "warning"]);
+
+    const correctiveEngineJobId = `${PREFIX}-verify-corrective-rejected`;
+    const [correctiveJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "verify",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "submitted",
+        engineJobId: correctiveEngineJobId,
+        totalCases: 1,
+        submittedAt: new Date(),
+        requestPayload: {
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas: [GATE_AOA],
+          uransFidelity: "full",
+          verifyQueueItemId: item.id,
+          verifyPrecalc: { cl: 0.7, cd: 0.2, cm: -0.03 },
+          finalRecoveryMode: "fresh",
+        },
+      })
+      .returning();
+    await db
+      .update(simUransVerifyQueue)
+      .set({ state: "running", simJobId: correctiveJob.id })
+      .where(eq(simUransVerifyQueue.id, item.id));
+    await reconcile(
+      db,
+      stubEngine(jobResult(correctiveEngineJobId, nonRestartableFull)),
+      {
+        jobIds: [correctiveJob.id],
+        skipFailedRecovery: true,
+      },
+    );
+    const [exhausted] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, item.id));
+    expect(exhausted).toMatchObject({
+      state: "blocked",
+      freshAttemptCount: 2,
+      continuationAttemptCount: 1,
+      lastOutcome: "final_recovery_exhausted",
+    });
+    expect(exhausted.verifyResultId).toBeNull();
+    const terminalIncidents = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(eq(simSolverIncidents.verifyQueueId, item.id));
+    expect(
+      terminalIncidents.map((incident) => incident.severity).sort(),
+    ).toEqual(["critical", "warning", "warning"]);
+    expect(
+      terminalIncidents.find((incident) => incident.severity === "critical"),
+    ).toMatchObject({
+      stage: "final",
+      status: "open",
+      verifyQueueId: item.id,
+      simJobId: correctiveJob.id,
+      resultAttemptId: exhausted.latestResultAttemptId,
+    });
+    expect(
+      errorSpy.mock.calls.some((call) =>
+        call.join(" ").includes("FINAL URANS CRITICAL"),
+      ),
+    ).toBe(true);
+  }, 120000);
+
+  it("typed continuation infrastructure is retried without spending recovery budget, while permanent loss falls back to the corrective fresh solve", async () => {
+    await cleanCell();
+    const seeded = await seedAcceptedPrecalcCell("final-continuation-outcomes");
+    const [sourceAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: seeded.result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: GATE_AOA,
+        simJobId: seeded.job.id,
+        engineJobId: `${PREFIX}-final-continuation-source`,
+        engineCaseSlug: "a0",
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        converged: true,
+        unsteady: true,
+        qualityWarnings: [
+          `URANS ${URANS_BUDGET_STOP_MARKER}: restartable same-case state retained`,
+        ],
+        evidencePayload: { fidelity: "urans_full" },
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    await db.insert(resultClassifications).values({
+      resultAttemptId: sourceAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: GATE_AOA,
+      regime: "urans",
+      classifierVersion: "final-continuation-source-v1",
+      state: "rejected",
+      region: "post_stall",
+      confidence: 1,
+      reasons: ["insufficient-periods"],
+    });
+    const [item] = await db
+      .insert(simUransVerifyQueue)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: GATE_AOA,
+        state: "running",
+        precalcResultId: seeded.result.id,
+        backgroundOwner: true,
+        freshAttemptCount: 1,
+        continuationAttemptCount: 0,
+        latestResultAttemptId: sourceAttempt.id,
+        lastOutcome: "continuation_pending",
+      })
+      .returning();
+    const jobIds = [seeded.job.id];
+    try {
+      const transientEngineJobId = `${PREFIX}-final-continuation-transient`;
+      const [transientJob] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          jobKind: "verify",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "submitted",
+          engineJobId: transientEngineJobId,
+          totalCases: 1,
+          submittedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+            ],
+            aoas: [GATE_AOA],
+            uransFidelity: "full",
+            verifyQueueItemId: item.id,
+            verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
+            finalRecoveryMode: "continuation",
+            continueFromResultAttemptId: sourceAttempt.id,
+          },
+        })
+        .returning();
+      jobIds.push(transientJob.id);
+      await db
+        .update(simUransVerifyQueue)
+        .set({ simJobId: transientJob.id })
+        .where(eq(simUransVerifyQueue.id, item.id));
+      await reconcile(
+        db,
+        stubEngine({
+          job_id: transientEngineJobId,
+          state: "failed",
+          polars: [],
+          message: "temporary object storage interruption",
+          failure_disposition: "infrastructure",
+          continuation_failure_kind: "transient",
+        }),
+        { jobIds: [transientJob.id], skipFailedRecovery: true },
+      );
+      const [afterTransient] = await db
+        .select()
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      expect(afterTransient).toMatchObject({
+        state: "pending",
+        simJobId: null,
+        freshAttemptCount: 1,
+        continuationAttemptCount: 0,
+        latestResultAttemptId: sourceAttempt.id,
+        lastOutcome: "continuation_retry_wait",
+      });
+      expect(afterTransient.nextSubmitAt!.getTime()).toBeGreaterThan(
+        Date.now(),
+      );
+
+      const permanentEngineJobId = `${PREFIX}-final-continuation-permanent`;
+      const [permanentJob] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          jobKind: "verify",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "submitted",
+          engineJobId: permanentEngineJobId,
+          totalCases: 1,
+          submittedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+            ],
+            aoas: [GATE_AOA],
+            uransFidelity: "full",
+            verifyQueueItemId: item.id,
+            verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
+            finalRecoveryMode: "continuation",
+            continueFromResultAttemptId: sourceAttempt.id,
+          },
+        })
+        .returning();
+      jobIds.push(permanentJob.id);
+      await db
+        .update(simUransVerifyQueue)
+        .set({
+          state: "running",
+          simJobId: permanentJob.id,
+          nextSubmitAt: null,
+        })
+        .where(eq(simUransVerifyQueue.id, item.id));
+      await reconcile(
+        db,
+        stubEngine({
+          job_id: permanentEngineJobId,
+          state: "failed",
+          polars: [],
+          message: "continuation archive is permanently unavailable",
+          continuation_failure_kind: "permanent",
+        }),
+        { jobIds: [permanentJob.id], skipFailedRecovery: true },
+      );
+      const [afterPermanent] = await db
+        .select()
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      expect(afterPermanent).toMatchObject({
+        state: "pending",
+        simJobId: null,
+        freshAttemptCount: 1,
+        continuationAttemptCount: 1,
+        latestResultAttemptId: sourceAttempt.id,
+        nextSubmitAt: null,
+        lastOutcome: "fresh_retry_pending",
+      });
+      const incidents = await db
+        .select()
+        .from(simSolverIncidents)
+        .where(eq(simSolverIncidents.verifyQueueId, item.id));
+      expect(incidents).toHaveLength(2);
+      expect(
+        incidents.every((incident) => incident.severity === "warning"),
+      ).toBe(true);
+      expect(
+        incidents.map((incident) => incident.occurrenceKey).sort(),
+      ).toEqual(
+        [
+          `final:${item.id}:${permanentJob.id}:fresh_retry_pending`,
+          `final:${item.id}:${transientJob.id}:continuation_retry_wait`,
+        ].sort(),
+      );
+    } finally {
+      await db
+        .delete(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      await cleanCell();
+      await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
+    }
   }, 120000);
 
   it("keeps accepted staged evidence as history when the ingest lease is replaced before publication", async () => {

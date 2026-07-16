@@ -33,6 +33,8 @@ import {
 
 export const MESH_RECOVERY_CAPABILITY_MISMATCH_CODE =
   "mesh_recovery_version_mismatch";
+export const URANS_RECOVERY_CAPABILITY_MISMATCH_CODE =
+  "urans_recovery_version_mismatch";
 export const ENGINE_IDENTITY_MISMATCH_CODE = "engine_identity_mismatch";
 
 export class EngineError extends Error {

@@ -54,7 +54,7 @@ class FakeGatewayState:
             "role": "solver_gateway",
             "version": "0.1.0",
             "build_id": self.runtime["build_id"],
-            "mesh_recovery_version": 1,
+            "mesh_recovery_version": 2,
             "default_engine": dict(canary.ENGINE),
             "supported_engines": [dict(canary.ENGINE)],
             "registered_disabled_engines": [],
@@ -162,7 +162,7 @@ class FakeGatewayState:
                 "requested_execution_pool": canary.EXECUTION_POOL,
                 "engine": stale,
                 "execution_pool": canary.EXECUTION_POOL,
-                "mesh_recovery_version": 1,
+                "mesh_recovery_version": 2,
                 "scheduling": self.scheduling(request),
             }
         return {
@@ -175,7 +175,7 @@ class FakeGatewayState:
             "requested_execution_pool": canary.EXECUTION_POOL,
             "engine": dict(self.runtime),
             "execution_pool": canary.EXECUTION_POOL,
-            "mesh_recovery_version": 1,
+            "mesh_recovery_version": 2,
             "scheduling": self.scheduling(request),
         }
 
@@ -446,7 +446,7 @@ class FakeGatewayState:
             "engine": dict(self.runtime),
             "execution_pool": canary.EXECUTION_POOL,
             "method_keys": [method],
-            "mesh_recovery_version": 1,
+            "mesh_recovery_version": 2,
         }
 
 
@@ -660,7 +660,7 @@ def test_canary_submits_all_three_exact_2606_workloads_and_checks_evidence():
     assert [request["resources"]["solver_processes"] for request in requests] == [1, 2, 1]
     assert all(request["expected_engine"] == canary.ENGINE for request in requests)
     assert all(request["expected_execution_pool"] == canary.EXECUTION_POOL for request in requests)
-    assert all(request["expected_mesh_recovery_version"] == 1 for request in requests)
+    assert all(request["expected_mesh_recovery_version"] == 2 for request in requests)
     assert all(
         request["airfoil"]["coordinates"]
         == (ROOT / "examples" / "naca0012.dat").read_text()

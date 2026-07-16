@@ -354,41 +354,40 @@ export function campaignStatusLine(
       const closedRejected = campaign.closedWithRejectedCount ?? 0;
       if (blocked > 0) {
         const unavailable = [
-          closedFailed > 0
-            ? `${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"}`
-            : null,
-          closedRejected > 0 ? `${fCount(closedRejected)} rejected` : null,
-          `${fCount(blocked)} machine-blocked`,
+          closedFailed > 0 ? `${fCount(closedFailed)} unavailable` : null,
+          closedRejected > 0 ? `${fCount(closedRejected)} unavailable` : null,
+          `${fCount(blocked)} critical`,
         ].filter((part): part is string => part != null);
         return {
           gate: null,
           lifecycle,
-          text: `Completed — closed with ${unavailable.join(" · ")}.`,
-          tone: "amber",
+          text: `Completed — ${unavailable.join(" · ")} result failure${closedFailed + closedRejected + blocked === 1 ? "" : "s"}; system investigation required.`,
+          tone: "red",
         };
       }
       if (closedFailed > 0 && closedRejected > 0) {
+        const unavailable = closedFailed + closedRejected;
         return {
           gate: null,
           lifecycle,
-          text: `Completed — closed with ${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"} · ${fCount(closedRejected)} rejected.`,
-          tone: "teal",
+          text: `Completed — ${fCount(unavailable)} unavailable results.`,
+          tone: "red",
         };
       }
       if (closedFailed > 0) {
         return {
           gate: null,
           lifecycle,
-          text: `Completed — closed with ${fCount(closedFailed)} failed point${closedFailed === 1 ? "" : "s"}.`,
-          tone: "teal",
+          text: `Completed — ${fCount(closedFailed)} unavailable result${closedFailed === 1 ? "" : "s"}.`,
+          tone: "red",
         };
       }
       if (closedRejected > 0) {
         return {
           gate: null,
           lifecycle,
-          text: `Completed — closed with ${fCount(closedRejected)} rejected point${closedRejected === 1 ? "" : "s"}.`,
-          tone: "teal",
+          text: `Completed — ${fCount(closedRejected)} unavailable result${closedRejected === 1 ? "" : "s"}.`,
+          tone: "red",
         };
       }
       return {
@@ -403,13 +402,13 @@ export function campaignStatusLine(
       if (automaticPrecalc > 0) {
         const blockedSuffix =
           blocked > 0
-            ? ` ${fCount(blocked)} other point${blocked === 1 ? " is" : "s are"} machine-blocked and unavailable.`
+            ? ` · ${fCount(blocked)} critical failure${blocked === 1 ? "" : "s"}`
             : "";
         return {
           gate: null,
           lifecycle,
-          text: `Preliminary URANS work is queued or running for ${fCount(automaticPrecalc)} point${automaticPrecalc === 1 ? "" : "s"}; no human review is required.${blockedSuffix}`,
-          tone: blocked > 0 ? "amber" : "violet",
+          text: `Fast URANS · ${fCount(automaticPrecalc)} queued or running${blockedSuffix}.`,
+          tone: blocked > 0 ? "red" : "violet",
         };
       }
       // Amendment-A split when the payload carries it: red strictly for
@@ -428,8 +427,8 @@ export function campaignStatusLine(
           return {
             gate: null,
             lifecycle,
-            text: `All obligated work is terminal — ${fCount(blocked)} machine-blocked${suffix.length ? ` · ${suffix.join(" · ")}` : ""}. No human review is required.`,
-            tone: "amber",
+            text: `${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"}${suffix.length ? ` · ${suffix.join(" · ")}` : ""}; system recovery required.`,
+            tone: "red",
           };
         }
         if (rb.needsReview > 0) {
@@ -440,7 +439,7 @@ export function campaignStatusLine(
           return {
             gate: null,
             lifecycle,
-            text: `All obligated work is terminal — ${fCount(rb.needsReview)} unavailable result${rb.needsReview === 1 ? "" : "s"}${suffix}. No human review is required.`,
+            text: `${fCount(rb.needsReview)} unavailable result${rb.needsReview === 1 ? "" : "s"}${suffix}; system investigation required.`,
             tone: "red",
           };
         }
@@ -448,7 +447,7 @@ export function campaignStatusLine(
           return {
             gate: null,
             lifecycle,
-            text: `All obligated work is terminal — ${fCount(rb.awaitingUrans)} point${rb.awaitingUrans === 1 ? "" : "s"} awaiting URANS.`,
+            text: `Fast URANS · ${fCount(rb.awaitingUrans)} queued.`,
             tone: "violet",
           };
         }
@@ -456,8 +455,8 @@ export function campaignStatusLine(
         return {
           gate: null,
           lifecycle,
-          text: `All obligated work is terminal — ${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}. No human review is required.`,
-          tone: "amber",
+          text: `${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}; system recovery required.`,
+          tone: "red",
         };
       }
       // Older payloads have no refined machine-owned buckets. Failed and
@@ -467,8 +466,8 @@ export function campaignStatusLine(
       return {
         gate: null,
         lifecycle,
-        text: `All obligated work is terminal — ${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}. No human review is required.`,
-        tone: "amber",
+        text: `${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}; system recovery required.`,
+        tone: "red",
       };
     }
     case "paused":

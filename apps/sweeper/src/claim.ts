@@ -45,7 +45,7 @@ async function claimAoasInTransaction(
         error = NULL, "updatedAt" = now()
       WHERE results.status IN ('pending', 'stale')
         AND results.regime IS DISTINCT FROM 'urans'
-        AND COALESCE(results.fidelity, '') NOT LIKE 'urans%'
+        AND COALESCE(results.fidelity::text, '') NOT LIKE 'urans%'
         AND NOT EXISTS (
           SELECT 1 FROM sim_precalc_obligations obligation
           WHERE obligation.airfoil_id = results.airfoil_id

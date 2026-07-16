@@ -127,31 +127,30 @@ describe("point filter query-param round-trip", () => {
 
 // ---------------------------------------------------------------------------
 // statusChipDisplay — the ONE recolor rule for status chips (amendment A):
-// violet strictly for the calm awaiting-URANS queue, red strictly for
-// failed / needs-review, amber for a rejected row whose next solve is
-// already scheduled (reviewBucket null).
+// violet strictly for automatic recovery, red strictly for unavailable or
+// exhausted recovery. Internal attempt verdicts never become user labels.
 // ---------------------------------------------------------------------------
 describe("statusChipDisplay", () => {
   it("splits the rejected bucket by the server-derived reviewBucket", () => {
     expect(statusChipDisplay("rejected", "awaiting_urans")).toEqual({
-      label: "awaiting URANS",
+      label: "fast URANS queued",
       tone: "violet",
     });
     expect(statusChipDisplay("rejected", "needs_review")).toEqual({
-      label: "unavailable",
+      label: "result unavailable",
       tone: "red",
     });
     expect(statusChipDisplay("rejected", null)).toEqual({
-      label: "rejected",
-      tone: "amber",
+      label: "result unavailable",
+      tone: "red",
     });
     expect(statusChipDisplay("rejected", null, "scheduled")).toEqual({
-      label: "rejected · rescheduled",
-      tone: "amber",
+      label: "automatic recovery queued",
+      tone: "violet",
     });
     expect(statusChipDisplay("rejected", null, "blocked")).toEqual({
-      label: "blocked · unavailable",
-      tone: "amber",
+      label: "critical recovery failure",
+      tone: "red",
     });
   });
 
@@ -165,7 +164,7 @@ describe("statusChipDisplay", () => {
 
   it("MUST-CATCH: a stalled RANS row with durable PRECALC work is shown as queued, not failed", () => {
     expect(statusChipDisplay("failed", "awaiting_urans", "scheduled")).toEqual({
-      label: "URANS queued",
+      label: "fast URANS queued",
       tone: "violet",
     });
   });
@@ -176,8 +175,8 @@ describe("statusChipDisplay", () => {
       tone: "teal",
     });
     expect(statusChipDisplay("needs_urans", null)).toEqual({
-      label: "needs URANS",
-      tone: "amber",
+      label: "fast URANS next",
+      tone: "violet",
     });
     expect(statusChipDisplay("solving", null)).toEqual({
       label: "solving",

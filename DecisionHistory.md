@@ -2,40 +2,102 @@
 
 ## Direction
 
-- Confirmed intent: solver setup and evidence must support multiple independently
-  versioned engine implementations. OpenCFD 2606 replaces 2406 as the only
-  executable OpenCFD runtime after a guarded drain; 2406 remains immutable
-  historical evidence, not an enabled execution pool. The active campaign
-  continues through a linked 2606 successor generation that reruns its exact
-  eligible source snapshot, so evidence from the two numerical releases is
-  never merged into one polar. Foundation 14 remains a separate implementation. Future
-  solvers use the same adapter boundary but keep their own numerical identity;
-  the owner's thesis-derived open-source Euler/boundary-layer solver is not
-  MSES and must never inherit MSES identity or provenance.
+- Confirmed intent: solver setup and evidence support independently versioned
+  engine implementations. OpenCFD 2606 replaces 2406 after a guarded drain and
+  reruns the active campaign through a linked successor generation; 2406 stays
+  immutable historical evidence. Foundation 14 and future solvers keep separate
+  numerical identities, and the owner's thesis-derived open-source
+  Euler/boundary-layer solver must never inherit MSES identity or provenance.
   [D-2026-07-15-multi-engine-identity]
   [D-2026-07-15-opencfd-2606-cutover]
-- Confirmed intent: production campaigns should use real available compute while
-  preserving trustworthy solver evidence and automatic recovery rather than
-  handing repairable pipeline work to users. The single visible CPU-capacity
-  control must be the actual admission limit; an undocumented job cap must not
-  strand worker tokens. A no-shedding preliminary URANS result remains
-  preliminary evidence even when its physical regime is steady, and terminal
-  automatic outcomes must not be presented as user repair tasks.
-  Storage pressure must stop only new job admission while reconciliation and
-  evidence ingestion remain live and the UI states the measured reason.
-  Campaign-detail overviews should prioritize one operational message and a
-  live instrument cluster over repeated badges, cards, borders, or pipeline
-  prose; secondary setup and evidence detail remains progressively disclosed.
+- Confirmed intent: production campaigns use real available compute and recover
+  repairable work automatically. The visible CPU limit is the real admission
+  limit; storage pressure blocks only new admission while reconciliation and
+  ingestion continue. No-shedding preliminary URANS remains preliminary
+  evidence. Each point is one RANS screening → fast preliminary URANS → final
+  verified URANS journey; aerodynamic RANS rejection is a normal handoff.
+  A mesh/runtime problem is repaired automatically before fast URANS, and only
+  exhaustion of that non-aerodynamic recovery or of fast/final URANS is a
+  critical system incident. Campaign detail leads with one operational message
+  and a live instrument, progressively discloses secondary detail, separates
+  physical attempts from non-physical submissions, and shows pinned real
+  geometry in a true modal that owns focus and scroll.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
   [D-2026-07-15-campaign-instrument-overview]
+  [D-2026-07-16-campaign-cell-evidence-dialog]
+  [D-2026-07-16-preliminary-urans-reliability]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
   evidence is conserved, local raw VTK is removed only after verified remote
   restore, and production uses attached workload identity rather than exported
   credentials. [D-2026-07-15-gcs-zstd-evidence]
+
+## D-2026-07-16-preliminary-urans-reliability — Every point follows one automatic fidelity sequence
+
+Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md)
+
+- Decision: present and execute each requested angle as one sequence:
+  RANS screening → fast preliminary URANS → final verified URANS. A rejected
+  or non-converged RANS screen is normal handoff evidence, not point failure.
+  Deterministic mesh or runtime failure is not aerodynamic handoff evidence:
+  repair it automatically under a versioned strategy and show a red system
+  incident only if the current strategy cannot reach fast URANS.
+  Admit its preliminary handoff ahead of unrelated new RANS after the parent is
+  terminal, and guarantee final verification one slot after at most eight new
+  wave-1 RANS admissions. Continue only the exact saved transient from the same
+  immutable solver implementation; restore it from archived evidence when
+  needed, and start successor-engine cells fresh. Recovery requests pin the
+  engine's integer `urans_recovery_version`; absent capability is legacy
+  version 0 and any mismatch fails before solve work, leaving recovery pending
+  while ordinary RANS and first-pass preliminary URANS remain eligible.
+  An admin `full` request means “ensure final verification” for its exact or
+  whole-polar scope: it owns the same preliminary and final per-point
+  obligations and never launches a direct one-shot full solve that bypasses
+  fast URANS.
+  Keep one visible row and one count per requested AoA even when symmetry lets
+  a row reuse the exact stored result of its positive-angle source.
+  Storage/setup loss and same-case continuation do not spend a new fresh solve.
+  Exhausted or non-progressing preliminary/final recovery is one critical
+  system incident, and repeated signatures require investigation plus a
+  remediation version.
+- Why: a per-point list is not a matrix of independent failure categories, and
+  exposing RANS rejection, continuation submissions, and evidence records as
+  peer outcomes made normal handoff look terminal. Leaving unavailable results
+  amber hides a reliability defect; waiting for campaign-wide RANS completion
+  starves known escalations; asking users to retry or change setup transfers
+  system-owned CFD work; fresh reruns discard transient progress; and
+  cross-version continuation falsifies provenance. The selected sequence keeps
+  the common path legible, conserves compatible evidence and mesh work, makes
+  rare failures unmistakable, and lets the control plane deploy safely before
+  the recovery-capable engine.
+
+## D-2026-07-16-campaign-cell-evidence-dialog — Campaign cells explain automatic recovery without calling it failure
+
+Detail: [DecisionDetails/D-2026-07-16-campaign-cell-evidence-dialog.md](DecisionDetails/D-2026-07-16-campaign-cell-evidence-dialog.md)
+
+- Decision: keep ordinary RANS interruptions and automatic preliminary-URANS
+  outcomes as separate audit read models, but present them through one
+  per-point solver-sequence rail rather than separate user-facing panels.
+  Report the bounded physical CFD attempt budget independently from
+  preliminary evidence records, non-physical submissions, and terminal
+  interrupted continuations. Infer an interrupted continuation only from the
+  exact ordered obligation sequence. Campaign cell detail is a true modal
+  layer with scroll/focus ownership and nested-dialog behavior; its identity
+  and Airfoil tab use the pinned revision's stored geometry.
+  D-2026-07-16-preliminary-urans-reliability supersedes both this decision's
+  separate-panel presentation and its terminal “results unavailable/no user
+  action” wording; the underlying evidence separation remains authoritative.
+- Why: relabeling the former `FAILED POINTS` heading would still combine normal
+  RANS escalation, preliminary URANS, setup loss, and evidence rows into one
+  ambiguous count. Removing the history would hide immutable evidence, while
+  exposing raw classifications would require users to decode solver internals.
+  The separate domain read model preserves audit truth and explains automatic
+  recovery in user terms. A drawer without modal ownership allowed the
+  background to move and lose context; placeholder or reconstructed geometry
+  would violate the evidence contract.
 
 ## D-2026-07-15-gcs-zstd-evidence — Final evidence is remote and hydrated on demand
 
@@ -1099,7 +1161,13 @@ Detail: [DecisionDetails/D-2026-07-14-auto-job-admission.md](DecisionDetails/D-2
   connection failure before engine acceptance consumes no solver attempt. A
   process restart, cache refresh, or second campaign referencing the same cell
   cannot create an unbounded loop. Operational job purging may null the job
-  link, but preserves the immutable attempt audit.
+  link, but preserves the immutable attempt audit. This fresh-physical-solve
+  allowance is superseded by
+  D-2026-07-15-precalc-physical-attempt-budget and
+  D-2026-07-16-preliminary-urans-reliability: restartable same-case integration
+  segments preserve one physical solve rather than spending additional fresh
+  attempts, and persisted cross-segment progress/no-progress policy—not a raw
+  submission count—prevents an unbounded continuation loop.
 - Historical-upgrade completeness uses the same persisted marker literals as
   the runtime classifier: `stopped by the wall-clock budget guard` and
   `requires further same-case integration`. An older classifier's `accepted`

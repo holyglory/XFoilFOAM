@@ -290,8 +290,8 @@ export function RefinementBoard({
         if (scoped.retryableTotal === 0) {
           setNotice(
             scoped.total > 0
-              ? "failed points in this lane are not eligible for an unchanged retry — open the cell for their automatic-recovery state"
-              : "no failed points in this lane's cell — the fit is missing evidence for another reason (see the cell panel)",
+              ? "solver failures in this lane are not eligible for an unchanged retry — open the cell for their automatic-recovery state"
+              : "no retryable solver failures in this lane's cell — the fit is missing evidence for another reason (see the cell panel)",
           );
           setRequeueState(null);
         } else {
@@ -305,7 +305,7 @@ export function RefinementBoard({
         expectedCount: requeueState.count,
       });
       setNotice(
-        `requeued ${res.requeued} failed point${res.requeued === 1 ? "" : "s"} for this lane`,
+        `requeued ${res.requeued} retryable solver failure${res.requeued === 1 ? "" : "s"} for this lane`,
       );
       setRequeueState(null);
       onChanged();

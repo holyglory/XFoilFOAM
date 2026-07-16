@@ -1,4 +1,9 @@
-import { type DB, simJobs, simPrecalcObligations } from "@aerodb/db";
+import {
+  type DB,
+  restartablePrecalcCheckpointSql,
+  simJobs,
+  simPrecalcObligations,
+} from "@aerodb/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 
 export interface PhysicalPrecalcComposition {
@@ -81,7 +86,15 @@ export async function composePhysicalPrecalcJob(
     syncPromiseId?: unknown;
     remoteSolver?: unknown;
     upstreamBaseUrl?: unknown;
+    continueFromResultAttemptId?: unknown;
+    continueFromResultId?: unknown;
   };
+  const sameCaseContinuation =
+    ids.length === 1 &&
+    ((typeof payload.continueFromResultAttemptId === "string" &&
+      payload.continueFromResultAttemptId.length > 0) ||
+      (typeof payload.continueFromResultId === "string" &&
+        payload.continueFromResultId.length > 0));
   const remoteProvenance =
     typeof payload.syncPromiseId === "string" &&
     payload.remoteSolver === true &&
@@ -169,6 +182,26 @@ export async function composePhysicalPrecalcJob(
       .orderBy(simPrecalcObligations.id)
       .for("update");
     if (obligations.length !== ids.length) return null;
+    const restartableAtMax = sameCaseContinuation
+      ? ((await tx.execute(sql`
+          SELECT obligation.id
+          FROM sim_precalc_obligations obligation
+          WHERE obligation.id = ${ids[0]}
+            AND ${restartablePrecalcCheckpointSql(sql`obligation.id`, {
+              targetSolverImplementationId:
+                spec.job.solverImplementationId ?? null,
+              continuationResultAttemptId:
+                typeof payload.continueFromResultAttemptId === "string"
+                  ? payload.continueFromResultAttemptId
+                  : null,
+              continuationResultId:
+                typeof payload.continueFromResultId === "string"
+                  ? payload.continueFromResultId
+                  : null,
+            })}
+        `)) as unknown as Array<{ id: string }>)
+      : [];
+    const restartableAtMaxIds = new Set(restartableAtMax.map((row) => row.id));
 
     const latestIds = obligations
       .map((obligation) => obligation.latestSimJobId)
@@ -187,7 +220,8 @@ export async function composePhysicalPrecalcJob(
         : null;
       if (
         obligation.state !== "pending" ||
-        obligation.attemptCount >= obligation.maxAttempts ||
+        (obligation.attemptCount >= obligation.maxAttempts &&
+          !restartableAtMaxIds.has(obligation.id)) ||
         (obligation.nextSubmitAt &&
           new Date(obligation.nextSubmitAt).getTime() > now) ||
         (!obligation.backgroundOwner && !runnableOwnerIds.has(obligation.id)) ||
@@ -336,9 +370,10 @@ export async function composePhysicalPrecalcJob(
         )
           return null;
       }
-      const conditionSql = spec.directParent.conditionId
-        ? sql`request_payload ->> 'conditionId' = ${spec.directParent.conditionId}`
-        : sql`request_payload ->> 'conditionId' IS NULL`;
+      // A terminal batched RANS parent may owe several condition-local
+      // PRECALC children, but they drain sequentially. Recheck the parent's
+      // global live-child fence under its UPDATE lock so two sweepers cannot
+      // race different conditions past the one-capacity-slot admission.
       const [liveChild] = await tx
         .select({ id: simJobs.id })
         .from(simJobs)
@@ -346,11 +381,6 @@ export async function composePhysicalPrecalcJob(
           and(
             eq(simJobs.parentJobId, spec.directParent.parentJobId),
             eq(simJobs.wave, 2),
-            eq(
-              simJobs.simulationPresetRevisionId,
-              spec.directParent.revisionId,
-            ),
-            conditionSql,
             inArray(simJobs.status, [
               "pending",
               "submitted",

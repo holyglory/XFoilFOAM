@@ -425,7 +425,7 @@ export function fidelityChipView(
     };
   }
   if (verify?.state === "blocked")
-    return { label: "precalc · verify blocked", tone: "amber" };
+    return { label: "final URANS · critical", tone: "red" };
   if (fidelity === "urans_full") return { label: "verified", tone: "teal" };
   if (fidelity === "urans_precalc") {
     if (verify?.state === "pending" || verify?.state === "running")
@@ -484,22 +484,22 @@ export function statusChipDisplay(
   switch (bucket) {
     case "failed":
       if (reviewBucket === "awaiting_urans" && workDisposition === "scheduled")
-        return { label: "URANS queued", tone: "violet" };
-      return { label: "failed", tone: "red" };
+        return { label: "fast URANS queued", tone: "violet" };
+      return { label: "result unavailable", tone: "red" };
     case "rejected":
       if (workDisposition === "blocked")
-        return { label: "blocked · unavailable", tone: "amber" };
+        return { label: "critical recovery failure", tone: "red" };
       if (reviewBucket === "awaiting_urans")
-        return { label: "awaiting URANS", tone: "violet" };
+        return { label: "fast URANS queued", tone: "violet" };
       if (reviewBucket === "needs_review")
-        return { label: "unavailable", tone: "red" };
+        return { label: "result unavailable", tone: "red" };
       if (workDisposition === "scheduled")
-        return { label: "rejected · rescheduled", tone: "amber" };
-      return { label: "rejected", tone: "amber" };
+        return { label: "automatic recovery queued", tone: "violet" };
+      return { label: "result unavailable", tone: "red" };
     case "accepted":
       return { label: "accepted", tone: "teal" };
     case "needs_urans":
-      return { label: "needs URANS", tone: "amber" };
+      return { label: "fast URANS next", tone: "violet" };
     case "solving":
       return { label: "solving", tone: "amber" };
     default:
@@ -732,11 +732,11 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     events.push({
       kind: "classification",
       at: null,
-      tone: "amber",
-      title: "full-fidelity verification blocked",
+      tone: "red",
+      title: "final URANS recovery failed",
       detail: `${verify.submitHttpStatus ? `HTTP ${verify.submitHttpStatus} — ` : ""}${verify.submitError ?? "the engine rejected the full-fidelity submit after its bounded automatic retry"}`,
       whyLines: [
-        "accepted preliminary evidence is retained; this is terminal machine work, not a coefficient-review task",
+        "accepted preliminary evidence is retained; this critical system incident requires automatic recovery and investigation",
       ],
     });
   }

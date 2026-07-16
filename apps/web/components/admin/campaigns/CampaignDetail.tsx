@@ -49,6 +49,7 @@ import {
 import { C, MONO } from "@/lib/tokens";
 import { isProcessDead } from "@/lib/solver-state";
 import type { CampaignPointsBucket } from "@/lib/point-history";
+import { SolverIncidentPanel } from "../SolverIncidentPanel";
 import {
   campaignInstrumentStatus,
   campaignStatusLine,
@@ -640,6 +641,11 @@ export function CampaignDetail({
         )}
       </div>
 
+      <SolverIncidentPanel
+        summary={summary.solverIncidents}
+        surface="campaign"
+      />
+
       {notice && (
         <div
           data-testid="campaign-notice"
@@ -848,7 +854,7 @@ export function CampaignDetail({
               {barSegments.blockedCount > 0 && remediationCopy && (
                 <div
                   data-testid="campaign-blocked-count"
-                  className="campaign-instrument-exception-action is-amber"
+                  className="campaign-instrument-exception-action is-red"
                   title={remediationCopy.title}
                 >
                   <ShieldAlert size={18} strokeWidth={1.6} aria-hidden />
@@ -882,14 +888,14 @@ export function CampaignDetail({
                 fontFamily: MONO,
                 fontSize: 10.5,
                 color: C.text2,
-                border: "1px solid rgba(245,158,11,0.38)",
-                background: "rgba(245,158,11,0.06)",
+                border: "1px solid rgba(245,101,101,0.42)",
+                background: "rgba(245,101,101,0.07)",
                 borderRadius: 8,
                 padding: "8px 10px",
                 lineHeight: 1.5,
               }}
             >
-              <span style={{ color: C.amber, fontWeight: 700 }}>
+              <span style={{ color: C.redText, fontWeight: 700 }}>
                 {fCount(blocked)} {remediationCopy.label}
               </span>
               {" — "}
@@ -1233,7 +1239,7 @@ export function CampaignDetail({
                 lineHeight: 1.55,
               }}
             >
-              This blocked condition stops counting against completion.{" "}
+              This condition will stop counting against completion.{" "}
               {fCount(forceReleaseTarget.counters.remaining)} pending point
               {forceReleaseTarget.counters.remaining === 1 ? "" : "s"} will be
               cancelled, {fCount(forceReleaseTarget.counters.failed)} failed

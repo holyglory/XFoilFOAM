@@ -18,23 +18,38 @@ Covers (no real OpenFOAM solves — fake runners shaped like prod output):
   - MUST-CATCH restartability: a timed-out transient leaves a case dir that
     stages successfully for continuation (latestTime fields intact).
 """
+import base64
+import hashlib
+import json
 import math
 import os
 import re
+import shutil
+import tarfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from airfoilfoam import jobs, pipeline
+from airfoilfoam import evidence_runtime, jobs, pipeline
 from airfoilfoam.celery_app import TASK_TIME_LIMIT_MARGIN_S, task_hard_time_limit_s
 from airfoilfoam.config import get_settings
+from airfoilfoam.evidence_store import RemoteEvidencePointer, create_tar_zst
+from airfoilfoam.evidence_runtime import (
+    EVIDENCE_ARCHIVE_NAME,
+    EVIDENCE_POINTER_NAME,
+)
 from airfoilfoam.models import (
     URANS_BUDGET_OVERRIDE_MAX_S,
     AirfoilInput,
     AoASpec,
     CaseSpec,
+    ContinuationFailureKind,
     ContinueFrom,
+    EngineIdentity,
+    EngineRuntimeIdentity,
+    FailureDisposition,
     FluidProperties,
     MeshParams,
     PolarRequest,
@@ -42,10 +57,16 @@ from airfoilfoam.models import (
     SolverParams,
     urans_budget_seconds,
 )
+from airfoilfoam.openfoam.dialects import (
+    OPENCFD_2406_IDENTITY,
+    OPENCFD_2606_IDENTITY,
+)
 from airfoilfoam.openfoam.runner import OpenFOAMError
 from airfoilfoam.pipeline import (
     CaseOutcome,
+    ContinuationPermanentError,
     ContinuationSource,
+    ContinuationTransientError,
     TransientResume,
     _finalize_outcome,
     _run_transient_attempt,
@@ -124,6 +145,143 @@ def _make_saved_case(
     # A stale divergence verdict must never poison the resumed attempt.
     (tcase / "divergence_condemned.json").write_text('{"reason": "old verdict"}')
     return tcase
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_continuation_evidence(
+    case_dir: Path,
+    *,
+    archive_kind: str,
+    aoa_deg: float = SPEC.aoa_deg,
+    engine_identity: EngineIdentity | None = None,
+) -> tuple[Path, object]:
+    """Archive a restartable trajectory, then strip every mutable/raw source."""
+
+    tcase = case_dir / "transient"
+    evidence = case_dir / "evidence"
+    shutil.rmtree(evidence)
+    (evidence / "openfoam" / "transient").mkdir(parents=True)
+    shutil.copytree(
+        tcase / "system",
+        evidence / "openfoam" / "transient" / "system",
+    )
+    shutil.copytree(
+        tcase / "constant",
+        evidence / "openfoam" / "transient" / "constant",
+    )
+    shutil.copytree(
+        tcase / "postProcessing",
+        evidence / "openfoam" / "postProcessing",
+    )
+    init_log = tcase / "log.simpleFoam.init"
+    if init_log.is_file():
+        archived_log = (
+            evidence
+            / "openfoam"
+            / "logs"
+            / tcase.name
+            / "log.simpleFoam.init"
+        )
+        archived_log.parent.mkdir(parents=True)
+        shutil.copy2(init_log, archived_log)
+    time_root = evidence / "time_directories"
+    for child in sorted(tcase.iterdir()):
+        if not child.is_dir():
+            continue
+        try:
+            float(child.name)
+        except ValueError:
+            continue
+        shutil.copytree(child, time_root / child.name)
+
+    entries = []
+    for path in sorted(p for p in evidence.rglob("*") if p.is_file()):
+        entries.append(
+            {
+                "path": path.relative_to(evidence).as_posix(),
+                "byteSize": path.stat().st_size,
+                "sha256": _sha256(path),
+                "kind": "test_evidence",
+            }
+        )
+    manifest = {
+        "schemaVersion": 2,
+        "aoaDeg": aoa_deg,
+        "bundleExcludes": [],
+        "files": entries,
+    }
+    if engine_identity is not None:
+        manifest["engine"] = engine_identity.model_dump(mode="json")
+        manifest["engineNamespace"] = engine_identity.compatibility_key
+    (evidence / "evidence_manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    if archive_kind == "legacy":
+        archive = evidence / "openfoam_evidence.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            for child in sorted(evidence.iterdir()):
+                if child != archive:
+                    bundle.add(child, arcname=child.name, recursive=True)
+        archive_record = None
+    elif archive_kind in {"canonical", "remote"}:
+        archive = evidence / EVIDENCE_ARCHIVE_NAME
+        archive_record = create_tar_zst(evidence, archive)
+    else:  # pragma: no cover - helper contract
+        raise AssertionError(archive_kind)
+
+    shutil.rmtree(evidence / "openfoam")
+    shutil.rmtree(evidence / "time_directories")
+    shutil.rmtree(tcase)
+    shutil.rmtree(case_dir / "postProcessing")
+    return archive, archive_record
+
+
+def _write_source_job_metadata(
+    case_dir: Path,
+    *,
+    engine_identity: EngineIdentity | None,
+    aoa_deg: float = SPEC.aoa_deg,
+    include_identity: bool = True,
+) -> None:
+    cases_root = next(parent for parent in case_dir.parents if parent.name == "cases")
+    job_root = cases_root.parent
+    case_slug = case_dir.relative_to(cases_root).as_posix()
+    request: dict[str, object] = {}
+    status: dict[str, object] = {}
+    result: dict[str, object] = {
+        "polars": [
+            {
+                "points": [],
+                "attempts": [
+                    {
+                        "case_slug": case_slug,
+                        "aoa_deg": aoa_deg,
+                        "evidence_artifacts": [],
+                    }
+                ],
+            }
+        ]
+    }
+    if include_identity:
+        assert engine_identity is not None
+        identity = engine_identity.model_dump(mode="json")
+        request["expected_engine"] = identity
+        status["requested_engine"] = identity
+        result["requested_engine"] = identity
+        result["polars"][0]["attempts"][0]["engine"] = identity
+    job_root.mkdir(parents=True, exist_ok=True)
+    (job_root / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    (job_root / "status.json").write_text(json.dumps(status), encoding="utf-8")
+    (job_root / "result.json").write_text(json.dumps(result), encoding="utf-8")
 
 
 def _continuation_request(naca0012_selig_text, **overrides) -> PolarRequest:
@@ -242,6 +400,578 @@ def test_stage_continuation_copies_state_and_locates_restart(tmp_path):
     assert not (dst / "transient" / "VTK").exists()
     assert not (dst / "transient" / "processor0").exists()
     assert not (dst / "transient" / "divergence_condemned.json").exists()
+
+
+def test_stage_continuation_requires_exact_same_engine_before_live_copy(tmp_path):
+    src = tmp_path / "jobs" / ("1" * 32) / "cases" / "same-engine"
+    _make_saved_case(src)
+    _write_source_job_metadata(
+        src,
+        engine_identity=OPENCFD_2606_IDENTITY,
+    )
+
+    compatible = tmp_path / "jobs" / ("2" * 32) / "cases" / "compatible"
+    source = stage_continuation_case(
+        src,
+        compatible,
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+    assert source.resume_from == pytest.approx(0.1)
+    assert (compatible / "transient" / "0.1" / "U").is_file()
+
+    incompatible = tmp_path / "jobs" / ("3" * 32) / "cases" / "incompatible"
+    with pytest.raises(
+        ContinuationPermanentError,
+        match="cross-engine field/history merging is forbidden",
+    ):
+        stage_continuation_case(
+            src,
+            incompatible,
+            aoa_deg=SPEC.aoa_deg,
+            expected_engine=OPENCFD_2406_IDENTITY,
+        )
+    assert not incompatible.exists()
+
+
+def test_historical_missing_identity_is_pinned_to_opencfd_2406(tmp_path):
+    src = tmp_path / "jobs" / ("4" * 32) / "cases" / "legacy"
+    _make_saved_case(src)
+    _write_source_job_metadata(
+        src,
+        engine_identity=None,
+        include_identity=False,
+    )
+
+    compatible = tmp_path / "jobs" / ("5" * 32) / "cases" / "compatible"
+    source = stage_continuation_case(
+        src,
+        compatible,
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2406_IDENTITY,
+    )
+    assert source.resume_from == pytest.approx(0.1)
+
+    incompatible = tmp_path / "jobs" / ("6" * 32) / "cases" / "incompatible"
+    with pytest.raises(
+        ContinuationPermanentError,
+        match="source job uses openfoam:opencfd:2406",
+    ):
+        stage_continuation_case(
+            src,
+            incompatible,
+            aoa_deg=SPEC.aoa_deg,
+            expected_engine=OPENCFD_2606_IDENTITY,
+        )
+    assert not incompatible.exists()
+
+
+def test_live_continuation_requires_exact_source_result_aoa(tmp_path):
+    src = tmp_path / "jobs" / ("f" * 32) / "cases" / "wrong-point"
+    _make_saved_case(src)
+    _write_source_job_metadata(
+        src,
+        engine_identity=OPENCFD_2606_IDENTITY,
+        aoa_deg=SPEC.aoa_deg - 1.0,
+    )
+    dst = tmp_path / "jobs" / ("0" * 32) / "cases" / "wrong-point"
+
+    with pytest.raises(
+        ContinuationPermanentError,
+        match="has no point at exact AoA",
+    ):
+        stage_continuation_case(
+            src,
+            dst,
+            aoa_deg=SPEC.aoa_deg,
+            expected_engine=OPENCFD_2606_IDENTITY,
+        )
+    assert not dst.exists()
+
+
+@pytest.mark.parametrize("archive_kind", ["legacy", "canonical"])
+def test_stage_continuation_restores_stripped_case_from_verified_local_archive(
+    tmp_path,
+    archive_kind,
+):
+    src = tmp_path / "src_job" / "cases" / "archived"
+    _make_saved_case(src)
+    _build_continuation_evidence(src, archive_kind=archive_kind)
+    assert not (src / "transient").exists()
+    assert not (src / "evidence" / "openfoam").exists()
+
+    dst = tmp_path / "new_job" / "cases" / "archived"
+    source = stage_continuation_case(src, dst, settings=get_settings())
+
+    assert source.transient_subdir == "transient"
+    assert source.transient_start == 0.0
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "system" / "controlDict").is_file()
+    assert (dst / "transient" / "constant" / "polyMesh" / "points").is_file()
+    assert (dst / "transient" / "0.1" / "U").read_text() == "saved U at 0.1"
+    assert (
+        dst
+        / "transient"
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat"
+    ).is_file()
+    # The immutable source bundle is not copied into the new mutable case.
+    assert not (dst / "evidence").exists()
+
+
+def test_modern_archive_requires_matching_source_engine_and_exact_aoa(tmp_path):
+    src = tmp_path / "jobs" / ("7" * 32) / "cases" / "modern"
+    _make_saved_case(src)
+    _build_continuation_evidence(
+        src,
+        archive_kind="canonical",
+        aoa_deg=SPEC.aoa_deg,
+        engine_identity=OPENCFD_2606_IDENTITY,
+    )
+    _write_source_job_metadata(
+        src,
+        engine_identity=OPENCFD_2606_IDENTITY,
+    )
+
+    dst = tmp_path / "jobs" / ("8" * 32) / "cases" / "modern"
+    source = stage_continuation_case(
+        src,
+        dst,
+        settings=get_settings(),
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "0.1" / "p").is_file()
+
+    wrong_aoa_src = tmp_path / "jobs" / ("9" * 32) / "cases" / "wrong-aoa"
+    _make_saved_case(wrong_aoa_src)
+    _build_continuation_evidence(
+        wrong_aoa_src,
+        archive_kind="canonical",
+        aoa_deg=SPEC.aoa_deg - 1.0,
+        engine_identity=OPENCFD_2606_IDENTITY,
+    )
+    _write_source_job_metadata(
+        wrong_aoa_src,
+        engine_identity=OPENCFD_2606_IDENTITY,
+    )
+    wrong_aoa_dst = tmp_path / "jobs" / ("a" * 32) / "cases" / "wrong-aoa"
+    with pytest.raises(
+        ContinuationPermanentError,
+        match="manifest AoA does not match",
+    ):
+        stage_continuation_case(
+            wrong_aoa_src,
+            wrong_aoa_dst,
+            settings=get_settings(),
+            aoa_deg=SPEC.aoa_deg,
+            expected_engine=OPENCFD_2606_IDENTITY,
+        )
+    assert not wrong_aoa_dst.exists()
+
+
+def test_continuation_engine_guard_compares_logical_identity_not_build_fingerprint(
+    tmp_path,
+):
+    source_runtime = EngineRuntimeIdentity(
+        **OPENCFD_2606_IDENTITY.model_dump(),
+        build_id="source-build",
+        application_source_sha256="a" * 64,
+    )
+    archive_runtime = EngineRuntimeIdentity(
+        **OPENCFD_2606_IDENTITY.model_dump(),
+        build_id="archive-build",
+        application_source_sha256="b" * 64,
+    )
+    src = tmp_path / "jobs" / ("a1" * 16) / "cases" / "runtime-builds"
+    _make_saved_case(src)
+    _build_continuation_evidence(
+        src,
+        archive_kind="canonical",
+        engine_identity=archive_runtime,
+    )
+    _write_source_job_metadata(
+        src,
+        engine_identity=source_runtime,
+    )
+    dst = tmp_path / "jobs" / ("a2" * 16) / "cases" / "runtime-builds"
+
+    source = stage_continuation_case(
+        src,
+        dst,
+        settings=get_settings(),
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "0.1" / "U").is_file()
+
+
+def test_archive_engine_must_match_source_job_before_history_materialization(
+    tmp_path,
+):
+    src = tmp_path / "jobs" / ("b" * 32) / "cases" / "mismatched-archive"
+    _make_saved_case(src)
+    _build_continuation_evidence(
+        src,
+        archive_kind="canonical",
+        engine_identity=OPENCFD_2406_IDENTITY,
+    )
+    _write_source_job_metadata(
+        src,
+        engine_identity=OPENCFD_2606_IDENTITY,
+    )
+    dst = tmp_path / "jobs" / ("c" * 32) / "cases" / "mismatched-archive"
+
+    with pytest.raises(
+        ContinuationPermanentError,
+        match="manifest engine disagrees with source job",
+    ):
+        stage_continuation_case(
+            src,
+            dst,
+            settings=get_settings(),
+            aoa_deg=SPEC.aoa_deg,
+            expected_engine=OPENCFD_2606_IDENTITY,
+        )
+    assert not dst.exists()
+
+
+def test_stage_continuation_restores_stripped_case_from_pinned_remote_archive(
+    tmp_path,
+    monkeypatch,
+):
+    src = tmp_path / "src_job" / "cases" / "remote"
+    _make_saved_case(src)
+    local_archive, archive_record = _build_continuation_evidence(
+        src,
+        archive_kind="remote",
+    )
+    assert archive_record is not None
+    remote_archive = tmp_path / "remote-object.tar.zst"
+    shutil.copy2(local_archive, remote_archive)
+    # A stale/corrupt local archive must not outrank the exact pinned
+    # generation. The pointer anchors local identity and forces remote fallback.
+    local_archive.write_bytes(b"stale local bytes")
+    pointer = RemoteEvidencePointer(
+        bucket="test-bucket",
+        object_key=f"solver-evidence/v1/{archive_record.stored_sha256}.tar.zst",
+        generation=7,
+        stored_sha256=archive_record.stored_sha256,
+        stored_size=archive_record.stored_size,
+        tar_sha256=archive_record.tar_sha256,
+        tar_size=archive_record.tar_size,
+        crc32c=base64.b64encode(b"\0\0\0\0").decode("ascii"),
+        zstd_level=archive_record.zstd_level,
+        created_at="2026-07-16T00:00:00+00:00",
+    )
+    (src / "evidence" / EVIDENCE_POINTER_NAME).write_text(
+        json.dumps(pointer.to_dict()),
+        encoding="utf-8",
+    )
+
+    class FakeRemoteStore:
+        used = False
+
+        @contextmanager
+        def archive_source(self, requested):
+            assert requested == pointer
+            self.used = True
+            yield remote_archive
+
+    fake_store = FakeRemoteStore()
+    monkeypatch.setattr(
+        "airfoilfoam.evidence_runtime.evidence_object_store",
+        lambda _settings: fake_store,
+    )
+
+    dst = tmp_path / "new_job" / "cases" / "remote"
+    source = stage_continuation_case(src, dst, settings=get_settings())
+
+    assert fake_store.used
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "0.1" / "p").is_file()
+    assert (
+        dst
+        / "transient"
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat"
+    ).is_file()
+
+
+def test_legacy_local_archive_remains_valid_with_unavailable_migration_pointer(
+    tmp_path,
+    monkeypatch,
+):
+    src = tmp_path / "jobs" / ("d" * 32) / "cases" / "legacy-pointer"
+    _make_saved_case(src)
+    _build_continuation_evidence(
+        src,
+        archive_kind="legacy",
+        engine_identity=OPENCFD_2406_IDENTITY,
+    )
+    pointer = RemoteEvidencePointer(
+        bucket="unavailable-bucket",
+        object_key="solver-evidence/v1/sha256/00/" + ("0" * 64) + ".tar.zst",
+        generation=1,
+        stored_sha256="0" * 64,
+        stored_size=1,
+        tar_sha256="1" * 64,
+        tar_size=1024,
+        crc32c=base64.b64encode(b"\0\0\0\0").decode("ascii"),
+        zstd_level=10,
+        created_at="2026-07-16T00:00:00+00:00",
+    )
+    (src / "evidence" / EVIDENCE_POINTER_NAME).write_text(
+        json.dumps(pointer.to_dict()),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "airfoilfoam.evidence_runtime.evidence_object_store",
+        lambda _settings: None,
+    )
+
+    dst = tmp_path / "jobs" / ("e" * 32) / "cases" / "legacy-pointer"
+    source = stage_continuation_case(
+        src,
+        dst,
+        settings=get_settings(),
+        aoa_deg=SPEC.aoa_deg,
+    )
+
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "0.1" / "U").is_file()
+
+
+def test_stage_continuation_uses_exact_warm_march_evidence_artifact_by_aoa(
+    tmp_path,
+):
+    job_root = tmp_path / "data" / "jobs" / ("b" * 32)
+    src = job_root / "cases" / "polar"
+    src.mkdir(parents=True)
+
+    target_build = tmp_path / "target-build"
+    _make_saved_case(target_build, latest="0.1")
+    target_archive, _ = _build_continuation_evidence(
+        target_build,
+        archive_kind="legacy",
+        aoa_deg=15.0,
+    )
+    target_evidence = src / "a3" / "evidence"
+    target_evidence.parent.mkdir(parents=True)
+    shutil.move(target_build / "evidence", target_evidence)
+
+    distractor_build = tmp_path / "distractor-build"
+    _make_saved_case(distractor_build, latest="0.2")
+    distractor_archive, _ = _build_continuation_evidence(
+        distractor_build,
+        archive_kind="canonical",
+        aoa_deg=14.0,
+    )
+    distractor_evidence = src / "a2" / "evidence"
+    distractor_evidence.parent.mkdir(parents=True)
+    shutil.move(distractor_build / "evidence", distractor_evidence)
+
+    def point(
+        aoa: float,
+        evidence_base: str,
+        archive: Path,
+        kind: str,
+    ) -> dict:
+        return {
+            "case_slug": "polar",
+            "aoa_deg": aoa,
+            "evidence_artifacts": [
+                {
+                    "kind": kind,
+                    "path": f"{evidence_base}/{archive.name}",
+                    "sha256": _sha256(archive),
+                    "byte_size": archive.stat().st_size,
+                    "metadata": {"evidenceBase": evidence_base},
+                }
+            ],
+        }
+
+    (job_root / "result.json").write_text(
+        json.dumps(
+            {
+                "polars": [
+                    {
+                        "points": [],
+                        "attempts": [
+                            point(
+                                14.0,
+                                "a2/evidence",
+                                distractor_evidence / distractor_archive.name,
+                                "engine_bundle",
+                            ),
+                            point(
+                                15.0,
+                                "a3/evidence",
+                                target_evidence / target_archive.name,
+                                "openfoam_bundle",
+                            ),
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dst = tmp_path / "new-job" / "cases" / "continued"
+    source = stage_continuation_case(
+        src,
+        dst,
+        settings=get_settings(),
+        aoa_deg=15.0,
+    )
+
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "0.1" / "U").is_file()
+    assert not (dst / "transient" / "0.2").exists()
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "invalid_value", "message"),
+    [
+        ("sha256", "not-a-digest", "invalid evidence archive SHA-256"),
+        ("byte_size", -1, "invalid evidence archive byte size"),
+    ],
+)
+def test_stage_continuation_rejects_malformed_recorded_archive_identity(
+    tmp_path,
+    metadata_key,
+    invalid_value,
+    message,
+):
+    job_root = tmp_path / "data" / "jobs" / ("c1" * 16)
+    src = job_root / "cases" / "polar"
+    src.mkdir(parents=True)
+    result = {
+        "polars": [
+            {
+                "points": [],
+                "attempts": [
+                    {
+                        "case_slug": "polar",
+                        "aoa_deg": SPEC.aoa_deg,
+                        "evidence_artifacts": [
+                            {
+                                "kind": "engine_bundle",
+                                "path": "evidence/engine_evidence.tar.zst",
+                                metadata_key: invalid_value,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    (job_root / "result.json").write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ContinuationPermanentError, match=message):
+        stage_continuation_case(
+            src,
+            tmp_path / "new-job" / "cases" / "continued",
+            settings=get_settings(),
+            aoa_deg=SPEC.aoa_deg,
+        )
+
+
+def test_stage_continuation_falls_through_restart_invalid_archive_to_legacy(
+    tmp_path,
+):
+    bad = tmp_path / "bad-build"
+    _make_saved_case(bad)
+    (bad / "transient" / "0.1" / "U").unlink()
+    bad_archive, _ = _build_continuation_evidence(
+        bad,
+        archive_kind="canonical",
+    )
+
+    good = tmp_path / "good-build"
+    _make_saved_case(good)
+    good_archive, _ = _build_continuation_evidence(
+        good,
+        archive_kind="legacy",
+    )
+
+    src = tmp_path / "src-job" / "cases" / "fallback"
+    evidence = src / "evidence"
+    evidence.mkdir(parents=True)
+    shutil.copy2(bad_archive, evidence / EVIDENCE_ARCHIVE_NAME)
+    shutil.copy2(good_archive, evidence / "openfoam_evidence.tar.gz")
+
+    dst = tmp_path / "new-job" / "cases" / "fallback"
+    source = stage_continuation_case(src, dst, settings=get_settings())
+
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "0.1" / "U").is_file()
+
+
+def test_archived_init_seeded_trajectory_infers_positive_transient_start(tmp_path):
+    src = tmp_path / "src-job" / "cases" / "init-seeded"
+    tcase = _make_saved_case(
+        src,
+        with_marker=False,
+        with_init_log=True,
+        latest="600.05",
+    )
+    coeff = tcase / "postProcessing" / "forceCoeffs1" / "600" / "coefficient.dat"
+    coeff.parent.mkdir(parents=True)
+    coeff.write_text(_coeff_rows(600.001, 600.05))
+    _build_continuation_evidence(src, archive_kind="canonical")
+
+    dst = tmp_path / "new-job" / "cases" / "init-seeded"
+    source = stage_continuation_case(src, dst, settings=get_settings())
+
+    assert source.transient_start == pytest.approx(600.0)
+    assert source.resume_from == pytest.approx(600.05)
+    assert read_transient_start_marker(dst / "transient") == pytest.approx(600.0)
+
+
+def test_stage_continuation_rejects_archive_that_disagrees_with_manifest(tmp_path):
+    src = tmp_path / "src_job" / "cases" / "corrupt"
+    _make_saved_case(src)
+    _build_continuation_evidence(src, archive_kind="canonical")
+    manifest = src / "evidence" / "evidence_manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["files"][0]["sha256"] = "0" * 64
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    dst = tmp_path / "new_job" / "cases" / "corrupt"
+    with pytest.raises(OpenFOAMError, match="manifest"):
+        stage_continuation_case(
+            src,
+            dst,
+            settings=get_settings(),
+        )
+    assert not dst.exists()
+    assert not list(dst.parent.glob(f".{dst.name}.continuation-*"))
+
+
+def test_stage_continuation_bounds_retained_local_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    src = tmp_path / "src_job" / "cases" / "oversized-manifest"
+    _make_saved_case(src)
+    _build_continuation_evidence(src, archive_kind="canonical")
+    monkeypatch.setattr(evidence_runtime, "MAX_EVIDENCE_MANIFEST_BYTES", 32)
+
+    with pytest.raises(OpenFOAMError, match="manifest exceeds"):
+        stage_continuation_case(
+            src,
+            tmp_path / "new_job" / "cases" / "oversized-manifest",
+            settings=get_settings(),
+        )
 
 
 def test_stage_continuation_missing_or_unrestartable_sources_fail_honestly(tmp_path):
@@ -492,9 +1222,19 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     captured = {}
     source = ContinuationSource(transient_subdir="transient", transient_start=0.42, resume_from=1.1)
 
-    def fake_stage(src_case, dst_case):
+    def fake_stage(
+        src_case,
+        dst_case,
+        *,
+        settings=None,
+        aoa_deg=None,
+        expected_engine=None,
+    ):
         captured["src_case"] = src_case
         captured["dst_case"] = dst_case
+        captured["settings"] = settings
+        captured["aoa_deg"] = aoa_deg
+        captured["expected_engine"] = expected_engine
         return source
 
     def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
@@ -523,6 +1263,9 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     cf = request.continue_from
     assert captured["src_case"] == store.cases_dir(cf.engine_job_id) / cf.case_slug
     assert captured["dst_case"] == store.case_dir("continuation-wiring-test", SPEC.slug)
+    assert captured["settings"] is settings
+    assert captured["aoa_deg"] == SPEC.aoa_deg
+    assert captured["expected_engine"] == OPENCFD_2606_IDENTITY
     assert captured["case_dir"] == captured["dst_case"]
     resume = captured["resume"]
     assert isinstance(resume, TransientResume)
@@ -556,12 +1299,48 @@ def test_execute_job_continuation_missing_source_fails_honestly(monkeypatch, nac
     result = jobs.execute_job("continuation-missing-src", request, store=store, settings=settings)
 
     assert result.state.value == "failed"
+    assert result.failure_disposition is None
+    assert result.continuation_failure_kind == ContinuationFailureKind.permanent
     assert "continuation failed" in (result.message or "")
     assert "not found" in (result.message or "")
     assert result.polars == [] or all(not p.points for p in result.polars)
     status = store.read_status("continuation-missing-src")
     assert status is not None and status.state.value == "failed"
+    assert status.failure_disposition is None
+    assert status.continuation_failure_kind == ContinuationFailureKind.permanent
     assert "continuation failed" in (status.message or "")
+
+
+def test_execute_job_continuation_transient_storage_failure_is_typed(
+    monkeypatch,
+    naca0012_selig_text,
+):
+    def transient_stage(*_args, **_kwargs):
+        raise ContinuationTransientError(
+            "continuation_source_transient: insufficient safe free space"
+        )
+
+    def forbid(*_args, **_kwargs):
+        raise AssertionError("must not solve after continuation staging fails")
+
+    monkeypatch.setattr(jobs, "stage_continuation_case", transient_stage)
+    monkeypatch.setattr(jobs, "run_case", forbid)
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", forbid)
+
+    request = _continuation_request(naca0012_selig_text)
+    settings = get_settings()
+    store = JobStore(settings)
+    result = jobs.execute_job(
+        "continuation-transient-storage",
+        request,
+        store=store,
+        settings=settings,
+    )
+
+    assert result.state.value == "failed"
+    assert result.failure_disposition == FailureDisposition.infrastructure
+    assert result.continuation_failure_kind == ContinuationFailureKind.transient
+    assert "insufficient safe free space" in (result.message or "")
 
 
 # --------------------------------------------------------------------------- #

@@ -78,7 +78,7 @@ export async function findGaps(db: DB, limit = 500): Promise<Gap[]> {
       )
       AND (r.id IS NULL OR (
         r.regime IS DISTINCT FROM 'urans'
-        AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+        AND COALESCE(r.fidelity::text, '') NOT LIKE 'urans%'
       ))
       AND NOT EXISTS (
         SELECT 1 FROM sim_precalc_obligations obligation

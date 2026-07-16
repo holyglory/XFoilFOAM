@@ -390,7 +390,7 @@ def test_recovered_mesh_evidence_is_checksummed_cached_and_archived_per_point(
     expected_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     checksum = evidence_dir / pipeline.SHARED_MESH_EVIDENCE_CHECKSUM
     assert checksum.read_text().split()[0] == expected_digest
-    assert manifest["meshRecoveryVersion"] == 1
+    assert manifest["meshRecoveryVersion"] == 2
     assert manifest["status"] == "verified"
     assert manifest["actualMesh"]["params"]["mesher"] == actual.mesher
     assert manifest["actualMesh"]["params"]["first_cell_height_chords"] == pytest.approx(
@@ -511,12 +511,14 @@ def test_all_deterministic_candidates_exhaust_in_exact_order_with_real_diagnosti
     expected = [(pipeline.MESH_RECOVERY_PUBLIC_MESHER, 0.01575)]
     for name in pipeline.MESH_RECOVERY_MESHER_CANDIDATES:
         expected.extend(((name, 0.01575), (name, 0.006)))
+        if name in pipeline.MESH_RECOVERY_FINE_WALL_MESHERS:
+            expected.append((name, 0.003))
     assert events == expected
     message = str(raised.value)
-    assert "exhausted after 9 deterministic attempts" in message
+    assert f"exhausted after {len(expected)} deterministic attempts" in message
     assert "real-log-blockmesh-cgrid-0.01575" in message
     assert (
-        f"real-log-{pipeline.MESH_RECOVERY_MESHER_CANDIDATES[-1]}-0.006"
+        f"real-log-{pipeline.MESH_RECOVERY_MESHER_CANDIDATES[-1]}-0.003"
         in message
     )
     for name in (pipeline.MESH_RECOVERY_PUBLIC_MESHER, *pipeline.MESH_RECOVERY_MESHER_CANDIDATES):
@@ -559,7 +561,9 @@ def test_infrastructure_failure_stops_ladder_without_cap_or_next_candidate(
         (
             DeterministicMeshError(
                 "blockMesh segmented topology preflight failed: recovery exhausted "
-                "after 9 deterministic attempts"
+                "after "
+                f"{1 + 2 * len(pipeline.MESH_RECOVERY_MESHER_CANDIDATES) + len(pipeline.MESH_RECOVERY_FINE_WALL_MESHERS)} "
+                "deterministic attempts"
             ),
             FailureDisposition.deterministic_mesh,
         ),

@@ -1848,9 +1848,7 @@ export const solverEvidenceArchives = pgTable(
     blobId: uuid("blob_id")
       .notNull()
       .references(() => solverEvidenceBlobs.id),
-    state: solverEvidenceArchiveStateEnum("state")
-      .notNull()
-      .default("current"),
+    state: solverEvidenceArchiveStateEnum("state").notNull().default("current"),
     supersededByArchiveId: uuid("superseded_by_archive_id"),
     supersededAt: ts(),
     createdAt: ts().notNull().defaultNow(),
@@ -1882,18 +1880,16 @@ export const solverEvidenceArchives = pgTable(
       t.resultAttemptId,
       t.blobId,
     ),
-    currentAttemptUq: uniqueIndex(
-      "solver_evidence_archives_current_attempt_uq",
-    )
+    currentAttemptUq: uniqueIndex("solver_evidence_archives_current_attempt_uq")
       .on(t.resultAttemptId)
       .where(sql`${t.state} = 'current'`),
     resultIdx: index("solver_evidence_archives_result_idx").on(
       t.resultId,
       t.resultAttemptId,
     ),
-    sourceArtifactIdx: index(
-      "solver_evidence_archives_source_artifact_idx",
-    ).on(t.sourceArtifactId),
+    sourceArtifactIdx: index("solver_evidence_archives_source_artifact_idx").on(
+      t.sourceArtifactId,
+    ),
     blobIdx: index("solver_evidence_archives_blob_idx").on(t.blobId),
     supersessionShapeCheck: check(
       "solver_evidence_archives_supersession_shape_check",
@@ -2455,6 +2451,14 @@ export const simJobs = pgTable(
     methodKeyCheck: check(
       "sim_jobs_method_key_check",
       sql`${t.methodKey} IS NULL OR btrim(${t.methodKey}) <> ''`,
+    ),
+    noDirectFullRequestCheck: check(
+      "sim_jobs_no_direct_full_request_check",
+      sql`${t.requestPayload} IS NULL OR NOT (
+        ${t.requestPayload} ? 'uransRequestId'
+        AND ${t.requestPayload} ->> 'uransFidelity' = 'full'
+        AND NOT (${t.requestPayload} ? 'verifyQueueItemId')
+      )`,
     ),
     statusIdx: index("sim_jobs_status_idx").on(t.status),
     engineJobIdx: index("sim_jobs_engine_job_idx").on(t.engineJobId),
@@ -3185,6 +3189,31 @@ export const simUransVerifyQueue = pgTable(
     deltaCl: doublePrecision("delta_cl"),
     deltaCd: doublePrecision("delta_cd"),
     deltaCm: doublePrecision("delta_cm"),
+    /** Physical full-URANS starts consumed by this verification item.
+     * Same-case continuations are tracked separately and never consume a
+     * fresh-start allowance. */
+    freshAttemptCount: integer("fresh_attempt_count").notNull().default(0),
+    maxFreshAttempts: integer("max_fresh_attempts").notNull().default(2),
+    /** At most one continuation is authorized for each fresh trajectory. */
+    continuationAttemptCount: integer("continuation_attempt_count")
+      .notNull()
+      .default(0),
+    /** Admin-requested budget for a seeded same-case final continuation.
+     * NULL uses the controller default. Shared request ownership keeps the
+     * largest explicit override so attaching another owner cannot shorten an
+     * already-promised physical continuation. */
+    continuationBudgetOverrideS: integer("continuation_budget_override_s"),
+    /** Latest immutable exact full-fidelity attempt, including rejected
+     * evidence that the canonical-result replace guard deliberately did not
+     * select over the accepted preliminary result. */
+    latestResultAttemptId: uuid("latest_result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "set null" },
+    ),
+    nextSubmitAt: timestamp("next_submit_at", { withTimezone: true }),
+    /** Stable machine outcome for scheduling and incident aggregation. */
+    lastOutcome: text("last_outcome"),
+    lastError: text("last_error"),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -3192,6 +3221,22 @@ export const simUransVerifyQueue = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    freshAttemptCountCheck: check(
+      "sim_urans_verify_queue_fresh_attempt_count_check",
+      sql`${t.freshAttemptCount} >= 0`,
+    ),
+    maxFreshAttemptsCheck: check(
+      "sim_urans_verify_queue_max_fresh_attempts_check",
+      sql`${t.maxFreshAttempts} >= 1`,
+    ),
+    continuationAttemptCountCheck: check(
+      "sim_urans_verify_queue_continuation_attempt_count_check",
+      sql`${t.continuationAttemptCount} >= 0 AND ${t.continuationAttemptCount} <= ${t.freshAttemptCount}`,
+    ),
+    continuationBudgetOverrideCheck: check(
+      "sim_urans_verify_queue_continuation_budget_override_check",
+      sql`${t.continuationBudgetOverrideS} IS NULL OR ${t.continuationBudgetOverrideS} > 0`,
+    ),
     // Idempotent enqueue: one open item per cell (partial unique).
     openCellUq: uniqueIndex("sim_urans_verify_queue_open_cell_uq")
       .on(t.airfoilId, t.revisionId, t.aoaDeg)
@@ -3200,6 +3245,9 @@ export const simUransVerifyQueue = pgTable(
       .on(t.simJobId)
       .where(sql`${t.simJobId} IS NOT NULL`),
     stateIdx: index("sim_urans_verify_queue_state_idx").on(t.state),
+    pendingDueIdx: index("sim_urans_verify_queue_pending_due_idx")
+      .on(t.nextSubmitAt, t.createdAt)
+      .where(sql`${t.state} = 'pending'`),
     campaignIdx: index("sim_urans_verify_queue_campaign_idx").on(
       t.campaignId,
       t.state,
@@ -3341,6 +3389,29 @@ export const simUransRequestCampaigns = pgTable(
   }),
 );
 
+/** Durable request coverage for one global physical final-verification
+ * obligation. A whole-polar admin request links to one queue row per angle;
+ * an already-existing automatic queue row can be shared without copying the
+ * request's independent lifecycle into background_owner. */
+export const simUransVerifyQueueRequests = pgTable(
+  "sim_urans_verify_queue_requests",
+  {
+    queueId: uuid("queue_id")
+      .notNull()
+      .references(() => simUransVerifyQueue.id, { onDelete: "cascade" }),
+    requestId: uuid("request_id")
+      .notNull()
+      .references(() => simUransRequests.id, { onDelete: "cascade" }),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.queueId, t.requestId] }),
+    requestIdx: index("sim_urans_verify_queue_requests_request_idx").on(
+      t.requestId,
+    ),
+  }),
+);
+
 /** Durable answered-submit policy for full-fidelity ladder work. Exactly one
  * physical owner is present: either an explicit full URANS request or an
  * automatic full verification item. These rows never assert that OpenFOAM ran
@@ -3439,6 +3510,16 @@ export const simPrecalcObligations = pgTable(
     maxAttempts: integer("max_attempts").notNull().default(2),
     submitFailureCount: integer("submit_failure_count").notNull().default(0),
     nextSubmitAt: timestamp("next_submit_at", { withTimezone: true }),
+    /** Count of completed physical same-case continuation segments. A
+     * continuation-stage infrastructure failure does not advance this count. */
+    continuationSegmentCount: integer("continuation_segment_count")
+      .notNull()
+      .default(0),
+    /** Consecutive completed continuation segments that failed to extend the
+     * retained simulated-time/period window meaningfully. */
+    continuationNoProgressCount: integer("continuation_no_progress_count")
+      .notNull()
+      .default(0),
     latestSimJobId: uuid("latest_sim_job_id").references(
       (): AnyPgColumn => simJobs.id,
       { onDelete: "set null" },
@@ -3471,6 +3552,10 @@ export const simPrecalcObligations = pgTable(
     submitFailureBoundsCheck: check(
       "sim_precalc_obligations_submit_failure_bounds_check",
       sql`${t.submitFailureCount} >= 0 AND ${t.submitFailureCount} <= 2`,
+    ),
+    continuationProgressBoundsCheck: check(
+      "sim_precalc_obligations_continuation_progress_bounds_check",
+      sql`${t.continuationSegmentCount} >= 0 AND ${t.continuationNoProgressCount} >= 0 AND ${t.continuationNoProgressCount} <= ${t.continuationSegmentCount}`,
     ),
     cellUq: unique("sim_precalc_obligations_cell_uq").on(
       t.airfoilId,
@@ -3530,6 +3615,17 @@ export const simPrecalcObligationAttempts = pgTable(
      * submission. Stored here because producing sim_jobs are retention-
      * eligible; default 0 is the honest legacy/pre-capability value. */
     meshRecoveryVersion: integer("mesh_recovery_version").notNull().default(0),
+    /** Physical continuation ordinal. NULL for fresh solves and for
+     * continuation submissions that never reached physical CFD evidence. */
+    continuationSegmentNumber: integer("continuation_segment_number"),
+    /** Cross-segment progress evidence copied from the immutable engine
+     * payload. These values never replace result evidence; they make bounded
+     * continuation policy restart-safe and auditable. */
+    progressPeriodsRetained: doublePrecision("progress_periods_retained"),
+    progressSimulatedTimeS: doublePrecision("progress_simulated_time_s"),
+    progressDriftFrac: doublePrecision("progress_drift_frac"),
+    progressStationary: boolean("progress_stationary"),
+    continuationProgressed: boolean("continuation_progressed"),
     // submitted | accepted | rejected | failed | cancelled
     state: text("state").notNull().default("submitted"),
     outcome: text("outcome"),
@@ -3564,6 +3660,14 @@ export const simPrecalcObligationAttempts = pgTable(
     meshRecoveryVersionCheck: check(
       "sim_precalc_obligation_attempts_mesh_recovery_version_check",
       sql`${t.meshRecoveryVersion} >= 0`,
+    ),
+    continuationSegmentCheck: check(
+      "sim_precalc_obligation_attempts_continuation_segment_check",
+      sql`${t.continuationSegmentNumber} IS NULL OR ${t.continuationSegmentNumber} > 0`,
+    ),
+    continuationProgressCheck: check(
+      "sim_precalc_obligation_attempts_continuation_progress_check",
+      sql`${t.continuationProgressed} IS NULL OR ${t.continuationSegmentNumber} IS NOT NULL`,
     ),
     jobUq: unique("sim_precalc_obligation_attempts_job_uq").on(
       t.obligationId,
@@ -3637,6 +3741,158 @@ export const simPrecalcObligationRequests = pgTable(
     pk: primaryKey({ columns: [t.obligationId, t.requestId] }),
     requestIdx: index("sim_precalc_obligation_requests_request_idx").on(
       t.requestId,
+    ),
+  }),
+);
+
+/** Durable solver recovery incidents. One row is one immutable recovery
+ * occurrence, deduplicated by a controller-generated occurrence key. Current
+ * severity/status are operational metadata; solver/result evidence remains in
+ * result_attempts and is never copied or rewritten here. */
+export const simSolverIncidents = pgTable(
+  "sim_solver_incidents",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    stage: text("stage").notNull(), // rans | preliminary | final
+    reason: text("reason").notNull(),
+    severity: text("severity").notNull(), // warning | critical
+    status: text("status").notNull().default("open"), // open | resolved
+    resultId: uuid("result_id").references((): AnyPgColumn => results.id, {
+      onDelete: "cascade",
+    }),
+    precalcObligationId: uuid("precalc_obligation_id").references(
+      () => simPrecalcObligations.id,
+      { onDelete: "cascade" },
+    ),
+    verifyQueueId: uuid("verify_queue_id").references(
+      () => simUransVerifyQueue.id,
+      { onDelete: "cascade" },
+    ),
+    uransRequestId: uuid("urans_request_id").references(
+      () => simUransRequests.id,
+      { onDelete: "cascade" },
+    ),
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
+      onDelete: "set null",
+    }),
+    resultAttemptId: uuid("result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "set null" },
+    ),
+    /** Globally stable event identity, normally stage + physical owner +
+     * immutable attempt/job identity. Reconciliation replay cannot double
+     * count the same incident. */
+    occurrenceKey: text("occurrence_key").notNull(),
+    /** Version of the controller/remediation algorithm that observed this
+     * occurrence. Recurrence summaries keep versions separate so an operator
+     * can tell whether a deployed correction is actually reducing failures. */
+    remediationVersion: text("remediation_version").notNull(),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    occurredAt: timestamp("occurred_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    resultAttemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sim_solver_incidents_result_attempt_owner_fk",
+    }),
+    ownerXorCheck: check(
+      "sim_solver_incidents_owner_xor_check",
+      sql`num_nonnulls(${t.resultId}, ${t.precalcObligationId}, ${t.verifyQueueId}, ${t.uransRequestId}) = 1`,
+    ),
+    stageCheck: check(
+      "sim_solver_incidents_stage_check",
+      sql`${t.stage} IN ('rans', 'preliminary', 'final')`,
+    ),
+    severityCheck: check(
+      "sim_solver_incidents_severity_check",
+      sql`${t.severity} IN ('warning', 'critical')`,
+    ),
+    statusCheck: check(
+      "sim_solver_incidents_status_check",
+      sql`${t.status} IN ('open', 'resolved')`,
+    ),
+    statusShapeCheck: check(
+      "sim_solver_incidents_status_shape_check",
+      sql`(${t.status} = 'open' AND ${t.resolvedAt} IS NULL) OR (${t.status} = 'resolved' AND ${t.resolvedAt} IS NOT NULL)`,
+    ),
+    reasonCheck: check(
+      "sim_solver_incidents_reason_check",
+      sql`btrim(${t.reason}) <> ''`,
+    ),
+    occurrenceKeyCheck: check(
+      "sim_solver_incidents_occurrence_key_check",
+      sql`btrim(${t.occurrenceKey}) <> ''`,
+    ),
+    remediationVersionCheck: check(
+      "sim_solver_incidents_remediation_version_check",
+      sql`btrim(${t.remediationVersion}) <> ''`,
+    ),
+    occurrenceUq: uniqueIndex("sim_solver_incidents_occurrence_uq").on(
+      t.occurrenceKey,
+    ),
+    aggregateIdx: index("sim_solver_incidents_aggregate_idx").on(
+      t.stage,
+      t.reason,
+      t.solverImplementationId,
+      t.remediationVersion,
+      t.occurredAt,
+    ),
+    openIdx: index("sim_solver_incidents_open_idx")
+      .on(t.severity, t.occurredAt)
+      .where(sql`${t.status} = 'open'`),
+    resultOwnerIdx: index("sim_solver_incidents_result_owner_idx").on(
+      t.resultId,
+      t.status,
+    ),
+    precalcOwnerIdx: index("sim_solver_incidents_precalc_owner_idx").on(
+      t.precalcObligationId,
+      t.status,
+    ),
+    verifyOwnerIdx: index("sim_solver_incidents_verify_owner_idx").on(
+      t.verifyQueueId,
+      t.status,
+    ),
+    requestOwnerIdx: index("sim_solver_incidents_request_owner_idx").on(
+      t.uransRequestId,
+      t.status,
+    ),
+  }),
+);
+
+/** Campaign beneficiaries of one physical incident. Historical associations
+ * remain after a campaign pauses/completes so campaign-level recurrence
+ * reports conserve the incidents that occurred while it owned the work. */
+export const simSolverIncidentCampaigns = pgTable(
+  "sim_solver_incident_campaigns",
+  {
+    incidentId: uuid("incident_id")
+      .notNull()
+      .references(() => simSolverIncidents.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references((): AnyPgColumn => simCampaigns.id, { onDelete: "cascade" }),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.incidentId, t.campaignId] }),
+    campaignIdx: index("sim_solver_incident_campaigns_campaign_idx").on(
+      t.campaignId,
+      t.incidentId,
     ),
   }),
 );
@@ -4292,6 +4548,8 @@ export type SimUransRequest = typeof simUransRequests.$inferSelect;
 export type SimLadderSubmitRetry = typeof simLadderSubmitRetries.$inferSelect;
 export type SimUransRequestCampaign =
   typeof simUransRequestCampaigns.$inferSelect;
+export type SimUransVerifyQueueRequest =
+  typeof simUransVerifyQueueRequests.$inferSelect;
 export type SimPrecalcObligation = typeof simPrecalcObligations.$inferSelect;
 export type SimPrecalcObligationAttempt =
   typeof simPrecalcObligationAttempts.$inferSelect;
@@ -4299,6 +4557,9 @@ export type SimPrecalcObligationCampaign =
   typeof simPrecalcObligationCampaigns.$inferSelect;
 export type SimPrecalcObligationRequest =
   typeof simPrecalcObligationRequests.$inferSelect;
+export type SimSolverIncident = typeof simSolverIncidents.$inferSelect;
+export type SimSolverIncidentCampaign =
+  typeof simSolverIncidentCampaigns.$inferSelect;
 export type SimRansPolarPromotion = typeof simRansPolarPromotions.$inferSelect;
 export type SimRansPolarPromotionPoint =
   typeof simRansPolarPromotionPoints.$inferSelect;

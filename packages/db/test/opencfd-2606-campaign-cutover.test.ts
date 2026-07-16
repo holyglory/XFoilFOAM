@@ -959,8 +959,11 @@ describe("0066 OpenCFD 2606 campaign cutover", () => {
       sha256: OLD_ARTIFACT_SHA256,
       artifactSolverImplementationId: OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
     });
-    expect((await campaignFailures(db, IDS.campaign)).total).toBe(1);
-    expect((await campaignRejected(db, IDS.campaign)).total).toBe(1);
+    // The immutable 2406 RANS attempts remain queryable evidence, but neither
+    // aerodynamic RANS failure nor rejection is a user-terminal campaign
+    // result. Both belong to the automatic RANS → preliminary-URANS handoff.
+    expect((await campaignFailures(db, IDS.campaign)).total).toBe(0);
+    expect((await campaignRejected(db, IDS.campaign)).total).toBe(0);
 
     const prepared = await prepareOpenCfd2606Cutover(db, {
       actor: "cutover-test",

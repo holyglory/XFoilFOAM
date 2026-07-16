@@ -21,6 +21,7 @@
 import "./enabled-engine-pool-fixture";
 
 import {
+  RANS_RECOVERY_REMEDIATION_VERSION,
   airfoils,
   autoRetryCrashedResultsForJob,
   boundaryProfiles,
@@ -44,7 +45,9 @@ import {
   simRansPolarPromotionPoints,
   simRansPolarPromotions,
   simResultSubmitRetries,
+  simSolverIncidents,
   solverProfiles,
+  solverIncidentSummary,
   sweeperState,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
@@ -376,10 +379,52 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     expect(points.every((p) => p.state === "terminal")).toBe(true);
 
     const totals = await campaignProgressTotals(db, campaignId);
-    expect(totals.failed).toBe(ANGLES.length);
+    expect(totals.failed).toBe(0);
+    expect(totals.blocked).toBe(ANGLES.length);
     const buckets = await campaignReviewBuckets(db, campaignId);
     expect(buckets.needsReview).toBe(0);
     expect(buckets.awaitingUrans).toBe(0);
+
+    const incidents = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(
+        inArray(
+          simSolverIncidents.resultId,
+          rows.map((row) => row.id),
+        ),
+      );
+    expect(incidents).toHaveLength(ANGLES.length);
+    for (const incident of incidents) {
+      expect(incident).toMatchObject({
+        stage: "rans",
+        reason: "solver-execution-failed",
+        severity: "critical",
+        status: "open",
+        remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
+        simJobId: secondJobId,
+        resultAttemptId: null,
+      });
+      expect(incident.resultId).not.toBeNull();
+      expect(incident.occurrenceKey).toBe(
+        `rans:${incident.resultId}:${secondJobId}:auto-retry-exhausted`,
+      );
+    }
+    const incidentSummary = await solverIncidentSummary(db, { campaignId });
+    expect(incidentSummary).toMatchObject({
+      occurrenceCount: ANGLES.length,
+      openCount: ANGLES.length,
+      criticalGroupCount: 1,
+    });
+    expect(incidentSummary.groups).toEqual([
+      expect.objectContaining({
+        stage: "rans",
+        reason: "solver-execution-failed",
+        occurrenceCount: ANGLES.length,
+        openCriticalCount: ANGLES.length,
+        requiresInvestigation: true,
+      }),
+    ]);
   }, 240000);
 
   it("MUST-CATCH: re-ingesting the same failed job preserves the marker (no second retry from an ingest replay)", async () => {
@@ -402,6 +447,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
         job_id: `${PREFIX}-engine-2`,
         state: "failed",
         message: CRASH_MESSAGE,
+        mesh_recovery_version: 3,
         polars: [
           {
             speed: SPEED,
@@ -427,14 +473,40 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       expect(row.status).toBe("failed");
       expect(row.autoRetriedAt).not.toBeNull(); // marker SURVIVED the upsert
     }
+    const replayAttempts = await db
+      .select({ evidencePayload: resultAttempts.evidencePayload })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, secondJobId));
+    expect(replayAttempts).toHaveLength(ANGLES.length);
+    expect(
+      replayAttempts.every(
+        (attempt) =>
+          (
+            attempt.evidencePayload as {
+              mesh_recovery_version?: number;
+            } | null
+          )?.mesh_recovery_version === 3,
+      ),
+    ).toBe(true);
     // And the auto-retry pass still refuses a second retry: everything
     // escalates, nothing requeues.
     const outcome = await autoRetryCrashedResultsForJob(db, secondJobId);
     expect(outcome.retried).toEqual([]);
     expect(outcome.escalated.length).toBe(ANGLES.length);
+    expect(
+      await db
+        .select({ id: simSolverIncidents.id })
+        .from(simSolverIncidents)
+        .where(
+          inArray(
+            simSolverIncidents.resultId,
+            after.map((row) => row.id),
+          ),
+        ),
+    ).toHaveLength(ANGLES.length);
   }, 240000);
 
-  it("MUST-CATCH: a typed hard-solver partial failure stays with promotion routing while infrastructure and mesh failures keep the ordinary one-shot route", async () => {
+  it("MUST-CATCH: typed hard-solver stays with promotion, infrastructure gets one retry, and deterministic mesh stays terminal", async () => {
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -514,6 +586,9 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
           error: fixture.error,
           evidencePayload: {
             failure_disposition: fixture.disposition,
+            ...(fixture.disposition === "deterministic_mesh"
+              ? { mesh_recovery_version: 7 }
+              : {}),
           },
           solvedAt: new Date(),
         })
@@ -574,19 +649,180 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       simJobId: job.id,
       autoRetriedAt: null,
     });
-    expect(outcome.retried.map((row) => row.resultId).sort()).toEqual(
-      seeded
-        .filter((row) => row.disposition !== "hard_solver")
-        .map((row) => row.resultId)
-        .sort(),
+    const infrastructure = seeded.find(
+      (row) => row.disposition === "infrastructure",
+    )!;
+    const deterministic = seeded.find(
+      (row) => row.disposition === "deterministic_mesh",
+    )!;
+    expect(outcome.retried.map((row) => row.resultId)).toEqual([
+      infrastructure.resultId,
+    ]);
+    expect(byId.get(infrastructure.resultId)).toMatchObject({
+      status: "pending",
+      simJobId: null,
+    });
+    expect(byId.get(infrastructure.resultId)?.autoRetriedAt).not.toBeNull();
+    expect(outcome.suppressed.map((row) => row.resultId)).toEqual([
+      deterministic.resultId,
+    ]);
+    expect(byId.get(deterministic.resultId)).toMatchObject({
+      status: "failed",
+      simJobId: job.id,
+      autoRetriedAt: null,
+    });
+    const [meshIncident] = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(eq(simSolverIncidents.resultId, deterministic.resultId));
+    expect(meshIncident).toMatchObject({
+      stage: "rans",
+      reason: "mesh-quality-failure",
+      severity: "critical",
+      status: "open",
+      simJobId: job.id,
+      resultAttemptId: expect.any(String),
+      remediationVersion: "rans-mesh-recovery-v7",
+    });
+    expect(meshIncident.occurrenceKey).toBe(
+      `rans:${deterministic.resultId}:${job.id}:deterministic-mesh:v7`,
     );
-    for (const routed of seeded.filter(
-      (row) => row.disposition !== "hard_solver",
-    )) {
-      expect(byId.get(routed.resultId)?.status).toBe("pending");
-      expect(byId.get(routed.resultId)?.simJobId).toBeNull();
-      expect(byId.get(routed.resultId)?.autoRetriedAt).not.toBeNull();
+    expect(meshIncident.metadata).toMatchObject({ meshRecoveryVersion: 7 });
+    expect(
+      await db
+        .select({ id: simSolverIncidents.id })
+        .from(simSolverIncidents)
+        .where(
+          inArray(simSolverIncidents.resultId, [
+            hard.resultId,
+            infrastructure.resultId,
+          ]),
+        ),
+    ).toHaveLength(0);
+  }, 240000);
+
+  it("MUST-CATCH: done-but-rejected non-handoff RANS records one critical incident while normal needs-URANS handoff records none", async () => {
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        campaignId,
+        jobKind: "sweep",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "done",
+        totalCases: 2,
+        requestPayload: { aoas: [26.25, 26.5] },
+      })
+      .returning();
+    const fixtures = [
+      {
+        aoaDeg: 26.25,
+        state: "rejected" as const,
+        reasons: ["missing-coefficients"],
+      },
+      {
+        aoaDeg: 26.5,
+        state: "needs_urans" as const,
+        reasons: ["not-converged", "solver-stalled"],
+      },
+    ];
+    const seeded: Array<{
+      resultId: string;
+      attemptId: string;
+      state: (typeof fixtures)[number]["state"];
+    }> = [];
+    for (const fixture of fixtures) {
+      const [result] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: fixture.aoaDeg,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          fidelity: "rans",
+          converged: false,
+          simJobId: job.id,
+          engineJobId: `${PREFIX}-done-rejected`,
+        })
+        .returning();
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: result.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: fixture.aoaDeg,
+          simJobId: job.id,
+          engineJobId: `${PREFIX}-done-rejected`,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          validForPolar: false,
+          converged: false,
+          evidencePayload: { fidelity: "rans" },
+          solvedAt: new Date(),
+        })
+        .returning();
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: attempt.id })
+        .where(eq(results.id, result.id));
+      await db.insert(resultClassifications).values({
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: fixture.aoaDeg,
+        regime: "rans",
+        classifierVersion: "terminal-rans-incident-guard:v1",
+        state: fixture.state,
+        reasons: fixture.reasons,
+      });
+      seeded.push({
+        resultId: result.id,
+        attemptId: attempt.id,
+        state: fixture.state,
+      });
     }
+
+    await autoRetryCrashedResultsForJob(db, job.id);
+    await autoRetryCrashedResultsForJob(db, job.id);
+
+    const incidents = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(
+        inArray(
+          simSolverIncidents.resultId,
+          seeded.map((row) => row.resultId),
+        ),
+      );
+    const rejected = seeded.find((row) => row.state === "rejected")!;
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]).toMatchObject({
+      stage: "rans",
+      reason: "non-publishable-rans-evidence",
+      severity: "critical",
+      status: "open",
+      resultId: rejected.resultId,
+      resultAttemptId: rejected.attemptId,
+      simJobId: job.id,
+      remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
+      metadata: expect.objectContaining({
+        classificationReasons: ["missing-coefficients"],
+        recovery: "evidence-rejected",
+      }),
+    });
+    expect(incidents[0]?.occurrenceKey).toBe(
+      `rans:${rejected.resultId}:${job.id}:evidence-rejected`,
+    );
   }, 240000);
 
   it("MUST-CATCH: durable whole-polar promotion events recover campaign and background parents after a crash before child composition", async () => {

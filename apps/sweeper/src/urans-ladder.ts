@@ -1,14 +1,16 @@
 // URANS fidelity-ladder tick (pinned contracts 4–6, spec: single existing
 // priority scale — no second scale). Runs inside the submit-capacity branch of
-// the sweeper tick. Exact campaign RANS→PRECALC recoveries take the next free
-// slot; new RANS work then outranks admin-request PRECALC and verification.
-// Verify work additionally requires zero campaign RANS/precalc work
-// machine-wide. At most ONE submission wins each scheduler tick.
+// the sweeper tick. Exact conditional whole-polar promotions take the next
+// free slot; targeted terminal-parent PRECALC alternates admission with the
+// still-open RANS backlog. Final verification receives one bounded interleave
+// after at most eight newly admitted wave-1 RANS jobs; otherwise new RANS work
+// outranks admin-request PRECALC and verification. At most ONE submission wins
+// each scheduler tick.
 //
 // Tier 2 (precalc rank):
 //   a) campaign wave-2 URANS retries — a rejected RANS attempt is normal
-//      escalation input and receives the next free worker slot ahead of new
-//      RANS work, while the parent remains terminal before shared-mesh reuse;
+//      escalation input and is admitted from its terminal parent without a
+//      campaign-wide gap fence, alternating with ordinary RANS admission;
 //   b) admin request-URANS work items (contract 6).
 // Tier 3 (global lowest): verify-queue items (contract 4) — one cell re-solved
 //   at FULL fidelity; deltas recorded at ingest (reconcile settle path).
@@ -16,19 +18,32 @@
 import {
   airfoils,
   activeCampaignOwnersForUransRequest,
+  blockFinalUransVerificationBeforeSubmit,
+  campaignHasOpenRansGaps,
   claimNextPendingUransRequest,
   claimNextPendingVerifyItem,
   type DB,
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   hasOpenCampaignLadderWork,
   healOrphanedUransRequests,
   healOrphanedVerifyItems,
+  ensureFullUransRequestCoverage,
   ensurePrecalcObligations,
+  finalUransRecoveryPlanForVerifyItem,
+  FINAL_URANS_OUTCOMES,
+  finalVerifyInterleaveDecision,
+  FullUransRequestCoverageIncompleteError,
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   precalcContinuationsForObligations,
   precalcRequestStateFromObligations,
   precalcSnapshotForVerifyItem,
+  requeueRestartablePrecalcContinuations,
+  refreshFullUransRequestState,
   releaseClaimedUransRequest,
   releaseClaimedVerifyItem,
   recordPrecalcObligationSubmission,
+  recordSolverIncidentInTransaction,
+  restartablePrecalcCheckpointSql,
   results,
   simCampaigns,
   simJobs,
@@ -37,6 +52,8 @@ import {
   simulationPresets,
   simUransRequests,
   simUransVerifyQueue,
+  type VerifyInterleaveScope,
+  URANS_RECOVERY_REMEDIATION_VERSION,
 } from "@aerodb/db";
 import {
   DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER,
@@ -50,6 +67,7 @@ import {
   eq,
   inArray,
   isNotNull,
+  isNull,
   notExists,
   notInArray,
   or,
@@ -62,7 +80,11 @@ import {
   buildPolarRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
-import { engineMeshRecoveryVersion } from "./engine-capabilities";
+import {
+  engineMeshRecoveryVersion,
+  engineUransRecoveryVersion,
+  supportsDurableUransRecovery,
+} from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
 import {
   requireExecutionPoolForSetup,
@@ -74,17 +96,35 @@ import { composePhysicalPrecalcJob } from "./precalc-composition";
 import { submitUransRetryForJob } from "./reconcile";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
-/** Parents whose gated retry was already re-attempted this process lifetime —
+/** Parents whose recovery was already re-attempted this process lifetime —
  *  a parent whose retry plan is empty must not be re-planned every tick
  *  forever. In-memory on purpose (a restart simply rescans; no payload
  *  mutation, no deadlock). Tests reset via resetUransLadderMemory(). */
-const settledGatedParents = new Set<string>();
+const settledRecoveryParents = new Set<string>();
+/** Fair admission handoff between exact per-point PRECALC escalation and the
+ * still-open RANS backlog. A successful targeted escalation while any
+ * campaign RANS cell remains yields the next pre-RANS pass to submitOneBatch.
+ * If RANS has no composable work, the same tick's ladder fallback may consume
+ * PRECALC instead, so capacity never sits idle. Conditional whole-polar
+ * promotions remain outside this alternation because their immutable event
+ * already replaced the parent request's RANS scope. */
+let campaignRansAdmissionTurnDue = false;
 
 export function resetUransLadderMemory(): void {
-  settledGatedParents.clear();
+  settledRecoveryParents.clear();
+  campaignRansAdmissionTurnDue = false;
 }
 
-const GATED_PARENTS_PER_TICK = 3;
+function normalizedContinuationImplementationId(
+  implementationId: string | null | undefined,
+): string | null {
+  if (!implementationId) return null;
+  return implementationId === LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID
+    ? OPENCFD_2406_SOLVER_IMPLEMENTATION_ID
+    : implementationId;
+}
+
+const RECOVERY_PARENTS_PER_TICK = 3;
 const PROMOTION_RECOVERIES_PER_TICK = 16;
 
 function jobMeshRecoveryVersionSql(requestPayload: SQLWrapper) {
@@ -146,6 +186,7 @@ const RESERVED_LADDER_PAYLOAD_KEYS = new Set([
   "resources",
   "setupSnapshot",
   "speedMap",
+  "uransRecoveryVersion",
   "uransFidelity",
 ]);
 
@@ -427,6 +468,7 @@ export async function submitRecordedPromotionRecovery(
     parentJobIds?: string[];
     promotionIds?: string[];
     meshRecoveryVersion?: number;
+    uransRecoveryVersion?: number | null;
   } = {},
 ): Promise<boolean> {
   const meshRecoveryVersion =
@@ -437,6 +479,12 @@ export async function submitRecordedPromotionRecovery(
     );
     return false;
   }
+  const uransRecoveryVersion =
+    opts.uransRecoveryVersion !== undefined
+      ? opts.uransRecoveryVersion
+      : await engineUransRecoveryVersion(engine);
+  const durableRecoveryAvailable =
+    supportsDurableUransRecovery(uransRecoveryVersion);
   const scope = promotionRecoveryScopeSql(opts);
   const candidates = (await db.execute(sql`
     SELECT promotion.id AS promotion_id, parent.id AS parent_job_id
@@ -507,7 +555,10 @@ export async function submitRecordedPromotionRecovery(
           ON obligation.id = point.obligation_id
         WHERE point.promotion_id = promotion.id
           AND obligation.state = 'pending'
-          AND obligation.attempt_count < obligation.max_attempts
+          AND (
+            obligation.attempt_count < obligation.max_attempts
+            OR ${restartablePrecalcCheckpointSql(sql`obligation.id`)}
+          )
           AND (
             obligation.next_submit_at IS NULL
             OR obligation.next_submit_at <= now()
@@ -556,7 +607,10 @@ export async function submitRecordedPromotionRecovery(
           ON unowned_obligation.id = unowned_point.obligation_id
         WHERE unowned_point.promotion_id = promotion.id
           AND unowned_obligation.state = 'pending'
-          AND unowned_obligation.attempt_count < unowned_obligation.max_attempts
+          AND (
+            unowned_obligation.attempt_count < unowned_obligation.max_attempts
+            OR ${restartablePrecalcCheckpointSql(sql`unowned_obligation.id`)}
+          )
           AND (
             unowned_obligation.next_submit_at IS NULL
             OR unowned_obligation.next_submit_at <= now()
@@ -635,18 +689,30 @@ export async function submitRecordedPromotionRecovery(
     )
       continue;
     const now = Date.now();
-    let schedulable = points.filter(
+    const duePending = points.filter(
       (point) =>
         point.state === "pending" &&
-        point.attemptCount < point.maxAttempts &&
         (!point.nextSubmitAt || new Date(point.nextSubmitAt).getTime() <= now),
+    );
+    const continuations = await precalcContinuationsForObligations(
+      db,
+      duePending.map((point) => point.obligationId),
+    );
+    const continuationIds = new Set(
+      continuations.map((continuation) => continuation.obligationId),
+    );
+    let schedulable = duePending.filter((point) =>
+      continuationIds.has(point.obligationId)
+        ? durableRecoveryAvailable
+        : point.attemptCount < point.maxAttempts,
     );
     if (!schedulable.length) continue;
     let obligationIds = schedulable.map((point) => point.obligationId);
-    const [continuation] = await precalcContinuationsForObligations(
-      db,
-      obligationIds,
-    );
+    const continuation = durableRecoveryAvailable
+      ? continuations.find((candidate) =>
+          obligationIds.includes(candidate.obligationId),
+        )
+      : undefined;
     let continueFrom: { engineJobId: string; caseSlug: string } | null = null;
     let budgetOverrideS: number | null = null;
     let continuationResultAttemptId: string | null = null;
@@ -702,6 +768,7 @@ export async function submitRecordedPromotionRecovery(
       continueFrom,
       budgetOverrideS,
       meshRecoveryVersion,
+      uransRecoveryVersion: continuation ? uransRecoveryVersion! : undefined,
       recordedPromotion: {
         promotionId: event.promotionId,
         parentJobId: event.parentJobId,
@@ -721,16 +788,17 @@ export async function submitRecordedPromotionRecovery(
   return false;
 }
 
-/** Tier-2a: submit one durable campaign PRECALC recovery. A rejected RANS
- *  attempt is normal escalation work, so the loop gives it the next free slot
- *  ahead of a newly-composed RANS batch. The source wave-1 parent must still
- *  be terminal: URANS never races the parent over its shared mesh. */
+/** Tier-2a: submit one durable campaign PRECALC recovery. The source wave-1
+ * parent must be terminal, so URANS never races it over shared mesh state.
+ * When unrelated RANS gaps remain, successful targeted admissions alternate
+ * with the ordinary RANS composer. */
 export async function submitCampaignPrecalcRecoveries(
   db: DB,
   engine: EngineClient,
   campaignIds?: string[],
   parentJobIds?: string[],
   meshRecoveryVersion?: number,
+  uransRecoveryVersion?: number | null,
 ): Promise<boolean> {
   const statusFilter = inArray(simCampaigns.status, ["active", "attention"]);
   const campaigns = await db
@@ -741,7 +809,27 @@ export async function submitCampaignPrecalcRecoveries(
         ? and(statusFilter, inArray(simCampaigns.id, campaignIds))
         : statusFilter,
     );
+  const ransOpenByCampaign = new Map<string, boolean>();
+  const campaignStillHasRans = async (campaignId: string) => {
+    const known = ransOpenByCampaign.get(campaignId);
+    if (known !== undefined) return known;
+    const open = await campaignHasOpenRansGaps(db, campaignId);
+    ransOpenByCampaign.set(campaignId, open);
+    return open;
+  };
+  if (campaignRansAdmissionTurnDue) {
+    campaignRansAdmissionTurnDue = false;
+    for (const campaign of campaigns) {
+      if (await campaignStillHasRans(campaign.id)) {
+        // Main-loop ordering immediately gives this free slot to RANS. When
+        // RANS cannot compose, uransLadderTick calls this function again in
+        // the same tick and exact PRECALC remains the non-idling fallback.
+        return false;
+      }
+    }
+  }
   for (const campaign of campaigns) {
+    const campaignHasRansBacklog = await campaignStillHasRans(campaign.id);
     // STARVATION GUARD (adversarial review 2026-07-07): parents whose retry
     // plan is empty never grow a wave-2 child, so they never leave the
     // NOT-EXISTS filter. They MUST also be excluded from the SQL window —
@@ -753,7 +841,7 @@ export async function submitCampaignPrecalcRecoveries(
     // exclusion the window slides forward every tick; a restart clears the
     // set and simply re-settles from the front at 3 parents/tick — bounded
     // progress, no re-block. MUST-CATCH: urans-ladder.test.ts starvation test.
-    const settledIds = [...settledGatedParents];
+    const settledIds = [...settledRecoveryParents];
     const child = alias(simJobs, "settled_wave2_child");
     const parents = await db
       .select()
@@ -808,11 +896,11 @@ export async function submitCampaignPrecalcRecoveries(
         ),
       )
       .orderBy(simJobs.finishedAt)
-      .limit(GATED_PARENTS_PER_TICK);
+      .limit(RECOVERY_PARENTS_PER_TICK);
     let attempted = 0;
     for (const parent of parents) {
-      if (settledGatedParents.has(parent.id)) continue;
-      if (attempted >= GATED_PARENTS_PER_TICK) break;
+      if (settledRecoveryParents.has(parent.id)) continue;
+      if (attempted >= RECOVERY_PARENTS_PER_TICK) break;
       attempted += 1;
       await touchHeartbeat(db);
       const before = await db
@@ -821,6 +909,8 @@ export async function submitCampaignPrecalcRecoveries(
         .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
       await submitUransRetryForJob(db, engine, parent, {
         meshRecoveryVersion,
+        uransRecoveryVersion,
+        capacityScheduledEscalation: true,
       });
       const [campaignAfterSubmit] = parent.campaignId
         ? await db
@@ -834,7 +924,7 @@ export async function submitCampaignPrecalcRecoveries(
         // Its cancelled child is deliberately NOT a settled obligation: the
         // queued/no-owner rows must be reconsidered after explicit resume in
         // this same process, not only after a restart clears memory.
-        settledGatedParents.delete(parent.id);
+        settledRecoveryParents.delete(parent.id);
         continue;
       }
       const beforeIds = new Set(before.map((row) => row.id));
@@ -907,8 +997,8 @@ export async function submitCampaignPrecalcRecoveries(
         // A retry-wait obligation intentionally produces no child until its
         // due time. It is not a no-plan parent and must remain reachable in
         // this process. Memoize only when all known physical cells settled.
-        if (openObligation) settledGatedParents.delete(parent.id);
-        else settledGatedParents.add(parent.id);
+        if (openObligation) settledRecoveryParents.delete(parent.id);
+        else settledRecoveryParents.add(parent.id);
         continue;
       }
       if (
@@ -919,13 +1009,14 @@ export async function submitCampaignPrecalcRecoveries(
         // The live child itself is the durable duplicate barrier. Do not memo
         // the parent: once this child settles, another physical obligation on
         // the same parent may need a continuation in this same process.
-        settledGatedParents.delete(parent.id);
+        settledRecoveryParents.delete(parent.id);
+        if (campaignHasRansBacklog) campaignRansAdmissionTurnDue = true;
         return true;
       }
       // Even a synchronously-terminal child may have left another cell or its
       // one continuation pending. Re-scan next tick; memoization is reserved
       // for the genuine no-plan branch above.
-      settledGatedParents.delete(parent.id);
+      settledRecoveryParents.delete(parent.id);
     }
   }
   return false;
@@ -990,6 +1081,9 @@ async function submitLadderJob(
     budgetOverrideS?: number | null;
     /** Live engine capability stamped into PRECALC execution provenance. */
     meshRecoveryVersion?: number;
+    /** Exact live durable URANS recovery contract. Required only when this
+     * composition resumes/retries physical work unavailable to legacy engines. */
+    uransRecoveryVersion?: number;
     /** Claimed admin request linked to the composed job before submit. */
     uransRequestId?: string;
     /** Claimed automatic full-verification item. */
@@ -1015,6 +1109,11 @@ async function submitLadderJob(
   httpStatus?: number | null;
   ladderDisposition?: "retry_wait" | "blocked" | null;
 }> {
+  if (opts.fidelity === "full" && opts.uransRequestId) {
+    throw new Error(
+      "direct full-fidelity request submission is forbidden; route through preliminary coverage and a verify queue item",
+    );
+  }
   const {
     target,
     aoas,
@@ -1096,6 +1195,9 @@ async function submitLadderJob(
   if (fidelity === "precalc") {
     request.expected_mesh_recovery_version = meshRecoveryVersion!;
   }
+  if (opts.uransRecoveryVersion != null) {
+    request.expected_urans_recovery_version = opts.uransRecoveryVersion;
+  }
   if (opts.continueFrom) {
     // Amendment C: the engine copies/links the saved case dir into the new
     // job and restarts the transient from latestTime, merging coefficient
@@ -1136,6 +1238,9 @@ async function submitLadderJob(
       uransFidelity: fidelity,
       ...(fidelity === "precalc"
         ? { meshRecoveryVersion: meshRecoveryVersion! }
+        : {}),
+      ...(opts.uransRecoveryVersion != null
+        ? { uransRecoveryVersion: opts.uransRecoveryVersion }
         : {}),
       resources: request.resources,
       setupSnapshot: target.snapshot,
@@ -1285,11 +1390,9 @@ async function submitLadderJob(
     connectionErrorPrefix: "engine unreachable at ladder submit: ",
     submitErrorPrefix: "ladder submit failed: ",
     precalcObligationIds: payloadObligationIds,
-    ...(fidelity === "full" && opts.uransRequestId
-      ? { ladderSubmitOwner: { uransRequestId: opts.uransRequestId } }
-      : fidelity === "full" && opts.verifyQueueId
-        ? { ladderSubmitOwner: { verifyQueueId: opts.verifyQueueId } }
-        : {}),
+    ...(fidelity === "full" && opts.verifyQueueId
+      ? { ladderSubmitOwner: { verifyQueueId: opts.verifyQueueId } }
+      : {}),
   });
   if (submit.kind === "submitted") {
     return {
@@ -1356,6 +1459,52 @@ async function submitLadderJob(
   };
 }
 
+async function blockFullRequestOrchestration(
+  db: DB,
+  input: {
+    requestId: string;
+    revisionId: string;
+    reason: string;
+    error: string;
+  },
+): Promise<void> {
+  await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [blocked] = await tx
+      .update(simUransRequests)
+      .set({ state: "blocked", simJobId: null })
+      .where(
+        and(
+          eq(simUransRequests.id, input.requestId),
+          eq(simUransRequests.fidelity, "full"),
+          eq(simUransRequests.state, "running"),
+        ),
+      )
+      .returning({ id: simUransRequests.id });
+    if (!blocked) return;
+    const [revision] = await tx
+      .select({
+        solverImplementationId:
+          simulationPresetRevisions.solverImplementationId,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, input.revisionId))
+      .limit(1);
+    await recordSolverIncidentInTransaction(tx, {
+      stage: "final",
+      reason: input.reason,
+      severity: "critical",
+      owner: { uransRequestId: input.requestId },
+      solverImplementationId:
+        revision?.solverImplementationId ??
+        LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+      occurrenceKey: `final-request:${input.requestId}:${input.reason}`,
+      remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+      metadata: { orchestrationError: input.error },
+    });
+  });
+}
+
 /** Tier-2b: consume ONE pending admin request-URANS item (contract 6).
  *  aoaDeg NULL = whole polar (the pinned revision's sweep angle grid). */
 async function consumeUransRequest(
@@ -1364,6 +1513,7 @@ async function consumeUransRequest(
   cpuSlots: number,
   requestIds?: string[],
   meshRecoveryVersion?: number,
+  uransRecoveryVersion?: number | null,
   requiredFidelity?: UransFidelity,
 ): Promise<boolean> {
   const request = await claimNextPendingUransRequest(db, {
@@ -1371,13 +1521,33 @@ async function consumeUransRequest(
     fidelity: requiredFidelity,
   });
   if (!request) return false;
-  const fidelity: UransFidelity =
+  const requestedFidelity: UransFidelity =
     request.fidelity === "full" ? "full" : "precalc";
+  let physicalFidelity: UransFidelity = requestedFidelity;
+  const durableRecoveryAvailable =
+    supportsDurableUransRecovery(uransRecoveryVersion);
+  if (
+    requestedFidelity === "precalc" &&
+    request.continueFromResultId &&
+    !durableRecoveryAvailable
+  ) {
+    await releaseClaimedUransRequest(db, request.id);
+    return false;
+  }
   const target = await resolveTarget(db, request.airfoilId, request.revisionId);
   if (!target) {
     console.error(
-      `[sweeper] URANS request ${request.id} cancelled: revision ${request.revisionId} unresolvable (missing revision or bc)`,
+      `[sweeper] URANS request ${request.id} ${requestedFidelity === "full" ? "critically blocked" : "cancelled"}: revision ${request.revisionId} unresolvable (missing revision or bc)`,
     );
+    if (requestedFidelity === "full") {
+      await blockFullRequestOrchestration(db, {
+        requestId: request.id,
+        revisionId: request.revisionId,
+        reason: "immutable-setup-unresolvable",
+        error: `revision ${request.revisionId} is missing or has no resolvable boundary profile`,
+      });
+      return false;
+    }
     await db
       .update(simUransRequests)
       .set({ state: "cancelled" })
@@ -1390,21 +1560,62 @@ async function consumeUransRequest(
   // without it there is no case state to resume, so the item cancels loudly
   // instead of pretending a fresh solve is a continuation.
   let continueFrom: { engineJobId: string; caseSlug: string } | null = null;
-  let effectiveBudgetOverrideS = request.budgetOverrideS ?? null;
+  let effectiveBudgetOverrideS =
+    requestedFidelity === "precalc" ? (request.budgetOverrideS ?? null) : null;
   let aoas: number[];
-  if (request.continueFromResultId) {
+  if (requestedFidelity === "precalc" && request.continueFromResultId) {
+    const sourceJob = alias(simJobs, "continuation_source_job");
+    const sourceRevision = alias(
+      simulationPresetRevisions,
+      "continuation_source_revision",
+    );
     const [source] = await db
       .select({
         aoaDeg: results.aoaDeg,
         engineJobId: results.engineJobId,
         engineCaseSlug: results.engineCaseSlug,
+        revisionId: results.simulationPresetRevisionId,
+        solverImplementationId: results.solverImplementationId,
+        jobSolverImplementationId: sourceJob.solverImplementationId,
+        revisionSolverImplementationId: sourceRevision.solverImplementationId,
       })
       .from(results)
+      .leftJoin(sourceJob, eq(sourceJob.id, results.simJobId))
+      .leftJoin(
+        sourceRevision,
+        eq(sourceRevision.id, results.simulationPresetRevisionId),
+      )
       .where(eq(results.id, request.continueFromResultId))
       .limit(1);
     if (!source || !source.engineJobId || !source.engineCaseSlug) {
       console.error(
         `[sweeper] URANS request ${request.id} cancelled: continuation source ${request.continueFromResultId} has no saved case state (row missing or engine ids absent)`,
+      );
+      await db
+        .update(simUransRequests)
+        .set({ state: "cancelled" })
+        .where(eq(simUransRequests.id, request.id));
+      return false;
+    }
+    const targetImplementationId = normalizedContinuationImplementationId(
+      solverImplementationIdForSetup(target.snapshot),
+    );
+    const incompatibleSource =
+      source.revisionId !== request.revisionId ||
+      normalizedContinuationImplementationId(
+        source.revisionSolverImplementationId,
+      ) !== targetImplementationId ||
+      (source.solverImplementationId != null &&
+        normalizedContinuationImplementationId(
+          source.solverImplementationId,
+        ) !== targetImplementationId) ||
+      (source.jobSolverImplementationId != null &&
+        normalizedContinuationImplementationId(
+          source.jobSolverImplementationId,
+        ) !== targetImplementationId);
+    if (incompatibleSource) {
+      console.error(
+        `[sweeper] URANS request ${request.id} cancelled: continuation source ${request.continueFromResultId} does not match target revision ${request.revisionId} solver implementation`,
       );
       await db
         .update(simUransRequests)
@@ -1423,35 +1634,103 @@ async function consumeUransRequest(
   }
   if (!aoas.length) {
     console.error(
-      `[sweeper] URANS request ${request.id} cancelled: no angles derivable from the pinned revision sweep`,
+      `[sweeper] URANS request ${request.id} ${requestedFidelity === "full" ? "critically blocked" : "cancelled"}: no angles derivable from the pinned revision sweep`,
     );
+    if (requestedFidelity === "full") {
+      await blockFullRequestOrchestration(db, {
+        requestId: request.id,
+        revisionId: request.revisionId,
+        reason: "immutable-sweep-empty",
+        error: "no angles are derivable from the pinned revision sweep",
+      });
+      return false;
+    }
     await db
       .update(simUransRequests)
       .set({ state: "cancelled" })
       .where(eq(simUransRequests.id, request.id));
     return false;
   }
+  let fullCoverage: Awaited<
+    ReturnType<typeof ensureFullUransRequestCoverage>
+  > | null = null;
+  if (requestedFidelity === "full") {
+    try {
+      fullCoverage = await ensureFullUransRequestCoverage(db, {
+        requestId: request.id,
+        cells: aoas.map((aoaDeg) => ({
+          airfoilId: request.airfoilId,
+          revisionId: request.revisionId,
+          aoaDeg,
+        })),
+      });
+    } catch (error) {
+      if (error instanceof FullUransRequestCoverageIncompleteError) {
+        console.warn(
+          `[sweeper] full URANS request ${request.id} deferred: ${error.missingCells.length} natural cell(s) are still owned by another queue transition`,
+        );
+        await releaseClaimedUransRequest(db, request.id);
+        return false;
+      }
+      console.error(
+        `[sweeper] full URANS request ${request.id} coverage failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      await releaseClaimedUransRequest(db, request.id);
+      return false;
+    }
+    physicalFidelity = "precalc";
+    if (
+      !fullCoverage.precalcObligations.some((obligation) =>
+        ["pending", "running"].includes(obligation.state),
+      )
+    ) {
+      await refreshFullUransRequestState(db, request.id);
+      return false;
+    }
+    if (meshRecoveryVersion == null) {
+      // A final request never skips its required fast-URANS baseline. Leave
+      // the aggregate pending while the rolling engine cutover cannot execute
+      // preliminary recovery; unrelated ready final verification may proceed.
+      await refreshFullUransRequestState(db, request.id);
+      return false;
+    }
+  }
   let obligationIds: string[] = [];
   let obligationContinuationResultAttemptId: string | null = null;
-  if (fidelity === "precalc") {
+  if (physicalFidelity === "precalc") {
     const campaignIds = await activeCampaignOwnersForUransRequest(
       db,
       request.id,
     );
-    const obligations = await ensurePrecalcObligations(
+    const obligations =
+      fullCoverage?.precalcObligations ??
+      (await ensurePrecalcObligations(
+        db,
+        aoas.map((aoaDeg) => ({
+          airfoilId: request.airfoilId,
+          revisionId: request.revisionId,
+          aoaDeg,
+          sourceResultId: request.continueFromResultId,
+        })),
+        { campaignIds, requestIds: [request.id] },
+      ));
+    const continuations = await precalcContinuationsForObligations(
       db,
-      aoas.map((aoaDeg) => ({
-        airfoilId: request.airfoilId,
-        revisionId: request.revisionId,
-        aoaDeg,
-        sourceResultId: request.continueFromResultId,
-      })),
-      { campaignIds, requestIds: [request.id] },
+      obligations
+        .filter((obligation) => obligation.state === "pending")
+        .map((obligation) => obligation.id),
+    );
+    const continuationIds = new Set(
+      continuations.map((continuation) => continuation.obligationId),
     );
     const schedulable = obligations.filter(
       (obligation) =>
         obligation.state === "pending" &&
-        obligation.attemptCount < obligation.maxAttempts &&
+        (continuationIds.has(obligation.id)
+          ? durableRecoveryAvailable
+          : obligation.attemptCount < obligation.maxAttempts) &&
         (!obligation.nextSubmitAt ||
           new Date(obligation.nextSubmitAt).getTime() <= Date.now()),
     );
@@ -1460,7 +1739,9 @@ async function consumeUransRequest(
         obligations.some(
           (obligation) =>
             obligation.state === "pending" &&
-            obligation.attemptCount < obligation.maxAttempts,
+            (continuationIds.has(obligation.id)
+              ? durableRecoveryAvailable
+              : obligation.attemptCount < obligation.maxAttempts),
         )
       ) {
         // A first answered 5xx owns one durable backoff. Keep the request
@@ -1468,14 +1749,18 @@ async function consumeUransRequest(
         await releaseClaimedUransRequest(db, request.id);
         return false;
       }
-      const requestState = await precalcRequestStateFromObligations(
-        db,
-        request.id,
-      );
-      await db
-        .update(simUransRequests)
-        .set({ state: requestState, simJobId: null })
-        .where(eq(simUransRequests.id, request.id));
+      if (requestedFidelity === "full") {
+        await refreshFullUransRequestState(db, request.id);
+      } else {
+        const requestState = await precalcRequestStateFromObligations(
+          db,
+          request.id,
+        );
+        await db
+          .update(simUransRequests)
+          .set({ state: requestState, simJobId: null })
+          .where(eq(simUransRequests.id, request.id));
+      }
       return false;
     }
     const schedulableAoas = new Set(
@@ -1483,10 +1768,11 @@ async function consumeUransRequest(
     );
     aoas = aoas.filter((aoa) => schedulableAoas.has(aoa));
     obligationIds = schedulable.map((obligation) => obligation.id);
-    const [latestContinuation] = await precalcContinuationsForObligations(
-      db,
-      obligationIds,
-    );
+    const latestContinuation = durableRecoveryAvailable
+      ? continuations.find((continuation) =>
+          obligationIds.includes(continuation.obligationId),
+        )
+      : undefined;
     if (latestContinuation) {
       aoas = [latestContinuation.aoaDeg];
       obligationIds = [latestContinuation.obligationId];
@@ -1502,7 +1788,7 @@ async function consumeUransRequest(
   const outcome = await submitLadderJob(db, engine, {
     target,
     aoas,
-    fidelity,
+    fidelity: physicalFidelity,
     jobKind: "targeted",
     // Physical continuation work is global; campaign ownership stays on the
     // request association rows so one campaign cannot cancel shared evidence.
@@ -1516,7 +1802,7 @@ async function consumeUransRequest(
             budgetOverrideS: effectiveBudgetOverrideS,
           }
         : {}),
-      ...(request.continueFromResultId
+      ...(requestedFidelity === "precalc" && request.continueFromResultId
         ? {
             continueFromResultId: request.continueFromResultId,
             budgetOverrideS: request.budgetOverrideS ?? null,
@@ -1527,6 +1813,9 @@ async function consumeUransRequest(
     continueFrom,
     budgetOverrideS: effectiveBudgetOverrideS,
     meshRecoveryVersion,
+    uransRecoveryVersion: continueFrom
+      ? (uransRecoveryVersion ?? undefined)
+      : undefined,
     uransRequestId: request.id,
   });
   if (outcome.submitted) {
@@ -1538,7 +1827,7 @@ async function consumeUransRequest(
       .set({ state: "running", simJobId: outcome.jobId })
       .where(eq(simUransRequests.id, request.id));
     console.log(
-      `[sweeper] URANS request ${request.id} submitted (${fidelity}, ${aoas.length} angle(s), job ${outcome.jobId}${
+      `[sweeper] URANS request ${request.id} submitted (${physicalFidelity}${requestedFidelity === "full" ? " preliminary stage for requested full fidelity" : ""}, ${aoas.length} angle(s), job ${outcome.jobId}${
         continueFrom
           ? `, CONTINUATION of engine ${continueFrom.engineJobId}/${continueFrom.caseSlug}${request.budgetOverrideS ? ` with budget override ${request.budgetOverrideS}s` : ""}`
           : ""
@@ -1556,14 +1845,18 @@ async function consumeUransRequest(
     return false;
   }
   if (obligationIds.length) {
-    const requestState = await precalcRequestStateFromObligations(
-      db,
-      request.id,
-    );
-    await db
-      .update(simUransRequests)
-      .set({ state: requestState, simJobId: null })
-      .where(eq(simUransRequests.id, request.id));
+    if (requestedFidelity === "full") {
+      await refreshFullUransRequestState(db, request.id);
+    } else {
+      const requestState = await precalcRequestStateFromObligations(
+        db,
+        request.id,
+      );
+      await db
+        .update(simUransRequests)
+        .set({ state: requestState, simJobId: null })
+        .where(eq(simUransRequests.id, request.id));
+    }
     return false;
   }
   console.error(
@@ -1575,15 +1868,25 @@ async function consumeUransRequest(
   return false;
 }
 
-/** Tier-3: consume ONE pending verify-queue item (contract 4) — ONLY when no
- *  campaign RANS/precalc work exists machine-wide (checked by the caller). */
+/** Consume ONE pending verify-queue item (contract 4). The caller owns whether
+ * this is the bounded RANS interleave or the idle-capacity fallback. */
 async function consumeVerifyItem(
   db: DB,
   engine: EngineClient,
   cpuSlots: number,
-  scope: { campaignIds?: string[]; verifyIds?: string[] } = {},
+  scope: {
+    campaignIds?: string[];
+    verifyIds?: string[];
+    uransRecoveryVersion?: number | null;
+  } = {},
 ): Promise<boolean> {
-  const item = await claimNextPendingVerifyItem(db, scope);
+  const durableRecoveryAvailable = supportsDurableUransRecovery(
+    scope.uransRecoveryVersion,
+  );
+  const item = await claimNextPendingVerifyItem(db, {
+    ...scope,
+    allowAutomaticRecovery: durableRecoveryAvailable,
+  });
   if (!item) return false;
   const precalc = await precalcSnapshotForVerifyItem(db, item);
   if (!precalc) {
@@ -1609,6 +1912,85 @@ async function consumeVerifyItem(
       .where(eq(simUransVerifyQueue.id, item.id));
     return false;
   }
+  let recovery = await finalUransRecoveryPlanForVerifyItem(db, item);
+  if (recovery.mode === "media_repair") {
+    await releaseClaimedVerifyItem(db, item.id);
+    return false;
+  }
+  if (recovery.mode === "exhausted") {
+    const blocked = await blockFinalUransVerificationBeforeSubmit(db, {
+      verifyQueueId: item.id,
+      reason: recovery.reason,
+      incidentReason: "recovery-budget-exhausted",
+      targetSolverImplementationId: solverImplementationIdForSetup(
+        target.snapshot,
+      ),
+    });
+    if (blocked) {
+      console.error(
+        `[sweeper] FINAL URANS CRITICAL (item ${item.id}, aoa ${item.aoaDeg}): ${recovery.reason}. Accepted preliminary evidence remains selected.`,
+      );
+    }
+    return false;
+  }
+  if (recovery.mode === "continuation") {
+    const targetImplementationId = normalizedContinuationImplementationId(
+      solverImplementationIdForSetup(target.snapshot),
+    );
+    const sourceImplementationId = normalizedContinuationImplementationId(
+      recovery.solverImplementationId,
+    );
+    if (
+      !targetImplementationId ||
+      !sourceImplementationId ||
+      targetImplementationId !== sourceImplementationId
+    ) {
+      recovery =
+        item.freshAttemptCount < item.maxFreshAttempts
+          ? { mode: "fresh" }
+          : {
+              mode: "exhausted",
+              reason:
+                "saved full-URANS checkpoint belongs to a different solver implementation and no fresh recovery start remains",
+            };
+      if (recovery.mode === "exhausted") {
+        const blocked = await blockFinalUransVerificationBeforeSubmit(db, {
+          verifyQueueId: item.id,
+          reason: recovery.reason,
+          incidentReason: "solver-implementation-mismatch",
+          targetSolverImplementationId:
+            targetImplementationId ??
+            sourceImplementationId ??
+            solverImplementationIdForSetup(target.snapshot),
+          metadata: {
+            sourceSolverImplementationId: sourceImplementationId,
+          },
+        });
+        if (blocked) {
+          console.error(
+            `[sweeper] FINAL URANS CRITICAL (item ${item.id}, aoa ${item.aoaDeg}): ${recovery.reason}. Accepted preliminary evidence remains selected.`,
+          );
+        }
+        return false;
+      }
+    }
+  }
+  const continuation =
+    recovery.mode === "continuation"
+      ? {
+          engineJobId: recovery.engineJobId,
+          caseSlug: recovery.engineCaseSlug,
+        }
+      : null;
+  const budgetOverrideS =
+    recovery.mode === "continuation" ? recovery.budgetOverrideS : null;
+  const usesAutomaticRecoveryContract =
+    recovery.mode === "continuation" ||
+    item.freshAttemptCount > 0 ||
+    item.continuationAttemptCount > 0 ||
+    item.lastOutcome === FINAL_URANS_OUTCOMES.continuationPending ||
+    item.lastOutcome === FINAL_URANS_OUTCOMES.continuationRetryWait ||
+    item.lastOutcome === FINAL_URANS_OUTCOMES.freshRetryPending;
   const outcome = await submitLadderJob(db, engine, {
     target,
     aoas: [item.aoaDeg],
@@ -1617,13 +1999,28 @@ async function consumeVerifyItem(
     // One physical verification job serves every associated campaign and/or
     // the background owner. Never stamp an arbitrary campaign on the job.
     campaignId: null,
-    payloadExtras: { verifyQueueItemId: item.id, verifyPrecalc: precalc },
+    payloadExtras: {
+      verifyQueueItemId: item.id,
+      verifyPrecalc: precalc,
+      finalRecoveryMode: recovery.mode,
+      ...(recovery.mode === "continuation"
+        ? {
+            continueFromResultAttemptId: recovery.resultAttemptId,
+            budgetOverrideS,
+          }
+        : {}),
+    },
     cpuSlots,
+    continueFrom: continuation,
+    budgetOverrideS,
+    uransRecoveryVersion: usesAutomaticRecoveryContract
+      ? (scope.uransRecoveryVersion ?? undefined)
+      : undefined,
     verifyQueueId: item.id,
   });
   if (outcome.submitted) {
     console.log(
-      `[sweeper] verify item ${item.id} submitted (aoa ${item.aoaDeg}, full fidelity, job ${outcome.jobId})`,
+      `[sweeper] verify item ${item.id} submitted (aoa ${item.aoaDeg}, full fidelity, ${recovery.mode}, job ${outcome.jobId})`,
     );
     return true;
   }
@@ -1631,6 +2028,7 @@ async function consumeVerifyItem(
     await releaseClaimedVerifyItem(db, item.id);
     return false; // pending for a live/paused campaign; backoff/compensation recorded
   }
+  if (outcome.capabilityMismatch) return false;
   if (outcome.submissionInProgress) return true;
   console.error(
     `[sweeper] verify item ${item.id} ${outcome.ladderDisposition === "retry_wait" ? "waiting for its one automatic submit retry" : "blocked"}: engine rejected the submit (${outcome.error})`,
@@ -1639,6 +2037,33 @@ async function consumeVerifyItem(
   // preliminary result remains untouched and visible while verification is
   // terminally unavailable.
   return false;
+}
+
+/** Give final verification its bounded restart-safe share of admission.
+ * Promotion and targeted preliminary recovery call sites run before this
+ * helper. The decision is reconstructed from submitted DB job history, so a
+ * sweeper restart cannot reset or accidentally extend the eight-RANS bound. */
+export async function submitInterleavedVerifyIfDue(
+  db: DB,
+  engine: EngineClient,
+  cpuSlots = 0,
+  scope: VerifyInterleaveScope & {
+    uransRecoveryVersion?: number | null;
+  } = {},
+): Promise<boolean> {
+  const durableRecoveryAvailable = supportsDurableUransRecovery(
+    scope.uransRecoveryVersion,
+  );
+  const decision = await finalVerifyInterleaveDecision(db, {
+    ...scope,
+    allowAutomaticRecovery: durableRecoveryAvailable,
+  });
+  if (!decision.due) return false;
+  return consumeVerifyItem(db, engine, cpuSlots, {
+    campaignIds: scope.campaignIds,
+    verifyIds: scope.verifyIds,
+    uransRecoveryVersion: scope.uransRecoveryVersion,
+  });
 }
 
 /** One ladder pass: heal orphans, then submit AT MOST one piece of work in
@@ -1668,6 +2093,9 @@ export async function uransLadderTick(
     /** `null` means this tick reached the engine but could not validate its
      * PRECALC capability. Undefined means the caller has not probed yet. */
     meshRecoveryVersion?: number | null;
+    /** Separate rolling-cutover contract for durable URANS continuation and
+     * corrective final recovery. Legacy mesh-recovery v1 is insufficient. */
+    uransRecoveryVersion?: number | null;
   } = {},
 ): Promise<boolean> {
   const healedItems = await healOrphanedVerifyItems(db, {
@@ -1698,12 +2126,39 @@ export async function uransLadderTick(
               ? { campaignIds: opts.campaignIds }
               : {},
         );
+  const uransRecoveryVersion =
+    opts.uransRecoveryVersion !== undefined
+      ? opts.uransRecoveryVersion
+      : await engineUransRecoveryVersion(engine);
+  const durableRecoveryAvailable =
+    supportsDurableUransRecovery(uransRecoveryVersion);
 
   if (meshRecoveryVersion != null) {
+    const continuationRecoveryScope = opts.requestIds?.length
+      ? { requestIds: opts.requestIds }
+      : opts.promotionIds?.length
+        ? { promotionIds: opts.promotionIds }
+        : opts.campaignIds !== undefined
+          ? { campaignIds: opts.campaignIds }
+          : opts.requestIds !== undefined || opts.promotionIds !== undefined
+            ? { obligationIds: [] }
+            : {};
+    if (durableRecoveryAvailable) {
+      const continuationRecovery = await requeueRestartablePrecalcContinuations(
+        db,
+        continuationRecoveryScope,
+      );
+      if (continuationRecovery.obligationIds.length) {
+        console.log(
+          `[sweeper] reopened ${continuationRecovery.obligationIds.length} restartable PRECALC obligation(s) for same-case continuation; repaired ${continuationRecovery.repairedSubmissionIds.length} pre-typed infrastructure submission(s) without spending fresh-solve budget`,
+        );
+      }
+    }
     if (
       await submitRecordedPromotionRecovery(db, engine, cpuSlots, {
         ...opts,
         meshRecoveryVersion,
+        uransRecoveryVersion,
       })
     )
       return true;
@@ -1714,6 +2169,7 @@ export async function uransLadderTick(
         opts.campaignIds,
         opts.parentJobIds,
         meshRecoveryVersion,
+        uransRecoveryVersion,
       )
     )
       return true;
@@ -1725,13 +2181,15 @@ export async function uransLadderTick(
       cpuSlots,
       opts.requestIds,
       meshRecoveryVersion ?? undefined,
+      uransRecoveryVersion,
       meshRecoveryVersion == null ? "full" : undefined,
     )
   )
     return true;
-  // Verify tier is the GLOBAL LOWEST rank (contract 5): only when no campaign
-  // RANS/precalc work exists machine-wide. A supplied requestIds list is a
-  // test-only closed world; production never supplies it.
+  // Idle-capacity verify fallback: the main scheduler separately applies the
+  // restart-safe one-per-eight-RANS interleave before ordinary RANS admission.
+  // Outside that bound, verify remains below live campaign RANS/PRECALC work.
+  // A supplied requestIds list is a test-only closed world.
   if (
     await hasOpenCampaignLadderWork(db, {
       requestIds: opts.requestIds,
@@ -1743,5 +2201,6 @@ export async function uransLadderTick(
   return consumeVerifyItem(db, engine, cpuSlots, {
     campaignIds: opts.campaignIds,
     verifyIds: opts.verifyIds,
+    uransRecoveryVersion,
   });
 }

@@ -11,7 +11,13 @@ from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
 from airfoilfoam.storage import JobStore
 from airfoilfoam.pipeline import CaseOutcome
-from airfoilfoam.models import JobResult, JobState, PolarRequest
+from airfoilfoam.models import (
+    ContinuationFailureKind,
+    JobResult,
+    JobState,
+    JobStatus,
+    PolarRequest,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +72,8 @@ def client():
 def test_health_and_capabilities(client):
     health = client.get("/health").json()
     assert health["status"] == "ok"
-    assert health["mesh_recovery_version"] == 1
+    assert health["mesh_recovery_version"] == 2
+    assert health["urans_recovery_version"] == 1
     caps = client.get("/capabilities").json()
     assert "blockmesh-cgrid" in caps["meshers"]
     assert "kOmegaSST" in caps["turbulence_models"]
@@ -102,11 +109,11 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert status["state"] == "completed"
     assert status["total_cases"] == 3
     assert status["completed_cases"] == 3
-    assert status["mesh_recovery_version"] == 1
+    assert status["mesh_recovery_version"] == 2
 
     result = client.get(f"/jobs/{job_id}/result").json()
     assert result["state"] == "completed"
-    assert result["mesh_recovery_version"] == 1
+    assert result["mesh_recovery_version"] == 2
     assert len(result["polars"]) == 1
     polar = result["polars"][0]
     assert polar["reynolds"] == pytest.approx(50 * 1.0 / 1.5e-5)
@@ -136,7 +143,7 @@ def test_polar_submit_rejects_capability_cutover_before_queueing(
         json={
             "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
             "aoa": {"angles": [0]},
-            "expected_mesh_recovery_version": 2,
+            "expected_mesh_recovery_version": 3,
         },
     )
 
@@ -144,11 +151,11 @@ def test_polar_submit_rejects_capability_cutover_before_queueing(
     detail = response.json()["detail"]
     assert detail == {
         "code": "mesh_recovery_version_mismatch",
-        "requested_version": 2,
-        "actual_version": 1,
+        "requested_version": 3,
+        "actual_version": 2,
         "message": (
             "Engine mesh-recovery capability changed before submission: "
-            "requested v2, API is v1. Refresh capability and retry."
+            "requested v3, API is v2. Refresh capability and retry."
         ),
     }
 
@@ -158,13 +165,55 @@ def test_worker_rejects_capability_mismatch_before_geometry_or_solver(tmp_path):
         {
             "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
             "aoa": {"angles": [0]},
-            "expected_mesh_recovery_version": 2,
+            "expected_mesh_recovery_version": 3,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="requested v3, worker is v2"):
+        jobs.execute_job(
+            "capability-mismatch",
+            request,
+            store=JobStore(),
+        )
+
+
+def test_polar_submit_rejects_urans_recovery_cutover_before_queueing(
+    client, naca0012_selig_text
+):
+    response = client.post(
+        "/polars",
+        json={
+            "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
+            "aoa": {"angles": [0]},
+            "expected_urans_recovery_version": 2,
+        },
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail == {
+        "code": "urans_recovery_version_mismatch",
+        "requested_version": 2,
+        "actual_version": 1,
+        "message": (
+            "Engine URANS-recovery capability changed before submission: "
+            "requested v2, API is v1. Refresh capability and retry."
+        ),
+    }
+
+
+def test_worker_rejects_urans_recovery_mismatch_before_geometry_or_solver(tmp_path):
+    request = PolarRequest.model_validate(
+        {
+            "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
+            "aoa": {"angles": [0]},
+            "expected_urans_recovery_version": 2,
         }
     )
 
     with pytest.raises(RuntimeError, match="requested v2, worker is v1"):
         jobs.execute_job(
-            "capability-mismatch",
+            "urans-recovery-capability-mismatch",
             request,
             store=JobStore(),
         )
@@ -178,7 +227,7 @@ def test_api_queued_status_does_not_claim_worker_execution(tmp_path, naca0012_se
         {
             "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
             "aoa": {"angles": [0]},
-            "expected_mesh_recovery_version": 1,
+            "expected_mesh_recovery_version": 2,
         }
     )
     store.create("queued-only", request)
@@ -250,6 +299,36 @@ def test_runtime_endpoint_reports_unreadable_status(client):
     assert row["has_result"] is False
     assert row["process_count"] == 0
     assert client.get(f"/jobs/{job_id}").status_code == 409
+
+
+def test_runtime_endpoint_reports_typed_continuation_failure(client):
+    store = JobStore()
+    job_id = "runtime-continuation-permanent"
+    store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
+    store.write_status(
+        JobStatus(
+            job_id=job_id,
+            state=JobState.failed,
+            message="continuation_source_permanent: archive checksum mismatch",
+            continuation_failure_kind=ContinuationFailureKind.permanent,
+        )
+    )
+    store.write_result(
+        JobResult(
+            job_id=job_id,
+            state=JobState.failed,
+            polars=[],
+            message="continuation_source_permanent: archive checksum mismatch",
+            continuation_failure_kind=ContinuationFailureKind.permanent,
+        )
+    )
+
+    body = client.post("/jobs/runtime", json={"job_ids": [job_id]}).json()
+    row = body["jobs"][0]
+    assert row["status_failure_disposition"] is None
+    assert row["status_continuation_failure_kind"] == "permanent"
+    assert row["result_failure_disposition"] is None
+    assert row["result_continuation_failure_kind"] == "permanent"
 
 
 def test_file_traversal_blocked(client, fake_run_case, naca0012_selig_text):

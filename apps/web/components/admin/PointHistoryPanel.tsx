@@ -605,7 +605,7 @@ export function PointHistoryPanel() {
         const res = await continueUransResult(item.resultId, extraHours * 3600);
         setRequeueNotice(
           res.created
-            ? `continuation queued (+${extraHours} h) — resumes from the saved case state after all RANS gaps`
+            ? `continuation queued (+${extraHours} h) — resumes the saved URANS state automatically`
             : `already queued — the open continuation request is reused (${res.request.state})`,
         );
         openStory(item);
@@ -646,13 +646,13 @@ export function PointHistoryPanel() {
       if (uransBusy) return;
       const scope =
         target.aoaDeg == null ? "the whole polar" : `α ${f(target.aoaDeg, 2)}°`;
-      const budget =
+      const sequence =
         fidelity === "precalc"
-          ? "half-resolution mesh, 3 shedding periods, 4 h budget"
-          : "full mesh, 7 shedding periods, 12 h budget";
+          ? "This starts the fast preliminary stage."
+          : "If fast preliminary URANS is not accepted yet, it runs first; final verification follows automatically.";
       if (
         !window.confirm(
-          `Queue a ${fidelity}-fidelity URANS solve for ${target.label} (${scope})? ${budget}. It runs after all RANS gaps, at precalc rank.`,
+          `Queue URANS for ${target.label} (${scope})? ${sequence}`,
         )
       )
         return;
@@ -667,8 +667,10 @@ export function PointHistoryPanel() {
         });
         setUransNotice(
           res.created
-            ? `URANS ${fidelity} requested for ${target.label} (${scope}) — queued automatically`
-            : `already requested — the open ${fidelity} request for ${scope} is reused (${res.request.state})`,
+            ? fidelity === "precalc"
+              ? `fast URANS requested for ${target.label} (${scope}) — queued automatically`
+              : `final verification requested for ${target.label} (${scope}) — fast URANS runs first when needed`
+            : `already requested — the open ${fidelity === "precalc" ? "fast-URANS" : "final-verification"} request for ${scope} is reused (${res.request.state})`,
         );
         if (
           opts?.refreshStory &&
@@ -881,7 +883,7 @@ export function PointHistoryPanel() {
             <option value="">verify: any</option>
             <option value="pending">verify pending</option>
             <option value="disagreed">verify disagreed</option>
-            <option value="blocked">verify blocked</option>
+            <option value="blocked">final URANS critical</option>
           </select>
           <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>
             sorted by last activity
@@ -1389,11 +1391,13 @@ export function PointHistoryPanel() {
                     letterSpacing: "0.08em",
                   }}
                 >
-                  REQUEST URANS
+                  URANS RECOVERY
                 </span>
                 {(["precalc", "full"] as const).map((fid) => {
                   const open = openRequestFor(openItem.aoaDeg, fid);
                   const eligible = openItem.revisionId != null && !open;
+                  const stageLabel =
+                    fid === "precalc" ? "fast URANS" : "final verification";
                   return (
                     <button
                       key={fid}
@@ -1402,12 +1406,12 @@ export function PointHistoryPanel() {
                       disabled={!eligible || uransBusy}
                       title={
                         open
-                          ? `An open ${fid} request already covers this ${open.aoaDeg == null ? "cell (whole polar)" : "angle"} — requests are idempotent`
+                          ? `An open ${stageLabel} request already covers this ${open.aoaDeg == null ? "cell (whole polar)" : "angle"} — requests are idempotent`
                           : openItem.revisionId == null
                             ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
                             : fid === "precalc"
-                              ? "Half-resolution mesh, 3 shedding periods, 4 h budget — schedules after all RANS gaps"
-                              : "Full mesh, 7 shedding periods, 12 h budget — schedules after all RANS gaps"
+                              ? "Run the fast preliminary URANS stage"
+                              : "Request final verification; fast URANS runs first when needed"
                       }
                       onClick={() =>
                         void doRequestUrans(
@@ -1431,8 +1435,8 @@ export function PointHistoryPanel() {
                       }}
                     >
                       {open
-                        ? `${fid} requested (${open.state}${open.aoaDeg == null ? " · whole polar" : ""})`
-                        : fid}
+                        ? `${stageLabel} requested (${open.state}${open.aoaDeg == null ? " · whole polar" : ""})`
+                        : stageLabel}
                     </button>
                   );
                 })}

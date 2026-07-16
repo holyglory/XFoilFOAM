@@ -1,10 +1,16 @@
 import {
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+  RANS_RECOVERY_REMEDIATION_VERSION,
   type DB,
   onResultIngested,
   probeCampaignCompletion,
+  recordSolverIncidentInTransaction,
   recomputeProgressForCampaign,
   recordPrecalcObligationSubmitFailureInTransaction,
+  refreshFullUransRequestStateInTransaction,
+  refreshFullUransRequestsForVerifyQueueInTransaction,
   refreshPrecalcSettlementCampaigns,
+  restartablePrecalcCheckpointSql,
   results,
   simLadderSubmitRetries,
   simJobs,
@@ -21,6 +27,7 @@ import {
   type EngineClient,
   type JobStatus,
   type PolarRequest,
+  URANS_RECOVERY_CAPABILITY_MISMATCH_CODE,
 } from "@aerodb/engine-client";
 import { and, count, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
@@ -109,7 +116,32 @@ function pendingSubmitWhere(jobId: string, campaignId: string | null) {
                 WHERE obligation.id IS NULL
                    OR obligation.state NOT IN ('pending', 'running')
                    OR obligation.latest_sim_job_id IS DISTINCT FROM ${simJobs.id}
-                   OR obligation.attempt_count >= obligation.max_attempts
+                   OR (
+                     obligation.attempt_count >= obligation.max_attempts
+                     AND NOT (
+                       jsonb_array_length(
+                         ${simJobs.requestPayload} -> 'precalcObligationIds'
+                       ) = 1
+                       AND (
+                         NULLIF(
+                           ${simJobs.requestPayload} ->> 'continueFromResultAttemptId',
+                           ''
+                         ) IS NOT NULL
+                         OR NULLIF(
+                           ${simJobs.requestPayload} ->> 'continueFromResultId',
+                           ''
+                         ) IS NOT NULL
+                       )
+                       AND ${restartablePrecalcCheckpointSql(
+                         sql`obligation.id`,
+                         {
+                           targetSolverImplementationId: sql`${simJobs.solverImplementationId}`,
+                           continuationResultAttemptId: sql`${simJobs.requestPayload} ->> 'continueFromResultAttemptId'`,
+                           continuationResultId: sql`${simJobs.requestPayload} ->> 'continueFromResultId'`,
+                         },
+                       )}
+                     )
+                   )
                    OR obligation.next_submit_at > now()
                    OR NOT (
                      obligation.background_owner
@@ -269,6 +301,27 @@ function pendingSubmitWhere(jobId: string, campaignId: string | null) {
                     WHERE ownership.queue_id = verify_item.id
                       AND ownership.state = 'active'
                       AND owner_campaign.status IN ('active', 'attention')
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM sim_urans_verify_queue_requests coverage
+                    JOIN sim_urans_requests request_item
+                      ON request_item.id = coverage.request_id
+                    WHERE coverage.queue_id = verify_item.id
+                      AND request_item.fidelity = 'full'
+                      AND request_item.state IN ('pending', 'running')
+                      AND (
+                        request_item.background_owner
+                        OR EXISTS (
+                          SELECT 1
+                          FROM sim_urans_request_campaigns request_ownership
+                          JOIN sim_campaigns owner_campaign
+                            ON owner_campaign.id = request_ownership.campaign_id
+                          WHERE request_ownership.request_id = request_item.id
+                            AND request_ownership.state = 'active'
+                            AND owner_campaign.status IN ('active', 'attention')
+                        )
+                      )
                   )
                 )
             )
@@ -524,15 +577,44 @@ async function withSubmitLifecycleLocks<T>(
       await tx.execute(sql`
         SELECT campaign.id
         FROM sim_jobs job
-        JOIN sim_urans_verify_queue_campaigns ownership
-          ON ownership.queue_id::text = job.request_payload ->> 'verifyQueueItemId'
-         AND ownership.state = 'active'
         JOIN sim_campaigns campaign
-          ON campaign.id = ownership.campaign_id
+          ON campaign.id IN (
+            SELECT ownership.campaign_id
+            FROM sim_urans_verify_queue_campaigns ownership
+            WHERE ownership.queue_id::text =
+                  job.request_payload ->> 'verifyQueueItemId'
+              AND ownership.state = 'active'
+            UNION
+            SELECT request_ownership.campaign_id
+            FROM sim_urans_verify_queue_requests coverage
+            JOIN sim_urans_requests request_item
+              ON request_item.id = coverage.request_id
+            JOIN sim_urans_request_campaigns request_ownership
+              ON request_ownership.request_id = request_item.id
+            WHERE coverage.queue_id::text =
+                  job.request_payload ->> 'verifyQueueItemId'
+              AND request_item.fidelity = 'full'
+              AND request_item.state IN ('pending', 'running')
+              AND request_ownership.state = 'active'
+          )
          AND campaign.status IN ('active', 'attention')
         WHERE job.id = ${jobId}
         ORDER BY campaign.id
         FOR SHARE OF campaign
+      `);
+      await tx.execute(sql`
+        SELECT request_item.id
+        FROM sim_jobs job
+        JOIN sim_urans_verify_queue_requests coverage
+          ON coverage.queue_id::text =
+             job.request_payload ->> 'verifyQueueItemId'
+        JOIN sim_urans_requests request_item
+          ON request_item.id = coverage.request_id
+         AND request_item.fidelity = 'full'
+         AND request_item.state IN ('pending', 'running')
+        WHERE job.id = ${jobId}
+        ORDER BY request_item.id
+        FOR SHARE OF request_item
       `);
     }
     return work(tx);
@@ -736,6 +818,29 @@ async function releaseLadderOwnerAfterTransportFailure(
                 AND ownership.state = 'active'
                 AND campaign.status IN ('active', 'attention', 'paused')
             ) THEN 'pending'
+            WHEN EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_requests coverage
+              JOIN sim_urans_requests request_item
+                ON request_item.id = coverage.request_id
+              WHERE coverage.queue_id = verify_item.id
+                AND request_item.fidelity = 'full'
+                AND request_item.state IN ('pending', 'running')
+                AND (
+                  request_item.background_owner
+                  OR EXISTS (
+                    SELECT 1
+                    FROM sim_urans_request_campaigns request_ownership
+                    JOIN sim_campaigns campaign
+                      ON campaign.id = request_ownership.campaign_id
+                    WHERE request_ownership.request_id = request_item.id
+                      AND request_ownership.state = 'active'
+                      AND campaign.status IN (
+                        'active', 'attention', 'paused'
+                      )
+                  )
+                )
+            ) THEN 'pending'
             ELSE 'cancelled'
           END,
           sim_job_id = NULL,
@@ -749,6 +854,10 @@ async function releaseLadderOwnerAfterTransportFailure(
             AND submit_retry.latest_sim_job_id IS DISTINCT FROM ${jobId}
         )
     `);
+    await refreshFullUransRequestsForVerifyQueueInTransaction(
+      tx,
+      owner.verifyQueueId!,
+    );
   }
   // A transport failure consumes no answered-submit allowance. If this is a
   // retry after an earlier 5xx, retain its state/count/due boundary while
@@ -893,6 +1002,10 @@ async function settleAnsweredLadderFailureInTransaction(
           eq(simUransVerifyQueue.simJobId, jobId),
         ),
       );
+    await refreshFullUransRequestsForVerifyQueueInTransaction(
+      tx,
+      owner.verifyQueueId!,
+    );
   }
   return disposition;
 }
@@ -959,6 +1072,10 @@ interface SubmitFailureCell {
   revisionId: string | null;
   aoaDeg: number;
   attemptCount: number;
+  solverImplementationId: string;
+  wave: number;
+  uransFidelity: string | null;
+  hasExactPrecalcObligation: boolean;
 }
 
 /** An answered HTTP failure is not evidence that OpenFOAM ran. The retained
@@ -1003,7 +1120,10 @@ async function recordAnsweredSubmitFailure(
             eq(simJobs.engineState, SUBMITTING_ENGINE_STATE),
           ),
         )
-        .returning({ id: simJobs.id });
+        .returning({
+          id: simJobs.id,
+          requestPayload: simJobs.requestPayload,
+        });
       if (!stopped)
         return {
           retryScheduled: 0,
@@ -1030,12 +1150,45 @@ async function recordAnsweredSubmitFailure(
           error,
           httpStatus,
         );
+      const requestId =
+        stopped.requestPayload &&
+        typeof stopped.requestPayload === "object" &&
+        typeof (stopped.requestPayload as { uransRequestId?: unknown })
+          .uransRequestId === "string"
+          ? (stopped.requestPayload as { uransRequestId: string })
+              .uransRequestId
+          : null;
+      if (requestId) {
+        await refreshFullUransRequestStateInTransaction(tx, requestId);
+      }
 
       const claimedRows = (await tx.execute(sql`
       SELECT r.id, r.airfoil_id, r.simulation_preset_revision_id,
              r.aoa_deg::float8 AS aoa_deg,
-             COALESCE(retry.attempt_count, 0)::int AS attempt_count
+             COALESCE(retry.attempt_count, 0)::int AS attempt_count,
+             COALESCE(
+               r.solver_implementation_id,
+               revision.solver_implementation_id,
+               job.solver_implementation_id,
+               ${LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID}::uuid
+             ) AS solver_implementation_id,
+             job.wave,
+             job.request_payload ->> 'uransFidelity' AS urans_fidelity,
+             EXISTS (
+               SELECT 1
+               FROM sim_precalc_obligations obligation
+               WHERE obligation.airfoil_id = r.airfoil_id
+                 AND obligation.revision_id = r.simulation_preset_revision_id
+                 AND obligation.aoa_deg = r.aoa_deg
+                 AND (
+                   obligation.state <> 'cancelled'
+                   OR obligation.attempt_count > 0
+                 )
+             ) AS has_exact_precalc_obligation
       FROM results r
+      JOIN sim_jobs job ON job.id = r.sim_job_id
+      LEFT JOIN simulation_preset_revisions revision
+        ON revision.id = r.simulation_preset_revision_id
       LEFT JOIN sim_result_submit_retries retry ON retry.result_id = r.id
       WHERE r.sim_job_id = ${jobId}
         AND r.status IN ('queued', 'running')
@@ -1047,6 +1200,10 @@ async function recordAnsweredSubmitFailure(
         simulation_preset_revision_id: string | null;
         aoa_deg: number;
         attempt_count: number;
+        solver_implementation_id: string;
+        wave: number;
+        urans_fidelity: string | null;
+        has_exact_precalc_obligation: boolean;
       }>;
       const cells: SubmitFailureCell[] = claimedRows.map((row) => ({
         id: row.id,
@@ -1054,6 +1211,10 @@ async function recordAnsweredSubmitFailure(
         revisionId: row.simulation_preset_revision_id,
         aoaDeg: Number(row.aoa_deg),
         attemptCount: Number(row.attempt_count),
+        solverImplementationId: row.solver_implementation_id,
+        wave: Number(row.wave),
+        uransFidelity: row.urans_fidelity,
+        hasExactPrecalcObligation: row.has_exact_precalc_obligation,
       }));
       const retryRows = retryableServerError
         ? cells.filter((row) => row.attemptCount === 0)
@@ -1157,6 +1318,34 @@ async function recordAnsweredSubmitFailure(
           resultId: row.id,
           status: "failed",
         });
+      }
+      if (!ladderOwner && precalcObligationIds.length === 0) {
+        for (const row of blockedRows.filter(
+          (cell) =>
+            cell.wave === 1 &&
+            cell.uransFidelity !== "precalc" &&
+            cell.uransFidelity !== "full" &&
+            !cell.hasExactPrecalcObligation,
+        )) {
+          await recordSolverIncidentInTransaction(tx, {
+            stage: "rans",
+            reason: "engine-submit-rejected",
+            severity: "critical",
+            owner: { resultId: row.id },
+            solverImplementationId: row.solverImplementationId,
+            occurrenceKey: `rans:${row.id}:${jobId}:engine-submit-blocked`,
+            remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
+            simJobId: jobId,
+            metadata: {
+              airfoilId: row.airfoilId,
+              revisionId: row.revisionId,
+              aoaDeg: row.aoaDeg,
+              error,
+              httpStatus,
+              recovery: "engine-submit-blocked",
+            },
+          });
+        }
       }
       return {
         retryScheduled: retryRows.length,
@@ -1325,6 +1514,21 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
         opts.jobId,
         `engine capability changed before PRECALC execution: ${message}`,
         campaignId,
+      );
+      return { kind: "capability_mismatch", error: message };
+    }
+    if (
+      error instanceof EngineError &&
+      error.status === 409 &&
+      error.code === URANS_RECOVERY_CAPABILITY_MISMATCH_CODE &&
+      opts.request.expected_urans_recovery_version != null
+    ) {
+      await recordUnexecutedTransientSubmitFailure(
+        opts.db,
+        opts.jobId,
+        `engine URANS-recovery capability changed before execution: ${message}`,
+        campaignId,
+        opts.ladderSubmitOwner,
       );
       return { kind: "capability_mismatch", error: message };
     }

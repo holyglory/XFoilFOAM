@@ -88,11 +88,10 @@ function statusLine(
   }
   if (item.status === "completed") {
     if (blocked > 0) {
-      return `Completed with ${fCount(blocked)} machine-blocked point${blocked === 1 ? "" : "s"}; no human review is required.`;
+      return `Completed with ${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"}; system investigation is required.`;
     }
     return item.closedWithFailedCount != null && item.closedWithFailedCount > 0
-      ? `Completed (closed with ${fCount(item.closedWithFailedCount)} failed) ${item.completedAt ? ago(item.completedAt) : ""}`.trim() +
-          "."
+      ? `Completed with ${fCount(item.closedWithFailedCount)} unavailable result${item.closedWithFailedCount === 1 ? "" : "s"}${item.completedAt ? ` ${ago(item.completedAt)}` : ""}.`
       : `Completed${item.completedAt ? ` ${ago(item.completedAt)}` : ""}.`;
   }
   if (item.status === "paused") {
@@ -107,7 +106,7 @@ function statusLine(
     if (automaticPrecalc > 0) {
       const blockedSuffix =
         blocked > 0
-          ? ` ${fCount(blocked)} other point${blocked === 1 ? " is" : "s are"} blocked.`
+          ? ` ${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"} also require system recovery.`
           : "";
       return `Automatic precalc continuation queued or running for ${fCount(automaticPrecalc)} point${automaticPrecalc === 1 ? "" : "s"}; no human review is required.${blockedSuffix}`;
     }
@@ -116,7 +115,7 @@ function statusLine(
     const rb = item.reviewBuckets;
     if (rb) {
       if (blocked > 0) {
-        return `All work settled — ${fCount(blocked)} machine-blocked point${blocked === 1 ? "" : "s"}; no human review is required.`;
+        return `All work settled — ${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"}; system investigation is required.`;
       }
       const needs: string[] = [];
       if (rb.needsReview > 0)
@@ -127,12 +126,8 @@ function statusLine(
       const unavailable = totals.failed + totals.rejected + blocked;
       return `All work settled — ${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}; no human review is required.`;
     }
-    const needs: string[] = [];
-    if (totals.failed > 0) needs.push(`${fCount(totals.failed)} failed`);
-    if (totals.rejected > 0) needs.push(`${fCount(totals.rejected)} rejected`);
-    if (blocked > 0) needs.push(`${fCount(blocked)} blocked`);
     const unavailable = totals.failed + totals.rejected + blocked;
-    return `All work settled with ${needs.length ? needs.join(" + ") : "0 unavailable"} point${unavailable === 1 ? "" : "s"} — inspect unavailable evidence or close with failures.`;
+    return `${fCount(unavailable)} result${unavailable === 1 ? "" : "s"} unavailable; system recovery required.`;
   }
   // active — scheduler-dependent clause from the shared solver derivation
   // first: never a bare "Active — waiting" while nothing can run. Gated
@@ -171,7 +166,7 @@ function statusLine(
     if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
     if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);
   }
-  if (blocked > 0) parts.push(`${fCount(blocked)} blocked`);
+  if (blocked > 0) parts.push(`${fCount(blocked)} critical`);
   return `Active — ${parts.join(" · ")}.`;
 }
 
@@ -471,16 +466,20 @@ export function CampaignsHub({
               : [];
             const reviewBuckets = item.reviewBuckets;
             const attentionColor =
-              (reviewBuckets?.needsReview ?? 0) > 0
+              blocked > 0 || (reviewBuckets?.needsReview ?? 0) > 0
                 ? C.red
                 : item.automaticPrecalcOpen > 0 ||
                     (reviewBuckets?.awaitingUrans ?? 0) > 0
                   ? C.violet
                   : C.amber;
             const statusColor =
-              item.status === "attention"
-                ? attentionColor
-                : (STATUS_COLOR[item.status] ?? C.muted);
+              blocked > 0 ||
+              (item.status === "completed" &&
+                (item.closedWithFailedCount ?? 0) > 0)
+                ? C.red
+                : item.status === "attention"
+                  ? attentionColor
+                  : (STATUS_COLOR[item.status] ?? C.muted);
             // Gate badge (mockup fec7b453 screen 3): while a scheduler gate
             // blocks an ACTIVE campaign, the gate is the PRIMARY chip and the
             // lifecycle demotes to a small dim chip — never an "Active"
@@ -697,7 +696,7 @@ export function CampaignsHub({
                   }}
                 >
                   <div
-                    aria-label={`progress ${settled} done and ${blocked} blocked of ${totals.requested}`}
+                    aria-label={`progress ${settled} done and ${blocked} critical failures of ${totals.requested}`}
                     style={{
                       height: 6,
                       borderRadius: 4,
@@ -706,7 +705,7 @@ export function CampaignsHub({
                       display: "flex",
                     }}
                   >
-                    {/* Amber marks unavailable/blocked evidence; automatic
+                    {/* Red marks critical exhausted recovery; automatic
                         precalc and awaiting-URANS work keep the teal bar. */}
                     <div
                       style={{
@@ -720,7 +719,7 @@ export function CampaignsHub({
                         style={{
                           width: `${blockedProgress * 100}%`,
                           height: "100%",
-                          background: C.amber,
+                          background: C.red,
                         }}
                       />
                     )}
@@ -746,10 +745,10 @@ export function CampaignsHub({
                             {" · "}
                             <span
                               data-testid={`campaign-blocked-${item.slug}`}
-                              title="Machine-owned bounded preliminary work is unavailable; no human review is required"
-                              style={{ color: C.amber }}
+                              title="Critical: automatic preliminary recovery ended without a publishable result"
+                              style={{ color: C.redText }}
                             >
-                              {fCount(blocked)} blocked
+                              {fCount(blocked)} critical
                             </span>
                           </>
                         )}
@@ -814,7 +813,7 @@ export function CampaignsHub({
                             <button
                               type="button"
                               data-testid={`campaign-failed-link-${item.slug}`}
-                              title="Open these failed points in the Points explorer"
+                              title="Open these solver failures in the Points explorer"
                               onClick={() => onOpenPoints(item.id, "failed")}
                               style={{
                                 fontFamily: MONO,
