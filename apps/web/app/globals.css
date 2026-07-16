@@ -556,6 +556,10 @@ a {
   border-top: 1px solid var(--aero-border-row);
 }
 
+.campaign-instrument-details[hidden] {
+  display: none;
+}
+
 .campaign-instrument-detail-strip {
   display: flex;
   gap: 14px;

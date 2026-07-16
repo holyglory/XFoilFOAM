@@ -302,6 +302,17 @@ test.describe.serial("simulation campaigns: wizard, plan edits, routing, refinem
     await expect(
       hero.getByRole("progressbar", { name: "Campaign completion" }),
     ).toBeVisible();
+    const detailsToggle = page.getByTestId("campaign-details-toggle");
+    const detailsPanel = page.getByTestId("campaign-details");
+    await expect(detailsToggle).toHaveAttribute(
+      "aria-controls",
+      "campaign-instrument-details",
+    );
+    await expect(detailsPanel).toBeHidden();
+    await detailsToggle.click();
+    await expect(detailsPanel).toBeVisible();
+    await detailsToggle.click();
+    await expect(detailsPanel).toBeHidden();
     await expect(gauge).toHaveAttribute("role", "progressbar");
     await expect(gauge).toHaveAttribute("aria-valuemin", "0");
     await expect(gauge).toHaveAttribute(
