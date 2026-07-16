@@ -1689,6 +1689,87 @@ describe("sweeper: gap → claim → ingest", () => {
         ),
       );
     expect(attemptsAfter.length).toBe(3);
+    const steadyAttempt = attemptsAfter.find(
+      (attempt) => attempt.aoaDeg === steadyAoa && attempt.regime === "rans",
+    );
+    expect(steadyAttempt).toBeDefined();
+    expect(
+      Object.hasOwn(
+        steadyAttempt!.evidencePayload as Record<string, unknown>,
+        "mesh_recovery_version",
+      ),
+    ).toBe(false);
+
+    // MUST-CATCH (production rolling deploy 2026-07-16): legacy attempts
+    // predate the optional mesh-recovery acknowledgement and therefore omit
+    // its JSON key. A short-lived writer compared that payload with a newly
+    // constructed `mesh_recovery_version: null` payload and blocked every
+    // otherwise exact partial replay as changed immutable evidence. Explicit
+    // null and absence mean the same "not acknowledged" state.
+    await db
+      .update(resultAttempts)
+      .set({
+        evidencePayload: {
+          ...(steadyAttempt!.evidencePayload as Record<string, unknown>),
+          mesh_recovery_version: null,
+        },
+      })
+      .where(eq(resultAttempts.id, steadyAttempt!.id));
+    await ingestResult({
+      db,
+      engine: mediaEngine,
+      engineJobId: "testjob",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [
+        { speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId },
+      ],
+      result: withExactManifestEvidence(result),
+    });
+
+    // A real acknowledged version remains immutable evidence: equal numeric
+    // versions replay, while a different numeric acknowledgement must fail.
+    for (const attempt of attemptsAfter) {
+      await db
+        .update(resultAttempts)
+        .set({
+          evidencePayload: {
+            ...(attempt.evidencePayload as Record<string, unknown>),
+            mesh_recovery_version: 1,
+          },
+        })
+        .where(eq(resultAttempts.id, attempt.id));
+    }
+    const recoveredV1 = JSON.parse(JSON.stringify(result)) as JobResult;
+    recoveredV1.mesh_recovery_version = 1;
+    await ingestResult({
+      db,
+      engine: mediaEngine,
+      engineJobId: "testjob",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [
+        { speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId },
+      ],
+      result: withExactManifestEvidence(recoveredV1),
+    });
+    const changedRecoveryVersion = JSON.parse(
+      JSON.stringify(recoveredV1),
+    ) as JobResult;
+    changedRecoveryVersion.mesh_recovery_version = 2;
+    await expect(
+      ingestResult({
+        db,
+        engine: mediaEngine,
+        engineJobId: "testjob",
+        simJobId: job.id,
+        airfoilId: a.id,
+        speedMap: [
+          { speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId },
+        ],
+        result: withExactManifestEvidence(changedRecoveryVersion),
+      }),
+    ).rejects.toThrow("result attempt replay changed immutable evidence");
     expect(extentCalls).toBe(0);
     expect(defaultRenderCalls).toBe(0);
   }, 60000);
@@ -1708,7 +1789,7 @@ describe("sweeper: gap → claim → ingest", () => {
           eq(results.simulationPresetRevisionId, presetRevisionId),
           eq(results.aoaDeg, aoa),
         ),
-      );
+    );
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2063,7 +2144,7 @@ describe("sweeper: gap → claim → ingest", () => {
           eq(results.simulationPresetRevisionId, presetRevisionId),
           eq(results.aoaDeg, aoa),
         ),
-    );
+      );
     cleanupResultIds.add(row.id);
     const [sourceAttempt] = await db
       .select({ id: resultAttempts.id })

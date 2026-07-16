@@ -1227,7 +1227,13 @@ async function insertResultAttempt(opts: {
     frame_track: derived?.frameTrack ?? p.frame_track ?? null,
     steady_history: derived?.steadyHistory ?? p.steady_history ?? null,
     quality_warnings: qualityWarningsForPoint(p) ?? [],
-    mesh_recovery_version: opts.meshRecoveryVersion ?? null,
+    // This job-level acknowledgement was added after immutable attempt
+    // payloads were already live. Keep absence as absence when the engine did
+    // not acknowledge a version, so an ordinary deploy cannot rewrite the
+    // identity of legacy evidence merely by adding a new optional null key.
+    ...(opts.meshRecoveryVersion == null
+      ? {}
+      : { mesh_recovery_version: opts.meshRecoveryVersion }),
   };
   const [inserted] = await db
     .insert(resultAttempts)
@@ -1305,7 +1311,8 @@ async function insertResultAttempt(opts: {
   if (!existing) return null;
   if (
     existing.resultId !== resultId ||
-    stableHash(existing.evidencePayload ?? null) !== stableHash(evidencePayload)
+    stableAttemptEvidenceHash(existing.evidencePayload ?? null) !==
+      stableAttemptEvidenceHash(evidencePayload)
   ) {
     throw new Error(
       `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
@@ -1962,6 +1969,22 @@ function stableHash(value: unknown): string {
     .update(JSON.stringify(stable(value)))
     .digest("hex")
     .slice(0, 24);
+}
+
+/** Hash one immutable attempt payload across the rolling-deploy boundary that
+ * introduced `mesh_recovery_version`. Legacy rows omit this optional
+ * acknowledgement, while one short-lived writer stored an explicit null. Both
+ * mean "the engine did not acknowledge a recovery strategy". Numeric values
+ * remain part of the immutable identity and are never normalized away. */
+function stableAttemptEvidenceHash(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return stableHash(value);
+  }
+  const normalized = { ...(value as Record<string, unknown>) };
+  if (normalized.mesh_recovery_version === null) {
+    delete normalized.mesh_recovery_version;
+  }
+  return stableHash(normalized);
 }
 
 function mergePendingRemoteEvidenceCleanup(
