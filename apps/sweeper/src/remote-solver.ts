@@ -16,6 +16,7 @@ import {
   results,
   schedulingProfiles,
   simJobs,
+  simPrecalcObligations,
   simRansPolarPromotions,
   simResultSubmitRetries,
   simulationPresetRevisions,
@@ -60,6 +61,7 @@ import {
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { touchHeartbeat } from "./heartbeat";
 import { retryScopeForRequestedPolar } from "./retry-plan";
+import { submitUransRetryForJob } from "./reconcile";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
 const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
@@ -696,6 +698,8 @@ async function remotePromiseWorkState(
       resultStatus: results.status,
       retryState: simResultSubmitRetries.state,
       retryAt: simResultSubmitRetries.nextAttemptAt,
+      precalcState: simPrecalcObligations.state,
+      precalcNextSubmitAt: simPrecalcObligations.nextSubmitAt,
     })
     .from(syncSweepPromisePoints)
     .leftJoin(
@@ -707,6 +711,17 @@ async function remotePromiseWorkState(
           syncSweepPromisePoints.simulationPresetRevisionId,
         ),
         eq(results.aoaDeg, syncSweepPromisePoints.aoaDeg),
+      ),
+    )
+    .leftJoin(
+      simPrecalcObligations,
+      and(
+        eq(simPrecalcObligations.airfoilId, syncSweepPromisePoints.airfoilId),
+        eq(
+          simPrecalcObligations.revisionId,
+          syncSweepPromisePoints.simulationPresetRevisionId,
+        ),
+        eq(simPrecalcObligations.aoaDeg, syncSweepPromisePoints.aoaDeg),
       ),
     )
     .leftJoin(
@@ -723,6 +738,30 @@ async function remotePromiseWorkState(
   let completed = false;
   let terminal = false;
   for (const row of activeRows) {
+    // Preliminary-URANS obligations own their physical cell independently of
+    // the mutable results projection. Re-submitting RANS while an obligation
+    // is pending/running is both duplicate work and a livelock: claimAoas
+    // correctly refuses the cell, while the old remote loop kept composing a
+    // cancelled placeholder job forever. A satisfied obligation is waiting
+    // for exact accepted evidence delivery; a blocked/cancelled obligation is
+    // a terminal evidence handoff, never another RANS solve.
+    if (["pending", "running"].includes(row.precalcState ?? "")) {
+      if (row.precalcNextSubmitAt && row.precalcNextSubmitAt.getTime() > now) {
+        if (!waitingUntil || row.precalcNextSubmitAt < waitingUntil)
+          waitingUntil = row.precalcNextSubmitAt;
+      } else {
+        busy = true;
+      }
+      continue;
+    }
+    if (row.precalcState === "satisfied") {
+      completed = true;
+      continue;
+    }
+    if (["blocked", "cancelled"].includes(row.precalcState ?? "")) {
+      terminal = true;
+      continue;
+    }
     if (!row.resultId) {
       dueAoas.push(Number(row.aoaDeg));
       continue;
@@ -822,6 +861,23 @@ async function mirroredRemotePromiseIds(
     )
     .orderBy(syncSweepPromises.createdAt, syncSweepPromises.id);
   return rows.map((row) => row.id);
+}
+
+async function mirroredRemoteActiveAoaCount(
+  db: DB,
+  promiseIds: string[],
+): Promise<number> {
+  if (!promiseIds.length) return 0;
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(syncSweepPromisePoints)
+    .where(
+      and(
+        inArray(syncSweepPromisePoints.promiseId, promiseIds),
+        eq(syncSweepPromisePoints.status, "active"),
+      ),
+    );
+  return Number(row?.count ?? 0);
 }
 
 async function cancelAuthoritativelyExpiredPromise(
@@ -1337,7 +1393,13 @@ async function composeRemotePromiseJob(
           finishedAt: new Date(),
         })
         .where(eq(simJobs.id, job.id));
-      return { kind: "busy" as const, state };
+      // No row was claimable even though the mirror projected it as due. The
+      // claim guard is authoritative (another owner, terminal retry ledger,
+      // or immutable preliminary evidence). Returning busy here recreated the
+      // same cancelled placeholder every tick and prevented the next hub
+      // claim forever. Release this mirror through the durable cancellation
+      // outbox instead.
+      return { kind: "terminal" as const, state };
     }
     if (claimed.length !== state.dueAoas.length) {
       await tx
@@ -1354,6 +1416,75 @@ async function composeRemotePromiseJob(
   });
 }
 
+/** Resume bounded preliminary work owned by one mirrored promise before the
+ * ordinary RANS composer considers its remaining cells. The initial terminal
+ * ingest creates durable obligations, but a rejected wave-2 child is not a
+ * wave-1 parent and therefore cannot schedule its own second bounded attempt.
+ * Campaigns have a separate recovery scan; remote promises need the same
+ * restart-safe recovery keyed by their stored promise provenance. */
+async function submitRemotePrecalcRecovery(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+  promiseId: string,
+): Promise<boolean> {
+  const [candidate] = (await db.execute(sql`
+    SELECT DISTINCT parent.id
+    FROM sync_sweep_promises remote_promise
+    JOIN sync_sweep_promise_points promise_point
+      ON promise_point.promise_id = remote_promise.id
+     AND promise_point.status = 'active'
+    JOIN sim_precalc_obligations obligation
+      ON obligation.airfoil_id = promise_point.airfoil_id
+     AND obligation.revision_id = promise_point.simulation_preset_revision_id
+     AND obligation.aoa_deg = promise_point.aoa_deg
+     AND obligation.state = 'pending'
+     AND obligation.attempt_count < obligation.max_attempts
+     AND (obligation.next_submit_at IS NULL OR obligation.next_submit_at <= now())
+    JOIN sim_jobs parent
+      ON parent.airfoil_id = remote_promise.airfoil_id
+     AND parent.simulation_preset_revision_id = remote_promise.simulation_preset_revision_id
+     AND parent.wave = 1
+     AND parent.request_payload ->> 'syncPromiseId' = remote_promise.id::text
+     AND parent.request_payload ->> 'remoteSolver' = 'true'
+     AND (
+       (parent.status IN ('done', 'failed') AND parent."ingestedAt" IS NOT NULL)
+       OR (
+         parent.status = 'cancelled'
+         AND (
+           parent."ingestedAt" IS NOT NULL
+           OR EXISTS (
+             SELECT 1 FROM result_attempts parent_attempt
+             WHERE parent_attempt.sim_job_id = parent.id
+           )
+         )
+       )
+     )
+    WHERE remote_promise.id = ${promiseId}
+      AND remote_promise.status = 'active'
+      AND remote_promise.source_base_url = ${syncBase(settings)}
+      AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs active_child
+        WHERE active_child.parent_job_id = parent.id
+          AND active_child.wave = 2
+          AND active_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+    ORDER BY parent.id
+    LIMIT 1
+  `)) as unknown as Array<{ id: string }>;
+  if (!candidate) return false;
+  const [parent] = await db
+    .select()
+    .from(simJobs)
+    .where(eq(simJobs.id, candidate.id))
+    .limit(1);
+  if (!parent) return false;
+  await submitUransRetryForJob(db, engine, parent);
+  return true;
+}
+
 async function submitMirroredRemotePromise(
   db: DB,
   engine: EngineClient,
@@ -1364,6 +1495,10 @@ async function submitMirroredRemotePromise(
     const error = `remote engine submit for promise ${promiseId} is waiting for the shared connection backoff`;
     await setStatus(db, "error", error);
     return { kind: "waiting" };
+  }
+  if (await submitRemotePrecalcRecovery(db, engine, settings, promiseId)) {
+    await setStatus(db, "solving", null);
+    return { kind: "busy" };
   }
   const composition = await composeRemotePromiseJob(db, settings, promiseId);
   if (composition.kind === "stopped") {
@@ -1972,6 +2107,78 @@ async function settleSuccessfulRemoteResultDelivery(
   });
 }
 
+/** Record that the hub durably stored an exact non-polar terminal generation.
+ * The point is cancelled rather than fulfilled: rejected/provisional evidence
+ * must suppress duplicate federation work without masquerading as an accepted
+ * polar value. The surrounding mixed promise is released through the normal
+ * durable cancellation outbox once every point is fulfilled or cancelled. */
+async function settleTerminalRemoteResultDelivery(
+  db: DB,
+  claim: DeliveryClaim,
+  promiseId: string,
+  job: typeof simJobs.$inferSelect,
+  result: typeof results.$inferSelect,
+  resultAttemptId: string,
+): Promise<void> {
+  const revisionId = job.simulationPresetRevisionId;
+  if (!revisionId)
+    throw new Error(`remote job ${job.id} has no immutable setup revision`);
+  await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const pointRows = (await tx.execute(sql`
+      SELECT promise_point.id
+      FROM sync_sweep_promises promise
+      JOIN sync_sweep_promise_points promise_point
+        ON promise_point.promise_id = promise.id
+      WHERE promise.id = ${promiseId}
+        AND promise_point.airfoil_id = ${job.airfoilId}
+        AND promise_point.simulation_preset_revision_id = ${revisionId}
+        AND promise_point.aoa_deg = ${result.aoaDeg}
+        AND promise_point.status IN ('active', 'expired')
+      ORDER BY promise.id, promise_point.id
+      FOR UPDATE OF promise, promise_point
+    `)) as unknown as Array<{ id: string }>;
+    if (pointRows.length !== 1) {
+      throw new Error(
+        `terminal remote result ${result.id} at ${result.aoaDeg}° is outside active mirrored promise ${promiseId}`,
+      );
+    }
+    const now = new Date();
+    await tx
+      .update(syncSweepPromisePoints)
+      .set({
+        status: "cancelled",
+        resultId: result.id,
+        resultAttemptId,
+        updatedAt: now,
+      })
+      .where(eq(syncSweepPromisePoints.id, pointRows[0]!.id));
+    const delivered = await tx
+      .update(syncRemoteResultDeliveries)
+      .set({
+        state: "delivered",
+        claimToken: null,
+        claimedAt: null,
+        claimExpiresAt: null,
+        lastHttpStatus: 200,
+        lastError: null,
+        remoteConflictIds: [],
+        deliveredAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(syncRemoteResultDeliveries.id, claim.id),
+          eq(syncRemoteResultDeliveries.state, "pushing"),
+          eq(syncRemoteResultDeliveries.claimToken, claim.token),
+          gt(syncRemoteResultDeliveries.claimExpiresAt, now),
+        ),
+      )
+      .returning({ id: syncRemoteResultDeliveries.id });
+    await assertSingleDeliverySettlement(delivered, claim);
+  });
+}
+
 /** Complete an upstream promise only after the local durable mirror proves
  * every promised physical point was accepted by /polars. The helper is also
  * called from later ticks, so a process death after the last point stamp but
@@ -1987,7 +2194,8 @@ async function completeMirroredPromiseIfReady(
            remote_promise.status,
            remote_promise.aoa_count::int AS aoa_count,
            count(promise_point.id)::int AS point_count,
-           COALESCE(bool_and(promise_point.status IN ('fulfilled', 'cancelled')), false) AS all_fulfilled
+           COALESCE(bool_and(promise_point.status IN ('fulfilled', 'cancelled')), false) AS all_fulfilled,
+           COALESCE(bool_or(promise_point.status = 'cancelled'), false) AS has_cancelled
     FROM sync_sweep_promises remote_promise
     LEFT JOIN sync_sweep_promise_points promise_point
       ON promise_point.promise_id = remote_promise.id
@@ -2002,6 +2210,7 @@ async function completeMirroredPromiseIfReady(
     aoa_count: number;
     point_count: number;
     all_fulfilled: boolean;
+    has_cancelled: boolean;
   }>;
   if (!coverage) return false;
   if (coverage.status === "fulfilled") return true;
@@ -2011,6 +2220,16 @@ async function completeMirroredPromiseIfReady(
     !coverage.all_fulfilled
   )
     return false;
+
+  if (coverage.has_cancelled) {
+    await cancelMirroredRemotePromise(
+      db,
+      settings,
+      promiseId,
+      "remote promise settled with one or more evidence-backed terminal outcomes",
+    );
+    return false;
+  }
 
   const response = await fetch(
     `${syncBase(settings)}/sweeps/${promiseId}/complete`,
@@ -2109,8 +2328,13 @@ async function pushOneRemoteResult(
   promiseId: string,
   job: typeof simJobs.$inferSelect,
   result: typeof results.$inferSelect,
+  options: {
+    attempt?: typeof resultAttempts.$inferSelect;
+    terminalOutcome?: boolean;
+  } = {},
 ): Promise<boolean> {
-  const attempt = await currentAttemptForResult(db, job, result);
+  const attempt =
+    options.attempt ?? (await currentAttemptForResult(db, job, result));
   const [runtime] = attempt.solverRuntimeBuildId
     ? await db
         .select({
@@ -2128,17 +2352,21 @@ async function pushOneRemoteResult(
         .where(eq(solverRuntimeBuilds.id, attempt.solverRuntimeBuildId))
         .limit(1)
     : [];
-  const [accepted] = await db
-    .select({ id: resultClassifications.id })
+  const [classification] = await db
+    .select({
+      id: resultClassifications.id,
+      state: resultClassifications.state,
+    })
     .from(resultClassifications)
-    .where(
-      and(
-        eq(resultClassifications.resultAttemptId, attempt.id),
-        eq(resultClassifications.state, "accepted"),
-      ),
-    )
+    .where(eq(resultClassifications.resultAttemptId, attempt.id))
     .limit(1);
-  if (!accepted) return false;
+  const accepted = classification?.state === "accepted";
+  if (
+    !accepted &&
+    (!options.terminalOutcome ||
+      !["rejected", "needs_urans"].includes(classification?.state ?? ""))
+  )
+    return false;
   const claim = await claimResultDelivery(db, promiseId, job, result, attempt);
   if (!claim) return false;
   try {
@@ -2397,6 +2625,7 @@ async function pushOneRemoteResult(
     let responsePayload: {
       conflictIds?: unknown[];
       fulfilledAoas?: unknown[];
+      terminalAoas?: unknown[];
       unfulfilledAoas?: unknown[];
       error?: unknown;
     } | null;
@@ -2449,19 +2678,39 @@ async function pushOneRemoteResult(
     const exactFulfilled = responsePayload?.fulfilledAoas?.some(
       (aoa) => typeof aoa === "number" && aoa === result.aoaDeg,
     );
+    const exactTerminal = responsePayload?.terminalAoas?.some(
+      (aoa) => typeof aoa === "number" && aoa === result.aoaDeg,
+    );
+    if (exactTerminal && options.terminalOutcome) {
+      await settleTerminalRemoteResultDelivery(
+        db,
+        claim,
+        promiseId,
+        job,
+        result,
+        attempt.id,
+      );
+      await completeMirroredPromiseIfReady(db, settings, promiseId, job.id);
+      await setStatus(db, "idle", null, {
+        remoteSolverLastPushAt: new Date(),
+      });
+      return true;
+    }
     if (!exactFulfilled) {
       const exactUnfulfilled = responsePayload?.unfulfilledAoas?.some(
         (aoa) => typeof aoa === "number" && aoa === result.aoaDeg,
       );
-      const error = exactUnfulfilled
-        ? `remote hub explicitly left ${result.aoaDeg}° unfulfilled for promise ${promiseId}`
-        : `remote hub response omitted exact fulfillment for ${result.aoaDeg}° on promise ${promiseId}`;
+      const error = exactTerminal
+        ? `remote hub classified locally accepted ${result.aoaDeg}° as terminal for promise ${promiseId}`
+        : exactUnfulfilled
+          ? `remote hub explicitly left ${result.aoaDeg}° unfulfilled for promise ${promiseId}`
+          : `remote hub response omitted exact fulfillment for ${result.aoaDeg}° on promise ${promiseId}`;
       await settleResultDelivery(db, claim, {
-        kind: exactUnfulfilled ? "blocked" : "retry",
+        kind: exactUnfulfilled || exactTerminal ? "blocked" : "retry",
         error,
         httpStatus: response.status,
       });
-      if (exactUnfulfilled) {
+      if (exactUnfulfilled || exactTerminal) {
         await cancelMirroredRemotePromise(db, settings, promiseId, error);
       }
       throw new Error(error);
@@ -2558,7 +2807,8 @@ async function processReusablePromiseEvidence(
       remote_promise.id AS promise_id,
       remote_promise."createdAt" AS promise_created_at,
       solved_result.id AS result_id,
-      solved_job.id AS job_id
+      solved_job.id AS job_id,
+      solved_attempt.id AS attempt_id
     FROM sync_sweep_promises remote_promise
     JOIN sync_sweep_promise_points promise_point
       ON promise_point.promise_id = remote_promise.id
@@ -2567,14 +2817,21 @@ async function processReusablePromiseEvidence(
       ON solved_result.airfoil_id = promise_point.airfoil_id
      AND solved_result.simulation_preset_revision_id = promise_point.simulation_preset_revision_id
      AND solved_result.aoa_deg = promise_point.aoa_deg
-     AND solved_result.status = 'done'
-    JOIN sim_jobs solved_job ON solved_job.id = solved_result.sim_job_id
-    JOIN result_attempts solved_attempt
-      ON solved_attempt.id = solved_result.current_result_attempt_id
-     AND solved_attempt.result_id = solved_result.id
-    JOIN result_classifications solved_classification
-      ON solved_classification.result_attempt_id = solved_attempt.id
-     AND solved_classification.state = 'accepted'
+    JOIN LATERAL (
+      SELECT accepted_attempt.*
+      FROM result_attempts accepted_attempt
+      JOIN result_classifications accepted_classification
+        ON accepted_classification.result_attempt_id = accepted_attempt.id
+       AND accepted_classification.state = 'accepted'
+      WHERE accepted_attempt.result_id = solved_result.id
+        AND accepted_attempt.status = 'done'
+      ORDER BY
+        CASE WHEN accepted_attempt.regime = 'urans' THEN 0 ELSE 1 END,
+        accepted_attempt."createdAt" DESC,
+        accepted_attempt.id DESC
+      LIMIT 1
+    ) solved_attempt ON true
+    JOIN sim_jobs solved_job ON solved_job.id = solved_attempt.sim_job_id
     WHERE remote_promise.status = 'active'
       AND remote_promise.source_base_url = ${syncBase(settings)}
       AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
@@ -2633,6 +2890,7 @@ async function processReusablePromiseEvidence(
         FROM sync_remote_result_deliveries delivery
         WHERE delivery.promise_id = remote_promise.id
           AND delivery.result_id = solved_result.id
+          AND delivery.generation_key = solved_attempt.id::text
           AND (
             delivery.state IN ('delivered', 'blocked', 'superseded')
             OR (delivery.state = 'retry_wait' AND delivery.next_attempt_at > now())
@@ -2645,6 +2903,7 @@ async function processReusablePromiseEvidence(
     promise_id: string;
     result_id: string;
     job_id: string;
+    attempt_id: string;
   }>;
   for (const candidate of candidates) {
     const [job] = await db
@@ -2657,21 +2916,160 @@ async function processReusablePromiseEvidence(
       .from(results)
       .where(eq(results.id, candidate.result_id))
       .limit(1);
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.id, candidate.attempt_id),
+          eq(resultAttempts.resultId, candidate.result_id),
+        ),
+      )
+      .limit(1);
     if (
       job &&
       result &&
+      attempt &&
       (await pushOneRemoteResult(
         db,
         settings,
         candidate.promise_id,
         job,
         result,
+        { attempt },
       ))
     ) {
       return true;
     }
   }
   return false;
+}
+
+/** Push the exact final non-accepted generation once the bounded preliminary
+ * owner is terminal. This is evidence publication, not polar acceptance: the
+ * hub returns the AoA in terminalAoas, stores the immutable attempt/artifacts,
+ * and keeps it out of fitted/public polars. Presence of a valid manifest keeps
+ * the promise here while media or a retry timer catches up, rather than
+ * cancelling the lease and immediately reclaiming the same gap. */
+async function processTerminalPromiseEvidence(
+  db: DB,
+  settings: Settings,
+): Promise<boolean> {
+  const candidates = (await db.execute(sql`
+    SELECT
+      remote_promise.id AS promise_id,
+      terminal_result.id AS result_id,
+      terminal_job.id AS job_id,
+      terminal_attempt.id AS attempt_id
+    FROM sync_sweep_promises remote_promise
+    JOIN sync_sweep_promise_points promise_point
+      ON promise_point.promise_id = remote_promise.id
+     AND promise_point.status = 'active'
+    JOIN results terminal_result
+      ON terminal_result.airfoil_id = promise_point.airfoil_id
+     AND terminal_result.simulation_preset_revision_id = promise_point.simulation_preset_revision_id
+     AND terminal_result.aoa_deg = promise_point.aoa_deg
+    LEFT JOIN sim_precalc_obligations obligation
+      ON obligation.airfoil_id = promise_point.airfoil_id
+     AND obligation.revision_id = promise_point.simulation_preset_revision_id
+     AND obligation.aoa_deg = promise_point.aoa_deg
+    JOIN LATERAL (
+      SELECT rejected_attempt.*
+      FROM result_attempts rejected_attempt
+      JOIN result_classifications rejected_classification
+        ON rejected_classification.result_attempt_id = rejected_attempt.id
+       AND rejected_classification.state = 'rejected'
+      WHERE rejected_attempt.result_id = terminal_result.id
+        AND rejected_attempt.status IN ('done', 'failed')
+      ORDER BY
+        CASE WHEN rejected_attempt.regime = 'urans' THEN 0 ELSE 1 END,
+        rejected_attempt."createdAt" DESC,
+        rejected_attempt.id DESC
+      LIMIT 1
+    ) terminal_attempt ON true
+    JOIN sim_jobs terminal_job ON terminal_job.id = terminal_attempt.sim_job_id
+    LEFT JOIN sync_remote_result_deliveries delivery
+      ON delivery.promise_id = remote_promise.id
+     AND delivery.result_id = terminal_result.id
+     AND delivery.generation_key = terminal_attempt.id::text
+    WHERE remote_promise.status = 'active'
+      AND remote_promise.source_base_url = ${syncBase(settings)}
+      AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND (
+        obligation.state IN ('blocked', 'cancelled')
+        OR (obligation.id IS NULL AND terminal_result.status = 'failed')
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM solver_evidence_artifacts manifest
+        WHERE manifest.result_id = terminal_result.id
+          AND manifest.result_attempt_id = terminal_attempt.id
+          AND manifest.kind = 'manifest'
+        GROUP BY manifest.result_id, manifest.result_attempt_id
+        HAVING count(*) = 1
+           AND count(*) FILTER (
+             WHERE manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+               AND manifest.byte_size > 0
+               AND length(trim(manifest.storage_key)) > 0
+               AND length(trim(manifest.mime_type)) > 0
+           ) = 1
+      )
+    ORDER BY
+      CASE
+        WHEN delivery.id IS NULL
+          OR delivery.state = 'pending'
+          OR (delivery.state = 'retry_wait' AND delivery.next_attempt_at <= now())
+          OR (delivery.state = 'pushing' AND delivery.claim_expires_at <= now())
+        THEN 0 ELSE 1
+      END,
+      remote_promise."createdAt",
+      promise_point.aoa_deg,
+      terminal_attempt.id
+    LIMIT 50
+  `)) as unknown as Array<{
+    promise_id: string;
+    result_id: string;
+    job_id: string;
+    attempt_id: string;
+  }>;
+  for (const candidate of candidates) {
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, candidate.job_id))
+      .limit(1);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, candidate.result_id))
+      .limit(1);
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.id, candidate.attempt_id),
+          eq(resultAttempts.resultId, candidate.result_id),
+        ),
+      )
+      .limit(1);
+    if (
+      job &&
+      result &&
+      attempt &&
+      (await pushOneRemoteResult(
+        db,
+        settings,
+        candidate.promise_id,
+        job,
+        result,
+        { attempt, terminalOutcome: true },
+      ))
+    ) {
+      return true;
+    }
+  }
+  return candidates.length > 0;
 }
 
 async function processRemoteResultDeliveries(
@@ -3111,13 +3509,16 @@ export async function remoteSolverTick(
       return;
     }
     const active = await activeRemoteJobs(db);
+    const mirrored = await mirroredRemotePromiseIds(db, settings);
+    const mirroredAoaCount = await mirroredRemoteActiveAoaCount(db, mirrored);
     await heartbeat(
       settings,
-      active.length ? "solving" : "idle",
-      active.length,
-      active.reduce((sum, job) => sum + job.totalCases, 0),
+      active.length || mirrored.length ? "solving" : "idle",
+      mirrored.length,
+      mirroredAoaCount,
     );
     if (await processReusablePromiseEvidence(db, settings)) return;
+    if (await processTerminalPromiseEvidence(db, settings)) return;
     if (active.length === 0) {
       if (!allowEngineSubmission) {
         await setStatus(
@@ -3127,7 +3528,6 @@ export async function remoteSolverTick(
         );
         return;
       }
-      const mirrored = await mirroredRemotePromiseIds(db, settings);
       if (mirrored.length) {
         await submitMirroredRemotePromise(db, engine, settings, mirrored[0]);
       } else if (engineBackoffActive()) {

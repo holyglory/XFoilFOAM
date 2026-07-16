@@ -72,6 +72,7 @@ const {
   results,
   schedulingProfiles,
   simJobs,
+  simulationPresetAirfoilTargets,
   simulationPresets,
   solverEvidenceArtifacts,
   solverProfiles,
@@ -124,6 +125,9 @@ let mach: number | null = null;
 let speed = 0;
 let kinematicViscosity = 0;
 const CHORD = 0.432;
+const TERMINAL_GAP_AOA = 739.101;
+const TERMINAL_ACCEPTED_AOA = 739.102;
+const CANCELLED_GAP_AOA = 739.201;
 const profileIds = {
   boundary: "",
   mesh: "",
@@ -218,7 +222,9 @@ async function createFixture() {
     .limit(1);
   if (!air) throw new Error("seeded air medium required");
   mediumId = air.id;
-  speed = 23.75;
+  // Keep this fixture first in the claim queue without mutating any unrelated
+  // shared-DB preset: the claim route sorts by Reynolds before airfoil slug.
+  speed = 0.00004;
   kinematicViscosity = air.kinematicViscosity;
   reynolds = Math.round((speed * CHORD) / air.kinematicViscosity);
   mach = air.speedOfSound ? speed / air.speedOfSound : null;
@@ -236,7 +242,7 @@ async function createFixture() {
   const [foil] = await db
     .insert(airfoils)
     .values({
-      slug: `${PREFIX}-foil`,
+      slug: `000-${PREFIX}-foil`,
       name: `${PREFIX} foil`,
       categoryId,
       points: contour,
@@ -320,7 +326,7 @@ async function createFixture() {
     .values({
       slug: `${PREFIX}-sweep`,
       name: `${PREFIX} sweep`,
-      aoaList: [700.001, 701.001, 702.001],
+      aoaList: [TERMINAL_GAP_AOA, TERMINAL_ACCEPTED_AOA, CANCELLED_GAP_AOA],
     })
     .returning();
   profileIds.boundary = boundary.id;
@@ -344,14 +350,27 @@ async function createFixture() {
       outputProfileId: profileIds.output,
       sweepDefinitionId: profileIds.sweep,
       legacyBoundaryConditionId: legacyBcId,
+      targetScope: "airfoils",
       enabled: false,
     })
     .returning({ id: simulationPresets.id });
   presetId = preset.id;
+  await db.insert(simulationPresetAirfoilTargets).values({
+    presetId,
+    airfoilId,
+  });
+  await db
+    .update(simulationPresets)
+    .set({ enabled: true, updatedAt: new Date() })
+    .where(eq(simulationPresets.id, presetId));
   const resolved = await ensureSimulationPresetRevision(db, presetId);
   if (!resolved) throw new Error("simulation preset revision required");
   revisionId = resolved.revision.id;
   revisionSignatureHash = resolved.revision.signatureHash;
+  await db
+    .update(simulationPresets)
+    .set({ enabled: false, updatedAt: new Date() })
+    .where(eq(simulationPresets.id, presetId));
 }
 
 function bytesItem(label: string, mimeType = "application/json") {
@@ -2323,7 +2342,8 @@ describe("remote solver sync validation regressions", () => {
     expect(pushed.statusCode).toBe(200);
     expect(pushed.json()).toMatchObject({
       fulfilledAoas: [],
-      unfulfilledAoas: [aoaDeg],
+      terminalAoas: [aoaDeg],
+      unfulfilledAoas: [],
     });
     const canonical = await resultAt(aoaDeg);
     const [attempt] = await db
@@ -2331,6 +2351,7 @@ describe("remote solver sync validation regressions", () => {
       .from(resultAttempts)
       .where(eq(resultAttempts.resultId, canonical!.id));
     expect(canonical).toMatchObject({
+      status: "failed",
       currentResultAttemptId: null,
       qualityWarnings: null,
       fidelity: null,
@@ -2360,15 +2381,248 @@ describe("remote solver sync validation regressions", () => {
       reasons: expect.arrayContaining(["incomplete-urans-integration"]),
     });
     expect((await readPromise(promiseId)).points).toMatchObject([
-      { status: "active", resultId: null },
+      {
+        status: "cancelled",
+        resultId: canonical!.id,
+        resultAttemptId: attempt.id,
+      },
     ]);
+    const replayed = await postPolars(
+      polarPayload([makePoint(aoaDeg, evidence)], {
+        promiseId,
+        bcId: undefined,
+      }),
+    );
+    expect(replayed.statusCode, replayed.body).toBe(200);
+    expect(replayed.json()).toMatchObject({
+      attempts: 0,
+      conflictIds: [],
+      fulfilledAoas: [],
+      terminalAoas: [aoaDeg],
+      unfulfilledAoas: [],
+    });
+    const completed = await postJson(
+      `/api/sync/v1/sweeps/${promiseId}/complete`,
+      { accepted: false, terminalEvidenceReported: true },
+    );
+    expect(completed.statusCode, completed.body).toBe(409);
+    expect(completed.json()).toMatchObject({
+      error: "promise still has points without imported solver evidence",
+      unfulfilledPointCount: 1,
+    });
+    const cancelled = await postJson(
+      `/api/sync/v1/sweeps/${promiseId}/cancel`,
+      { terminalEvidenceReported: true },
+    );
+    expect(cancelled.statusCode, cancelled.body).toBe(200);
+    const settled = await readPromise(promiseId);
+    expect(settled.promise.status).toBe("cancelled");
+    expect(settled.points).toMatchObject([
+      {
+        status: "cancelled",
+        resultId: canonical!.id,
+        resultAttemptId: attempt.id,
+      },
+    ]);
+  });
+
+  it("skips an evidence-backed terminal cell but reclaims a plain cancelled promise", async () => {
+    const terminalPromiseId = await createPromise("active", [
+      TERMINAL_GAP_AOA,
+      TERMINAL_ACCEPTED_AOA,
+    ]);
+    const terminalEvidence = uransEvidencePatch("terminal-gap", [
+      "URANS integration stopped by the wall-clock budget guard before a stable period window",
+    ]);
+    const terminalPush = await postPolars(
+      polarPayload(
+        [
+          makePoint(TERMINAL_GAP_AOA, terminalEvidence),
+          makePoint(TERMINAL_ACCEPTED_AOA),
+        ],
+        {
+          promiseId: terminalPromiseId,
+          bcId: undefined,
+        },
+      ),
+    );
+    expect(terminalPush.statusCode, terminalPush.body).toBe(200);
+    expect(terminalPush.json()).toMatchObject({
+      fulfilledAoas: [TERMINAL_ACCEPTED_AOA],
+      terminalAoas: [TERMINAL_GAP_AOA],
+      unfulfilledAoas: [],
+    });
+    const terminalComplete = await postJson(
+      `/api/sync/v1/sweeps/${terminalPromiseId}/complete`,
+      { terminalEvidenceReported: true },
+    );
+    expect(terminalComplete.statusCode, terminalComplete.body).toBe(409);
+    const terminalCancelled = await postJson(
+      `/api/sync/v1/sweeps/${terminalPromiseId}/cancel`,
+      { terminalEvidenceReported: true },
+    );
+    expect(terminalCancelled.statusCode, terminalCancelled.body).toBe(200);
+    const terminalPromise = await readPromise(terminalPromiseId);
+    expect(terminalPromise.promise.status).toBe("cancelled");
+    expect(terminalPromise.points).toMatchObject([
+      {
+        aoaDeg: TERMINAL_GAP_AOA,
+        status: "cancelled",
+        resultId: expect.any(String),
+        resultAttemptId: expect.any(String),
+      },
+      {
+        aoaDeg: TERMINAL_ACCEPTED_AOA,
+        status: "fulfilled",
+        resultId: expect.any(String),
+        resultAttemptId: expect.any(String),
+      },
+    ]);
+
+    const cancelledPromiseId = await createPromise("active", CANCELLED_GAP_AOA);
+    const cancelled = await postJson(
+      `/api/sync/v1/sweeps/${cancelledPromiseId}/cancel`,
+      {},
+    );
+    expect(cancelled.statusCode, cancelled.body).toBe(200);
+    expect(await resultAt(CANCELLED_GAP_AOA)).toBeNull();
+
+    await db
+      .update(simulationPresets)
+      .set({ enabled: true, updatedAt: new Date() })
+      .where(eq(simulationPresets.id, presetId));
+    try {
+      const claim = await postJson("/api/sync/v1/sweeps/claim", {
+        limit: 1,
+        sourceInstanceId: `${PREFIX}-terminal-gap-claimer`,
+      });
+      expect(claim.statusCode, claim.body).toBe(200);
+      const claimedPromise = claim.json().promise as {
+        id: string;
+        aoas: number[];
+        airfoil: { id: string };
+        setupRevision: { id: string };
+      };
+      cleanupPromiseIds.add(claimedPromise.id);
+      expect(claimedPromise).toMatchObject({
+        aoas: [CANCELLED_GAP_AOA],
+        airfoil: { id: airfoilId },
+        setupRevision: { id: revisionId },
+      });
+    } finally {
+      await db
+        .update(simulationPresets)
+        .set({ enabled: false, updatedAt: new Date() })
+        .where(eq(simulationPresets.id, presetId));
+    }
+
+    expect(await resultAt(TERMINAL_GAP_AOA)).toMatchObject({
+      status: "failed",
+      currentResultAttemptId: null,
+    });
+    expect((await readPromise(cancelledPromiseId)).points).toMatchObject([
+      { status: "cancelled", resultId: null, resultAttemptId: null },
+    ]);
+  });
+
+  it("retains a rejected URANS continuation without erasing its needs_urans RANS pointer", async () => {
+    const hardFailureAoa = 0.25;
+    const provisionalAoa = 1.25;
+    const promiseId = await createPromise("active", [
+      hardFailureAoa,
+      provisionalAoa,
+    ]);
+    const marchedEngineJobId = `${PREFIX}-terminal-continuation-rans`;
+    const ransPush = await postPolars(
+      polarPayload(
+        [
+          makePoint(hardFailureAoa, {
+            engineJobId: marchedEngineJobId,
+            converged: false,
+            stalled: true,
+          }),
+          makePoint(provisionalAoa, {
+            engineJobId: marchedEngineJobId,
+          }),
+        ],
+        { promiseId, bcId: undefined },
+      ),
+    );
+    expect(ransPush.statusCode, ransPush.body).toBe(200);
+    expect(ransPush.json()).toMatchObject({
+      fulfilledAoas: [],
+      terminalAoas: [hardFailureAoa, provisionalAoa],
+      unfulfilledAoas: [],
+    });
+    const before = await readPromise(promiseId);
+    const provisionalPoint = before.points.find(
+      (point) => point.aoaDeg === provisionalAoa,
+    )!;
+    const provisionalResult = await resultAt(provisionalAoa);
+    expect(provisionalPoint.status).toBe("cancelled");
+    expect(provisionalResult?.currentResultAttemptId).toBe(
+      provisionalPoint.resultAttemptId,
+    );
+    const [provisionalClassification] = await db
+      .select({ state: resultClassifications.state })
+      .from(resultClassifications)
+      .where(
+        eq(
+          resultClassifications.resultAttemptId,
+          provisionalPoint.resultAttemptId!,
+        ),
+      )
+      .limit(1);
+    expect(provisionalClassification?.state).toBe("needs_urans");
+
+    const failedUrans = uransEvidencePatch("terminal-continuation-urans", [
+      "URANS integration stopped by the wall-clock budget guard: retained 1.4 of 3 periods (budget)",
+    ]);
+    const childPush = await postPolars(
+      polarPayload(
+        [
+          makePoint(provisionalAoa, {
+            ...failedUrans,
+            engineJobId: `${PREFIX}-terminal-continuation-urans`,
+          }),
+        ],
+        { promiseId, bcId: undefined },
+      ),
+    );
+    expect(childPush.statusCode, childPush.body).toBe(200);
+    expect(childPush.json()).toMatchObject({
+      fulfilledAoas: [],
+      terminalAoas: [provisionalAoa],
+      unfulfilledAoas: [],
+    });
+
+    const canonical = await resultAt(provisionalAoa);
+    expect(canonical).toMatchObject({
+      status: "done",
+      currentResultAttemptId: provisionalPoint.resultAttemptId,
+    });
+    const after = await readPromise(promiseId);
     expect(
-      (
-        await postJson(`/api/sync/v1/sweeps/${promiseId}/complete`, {
-          accepted: false,
-        })
-      ).statusCode,
-    ).toBe(409);
+      after.points.find((point) => point.aoaDeg === provisionalAoa),
+    ).toMatchObject({
+      status: "cancelled",
+      resultId: provisionalPoint.resultId,
+      resultAttemptId: provisionalPoint.resultAttemptId,
+    });
+    const attempts = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, canonical!.id));
+    expect(attempts).toHaveLength(2);
+    const childAttempt = attempts.find(
+      (attempt) => attempt.id !== provisionalPoint.resultAttemptId,
+    );
+    const [rejectedChild] = await db
+      .select({ state: resultClassifications.state })
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultAttemptId, childAttempt!.id))
+      .limit(1);
+    expect(rejectedChild?.state).toBe("rejected");
   });
 
   it("rejects malformed force history before writing solver evidence", async () => {

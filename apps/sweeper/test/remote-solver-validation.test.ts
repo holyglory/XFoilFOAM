@@ -72,6 +72,7 @@ const {
   simRansPolarPromotionPoints,
   simRansPolarPromotions,
   simResultSubmitRetries,
+  settlePrecalcObligationsForJob,
   simulationPresets,
   solverEvidenceArtifacts,
   solverProfiles,
@@ -583,6 +584,7 @@ function stubFetch(
     conflictStatuses?: Record<string, "pending" | "promoted" | "archived">;
     failPolarIndex?: number;
     failCancelCount?: number;
+    terminalPolarIndex?: number;
     unfulfilledPolarIndex?: number;
     observeJobId?: string;
   } = {},
@@ -620,9 +622,12 @@ function stubFetch(
           conflictIds: opts.conflictIdsByPolarIndex?.[polarIndex] ?? [],
           fulfilledAoas:
             opts.unfulfilledPolarIndex === polarIndex ||
+            opts.terminalPolarIndex === polarIndex ||
             Boolean(opts.conflictIdsByPolarIndex?.[polarIndex]?.length)
               ? []
               : pushedAoas,
+          terminalAoas:
+            opts.terminalPolarIndex === polarIndex ? pushedAoas : [],
           unfulfilledAoas:
             opts.unfulfilledPolarIndex === polarIndex ? pushedAoas : [],
         }),
@@ -1155,6 +1160,141 @@ describe("remote solver submit lifecycle", () => {
     expect(submitPolar).not.toHaveBeenCalled();
     expect(await jobsForPromise(promise.id)).toEqual([]);
     expect((await readPromise(promise.id)).promise.status).toBe("active");
+  });
+
+  it("MUST-CATCH: releases a mixed promise when its remaining URANS cell is locally terminal instead of creating cancelled placeholder jobs forever", async () => {
+    const acceptedAoa = 900.601;
+    const terminalAoa = 900.602;
+    const promiseId = randomUUID();
+    const acceptedJob = await seedDoneRemoteJob(
+      "mixed-terminal-accepted",
+      [acceptedAoa],
+      2,
+      promiseId,
+    );
+    await db
+      .update(simJobs)
+      .set({ requestPayload: { historicalAcceptedFixture: true } })
+      .where(eq(simJobs.id, acceptedJob.id));
+    const promise = await seedMirroredPromise(
+      "mixed-terminal",
+      [acceptedAoa, terminalAoa],
+      promiseId,
+    );
+    const [acceptedResult] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, acceptedJob.id));
+    const [acceptedAttempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, acceptedResult.id));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({
+        status: "fulfilled",
+        resultId: acceptedResult.id,
+        resultAttemptId: acceptedAttempt.id,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(syncSweepPromisePoints.promiseId, promise.id),
+          eq(syncSweepPromisePoints.aoaDeg, acceptedAoa),
+        ),
+      );
+
+    const terminalEngineJobId = `${PREFIX}-mixed-terminal-urans`;
+    const [terminalResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: terminalAoa,
+        status: "stale",
+        source: "queued",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        engineJobId: terminalEngineJobId,
+        converged: false,
+        unsteady: true,
+        error: "preliminary URANS exhausted without a stable period window",
+        solvedAt: new Date(),
+      })
+      .returning();
+    const [terminalAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: terminalResult.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: terminalAoa,
+        engineJobId: terminalEngineJobId,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        converged: false,
+        unsteady: true,
+        error: "preliminary URANS exhausted without a stable period window",
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          failure_disposition: "non_stationary",
+        },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db.insert(resultClassifications).values({
+      resultId: terminalResult.id,
+      resultAttemptId: terminalAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: terminalAoa,
+      regime: "urans",
+      classifierVersion: "remote-terminal-livelock-test-v1",
+      state: "rejected",
+      reasons: ["preliminary URANS did not retain a stable period window"],
+    });
+
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("mixed-terminal-must-not-submit"),
+    );
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await remoteSolverTick(db, engine);
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    const afterFirstTick = await jobsForPromise(promise.id);
+    const mirror = await readPromise(promise.id);
+    expect(mirror.promise.status).toBe("cancelled");
+    expect(mirror.points).toMatchObject([
+      {
+        aoaDeg: acceptedAoa,
+        status: "fulfilled",
+        resultAttemptId: acceptedAttempt.id,
+      },
+      { aoaDeg: terminalAoa, status: "cancelled" },
+    ]);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(1);
+
+    await remoteSolverTick(db, engine);
+
+    expect(await jobsForPromise(promise.id)).toHaveLength(
+      afterFirstTick.length,
+    );
+    expect(
+      (await jobsForPromise(promise.id)).filter(
+        (job) =>
+          job.status === "cancelled" &&
+          job.error === "remote promise had no locally claimable AoAs",
+      ).length,
+    ).toBeLessThanOrEqual(1);
   });
 
   it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {
@@ -2185,6 +2325,196 @@ describe("remote-owned derived PRECALC lifecycle", () => {
     ).toHaveLength(0);
   });
 
+  it("MUST-CATCH: an active remote promise resumes its one remaining PRECALC attempt instead of falling back to RANS after a rejected wave-2 child", async () => {
+    const aoaDeg = 920.101;
+    const { promise, parent, result } = await seedRemoteRejectedParent(
+      "derived-second-precalc",
+      aoaDeg,
+    );
+    const { fetchMock } = stubFetch();
+    const firstSubmit = vi.fn(async () =>
+      acceptedStatus("derived-second-precalc-first"),
+    );
+
+    await submitUransRetryForJob(
+      db,
+      {
+        submitPolar: firstSubmit,
+        cancelJob: vi.fn(),
+      } as unknown as EngineClient,
+      parent,
+    );
+
+    expect(firstSubmit).toHaveBeenCalledTimes(1);
+    const [firstChild] = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+    const [obligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.latestSimJobId, firstChild.id));
+    expect(obligation).toMatchObject({
+      state: "running",
+      attemptCount: 1,
+      maxAttempts: 2,
+      latestSimJobId: firstChild.id,
+    });
+
+    const warning =
+      "URANS integration stopped by the wall-clock budget guard: retained 1.4 of 3 periods";
+    const firstCaseSlug = "derived_second_precalc_first";
+    const [rejectedAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        simJobId: firstChild.id,
+        engineJobId: firstChild.engineJobId,
+        engineCaseSlug: firstCaseSlug,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        cl: 0.77,
+        cd: 0.048,
+        cm: -0.061,
+        clCd: 16.04,
+        stalled: true,
+        unsteady: true,
+        converged: true,
+        qualityWarnings: [warning],
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          frame_track: {
+            stationary: false,
+            periods_retained: 1.4,
+            selected_frame_count: 28,
+          },
+        },
+        solvedAt: new Date(),
+      })
+      .returning();
+    // Cache refresh during the first PRECALC composition attached the current
+    // result-level projection to the immutable RANS classification. Preserve
+    // that RANS attempt classification as history before projecting the newer
+    // rejected URANS generation onto the canonical result.
+    await db
+      .update(resultClassifications)
+      .set({ resultId: null })
+      .where(eq(resultClassifications.resultId, result.id));
+    await db.insert(resultClassifications).values({
+      resultId: result.id,
+      resultAttemptId: rejectedAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "urans",
+      classifierVersion: "remote-second-precalc-test-v1",
+      state: "rejected",
+      reasons: ["preliminary URANS needs one bounded continuation"],
+    });
+    await db
+      .update(results)
+      .set({
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        simJobId: firstChild.id,
+        engineJobId: firstChild.engineJobId,
+        engineCaseSlug: firstCaseSlug,
+        currentResultAttemptId: rejectedAttempt.id,
+        cl: rejectedAttempt.cl,
+        cd: rejectedAttempt.cd,
+        cm: rejectedAttempt.cm,
+        clCd: rejectedAttempt.clCd,
+        stalled: true,
+        unsteady: true,
+        converged: true,
+        qualityWarnings: [warning],
+        error: null,
+        solvedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(results.id, result.id));
+    await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        engineState: "completed",
+        completedCases: 1,
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(simJobs.id, firstChild.id));
+    const [settlementChild] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, firstChild.id));
+    await settlePrecalcObligationsForJob(db, settlementChild);
+    const [pending] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(pending).toMatchObject({
+      state: "pending",
+      attemptCount: 1,
+      maxAttempts: 2,
+      latestSimJobId: firstChild.id,
+      lastOutcome: "rejected",
+    });
+
+    const secondSubmit = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("derived-second-precalc-second"),
+    );
+    await remoteSolverTick(db, {
+      submitPolar: secondSubmit,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect(secondSubmit).toHaveBeenCalledTimes(1);
+    expect(secondSubmit.mock.calls[0]?.[0]).toMatchObject({
+      aoa: { angles: [aoaDeg] },
+      solver: { force_transient: true, urans_fidelity: "precalc" },
+    });
+    const children = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)))
+      .orderBy(simJobs.createdAt, simJobs.id);
+    expect(children).toHaveLength(2);
+    expect(children[1]).toMatchObject({ status: "submitted", wave: 2 });
+    expect(children[1]?.requestPayload).toMatchObject({
+      syncPromiseId: promise.id,
+      remoteSolver: true,
+      upstreamBaseUrl: UPSTREAM,
+      aoas: [aoaDeg],
+      precalcObligationIds: [obligation.id],
+      uransFidelity: "precalc",
+    });
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
+    expect(
+      (await jobsForPromise(promise.id)).filter(
+        (job) => job.wave === 1 && job.id !== parent.id,
+      ),
+    ).toHaveLength(0);
+    const [runningSecondAttempt] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(runningSecondAttempt).toMatchObject({
+      state: "running",
+      attemptCount: 2,
+      latestSimJobId: children[1]?.id,
+    });
+  });
+
   it.each([
     ["cancelled", 921.001],
     ["expired", 922.001],
@@ -2617,6 +2947,258 @@ describe("remote solver push validation regressions", () => {
         ),
       },
     ]);
+  });
+
+  it("MUST-CATCH: hands off exhausted rejected URANS evidence as terminal only after accepted siblings settle, then remains idempotent", async () => {
+    const acceptedAoa = 813.101;
+    const terminalAoa = 813.102;
+    const promiseId = randomUUID();
+    const acceptedJob = await seedDoneRemoteJob(
+      "mixed-terminal-handoff-accepted",
+      [acceptedAoa],
+      2,
+      promiseId,
+    );
+    const promise = await seedMirroredPromise(
+      "mixed-terminal-handoff",
+      [acceptedAoa, terminalAoa],
+      promiseId,
+    );
+    const terminalEngineJobId = `${PREFIX}-mixed-terminal-handoff-urans`;
+    const terminalCaseSlug = "mixed_terminal_handoff_urans";
+    const [terminalJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 2,
+        jobKind: "targeted",
+        status: "done",
+        engineJobId: terminalEngineJobId,
+        engineState: "completed",
+        totalCases: 1,
+        completedCases: 1,
+        submittedAt: new Date(),
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        requestPayload: {
+          syncPromiseId: promise.id,
+          remoteSolver: true,
+          upstreamBaseUrl: UPSTREAM,
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas: [terminalAoa],
+          uransFidelity: "precalc",
+        },
+      })
+      .returning();
+    const terminalError =
+      "preliminary URANS remained non-stationary after two bounded attempts";
+    const [terminalResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: terminalAoa,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        simJobId: terminalJob.id,
+        engineJobId: terminalEngineJobId,
+        engineCaseSlug: terminalCaseSlug,
+        stalled: true,
+        unsteady: true,
+        converged: false,
+        error: terminalError,
+        solvedAt: new Date(),
+      })
+      .returning();
+    const [terminalAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: terminalResult.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: terminalAoa,
+        simJobId: terminalJob.id,
+        engineJobId: terminalEngineJobId,
+        engineCaseSlug: terminalCaseSlug,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        stalled: true,
+        unsteady: true,
+        converged: false,
+        error: terminalError,
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          failure_disposition: "hard_solver",
+        },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db.insert(resultClassifications).values({
+      resultId: null,
+      resultAttemptId: terminalAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: terminalAoa,
+      regime: "urans",
+      classifierVersion: "remote-terminal-handoff-test-v1",
+      state: "rejected",
+      reasons: [terminalError],
+    });
+    const terminalManifest = writeMedia(
+      `jobs/${terminalEngineJobId}/${terminalCaseSlug}/manifest.json`,
+      "mixed-terminal-handoff-manifest",
+    );
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: terminalResult.id,
+      resultAttemptId: terminalAttempt.id,
+      airfoilId,
+      simJobId: terminalJob.id,
+      engineJobId: terminalEngineJobId,
+      engineCaseSlug: terminalCaseSlug,
+      aoaDeg: terminalAoa,
+      kind: "manifest",
+      role: "raw",
+      storageKey: terminalManifest.storageKey,
+      mimeType: "application/json",
+      sha256: terminalManifest.sha256,
+      byteSize: terminalManifest.byteSize,
+      metadata: { terminalOutcome: true, attemptCount: 2 },
+    });
+    const [obligation] = await db
+      .insert(simPrecalcObligations)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: terminalAoa,
+        backgroundOwner: false,
+        state: "blocked",
+        attemptCount: 2,
+        maxAttempts: 2,
+        latestSimJobId: terminalJob.id,
+        lastOutcome: "rejected_exhausted",
+        lastError: terminalError,
+        completedAt: new Date(),
+      })
+      .returning();
+    await db.insert(simPrecalcObligationAttempts).values({
+      obligationId: obligation.id,
+      simJobId: terminalJob.id,
+      attemptNumber: 2,
+      solverAttemptNumber: 2,
+      consumesSolverAttempt: true,
+      state: "rejected",
+      outcome: "rejected_exhausted",
+      resultAttemptId: terminalAttempt.id,
+      error: terminalError,
+      completedAt: new Date(),
+    });
+    const [canonicalBeforeHandoff] = await db
+      .select({
+        status: results.status,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(eq(results.id, terminalResult.id));
+    expect(canonicalBeforeHandoff).toEqual({
+      status: "failed",
+      currentResultAttemptId: null,
+    });
+    const { fetchMock } = stubFetch({ terminalPolarIndex: 2 });
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("mixed-terminal-handoff-must-not-resolve"),
+    );
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await remoteSolverTick(db, engine);
+
+    expect(requests(fetchMock, "/polars")).toHaveLength(1);
+    expect(requests(fetchMock, "/polars")[0]?.body.results).toMatchObject([
+      { aoaDeg: acceptedAoa, status: "done" },
+    ]);
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+    expect((await readPromise(promise.id)).points).toMatchObject([
+      { aoaDeg: acceptedAoa, status: "fulfilled" },
+      { aoaDeg: terminalAoa, status: "active" },
+    ]);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
+
+    await remoteSolverTick(db, engine);
+
+    const pushesAfterTerminal = requests(fetchMock, "/polars");
+    expect(pushesAfterTerminal).toHaveLength(2);
+    expect(pushesAfterTerminal[1]?.body.results).toMatchObject([
+      {
+        aoaDeg: terminalAoa,
+        status: "failed",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        error: terminalError,
+        evidenceArtifacts: [
+          expect.objectContaining({ sha256: terminalManifest.sha256 }),
+        ],
+      },
+    ]);
+    const settled = await readPromise(promise.id);
+    expect(settled.promise.status).toBe("cancelled");
+    expect(settled.points).toMatchObject([
+      { aoaDeg: acceptedAoa, status: "fulfilled" },
+      {
+        aoaDeg: terminalAoa,
+        status: "cancelled",
+        resultId: terminalResult.id,
+        resultAttemptId: terminalAttempt.id,
+      },
+    ]);
+    expect(
+      (await deliveriesForJob(terminalJob.id)).find(
+        (delivery) => delivery.resultId === terminalResult.id,
+      ),
+    ).toMatchObject({
+      state: "delivered",
+      resultAttemptId: terminalAttempt.id,
+      generationKey: terminalAttempt.id,
+      lastHttpStatus: 200,
+    });
+    const [canonicalAfterHandoff] = await db
+      .select({
+        status: results.status,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(eq(results.id, terminalResult.id));
+    expect(canonicalAfterHandoff).toEqual({
+      status: "failed",
+      currentResultAttemptId: null,
+    });
+    expect(requests(fetchMock, `/sweeps/${promise.id}/complete`)).toHaveLength(
+      0,
+    );
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(1);
+    expect(submitPolar).not.toHaveBeenCalled();
+    const jobCountAfterSettlement = (await jobsForPromise(promise.id)).length;
+
+    await remoteSolverTick(db, engine);
+
+    expect(requests(fetchMock, "/polars")).toHaveLength(2);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(1);
+    expect(await jobsForPromise(promise.id)).toHaveLength(
+      jobCountAfterSettlement,
+    );
+    expect(submitPolar).not.toHaveBeenCalled();
   });
 
   it("persists a failed point delivery and retries only undelivered results", async () => {
@@ -3096,6 +3678,171 @@ describe("remote solver push validation regressions", () => {
       (await deliveriesForJob(ready.id)).find((row) => row.resultId)?.state,
     ).toBe("delivered");
   }, 120_000);
+
+  it("MUST-CATCH: reuses exact accepted historical URANS evidence when the canonical result pointer is stale and provisional", async () => {
+    const aoaDeg = 854.051;
+    const promiseId = randomUUID();
+    const historicalJob = await seedDoneRemoteJob(
+      "historical-accepted-urans",
+      [aoaDeg],
+      2,
+      promiseId,
+    );
+    await db
+      .update(simJobs)
+      .set({ requestPayload: { historicalEvidenceFixture: true } })
+      .where(eq(simJobs.id, historicalJob.id));
+    const promise = await seedMirroredPromise(
+      "historical-accepted-urans",
+      [aoaDeg],
+      promiseId,
+    );
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, historicalJob.id));
+    const [historicalAttempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    const [historicalManifest] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, historicalAttempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    await db
+      .update(resultAttempts)
+      .set({
+        regime: "urans",
+        unsteady: true,
+        stalled: true,
+        validForPolar: true,
+        cl: 0.731,
+        cd: 0.041,
+        cm: -0.063,
+        clCd: 17.829,
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          frame_track: {
+            stationary: true,
+            periods_retained: 2,
+            selected_frame_count: 40,
+          },
+        },
+      })
+      .where(eq(resultAttempts.id, historicalAttempt.id));
+    await db
+      .update(resultClassifications)
+      .set({
+        resultId: null,
+        regime: "urans",
+        state: "accepted",
+        reasons: [],
+      })
+      .where(eq(resultClassifications.resultAttemptId, historicalAttempt.id));
+    const [provisionalAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        simJobId: historicalJob.id,
+        engineJobId: `${PREFIX}-newer-provisional-rans`,
+        engineCaseSlug: "newer_provisional_rans",
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: true,
+        cl: 9.99,
+        cd: 0.99,
+        cm: -0.99,
+        clCd: 10.09,
+        stalled: true,
+        unsteady: false,
+        converged: true,
+        evidencePayload: { fidelity: "rans" },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db.insert(resultClassifications).values({
+      resultId: result.id,
+      resultAttemptId: provisionalAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "rans",
+      classifierVersion: "historical-urans-pointer-test-v1",
+      state: "needs_urans",
+      reasons: ["newer RANS generation remains provisional"],
+    });
+    await db
+      .update(results)
+      .set({
+        status: "stale",
+        source: "queued",
+        regime: "rans",
+        fidelity: "rans",
+        currentResultAttemptId: provisionalAttempt.id,
+        cl: provisionalAttempt.cl,
+        cd: provisionalAttempt.cd,
+        cm: provisionalAttempt.cm,
+        clCd: provisionalAttempt.clCd,
+        error: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(results.id, result.id));
+
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("historical-urans-must-not-resolve"),
+    );
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    const pushes = requests(fetchMock, "/polars");
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0].body.results).toMatchObject([
+      {
+        aoaDeg,
+        regime: "urans",
+        fidelity: "urans_precalc",
+        cl: 0.731,
+        cd: 0.041,
+        cm: -0.063,
+        evidenceArtifacts: [
+          expect.objectContaining({ sha256: historicalManifest.sha256 }),
+        ],
+      },
+    ]);
+    expect(pushes[0].body.results[0].cl).not.toBe(provisionalAttempt.cl);
+    expect((await readPromise(promise.id)).promise.status).toBe("fulfilled");
+    expect((await readPromise(promise.id)).points).toMatchObject([
+      {
+        status: "fulfilled",
+        resultId: result.id,
+        resultAttemptId: historicalAttempt.id,
+      },
+    ]);
+    expect(
+      (await deliveriesForJob(historicalJob.id)).find(
+        (delivery) => delivery.resultId === result.id,
+      ),
+    ).toMatchObject({
+      state: "delivered",
+      resultAttemptId: historicalAttempt.id,
+      generationKey: historicalAttempt.id,
+    });
+  });
 
   it("reuses accepted cached evidence for a new promise but releases rejected cached evidence for continuation", async () => {
     const acceptedAoa = 854.101;
