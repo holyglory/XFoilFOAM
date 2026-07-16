@@ -28,7 +28,7 @@ import {
 } from "@aerodb/db/polar-cache";
 import {
   ensureSimulationPresetRevision,
-  physicsHashForSnapshot,
+  methodCompatibilityHashForSnapshot,
 } from "@aerodb/db/simulation-setup";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -373,8 +373,8 @@ describe("public polar compatibility series", () => {
     });
 
     const hashFor = (resolved: typeof baseA) =>
-      resolved.revision.physicsHash ??
-      physicsHashForSnapshot(resolved.snapshot);
+      resolved.revision.methodCompatibilityHash ??
+      methodCompatibilityHashForSnapshot(resolved.snapshot);
     baseHash = hashFor(baseA);
     expect(hashFor(baseB)).toBe(baseHash);
     expect(
@@ -552,7 +552,13 @@ describe("public polar compatibility series", () => {
     // hash even though its immutable snapshot is fully compatible.
     await db
       .update(simulationPresetRevisions)
-      .set({ physicsHash: null, isCanonicalPhysics: false })
+      .set({
+        physicsHash: null,
+        isCanonicalPhysics: false,
+        methodCompatibilityHashVersion: null,
+        methodCompatibilityHash: null,
+        isCanonicalMethod: false,
+      })
       .where(eq(simulationPresetRevisions.id, baseB.revision.id));
   }, 60_000);
 
@@ -1088,7 +1094,12 @@ describe("public polar compatibility series", () => {
     expect(legacyFallbackRevision).toBeTruthy();
     await db
       .update(simulationPresetRevisions)
-      .set({ snapshot: { malformed: true }, physicsHash: null })
+      .set({
+        snapshot: { malformed: true },
+        physicsHash: null,
+        methodCompatibilityHashVersion: null,
+        methodCompatibilityHash: null,
+      })
       .where(eq(simulationPresetRevisions.id, legacyFallbackRevision!.id));
     try {
       const detail = await assembleDetail(slug);
@@ -1104,7 +1115,12 @@ describe("public polar compatibility series", () => {
     } finally {
       await db
         .update(simulationPresetRevisions)
-        .set({ snapshot: legacyFallbackRevision!.snapshot, physicsHash: null })
+        .set({
+          snapshot: legacyFallbackRevision!.snapshot,
+          physicsHash: null,
+          methodCompatibilityHashVersion: null,
+          methodCompatibilityHash: null,
+        })
         .where(eq(simulationPresetRevisions.id, legacyFallbackRevision!.id));
     }
   });

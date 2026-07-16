@@ -27,6 +27,7 @@ import {
   simulationPresetRevisions,
   simulationPresets,
   solverProfiles,
+  solverImplementations,
   solverEvidenceArtifacts,
   SYNC_BLOB_LOCK_NAMESPACE,
   syncBlobLockStripe,
@@ -41,10 +42,13 @@ import {
   sweepDefinitions,
   type DB,
   withEvidenceArtifactWriteLocks,
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  METHOD_COMPATIBILITY_HASH_VERSION,
 } from "@aerodb/db";
 import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
 import {
   ensureEnabledSimulationPresetRevisions,
+  methodCompatibilityHashForSnapshot,
   physicsHashForSnapshot,
   simulationSetupSignature,
   type SimulationSetupSnapshot,
@@ -74,6 +78,10 @@ import { z } from "zod";
 
 import { requireAdmin } from "./admin-auth";
 import { advisoryLockSql, db } from "./db";
+import {
+  resolveEngineRuntimeBuild,
+  type ResolvedEngineRuntime,
+} from "./engine-provenance";
 import { env } from "./env";
 import { mediaStore } from "./media-store";
 import {
@@ -273,6 +281,48 @@ const forceHistorySchema = z
     }
   });
 
+const syncEngineRuntimeSchema = z
+  .object({
+    family: z.string().trim().min(1),
+    distribution: z.string().trim().min(1),
+    version: z.string().trim().min(1),
+    numericsRevision: z.string().trim().min(1),
+    adapterContractVersion: z.coerce.number().int().positive(),
+    buildId: z.string().trim().min(1),
+    sourceRevision: z.string().trim().nullable().optional(),
+    imageDigest: z.string().trim().nullable().optional(),
+    applicationSourceSha256: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i)
+      .nullable()
+      .optional(),
+    packageSha256: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i)
+      .nullable()
+      .optional(),
+    binarySha256: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i)
+      .nullable()
+      .optional(),
+    architecture: z.string().trim().nullable().optional(),
+  })
+  .transform((engine) => ({
+    family: engine.family,
+    distribution: engine.distribution,
+    version: engine.version,
+    numerics_revision: engine.numericsRevision,
+    adapter_contract_version: engine.adapterContractVersion,
+    build_id: engine.buildId,
+    source_revision: engine.sourceRevision ?? null,
+    image_digest: engine.imageDigest ?? null,
+    application_source_sha256: engine.applicationSourceSha256 ?? null,
+    package_sha256: engine.packageSha256 ?? null,
+    binary_sha256: engine.binarySha256 ?? null,
+    architecture: engine.architecture ?? null,
+  }));
+
 const polarPointSchema = z.object({
   aoaDeg: z.coerce.number(),
   status: z
@@ -309,6 +359,8 @@ const polarPointSchema = z.object({
   qualityWarnings: z.array(z.string()).nullable().optional(),
   frameTrack: z.record(z.unknown()).nullable().optional(),
   steadyHistory: z.record(z.unknown()).nullable().optional(),
+  methodKey: z.string().trim().min(1).nullable().optional(),
+  engine: syncEngineRuntimeSchema.nullable().optional(),
   engineJobId: z.string().nullable().optional(),
   engineCaseSlug: z.string().nullable().optional(),
   evidencePayload: z.record(z.unknown()).optional(),
@@ -967,6 +1019,7 @@ function contentExtension(
   if (mimeType === "video/mp4") return ".mp4";
   if (mimeType === "application/json") return ".json";
   if (mimeType === "application/gzip") return ".gz";
+  if (mimeType === "application/zstd") return ".zst";
   return ".bin";
 }
 
@@ -1752,6 +1805,7 @@ function remoteResultValues(
   point: z.infer<typeof polarPointSchema>,
   bcId: string,
   engineJobId: string,
+  runtime: ResolvedEngineRuntime | null,
 ) {
   return {
     bcId,
@@ -1788,6 +1842,9 @@ function remoteResultValues(
     simJobId: null,
     engineJobId,
     engineCaseSlug: point.engineCaseSlug ?? null,
+    methodKey: point.methodKey ?? null,
+    solverImplementationId: runtime?.solverImplementationId ?? null,
+    solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
     solvedAt: point.status === "done" ? new Date() : null,
     updatedAt: new Date(),
   };
@@ -1799,6 +1856,7 @@ function remoteAttemptValues(opts: {
   bcId: string;
   revisionId: string;
   engineJobId: string;
+  runtime: ResolvedEngineRuntime | null;
 }) {
   const { point } = opts;
   const regime =
@@ -1813,6 +1871,8 @@ function remoteAttemptValues(opts: {
     quality_warnings: point.qualityWarnings ?? null,
     frame_track: point.frameTrack ?? null,
     steady_history: point.steadyHistory ?? null,
+    method_key: point.methodKey ?? null,
+    engine: point.engine ?? null,
     // forceHistory is transported separately to keep the public contract
     // typed, but the immutable attempt payload is the classifier/source of
     // truth. Always normalize it into the exact attempt generation.
@@ -1840,6 +1900,9 @@ function remoteAttemptValues(opts: {
         Number(point.cd ?? 0) > 0,
       engineJobId: opts.engineJobId,
       engineCaseSlug: point.engineCaseSlug ?? null,
+      methodKey: point.methodKey ?? null,
+      solverImplementationId: opts.runtime?.solverImplementationId ?? null,
+      solverRuntimeBuildId: opts.runtime?.solverRuntimeBuildId ?? null,
       cl: point.cl ?? null,
       cd: point.cd ?? null,
       cm: point.cm ?? null,
@@ -1876,6 +1939,9 @@ function comparableRemoteAttempt(attempt: Record<string, unknown>) {
     validForPolar: attempt.validForPolar,
     engineJobId: attempt.engineJobId,
     engineCaseSlug: attempt.engineCaseSlug ?? null,
+    methodKey: attempt.methodKey ?? null,
+    solverImplementationId: attempt.solverImplementationId ?? null,
+    solverRuntimeBuildId: attempt.solverRuntimeBuildId ?? null,
     cl: attempt.cl ?? null,
     cd: attempt.cd ?? null,
     cm: attempt.cm ?? null,
@@ -2474,6 +2540,38 @@ async function importSimulationSetupRevision(
     };
   }
   const snapshot = snapshotRaw as unknown as SimulationSetupSnapshot;
+  const [solverImplementation] = await db
+    .select()
+    .from(solverImplementations)
+    .where(
+      snapshot.engine
+        ? eq(solverImplementations.key, snapshot.engine.key)
+        : eq(solverImplementations.id, OPENCFD_2406_SOLVER_IMPLEMENTATION_ID),
+    )
+    .limit(1);
+  if (
+    !solverImplementation ||
+    (snapshot.engine &&
+      (solverImplementation.family !== snapshot.engine.family ||
+        solverImplementation.distribution !== snapshot.engine.distribution ||
+        solverImplementation.releaseVersion !==
+          snapshot.engine.releaseVersion ||
+        solverImplementation.numericsRevision !==
+          snapshot.engine.numericsRevision ||
+        solverImplementation.adapterContractVersion !==
+          snapshot.engine.adapterContractVersion))
+  ) {
+    return {
+      imported: false,
+      conflictId: await createConflict({
+        dataType: "simulation_setup",
+        naturalKey: snapshot.engine?.key ?? "legacy-openfoam-opencfd-2406",
+        incomingPayload: data,
+        sourceInstanceId: source.sourceInstanceId,
+        sourceInstanceName: source.sourceInstanceName,
+      }),
+    };
+  }
   const signatureHash =
     nullableText(data.signatureHash ?? data.signature_hash) ??
     simulationSetupSignature(snapshot);
@@ -2622,6 +2720,7 @@ async function importSimulationSetupRevision(
     .values({
       slug: `${prefix}-solver`,
       name: `Remote solver ${signatureHash.slice(0, 8)}`,
+      solverImplementationId: solverImplementation.id,
       turbulenceModel: snapshot.solver.turbulenceModel,
       nIterations: snapshot.solver.nIterations,
       convergenceTolerance: snapshot.solver.convergenceTolerance,
@@ -2633,6 +2732,7 @@ async function importSimulationSetupRevision(
     .onConflictDoUpdate({
       target: solverProfiles.slug,
       set: {
+        solverImplementationId: solverImplementation.id,
         turbulenceModel: snapshot.solver.turbulenceModel,
         nIterations: snapshot.solver.nIterations,
         convergenceTolerance: snapshot.solver.convergenceTolerance,
@@ -2810,6 +2910,8 @@ async function importSimulationSetupRevision(
     .returning({ id: simulationPresets.id });
   localSnapshot.preset.id = preset.id;
   const physicsHash = physicsHashForSnapshot(localSnapshot);
+  const methodCompatibilityHash =
+    methodCompatibilityHashForSnapshot(localSnapshot);
   const revisionNumber = Math.max(
     1,
     Math.round(
@@ -2832,6 +2934,9 @@ async function importSimulationSetupRevision(
       ),
       snapshot: localSnapshot as unknown as Record<string, unknown>,
       physicsHash,
+      solverImplementationId: solverImplementation.id,
+      methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+      methodCompatibilityHash,
     })
     .onConflictDoNothing({
       target: [
@@ -2847,6 +2952,8 @@ async function importSimulationSetupRevision(
           .select({
             id: simulationPresetRevisions.id,
             physicsHash: simulationPresetRevisions.physicsHash,
+            methodCompatibilityHash:
+              simulationPresetRevisions.methodCompatibilityHash,
             snapshot: simulationPresetRevisions.snapshot,
           })
           .from(simulationPresetRevisions)
@@ -2861,13 +2968,27 @@ async function importSimulationSetupRevision(
   const revisionId = revision?.id ?? existingRevision?.id;
   // Older sync-imported rows can predate physicsHash. Derive the rollout
   // repair from their immutable stored snapshot, never the incoming payload.
-  if (existingRevision && !existingRevision.physicsHash) {
+  if (
+    existingRevision &&
+    (!existingRevision.physicsHash ||
+      (localSnapshot.engine && !existingRevision.methodCompatibilityHash))
+  ) {
+    const storedSnapshot =
+      existingRevision.snapshot as unknown as SimulationSetupSnapshot;
+    const storedMethodHash = storedSnapshot.engine
+      ? methodCompatibilityHashForSnapshot(storedSnapshot)
+      : null;
     await db
       .update(simulationPresetRevisions)
       .set({
-        physicsHash: physicsHashForSnapshot(
-          existingRevision.snapshot as unknown as SimulationSetupSnapshot,
-        ),
+        physicsHash: physicsHashForSnapshot(storedSnapshot),
+        ...(storedMethodHash
+          ? {
+              solverImplementationId: solverImplementation.id,
+              methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+              methodCompatibilityHash: storedMethodHash,
+            }
+          : {}),
       })
       .where(eq(simulationPresetRevisions.id, existingRevision.id));
   }
@@ -2931,10 +3052,12 @@ async function promotePolarConflict(
     bcId = nullableText(jsonObject(snapshot.preset).legacyBoundaryConditionId);
   }
   if (!bcId) throw new Error("polar conflict cannot resolve boundary/setup id");
+  const runtime = await resolveEngineRuntimeBuild(db, point.engine);
   const resultValues = remoteResultValues(
     point,
     bcId as string,
     importedEngineJobId,
+    runtime,
   );
   const { regime: attemptRegime, values: attemptValues } = remoteAttemptValues({
     point,
@@ -2942,6 +3065,7 @@ async function promotePolarConflict(
     bcId: bcId as string,
     revisionId,
     engineJobId: importedEngineJobId,
+    runtime,
   });
 
   await db.transaction(async (rawTx) => {
@@ -3303,6 +3427,7 @@ async function importPolarPush(
     fidelity: string | null;
   }> = [];
   for (const point of payload.results) {
+    const runtime = await resolveEngineRuntimeBuild(db, point.engine);
     const rawEngineJobId =
       point.engineJobId ?? payload.promiseId ?? "direct-push";
     const importedEngineJobId = `sync:${sourceInstanceId}:${syncIdentityToken(
@@ -3310,7 +3435,7 @@ async function importPolarPush(
       "engineJobId",
     )}`;
     const incomingResult: Partial<typeof results.$inferInsert> =
-      remoteResultValues(point, bcId, importedEngineJobId);
+      remoteResultValues(point, bcId, importedEngineJobId, runtime);
     const { regime: attemptRegime, values: attemptValues } =
       remoteAttemptValues({
         point,
@@ -3318,6 +3443,7 @@ async function importPolarPush(
         bcId,
         revisionId,
         engineJobId: importedEngineJobId,
+        runtime,
       });
     const insertAttemptForResult = async (tx: DB, resultId: string) => {
       const [existingAttempt] = await tx
@@ -3606,6 +3732,9 @@ async function importPolarPush(
         simJobId: null,
         engineJobId: importedEngineJobId,
         engineCaseSlug: point.engineCaseSlug ?? null,
+        methodKey: point.methodKey ?? null,
+        solverImplementationId: runtime?.solverImplementationId ?? null,
+        solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
         aoaDeg: point.aoaDeg,
         kind: (nullableText(artifact.kind) ?? "field_data") as never,
         field: nullableText(artifact.field),
@@ -3650,6 +3779,11 @@ async function importPolarPush(
             storedManifest.simJobId !== incomingManifest.simJobId ||
             storedManifest.engineJobId !== incomingManifest.engineJobId ||
             storedManifest.engineCaseSlug !== incomingManifest.engineCaseSlug ||
+            storedManifest.methodKey !== incomingManifest.methodKey ||
+            storedManifest.solverImplementationId !==
+              incomingManifest.solverImplementationId ||
+            storedManifest.solverRuntimeBuildId !==
+              incomingManifest.solverRuntimeBuildId ||
             storedManifest.aoaDeg !== incomingManifest.aoaDeg ||
             storedManifest.field !== incomingManifest.field ||
             storedManifest.role !== incomingManifest.role ||
@@ -3704,6 +3838,11 @@ async function importPolarPush(
             replayed.airfoilId !== association.airfoilId ||
             replayed.engineJobId !== association.engineJobId ||
             replayed.engineCaseSlug !== association.engineCaseSlug ||
+            replayed.methodKey !== association.methodKey ||
+            replayed.solverImplementationId !==
+              association.solverImplementationId ||
+            replayed.solverRuntimeBuildId !==
+              association.solverRuntimeBuildId ||
             replayed.aoaDeg !== association.aoaDeg ||
             replayed.mimeType !== association.mimeType ||
             replayed.byteSize !== association.byteSize ||
@@ -4215,6 +4354,7 @@ function extFromMime(mime: string): string {
   if (mime.includes("json")) return ".json";
   if (mime.includes("csv")) return ".csv";
   if (mime.includes("gzip")) return ".gz";
+  if (mime.includes("zstd")) return ".zst";
   if (mime.includes("text")) return ".txt";
   return ".bin";
 }
@@ -4702,6 +4842,7 @@ async function importRemoteEvidenceReference(
   const expectedSize = nullableNumber(data.byteSize ?? data.byte_size);
   const kind: (typeof solverEvidenceArtifacts.$inferInsert)["kind"] =
     data.kind === "manifest" ||
+    data.kind === "engine_bundle" ||
     data.kind === "openfoam_bundle" ||
     data.kind === "vtk_window" ||
     data.kind === "time_directory" ||
@@ -4823,6 +4964,9 @@ async function importRemoteEvidenceReference(
     simJobId: exact.attempt.simJobId,
     engineJobId: exact.attempt.engineJobId,
     engineCaseSlug: exact.attempt.engineCaseSlug,
+    methodKey: exact.attempt.methodKey,
+    solverImplementationId: exact.attempt.solverImplementationId,
+    solverRuntimeBuildId: exact.attempt.solverRuntimeBuildId,
     aoaDeg: exact.attempt.aoaDeg,
     kind,
     field: nullableText(data.field),

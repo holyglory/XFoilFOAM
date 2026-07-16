@@ -21,6 +21,7 @@ import {
   type AdminMeshProfile,
   type AdminOutputProfile,
   type AdminSimulationSetup,
+  type AdminSolverImplementation,
   type AdminSolverProfile,
   type BoundaryProfileInput,
   createBoundaryProfile,
@@ -89,8 +90,11 @@ const defaultMeshForm = (): MeshProfileInput => ({
   targetYPlus: 1,
   spanChords: 0.1,
 });
-const defaultSolverForm = (): SolverProfileInput => ({
+const defaultSolverForm = (
+  solverImplementationId: string,
+): SolverProfileInput => ({
   name: "",
+  solverImplementationId,
   turbulenceModel: "kOmegaSST",
   nIterations: 3000,
   convergenceTolerance: 1e-5,
@@ -404,17 +408,59 @@ function MeshQuickCreateModal({
 // ---------------------------------------------------------------------------
 function SolverQuickCreateModal({
   startFrom,
+  implementations,
   onCreated,
   onClose,
 }: {
   startFrom: AdminSolverProfile | null;
+  implementations: AdminSolverImplementation[];
   onCreated: (row: AdminSolverProfile) => void;
   onClose: () => void;
 }) {
+  const activeImplementations = implementations.filter(
+    (implementation) => implementation.retiredAt == null,
+  );
+  const preferredImplementationId =
+    activeImplementations.find(
+      (implementation) =>
+        implementation.family.toLowerCase() === "openfoam" &&
+        implementation.distribution.toLowerCase() === "opencfd" &&
+        implementation.releaseVersion === "2606",
+    )?.id ??
+    activeImplementations[0]?.id ??
+    "";
+  const startImplementationId =
+    startFrom &&
+    activeImplementations.some(
+      (implementation) =>
+        implementation.id === startFrom.solverImplementationId,
+    )
+      ? startFrom.solverImplementationId
+      : preferredImplementationId;
+  const implementationLabels = Object.fromEntries([
+    ["", "choose engine implementation"],
+    ...activeImplementations.map((implementation) => {
+      const family =
+        implementation.family.toLowerCase() === "openfoam"
+          ? "OpenFOAM"
+          : implementation.family;
+      const distribution =
+        implementation.distribution.toLowerCase() === "opencfd"
+          ? "OpenCFD"
+          : implementation.distribution.toLowerCase() === "foundation"
+            ? "Foundation"
+            : implementation.distribution;
+      return [
+        implementation.id,
+        `${family} · ${distribution} ${implementation.releaseVersion}`,
+      ];
+    }),
+  ]);
   const [form, setForm] = useState<SolverProfileInput>(() =>
     startFrom
       ? {
           name: "",
+          solverImplementationId: startImplementationId,
           turbulenceModel: startFrom.turbulenceModel,
           nIterations: startFrom.nIterations,
           convergenceTolerance: startFrom.convergenceTolerance,
@@ -423,7 +469,7 @@ function SolverQuickCreateModal({
           transientDiscardFraction: startFrom.transientDiscardFraction,
           transientMaxCourant: startFrom.transientMaxCourant,
         }
-      : defaultSolverForm(),
+      : defaultSolverForm(preferredImplementationId),
   );
   const { busy, err, issues, submit } = useQuickCreateSubmit(
     createSolverProfile,
@@ -432,6 +478,7 @@ function SolverQuickCreateModal({
   const validate = () =>
     compactIssues([
       requiredIssue(form.name, "Name"),
+      requiredChoiceIssue(form.solverImplementationId, "Engine implementation"),
       requiredChoiceIssue(form.turbulenceModel, "Turbulence model"),
       positiveIntegerIssue(form.nIterations, "Iterations"),
       positiveIssue(form.convergenceTolerance, "Tolerance"),
@@ -471,6 +518,19 @@ function SolverQuickCreateModal({
         onChange={(slug) => setForm((f) => ({ ...f, slug }))}
       />
       <div style={twoCol}>
+        <SelectField
+          label="Engine implementation"
+          value={form.solverImplementationId}
+          options={[
+            "",
+            ...activeImplementations.map((implementation) => implementation.id),
+          ]}
+          optionLabels={implementationLabels}
+          error={issueFor(issues, "Engine implementation")}
+          onChange={(solverImplementationId) =>
+            setForm((form) => ({ ...form, solverImplementationId }))
+          }
+        />
         <SelectField
           label="Turbulence model"
           value={form.turbulenceModel}
@@ -731,6 +791,7 @@ export function NumericsQuickCreate({
     return (
       <SolverQuickCreateModal
         startFrom={setup.solverProfiles.find((r) => r.id === currentId) ?? null}
+        implementations={setup.solverImplementations}
         onCreated={(row) => onCreated("solver", row)}
         onClose={onClose}
       />

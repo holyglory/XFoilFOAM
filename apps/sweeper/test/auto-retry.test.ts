@@ -18,6 +18,8 @@
 // Live shared-DB pattern (worker-restart-orphan.test.ts harness): scoped rows,
 // file-unique chord, shared guarded cleanup.
 
+import "./enabled-engine-pool-fixture";
+
 import {
   airfoils,
   autoRetryCrashedResultsForJob,

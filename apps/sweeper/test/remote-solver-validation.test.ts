@@ -1,3 +1,5 @@
+import "./enabled-engine-pool-fixture";
+
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -73,6 +75,9 @@ const {
   simulationPresets,
   solverEvidenceArtifacts,
   solverProfiles,
+  solverRuntimeBuilds,
+  solverRuntimeProvenanceKey,
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   syncApiSettings,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
@@ -115,6 +120,7 @@ const profileIds = {
   output: "",
   sweep: "",
 };
+const cleanupRuntimeBuildIds = new Set<string>();
 
 function sha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
@@ -373,6 +379,14 @@ async function cleanupRemoteRows() {
   await db
     .delete(simJobs)
     .where(eq(simJobs.simulationPresetRevisionId, revisionId));
+  if (cleanupRuntimeBuildIds.size) {
+    await db
+      .delete(solverRuntimeBuilds)
+      .where(
+        inArray(solverRuntimeBuilds.id, Array.from(cleanupRuntimeBuildIds)),
+      );
+    cleanupRuntimeBuildIds.clear();
+  }
   await db
     .delete(syncSweepPromises)
     .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
@@ -2302,6 +2316,78 @@ describe("remote-owned derived PRECALC lifecycle", () => {
 });
 
 describe("remote solver push validation regressions", () => {
+  it("preserves the application-source fingerprint in the pushed runtime identity", async () => {
+    const aoaDeg = 809.501;
+    const job = await seedDoneRemoteJob("runtime-provenance", [aoaDeg]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("runtime-provenance", [aoaDeg], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    const applicationSourceSha256 = sha256(
+      Buffer.from(`${PREFIX}:runtime-application-source`),
+    );
+    const provenance = {
+      solverImplementationId: OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+      buildId: `${PREFIX}-runtime-build`,
+      sourceRevision: null,
+      imageDigest: null,
+      applicationSourceSha256,
+      packageSha256: null,
+      binarySha256: null,
+      architecture: "x86_64",
+    };
+    const [runtime] = await db
+      .insert(solverRuntimeBuilds)
+      .values({
+        ...provenance,
+        provenanceKey: solverRuntimeProvenanceKey(provenance),
+        metadata: { fixture: PREFIX },
+      })
+      .returning({ id: solverRuntimeBuilds.id });
+    cleanupRuntimeBuildIds.add(runtime.id);
+    await db
+      .update(resultAttempts)
+      .set({
+        methodKey: "openfoam.rans",
+        solverImplementationId: OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: runtime.id,
+      })
+      .where(eq(resultAttempts.id, attempt.id));
+    await db
+      .update(results)
+      .set({
+        methodKey: "openfoam.rans",
+        solverImplementationId: OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: runtime.id,
+      })
+      .where(eq(results.id, result.id));
+    await db
+      .update(simJobs)
+      .set({
+        solverImplementationId: OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: runtime.id,
+      })
+      .where(eq(simJobs.id, job.id));
+    const { fetchMock } = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    const [polar] = requests(fetchMock, "/polars");
+    expect(polar.body.results[0].engine).toMatchObject({
+      family: "openfoam",
+      distribution: "opencfd",
+      version: "2406",
+      applicationSourceSha256,
+    });
+  });
+
   it("MUST-CATCH: streams one durable completed result per tick and completes only after every delivery", async () => {
     const job = await seedDoneRemoteJob(
       "chunking",

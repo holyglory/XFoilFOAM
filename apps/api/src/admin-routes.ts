@@ -22,6 +22,8 @@ import {
   simulationPresetRevisions,
   simulationPresets,
   solverProfiles,
+  solverImplementations,
+  solverExecutionPools,
   sweeperState,
   sweepDefinitions,
   campaignBacklogStrip,
@@ -48,12 +50,15 @@ import {
   ensureSimulationPresetRevision,
 } from "@aerodb/db/simulation-setup";
 import {
-  EngineClient,
+  type EngineClient,
   EngineError,
   classifyQueueLifecycle,
   type EngineCacheStats,
   type EngineQueueState,
   type JobRuntimeSummary,
+  engineCapabilityForExpected,
+  liveWorkerConsumesExecutionPool,
+  runtimeIdentityForExpected,
 } from "@aerodb/engine-client";
 import {
   and,
@@ -88,6 +93,7 @@ import {
   verifyOAuthState,
   verifySession,
 } from "./admin-auth";
+import { makeEngineClient } from "./engine-client";
 import { db } from "./db";
 import { env } from "./env";
 import { categoriesTree } from "./services/catalog";
@@ -228,6 +234,26 @@ interface QueueJobRow {
   kind: "sweep-rans" | "point-rans" | "point-urans";
   engine_job_id: string | null;
   engine_state: string | null;
+  method_key: string | null;
+  solver_implementation_id: string | null;
+  solver_implementation_key: string | null;
+  solver_family: string | null;
+  solver_distribution: string | null;
+  solver_release_version: string | null;
+  solver_numerics_revision: string | null;
+  solver_adapter_contract_version: number | null;
+  solver_runtime_build_id: string | null;
+  solver_runtime_build: string | null;
+  solver_source_revision: string | null;
+  solver_image_digest: string | null;
+  solver_application_source_sha256: string | null;
+  solver_package_sha256: string | null;
+  solver_binary_sha256: string | null;
+  solver_architecture: string | null;
+  solver_execution_pool_id: string | null;
+  solver_execution_pool_slug: string | null;
+  solver_execution_pool_name: string | null;
+  solver_execution_pool_routing_key: string | null;
   total_cases: number;
   completed_cases: number;
   airfoil_name: string | null;
@@ -280,6 +306,46 @@ interface QueueJobRow {
 function iso(v: Date | string | null): string | null {
   if (!v) return null;
   return v instanceof Date ? v.toISOString() : v;
+}
+
+function toSolverImplementationDTO(
+  row: typeof solverImplementations.$inferSelect,
+) {
+  return {
+    ...row,
+    retiredAt: iso(row.retiredAt),
+    createdAt: iso(row.createdAt),
+  };
+}
+
+async function solverProfileDTO(row: typeof solverProfiles.$inferSelect) {
+  const [implementation] = await db
+    .select()
+    .from(solverImplementations)
+    .where(eq(solverImplementations.id, row.solverImplementationId))
+    .limit(1);
+  return {
+    ...row,
+    implementation: implementation
+      ? toSolverImplementationDTO(implementation)
+      : null,
+    createdAt: iso(row.createdAt),
+    updatedAt: iso(row.updatedAt),
+  };
+}
+
+async function activeSolverImplementation(id: string) {
+  const [implementation] = await db
+    .select()
+    .from(solverImplementations)
+    .where(
+      and(
+        eq(solverImplementations.id, id),
+        isNull(solverImplementations.retiredAt),
+      ),
+    )
+    .limit(1);
+  return implementation ?? null;
 }
 
 const QUEUE_REVISION_ENSURE_TTL_MS = 10_000;
@@ -524,6 +590,41 @@ function toQueueJob(r: QueueJobRow) {
     kind: r.kind,
     engineJobId: r.engine_job_id,
     engineState: r.engine_state,
+    methodKey: r.method_key,
+    solverImplementation:
+      r.solver_implementation_id == null
+        ? null
+        : {
+            id: r.solver_implementation_id,
+            key: r.solver_implementation_key,
+            family: r.solver_family,
+            distribution: r.solver_distribution,
+            releaseVersion: r.solver_release_version,
+            numericsRevision: r.solver_numerics_revision,
+            adapterContractVersion: r.solver_adapter_contract_version,
+          },
+    solverRuntimeBuild:
+      r.solver_runtime_build_id == null
+        ? null
+        : {
+            id: r.solver_runtime_build_id,
+            buildId: r.solver_runtime_build,
+            sourceRevision: r.solver_source_revision,
+            imageDigest: r.solver_image_digest,
+            applicationSourceSha256: r.solver_application_source_sha256,
+            packageSha256: r.solver_package_sha256,
+            binarySha256: r.solver_binary_sha256,
+            architecture: r.solver_architecture,
+          },
+    solverExecutionPool:
+      r.solver_execution_pool_id == null
+        ? null
+        : {
+            id: r.solver_execution_pool_id,
+            slug: r.solver_execution_pool_slug,
+            name: r.solver_execution_pool_name,
+            routingKey: r.solver_execution_pool_routing_key,
+          },
     totalCases: Number(r.total_cases ?? 0),
     completedCases: Number(r.completed_cases ?? 0),
     airfoilName: r.airfoil_name,
@@ -704,6 +805,26 @@ async function queueJobs(group: QueueJobStatusGroup, limit: number) {
       END AS kind,
       j.engine_job_id,
       j.engine_state,
+      j.method_key,
+      si.id AS solver_implementation_id,
+      si.key AS solver_implementation_key,
+      si.family AS solver_family,
+      si.distribution AS solver_distribution,
+      si.release_version AS solver_release_version,
+      si.numerics_revision AS solver_numerics_revision,
+      si.adapter_contract_version AS solver_adapter_contract_version,
+      srb.id AS solver_runtime_build_id,
+      srb.build_id AS solver_runtime_build,
+      srb.source_revision AS solver_source_revision,
+      srb.image_digest AS solver_image_digest,
+      srb.application_source_sha256 AS solver_application_source_sha256,
+      srb.package_sha256 AS solver_package_sha256,
+      srb.binary_sha256 AS solver_binary_sha256,
+      srb.architecture AS solver_architecture,
+      sep.id AS solver_execution_pool_id,
+      sep.slug AS solver_execution_pool_slug,
+      sep.name AS solver_execution_pool_name,
+      sep.routing_key AS solver_execution_pool_routing_key,
       j.total_cases,
       j.completed_cases,
       j.campaign_id,
@@ -805,6 +926,9 @@ async function queueJobs(group: QueueJobStatusGroup, limit: number) {
     LEFT JOIN airfoils a ON a.id = j.airfoil_id
     LEFT JOIN sim_campaigns camp ON camp.id = j.campaign_id
     LEFT JOIN simulation_preset_revisions rev ON rev.id = j.simulation_preset_revision_id
+    LEFT JOIN solver_implementations si ON si.id = j.solver_implementation_id
+    LEFT JOIN solver_runtime_builds srb ON srb.id = j.solver_runtime_build_id
+    LEFT JOIN solver_execution_pools sep ON sep.id = j.solver_execution_pool_id
     LEFT JOIN boundary_conditions b ON b.id = NULLIF(j.bc_ids->>0, '')::uuid
     LEFT JOIN mediums m ON m.id = b.medium_id
     LEFT JOIN result_summary rs ON rs.sim_job_id = j.id
@@ -966,6 +1090,7 @@ const meshProfileBody = z.object({
 const solverProfileBody = z.object({
   slug: z.string().trim().min(1).optional(),
   name: z.string().trim().min(1),
+  solverImplementationId: z.string().uuid().optional(),
   turbulenceModel: z.string().trim().min(1).default("kOmegaSST"),
   nIterations: z.coerce.number().int().positive().default(3000),
   convergenceTolerance: z.coerce.number().positive().default(1e-5),
@@ -977,6 +1102,16 @@ const solverProfileBody = z.object({
     .positive()
     .default(DEFAULT_TRANSIENT_MAX_COURANT),
 });
+
+const solverExecutionPoolPatchBody = z
+  .object({
+    enabled: z.boolean().optional(),
+    capacityLimit: z.coerce.number().int().min(0).nullable().optional(),
+  })
+  .refine(
+    (body) => body.enabled !== undefined || body.capacityLimit !== undefined,
+    "enabled or capacityLimit is required",
+  );
 
 const schedulingProfileBody = z.object({
   slug: z.string().trim().min(1).optional(),
@@ -1264,6 +1399,8 @@ async function rowsForSimulationSetup() {
     referenceRows,
     boundaryRows,
     meshRows,
+    implementationRows,
+    executionPoolRows,
     solverRows,
     schedulingRows,
     outputRows,
@@ -1288,6 +1425,18 @@ async function rowsForSimulationSetup() {
       .orderBy(asc(referenceGeometryProfiles.name)),
     db.select().from(boundaryProfiles).orderBy(asc(boundaryProfiles.name)),
     db.select().from(meshProfiles).orderBy(asc(meshProfiles.name)),
+    db
+      .select()
+      .from(solverImplementations)
+      .orderBy(
+        asc(solverImplementations.family),
+        asc(solverImplementations.distribution),
+        asc(solverImplementations.releaseVersion),
+      ),
+    db
+      .select()
+      .from(solverExecutionPools)
+      .orderBy(asc(solverExecutionPools.name)),
     db.select().from(solverProfiles).orderBy(asc(solverProfiles.name)),
     db.select().from(schedulingProfiles).orderBy(asc(schedulingProfiles.name)),
     db.select().from(outputProfiles).orderBy(asc(outputProfiles.name)),
@@ -1378,6 +1527,12 @@ async function rowsForSimulationSetup() {
     revision: latestRevisionByPreset.get(row.preset.id) ?? null,
     targetAirfoilIds: targetIdsByPreset.get(row.preset.id) ?? [],
   }));
+  const implementationById = new Map(
+    implementationRows.map((implementation) => [
+      implementation.id,
+      implementation,
+    ]),
+  );
   return {
     flowConditions: flowRows.map(({ flowState, mediumSlug, mediumName }) => ({
       ...flowState,
@@ -1401,11 +1556,44 @@ async function rowsForSimulationSetup() {
       createdAt: iso(row.createdAt)!,
       updatedAt: iso(row.updatedAt)!,
     })),
-    solverProfiles: solverRows.map((row) => ({
+    solverImplementations: implementationRows.map((row) => ({
       ...row,
+      retiredAt: iso(row.retiredAt),
+      createdAt: iso(row.createdAt)!,
+    })),
+    solverExecutionPools: executionPoolRows.map((row) => ({
+      ...row,
+      implementation: implementationById.has(row.solverImplementationId)
+        ? toSolverImplementationDTO(
+            implementationById.get(row.solverImplementationId)!,
+          )
+        : null,
       createdAt: iso(row.createdAt)!,
       updatedAt: iso(row.updatedAt)!,
     })),
+    solverProfiles: solverRows.map((row) => {
+      const implementation = implementationById.get(row.solverImplementationId);
+      return {
+        ...row,
+        implementation: implementation
+          ? {
+              id: implementation.id,
+              key: implementation.key,
+              family: implementation.family,
+              distribution: implementation.distribution,
+              releaseVersion: implementation.releaseVersion,
+              methodFamily: implementation.methodFamily,
+              adapterContractVersion: implementation.adapterContractVersion,
+              numericsRevision: implementation.numericsRevision,
+              capabilities: implementation.capabilities,
+              licenseSpdx: implementation.licenseSpdx,
+              retiredAt: iso(implementation.retiredAt),
+            }
+          : null,
+        createdAt: iso(row.createdAt)!,
+        updatedAt: iso(row.updatedAt)!,
+      };
+    }),
     schedulingProfiles: schedulingRows.map((row) => ({
       ...row,
       createdAt: iso(row.createdAt)!,
@@ -1877,6 +2065,8 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         referenceGeometryProfiles: rows.referenceGeometryProfiles,
         boundaryProfiles: rows.boundaryProfiles,
         meshProfiles: rows.meshProfiles,
+        solverImplementations: rows.solverImplementations,
+        solverExecutionPools: rows.solverExecutionPools,
         solverProfiles: rows.solverProfiles,
         schedulingProfiles: rows.schedulingProfiles,
         outputProfiles: rows.outputProfiles,
@@ -2231,6 +2421,14 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     { preHandler: requireAdmin },
     async (req, reply) => {
       const b = solverProfileBody.parse(req.body);
+      if (
+        b.solverImplementationId &&
+        !(await activeSolverImplementation(b.solverImplementationId))
+      ) {
+        return reply
+          .code(422)
+          .send({ error: "solver implementation is missing or retired" });
+      }
       const slug = b.slug
         ? slugifyGeneric(b.slug)
         : await uniqueSetupSlug("solver_profiles", slugifyGeneric(b.name));
@@ -2238,11 +2436,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         .insert(solverProfiles)
         .values({ ...b, slug })
         .returning();
-      return reply.code(201).send({
-        ...row,
-        createdAt: iso(row.createdAt),
-        updatedAt: iso(row.updatedAt),
-      });
+      return reply.code(201).send(await solverProfileDTO(row));
     },
   );
 
@@ -2252,6 +2446,14 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const { id } = req.params as { id: string };
       const b = solverProfileBody.partial().parse(req.body);
+      if (
+        b.solverImplementationId &&
+        !(await activeSolverImplementation(b.solverImplementationId))
+      ) {
+        return reply
+          .code(422)
+          .send({ error: "solver implementation is missing or retired" });
+      }
       const [row] = await db
         .update(solverProfiles)
         .set(b)
@@ -2260,10 +2462,108 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       if (!row)
         return reply.code(404).send({ error: "solver profile not found" });
       await refreshPresetsBySolverProfileId(id);
+      return solverProfileDTO(row);
+    },
+  );
+
+  app.patch(
+    "/api/admin/solver-execution-pools/:id",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+      const body = solverExecutionPoolPatchBody.parse(req.body);
+      const [pool] = await db
+        .select({
+          pool: solverExecutionPools,
+          implementation: solverImplementations,
+        })
+        .from(solverExecutionPools)
+        .innerJoin(
+          solverImplementations,
+          eq(
+            solverImplementations.id,
+            solverExecutionPools.solverImplementationId,
+          ),
+        )
+        .where(eq(solverExecutionPools.id, id))
+        .limit(1);
+      if (!pool)
+        return reply
+          .code(404)
+          .send({ error: "solver execution pool not found" });
+      if (body.enabled === true) {
+        if (pool.implementation.retiredAt) {
+          return reply
+            .code(409)
+            .send({ error: "retired solver implementation cannot be enabled" });
+        }
+        const expected = {
+          family: pool.implementation.family,
+          distribution: pool.implementation.distribution,
+          version: pool.implementation.releaseVersion,
+          numerics_revision: pool.implementation.numericsRevision,
+          adapter_contract_version: pool.implementation.adapterContractVersion,
+        };
+        const engine = makeEngineClient();
+        const [capabilityProbe, queueProbe] = await Promise.allSettled([
+          engine.capabilities({
+            timeoutMs: 5_000,
+            expectedEngine: expected,
+          }),
+          engine.getQueue({ timeoutMs: 5_000 }),
+        ]);
+        const capabilities =
+          capabilityProbe.status === "fulfilled" ? capabilityProbe.value : null;
+        const queue =
+          queueProbe.status === "fulfilled" ? queueProbe.value : null;
+        const capability = engineCapabilityForExpected(capabilities, expected);
+        const capabilityError =
+          capabilityProbe.status === "rejected"
+            ? (capabilityProbe.reason as Error).message
+            : null;
+        const queueError =
+          queueProbe.status === "rejected"
+            ? (queueProbe.reason as Error).message
+            : (queue?.worker_queues_error ??
+              queue?.worker_runtime_error ??
+              null);
+        if (
+          !capability ||
+          capability.routing_key !== pool.pool.routingKey ||
+          !liveWorkerConsumesExecutionPool(
+            queue,
+            pool.pool.routingKey,
+            expected,
+          )
+        ) {
+          // Enabling is a live admission decision, not just a configuration
+          // edit. A request can arrive while this row is already enabled (or
+          // be retried after a response was lost), so merely rejecting the
+          // handshake would leave work admitted to an unverified route.
+          // Persist the fail-safe state before acknowledging the rejection.
+          await db
+            .update(solverExecutionPools)
+            .set({ enabled: false })
+            .where(eq(solverExecutionPools.id, id));
+          const handshakeError =
+            capabilityError ??
+            queueError ??
+            `fresh gateway capabilities and a live worker do not both acknowledge ${pool.implementation.key} on route ${pool.pool.routingKey}`;
+          return reply.code(409).send({
+            error: `${handshakeError}; the execution pool has been disabled`,
+          });
+        }
+      }
+      const [updated] = await db
+        .update(solverExecutionPools)
+        .set(body)
+        .where(eq(solverExecutionPools.id, id))
+        .returning();
       return {
-        ...row,
-        createdAt: iso(row.createdAt),
-        updatedAt: iso(row.updatedAt),
+        ...updated,
+        implementation: toSolverImplementationDTO(pool.implementation),
+        createdAt: iso(updated.createdAt),
+        updatedAt: iso(updated.updatedAt),
       };
     },
   );
@@ -3657,7 +3957,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         wantJobs ? queueJobs("active", 40) : Promise.resolve(null),
         wantActivity ? queueJobs("finished", 80) : Promise.resolve(null),
       ]);
-      const engine = new EngineClient(env.engineUrl);
+      const engine = makeEngineClient();
       // Every engine probe below is TTL-cached with stale-while-refresh and a
       // bounded race cap on its cold path — the queue payload NEVER waits on a
       // live engine round-trip (the engine's uvicorn can take seconds while
@@ -3704,6 +4004,10 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
             )
           : Promise.resolve(emptyRuntimeSnapshot),
       ]);
+      const expectedEngineRuntime = runtimeIdentityForExpected(
+        engineHealth,
+        env.engineIdentity,
+      );
       const runtimeByEngineJobId = runtimeSnapshot.runtimes;
       const annotateJob = <T extends ReturnType<typeof toQueueJob>>(
         job: T,
@@ -3847,11 +4151,21 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         engineHealth,
         engineHealthError,
         engineExpectedBuildId: env.engineExpectedBuildId,
-        engineBuildId: engineHealth?.build_id ?? null,
+        engineBuildId:
+          expectedEngineRuntime?.build_id ??
+          (engineHealth?.role === "solver_gateway"
+            ? null
+            : (engineHealth?.build_id ?? null)),
         engineBuildMismatch: Boolean(
           env.engineExpectedBuildId &&
-          engineHealth?.build_id &&
-          engineHealth.build_id !== env.engineExpectedBuildId,
+          (expectedEngineRuntime?.build_id ??
+            (engineHealth?.role === "solver_gateway"
+              ? null
+              : engineHealth?.build_id)) &&
+          (expectedEngineRuntime?.build_id ??
+            (engineHealth?.role === "solver_gateway"
+              ? null
+              : engineHealth?.build_id)) !== env.engineExpectedBuildId,
         ),
         // Disk truth from the engine's GET /cache/stats (~30 s cache); null when
         // the endpoint is unreachable or errors — never invented (pinned contract).
@@ -4964,7 +5278,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         };
       }
 
-      const engine = new EngineClient(env.engineUrl);
+      const engine = makeEngineClient();
       let engineQueue: EngineQueueState | null = null;
       try {
         engineQueue = await engine.getQueue();
@@ -5165,9 +5479,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       let engineCancelError: string | null = null;
       if (cancellation.engineJobId) {
         try {
-          await new EngineClient(env.engineUrl).cancelJob(
-            cancellation.engineJobId,
-          );
+          await makeEngineClient().cancelJob(cancellation.engineJobId);
         } catch (e) {
           engineCancelError = (e as Error).message;
         }

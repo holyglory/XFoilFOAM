@@ -609,9 +609,10 @@ def test_marched_sweep_cancellation_is_not_promoted_to_urans(tmp_path, monkeypat
         )
 
 
-def test_force_transient_accepts_missing_steady_coefficients(tmp_path, monkeypatch):
+def test_force_transient_rejects_missing_frame_track(tmp_path, monkeypatch):
     from airfoilfoam import pipeline
     from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
+    from airfoilfoam.openfoam.runner import HardSolverError
 
     class FakeRunner:
         def application(self, *_args, **_kwargs):
@@ -633,23 +634,24 @@ def test_force_transient_accepts_missing_steady_coefficients(tmp_path, monkeypat
     monkeypatch.setattr(pipeline, "_run_transient", fake_transient)
     outcome = CaseOutcome(spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0), reynolds=666_666)
 
-    _finalize_outcome(
-        tmp_path,
-        outcome,
-        airfoil=SimpleNamespace(name="unit airfoil", contour=[]),
-        resolved=MeshParams(),
-        spec=outcome.spec,
-        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
-        roughness=RoughnessParams(),
-        solver_params=SolverParams(force_transient=True, write_images=[]),
-        runner=FakeRunner(),
-        n_proc=1,
-        render_images=False,
-        solver_timeout=7200,
-    )
+    with pytest.raises(HardSolverError, match="no integer-period frame track"):
+        _finalize_outcome(
+            tmp_path,
+            outcome,
+            airfoil=SimpleNamespace(name="unit airfoil", contour=[]),
+            resolved=MeshParams(),
+            spec=outcome.spec,
+            fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(force_transient=True, write_images=[]),
+            runner=FakeRunner(),
+            n_proc=1,
+            render_images=False,
+            solver_timeout=7200,
+        )
 
     assert outcome.unsteady
-    assert outcome.converged
+    assert not outcome.converged
     assert outcome.cl == pytest.approx(0.45)
     assert outcome.cd == pytest.approx(0.08)
 

@@ -8,7 +8,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 function serviceBlock(source: string, service: string): string {
   const match = new RegExp(
-    `^  ${service}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:|^volumes:|\\Z)`,
+    `^  ${service}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:|^volumes:|(?![\\s\\S]))`,
     "m",
   ).exec(source);
   if (!match) throw new Error(`missing compose service ${service}`);
@@ -45,6 +45,65 @@ describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
       expect(serviceBlock(source, "sweeper")).toMatch(
         /storage-init:\n\s+condition: service_completed_successfully/,
       );
+    });
+  },
+);
+
+describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
+  "%s solver engine isolation",
+  (filename) => {
+    it("keeps OpenCFD 2606 as the only default gateway route", () => {
+      const source = readFileSync(resolve(repoRoot, filename), "utf8");
+      const api = serviceBlock(source, "api");
+
+      expect(api).toContain(
+        "openfoam:opencfd:2606:numerics-1:adapter-1",
+      );
+      expect(api).not.toMatch(
+        /AIRFOILFOAM_ENABLED_ENGINE_KEYS:[^\n]*foundation/,
+      );
+    });
+
+    it("isolates Foundation 14 behind a profile and distinct queue", () => {
+      const source = readFileSync(resolve(repoRoot, filename), "utf8");
+      const openCfd = serviceBlock(source, "worker");
+      const foundation = serviceBlock(source, "worker-foundation14");
+
+      expect(openCfd).toContain("AIRFOILFOAM_ENGINE_DISTRIBUTION: opencfd");
+      expect(openCfd).toContain('AIRFOILFOAM_ENGINE_VERSION: "2606"');
+      expect(openCfd).not.toContain('AIRFOILFOAM_ENGINE_VERSION: "2406"');
+      expect(openCfd).toContain(
+        "AIRFOILFOAM_CELERY_QUEUE: openfoam-opencfd-2606",
+      );
+      expect(openCfd).not.toContain("AIRFOILFOAM_CELERY_QUEUE: celery");
+      expect(foundation).toContain('profiles: ["foundation14"]');
+      expect(foundation).toContain(
+        "dockerfile: docker/Dockerfile.worker-foundation14",
+      );
+      expect(foundation).toContain(
+        "AIRFOILFOAM_ENGINE_DISTRIBUTION: foundation",
+      );
+      expect(foundation).toContain('AIRFOILFOAM_ENGINE_VERSION: "14"');
+      expect(foundation).toContain(
+        "AIRFOILFOAM_CELERY_QUEUE: openfoam-foundation-14",
+      );
+    });
+
+    it("shares results and one CPU-token ledger across engine workers", () => {
+      const source = readFileSync(resolve(repoRoot, filename), "utf8");
+      const openCfd = serviceBlock(source, "worker");
+      const foundation = serviceBlock(source, "worker-foundation14");
+
+      for (const worker of [openCfd, foundation]) {
+        expect(worker).toContain("results:/data/airfoilfoam");
+        expect(worker).toContain(
+          "engine_runtime:/data/airfoilfoam-runtime",
+        );
+        expect(worker).toContain(
+          "AIRFOILFOAM_CPU_TOKEN_STATE_PATH: /data/airfoilfoam-runtime/cpu-tokens.json",
+        );
+      }
+      expect(source).toMatch(/^  engine_runtime:\s*(?:#.*)?$/m);
     });
   },
 );

@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Callable, Iterator, Optional
 from uuid import uuid4
@@ -22,6 +23,10 @@ from .config import Settings
 from .models import ResourceParams, ResourcePolicy, SchedulingMetadata
 
 _TOKEN_OWNER = uuid4().hex
+
+
+class CpuTokenBudgetMismatch(RuntimeError):
+    """Active workers disagree about the capacity of their shared token pool."""
 
 
 @dataclass(frozen=True)
@@ -60,7 +65,7 @@ class TokenSnapshot:
 def queue_depth(settings: Settings) -> Optional[int]:
     try:
         client = Redis.from_url(settings.broker_url, socket_connect_timeout=0.2, socket_timeout=0.2)
-        return int(client.llen("celery"))
+        return int(client.llen(settings.celery_queue))
     except Exception:
         return None
 
@@ -68,7 +73,11 @@ def queue_depth(settings: Settings) -> Optional[int]:
 def cpu_token_pressure(settings: Settings) -> Optional[int]:
     """Best-effort count of live worker-local CPU tokens already leased."""
     try:
-        pool = CpuTokenPool(settings.cpu_token_state_path, settings.resolved_worker_cpu_budget())
+        pool = CpuTokenPool(
+            settings.cpu_token_state_path,
+            settings.resolved_worker_cpu_budget(),
+            foreign_lease_ttl=settings.cpu_token_lease_ttl_seconds,
+        )
         return pool.snapshot().used
     except Exception:
         return None
@@ -130,9 +139,20 @@ def resolve_resources(
 
 
 class CpuTokenPool:
-    def __init__(self, path: Path, budget: int):
+    def __init__(
+        self,
+        path: Path,
+        budget: int,
+        *,
+        foreign_lease_ttl: float = 120.0,
+        owner: str | None = None,
+    ):
         self.path = path
         self.budget = max(1, int(budget))
+        self.foreign_lease_ttl = max(0.05, float(foreign_lease_ttl))
+        # Capture the runtime owner at construction. Tests may provide a
+        # second owner to model another container sharing the same state file.
+        self.owner = owner or _TOKEN_OWNER
 
     @contextmanager
     def acquire(
@@ -161,9 +181,19 @@ class CpuTokenPool:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out waiting for {tokens} CPU token(s)")
             time.sleep(poll_interval)
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(lease_id, heartbeat_stop),
+            name=f"cpu-token-{lease_id[:8]}",
+            daemon=True,
+        )
+        heartbeat.start()
         try:
             yield
         finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=max(0.1, self.foreign_lease_ttl / 3.0))
             self._release(lease_id)
 
     def snapshot(self) -> TokenSnapshot:
@@ -188,7 +218,35 @@ class CpuTokenPool:
                 state = json.loads(raw) if raw else {"leases": []}
             except json.JSONDecodeError:
                 state = {"leases": []}
-            state["leases"] = [lease for lease in state.get("leases", []) if _lease_alive(lease)]
+            now = time.time()
+            state["leases"] = [
+                lease
+                for lease in state.get("leases", [])
+                if _lease_alive(
+                    lease,
+                    current_owner=self.owner,
+                    now=now,
+                    foreign_ttl=self.foreign_lease_ttl,
+                )
+            ]
+            active_budgets = {
+                int(lease["budget"])
+                for lease in state["leases"]
+                if lease.get("budget") is not None
+            }
+            if any(
+                lease.get("owner") != self.owner and lease.get("budget") is None
+                for lease in state["leases"]
+            ):
+                raise CpuTokenBudgetMismatch(
+                    "shared CPU-token budget is unknown for a live foreign worker lease"
+                )
+            if active_budgets and active_budgets != {self.budget}:
+                raise CpuTokenBudgetMismatch(
+                    "shared CPU-token budget mismatch: active worker budget(s) "
+                    f"{sorted(active_budgets)}, this worker budget {self.budget}"
+                )
+            state["budget"] = self.budget
             result = fn(state)
             f.seek(0)
             f.truncate()
@@ -206,11 +264,13 @@ class CpuTokenPool:
             state["leases"].append(
                 {
                     "id": lease_id,
-                    "owner": _TOKEN_OWNER,
+                    "owner": self.owner,
                     "pid": os.getpid(),
                     "pid_start": _pid_start_time(os.getpid()),
                     "tokens": tokens,
+                    "budget": self.budget,
                     "ts": time.time(),
+                    "heartbeat_at": time.time(),
                 }
             )
             return True
@@ -223,10 +283,38 @@ class CpuTokenPool:
 
         self._with_state(edit)
 
+    def _heartbeat_loop(self, lease_id: str, stop: threading.Event) -> None:
+        interval = max(0.01, min(5.0, self.foreign_lease_ttl / 3.0))
+        while not stop.wait(interval):
+            try:
+                def edit(state):
+                    for lease in state["leases"]:
+                        if lease.get("id") == lease_id and lease.get("owner") == self.owner:
+                            lease["heartbeat_at"] = time.time()
+                            return True
+                    return False
 
-def _lease_alive(lease: dict) -> bool:
-    if lease.get("owner") != _TOKEN_OWNER:
-        return False
+                if not self._with_state(edit):
+                    return
+            except Exception:  # noqa: BLE001 - acquisition owner releases in finally
+                # A transient state-file error must not kill the holder thread;
+                # retry before the foreign-worker TTL expires.
+                continue
+
+
+def _lease_alive(
+    lease: dict,
+    *,
+    current_owner: str,
+    now: float,
+    foreign_ttl: float,
+) -> bool:
+    if lease.get("owner") != current_owner:
+        heartbeat_at = lease.get("heartbeat_at", lease.get("ts"))
+        try:
+            return now - float(heartbeat_at) <= foreign_ttl
+        except (TypeError, ValueError):
+            return False
     pid = int(lease.get("pid", -1))
     if not _pid_alive(pid):
         return False

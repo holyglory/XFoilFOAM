@@ -10,6 +10,7 @@ No OpenFOAM needed.
 """
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,8 @@ import numpy as np
 import pytest
 
 from airfoilfoam import pipeline
+from airfoilfoam.config import Settings
+from airfoilfoam.evidence_store import EvidenceStoreError, RemoteEvidencePointer
 from airfoilfoam.jobs import _outcome_to_point
 from airfoilfoam.models import (
     FRAME_IMAGE_ARTIFACT_KIND,
@@ -1104,6 +1107,56 @@ def test_fresh_chunk_monitor_switches_to_frame_write_cadence(tmp_path, monkeypat
     assert f"maxDeltaT {period / pipeline.URANS_FRAME_WRITE_PER_CYCLE:.12g};" in control
 
 
+def test_live_control_dict_update_is_atomic_and_preserves_force_function(
+    tmp_path, monkeypatch
+):
+    """OpenFOAM must never observe a truncated live controlDict.
+
+    OpenCFD 2606 reloads ``runTimeModifiable`` dictionaries while pimpleFoam is
+    active.  A truncate-and-rewrite update can be observed between those two
+    operations, causing the live ``forceCoeffs`` function object to disappear
+    while the solver continues.  The replacement file must be complete before
+    it atomically becomes the live dictionary.
+    """
+    control = tmp_path / "controlDict"
+    original = (
+        "application pimpleFoam;\n"
+        "endTime 1;\n"
+        "writeInterval 0.1;\n"
+        "functions\n"
+        "{\n"
+        "    forceCoeffs1\n"
+        "    {\n"
+        "        type forceCoeffs;\n"
+        "    }\n"
+        "}\n"
+    )
+    control.write_text(original)
+    real_replace = pipeline.os.replace
+    replacements = []
+
+    def tracked_replace(source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        staged = source.read_text()
+        # The old complete dictionary remains live until replacement.
+        assert destination.read_text() == original
+        assert "forceCoeffs1" in staged
+        assert "writeInterval 0.02;" in staged
+        replacements.append((source, destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(pipeline.os, "replace", tracked_replace)
+
+    pipeline._set_control_dict_entries(control, {"writeInterval": 0.02})
+
+    assert len(replacements) == 1
+    assert replacements[0][1] == control
+    assert "forceCoeffs1" in control.read_text()
+    assert "writeInterval 0.02;" in control.read_text()
+    assert not list(tmp_path.glob(".controlDict.*.tmp"))
+
+
 @pytest.mark.parametrize(
     ("fidelity", "min_periods", "expected_certification_cycles"),
     [("precalc", 3, 4.0), ("full", 7, 5.5)],
@@ -2163,6 +2216,160 @@ def test_evidence_archive_ships_frame_pngs_with_pinned_kind(tmp_path):
     assert any(e["path"] == "frames/vorticity/f0000.png" for e in manifest["files"])
 
 
+def _publish_as_verified_remote(publication, _settings):
+    pointer = RemoteEvidencePointer(
+        bucket="airfoils-pro-storage-bucket",
+        object_key=(
+            "solver-evidence/v1/sha256/"
+            f"{publication.archive.stored_sha256[:2]}/"
+            f"{publication.archive.stored_sha256}.tar.zst"
+        ),
+        generation=1_752_612_345_678_901,
+        stored_sha256=publication.archive.stored_sha256,
+        stored_size=publication.archive.stored_size,
+        tar_sha256=publication.archive.tar_sha256,
+        tar_size=publication.archive.tar_size,
+        crc32c="AAAAAA==",
+        zstd_level=publication.archive.zstd_level,
+        created_at="2026-07-15T20:50:14+00:00",
+    )
+    publication.pointer_path.write_text(
+        json.dumps(pointer.to_dict(), sort_keys=True), encoding="utf-8"
+    )
+    return replace(publication, pointer=pointer)
+
+
+def test_remote_evidence_removes_raw_but_retains_archive_until_database_ack(
+    tmp_path, monkeypatch
+):
+    case_dir = tmp_path / "case"
+    (case_dir / "system").mkdir(parents=True)
+    (case_dir / "system" / "controlDict").write_text("application simpleFoam;\n")
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0), reynolds=666_666
+    )
+    settings = Settings(
+        data_dir=tmp_path,
+        evidence_bucket="airfoils-pro-storage-bucket",
+        evidence_remote_only=True,
+        control_plane_token="test-control-plane-token-32-bytes-minimum",
+    )
+    monkeypatch.setattr(pipeline, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        pipeline, "publish_evidence_archive", _publish_as_verified_remote
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "verify_remote_evidence_restore",
+        lambda *_args: "archive+manifest+all-members-restore:1",
+    )
+    _archive_case_evidence(case_dir, case_dir, outcome)
+
+    bundle = next(
+        artifact for artifact in outcome.evidence_artifacts if artifact.kind == "engine_bundle"
+    )
+    assert bundle.metadata["storageBackend"] == "gcs"
+    assert bundle.metadata["generation"] == "1752612345678901"
+    assert (
+        bundle.metadata["localEvidenceDisposition"]
+        == "remote-copy-plus-local-archive-pending-database-ack"
+    )
+    assert bundle.metadata["rawLocalEvidenceDisposition"] == "removed"
+    assert bundle.metadata["localArchiveRetainedUntilDatabaseAck"] is True
+    assert not (case_dir / "evidence" / "openfoam").exists()
+    assert (case_dir / "evidence" / "engine_evidence.tar.zst").is_file()
+    assert (case_dir / "evidence" / "engine_evidence.remote.json").is_file()
+    assert (case_dir / "evidence" / "evidence_manifest.json").is_file()
+
+
+def test_remote_member_restore_failure_preserves_raw_and_local_archive(
+    tmp_path, monkeypatch
+):
+    case_dir = tmp_path / "case"
+    (case_dir / "system").mkdir(parents=True)
+    (case_dir / "system" / "controlDict").write_text(
+        "application simpleFoam;\n"
+    )
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0),
+        reynolds=666_666,
+    )
+    settings = Settings(
+        data_dir=tmp_path,
+        evidence_bucket="airfoils-pro-storage-bucket",
+        evidence_remote_only=True,
+        control_plane_token="test-control-plane-token-32-bytes-minimum",
+    )
+    monkeypatch.setattr(pipeline, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        pipeline, "publish_evidence_archive", _publish_as_verified_remote
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "verify_remote_evidence_restore",
+        lambda *_args: (_ for _ in ()).throw(
+            EvidenceStoreError("manifest member missing from archive")
+        ),
+    )
+
+    _archive_case_evidence(case_dir, case_dir, outcome)
+
+    bundle = next(
+        artifact
+        for artifact in outcome.evidence_artifacts
+        if artifact.kind == "engine_bundle"
+    )
+    assert bundle.metadata["rawLocalEvidenceDisposition"] == "retained"
+    assert (case_dir / "evidence" / "openfoam").is_dir()
+    assert (case_dir / "evidence" / "engine_evidence.tar.zst").is_file()
+    assert any("raw cleanup pending" in warning for warning in outcome.quality_warnings)
+
+
+def test_completed_solve_survives_remote_publish_failure_with_local_evidence(
+    tmp_path, monkeypatch
+):
+    """A GCS outage after CFD completion must not turn the solve into failure.
+
+    Exercise the normal finalization path (including coefficient finalization,
+    evidence collection, manifest generation, and real tar.zst creation), not
+    only the archive helper in isolation.  The retained package is the durable
+    input for a later migration retry, while the unpacked source remains
+    immediately usable for evidence rendering.
+    """
+    settings = Settings(
+        data_dir=tmp_path,
+        evidence_bucket="airfoils-pro-storage-bucket",
+        evidence_remote_only=True,
+        control_plane_token="test-control-plane-token-32-bytes-minimum",
+    )
+    monkeypatch.setattr(pipeline, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        pipeline,
+        "publish_evidence_archive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            EvidenceStoreError("simulated GCS credentials outage")
+        ),
+    )
+    transient = _fake_transient_with_series(tmp_path, period=0.5)
+
+    outcome = _finalize_with(tmp_path, transient, monkeypatch)
+
+    assert outcome.cl == pytest.approx(0.75, abs=1e-3)
+    assert outcome.frame_track is not None
+    bundle = next(
+        artifact for artifact in outcome.evidence_artifacts if artifact.kind == "engine_bundle"
+    )
+    assert bundle.metadata["localEvidenceDisposition"] == "volume"
+    assert (tmp_path / "evidence" / "engine_evidence.tar.zst").is_file()
+    assert (tmp_path / "evidence" / "openfoam").is_dir()
+    assert (tmp_path / "evidence" / "evidence_manifest.json").is_file()
+    assert not (tmp_path / "evidence" / "engine_evidence.remote.json").exists()
+    assert any(
+        "remote evidence archival pending" in warning
+        for warning in outcome.quality_warnings
+    )
+
+
 def test_early_stopped_point_stats_exclude_startup_via_marker(tmp_path, monkeypatch):
     """F1 regression (adversarial review, 2026-07): early-stopped runs must
     window the frame-track stats to the certified-stable tail recorded by the
@@ -2236,6 +2443,7 @@ def test_frame_artifacts_carry_field_and_index_and_tar_excludes_frames(tmp_path)
     bundle EXCLUDES the incompressible frames/ tree (it tripled per-point
     frame volume; frames ship as individual artifacts)."""
     import tarfile as _tarfile
+    import zstandard as _zstandard
 
     case_dir = tmp_path / "case"
     (case_dir / "system").mkdir(parents=True)
@@ -2256,8 +2464,12 @@ def test_frame_artifacts_carry_field_and_index_and_tar_excludes_frames(tmp_path)
     assert art.metadata["frameIndex"] == 7
     manifest = json.loads((case_dir / "evidence" / "evidence_manifest.json").read_text())
     assert manifest["bundleExcludes"] == ["frames"]
-    with _tarfile.open(case_dir / "evidence" / "openfoam_evidence.tar.gz") as tar:
-        names = tar.getnames()
+    with (case_dir / "evidence" / "engine_evidence.tar.zst").open("rb") as compressed:
+        with _zstandard.ZstdDecompressor().stream_reader(
+            compressed, read_across_frames=True
+        ) as raw_tar:
+            with _tarfile.open(fileobj=raw_tar, mode="r|") as tar:
+                names = [member.name for member in tar]
     assert not any(n == "frames" or n.startswith("frames/") for n in names)
     # The manifest itself still ships in the bundle.
     assert "evidence_manifest.json" in names

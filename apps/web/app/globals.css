@@ -272,171 +272,202 @@ a {
 .campaign-instrument-hero {
   display: grid;
   justify-items: center;
-  gap: 4px;
-  padding: 18px 2px 0;
+  width: 100%;
+  gap: 0;
+  padding: 37px 0 0;
 }
 
-.campaign-instrument-gauge {
-  width: min(540px, 92vw);
-  height: 385px;
+.campaign-progress-gauge {
+  width: min(535px, 100%);
+  aspect-ratio: 1.93 / 1;
   position: relative;
-  display: grid;
-  place-items: center;
-  overflow: hidden;
-  color: var(--aero-stroke);
 }
 
-.campaign-instrument-gauge > svg {
-  width: 500px;
-  height: 500px;
-  max-width: 90vw;
-  color: var(--aero-stroke);
-  filter: drop-shadow(
-    0 0 14px color-mix(in srgb, var(--aero-teal) 9%, transparent)
-  );
+.campaign-progress-dial-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .campaign-instrument-gauge-value {
   position: absolute;
-  inset: 0;
+  z-index: 1;
+  top: 42%;
+  left: 0;
+  width: 100%;
   display: grid;
-  place-content: center;
   justify-items: center;
-  padding-top: 58px;
   font-family: "IBM Plex Mono", monospace;
   text-align: center;
+  pointer-events: none;
 }
 
 .campaign-instrument-gauge-value strong {
   color: var(--aero-teal);
-  font-size: clamp(38px, 6vw, 68px);
+  font-size: clamp(44px, 5.4vw, 68px);
   font-weight: 500;
   letter-spacing: -0.045em;
   line-height: 1;
 }
 
 .campaign-instrument-gauge-value span {
-  margin-top: 6px;
+  margin-top: 7px;
   color: var(--aero-teal);
-  font-size: 15px;
+  font-size: clamp(12px, 1.45vw, 18px);
 }
 
 .campaign-instrument-gauge-value small {
-  margin-top: 15px;
-  padding-top: 10px;
-  min-width: 118px;
+  min-width: 150px;
+  margin-top: 19px;
+  padding-top: 11px;
   color: var(--aero-muted);
   border-top: 1px solid var(--aero-stroke);
-  font-size: 12px;
+  font-size: clamp(10px, 1.1vw, 14px);
 }
 
 .campaign-instrument-gauge-value b {
-  margin-top: 8px;
+  margin-top: 9px;
   color: var(--aero-teal);
-  font-size: 12px;
+  font-size: clamp(10px, 1.05vw, 13px);
   font-weight: 500;
 }
 
-.campaign-instrument-progress {
+.campaign-instrument-stage-rail {
+  position: relative;
+  width: min(1010px, 100%);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 90px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.campaign-instrument-stage-connector {
+  position: absolute;
+  z-index: 0;
+  top: 27px;
+  left: calc(100% / 6);
+  width: calc(100% * 2 / 3);
+  height: 2px;
   appearance: none;
-  width: min(480px, 82vw);
-  height: 4px;
-  margin-top: -41px;
   overflow: hidden;
   border: 0;
-  border-radius: 99px;
-  background: var(--aero-panel3);
+  border-radius: 0;
+  background: var(--aero-stroke);
 }
 
-.campaign-instrument-progress::-webkit-progress-bar {
-  background: var(--aero-panel3);
-  border-radius: 99px;
+.campaign-instrument-stage-connector::-webkit-progress-bar {
+  background: var(--aero-stroke);
 }
 
-.campaign-instrument-progress::-webkit-progress-value {
+.campaign-instrument-stage-connector::-webkit-progress-value {
   background: var(--aero-teal);
-  border-radius: 99px;
 }
 
-.campaign-instrument-progress::-moz-progress-bar {
+.campaign-instrument-stage-connector::-moz-progress-bar {
   background: var(--aero-teal);
-  border-radius: 99px;
-}
-
-.campaign-instrument-stage-rail {
-  width: min(900px, 100%);
-  display: flex;
-  align-items: flex-start;
-  margin-top: 28px;
-}
-
-.campaign-instrument-stage-wrap {
-  min-width: 0;
-  flex: 1 1 0;
-  display: flex;
-  align-items: flex-start;
-}
-
-.campaign-instrument-stage-arrow {
-  flex: 0 0 auto;
-  margin: 8px 7px 0;
-  color: var(--aero-dimmer);
 }
 
 .campaign-instrument-stage {
+  position: relative;
+  z-index: 1;
   min-width: 0;
-  flex: 1 1 0;
   display: grid;
   justify-items: center;
-  gap: 7px;
+  align-content: start;
   color: var(--aero-dim);
   text-align: center;
   font-family: "IBM Plex Mono", monospace;
+}
+
+.campaign-instrument-stage-node {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  color: var(--aero-dim);
+  background: var(--aero-bg);
+  border: 2px solid var(--aero-stroke);
+  border-radius: 50%;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.campaign-instrument-stage-node::before {
+  position: absolute;
+  inset: 8px;
+  content: "";
+  border: 1px solid var(--aero-stroke2);
+  border-radius: inherit;
 }
 
 .campaign-instrument-stage.is-active {
   color: var(--aero-teal);
 }
 
+.campaign-instrument-stage.is-active .campaign-instrument-stage-node {
+  color: var(--aero-teal);
+  border-color: var(--aero-teal);
+  box-shadow: 0 0 17px color-mix(in srgb, var(--aero-teal) 32%, transparent);
+}
+
+.campaign-instrument-stage.is-active .campaign-instrument-stage-node::before {
+  border-color: color-mix(in srgb, var(--aero-teal) 58%, transparent);
+}
+
 .campaign-instrument-stage.is-settled:not(.is-active) {
   color: var(--aero-teal-dim);
 }
 
+.campaign-instrument-stage.is-settled:not(.is-active)
+  .campaign-instrument-stage-node {
+  color: var(--aero-teal-dim);
+  border-color: var(--aero-teal-dim);
+}
+
 .campaign-instrument-stage strong {
-  min-height: 29px;
+  min-height: 20px;
+  margin-top: 13px;
   color: currentColor;
-  font-size: 11px;
+  font-size: clamp(10px, 1.1vw, 14px);
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.045em;
+  line-height: 1.35;
 }
 
 .campaign-instrument-stage span {
+  margin-top: 6px;
   color: var(--aero-muted);
-  font-size: 10px;
+  font-size: clamp(9px, 0.95vw, 12px);
+  line-height: 1.35;
 }
 
 .campaign-instrument-lower {
   display: grid;
   gap: 7px;
-  padding: 18px 0 4px;
-  border-top: 1px solid var(--aero-border-rule);
+  padding: 0 0 4px;
 }
 
 .campaign-instrument-metrics {
+  width: min(820px, 100%);
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   justify-content: center;
+  margin-top: 49px;
   color: var(--aero-muted);
 }
 
 .campaign-instrument-metric {
   min-width: 0;
-  min-height: 65px;
+  min-height: 78px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
-  padding: 7px 16px;
+  gap: 15px;
+  padding: 8px 20px;
   color: var(--aero-muted);
   font-family: "IBM Plex Mono", monospace;
   text-align: left;
@@ -456,7 +487,7 @@ a {
 
 .campaign-instrument-metric strong {
   color: var(--aero-text);
-  font-size: 23px;
+  font-size: clamp(21px, 2.1vw, 28px);
   font-weight: 500;
   line-height: 1;
 }
@@ -464,9 +495,15 @@ a {
 .campaign-instrument-metric small,
 .campaign-instrument-metric em {
   color: var(--aero-muted);
-  font-size: 10px;
+  font-size: clamp(9px, 0.98vw, 12px);
   font-style: normal;
   line-height: 1.35;
+}
+
+.campaign-instrument-metric > svg {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
 }
 
 .campaign-instrument-metric-amber > svg {
@@ -481,18 +518,11 @@ a {
   color: var(--aero-teal);
 }
 
-.campaign-instrument-metric-red > svg {
-  color: var(--aero-red-text);
-}
-
-.campaign-instrument-metric.is-action {
-  cursor: pointer;
-}
-
-.campaign-instrument-metric.is-action:hover,
-.campaign-instrument-metric.is-action:focus-visible {
-  background: var(--aero-panel2);
-  outline: none;
+.campaign-instrument-closing-rule {
+  width: 100%;
+  height: 1px;
+  margin-top: 34px;
+  background: var(--aero-border-rule);
 }
 
 .campaign-instrument-details-toggle {
@@ -512,7 +542,11 @@ a {
 .campaign-instrument-details-toggle:hover,
 .campaign-instrument-details-toggle:focus-visible {
   color: var(--aero-teal);
-  outline: none;
+}
+
+.campaign-instrument-details-toggle:focus-visible {
+  outline: 2px solid var(--aero-teal);
+  outline-offset: 2px;
 }
 
 .campaign-instrument-details {
@@ -522,6 +556,10 @@ a {
   border-top: 1px solid var(--aero-border-row);
 }
 
+.campaign-instrument-details[hidden] {
+  display: none;
+}
+
 .campaign-instrument-detail-strip {
   display: flex;
   gap: 14px;
@@ -529,6 +567,68 @@ a {
   color: var(--aero-muted);
   font-family: "IBM Plex Mono", monospace;
   font-size: 10px;
+}
+
+.campaign-instrument-exceptions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.campaign-instrument-exception-action {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  color: var(--aero-muted);
+  background: transparent;
+  border: 1px solid var(--aero-border-row);
+  border-radius: 6px;
+  font-family: "IBM Plex Mono", monospace;
+  text-align: left;
+}
+
+button.campaign-instrument-exception-action {
+  cursor: pointer;
+}
+
+button.campaign-instrument-exception-action:hover {
+  border-color: currentColor;
+}
+
+button.campaign-instrument-exception-action:focus-visible {
+  border-color: var(--aero-teal);
+  outline: 2px solid var(--aero-teal);
+  outline-offset: 2px;
+}
+
+.campaign-instrument-exception-action > span {
+  display: grid;
+  gap: 1px;
+}
+
+.campaign-instrument-exception-action strong {
+  color: var(--aero-text);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.campaign-instrument-exception-action small {
+  color: var(--aero-muted);
+  font-size: 9px;
+}
+
+.campaign-instrument-exception-action.is-violet > svg {
+  color: var(--aero-violet);
+}
+
+.campaign-instrument-exception-action.is-amber > svg {
+  color: var(--aero-amber);
+}
+
+.campaign-instrument-exception-action.is-red > svg {
+  color: var(--aero-red-text);
 }
 
 @media (max-width: 640px) {
@@ -551,58 +651,80 @@ a {
     gap: 2px;
   }
 
-  .campaign-instrument-gauge {
-    height: 235px;
-  }
-
-  .campaign-instrument-gauge > svg {
-    width: 280px;
-    height: 280px;
-  }
-
-  .campaign-instrument-gauge-value {
-    padding-top: 32px;
-  }
-
   .campaign-instrument-hero {
-    padding-top: 4px;
+    padding-top: 24px;
   }
 
-  .campaign-instrument-progress {
-    margin-top: -27px;
+  .campaign-progress-gauge {
+    width: min(390px, 100%);
   }
 
   .campaign-instrument-stage-rail {
-    margin-top: 20px;
+    margin-top: 62px;
   }
 
-  .campaign-instrument-stage-arrow {
-    width: 15px;
-    margin-inline: 2px;
+  .campaign-instrument-stage-connector {
+    top: 19px;
+  }
+
+  .campaign-instrument-stage-node {
+    width: 40px;
+    height: 40px;
+    font-size: 10px;
+  }
+
+  .campaign-instrument-stage-node::before {
+    inset: 6px;
   }
 
   .campaign-instrument-stage strong {
-    min-height: 36px;
-    font-size: 9px;
+    min-height: 29px;
+    margin-top: 10px;
+    padding-inline: 2px;
+    font-size: 9.5px;
   }
 
   .campaign-instrument-stage span {
-    font-size: 9px;
+    max-width: 112px;
+    margin-top: 4px;
+    padding-inline: 2px;
+    font-size: 8.5px;
   }
 
   .campaign-instrument-metrics {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin-top: 30px;
   }
 
   .campaign-instrument-metric {
-    min-height: 54px;
-    justify-content: flex-start;
-    padding-inline: 10px;
+    min-height: 94px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+    padding: 8px 4px;
+    text-align: center;
   }
 
   .campaign-instrument-metric + .campaign-instrument-metric {
-    border-left: 0;
-    border-top: 1px solid var(--aero-border-row);
+    border-left: 1px solid var(--aero-border-rule);
+  }
+
+  .campaign-instrument-metric > svg {
+    width: 27px;
+    height: 27px;
+  }
+
+  .campaign-instrument-metric > span {
+    justify-items: center;
+  }
+
+  .campaign-instrument-metric strong {
+    font-size: 19px;
+  }
+
+  .campaign-instrument-metric small,
+  .campaign-instrument-metric em {
+    font-size: 8px;
   }
 
   .campaign-card-actions-paused {

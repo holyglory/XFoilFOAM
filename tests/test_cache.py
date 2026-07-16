@@ -22,6 +22,7 @@ from airfoilfoam.models import (
     SolverParams,
     TurbulenceModel,
     TurbulenceParams,
+    EngineIdentity,
 )
 from airfoilfoam.openfoam.runner import Runner, RunResult
 from airfoilfoam.pipeline import (
@@ -113,9 +114,69 @@ class FakeRunner(Runner):
         return sum(1 for c in self.commands if c.startswith(prefix))
 
 
+def _minimal_cache_manifest(entry: Path, *, kind: str, size: int, namespace: str) -> None:
+    entry.mkdir(parents=True, exist_ok=True)
+    (entry / MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "engineNamespace": namespace,
+                "kind": kind,
+                "key": entry.name,
+                "byteSize": size,
+                "files": [{"path": "unused", "sha256": "0" * 64, "byteSize": size}],
+            }
+        )
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Keys
 # --------------------------------------------------------------------------- #
+def test_cache_cap_and_stats_are_global_across_engine_namespaces(tmp_path):
+    shared = tmp_path / "cache"
+    foundation_identity = EngineIdentity(
+        family="openfoam",
+        distribution="foundation",
+        version="14",
+        numerics_revision="1",
+        adapter_contract_version=1,
+    )
+    foundation_root = shared / "engines" / foundation_identity.compatibility_key.replace(":", "_")
+    legacy_entry = shared / "mesh" / ("a" * 64)
+    foundation_entry = foundation_root / "seed" / ("b" * 64) / "a0_adapter"
+    _minimal_cache_manifest(
+        legacy_entry,
+        kind="mesh",
+        size=100,
+        namespace="openfoam:opencfd:2406:numerics-1",
+    )
+    _minimal_cache_manifest(
+        foundation_entry,
+        kind="seed",
+        size=100,
+        namespace=foundation_identity.compatibility_key,
+    )
+    os.utime(legacy_entry / MANIFEST_NAME, (1, 1))
+    os.utime(foundation_entry / MANIFEST_NAME, (2, 2))
+
+    foundation_cache = EngineCache(
+        foundation_root,
+        max_bytes=150,
+        engine_identity=foundation_identity,
+        shared_root=shared,
+    )
+    foundation_cache.evict_to_cap()
+
+    assert not legacy_entry.exists()
+    assert foundation_entry.exists()
+    stats = EngineCache(shared, max_bytes=150).stats()
+    assert stats["mesh_entries"] == 0
+    assert stats["seed_entries"] == 1
+    assert stats["total_bytes"] == 100
+    assert stats["namespaces"][foundation_identity.compatibility_key]["total_bytes"] == 100
+
+
 def test_mesh_key_stable_for_identical_inputs(naca0012_selig_text):
     af1 = _airfoil(naca0012_selig_text)
     af2 = _airfoil(naca0012_selig_text)

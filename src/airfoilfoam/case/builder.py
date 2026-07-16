@@ -7,6 +7,7 @@ from .. import physics
 from ..airfoil import Airfoil
 from ..meshing.base import BoundaryPatch
 from ..models import CaseSpec, FluidProperties, MeshParams, RoughnessParams, SolverParams
+from ..openfoam.dialects import OPENCFD_2606, OpenFoamDialect
 from ..openfoam.foam_dict import Raw, dimensions, render_field, vector, write_foam_dict
 from .turbulence import build_turbulence
 
@@ -24,6 +25,7 @@ class CaseBuilder:
         roughness: RoughnessParams,
         solver: SolverParams,
         n_proc: int = 1,
+        dialect: OpenFoamDialect = OPENCFD_2606,
     ):
         self.airfoil = airfoil
         self.patches = patches
@@ -33,6 +35,7 @@ class CaseBuilder:
         self.roughness = roughness
         self.solver = solver
         self.n_proc = n_proc
+        self.dialect = dialect
 
         by_role = lambda r: [p.name for p in patches if p.role == r]  # noqa: E731
         self.wall = by_role("wall")[0]
@@ -78,28 +81,17 @@ class CaseBuilder:
 
     # -- constant/ ---------------------------------------------------------- #
     def _write_constant(self, turb) -> None:
-        write_foam_dict(
-            self._p("constant", "transportProperties"),
-            "dictionary",
-            "transportProperties",
-            {
-                "transportModel": "Newtonian",
-                "nu": Raw(f"{dimensions(0, 2, -1, 0, 0, 0, 0)} {self.nu:.10g}"),
-            },
-        )
-        write_foam_dict(
-            self._p("constant", "turbulenceProperties"),
-            "dictionary",
-            "turbulenceProperties",
-            {
-                "simulationType": "RAS",
-                "RAS": {
-                    "RASModel": turb.ras_model,
-                    "turbulence": "on",
-                    "printCoeffs": "on",
-                },
-            },
-        )
+        for spec in self.dialect.constant_dictionary_specs(
+            self.nu,
+            turb.ras_model,
+            self.fluid.density,
+        ):
+            write_foam_dict(
+                self._case_dir / spec.path,
+                spec.class_name,
+                spec.object_name,
+                spec.contents,
+            )
 
     # -- system/ ------------------------------------------------------------ #
     def _write_system(self, turb) -> None:
@@ -116,9 +108,9 @@ class CaseBuilder:
         area = chord * span
         return {
             "type": "forceCoeffs",
-            "libs": ["forces"],
+            "libs": list(self.dialect.force_libraries),
             "writeControl": "timeStep",
-            "writeInterval": 1,
+            self.dialect.force_interval_key: 1,
             "log": "no",
             "patches": [self.wall],
             "rho": "rhoInf",
@@ -139,7 +131,7 @@ class CaseBuilder:
             "dictionary",
             "controlDict",
             {
-                "application": "simpleFoam",
+                **self.dialect.control_solver_entry(transient=False),
                 "startFrom": "startTime",
                 "startTime": 0,
                 "stopAt": "endTime",
@@ -259,7 +251,7 @@ class CaseBuilder:
             "dictionary",
             "controlDict",
             {
-                "application": "pimpleFoam",
+                **self.dialect.control_solver_entry(transient=True),
                 "startFrom": "latestTime",
                 "startTime": start_time,
                 "stopAt": "endTime",

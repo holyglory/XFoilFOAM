@@ -31,7 +31,6 @@ import {
   restoreCondition,
   resumeCampaign,
 } from "@aerodb/db";
-import { EngineClient } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
@@ -39,7 +38,7 @@ import { z } from "zod";
 import { getCachedEngineHealth } from "./admin-routes";
 import { requireAdmin, sessionEmail } from "./admin-auth";
 import { db } from "./db";
-import { env } from "./env";
+import { makeEngineClient } from "./engine-client";
 import { readSweeperState } from "./services/sweeper-state";
 
 const numberLike = z.union([z.number(), z.string().trim().min(1)]);
@@ -195,9 +194,8 @@ export async function registerCampaignRoutes(
     // sim_jobs count + the SAME cached engine-health probe the queue endpoint
     // uses — no new probe paths.
     const sweeper = await readSweeperState();
-    const { health, error: engineError } = await getCachedEngineHealth(
-      new EngineClient(env.engineUrl),
-    );
+    const { health, error: engineError } =
+      await getCachedEngineHealth(makeEngineClient());
     const [jobsRow] = (await db.execute(sql`
       SELECT count(*)::int AS n FROM sim_jobs WHERE status IN ('submitted', 'running', 'ingesting')
     `)) as unknown as Array<{ n: number }>;
@@ -255,7 +253,7 @@ export async function registerCampaignRoutes(
       try {
         const summary = await campaignSummary(db, id);
         const sweeper = await readSweeperState();
-        const engine = new EngineClient(env.engineUrl);
+        const engine = makeEngineClient();
         const { health, error: engineError } =
           await getCachedEngineHealth(engine);
         const [jobsRow] = (await db.execute(sql`

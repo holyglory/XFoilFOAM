@@ -5,6 +5,8 @@
 // disagreement path, request-URANS idempotency, phase derivation and
 // completion blocking. Live shared-DB pattern (scoped rows, full cleanup).
 
+import "./enabled-engine-pool-fixture";
+
 import {
   AUTO_PRECALC_CONTINUATION_BUDGET_S,
   AUTO_PRECALC_CONTINUATION_REQUESTED_BY,

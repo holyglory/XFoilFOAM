@@ -70,16 +70,29 @@ def task_hard_time_limit_s(
 def make_celery() -> Celery:
     settings = get_settings()
     app = Celery("airfoilfoam", broker=settings.broker_url, backend=settings.result_backend)
+    # This deliberately public worker record is returned by Celery's live
+    # ``inspect.conf()`` command.  The gateway correlates it with
+    # ``inspect.active_queues()`` before allowing an execution pool to be
+    # enabled; no broker secrets or unrelated worker configuration are exposed.
+    worker_runtime_advertisement = {
+        # Do not name this field ``routing_key``: Celery intentionally censors
+        # config keys containing "key" in inspect responses.  The value is an
+        # execution-pool slug/queue name, not a credential.
+        "execution_pool": settings.celery_queue,
+        "engine": settings.engine_runtime_identity().model_dump(mode="json"),
+    }
     app.conf.update(
         task_serializer="json",
         result_serializer="json",
         accept_content=["json"],
+        task_default_queue=settings.celery_queue,
         task_track_started=True,
         worker_prefetch_multiplier=1,
         task_acks_late=True,
         # Default (single-case) hard ceiling; the submit endpoint overrides it
         # per dispatch with the job's real case count.
         task_time_limit=task_hard_time_limit_s(settings),
+        airfoilfoam_worker_runtime=worker_runtime_advertisement,
     )
     app.autodiscover_tasks(["airfoilfoam"])
     return app

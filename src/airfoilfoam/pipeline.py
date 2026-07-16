@@ -15,7 +15,6 @@ import os
 import re
 import signal
 import shutil
-import tarfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,12 +28,21 @@ from .cache import EngineCache, SeedHit
 from .capabilities import MESH_RECOVERY_VERSION
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
+from .config import get_settings
+from .evidence_runtime import (
+    create_local_evidence_archive,
+    publish_evidence_archive,
+    remove_verified_local_raw_evidence,
+    verify_remote_evidence_restore,
+)
+from .evidence_store import ARCHIVE_MIME_TYPE, EvidenceStoreError
 from .meshing.base import Mesher, MeshResult, get_mesher
 from .models import (
     FRAME_IMAGE_ARTIFACT_KIND,
     PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
     CaseSpec,
     EvidenceArtifact,
+    EngineRuntimeIdentity,
     FailureDisposition,
     FluidProperties,
     FrameChannelStats,
@@ -65,6 +73,10 @@ from .openfoam.runner import (
     OpenFOAMError,
     RunResult,
     Runner,
+)
+from .openfoam.dialects import (
+    dialect_for_runner,
+    find_force_coefficient_files,
 )
 from .postprocess.forces import (
     AveragedCoefficients,
@@ -122,6 +134,8 @@ def _check_cancel(cancel_check: CancelCheck) -> None:
 class CaseOutcome:
     spec: CaseSpec
     reynolds: float
+    engine: Optional[EngineRuntimeIdentity] = None
+    method_key: str = "openfoam.rans"
     cl: Optional[float] = None
     cd: Optional[float] = None
     cm: Optional[float] = None
@@ -183,9 +197,7 @@ def _time_of(coeff_path) -> float:
 
 
 def _coeff_files(case_dir: Path) -> list:
-    return sorted(
-        case_dir.glob("postProcessing/forceCoeffs1/*/coefficient.dat"), key=_time_of
-    )
+    return find_force_coefficient_files(case_dir)
 
 
 def _transient_coeff_selection(case_dir: Path, since: Optional[float]) -> list:
@@ -954,6 +966,57 @@ def _no_shedding_min_observation_s(speed: float, chord: float) -> float:
     return URANS_NO_SHEDDING_MIN_SLOW_PERIODS * c / (slow_st * u)
 
 
+def _force_history_for_no_shedding_horizon(
+    coeff_paths: list[Path],
+    spec: CaseSpec,
+    *,
+    target_cycles: int,
+) -> Optional[ForceHistory]:
+    """Grade the trailing physical slow-wake horizon for no-shedding.
+
+    A periodic early-stop marker intentionally retains its certified cycle
+    window and disables the normal startup discard.  That is correct for a
+    real limit cycle, but a tiny numerical ripple can arm the marker on an
+    otherwise steady wake.  In that collision the full startup transient must
+    neither defeat the amplitude-flat verdict nor bias the reported mean.
+
+    Select the last complete 2.1 slow-period observation using real coefficient
+    timestamps.  The exact mathematical cutoff is interpolated between its two
+    byte-backed neighboring samples, so adaptive timesteps cannot shorten the
+    physical floor by one sample. Genuine St=0.05 shedding still contributes
+    more than two complete cycles and fails the amplitude-flat test.
+    """
+    if not coeff_paths:
+        return None
+    try:
+        times, _cl, _cd, _cm = coefficient_series(coeff_paths)
+    except Exception:  # noqa: BLE001 - ordinary in-flight evidence degradation
+        return None
+    if times.size < 2:
+        return None
+    first = float(times[0])
+    last = float(times[-1])
+    total_span = last - first
+    if not math.isfinite(total_span) or total_span <= 0:
+        return None
+    required = _no_shedding_min_observation_s(spec.speed, spec.chord)
+    cutoff = first
+    if math.isfinite(required) and required > 0 and total_span > required:
+        cutoff = last - required
+    try:
+        return compute_force_history(
+            coeff_paths,
+            spec.speed,
+            spec.chord,
+            0.0,
+            target_cycles=target_cycles,
+            alpha_deg=spec.aoa_deg,
+            observation_start_time=cutoff,
+        )
+    except Exception:  # noqa: BLE001 - caller retains its primary force history
+        return None
+
+
 class MediaBudget:
     """Wall-clock budget for one case's post-solve media/frame stage.
 
@@ -1059,7 +1122,19 @@ def _set_foam_dict_entries(dict_path: Path, entries: dict[str, object]) -> None:
             text = pattern.sub(replacement, text, count=1)
         else:
             text += f"\n{key:<16} {value_text};\n"
-    dict_path.write_text(text)
+    # ``runTimeModifiable`` makes OpenFOAM poll this file while pimpleFoam is
+    # live.  Path.write_text() truncates the live inode before rewriting it;
+    # OpenCFD 2606 can observe that intermediate file and remove the
+    # ``forceCoeffs`` function object while continuing the solve.  Stage the
+    # complete dictionary beside the target and publish it with one atomic
+    # rename so every reader sees either the complete old or complete new
+    # dictionary.
+    tmp = dict_path.with_name(f".{dict_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, dict_path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _set_control_dict_entries(control_dict: Path, entries: dict[str, object]) -> None:
@@ -1877,6 +1952,7 @@ def _prepare_transient_case(
     urans_precalc_mesh: Optional[MeshParams] = None,
 ) -> tuple[MeshParams, object]:
     _check_cancel(cancel_check)
+    dialect = dialect_for_runner(runner)
     if tcase.exists():
         shutil.rmtree(tcase)
     tcase.mkdir(parents=True, exist_ok=True)
@@ -1904,7 +1980,17 @@ def _prepare_transient_case(
     init_solver = solver_params.model_copy(
         update={"n_iterations": min(solver_params.n_iterations, TRANSIENT_INIT_ITERS)}
     )
-    CaseBuilder(airfoil, patches, tmesh, spec, fluid, roughness, init_solver, n_proc=n_proc).write(tcase)
+    CaseBuilder(
+        airfoil,
+        patches,
+        tmesh,
+        spec,
+        fluid,
+        roughness,
+        init_solver,
+        n_proc=n_proc,
+        dialect=dialect,
+    ).write(tcase)
     if shared_mesh_dir is None:
         mesher.write_inputs(tcase, airfoil, tmesh, spec.chord)
         mesher.run_mesh(tcase, tmesh, runner)
@@ -1941,15 +2027,15 @@ def _prepare_transient_case(
             "skipping the in-case short simpleFoam init",
             tcase,
         )
-        runner.application(tcase, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+        runner.application(tcase, dialect.potential_foam_command, timeout=600)
         _check_cancel(cancel_check)
         return tmesh, patches
-    runner.application(tcase, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+    runner.application(tcase, dialect.potential_foam_command, timeout=600)
     _check_cancel(cancel_check)
     # Unconditional steady (RANS) initialisation stage, for the URANS-only path
     # too: even a short, non-converged SIMPLE field gives the transient a
     # developed, already-separated start instead of violent uniform flow.
-    init = runner.solver(tcase, "simpleFoam", n_proc, timeout=timeout)
+    init = runner.solver(tcase, dialect.steady_solver_command, n_proc, timeout=timeout)
     _check_cancel(cancel_check)
     (tcase / "log.simpleFoam.init").write_text(init.stdout)
     # The steady initialisation is only a convenience seed for pimpleFoam. When
@@ -1980,6 +2066,7 @@ def _run_transient_attempt(
     deadline: float | None = None,
 ) -> Optional[TransientResult]:
     _check_cancel(cancel_check)
+    dialect = dialect_for_runner(runner)
     # Fresh attempt = fresh verdict: a marker left by a condemned earlier stage
     # (e.g. the steady init) must not poison this pimpleFoam pass.
     clear_divergence_condemnation(tcase)
@@ -1997,7 +2084,17 @@ def _run_transient_attempt(
             "URANS integration stopped by the wall-clock budget guard before "
             "the next same-case chunk could start"
         )
-    CaseBuilder(airfoil, patches, tmesh, spec, fluid, roughness, solver_params, n_proc=n_proc).write_transient(
+    CaseBuilder(
+        airfoil,
+        patches,
+        tmesh,
+        spec,
+        fluid,
+        roughness,
+        solver_params,
+        n_proc=n_proc,
+        dialect=dialect,
+    ).write_transient(
         tcase,
         start_t,
         end_t,
@@ -2018,7 +2115,7 @@ def _run_transient_attempt(
     solve_started = time.monotonic()
     res = runner.solver(
         tcase,
-        "pimpleFoam",
+        dialect.transient_solver_command,
         n_proc,
         timeout=remaining_timeout,
         restart=True,
@@ -2126,6 +2223,16 @@ def _run_transient_attempt(
             target_cycles=target_cycles,
             alpha_deg=spec.aoa_deg,
         )
+        no_shedding_tail = _force_history_for_no_shedding_horizon(
+            list(coeff_paths),
+            spec,
+            target_cycles=target_cycles,
+        )
+        if is_no_shedding(no_shedding_tail):
+            # This tail owns both the physical verdict and the accepted mean.
+            # In particular, do not let a periodic early-stop marker re-include
+            # startup forces in an otherwise steady-equivalent result.
+            history = no_shedding_tail
     except Exception:  # noqa: BLE001 - quality/history is non-fatal
         history = None
     try:
@@ -2163,7 +2270,7 @@ def _run_transient_attempt(
         quality,
         early_stopped=bool(early_stop),
     )
-    if early_stop and quality.ok:
+    if early_stop and quality.ok and not quality.no_shedding:
         quality = UransQuality(
             ok=True,
             can_refine=False,
@@ -3032,12 +3139,59 @@ def _copy_tree_files(
             _copy_file_preserving_rel(src_base, src, dst_base, entries, role, manifest_base=manifest_base)
 
 
+def _copy_tree_files_classified(
+    src_base: Path,
+    dst_base: Path,
+    entries: list[dict[str, object]],
+    role_for_path: Callable[[Path], str],
+    manifest_base: Path | None = None,
+) -> None:
+    """Copy a tree while deriving each file's evidence role from its path."""
+    if not src_base.exists():
+        return
+    for root, _dirs, files in os.walk(src_base, followlinks=True):
+        for name in sorted(files):
+            src = Path(root) / name
+            if not src.is_file():
+                continue
+            relative_path = src.relative_to(src_base)
+            _copy_file_preserving_rel(
+                src_base,
+                src,
+                dst_base,
+                entries,
+                role_for_path(relative_path),
+                manifest_base=manifest_base,
+            )
+
+
+def _constant_evidence_role(relative_path: Path) -> str:
+    """Only the resolved polyMesh is mesh; other constant files are dictionaries."""
+    return (
+        "mesh"
+        if relative_path.parts and relative_path.parts[0] == "polyMesh"
+        else "dictionary"
+    )
+
+
+def _post_processing_evidence_role(relative_path: Path) -> str:
+    """Keep force coefficients, y+ output, and other function data distinct."""
+    function_name = relative_path.parts[0] if relative_path.parts else ""
+    if function_name.startswith("forceCoeffs"):
+        return "force_coefficients"
+    if function_name == "yPlus":
+        return "y_plus"
+    return "field_data"
+
+
 def _evidence_mime(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".json":
         return "application/json"
     if suffix == ".gz":
         return "application/gzip"
+    if suffix == ".zst":
+        return "application/zstd"
     if suffix in {".vtu", ".vtk", ".vtp"}:
         return "application/vnd.vtk"
     if suffix in {".dat", ".log", ".txt"}:
@@ -3100,7 +3254,13 @@ def _archive_case_evidence(
     entries: list[dict[str, object]] = []
     raw_dir = evidence_dir / "openfoam"
     _copy_tree_files(case_dir / "system", raw_dir / "system", entries, "dictionary", manifest_base=evidence_dir)
-    _copy_tree_files(case_dir / "constant", raw_dir / "constant", entries, "mesh", manifest_base=evidence_dir)
+    _copy_tree_files_classified(
+        case_dir / "constant",
+        raw_dir / "constant",
+        entries,
+        _constant_evidence_role,
+        manifest_base=evidence_dir,
+    )
     _copy_tree_files(
         case_dir / SHARED_MESH_EVIDENCE_DIR,
         raw_dir / "mesh_evidence",
@@ -3110,13 +3270,25 @@ def _archive_case_evidence(
     )
     if post_dir != case_dir:
         _copy_tree_files(post_dir / "system", raw_dir / "transient" / "system", entries, "dictionary", manifest_base=evidence_dir)
-        _copy_tree_files(post_dir / "constant", raw_dir / "transient" / "constant", entries, "mesh", manifest_base=evidence_dir)
+        _copy_tree_files_classified(
+            post_dir / "constant",
+            raw_dir / "transient" / "constant",
+            entries,
+            _constant_evidence_role,
+            manifest_base=evidence_dir,
+        )
 
     for log in sorted(set(case_dir.glob("log*")) | set(post_dir.glob("log*"))):
         if log.is_file():
             _copy_file_preserving_rel(log.parent, log, raw_dir / "logs" / log.parent.name, entries, "log", manifest_base=evidence_dir)
 
-    _copy_tree_files(post_dir / "postProcessing", raw_dir / "postProcessing", entries, "force_coefficients", manifest_base=evidence_dir)
+    _copy_tree_files_classified(
+        post_dir / "postProcessing",
+        raw_dir / "postProcessing",
+        entries,
+        _post_processing_evidence_role,
+        manifest_base=evidence_dir,
+    )
 
     # Keep exact field evidence separately so future custom renders never depend
     # on mutable warm-start case directories.
@@ -3166,7 +3338,14 @@ def _archive_case_evidence(
                 unavailable[role] = missing
 
     manifest = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
+        "engine": (
+            outcome.engine.model_dump(mode="json") if outcome.engine is not None else None
+        ),
+        "engineNamespace": (
+            outcome.engine.compatibility_key if outcome.engine is not None else None
+        ),
+        "methodKey": outcome.method_key,
         "casePath": str(case_dir),
         "postPath": str(post_dir),
         "aoaDeg": outcome.spec.aoa_deg,
@@ -3194,18 +3373,43 @@ def _archive_case_evidence(
     manifest_path = evidence_dir / "evidence_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
-    bundle_path = evidence_dir / "openfoam_evidence.tar.gz"
-    with tarfile.open(bundle_path, "w:gz") as tar:
-        for child in sorted(evidence_dir.iterdir()):
-            if child.name == bundle_path.name or child.name == "frames":
-                continue
-            tar.add(child, arcname=child.name, recursive=True)
+    settings = get_settings()
+    publication = create_local_evidence_archive(evidence_dir, settings)
+    try:
+        publication = publish_evidence_archive(publication, settings)
+    except EvidenceStoreError as exc:
+        # A transient object-store failure must not discard a completed CFD
+        # solve or force the expensive physical attempt to run again. Keep a
+        # complete local tar.zst plus its raw render source; the migration pass
+        # can publish it later. The result remains truthful and visibly warns
+        # that remote archival is pending.
+        logger.error("evidence object upload failed for %s: %s", evidence_dir, exc, exc_info=True)
+        outcome.quality_warnings.append(
+            f"remote evidence archival pending; complete local tar.zst retained: {exc}"
+        )
+        # ``publication`` still refers to the exact archive whose upload
+        # failed; do not spend another full compression pass recreating it.
 
     artifacts = []
     for kind, path, mime in (
         ("manifest", manifest_path, "application/json"),
-        ("openfoam_bundle", bundle_path, "application/gzip"),
+        ("engine_bundle", publication.archive_path, ARCHIVE_MIME_TYPE),
     ):
+        storage_metadata = publication.artifact_metadata() if kind == "engine_bundle" else {}
+        if kind == "engine_bundle":
+            if not publication.remote:
+                storage_metadata["localEvidenceDisposition"] = "volume"
+            elif settings.evidence_remote_only:
+                # Upload alone is not deletion authorization.  The sweeper
+                # must first register the exact archive and every member, then
+                # obtain an authenticated fresh-restore acknowledgement.
+                storage_metadata["localEvidenceDisposition"] = (
+                    "remote-copy-plus-local-archive-pending-database-ack"
+                )
+            else:
+                storage_metadata["localEvidenceDisposition"] = (
+                    "remote-copy-plus-local-retained"
+                )
         artifacts.append(
             EvidenceArtifact(
                 kind=kind,
@@ -3216,9 +3420,22 @@ def _archive_case_evidence(
                 role="evidence",
                 metadata={
                     "evidenceBase": str(evidence_rel),
+                    "engineNamespace": (
+                        outcome.engine.compatibility_key
+                        if outcome.engine is not None
+                        else None
+                    ),
+                    "methodKey": outcome.method_key,
                     "fileCount": len(entries),
+                    "bundledFileCount": sum(
+                        1
+                        for entry in entries
+                        if str(entry.get("path", "")).split("/", 1)[0]
+                        not in {"frames"}
+                    ),
                     "windowStart": start_time,
                     "windowEnd": end_time,
+                    **storage_metadata,
                 },
             )
         )
@@ -3231,6 +3448,10 @@ def _archive_case_evidence(
         metadata: dict[str, object] = {
             "evidenceBase": str(evidence_rel),
             "manifestPath": str(manifest_path.relative_to(case_dir)),
+            "engineNamespace": (
+                outcome.engine.compatibility_key if outcome.engine is not None else None
+            ),
+            "methodKey": outcome.method_key,
             "windowStart": start_time,
             "windowEnd": end_time,
         }
@@ -3258,6 +3479,35 @@ def _archive_case_evidence(
             )
         )
     outcome.evidence_artifacts = artifacts
+    if publication.remote and settings.evidence_remote_only:
+        bundle_artifact = next(
+            artifact for artifact in artifacts if artifact.kind == "engine_bundle"
+        )
+        try:
+            restore_verification = verify_remote_evidence_restore(
+                evidence_dir, publication, settings
+            )
+            raw_bytes_removed = remove_verified_local_raw_evidence(
+                evidence_dir, publication
+            )
+            bundle_artifact.metadata["remoteRestoreVerification"] = (
+                restore_verification
+            )
+            bundle_artifact.metadata["rawLocalEvidenceDisposition"] = "removed"
+            bundle_artifact.metadata["rawLocalBytesRemoved"] = raw_bytes_removed
+            bundle_artifact.metadata["localArchiveRetainedUntilDatabaseAck"] = True
+        except Exception as exc:  # noqa: BLE001 - full local archive/raw stay safe
+            bundle_artifact.metadata["rawLocalEvidenceDisposition"] = "retained"
+            bundle_artifact.metadata["localArchiveRetainedUntilDatabaseAck"] = True
+            logger.error(
+                "remote evidence raw cleanup deferred for %s: %s",
+                evidence_dir,
+                exc,
+                exc_info=True,
+            )
+            outcome.quality_warnings.append(
+                f"remote evidence raw cleanup pending; complete local archive retained: {exc}"
+            )
 
 
 def _finalize_outcome(
@@ -3377,7 +3627,9 @@ def _finalize_outcome(
     post_dir = case_dir
     frame_stats: Optional[PeriodWindowStats] = None
     frame_series: Optional[tuple] = None  # merged (t, cl, cd, cm) coefficient arrays
+    urans_rejection: Optional[HardSolverError] = None
     if solver_params.force_transient or (not outcome.converged and solver_params.transient_fallback):
+        outcome.method_key = "openfoam.urans"
         # Fidelity tier: the tier owns the retained-period target and the
         # transient wall-clock budget (precalc: 3 periods / 7200 s; full:
         # 7 periods / 43200 s) — contract item 1, pinned cross-runtime.
@@ -3406,7 +3658,7 @@ def _finalize_outcome(
             # converged steady point (mean coefficients), not as unsteady, so it
             # gets steady single-frame media rather than a periodic animation.
             outcome.unsteady = not transient.quality.no_shedding
-            outcome.converged = True
+            outcome.converged = transient.quality.ok
             # Truthful tier echo: these values came from the URANS transient
             # of this request's fidelity tier (a no-shedding steady-equivalent
             # mean is STILL a URANS-produced value, so it echoes urans_*).
@@ -3417,6 +3669,9 @@ def _finalize_outcome(
                 outcome.strouhal = transient.force_history.strouhal
             if not transient.quality.ok:
                 outcome.quality_warnings.append(transient.quality.reason)
+                urans_rejection = HardSolverError(
+                    "URANS evidence rejected: " + transient.quality.reason
+                )
             # Frame-track recording contract: integer-period time-weighted stats
             # become the SINGLE SOURCE OF TRUTH for the point coefficients and
             # the measured Strouhal number. No-shedding points stay on the plain
@@ -3501,6 +3756,15 @@ def _finalize_outcome(
                         f"cycle means scatter ±{frame_stats.cycle_mean_std:.3g} over "
                         f"{frame_stats.whole_periods} cycles (precalc)"
                     )
+            if not transient.quality.no_shedding and urans_rejection is None:
+                if frame_stats is None:
+                    urans_rejection = HardSolverError(
+                        "URANS evidence rejected: no integer-period frame track "
+                        "could be measured from the retained force history"
+                    )
+                if urans_rejection is not None:
+                    outcome.converged = False
+                    outcome.quality_warnings.append(str(urans_rejection))
         elif solver_params.force_transient or not coeff_files:
             # A URANS-only case must never silently fall back to the steady
             # coefficients; a fallback case with steady coefficients keeps them.
@@ -3531,7 +3795,8 @@ def _finalize_outcome(
 
     # y+
     _check_cancel(cancel_check)
-    runner.application(post_dir, "simpleFoam -postProcess -func yPlus -latestTime")
+    dialect = dialect_for_runner(runner)
+    runner.application(post_dir, dialect.y_plus_command)
     _check_cancel(cancel_check)
     yplus_files = sorted(post_dir.glob("postProcessing/yPlus/*/yPlus.dat"))
     if yplus_files:
@@ -3542,12 +3807,22 @@ def _finalize_outcome(
     media_end_time = None
     frame_times: list[float] = []
     frame_fields_rendered: list[str] = []
-    requested_fields = [field.value if hasattr(field, "value") else str(field) for field in solver_params.write_images]
+    requested_fields = [
+        field.value if hasattr(field, "value") else str(field)
+        for field in solver_params.write_images
+    ]
+    if urans_rejection is not None:
+        # A rejected transient still retains raw fields, logs, dictionaries,
+        # force history, y+ and VTK as immutable attempt evidence.  It must not
+        # publish derived contours/means/video that look like accepted result
+        # media, and the manifest must not claim those fields were requested
+        # for publication.
+        requested_fields = []
     budget = MediaBudget(
         media_budget_s if media_budget_s is not None else MEDIA_BUDGET_FRACTION_DEFAULT * solver_timeout
     )
     expected_artifacts = 0
-    if render_images and solver_params.write_images:
+    if render_images and solver_params.write_images and urans_rejection is None:
         img_out = (case_dir / image_subdir / "images") if image_subdir else (case_dir / "images")
         prefix = f"{image_subdir}/" if image_subdir else ""
         suffix = f"{airfoil.name} a={spec.aoa_deg:g}deg U={spec.speed:g}"
@@ -3579,7 +3854,7 @@ def _finalize_outcome(
             # shedding window so dense refined runs become readable media.
             # foamToVTK is never budget-skipped: the VTU frames are the raw
             # EVIDENCE (archived below) — only derived media renders degrade.
-            runner.application(post_dir, "foamToVTK").check()
+            runner.application(post_dir, dialect.vtk_all_times_command).check()
             _check_cancel(cancel_check)
             if not budget.exceeded():
                 media_progress("rendering instantaneous contours")
@@ -3673,7 +3948,7 @@ def _finalize_outcome(
                     )
         else:
             expected_artifacts = len(fields)
-            runner.application(post_dir, "foamToVTK -latestTime").check()
+            runner.application(post_dir, dialect.vtk_latest_time_command).check()
             _check_cancel(cancel_check)
             if not budget.exceeded():
                 imgs = render_contours(
@@ -3735,6 +4010,12 @@ def _finalize_outcome(
         end_time=media_end_time if outcome.unsteady else None,
         requested_fields=requested_fields if render_images else [],
     )
+    if urans_rejection is not None:
+        # Raise only after archiving the rejected attempt.  ``run_case`` turns
+        # this typed solver rejection into error/failure_disposition metadata,
+        # so the job cannot count it as an accepted point while every raw byte
+        # needed for diagnosis or continuation remains reachable.
+        raise urans_rejection
 
 
 def run_case(
@@ -3775,7 +4056,18 @@ def run_case(
     ``urans_budget_s`` (when given) replacing the tier wall budget."""
     case_dir.mkdir(parents=True, exist_ok=True)
     re = physics.reynolds(spec.speed, spec.chord, fluid.nu)
-    outcome = CaseOutcome(spec=spec, reynolds=re)
+    runtime = (
+        runner.settings.engine_runtime_identity()
+        if getattr(runner, "settings", None) is not None
+        else None
+    )
+    outcome = CaseOutcome(
+        spec=spec,
+        reynolds=re,
+        engine=runtime,
+        method_key="openfoam.urans" if solver_params.force_transient else "openfoam.rans",
+    )
+    dialect = dialect_for_runner(runner)
     if mesh_quality_warnings:
         outcome.quality_warnings.extend(mesh_quality_warnings)
     steady_timeout = min(solver_timeout, rans_solver_timeout or solver_timeout)
@@ -3837,7 +4129,15 @@ def run_case(
 
         def write_case(sp):
             CaseBuilder(
-                airfoil, patches, resolved, spec, fluid, roughness, sp, n_proc=n_proc
+                airfoil,
+                patches,
+                resolved,
+                spec,
+                fluid,
+                roughness,
+                sp,
+                n_proc=n_proc,
+                dialect=dialect,
             ).write(case_dir)
             if mesh_dir is not None:
                 _link_mesh(case_dir, mesh_dir, runner)
@@ -3862,9 +4162,11 @@ def run_case(
             )
             if not seeded:
                 # Potential-flow initialisation greatly stabilises the cold RANS start.
-                runner.application(case_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+                runner.application(case_dir, dialect.potential_foam_command, timeout=600)
             _check_cancel(cancel_check)
-            res = runner.solver(case_dir, "simpleFoam", n_proc, timeout=steady_timeout)
+            res = runner.solver(
+                case_dir, dialect.steady_solver_command, n_proc, timeout=steady_timeout
+            )
             _check_cancel(cancel_check)
             return res
 
@@ -4130,6 +4432,7 @@ def write_shared_mesh_evidence(
     chord: float,
     mesh_result: MeshResult,
     attempt_diagnostics: list[dict[str, object]],
+    engine: Optional[EngineRuntimeIdentity] = None,
 ) -> Path:
     """Persist the exact accepted mesh setup and bounded recovery history.
 
@@ -4142,6 +4445,16 @@ def write_shared_mesh_evidence(
     evidence_dir = mesh_dir / SHARED_MESH_EVIDENCE_DIR
     stage = mesh_dir / f".{SHARED_MESH_EVIDENCE_DIR}.{uuid.uuid4().hex}.tmp"
     previous = evidence_dir if evidence_dir.is_dir() else None
+    if engine is None and previous is not None:
+        try:
+            previous_payload = json.loads(
+                (previous / SHARED_MESH_EVIDENCE_MANIFEST).read_text()
+            )
+            previous_engine = previous_payload.get("engine")
+            if isinstance(previous_engine, dict):
+                engine = EngineRuntimeIdentity.model_validate(previous_engine)
+        except (OSError, ValueError, TypeError):
+            pass
     stage.mkdir(parents=True, exist_ok=False)
     qa_payload = _read_current_shared_mesh_qa(mesh_dir)
     artifacts: dict[str, Optional[dict[str, object]]] = {}
@@ -4221,6 +4534,8 @@ def write_shared_mesh_evidence(
         }
         payload = {
             "schemaVersion": SHARED_MESH_EVIDENCE_SCHEMA_VERSION,
+            "engine": engine.model_dump(mode="json") if engine is not None else None,
+            "engineNamespace": engine.compatibility_key if engine is not None else None,
             "meshRecoveryVersion": MESH_RECOVERY_VERSION,
             "createdAtEpochS": time.time(),
             "status": "verified" if qa_payload is not None else "prepared_unverified",
@@ -4306,6 +4621,7 @@ def validate_shared_mesh(
             roughness,
             solver_params,
             n_proc=n_proc,
+            dialect=dialect_for_runner(runner),
         ).write(qa_dir)
         _link_mesh(qa_dir, mesh_dir, runner)
         qa = _run_transient_mesh_qa_gate(qa_dir, runner, quality_warnings)
@@ -4404,7 +4720,17 @@ def prepare_mesh(
                 extra={"meshCacheKey": mesh_key, "meshCacheHit": True},
             )
             write_shared_mesh_evidence(
-                mesh_dir, resolved, mesher, chord, result, []
+                mesh_dir,
+                resolved,
+                mesher,
+                chord,
+                result,
+                [],
+                engine=(
+                    runner.settings.engine_runtime_identity()
+                    if getattr(runner, "settings", None) is not None
+                    else None
+                ),
             )
             return result
     result = mesher.run_mesh(mesh_dir, resolved, runner)
@@ -4420,7 +4746,17 @@ def prepare_mesh(
     _check_cancel(cancel_check)
     result.extra.update({"meshCacheKey": mesh_key, "meshCacheHit": False})
     evidence_dir = write_shared_mesh_evidence(
-        mesh_dir, resolved, mesher, chord, result, []
+        mesh_dir,
+        resolved,
+        mesher,
+        chord,
+        result,
+        [],
+        engine=(
+            runner.settings.engine_runtime_identity()
+            if getattr(runner, "settings", None) is not None
+            else None
+        ),
     )
     if cache is not None and mesh_key is not None and verified:
         cache.publish_mesh(
@@ -4689,12 +5025,16 @@ def _try_seed_initial_field(
 
 def _publish_steady_seed(
     cache: Optional[EngineCache], case_dir: Path, airfoil, chord, resolved, spec, fluid,
-    roughness, solver_params, solver: str = "simpleFoam",
+    roughness, solver_params, solver: Optional[str] = None,
 ) -> None:
     """Publish the latest-time fields of an ACCEPTED steady solve so later jobs
     at the same (mesh, fluid, speed) can seed nearby angles from them."""
     if cache is None:
         return
+    if solver is None:
+        from .openfoam.dialects import get_openfoam_dialect
+
+        solver = get_openfoam_dialect(cache.engine_identity).steady_solver_command
     if spec.aoa_deg < 0:
         # Never make an unverified negative branch a cross-job initial state.
         # The primary polar marcher has its own retained 0-degree anchor for
@@ -4723,9 +5063,21 @@ def _solve_cold_marched(
 ):
     """Cold-start the first AoA of a polar (build case, reuse mesh, potentialFoam,
     or a cached-solution seed from a previous job when one is close enough)."""
+    dialect = dialect_for_runner(runner)
+
     def write_case(sp):
         _check_cancel(cancel_check)
-        CaseBuilder(airfoil, patches, resolved, spec, fluid, roughness, sp, n_proc=n_proc).write(polar_dir)
+        CaseBuilder(
+            airfoil,
+            patches,
+            resolved,
+            spec,
+            fluid,
+            roughness,
+            sp,
+            n_proc=n_proc,
+            dialect=dialect,
+        ).write(polar_dir)
         _link_mesh(polar_dir, mesh_dir, runner)
         # keep only a few time dirs (warm-starts need just the latest as a seed)
         runner.application(polar_dir, "foamDictionary -entry purgeWrite -set 3 system/controlDict")
@@ -4739,9 +5091,11 @@ def _solve_cold_marched(
             runner, cache, cancel_check=cancel_check,
         )
         if not seeded:
-            runner.application(polar_dir, "potentialFoam -writephi -initialiseUBCs", timeout=600)
+            runner.application(polar_dir, dialect.potential_foam_command, timeout=600)
         _check_cancel(cancel_check)
-        res = runner.solver(polar_dir, "simpleFoam", n_proc, timeout=solver_timeout)
+        res = runner.solver(
+            polar_dir, dialect.steady_solver_command, n_proc, timeout=solver_timeout
+        )
         _check_cancel(cancel_check)
         return res
 
@@ -4772,7 +5126,12 @@ def _solve_warm(polar_dir, spec, solver_params, runner, solver_timeout, n_proc=1
         _check_cancel(cancel_check)
         runner.application(polar_dir, cmd).check()
     _check_cancel(cancel_check)
-    res = runner.solver(polar_dir, "simpleFoam", n_proc, timeout=solver_timeout)
+    res = runner.solver(
+        polar_dir,
+        dialect_for_runner(runner).steady_solver_command,
+        n_proc,
+        timeout=solver_timeout,
+    )
     _check_cancel(cancel_check)
     return res
 
@@ -4995,7 +5354,12 @@ def _run_full_urans_replacement(
         case_slug = f"{polar_dir.name}/urans_a{j}"
         case_dir = polar_dir / f"urans_a{j}"
         if phase_progress:
-            phase_progress(JobPhase.solving_urans, aoa, case_slug, "pimpleFoam")
+            phase_progress(
+                JobPhase.solving_urans,
+                aoa,
+                case_slug,
+                dialect_for_runner(runner).transient_solver_command,
+            )
         extra_run_case_kwargs = {}
         if mesh_quality_warnings:
             extra_run_case_kwargs["mesh_quality_warnings"] = mesh_quality_warnings
@@ -5083,10 +5447,24 @@ def solve_polar_marched(
                     JobPhase.solving_urans if solver_params.force_transient else JobPhase.solving_rans,
                     aoa,
                     f"{polar_dir.name}/a{case_index}",
-                    "pimpleFoam" if solver_params.force_transient else "simpleFoam",
+                    (
+                        dialect_for_runner(runner).transient_solver_command
+                        if solver_params.force_transient
+                        else dialect_for_runner(runner).steady_solver_command
+                    ),
                 )
             outcome = CaseOutcome(
-                spec=spec, reynolds=physics.reynolds(speed, chord, fluid.nu), n_cells=n_cells
+                spec=spec,
+                reynolds=physics.reynolds(speed, chord, fluid.nu),
+                n_cells=n_cells,
+                engine=(
+                    runner.settings.engine_runtime_identity()
+                    if getattr(runner, "settings", None) is not None
+                    else None
+                ),
+                method_key=(
+                    "openfoam.urans" if solver_params.force_transient else "openfoam.rans"
+                ),
             )
             if mesh_quality_warnings:
                 outcome.quality_warnings.extend(mesh_quality_warnings)

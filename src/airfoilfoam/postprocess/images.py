@@ -58,7 +58,13 @@ def find_internal_vtu(case_dir: Path) -> Path:
 
 
 def find_all_vtus(case_dir: Path) -> list[Path]:
-    """All internal-field VTUs under the case, ordered by time (ascending)."""
+    """All internal-field VTK datasets under the case, ordered by solution time.
+
+    OpenCFD emits XML ``.vtu`` datasets (often with a ``.series`` time map),
+    while OpenFOAM Foundation 14's foamToVTK is a legacy ``.vtk`` writer.  The
+    rest of the renderer intentionally consumes ``meshio`` datasets and does not
+    need to know which storage dialect supplied them.
+    """
     candidates = sorted(case_dir.glob("VTK/*/internal.vtu"), key=lambda p: _vtu_time(p))
     if not candidates:
         candidates = sorted(
@@ -66,7 +72,12 @@ def find_all_vtus(case_dir: Path) -> list[Path]:
             key=lambda p: _vtu_time(p),
         )
     if not candidates:
-        raise FileNotFoundError(f"No internal.vtu found under {case_dir / 'VTK'}")
+        # Foundation v14 with ``foamToVTK -useTimeName`` writes the internal
+        # volume as VTK/<case>_<physicalTime>.vtk. Boundary files live below a
+        # subdirectory and therefore cannot be mistaken for the volume here.
+        candidates = sorted(case_dir.glob("VTK/*.vtk"), key=lambda p: _vtu_time(p))
+    if not candidates:
+        raise FileNotFoundError(f"No internal VTK dataset found under {case_dir / 'VTK'}")
     return candidates
 
 

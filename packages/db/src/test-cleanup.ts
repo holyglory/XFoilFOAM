@@ -46,7 +46,7 @@ import {
 import {
   POLAR_COMPATIBILITY_VERSION,
   refreshPolarCompatibilityCache,
-  resolveRevisionPhysicsHash,
+  resolveRevisionMethodCompatibilityHash,
 } from "./polar-compatibility-cache";
 
 export interface CampaignFixtureCleanupOptions {
@@ -166,7 +166,7 @@ export async function cleanupCampaignFixtures(
     if (revisionIds.length) {
       const physicsHashByRevision = new Map<string, string>();
       for (const revisionId of revisionIds) {
-        const compatibilityHash = await resolveRevisionPhysicsHash(
+        const compatibilityHash = await resolveRevisionMethodCompatibilityHash(
           db,
           revisionId,
         );

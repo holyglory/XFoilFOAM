@@ -6,6 +6,7 @@ import {
   refreshPolarCacheForRevision,
   refreshPolarCompatibilityCache,
 } from "../src/polar-cache";
+import { resolveRevisionMethodCompatibilityHash } from "../src/polar-compatibility-cache";
 import {
   airfoils,
   boundaryProfiles,
@@ -39,6 +40,7 @@ describe("revision polar cache transaction boundary", () => {
   let airfoilId = "";
   let categoryId = "";
   let revisionId = "";
+  let compatibilityHash = "";
   let presetId = "";
   let bcId = "";
   const profileIds: Record<string, string> = {};
@@ -177,6 +179,9 @@ describe("revision polar cache transaction boundary", () => {
       })
       .returning({ id: simulationPresetRevisions.id });
     revisionId = revision.id;
+    compatibilityHash =
+      (await resolveRevisionMethodCompatibilityHash(db, revisionId)) ?? "";
+    expect(compatibilityHash).toMatch(/^[a-f0-9]{64}$/);
 
     const [category] = await db
       .insert(categories)
@@ -917,7 +922,7 @@ describe("revision polar cache transaction boundary", () => {
       FROM polar_compatibility_fit_members member
       JOIN polar_compatibility_fit_sets fit ON fit.id = member.fit_set_id
       WHERE fit.airfoil_id = ${airfoilId}
-        AND fit.compatibility_hash = ${`${PREFIX}-physics`}
+        AND fit.compatibility_hash = ${compatibilityHash}
         AND fit.is_current = true
         AND member.result_id = ${result.id}
         AND member.role = 'selected'
@@ -948,13 +953,13 @@ describe("revision polar cache transaction boundary", () => {
       .update(resultClassifications)
       .set({ state: "accepted", reasons: [] })
       .where(eq(resultClassifications.resultId, result.id));
-    await refreshPolarCompatibilityCache(db, airfoilId, `${PREFIX}-physics`);
+    await refreshPolarCompatibilityCache(db, airfoilId, compatibilityHash);
     const wrongAttemptMembers = (await db.execute(sql`
       SELECT member.result_id
       FROM polar_compatibility_fit_members member
       JOIN polar_compatibility_fit_sets fit ON fit.id = member.fit_set_id
       WHERE fit.airfoil_id = ${airfoilId}
-        AND fit.compatibility_hash = ${`${PREFIX}-physics`}
+        AND fit.compatibility_hash = ${compatibilityHash}
         AND fit.is_current = true
         AND member.result_id = ${result.id}
     `)) as unknown as Array<{ result_id: string }>;
@@ -980,7 +985,7 @@ describe("revision polar cache transaction boundary", () => {
       .where(
         and(
           eq(polarCompatibilityFitSets.airfoilId, airfoilId),
-          eq(polarCompatibilityFitSets.compatibilityHash, `${PREFIX}-physics`),
+          eq(polarCompatibilityFitSets.compatibilityHash, compatibilityHash),
           eq(polarCompatibilityFitSets.isCurrent, true),
         ),
       );
@@ -1038,7 +1043,7 @@ describe("revision polar cache transaction boundary", () => {
       FROM polar_compatibility_fit_members member
       JOIN polar_compatibility_fit_sets fit ON fit.id = member.fit_set_id
       WHERE fit.airfoil_id = ${airfoilId}
-        AND fit.compatibility_hash = ${`${PREFIX}-physics`}
+        AND fit.compatibility_hash = ${compatibilityHash}
         AND fit.is_current = true
         AND member.result_id = ${result.id}
     `)) as unknown as Array<{ result_id: string }>;
@@ -1904,13 +1909,13 @@ describe("revision polar cache transaction boundary", () => {
         error: null,
       })
       .where(eq(results.id, result.id));
-    await refreshPolarCompatibilityCache(db, airfoilId, `${PREFIX}-physics`);
+    await refreshPolarCompatibilityCache(db, airfoilId, compatibilityHash);
     const stalePointerlessMembers = (await db.execute(sql`
       SELECT member.result_id
       FROM polar_compatibility_fit_members member
       JOIN polar_compatibility_fit_sets fit ON fit.id = member.fit_set_id
       WHERE fit.airfoil_id = ${airfoilId}
-        AND fit.compatibility_hash = ${`${PREFIX}-physics`}
+        AND fit.compatibility_hash = ${compatibilityHash}
         AND fit.is_current = true
         AND member.result_id = ${result.id}
     `)) as unknown as Array<{ result_id: string }>;
@@ -2090,20 +2095,27 @@ describe("revision polar cache transaction boundary", () => {
     expect(independent?.reasons).not.toContain("low-aoa-rans-failure");
   }, 60_000);
 
-  it("derives and persists a null physics hash under ordered locks without concurrent deadlock", async () => {
+  it("derives and persists a null method compatibility hash under ordered locks without concurrent deadlock", async () => {
     await db
       .update(simulationPresetRevisions)
-      .set({ physicsHash: null, isCanonicalPhysics: false })
+      .set({
+        methodCompatibilityHashVersion: null,
+        methodCompatibilityHash: null,
+        isCanonicalMethod: false,
+      })
       .where(eq(simulationPresetRevisions.id, revisionId));
     await Promise.all([
       refreshPolarCacheForRevision(db, airfoilId, revisionId),
       refreshPolarCacheForRevision(db, airfoilId, revisionId),
     ]);
     const [revision] = await db
-      .select({ physicsHash: simulationPresetRevisions.physicsHash })
+      .select({
+        methodCompatibilityHash:
+          simulationPresetRevisions.methodCompatibilityHash,
+      })
       .from(simulationPresetRevisions)
       .where(eq(simulationPresetRevisions.id, revisionId));
-    expect(revision.physicsHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(revision.methodCompatibilityHash).toMatch(/^[a-f0-9]{64}$/);
     const currentRows = (await db.execute(sql`
       SELECT count(*)::int AS count
       FROM polar_fit_sets

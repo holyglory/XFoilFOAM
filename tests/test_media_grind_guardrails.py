@@ -43,6 +43,7 @@ from airfoilfoam.postprocess.images import (  # noqa: E402
     render_frame_track_images,
     render_mean_contours,
 )
+from airfoilfoam.postprocess.unsteady import ForceHistory  # noqa: E402
 from airfoilfoam.storage import JobStore  # noqa: E402
 
 
@@ -363,15 +364,58 @@ class _FakeRunner:
 
 def _fake_transient(tmp_path):
     avg = SimpleNamespace(cl=0.45, cd=0.08, cm=-0.02, cl_cd=5.6, cl_std=0.01, cd_std=0.002, cm_std=0.001)
-    (tmp_path / "transient").mkdir(exist_ok=True)
+    transient = tmp_path / "transient"
+    transient.mkdir(exist_ok=True)
+    period = 0.25
+    times = np.linspace(0.0, 3.0, 1201)
+    phase = 2.0 * math.pi * times / period
+    cl = 0.45 + 0.05 * np.sin(phase)
+    cd = 0.08 + 0.005 * np.cos(phase)
+    cm = -0.02 + 0.002 * np.sin(phase)
+    coeff = transient / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    coeff.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    rows.extend(
+        f"{t:.8g} {drag:.8g} 0 0 {lift:.8g} 0 0 {moment:.8g} 0 0 0 0 0"
+        for t, lift, drag, moment in zip(times, cl, cd, cm)
+    )
+    coeff.write_text("\n".join(rows) + "\n")
+    history = ForceHistory(
+        t=times.tolist(),
+        cl=cl.tolist(),
+        cd=cd.tolist(),
+        cm=cm.tolist(),
+        cl_mean=float(cl.mean()),
+        cl_rms=float(cl.std()),
+        cd_mean=float(cd.mean()),
+        cd_rms=float(cd.std()),
+        cm_mean=float(cm.mean()),
+        cm_rms=float(cm.std()),
+        shedding_freq_hz=1.0 / period,
+        strouhal=(1.0 / period) / 10.0,
+        samples=len(times),
+        period_s=period,
+        retained_cycles=12,
+        window_start=float(times[0]),
+        window_end=float(times[-1]),
+    )
     return TransientResult(
         avg=avg,
-        case_dir=tmp_path / "transient",
-        force_history=None,
-        quality=UransQuality(ok=True, can_refine=False, reason="ok"),
+        case_dir=transient,
+        force_history=history,
+        quality=UransQuality(
+            ok=True,
+            can_refine=False,
+            reason="ok",
+            measured_period_s=period,
+            retained_cycles=12,
+        ),
         start_time=0.0,
-        end_time=1.0,
-        run_time=1.0,
+        end_time=3.0,
+        run_time=3.0,
+        coeff_paths=[coeff],
     )
 
 
@@ -386,7 +430,11 @@ def _finalize(tmp_path, monkeypatch, *, media_budget_s, phase_progress=None, ren
         spec=outcome.spec,
         fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
         roughness=RoughnessParams(),
-        solver_params=SolverParams(force_transient=True, write_images=[ImageField.velocity_magnitude]),
+        solver_params=SolverParams(
+            force_transient=True,
+            write_images=[ImageField.velocity_magnitude],
+            frame_fields=[],
+        ),
         runner=_FakeRunner(),
         n_proc=1,
         render_images=render_images,

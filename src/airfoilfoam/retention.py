@@ -12,25 +12,28 @@ Keep-set derivation:
   also copied to ``evidence/frames/`` as registered evidence artifacts. All of
   those trees are retained.
 * Evidence artifacts registered in result JSON point at
-  ``evidence/evidence_manifest.json`` and
-  ``evidence/openfoam_evidence.tar.gz``. Custom/default render outputs point
+  ``evidence/evidence_manifest.json`` and the canonical Zstandard bundle.
+  A verified ``engine_evidence.remote.json`` pins its immutable GCS object.
+  Custom/default render outputs point
   under ``evidence/custom_renders/`` and ``evidence/scaled_media/``. These are
   retained wherever an evidence directory appears, including ``a<N>/evidence``.
 * ``POST /jobs/{id}/render-field``, ``/field-extents`` and
-  ``/render-default-media`` use ``evidence/VTK`` when it exists and only fall
-  back to the live case ``VTK`` directory when evidence VTK is absent. The
-  retention decision is therefore to keep uncompressed ``evidence/VTK`` as the
-  re-render source and strip the live case ``VTK`` in full-strip mode.
+  ``/render-default-media`` hydrate authenticated VTK members from GCS when a
+  verified pointer exists.  Uncompressed ``evidence/VTK`` is therefore removed
+  only for a remote-backed archive; without that pointer it remains the local
+  re-render source.
 * ``continue_from`` staging validates and copies the live saved transient case:
   latest numeric time directory with ``U``/``p``, ``system/controlDict`` and
   ``constant/polyMesh``. It deliberately skips media/evidence/VTK/custom render
   trees and stale ``processor*`` decompositions. ``keep_case_state=True``
   preserves those live solver-state directories for budget-stop continuation;
   the default full strip removes them.
-* ``evidence/openfoam`` and ``evidence/time_directories`` are redundant after
-  finalization because the downloadable ``openfoam_evidence.tar.gz`` remains
-  available and custom re-rendering reads ``evidence/VTK`` directly. Strip
-  removes those redundant uncompressed evidence copies.
+* ``evidence/openfoam``, ``evidence/time_directories``, packaged ``VTK``, and
+  local archives are never removed by generic retention. Successful new-result
+  finalization has already removed its verified duplicates, while the dedicated
+  migration flow requires a database acknowledgement and a fresh
+  generation-pinned restore immediately before cleanup. A filename, local
+  bundle, or remote pointer alone is never deletion authority.
 
 Unknown entries are fail-safe: they are retained and reported instead of being
 deleted by a broad "everything not in the keep set" rule.
@@ -39,6 +42,7 @@ deleted by a broad "everything not in the keep set" rule.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -48,17 +52,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .evidence_store import EvidenceStoreError, read_remote_pointer
+
 
 STRIP_MARKER = ".stripped.json"
 
 _ROOT_JSON_KEEP = {"request.json", "result.json", "status.json", "runtime.json"}
 _CASE_DELETE_DIRS = {"constant", "system", "postProcessing", "VTK", "dynamicCode"}
 _CASE_KEEP_DIRS = {"images", "frames", "evidence", "custom_renders"}
-_EVIDENCE_DELETE_DIRS = {"openfoam", "time_directories"}
 _EVIDENCE_KEEP_NAMES = {
     "evidence_manifest.json",
     "openfoam_evidence.tar.gz",
+    "engine_evidence.tar.gz",
+    "engine_evidence.tar.zst",
+    "engine_evidence.remote.json",
+    "storage_migration.json",
+    "storage_migration.database.json",
     "VTK",
+    "openfoam",
+    "time_directories",
     "frames",
     "scaled_media",
     "custom_renders",
@@ -242,6 +254,12 @@ def _job_retention_guard(job_root: Path):
 
 
 def _strip_case_dir(job_root: Path, case_dir: Path, report: StripReport, *, keep_case_state: bool) -> None:
+    if keep_case_state:
+        # Continuation staging deliberately skips every VTK directory and
+        # regenerates field exports from the saved OpenFOAM time directories.
+        # Keeping these derived exports for the whole continuation window
+        # duplicates the immutable remote evidence for no recovery benefit.
+        _strip_continuation_vtk(case_dir, report)
     for child in sorted(case_dir.iterdir()):
         name = child.name
         if name == "evidence" and child.is_dir():
@@ -266,6 +284,21 @@ def _strip_case_dir(job_root: Path, case_dir: Path, report: StripReport, *, keep
         _record_unknown(job_root, child, report)
 
 
+def _strip_continuation_vtk(case_dir: Path, report: StripReport) -> None:
+    """Remove derived live-case VTK while preserving packaged evidence."""
+
+    for root, dirnames, _filenames in os.walk(case_dir, topdown=True):
+        current = Path(root)
+        # Evidence has its own pointer-aware deletion contract below.  Never
+        # bypass it merely because the surrounding live case is continuable.
+        if current.name == "evidence":
+            dirnames[:] = []
+            continue
+        if "VTK" in dirnames:
+            _remove_path(current / "VTK", report)
+            dirnames.remove("VTK")
+
+
 def _strip_media_segment(job_root: Path, segment_dir: Path, report: StripReport) -> None:
     for child in sorted(segment_dir.iterdir()):
         if child.name == "evidence" and child.is_dir():
@@ -277,13 +310,70 @@ def _strip_media_segment(job_root: Path, segment_dir: Path, report: StripReport)
 
 
 def _strip_evidence_dir(job_root: Path, evidence_dir: Path, report: StripReport) -> None:
+    _validate_remote_pointer(evidence_dir, job_root, report)
+    _storage_migration_pending(evidence_dir, job_root, report)
     for child in sorted(evidence_dir.iterdir()):
-        if child.name in _EVIDENCE_DELETE_DIRS:
-            _remove_path(child, report)
-        elif child.name in _EVIDENCE_KEEP_NAMES:
+        if child.name in _EVIDENCE_KEEP_NAMES:
             continue
         else:
             _record_unknown(job_root, child, report)
+
+
+def _validate_remote_pointer(
+    evidence_dir: Path,
+    job_root: Path,
+    report: StripReport,
+) -> None:
+    pointer_path = evidence_dir / "engine_evidence.remote.json"
+    if not pointer_path.is_file():
+        return
+    try:
+        pointer = read_remote_pointer(pointer_path)
+        local_archive = evidence_dir / "engine_evidence.tar.zst"
+        if local_archive.is_file():
+            size, digest = _file_size_sha256(local_archive)
+            if size != pointer.stored_size or digest != pointer.stored_sha256:
+                raise EvidenceStoreError(
+                    "local tar.zst does not match the verified remote pointer"
+                )
+    except (EvidenceStoreError, OSError) as exc:
+        _record_unknown(job_root, pointer_path, report)
+
+
+def _file_size_sha256(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _storage_migration_pending(
+    evidence_dir: Path,
+    job_root: Path,
+    report: StripReport,
+) -> bool:
+    """Keep every packaged source until the dedicated migration finalizes.
+
+    The migration owns the destructive contract because it can verify the
+    database acknowledgement and perform a fresh exact-generation restore.
+    An unreadable or non-complete receipt fails closed.
+    """
+
+    receipt_path = evidence_dir / "storage_migration.json"
+    if not receipt_path.is_file():
+        return False
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        complete = isinstance(payload, dict) and payload.get("state") == "complete"
+    except Exception:
+        complete = False
+    if not complete:
+        _record_unknown(job_root, receipt_path, report)
+        return True
+    return False
 
 
 def _strip_solver_state_dir(job_root: Path, solver_dir: Path, report: StripReport) -> None:

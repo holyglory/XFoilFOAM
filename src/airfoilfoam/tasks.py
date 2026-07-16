@@ -42,6 +42,7 @@ from .pipeline import (
     write_march_stop,
 )
 from .storage import JobStore
+from .openfoam.dialects import FORCE_COEFFICIENT_FILENAMES
 
 HEARTBEAT_INTERVAL_S = 10
 
@@ -61,9 +62,9 @@ logger = logging.getLogger(__name__)
 
 def newest_progress_file_mtime(job_dir: Path) -> Optional[float]:
     """Newest mtime of the on-disk progress tokens under a job's cases tree:
-    ``coefficient.dat`` rows (a live pimpleFoam march appends continuously),
+    force-coefficient rows (a live transient march appends continuously),
     frame-track PNGs (an advancing media stage writes one per frame), and
-    ``.vtu`` frames (an advancing foamToVTK conversion — which runs in a
+    ``.vtu``/``.vtk`` frames (an advancing foamToVTK conversion — which runs in a
     separate container under the docker runner, invisible to the /proc scan).
     Returns None when no token file exists. Walks only when called — the
     caller short-circuits on cheap status.json evidence first."""
@@ -75,8 +76,9 @@ def newest_progress_file_mtime(job_dir: Path) -> Optional[float]:
         in_frames = "frames" in Path(root).parts[-2:]
         for name in files:
             if (
-                name != "coefficient.dat"
+                name not in FORCE_COEFFICIENT_FILENAMES
                 and not name.endswith(".vtu")
+                and not name.endswith(".vtk")
                 and not (in_frames and name.endswith(".png"))
             ):
                 continue
@@ -168,6 +170,8 @@ def _check_and_condemn_stall(store: JobStore, job_id: str, settings: Settings) -
                 state=JobState.failed,
                 polars=existing.polars if existing is not None else [],
                 message=reason,
+                engine=(existing.engine if existing is not None else status.engine),
+                method_keys=(existing.method_keys if existing is not None else []),
             )
         )
     except Exception:  # noqa: BLE001 - the exit below still converts the grind to the handled death class
@@ -400,10 +404,10 @@ def _live_coefficient_segments(job_dir: Path, now: float) -> list[Path]:
     """The newest recently-written coefficient.dat per case dir. Targeted
     globs (cases can nest as <slug>/, <polar>/transient_aN/ or
     <polar>/urans_aN/transient/) so no walk over time/VTK dirs happens."""
-    patterns = (
-        "cases/*/postProcessing/forceCoeffs1/*/coefficient.dat",
-        "cases/*/*/postProcessing/forceCoeffs1/*/coefficient.dat",
-        "cases/*/*/*/postProcessing/forceCoeffs1/*/coefficient.dat",
+    patterns = tuple(
+        f"cases/{depth}/postProcessing/forceCoeffs1/*/{filename}"
+        for depth in ("*", "*/*", "*/*/*")
+        for filename in FORCE_COEFFICIENT_FILENAMES
     )
     newest_per_case: dict[Path, tuple[float, Path]] = {}
     for pattern in patterns:
@@ -696,15 +700,26 @@ def reconcile_orphaned_jobs(sender=None, **_kwargs) -> None:
     app = getattr(sender, "app", None) or celery_app
     active_ids: set[str] = set()
     try:
-        replies = app.control.inspect(timeout=2.0).active() or {}
+        replies = app.control.inspect(timeout=2.0).active()
+        if not replies:
+            logger.warning(
+                "orphan reconcile: celery inspect returned no cross-worker snapshot; "
+                "failing closed"
+            )
+            return
         for rows in replies.values():
             for row in rows or []:
                 task_id = (row or {}).get("id")
                 if task_id:
                     active_ids.add(str(task_id))
-    except Exception:  # noqa: BLE001 - best effort; the boot-time guard still protects fresh tasks
-        logger.warning("orphan reconcile: celery inspect failed; relying on boot-time guard", exc_info=True)
-    reconciled = store.reconcile_orphans(boot_time=_WORKER_BOOT_TIME, active_task_ids=active_ids)
+    except Exception:  # noqa: BLE001 - cross-worker uncertainty must never fail healthy work
+        logger.warning("orphan reconcile: celery inspect failed; failing closed", exc_info=True)
+        return
+    reconciled = store.reconcile_orphans(
+        boot_time=_WORKER_BOOT_TIME,
+        active_task_ids=active_ids,
+        worker_engine=get_settings().engine_identity(),
+    )
     for job_id in reconciled:
         # acks_late means Redis may redeliver the lost task after its
         # visibility timeout; revoke so a redelivery is discarded instead of
@@ -836,6 +851,7 @@ def _terminal_failure_disposition(
 def run_polar(self, job_id: str, request_json: str) -> dict:
     install_subprocess_signal_handlers()
     settings = get_settings()
+    runtime_engine = settings.engine_runtime_identity()
     store = JobStore(settings)
     request = PolarRequest.model_validate_json(request_json)
     lock_path = store.job_dir(job_id) / ".execute.lock"
@@ -863,16 +879,26 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
             # earlier pending status intentionally leaves it null so a rolling
             # deployment cannot claim that queued work ran newer code.
             status.mesh_recovery_version = MESH_RECOVERY_VERSION
+            status.engine = runtime_engine
+            status.execution_pool = settings.celery_queue
             store.write_status(status)
         stop_heartbeat, heartbeat_thread = _start_runtime_heartbeat(store, job_id, settings)
         try:
             result = execute_job(job_id, request, store=store, settings=settings)
         except JobCancelled:
-            result = JobResult(job_id=job_id, state=JobState.cancelled, message="cancelled")
+            result = JobResult(
+                job_id=job_id,
+                state=JobState.cancelled,
+                message="cancelled",
+                engine=runtime_engine,
+                execution_pool=settings.celery_queue,
+            )
             status = store.read_status(job_id) or JobStatus(job_id=job_id, state=JobState.cancelled)
             status.state = JobState.cancelled
             status.phase = JobPhase.cancelled
             status.message = "cancelled"
+            status.engine = runtime_engine
+            status.execution_pool = settings.celery_queue
             store.write_status(status)
             store.write_result(result)
             return {"job_id": job_id, "state": "cancelled"}
@@ -883,6 +909,8 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
                     job_id=job_id,
                     state=JobState.failed,
                     message=f"{type(exc).__name__}: {exc}",
+                    engine=runtime_engine,
+                    execution_pool=settings.celery_queue,
                     failure_disposition=failure_disposition,
                 )
             )
@@ -891,6 +919,8 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
                     job_id=job_id,
                     state=JobState.failed,
                     message=f"{type(exc).__name__}: {exc}",
+                    engine=runtime_engine,
+                    execution_pool=settings.celery_queue,
                     failure_disposition=failure_disposition,
                 )
             )

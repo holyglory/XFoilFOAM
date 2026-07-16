@@ -327,10 +327,13 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
       .where(eq(results.id, evidenceResult.id));
     await refreshPolarCacheForRevision(db, airfoilId, setup.revisionId);
     const [revision] = await db
-      .select({ physicsHash: simulationPresetRevisions.physicsHash })
+      .select({
+        methodCompatibilityHash:
+          simulationPresetRevisions.methodCompatibilityHash,
+      })
       .from(simulationPresetRevisions)
       .where(eq(simulationPresetRevisions.id, setup.revisionId));
-    expect(revision.physicsHash).toBeTruthy();
+    expect(revision.methodCompatibilityHash).toBeTruthy();
     const currentBefore = await db
       .select({ id: polarCompatibilityFitSets.id })
       .from(polarCompatibilityFitSets)
@@ -339,7 +342,7 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
           eq(polarCompatibilityFitSets.airfoilId, airfoilId),
           eq(
             polarCompatibilityFitSets.compatibilityHash,
-            revision.physicsHash!,
+            revision.methodCompatibilityHash!,
           ),
           eq(polarCompatibilityFitSets.isCurrent, true),
         ),
@@ -377,7 +380,7 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
           eq(polarCompatibilityFitSets.airfoilId, airfoilId),
           eq(
             polarCompatibilityFitSets.compatibilityHash,
-            revision.physicsHash!,
+            revision.methodCompatibilityHash!,
           ),
           eq(polarCompatibilityFitSets.isCurrent, true),
         ),

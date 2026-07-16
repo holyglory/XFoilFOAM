@@ -4,6 +4,83 @@
 import type { PointFidelity, SteadyHistory, UransFidelity } from "./fidelity";
 import type { FrameTrack } from "./frame-track";
 
+/** Logical numerical implementation identity. Runtime/build provenance is
+ * deliberately separate: rebuilding an image without changing numerics must
+ * not split a compatible polar, while a distribution/version/numerics change
+ * must never be silently merged with prior evidence. */
+export interface EngineIdentity {
+  /** Stable extensible slug. Current adapters support `openfoam`; future
+   * engines do not require a core contract migration. */
+  family: string;
+  /** Distribution/implementation slug (`opencfd`, `foundation`, or a future
+   * engine's own canonical implementation). */
+  distribution: string;
+  version: string;
+  numerics_revision: string;
+  adapter_contract_version: number;
+}
+
+/** Exact runtime that acknowledged or produced a job/result. These fields are
+ * evidence provenance and are intentionally excluded from compatibility keys. */
+export interface EngineRuntimeIdentity extends EngineIdentity {
+  build_id: string;
+  source_revision?: string | null;
+  image_digest?: string | null;
+  /** Deterministic SHA-256 of the adapter/application source tree copied into
+   * the worker image. This is distinct from the upstream solver package or
+   * solver executable checksum. */
+  application_source_sha256?: string | null;
+  binary_sha256?: string | null;
+  /** Digest of the installed Foundation/OpenCFD package when execution is
+   * package-backed rather than a single canonical solver binary. */
+  package_sha256?: string | null;
+  architecture?: string | null;
+}
+
+/** One logical adapter target advertised by the solver gateway. This is not a
+ * runtime acknowledgement: no worker build has executed merely because the
+ * gateway knows how to route to this adapter. */
+export interface EngineCapabilityDescriptor {
+  engine: EngineIdentity;
+  routing_key: string;
+  analysis_methods: string[];
+  steady: boolean;
+  transient: boolean;
+  volume_fields: boolean;
+  mesh_evidence: boolean;
+  stored_media: boolean;
+  custom_field_rendering: boolean;
+  multi_element_geometry: boolean;
+  supported_turbulence_models: string[];
+  supported_image_fields: string[];
+}
+
+/** Gateway capability response. Exact runtime/build provenance deliberately
+ * does not appear in its inventories; it is acknowledged by job status and
+ * result payloads only after a worker has accepted/executed the request.
+ * Legacy single-adapter fields remain optional during the rolling cutover. */
+export interface EngineCapabilities {
+  engine?: EngineRuntimeIdentity | null;
+  /** Queue/routing key accepted by this adapter API. */
+  routing_key?: string;
+  default_engine?: EngineIdentity | null;
+  supported_engines?: EngineIdentity[];
+  registered_disabled_engines?: EngineIdentity[];
+  /** Gateway-wide logical adapter inventory. */
+  engines?: EngineCapabilityDescriptor[];
+  methods?: string[];
+  supports_steady?: boolean;
+  supports_unsteady?: boolean;
+  supports_volumetric_fields?: boolean;
+  supports_mesh_evidence?: boolean;
+  supports_continuation?: boolean;
+  meshers?: string[];
+  turbulence_models?: string[];
+  openfoam_image?: string | null;
+  runner?: string | null;
+  mesh_recovery_version?: number;
+}
+
 export type AirfoilFormat = "auto" | "selig" | "lednicer";
 
 export interface AirfoilInput {
@@ -128,6 +205,12 @@ export interface ContinueFrom {
 }
 
 export interface PolarRequest {
+  /** Exact logical implementation requested by the control plane. New clients
+   * always send this field; omission remains accepted only for legacy callers. */
+  expected_engine?: EngineIdentity;
+  /** DB-selected enabled execution-pool route. The engine API and worker both
+   * reject a mismatch before CFD execution. */
+  expected_execution_pool?: string;
   airfoil: AirfoilInput;
   chord_lengths?: number[];
   speeds?: number[];
@@ -221,10 +304,19 @@ export interface JobStatus {
   /** Typed terminal failure when execution ended before per-angle attempt
    * evidence existed. Null/absent on non-terminal and legacy jobs. */
   failure_disposition?: FailureDisposition | null;
+  /** Runtime acknowledgement. Missing only on historical responses from the
+   * retired OpenCFD-v2406 runtime. */
+  engine?: EngineRuntimeIdentity | null;
+  /** Logical engine accepted at submission. Present before a worker runtime
+   * is assigned, so pending Foundation jobs still acknowledge exact routing. */
+  requested_engine?: EngineIdentity | null;
+  requested_execution_pool?: string | null;
+  execution_pool?: string | null;
 }
 
 export interface EngineHealth {
   status: string;
+  role?: string | null;
   version: string;
   build_id?: string | null;
   package_file?: string | null;
@@ -232,6 +324,26 @@ export interface EngineHealth {
    * means the legacy strategy (0); malformed/unreachable health is unknown
    * and must never authorize reopening deterministic blockers. */
   mesh_recovery_version?: number;
+  /** Structured engine/runtime identity. Top-level version/build_id remain for
+   * legacy control-plane and operator compatibility during rollout. */
+  engine?: EngineRuntimeIdentity | null;
+  /** Gateway-wide logical routing inventory. Neither this nor default_engine
+   * is evidence that a particular worker runtime/build is currently online. */
+  default_engine?: EngineIdentity | null;
+  supported_engines?: EngineIdentity[];
+  registered_disabled_engines?: EngineIdentity[];
+  /** Non-secret immutable-evidence storage contract currently served by the
+   * gateway. A certified OpenCFD 2606 pool must match its canary receipt
+   * exactly; absence is unsafe for cutover attestation. */
+  evidence_storage?: {
+    backend: "gcs" | "volume";
+    bucket: string | null;
+    object_prefix: string;
+    archive_format: string;
+    compression: string;
+    zstd_level: number;
+    remote_only: boolean;
+  } | null;
 }
 
 /** GET /cache/stats — disk truth about the engine mesh/seed cache. */
@@ -255,6 +367,46 @@ export interface EngineStripJobResponse {
 
 export interface EngineDeleteJobResponse {
   bytes_freed: number;
+}
+
+export interface EvidenceCleanupDatabaseAssociation {
+  result_id: string;
+  result_attempt_id: string;
+  source_artifact_id: string;
+  archive_id: string;
+  member_association_count: number;
+  member_associations_sha256: string;
+  manifest_member_set_sha256: string;
+}
+
+export interface RemoteEvidencePointerPayload {
+  schemaVersion: number;
+  format: "tar+zstd";
+  bucket: string;
+  objectKey: string;
+  generation: string;
+  storedSha256: string;
+  storedSize: number;
+  tarSha256: string;
+  tarSize: number;
+  crc32c: string;
+  zstdLevel: number;
+  createdAt: string;
+}
+
+export interface FinalizeRemoteEvidenceRequest {
+  case_slug: string;
+  evidence_base: string;
+  remote: RemoteEvidencePointerPayload;
+  database_associations: EvidenceCleanupDatabaseAssociation[];
+}
+
+export interface FinalizeRemoteEvidenceResponse {
+  state: "complete" | "no_local_bytes";
+  evidence_base: string;
+  bytes_freed: number;
+  verification: string;
+  association_count: number;
 }
 
 export interface EngineMaintenanceJobItem {
@@ -282,8 +434,39 @@ export interface EngineTaskSummary {
   time_start?: number | null;
 }
 
+export interface EngineWorkerQueueBinding {
+  worker: string;
+  queues: string[];
+  /** Pool/queue the worker itself claims in deliberately exposed live config. */
+  execution_pool?: string | null;
+  /** Exact live worker build. Null/malformed values cannot authorize a pool. */
+  engine?: EngineRuntimeIdentity | null;
+}
+
+export interface EngineQueueDescriptor {
+  routing_key: string;
+  enabled: boolean;
+  depth: number | null;
+  engine: EngineIdentity;
+}
+
 export interface EngineQueueState {
   queue_depth: number | null;
+  /** Legacy/default queue depth plus exact per-route inventory. */
+  default_queue_depth?: number | null;
+  queue_depths?: Record<string, number | null>;
+  queue_enabled?: Record<string, boolean>;
+  queues?: EngineQueueDescriptor[];
+  /** Fresh Celery inspector evidence. Null/error means worker availability is
+   * unknown and must not authorize enabling an execution pool. */
+  worker_queues?: EngineWorkerQueueBinding[] | null;
+  worker_queues_error?: string | null;
+  worker_runtime_error?: string | null;
+  inspection_errors?: Record<string, string>;
+  /** Exact workers represented by each active/reserved/scheduled inspector
+   * snapshot. Maintenance must reject snapshots whose coverage differs from
+   * the live worker inventory. */
+  inspection_workers?: Record<string, string[]>;
   active: EngineTaskSummary[];
   reserved: EngineTaskSummary[];
   scheduled: EngineTaskSummary[];
@@ -363,6 +546,10 @@ export interface PolarPoint {
   cd_std?: number | null;
   cm_std?: number | null;
   unsteady: boolean;
+  /** Extensible numerical method identity. Keep `regime`/`unsteady` as the
+   * existing OpenFOAM classification; future solvers use their own namespaced
+   * method key without widening the RANS/URANS enum. */
+  method_key?: string | null;
   converged: boolean;
   final_residual?: number | null;
   iterations?: number | null;
@@ -394,6 +581,9 @@ export interface PolarPoint {
    * compatibility with stored results from pre-contract engine builds. */
   failure_disposition?: FailureDisposition;
   error?: string | null;
+  /** Exact runtime that produced this point. Point-level provenance prevents
+   * partial/restarted jobs from inheriting an unverified controller default. */
+  engine?: EngineRuntimeIdentity | null;
 }
 
 export type FailureDisposition =
@@ -549,4 +739,11 @@ export interface JobResult {
   /** Typed terminal failure when execution ended before per-angle attempt
    * evidence existed. Null/absent on non-terminal and legacy results. */
   failure_disposition?: FailureDisposition | null;
+  /** Exact runtime acknowledged by the worker that produced this result. */
+  engine?: EngineRuntimeIdentity | null;
+  requested_engine?: EngineIdentity | null;
+  requested_execution_pool?: string | null;
+  execution_pool?: string | null;
+  /** Distinct methods that actually produced evidence in this job. */
+  method_keys?: string[];
 }

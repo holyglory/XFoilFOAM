@@ -75,6 +75,7 @@ const {
   simulationPresets,
   solverEvidenceArtifacts,
   solverProfiles,
+  solverRuntimeBuilds,
   syncApiPermissions,
   syncApiSettings,
   syncImportConflicts,
@@ -133,6 +134,7 @@ const profileIds = {
 };
 const cleanupPromiseIds = new Set<string>();
 const cleanupConflictIds = new Set<string>();
+const cleanupRuntimeBuildIds = new Set<string>();
 
 function sha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
@@ -675,11 +677,13 @@ async function resultAt(aoaDeg: number) {
 async function createSelectedRemoteAssetGeneration(
   aoaDeg: number,
   label: string,
+  pointPatch: Record<string, unknown> = {},
 ) {
   const remoteResultId = `${PREFIX}-${label}-remote-result`;
   const imported = await postPolars(
     polarPayload([
       makePoint(aoaDeg, {
+        ...pointPatch,
         engineJobId: remoteResultId,
         evidenceArtifacts: [artifactItem(`${label}-manifest`)],
       }),
@@ -707,7 +711,10 @@ async function createSelectedRemoteAssetGeneration(
   return { remoteResultId, result, manifest: manifests[0] };
 }
 
-async function runUpstreamEvidenceExport(data: Record<string, unknown>) {
+async function runUpstreamEvidenceExport(
+  data: Record<string, unknown>,
+  mode: "full" | "db_only_remote_assets" = "full",
+) {
   const [settingsBefore] = await db
     .select()
     .from(syncApiSettings)
@@ -756,7 +763,7 @@ async function runUpstreamEvidenceExport(data: Record<string, unknown>) {
         "x-xfoilfoam-sync-secret": SECRET,
       },
       payload: JSON.stringify({
-        mode: "full",
+        mode,
         types: ["evidence_artifacts"],
         limit: 25,
       }),
@@ -864,6 +871,12 @@ afterAll(async () => {
   await db
     .delete(simJobs)
     .where(eq(simJobs.simulationPresetRevisionId, revisionId));
+  if (cleanupRuntimeBuildIds.size)
+    await db
+      .delete(solverRuntimeBuilds)
+      .where(
+        inArray(solverRuntimeBuilds.id, Array.from(cleanupRuntimeBuildIds)),
+      );
   if (cleanupConflictIds.size)
     await db
       .delete(syncImportConflicts)
@@ -936,6 +949,94 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
+  it("preserves the generic cross-engine bundle kind during remote asset sync", async () => {
+    const applicationSourceSha256 = sha256(
+      Buffer.from(`${PREFIX}:remote-application-source`),
+    );
+    const fixture = await createSelectedRemoteAssetGeneration(
+      726.901,
+      "generic-engine-bundle",
+      {
+        methodKey: "openfoam.rans",
+        engine: {
+          family: "openfoam",
+          distribution: "opencfd",
+          version: "2406",
+          numericsRevision: "1",
+          adapterContractVersion: 1,
+          buildId: `${PREFIX}-remote-build`,
+          sourceRevision: null,
+          imageDigest: null,
+          applicationSourceSha256,
+          packageSha256: null,
+          binarySha256: null,
+          architecture: "x86_64",
+        },
+      },
+    );
+    const [runtime] = await db
+      .select({
+        id: solverRuntimeBuilds.id,
+        applicationSourceSha256: solverRuntimeBuilds.applicationSourceSha256,
+      })
+      .from(resultAttempts)
+      .innerJoin(
+        solverRuntimeBuilds,
+        eq(resultAttempts.solverRuntimeBuildId, solverRuntimeBuilds.id),
+      )
+      .where(eq(resultAttempts.id, fixture.result.currentResultAttemptId!))
+      .limit(1);
+    expect(runtime?.applicationSourceSha256).toBe(applicationSourceSha256);
+    cleanupRuntimeBuildIds.add(runtime!.id);
+    const bundleBytes = Buffer.from(`${PREFIX}:generic-engine-bundle`);
+    const remoteArtifactId = `${PREFIX}-generic-engine-bundle-artifact`;
+    const run = await runUpstreamEvidenceExport(
+      {
+        remoteArtifactId,
+        remoteResultId: fixture.remoteResultId,
+        remoteResultAttemptId: fixture.result.currentResultAttemptId,
+        kind: "engine_bundle",
+        field: null,
+        role: "evidence",
+        mimeType: "application/gzip",
+        sha256: sha256(bundleBytes),
+        byteSize: bundleBytes.byteLength,
+        generationManifestSha256: fixture.manifest.sha256,
+        downloadUrl: "/artifacts/generic-engine-bundle/download",
+      },
+      "db_only_remote_assets",
+    );
+
+    expect(run.response.statusCode, run.response.body).toBe(200);
+    expect(run.response.json().lastRun).toMatchObject({
+      imported: 1,
+      conflicts: [],
+    });
+    const [stored] = await db
+      .select({
+        kind: solverEvidenceArtifacts.kind,
+        role: solverEvidenceArtifacts.role,
+        engineUrl: solverEvidenceArtifacts.engineUrl,
+      })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            fixture.result.currentResultAttemptId!,
+          ),
+          eq(solverEvidenceArtifacts.sha256, sha256(bundleBytes)),
+        ),
+      )
+      .limit(1);
+    expect(stored).toMatchObject({
+      kind: "engine_bundle",
+      role: "evidence",
+      engineUrl:
+        "https://upstream.example.test/api/sync/v1/artifacts/generic-engine-bundle/download",
+    });
+  });
+
   it("refuses an up-tier authority switch while mirrored work is unfinished", async () => {
     const oldBase = "http://old-hub.test/api/sync/v1";
     const oldSecret = `${PREFIX}-old-upstream-secret`;

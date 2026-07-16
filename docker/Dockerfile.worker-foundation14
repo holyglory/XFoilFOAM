@@ -1,0 +1,70 @@
+# Dedicated OpenFOAM Foundation v14 worker.  It consumes a separate Celery
+# queue, so deploying or rolling it cannot recreate the default OpenCFD v2606
+# worker or terminate its in-flight solves.
+FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+
+ARG TARGETARCH
+ARG AIRFOILFOAM_BUILD_ID=dev
+
+LABEL org.opencontainers.image.source="https://github.com/holyglory/XFoilFOAM" \
+      org.opencontainers.image.revision="${AIRFOILFOAM_BUILD_ID}" \
+      org.opencontainers.image.version="openfoam-foundation-14" \
+      org.opencontainers.image.title="XFoilFOAM OpenFOAM Foundation 14 worker" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      io.xfoilfoam.engine.source="https://github.com/OpenFOAM/OpenFOAM-14" \
+      io.xfoilfoam.engine.revision="b4f91ad8bbbab628441562fc419f040cc4796f11" \
+      io.xfoilfoam.engine.package-version="20260714" \
+      io.xfoilfoam.engine.package-sha256.amd64="901e23926da833f0515969c563b258639ffbdee7f26270452c3384b3f689d30f" \
+      io.xfoilfoam.engine.package-sha256.arm64="68ce8b2d20f1cf9eb971f37acdc1e771b658f5ac0cd28056f46e645ffed3a0f2"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-pip python3-venv ffmpeg \
+    && case "${TARGETARCH}" in \
+         amd64) package_arch=amd64; package_sha="901e23926da833f0515969c563b258639ffbdee7f26270452c3384b3f689d30f" ;; \
+         arm64) package_arch=arm64; package_sha="68ce8b2d20f1cf9eb971f37acdc1e771b658f5ac0cd28056f46e645ffed3a0f2" ;; \
+         *) echo "unsupported OpenFOAM 14 package architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && package_url="https://dl.openfoam.org/ubuntu/dists/noble/main/binary-${package_arch}/openfoam14_20260714_${package_arch}.deb" \
+    && curl -fL "${package_url}" -o /tmp/openfoam14.deb \
+    && echo "${package_sha}  /tmp/openfoam14.deb" | sha256sum -c - \
+    && echo "${package_sha}" > /etc/airfoilfoam-engine-package-sha256 \
+    && apt-get install -y --no-install-recommends /tmp/openfoam14.deb \
+    && rm -f /tmp/openfoam14.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV AIRFOILFOAM_OPENFOAM_RUNNER=local \
+    AIRFOILFOAM_OPENFOAM_BASHRC=/opt/openfoam14/etc/bashrc \
+    AIRFOILFOAM_ENGINE_FAMILY=openfoam \
+    AIRFOILFOAM_ENGINE_DISTRIBUTION=foundation \
+    AIRFOILFOAM_ENGINE_VERSION=14 \
+    AIRFOILFOAM_ENGINE_NUMERICS_REVISION=1 \
+    AIRFOILFOAM_ENGINE_ADAPTER_CONTRACT_VERSION=1 \
+    AIRFOILFOAM_ENGINE_SOURCE_REVISION=b4f91ad8bbbab628441562fc419f040cc4796f11 \
+    AIRFOILFOAM_CELERY_QUEUE=openfoam-foundation-14 \
+    AIRFOILFOAM_DATA_DIR=/data/airfoilfoam \
+    AIRFOILFOAM_BUILD_ID=${AIRFOILFOAM_BUILD_ID} \
+    AIRFOILFOAM_CELERY_CONCURRENCY=8 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    C_FORCE_ROOT=1 \
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/airfoilfoam-venv \
+    PATH=/opt/airfoilfoam-venv/bin:${PATH}
+
+RUN python3 -m venv "${VIRTUAL_ENV}"
+WORKDIR /app
+COPY docker/build-requirements.lock docker/requirements.lock /tmp/
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN PYTHONPATH=src python3 -c "from pathlib import Path; from airfoilfoam.provenance import write_application_source_sha256; write_application_source_sha256(Path('/app'))" \
+    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/build-requirements.lock \
+    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && python3 -m pip check \
+    && python3 -c "from importlib.metadata import version; expected = {'google-cloud-storage': '3.13.0', 'google-crc32c': '1.8.0', 'zstandard': '0.25.0'}; actual = {name: version(name) for name in expected}; assert actual == expected, f'dependency version mismatch: {actual!r}'" \
+    && rm -f /tmp/build-requirements.lock /tmp/requirements.lock
+
+RUN mkdir -p /data/airfoilfoam
+
+CMD ["sh", "-c", "export AIRFOILFOAM_ENGINE_PACKAGE_SHA256=$(cat /etc/airfoilfoam-engine-package-sha256); celery -A airfoilfoam.celery_app worker --loglevel=info --concurrency=${AIRFOILFOAM_CELERY_CONCURRENCY:-8} -Q ${AIRFOILFOAM_CELERY_QUEUE:-openfoam-foundation-14}"]

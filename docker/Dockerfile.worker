@@ -1,31 +1,84 @@
 # Worker image: OpenFOAM + Python. The container *is* the OpenFOAM environment,
 # so the solver runs locally inside it (AIRFOILFOAM_OPENFOAM_RUNNER=local).
-FROM opencfd/openfoam-default:2406
+FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb
+
+ARG TARGETARCH
+# Measured SHA-256 values of the official OpenCFD Resolute package artifacts:
+# https://dl.openfoam.com/repos/deb/dists/resolute/main/binary-${TARGETARCH}/Packages.gz
+ARG AIRFOILFOAM_BUILD_ID=dev
+
+LABEL org.opencontainers.image.source="https://github.com/holyglory/XFoilFOAM" \
+      org.opencontainers.image.revision="${AIRFOILFOAM_BUILD_ID}" \
+      org.opencontainers.image.version="openfoam-opencfd-2606" \
+      org.opencontainers.image.title="XFoilFOAM OpenFOAM OpenCFD 2606 worker" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      io.xfoilfoam.engine.source="https://gitlab.com/openfoam/core/openfoam/-/tree/OpenFOAM-v2606" \
+      io.xfoilfoam.engine.revision="481094fdf34f11ed6d0d603ee59a858a0124236d" \
+      io.xfoilfoam.engine.package-version="2606.0~rc2-1" \
+      io.xfoilfoam.engine.package-sha256.amd64="aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d" \
+      io.xfoilfoam.engine.package-sha256.arm64="8d395ac52c284bc74c0aed774f692004d47ad7088596fabde5efc1f71991548a" \
+      io.xfoilfoam.engine.base-image="opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb"
 
 USER root
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv ffmpeg \
+    && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-pip python3-venv ffmpeg \
+    && case "${TARGETARCH}" in \
+         amd64) package_arch=amd64; package_sha="aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d" ;; \
+         arm64) package_arch=arm64; package_sha="8d395ac52c284bc74c0aed774f692004d47ad7088596fabde5efc1f71991548a" ;; \
+         *) echo "unsupported OpenCFD 2606 package architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && package_url="https://dl.openfoam.com/repos/deb/dists/resolute/main/pool/2606_0/binary-${package_arch}/openfoam2606_2606.0~rc2-1_${package_arch}.deb" \
+    && curl -fL "${package_url}" -o /tmp/openfoam2606.deb \
+    && echo "${package_sha}  /tmp/openfoam2606.deb" | sha256sum -c - \
+    && test "$(dpkg-deb -f /tmp/openfoam2606.deb Version)" = "2606.0~rc2-1" \
+    && installed_version="$(dpkg-query -W -f='${Version}' openfoam2606)" \
+    && test "${installed_version}" = "2606.0~rc2-1" \
+    && mkdir -p /tmp/openfoam2606-root \
+    && dpkg-deb -x /tmp/openfoam2606.deb /tmp/openfoam2606-root \
+    && binary="$(bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1; command -v simpleFoam')" \
+    && test -n "${binary}" \
+    && test -f "/tmp/openfoam2606-root${binary}" \
+    && cmp -s "${binary}" "/tmp/openfoam2606-root${binary}" \
+    && echo "${package_sha}" > /etc/airfoilfoam-engine-package-sha256 \
+    && sha256sum "${binary}" | cut -d " " -f 1 > /etc/airfoilfoam-engine-binary-sha256 \
+    && rm -rf /tmp/openfoam2606.deb /tmp/openfoam2606-root \
     && rm -rf /var/lib/apt/lists/*
 
-ARG AIRFOILFOAM_BUILD_ID=dev
 ENV AIRFOILFOAM_OPENFOAM_RUNNER=local \
-    AIRFOILFOAM_OPENFOAM_BASHRC=/usr/lib/openfoam/openfoam2406/etc/bashrc \
+    AIRFOILFOAM_OPENFOAM_BASHRC=/usr/lib/openfoam/openfoam2606/etc/bashrc \
+    AIRFOILFOAM_ENGINE_FAMILY=openfoam \
+    AIRFOILFOAM_ENGINE_DISTRIBUTION=opencfd \
+    AIRFOILFOAM_ENGINE_VERSION=2606 \
+    AIRFOILFOAM_ENGINE_NUMERICS_REVISION=1 \
+    AIRFOILFOAM_ENGINE_ADAPTER_CONTRACT_VERSION=1 \
+    AIRFOILFOAM_ENGINE_SOURCE_REVISION=481094fdf34f11ed6d0d603ee59a858a0124236d \
+    AIRFOILFOAM_CELERY_QUEUE=openfoam-opencfd-2606 \
     AIRFOILFOAM_DATA_DIR=/data/airfoilfoam \
     AIRFOILFOAM_BUILD_ID=${AIRFOILFOAM_BUILD_ID} \
     AIRFOILFOAM_CELERY_CONCURRENCY=8 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     C_FORCE_ROOT=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/airfoilfoam-venv \
+    PATH=/opt/airfoilfoam-venv/bin:${PATH}
 
+RUN python3 -m venv "${VIRTUAL_ENV}"
 WORKDIR /app
+COPY docker/build-requirements.lock docker/requirements.lock /tmp/
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip3 install --no-cache-dir .
+RUN PYTHONPATH=src python3 -c "from pathlib import Path; from airfoilfoam.provenance import write_application_source_sha256; write_application_source_sha256(Path('/app'))" \
+    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/build-requirements.lock \
+    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && python3 -m pip check \
+    && python3 -c "from importlib.metadata import version; expected = {'google-cloud-storage': '3.13.0', 'google-crc32c': '1.8.0', 'zstandard': '0.25.0'}; actual = {name: version(name) for name in expected}; assert actual == expected, f'dependency version mismatch: {actual!r}'" \
+    && rm -f /tmp/build-requirements.lock /tmp/requirements.lock
 
 RUN mkdir -p /data/airfoilfoam
 
-# The opencfd OpenFOAM image runs as root; MPI runs use --allow-run-as-root.
+# The OpenCFD runtime image runs as root; MPI runs use --allow-run-as-root.
 # -A airfoilfoam.celery_app imports tasks; worker-local CPU tokens coordinate
 # OpenFOAM solves across these Celery processes.
-CMD ["sh", "-c", "celery -A airfoilfoam.celery_app worker --loglevel=info --concurrency=${AIRFOILFOAM_CELERY_CONCURRENCY:-8}"]
+CMD ["sh", "-c", "export AIRFOILFOAM_ENGINE_PACKAGE_SHA256=$(cat /etc/airfoilfoam-engine-package-sha256); export AIRFOILFOAM_ENGINE_BINARY_SHA256=$(cat /etc/airfoilfoam-engine-binary-sha256); celery -A airfoilfoam.celery_app worker --loglevel=info --concurrency=${AIRFOILFOAM_CELERY_CONCURRENCY:-8} -Q ${AIRFOILFOAM_CELERY_QUEUE:-openfoam-opencfd-2606}"]

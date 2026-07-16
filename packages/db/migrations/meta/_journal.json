@@ -456,6 +456,27 @@
       "when": 1786406400000,
       "tag": "0064_precalc_physical_attempt_budget",
       "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1786492800000,
+      "tag": "0065_solver_engine_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1786579200000,
+      "tag": "0066_opencfd_2606_campaign_cutover",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1786665600000,
+      "tag": "0067_solver_evidence_object_storage",
+      "breakpoints": true
     }
   ]
 }

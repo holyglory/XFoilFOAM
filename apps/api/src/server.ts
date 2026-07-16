@@ -5,6 +5,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import { registerAdminRoutes } from "./admin-routes";
 import { registerCampaignRoutes } from "./campaign-routes";
+import { registerEngineCutoverRoutes } from "./engine-cutover-routes";
 import { registerPointHistoryRoutes } from "./point-history-routes";
 import { registerRoutes } from "./routes";
 import { registerSolvedPointsRoutes } from "./solved-points-routes";
@@ -37,6 +38,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerSolvedPointsRoutes(app);
   await registerPointHistoryRoutes(app);
   await registerCampaignRoutes(app);
+  await registerEngineCutoverRoutes(app);
   app.setErrorHandler(
     (err: Error & { code?: string; statusCode?: number }, _req, reply) => {
       const multipartLimit =

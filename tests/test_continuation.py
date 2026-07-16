@@ -114,7 +114,7 @@ def _make_saved_case(
     steady_coeff.write_text(_coeff_rows(0.001, 0.02))
     # Media/evidence bulk a continuation must NOT drag along.
     (case_dir / "evidence").mkdir()
-    (case_dir / "evidence" / "openfoam_evidence.tar.gz").write_text("bundle")
+    (case_dir / "evidence" / "engine_evidence.tar.zst").write_text("bundle")
     (case_dir / "images").mkdir()
     (case_dir / "images" / "vorticity.png").write_text("png")
     (tcase / "VTK").mkdir()

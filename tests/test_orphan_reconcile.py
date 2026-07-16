@@ -21,6 +21,7 @@ from airfoilfoam.models import (
     PolarPoint,
 )
 from airfoilfoam.storage import ORPHAN_MESSAGE, JobStore
+from airfoilfoam.openfoam.dialects import FOUNDATION_14_IDENTITY
 
 
 def make_store(tmp_path) -> JobStore:
@@ -192,8 +193,27 @@ class _FakeSender:
 def test_worker_ready_hook_reconciles_and_revokes(tmp_path, monkeypatch):
     settings = Settings(data_dir=tmp_path / "data")
     store = JobStore(settings)
-    seed(store, "zombie", JobState.running, task_id="zombie")
-    seed(store, "alive", JobState.running, task_id="alive")
+    seed(
+        store,
+        "zombie",
+        JobState.running,
+        task_id="zombie",
+        requested_engine=settings.engine_identity(),
+    )
+    seed(
+        store,
+        "alive",
+        JobState.running,
+        task_id="alive",
+        requested_engine=settings.engine_identity(),
+    )
+    seed(
+        store,
+        "other-engine",
+        JobState.running,
+        task_id="other-engine",
+        requested_engine=FOUNDATION_14_IDENTITY,
+    )
 
     monkeypatch.setattr(tasks, "get_settings", lambda: settings)
     monkeypatch.setattr(tasks, "_WORKER_BOOT_TIME", now_utc() + timedelta(seconds=1))
@@ -204,14 +224,22 @@ def test_worker_ready_hook_reconciles_and_revokes(tmp_path, monkeypatch):
     assert store.read_status("zombie").state is JobState.failed
     assert store.read_status("zombie").message == ORPHAN_MESSAGE
     assert store.read_status("alive").state is JobState.running
+    # An OpenCFD worker must never fail a Foundation job merely because that
+    # job is absent from this worker's active-task view.
+    assert store.read_status("other-engine").state is JobState.running
     # lost task revoked so an acks_late redelivery cannot resurrect the job
     assert app.control.revoked == ["zombie"]
 
 
-def test_worker_ready_hook_survives_inspect_failure(tmp_path, monkeypatch):
+def test_worker_ready_hook_fails_closed_on_inspect_failure(tmp_path, monkeypatch):
     settings = Settings(data_dir=tmp_path / "data")
     store = JobStore(settings)
-    seed(store, "zombie", JobState.running)
+    seed(
+        store,
+        "zombie",
+        JobState.running,
+        requested_engine=settings.engine_identity(),
+    )
 
     monkeypatch.setattr(tasks, "get_settings", lambda: settings)
     monkeypatch.setattr(tasks, "_WORKER_BOOT_TIME", now_utc() + timedelta(seconds=1))
@@ -228,5 +256,7 @@ def test_worker_ready_hook_survives_inspect_failure(tmp_path, monkeypatch):
 
     tasks.reconcile_orphaned_jobs(sender=_FakeSender(_BrokenApp()))
 
-    assert store.read_status("zombie").state is JobState.failed
-    assert store.read_status("zombie").message == ORPHAN_MESSAGE
+    # Cross-worker state is unknown, so a healthy solve in another container
+    # must not be terminalized from a shared filesystem scan.
+    assert store.read_status("zombie").state is JobState.running
+    assert store.read_status("zombie").message is None

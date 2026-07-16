@@ -1,9 +1,14 @@
 import { type Point } from "@aerodb/core";
-import type { Airfoil } from "@aerodb/db";
+import {
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  type Airfoil,
+} from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import {
   ALL_IMAGE_FIELDS,
+  LEGACY_OPENCFD_2406_ENGINE,
   type AirfoilFormat,
+  type EngineIdentity,
   type MeshParams,
   type PolarRequest,
   type RansFailurePolicy,
@@ -11,6 +16,39 @@ import {
   type TurbulenceModelName,
   type UransFidelity,
 } from "@aerodb/engine-client";
+
+export function engineIdentityForSetup(
+  setup: SimulationSetupSnapshot,
+): EngineIdentity {
+  const engine = setup.engine;
+  if (!engine) return { ...LEGACY_OPENCFD_2406_ENGINE };
+  if (
+    engine.family !== "openfoam" ||
+    (engine.distribution !== "opencfd" && engine.distribution !== "foundation")
+  ) {
+    throw new Error(
+      `unsupported solver implementation ${engine.key}; this worker supports OpenFOAM only`,
+    );
+  }
+  return {
+    family: engine.family,
+    distribution: engine.distribution,
+    version: engine.releaseVersion,
+    numerics_revision: engine.numericsRevision,
+    adapter_contract_version: engine.adapterContractVersion,
+  };
+}
+
+/** Requested implementation FK for newly composed jobs. A historical
+ * snapshot without structured identity can enter only the explicit legacy
+ * OpenCFD-v2406 compatibility route. */
+export function solverImplementationIdForSetup(
+  setup: SimulationSetupSnapshot,
+): string {
+  return (
+    setup.engine?.implementationId ?? OPENCFD_2406_SOLVER_IMPLEMENTATION_ID
+  );
+}
 
 /** Map an immutable simulation setup revision + airfoil into a Python PolarRequest.
  *  wave 1 = steady (transient_fallback off); wave 2 = re-run post-stall as URANS.
@@ -36,6 +74,9 @@ export function buildPolarRequest(opts: {
    *  (one shared mesh per chord, all speeds×angles march warm-started).
    *  Omitted → the snapshot's single speed (legacy behavior). */
   speeds?: number[];
+  /** Logical numerical implementation selected by the immutable setup.
+   * Defaults only to the historical OpenCFD-v2406 compatibility path. */
+  engineIdentity?: EngineIdentity;
 }): { request: PolarRequest; speed: number; nu: number } {
   const {
     airfoil,
@@ -46,6 +87,7 @@ export function buildPolarRequest(opts: {
     ransFailurePolicy,
     cpuSlots,
     speeds,
+    engineIdentity,
   } = opts;
   const cpuBudget =
     cpuSlots == null
@@ -69,6 +111,9 @@ export function buildPolarRequest(opts: {
     span_chords: mesh.spanChords,
   });
   const request: PolarRequest = {
+    expected_engine: {
+      ...(engineIdentity ?? engineIdentityForSetup(setup)),
+    },
     airfoil: {
       name: airfoil.name,
       format: airfoil.pointFormat as AirfoilFormat,

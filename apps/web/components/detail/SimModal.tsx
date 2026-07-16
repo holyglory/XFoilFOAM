@@ -280,6 +280,9 @@ export function SimModal(props: {
   }, [ctx?.aoa, ctx?.resultId, sim?.alpha, sortedTrack]);
   const evidenceBundle =
     sim?.evidenceArtifacts?.find(
+      (artifact) => artifact.kind === "engine_bundle",
+    ) ??
+    sim?.evidenceArtifacts?.find(
       (artifact) => artifact.kind === "openfoam_bundle",
     ) ?? null;
   const fieldDataArtifact =

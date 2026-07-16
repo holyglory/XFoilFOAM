@@ -58,9 +58,16 @@ import {
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
-import { buildPolarRequest } from "./build-request";
+import {
+  buildPolarRequest,
+  solverImplementationIdForSetup,
+} from "./build-request";
 import { engineMeshRecoveryVersion } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
+import {
+  requireExecutionPoolForSetup,
+  SolverExecutionPoolUnavailableError,
+} from "./engine-pool";
 import { touchHeartbeat } from "./heartbeat";
 import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
@@ -1048,6 +1055,20 @@ async function submitLadderJob(
       error: `airfoil ${target.airfoilId} not found`,
     };
   }
+  let executionPool;
+  try {
+    executionPool = await requireExecutionPoolForSetup(db, target.snapshot);
+  } catch (error) {
+    if (!(error instanceof SolverExecutionPoolUnavailableError)) throw error;
+    return {
+      jobId: "",
+      submitted: false,
+      connectionFailure: false,
+      lifecycleStopped: false,
+      submissionInProgress: false,
+      error: error.message,
+    };
+  }
   const { request, speed } = buildPolarRequest({
     airfoil: a,
     setup: target.snapshot,
@@ -1056,6 +1077,7 @@ async function submitLadderJob(
     uransFidelity: fidelity,
     cpuSlots,
   });
+  request.expected_execution_pool = executionPool.routingKey;
   // Ladder jobs are URANS-BY-DEFINITION: the in-job steady stage is only the
   // designed warm-start init, never the reported result. Pin the transient
   // flags locally instead of relying on buildPolarRequest's wave-2 inference —
@@ -1091,6 +1113,9 @@ async function submitLadderJob(
     airfoilId: a.id,
     bcIds: [target.bcId],
     simulationPresetRevisionId: target.revisionId,
+    solverImplementationId: solverImplementationIdForSetup(target.snapshot),
+    solverExecutionPoolId: executionPool.id,
+    methodKey: "openfoam.urans",
     campaignId: campaignId ?? null,
     jobKind,
     referenceChordM: target.snapshot.referenceGeometry.referenceLengthM,

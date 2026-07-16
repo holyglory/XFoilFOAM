@@ -2,6 +2,7 @@
 foamToVTK output, loud (never silent) URANS media failures, and the refined
 URANS feasibility guard. No OpenFOAM / no real solves."""
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from airfoilfoam.pipeline import (
     _finalize_outcome,
 )
 from airfoilfoam.postprocess.images import _vtu_time, find_all_vtus, select_vtus
+from airfoilfoam.postprocess.unsteady import ForceHistory
 
 
 # ---------------------------------------------------------------------------
@@ -142,14 +144,55 @@ def test_urans_media_render_failures_are_loud_quality_warnings(tmp_path, monkeyp
     avg = SimpleNamespace(cl=0.45, cd=0.08, cm=-0.02, cl_cd=5.625, cl_std=0.01, cd_std=0.002, cm_std=0.001)
 
     def fake_transient(case_dir, *_args, **_kwargs):
+        period = 0.25
+        times = [3.0 * i / 1200 for i in range(1201)]
+        cl = [0.45 + 0.05 * math.sin(2.0 * math.pi * t / period) for t in times]
+        cd = [0.08 + 0.005 * math.cos(2.0 * math.pi * t / period) for t in times]
+        cm = [-0.02 + 0.002 * math.sin(2.0 * math.pi * t / period) for t in times]
+        coeff = case_dir / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+        coeff.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+        ]
+        rows.extend(
+            f"{t:.8g} {drag:.8g} 0 0 {lift:.8g} 0 0 {moment:.8g} 0 0 0 0 0"
+            for t, lift, drag, moment in zip(times, cl, cd, cm)
+        )
+        coeff.write_text("\n".join(rows) + "\n")
+        history = ForceHistory(
+            t=times,
+            cl=cl,
+            cd=cd,
+            cm=cm,
+            cl_mean=sum(cl) / len(cl),
+            cl_rms=(sum((value - 0.45) ** 2 for value in cl) / len(cl)) ** 0.5,
+            cd_mean=sum(cd) / len(cd),
+            cd_rms=(sum((value - 0.08) ** 2 for value in cd) / len(cd)) ** 0.5,
+            cm_mean=sum(cm) / len(cm),
+            cm_rms=(sum((value + 0.02) ** 2 for value in cm) / len(cm)) ** 0.5,
+            shedding_freq_hz=1.0 / period,
+            strouhal=(1.0 / period) / 10.0,
+            samples=len(times),
+            period_s=period,
+            retained_cycles=12,
+            window_start=times[0],
+            window_end=times[-1],
+        )
         return TransientResult(
             avg=avg,
             case_dir=case_dir,
-            force_history=None,
-            quality=UransQuality(ok=True, can_refine=False, reason="ok"),
+            force_history=history,
+            quality=UransQuality(
+                ok=True,
+                can_refine=False,
+                reason="ok",
+                measured_period_s=period,
+                retained_cycles=12,
+            ),
             start_time=0.0,
-            end_time=1.0,
-            run_time=1.0,
+            end_time=3.0,
+            run_time=3.0,
+            coeff_paths=[coeff],
         )
 
     def boom_mean(*_args, **_kwargs):
@@ -181,7 +224,9 @@ def test_urans_media_render_failures_are_loud_quality_warnings(tmp_path, monkeyp
         fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
         roughness=RoughnessParams(),
         solver_params=SolverParams(
-            force_transient=True, write_images=[ImageField.velocity_magnitude]
+            force_transient=True,
+            write_images=[ImageField.velocity_magnitude],
+            frame_fields=[],
         ),
         runner=FakeRunner(),
         n_proc=1,
@@ -192,7 +237,8 @@ def test_urans_media_render_failures_are_loud_quality_warnings(tmp_path, monkeyp
     # The job still succeeds (media loss is degradation, not failure) ...
     assert outcome.unsteady
     assert outcome.converged
-    assert outcome.cl == pytest.approx(0.45)
+    assert outcome.frame_track is not None
+    assert outcome.cl == pytest.approx(0.45, abs=5e-5)
     # ... but the losses are recorded loudly, not swallowed.
     warnings = "\n".join(outcome.quality_warnings)
     assert "mean-image render failed: no VTU frames in retained window" in warnings

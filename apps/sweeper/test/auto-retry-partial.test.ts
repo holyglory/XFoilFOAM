@@ -27,6 +27,8 @@
 // Live shared-DB pattern (auto-retry.test.ts harness): scoped rows,
 // file-unique chord, shared guarded cleanup.
 
+import "./enabled-engine-pool-fixture";
+
 import {
   airfoils,
   boundaryProfiles,

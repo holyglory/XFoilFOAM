@@ -27,10 +27,10 @@ import {
   simulationPresetRevisions,
 } from "./schema";
 import {
-  ensureRevisionPhysicsHash,
+  ensureRevisionMethodCompatibilityHash,
   POLAR_COMPATIBILITY_VERSION,
   refreshPolarCompatibilityCache,
-  resolveRevisionPhysicsHash,
+  resolveRevisionMethodCompatibilityHash,
 } from "./polar-compatibility-cache";
 export * from "./polar-compatibility-cache";
 
@@ -847,7 +847,7 @@ export async function refreshPolarCacheForRevision(
 ): Promise<PolarCacheRefreshResult> {
   const refreshed = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
-    const compatibilityHash = await resolveRevisionPhysicsHash(
+    const compatibilityHash = await resolveRevisionMethodCompatibilityHash(
       tx,
       simulationPresetRevisionId,
     );
@@ -863,13 +863,14 @@ export async function refreshPolarCacheForRevision(
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`polar-revision:${airfoilId}:${simulationPresetRevisionId}`}, 0))`,
     );
-    const persistedCompatibilityHash = await ensureRevisionPhysicsHash(
-      tx,
-      simulationPresetRevisionId,
-    );
+    const persistedCompatibilityHash =
+      await ensureRevisionMethodCompatibilityHash(
+        tx,
+        simulationPresetRevisionId,
+      );
     if (persistedCompatibilityHash !== compatibilityHash) {
       throw new Error(
-        `revision physics hash changed while acquiring ordered polar locks (${simulationPresetRevisionId})`,
+        `revision method compatibility hash changed while acquiring ordered polar locks (${simulationPresetRevisionId})`,
       );
     }
     await hooks?.beforeEvidenceLoad?.(tx);

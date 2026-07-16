@@ -718,9 +718,14 @@ export async function campaignReviewBucketRows(
       COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
       COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
     FROM sim_campaign_points p
+    JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
+    JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
-    WHERE p.campaign_id = ${campaignId} ${airfoilFilter}
+    WHERE p.campaign_id = ${campaignId}
+      AND condition.generation = campaign.current_condition_generation
+      AND condition.status IN ('active', 'kept')
+      ${airfoilFilter}
     GROUP BY p.condition_id, p.airfoil_id
     HAVING COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL}) > 0
         OR COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL}) > 0
@@ -743,9 +748,13 @@ export async function campaignReviewBuckets(
       COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
       COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
     FROM sim_campaign_points p
+    JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
+    JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
     WHERE p.campaign_id = ${campaignId}
+      AND condition.generation = campaign.current_condition_generation
+      AND condition.status IN ('active', 'kept')
   `)) as unknown as Array<{ awaiting_urans: number; needs_review: number }>;
   return {
     awaitingUrans: Number(row?.awaiting_urans ?? 0),
@@ -765,12 +774,16 @@ export async function reviewBucketsByCampaign(
       COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
       COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
     FROM sim_campaign_points p
+    JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
+    JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
     WHERE p.campaign_id = ANY(${sql`ARRAY[${sql.join(
       campaignIds.map((id) => sql`${id}::uuid`),
       sql`, `,
     )}]`})
+      AND condition.generation = campaign.current_condition_generation
+      AND condition.status IN ('active', 'kept')
     GROUP BY p.campaign_id
   `)) as unknown as Array<{
     campaign_id: string;

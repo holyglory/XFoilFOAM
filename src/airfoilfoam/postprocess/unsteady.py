@@ -1199,12 +1199,16 @@ def force_history(
     max_points: int = 400,
     target_cycles: int = 7,
     alpha_deg: float | None = None,
+    observation_start_time: float | None = None,
 ) -> ForceHistory:
     """Extract the windowed Cl/Cd/Cm time series from a transient coefficient.dat,
     plus the measured shedding frequency and Strouhal number.
 
     Drops the first ``discard_fraction`` (startup) and downsamples to at most
-    ``max_points`` for transport.
+    ``max_points`` for transport. ``observation_start_time`` may additionally
+    pin an exact physical-time boundary; that boundary is interpolated between
+    real adjacent coefficient samples so an adaptive timestep cannot shorten a
+    required observation horizon by one sample.
     """
     t_all, cl_all, cd_all, cm_all = _coefficient_series(path)
     if t_all.size == 0:
@@ -1212,8 +1216,29 @@ def force_history(
     start_time = float(t_all[0])
     if discard_fraction > 0 and t_all[-1] > t_all[0]:
         start_time = float(t_all[0]) + min(max(discard_fraction, 0.0), 0.999999) * float(t_all[-1] - t_all[0])
-    mask = t_all >= start_time
-    t_a, cl_a, cd_a, cm_a = t_all[mask], cl_all[mask], cd_all[mask], cm_all[mask]
+    if observation_start_time is not None:
+        try:
+            explicit_start = float(observation_start_time)
+        except (TypeError, ValueError):
+            explicit_start = math.inf
+        if math.isfinite(explicit_start):
+            start_time = max(start_time, explicit_start)
+    if start_time > float(t_all[0]) and start_time < float(t_all[-1]):
+        t_a, cl_a, cd_a, cm_a = _window_series(
+            t_all,
+            cl_all,
+            cd_all,
+            cm_all,
+            PeriodWindow(
+                start=start_time,
+                end=float(t_all[-1]),
+                cycles=0,
+                period_s=0.0,
+            ),
+        )
+    else:
+        mask = t_all >= start_time
+        t_a, cl_a, cd_a, cm_a = t_all[mask], cl_all[mask], cd_all[mask], cm_all[mask]
     if t_a.size == 0:
         raise ValueError(f"No usable coefficient data found in {path}")
 

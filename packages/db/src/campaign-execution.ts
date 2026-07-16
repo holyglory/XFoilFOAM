@@ -19,6 +19,10 @@ import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
 import {
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_SNAPSHOT,
+  type SolverImplementationSnapshot,
+} from "./solver-implementations";
+import {
   airfoils,
   polarFitSets,
   simCampaignConditions,
@@ -187,6 +191,7 @@ export function settledCampaignUransChildSql(columns: {
  *  read (the jsonb payload always carries these blocks). */
 export interface CampaignBatchSnapshot {
   preset?: { legacyBoundaryConditionId?: string | null };
+  engine?: SolverImplementationSnapshot;
   flowState: {
     mediumId: string;
     temperatureK: number;
@@ -290,7 +295,20 @@ function withoutRowIdentity(
  * profiles group together across presets.
  */
 export function campaignBatchGroupKey(snapshot: CampaignBatchSnapshot): string {
+  const engine =
+    snapshot.engine ?? LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_SNAPSHOT;
   const subset = {
+    // Execution grouping includes the adapter contract even though public
+    // polar compatibility does not: one engine job must use one wire dialect.
+    engine: {
+      key: engine.key,
+      family: engine.family,
+      distribution: engine.distribution,
+      releaseVersion: engine.releaseVersion,
+      methodFamily: engine.methodFamily,
+      adapterContractVersion: engine.adapterContractVersion,
+      numericsRevision: engine.numericsRevision,
+    },
     ambient: {
       mediumId: snapshot.flowState.mediumId,
       temperatureK: snapshot.flowState.temperatureK,
@@ -469,7 +487,10 @@ export async function findCampaignGapBatch(
            p.revision_id, cond.preset_id, camp.priority, cond.reynolds, a.slug
     FROM sim_campaign_points p
     JOIN sim_campaigns camp ON camp.id = p.campaign_id AND camp.status = 'active'
-    JOIN sim_campaign_conditions cond ON cond.id = p.condition_id AND cond.status IN ('active', 'kept')
+    JOIN sim_campaign_conditions cond
+      ON cond.id = p.condition_id
+     AND cond.generation = camp.current_condition_generation
+     AND cond.status IN ('active', 'kept')
     JOIN airfoils a ON a.id = p.airfoil_id
     LEFT JOIN results r
       ON r.airfoil_id = p.airfoil_id AND r.simulation_preset_revision_id = p.revision_id AND r.aoa_deg = p.aoa_deg
@@ -501,7 +522,11 @@ export async function findCampaignGapBatch(
            ) AS requested_aoas,
            array_agg(p.aoa_deg::float8 ORDER BY p.aoa_deg) AS aoas
     FROM sim_campaign_points p
-    JOIN sim_campaign_conditions cond ON cond.id = p.condition_id AND cond.status IN ('active', 'kept')
+    JOIN sim_campaigns camp ON camp.id = p.campaign_id
+    JOIN sim_campaign_conditions cond
+      ON cond.id = p.condition_id
+     AND cond.generation = camp.current_condition_generation
+     AND cond.status IN ('active', 'kept')
     JOIN simulation_preset_revisions rev ON rev.id = p.revision_id
     JOIN airfoils a ON a.id = p.airfoil_id
     LEFT JOIN results r
@@ -936,6 +961,7 @@ export async function probeCampaignCompletion(
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'requested' AND c.status IN ('active', 'kept')
+          AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND NOT EXISTS (
             SELECT 1 FROM sim_precalc_obligations blocked_obligation
             WHERE blocked_obligation.airfoil_id = p.airfoil_id
@@ -945,8 +971,16 @@ export async function probeCampaignCompletion(
           )
       ) AS open,
       EXISTS (
-        SELECT 1 FROM sim_campaign_lanes l
-        WHERE l.campaign_id = ${campaignId} AND l.state IN ('awaiting_seed', 'iterating')
+        SELECT 1
+        FROM sim_campaign_lanes l
+        JOIN sim_campaign_conditions lane_condition
+          ON lane_condition.id = l.condition_id
+        JOIN sim_campaigns lane_campaign
+          ON lane_campaign.id = l.campaign_id
+        WHERE l.campaign_id = ${campaignId}
+          AND lane_condition.generation = lane_campaign.current_condition_generation
+          AND lane_condition.status IN ('active', 'kept')
+          AND l.state IN ('awaiting_seed', 'iterating')
       ) AS lanes_open,
       EXISTS (
         SELECT 1 FROM sim_campaign_points p
@@ -954,6 +988,7 @@ export async function probeCampaignCompletion(
         JOIN results live
           ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
+          AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND live.status IN ('queued', 'running', 'pending', 'stale')
       ) AS in_flight,
       EXISTS (
@@ -966,6 +1001,7 @@ export async function probeCampaignCompletion(
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results r ON r.id = p.result_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
+          AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND r.status = 'failed'
       ) AS has_failed,
       EXISTS (
@@ -974,6 +1010,7 @@ export async function probeCampaignCompletion(
         LEFT JOIN results r ON r.id = p.result_id
         LEFT JOIN result_classifications rc ON rc.result_id = r.id
         WHERE p.campaign_id = ${campaignId} AND c.status IN ('active', 'kept')
+          AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND p.derived_by_symmetry = false
           AND (
             (p.state = 'terminal' AND r.status = 'done' AND (
@@ -1001,6 +1038,7 @@ export async function probeCampaignCompletion(
         JOIN result_classifications rc ON rc.result_id = p.result_id
         JOIN results tier_result ON tier_result.id = p.result_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
+          AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND p.derived_by_symmetry = false
           AND (
             NOT EXISTS (
@@ -1049,7 +1087,13 @@ export async function probeCampaignCompletion(
         SELECT 1
         FROM result_media_repairs repair
         JOIN sim_campaign_points media_point ON media_point.result_id = repair.result_id
+        JOIN sim_campaign_conditions media_condition
+          ON media_condition.id = media_point.condition_id
+        JOIN sim_campaigns media_campaign
+          ON media_campaign.id = media_point.campaign_id
         WHERE media_point.campaign_id = ${campaignId}
+          AND media_condition.generation = media_campaign.current_condition_generation
+          AND media_condition.status IN ('active', 'kept')
           AND NOT media_point.derived_by_symmetry
           AND repair.state IN ('pending', 'running', 'retry_wait')
       )) AS precalc_open,
@@ -1910,7 +1954,12 @@ export async function laneTick(
     .from(simCampaignConditions)
     .where(eq(simCampaignConditions.id, key.conditionId))
     .limit(1);
-  if (!condition || condition.status === "released") return frozen;
+  if (
+    !condition ||
+    !["active", "kept"].includes(condition.status) ||
+    condition.generation !== campaign.currentConditionGeneration
+  )
+    return frozen;
 
   const [planRev] = campaign.currentPlanRevisionId
     ? await db
@@ -2275,8 +2324,12 @@ export async function reconcileCampaigns(
     ? ((await db.execute(sql`
         SELECT l.campaign_id, l.airfoil_id, l.condition_id, l.objective
         FROM sim_campaign_lanes l
+        JOIN sim_campaign_conditions condition ON condition.id = l.condition_id
+        JOIN sim_campaigns campaign ON campaign.id = l.campaign_id
         LEFT JOIN polar_fit_sets f ON f.id = l.witness_fit_set_id
         WHERE l.campaign_id = ${campaignId}
+          AND condition.generation = campaign.current_condition_generation
+          AND condition.status IN ('active', 'kept')
           AND (
             l.state IN ('awaiting_seed', 'iterating')
             OR (l.state IN ('converged_provisional', 'converged_final', 'converged_window')
@@ -2317,7 +2370,10 @@ export async function releasedConditionsWithGainedEvidence(
   const rows = (await db.execute(sql`
     SELECT DISTINCT cond.id
     FROM sim_campaign_conditions cond
-    WHERE cond.campaign_id = ${campaignId} AND cond.status = 'released'
+    JOIN sim_campaigns campaign ON campaign.id = cond.campaign_id
+    WHERE cond.campaign_id = ${campaignId}
+      AND cond.generation = campaign.current_condition_generation
+      AND cond.status = 'released'
       AND EXISTS (
         SELECT 1
         FROM sim_campaign_points p

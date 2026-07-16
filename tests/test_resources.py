@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import pytest
 
 from airfoilfoam.config import Settings
 from airfoilfoam.models import ResourceParams, ResourcePolicy
-from airfoilfoam.resources import CpuTokenPool, resolve_resources
+from airfoilfoam.resources import (
+    CpuTokenBudgetMismatch,
+    CpuTokenPool,
+    queue_depth,
+    resolve_resources,
+)
 
 
 def _settings(tmp_path, *, worker_cpu_budget=4, case_concurrency=4, solver_processes=1):
@@ -132,3 +138,51 @@ def test_cpu_token_pool_drops_stale_leases_from_prior_worker_runtime(tmp_path):
         pass
     state = json.loads(path.read_text())
     assert state["leases"] == []
+
+
+def test_cpu_token_pool_honors_live_foreign_owner_heartbeat(tmp_path):
+    path = tmp_path / "tokens.json"
+    first = CpuTokenPool(path, budget=2, owner="worker-a", foreign_lease_ttl=0.06)
+    second = CpuTokenPool(path, budget=2, owner="worker-b", foreign_lease_ttl=0.06)
+
+    with first.acquire(2):
+        # Wait beyond the raw TTL: the holder's heartbeat must keep the lease
+        # live to another container, preventing cross-engine oversubscription.
+        time.sleep(0.12)
+        with pytest.raises(TimeoutError):
+            with second.acquire(1, timeout=0.03, poll_interval=0.005):
+                pass
+
+    with second.acquire(2, timeout=0.1):
+        pass
+
+
+def test_cpu_token_pool_rejects_conflicting_live_worker_budgets(tmp_path):
+    path = tmp_path / "tokens.json"
+    first = CpuTokenPool(path, budget=4, owner="worker-a")
+    second = CpuTokenPool(path, budget=2, owner="worker-b")
+
+    with first.acquire(1):
+        with pytest.raises(CpuTokenBudgetMismatch, match="budget mismatch"):
+            second.snapshot()
+
+
+def test_queue_depth_uses_worker_execution_pool(tmp_path, monkeypatch):
+    seen: list[str] = []
+
+    class FakeRedis:
+        @classmethod
+        def from_url(cls, *_args, **_kwargs):
+            return cls()
+
+        def llen(self, queue_name):
+            seen.append(queue_name)
+            return 7
+
+    monkeypatch.setattr("airfoilfoam.resources.Redis", FakeRedis)
+    settings = _settings(tmp_path).model_copy(
+        update={"celery_queue": "openfoam-foundation-14"}
+    )
+
+    assert queue_depth(settings) == 7
+    assert seen == ["openfoam-foundation-14"]

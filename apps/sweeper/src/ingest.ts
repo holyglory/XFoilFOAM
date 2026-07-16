@@ -11,12 +11,15 @@ import {
   type ResultInsert,
   resultAttempts,
   resultClassifications,
+  solverEvidenceArchives,
+  solverEvidenceArtifactMembers,
   resultFieldExtents,
   resultMediaRepairs,
   refreshPolarCacheForRevision,
   results,
   resultMedia,
   solverEvidenceArtifacts,
+  solverEvidenceBlobs,
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
 import {
@@ -28,6 +31,7 @@ import {
   ALL_IMAGE_FIELDS,
   type EngineClient,
   type EngineEvidenceArtifact,
+  type FinalizeRemoteEvidenceRequest,
   type ImageFieldName,
   type JobResult,
   parseFrameTrack,
@@ -41,17 +45,78 @@ import {
 } from "@aerodb/engine-client";
 import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { constants, createReadStream } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, readFile, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 import { touchHeartbeat } from "./heartbeat";
+import {
+  databaseMemberAssociationsSha256,
+  manifestMemberSetSha256,
+  parseEvidenceManifest,
+} from "./evidence-manifest";
+import {
+  persistEngineRuntimeForJob,
+  resolveEngineRuntimeBuild,
+  type ResolvedEngineRuntime,
+} from "./engine-provenance";
 import type { RansRetryScope } from "./retry-plan";
 
 const execFileAsync = promisify(execFile);
 export const DEFAULT_RENDER_PROFILE_KEY = "default:v1:zoom2";
+
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const GCS_GENERATION_PATTERN = /^[1-9][0-9]{0,19}$/;
+const GCS_CRC32C_PATTERN = /^[A-Za-z0-9+/]{6}==$/;
+const ARCHIVED_EVIDENCE_MEMBER_KINDS = new Set([
+  "manifest",
+  "vtk_window",
+  "time_directory",
+  "log",
+  "force_coefficients",
+  "mesh",
+  "dictionary",
+  "field_data",
+]);
+
+interface VerifiedGcsEvidenceBundle {
+  bucket: string;
+  objectKey: string;
+  generation: string;
+  crc32c: string;
+  uncompressedTarSha256: string;
+  uncompressedTarByteSize: number;
+  verifiedAt: Date;
+  verifiedAtText: string;
+  evidenceBase: string;
+  zstdLevel: number;
+  blobMetadata: Record<string, unknown>;
+}
+
+export interface PendingRemoteEvidenceCleanup {
+  caseSlug: string;
+  evidenceBase: string;
+  pointer: FinalizeRemoteEvidenceRequest["remote"];
+  bundledFileCount: number;
+  associations: Array<{
+    resultId: string;
+    resultAttemptId: string;
+    sourceArtifactId: string;
+    archiveId: string;
+    memberAssociationCount?: number;
+    memberAssociationsSha256?: string;
+    manifestMemberSetSha256?: string;
+  }>;
+}
+
+export class TerminalEvidenceCleanupPendingError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "TerminalEvidenceCleanupPendingError";
+  }
+}
 
 interface VideoMetadata {
   durationS?: number;
@@ -182,6 +247,242 @@ export function matchConditionEntryBySpeed(
 function storageKeyOf(urlPath: string): string {
   const m = urlPath.match(/^\/?jobs\/([^/]+)\/files\/(.+)$/);
   return m ? `jobs/${m[1]}/${m[2]}` : urlPath.replace(/^\/+/, "");
+}
+
+function requireExactNonEmptyString(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.trim() !== value
+  ) {
+    throw new Error(
+      `GCS evidence metadata ${label} must be a non-empty string`,
+    );
+  }
+  return value;
+}
+
+function safeRelativePathParts(value: unknown, label: string): string[] {
+  const path = requireExactNonEmptyString(value, label);
+  if (path.startsWith("/") || path.includes("\\") || path.includes("\0")) {
+    throw new Error(
+      `GCS evidence metadata ${label} must be a safe relative path`,
+    );
+  }
+  const parts = path.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error(
+      `GCS evidence metadata ${label} must be a safe relative path`,
+    );
+  }
+  return parts;
+}
+
+function requireContentAddressedObjectKey(
+  objectKey: string,
+  storedSha256: string,
+  label: string,
+): void {
+  const suffix = `sha256/${storedSha256.slice(0, 2)}/${storedSha256}.tar.zst`;
+  if (objectKey !== suffix && !objectKey.endsWith(`/${suffix}`)) {
+    throw new Error(
+      `GCS evidence metadata ${label} must use the content-addressed ${suffix} form`,
+    );
+  }
+}
+
+function requirePositiveSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `GCS evidence metadata ${label} must be a positive safe integer`,
+    );
+  }
+  return value;
+}
+
+function requireNonnegativeSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      `GCS evidence metadata ${label} must be a non-negative safe integer`,
+    );
+  }
+  return value;
+}
+
+function requirePattern(
+  value: unknown,
+  label: string,
+  pattern: RegExp,
+): string {
+  const text = requireExactNonEmptyString(value, label);
+  if (!pattern.test(text)) {
+    throw new Error(`GCS evidence metadata ${label} is malformed`);
+  }
+  return text;
+}
+
+function parseVerifiedGcsEvidenceBundle(
+  kind: string,
+  artifact: EngineEvidenceArtifact,
+): VerifiedGcsEvidenceBundle | null {
+  if (kind !== "engine_bundle") return null;
+  const metadata = artifact.metadata;
+  if (!metadata) return null;
+  if (metadata.storageBackend == null) {
+    const hasPartialCanonicalPointer = [
+      "bucket",
+      "objectKey",
+      "generation",
+      "crc32c",
+      "compression",
+      "uncompressedTarSha256",
+      "uncompressedTarByteSize",
+      "verifiedAt",
+    ].some((key) => metadata[key] != null);
+    if (hasPartialCanonicalPointer) {
+      throw new Error(
+        "GCS evidence metadata storageBackend is required when archive pointer metadata is present",
+      );
+    }
+    return null;
+  }
+  if (metadata.storageBackend === "volume") return null;
+  if (metadata.storageBackend !== "gcs") {
+    throw new Error(
+      "GCS evidence metadata storageBackend must be 'gcs' or 'volume'",
+    );
+  }
+  if (artifact.mime_type !== "application/zstd") {
+    throw new Error("GCS engine_bundle evidence must use application/zstd");
+  }
+  if (metadata.compression !== "zstd") {
+    throw new Error("GCS evidence metadata compression must be 'zstd'");
+  }
+  if (metadata.archiveFormat != null && metadata.archiveFormat !== "tar+zstd") {
+    throw new Error("GCS evidence metadata archiveFormat must be 'tar+zstd'");
+  }
+  if (
+    metadata.zstdLevel != null &&
+    (!Number.isInteger(metadata.zstdLevel) ||
+      (metadata.zstdLevel as number) < 1 ||
+      (metadata.zstdLevel as number) > 22)
+  ) {
+    throw new Error(
+      "GCS evidence metadata zstdLevel must be an integer from 1 to 22",
+    );
+  }
+  const verifiedAtText = requireExactNonEmptyString(
+    metadata.verifiedAt,
+    "verifiedAt",
+  );
+  const verifiedAt = new Date(verifiedAtText);
+  if (!Number.isFinite(verifiedAt.getTime())) {
+    throw new Error(
+      "GCS evidence metadata verifiedAt must be an ISO timestamp",
+    );
+  }
+  const evidenceBase = safeRelativePathParts(
+    metadata.evidenceBase,
+    "evidenceBase",
+  ).join("/");
+  // Validate the bundle's own case-relative path now. A malicious path must
+  // roll back both the logical artifact and its physical archive identity.
+  archiveMemberPathFromArtifactPath(evidenceBase, artifact.path, "bundle path");
+  const bucket = requireExactNonEmptyString(metadata.bucket, "bucket");
+  const objectKey = safeRelativePathParts(metadata.objectKey, "objectKey").join(
+    "/",
+  );
+  const storedSha256 = requirePattern(
+    artifact.sha256,
+    "artifact sha256",
+    SHA256_PATTERN,
+  );
+  requireContentAddressedObjectKey(objectKey, storedSha256, "objectKey");
+  const generation = requirePattern(
+    metadata.generation,
+    "generation",
+    GCS_GENERATION_PATTERN,
+  );
+  const crc32c = requirePattern(metadata.crc32c, "crc32c", GCS_CRC32C_PATTERN);
+  const uncompressedTarSha256 = requirePattern(
+    metadata.uncompressedTarSha256,
+    "uncompressedTarSha256",
+    SHA256_PATTERN,
+  );
+  const uncompressedTarByteSize = requirePositiveSafeInteger(
+    metadata.uncompressedTarByteSize,
+    "uncompressedTarByteSize",
+  );
+  requirePositiveSafeInteger(artifact.byte_size, "artifact byte_size");
+  const zstdLevel = requirePositiveSafeInteger(
+    metadata.zstdLevel,
+    "zstdLevel",
+  );
+  if (zstdLevel > 22) {
+    throw new Error("GCS evidence metadata zstdLevel must be at most 22");
+  }
+  const blobMetadata: Record<string, unknown> = {
+    archiveFormat: "tar+zstd",
+    zstdLevel,
+  };
+  return {
+    bucket,
+    objectKey,
+    generation,
+    crc32c,
+    uncompressedTarSha256,
+    uncompressedTarByteSize,
+    verifiedAt,
+    verifiedAtText,
+    evidenceBase,
+    zstdLevel,
+    blobMetadata,
+  };
+}
+
+function archiveMemberPathFromArtifactPath(
+  evidenceBase: string,
+  artifactPath: string,
+  label = "artifact path",
+): string {
+  const baseParts = safeRelativePathParts(evidenceBase, "evidenceBase");
+  const artifactParts = safeRelativePathParts(artifactPath, label);
+  const withinBase = baseParts.every(
+    (part, index) => artifactParts[index] === part,
+  );
+  const memberParts = artifactParts.slice(baseParts.length);
+  if (!withinBase || memberParts.length === 0) {
+    throw new Error(
+      `GCS evidence ${label} must name a member below evidenceBase`,
+    );
+  }
+  return memberParts.join("/");
+}
+
+function archiveMemberPathFromStoredArtifact(
+  evidenceBase: string,
+  storageKey: string,
+): string {
+  const baseParts = safeRelativePathParts(evidenceBase, "evidenceBase");
+  const storedParts = safeRelativePathParts(storageKey, "stored artifact path");
+  const offsets: number[] = [];
+  for (let i = 0; i <= storedParts.length - baseParts.length; i++) {
+    if (baseParts.every((part, index) => storedParts[i + index] === part)) {
+      offsets.push(i);
+    }
+  }
+  if (offsets.length !== 1) {
+    throw new Error(
+      "stored GCS evidence artifact path does not identify one unambiguous evidenceBase",
+    );
+  }
+  const memberParts = storedParts.slice(offsets[0] + baseParts.length);
+  if (memberParts.length === 0) {
+    throw new Error(
+      "stored GCS evidence artifact path names evidenceBase itself",
+    );
+  }
+  return memberParts.join("/");
 }
 
 function finitePositiveNumber(value: unknown): number | undefined {
@@ -885,6 +1186,7 @@ async function insertResultAttempt(opts: {
   presetRevisionId?: string | null;
   simJobId: string;
   engineJobId: string;
+  runtime: ResolvedEngineRuntime | null;
   point: PolarPoint;
   derived?: {
     fidelity: PointFidelity;
@@ -904,6 +1206,7 @@ async function insertResultAttempt(opts: {
     presetRevisionId,
     simJobId,
     engineJobId,
+    runtime,
     point: p,
     derived,
   } = opts;
@@ -938,6 +1241,9 @@ async function insertResultAttempt(opts: {
       simJobId,
       engineJobId,
       engineCaseSlug: p.case_slug ?? null,
+      methodKey: p.method_key ?? null,
+      solverImplementationId: runtime?.solverImplementationId ?? null,
+      solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
       cl: p.cl ?? null,
       cd: p.cd ?? null,
       cm: p.cm ?? null,
@@ -1005,6 +1311,280 @@ async function insertResultAttempt(opts: {
   return existing.id;
 }
 
+type StoredEvidenceArtifact = typeof solverEvidenceArtifacts.$inferSelect;
+type StoredEvidenceArchive = typeof solverEvidenceArchives.$inferSelect;
+
+function artifactEvidenceBase(
+  artifact: Pick<StoredEvidenceArtifact, "metadata">,
+  expectedEvidenceBase: string,
+): string {
+  const actual = safeRelativePathParts(
+    artifact.metadata?.evidenceBase,
+    "artifact evidenceBase",
+  ).join("/");
+  if (actual !== expectedEvidenceBase) {
+    throw new Error(
+      "archive member evidenceBase does not match its exact engine_bundle",
+    );
+  }
+  return actual;
+}
+
+async function registerArchiveMember(opts: {
+  db: DB;
+  archive: StoredEvidenceArchive;
+  artifact: StoredEvidenceArtifact;
+  evidenceBase: string;
+  artifactPath?: string;
+}): Promise<void> {
+  if (!ARCHIVED_EVIDENCE_MEMBER_KINDS.has(opts.artifact.kind)) return;
+  if (
+    opts.artifact.resultId !== opts.archive.resultId ||
+    opts.artifact.resultAttemptId !== opts.archive.resultAttemptId
+  ) {
+    throw new Error(
+      "archive member does not belong to the archive's exact result attempt",
+    );
+  }
+  artifactEvidenceBase(opts.artifact, opts.evidenceBase);
+  const memberPath = opts.artifactPath
+    ? archiveMemberPathFromArtifactPath(opts.evidenceBase, opts.artifactPath)
+    : archiveMemberPathFromStoredArtifact(
+        opts.evidenceBase,
+        opts.artifact.storageKey,
+      );
+  const [inserted] = await opts.db
+    .insert(solverEvidenceArtifactMembers)
+    .values({
+      archiveId: opts.archive.id,
+      artifactId: opts.artifact.id,
+      memberPath,
+    })
+    .onConflictDoNothing()
+    .returning({
+      archiveId: solverEvidenceArtifactMembers.archiveId,
+      artifactId: solverEvidenceArtifactMembers.artifactId,
+      memberPath: solverEvidenceArtifactMembers.memberPath,
+    });
+  if (inserted) return;
+  const [existing] = await opts.db
+    .select({
+      archiveId: solverEvidenceArtifactMembers.archiveId,
+      artifactId: solverEvidenceArtifactMembers.artifactId,
+      memberPath: solverEvidenceArtifactMembers.memberPath,
+    })
+    .from(solverEvidenceArtifactMembers)
+    .where(
+      and(
+        eq(solverEvidenceArtifactMembers.archiveId, opts.archive.id),
+        eq(solverEvidenceArtifactMembers.artifactId, opts.artifact.id),
+      ),
+    )
+    .limit(1);
+  if (!existing || existing.memberPath !== memberPath) {
+    throw new Error(
+      `archive member path ${memberPath} conflicts with immutable evidence already registered for this archive`,
+    );
+  }
+}
+
+async function registerVerifiedGcsArchive(opts: {
+  db: DB;
+  resultId: string;
+  resultAttemptId: string;
+  sourceArtifact: StoredEvidenceArtifact;
+  artifact: EngineEvidenceArtifact;
+  bundle: VerifiedGcsEvidenceBundle;
+}): Promise<StoredEvidenceArchive> {
+  const [owner] = await opts.db
+    .select({ id: resultAttempts.id })
+    .from(resultAttempts)
+    .where(
+      and(
+        eq(resultAttempts.id, opts.resultAttemptId),
+        eq(resultAttempts.resultId, opts.resultId),
+      ),
+    )
+    .limit(1);
+  if (!owner) {
+    throw new Error(
+      `GCS engine_bundle attempt ${opts.resultAttemptId} does not own result ${opts.resultId}`,
+    );
+  }
+  if (
+    opts.sourceArtifact.kind !== "engine_bundle" ||
+    opts.sourceArtifact.resultId !== opts.resultId ||
+    opts.sourceArtifact.resultAttemptId !== opts.resultAttemptId
+  ) {
+    throw new Error(
+      "GCS canonical archive source must be an exact owned engine_bundle artifact",
+    );
+  }
+
+  const blobValues = {
+    backend: "gcs" as const,
+    bucket: opts.bundle.bucket,
+    objectKey: opts.bundle.objectKey,
+    generation: opts.bundle.generation,
+    compression: "zstd" as const,
+    mimeType: opts.artifact.mime_type,
+    sha256: opts.artifact.sha256,
+    byteSize: opts.artifact.byte_size,
+    crc32c: opts.bundle.crc32c,
+    uncompressedTarSha256: opts.bundle.uncompressedTarSha256,
+    uncompressedTarByteSize: opts.bundle.uncompressedTarByteSize,
+    verifiedAt: opts.bundle.verifiedAt,
+    metadata: opts.bundle.blobMetadata,
+  };
+  const [insertedBlob] = await opts.db
+    .insert(solverEvidenceBlobs)
+    .values(blobValues)
+    .onConflictDoNothing()
+    .returning();
+  let blob = insertedBlob;
+  if (!blob) {
+    [blob] = await opts.db
+      .select()
+      .from(solverEvidenceBlobs)
+      .where(
+        and(
+          eq(solverEvidenceBlobs.backend, "gcs"),
+          eq(solverEvidenceBlobs.bucket, opts.bundle.bucket),
+          eq(solverEvidenceBlobs.objectKey, opts.bundle.objectKey),
+          eq(solverEvidenceBlobs.generation, opts.bundle.generation),
+        ),
+      )
+      .limit(1);
+  }
+  if (
+    !blob ||
+    blob.compression !== blobValues.compression ||
+    blob.mimeType !== blobValues.mimeType ||
+    blob.sha256 !== blobValues.sha256 ||
+    blob.byteSize !== blobValues.byteSize ||
+    blob.crc32c !== blobValues.crc32c ||
+    blob.uncompressedTarSha256 !== blobValues.uncompressedTarSha256 ||
+    blob.uncompressedTarByteSize !== blobValues.uncompressedTarByteSize ||
+    stableHash(blob.metadata) !== stableHash(blobValues.metadata)
+  ) {
+    throw new Error(
+      `GCS object gs://${opts.bundle.bucket}/${opts.bundle.objectKey}#${opts.bundle.generation} changed immutable blob metadata`,
+    );
+  }
+
+  // `verifiedAt` records an observation, not physical object identity. Two
+  // exact result attempts may legitimately reference the same immutable
+  // content-addressed GCS generation after verifying it at different times.
+  // Keep the first blob row's valid timestamp; every logical source artifact
+  // still preserves its own verification timestamp in metadata.
+
+  const [current] = await opts.db
+    .select()
+    .from(solverEvidenceArchives)
+    .where(
+      and(
+        eq(solverEvidenceArchives.resultAttemptId, opts.resultAttemptId),
+        eq(solverEvidenceArchives.state, "current"),
+      ),
+    )
+    .limit(1);
+  if (
+    current &&
+    (current.resultId !== opts.resultId ||
+      current.sourceArtifactId !== opts.sourceArtifact.id ||
+      current.blobId !== blob.id)
+  ) {
+    throw new Error(
+      `exact attempt ${opts.resultAttemptId} already has a different current evidence archive; normal ingest cannot supersede it`,
+    );
+  }
+  let archive = current;
+  if (!archive) {
+    [archive] = await opts.db
+      .insert(solverEvidenceArchives)
+      .values({
+        resultId: opts.resultId,
+        resultAttemptId: opts.resultAttemptId,
+        sourceArtifactId: opts.sourceArtifact.id,
+        blobId: blob.id,
+        state: "current",
+      })
+      .returning();
+  }
+  if (!archive) {
+    throw new Error(
+      `failed to register current evidence archive for attempt ${opts.resultAttemptId}`,
+    );
+  }
+
+  // The manifest normally arrives before the bundle. Backfill every already
+  // registered logical member now; later artifacts take the same idempotent
+  // path after their association is inserted.
+  const existingArtifacts = await opts.db
+    .select()
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultId, opts.resultId),
+        eq(solverEvidenceArtifacts.resultAttemptId, opts.resultAttemptId),
+      ),
+    )
+    .orderBy(solverEvidenceArtifacts.id);
+  for (const existingArtifact of existingArtifacts) {
+    await registerArchiveMember({
+      db: opts.db,
+      archive,
+      artifact: existingArtifact,
+      evidenceBase: opts.bundle.evidenceBase,
+    });
+  }
+  return archive;
+}
+
+async function currentArchiveWithEvidenceBase(
+  db: DB,
+  resultId: string,
+  resultAttemptId: string,
+): Promise<{ archive: StoredEvidenceArchive; evidenceBase: string } | null> {
+  const [archive] = await db
+    .select()
+    .from(solverEvidenceArchives)
+    .where(
+      and(
+        eq(solverEvidenceArchives.resultId, resultId),
+        eq(solverEvidenceArchives.resultAttemptId, resultAttemptId),
+        eq(solverEvidenceArchives.state, "current"),
+      ),
+    )
+    .limit(1);
+  if (!archive) return null;
+  const [source] = await db
+    .select({ metadata: solverEvidenceArtifacts.metadata })
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.id, archive.sourceArtifactId),
+        inArray(solverEvidenceArtifacts.kind, [
+          "engine_bundle",
+          "openfoam_bundle",
+        ]),
+        eq(solverEvidenceArtifacts.resultId, resultId),
+        eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId),
+      ),
+    )
+    .limit(1);
+  if (!source) {
+    throw new Error(
+      `current archive ${archive.id} has no exact owned bundle source`,
+    );
+  }
+  const evidenceBase = safeRelativePathParts(
+    source.metadata?.evidenceBase,
+    "archive source evidenceBase",
+  ).join("/");
+  return { archive, evidenceBase };
+}
+
 export async function registerEvidenceArtifacts(opts: {
   db: DB;
   engine: EngineClient;
@@ -1015,7 +1595,8 @@ export async function registerEvidenceArtifacts(opts: {
   engineJobId: string;
   point: PolarPoint;
   artifact: EngineEvidenceArtifact;
-}): Promise<void> {
+  runtime?: ResolvedEngineRuntime | null;
+}): Promise<PendingRemoteEvidenceCleanup | null> {
   const {
     db,
     engine,
@@ -1026,12 +1607,14 @@ export async function registerEvidenceArtifacts(opts: {
     engineJobId,
     point,
     artifact,
+    runtime,
   } = opts;
   const urlPath = artifact.url ?? artifact.path;
-  if (!urlPath) return;
+  if (!urlPath) return null;
   const storageKey = storageKeyOf(urlPath);
   const knownKinds = [
     "manifest",
+    "engine_bundle",
     "openfoam_bundle",
     "vtk_window",
     "time_directory",
@@ -1058,9 +1641,34 @@ export async function registerEvidenceArtifacts(opts: {
     console.error(
       `[sweeper] evidence artifact kind "${artifact.kind}" unknown to this build — SKIPPED (job ${engineJobId}, case ${point.case_slug}, aoa ${point.aoa_deg}, path ${artifact.path})`,
     );
-    return;
+    return null;
   }
-  const write = async (writeDb: DB) => {
+  const gcsBundle = parseVerifiedGcsEvidenceBundle(kind, artifact);
+  if (gcsBundle && (!resultId || !resultAttemptId)) {
+    throw new Error(
+      "verified GCS engine_bundle evidence requires an exact result and result attempt owner",
+    );
+  }
+  const write = async (
+    writeDb: DB,
+  ): Promise<PendingRemoteEvidenceCleanup | null> => {
+    if (gcsBundle) {
+      const [exactOwner] = await writeDb
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(
+          and(
+            eq(resultAttempts.id, resultAttemptId!),
+            eq(resultAttempts.resultId, resultId!),
+          ),
+        )
+        .limit(1);
+      if (!exactOwner) {
+        throw new Error(
+          `GCS engine_bundle attempt ${resultAttemptId} does not own result ${resultId}`,
+        );
+      }
+    }
     const association = {
       resultId: resultId ?? null,
       resultAttemptId: resultAttemptId ?? null,
@@ -1068,6 +1676,9 @@ export async function registerEvidenceArtifacts(opts: {
       simJobId,
       engineJobId,
       engineCaseSlug: point.case_slug ?? null,
+      methodKey: point.method_key ?? null,
+      solverImplementationId: runtime?.solverImplementationId ?? null,
+      solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
       aoaDeg: point.aoa_deg,
       kind,
       field: artifact.field ?? null,
@@ -1107,6 +1718,11 @@ export async function registerEvidenceArtifacts(opts: {
           existingManifest.simJobId === association.simJobId &&
           existingManifest.engineJobId === association.engineJobId &&
           existingManifest.engineCaseSlug === association.engineCaseSlug &&
+          existingManifest.methodKey === association.methodKey &&
+          existingManifest.solverImplementationId ===
+            association.solverImplementationId &&
+          existingManifest.solverRuntimeBuildId ===
+            association.solverRuntimeBuildId &&
           existingManifest.aoaDeg === association.aoaDeg &&
           existingManifest.field === association.field &&
           existingManifest.role === association.role &&
@@ -1117,10 +1733,29 @@ export async function registerEvidenceArtifacts(opts: {
           existingManifest.engineUrl === association.engineUrl &&
           stableHash(existingManifest.metadata ?? {}) ===
             stableHash(association.metadata);
-        if (exactReplay) return;
-        throw new Error(
-          `manifest replay changed immutable association metadata for attempt ${resultAttemptId}`,
-        );
+        if (!exactReplay) {
+          throw new Error(
+            `manifest replay changed immutable association metadata for attempt ${resultAttemptId}`,
+          );
+        }
+        const currentArchive =
+          resultId && resultAttemptId
+            ? await currentArchiveWithEvidenceBase(
+                writeDb,
+                resultId,
+                resultAttemptId,
+              )
+            : null;
+        if (currentArchive) {
+          await registerArchiveMember({
+            db: writeDb,
+            archive: currentArchive.archive,
+            artifact: existingManifest,
+            evidenceBase: currentArchive.evidenceBase,
+            artifactPath: artifact.path,
+          });
+        }
+        return null;
       }
     }
     const [inserted] = await writeDb
@@ -1131,43 +1766,130 @@ export async function registerEvidenceArtifacts(opts: {
       // idempotent while each new owner gets its own immutable association;
       // never relabel another attempt's row just because the bytes match.
       .onConflictDoNothing()
-      .returning({ id: solverEvidenceArtifacts.id });
-    if (inserted) return;
-    const [replayed] = await writeDb
-      .select()
-      .from(solverEvidenceArtifacts)
-      .where(
-        and(
-          resultAttemptId
-            ? eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId)
-            : sql`${solverEvidenceArtifacts.resultAttemptId} IS NULL`,
-          eq(solverEvidenceArtifacts.kind, kind),
-          sql`${solverEvidenceArtifacts.field} IS NOT DISTINCT FROM ${association.field}`,
-          sql`${solverEvidenceArtifacts.role} IS NOT DISTINCT FROM ${association.role}`,
-          eq(solverEvidenceArtifacts.storageKey, storageKey),
-          eq(solverEvidenceArtifacts.sha256, artifact.sha256),
-        ),
-      )
-      .limit(1);
-    if (
-      !replayed ||
-      replayed.resultId !== association.resultId ||
-      replayed.airfoilId !== association.airfoilId ||
-      replayed.simJobId !== association.simJobId ||
-      replayed.engineJobId !== association.engineJobId ||
-      replayed.engineCaseSlug !== association.engineCaseSlug ||
-      replayed.aoaDeg !== association.aoaDeg ||
-      replayed.mimeType !== association.mimeType ||
-      replayed.byteSize !== association.byteSize ||
-      replayed.engineUrl !== association.engineUrl ||
-      stableHash(replayed.metadata ?? {}) !== stableHash(association.metadata)
-    ) {
-      throw new Error(
-        `evidence artifact replay changed immutable association metadata for attempt ${resultAttemptId ?? "unbound"} (${kind}/${artifact.field ?? ""}/${artifact.role ?? ""})`,
-      );
+      .returning();
+    let storedArtifact = inserted;
+    if (!storedArtifact) {
+      [storedArtifact] = await writeDb
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            resultAttemptId
+              ? eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId)
+              : sql`${solverEvidenceArtifacts.resultAttemptId} IS NULL`,
+            eq(solverEvidenceArtifacts.kind, kind),
+            sql`${solverEvidenceArtifacts.field} IS NOT DISTINCT FROM ${association.field}`,
+            sql`${solverEvidenceArtifacts.role} IS NOT DISTINCT FROM ${association.role}`,
+            eq(solverEvidenceArtifacts.storageKey, storageKey),
+            eq(solverEvidenceArtifacts.sha256, artifact.sha256),
+          ),
+        )
+        .limit(1);
+      if (
+        !storedArtifact ||
+        storedArtifact.resultId !== association.resultId ||
+        storedArtifact.airfoilId !== association.airfoilId ||
+        storedArtifact.simJobId !== association.simJobId ||
+        storedArtifact.engineJobId !== association.engineJobId ||
+        storedArtifact.engineCaseSlug !== association.engineCaseSlug ||
+        storedArtifact.methodKey !== association.methodKey ||
+        storedArtifact.solverImplementationId !==
+          association.solverImplementationId ||
+        storedArtifact.solverRuntimeBuildId !==
+          association.solverRuntimeBuildId ||
+        storedArtifact.aoaDeg !== association.aoaDeg ||
+        storedArtifact.mimeType !== association.mimeType ||
+        storedArtifact.byteSize !== association.byteSize ||
+        storedArtifact.engineUrl !== association.engineUrl ||
+        stableHash(storedArtifact.metadata ?? {}) !==
+          stableHash(association.metadata)
+      ) {
+        throw new Error(
+          `evidence artifact replay changed immutable association metadata for attempt ${resultAttemptId ?? "unbound"} (${kind}/${artifact.field ?? ""}/${artifact.role ?? ""})`,
+        );
+      }
     }
+    if (!storedArtifact) {
+      throw new Error("failed to register immutable evidence artifact");
+    }
+
+    if (gcsBundle) {
+      const archive = await registerVerifiedGcsArchive({
+        db: writeDb,
+        resultId: resultId!,
+        resultAttemptId: resultAttemptId!,
+        sourceArtifact: storedArtifact,
+        artifact,
+        bundle: gcsBundle,
+      });
+      const metadata = artifact.metadata ?? {};
+      const cleanupDisposition = metadata.localEvidenceDisposition;
+      if (
+        cleanupDisposition !==
+          "remote-copy-plus-local-archive-pending-database-ack" &&
+        cleanupDisposition !== "remote-only-pending-cleanup"
+      ) {
+        return null;
+      }
+      if (!point.case_slug) {
+        throw new Error("GCS evidence cleanup requires an exact case_slug");
+      }
+      const bundledFileCount = requireNonnegativeSafeInteger(
+        metadata.bundledFileCount,
+        "bundledFileCount",
+      );
+      return {
+        caseSlug: point.case_slug,
+        evidenceBase: gcsBundle.evidenceBase,
+        pointer: {
+          schemaVersion: 1,
+          format: "tar+zstd",
+          bucket: gcsBundle.bucket,
+          objectKey: gcsBundle.objectKey,
+          generation: gcsBundle.generation,
+          storedSha256: artifact.sha256,
+          storedSize: artifact.byte_size,
+          tarSha256: gcsBundle.uncompressedTarSha256,
+          tarSize: gcsBundle.uncompressedTarByteSize,
+          crc32c: gcsBundle.crc32c,
+          zstdLevel: gcsBundle.zstdLevel,
+          createdAt: gcsBundle.verifiedAtText,
+        },
+        bundledFileCount,
+        associations: [
+          {
+            resultId: resultId!,
+            resultAttemptId: resultAttemptId!,
+            sourceArtifactId: storedArtifact.id,
+            archiveId: archive.id,
+          },
+        ],
+      };
+    }
+
+    if (
+      resultId &&
+      resultAttemptId &&
+      ARCHIVED_EVIDENCE_MEMBER_KINDS.has(storedArtifact.kind)
+    ) {
+      const currentArchive = await currentArchiveWithEvidenceBase(
+        writeDb,
+        resultId,
+        resultAttemptId,
+      );
+      if (currentArchive) {
+        await registerArchiveMember({
+          db: writeDb,
+          archive: currentArchive.archive,
+          artifact: storedArtifact,
+          evidenceBase: currentArchive.evidenceBase,
+          artifactPath: artifact.path,
+        });
+      }
+    }
+    return null;
   };
-  await withEvidenceArtifactWriteLocks(
+  return withEvidenceArtifactWriteLocks(
     db,
     {
       storageKey,
@@ -1237,6 +1959,278 @@ function stableHash(value: unknown): string {
     .update(JSON.stringify(stable(value)))
     .digest("hex")
     .slice(0, 24);
+}
+
+function mergePendingRemoteEvidenceCleanup(
+  target: Map<string, PendingRemoteEvidenceCleanup>,
+  incoming: PendingRemoteEvidenceCleanup,
+): void {
+  // `evidenceBase` is only unique inside one exact case directory. Ordinary
+  // batch jobs deliberately reuse names such as "evidence" for every case,
+  // so cleanup identity must include both path components that the engine
+  // endpoint binds to its contained directory.
+  const cleanupKey = `${incoming.caseSlug}\0${incoming.evidenceBase}`;
+  const existing = target.get(cleanupKey);
+  if (!existing) {
+    target.set(cleanupKey, incoming);
+    return;
+  }
+  if (
+    existing.bundledFileCount !== incoming.bundledFileCount ||
+    stableHash(existing.pointer) !== stableHash(incoming.pointer)
+  ) {
+    throw new Error(
+      `evidence cleanup ${incoming.caseSlug}/${incoming.evidenceBase} resolved to conflicting remote identities`,
+    );
+  }
+  for (const association of incoming.associations) {
+    const identity = stableHash(association);
+    const duplicate = existing.associations.find(
+      (candidate) => stableHash(candidate) === identity,
+    );
+    if (!duplicate) existing.associations.push(association);
+  }
+}
+
+async function validateRemoteEvidenceCleanupCoverage(
+  db: DB,
+  cleanup: PendingRemoteEvidenceCleanup,
+): Promise<void> {
+  let commonManifestSetSha256: string | null = null;
+  for (const association of cleanup.associations) {
+    const [archive] = await db
+      .select()
+      .from(solverEvidenceArchives)
+      .where(
+        and(
+          eq(solverEvidenceArchives.id, association.archiveId),
+          eq(solverEvidenceArchives.resultId, association.resultId),
+          eq(
+            solverEvidenceArchives.resultAttemptId,
+            association.resultAttemptId,
+          ),
+          eq(
+            solverEvidenceArchives.sourceArtifactId,
+            association.sourceArtifactId,
+          ),
+          eq(solverEvidenceArchives.state, "current"),
+        ),
+      )
+      .limit(1);
+    if (!archive) {
+      throw new Error(
+        `cleanup archive ${association.archiveId} is not the exact current archive for its result attempt`,
+      );
+    }
+    const memberRows = await db
+      .select({
+        memberPath: solverEvidenceArtifactMembers.memberPath,
+        artifactId: solverEvidenceArtifacts.id,
+        kind: solverEvidenceArtifacts.kind,
+        resultId: solverEvidenceArtifacts.resultId,
+        resultAttemptId: solverEvidenceArtifacts.resultAttemptId,
+        sha256: solverEvidenceArtifacts.sha256,
+        byteSize: solverEvidenceArtifacts.byteSize,
+      })
+      .from(solverEvidenceArtifactMembers)
+      .innerJoin(
+        solverEvidenceArtifacts,
+        eq(
+          solverEvidenceArtifacts.id,
+          solverEvidenceArtifactMembers.artifactId,
+        ),
+      )
+      .where(eq(solverEvidenceArtifactMembers.archiveId, association.archiveId));
+    const manifestRows = memberRows.filter(
+      (row) => row.kind === "manifest" && row.memberPath === "evidence_manifest.json",
+    );
+    if (manifestRows.length !== 1) {
+      throw new Error(
+        `cleanup archive ${association.archiveId} must map one exact manifest; found ${manifestRows.length}`,
+      );
+    }
+    const [manifestArtifact] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.id, manifestRows[0]!.artifactId))
+      .limit(1);
+    if (!manifestArtifact) {
+      throw new Error("cleanup manifest artifact disappeared during validation");
+    }
+    const manifestPath = await localMediaPath(manifestArtifact.storageKey);
+    if (!manifestPath) {
+      throw new Error(
+        `retained evidence manifest is unavailable for cleanup archive ${association.archiveId}`,
+      );
+    }
+    const manifestBytes = await readFile(manifestPath);
+    const parsed = parseEvidenceManifest(manifestBytes);
+    if (parsed.bundled.length !== cleanup.bundledFileCount) {
+      throw new Error(
+        `cleanup bundle count ${cleanup.bundledFileCount} does not match ${parsed.bundled.length} manifest members`,
+      );
+    }
+    const expectedByPath = new Map(
+      parsed.memberSet.map((entry) => [entry.path, entry]),
+    );
+    if (memberRows.length !== expectedByPath.size) {
+      throw new Error(
+        `cleanup archive ${association.archiveId} member coverage is incomplete: ${memberRows.length}/${expectedByPath.size}`,
+      );
+    }
+    const seenPaths = new Set<string>();
+    for (const row of memberRows) {
+      if (
+        row.resultId !== association.resultId ||
+        row.resultAttemptId !== association.resultAttemptId
+      ) {
+        throw new Error(
+          `cleanup archive ${association.archiveId} contains a foreign member association`,
+        );
+      }
+      if (seenPaths.has(row.memberPath)) {
+        throw new Error(
+          `cleanup archive ${association.archiveId} maps duplicate member ${row.memberPath}`,
+        );
+      }
+      seenPaths.add(row.memberPath);
+      const expected = expectedByPath.get(row.memberPath);
+      if (
+        !expected ||
+        expected.sha256 !== row.sha256 ||
+        expected.byteSize !== row.byteSize
+      ) {
+        throw new Error(
+          `cleanup archive ${association.archiveId} member ${row.memberPath} does not match the retained manifest`,
+        );
+      }
+    }
+
+    if (parsed.excluded.length) {
+      const allAttemptArtifacts = await db
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, association.resultId),
+            eq(
+              solverEvidenceArtifacts.resultAttemptId,
+              association.resultAttemptId,
+            ),
+          ),
+        );
+      for (const excluded of parsed.excluded) {
+        const matches = allAttemptArtifacts.filter((artifact) => {
+          if (artifact.metadata?.evidenceBase !== cleanup.evidenceBase) return false;
+          try {
+            return (
+              archiveMemberPathFromStoredArtifact(
+                cleanup.evidenceBase,
+                artifact.storageKey,
+              ) === excluded.path
+            );
+          } catch {
+            return false;
+          }
+        });
+        if (
+          matches.length !== 1 ||
+          matches[0]!.sha256 !== excluded.sha256 ||
+          matches[0]!.byteSize !== excluded.byteSize
+        ) {
+          throw new Error(
+            `excluded manifest member ${excluded.path} is not exactly registered as a separate artifact`,
+          );
+        }
+        if (memberRows.some((row) => row.artifactId === matches[0]!.id)) {
+          throw new Error(
+            `excluded manifest member ${excluded.path} must not authorize archive cleanup as a bundled member`,
+          );
+        }
+      }
+    }
+
+    const manifestSetSha256 = manifestMemberSetSha256(parsed.memberSet);
+    if (
+      commonManifestSetSha256 !== null &&
+      commonManifestSetSha256 !== manifestSetSha256
+    ) {
+      throw new Error(
+        `evidenceBase ${cleanup.evidenceBase} has conflicting manifest member sets across database associations`,
+      );
+    }
+    commonManifestSetSha256 = manifestSetSha256;
+    association.memberAssociationCount = memberRows.length;
+    association.manifestMemberSetSha256 = manifestSetSha256;
+    association.memberAssociationsSha256 = databaseMemberAssociationsSha256(
+      memberRows.map((row) => ({
+        path: row.memberPath,
+        artifactId: row.artifactId,
+        sha256: row.sha256,
+        byteSize: row.byteSize,
+      })),
+    );
+  }
+}
+
+async function acknowledgeTerminalRemoteEvidenceCleanups(
+  db: DB,
+  engine: EngineClient,
+  engineJobId: string,
+  cleanups: Map<string, PendingRemoteEvidenceCleanup>,
+): Promise<number> {
+  try {
+    let acknowledged = 0;
+    for (const cleanup of [...cleanups.values()].sort(
+      (a, b) =>
+        a.caseSlug.localeCompare(b.caseSlug) ||
+        a.evidenceBase.localeCompare(b.evidenceBase),
+    )) {
+      await validateRemoteEvidenceCleanupCoverage(db, cleanup);
+      const response = await engine.finalizeRemoteEvidence(engineJobId, {
+      case_slug: cleanup.caseSlug,
+      evidence_base: cleanup.evidenceBase,
+      remote: cleanup.pointer,
+      database_associations: cleanup.associations.map((association) => {
+        if (
+          association.memberAssociationCount == null ||
+          !association.memberAssociationsSha256 ||
+          !association.manifestMemberSetSha256
+        ) {
+          throw new Error("cleanup member coverage was not attested");
+        }
+        return {
+          result_id: association.resultId,
+          result_attempt_id: association.resultAttemptId,
+          source_artifact_id: association.sourceArtifactId,
+          archive_id: association.archiveId,
+          member_association_count: association.memberAssociationCount,
+          member_associations_sha256: association.memberAssociationsSha256,
+          manifest_member_set_sha256: association.manifestMemberSetSha256,
+        };
+      }),
+    });
+      if (
+        !["complete", "no_local_bytes"].includes(response.state) ||
+        response.evidence_base !== cleanup.evidenceBase ||
+        response.association_count !== cleanup.associations.length ||
+        !response.verification.startsWith(
+          "archive+manifest+all-members-restore:",
+        )
+      ) {
+        throw new Error(
+          `engine returned an incomplete cleanup acknowledgement for ${cleanup.evidenceBase}`,
+        );
+      }
+      acknowledged++;
+    }
+    return acknowledged;
+  } catch (error) {
+    throw new TerminalEvidenceCleanupPendingError(
+      `terminal remote evidence cleanup pending: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
 }
 
 function scaleGroupKey(
@@ -3387,6 +4381,9 @@ async function publishStagedPoints(
               status: candidateAttempt.status,
               source: candidateAttempt.source,
               regime: candidateAttempt.regime,
+              methodKey: candidateAttempt.methodKey,
+              solverImplementationId: candidateAttempt.solverImplementationId,
+              solverRuntimeBuildId: candidateAttempt.solverRuntimeBuildId,
               reynolds: candidate.reynolds,
               speed: candidate.speed,
               chord: candidate.chord,
@@ -3457,6 +4454,9 @@ async function publishStagedPoints(
               status: "failed",
               source: "queued",
               regime: candidateAttempt.regime,
+              methodKey: candidateAttempt.methodKey,
+              solverImplementationId: candidateAttempt.solverImplementationId,
+              solverRuntimeBuildId: candidateAttempt.solverRuntimeBuildId,
               reynolds: candidate.reynolds,
               speed: candidate.speed,
               chord: candidate.chord,
@@ -3547,6 +4547,9 @@ async function publishStagedPoints(
                 status: selectedAttempt.status,
                 source: selectedAttempt.source,
                 regime: selectedAttempt.regime,
+                methodKey: selectedAttempt.methodKey,
+                solverImplementationId: selectedAttempt.solverImplementationId,
+                solverRuntimeBuildId: selectedAttempt.solverRuntimeBuildId,
                 cl: selectedAttempt.cl,
                 cd: selectedAttempt.cd,
                 cm: selectedAttempt.cm,
@@ -3709,6 +4712,9 @@ export async function publishRepairedResultAttempt(opts: {
             status: attempt.status,
             source: attempt.source,
             regime: attempt.regime,
+            methodKey: attempt.methodKey,
+            solverImplementationId: attempt.solverImplementationId,
+            solverRuntimeBuildId: attempt.solverRuntimeBuildId,
             cl: attempt.cl,
             cd: attempt.cd,
             cm: attempt.cm,
@@ -3801,6 +4807,7 @@ export async function ingestResult(opts: {
   points: number;
   media: number;
   attempts: number;
+  evidenceCleanups: number;
   dirtyLanes: CampaignLaneKey[];
   ransPrecalcPromotions: IngestedRansPrecalcPromotion[];
 }> {
@@ -3814,6 +4821,11 @@ export async function ingestResult(opts: {
     conditionMap,
     result,
   } = opts;
+  const jobRuntime = await persistEngineRuntimeForJob(
+    db,
+    simJobId,
+    result.engine,
+  );
   const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(db));
   let points = 0;
   let media = 0;
@@ -3827,6 +4839,10 @@ export async function ingestResult(opts: {
   const candidatesByRevision = new Map<string, StagedPoint[]>();
   const legacyCandidates: StagedPoint[] = [];
   const ransPrecalcPromotions: IngestedRansPrecalcPromotion[] = [];
+  const remoteEvidenceCleanups = new Map<
+    string,
+    PendingRemoteEvidenceCleanup
+  >();
 
   const stagePoint = async (input: {
     point: PolarPoint;
@@ -3838,6 +4854,11 @@ export async function ingestResult(opts: {
     chord: number;
   }): Promise<StagedPoint> => {
     const p = input.point;
+    const pointRuntime = p.engine
+      ? await persistEngineRuntimeForJob(db, simJobId, p.engine)
+      : jobRuntime;
+    const runtime =
+      pointRuntime ?? (await resolveEngineRuntimeBuild(db, p.engine));
     const failed = failedForPoint(p);
     const pointError = p.error?.trim()
       ? p.error
@@ -3887,6 +4908,7 @@ export async function ingestResult(opts: {
       presetRevisionId: input.presetRevisionId,
       simJobId,
       engineJobId,
+      runtime,
       point: p,
       derived,
       extraQualityWarnings,
@@ -3899,7 +4921,7 @@ export async function ingestResult(opts: {
     // current pointer can change. Every row carries both owner ids, enforced
     // by the 0053 composite foreign keys.
     for (const artifact of p.evidence_artifacts ?? []) {
-      await registerEvidenceArtifacts({
+      const cleanup = await registerEvidenceArtifacts({
         db,
         engine,
         resultId: cell.id,
@@ -3909,7 +4931,11 @@ export async function ingestResult(opts: {
         engineJobId,
         point: p,
         artifact,
+        runtime,
       });
+      if (cleanup) {
+        mergePendingRemoteEvidenceCleanup(remoteEvidenceCleanups, cleanup);
+      }
     }
     if (!failed) {
       media += await registerShippedMedia(
@@ -4055,6 +5081,17 @@ export async function ingestResult(opts: {
 
   await opts.hooks?.afterEvidenceStaged?.();
 
+  const evidenceCleanups = ["completed", "failed", "cancelled"].includes(
+    result.state,
+  )
+    ? await acknowledgeTerminalRemoteEvidenceCleanups(
+        db,
+        engine,
+        engineJobId,
+        remoteEvidenceCleanups,
+      )
+    : 0;
+
   const finalizedByResult = new Map<string, FinalizedPoint>();
   for (const [revisionId, candidates] of candidatesByRevision) {
     const finalized = await publishStagedPoints(
@@ -4124,6 +5161,7 @@ export async function ingestResult(opts: {
     points,
     media,
     attempts,
+    evidenceCleanups,
     dirtyLanes: [...dirtyLanes.values()],
     ransPrecalcPromotions,
   };

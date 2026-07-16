@@ -21,6 +21,7 @@ jobs:
       VPS_USER: ${{ secrets.AIRFOILS_VPS_USER }}
       VPS_PORT: ${{ secrets.AIRFOILS_VPS_PORT }}
       VPS_SSH_KEY: ${{ secrets.AIRFOILS_VPS_SSH_KEY }}
+      VPS_KNOWN_HOSTS: ${{ secrets.AIRFOILS_VPS_KNOWN_HOSTS }}
       VPS_APP_DIR: ${{ vars.AIRFOILS_VPS_APP_DIR }}
       PUBLIC_ORIGIN: ${{ vars.AIRFOILS_PUBLIC_ORIGIN }}
     steps:
@@ -39,7 +40,23 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/deploy/vps-redeploy.sh
+          bash -n scripts/deploy/promote-and-redeploy.sh
+          python3 scripts/deploy/deployment-source-manifest.py --help >/dev/null
           test -f docker-compose.deploy.yml
+
+      - name: Seal deployment source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/deploy/deployment-source-manifest.py \
+            --create \
+            --root . \
+            --manifest .deployment-source.json \
+            --revision "${GITHUB_SHA}"
+          python3 scripts/deploy/deployment-source-manifest.py \
+            --verify \
+            --root . \
+            --manifest .deployment-source.json
 
       - name: Install SSH key
         shell: bash
@@ -48,6 +65,7 @@ jobs:
           : "${VPS_HOST:?Set AIRFOILS_VPS_HOST secret}"
           : "${VPS_USER:?Set AIRFOILS_VPS_USER secret}"
           : "${VPS_SSH_KEY:?Set AIRFOILS_VPS_SSH_KEY secret}"
+          : "${VPS_KNOWN_HOSTS:?Set AIRFOILS_VPS_KNOWN_HOSTS to the operator-verified pinned VPS host key}"
           if [[ -z "${VPS_PORT:-}" ]]; then
             VPS_PORT=22
           fi
@@ -56,7 +74,16 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/airfoils_pro_vps
           chmod 600 ~/.ssh/airfoils_pro_vps
-          ssh-keyscan -p "$VPS_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          KNOWN_HOST_LOOKUP="$VPS_HOST"
+          if [[ "$VPS_PORT" != "22" ]]; then
+            KNOWN_HOST_LOOKUP="[$VPS_HOST]:$VPS_PORT"
+          fi
+          ssh-keygen -F "$KNOWN_HOST_LOOKUP" -f ~/.ssh/known_hosts >/dev/null || {
+            echo "AIRFOILS_VPS_KNOWN_HOSTS does not contain the configured host/port entry." >&2
+            exit 2
+          }
 
       - name: Ensure VPS deploy tools are available
         shell: bash
@@ -78,38 +105,49 @@ jobs:
             fi
           '
 
-      - name: Upload source to VPS
+      - name: Prepare unique VPS staging directory
         shell: bash
         run: |
           set -euo pipefail
           APP_DIR="${VPS_APP_DIR:-/opt/airfoils-pro/app}"
+          STAGING_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
+          [[ "$STAGING_ID" =~ ^[0-9]+-[0-9]+-[0-9a-f]{40}$ ]]
+          STAGING_DIR="$(dirname "$APP_DIR")/deploy-staging/$STAGING_ID"
+          printf 'VPS_STAGING_DIR=%s\n' "$STAGING_DIR" >> "$GITHUB_ENV"
+          printf -v STAGING_Q '%q' "$STAGING_DIR"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "install -d -m 700 -- $STAGING_Q"
+
+      - name: Upload source to isolated VPS staging
+        shell: bash
+        run: |
+          set -euo pipefail
           rsync -az --delete \
             -e "ssh -i ~/.ssh/airfoils_pro_vps -p ${VPS_PORT}" \
-            --exclude '.git/' \
-            --exclude '.github/' \
-            --exclude '.ssh/' \
-            --exclude '.env' \
-            --exclude '.env.deploy' \
-            --exclude '.env.local' \
-            --exclude 'node_modules/' \
-            --exclude '.next/' \
-            --exclude '.next-build/' \
-            --exclude '.pnpm-store/' \
-            --exclude 'coverage/' \
-            --exclude 'data/' \
-            --exclude 'VTK/' \
-            --exclude 'processor*/' \
-            --exclude 'postProcessing/' \
-            --exclude '.codex-artifacts/' \
-            --exclude '.codex-db-backups/' \
-            --exclude 'test-results/' \
-            ./ "${VPS_USER}@${VPS_HOST}:${APP_DIR}/"
+            --exclude-from scripts/deploy/source-rsync-excludes.txt \
+            ./ "${VPS_USER}@${VPS_HOST}:${VPS_STAGING_DIR}/"
 
-      - name: Redeploy VPS control plane
+      - name: Promote source under deploy lock and redeploy control plane
         shell: bash
         run: |
           set -euo pipefail
           APP_DIR="${VPS_APP_DIR:-/opt/airfoils-pro/app}"
           ORIGIN="${PUBLIC_ORIGIN:-https://airfoils.pro}"
+          printf -v STAGING_Q '%q' "$VPS_STAGING_DIR"
+          printf -v APP_Q '%q' "$APP_DIR"
+          printf -v ORIGIN_Q '%q' "$ORIGIN"
+          printf -v REVISION_Q '%q' "$GITHUB_SHA"
           ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
-            "cd '${APP_DIR}' && chmod +x scripts/deploy/vps-redeploy.sh && APP_DIR='${APP_DIR}' PUBLIC_ORIGIN='${ORIGIN}' scripts/deploy/vps-redeploy.sh"
+            "chmod +x $STAGING_Q/scripts/deploy/promote-and-redeploy.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q PUBLIC_ORIGIN=$ORIGIN_Q EXPECTED_SOURCE_REVISION=$REVISION_Q $STAGING_Q/scripts/deploy/promote-and-redeploy.sh"
+
+      - name: Remove VPS staging payload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${VPS_STAGING_DIR:-}" ]]; then
+            exit 0
+          fi
+          printf -v STAGING_Q '%q' "$VPS_STAGING_DIR"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "rm -rf -- $STAGING_Q"

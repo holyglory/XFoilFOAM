@@ -20,6 +20,11 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
+import {
+  DEFAULT_SOLVER_IMPLEMENTATION_ID,
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+} from "./solver-implementations";
+
 // ---------------------------------------------------------------------------
 // Enums — pgEnum for stable closed domains. Python-mirroring domains that may
 // grow (turbulence_model, viscosity_model, point_format, airfoil source) are
@@ -44,6 +49,7 @@ export const mediaRoleEnum = pgEnum("media_role", [
 ]);
 export const evidenceArtifactKindEnum = pgEnum("evidence_artifact_kind", [
   "manifest",
+  "engine_bundle",
   "openfoam_bundle",
   "vtk_window",
   "time_directory",
@@ -127,6 +133,18 @@ export const remoteAssetAvailabilityEnum = pgEnum("remote_asset_availability", [
   "missing",
   "failed",
 ]);
+export const solverEvidenceBlobBackendEnum = pgEnum(
+  "solver_evidence_blob_backend",
+  ["volume", "gcs"],
+);
+export const solverEvidenceBlobCompressionEnum = pgEnum(
+  "solver_evidence_blob_compression",
+  ["gzip", "zstd"],
+);
+export const solverEvidenceArchiveStateEnum = pgEnum(
+  "solver_evidence_archive_state",
+  ["current", "superseded"],
+);
 
 const ts = () => timestamp({ withTimezone: true });
 export const ALL_IMAGE_FIELDS = [
@@ -479,6 +497,207 @@ export const boundaryProfiles = pgTable("boundary_profiles", {
     .$onUpdate(() => new Date()),
 });
 
+// ---------------------------------------------------------------------------
+// Solver identity and runtime topology. A solver implementation is the
+// immutable logical/numerical identity used for compatibility. Runtime builds
+// are exact executable provenance. Execution pools are mutable operational
+// routing/capacity and deliberately do not participate in numerical identity.
+// ---------------------------------------------------------------------------
+export const solverImplementations = pgTable(
+  "solver_implementations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    key: text("key").notNull().unique(),
+    family: text("family").notNull(),
+    distribution: text("distribution").notNull(),
+    releaseVersion: text("release_version").notNull(),
+    methodFamily: text("method_family").notNull(),
+    adapterContractVersion: integer("adapter_contract_version").notNull(),
+    numericsRevision: text("numerics_revision").notNull(),
+    capabilities: jsonb("capabilities")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    upstreamUrl: text("upstream_url"),
+    licenseSpdx: text("license_spdx"),
+    retiredAt: timestamp("retired_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    logicalIdentityUq: uniqueIndex(
+      "solver_implementations_logical_identity_uq",
+    ).on(
+      t.family,
+      t.distribution,
+      t.releaseVersion,
+      t.adapterContractVersion,
+      t.numericsRevision,
+    ),
+    activeIdx: index("solver_implementations_active_idx")
+      .on(t.family, t.distribution, t.releaseVersion)
+      .where(sql`${t.retiredAt} IS NULL`),
+    adapterVersionCheck: check(
+      "solver_implementations_adapter_version_check",
+      sql`${t.adapterContractVersion} >= 0`,
+    ),
+  }),
+);
+
+export const solverRuntimeBuilds = pgTable(
+  "solver_runtime_builds",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    provenanceKey: text("provenance_key").notNull().unique(),
+    buildId: text("build_id").notNull(),
+    sourceRevision: text("source_revision"),
+    imageDigest: text("image_digest"),
+    applicationSourceSha256: text("application_source_sha256"),
+    packageSha256: text("package_sha256"),
+    binarySha256: text("binary_sha256"),
+    architecture: text("architecture"),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    ownerUq: unique("solver_runtime_builds_id_implementation_uq").on(
+      t.id,
+      t.solverImplementationId,
+    ),
+    provenanceKeyCheck: check(
+      "solver_runtime_builds_provenance_key_check",
+      sql`${t.provenanceKey} ~ '^[0-9a-f]{64}$'`,
+    ),
+    applicationSourceSha256Check: check(
+      "solver_runtime_builds_application_source_sha256_check",
+      sql`${t.applicationSourceSha256} IS NULL OR ${t.applicationSourceSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    imageDigestCheck: check(
+      "solver_runtime_builds_image_digest_check",
+      sql`${t.imageDigest} IS NULL OR ${t.imageDigest} ~ '^sha256:[0-9a-f]{64}$'`,
+    ),
+    packageSha256Check: check(
+      "solver_runtime_builds_package_sha256_check",
+      sql`${t.packageSha256} IS NULL OR ${t.packageSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    binarySha256Check: check(
+      "solver_runtime_builds_binary_sha256_check",
+      sql`${t.binarySha256} IS NULL OR ${t.binarySha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    contentFingerprintCheck: check(
+      "solver_runtime_builds_content_fingerprint_check",
+      sql`COALESCE(${t.applicationSourceSha256} ~ '^[0-9a-f]{64}$', false)
+        OR COALESCE(${t.imageDigest} ~ '^sha256:[0-9a-f]{64}$', false)
+        OR COALESCE(${t.packageSha256} ~ '^[0-9a-f]{64}$', false)
+        OR COALESCE(${t.binarySha256} ~ '^[0-9a-f]{64}$', false)`,
+    ),
+    implementationIdx: index("solver_runtime_builds_implementation_idx").on(
+      t.solverImplementationId,
+      t.createdAt,
+    ),
+    buildIdIdx: index("solver_runtime_builds_build_id_idx").on(
+      t.solverImplementationId,
+      t.buildId,
+    ),
+  }),
+);
+
+export const solverExecutionPools = pgTable(
+  "solver_execution_pools",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slug: text("slug").notNull().unique(),
+    name: text("name").notNull(),
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    routingKey: text("routing_key").notNull(),
+    capacityKind: text("capacity_kind").notNull().default("cpu_slots"),
+    capacityLimit: integer("capacity_limit"),
+    enabled: boolean("enabled").notNull().default(false),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    ownerUq: unique("solver_execution_pools_id_implementation_uq").on(
+      t.id,
+      t.solverImplementationId,
+    ),
+    routingUq: uniqueIndex("solver_execution_pools_routing_uq").on(
+      t.routingKey,
+    ),
+    implementationIdx: index("solver_execution_pools_implementation_idx").on(
+      t.solverImplementationId,
+      t.enabled,
+    ),
+    capacityCheck: check(
+      "solver_execution_pools_capacity_check",
+      sql`${t.capacityLimit} IS NULL OR ${t.capacityLimit} >= 0`,
+    ),
+  }),
+);
+
+/** Immutable proof that a production canary suite completed through one exact
+ * live execution pool and runtime build. The receipt is deliberately stored
+ * with its canonical digest: a deploy retry can identify an exact replay, but
+ * cannot silently substitute different jobs, artifacts, or executable bytes. */
+export const solverEngineCanaryAttestations = pgTable(
+  "solver_engine_canary_attestations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    solverRuntimeBuildId: uuid("solver_runtime_build_id")
+      .notNull()
+      .references(() => solverRuntimeBuilds.id),
+    solverExecutionPoolId: uuid("solver_execution_pool_id")
+      .notNull()
+      .references(() => solverExecutionPools.id),
+    receiptSha256: text("receipt_sha256").notNull().unique(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    attestedBy: text("attested_by"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    runtimeBuildOwnerFk: foreignKey({
+      columns: [t.solverRuntimeBuildId, t.solverImplementationId],
+      foreignColumns: [
+        solverRuntimeBuilds.id,
+        solverRuntimeBuilds.solverImplementationId,
+      ],
+      name: "solver_engine_canary_attestations_runtime_owner_fk",
+    }),
+    executionPoolOwnerFk: foreignKey({
+      columns: [t.solverExecutionPoolId, t.solverImplementationId],
+      foreignColumns: [
+        solverExecutionPools.id,
+        solverExecutionPools.solverImplementationId,
+      ],
+      name: "solver_engine_canary_attestations_pool_owner_fk",
+    }),
+    receiptSha256Check: check(
+      "solver_engine_canary_attestations_receipt_sha256_check",
+      sql`${t.receiptSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    implementationCreatedIdx: index(
+      "solver_engine_canary_attestations_implementation_created_idx",
+    ).on(t.solverImplementationId, t.createdAt),
+  }),
+);
+
 export const meshProfiles = pgTable("mesh_profiles", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull().unique(),
@@ -501,30 +720,42 @@ export const meshProfiles = pgTable("mesh_profiles", {
     .$onUpdate(() => new Date()),
 });
 
-export const solverProfiles = pgTable("solver_profiles", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  slug: text("slug").notNull().unique(),
-  name: text("name").notNull(),
-  turbulenceModel: text("turbulence_model").notNull().default("kOmegaSST"),
-  nIterations: integer("n_iterations").notNull().default(3000),
-  convergenceTolerance: doublePrecision("convergence_tolerance")
-    .notNull()
-    .default(1e-5),
-  momentumScheme: text("momentum_scheme").notNull().default("linearUpwind"),
-  transientCycles: doublePrecision("transient_cycles").notNull().default(10),
-  transientDiscardFraction: doublePrecision("transient_discard_fraction")
-    .notNull()
-    .default(0.4),
-  transientMaxCourant: doublePrecision("transient_max_courant")
-    .notNull()
-    .default(DEFAULT_TRANSIENT_MAX_COURANT),
-  isSeeded: boolean("is_seeded").notNull().default(false),
-  createdAt: ts().notNull().defaultNow(),
-  updatedAt: ts()
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-});
+export const solverProfiles = pgTable(
+  "solver_profiles",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .default(DEFAULT_SOLVER_IMPLEMENTATION_ID)
+      .references(() => solverImplementations.id),
+    slug: text("slug").notNull().unique(),
+    name: text("name").notNull(),
+    turbulenceModel: text("turbulence_model").notNull().default("kOmegaSST"),
+    nIterations: integer("n_iterations").notNull().default(3000),
+    convergenceTolerance: doublePrecision("convergence_tolerance")
+      .notNull()
+      .default(1e-5),
+    momentumScheme: text("momentum_scheme").notNull().default("linearUpwind"),
+    transientCycles: doublePrecision("transient_cycles").notNull().default(10),
+    transientDiscardFraction: doublePrecision("transient_discard_fraction")
+      .notNull()
+      .default(0.4),
+    transientMaxCourant: doublePrecision("transient_max_courant")
+      .notNull()
+      .default(DEFAULT_TRANSIENT_MAX_COURANT),
+    isSeeded: boolean("is_seeded").notNull().default(false),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    implementationIdx: index("solver_profiles_implementation_idx").on(
+      t.solverImplementationId,
+    ),
+  }),
+);
 
 export const schedulingProfiles = pgTable("scheduling_profiles", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -771,15 +1002,30 @@ export const simulationPresetRevisions = pgTable(
     mach: doublePrecision("mach"),
     referenceLengthM: doublePrecision("reference_length_m").notNull(),
     snapshot: jsonb("snapshot").$type<Record<string, unknown>>().notNull(),
+    // Historical snapshots did not record an implementation. Migration 0065
+    // associates those rows with the explicit legacy/unknown identity without
+    // rewriting their immutable JSON or claiming an exact release/build.
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .default(LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID)
+      .references(() => solverImplementations.id),
     // sha256 over ONLY the physics+numerics snapshot blocks (see
     // physicsHashForSnapshot in simulation-setup.ts). Nullable until backfilled.
     physicsHash: text("physics_hash"),
+    // Versioned compatibility includes the logical solver implementation and
+    // numerics revision. Runtime build and execution pool are intentionally
+    // excluded. Nullable until lazily derived from an immutable snapshot.
+    methodCompatibilityHashVersion: integer(
+      "method_compatibility_hash_version",
+    ),
+    methodCompatibilityHash: text("method_compatibility_hash"),
     // Deterministic canonical-revision election per physicsHash: the campaign
     // launch materializer reuses the canonical row (prefer enabled-preset
     // revision, else oldest createdAt, tie-break lowest id).
     isCanonicalPhysics: boolean("is_canonical_physics")
       .notNull()
       .default(false),
+    isCanonicalMethod: boolean("is_canonical_method").notNull().default(false),
     createdAt: ts().notNull().defaultNow(),
   },
   (t) => ({
@@ -798,11 +1044,23 @@ export const simulationPresetRevisions = pgTable(
     physicsHashIdx: index("simulation_preset_revisions_physics_hash_idx").on(
       t.physicsHash,
     ),
+    methodCompatibilityHashIdx: index(
+      "simulation_preset_revisions_method_compatibility_hash_idx",
+    ).on(t.methodCompatibilityHashVersion, t.methodCompatibilityHash),
     canonicalPhysicsUq: uniqueIndex(
       "simulation_preset_revisions_canonical_physics_uq",
     )
       .on(t.physicsHash)
       .where(sql`${t.isCanonicalPhysics}`),
+    canonicalMethodUq: uniqueIndex(
+      "simulation_preset_revisions_canonical_method_uq",
+    )
+      .on(t.methodCompatibilityHashVersion, t.methodCompatibilityHash)
+      .where(sql`${t.isCanonicalMethod}`),
+    methodHashShapeCheck: check(
+      "simulation_preset_revisions_method_hash_shape_check",
+      sql`(${t.methodCompatibilityHashVersion} IS NULL AND ${t.methodCompatibilityHash} IS NULL) OR (${t.methodCompatibilityHashVersion} > 0 AND ${t.methodCompatibilityHash} ~ '^[0-9a-f]{64}$')`,
+    ),
   }),
 );
 
@@ -833,6 +1091,13 @@ export const resultAttempts = pgTable(
     }),
     engineJobId: text("engine_job_id"),
     engineCaseSlug: text("engine_case_slug"),
+    methodKey: text("method_key"),
+    solverImplementationId: uuid("solver_implementation_id").references(
+      () => solverImplementations.id,
+    ),
+    solverRuntimeBuildId: uuid("solver_runtime_build_id").references(
+      () => solverRuntimeBuilds.id,
+    ),
     status: resultStatusEnum("status").notNull().default("done"),
     source: dataSourceEnum("source").notNull().default("solved"),
     regime: regimeEnum("regime"),
@@ -875,6 +1140,28 @@ export const resultAttempts = pgTable(
       t.simulationPresetRevisionId,
     ),
     simJobIdx: index("result_attempts_sim_job_idx").on(t.simJobId),
+    solverImplementationIdx: index(
+      "result_attempts_solver_implementation_idx",
+    ).on(t.solverImplementationId),
+    solverRuntimeBuildIdx: index("result_attempts_solver_runtime_build_idx").on(
+      t.solverRuntimeBuildId,
+    ),
+    runtimeBuildOwnerFk: foreignKey({
+      columns: [t.solverRuntimeBuildId, t.solverImplementationId],
+      foreignColumns: [
+        solverRuntimeBuilds.id,
+        solverRuntimeBuilds.solverImplementationId,
+      ],
+      name: "result_attempts_runtime_build_owner_fk",
+    }),
+    runtimeBuildShapeCheck: check(
+      "result_attempts_runtime_build_shape_check",
+      sql`${t.solverRuntimeBuildId} IS NULL OR ${t.solverImplementationId} IS NOT NULL`,
+    ),
+    methodKeyCheck: check(
+      "result_attempts_method_key_check",
+      sql`${t.methodKey} IS NULL OR btrim(${t.methodKey}) <> ''`,
+    ),
     validIdx: index("result_attempts_valid_idx").on(t.validForPolar),
     catalogRejectedIdx: index("result_attempts_catalog_rejected_idx").on(
       t.airfoilId,
@@ -987,6 +1274,13 @@ export const results = pgTable(
     }),
     engineJobId: text("engine_job_id"),
     engineCaseSlug: text("engine_case_slug"),
+    methodKey: text("method_key"),
+    solverImplementationId: uuid("solver_implementation_id").references(
+      () => solverImplementations.id,
+    ),
+    solverRuntimeBuildId: uuid("solver_runtime_build_id").references(
+      () => solverRuntimeBuilds.id,
+    ),
     priority: integer("priority").notNull().default(0),
     solvedAt: ts(),
     createdAt: ts().notNull().defaultNow(),
@@ -996,6 +1290,22 @@ export const results = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    runtimeBuildOwnerFk: foreignKey({
+      columns: [t.solverRuntimeBuildId, t.solverImplementationId],
+      foreignColumns: [
+        solverRuntimeBuilds.id,
+        solverRuntimeBuilds.solverImplementationId,
+      ],
+      name: "results_runtime_build_owner_fk",
+    }),
+    runtimeBuildShapeCheck: check(
+      "results_runtime_build_shape_check",
+      sql`${t.solverRuntimeBuildId} IS NULL OR ${t.solverImplementationId} IS NOT NULL`,
+    ),
+    methodKeyCheck: check(
+      "results_method_key_check",
+      sql`${t.methodKey} IS NULL OR btrim(${t.methodKey}) <> ''`,
+    ),
     currentAttemptOwnerFk: foreignKey({
       columns: [t.currentResultAttemptId, t.id],
       foreignColumns: [resultAttempts.id, resultAttempts.resultId],
@@ -1347,6 +1657,13 @@ export const solverEvidenceArtifacts = pgTable(
     }),
     engineJobId: text("engine_job_id"),
     engineCaseSlug: text("engine_case_slug"),
+    methodKey: text("method_key"),
+    solverImplementationId: uuid("solver_implementation_id").references(
+      () => solverImplementations.id,
+    ),
+    solverRuntimeBuildId: uuid("solver_runtime_build_id").references(
+      () => solverRuntimeBuilds.id,
+    ),
     aoaDeg: doublePrecision("aoa_deg"),
     kind: evidenceArtifactKindEnum("kind").notNull(),
     field: text("field"),
@@ -1363,6 +1680,22 @@ export const solverEvidenceArtifacts = pgTable(
     createdAt: ts().notNull().defaultNow(),
   },
   (t) => ({
+    runtimeBuildOwnerFk: foreignKey({
+      columns: [t.solverRuntimeBuildId, t.solverImplementationId],
+      foreignColumns: [
+        solverRuntimeBuilds.id,
+        solverRuntimeBuilds.solverImplementationId,
+      ],
+      name: "solver_evidence_artifacts_runtime_build_owner_fk",
+    }),
+    runtimeBuildShapeCheck: check(
+      "solver_evidence_artifacts_runtime_build_shape_check",
+      sql`${t.solverRuntimeBuildId} IS NULL OR ${t.solverImplementationId} IS NOT NULL`,
+    ),
+    methodKeyCheck: check(
+      "solver_evidence_artifacts_method_key_check",
+      sql`${t.methodKey} IS NULL OR btrim(${t.methodKey}) <> ''`,
+    ),
     attemptOwnerFk: foreignKey({
       columns: [t.resultAttemptId, t.resultId],
       foreignColumns: [resultAttempts.id, resultAttempts.resultId],
@@ -1380,6 +1713,15 @@ export const solverEvidenceArtifacts = pgTable(
       t.storageKey,
       t.sha256,
     ),
+    solverImplementationIdx: index(
+      "solver_evidence_artifacts_solver_implementation_idx",
+    ).on(t.solverImplementationId),
+    solverRuntimeBuildIdx: index(
+      "solver_evidence_artifacts_solver_runtime_build_idx",
+    ).on(t.solverRuntimeBuildId),
+    idAttemptResultUq: unique(
+      "solver_evidence_artifacts_id_attempt_result_uq",
+    ).on(t.id, t.resultAttemptId, t.resultId),
     attemptContentUq: uniqueIndex(
       "solver_evidence_artifacts_attempt_content_uq",
     )
@@ -1402,6 +1744,203 @@ export const solverEvidenceArtifacts = pgTable(
         t.sha256,
       )
       .where(sql`${t.resultAttemptId} IS NULL AND ${t.resultId} IS NOT NULL`),
+  }),
+);
+
+/**
+ * One immutable physical evidence archive. Solver implementation, runtime
+ * build, numerical method, and exact result ownership deliberately remain on
+ * the source solverEvidenceArtifacts row instead of being duplicated here.
+ */
+export const solverEvidenceBlobs = pgTable(
+  "solver_evidence_blobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    backend: solverEvidenceBlobBackendEnum("backend").notNull(),
+    bucket: text("bucket"),
+    objectKey: text("object_key").notNull(),
+    /** GCS uint64 generation, stored as decimal text to prevent JS rounding. */
+    generation: text("generation"),
+    compression: solverEvidenceBlobCompressionEnum("compression").notNull(),
+    mimeType: text("mime_type").notNull(),
+    /** Digest and size of the compressed bytes at the physical location. */
+    sha256: text("sha256").notNull(),
+    byteSize: bigint("byte_size", { mode: "number" }).notNull(),
+    /** Canonical base64 big-endian CRC32C, matching the GCS representation. */
+    crc32c: text("crc32c").notNull(),
+    /** Digest and size of the decompressed tar stream. */
+    uncompressedTarSha256: text("uncompressed_tar_sha256").notNull(),
+    uncompressedTarByteSize: bigint("uncompressed_tar_byte_size", {
+      mode: "number",
+    }).notNull(),
+    verifiedAt: ts().notNull(),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    volumeIdentityUq: uniqueIndex("solver_evidence_blobs_volume_identity_uq")
+      .on(t.objectKey)
+      .where(sql`${t.backend} = 'volume'`),
+    gcsIdentityUq: uniqueIndex("solver_evidence_blobs_gcs_identity_uq")
+      .on(t.bucket, t.objectKey, t.generation)
+      .where(sql`${t.backend} = 'gcs'`),
+    contentIdx: index("solver_evidence_blobs_content_idx").on(
+      t.sha256,
+      t.byteSize,
+    ),
+    backendShapeCheck: check(
+      "solver_evidence_blobs_backend_shape_check",
+      sql`(
+        (${t.backend} = 'volume' AND ${t.bucket} IS NULL AND ${t.generation} IS NULL)
+        OR (${t.backend} = 'gcs' AND btrim(COALESCE(${t.bucket}, '')) <> '' AND ${t.generation} ~ '^[1-9][0-9]{0,19}$')
+      )`,
+    ),
+    objectKeyCheck: check(
+      "solver_evidence_blobs_object_key_check",
+      sql`btrim(${t.objectKey}) <> '' AND ${t.objectKey} NOT LIKE '/%' AND ${t.objectKey} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.objectKey}) = 0`,
+    ),
+    mimeTypeCheck: check(
+      "solver_evidence_blobs_mime_type_check",
+      sql`btrim(${t.mimeType}) <> ''`,
+    ),
+    sha256Check: check(
+      "solver_evidence_blobs_sha256_check",
+      sql`${t.sha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    byteSizeCheck: check(
+      "solver_evidence_blobs_byte_size_check",
+      sql`${t.byteSize} > 0`,
+    ),
+    crc32cCheck: check(
+      "solver_evidence_blobs_crc32c_check",
+      sql`${t.crc32c} ~ '^[A-Za-z0-9+/]{6}==$'`,
+    ),
+    tarSha256Check: check(
+      "solver_evidence_blobs_tar_sha256_check",
+      sql`${t.uncompressedTarSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    tarByteSizeCheck: check(
+      "solver_evidence_blobs_tar_byte_size_check",
+      sql`${t.uncompressedTarByteSize} > 0`,
+    ),
+    metadataCheck: check(
+      "solver_evidence_blobs_metadata_check",
+      sql`jsonb_typeof(${t.metadata}) = 'object'`,
+    ),
+  }),
+);
+
+/**
+ * Versioned archive selection for one exact result attempt. The partial
+ * unique index permits at most one current archive while retaining immutable
+ * superseded generations for audit and rollback.
+ */
+export const solverEvidenceArchives = pgTable(
+  "solver_evidence_archives",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id").notNull(),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    sourceArtifactId: uuid("source_artifact_id").notNull(),
+    blobId: uuid("blob_id")
+      .notNull()
+      .references(() => solverEvidenceBlobs.id),
+    state: solverEvidenceArchiveStateEnum("state")
+      .notNull()
+      .default("current"),
+    supersededByArchiveId: uuid("superseded_by_archive_id"),
+    supersededAt: ts(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "solver_evidence_archives_attempt_owner_fk",
+    }).onDelete("cascade"),
+    sourceOwnerFk: foreignKey({
+      columns: [t.sourceArtifactId, t.resultAttemptId, t.resultId],
+      foreignColumns: [
+        solverEvidenceArtifacts.id,
+        solverEvidenceArtifacts.resultAttemptId,
+        solverEvidenceArtifacts.resultId,
+      ],
+      name: "solver_evidence_archives_source_owner_fk",
+    }).onDelete("cascade"),
+    // Migration 0067 adds the composite self-FK
+    // (supersededByArchiveId, resultAttemptId) -> (id, resultAttemptId).
+    // It is kept migration-only because a self-referential composite FK makes
+    // TypeScript infer this table recursively as `any`.
+    idAttemptUq: unique("solver_evidence_archives_id_attempt_uq").on(
+      t.id,
+      t.resultAttemptId,
+    ),
+    attemptBlobUq: unique("solver_evidence_archives_attempt_blob_uq").on(
+      t.resultAttemptId,
+      t.blobId,
+    ),
+    currentAttemptUq: uniqueIndex(
+      "solver_evidence_archives_current_attempt_uq",
+    )
+      .on(t.resultAttemptId)
+      .where(sql`${t.state} = 'current'`),
+    resultIdx: index("solver_evidence_archives_result_idx").on(
+      t.resultId,
+      t.resultAttemptId,
+    ),
+    sourceArtifactIdx: index(
+      "solver_evidence_archives_source_artifact_idx",
+    ).on(t.sourceArtifactId),
+    blobIdx: index("solver_evidence_archives_blob_idx").on(t.blobId),
+    supersessionShapeCheck: check(
+      "solver_evidence_archives_supersession_shape_check",
+      sql`(
+        (${t.state} = 'current' AND ${t.supersededByArchiveId} IS NULL AND ${t.supersededAt} IS NULL)
+        OR (${t.state} = 'superseded' AND ${t.supersededAt} IS NOT NULL)
+      )`,
+    ),
+    noSelfSupersessionCheck: check(
+      "solver_evidence_archives_no_self_supersession_check",
+      sql`${t.supersededByArchiveId} IS NULL OR ${t.supersededByArchiveId} <> ${t.id}`,
+    ),
+  }),
+);
+
+/**
+ * Maps an existing logical evidence-artifact row to its relative tar member.
+ * The migration owner trigger proves that member and archive share the same
+ * exact result attempt, without duplicating runtime identity on this row.
+ */
+export const solverEvidenceArtifactMembers = pgTable(
+  "solver_evidence_artifact_members",
+  {
+    archiveId: uuid("archive_id")
+      .notNull()
+      .references(() => solverEvidenceArchives.id, { onDelete: "cascade" }),
+    artifactId: uuid("artifact_id")
+      .notNull()
+      .references(() => solverEvidenceArtifacts.id, { onDelete: "cascade" }),
+    memberPath: text("member_path").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      columns: [t.archiveId, t.artifactId],
+      name: "solver_evidence_artifact_members_pk",
+    }),
+    archivePathUq: unique(
+      "solver_evidence_artifact_members_archive_path_uq",
+    ).on(t.archiveId, t.memberPath),
+    artifactIdx: index("solver_evidence_artifact_members_artifact_idx").on(
+      t.artifactId,
+    ),
+    pathCheck: check(
+      "solver_evidence_artifact_members_path_check",
+      sql`btrim(${t.memberPath}) <> '' AND ${t.memberPath} NOT LIKE '/%' AND ${t.memberPath} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.memberPath}) = 0`,
+    ),
   }),
 );
 
@@ -1831,6 +2370,16 @@ export const simJobs = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     engineJobId: text("engine_job_id"),
+    methodKey: text("method_key"),
+    solverImplementationId: uuid("solver_implementation_id").references(
+      () => solverImplementations.id,
+    ),
+    solverRuntimeBuildId: uuid("solver_runtime_build_id").references(
+      () => solverRuntimeBuilds.id,
+    ),
+    solverExecutionPoolId: uuid("solver_execution_pool_id").references(
+      () => solverExecutionPools.id,
+    ),
     parentJobId: uuid("parent_job_id").references(
       (): AnyPgColumn => simJobs.id,
       { onDelete: "set null" },
@@ -1883,8 +2432,41 @@ export const simJobs = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    runtimeBuildOwnerFk: foreignKey({
+      columns: [t.solverRuntimeBuildId, t.solverImplementationId],
+      foreignColumns: [
+        solverRuntimeBuilds.id,
+        solverRuntimeBuilds.solverImplementationId,
+      ],
+      name: "sim_jobs_runtime_build_owner_fk",
+    }),
+    executionPoolOwnerFk: foreignKey({
+      columns: [t.solverExecutionPoolId, t.solverImplementationId],
+      foreignColumns: [
+        solverExecutionPools.id,
+        solverExecutionPools.solverImplementationId,
+      ],
+      name: "sim_jobs_execution_pool_owner_fk",
+    }),
+    runtimeShapeCheck: check(
+      "sim_jobs_runtime_shape_check",
+      sql`(${t.solverRuntimeBuildId} IS NULL AND ${t.solverExecutionPoolId} IS NULL) OR ${t.solverImplementationId} IS NOT NULL`,
+    ),
+    methodKeyCheck: check(
+      "sim_jobs_method_key_check",
+      sql`${t.methodKey} IS NULL OR btrim(${t.methodKey}) <> ''`,
+    ),
     statusIdx: index("sim_jobs_status_idx").on(t.status),
     engineJobIdx: index("sim_jobs_engine_job_idx").on(t.engineJobId),
+    solverImplementationIdx: index("sim_jobs_solver_implementation_idx").on(
+      t.solverImplementationId,
+    ),
+    solverRuntimeBuildIdx: index("sim_jobs_solver_runtime_build_idx").on(
+      t.solverRuntimeBuildId,
+    ),
+    solverExecutionPoolIdx: index("sim_jobs_solver_execution_pool_idx").on(
+      t.solverExecutionPoolId,
+    ),
     airfoilIdx: index("sim_jobs_airfoil_idx").on(t.airfoilId),
     presetRevisionIdx: index("sim_jobs_preset_revision_idx").on(
       t.simulationPresetRevisionId,
@@ -1895,6 +2477,53 @@ export const simJobs = pgTable(
       t.status,
       t.ingestLeaseExpiresAt,
     ),
+  }),
+);
+
+/** Durable post-cutover liveness proof. `routed` means a job for the newly
+ * created campaign generation was stamped with the exact 2606 implementation
+ * and pool; `evidence` additionally proves ingestion from the attested runtime
+ * build. Status is monotonic and remains pending across deploy retries. */
+export const solverCutoverContinuationChecks = pgTable(
+  "solver_cutover_continuation_checks",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    canaryAttestationId: uuid("canary_attestation_id")
+      .notNull()
+      .references(() => solverEngineCanaryAttestations.id)
+      .unique(),
+    status: text("status").notNull().default("pending"),
+    simJobId: uuid("sim_job_id").references(() => simJobs.id, {
+      onDelete: "set null",
+    }),
+    evidenceResultId: uuid("evidence_result_id").references(() => results.id, {
+      onDelete: "set null",
+    }),
+    lastError: text("last_error"),
+    createdAt: ts().notNull().defaultNow(),
+    checkedAt: ts().notNull().defaultNow(),
+    routedAt: ts(),
+    evidenceAt: ts(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    statusCheck: check(
+      "solver_cutover_continuation_checks_status_check",
+      sql`${t.status} IN ('pending', 'routed', 'evidence', 'not_required')`,
+    ),
+    stageShapeCheck: check(
+      "solver_cutover_continuation_checks_stage_shape_check",
+      sql`(${t.status} = 'pending' AND ${t.simJobId} IS NULL AND ${t.evidenceResultId} IS NULL AND ${t.routedAt} IS NULL AND ${t.evidenceAt} IS NULL)
+        OR (${t.status} = 'routed' AND ${t.simJobId} IS NOT NULL AND ${t.evidenceResultId} IS NULL AND ${t.routedAt} IS NOT NULL AND ${t.evidenceAt} IS NULL)
+        OR (${t.status} = 'evidence' AND ${t.simJobId} IS NOT NULL AND ${t.evidenceResultId} IS NOT NULL AND ${t.routedAt} IS NOT NULL AND ${t.evidenceAt} IS NOT NULL)
+        OR (${t.status} = 'not_required' AND ${t.simJobId} IS NULL AND ${t.evidenceResultId} IS NULL AND ${t.routedAt} IS NULL AND ${t.evidenceAt} IS NULL)`,
+    ),
+    statusCheckedIdx: index(
+      "solver_cutover_continuation_checks_status_checked_idx",
+    ).on(t.status, t.checkedAt),
   }),
 );
 
@@ -1972,6 +2601,9 @@ export const simCampaigns = pgTable(
     currentPlanRevisionId: uuid("current_plan_revision_id").references(
       (): AnyPgColumn => simCampaignPlanRevisions.id,
     ),
+    currentConditionGeneration: integer("current_condition_generation")
+      .notNull()
+      .default(1),
     closedWithFailedCount: integer("closed_with_failed_count"), // set by "Close with failures"
     closedWithRejectedCount: integer("closed_with_rejected_count"), // set alongside; null on pre-0028 closes (unknown, not zero)
     completedAt: ts(),
@@ -1990,6 +2622,10 @@ export const simCampaigns = pgTable(
     priorityCheck: check(
       "sim_campaigns_priority_check",
       sql`${t.priority} >= 0 AND ${t.priority} <= 9`,
+    ),
+    conditionGenerationCheck: check(
+      "sim_campaigns_condition_generation_check",
+      sql`${t.currentConditionGeneration} > 0`,
     ),
   }),
 );
@@ -2056,7 +2692,7 @@ export const simCampaignPlanRevisions = pgTable(
       .notNull()
       .references(() => simCampaigns.id, { onDelete: "cascade" }),
     revisionNumber: integer("revision_number").notNull(),
-    kind: text("kind").notNull(), // initial | edit | force_release
+    kind: text("kind").notNull(), // initial | edit | force_release | engine_cutover
     plan: jsonb("plan").$type<Record<string, unknown>>().notNull(), // canonical byte-stable plan document (spec §3.1)
     summary: jsonb("summary").$type<Record<string, unknown>>().notNull(),
     createdBy: text("created_by"),
@@ -2081,6 +2717,7 @@ export const simCampaignConditions = pgTable(
       .notNull()
       .references(() => simCampaigns.id, { onDelete: "cascade" }),
     ord: integer("ord").notNull(),
+    generation: integer("generation").notNull().default(1),
     // Provenance only — display reads the pinned revision snapshot, never live
     // registry rows.
     flowConditionId: uuid("flow_condition_id")
@@ -2099,7 +2736,12 @@ export const simCampaignConditions = pgTable(
     // Cached from the pinned revision.
     reynolds: bigint("reynolds", { mode: "number" }).notNull(),
     mach: doublePrecision("mach"),
-    status: text("status").notNull().default("active"), // active | kept | released
+    status: text("status").notNull().default("active"), // active | kept | released | superseded
+    supersedesConditionId: uuid("supersedes_condition_id").references(
+      (): AnyPgColumn => simCampaignConditions.id,
+      { onDelete: "set null" },
+    ),
+    supersededAt: timestamp("superseded_at", { withTimezone: true }),
     introducedInPlanRevisionId: uuid("introduced_in_plan_revision_id")
       .notNull()
       .references(() => simCampaignPlanRevisions.id),
@@ -2113,12 +2755,14 @@ export const simCampaignConditions = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
-    // Re-adding a previously released combo RE-ACTIVATES this row (same pinned
-    // revision; evidence continuity; no duplicate rows).
+    // Re-adding a released combo reactivates it only inside the current
+    // generation. A solver cutover creates a successor generation instead of
+    // ever relabelling the old condition/evidence.
     comboUq: uniqueIndex("sim_campaign_conditions_combo_uq").on(
       t.campaignId,
       t.flowConditionId,
       t.referenceGeometryProfileId,
+      t.generation,
     ),
     campaignStatusIdx: index("sim_campaign_conditions_campaign_status_idx").on(
       t.campaignId,
@@ -2126,6 +2770,145 @@ export const simCampaignConditions = pgTable(
     ),
     revisionIdx: index("sim_campaign_conditions_revision_idx").on(
       t.simulationPresetRevisionId,
+    ),
+    campaignGenerationIdx: index(
+      "sim_campaign_conditions_campaign_generation_idx",
+    ).on(t.campaignId, t.generation, t.status),
+    supersedesUq: uniqueIndex("sim_campaign_conditions_supersedes_uq")
+      .on(t.supersedesConditionId)
+      .where(sql`${t.supersedesConditionId} IS NOT NULL`),
+    generationCheck: check(
+      "sim_campaign_conditions_generation_check",
+      sql`${t.generation} > 0`,
+    ),
+    supersessionShapeCheck: check(
+      "sim_campaign_conditions_supersession_shape_check",
+      sql`(${t.status} = 'superseded' AND ${t.supersededAt} IS NOT NULL) OR (${t.status} <> 'superseded' AND ${t.supersededAt} IS NULL)`,
+    ),
+  }),
+);
+
+/** Audited, staged solver cutover for one campaign generation. Preparation
+ * closes admission and pauses; finalization creates the successor generation;
+ * completion is allowed only after the target execution pool is live. */
+export const simCampaignSolverCutovers = pgTable(
+  "sim_campaign_solver_cutovers",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    fromSolverImplementationId: uuid("from_solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    toSolverImplementationId: uuid("to_solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    canaryAttestationId: uuid("canary_attestation_id").references(
+      () => solverEngineCanaryAttestations.id,
+    ),
+    sourcePlanRevisionId: uuid("source_plan_revision_id")
+      .notNull()
+      .references(() => simCampaignPlanRevisions.id),
+    targetPlanRevisionId: uuid("target_plan_revision_id").references(
+      () => simCampaignPlanRevisions.id,
+    ),
+    sourceGeneration: integer("source_generation").notNull(),
+    targetGeneration: integer("target_generation").notNull(),
+    priorCampaignStatus: text("prior_campaign_status").notNull(),
+    status: text("status").notNull().default("prepared"),
+    reason: text("reason"),
+    preparedBy: text("prepared_by"),
+    finalizedBy: text("finalized_by"),
+    completedBy: text("completed_by"),
+    sourceConditionCount: integer("source_condition_count")
+      .notNull()
+      .default(0),
+    targetConditionCount: integer("target_condition_count")
+      .notNull()
+      .default(0),
+    targetPointCount: integer("target_point_count").notNull().default(0),
+    preparedAt: timestamp("prepared_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    finalizedAt: timestamp("finalized_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => ({
+    campaignTargetGenerationUq: uniqueIndex(
+      "sim_campaign_solver_cutovers_campaign_target_generation_uq",
+    ).on(t.campaignId, t.targetGeneration),
+    statusIdx: index("sim_campaign_solver_cutovers_status_idx").on(
+      t.status,
+      t.campaignId,
+    ),
+    generationCheck: check(
+      "sim_campaign_solver_cutovers_generation_check",
+      sql`${t.sourceGeneration} > 0 AND ${t.targetGeneration} = ${t.sourceGeneration} + 1`,
+    ),
+    statusCheck: check(
+      "sim_campaign_solver_cutovers_status_check",
+      sql`${t.status} IN ('prepared', 'finalized', 'completed')`,
+    ),
+    priorStatusCheck: check(
+      "sim_campaign_solver_cutovers_prior_status_check",
+      sql`${t.priorCampaignStatus} IN ('active', 'paused', 'attention')`,
+    ),
+    countsCheck: check(
+      "sim_campaign_solver_cutovers_counts_check",
+      sql`${t.sourceConditionCount} >= 0 AND ${t.targetConditionCount} >= 0 AND ${t.targetPointCount} >= 0`,
+    ),
+    distinctImplementationCheck: check(
+      "sim_campaign_solver_cutovers_distinct_implementation_check",
+      sql`${t.fromSolverImplementationId} <> ${t.toSolverImplementationId}`,
+    ),
+    stageShapeCheck: check(
+      "sim_campaign_solver_cutovers_stage_shape_check",
+      sql`(${t.status} = 'prepared' AND ${t.canaryAttestationId} IS NULL AND ${t.targetPlanRevisionId} IS NULL AND ${t.finalizedAt} IS NULL AND ${t.completedAt} IS NULL)
+        OR (${t.status} = 'finalized' AND ${t.canaryAttestationId} IS NOT NULL AND ${t.targetPlanRevisionId} IS NOT NULL AND ${t.finalizedAt} IS NOT NULL AND ${t.completedAt} IS NULL)
+        OR (${t.status} = 'completed' AND ${t.canaryAttestationId} IS NOT NULL AND ${t.targetPlanRevisionId} IS NOT NULL AND ${t.finalizedAt} IS NOT NULL AND ${t.completedAt} IS NOT NULL)`,
+    ),
+  }),
+);
+
+/** Exact eligible source-cell membership captured while finalization still
+ * has the pre-release source grid. Continuation compares the live successor
+ * grid to these rows, so unrelated older released points cannot widen the
+ * proof and a deleted/replaced target point cannot be hidden by a count. */
+export const simCampaignSolverCutoverPoints = pgTable(
+  "sim_campaign_solver_cutover_points",
+  {
+    cutoverId: uuid("cutover_id")
+      .notNull()
+      .references(() => simCampaignSolverCutovers.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    sourceConditionId: uuid("source_condition_id")
+      .notNull()
+      .references(() => simCampaignConditions.id),
+    targetConditionId: uuid("target_condition_id")
+      .notNull()
+      .references(() => simCampaignConditions.id),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    targetRevisionId: uuid("target_revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      columns: [t.cutoverId, t.sourceConditionId, t.airfoilId, t.aoaDeg],
+    }),
+    targetCellUq: uniqueIndex(
+      "sim_campaign_solver_cutover_points_target_cell_uq",
+    ).on(t.cutoverId, t.targetConditionId, t.airfoilId, t.aoaDeg),
+    campaignIdx: index("sim_campaign_solver_cutover_points_campaign_idx").on(
+      t.campaignId,
+      t.cutoverId,
     ),
   }),
 );
@@ -3447,6 +4230,9 @@ export type ReferenceGeometryProfile =
 export type OperatingCondition = typeof operatingConditions.$inferSelect;
 export type BoundaryProfile = typeof boundaryProfiles.$inferSelect;
 export type MeshProfile = typeof meshProfiles.$inferSelect;
+export type SolverImplementation = typeof solverImplementations.$inferSelect;
+export type SolverRuntimeBuild = typeof solverRuntimeBuilds.$inferSelect;
+export type SolverExecutionPool = typeof solverExecutionPools.$inferSelect;
 export type SolverProfile = typeof solverProfiles.$inferSelect;
 export type SchedulingProfile = typeof schedulingProfiles.$inferSelect;
 export type OutputProfile = typeof outputProfiles.$inferSelect;
@@ -3473,6 +4259,10 @@ export type ResultAttemptInsert = typeof resultAttempts.$inferInsert;
 export type ResultMedia = typeof resultMedia.$inferSelect;
 export type SolverEvidenceArtifact =
   typeof solverEvidenceArtifacts.$inferSelect;
+export type SolverEvidenceBlob = typeof solverEvidenceBlobs.$inferSelect;
+export type SolverEvidenceArchive = typeof solverEvidenceArchives.$inferSelect;
+export type SolverEvidenceArtifactMember =
+  typeof solverEvidenceArtifactMembers.$inferSelect;
 export type FieldRenderCache = typeof fieldRenderCache.$inferSelect;
 export type ForceHistoryRow = typeof forceHistory.$inferSelect;
 export type ResultClassification = typeof resultClassifications.$inferSelect;

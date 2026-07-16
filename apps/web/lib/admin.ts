@@ -132,6 +132,32 @@ export interface AdminJob {
   status: string;
   wave: number;
   kind: "sweep-rans" | "point-rans" | "point-urans";
+  methodKey: string | null;
+  solverImplementation: {
+    id: string;
+    key: string;
+    family: string;
+    distribution: string;
+    releaseVersion: string;
+    numericsRevision: string;
+    adapterContractVersion: number;
+  } | null;
+  solverRuntimeBuild: {
+    id: string;
+    buildId: string;
+    sourceRevision: string | null;
+    imageDigest: string | null;
+    applicationSourceSha256: string | null;
+    packageSha256: string | null;
+    binarySha256: string | null;
+    architecture: string | null;
+  } | null;
+  solverExecutionPool: {
+    id: string;
+    slug: string;
+    name: string;
+    routingKey: string;
+  } | null;
   engineJobId: string | null;
   engineState: string | null;
   totalCases: number;
@@ -959,8 +985,41 @@ export interface AdminMeshProfile {
   updatedAt: string;
 }
 
+export interface AdminSolverImplementation {
+  id: string;
+  key: string;
+  family: string;
+  distribution: string;
+  releaseVersion: string;
+  methodFamily: string;
+  adapterContractVersion: number;
+  numericsRevision: string;
+  capabilities: Record<string, unknown>;
+  upstreamUrl: string | null;
+  licenseSpdx: string | null;
+  retiredAt: string | null;
+  createdAt?: string;
+}
+
+export interface AdminSolverExecutionPool {
+  id: string;
+  slug: string;
+  name: string;
+  solverImplementationId: string;
+  routingKey: string;
+  capacityKind: string;
+  capacityLimit: number | null;
+  enabled: boolean;
+  metadata: Record<string, unknown>;
+  implementation: AdminSolverImplementation | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AdminSolverProfile {
   id: string;
+  solverImplementationId: string;
+  implementation: AdminSolverImplementation | null;
   slug: string;
   name: string;
   turbulenceModel: string;
@@ -1048,6 +1107,8 @@ export interface AdminSimulationSetup {
   referenceGeometryProfiles: AdminReferenceGeometryProfile[];
   boundaryProfiles: AdminBoundaryProfile[];
   meshProfiles: AdminMeshProfile[];
+  solverImplementations: AdminSolverImplementation[];
+  solverExecutionPools: AdminSolverExecutionPool[];
   solverProfiles: AdminSolverProfile[];
   schedulingProfiles: AdminSchedulingProfile[];
   outputProfiles: AdminOutputProfile[];
@@ -1092,6 +1153,7 @@ export type MeshProfileInput = Pick<
 export type SolverProfileInput = Pick<
   AdminSolverProfile,
   | "name"
+  | "solverImplementationId"
   | "turbulenceModel"
   | "nIterations"
   | "convergenceTolerance"
@@ -1224,6 +1286,14 @@ export const deleteSolverProfile = (id: string) =>
   aj<{ ok: true }>(`/api/admin/solver-profiles/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+export const updateSolverExecutionPool = (
+  id: string,
+  body: { enabled?: boolean; capacityLimit?: number | null },
+) =>
+  aj<AdminSolverExecutionPool>(
+    `/api/admin/solver-execution-pools/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
 export const createSchedulingProfile = (body: SchedulingProfileInput) =>
   aj<AdminSchedulingProfile>("/api/admin/scheduling-profiles", {
     method: "POST",

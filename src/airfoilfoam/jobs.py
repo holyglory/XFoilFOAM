@@ -24,7 +24,8 @@ from .models import (
     PolarPoint,
     PolarRequest,
 )
-from .openfoam.runner import OpenFOAMError, get_runner
+from .openfoam.runner import EngineIdentityMismatch, OpenFOAMError, get_runner
+from .openfoam.dialects import OPENCFD_2606_IDENTITY, get_openfoam_dialect
 from .pipeline import (
     CaseOutcome,
     PolarMarchResult,
@@ -98,6 +99,8 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
             artifact.model_copy(update={"url": url(artifact.path)})
             for artifact in outcome.evidence_artifacts
         ],
+        engine=outcome.engine,
+        method_key=outcome.method_key,
         failure_disposition=outcome.failure_disposition,
         error=outcome.error,
     )
@@ -112,6 +115,29 @@ def execute_job(
 ) -> JobResult:
     settings = settings or get_settings()
     store = store or JobStore(settings)
+    runtime_engine = settings.engine_runtime_identity()
+    expected_engine = request.expected_engine or OPENCFD_2606_IDENTITY
+    if expected_engine != runtime_engine.logical_identity():
+        raise EngineIdentityMismatch(
+            "engine_identity_mismatch: worker engine identity mismatch: requested "
+            f"{expected_engine.compatibility_key} adapter-{expected_engine.adapter_contract_version}, "
+            "worker is "
+            f"{runtime_engine.compatibility_key} adapter-{runtime_engine.adapter_contract_version}"
+        )
+    dialect = get_openfoam_dialect(expected_engine)
+    if (
+        request.expected_execution_pool is not None
+        and request.expected_execution_pool != dialect.queue_name
+    ):
+        raise EngineIdentityMismatch(
+            "execution_pool_mismatch: worker adapter routing mismatch: requested "
+            f"{request.expected_execution_pool}, engine requires {dialect.queue_name}"
+        )
+    if settings.celery_queue != dialect.queue_name:
+        raise EngineIdentityMismatch(
+            "execution_pool_mismatch: worker is consuming "
+            f"{settings.celery_queue}, engine requires {dialect.queue_name}"
+        )
     if (
         request.expected_mesh_recovery_version is not None
         and request.expected_mesh_recovery_version != MESH_RECOVERY_VERSION
@@ -131,7 +157,15 @@ def execute_job(
     chords, speeds = request.chord_lengths, request.speeds
     total = len(chords) * len(speeds) * len(aoas)
     plan = resolve_resources(request.resources, settings, total)
-    cpu_tokens = CpuTokenPool(settings.cpu_token_state_path, plan.worker_cpu_budget)
+    cpu_tokens = CpuTokenPool(
+        settings.cpu_token_state_path,
+        plan.worker_cpu_budget,
+        foreign_lease_ttl=settings.cpu_token_lease_ttl_seconds,
+    )
+    # Validate the shared cross-container budget before any meshing/solver
+    # work. A conflicting live worker configuration is an operational error,
+    # never permission to oversubscribe the host while waiting for acquire().
+    cpu_tokens.snapshot()
     mesh_stats = {"count": 0}
     mesh_reuse_mode = "symlink" if runner.external_paths_visible else "copy"
     # Persistent cross-job cache: meshes are copied instead of rebuilt when a
@@ -197,6 +231,10 @@ def execute_job(
                 aoa_case_count=total,
                 mesh_reuse_mode=mesh_reuse_mode,
             ),
+            requested_engine=expected_engine,
+            requested_execution_pool=dialect.queue_name,
+            engine=runtime_engine,
+            execution_pool=settings.celery_queue,
             mesh_recovery_version=MESH_RECOVERY_VERSION,
         )
         store.write_status(st)
@@ -351,13 +389,29 @@ def execute_job(
                 )
         return polars
 
+    def method_keys(polars: list[Polar]) -> list[str]:
+        return sorted(
+            {
+                point.method_key
+                for polar in polars
+                for point in [*polar.points, *polar.attempts]
+                if point.method_key is not None
+            }
+        )
+
     def write_partial_result_locked() -> None:
+        partial_polars = build_polars()
         store.write_result(
             JobResult(
                 job_id=job_id,
                 state=JobState.running,
-                polars=build_polars(),
+                polars=partial_polars,
                 scheduling=scheduling_metadata(),
+                requested_engine=expected_engine,
+                requested_execution_pool=dialect.queue_name,
+                engine=runtime_engine,
+                execution_pool=settings.celery_queue,
+                method_keys=method_keys(partial_polars),
             )
         )
 
@@ -413,6 +467,11 @@ def execute_job(
                 polars=build_polars(),
                 message=message,
                 scheduling=scheduling_metadata(),
+                requested_engine=expected_engine,
+                requested_execution_pool=dialect.queue_name,
+                engine=runtime_engine,
+                execution_pool=settings.celery_queue,
+                method_keys=method_keys(build_polars()),
             )
             store.write_result(result)
             set_status(
@@ -459,7 +518,7 @@ def execute_job(
                 plan.solver_processes,
                 JobPhase.solving_urans,
                 f"URANS continuation AoA {spec.aoa_deg:g} (resume from t={source.resume_from:g})",
-                solver="pimpleFoam",
+                solver=dialect.transient_solver_command,
                 case=spec,
             ),
         ):
@@ -521,7 +580,11 @@ def execute_job(
                     plan.solver_processes,
                     JobPhase.solving_rans if not request.solver.force_transient else JobPhase.solving_urans,
                     f"{'URANS' if request.solver.force_transient else 'RANS'} solving polar U={s:g}",
-                    solver="pimpleFoam" if request.solver.force_transient else "simpleFoam",
+                    solver=(
+                        dialect.transient_solver_command
+                        if request.solver.force_transient
+                        else dialect.steady_solver_command
+                    ),
                 ),
             ):
                 march = solve_polar_marched(
@@ -573,7 +636,11 @@ def execute_job(
             ensure_not_cancelled()
             mesh_dir, resolved, n_cells, mesh_mesher = meshes[spec.chord]
             solver_phase = JobPhase.solving_urans if request.solver.force_transient else JobPhase.solving_rans
-            solver_name = "pimpleFoam" if request.solver.force_transient else "simpleFoam"
+            solver_name = (
+                dialect.transient_solver_command
+                if request.solver.force_transient
+                else dialect.steady_solver_command
+            )
 
             def phase_progress(
                 phase: JobPhase,
@@ -650,6 +717,11 @@ def execute_job(
         state=state,
         polars=polars,
         scheduling=scheduling_metadata(),
+        requested_engine=expected_engine,
+        requested_execution_pool=dialect.queue_name,
+        engine=runtime_engine,
+        execution_pool=settings.celery_queue,
+        method_keys=method_keys(polars),
     )
     store.write_result(result)
     set_status(

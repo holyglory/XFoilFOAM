@@ -61,7 +61,7 @@ function candidate(
 
 describe("public polar compatibility evidence resolution", () => {
   it("invalidates caches built before incomplete-URANS quality gating", () => {
-    expect(POLAR_COMPATIBILITY_VERSION).toBe("polar-compat-v4");
+    expect(POLAR_COMPATIBILITY_VERSION).toBe("polar-compat-v5");
   });
 
   it.each([URANS_BUDGET_STOP_MARKER, URANS_CONTINUATION_REQUIRED_MARKER])(

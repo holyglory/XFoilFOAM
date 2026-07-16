@@ -2,6 +2,18 @@
 
 ## Direction
 
+- Confirmed intent: solver setup and evidence must support multiple independently
+  versioned engine implementations. OpenCFD 2606 replaces 2406 as the only
+  executable OpenCFD runtime after a guarded drain; 2406 remains immutable
+  historical evidence, not an enabled execution pool. The active campaign
+  continues through a linked 2606 successor generation that reruns its exact
+  eligible source snapshot, so evidence from the two numerical releases is
+  never merged into one polar. Foundation 14 remains a separate implementation. Future
+  solvers use the same adapter boundary but keep their own numerical identity;
+  the owner's thesis-derived open-source Euler/boundary-layer solver is not
+  MSES and must never inherit MSES identity or provenance.
+  [D-2026-07-15-multi-engine-identity]
+  [D-2026-07-15-opencfd-2606-cutover]
 - Confirmed intent: production campaigns should use real available compute while
   preserving trustworthy solver evidence and automatic recovery rather than
   handing repairable pipeline work to users. The single visible CPU-capacity
@@ -18,6 +30,77 @@
   [D-2026-07-15-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
   [D-2026-07-15-campaign-instrument-overview]
+- Confirmed intent: finalized solver evidence belongs in the private GCS
+  archive as content-addressed Zstandard bundles, while the VPS retains only
+  active solve state and bounded temporary render hydration. Complete solver
+  evidence is conserved, local raw VTK is removed only after verified remote
+  restore, and production uses attached workload identity rather than exported
+  credentials. [D-2026-07-15-gcs-zstd-evidence]
+
+## D-2026-07-15-gcs-zstd-evidence — Final evidence is remote and hydrated on demand
+
+Detail: [DecisionDetails/D-2026-07-15-gcs-zstd-evidence.md](DecisionDetails/D-2026-07-15-gcs-zstd-evidence.md)
+
+- Decision: store each finalized exact solver result as a versioned,
+  content-addressed tar.zst object in the private
+  `airfoils-pro-storage-bucket`; after upload and restore verification, remove
+  uncompressed finalized VTK and other packaged raw members from the VPS and
+  hydrate only the required members into a bounded temporary render cache.
+  Transcode legacy gzip without changing its uncompressed tar stream, retain
+  an auditable old/new identity receipt, use a 30-day bucket soft-delete
+  window, and authenticate through the VM's attached service account.
+- Why: another persistent-disk increase cannot hold the projected campaign;
+  filesystem compression retains the duplicate; gzip measured materially
+  larger and slower to restore; per-VTU objects weaken atomic evidence
+  verification and create excessive lifecycle overhead. The selected design
+  keeps every solver result while reclaiming the duplicated local evidence and
+  separates durable archives from active-solve/render capacity.
+
+## D-2026-07-15-opencfd-2606-cutover — OpenCFD 2606 replaces the executable 2406 pool
+
+Detail: [DecisionDetails/D-2026-07-15-opencfd-2606-cutover.md](DecisionDetails/D-2026-07-15-opencfd-2606-cutover.md)
+
+- Decision: make checksum-pinned OpenCFD 2606 the default and only executable
+  OpenCFD worker. Fence new 2406 admission, drain active 2406 work through the
+  solver-maintenance guard, disable its execution pool, and remove its deployed
+  container without deleting its implementation or evidence records. Continue
+  the active campaign as a linked successor generation with a new immutable
+  2606 setup identity and rerun the exact eligible source snapshot:
+  current-generation `active`/`kept` conditions and non-released points. 2406
+  results remain historical evidence and cannot satisfy 2606
+  coverage, fits, caches, or final polar curves. This supersedes only the
+  OpenCFD-2406-default/runtime portion of
+  D-2026-07-15-multi-engine-identity; its multi-engine and provenance model
+  remains authoritative.
+- Why: changing the image in place or relabelling 2406 rows would falsify
+  numerical provenance; rerunning only unfinished cells would split one
+  campaign across incompatible method identities and leave neither release
+  with a complete coherent eligible grid; retaining both executable OpenCFD pools would
+  contradict the requested 2406-container removal and leave ambiguous default
+  routing. A drained successor generation reruns every eligible cell but preserves all
+  prior evidence, makes the release boundary auditable, gives 2606 one complete
+  internally consistent polar grid, and retains a reversible pinned-image
+  rollback without keeping the old worker live.
+
+## D-2026-07-15-multi-engine-identity — Solver implementations have immutable numerical identity
+
+Detail: [DecisionDetails/D-2026-07-15-multi-engine-identity.md](DecisionDetails/D-2026-07-15-multi-engine-identity.md)
+
+- Decision: model solver family, implementation/distribution, release, and an
+  explicit numerics revision in immutable setup compatibility; record source,
+  adapter, build, binary, and image provenance on actual jobs and evidence.
+  Keep OpenCFD 2406 as the default implementation and add Foundation 14 through
+  a separate dialect, queue, and worker image. Engine-specific numerical
+  profiles and capabilities remain typed; scheduling pools and output policy
+  remain separate domains. The current delivery deliberately excludes XFoil.
+- Why: replacing the OpenCFD image would reinterpret old setup and evidence and
+  make rollback unsafe; a single global version cannot distinguish the
+  divergent OpenCFD and Foundation lines; one universal settings table would
+  falsely equate OpenFOAM meshes, XFoil paneling, and future coupled
+  Euler/boundary-layer controls. Versioned adapters preserve current production
+  behavior, prevent cross-engine polar/cache collisions, and leave a truthful
+  extension seam for the owner's independently implemented solver without
+  claiming it is Drela's proprietary MSES.
 
 ## D-2026-07-15-campaign-instrument-overview — Campaign progress is an instrument, not a status wall
 

@@ -36,6 +36,8 @@ import {
   mergeAdminQueue,
   type AdminReferenceGeometryProfile,
   type AdminSchedulingProfile,
+  type AdminSolverExecutionPool,
+  type AdminSolverImplementation,
   type AdminSyncPermission,
   type AdminSyncState,
   type AdminSimulationPreset,
@@ -95,6 +97,7 @@ import {
   updateReferenceGeometryProfile,
   updateSchedulingProfile,
   updateSimulationPreset,
+  updateSolverExecutionPool,
   updateSolverProfile,
   updateSweepDefinition,
 } from "@/lib/admin";
@@ -1381,6 +1384,8 @@ const EMPTY_SETUP: AdminSimulationSetup = {
   referenceGeometryProfiles: [],
   boundaryProfiles: [],
   meshProfiles: [],
+  solverImplementations: [],
+  solverExecutionPools: [],
   solverProfiles: [],
   schedulingProfiles: [],
   outputProfiles: [],
@@ -1581,8 +1586,50 @@ const defaultMeshForm = (): MeshProfileInput => ({
   targetYPlus: 1,
   spanChords: 0.1,
 });
-const defaultSolverForm = (): SolverProfileInput => ({
+function solverFamilyLabel(family: string) {
+  return family.toLowerCase() === "openfoam" ? "OpenFOAM" : family;
+}
+
+function solverDistributionLabel(distribution: string) {
+  if (distribution.toLowerCase() === "opencfd") return "OpenCFD";
+  if (distribution.toLowerCase() === "foundation") return "Foundation";
+  return distribution;
+}
+
+function solverImplementationLabel(
+  implementation: Pick<
+    AdminSolverImplementation,
+    "family" | "distribution" | "releaseVersion"
+  >,
+) {
+  return `${solverFamilyLabel(implementation.family)} · ${solverDistributionLabel(implementation.distribution)} ${implementation.releaseVersion}`;
+}
+
+function selectableSolverImplementations(setup: AdminSimulationSetup) {
+  return setup.solverImplementations.filter(
+    (implementation) => implementation.retiredAt == null,
+  );
+}
+
+function preferredSolverImplementationId(setup: AdminSimulationSetup) {
+  const active = selectableSolverImplementations(setup);
+  return (
+    active.find(
+      (implementation) =>
+        implementation.family.toLowerCase() === "openfoam" &&
+        implementation.distribution.toLowerCase() === "opencfd" &&
+        implementation.releaseVersion === "2606",
+    )?.id ??
+    active[0]?.id ??
+    ""
+  );
+}
+
+const defaultSolverForm = (
+  solverImplementationId = "",
+): SolverProfileInput => ({
   name: "",
+  solverImplementationId,
   turbulenceModel: "kOmegaSST",
   nIterations: 3000,
   convergenceTolerance: 1e-5,
@@ -1934,6 +1981,24 @@ function SimulationSetupPanel({
   const flowPreview = medium ? previewFlow(medium, flowForm) : null;
   const selectedPreset =
     setup.simulationPresets.find((p) => p.id === presetId) ?? null;
+  const solverImplementationOptions = (() => {
+    const active = selectableSolverImplementations(setup);
+    const current = setup.solverImplementations.find(
+      (implementation) =>
+        implementation.id === solverForm.solverImplementationId,
+    );
+    return current &&
+      !active.some((implementation) => implementation.id === current.id)
+      ? [...active, current]
+      : active;
+  })();
+  const solverImplementationOptionLabels = Object.fromEntries([
+    ["", "choose engine implementation"],
+    ...solverImplementationOptions.map((implementation) => [
+      implementation.id,
+      `${solverImplementationLabel(implementation)}${implementation.retiredAt ? " · retired" : ""}`,
+    ]),
+  ]);
 
   const refresh = async () => {
     const [ms, data] = await Promise.all([
@@ -1942,6 +2007,11 @@ function SimulationSetupPanel({
     ]);
     setMediumsList(ms.items);
     setSetup(data);
+    setSolverForm((current) => ({
+      ...current,
+      solverImplementationId:
+        current.solverImplementationId || preferredSolverImplementationId(data),
+    }));
     setFlowForm((current) => {
       if (current.mediumId || !ms.items[0]) return current;
       const defaults = defaultFlowForm(ms.items[0]);
@@ -2067,6 +2137,10 @@ function SimulationSetupPanel({
   const validateSolver = () =>
     compactIssues([
       requiredIssue(solverForm.name, "Name"),
+      requiredChoiceIssue(
+        solverForm.solverImplementationId,
+        "Engine implementation",
+      ),
       requiredChoiceIssue(solverForm.turbulenceModel, "Turbulence model"),
       positiveIntegerIssue(solverForm.nIterations, "Iterations"),
       positiveIssue(solverForm.convergenceTolerance, "Tolerance"),
@@ -2225,6 +2299,7 @@ function SimulationSetupPanel({
     setSolverId(row.id);
     setSolverForm({
       name: row.name,
+      solverImplementationId: row.solverImplementationId,
       turbulenceModel: row.turbulenceModel,
       nIterations: row.nIterations,
       convergenceTolerance: row.convergenceTolerance,
@@ -2395,7 +2470,9 @@ function SimulationSetupPanel({
       await deleteSolverProfile(id);
       if (solverId === id) {
         setSolverId("");
-        setSolverForm(defaultSolverForm());
+        setSolverForm(
+          defaultSolverForm(preferredSolverImplementationId(setup)),
+        );
       }
       await refresh();
     });
@@ -3165,11 +3242,13 @@ function SimulationSetupPanel({
           onSelect={selectSolver}
           onNew={() => {
             setSolverId("");
-            setSolverForm(defaultSolverForm());
+            setSolverForm(
+              defaultSolverForm(preferredSolverImplementationId(setup)),
+            );
           }}
           onRemove={(row) => removeSolver(row.id)}
           describe={(s) =>
-            `${s.turbulenceModel} · ${s.nIterations} iters · ${s.transientCycles} cycles`
+            `${s.implementation ? solverImplementationLabel(s.implementation) : "engine unavailable"} · ${s.turbulenceModel} · ${s.nIterations} iters · ${s.transientCycles} cycles`
           }
           emptyText="No solver profiles yet."
           busy={busy}
@@ -3178,7 +3257,9 @@ function SimulationSetupPanel({
             text={solverId ? "EDIT SOLVER PROFILE" : "ADD SOLVER PROFILE"}
             onNew={() => {
               setSolverId("");
-              setSolverForm(defaultSolverForm());
+              setSolverForm(
+                defaultSolverForm(preferredSolverImplementationId(setup)),
+              );
             }}
           />
           <TextField
@@ -3195,6 +3276,24 @@ function SimulationSetupPanel({
             />
           )}
           <div className="admin-form-grid">
+            <SelectField
+              label="Engine implementation"
+              value={solverForm.solverImplementationId}
+              options={[
+                "",
+                ...solverImplementationOptions.map(
+                  (implementation) => implementation.id,
+                ),
+              ]}
+              optionLabels={solverImplementationOptionLabels}
+              error={issueFor(validationIssues, "Engine implementation")}
+              onChange={(solverImplementationId) =>
+                setSolverForm((form) => ({
+                  ...form,
+                  solverImplementationId,
+                }))
+              }
+            />
             <SelectField
               label="Turbulence model"
               value={solverForm.turbulenceModel}
@@ -4659,6 +4758,9 @@ function QueueDashboard({
   onOpenPoints: (campaignId: string, status: CampaignPointsBucket) => void;
 }) {
   const [queue, setQueue] = useState<AdminQueue | null>(null);
+  const [engineSetup, setEngineSetup] = useState<AdminSimulationSetup | null>(
+    null,
+  );
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [maintenanceNotice, setMaintenanceNotice] = useState<string | null>(
@@ -4748,6 +4850,13 @@ function QueueDashboard({
   useEffect(() => {
     void refresh();
   }, [tab, refresh]);
+
+  useEffect(() => {
+    if (tab !== "engine") return;
+    getAdminSimulationSetup()
+      .then(setEngineSetup)
+      .catch((e) => setErr((e as Error).message));
+  }, [tab]);
 
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -4843,6 +4952,12 @@ function QueueDashboard({
       : solver.tone === "amber"
         ? "rgba(245, 165, 36, 0.07)"
         : C.tealFill;
+
+  const toggleEnginePool = (pool: AdminSolverExecutionPool) =>
+    void act(async () => {
+      await updateSolverExecutionPool(pool.id, { enabled: !pool.enabled });
+      setEngineSetup(await getAdminSimulationSetup());
+    });
 
   const purgeArtifacts = () => {
     const prefix = purgePrefix.trim();
@@ -5060,11 +5175,11 @@ function QueueDashboard({
                 </button>
               )}
               <div
-                data-admin-field="OpenFOAM CPU slots"
+                data-admin-field="Solver CPU slots"
                 style={{ display: "flex", alignItems: "center", gap: 8 }}
               >
                 <span style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>
-                  OpenFOAM CPU slots
+                  Solver CPU slots
                 </span>
                 <CpuSlotsStepper
                   value={sw.cpuSlots}
@@ -5129,7 +5244,7 @@ function QueueDashboard({
             testId="queue-active-jobs"
           >
             {!queue ? (
-              <EmptyQueueLine text="Loading active OpenFOAM jobs…" />
+              <EmptyQueueLine text="Loading active solver jobs…" />
             ) : activeJobs.length === 0 ? (
               <EmptyQueueLine
                 text={
@@ -5350,10 +5465,146 @@ function QueueDashboard({
       {tab === "engine" && (
         <div style={{ display: "grid", gap: 14 }}>
           <section
+            data-testid="solver-engine-inventory"
+            style={{ ...card, padding: 14, borderRadius: 8 }}
+          >
+            <div style={label}>SOLVER IMPLEMENTATIONS</div>
+            {!engineSetup ? (
+              <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>
+                loading registered engines…
+              </div>
+            ) : selectableSolverImplementations(engineSetup).length === 0 ? (
+              <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim }}>
+                No active solver implementations are registered.
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: 9 }}>
+                {selectableSolverImplementations(engineSetup).map(
+                  (implementation) => {
+                    const pools = engineSetup.solverExecutionPools.filter(
+                      (pool) =>
+                        pool.solverImplementationId === implementation.id,
+                    );
+                    const profileCount = engineSetup.solverProfiles.filter(
+                      (profile) =>
+                        profile.solverImplementationId === implementation.id,
+                    ).length;
+                    return (
+                      <div
+                        key={implementation.id}
+                        data-testid={`solver-implementation-${implementation.distribution}-${implementation.releaseVersion}`}
+                        style={{
+                          borderTop: `1px solid ${C.borderSoft}`,
+                          paddingTop: 9,
+                          display: "grid",
+                          gap: 7,
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 10,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <div>
+                            <div
+                              style={{
+                                fontFamily: MONO,
+                                fontSize: 12,
+                                color: C.text,
+                                fontWeight: 700,
+                              }}
+                            >
+                              {solverImplementationLabel(implementation)}
+                            </div>
+                            <div
+                              style={{
+                                marginTop: 3,
+                                fontFamily: MONO,
+                                fontSize: 10,
+                                color: C.dim,
+                              }}
+                            >
+                              {implementation.methodFamily.replace(/_/g, " ")} ·
+                              numerics {implementation.numericsRevision} ·{" "}
+                              {profileCount} profile
+                              {profileCount === 1 ? "" : "s"}
+                              {implementation.licenseSpdx
+                                ? ` · ${implementation.licenseSpdx}`
+                                : ""}
+                            </div>
+                          </div>
+                        </div>
+                        {pools.length === 0 ? (
+                          <div
+                            style={{
+                              fontFamily: MONO,
+                              fontSize: 10.5,
+                              color: C.amber,
+                            }}
+                          >
+                            No execution pool is registered for this engine.
+                          </div>
+                        ) : (
+                          pools.map((pool) => (
+                            <div
+                              key={pool.id}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 10,
+                                flexWrap: "wrap",
+                              }}
+                            >
+                              <span
+                                style={{
+                                  fontFamily: MONO,
+                                  fontSize: 10.5,
+                                  color: pool.enabled ? C.teal : C.dim,
+                                }}
+                              >
+                                {pool.name} · route {pool.routingKey} ·{" "}
+                                {pool.enabled ? "enabled" : "disabled"}
+                              </span>
+                              <button
+                                type="button"
+                                aria-label={`${pool.enabled ? "Disable" : "Enable"} ${solverImplementationLabel(implementation)} execution pool`}
+                                disabled={busy}
+                                onClick={() => toggleEnginePool(pool)}
+                                style={{
+                                  ...ghostBtn,
+                                  padding: "5px 9px",
+                                  fontSize: 10,
+                                  color: pool.enabled ? C.amber : C.teal,
+                                  opacity: busy ? 0.6 : 1,
+                                }}
+                              >
+                                {pool.enabled ? "disable pool" : "enable pool"}
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    );
+                  },
+                )}
+                <div style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
+                  Enabling a pool performs a live capability check. Start its
+                  worker image and enable its gateway adapter before activation.
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section
             data-testid="engine-identity"
             style={{ ...card, padding: 14, borderRadius: 8 }}
           >
-            <div style={label}>ENGINE</div>
+            <div style={label}>SOLVER GATEWAY</div>
             <div
               style={{
                 display: "flex",
@@ -6667,6 +6918,14 @@ function JobConditionChips({ job }: { job: AdminJob }) {
         value={`chord ${f(job.referenceChordM, 3)} m · ${reLabel}`}
       />
       <MetricChip label="Boundary" value={job.bcName ?? "—"} />
+      <MetricChip
+        label="Engine"
+        value={
+          job.solverImplementation
+            ? `${solverImplementationLabel(job.solverImplementation)}${job.solverRuntimeBuild?.buildId ? ` · build ${job.solverRuntimeBuild.buildId}` : ""}${job.solverExecutionPool?.name ? ` · ${job.solverExecutionPool.name}` : ""}`
+            : "legacy / unknown"
+        }
+      />
       <MetricChip label="Solver" value={job.turbulenceModel ?? "—"} />
       <MetricChip
         label="Scheduling"

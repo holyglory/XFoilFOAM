@@ -54,6 +54,7 @@ import {
   type JobRuntimeSummary,
   type JobStatus,
   type UransFidelity,
+  isEngineRuntimeIdentity,
 } from "@aerodb/engine-client";
 import {
   and,
@@ -68,12 +69,24 @@ import {
   type SQLWrapper,
 } from "drizzle-orm";
 
-import { buildPolarRequest } from "./build-request";
+import {
+  buildPolarRequest,
+  solverImplementationIdForSetup,
+} from "./build-request";
 import {
   engineMeshRecoveryVersion,
   parsedMeshRecoveryVersion,
 } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
+import {
+  requireExecutionPoolForSetup,
+  SolverExecutionPoolUnavailableError,
+} from "./engine-pool";
+import { persistEngineRuntimeForJob } from "./engine-provenance";
+import {
+  expectedEngineForJob,
+  expectedExecutionPoolForJob,
+} from "./engine-routing";
 import { touchHeartbeat } from "./heartbeat";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
 import {
@@ -81,6 +94,7 @@ import {
   failedForPoint,
   type IngestedRansPrecalcPromotion,
   ingestResult,
+  TerminalEvidenceCleanupPendingError,
   type SpeedBc,
 } from "./ingest";
 import {
@@ -425,6 +439,7 @@ export function parsedExecutedMeshRecoveryVersion(
 type EngineRequestPayloadAcknowledgement = {
   scheduling?: JobStatus["scheduling"];
   mesh_recovery_version?: unknown;
+  engine?: unknown;
 };
 
 /** Build an atomic JSONB update from engine-authored metadata. Always start
@@ -455,6 +470,14 @@ function requestPayloadWithEngineAcknowledgementSql(
       true
     )`;
   }
+  if (isEngineRuntimeIdentity(acknowledgement.engine)) {
+    payload = sql`jsonb_set(
+      ${payload},
+      '{executedEngine}',
+      ${JSON.stringify(acknowledgement.engine)}::jsonb,
+      true
+    )`;
+  }
   return payload;
 }
 
@@ -466,11 +489,31 @@ async function jobWithPersistedMeshRecoveryAcknowledgement(
   db: DB,
   job: SimJobRow,
   rawVersion: unknown,
+  rawEngine: unknown,
   lease: Pick<IngestLease, "jobId" | "token">,
 ): Promise<SimJobRow> {
+  await persistEngineRuntimeForJob(db, job.id, rawEngine);
   const version = parsedExecutedMeshRecoveryVersion(rawVersion);
+  const runtimeEngine = isEngineRuntimeIdentity(rawEngine) ? rawEngine : null;
+  let payload = sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb)`;
+  if (version != null) {
+    payload = sql`jsonb_set(
+      ${payload},
+      '{executedMeshRecoveryVersion}',
+      to_jsonb(${version}::integer),
+      true
+    )`;
+  }
+  if (runtimeEngine) {
+    payload = sql`jsonb_set(
+      ${payload},
+      '{executedEngine}',
+      ${JSON.stringify(runtimeEngine)}::jsonb,
+      true
+    )`;
+  }
   const [current] =
-    version == null
+    version == null && runtimeEngine == null
       ? await db
           .select({ requestPayload: simJobs.requestPayload })
           .from(simJobs)
@@ -479,12 +522,7 @@ async function jobWithPersistedMeshRecoveryAcknowledgement(
       : await db
           .update(simJobs)
           .set({
-            requestPayload: sql`jsonb_set(
-            COALESCE(${simJobs.requestPayload}, '{}'::jsonb),
-            '{executedMeshRecoveryVersion}',
-            to_jsonb(${version}::integer),
-            true
-          )`,
+            requestPayload: payload,
           })
           .where(ingestLeaseOwnedWhere(job.id, lease.token))
           .returning({ requestPayload: simJobs.requestPayload });
@@ -996,6 +1034,7 @@ export async function updateJobFromEngineStatus(
   job: SimJobRow,
   status: JobStatus,
 ): Promise<void> {
+  await persistEngineRuntimeForJob(db, job.id, status.engine);
   if (status.state === "cancelled") {
     // G2 dispatch site 1 (status mapping): `cancelled` used to fall through
     // the ternary below to status "running".
@@ -1755,6 +1794,16 @@ export async function submitUransRetryForJob(
     .from(sweeperState)
     .where(eq(sweeperState.id, 1))
     .limit(1);
+  let executionPool;
+  try {
+    executionPool = await requireExecutionPoolForSetup(db, setup.snapshot);
+  } catch (error) {
+    if (!(error instanceof SolverExecutionPoolUnavailableError)) throw error;
+    console.error(
+      `[sweeper] URANS routing for job ${parent.id} deferred: ${error.message}`,
+    );
+    return;
+  }
   const { request, speed } = buildPolarRequest({
     airfoil: a,
     setup: setup.snapshot,
@@ -1763,6 +1812,7 @@ export async function submitUransRetryForJob(
     uransFidelity: "precalc",
     cpuSlots: capacity?.cpuSlots ?? 0,
   });
+  request.expected_execution_pool = executionPool.routingKey;
   request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;
   if (continuation) {
     request.continue_from = {
@@ -1780,6 +1830,9 @@ export async function submitUransRetryForJob(
       airfoilId: a.id,
       bcIds: [bcId],
       simulationPresetRevisionId: setup.revisionId,
+      solverImplementationId: solverImplementationIdForSetup(setup.snapshot),
+      solverExecutionPoolId: executionPool.id,
+      methodKey: "openfoam.urans",
       // Physical preliminary work can satisfy several campaigns. Ownership
       // lives in sim_precalc_obligation_campaigns; a scalar campaign_id would
       // let one beneficiary cancel every other owner's solve.
@@ -2066,6 +2119,16 @@ async function submitCampaignUransRetries(
       obligationIds = [continuation.obligationId];
     }
     const snapshot = revision.snapshot as unknown as SimulationSetupSnapshot;
+    let executionPool;
+    try {
+      executionPool = await requireExecutionPoolForSetup(db, snapshot);
+    } catch (error) {
+      if (!(error instanceof SolverExecutionPoolUnavailableError)) throw error;
+      console.error(
+        `[sweeper] URANS routing for job ${parent.id}, condition ${entry.conditionId} deferred: ${error.message}`,
+      );
+      continue;
+    }
     const { request, speed } = buildPolarRequest({
       airfoil: a,
       setup: snapshot,
@@ -2074,6 +2137,7 @@ async function submitCampaignUransRetries(
       uransFidelity: "precalc",
       cpuSlots: capacity?.cpuSlots ?? 0,
     });
+    request.expected_execution_pool = executionPool.routingKey;
     request.expected_mesh_recovery_version = opts.meshRecoveryVersion ?? 0;
     if (continuation) {
       request.continue_from = {
@@ -2092,6 +2156,9 @@ async function submitCampaignUransRetries(
         airfoilId: a.id,
         bcIds: [entry.bcId],
         simulationPresetRevisionId: entry.revisionId,
+        solverImplementationId: solverImplementationIdForSetup(snapshot),
+        solverExecutionPoolId: executionPool.id,
+        methodKey: "openfoam.urans",
         campaignId: null,
         jobKind: "targeted",
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,
@@ -2333,12 +2400,16 @@ async function ingestCompletedJob(
   const lease = await claimJobForIngest(db, job.id);
   if (!lease) return;
   try {
-    const result = await engine.getResult(engineJobId);
+    const result = await engine.getResult(engineJobId, {
+      expectedEngine: expectedEngineForJob(job),
+      expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+    });
     await renewIngestLeaseOrThrow(db, lease);
     job = await jobWithPersistedMeshRecoveryAcknowledgement(
       db,
       job,
       result.mesh_recovery_version,
+      result.engine,
       lease,
     );
     const speedMap = speedMapForJob(job);
@@ -2416,7 +2487,10 @@ async function ingestRunningPartialJob(
   if (!lease) return false;
   let result;
   try {
-    result = await engine.getResult(engineJobId);
+    result = await engine.getResult(engineJobId, {
+      expectedEngine: expectedEngineForJob(job),
+      expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+    });
   } catch {
     await releaseIngestLeaseToRunning(db, lease);
     return false;
@@ -2431,6 +2505,7 @@ async function ingestRunningPartialJob(
       db,
       job,
       result.mesh_recovery_version,
+      result.engine,
       lease,
     );
     const ingested = await ingestResult({
@@ -2553,7 +2628,10 @@ async function releaseWorkerRestartOrphan(
   let solvedPoints = 0;
   if (job.engineJobId) {
     try {
-      const result = await engine.getResult(job.engineJobId);
+      const result = await engine.getResult(job.engineJobId, {
+        expectedEngine: expectedEngineForJob(job),
+        expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+      });
       const ingested = await ingestResult({
         db,
         engine,
@@ -2576,6 +2654,10 @@ async function releaseWorkerRestartOrphan(
           `[sweeper] ${e.message}; stale orphan-recovery owner stopped`,
         );
         return;
+      }
+      if (e instanceof TerminalEvidenceCleanupPendingError) {
+        await markIngestRetry(db, job.id, e, lease);
+        throw e;
       }
       // No readable partial result (or ingest hiccup): nothing solved to
       // preserve — release everything below. Loud, never silent.
@@ -2672,12 +2754,16 @@ async function ingestFailedEngineJob(
   const engineJobId = job.engineJobId;
   let result: JobResult;
   try {
-    result = await engine.getResult(engineJobId);
+    result = await engine.getResult(engineJobId, {
+      expectedEngine: expectedEngineForJob(job),
+      expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+    });
   } catch (e) {
     try {
       job = await jobWithPersistedMeshRecoveryAcknowledgement(
         db,
         job,
+        undefined,
         undefined,
         lease,
       );
@@ -2722,6 +2808,7 @@ async function ingestFailedEngineJob(
       db,
       job,
       result.mesh_recovery_version,
+      result.engine,
       lease,
     );
     await renewIngestLeaseOrThrow(db, lease);
@@ -2847,6 +2934,10 @@ async function ingestFailedEngineJob(
       );
       return;
     }
+    if (e instanceof TerminalEvidenceCleanupPendingError) {
+      await markIngestRetry(db, job.id, e, lease);
+      return;
+    }
     // Loud, never silent (the old bare catch was exactly how a mid-ingest
     // hiccup erased all trace of the shipped evidence).
     logEngineJobFailed(
@@ -2879,7 +2970,10 @@ async function ingestResultFileIfReady(
   if (!job.engineJobId) return false;
   let result;
   try {
-    result = await engine.getResult(job.engineJobId);
+    result = await engine.getResult(job.engineJobId, {
+      expectedEngine: expectedEngineForJob(job),
+      expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+    });
   } catch {
     return false;
   }
@@ -2944,7 +3038,10 @@ async function recoverFailedEngineJobs(
     await touchHeartbeat(db);
     let status: JobStatus | null = null;
     try {
-      status = await engine.getJob(job.engineJobId);
+      status = await engine.getJob(job.engineJobId, {
+        expectedEngine: expectedEngineForJob(job),
+        expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+      });
     } catch (e) {
       try {
         if (
@@ -3305,7 +3402,10 @@ export async function reconcile(
     }
     let status;
     try {
-      status = await engine.getJob(job.engineJobId);
+      status = await engine.getJob(job.engineJobId, {
+        expectedEngine: expectedEngineForJob(job),
+        expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+      });
     } catch (e) {
       try {
         if (

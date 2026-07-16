@@ -1,0 +1,55 @@
+# Emergency-only reconstruction of the former OpenCFD 2406 worker.
+#
+# This Dockerfile is intentionally absent from every Compose graph. The
+# guarded reconstruction script supplies a build context exported from the
+# exact pre-cutover Git commit, so current 2606 adapter sources can never be
+# combined with the historical 2406 runtime by accident.
+FROM opencfd/openfoam-default:2406@sha256:dd5aa20630a55722663bf83ba0cb74870cba130081303e32e3865007fa2aa35a
+
+USER root
+
+ARG TARGETARCH
+RUN test "${TARGETARCH}" = "amd64" \
+    && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources \
+    && printf '%s\n' \
+      'deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20260715T000000Z noble main restricted universe multiverse' \
+      'deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20260715T000000Z noble-updates main restricted universe multiverse' \
+      'deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20260715T000000Z noble-security main restricted universe multiverse' \
+      > /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get install -y --no-install-recommends \
+      python3=3.12.3-0ubuntu2.1 \
+      python3-pip=24.0+dfsg-1ubuntu1.3 \
+      python3-venv=3.12.3-0ubuntu2.1 \
+      ffmpeg=7:6.1.1-3ubuntu5 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG AIRFOILFOAM_BUILD_ID=opencfd2406-emergency-rollback
+ENV AIRFOILFOAM_OPENFOAM_RUNNER=local \
+    AIRFOILFOAM_OPENFOAM_BASHRC=/usr/lib/openfoam/openfoam2406/etc/bashrc \
+    AIRFOILFOAM_DATA_DIR=/data/airfoilfoam \
+    AIRFOILFOAM_BUILD_ID=${AIRFOILFOAM_BUILD_ID} \
+    AIRFOILFOAM_CELERY_CONCURRENCY=8 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    C_FORCE_ROOT=1 \
+    PYTHONUNBUFFERED=1
+
+LABEL org.opencontainers.image.title="XFoilFOAM emergency OpenCFD 2406 worker reconstruction" \
+      org.opencontainers.image.revision="313ad394d8364ae67c62b0929238e23355073f15" \
+      io.xfoilfoam.rollback-only="true" \
+      io.xfoilfoam.engine.base-image="opencfd/openfoam-default:2406@sha256:dd5aa20630a55722663bf83ba0cb74870cba130081303e32e3865007fa2aa35a" \
+      io.xfoilfoam.engine.source-revision="313ad394d8364ae67c62b0929238e23355073f15"
+
+WORKDIR /app
+COPY rollback-requirements.lock /tmp/rollback-requirements.lock
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip3 install --no-cache-dir --require-hashes -r /tmp/rollback-requirements.lock \
+    && pip3 install --no-cache-dir --no-deps --no-build-isolation . \
+    && rm -f /tmp/rollback-requirements.lock
+
+RUN mkdir -p /data/airfoilfoam
+
+# Never started by Compose. An operator must explicitly run the resulting
+# image as part of a separately approved rollback transition.
+CMD ["sh", "-c", "celery -A airfoilfoam.celery_app worker --loglevel=info --concurrency=${AIRFOILFOAM_CELERY_CONCURRENCY:-8}"]

@@ -67,17 +67,20 @@ import {
   simUransVerifyQueueCampaigns,
   simulationPresetRevisions,
   simulationPresets,
+  solverImplementations,
   solverProfiles,
   sweepDefinitions,
 } from "./schema";
 import {
   ensureSimulationPresetRevision,
   flowConditionCanonicalKey,
+  methodCompatibilityHashForSnapshot,
   physicsHashForSnapshot,
   referenceGeometryCanonicalKey,
   resolveSimulationPresetSnapshot,
   type SimulationSetupSnapshot,
 } from "./simulation-setup";
+import { METHOD_COMPATIBILITY_HASH_VERSION } from "./solver-implementations";
 
 // ---------------------------------------------------------------------------
 // Shared db/tx plumbing. Drizzle's PgTransaction is structurally the same
@@ -1017,6 +1020,7 @@ interface NumericsRows {
   uransMesh: typeof meshProfiles.$inferSelect | null;
   uransPrecalcMesh: typeof meshProfiles.$inferSelect | null;
   solver: typeof solverProfiles.$inferSelect;
+  solverImplementation: typeof solverImplementations.$inferSelect;
   output: typeof outputProfiles.$inferSelect;
 }
 
@@ -1051,6 +1055,16 @@ export async function loadNumericsRows(
   if (!mesh) throw new CampaignError("not_found", "mesh profile not found");
   if (!solver) throw new CampaignError("not_found", "solver profile not found");
   if (!output) throw new CampaignError("not_found", "output profile not found");
+  const [solverImplementation] = await asDb(db)
+    .select()
+    .from(solverImplementations)
+    .where(eq(solverImplementations.id, solver.solverImplementationId))
+    .limit(1);
+  if (!solverImplementation)
+    throw new CampaignError(
+      "not_found",
+      "solver implementation for solver profile not found",
+    );
   const uransMesh = numerics.uransMeshProfileId
     ? (
         await asDb(db)
@@ -1076,13 +1090,32 @@ export async function loadNumericsRows(
       "not_found",
       "URANS precalc mesh profile not found",
     );
-  return { boundary, mesh, uransMesh, uransPrecalcMesh, solver, output };
+  return {
+    boundary,
+    mesh,
+    uransMesh,
+    uransPrecalcMesh,
+    solver,
+    solverImplementation,
+    output,
+  };
 }
 
 function stripRowMeta<
   T extends { createdAt: Date; updatedAt: Date; isSeeded: boolean },
 >(row: T) {
   const { createdAt: _c, updatedAt: _u, isSeeded: _s, ...rest } = row;
+  return rest;
+}
+
+function stripSolverRowMeta(row: typeof solverProfiles.$inferSelect) {
+  const {
+    createdAt: _c,
+    updatedAt: _u,
+    isSeeded: _s,
+    solverImplementationId: _implementationId,
+    ...rest
+  } = row;
   return rest;
 }
 
@@ -1111,6 +1144,17 @@ function buildPhysicsHashSnapshot(args: {
       name: "",
       enabled: false,
       legacyBoundaryConditionId: null,
+    },
+    engine: {
+      implementationId: numerics.solverImplementation.id,
+      key: numerics.solverImplementation.key,
+      family: numerics.solverImplementation.family,
+      distribution: numerics.solverImplementation.distribution,
+      releaseVersion: numerics.solverImplementation.releaseVersion,
+      methodFamily: numerics.solverImplementation.methodFamily,
+      adapterContractVersion:
+        numerics.solverImplementation.adapterContractVersion,
+      numericsRevision: numerics.solverImplementation.numericsRevision,
     },
     flowState: {
       id: flow.id,
@@ -1152,7 +1196,7 @@ function buildPhysicsHashSnapshot(args: {
     uransPrecalcMesh: numerics.uransPrecalcMesh
       ? stripRowMeta(numerics.uransPrecalcMesh)
       : null,
-    solver: stripRowMeta(numerics.solver),
+    solver: stripSolverRowMeta(numerics.solver),
     scheduling: null,
     output: null,
     sweep: null,
@@ -1166,6 +1210,7 @@ interface ResolvedCampaignRevision {
   reynolds: number;
   mach: number | null;
   physicsHash: string;
+  methodCompatibilityHash: string;
   presetCreated: boolean;
 }
 
@@ -1260,9 +1305,9 @@ async function ensureCampaignPresetSupport(
   return { schedulingProfileId: sched.id, sweepDefinitionId: sweep.id };
 }
 
-async function lookupRevisionByPhysicsHash(
+async function lookupRevisionByMethodCompatibilityHash(
   tx: CampaignTx,
-  physicsHash: string,
+  methodCompatibilityHash: string,
 ) {
   const [found] = await asDb(tx)
     .select({ revision: simulationPresetRevisions, preset: simulationPresets })
@@ -1271,9 +1316,20 @@ async function lookupRevisionByPhysicsHash(
       simulationPresets,
       eq(simulationPresets.id, simulationPresetRevisions.presetId),
     )
-    .where(eq(simulationPresetRevisions.physicsHash, physicsHash))
+    .where(
+      and(
+        eq(
+          simulationPresetRevisions.methodCompatibilityHashVersion,
+          METHOD_COMPATIBILITY_HASH_VERSION,
+        ),
+        eq(
+          simulationPresetRevisions.methodCompatibilityHash,
+          methodCompatibilityHash,
+        ),
+      ),
+    )
     .orderBy(
-      desc(simulationPresetRevisions.isCanonicalPhysics),
+      desc(simulationPresetRevisions.isCanonicalMethod),
       desc(simulationPresets.enabled),
       asc(simulationPresetRevisions.createdAt),
       asc(simulationPresetRevisions.id),
@@ -1304,26 +1360,42 @@ async function resolveCampaignConditionRevision(
     numerics: args.numerics,
   });
   const physicsHash = physicsHashForSnapshot(snapshot);
-  const cached = args.cache.get(physicsHash);
+  const methodCompatibilityHash = methodCompatibilityHashForSnapshot(snapshot);
+  const cached = args.cache.get(methodCompatibilityHash);
   if (cached) return cached;
 
-  // Advisory lock on the hash: races between concurrent materializers on the
-  // same physics collapse to one canonical revision (spec §5.3c).
+  // Engine release/numerics identity is part of reuse. Same physical setup
+  // solved by OpenCFD and Foundation must never collapse to one revision.
+  await asDb(tx).execute(
+    sql`SELECT pg_advisory_xact_lock(hashtextextended(${"campaign-method:" + methodCompatibilityHash}, 0))`,
+  );
+  // Preserve the legacy physics-canonical election as a compatibility index;
+  // exactly one method may own it, while every method gets its own canonical.
   await asDb(tx).execute(
     sql`SELECT pg_advisory_xact_lock(hashtextextended(${"campaign-physics:" + physicsHash}, 0))`,
   );
 
-  const found = await lookupRevisionByPhysicsHash(tx, physicsHash);
+  const found = await lookupRevisionByMethodCompatibilityHash(
+    tx,
+    methodCompatibilityHash,
+  );
   if (found) {
+    if (!found.revision.isCanonicalMethod) {
+      await asDb(tx)
+        .update(simulationPresetRevisions)
+        .set({ isCanonicalMethod: true })
+        .where(eq(simulationPresetRevisions.id, found.revision.id));
+    }
     const resolved: ResolvedCampaignRevision = {
       presetId: found.preset.id,
       revisionId: found.revision.id,
       reynolds: found.revision.reynolds,
       mach: found.revision.mach,
       physicsHash,
+      methodCompatibilityHash,
       presetCreated: false,
     };
-    args.cache.set(physicsHash, resolved);
+    args.cache.set(methodCompatibilityHash, resolved);
     return resolved;
   }
 
@@ -1365,9 +1437,29 @@ async function resolveCampaignConditionRevision(
   // Hash the authoritative resolved snapshot (identical inputs → identical
   // hash; recomputing guards against any drift between builders).
   const actualHash = physicsHashForSnapshot(resolvedPreset.snapshot);
+  const actualMethodCompatibilityHash = methodCompatibilityHashForSnapshot(
+    resolvedPreset.snapshot,
+  );
+  const [existingPhysicsCanonical] = await asDb(tx)
+    .select({ id: simulationPresetRevisions.id })
+    .from(simulationPresetRevisions)
+    .where(
+      and(
+        eq(simulationPresetRevisions.physicsHash, actualHash),
+        eq(simulationPresetRevisions.isCanonicalPhysics, true),
+      ),
+    )
+    .limit(1);
   await asDb(tx)
     .update(simulationPresetRevisions)
-    .set({ physicsHash: actualHash, isCanonicalPhysics: true })
+    .set({
+      solverImplementationId: resolvedPreset.snapshot.engine!.implementationId,
+      physicsHash: actualHash,
+      methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+      methodCompatibilityHash: actualMethodCompatibilityHash,
+      isCanonicalPhysics: !existingPhysicsCanonical,
+      isCanonicalMethod: true,
+    })
     .where(eq(simulationPresetRevisions.id, resolvedPreset.revision.id));
   const resolved: ResolvedCampaignRevision = {
     presetId: preset.id,
@@ -1375,10 +1467,12 @@ async function resolveCampaignConditionRevision(
     reynolds: resolvedPreset.revision.reynolds,
     mach: resolvedPreset.revision.mach,
     physicsHash: actualHash,
+    methodCompatibilityHash: actualMethodCompatibilityHash,
     presetCreated: true,
   };
-  args.cache.set(physicsHash, resolved);
-  if (actualHash !== physicsHash) args.cache.set(actualHash, resolved);
+  args.cache.set(methodCompatibilityHash, resolved);
+  if (actualMethodCompatibilityHash !== methodCompatibilityHash)
+    args.cache.set(actualMethodCompatibilityHash, resolved);
   return resolved;
 }
 
@@ -2017,8 +2111,11 @@ async function campaignProgressSnapshot(
       COALESCE(sum(blocked_precalc_exhausted), 0)::int AS blocked_precalc_exhausted,
       COALESCE(sum(blocked_engine_submit), 0)::int AS blocked_engine_submit,
       COALESCE(sum(blocked_other), 0)::int AS blocked_other
-    FROM sim_campaign_progress
-    WHERE campaign_id = ${campaignId}
+    FROM sim_campaign_progress progress
+    JOIN sim_campaign_conditions condition ON condition.id = progress.condition_id
+    JOIN sim_campaigns campaign ON campaign.id = progress.campaign_id
+    WHERE progress.campaign_id = ${campaignId}
+      AND condition.generation = campaign.current_condition_generation
   `)) as unknown as Array<
     Omit<CampaignProgressTotals, "remaining"> & {
       precalc_mesh_repairing: number;
@@ -2389,7 +2486,7 @@ export async function materializeCampaignLaunch(
     if (existing) {
       const totals = await campaignProgressTotals(tx, existing.id);
       const [conditionCount] = (await asDb(tx).execute(
-        sql`SELECT count(*)::int AS n FROM sim_campaign_conditions WHERE campaign_id = ${existing.id}`,
+        sql`SELECT count(*)::int AS n FROM sim_campaign_conditions WHERE campaign_id = ${existing.id} AND generation = ${existing.currentConditionGeneration}`,
       )) as unknown as Array<{ n: number }>;
       return {
         campaign: existing,
@@ -2660,8 +2757,8 @@ export async function previewCampaignReuse(
           geo,
           numerics,
         });
-        const hash = physicsHashForSnapshot(snapshot);
-        const found = await lookupRevisionByPhysicsHash(tx, hash);
+        const hash = methodCompatibilityHashForSnapshot(snapshot);
+        const found = await lookupRevisionByMethodCompatibilityHash(tx, hash);
         const row: CampaignReusePreviewCondition = {
           comboKey: combo.comboKey,
           temperatureK: combo.temperatureK,
@@ -2836,7 +2933,19 @@ async function loadCampaignConditionCombos(db: DbTx, campaignId: string) {
         simCampaignConditions.referenceGeometryProfileId,
       ),
     )
-    .where(eq(simCampaignConditions.campaignId, campaignId))
+    .innerJoin(
+      simCampaigns,
+      eq(simCampaigns.id, simCampaignConditions.campaignId),
+    )
+    .where(
+      and(
+        eq(simCampaignConditions.campaignId, campaignId),
+        eq(
+          simCampaignConditions.generation,
+          simCampaigns.currentConditionGeneration,
+        ),
+      ),
+    )
     .orderBy(asc(simCampaignConditions.ord));
   return rows.map((row) => ({
     condition: row.cc,
@@ -3362,6 +3471,7 @@ async function applyPlanEditCore(
         setups.map((s) => ({
           campaignId: campaign.id,
           ord: s.combo.ord,
+          generation: campaign.currentConditionGeneration,
           flowConditionId: s.flowConditionId,
           referenceGeometryProfileId: s.referenceGeometryProfileId,
           presetId: s.presetId,
@@ -3488,6 +3598,7 @@ async function applyPlanEditCore(
       WHERE l.campaign_id = ${campaign.id}
         AND l.objective = ${delta.objective}
         AND cc.id = l.condition_id
+        AND cc.generation = ${campaign.currentConditionGeneration}
         AND l.state IN ('converged_provisional', 'converged_final', 'converged_window', 'converged_stale')
         AND l.current_target_alpha IS NOT NULL
         AND NOT EXISTS (
@@ -4645,6 +4756,10 @@ export async function forceReleaseCondition(
         and(
           eq(simCampaignConditions.id, conditionId),
           eq(simCampaignConditions.campaignId, campaignId),
+          eq(
+            simCampaignConditions.generation,
+            campaign.currentConditionGeneration,
+          ),
         ),
       )
       .limit(1);
@@ -4735,8 +4850,11 @@ export async function restoreCondition(
     const condRows = await loadCampaignConditionCombos(tx, campaignId);
     const target = condRows.find((r) => r.condition.id === conditionId);
     if (!target) throw new CampaignError("not_found", "condition not found");
-    if (target.condition.status === "active")
-      throw new CampaignError("invalid_state", "condition is already active");
+    if (target.condition.status !== "released")
+      throw new CampaignError(
+        "invalid_state",
+        `only released conditions in the current generation can be restored (status: ${target.condition.status})`,
+      );
 
     const [t, p, speed, chord] = target.comboKey.split("|") as [
       string,
@@ -4843,10 +4961,24 @@ export async function continueLane(
         eq(simCampaignLanes.airfoilId, laneKey.airfoilId),
         eq(simCampaignLanes.conditionId, laneKey.conditionId),
         eq(simCampaignLanes.objective, laneKey.objective),
+        sql`EXISTS (
+          SELECT 1
+          FROM sim_campaign_conditions actionable_condition
+          JOIN sim_campaigns actionable_campaign
+            ON actionable_campaign.id = actionable_condition.campaign_id
+          WHERE actionable_condition.id = ${simCampaignLanes.conditionId}
+            AND actionable_condition.campaign_id = ${simCampaignLanes.campaignId}
+            AND actionable_condition.generation = actionable_campaign.current_condition_generation
+            AND actionable_condition.status IN ('active', 'kept')
+        )`,
       ),
     )
     .returning();
-  if (!lane) throw new CampaignError("not_found", "lane not found");
+  if (!lane)
+    throw new CampaignError(
+      "invalid_state",
+      "lane is not actionable in the campaign's current solver generation",
+    );
   return lane;
 }
 
@@ -4892,6 +5024,16 @@ function failedResultsWhere(
     AND NOT p.derived_by_symmetry
     AND r.id = p.result_id
     AND r.status = 'failed'
+    AND EXISTS (
+      SELECT 1
+      FROM sim_campaign_conditions actionable_condition
+      JOIN sim_campaigns actionable_campaign
+        ON actionable_campaign.id = actionable_condition.campaign_id
+      WHERE actionable_condition.id = p.condition_id
+        AND actionable_condition.campaign_id = p.campaign_id
+        AND actionable_condition.generation = actionable_campaign.current_condition_generation
+        AND actionable_condition.status IN ('active', 'kept')
+    )
     ${filters.conditionId ? sql`AND p.condition_id = ${filters.conditionId}` : sql``}
     ${filters.airfoilId ? sql`AND p.airfoil_id = ${filters.airfoilId}` : sql``}
   `;
@@ -4933,6 +5075,16 @@ function rejectedResultsWhere(
     AND r.id = p.result_id
     AND r.status = 'done'
     AND EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected')
+    AND EXISTS (
+      SELECT 1
+      FROM sim_campaign_conditions actionable_condition
+      JOIN sim_campaigns actionable_campaign
+        ON actionable_campaign.id = actionable_condition.campaign_id
+      WHERE actionable_condition.id = p.condition_id
+        AND actionable_condition.campaign_id = p.campaign_id
+        AND actionable_condition.generation = actionable_campaign.current_condition_generation
+        AND actionable_condition.status IN ('active', 'kept')
+    )
     ${filters.conditionId ? sql`AND p.condition_id = ${filters.conditionId}` : sql``}
     ${filters.airfoilId ? sql`AND p.airfoil_id = ${filters.airfoilId}` : sql``}
   `;
@@ -5316,7 +5468,7 @@ export async function listCampaigns(
       lifecycle.actor AS lifecycle_actor,
       lifecycle.reason AS lifecycle_reason,
       lifecycle."createdAt" AS lifecycle_created_at,
-      (SELECT count(*)::int FROM sim_campaign_conditions cc WHERE cc.campaign_id = c.id) AS condition_count,
+      (SELECT count(*)::int FROM sim_campaign_conditions cc WHERE cc.campaign_id = c.id AND cc.generation = c.current_condition_generation) AS condition_count,
       (SELECT count(*)::int FROM sim_campaign_airfoils ca JOIN airfoils scoped_airfoil ON scoped_airfoil.id = ca.airfoil_id WHERE ca.campaign_id = c.id AND scoped_airfoil."archivedAt" IS NULL AND scoped_airfoil."deletedAt" IS NULL) AS airfoil_count,
       (SELECT count(*)::int FROM sim_campaign_airfoils ca JOIN airfoils scoped_airfoil ON scoped_airfoil.id = ca.airfoil_id WHERE ca.campaign_id = c.id AND (scoped_airfoil."archivedAt" IS NOT NULL OR scoped_airfoil."deletedAt" IS NOT NULL)) AS excluded_airfoil_count,
       COALESCE(pr.requested, 0)::int AS requested,
@@ -5356,7 +5508,7 @@ export async function listCampaigns(
       count(*) OVER ()::int AS total
     FROM sim_campaigns c
     LEFT JOIN (
-      SELECT campaign_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
+      SELECT progress.campaign_id AS campaign_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
              sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
              sum(rejected) AS rejected, sum(blocked) AS blocked,
              sum(precalc_mesh_repairing) AS precalc_mesh_repairing,
@@ -5364,7 +5516,11 @@ export async function listCampaigns(
              sum(blocked_precalc_exhausted) AS blocked_precalc_exhausted,
              sum(blocked_engine_submit) AS blocked_engine_submit,
              sum(blocked_other) AS blocked_other
-      FROM sim_campaign_progress GROUP BY campaign_id
+      FROM sim_campaign_progress progress
+      JOIN sim_campaign_conditions condition ON condition.id = progress.condition_id
+      JOIN sim_campaigns progress_campaign ON progress_campaign.id = progress.campaign_id
+      WHERE condition.generation = progress_campaign.current_condition_generation
+      GROUP BY progress.campaign_id
     ) pr ON pr.campaign_id = c.id
     LEFT JOIN LATERAL (
       SELECT event.action, event.actor, event.reason, event."createdAt"
@@ -5600,10 +5756,16 @@ export async function campaignSummary(
       FROM sim_campaign_progress WHERE campaign_id = ${campaignId} GROUP BY condition_id
     ) pr ON pr.condition_id = cc.id
     WHERE cc.campaign_id = ${campaignId}
+      AND cc.generation = ${campaign.currentConditionGeneration}
     ORDER BY cc.ord ASC
   `)) as unknown as Array<Record<string, unknown>>;
   const laneRows = (await db.execute(sql`
-    SELECT objective, state, count(*)::int AS n FROM sim_campaign_lanes WHERE campaign_id = ${campaignId} GROUP BY objective, state
+    SELECT lane.objective, lane.state, count(*)::int AS n
+    FROM sim_campaign_lanes lane
+    JOIN sim_campaign_conditions condition ON condition.id = lane.condition_id
+    WHERE lane.campaign_id = ${campaignId}
+      AND condition.generation = ${campaign.currentConditionGeneration}
+    GROUP BY lane.objective, lane.state
   `)) as unknown as Array<{ objective: string; state: string; n: number }>;
   const lanesSummary: Record<string, Record<string, number>> = {};
   for (const row of laneRows) {
@@ -5715,7 +5877,7 @@ export async function campaignAirfoilRows(
   campaignId: string,
   opts: { cursor?: string | null; limit?: number } = {},
 ): Promise<{ items: CampaignAirfoilRow[]; nextCursor: string | null }> {
-  await requireCampaign(db, campaignId);
+  const campaign = await requireCampaign(db, campaignId);
   const limit = Math.min(Math.max(opts.limit ?? 25, 1), 100);
   const cursorFilter = opts.cursor ? sql`AND af.slug > ${opts.cursor}` : sql``;
   const airfoilRowsPage = (await db.execute(sql`
@@ -5741,6 +5903,31 @@ export async function campaignAirfoilRows(
       : null;
   if (page.length === 0) return { items: [], nextCursor: null };
   const ids = page.map((r) => r.id);
+  const currentConditions = await db
+    .select({ id: simCampaignConditions.id })
+    .from(simCampaignConditions)
+    .where(
+      and(
+        eq(simCampaignConditions.campaignId, campaignId),
+        eq(
+          simCampaignConditions.generation,
+          campaign.currentConditionGeneration,
+        ),
+      ),
+    );
+  const currentConditionIds = currentConditions.map((row) => row.id);
+  if (currentConditionIds.length === 0) {
+    return {
+      items: page.map((r) => ({
+        airfoilId: r.id,
+        slug: r.slug,
+        name: r.name,
+        isSymmetric: Boolean(r.is_symmetric),
+        perCondition: [],
+      })),
+      nextCursor,
+    };
+  }
   const progressRows = await db
     .select()
     .from(simCampaignProgress)
@@ -5748,6 +5935,7 @@ export async function campaignAirfoilRows(
       and(
         eq(simCampaignProgress.campaignId, campaignId),
         inArray(simCampaignProgress.airfoilId, ids),
+        inArray(simCampaignProgress.conditionId, currentConditionIds),
       ),
     );
   // Per-cell machine-owned awaiting-URANS work. The legacy needsReview field
@@ -5833,7 +6021,7 @@ export async function campaignLanes(
     limit?: number;
   } = {},
 ): Promise<{ items: CampaignLaneRow[]; nextCursor: string | null }> {
-  await requireCampaign(db, campaignId);
+  const campaign = await requireCampaign(db, campaignId);
   const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
   let cursorFilter = sql``;
   if (opts.cursor) {
@@ -5854,6 +6042,7 @@ export async function campaignLanes(
     JOIN airfoils af ON af.id = l.airfoil_id
     JOIN sim_campaign_conditions cc ON cc.id = l.condition_id
     WHERE l.campaign_id = ${campaignId}
+      AND cc.generation = ${campaign.currentConditionGeneration}
       ${opts.objective ? sql`AND l.objective = ${opts.objective}` : sql``}
       ${opts.state ? sql`AND l.state = ${opts.state}` : sql``}
       ${cursorFilter}
@@ -5907,6 +6096,16 @@ export async function campaignLaneDetail(
         eq(simCampaignLanes.airfoilId, laneKey.airfoilId),
         eq(simCampaignLanes.conditionId, laneKey.conditionId),
         eq(simCampaignLanes.objective, laneKey.objective),
+        sql`EXISTS (
+          SELECT 1
+          FROM sim_campaign_conditions visible_condition
+          JOIN sim_campaigns visible_campaign
+            ON visible_campaign.id = visible_condition.campaign_id
+          WHERE visible_condition.id = ${simCampaignLanes.conditionId}
+            AND visible_condition.campaign_id = ${simCampaignLanes.campaignId}
+            AND visible_condition.generation = visible_campaign.current_condition_generation
+            AND visible_condition.status IN ('active', 'kept')
+        )`,
       ),
     )
     .limit(1);
@@ -5965,7 +6164,11 @@ export async function campaignRate(
     SELECT count(*)::int AS n, min(r."solvedAt") AS since
     FROM results r
     JOIN sim_campaign_points p ON ${POINT_CELL_JOIN}
+    JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
+    JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
     WHERE p.campaign_id = ${campaignId}
+      AND condition.generation = campaign.current_condition_generation
+      AND condition.status IN ('active', 'kept')
       AND NOT p.derived_by_symmetry
       AND r.status = 'done'
       AND r."solvedAt" IS NOT NULL
@@ -6006,7 +6209,13 @@ export async function campaignBacklogStrip(
       COALESCE(sum(pr.blocked), 0)::int AS blocked,
       COALESCE(sum(pr.running), 0)::int AS running
     FROM sim_campaigns c
-    LEFT JOIN sim_campaign_progress pr ON pr.campaign_id = c.id
+    LEFT JOIN sim_campaign_progress pr
+      ON pr.campaign_id = c.id
+     AND EXISTS (
+       SELECT 1 FROM sim_campaign_conditions progress_condition
+       WHERE progress_condition.id = pr.condition_id
+         AND progress_condition.generation = c.current_condition_generation
+     )
     WHERE c.status IN ('active', 'paused', 'attention')
     GROUP BY c.id
     ORDER BY c.priority DESC, c."createdAt" ASC

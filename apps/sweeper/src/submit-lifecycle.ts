@@ -15,6 +15,7 @@ import {
 } from "@aerodb/db";
 import { releasedResultStatusSql } from "@aerodb/db/result-claim-lifecycle";
 import {
+  ENGINE_IDENTITY_MISMATCH_CODE,
   EngineError,
   MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
   type EngineClient,
@@ -24,6 +25,7 @@ import {
 import { and, count, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import { isEngineConnectionFailure } from "./engine-backoff";
+import { persistEngineRuntimeForJob } from "./engine-provenance";
 
 export type GuardedSubmitOutcome =
   | { kind: "submitted"; status: JobStatus }
@@ -1282,6 +1284,7 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   let status: JobStatus;
   try {
     status = await opts.engine.submitPolar(opts.request);
+    await persistEngineRuntimeForJob(opts.db, opts.jobId, status.engine);
   } catch (error) {
     const message = errorMessage(error);
     if (isEngineConnectionFailure(error)) {
@@ -1293,6 +1296,23 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
         opts.ladderSubmitOwner,
       );
       return { kind: "connection_failure", error: message };
+    }
+    if (
+      error instanceof EngineError &&
+      error.code === ENGINE_IDENTITY_MISMATCH_CODE
+    ) {
+      await recordUnexecutedTransientSubmitFailure(
+        opts.db,
+        opts.jobId,
+        `engine identity was not acknowledged before execution: ${message}`,
+        campaignId,
+        opts.ladderSubmitOwner,
+      );
+      // Reuse the non-executed capability-cutover outcome: callers restore
+      // ownership without consuming solver/submit retry budgets. Unlike an
+      // ordinary answered rejection, wrong-engine execution is never valid
+      // failure evidence.
+      return { kind: "capability_mismatch", error: message };
     }
     if (
       error instanceof EngineError &&

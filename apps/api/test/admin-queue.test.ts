@@ -12,10 +12,19 @@
 //
 // Shared-database integration test: rows are pw- prefixed and deleted in
 // afterAll (global test-hygiene rule).
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { airfoils, categories, simJobs, sweeperState } from "@aerodb/db";
+import {
+  airfoils,
+  categories,
+  FOUNDATION_14_EXECUTION_POOL_ID,
+  FOUNDATION_14_SOLVER_IMPLEMENTATION_ID,
+  simJobs,
+  solverRuntimeBuilds,
+  sweeperState,
+} from "@aerodb/db";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -29,15 +38,21 @@ const ENGINE_DELAY_MS = 3_000;
 let engineStub: Server;
 const engineHits: Record<string, number> = {};
 
-let app: Awaited<ReturnType<typeof import("../src/server")["buildServer"]>>;
-let db: typeof import("../src/db")["db"];
+let app: Awaited<ReturnType<(typeof import("../src/server"))["buildServer"]>>;
+let db: (typeof import("../src/db"))["db"];
 let adminCookie = "";
 let categoryId = "";
 let airfoilId = "";
+let runtimeBuildId = "";
 const jobIds: string[] = [];
 
 function engineResponseBody(url: string): string | null {
-  if (url === "/health") return JSON.stringify({ status: "ok", version: "stub", build_id: "stub-build" });
+  if (url === "/health")
+    return JSON.stringify({
+      status: "ok",
+      version: "stub",
+      build_id: "stub-build",
+    });
   if (url === "/queue") {
     return JSON.stringify({
       queue_depth: 0,
@@ -53,14 +68,24 @@ function engineResponseBody(url: string): string | null {
     });
   }
   if (url === "/cache/stats") {
-    return JSON.stringify({ mesh_entries: 1, seed_entries: 1, total_bytes: 10, cap_bytes: 100, oldest_last_used: null });
+    return JSON.stringify({
+      mesh_entries: 1,
+      seed_entries: 1,
+      total_bytes: 10,
+      cap_bytes: 100,
+      oldest_last_used: null,
+    });
   }
   if (url === "/jobs/runtime") return JSON.stringify({ jobs: [] });
   return null;
 }
 
 async function authedQueue(path: string) {
-  return app.inject({ method: "GET", url: path, headers: { cookie: adminCookie } });
+  return app.inject({
+    method: "GET",
+    url: path,
+    headers: { cookie: adminCookie },
+  });
 }
 
 beforeAll(async () => {
@@ -76,7 +101,9 @@ beforeAll(async () => {
       res.end(body ?? "{}");
     }, ENGINE_DELAY_MS);
   });
-  await new Promise<void>((resolve) => engineStub.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) =>
+    engineStub.listen(0, "127.0.0.1", resolve),
+  );
   const port = (engineStub.address() as AddressInfo).port;
 
   // src/env snapshots process.env at module load — configure BEFORE the
@@ -90,7 +117,10 @@ beforeAll(async () => {
   delete process.env.ADMIN_GOOGLE_CLIENT_ID;
   delete process.env.ADMIN_GOOGLE_CLIENT_SECRET;
 
-  const [{ buildServer }, dbModule] = await Promise.all([import("../src/server"), import("../src/db")]);
+  const [{ buildServer }, dbModule] = await Promise.all([
+    import("../src/server"),
+    import("../src/db"),
+  ]);
   db = dbModule.db;
   app = await buildServer();
 
@@ -119,6 +149,20 @@ beforeAll(async () => {
     })
     .returning({ id: airfoils.id });
   airfoilId = airfoil.id;
+  const [runtimeBuild] = await db
+    .insert(solverRuntimeBuilds)
+    .values({
+      solverImplementationId: FOUNDATION_14_SOLVER_IMPLEMENTATION_ID,
+      provenanceKey: createHash("sha256").update(PREFIX).digest("hex"),
+      buildId: `${PREFIX}-foundation-build`,
+      sourceRevision: "foundation-14-test-revision",
+      packageSha256: createHash("sha256")
+        .update(`${PREFIX}-package`)
+        .digest("hex"),
+      architecture: "x86_64",
+    })
+    .returning({ id: solverRuntimeBuilds.id });
+  runtimeBuildId = runtimeBuild.id;
   const jobs = await db
     .insert(simJobs)
     .values([
@@ -129,6 +173,10 @@ beforeAll(async () => {
         status: "running",
         engineJobId: `${PREFIX}-engine-1`,
         engineState: "running",
+        methodKey: "openfoam.rans",
+        solverImplementationId: FOUNDATION_14_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: runtimeBuildId,
+        solverExecutionPoolId: FOUNDATION_14_EXECUTION_POOL_ID,
         totalCases: 3,
         submittedAt: new Date(),
       },
@@ -159,9 +207,15 @@ beforeAll(async () => {
 afterAll(async () => {
   // Test hygiene: remove every row this suite created from the shared DB.
   if (db) {
-    if (jobIds.length > 0) await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
+    if (jobIds.length > 0)
+      await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
+    if (runtimeBuildId)
+      await db
+        .delete(solverRuntimeBuilds)
+        .where(eq(solverRuntimeBuilds.id, runtimeBuildId));
     if (airfoilId) await db.delete(airfoils).where(eq(airfoils.id, airfoilId));
-    if (categoryId) await db.delete(categories).where(eq(categories.id, categoryId));
+    if (categoryId)
+      await db.delete(categories).where(eq(categories.id, categoryId));
   }
   await app?.close();
   await new Promise<void>((resolve) => engineStub.close(() => resolve()));
@@ -188,11 +242,36 @@ describe("queue payload with a saturated (3 s) engine", () => {
     expect(body.engineRuntimeAsOf).toBeNull();
     expect(String(body.engineRuntimeError ?? "")).toContain("still running");
     // Jobs are present (DB truth) and annotated as runtime-unknown.
-    const seeded = (body.activeJobs as Array<{ engineJobId: string | null; runtimeState: string }>).filter((j) =>
-      (j.engineJobId ?? "").startsWith(PREFIX),
-    );
+    const seeded = (
+      body.activeJobs as Array<{
+        engineJobId: string | null;
+        runtimeState: string;
+      }>
+    ).filter((j) => (j.engineJobId ?? "").startsWith(PREFIX));
     expect(seeded.length).toBe(2);
     for (const job of seeded) expect(job.runtimeState).toBe("unknown");
+    const foundation = seeded.find(
+      (job) => job.engineJobId === `${PREFIX}-engine-1`,
+    ) as Record<string, unknown> | undefined;
+    expect(foundation).toMatchObject({
+      methodKey: "openfoam.rans",
+      solverImplementation: {
+        id: FOUNDATION_14_SOLVER_IMPLEMENTATION_ID,
+        family: "openfoam",
+        distribution: "foundation",
+        releaseVersion: "14",
+      },
+      solverRuntimeBuild: {
+        id: runtimeBuildId,
+        buildId: `${PREFIX}-foundation-build`,
+        sourceRevision: "foundation-14-test-revision",
+        architecture: "x86_64",
+      },
+      solverExecutionPool: {
+        id: FOUNDATION_14_EXECUTION_POOL_ID,
+        routingKey: "openfoam-foundation-14",
+      },
+    });
   });
 
   it("scope=activity stays fast on the warm path too (fresh cache entry still resolving)", async () => {
@@ -215,7 +294,10 @@ describe("queue payload with a saturated (3 s) engine", () => {
     expect(elapsed).toBeLessThan(1_000);
     const body = res.json();
     // Health landed (15 s TTL still fresh) — served from cache instantly.
-    expect(body.engineHealth).toMatchObject({ status: "ok", build_id: "stub-build" });
+    expect(body.engineHealth).toMatchObject({
+      status: "ok",
+      build_id: "stub-build",
+    });
     expect(body.engineHealthError).toBeNull();
     // The runtime snapshot resolved in the background; its asOf is its true
     // fetch time (stale data never presented as fresh).
@@ -277,7 +359,13 @@ describe("tab-scoped payload shapes", () => {
   it("scope=all (default) keeps the full back-compat payload", async () => {
     const body = (await authedQueue("/api/admin/queue")).json();
     expect(body.scope).toBe("all");
-    for (const key of ["jobs", "activeJobs", "finishedJobs", "pendingSweeps", "externalPromises"]) {
+    for (const key of [
+      "jobs",
+      "activeJobs",
+      "finishedJobs",
+      "pendingSweeps",
+      "externalPromises",
+    ]) {
       expect(Array.isArray(body[key])).toBe(true);
     }
     expect(body.results).toBeTruthy();
@@ -294,7 +382,11 @@ describe("tab-scoped payload shapes", () => {
 
 describe("admin login validation", () => {
   it("returns 400 with a plain error when email/password are missing (was a raw ZodError 500)", async () => {
-    const res = await app.inject({ method: "POST", url: "/api/admin/login", payload: {} });
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/login",
+      payload: {},
+    });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: "email and password are required" });
   });

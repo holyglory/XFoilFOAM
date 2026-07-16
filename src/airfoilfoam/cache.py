@@ -36,7 +36,7 @@ from typing import Optional
 from .airfoil import Airfoil
 from .config import Settings
 from .meshing.base import Mesher, get_mesher
-from .models import FluidProperties, MeshParams, RoughnessParams, SolverParams
+from .models import EngineIdentity, FluidProperties, MeshParams, RoughnessParams, SolverParams
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ MESH_PAYLOAD_DIR = "polyMesh"
 MESH_EVIDENCE_PAYLOAD_DIR = "meshEvidence"
 SEED_PAYLOAD_DIR = "fields"
 _STALE_TMP_AGE_S = 24 * 3600
+_LEGACY_ENGINE_NAMESPACE = "openfoam:opencfd:2406:numerics-1"
 
 # A steady seed is only compatible with the marcher that produced it.  Version
 # this independently from mesh topology: an older seed may be byte-perfect yet
@@ -87,9 +88,25 @@ class SeedHit:
 class EngineCache:
     """Content-addressed persistent mesh + steady-solution-seed cache."""
 
-    def __init__(self, root: Path, max_bytes: int):
+    def __init__(
+        self,
+        root: Path,
+        max_bytes: int,
+        engine_identity: Optional[EngineIdentity] = None,
+        *,
+        shared_root: Optional[Path] = None,
+    ):
         self.root = Path(root)
+        if shared_root is not None:
+            self.shared_root = Path(shared_root)
+        elif self.root.parent.name == "engines":
+            # A directly constructed non-legacy namespace still participates
+            # in the one cache-wide cap and lock.
+            self.shared_root = self.root.parent.parent
+        else:
+            self.shared_root = self.root
         self.max_bytes = max(1, int(max_bytes))
+        self.engine_identity = engine_identity or EngineIdentity()
         self.mesh_root = self.root / "mesh"
         self.seed_root = self.root / "seed"
         self.tmp_root = self.root / "tmp"
@@ -97,8 +114,10 @@ class EngineCache:
     @classmethod
     def from_settings(cls, settings: Settings) -> "EngineCache":
         return cls(
-            settings.resolved_cache_dir(),
+            settings.resolved_engine_cache_dir(),
             max_bytes=int(settings.cache_max_gb * 1024**3),
+            engine_identity=settings.engine_identity(),
+            shared_root=settings.resolved_cache_dir(),
         )
 
     # -- keys ---------------------------------------------------------------- #
@@ -365,8 +384,8 @@ class EngineCache:
         (that process is already evicting).
         """
         try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            lock_path = self.root / ".evict.lock"
+            self.shared_root.mkdir(parents=True, exist_ok=True)
+            lock_path = self.shared_root / ".evict.lock"
             with lock_path.open("w") as lock_file:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -401,7 +420,7 @@ class EngineCache:
             total -= size
             logger.info(
                 "cache evicted %s size=%dB (LRU, total now %dB of cap %dB)",
-                entry_dir.relative_to(self.root), size, total, self.max_bytes,
+                entry_dir.relative_to(self.shared_root), size, total, self.max_bytes,
             )
 
     # -- stats (read-only) ----------------------------------------------------- #
@@ -417,31 +436,53 @@ class EngineCache:
         seed_entries = 0
         total = 0
         oldest_last_used: float | None = None
-        for entry_dir in self._entry_dirs():
-            manifest_path = entry_dir / MANIFEST_NAME
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                size = int(manifest["byteSize"])
-                last_used = manifest_path.stat().st_mtime
-            except Exception:  # noqa: BLE001 - malformed entries are ignored
-                continue
-            if entry_dir.parent == self.mesh_root:
-                mesh_entries += 1
-            else:
-                seed_entries += 1
-            total += size
-            if oldest_last_used is None or last_used < oldest_last_used:
-                oldest_last_used = last_used
+        namespaces: dict[str, dict] = {}
+        for namespace_root in self._namespace_roots():
+            namespace_entries = self._namespace_entry_dirs(namespace_root)
+            namespace_key = self._namespace_key(namespace_root, namespace_entries)
+            namespace_mesh = 0
+            namespace_seed = 0
+            namespace_total = 0
+            namespace_oldest: float | None = None
+            for entry_dir in namespace_entries:
+                manifest_path = entry_dir / MANIFEST_NAME
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    size = int(manifest["byteSize"])
+                    last_used = manifest_path.stat().st_mtime
+                except Exception:  # noqa: BLE001 - malformed entries are ignored
+                    continue
+                kind = manifest.get("kind")
+                if kind == "mesh":
+                    namespace_mesh += 1
+                elif kind == "seed":
+                    namespace_seed += 1
+                else:
+                    continue
+                namespace_total += size
+                if namespace_oldest is None or last_used < namespace_oldest:
+                    namespace_oldest = last_used
+            if namespace_entries or namespace_root in {self.shared_root, self.root}:
+                namespaces[namespace_key] = {
+                    "mesh_entries": namespace_mesh,
+                    "seed_entries": namespace_seed,
+                    "total_bytes": namespace_total,
+                    "oldest_last_used": self._iso_timestamp(namespace_oldest),
+                }
+            mesh_entries += namespace_mesh
+            seed_entries += namespace_seed
+            total += namespace_total
+            if namespace_oldest is not None and (
+                oldest_last_used is None or namespace_oldest < oldest_last_used
+            ):
+                oldest_last_used = namespace_oldest
         return {
             "mesh_entries": mesh_entries,
             "seed_entries": seed_entries,
             "total_bytes": total,
             "cap_bytes": self.max_bytes,
-            "oldest_last_used": (
-                datetime.fromtimestamp(oldest_last_used, timezone.utc).isoformat()
-                if oldest_last_used is not None
-                else None
-            ),
+            "oldest_last_used": self._iso_timestamp(oldest_last_used),
+            "namespaces": namespaces,
         }
 
     def total_bytes(self) -> int:
@@ -455,16 +496,58 @@ class EngineCache:
         return total
 
     def _entry_dirs(self) -> list[Path]:
-        def live(parent: Path) -> list[Path]:
-            return [d for d in parent.iterdir() if d.is_dir() and not d.name.startswith(".")]
-
         dirs: list[Path] = []
-        if self.mesh_root.is_dir():
-            dirs.extend(live(self.mesh_root))
-        if self.seed_root.is_dir():
-            for group in live(self.seed_root):
-                dirs.extend(live(group))
+        for namespace_root in self._namespace_roots():
+            dirs.extend(self._namespace_entry_dirs(namespace_root))
         return dirs
+
+    @staticmethod
+    def _live_dirs(parent: Path) -> list[Path]:
+        if not parent.is_dir():
+            return []
+        return [d for d in parent.iterdir() if d.is_dir() and not d.name.startswith(".")]
+
+    def _namespace_roots(self) -> list[Path]:
+        roots = [self.shared_root]
+        roots.extend(self._live_dirs(self.shared_root / "engines"))
+        if self.root not in roots:
+            roots.append(self.root)
+        # Preserve order while avoiding duplicate Path spellings.
+        unique: list[Path] = []
+        seen: set[Path] = set()
+        for root in roots:
+            resolved = root.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                unique.append(root)
+        return unique
+
+    def _namespace_entry_dirs(self, namespace_root: Path) -> list[Path]:
+        dirs = self._live_dirs(namespace_root / "mesh")
+        for group in self._live_dirs(namespace_root / "seed"):
+            dirs.extend(self._live_dirs(group))
+        return dirs
+
+    def _namespace_key(self, namespace_root: Path, entries: list[Path]) -> str:
+        for entry in entries:
+            try:
+                manifest = json.loads((entry / MANIFEST_NAME).read_text(encoding="utf-8"))
+                namespace = manifest.get("engineNamespace")
+                if isinstance(namespace, str) and namespace:
+                    return namespace
+            except Exception:  # noqa: BLE001 - fallback remains deterministic
+                continue
+        if namespace_root.resolve() == self.shared_root.resolve():
+            return _LEGACY_ENGINE_NAMESPACE
+        return namespace_root.name
+
+    @staticmethod
+    def _iso_timestamp(timestamp: float | None) -> str | None:
+        return (
+            datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+            if timestamp is not None
+            else None
+        )
 
     def _sweep_stale_tmp(self) -> None:
         now = datetime.now(timezone.utc).timestamp()
@@ -477,15 +560,20 @@ class EngineCache:
                 except OSError:
                     continue
 
-        if self.tmp_root.is_dir():
-            sweep(self.tmp_root, list(self.tmp_root.iterdir()))
-        # .trash dirs left behind by a crashed removal
-        parents = [self.mesh_root, self.seed_root]
-        if self.seed_root.is_dir():
-            parents.extend(g for g in self.seed_root.iterdir() if g.is_dir())
-        for parent in parents:
-            if parent.is_dir():
-                sweep(parent, [d for d in parent.iterdir() if d.name.startswith(".") and d.is_dir()])
+        for namespace_root in self._namespace_roots():
+            tmp_root = namespace_root / "tmp"
+            if tmp_root.is_dir():
+                sweep(tmp_root, list(tmp_root.iterdir()))
+            # .trash dirs left behind by a crashed removal
+            mesh_root = namespace_root / "mesh"
+            seed_root = namespace_root / "seed"
+            parents = [mesh_root, seed_root, *self._live_dirs(seed_root)]
+            for parent in parents:
+                if parent.is_dir():
+                    sweep(
+                        parent,
+                        [d for d in parent.iterdir() if d.name.startswith(".") and d.is_dir()],
+                    )
 
     # -- internals ----------------------------------------------------------- #
     @staticmethod
@@ -545,6 +633,8 @@ class EngineCache:
                 )
             manifest = {
                 "schemaVersion": 1,
+                "engine": self.engine_identity.model_dump(mode="json"),
+                "engineNamespace": self.engine_identity.compatibility_key,
                 "kind": kind,
                 "key": key,
                 "createdAt": datetime.now(timezone.utc).isoformat(),

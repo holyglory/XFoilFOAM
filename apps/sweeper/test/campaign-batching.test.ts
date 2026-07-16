@@ -7,6 +7,8 @@
 // rejected. Follows the sweeper.test.ts live-DB pattern (scoped rows, full
 // cleanup in afterAll).
 
+import "./enabled-engine-pool-fixture";
+
 import {
   airfoils,
   boundaryProfiles,

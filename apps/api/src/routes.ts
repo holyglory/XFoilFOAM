@@ -26,6 +26,7 @@ import {
   simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
+  solverEvidenceArchives,
   solverProfiles,
   syncApiSettings,
   sweeperState,
@@ -33,7 +34,11 @@ import {
 } from "@aerodb/db";
 import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
-import { EngineClient, type ImageFieldName } from "@aerodb/engine-client";
+import {
+  EngineError,
+  EngineTimeoutError,
+  type ImageFieldName,
+} from "@aerodb/engine-client";
 import {
   and,
   asc,
@@ -53,8 +58,10 @@ import { z } from "zod";
 
 import { requireAdmin, sessionEmail } from "./admin-auth";
 import { db } from "./db";
+import { selectVisibleEvidenceArtifacts } from "./evidence-artifacts";
 import { env } from "./env";
-import { mediaStore } from "./media-store";
+import { makeEngineClient } from "./engine-client";
+import { MediaUpstreamError, mediaStore } from "./media-store";
 import { createAirfoil, createAirfoilsBulk } from "./services/airfoils";
 import { assembleDetail } from "./services/detail";
 import { categoriesTree, listAirfoils } from "./services/catalog";
@@ -1052,7 +1059,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       );
     const currentManifest =
       currentManifests.length === 1 ? currentManifests[0] : null;
-    const [artifacts, media, renders] = await Promise.all([
+    const [artifacts, media, renders, currentArchives] = await Promise.all([
       db
         .select()
         .from(solverEvidenceArtifacts)
@@ -1085,9 +1092,27 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
               : sql`false`,
           ),
         ),
+      db
+        .select({ sourceArtifactId: solverEvidenceArchives.sourceArtifactId })
+        .from(solverEvidenceArchives)
+        .where(
+          and(
+            eq(solverEvidenceArchives.resultId, resultId),
+            eq(
+              solverEvidenceArchives.resultAttemptId,
+              result.currentAttemptId,
+            ),
+            eq(solverEvidenceArchives.state, "current"),
+          ),
+        ),
     ]);
+    const currentArchiveSourceId =
+      currentArchives.length === 1 ? currentArchives[0].sourceArtifactId : null;
     return {
-      artifacts: artifacts.map(artifactDTO),
+      artifacts: selectVisibleEvidenceArtifacts(
+        artifacts,
+        currentArchiveSourceId,
+      ).map(artifactDTO),
       media: media.map((row) => ({
         ...row,
         url: mediaStore.url(row.storageKey),
@@ -1314,9 +1339,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     const points = (row.airfoil.points as Point[]).map(
       (p) => [p.x, p.y] as [number, number],
     );
-    const rendered = await new EngineClient(env.engineUrl).renderField(
-      attempt.engineJobId,
-      {
+    let rendered;
+    try {
+      rendered = await makeEngineClient().renderField(attempt.engineJobId, {
         case_slug: attempt.engineCaseSlug,
         evidence_base: evidenceBase,
         airfoil_points: points,
@@ -1333,8 +1358,26 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         width_px: body.widthPx,
         height_px: body.heightPx,
         params_hash: paramsHash,
-      },
-    );
+      });
+    } catch (error) {
+      if (error instanceof EngineError) {
+        const status = error.status;
+        return reply
+          .code(status === 502 ? 502 : status === 503 ? 503 : 502)
+          .send({
+            error:
+              status === 503
+                ? "archived solver evidence is temporarily unavailable"
+                : "archived solver evidence could not be verified or rendered",
+          });
+      }
+      if (error instanceof EngineTimeoutError || error instanceof TypeError) {
+        return reply.code(503).send({
+          error: "archived solver evidence rendering is temporarily unavailable",
+        });
+      }
+      throw error;
+    }
     const storageKey = `jobs/${attempt.engineJobId}/cases/${attempt.engineCaseSlug}/${rendered.path}`;
     const [saved] = await db
       .insert(fieldRenderCache)
@@ -1851,7 +1894,10 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         .header("content-length", size)
         .header("cache-control", "public, max-age=31536000, immutable");
       return reply.send(stream);
-    } catch {
+    } catch (error) {
+      if (error instanceof MediaUpstreamError) {
+        return reply.code(error.statusCode).send({ error: error.message });
+      }
       try {
         const proxied = await proxyRemoteAsset(key);
         if (!proxied) return reply.code(404).send({ error: "media not found" });
@@ -1861,6 +1907,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
           .header("cache-control", "private, max-age=60");
         return reply.send(proxied.stream);
       } catch (err) {
+        if (err instanceof MediaUpstreamError) {
+          return reply.code(err.statusCode).send({ error: err.message });
+        }
         return reply.code(502).send({
           error: "remote media fetch failed: " + (err as Error).message,
         });

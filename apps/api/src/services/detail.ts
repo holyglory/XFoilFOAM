@@ -36,7 +36,7 @@ import {
   polarCompatibilitySeriesId,
 } from "@aerodb/db/polar-cache";
 import {
-  physicsHashForSnapshot,
+  methodCompatibilityHashForSnapshot,
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
@@ -109,15 +109,29 @@ type DetailRevision = {
   createdAt: Date;
   revisionNumber: number;
   physicsHash: string | null;
+  methodCompatibilityHashVersion: number | null;
+  methodCompatibilityHash: string | null;
   snapshot: Record<string, unknown>;
 };
 
-function effectivePhysicsHash(revision: DetailRevision): string {
-  if (revision.physicsHash?.trim()) return revision.physicsHash;
+function effectiveCompatibilityHash(revision: DetailRevision): string {
+  if (
+    revision.methodCompatibilityHash?.trim() &&
+    revision.methodCompatibilityHashVersion != null
+  ) {
+    // polar_compatibility_fit_sets.compatibility_hash stores the raw,
+    // version-scoped method hash. The table's compatibility_version and the
+    // revision's method_compatibility_hash_version carry the namespaces; an
+    // extra textual prefix here makes every cache lookup miss.
+    return revision.methodCompatibilityHash;
+  }
+  const snapshot = revision.snapshot as unknown as SimulationSetupSnapshot;
+  // The shared helper deliberately maps engine-less historical snapshots to
+  // the explicit legacy-unknown implementation bucket. That matches v5 fit
+  // cache identity without pretending those rows are Foundation or exact
+  // OpenCFD evidence.
   try {
-    return physicsHashForSnapshot(
-      revision.snapshot as unknown as SimulationSetupSnapshot,
-    );
+    return methodCompatibilityHashForSnapshot(snapshot);
   } catch {
     // A malformed historical snapshot must not take down the public Detail
     // route or be guessed compatible with another setup. Isolate it under its
@@ -777,6 +791,9 @@ export async function assembleDetail(
     createdAt: simulationPresetRevisions.createdAt,
     revisionNumber: simulationPresetRevisions.revisionNumber,
     physicsHash: simulationPresetRevisions.physicsHash,
+    methodCompatibilityHashVersion:
+      simulationPresetRevisions.methodCompatibilityHashVersion,
+    methodCompatibilityHash: simulationPresetRevisions.methodCompatibilityHash,
     snapshot: simulationPresetRevisions.snapshot,
   };
   let pinnedRevision: DetailRevision | null = null;
@@ -841,7 +858,7 @@ export async function assembleDetail(
       ]);
       for (const row of [...libraryAnchorRows, ...campaignAnchorRows]) {
         if (Math.round(row.reynolds) <= 0) continue;
-        const hash = effectivePhysicsHash(row);
+        const hash = effectiveCompatibilityHash(row);
         const anchors = anchorsByHash.get(hash) ?? [];
         anchors.push(row);
         anchorsByHash.set(hash, anchors);
@@ -863,7 +880,7 @@ export async function assembleDetail(
         )
         .where(eq(results.airfoilId, a.id));
       for (const row of evidenceRevisionRows) {
-        const hash = effectivePhysicsHash(row);
+        const hash = effectiveCompatibilityHash(row);
         if (anchorsByHash.has(hash)) revisionById.set(row.id, row);
       }
     }
@@ -907,7 +924,7 @@ export async function assembleDetail(
     const compatibility = await loadCompatibilityCache(a.id, hashes);
     const hashByRevision = new Map<string, string>();
     for (const revision of revisionById.values()) {
-      const hash = effectivePhysicsHash(revision);
+      const hash = effectiveCompatibilityHash(revision);
       if (anchorsByHash.has(hash)) hashByRevision.set(revision.id, hash);
     }
     const rowsByHash = new Map<string, SolvedRow[]>();

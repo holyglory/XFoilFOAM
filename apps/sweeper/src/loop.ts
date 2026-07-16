@@ -19,7 +19,10 @@ import {
 import type { EngineClient } from "@aerodb/engine-client";
 import { count, eq, inArray, sql } from "drizzle-orm";
 
-import { buildPolarRequest } from "./build-request";
+import {
+  buildPolarRequest,
+  solverImplementationIdForSetup,
+} from "./build-request";
 import { claimAoas } from "./claim";
 import { refreshDiskAdmission } from "./disk-admission";
 import {
@@ -32,6 +35,7 @@ import {
   engineBackoffActive,
   recordEngineUnreachable,
 } from "./engine-backoff";
+import { requireExecutionPoolForSetup } from "./engine-pool";
 import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
 import {
   markTickCompleted,
@@ -182,6 +186,7 @@ async function submitContinuousBatch(
     .limit(1);
   const setup = await ensureSimulationPresetRevision(db, batch.presetId);
   if (!a || !setup) return false;
+  const executionPool = await requireExecutionPoolForSetup(db, setup.snapshot);
   const bcId = setup.snapshot.preset.legacyBoundaryConditionId ?? batch.bcId;
   const retryScope = retryScopeForRequestedPolar(
     batch.effectivePriority >= 10 ? batch.aoas : snapshotAoas(setup.snapshot),
@@ -199,6 +204,7 @@ async function submitContinuousBatch(
         : "continue",
     cpuSlots,
   });
+  request.expected_execution_pool = executionPool.routingKey;
 
   // The job row and all result ownership become visible in one commit. An
   // admin cancel can therefore see either no composition or the complete
@@ -210,6 +216,9 @@ async function submitContinuousBatch(
         airfoilId: a.id,
         bcIds: [bcId],
         simulationPresetRevisionId: setup.revision.id,
+        solverImplementationId: solverImplementationIdForSetup(setup.snapshot),
+        solverExecutionPoolId: executionPool.id,
+        methodKey: "openfoam.rans",
         referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
         wave: 1,
         status: "pending",
@@ -384,6 +393,7 @@ export async function submitCampaignBatch(
   // Min-Re entry = compat anchor: job revision, physics snapshot, chord.
   const anchor = entries[0];
   const snapshot = anchor.snapshot;
+  const executionPool = await requireExecutionPoolForSetup(db, snapshot);
   const retryScope = retryScopeForRequestedPolar(anchor.requestedPolarAoas);
 
   const { request } = buildPolarRequest({
@@ -398,6 +408,7 @@ export async function submitCampaignBatch(
     cpuSlots,
     speeds: entries.map((e) => e.speed),
   });
+  request.expected_execution_pool = executionPool.routingKey;
   const totalCases = entries.length * batch.angles.length;
   const jobKind = totalCases <= 3 ? "targeted" : "sweep";
 
@@ -426,6 +437,9 @@ export async function submitCampaignBatch(
         airfoilId: a.id,
         bcIds: [...new Set(entries.map((e) => e.bcId))],
         simulationPresetRevisionId: anchor.revisionId,
+        solverImplementationId: solverImplementationIdForSetup(snapshot),
+        solverExecutionPoolId: executionPool.id,
+        methodKey: "openfoam.rans",
         campaignId: batch.campaignId,
         jobKind,
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,

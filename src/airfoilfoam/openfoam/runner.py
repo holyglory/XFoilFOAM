@@ -34,6 +34,10 @@ class InfrastructureError(OpenFOAMError):
     """Execution environment failure, not aerodynamic solver evidence."""
 
 
+class EngineIdentityMismatch(InfrastructureError):
+    """A routed job reached a worker with a different logical engine identity."""
+
+
 class CommandTimeoutError(InfrastructureError):
     """An OpenFOAM command exhausted its wall-clock execution budget."""
 

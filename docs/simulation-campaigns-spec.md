@@ -25,6 +25,11 @@ pipeline, without changing how standing continuous presets behave.
   **plan revisions**.
 - **Point** — one requested solve cell: (condition, airfoil, angle).
 - **Lane** — one refinement track: (airfoil, condition, objective).
+- **Solver implementation** — an immutable numerical identity: engine family,
+  distribution/implementation, upstream release, method family, and explicit
+  numerics revision. Adapter protocol and runtime build provenance are separate.
+- **Execution pool** — mutable enabled/routing/capacity state for exactly one
+  solver implementation. Pools are scheduling metadata, not physics.
 - **Closure / completeness rule** — work solved for ≥1 campaign airfoil is completed
   for all campaign airfoils, even after removal from the plan (details §6.3).
 
@@ -35,12 +40,15 @@ All new tables use uuid PKs + createdAt/updatedAt like existing tables unless no
 ### 3.1 New tables
 
 **sim_campaigns**
+
 - slug text UNIQUE (auto-suffixed -2, -3 on collision; launch returns final name),
   name text, notes text NULL
 - status text NOT NULL: `active | paused | attention | completed | cancelled | archived`
 - priority int NOT NULL default 5, CHECK 0..9
 - idempotencyKey text UNIQUE NOT NULL (client-generated at Review)
 - currentPlanRevisionId FK → sim_campaign_plan_revisions (nullable until first insert)
+- currentConditionGeneration int NOT NULL default 1. A solver-release cutover
+  advances this only after the old execution pool is globally drained.
 - closedWithFailedCount int NULL (set by "Close with failures")
 - completedAt timestamptz NULL
 
@@ -49,25 +57,39 @@ Campaign scope is resolved to this explicit list at launch ("snapshot at launch"
 stated in the UI; growth is via Add airfoils).
 
 **sim_campaign_plan_revisions** (append-only audit; optimistic-concurrency anchor)
+
 - campaignId FK CASCADE, revisionNumber int, UNIQUE (campaignId, revisionNumber)
-- kind text NOT NULL: `initial | edit | force_release`
+- kind text NOT NULL: `initial | edit | force_release | engine_cutover`
 - plan jsonb NOT NULL — canonical, byte-stable:
   ```json
   {
     "mediumId": "…",
-    "ambients": [["288.15","101325"], ["255.65","54050"]],   // [T_K, P_Pa] canonical strings, sorted
-    "speedsMps": ["10.000","20.000","30.000","45.000"],       // sorted canonical strings
-    "chordsM": ["0.1500","0.2500"],
-    "spanM": "1.0000",                                        // single-valued
-    "areaMode": "derived",                                    // "explicit" only while 1 chord
+    "ambients": [
+      ["288.15", "101325"],
+      ["255.65", "54050"]
+    ], // [T_K, P_Pa] canonical strings, sorted
+    "speedsMps": ["10.000", "20.000", "30.000", "45.000"], // sorted canonical strings
+    "chordsM": ["0.1500", "0.2500"],
+    "spanM": "1.0000", // single-valued
+    "areaMode": "derived", // "explicit" only while 1 chord
     "areaM2": null,
-    "excludedConditions": [["288.15","101325","45.000","0.1500"]],  // click-to-exclude cells
-    "baseSweep": { "fromDeg": "-10.0000", "toDeg": "25.0000", "stepDeg": "0.5000", "listDeg": null },
-    "objectives": {
-      "ldMax":  { "enabled": true,  "toleranceDeg": "0.10", "maxRounds": 8 },
-      "clZero": { "enabled": true,  "toleranceDeg": "0.05", "maxRounds": 6 }
+    "excludedConditions": [["288.15", "101325", "45.000", "0.1500"]], // click-to-exclude cells
+    "baseSweep": {
+      "fromDeg": "-10.0000",
+      "toDeg": "25.0000",
+      "stepDeg": "0.5000",
+      "listDeg": null
     },
-    "numerics": { "boundaryProfileId": "…", "meshProfileId": "…", "solverProfileId": "…", "outputProfileId": "…" }
+    "objectives": {
+      "ldMax": { "enabled": true, "toleranceDeg": "0.10", "maxRounds": 8 },
+      "clZero": { "enabled": true, "toleranceDeg": "0.05", "maxRounds": 6 }
+    },
+    "numerics": {
+      "boundaryProfileId": "…",
+      "meshProfileId": "…",
+      "solverProfileId": "…",
+      "outputProfileId": "…"
+    }
   }
   ```
 - summary jsonb NOT NULL — { addedConditions, keptConditions, releasedConditions,
@@ -75,18 +97,36 @@ stated in the UI; growth is via Add airfoils).
 - createdBy text NULL
 
 **sim_campaign_conditions**
+
 - campaignId FK CASCADE, ord int
 - flowConditionId FK, referenceGeometryProfileId FK (provenance only — display reads
   the revision snapshot, never live registry rows)
 - presetId FK, simulationPresetRevisionId FK (PINNED at creation, never re-pinned)
 - cached reynolds bigint, mach double (copied from the pinned revision)
-- status text NOT NULL: `active | kept | released`
+- generation int NOT NULL; supersedesConditionId self-FK NULL; supersededAt
+  timestamptz NULL
+- status text NOT NULL: `active | kept | released | superseded`
 - introducedInPlanRevisionId FK, statusChangedInPlanRevisionId FK NULL
-- UNIQUE (campaignId, flowConditionId, referenceGeometryProfileId) — re-adding a
-  previously released combo RE-ACTIVATES this row (same pinned revision; evidence
-  continuity; no duplicate columns).
+- UNIQUE (campaignId, flowConditionId, referenceGeometryProfileId, generation).
+  Ordinary plan edits reactivate rows only within the current generation. A
+  superseded generation is immutable scheduling history and cannot be restored.
+
+**sim_campaign_solver_cutovers** (append-only staged audit)
+
+- One row per campaign successor generation, with source/target generations,
+  source/target plan revisions, prior campaign status, old operational
+  implementation, target implementation, reason/actor, counts, and timestamps.
+- status advances only `prepared → finalized → completed`; identity fields and
+  prior campaign state cannot be rewritten.
+- Prepare pauses previously runnable OpenCFD 2406 or pre-identity legacy
+  campaigns and disables/retire-fences the old global pool without relabelling
+  their revisions or evidence. Finalize requires a globally drained source
+  runtime and materializes the complete current grid on fresh OpenCFD 2606
+  revisions. Complete requires a live enabled 2606 pool and restores only
+  campaigns that were runnable before prepare.
 
 **sim_campaign_points** (materialized execution ledger)
+
 - PK (campaignId, conditionId, airfoilId, aoaDeg)
 - revisionId uuid NOT NULL (denormalized pin), planRevisionNumber int NOT NULL
 - state text NOT NULL default `requested`: `requested | released | terminal`
@@ -99,6 +139,7 @@ stated in the UI; growth is via Add airfoils).
   link pre-solved evidence — that UPDATE run as SELECT count is the reuse preview).
 
 **sim_campaign_progress** (counters; the only thing polled reads scan)
+
 - PK (campaignId, conditionId, airfoilId)
 - requested, solved, failed, running, superseded, derived int NOT NULL default 0
 - Maintained: written at launch/plan-edit inside the same transaction; incremented in
@@ -106,20 +147,47 @@ stated in the UI; growth is via Add airfoils).
 - Completion flip = counter comparison on ingest, never a tick-time scan.
 
 **sim_campaign_lanes**
+
 - PK (campaignId, airfoilId, conditionId, objective) — objective: `ld_max | cl_zero`
 - state text NOT NULL: `awaiting_seed | iterating | converged_provisional |
-  converged_final | converged_window | converged_stale | stalled |
-  insufficient_evidence | failed | symmetric_definition`
+converged_final | converged_window | converged_stale | stalled |
+insufficient_evidence | failed | symmetric_definition`
 - currentTargetAlpha double NULL, iterationCount int NOT NULL default 0
 - witnessFitSetId FK → polar_fit_sets NULL (the fit convergence was judged against)
 - extraRoundsGranted int NOT NULL default 0 ("Continue +N iterations")
 
 **sim_campaign_lane_steps** (append-only evidence)
+
 - laneId composite FK, iteration int, UNIQUE per (lane, iteration)
 - predictedAlpha double NOT NULL (canonical 0.01°), fitSetId FK NOT NULL,
   solvedResultId FK NULL, outcome text: `predicted | solved | superseded | released`
 
-### 3.2 Modified tables
+### 3.2 Solver implementation, runtime, and pool tables
+
+- **solver_implementations** — immutable unique identity and declared
+  capabilities. Seed OpenFOAM/OpenCFD/2606 as the new default,
+  OpenFOAM/Foundation/14 as active but opt-in, historical OpenCFD/2406 for old
+  evidence only, and a retired legacy/unknown bucket for snapshots whose
+  historical implementation cannot be proven. Retirement prevents new profile
+  selection but never rewrites evidence.
+- **solver_runtime_builds** — immutable exact provenance for one implementation:
+  build id, source revision, final image digest, deterministic adapter/application
+  source SHA-256, package/binary checksum, and architecture. Unknown fields stay
+  null, but every new acknowledgement requires at least one actual content
+  digest; legacy evidence without one keeps a null runtime reference. A SHA-256
+  provenance key deduplicates exact worker acknowledgements.
+- **solver_execution_pools** — one implementation + immutable routing key, with
+  mutable enabled/capacity/metadata. The cutover leaves historical OpenCFD 2406
+  route `celery` disabled, activates OpenCFD 2606 route
+  `openfoam-opencfd-2606` only after a live worker handshake/canary, and keeps
+  Foundation route `openfoam-foundation-14` disabled. Scheduling requires
+  exactly one enabled pool matching the immutable preset revision.
+- **solver_profiles** + `solverImplementationId` FK. Profile creation/update
+  rejects retired implementations; new/default OpenCFD profiles resolve to
+  2606. Existing immutable revisions retain their original 2406 or
+  legacy/unknown identity.
+
+### 3.3 Modified campaign/evidence tables
 
 - **simulation_presets** + `origin` text NOT NULL default 'library':
   `library | campaign` — set ONCE at INSERT, never reassigned. Library tab filters
@@ -129,10 +197,16 @@ stated in the UI; growth is via Add airfoils).
 - **simulation_preset_revisions** + `physicsHash` text — hash over ONLY the
   physics+numerics snapshot blocks: flowState (medium identity + T/P/speed + resolved
   density/viscosity), referenceGeometry, boundary, mesh, solver (NOT name, sweep,
-  scheduling, output). Backfilled by migration. Global UNIQUE index
-  (physicsHash) WITH a deterministic canonical-revision rule: the launch materializer
-  reuses ANY revision with a matching physicsHash (prefer: enabled-preset revision,
-  else oldest). Insert with ON CONFLICT DO NOTHING + reselect (race-safe).
+  scheduling, output). Keep it for physical/numerical comparison. Add immutable
+  `solverImplementationId`, `methodCompatibilityHashVersion`, and
+  `methodCompatibilityHash`: the versioned public-series/reuse identity hashes
+  `physicsHash` plus engine family, distribution, upstream release, method family,
+  and numerics revision. It deliberately excludes adapter contract version,
+  runtime provenance, execution pool, sweep, scheduling, and output. The launch
+  materializer reuses only a revision with a matching method compatibility hash
+  (prefer enabled-preset revision, else oldest), using advisory locking +
+  ON CONFLICT DO NOTHING/reselect for races. Historical snapshots without engine
+  identity remain legacy/unknown and cannot coalesce with OpenCFD evidence.
 - **flow_conditions** and **reference_geometry_profiles** +
   `origin` text NOT NULL default 'user' (`seeded | user | campaign`),
   `createdByCampaignId` uuid NULL ON DELETE SET NULL,
@@ -142,19 +216,25 @@ stated in the UI; growth is via Add airfoils).
   rows conservatively: only merge rows that are unreferenced or identically
   referenced; otherwise suffix the canonicalKey deterministically and log.
 - **sim_jobs** + `campaignId` uuid NULL, `jobKind` text NOT NULL default 'sweep'
-  (`sweep | targeted`). Refinement iterations and small campaign deltas are
-  `targeted`.
+  (`sweep | targeted`), requested `methodKey`, `solverImplementationId`,
+  `solverExecutionPoolId`, and acknowledged `solverRuntimeBuildId`. Refinement
+  iterations and small campaign deltas are `targeted`. Every status/result lookup,
+  cancellation, and recovery call uses the persisted implementation and pool.
+- **result_attempts**, **results**, and **solver_evidence_artifacts** + actual
+  `methodKey`, `solverImplementationId`, and `solverRuntimeBuildId`. Runtime and
+  implementation owner FKs prevent cross-engine provenance. The generic evidence
+  artifact is `engine_bundle`; legacy OpenFOAM bundle labels remain readable.
 - **airfoils** + `isSymmetric` boolean NOT NULL default false + `symmetryCheckedAt`
   timestamptz NULL. Computed from stored coordinates (see §9.1); backfilled by
   migration; recomputed on airfoil create/import.
 - **sweeper_state** + `cpuSlots` int NOT NULL default (existing effective default).
-  This is THE single global solver-capacity setting ("OpenFOAM CPU slots"), surfaced
+  This is THE single global solver-capacity setting ("Solver CPU slots"), surfaced
   on the Queue page. `maxConcurrentJobs` is derived/subordinated to it (keep the
   column for compatibility; the UI exposes only CPU slots; job building passes the
   global slots into the engine `resources` block). Per-preset scheduling_profiles
   remain as tables but LEAVE the campaign composition and the wizard entirely.
 
-### 3.3 Legacy compatibility
+### 3.4 Legacy compatibility
 
 - results.bcId is NOT NULL: campaign launch MUST run
   `syncLegacyBoundaryConditionForPreset` for every found-or-created preset BEFORE any
@@ -170,10 +250,12 @@ angle expansion — grids are generated in TS and inserted as values):
 - Canonical value precisions (SI): T 0.01 K · P 1 Pa · speed 0.001 m/s ·
   chord 0.0001 m · span 0.0001 m · area 1e-6 m².
 - Canonical strings: fixed-precision decimal strings (as in plan jsonb), sorted
-  ascending; range expansion computes from + i*step in decimal, canonicalizes,
+  ascending; range expansion computes from + i\*step in decimal, canonicalizes,
   dedupes. A 0.5° grid MUST be byte-identical to the matching subset of a 0.1° grid.
 - `physicsHash(snapshot)` — sha256 over a stable-stringified physics+numerics subset
   (exact field list documented in code next to SimulationSetupSnapshot).
+- `methodCompatibilityHash(snapshot)` — versioned sha256 over `physicsHash` plus
+  logical numerical implementation identity, excluding adapter/runtime/pool data.
 - Envelope diff = string-set difference over canonical chips → fully deterministic.
 
 ## 5. Launch protocol (POST /api/admin/campaigns)
@@ -188,21 +270,22 @@ angle expansion — grids are generated in TS and inserted as values):
    campaign (200). Launch button disables on first click.
 3. In ONE transaction:
    a. Quick-created mediums/profiles commit here (never earlier — abandoned wizard
-      drafts leave no rows). All quick-creates are NEW records (save-as-new).
+   drafts leave no rows). All quick-creates are NEW records (save-as-new).
    b. Per condition combo: value-level find-or-create flow/geometry rows via
-      canonicalKey ON CONFLICT (origin='campaign' only on genuine insert; a matching
-      library row is reused untouched).
-   c. Compute physicsHash; global lookup → reuse ANY matching revision; else create
-      an origin='campaign' preset (enabled=false) + revision (advisory lock on the
-      hash during launch kills races).
+   canonicalKey ON CONFLICT (origin='campaign' only on genuine insert; a matching
+   library row is reused untouched).
+   c. Compute physicsHash and methodCompatibilityHash; global lookup → reuse only a
+   revision with the same method compatibility identity; else create
+   an origin='campaign' preset (enabled=false) + revision (advisory lock on the
+   method hash during launch kills races).
    d. syncLegacyBoundaryConditionForPreset for every preset used.
    e. Insert campaign, airfoils, plan revision #1 (kind=initial), conditions
-      (status=active, pinned revisionIds), points (set-based; symmetric airfoils get
-      only α ≥ 0 solver points + derivedBySymmetry rows for the negative side),
-      link pre-solved evidence, write progress counters, create lanes for enabled
-      objectives (symmetric airfoils' cl_zero lanes start as `symmetric_definition`).
+   (status=active, pinned revisionIds), points (set-based; symmetric airfoils get
+   only α ≥ 0 solver points + derivedBySymmetry rows for the negative side),
+   link pre-solved evidence, write progress counters, create lanes for enabled
+   objectives (symmetric airfoils' cl_zero lanes start as `symmetric_definition`).
 4. The wizard reuse preview endpoint (GET …/campaigns/preview) is READ-ONLY: computes
-   would-be physicsHashes in memory, looks up existing revisions, counts solved
+   would-be method compatibility hashes in memory, looks up existing revisions, counts solved
    points; explicit "computing…" state; honest degrade copy on timeout
    (statement_timeout ≈ 5 s): "Couldn't compute the reuse preview in time — launching
    is still safe: already-solved points are never re-run." If reused == total, Review
@@ -221,7 +304,7 @@ one-line semantics banner, submit → acknowledge dialog instead of next step.
 - PREVIEW: client sends edited plan + basePlanRevisionNumber. Server computes the
   canonical set diff, classifies removed combos/angles (closure), returns diff with
   real counts (including "N running jobs on removed work will finish; evidence kept")
-  + a diff hash. NO writes.
+  - a diff hash. NO writes.
 - ACKNOWLEDGE: client sends baseRevisionNumber + diffHash. Server: BEGIN; SELECT
   campaign FOR UPDATE; 409 if plan revision advanced; RE-CLASSIFY inside the
   transaction; if the fresh diff differs materially → ROLLBACK and return the
@@ -237,9 +320,9 @@ one-line semantics banner, submit → acknowledge dialog instead of next step.
   never deleted." Type-to-confirm only when added points exceed the same launch
   threshold (10k).
 
-Closure sentence (exact copy): *"Conditions that already have results for any
+Closure sentence (exact copy): _"Conditions that already have results for any
 airfoil will stay and finish for all airfoils — removing values only cancels
-conditions nothing has been solved at yet."*
+conditions nothing has been solved at yet."_
 
 ### 6.2 What is editable
 
@@ -306,7 +389,8 @@ conditions nothing has been solved at yet."*
   on-demand (10) always wins. Priority levels named in UI: Background (0) /
   Standard (5, default) / High (8) with the honest starvation copy.
 - **Campaign job building** (batched, 2026-07-04): one campaign job =
-  (campaign, airfoil, chord, compatible physics group, identical open-angle set)
+  (campaign, airfoil, chord, compatible physical + solver-method group,
+  identical open-angle set)
   × all its open speeds, capped at CAMPAIGN_MAX_CASES_PER_JOB (256) with greedy
   reynolds-ordered chunking. Compatibility is value-based: identical ambient
   (T/P/density/viscosity) + identical boundary/mesh/solver/output blocks; one
@@ -320,11 +404,15 @@ conditions nothing has been solved at yet."*
   promotion must never widen a sibling entry. Jobs without a conditionMap keep
   the legacy single-revision path.
   Campaign jobs never bundle foreign gaps; refinement iterations are
-  single-angle `targeted` jobs; sim_jobs.campaignId set.
+  single-angle `targeted` jobs; sim_jobs.campaignId set. The job is stamped with
+  the immutable implementation and exactly one enabled execution pool before
+  submission; unavailable/ambiguous pools block admission rather than falling
+  back to another engine.
 - **Engine-side reuse** (2026-07-04, supersedes §15's "no engine changes"):
   the Python engine keeps persistent content-addressed caches on the
   engine_cache volume (env AIRFOILFOAM_CACHE_DIR, LRU-capped by
-  AIRFOILFOAM_CACHE_MAX_GB, default 20 GB): a MESH cache keyed
+  AIRFOILFOAM_CACHE_MAX_GB, default 20 GB): every namespace begins with the
+  numerical engine compatibility key; a MESH cache is then keyed
   (normalized geometry, canonical chord, resolved mesh params) so repeat
   meshing is a verified copy, and a SEED cache keyed (mesh key, fluid,
   canonical speed, solver signature) so a new steady case within 2.0° of a
@@ -378,19 +466,19 @@ conditions nothing has been solved at yet."*
      if base-sweep points still pending → `awaiting_seed`; if all terminal and fit
      still insufficient → `insufficient_evidence` (lane-scoped requeue-failed
      affordance).
-  2. α* = F.target (per objective). Append step (iteration, predictedAlpha, fitSetId)
+  2. α\* = F.target (per objective). Append step (iteration, predictedAlpha, fitSetId)
      when it advances the lane.
   3. CONVERGED iff: (a) no in-flight/requested point for this lane; (b) an ACCEPTED
-     evidence point exists at the pinned revision within tolerance of α*; (c) the fit
+     evidence point exists at the pinned revision within tolerance of α\*; (c) the fit
      did not move since the last prediction (fitSetId equals previous step's).
      `converged_final` when F.status = final, else `converged_provisional`.
      There is deliberately NO |α_new − α_prev| term (iteration 1 well-defined: a base
      sweep that already brackets the target converges immediately).
-  4. If canonicalAoa(α*) duplicates an already-requested lane angle and (3) fails:
+  4. If canonicalAoa(α\*) duplicates an already-requested lane angle and (3) fails:
      oscillation check — last 3 predictions within a 2·tolerance window →
      `converged_window` (reported as the current fit value ± the observed window);
      else keep iterating until maxRounds (+extraRoundsGranted) → `stalled`.
-  5. Else enqueue α* as a single-angle campaign point (targeted job, campaign
+  5. Else enqueue α\* as a single-angle campaign point (targeted job, campaign
      priority band); iteration++.
   6. Supersession reopen: on any new isCurrent fit at that (airfoil, revision), if
      |newTarget − convergedTarget| > tolerance and the campaign is active → back to
@@ -407,6 +495,7 @@ conditions nothing has been solved at yet."*
 ## 9. Symmetric airfoils
 
 ### 9.1 Detection
+
 `isAirfoilSymmetric(points)` in packages/core: after the existing normalization
 (chord-aligned, closed TE), compare upper/lower surfaces sampled at common x
 stations; symmetric iff max |y_up(x) + y_low(x)| ≤ 1e-4 (relative to chord = 1).
@@ -414,6 +503,7 @@ Stored on airfoils (isSymmetric, symmetryCheckedAt); backfilled by migration;
 computed on create/import. A real geometric property — never inferred from names.
 
 ### 9.2 Solve plan
+
 For symmetric airfoils, only α ≥ 0 points get solver work. Negative requested angles
 become `derivedBySymmetry` points: terminal as soon as the matching +α point is
 terminal, resultId → the +α results row. Derived coefficients: Cl(−α) = −Cl(α),
@@ -423,6 +513,7 @@ real solves. Fit input mirrors accepted/needs_urans evidence with the same
 classification state.
 
 ### 9.3 Presentation
+
 Derived points carry `derivedFromResultId` + a "derived by symmetry" marker in every
 surface (matrix cells, polar points, evidence views). Opening one shows the source
 +α evidence with a "mirrored (symmetric airfoil, derived from α = +X°)" badge; field
@@ -432,6 +523,7 @@ user distinguish "solver runs" from "points" (Review: "Solver runs 237,664 — 1
 symmetric airfoils solve positive angles only; 5,440 points derived by symmetry").
 
 ### 9.4 Meshing
+
 No engine change required for correctness (mesh is per chord per job, geometry
 already symmetric); job building simply never submits negative angles for symmetric
 airfoils. Keep the engine request untouched otherwise.
@@ -525,7 +617,7 @@ airfoils. Keep the engine request untouched otherwise.
   auto-pick); unresolved slot = validation issue. Priority select with honest copy,
   queue context (backlog + observed rate only), >10k type-to-confirm, idempotent
   Launch. All numeric inputs = UnitNumberField; validation = existing ValidationIssue
-  + focus-on-error system (chips get per-chip error targeting).
+  - focus-on-error system (chips get per-chip error targeting).
 - **Campaign detail**: header ≤2 rows (actions collapse to overflow <940); truthful
   status line; progress + rate line (§12); condition summary strip; virtualized
   matrix (search, failed-first default, sticky headers ≥940, stacked bar <620, own
@@ -540,7 +632,9 @@ airfoils. Keep the engine request untouched otherwise.
   status chip); expanded iteration table (predicted α → solved point by resultId →
   new fit target → Δ); "Continue +N"; provisional/stale/symmetric states.
 - **Queue page**: backlog strip, campaign chips on job cards, engine-unreachable
-  banner, single "OpenFOAM CPU slots" control (replaces the concurrency stepper).
+  banner, implementation/pool inventory, and single "Solver CPU slots" control
+  (replaces the concurrency stepper). Enabling a pool requires a fresh exact
+  gateway identity + routing capability acknowledgement.
 - **Pinned-detail admin journey**: every admin surface that deep-links to
   `/airfoils/<slug>` as evidence of a job/result (finished/active job cards,
   campaign cell side panel) appends `?revision=<uuid>` with the job's setup
@@ -573,7 +667,9 @@ airfoils. Keep the engine request untouched otherwise.
 ## 13. Testing requirements
 
 - Unit (core): canonicalization (range-expansion byte-equality incl. 0.5⊂0.1 grid),
-  physicsHash stability + exclusion list, fine targets (alphaLdmaxFine/alphaClZeroFine
+  physicsHash stability + exclusion list, method compatibility separation across
+  distribution/release/numerics and invariance across adapter/runtime/pool changes,
+  fine targets (alphaLdmaxFine/alphaClZeroFine
   vs analytic fixtures), symmetry detection (NACA 00xx true; cambered false;
   tolerance boundary), mirroring math.
 - API integration: launch idempotency (double POST → one campaign), preview
@@ -602,20 +698,30 @@ airfoils. Keep the engine request untouched otherwise.
 
 ## 14. Migration / backfill plan (order matters)
 
-1. Additive columns + new tables (no destructive changes).
-2. Backfill physicsHash for all existing revisions; build the global unique index
-   AFTER deduplication analysis (value-identical physics across presets is expected —
-   the unique index applies to NEW canonical-revision selection; if true duplicates
-   exist, keep them but mark a canonical row: implement as UNIQUE index on
-   (physicsHash) WHERE isCanonicalPhysics = true with a backfill that elects the
-   oldest/enabled-preset revision as canonical; the materializer reuses canonical).
-3. Backfill canonicalKey with conservative dedupe (§3.2).
-4. Backfill airfoils.isSymmetric from stored coordinates.
-5. `postgres-docker-backup` is REQUIRED before running migrations on any live DB.
+1. Additive columns + immutable solver implementation/runtime/pool tables (no
+   destructive changes). Preserve historical OpenCFD 2406, seed OpenCFD 2606
+   disabled until live activation, keep Foundation disabled, and retain a
+   retired legacy/unknown implementation.
+2. Preserve existing snapshot bytes and attach historical revisions to
+   legacy/unknown unless their implementation is proven. New/resolved revisions
+   store physicsHash plus versioned methodCompatibilityHash; canonical reuse and
+   public polar identity use the latter.
+3. Backfill physicsHash for existing revisions where valid; do not relabel their
+   numerical method from current deployment defaults.
+4. Backfill canonicalKey with conservative dedupe (§3.3).
+5. Backfill airfoils.isSymmetric from stored coordinates.
+6. `postgres-docker-backup` is REQUIRED before running migrations on any live DB.
+7. Deploy the new control plane/schema before engine maintenance. The guarded
+   cutover drains 2406/legacy work, replaces the worker, certifies and activates
+   2606, creates full-grid successor generations for the same campaign IDs, and
+   only then resumes prior runnable campaigns.
 
 ## 15. Out-of-scope for this feature (recorded)
 
 - "Keep filling forever" launch option creates/points to a continuous enabled preset
   (existing machinery); offered only for scope = all.
-- Remote/sync federation behavior unchanged; campaign branch respects promises.
-- Engine (Python) changes: none required.
+- Remote/sync federation preserves exact implementation/runtime provenance and
+  rejects identity conflicts; campaign scheduling still respects promises.
+- XFoil and the owner's future thesis-derived solver are not integrated by this
+  delivery. The latter must use its own canonical name and typed engine contract,
+  not the MSES identity.

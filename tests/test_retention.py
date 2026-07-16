@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import fcntl
+import base64
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -98,6 +100,27 @@ def _clean_store_job(job_id: str) -> Path:
     return root
 
 
+def _write_remote_pointer(evidence: Path, archive: Path, *, stored_sha: str | None = None) -> Path:
+    payload = archive.read_bytes()
+    return _write_json(
+        evidence / "engine_evidence.remote.json",
+        {
+            "schemaVersion": 1,
+            "format": "tar+zstd",
+            "bucket": "airfoils-pro-storage-bucket",
+            "objectKey": "solver-evidence/v1/sha256/aa/archive.tar.zst",
+            "generation": 1234567890123456789,
+            "storedSha256": stored_sha or hashlib.sha256(payload).hexdigest(),
+            "storedSize": len(payload),
+            "tarSha256": "b" * 64,
+            "tarSize": 123,
+            "crc32c": base64.b64encode(b"\0\0\0\0").decode("ascii"),
+            "zstdLevel": 10,
+            "createdAt": "2026-07-15T00:00:00+00:00",
+        },
+    )
+
+
 def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
     job_root = tmp_path / "job-strip"
     paths = _make_realistic_job(job_root)
@@ -112,8 +135,8 @@ def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
     for rel in ("0", "141", "3.5", "constant", "system", "postProcessing", "VTK", "dynamicCode", "processor0"):
         assert not (case / rel).exists()
     assert not (case / "log.simpleFoam").exists()
-    assert not (case / "a0" / "evidence" / "openfoam").exists()
-    assert not (case / "a0" / "evidence" / "time_directories").exists()
+    assert (case / "a0" / "evidence" / "openfoam").exists()
+    assert (case / "a0" / "evidence" / "time_directories").exists()
 
     for rel in ("request.json", "result.json", "status.json", "runtime.json"):
         assert (job_root / rel).is_file()
@@ -132,7 +155,7 @@ def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
         assert paths[key].is_file(), key
 
 
-def test_keep_case_state_preserves_continuation_material_but_prunes_redundant_evidence(tmp_path: Path):
+def test_keep_case_state_preserves_continuation_and_packaged_evidence(tmp_path: Path):
     job_root = tmp_path / "job-keep-state"
     paths = _make_realistic_job(job_root)
     case = paths["case"]
@@ -151,15 +174,97 @@ def test_keep_case_state_preserves_continuation_material_but_prunes_redundant_ev
 
     assert report.kept_case_state is True
     assert (job_root / "meshes").exists()
-    for rel in ("0", "141", "3.5", "constant", "system", "postProcessing", "VTK", "processor0"):
+    for rel in ("0", "141", "3.5", "constant", "system", "postProcessing", "processor0"):
         assert (case / rel).exists()
+    assert not (case / "VTK").exists()
     assert (case / "log.simpleFoam").is_file()
     # MUST-CATCH (continuation restartability): the shared-mesh symlink still
     # resolves to real mesh files after a case-state-preserving strip.
     assert (case / "constant" / "polyMesh" / "points").is_file()
-    assert not (case / "a0" / "evidence" / "openfoam").exists()
-    assert not (case / "a0" / "evidence" / "time_directories").exists()
+    assert (case / "a0" / "evidence" / "openfoam").exists()
+    assert (case / "a0" / "evidence" / "time_directories").exists()
     assert paths["rerender_vtk"].is_file()
+
+
+def test_remote_pointer_alone_never_authorizes_raw_vtk_or_local_zstd_removal(
+    tmp_path: Path,
+):
+    job_root = tmp_path / "job-remote-backed"
+    paths = _make_realistic_job(job_root)
+    evidence = paths["case"] / "a0" / "evidence"
+    archive = _write(evidence / "engine_evidence.tar.zst", b"verified-zstd")
+    pointer = _write_remote_pointer(evidence, archive)
+
+    strip_job_dir(job_root)
+
+    assert pointer.is_file()
+    assert paths["manifest"].is_file()
+    assert archive.is_file()
+    assert (evidence / "VTK").is_dir()
+    assert (evidence / "openfoam").exists()
+    assert (evidence / "time_directories").exists()
+    # The legacy encoding is retained for the dedicated migration to prove
+    # tar equivalence before it removes that historical source.
+    assert paths["bundle"].is_file()
+
+
+def test_awaiting_database_registration_prevents_retention_cleanup(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "job-migration-pending"
+    paths = _make_realistic_job(job_root)
+    evidence = paths["case"] / "a0" / "evidence"
+    archive = _write(evidence / "engine_evidence.tar.zst", b"verified-zstd")
+    _write_remote_pointer(evidence, archive)
+    receipt = _write_json(
+        evidence / "storage_migration.json",
+        {"schemaVersion": 1, "state": "awaiting_database_registration"},
+    )
+
+    report = strip_job_dir(job_root)
+
+    for path in (
+        archive,
+        paths["bundle"],
+        paths["rerender_vtk"],
+        paths["redundant_openfoam"],
+        paths["redundant_time"],
+    ):
+        assert path.exists(), path
+    assert str(receipt.relative_to(job_root)) in report.unknown_entries
+
+
+def test_mismatched_remote_pointer_never_authorizes_evidence_deletion(tmp_path: Path):
+    job_root = tmp_path / "job-bad-pointer"
+    paths = _make_realistic_job(job_root)
+    evidence = paths["case"] / "a0" / "evidence"
+    archive = _write(evidence / "engine_evidence.tar.zst", b"local-zstd")
+    pointer = _write_remote_pointer(evidence, archive, stored_sha="f" * 64)
+
+    report = strip_job_dir(job_root)
+
+    assert archive.is_file()
+    assert paths["rerender_vtk"].is_file()
+    assert (evidence / "openfoam").exists()
+    assert (evidence / "time_directories").exists()
+    assert str(pointer.relative_to(job_root)) in report.unknown_entries
+
+
+@pytest.mark.parametrize("bundle_bytes", [b"", b"truncated-not-a-tar"])
+def test_invalid_local_bundle_never_authorizes_packaged_evidence_deletion(
+    tmp_path: Path,
+    bundle_bytes: bytes,
+) -> None:
+    job_root = tmp_path / "job-corrupt-bundle"
+    paths = _make_realistic_job(job_root)
+    paths["bundle"].write_bytes(bundle_bytes)
+
+    strip_job_dir(job_root)
+
+    assert paths["bundle"].is_file()
+    assert paths["rerender_vtk"].is_file()
+    assert paths["redundant_openfoam"].is_file()
+    assert paths["redundant_time"].is_file()
 
 
 def test_strip_idempotency_uses_marker(tmp_path: Path):

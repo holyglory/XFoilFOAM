@@ -1,3 +1,5 @@
+import "./enabled-engine-pool-fixture";
+
 import {
   airfoils,
   boundaryProfiles,
@@ -65,7 +67,11 @@ import { buildPolarRequest } from "../src/build-request";
 import { claimAoas } from "../src/claim";
 import { findGaps, firstBatch } from "../src/gaps";
 import { touchHeartbeat } from "../src/heartbeat";
-import { ingestResult, retryFailedScaleRenders } from "../src/ingest";
+import {
+  ingestResult,
+  repairDefaultMediaForStoredResult,
+  retryFailedScaleRenders,
+} from "../src/ingest";
 import {
   reconcile,
   resetOrphans,
@@ -2057,14 +2063,8 @@ describe("sweeper: gap → claim → ingest", () => {
           eq(results.simulationPresetRevisionId, presetRevisionId),
           eq(results.aoaDeg, aoa),
         ),
-      );
+    );
     cleanupResultIds.add(row.id);
-
-    // Complete engine-shipped URANS media makes the preliminary point
-    // publishable immediately. A transient failure in the optional shared
-    // color-scale render remains a retryable presentation-artifact problem;
-    // it must not demote accepted CFD evidence or create human review work.
-    await refreshPolarCacheForRevision(db, a.id, presetRevisionId);
     const [sourceAttempt] = await db
       .select({ id: resultAttempts.id })
       .from(resultAttempts)
@@ -2074,6 +2074,31 @@ describe("sweeper: gap → claim → ingest", () => {
           eq(resultAttempts.simJobId, job.id),
         ),
       );
+
+    // The engine job must settle before the durable media worker starts its
+    // expensive extent/render pass. Exercise that production path explicitly
+    // instead of expecting ingest to render partial evidence inline.
+    await db
+      .update(simJobs)
+      .set({ status: "done", engineState: "completed", finishedAt: new Date() })
+      .where(eq(simJobs.id, job.id));
+    expect(
+      await discoverMissingResultMediaRepairs(db, { resultId: row.id }),
+    ).toBe(1);
+    await expect(
+      repairDefaultMediaForStoredResult({
+        db,
+        engine: renderDownEngine,
+        resultId: row.id,
+        resultAttemptId: sourceAttempt.id,
+      }),
+    ).rejects.toThrow("fetch failed");
+
+    // Complete engine-shipped URANS media makes the preliminary point
+    // publishable immediately. A transient failure in the optional shared
+    // color-scale render remains a retryable presentation-artifact problem;
+    // it must not demote accepted CFD evidence or create human review work.
+    await refreshPolarCacheForRevision(db, a.id, presetRevisionId);
     expect(row.currentResultAttemptId).toBe(sourceAttempt.id);
     const [beforeScaleRepair] = await db
       .select()
@@ -4773,10 +4798,14 @@ describe("sweeper: gap → claim → ingest", () => {
       .where(eq(simPrecalcObligations.id, fixture.obligation.id));
     expect(releasedObligation).toMatchObject({
       state: "pending",
-      attemptCount: 1,
+      attemptCount: 0,
       latestSimJobId: fixture.child.id,
-      lastOutcome: "failed",
+      lastOutcome: "infrastructure_retry_wait",
     });
+    await db
+      .update(simPrecalcObligations)
+      .set({ nextSubmitAt: new Date(0) })
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
 
     const requests: Parameters<EngineClient["submitPolar"]>[0][] = [];
     const outgoingEngine = {
@@ -4820,7 +4849,7 @@ describe("sweeper: gap → claim → ingest", () => {
       .where(eq(simPrecalcObligations.id, fixture.obligation.id));
     expect(retriedObligation).toMatchObject({
       state: "running",
-      attemptCount: 2,
+      attemptCount: 1,
     });
   }, 60000);
 
@@ -4856,10 +4885,14 @@ describe("sweeper: gap → claim → ingest", () => {
       .where(eq(simPrecalcObligations.id, fixture.obligation.id));
     expect(releasedObligation).toMatchObject({
       state: "pending",
-      attemptCount: 1,
+      attemptCount: 0,
       latestSimJobId: fixture.child.id,
-      lastOutcome: "failed",
+      lastOutcome: "infrastructure_retry_wait",
     });
+    await db
+      .update(simPrecalcObligations)
+      .set({ nextSubmitAt: new Date(0) })
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
 
     const requests: Parameters<EngineClient["submitPolar"]>[0][] = [];
     const outgoingEngine = {
@@ -4889,7 +4922,7 @@ describe("sweeper: gap → claim → ingest", () => {
       .where(eq(simPrecalcObligations.id, fixture.obligation.id));
     expect(retriedObligation).toMatchObject({
       state: "running",
-      attemptCount: 2,
+      attemptCount: 1,
     });
   }, 60000);
 
@@ -4941,10 +4974,15 @@ describe("sweeper: gap → claim → ingest", () => {
     });
     expect(afterObligation).toMatchObject({
       state: "pending",
-      attemptCount: 1,
-      lastOutcome: "failed",
+      attemptCount: 0,
+      lastOutcome: "infrastructure_retry_wait",
     });
-    expect(afterAttempt).toMatchObject({ state: "failed", outcome: "failed" });
+    expect(afterAttempt).toMatchObject({
+      state: "cancelled",
+      outcome: "infrastructure_retry_wait",
+      consumesSolverAttempt: false,
+      solverAttemptNumber: null,
+    });
   }, 60000);
 
   // MUST-CATCH (G3, incident 2026-07-05): a force-recreated worker killed the

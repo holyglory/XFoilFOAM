@@ -1,6 +1,8 @@
 import type {
+  EngineCapabilities,
   EngineCacheStats,
   EngineHealth,
+  EngineIdentity,
   EngineMaintenanceDiskResponse,
   EngineMaintenanceJobsResponse,
   EngineQueueState,
@@ -9,6 +11,8 @@ import type {
   FieldExtentsRequest,
   FieldExtentsResponse,
   EngineDeleteJobResponse,
+  FinalizeRemoteEvidenceRequest,
+  FinalizeRemoteEvidenceResponse,
   JobResult,
   JobRuntimeResponse,
   JobStatus,
@@ -18,9 +22,18 @@ import type {
   RenderFieldRequest,
   RenderFieldResponse,
 } from "./types";
+import {
+  LEGACY_OPENCFD_2406_ENGINE,
+  OPENCFD_2606_ENGINE,
+  isEngineCapabilityDescriptor,
+  isEngineIdentity,
+  isEngineRuntimeIdentity,
+  sameEngineIdentity,
+} from "./engine-identity";
 
 export const MESH_RECOVERY_CAPABILITY_MISMATCH_CODE =
   "mesh_recovery_version_mismatch";
+export const ENGINE_IDENTITY_MISMATCH_CODE = "engine_identity_mismatch";
 
 export class EngineError extends Error {
   constructor(
@@ -70,6 +83,21 @@ export class EngineTimeoutError extends Error {
 /** Per-call override for the built-in timeout defaults. */
 export interface EngineCallOptions {
   timeoutMs?: number;
+  /** Logical implementation recorded on the owning sim_job. Required by new
+   * control-plane job/result polls in a multi-engine gateway. */
+  expectedEngine?: EngineIdentity;
+  expectedExecutionPool?: string;
+}
+
+export interface EngineClientOptions {
+  /** Expected logical numerical implementation for every call through this
+   * client. New clients default to the executable OpenCFD-v2606 runtime. */
+  expectedEngine?: EngineIdentity;
+  /** Historical-read bridge. Missing structured identity is accepted only
+   * when the caller explicitly expects the legacy OpenCFD-v2406 identity. */
+  allowLegacyMissingIdentity?: boolean;
+  /** Dedicated server-to-server bearer token for destructive evidence cleanup. */
+  controlPlaneToken?: string;
 }
 
 /** Status/runtime polls (health, job status, queue, cache stats, runtimes). */
@@ -84,8 +112,221 @@ export const ENGINE_RENDER_TIMEOUT_MS = 120_000;
  *  for at most its budget — a hung fetch surfaces as EngineTimeoutError. */
 export class EngineClient {
   readonly baseUrl: string;
-  constructor(baseUrl: string) {
+  readonly expectedEngine: EngineIdentity;
+  private readonly allowLegacyMissingIdentity: boolean;
+  private readonly controlPlaneToken: string | null;
+
+  constructor(baseUrl: string, options: EngineClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.expectedEngine = {
+      ...(options.expectedEngine ?? OPENCFD_2606_ENGINE),
+    };
+    this.allowLegacyMissingIdentity =
+      options.allowLegacyMissingIdentity ?? true;
+    this.controlPlaneToken = options.controlPlaneToken?.trim() || null;
+  }
+
+  private verifyEngineAcknowledgement(
+    response: {
+      engine?: unknown;
+      requested_engine?: unknown;
+      requested_execution_pool?: unknown;
+      execution_pool?: unknown;
+      engines?: unknown;
+      supported_engines?: unknown;
+    },
+    operation: string,
+    expected?: EngineIdentity,
+    options: {
+      requireRuntime?: boolean;
+      requireRequestedAck?: boolean;
+      expectedExecutionPool?: string;
+      requireExecutionPool?: boolean;
+      /** Health/capability inventories acknowledge routable logical targets,
+       * never an executing runtime. Job/result verification must leave this
+       * false so a worker runtime cannot be replaced by gateway metadata. */
+      allowLogicalInventoryAck?: boolean;
+    } = {},
+  ): void {
+    const actual = response.engine;
+    const requested = response.requested_engine;
+    const requestedPool = response.requested_execution_pool;
+    const executedPool = response.execution_pool;
+    const inventories: EngineIdentity[][] = [];
+    if (response.engines != null) {
+      if (!Array.isArray(response.engines)) {
+        throw new EngineError(
+          `${operation} returned a malformed engine inventory`,
+          undefined,
+          ENGINE_IDENTITY_MISMATCH_CODE,
+        );
+      }
+      const identities = response.engines.map((candidate) => {
+        if (isEngineIdentity(candidate)) return candidate;
+        if (isEngineCapabilityDescriptor(candidate)) return candidate.engine;
+        throw new EngineError(
+          `${operation} returned a malformed engine inventory`,
+          undefined,
+          ENGINE_IDENTITY_MISMATCH_CODE,
+        );
+      });
+      inventories.push(identities);
+    }
+    if (response.supported_engines != null) {
+      if (!Array.isArray(response.supported_engines)) {
+        throw new EngineError(
+          `${operation} returned a malformed supported engine inventory`,
+          undefined,
+          ENGINE_IDENTITY_MISMATCH_CODE,
+        );
+      }
+      const identities = response.supported_engines.map((candidate) => {
+        if (isEngineIdentity(candidate)) return candidate;
+        throw new EngineError(
+          `${operation} returned a malformed supported engine inventory`,
+          undefined,
+          ENGINE_IDENTITY_MISMATCH_CODE,
+        );
+      });
+      inventories.push(identities);
+    }
+    const inventoryAcknowledged =
+      expected != null &&
+      inventories.some((inventory) =>
+        inventory.some((candidate) => sameEngineIdentity(expected, candidate)),
+      );
+    if (expected && inventories.length > 0 && !inventoryAcknowledged) {
+      throw new EngineError(
+        `${operation} does not advertise requested engine ${JSON.stringify(expected)}`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (requested != null) {
+      if (!isEngineIdentity(requested)) {
+        throw new EngineError(
+          `${operation} returned malformed requested_engine acknowledgement`,
+          undefined,
+          ENGINE_IDENTITY_MISMATCH_CODE,
+        );
+      }
+      if (expected && !sameEngineIdentity(expected, requested)) {
+        throw new EngineError(
+          `${operation} acknowledged request ${JSON.stringify(requested)} but ${JSON.stringify(expected)} owns the job`,
+          undefined,
+          ENGINE_IDENTITY_MISMATCH_CODE,
+        );
+      }
+    } else if (
+      expected &&
+      options.requireRequestedAck &&
+      !(
+        this.allowLegacyMissingIdentity &&
+        sameEngineIdentity(expected, LEGACY_OPENCFD_2406_ENGINE)
+      )
+    ) {
+      throw new EngineError(
+        `${operation} did not acknowledge requested engine ${JSON.stringify(expected)}`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    const expectedPool = options.expectedExecutionPool;
+    if (requestedPool != null && typeof requestedPool !== "string") {
+      throw new EngineError(
+        `${operation} returned malformed requested_execution_pool`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (
+      expectedPool &&
+      requestedPool != null &&
+      requestedPool !== expectedPool
+    ) {
+      throw new EngineError(
+        `${operation} acknowledged execution pool ${JSON.stringify(requestedPool)} but ${JSON.stringify(expectedPool)} owns the job`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    const legacyPoolOmission =
+      this.allowLegacyMissingIdentity &&
+      expected != null &&
+      sameEngineIdentity(expected, LEGACY_OPENCFD_2406_ENGINE) &&
+      expectedPool === "celery";
+    if (expectedPool && requestedPool == null && !legacyPoolOmission) {
+      throw new EngineError(
+        `${operation} did not acknowledge requested execution pool ${JSON.stringify(expectedPool)}`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (actual == null) {
+      if (inventoryAcknowledged && options.allowLogicalInventoryAck) return;
+      if (requested != null && !options.requireRuntime) return;
+      if (!expected) return;
+      if (
+        this.allowLegacyMissingIdentity &&
+        sameEngineIdentity(expected, LEGACY_OPENCFD_2406_ENGINE)
+      ) {
+        return;
+      }
+      throw new EngineError(
+        `${operation} did not acknowledge runtime for requested engine ${JSON.stringify(expected)}`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (!isEngineRuntimeIdentity(actual)) {
+      throw new EngineError(
+        `${operation} returned malformed engine runtime identity`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (expected && !sameEngineIdentity(expected, actual)) {
+      throw new EngineError(
+        `${operation} executed by ${JSON.stringify(actual)} but ${JSON.stringify(expected)} was requested`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (executedPool != null && typeof executedPool !== "string") {
+      throw new EngineError(
+        `${operation} returned malformed execution_pool`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (expectedPool && executedPool != null && executedPool !== expectedPool) {
+      throw new EngineError(
+        `${operation} executed on pool ${JSON.stringify(executedPool)} but ${JSON.stringify(expectedPool)} was requested`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+    if (
+      expectedPool &&
+      options.requireExecutionPool &&
+      executedPool == null &&
+      !legacyPoolOmission
+    ) {
+      throw new EngineError(
+        `${operation} did not acknowledge executing pool ${JSON.stringify(expectedPool)}`,
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      );
+    }
+  }
+
+  private requestWithExpectedEngine(request: PolarRequest): PolarRequest {
+    return {
+      ...request,
+      expected_engine: {
+        ...(request.expected_engine ?? this.expectedEngine),
+      },
+    };
   }
 
   private async json<T>(
@@ -126,7 +367,16 @@ export class EngineClient {
 
   async health(opts?: EngineCallOptions): Promise<boolean> {
     try {
-      await this.json("/health", opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS);
+      const health = await this.json<EngineHealth>(
+        "/health",
+        opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+      );
+      this.verifyEngineAcknowledgement(
+        health,
+        "GET /health",
+        opts?.expectedEngine,
+        { allowLogicalInventoryAck: true },
+      );
       return true;
     } catch {
       return false;
@@ -137,7 +387,30 @@ export class EngineClient {
     return this.json<EngineHealth>(
       "/health",
       opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
-    );
+    ).then((health) => {
+      this.verifyEngineAcknowledgement(
+        health,
+        "GET /health",
+        opts?.expectedEngine,
+        { allowLogicalInventoryAck: true },
+      );
+      return health;
+    });
+  }
+
+  capabilities(opts?: EngineCallOptions): Promise<EngineCapabilities> {
+    return this.json<EngineCapabilities>(
+      "/capabilities",
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+    ).then((capabilities) => {
+      this.verifyEngineAcknowledgement(
+        capabilities,
+        "GET /capabilities",
+        opts?.expectedEngine,
+        { allowLogicalInventoryAck: true },
+      );
+      return capabilities;
+    });
   }
 
   /** Submit a polar job → 202 with a job_id. */
@@ -145,21 +418,47 @@ export class EngineClient {
     request: PolarRequest,
     opts?: EngineCallOptions,
   ): Promise<JobStatus> {
+    const requestWithExpectedEngine = this.requestWithExpectedEngine(request);
+    const expectedEngine = requestWithExpectedEngine.expected_engine!;
     return this.json<JobStatus>(
       "/polars",
       opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
       {
         method: "POST",
-        body: JSON.stringify(request),
+        body: JSON.stringify(requestWithExpectedEngine),
       },
-    );
+    ).then((status) => {
+      this.verifyEngineAcknowledgement(status, "POST /polars", expectedEngine, {
+        requireRequestedAck: true,
+        expectedExecutionPool:
+          requestWithExpectedEngine.expected_execution_pool,
+        requireRuntime: status.state !== "pending",
+        requireExecutionPool: status.state !== "pending",
+      });
+      return status;
+    });
   }
 
   getJob(jobId: string, opts?: EngineCallOptions): Promise<JobStatus> {
     return this.json<JobStatus>(
       `/jobs/${encodeURIComponent(jobId)}`,
       opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
-    );
+    ).then((status) => {
+      this.verifyEngineAcknowledgement(
+        status,
+        `GET /jobs/${jobId}`,
+        opts?.expectedEngine,
+        {
+          requireRequestedAck: Boolean(opts?.expectedEngine),
+          expectedExecutionPool: opts?.expectedExecutionPool,
+          requireRuntime:
+            Boolean(opts?.expectedEngine) && status.state !== "pending",
+          requireExecutionPool:
+            Boolean(opts?.expectedExecutionPool) && status.state !== "pending",
+        },
+      );
+      return status;
+    });
   }
 
   cancelJob(
@@ -213,6 +512,29 @@ export class EngineClient {
     );
   }
 
+  finalizeRemoteEvidence(
+    jobId: string,
+    request: FinalizeRemoteEvidenceRequest,
+    opts?: EngineCallOptions,
+  ): Promise<FinalizeRemoteEvidenceResponse> {
+    if (!this.controlPlaneToken) {
+      throw new EngineError(
+        "ENGINE_CONTROL_PLANE_TOKEN is required for remote evidence cleanup",
+        undefined,
+        "evidence_cleanup_auth_missing",
+      );
+    }
+    return this.json<FinalizeRemoteEvidenceResponse>(
+      `/jobs/${encodeURIComponent(jobId)}/evidence/finalize-remote`,
+      opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.controlPlaneToken}` },
+        body: JSON.stringify(request),
+      },
+    );
+  }
+
   maintenanceJobs(
     opts?: EngineCallOptions,
   ): Promise<EngineMaintenanceJobsResponse> {
@@ -251,7 +573,32 @@ export class EngineClient {
     return this.json<JobResult>(
       `/jobs/${encodeURIComponent(jobId)}/result`,
       opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
-    );
+    ).then((result) => {
+      this.verifyEngineAcknowledgement(
+        result,
+        `GET /jobs/${jobId}/result`,
+        opts?.expectedEngine,
+        {
+          requireRequestedAck: Boolean(opts?.expectedEngine),
+          requireRuntime: Boolean(opts?.expectedEngine),
+          expectedExecutionPool: opts?.expectedExecutionPool,
+          requireExecutionPool: Boolean(opts?.expectedExecutionPool),
+        },
+      );
+      for (const polar of result.polars) {
+        for (const point of [...polar.points, ...(polar.attempts ?? [])]) {
+          if (point.engine != null) {
+            this.verifyEngineAcknowledgement(
+              point,
+              `GET /jobs/${jobId}/result point ${point.case_slug ?? point.aoa_deg}`,
+              opts?.expectedEngine,
+              { requireRuntime: Boolean(opts?.expectedEngine) },
+            );
+          }
+        }
+      }
+      return result;
+    });
   }
 
   renderField(

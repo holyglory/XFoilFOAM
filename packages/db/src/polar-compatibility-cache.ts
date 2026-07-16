@@ -9,7 +9,7 @@ import {
   type PolarEvidenceClassification,
   type PolarEvidencePoint,
 } from "@aerodb/core";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
@@ -25,14 +25,19 @@ import {
   simulationPresetRevisions,
 } from "./schema";
 import {
+  methodCompatibilityHashForSnapshot,
   physicsHashForSnapshot,
   type SimulationSetupSnapshot,
 } from "./simulation-setup";
+import {
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+  METHOD_COMPATIBILITY_HASH_VERSION,
+} from "./solver-implementations";
 
-// v4 makes the selected immutable attempt (including its attempt id) the
-// complete compatibility-cache evidence source. Older v3 rows can contain a
-// mutable result projection and are therefore never read as current v4 data.
-export const POLAR_COMPATIBILITY_VERSION = "polar-compat-v4";
+// v5 adds versioned solver-method identity. Older v4 rows grouped only by the
+// physical/numerical payload and could coalesce different OpenFOAM
+// distributions/releases; they are therefore never read as current v5 data.
+export const POLAR_COMPATIBILITY_VERSION = "polar-compat-v5";
 export const POLAR_COMPATIBILITY_MEMBER_ROLES = [
   "selected",
   "shadowed",
@@ -56,6 +61,33 @@ function physicsHashFromStoredSnapshot(
     // Historical malformed snapshots must not break exact revision ingestion
     // or merge with unrelated evidence. Leaving the hash NULL fails closed:
     // the revision stays isolated until an explicit repair can validate it.
+    return null;
+  }
+}
+
+function methodCompatibilityHashFromStoredSnapshot(
+  snapshot: Record<string, unknown>,
+  solverImplementationId: string,
+): string | null {
+  try {
+    const parsed = snapshot as unknown as SimulationSetupSnapshot;
+    const snapshotImplementationId = parsed.engine?.implementationId;
+    if (
+      snapshotImplementationId != null &&
+      snapshotImplementationId !== solverImplementationId
+    ) {
+      return null;
+    }
+    if (
+      snapshotImplementationId == null &&
+      solverImplementationId !== LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID
+    ) {
+      return null;
+    }
+    return methodCompatibilityHashForSnapshot(parsed);
+  } catch {
+    // An inconsistent/malformed immutable snapshot must remain isolated until
+    // explicit repair; never infer an implementation from mutable state.
     return null;
   }
 }
@@ -407,40 +439,143 @@ export async function resolveRevisionPhysicsHash(
   );
 }
 
+export async function ensureRevisionMethodCompatibilityHash(
+  db: DB,
+  simulationPresetRevisionId: string,
+): Promise<string | null> {
+  const [revision] = await db
+    .select({
+      id: simulationPresetRevisions.id,
+      solverImplementationId: simulationPresetRevisions.solverImplementationId,
+      methodCompatibilityHashVersion:
+        simulationPresetRevisions.methodCompatibilityHashVersion,
+      methodCompatibilityHash:
+        simulationPresetRevisions.methodCompatibilityHash,
+      snapshot: simulationPresetRevisions.snapshot,
+    })
+    .from(simulationPresetRevisions)
+    .where(eq(simulationPresetRevisions.id, simulationPresetRevisionId))
+    .limit(1);
+  if (!revision) return null;
+  if (
+    revision.methodCompatibilityHashVersion ===
+      METHOD_COMPATIBILITY_HASH_VERSION &&
+    revision.methodCompatibilityHash
+  ) {
+    return revision.methodCompatibilityHash;
+  }
+  const methodCompatibilityHash = methodCompatibilityHashFromStoredSnapshot(
+    revision.snapshot,
+    revision.solverImplementationId,
+  );
+  if (!methodCompatibilityHash) return null;
+  await db
+    .update(simulationPresetRevisions)
+    .set({
+      methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+      methodCompatibilityHash,
+      isCanonicalMethod: false,
+    })
+    .where(
+      and(
+        eq(simulationPresetRevisions.id, revision.id),
+        or(
+          isNull(simulationPresetRevisions.methodCompatibilityHash),
+          isNull(simulationPresetRevisions.methodCompatibilityHashVersion),
+          ne(
+            simulationPresetRevisions.methodCompatibilityHashVersion,
+            METHOD_COMPATIBILITY_HASH_VERSION,
+          ),
+        ),
+      ),
+    );
+  return methodCompatibilityHash;
+}
+
+/** Read/derive the versioned method hash without mutating the revision. */
+export async function resolveRevisionMethodCompatibilityHash(
+  db: DB,
+  simulationPresetRevisionId: string,
+): Promise<string | null> {
+  const [revision] = await db
+    .select({
+      solverImplementationId: simulationPresetRevisions.solverImplementationId,
+      methodCompatibilityHashVersion:
+        simulationPresetRevisions.methodCompatibilityHashVersion,
+      methodCompatibilityHash:
+        simulationPresetRevisions.methodCompatibilityHash,
+      snapshot: simulationPresetRevisions.snapshot,
+    })
+    .from(simulationPresetRevisions)
+    .where(eq(simulationPresetRevisions.id, simulationPresetRevisionId))
+    .limit(1);
+  if (!revision) return null;
+  if (
+    revision.methodCompatibilityHashVersion ===
+      METHOD_COMPATIBILITY_HASH_VERSION &&
+    revision.methodCompatibilityHash
+  ) {
+    return revision.methodCompatibilityHash;
+  }
+  return methodCompatibilityHashFromStoredSnapshot(
+    revision.snapshot,
+    revision.solverImplementationId,
+  );
+}
+
 /** Re is only an indexed prefilter here. Every NULL legacy candidate is
  * admitted to the group solely after its immutable snapshot hashes exactly. */
-async function populateLegacyHashes(
+async function populateMissingMethodCompatibilityHashes(
   db: DB,
   compatibilityHash: string,
 ): Promise<void> {
   const [anchor] = await db
     .select({ reynolds: simulationPresetRevisions.reynolds })
     .from(simulationPresetRevisions)
-    .where(eq(simulationPresetRevisions.physicsHash, compatibilityHash))
+    .where(
+      and(
+        eq(
+          simulationPresetRevisions.methodCompatibilityHashVersion,
+          METHOD_COMPATIBILITY_HASH_VERSION,
+        ),
+        eq(
+          simulationPresetRevisions.methodCompatibilityHash,
+          compatibilityHash,
+        ),
+      ),
+    )
     .limit(1);
   if (!anchor) return;
   const legacy = await db
     .select({
       id: simulationPresetRevisions.id,
+      solverImplementationId: simulationPresetRevisions.solverImplementationId,
       snapshot: simulationPresetRevisions.snapshot,
     })
     .from(simulationPresetRevisions)
     .where(
       and(
-        isNull(simulationPresetRevisions.physicsHash),
+        isNull(simulationPresetRevisions.methodCompatibilityHash),
         eq(simulationPresetRevisions.reynolds, anchor.reynolds),
       ),
     );
   for (const revision of legacy) {
-    const physicsHash = physicsHashFromStoredSnapshot(revision.snapshot);
-    if (!physicsHash) continue;
+    const methodCompatibilityHash = methodCompatibilityHashFromStoredSnapshot(
+      revision.snapshot,
+      revision.solverImplementationId,
+    );
+    if (!methodCompatibilityHash) continue;
     await db
       .update(simulationPresetRevisions)
-      .set({ physicsHash, isCanonicalPhysics: false })
+      .set({
+        methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+        methodCompatibilityHash,
+        isCanonicalMethod: false,
+      })
       .where(
         and(
           eq(simulationPresetRevisions.id, revision.id),
-          isNull(simulationPresetRevisions.physicsHash),
+          isNull(simulationPresetRevisions.methodCompatibilityHash),
         ),
       );
   }
@@ -456,7 +591,7 @@ export async function refreshPolarCompatibilityCache(
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`polar-compatibility:${POLAR_COMPATIBILITY_VERSION}:${airfoilId}:${compatibilityHash}`}, 0))`,
     );
-    await populateLegacyHashes(tx, compatibilityHash);
+    await populateMissingMethodCompatibilityHashes(tx, compatibilityHash);
 
     const rawRows = await tx
       .select({
@@ -528,7 +663,14 @@ export async function refreshPolarCompatibilityCache(
       .where(
         and(
           eq(results.airfoilId, airfoilId),
-          eq(simulationPresetRevisions.physicsHash, compatibilityHash),
+          eq(
+            simulationPresetRevisions.methodCompatibilityHashVersion,
+            METHOD_COMPATIBILITY_HASH_VERSION,
+          ),
+          eq(
+            simulationPresetRevisions.methodCompatibilityHash,
+            compatibilityHash,
+          ),
         ),
       );
     const verdicts = await activeReviewVerdicts(
@@ -585,7 +727,18 @@ export async function refreshPolarCompatibilityCache(
         mach: simulationPresetRevisions.mach,
       })
       .from(simulationPresetRevisions)
-      .where(eq(simulationPresetRevisions.physicsHash, compatibilityHash))
+      .where(
+        and(
+          eq(
+            simulationPresetRevisions.methodCompatibilityHashVersion,
+            METHOD_COMPATIBILITY_HASH_VERSION,
+          ),
+          eq(
+            simulationPresetRevisions.methodCompatibilityHash,
+            compatibilityHash,
+          ),
+        ),
+      )
       .limit(1);
     const acceptedPointCount = resolved.selected.filter(
       (candidate) => candidate.state === "accepted",

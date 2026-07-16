@@ -7,9 +7,16 @@ ENV AIRFOILFOAM_DATA_DIR=/data/airfoilfoam \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
+COPY docker/build-requirements.lock docker/requirements.lock /tmp/
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir .
+RUN PYTHONPATH=src python3 -c "from pathlib import Path; from airfoilfoam.provenance import write_application_source_sha256; write_application_source_sha256(Path('/app'))" \
+    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/build-requirements.lock \
+    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && python3 -m pip check \
+    && python3 -c "from importlib.metadata import version; expected = {'google-cloud-storage': '3.13.0', 'google-crc32c': '1.8.0', 'zstandard': '0.25.0'}; actual = {name: version(name) for name in expected}; assert actual == expected, f'dependency version mismatch: {actual!r}'" \
+    && rm -f /tmp/build-requirements.lock /tmp/requirements.lock
 
 RUN mkdir -p /data/airfoilfoam
 EXPOSE 8000

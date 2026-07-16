@@ -3,6 +3,8 @@
 // the engine HTTP request is in flight. Work that had not durably crossed the
 // DB submission boundary must leave no lasting engine task and no claimed cell.
 
+import "./enabled-engine-pool-fixture";
+
 import {
   AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
   airfoils,
@@ -312,6 +314,9 @@ afterAll(async () => {
 });
 
 describe("campaign compose→submit lifecycle boundary", () => {
+  // Vitest files share one database and run in parallel. This integration path
+  // performs campaign materialization plus several ownership writes, so allow
+  // bounded full-suite DB contention without changing any runtime timeout.
   it("does not submit a verify job after exact queue-owner binding was lost", async () => {
     const campaignId = await launch("verify-bind-lost", 18.731);
     const setup = await setupFor(campaignId);
@@ -410,7 +415,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(eq(simUransVerifyQueue.id, verify.id));
     expect(stopped.status).toBe("cancelled");
     expect(stillOwned).toEqual({ state: "running", simJobId: ownerJob.id });
-  });
+  }, 15_000);
 
   it("does not submit a stale RANS batch selected before terminal cancellation", async () => {
     const campaignId = await launch("stale-cancel", 17.137);
@@ -2668,6 +2673,13 @@ describe("campaign compose→submit lifecycle boundary", () => {
       nextAttemptAt: repairRetryAt,
       lastError: "campaign-owned repair waiting before manual promotion",
     });
+    // Default-media work is deliberately discovered only after the producing
+    // solver job is terminal; partial evidence from an active march must not
+    // start an expensive render alongside that march.
+    await db
+      .update(simJobs)
+      .set({ status: "done", engineState: "completed", finishedAt: new Date() })
+      .where(eq(simJobs.id, job.id));
     expect(
       await discoverMissingResultMediaRepairs(db, { resultId: accepted.id }),
     ).toBe(1);

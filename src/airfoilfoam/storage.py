@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, TypeVar
 
 from .config import Settings, get_settings
-from .models import JobPhase, JobResult, JobState, JobStatus, PolarRequest
+from .models import EngineIdentity, JobPhase, JobResult, JobState, JobStatus, PolarRequest
 
 T = TypeVar("T", JobResult, JobStatus, PolarRequest)
 
@@ -50,13 +50,29 @@ class JobStore:
 
     # -- lifecycle ---------------------------------------------------------- #
     def create(self, job_id: str, request: PolarRequest) -> None:
+        from .openfoam.dialects import get_openfoam_dialect
+
         self.job_dir(job_id).mkdir(parents=True, exist_ok=True)
         cancel_path = self.job_dir(job_id) / "cancelled"
         if cancel_path.exists():
             cancel_path.unlink()
         self._write_json_atomic(self.job_dir(job_id) / "request.json", request.model_dump_json(indent=2))
         total = len(request.cases())
-        self.write_status(JobStatus(job_id=job_id, state=JobState.pending, total_cases=total, queued_at=datetime.now(timezone.utc)))
+        requested_engine = request.expected_engine or EngineIdentity()
+        requested_pool = (
+            request.expected_execution_pool
+            or get_openfoam_dialect(requested_engine).queue_name
+        )
+        self.write_status(
+            JobStatus(
+                job_id=job_id,
+                state=JobState.pending,
+                total_cases=total,
+                queued_at=datetime.now(timezone.utc),
+                requested_engine=requested_engine,
+                requested_execution_pool=requested_pool,
+            )
+        )
 
     def mark_cancelled(self, job_id: str, reason: str = "cancelled") -> None:
         path = self.job_dir(job_id) / "cancelled"
@@ -98,6 +114,14 @@ class JobStore:
             status.task_id = status.task_id or previous.task_id
             if status.mesh_recovery_version is None:
                 status.mesh_recovery_version = previous.mesh_recovery_version
+            if status.engine is None:
+                status.engine = previous.engine
+            if status.requested_engine is None:
+                status.requested_engine = previous.requested_engine
+            if status.requested_execution_pool is None:
+                status.requested_execution_pool = previous.requested_execution_pool
+            if status.execution_pool is None:
+                status.execution_pool = previous.execution_pool
             if status.failure_disposition is None:
                 status.failure_disposition = previous.failure_disposition
             status.queued_at = status.queued_at or previous.queued_at
@@ -142,12 +166,24 @@ class JobStore:
         path = self.job_dir(result.job_id) / "result.json"
         if (
             result.mesh_recovery_version is None
+            or result.requested_engine is None
+            or result.requested_execution_pool is None
+            or result.engine is None
+            or result.execution_pool is None
             or result.failure_disposition is None
         ):
             status = self.read_status(result.job_id)
             if status is not None:
                 if result.mesh_recovery_version is None:
                     result.mesh_recovery_version = status.mesh_recovery_version
+                if result.engine is None:
+                    result.engine = status.engine
+                if result.requested_engine is None:
+                    result.requested_engine = status.requested_engine
+                if result.requested_execution_pool is None:
+                    result.requested_execution_pool = status.requested_execution_pool
+                if result.execution_pool is None:
+                    result.execution_pool = status.execution_pool
                 if result.failure_disposition is None:
                     result.failure_disposition = status.failure_disposition
         self._write_json_atomic(path, result.model_dump_json(indent=2))
@@ -234,6 +270,7 @@ class JobStore:
         *,
         boot_time: Optional[datetime] = None,
         active_task_ids: Optional[set[str]] = None,
+        worker_engine: Optional[EngineIdentity] = None,
     ) -> list[str]:
         """Mark jobs stranded at state=running by a dead worker as failed.
 
@@ -255,6 +292,12 @@ class JobStore:
         for job_id in self.list_job_ids():
             status = self.read_status(job_id)
             if status is None or status.state is not JobState.running:
+                continue
+            # Each execution-pool worker may reconcile only the jobs it could
+            # actually have inherited. Strict equality includes the adapter
+            # contract revision; missing legacy provenance is not guessed in
+            # this cross-worker safety path.
+            if worker_engine is not None and status.requested_engine != worker_engine:
                 continue
             # Genuinely active on some worker (task ids double as job ids for
             # run_polar, so check both).
@@ -286,7 +329,14 @@ class JobStore:
                     existing_result.message = ORPHAN_MESSAGE
                     self.write_result(existing_result)
                 else:
-                    self.write_result(JobResult(job_id=job_id, state=JobState.failed, message=ORPHAN_MESSAGE))
+                    self.write_result(
+                        JobResult(
+                            job_id=job_id,
+                            state=JobState.failed,
+                            message=ORPHAN_MESSAGE,
+                            engine=status.engine,
+                        )
+                    )
             status.active_solver = None
             status.active_case_slug = None
             status.active_aoa_deg = None
@@ -361,6 +411,10 @@ class JobStore:
         if "pimplefoam" in name or "/urans_" in cwd_text:
             return "urans"
         if "simplefoam" in name:
+            return "rans"
+        if "foamrun" in name and "incompressiblefluid" in name:
+            if "urans" in cwd_text or "transient" in cwd_text:
+                return "urans"
             return "rans"
         if "blockmesh" in name or "snappyhexmesh" in name or "extrudemesh" in name:
             return "meshing"

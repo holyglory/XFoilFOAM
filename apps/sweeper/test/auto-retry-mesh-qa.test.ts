@@ -5,6 +5,8 @@
 // must stay terminal with its evidence; a genuine transient crash in the
 // same job must still receive the normal one automatic retry.
 
+import "./enabled-engine-pool-fixture";
+
 import {
   airfoils,
   autoRetryCrashedResultsForJob,

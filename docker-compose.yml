@@ -18,6 +18,18 @@ services:
       AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
+      # Registered adapters are not schedulable merely because their code is
+      # present. Enable Foundation 14 only together with its optional worker:
+      # AIRFOILFOAM_ENABLED_ENGINE_KEYS=openfoam:opencfd:2606:numerics-1:adapter-1,openfoam:foundation:14:numerics-1:adapter-1
+      AIRFOILFOAM_ENABLED_ENGINE_KEYS: ${AIRFOILFOAM_ENABLED_ENGINE_KEYS:-openfoam:opencfd:2606:numerics-1:adapter-1}
+      AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}
+      AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX: ${AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX:-solver-evidence/v1}
+      AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL: ${AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL:-10}
+      AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_DIR: /data/airfoilfoam/evidence-hydration-cache
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_MAX_GB: ${AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_MAX_GB:-50}
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_TTL_SECONDS: ${AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_TTL_SECONDS:-86400}
+      AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS: ${AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS:-900}
       # Same cache location + cap as the worker so GET /cache/stats reports the
       # real store; the API only reads it (stats), hence the :ro mount below.
       AIRFOILFOAM_CACHE_DIR: /data/airfoilfoam-cache
@@ -42,9 +54,28 @@ services:
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
       AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_ENGINE_FAMILY: openfoam
+      AIRFOILFOAM_ENGINE_DISTRIBUTION: opencfd
+      AIRFOILFOAM_ENGINE_VERSION: "2606"
+      AIRFOILFOAM_ENGINE_NUMERICS_REVISION: "1"
+      AIRFOILFOAM_ENGINE_ADAPTER_CONTRACT_VERSION: "1"
+      AIRFOILFOAM_ENGINE_SOURCE_REVISION: 481094fdf34f11ed6d0d603ee59a858a0124236d
+      AIRFOILFOAM_CELERY_QUEUE: openfoam-opencfd-2606
+      AIRFOILFOAM_ENGINE_IMAGE_DIGEST: ${OPENCFD2606_IMAGE_DIGEST:-}
+      AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}
+      AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX: ${AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX:-solver-evidence/v1}
+      AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL: ${AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL:-10}
+      AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_DIR: /data/airfoilfoam/evidence-hydration-cache
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_MAX_GB: ${AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_MAX_GB:-50}
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_TTL_SECONDS: ${AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_TTL_SECONDS:-86400}
+      AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS: ${AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS:-900}
       AIRFOILFOAM_WORKER_CPU_BUDGET: "18"
       AIRFOILFOAM_CASE_CONCURRENCY: "18"
       AIRFOILFOAM_CELERY_CONCURRENCY: "18"
+      # All engine worker containers share one admission-token ledger. Starting
+      # the optional Foundation worker therefore cannot double the CPU budget.
+      AIRFOILFOAM_CPU_TOKEN_STATE_PATH: /data/airfoilfoam-runtime/cpu-tokens.json
       AIRFOILFOAM_RANS_SOLVER_TIMEOUT: "1200"
       AIRFOILFOAM_RANS_MAX_ITERATIONS: "600"
       # Persistent cross-job mesh + steady-solution-seed cache (LRU, size-capped).
@@ -53,10 +84,63 @@ services:
     volumes:
       - results:/data/airfoilfoam
       - engine_cache:/data/airfoilfoam-cache
+      - engine_runtime:/data/airfoilfoam-runtime
     depends_on:
       redis:
         condition: service_healthy
     # CFD is CPU heavy; raise/lower to taste.
+    deploy:
+      resources:
+        limits:
+          cpus: "18"
+
+  # OpenFOAM Foundation 14 is an opt-in, independently rollable runtime. The
+  # API routes its exact engine identity to this queue; the default OpenCFD
+  # worker never consumes it. Start it with `--profile foundation14` and enable
+  # the matching AIRFOILFOAM_ENABLED_ENGINE_KEYS entry on the API service.
+  worker-foundation14:
+    profiles: ["foundation14"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-foundation14
+      args:
+        AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
+      AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+      AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_ENGINE_FAMILY: openfoam
+      AIRFOILFOAM_ENGINE_DISTRIBUTION: foundation
+      AIRFOILFOAM_ENGINE_VERSION: "14"
+      AIRFOILFOAM_ENGINE_NUMERICS_REVISION: "1"
+      AIRFOILFOAM_ENGINE_ADAPTER_CONTRACT_VERSION: "1"
+      AIRFOILFOAM_CELERY_QUEUE: openfoam-foundation-14
+      AIRFOILFOAM_ENGINE_SOURCE_REVISION: b4f91ad8bbbab628441562fc419f040cc4796f11
+      AIRFOILFOAM_ENGINE_IMAGE_DIGEST: ${FOUNDATION14_IMAGE_DIGEST:-}
+      AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}
+      AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX: ${AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX:-solver-evidence/v1}
+      AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL: ${AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL:-10}
+      AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_DIR: /data/airfoilfoam/evidence-hydration-cache
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_MAX_GB: ${AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_MAX_GB:-50}
+      AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_TTL_SECONDS: ${AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_TTL_SECONDS:-86400}
+      AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS: ${AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS:-900}
+      AIRFOILFOAM_WORKER_CPU_BUDGET: "18"
+      AIRFOILFOAM_CASE_CONCURRENCY: "18"
+      AIRFOILFOAM_CELERY_CONCURRENCY: "18"
+      AIRFOILFOAM_CPU_TOKEN_STATE_PATH: /data/airfoilfoam-runtime/cpu-tokens.json
+      AIRFOILFOAM_RANS_SOLVER_TIMEOUT: "1200"
+      AIRFOILFOAM_RANS_MAX_ITERATIONS: "600"
+      AIRFOILFOAM_CACHE_DIR: /data/airfoilfoam-cache
+      AIRFOILFOAM_CACHE_MAX_GB: "20"
+    volumes:
+      - results:/data/airfoilfoam
+      - engine_cache:/data/airfoilfoam-cache
+      - engine_runtime:/data/airfoilfoam-runtime
+    depends_on:
+      redis:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -163,3 +247,4 @@ volumes:
   sync_imports:
   pgdata:
   engine_cache: # persistent engine mesh/seed cache (survives worker image rebuilds)
+  engine_runtime: # cross-worker CPU-token admission state

@@ -11,6 +11,110 @@ from pydantic import BaseModel, Field, model_validator
 # --------------------------------------------------------------------------- #
 # Inputs
 # --------------------------------------------------------------------------- #
+class EngineIdentity(BaseModel):
+    """Logical numerical implementation requested for a solve.
+
+    Family and distribution are deliberately extensible slugs: introducing the
+    thesis-derived coupled Euler/boundary-layer engine must not require changing
+    this shared contract.  Adapter registries, rather than this core model,
+    decide which identities a particular runtime can execute.
+
+    ``numerics_revision`` changes only when defaults, generated dictionaries or
+    adapter behaviour can change numerical results.  Runtime rebuild metadata
+    is intentionally kept out of this identity so a packaging-only rebuild does
+    not split a physically compatible polar.
+    """
+
+    family: str = Field(default="openfoam", pattern=r"^[a-z][a-z0-9_-]*$")
+    distribution: str = Field(default="opencfd", pattern=r"^[a-z][a-z0-9_-]*$")
+    version: str = Field(default="2606", min_length=1, max_length=80)
+    numerics_revision: str = Field(default="1", min_length=1, max_length=80)
+    adapter_contract_version: int = Field(default=1, ge=1)
+
+    @property
+    def compatibility_key(self) -> str:
+        """Stable namespace for caches and value-level numerical identity."""
+        return (
+            f"{self.family}:{self.distribution}:{self.version}:"
+            f"numerics-{self.numerics_revision}"
+        )
+
+    @property
+    def handshake_key(self) -> str:
+        """Exact queue/request-worker contract identity, including schema revision."""
+        return f"{self.compatibility_key}:adapter-{self.adapter_contract_version}"
+
+
+class EngineRuntimeIdentity(EngineIdentity):
+    """Exact worker/build provenance acknowledged by the executing runtime."""
+
+    build_id: str = Field(default="dev", min_length=1, max_length=200)
+    source_revision: Optional[str] = Field(default=None, max_length=200)
+    image_digest: Optional[str] = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+    application_source_sha256: Optional[str] = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    package_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    binary_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    architecture: Optional[str] = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def require_content_fingerprint(self) -> "EngineRuntimeIdentity":
+        """Reject label-only new runtime acknowledgements.
+
+        Historical evidence represents unrecorded runtime provenance as a null
+        ``engine`` value, so enforcing this on concrete non-legacy runtime
+        objects does not invent or erase legacy facts.
+        """
+        if self.distribution != "legacy" and not any(
+            (
+                self.image_digest,
+                self.application_source_sha256,
+                self.package_sha256,
+                self.binary_sha256,
+            )
+        ):
+            raise ValueError(
+                "runtime provenance requires at least one content fingerprint"
+            )
+        return self
+
+    def logical_identity(self) -> EngineIdentity:
+        return EngineIdentity.model_validate(
+            self.model_dump(
+                include={
+                    "family",
+                    "distribution",
+                    "version",
+                    "numerics_revision",
+                    "adapter_contract_version",
+                }
+            )
+        )
+
+
+class EngineCapabilities(BaseModel):
+    """Typed, capability-driven description of one solver implementation."""
+
+    engine: EngineIdentity
+    routing_key: str = Field(
+        min_length=1,
+        description="Exact execution-pool/Celery routing key for this adapter.",
+    )
+    analysis_methods: list[str] = Field(default_factory=list)
+    steady: bool = False
+    transient: bool = False
+    volume_fields: bool = False
+    mesh_evidence: bool = False
+    stored_media: bool = False
+    custom_field_rendering: bool = False
+    multi_element_geometry: bool = False
+    supported_turbulence_models: list[str] = Field(default_factory=list)
+    supported_image_fields: list[str] = Field(default_factory=list)
+
+
 class AirfoilFormat(str, Enum):
     auto = "auto"
     selig = "selig"
@@ -611,6 +715,19 @@ class PolarRequest(BaseModel):
         "worker reject a mismatch before solving so requested capability cannot be "
         "mistaken for execution provenance during a rolling deployment.",
     )
+    expected_engine: Optional[EngineIdentity] = Field(
+        default=None,
+        description="Exact logical solver implementation required by the controller. "
+        "Omission resolves to the current OpenFOAM/OpenCFD 2606 default; "
+        "new callers should always send this field.",
+    )
+    expected_execution_pool: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Controller-required execution-pool routing key. The gateway and worker "
+        "both reject a mismatch so a stale pool selection cannot silently run elsewhere.",
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> "PolarRequest":
@@ -853,7 +970,18 @@ class PolarPoint(BaseModel):
     )
     evidence_artifacts: list[EvidenceArtifact] = Field(
         default_factory=list,
-        description="Raw immutable OpenFOAM evidence artifacts for this solver point.",
+        description="Raw immutable engine evidence artifacts for this solver point.",
+    )
+    engine: Optional[EngineRuntimeIdentity] = Field(
+        default=None,
+        description="Exact worker/build provenance that produced this attempt. Null only for legacy stored results.",
+    )
+    method_key: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description="Extensible numerical-method identity, e.g. openfoam.rans or openfoam.urans. "
+        "Null only for legacy stored attempts; fidelity remains a separate tier dimension.",
     )
     failure_disposition: FailureDisposition = Field(
         default=FailureDisposition.none,
@@ -942,6 +1070,26 @@ class JobStatus(BaseModel):
     cpu_tokens_waiting: int = 0
     cpu_tokens_held: int = 0
     scheduling: Optional[SchedulingMetadata] = None
+    requested_engine: Optional[EngineIdentity] = Field(
+        default=None,
+        description="Resolved logical routing target. Present before execution without claiming runtime provenance.",
+    )
+    requested_execution_pool: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Resolved execution-pool routing target retained from submission.",
+    )
+    engine: Optional[EngineRuntimeIdentity] = Field(
+        default=None,
+        description="Executing worker acknowledgement. Null while work is only queued or for legacy stored status.",
+    )
+    execution_pool: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Execution pool acknowledged by the worker. Null while work is only queued.",
+    )
     mesh_recovery_version: Optional[int] = Field(
         default=None,
         ge=0,
@@ -961,6 +1109,30 @@ class JobResult(BaseModel):
     polars: list[Polar] = Field(default_factory=list)
     message: Optional[str] = None
     scheduling: Optional[SchedulingMetadata] = None
+    requested_engine: Optional[EngineIdentity] = Field(
+        default=None,
+        description="Resolved logical routing target retained independently from worker acknowledgement.",
+    )
+    requested_execution_pool: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Resolved execution-pool routing target retained from submission.",
+    )
+    engine: Optional[EngineRuntimeIdentity] = Field(
+        default=None,
+        description="Exact worker/build provenance that produced or rejected this result.",
+    )
+    execution_pool: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Execution pool acknowledged by the worker that produced this result.",
+    )
+    method_keys: list[str] = Field(
+        default_factory=list,
+        description="Distinct numerical methods present in this result. Jobs may contain both RANS and URANS attempts.",
+    )
     mesh_recovery_version: Optional[int] = Field(
         default=None,
         ge=0,

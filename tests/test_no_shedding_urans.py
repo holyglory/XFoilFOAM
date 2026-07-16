@@ -15,6 +15,7 @@ auto-refine, skip refinement, and return a VALID steady-equivalent result whose
 mean cl/cd/cm are the time-average of the transient window. Only genuinely
 absent force data is an honest failure.
 """
+import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -632,6 +633,137 @@ def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch
     assert result.avg.cm == pytest.approx(cm_true, abs=1e-9)
 
 
+def test_early_stop_no_shedding_uses_trailing_physical_horizon(
+    tmp_path, monkeypatch
+):
+    """A spurious early-stop marker must not turn a flat wake into URANS.
+
+    The OpenCFD 2606 canary produced this exact control-flow collision: a tiny
+    numerical ripple armed the periodic early-stop marker, while the final
+    force trace had no credible shedding frequency.  The startup portion is
+    intentionally violent here so only the trailing 2.1 slow-period physical
+    horizon is a valid no-shedding observation or averaging window.
+    """
+    cl_tail, cd_tail, cm_tail = -0.0046, 0.01514, 0.001065
+    speed, chord = 166.0, 0.05
+    required = pipeline._no_shedding_min_observation_s(speed, chord)
+    end_time = 0.03
+
+    class FakeRunner:
+        def solver(self, case_dir, *_args, **_kwargs):
+            coeff = (
+                case_dir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat"
+            )
+            coeff.parent.mkdir(parents=True, exist_ok=True)
+            rows = [
+                "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+                "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+            ]
+            for i in range(3001):
+                t = end_time * i / 3000
+                if t < end_time - required:
+                    # A non-flat startup that must be excluded from both the
+                    # physical verdict and the reported steady-equivalent mean.
+                    phase = 2.0 * math.pi * t / 0.004
+                    cl = 0.08 * math.sin(phase)
+                    cd = 0.04 + 0.015 * math.cos(phase)
+                    cm = 0.01 * math.sin(phase)
+                else:
+                    cl, cd, cm = cl_tail, cd_tail, cm_tail
+                rows.append(
+                    f"{t:.10g} {cd:.10g} 0 0 {cl:.10g} 0 0 "
+                    f"{cm:.10g} 0 0 0 0 0"
+                )
+            coeff.write_text("\n".join(rows) + "\n")
+            pipeline._write_early_stop_marker(
+                case_dir,
+                pipeline.StablePeriodResult(
+                    ok=True,
+                    reason="two stable periods with sufficient frames",
+                    stable=True,
+                    period_s=0.004,
+                    window_start=0.02,
+                    window_end=end_time,
+                    cycles=2,
+                    frame_count=60,
+                    frames_per_cycle=30.0,
+                ),
+                retain_from=0.0,
+            )
+            return SimpleNamespace(ok=True, stdout="pimple ok")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", _FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+
+    result = _run_transient_attempt(
+        tcase,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=CaseSpec(chord=chord, speed=speed, aoa_deg=0.0),
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            transient_discard_fraction=0.4,
+        ),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=120,
+        run_time=end_time,
+        delta_t=1e-5,
+        coeff_start_time=0.0,
+    )
+
+    assert result is not None and result.early_stopped
+    assert result.quality.ok and result.quality.no_shedding
+    assert "no vortex shedding" in result.quality.reason
+    assert result.force_history is not None
+    assert result.force_history.window_end - result.force_history.window_start == pytest.approx(
+        required, abs=2e-5
+    )
+    assert result.avg.cl == pytest.approx(cl_tail, abs=2e-7)
+    assert result.avg.cd == pytest.approx(cd_tail, abs=2e-7)
+    assert result.avg.cm == pytest.approx(cm_tail, abs=2e-7)
+
+
+def test_trailing_physical_horizon_does_not_hide_real_slow_shedding(tmp_path):
+    """Two-plus real St=0.05 cycles are not a flat-wake false positive."""
+    speed, chord = 166.0, 0.05
+    slow_period = chord / (pipeline.SHEDDING_STROUHAL_BAND[0] * speed)
+    required = pipeline._no_shedding_min_observation_s(speed, chord)
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    coeff.parent.mkdir(parents=True)
+    rows = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+        "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    for i in range(3001):
+        t = required * i / 3000
+        phase = 2.0 * math.pi * t / slow_period
+        rows.append(
+            f"{t:.10g} {0.015 + 0.002 * math.cos(phase):.10g} 0 0 "
+            f"{0.01 * math.sin(phase):.10g} 0 0 0 0 0 0 0 0"
+        )
+    coeff.write_text("\n".join(rows) + "\n")
+
+    history = pipeline._force_history_for_no_shedding_horizon(
+        [coeff],
+        CaseSpec(chord=chord, speed=speed, aoa_deg=0.0),
+        target_cycles=3,
+    )
+
+    assert history is not None
+    assert history.window_end - history.window_start <= required + 2e-5
+    assert not is_no_shedding(history)
+
+
 def test_no_shedding_finalize_recovers_naca0012_alpha0_as_steady(tmp_path, monkeypatch):
     """naca-0012 alpha=0 class: escalated to URANS, no shedding -> recovered as a
     valid CONVERGED STEADY point (unsteady=false), never a crash."""
@@ -690,3 +822,162 @@ def test_no_shedding_finalize_recovers_naca0012_alpha0_as_steady(tmp_path, monke
     assert outcome.cd == pytest.approx(cd_true)
     # A non-shedding case has no meaningful Strouhal to report.
     assert outcome.strouhal is None
+
+
+def test_finalize_rejects_short_flat_urans_before_publishing_transient_media(
+    tmp_path, monkeypatch
+):
+    """A warning-only flat trace below the physical horizon is not a point.
+
+    OpenCFD 2606 exposed this exact shape in the production canary: pimpleFoam
+    reached its requested field horizon, but the force function-object history
+    stopped at 0.00722634 s, below the 0.0126506 s slow-shedding observation
+    floor.  The old finalizer nevertheless set ``converged=true`` and rendered
+    mean/video media with ``frame_track=null``.  Raw solve evidence must still
+    be archived, but no derived transient media or accepted coefficients may
+    escape this gate.
+    """
+    from airfoilfoam.models import MeshParams
+    from airfoilfoam.openfoam.runner import HardSolverError
+    from airfoilfoam.postprocess.forces import AveragedCoefficients
+
+    hist = _flat_history(
+        cl_mean=-0.004595975527344631,
+        cd_mean=0.01513725538636765,
+        t0=0.00482046,
+        t1=0.0120468,
+        n=400,
+    )
+    reason = (
+        "URANS period acquisition exhausted the physical slow-shedding horizon "
+        "(39.0 initial guesses); URANS quality could not be measured: an "
+        "apparently flat signal spans 0.00722634s, below the physical "
+        "slow-shedding observation horizon 0.0126506s."
+    )
+    transient_dir = tmp_path / "transient"
+    transient_dir.mkdir()
+    (tmp_path / "system").mkdir()
+    (tmp_path / "system" / "controlDict").write_text("application simpleFoam;\n")
+    (transient_dir / "system").mkdir()
+    (transient_dir / "system" / "controlDict").write_text(
+        "application pimpleFoam;\n"
+    )
+    (transient_dir / "constant").mkdir()
+    (transient_dir / "constant" / "transportProperties").write_text(
+        "transportModel Newtonian;\n"
+    )
+    (transient_dir / "log.pimpleFoam").write_text(
+        "Time = 0.0235548\nEnd\n"
+    )
+    coeff_dir = transient_dir / "postProcessing" / "forceCoeffs1" / "0"
+    coeff_dir.mkdir(parents=True)
+    (coeff_dir / "coefficient.dat").write_text(
+        "# Time Cd Cs Cl CmRoll CmPitch CmYaw Cd(f) Cd(r) Cs(f) Cs(r) Cl(f) Cl(r)\n"
+        "0.0120468 0.0151 0 -0.0046 0 0.00106 0 0 0 0 0 0 0\n"
+    )
+    latest_time = transient_dir / "0.0235548"
+    latest_time.mkdir()
+    (latest_time / "U").write_text("internalField uniform (166 0 0);\n")
+
+    def fake_transient(*_args, **_kwargs):
+        return TransientResult(
+            avg=AveragedCoefficients(
+                cl=hist.cl_mean,
+                cd=hist.cd_mean,
+                cm=hist.cm_mean,
+                cl_std=hist.cl_rms,
+                cd_std=hist.cd_rms,
+                cm_std=hist.cm_rms,
+                samples=hist.samples,
+            ),
+            case_dir=transient_dir,
+            force_history=hist,
+            quality=pipeline.UransQuality(
+                ok=False,
+                can_refine=False,
+                no_shedding=False,
+                reason=reason,
+            ),
+            start_time=0.0,
+            end_time=0.0235548,
+            run_time=0.0235548,
+        )
+
+    class FakeRunner:
+        commands = []
+
+        def application(self, *_args, **_kwargs):
+            command = str(_args[1]) if len(_args) > 1 else ""
+            self.commands.append(command)
+            if "foamToVTK" in command:
+                raise RuntimeError("VTK conversion intentionally unavailable")
+            return SimpleNamespace(ok=True, check=lambda: None)
+
+    media_calls = []
+
+    def forbidden_media(*_args, **_kwargs):
+        media_calls.append(True)
+        return {"velocity_magnitude": "should-not-exist.png"}
+
+    monkeypatch.setattr(pipeline, "_run_transient", fake_transient)
+    monkeypatch.setattr(pipeline, "render_contours", forbidden_media)
+    monkeypatch.setattr(pipeline, "render_mean_contours", forbidden_media)
+    monkeypatch.setattr(
+        pipeline,
+        "render_animations",
+        lambda *_args, **_kwargs: (
+            media_calls.append(True)
+            or SimpleNamespace(
+                videos={"velocity_magnitude": "should-not-exist.mp4"},
+                errors={},
+            )
+        ),
+    )
+    runner = FakeRunner()
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=0.05, speed=166.0, aoa_deg=0.0),
+        reynolds=553_333,
+    )
+
+    with pytest.raises(HardSolverError, match="URANS evidence rejected"):
+        pipeline._finalize_outcome(
+            tmp_path,
+            outcome,
+            airfoil=SimpleNamespace(name="NACA0012", contour=[]),
+            resolved=MeshParams(),
+            spec=outcome.spec,
+            fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(
+                force_transient=True,
+                urans_fidelity="precalc",
+                write_images=["velocity_magnitude"],
+                frame_fields=["velocity_magnitude"],
+            ),
+            runner=runner,
+            n_proc=1,
+            render_images=True,
+            solver_timeout=14_400,
+        )
+
+    # Rejected attempts do not depend on a derived VTK conversion that may
+    # itself fail. Their original OpenFOAM bytes are archived directly.
+    assert not any("foamToVTK" in command for command in runner.commands)
+    manifest = json.loads((tmp_path / "evidence" / "evidence_manifest.json").read_text())
+    files = {entry["path"]: entry["role"] for entry in manifest["files"]}
+    assert manifest["media"]["requestedFields"] == []
+    assert files["openfoam/system/controlDict"] == "dictionary"
+    assert files["openfoam/transient/system/controlDict"] == "dictionary"
+    assert files["openfoam/logs/transient/log.pimpleFoam"] == "log"
+    assert (
+        files["openfoam/postProcessing/forceCoeffs1/0/coefficient.dat"]
+        == "force_coefficients"
+    )
+    assert files["time_directories/0.0235548/U"] == "time_directory"
+    assert (tmp_path / "evidence" / "engine_evidence.tar.zst").is_file()
+    assert not media_calls
+    assert not outcome.converged
+    assert outcome.frame_track is None
+    assert outcome.images == {}
+    assert outcome.mean_images == {}
+    assert outcome.video == {}

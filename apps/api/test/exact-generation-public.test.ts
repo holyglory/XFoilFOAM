@@ -575,6 +575,34 @@ describe("public exact-generation reads", () => {
     }
   });
 
+  it.each([502, 503])(
+    "preserves engine archived-evidence status %s for custom rendering",
+    async (status) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          new Response('{"detail":"remote evidence unavailable"}', {
+            status,
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      );
+      try {
+        const response = await app.inject({
+          method: "POST",
+          url: `/api/results/${resultId}/render`,
+          payload: { field: "vorticity", scaleMode: "auto" },
+        });
+        expect(response.statusCode).toBe(status);
+        expect(response.json().error).toMatch(
+          status === 503 ? /temporarily unavailable/ : /verified or rendered/,
+        );
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("rejects a delegated render when the upstream pointer advanced to another evidence signature", async () => {
     const [savedSettings] = await db
       .select()

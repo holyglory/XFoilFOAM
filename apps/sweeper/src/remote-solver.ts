@@ -21,15 +21,20 @@ import {
   simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
+  solverImplementations,
   solverProfiles,
+  solverRuntimeBuilds,
   syncApiSettings,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
   syncSweepPromisePoints,
   syncSweepPromises,
   sweepDefinitions,
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  METHOD_COMPATIBILITY_HASH_VERSION,
 } from "@aerodb/db";
 import {
+  methodCompatibilityHashForSnapshot,
   physicsHashForSnapshot,
   simulationSetupSignature,
   type SimulationSetupSnapshot,
@@ -41,13 +46,18 @@ import { createReadStream } from "node:fs";
 import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 
-import { buildPolarRequest } from "./build-request";
+import {
+  buildPolarRequest,
+  solverImplementationIdForSetup,
+} from "./build-request";
 import { claimAoas } from "./claim";
+import { configuredEngineIdentity } from "./config";
 import {
   clearEngineUnreachable,
   engineBackoffActive,
   recordEngineUnreachable,
 } from "./engine-backoff";
+import { requireExecutionPoolForSetup } from "./engine-pool";
 import { touchHeartbeat } from "./heartbeat";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
@@ -241,6 +251,31 @@ async function ensureRemoteRevision(
   settings: Settings,
 ) {
   const snapshot = claim.setupRevision.snapshot;
+  const [solverImplementation] = await db
+    .select()
+    .from(solverImplementations)
+    .where(
+      snapshot.engine
+        ? eq(solverImplementations.key, snapshot.engine.key)
+        : eq(solverImplementations.id, OPENCFD_2406_SOLVER_IMPLEMENTATION_ID),
+    )
+    .limit(1);
+  if (
+    !solverImplementation ||
+    (snapshot.engine &&
+      (solverImplementation.family !== snapshot.engine.family ||
+        solverImplementation.distribution !== snapshot.engine.distribution ||
+        solverImplementation.releaseVersion !==
+          snapshot.engine.releaseVersion ||
+        solverImplementation.numericsRevision !==
+          snapshot.engine.numericsRevision ||
+        solverImplementation.adapterContractVersion !==
+          snapshot.engine.adapterContractVersion))
+  ) {
+    throw new Error(
+      `remote setup references an unknown or conflicting solver implementation ${snapshot.engine?.key ?? "legacy OpenCFD 2406"}`,
+    );
+  }
   const signatureHash =
     claim.setupRevision.signatureHash || simulationSetupSignature(snapshot);
   const prefix = `remote-${slugPart(settings.instanceId, "local")}-${signatureHash.slice(0, 12)}`;
@@ -347,6 +382,7 @@ async function ensureRemoteRevision(
     .values({
       slug: `${prefix}-solver`,
       name: `Remote solver ${signatureHash.slice(0, 8)}`,
+      solverImplementationId: solverImplementation.id,
       turbulenceModel: snapshot.solver.turbulenceModel,
       nIterations: snapshot.solver.nIterations,
       convergenceTolerance: snapshot.solver.convergenceTolerance,
@@ -357,7 +393,10 @@ async function ensureRemoteRevision(
     })
     .onConflictDoUpdate({
       target: solverProfiles.slug,
-      set: { updatedAt: new Date() },
+      set: {
+        solverImplementationId: solverImplementation.id,
+        updatedAt: new Date(),
+      },
     })
     .returning({ id: solverProfiles.id });
   const [scheduling] = await db
@@ -496,6 +535,8 @@ async function ensureRemoteRevision(
     },
   };
   const physicsHash = physicsHashForSnapshot(localSnapshot);
+  const methodCompatibilityHash =
+    methodCompatibilityHashForSnapshot(localSnapshot);
   const [revision] = await db
     .insert(simulationPresetRevisions)
     .values({
@@ -507,6 +548,9 @@ async function ensureRemoteRevision(
       referenceLengthM: snapshot.referenceGeometry.referenceLengthM,
       snapshot: localSnapshot as unknown as Record<string, unknown>,
       physicsHash,
+      solverImplementationId: solverImplementation.id,
+      methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+      methodCompatibilityHash,
     })
     .onConflictDoNothing({
       target: [
@@ -529,17 +573,29 @@ async function ensureRemoteRevision(
         )
         .limit(1)
     )[0];
-  if (row && !row.physicsHash) {
-    const [withPhysicsHash] = await db
+  if (
+    row &&
+    (!row.physicsHash || (localSnapshot.engine && !row.methodCompatibilityHash))
+  ) {
+    const storedSnapshot = row.snapshot as unknown as SimulationSetupSnapshot;
+    const storedMethodHash = storedSnapshot.engine
+      ? methodCompatibilityHashForSnapshot(storedSnapshot)
+      : null;
+    const [withCompatibilityHash] = await db
       .update(simulationPresetRevisions)
       .set({
-        physicsHash: physicsHashForSnapshot(
-          row.snapshot as unknown as SimulationSetupSnapshot,
-        ),
+        physicsHash: physicsHashForSnapshot(storedSnapshot),
+        ...(storedMethodHash
+          ? {
+              solverImplementationId: solverImplementation.id,
+              methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+              methodCompatibilityHash: storedMethodHash,
+            }
+          : {}),
       })
       .where(eq(simulationPresetRevisions.id, row.id))
       .returning();
-    row = withPhysicsHash ?? row;
+    row = withCompatibilityHash ?? row;
   }
   return { revision: row, snapshot: localSnapshot, bcId: legacy.id };
 }
@@ -559,6 +615,7 @@ async function registerSolver(db: DB, settings: Settings): Promise<string> {
         process.env.AIRFOILFOAM_BUILD_ID ??
         process.env.npm_package_version ??
         null,
+      metadata: { engine: configuredEngineIdentity() },
     }),
   });
   const payload = (await res.json().catch(() => null)) as {
@@ -1163,6 +1220,7 @@ async function composeRemotePromiseJob(
     .limit(1);
   if (!airfoil || !revision) return { kind: "stopped" };
   const setup = revision.snapshot as unknown as SimulationSetupSnapshot;
+  const executionPool = await requireExecutionPoolForSetup(db, setup);
   const bcId = setup.preset.legacyBoundaryConditionId;
   if (!bcId)
     throw new Error(
@@ -1221,6 +1279,7 @@ async function composeRemotePromiseJob(
       ransFailurePolicy:
         state.requestedAoas.length > 1 ? "abort_for_precalc" : "continue",
     });
+    request.expected_execution_pool = executionPool.routingKey;
     request.resources = {
       ...(request.resources ?? {}),
       cpu_budget:
@@ -1249,6 +1308,9 @@ async function composeRemotePromiseJob(
         airfoilId: airfoil.id,
         bcIds: [bcId],
         simulationPresetRevisionId: revision.id,
+        solverImplementationId: solverImplementationIdForSetup(setup),
+        solverExecutionPoolId: executionPool.id,
+        methodKey: "openfoam.rans",
         referenceChordM: setup.referenceGeometry.referenceLengthM,
         wave: 1,
         jobKind: state.dueAoas.length <= 3 ? "targeted" : "sweep",
@@ -2049,6 +2111,23 @@ async function pushOneRemoteResult(
   result: typeof results.$inferSelect,
 ): Promise<boolean> {
   const attempt = await currentAttemptForResult(db, job, result);
+  const [runtime] = attempt.solverRuntimeBuildId
+    ? await db
+        .select({
+          runtime: solverRuntimeBuilds,
+          implementation: solverImplementations,
+        })
+        .from(solverRuntimeBuilds)
+        .innerJoin(
+          solverImplementations,
+          eq(
+            solverImplementations.id,
+            solverRuntimeBuilds.solverImplementationId,
+          ),
+        )
+        .where(eq(solverRuntimeBuilds.id, attempt.solverRuntimeBuildId))
+        .limit(1)
+    : [];
   const [accepted] = await db
     .select({ id: resultClassifications.id })
     .from(resultClassifications)
@@ -2251,6 +2330,24 @@ async function pushOneRemoteResult(
         attemptPayload.frame_track ?? attemptPayload.frameTrack ?? null,
       steadyHistory:
         attemptPayload.steady_history ?? attemptPayload.steadyHistory ?? null,
+      methodKey: attempt.methodKey,
+      engine: runtime
+        ? {
+            family: runtime.implementation.family,
+            distribution: runtime.implementation.distribution,
+            version: runtime.implementation.releaseVersion,
+            numericsRevision: runtime.implementation.numericsRevision,
+            adapterContractVersion:
+              runtime.implementation.adapterContractVersion,
+            buildId: runtime.runtime.buildId,
+            sourceRevision: runtime.runtime.sourceRevision,
+            imageDigest: runtime.runtime.imageDigest,
+            applicationSourceSha256: runtime.runtime.applicationSourceSha256,
+            packageSha256: runtime.runtime.packageSha256,
+            binarySha256: runtime.runtime.binarySha256,
+            architecture: runtime.runtime.architecture,
+          }
+        : null,
       engineJobId: attempt.engineJobId,
       engineCaseSlug: attempt.engineCaseSlug,
       evidencePayload: attempt.evidencePayload,

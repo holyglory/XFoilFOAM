@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 import os
+import platform
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,10 +32,107 @@ class Settings(BaseSettings):
         gt=0,
         description="Size cap [GiB] for the mesh/seed cache; least-recently-used entries are evicted beyond it.",
     )
+    evidence_bucket: str | None = Field(
+        default=None,
+        description="Private GCS bucket holding immutable finalized evidence archives. "
+        "Unset keeps tar.zst archives on the shared data volume for development.",
+    )
+    evidence_object_prefix: str = Field(
+        default="solver-evidence/v1",
+        description="Versioned prefix for content-addressed evidence objects.",
+    )
+    evidence_zstd_level: int = Field(
+        default=10,
+        ge=1,
+        le=22,
+        description="Zstandard compression level for finalized tar archives.",
+    )
+    evidence_remote_only: bool = Field(
+        default=False,
+        description="Remove local packaged evidence only after a verified GCS upload.",
+    )
+    control_plane_token: str | None = Field(
+        default=None,
+        min_length=32,
+        description="Dedicated server-to-server bearer token authorizing exact database-backed evidence cleanup.",
+    )
+    evidence_hydration_cache_dir: Path | None = Field(
+        default=None,
+        description="Temporary render hydration cache. Defaults to <data_dir>/evidence-hydration-cache.",
+    )
+    evidence_hydration_cache_max_gb: float = Field(
+        default=50.0,
+        gt=0,
+        description="Hard size target [GiB] for temporary hydrated archives and VTK trees.",
+    )
+    evidence_hydration_cache_ttl_seconds: int = Field(
+        default=24 * 60 * 60,
+        ge=60,
+        description="Idle age after which temporary evidence hydration may be evicted.",
+    )
+    evidence_gcs_timeout_seconds: int = Field(
+        default=900,
+        ge=30,
+        description="Bounded timeout for one GCS upload/download operation.",
+    )
 
     # --- OpenFOAM execution ---
+    engine_family: str = Field(
+        default="openfoam",
+        description="Extensible solver family slug executed by this worker.",
+    )
+    engine_distribution: str = Field(
+        default="opencfd",
+        description="Implementation/distribution slug executed by this worker.",
+    )
+    engine_version: str = Field(
+        default="2606",
+        description="Upstream solver release executed by this worker.",
+    )
+    engine_numerics_revision: str = Field(
+        default="1",
+        description="Explicit revision of numerically significant adapter behaviour/defaults.",
+    )
+    engine_adapter_contract_version: int = Field(
+        default=1,
+        ge=1,
+        description="Wire/adapter contract revision required for exact worker acknowledgement.",
+    )
+    engine_source_revision: str | None = Field(
+        default=None,
+        description="Pinned upstream/source revision, when known.",
+    )
+    engine_image_digest: str | None = Field(
+        default=None,
+        description="OCI image digest of the executing worker, when supplied by deployment.",
+    )
+    engine_application_source_sha256: str | None = Field(
+        default=None,
+        description="Deterministic checksum of the adapter/application sources copied into the worker image.",
+    )
+    engine_package_sha256: str | None = Field(
+        default=None,
+        description="Checksum of the installed upstream package/archive, when known.",
+    )
+    engine_binary_sha256: str | None = Field(
+        default=None,
+        description="Checksum of the solver executable, when captured by the image build.",
+    )
+    engine_architecture: str = Field(
+        default_factory=platform.machine,
+        description="Runtime architecture included in immutable provenance.",
+    )
+    celery_queue: str = Field(
+        default="openfoam-opencfd-2606",
+        description="Exact implementation-owned Celery queue this worker consumes.",
+    )
+    enabled_engine_keys: str = Field(
+        default="openfoam:opencfd:2606:numerics-1:adapter-1",
+        description="Comma-separated exact engine handshake keys the API gateway is allowed to route. "
+        "Registered but disabled adapters are rejected before queueing.",
+    )
     openfoam_image: str = Field(
-        default="opencfd/openfoam-default:2406",
+        default="opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb",
         description="Docker image containing OpenFOAM (used by the docker runner).",
     )
     openfoam_runner: str = Field(
@@ -43,7 +141,7 @@ class Settings(BaseSettings):
         "(run directly; used inside the OpenFOAM-based worker container).",
     )
     openfoam_bashrc: str = Field(
-        default="/usr/lib/openfoam/openfoam2406/etc/bashrc",
+        default="/usr/lib/openfoam/openfoam2606/etc/bashrc",
         description="Path to the OpenFOAM bashrc that must be sourced before running solvers.",
     )
     docker_binary: str = Field(default="docker", description="Path/name of the docker CLI.")
@@ -64,6 +162,12 @@ class Settings(BaseSettings):
     cpu_token_state_path: Path = Field(
         default=Path("/tmp/airfoilfoam-cpu-tokens.json"),
         description="Small JSON file used by worker processes to coordinate CPU token leases.",
+    )
+    cpu_token_lease_ttl_seconds: float = Field(
+        default=120.0,
+        ge=5.0,
+        description="Bounded heartbeat TTL used to recover CPU-token leases owned by another "
+        "worker container after that container disappears.",
     )
     solver_timeout: int = Field(default=7200, ge=60, description="Per-case URANS/global solver guard timeout [s].")
     rans_solver_timeout: int = Field(
@@ -126,6 +230,18 @@ class Settings(BaseSettings):
     # --- Messaging ---
     redis_url: str = Field(default="redis://localhost:6379/0")
 
+    @model_validator(mode="after")
+    def require_remote_cleanup_authentication(self) -> "Settings":
+        if (
+            (self.evidence_bucket or "").strip()
+            and self.evidence_remote_only
+            and not (self.control_plane_token or "").strip()
+        ):
+            raise ValueError(
+                "AIRFOILFOAM_CONTROL_PLANE_TOKEN (at least 32 characters) is required when remote-only GCS evidence is enabled"
+            )
+        return self
+
     @property
     def broker_url(self) -> str:
         return self.redis_url
@@ -139,6 +255,65 @@ class Settings(BaseSettings):
 
     def resolved_cache_dir(self) -> Path:
         return self.cache_dir if self.cache_dir is not None else self.data_dir / "cache"
+
+    def resolved_evidence_hydration_cache_dir(self) -> Path:
+        return (
+            self.evidence_hydration_cache_dir
+            if self.evidence_hydration_cache_dir is not None
+            else self.data_dir / "evidence-hydration-cache"
+        )
+
+    def engine_identity(self):
+        """Logical configured solver identity (local import avoids config/model cycles)."""
+        from .models import EngineIdentity
+
+        return EngineIdentity(
+            family=self.engine_family,
+            distribution=self.engine_distribution,
+            version=self.engine_version,
+            numerics_revision=self.engine_numerics_revision,
+            adapter_contract_version=self.engine_adapter_contract_version,
+        )
+
+    def engine_runtime_identity(self):
+        """Exact provenance acknowledged by work executed in this runtime."""
+        from .models import EngineRuntimeIdentity
+        from .provenance import installed_application_source_sha256
+
+        def optional_text(value: str | None) -> str | None:
+            if value is None:
+                return None
+            normalized = value.strip()
+            return normalized or None
+
+        return EngineRuntimeIdentity(
+            **self.engine_identity().model_dump(),
+            build_id=self.build_id,
+            source_revision=optional_text(self.engine_source_revision),
+            image_digest=optional_text(self.engine_image_digest),
+            application_source_sha256=(
+                optional_text(self.engine_application_source_sha256)
+                or installed_application_source_sha256()
+            ),
+            package_sha256=optional_text(self.engine_package_sha256),
+            binary_sha256=optional_text(self.engine_binary_sha256),
+            architecture=optional_text(self.engine_architecture),
+        )
+
+    def enabled_engine_key_set(self) -> set[str]:
+        return {
+            item.strip()
+            for item in self.enabled_engine_keys.split(",")
+            if item.strip()
+        }
+
+    def resolved_engine_cache_dir(self) -> Path:
+        """Numerical cache namespace, preserving the historical v2406 path byte-for-byte."""
+        identity = self.engine_identity()
+        if identity.compatibility_key == "openfoam:opencfd:2406:numerics-1":
+            return self.resolved_cache_dir()
+        safe = identity.compatibility_key.replace(":", "_")
+        return self.resolved_cache_dir() / "engines" / safe
 
     def media_budget_seconds(self) -> float:
         """Wall-clock seconds one case's post-solve media/frame stage may consume."""

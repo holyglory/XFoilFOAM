@@ -2299,10 +2299,19 @@ describe("admin job cancellation race guard", () => {
       .where(eq(simUransRequests.id, ladderRequest.id));
     expect(afterObligation).toMatchObject({
       state: "pending",
-      attemptCount: 1,
-      lastOutcome: "failed",
+      // Losing a worker/engine task is infrastructure interruption, not a CFD
+      // attempt. Recovery keeps the obligation pending and releases the
+      // reserved solver ordinal so a replacement does not consume its bounded
+      // physical-attempt budget.
+      attemptCount: 0,
+      lastOutcome: "infrastructure_retry_wait",
     });
-    expect(afterAttempt).toMatchObject({ state: "failed", outcome: "failed" });
+    expect(afterAttempt).toMatchObject({
+      state: "cancelled",
+      outcome: "infrastructure_retry_wait",
+      consumesSolverAttempt: false,
+      solverAttemptNumber: null,
+    });
     expect(afterRequest).toMatchObject({ state: "pending", simJobId: null });
   });
 
