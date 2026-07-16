@@ -1309,14 +1309,63 @@ async function insertResultAttempt(opts: {
     )
     .limit(1);
   if (!existing) return null;
+  const existingPayload = existing.evidencePayload ?? null;
+  const exactReplay =
+    stableHash(existingPayload) === stableHash(evidencePayload);
+  const sameLegacyUnacknowledgedVersion =
+    unacknowledgedMeshRecoveryVersion(existingPayload) &&
+    unacknowledgedMeshRecoveryVersion(evidencePayload) &&
+    stableAttemptEvidenceHashWithoutMeshRecoveryVersion(existingPayload) ===
+      stableAttemptEvidenceHashWithoutMeshRecoveryVersion(evidencePayload);
+  const incomingMeshRecoveryVersion =
+    acknowledgedMeshRecoveryVersion(evidencePayload);
+  const enrichLegacyMeshRecoveryVersion =
+    unacknowledgedMeshRecoveryVersion(existingPayload) &&
+    incomingMeshRecoveryVersion != null &&
+    stableAttemptEvidenceHashWithoutMeshRecoveryVersion(existingPayload) ===
+      stableAttemptEvidenceHashWithoutMeshRecoveryVersion(evidencePayload);
   if (
     existing.resultId !== resultId ||
-    stableAttemptEvidenceHash(existing.evidencePayload ?? null) !==
-      stableAttemptEvidenceHash(evidencePayload)
+    (!exactReplay &&
+      !sameLegacyUnacknowledgedVersion &&
+      !enrichLegacyMeshRecoveryVersion)
   ) {
     throw new Error(
       `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
     );
+  }
+  if (enrichLegacyMeshRecoveryVersion) {
+    // Rolling-deploy enrichment is one-way and compare-and-set. The exact
+    // engine replay supplied a newly persisted job-level acknowledgement, but
+    // every pre-existing point field already compared equal above. Add only
+    // that evidence key. If another replay wins the race, require its complete
+    // payload to equal ours; a competing version remains an immutable-evidence
+    // violation.
+    const [enriched] = await db
+      .update(resultAttempts)
+      .set({ evidencePayload })
+      .where(
+        and(
+          eq(resultAttempts.id, existing.id),
+          eq(resultAttempts.evidencePayload, existingPayload),
+        ),
+      )
+      .returning({ id: resultAttempts.id });
+    if (!enriched) {
+      const [raced] = await db
+        .select({ evidencePayload: resultAttempts.evidencePayload })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, existing.id))
+        .limit(1);
+      if (
+        !raced ||
+        stableHash(raced.evidencePayload ?? null) !== stableHash(evidencePayload)
+      ) {
+        throw new Error(
+          `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
+        );
+      }
+    }
   }
   return existing.id;
 }
@@ -1971,19 +2020,46 @@ function stableHash(value: unknown): string {
     .slice(0, 24);
 }
 
-/** Hash one immutable attempt payload across the rolling-deploy boundary that
- * introduced `mesh_recovery_version`. Legacy rows omit this optional
- * acknowledgement, while one short-lived writer stored an explicit null. Both
- * mean "the engine did not acknowledge a recovery strategy". Numeric values
- * remain part of the immutable identity and are never normalized away. */
-function stableAttemptEvidenceHash(value: unknown): string {
+function attemptEvidenceRecord(
+  value: unknown,
+): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function unacknowledgedMeshRecoveryVersion(value: unknown): boolean {
+  const record = attemptEvidenceRecord(value);
+  return (
+    record != null &&
+    (!Object.hasOwn(record, "mesh_recovery_version") ||
+      record.mesh_recovery_version === null)
+  );
+}
+
+function acknowledgedMeshRecoveryVersion(value: unknown): number | null {
+  const version = attemptEvidenceRecord(value)?.mesh_recovery_version;
+  return typeof version === "number" &&
+    Number.isSafeInteger(version) &&
+    version >= 0
+    ? version
+    : null;
+}
+
+/** Hash every point-owned field while excluding only the additive job-level
+ * mesh strategy acknowledgement introduced after legacy attempts were stored.
+ * Callers use this only to prove an otherwise exact replay before a one-time
+ * compare-and-set enrichment; numeric versions remain immutable afterwards. */
+function stableAttemptEvidenceHashWithoutMeshRecoveryVersion(
+  value: unknown,
+): string {
+  const record = attemptEvidenceRecord(value);
+  if (!record) {
     return stableHash(value);
   }
-  const normalized = { ...(value as Record<string, unknown>) };
-  if (normalized.mesh_recovery_version === null) {
-    delete normalized.mesh_recovery_version;
-  }
+  const normalized = { ...record };
+  delete normalized.mesh_recovery_version;
   return stableHash(normalized);
 }
 

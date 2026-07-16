@@ -1700,12 +1700,9 @@ describe("sweeper: gap → claim → ingest", () => {
       ),
     ).toBe(false);
 
-    // MUST-CATCH (production rolling deploy 2026-07-16): legacy attempts
-    // predate the optional mesh-recovery acknowledgement and therefore omit
-    // its JSON key. A short-lived writer compared that payload with a newly
-    // constructed `mesh_recovery_version: null` payload and blocked every
-    // otherwise exact partial replay as changed immutable evidence. Explicit
-    // null and absence mean the same "not acknowledged" state.
+    // FALSE-POSITIVE GUARD: one short-lived writer stored an explicit null.
+    // Null and absence both mean the legacy writer did not persist the
+    // job-level acknowledgement.
     await db
       .update(resultAttempts)
       .set({
@@ -1727,21 +1724,45 @@ describe("sweeper: gap → claim → ingest", () => {
       result: withExactManifestEvidence(result),
     });
 
-    // A real acknowledged version remains immutable evidence: equal numeric
-    // versions replay, while a different numeric acknowledgement must fail.
-    for (const attempt of attemptsAfter) {
-      await db
-        .update(resultAttempts)
-        .set({
-          evidencePayload: {
-            ...(attempt.evidencePayload as Record<string, unknown>),
-            mesh_recovery_version: 1,
-          },
-        })
-        .where(eq(resultAttempts.id, attempt.id));
-    }
+    // MUST-CATCH (production rolling deploy 2026-07-16): the legacy point
+    // payload omitted the optional key while the unchanged engine job's root
+    // result truthfully acknowledged mesh-recovery version 1. Every other
+    // point field must compare equal before the replay enriches only that
+    // missing key. Afterwards the numeric acknowledgement is immutable.
     const recoveredV1 = JSON.parse(JSON.stringify(result)) as JobResult;
     recoveredV1.mesh_recovery_version = 1;
+    await ingestResult({
+      db,
+      engine: mediaEngine,
+      engineJobId: "testjob",
+      simJobId: job.id,
+      airfoilId: a.id,
+      speedMap: [
+        { speed, bcId: bc.id, presetRevisionId: batch.presetRevisionId },
+      ],
+      result: withExactManifestEvidence(recoveredV1),
+    });
+    const enrichedAttempts = await db
+      .select({
+        id: resultAttempts.id,
+        evidencePayload: resultAttempts.evidencePayload,
+      })
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.simJobId, job.id),
+          eq(resultAttempts.engineJobId, "testjob"),
+        ),
+      );
+    expect(enrichedAttempts).toHaveLength(3);
+    expect(
+      enrichedAttempts.map(
+        (attempt) =>
+          (
+            attempt.evidencePayload as Record<string, unknown>
+          ).mesh_recovery_version,
+      ),
+    ).toEqual([1, 1, 1]);
     await ingestResult({
       db,
       engine: mediaEngine,
