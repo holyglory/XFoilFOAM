@@ -85,3 +85,19 @@ restoration, nested modal reference counting, exact geometry paths for the
 thumbnail and profile, keyboard tab behavior, same-chart zoom preservation, and
 390×844 overflow. It also proves the automatic panel contains no `FAILED
 POINTS`, bare mixed `attempts` count, or raw `solver evidence rejected` copy.
+
+## Production rollout
+
+Commit `39ebba7` deployed through GitHub Actions run `29497137489`. The exact
+20-32C/Re≈102k endpoint returned seven preliminary outcomes: α2°/3° each retain
+two RANS and two preliminary evidence records; α10°/15°/16°/19°/20° each retain
+two RANS records, one preliminary record, and one sequence-proven interrupted
+continuation. Every obligation reports two of two physical runs, one
+non-physical submission, and zero full-URANS evidence.
+
+Production browser verification confirmed the modal body lock, contained panel
+and backdrop wheel behavior, exact scroll/focus restoration, real thumbnail,
+Airfoil tab, and zero document/panel horizontal overflow at 1100×900 and
+390×844. The ordinary deploy recreated only Node control-plane services. The
+engine API and worker kept their exact container identities and start times
+while live `simpleFoam` processes continued.
