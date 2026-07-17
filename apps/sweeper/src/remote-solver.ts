@@ -1178,6 +1178,11 @@ async function processPendingPromiseCancellations(
           method: "POST",
           signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
           headers: headers(settings),
+          // The shared sync headers declare JSON. Sending an empty request
+          // body makes Fastify reject the cancellation before the route can
+          // release the authoritative lease, so keep the no-argument command
+          // as an explicit empty JSON object.
+          body: JSON.stringify({}),
         },
       );
       if (!response.ok && response.status !== 404) {
@@ -3471,6 +3476,33 @@ export async function remoteSolverTick(
     // stored hub URL, while the current same-authority credential is used.
     if (settings?.upstreamSecret) {
       await processPendingPromiseCancellations(db, settings);
+    }
+    // A completed mixed PRECALC wave can expose accepted siblings for durable
+    // delivery while rejected siblings remain pending for their one bounded
+    // continuation. Give those obligations the next engine slot before any
+    // delivery/completion path can release the mirror. The ordinary submit
+    // path also performs this check, but it runs after result delivery and is
+    // therefore too late for this transition.
+    if (
+      settings?.remoteSolverEnabled &&
+      settings.upstreamBaseUrl &&
+      settings.upstreamSecret &&
+      allowEngineSubmission &&
+      (await activeRemoteJobs(db)).length === 0
+    ) {
+      const recoveryMirrors = await mirroredRemotePromiseIds(db, settings);
+      if (
+        recoveryMirrors.length > 0 &&
+        (await submitRemotePrecalcRecovery(
+          db,
+          engine,
+          settings,
+          recoveryMirrors[0]!,
+        ))
+      ) {
+        await setStatus(db, "solving", null);
+        return;
+      }
     }
     let processedDurableDelivery = false;
     if (settings?.upstreamBaseUrl && settings.upstreamSecret) {
