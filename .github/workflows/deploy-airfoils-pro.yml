@@ -32,6 +32,11 @@ on:
         required: false
         default: false
         type: boolean
+      pending_cutover_attestation_413_recovery:
+        description: "Repair only the Node attestation body limit and replay the exact retained OpenCFD 2606 receipt"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: airfoils-pro-vps-deploy
@@ -41,7 +46,7 @@ jobs:
   deploy:
     name: Deploy control plane
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.pending_cutover_retention_retry || inputs.pending_cutover_transient_retention_retry || inputs.pending_cutover_early_stop_retention_retry) && 360 || (github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay && 360 || 45) }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_attestation_413_recovery && 180 || (github.event_name == 'workflow_dispatch' && (inputs.pending_cutover_retention_retry || inputs.pending_cutover_transient_retention_retry || inputs.pending_cutover_early_stop_retention_retry) && 360 || (github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay && 360 || 45)) }}
     env:
       VPS_HOST: ${{ secrets.AIRFOILS_VPS_HOST }}
       VPS_USER: ${{ secrets.AIRFOILS_VPS_USER }}
@@ -55,6 +60,7 @@ jobs:
       PENDING_CUTOVER_RETENTION_RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_retention_retry || false }}
       PENDING_CUTOVER_TRANSIENT_RETENTION_RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_transient_retention_retry || false }}
       PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_early_stop_retention_retry || false }}
+      PENDING_CUTOVER_ATTESTATION_413_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_attestation_413_recovery || false }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -82,6 +88,7 @@ jobs:
           bash -n scripts/deploy/retry-pending-opencfd2606-retention.sh
           bash -n scripts/deploy/retry-pending-opencfd2606-transient-retention.sh
           bash -n scripts/deploy/retry-pending-opencfd2606-early-stop-retention.sh
+          bash -n scripts/deploy/recover-pending-opencfd2606-attestation-413.sh
           python3 scripts/deploy/deployment-source-manifest.py --help >/dev/null
           test -f docker-compose.deploy.yml
 
@@ -244,6 +251,35 @@ jobs:
             "umask 077 && cat >$REMOTE_TARGET_Q && chmod 600 -- $REMOTE_TARGET_Q" \
             <"$TARGET_INVENTORY"
 
+      - name: Upload exact source inventories for attestation 413 recovery
+        if: ${{ env.PENDING_CUTOVER_ATTESTATION_413_RECOVERY == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_REVISION="7a13801aa5b39acba03ff256d1d3256655f6a275"
+          EXPECTED_BASE_INVENTORY_SHA256="08a0dd7c280654ac4567563e773a95420db79286a4ec1be3f4755f978863cb74"
+          BASE_INVENTORY="$RUNNER_TEMP/opencfd2606-attestation-413-base-ls-tree.txt"
+          TARGET_INVENTORY="$RUNNER_TEMP/opencfd2606-attestation-413-target-ls-tree.txt"
+          git cat-file -e "${BASE_REVISION}^{commit}"
+          git cat-file -e "${GITHUB_SHA}^{commit}"
+          git ls-tree -r --full-tree "$BASE_REVISION" >"$BASE_INVENTORY"
+          git ls-tree -r --full-tree "$GITHUB_SHA" >"$TARGET_INVENTORY"
+          printf '%s  %s\n' "$EXPECTED_BASE_INVENTORY_SHA256" "$BASE_INVENTORY" | sha256sum -c -
+          TARGET_INVENTORY_SHA256="$(sha256sum "$TARGET_INVENTORY" | awk '{print $1}')"
+          [[ "$TARGET_INVENTORY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'PENDING_CUTOVER_ATTESTATION_413_TARGET_INVENTORY_SHA256=%s\n' "$TARGET_INVENTORY_SHA256" >>"$GITHUB_ENV"
+          printf -v STAGING_Q '%q' "$VPS_STAGING_DIR"
+          REMOTE_BASE="$VPS_STAGING_DIR/.codex-artifacts/opencfd2606-attestation-413-base-ls-tree.txt"
+          REMOTE_TARGET="$VPS_STAGING_DIR/.codex-artifacts/opencfd2606-attestation-413-target-ls-tree.txt"
+          printf -v REMOTE_BASE_Q '%q' "$REMOTE_BASE"
+          printf -v REMOTE_TARGET_Q '%q' "$REMOTE_TARGET"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "install -d -m 700 -- $STAGING_Q/.codex-artifacts && umask 077 && cat >$REMOTE_BASE_Q && chmod 600 -- $REMOTE_BASE_Q" \
+            <"$BASE_INVENTORY"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "umask 077 && cat >$REMOTE_TARGET_Q && chmod 600 -- $REMOTE_TARGET_Q" \
+            <"$TARGET_INVENTORY"
+
       - name: Promote source or repair pending cutover under deploy lock
         shell: bash
         run: |
@@ -260,11 +296,19 @@ jobs:
           [[ "$PENDING_CUTOVER_RETENTION_RETRY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
           [[ "$PENDING_CUTOVER_TRANSIENT_RETENTION_RETRY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
           [[ "$PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
+          [[ "$PENDING_CUTOVER_ATTESTATION_413_RECOVERY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
           if ((RECOVERY_ACTIONS > 1)); then
             echo "Select only one pending-cutover recovery action per workflow dispatch." >&2
             exit 2
           fi
-          if [[ "$PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY" == "true" ]]; then
+          if [[ "$PENDING_CUTOVER_ATTESTATION_413_RECOVERY" == "true" ]]; then
+            : "${PENDING_CUTOVER_ATTESTATION_413_TARGET_INVENTORY_SHA256:?Target inventory SHA was not prepared}"
+            printf -v TARGET_INVENTORY_SHA_Q '%q' "$PENDING_CUTOVER_ATTESTATION_413_TARGET_INVENTORY_SHA256"
+            ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" \
+              -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+              "${VPS_USER}@${VPS_HOST}" \
+              "chmod +x $STAGING_Q/scripts/deploy/recover-pending-opencfd2606-attestation-413.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q EXPECTED_TARGET_SOURCE_REVISION=$REVISION_Q EXPECTED_TARGET_GIT_INVENTORY_SHA256=$TARGET_INVENTORY_SHA_Q $STAGING_Q/scripts/deploy/recover-pending-opencfd2606-attestation-413.sh"
+          elif [[ "$PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY" == "true" ]]; then
             : "${PENDING_CUTOVER_EARLY_STOP_RETENTION_TARGET_INVENTORY_SHA256:?Target inventory SHA was not prepared}"
             printf -v TARGET_INVENTORY_SHA_Q '%q' "$PENDING_CUTOVER_EARLY_STOP_RETENTION_TARGET_INVENTORY_SHA256"
             ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" \

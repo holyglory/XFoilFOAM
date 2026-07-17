@@ -29,6 +29,14 @@ const prepareBody = globalBody.extend({
 
 const attestationBody = z.object({ receipt: z.unknown() }).strict();
 
+// The producer-shaped OpenCFD 2606 receipt contains the immutable artifact
+// inventory for all three canaries. The first production receipt was
+// 2,313,736 bytes, so Fastify's default 1 MiB JSON limit rejected it before
+// the authoritative receipt schema could run. Keep the exception bounded and
+// attached only to the authenticated, exact-origin attestation endpoint;
+// sibling maintenance and public routes retain Fastify's default limit.
+export const OPENCFD_2606_ATTESTATION_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
+
 const linkedAttestationBody = z
   .object({ canaryAttestationId: z.string().uuid() })
   .strict();
@@ -129,7 +137,10 @@ export async function registerEngineCutoverRoutes(
 
   app.post(
     "/api/admin/solver-engine-cutovers/opencfd-2606/attest",
-    { preHandler: maintenancePreHandlers },
+    {
+      bodyLimit: OPENCFD_2606_ATTESTATION_BODY_LIMIT_BYTES,
+      preHandler: maintenancePreHandlers,
+    },
     async (req, reply) => {
       try {
         const body = attestationBody.parse(req.body ?? {});
