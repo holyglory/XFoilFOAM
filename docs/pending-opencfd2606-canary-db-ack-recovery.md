@@ -41,8 +41,9 @@ from an earlier inventory are intentionally rejected.
 Create the staging `.deployment-source.json` from the final reviewed target
 commit. Supply its exact revision, source-tree digest, file count, changed-path
 digest, and independent file digests for the rebuild runner, canary, migration
-0072, migration verifier, contract helper, recovery launcher, and Compose
-definition. The launcher refuses any byte or executable-mode drift.
+0072, migration verifier, contract helper, recovery launcher, canonical
+backup-and-copy hook, and Compose definition. The launcher refuses any byte or
+executable-mode drift.
 
 The target build ID must be new. The admin cookie is passed only through the
 environment and is never written to a journal. All state journals and backup
@@ -50,29 +51,46 @@ proofs are owner-controlled mode 0600; their directories are mode 0700.
 
 ## Backup-and-copy hook contract
 
-`BACKUP_AND_COPY_HOOK` must be an absolute, non-symlink executable whose
-SHA-256 is supplied independently. The launcher calls it only after
-`media-repair` is stopped and while descriptor 9 is locked. It receives:
+The launcher uses only the hash-pinned staged
+`scripts/deploy/create-verified-canary-postgres-backup.sh`; an arbitrary
+operator hook cannot replace it. The independently hash-pinned
+`POSTGRES_BACKUP_TOOL` remains an absolute regular file. The launcher calls the
+canonical hook only after `media-repair` is stopped and while descriptor 9 is
+locked. It receives:
 
 - `ENV_FILE`, `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, and
   `COMPOSE_PROJECT_DIRECTORY`;
-- exclusive output paths in `DATABASE_BACKUP_FILE`,
+- stable output paths in `DATABASE_BACKUP_FILE`,
   `DATABASE_BACKUP_MANIFEST`, and `DATABASE_BACKUP_OFF_VPS_RECEIPT`;
 - the exact expected PostgreSQL container and image IDs;
 - `MEDIA_QUIESCE_JOURNAL` and `DEPLOY_LOCK_HELD=1`.
 
-The hook must fail if an output already exists, invoke the repository's
-PostgreSQL Docker backup workflow against the exact full container ID, produce
-a database-scope custom-format backup, perform its strong scratch-database
-restore verification, then upload an immutable off-VPS copy. It must download
-that exact remote version again and compare SHA-256 and byte size before
-atomically publishing the receipt. Database passwords must not appear in
-command arguments.
+The hook derives a restart-safe state from those paths. An exact strongly
+verified local pair is reused byte-for-byte; a structurally complete but
+unverified pair finishes strong verification before any remote operation.
+Dump-only, manifest-only, and hash/size-unmatched local publications move to a
+private no-clobber quarantine and are fsynced without deleting evidence.
+Unsafe paths and complete pairs with different source provenance are hard
+collisions and remain untouched.
+
+For both the dump and manifest, the hook attempts create-only GCS publication,
+resolves the committed numeric generation even after a lost upload response,
+then downloads that exact generation and verifies SHA-256 and byte size. An
+existing exact object reuses its generation; different content is never
+overwritten. The manifest object name includes its own digest so a legitimate
+new verification record cannot collide merely because the dump bytes match.
+
+Only after both generation-pinned downloads pass does the hook construct the
+receipt. Its temporary inode is created and fsynced in the receipt's own
+mode-0700 parent, published through an exclusive hard link, and followed by a
+parent-directory fsync and exact byte validation. A replay revalidates and
+reuses the exact receipt without rewriting it; a different receipt fails as a
+collision. Database passwords must not appear in command arguments.
 
 The off-VPS receipt is a private JSON object with purpose
-`airfoils-pro-postgres-off-vps-copy`; an immutable `gs`, `s3`, or `ssh`
-destination locator and version; the source container ID; backup, manifest,
-and downloaded-copy digests and sizes; verification method
+`airfoils-pro-postgres-off-vps-copy`; immutable GCS dump and manifest locators
+and numeric generations; the source container and image IDs; both downloaded
+objects' digests and sizes; verification method
 `remote-download-sha256`; and a verification timestamp after the strong local
 restore. The contract helper validates every field and chronology before any
 build begins.

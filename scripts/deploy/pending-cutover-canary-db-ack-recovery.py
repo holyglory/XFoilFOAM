@@ -364,8 +364,18 @@ def validate_backup_contract(args: argparse.Namespace) -> dict[str, Any]:
     require_regular(dump, mode=0o600)
     require_regular(manifest_path, mode=0o600)
     require_regular(receipt_path, mode=0o600)
-    if stat.S_IMODE(dump.parent.stat().st_mode) != 0o700:
-        fail("database backup directory must be mode 0700")
+    for directory, label in (
+        (dump.parent, "database backup"),
+        (receipt_path.parent, "off-VPS receipt"),
+    ):
+        metadata = directory.lstat()
+        if (
+            directory.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.getuid()
+        ):
+            fail(f"{label} directory must be owner-controlled mode 0700")
     actual_dump_sha = sha256_file(dump)
     actual_manifest_sha = sha256_file(manifest_path)
     actual_receipt_sha = sha256_file(receipt_path)
@@ -453,6 +463,19 @@ def validate_backup_contract(args: argparse.Namespace) -> dict[str, Any]:
         fail("database backup is not a fresh, subsequently verified pre-migration snapshot")
 
     receipt = load_json(receipt_path)
+    if set(receipt) != {
+        "schemaVersion",
+        "purpose",
+        "backupSha256",
+        "backupSize",
+        "backupManifestSha256",
+        "backupManifestSize",
+        "sourceContainerId",
+        "sourceImageId",
+        "destination",
+        "verification",
+    }:
+        fail("off-VPS backup receipt schema is not exact")
     require_fields(
         receipt,
         {
@@ -461,25 +484,57 @@ def validate_backup_contract(args: argparse.Namespace) -> dict[str, Any]:
             "backupSha256": actual_dump_sha,
             "backupSize": dump.stat().st_size,
             "backupManifestSha256": actual_manifest_sha,
+            "backupManifestSize": manifest_path.stat().st_size,
             "sourceContainerId": args.expected_postgres_container_id,
+            "sourceImageId": args.expected_postgres_image_id,
         },
         "off-VPS backup receipt",
     )
     destination = receipt.get("destination")
-    if not isinstance(destination, dict) or destination.get("scheme") not in {
-        "gs",
-        "s3",
-        "ssh",
-    }:
-        fail("off-VPS backup receipt has no supported remote destination")
-    if not isinstance(destination.get("locator"), str) or not destination["locator"]:
+    if (
+        not isinstance(destination, dict)
+        or set(destination)
+        != {
+            "scheme",
+            "locator",
+            "immutableVersion",
+            "manifestLocator",
+            "manifestImmutableVersion",
+        }
+        or destination.get("scheme") != "gs"
+    ):
+        fail("off-VPS backup receipt has no exact GCS destination")
+    if (
+        not isinstance(destination.get("locator"), str)
+        or not destination["locator"].startswith("gs://")
+    ):
         fail("off-VPS backup receipt lacks its remote locator")
     if not isinstance(destination.get("immutableVersion"), str) or not destination[
         "immutableVersion"
     ]:
         fail("off-VPS backup receipt lacks an immutable remote generation/version")
+    if not destination["immutableVersion"].isdigit():
+        fail("off-VPS backup receipt has an invalid dump generation")
+    manifest_locator = destination.get("manifestLocator")
+    if manifest_locator != f"{destination['locator']}.{actual_manifest_sha}.manifest.json":
+        fail("off-VPS backup receipt has an unexpected manifest locator")
+    manifest_generation = destination.get("manifestImmutableVersion")
+    if not isinstance(manifest_generation, str) or not manifest_generation.isdigit():
+        fail("off-VPS backup receipt lacks an exact manifest generation")
     remote_verification = receipt.get("verification")
-    if not isinstance(remote_verification, dict):
+    if (
+        not isinstance(remote_verification, dict)
+        or set(remote_verification)
+        != {
+            "ok",
+            "method",
+            "sha256",
+            "size",
+            "manifestSha256",
+            "manifestSize",
+            "verifiedAt",
+        }
+    ):
         fail("off-VPS backup receipt lacks remote verification")
     require_fields(
         remote_verification,
@@ -488,6 +543,8 @@ def validate_backup_contract(args: argparse.Namespace) -> dict[str, Any]:
             "method": "remote-download-sha256",
             "sha256": actual_dump_sha,
             "size": dump.stat().st_size,
+            "manifestSha256": actual_manifest_sha,
+            "manifestSize": manifest_path.stat().st_size,
         },
         "off-VPS backup verification",
     )
@@ -511,6 +568,8 @@ def validate_backup_contract(args: argparse.Namespace) -> dict[str, Any]:
         "offVpsReceiptPath": str(receipt_path.resolve()),
         "offVpsReceiptSha256": actual_receipt_sha,
         "offVpsDestination": destination,
+        "offVpsManifestSha256": actual_manifest_sha,
+        "offVpsManifestSize": manifest_path.stat().st_size,
         "offVpsVerifiedAt": remote_verified_at.isoformat(),
     }
 

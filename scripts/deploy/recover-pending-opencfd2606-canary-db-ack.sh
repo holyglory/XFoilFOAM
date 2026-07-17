@@ -28,13 +28,14 @@ EXPECTED_TARGET_MIGRATION_SHA256="${EXPECTED_TARGET_MIGRATION_SHA256:?EXPECTED_T
 EXPECTED_TARGET_MIGRATION_VERIFIER_SHA256="${EXPECTED_TARGET_MIGRATION_VERIFIER_SHA256:?EXPECTED_TARGET_MIGRATION_VERIFIER_SHA256 is required}"
 EXPECTED_TARGET_CONTRACT_HELPER_SHA256="${EXPECTED_TARGET_CONTRACT_HELPER_SHA256:?EXPECTED_TARGET_CONTRACT_HELPER_SHA256 is required}"
 EXPECTED_TARGET_RECOVERY_RUNNER_SHA256="${EXPECTED_TARGET_RECOVERY_RUNNER_SHA256:?EXPECTED_TARGET_RECOVERY_RUNNER_SHA256 is required}"
+EXPECTED_TARGET_BACKUP_HOOK_SHA256="${EXPECTED_TARGET_BACKUP_HOOK_SHA256:?EXPECTED_TARGET_BACKUP_HOOK_SHA256 is required}"
 EXPECTED_TARGET_COMPOSE_SHA256="${EXPECTED_TARGET_COMPOSE_SHA256:?EXPECTED_TARGET_COMPOSE_SHA256 is required}"
 
 DATABASE_BACKUP_FILE="${DATABASE_BACKUP_FILE:?DATABASE_BACKUP_FILE is required}"
 DATABASE_BACKUP_MANIFEST="${DATABASE_BACKUP_MANIFEST:?DATABASE_BACKUP_MANIFEST is required}"
 DATABASE_BACKUP_OFF_VPS_RECEIPT="${DATABASE_BACKUP_OFF_VPS_RECEIPT:?DATABASE_BACKUP_OFF_VPS_RECEIPT is required}"
-BACKUP_AND_COPY_HOOK="${BACKUP_AND_COPY_HOOK:?BACKUP_AND_COPY_HOOK is required}"
-EXPECTED_BACKUP_AND_COPY_HOOK_SHA256="${EXPECTED_BACKUP_AND_COPY_HOOK_SHA256:?EXPECTED_BACKUP_AND_COPY_HOOK_SHA256 is required}"
+POSTGRES_BACKUP_TOOL="${POSTGRES_BACKUP_TOOL:?POSTGRES_BACKUP_TOOL is required}"
+EXPECTED_POSTGRES_BACKUP_TOOL_SHA256="${EXPECTED_POSTGRES_BACKUP_TOOL_SHA256:?EXPECTED_POSTGRES_BACKUP_TOOL_SHA256 is required}"
 EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256="${EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256:?EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256 is required}"
 
 EXPECTED_CURRENT_API_CONTAINER_ID="${EXPECTED_CURRENT_API_CONTAINER_ID:?EXPECTED_CURRENT_API_CONTAINER_ID is required}"
@@ -79,7 +80,8 @@ for value in \
   "$EXPECTED_TARGET_REBUILD_SHA256" "$EXPECTED_TARGET_CANARY_SHA256" \
   "$EXPECTED_TARGET_MIGRATION_SHA256" "$EXPECTED_TARGET_MIGRATION_VERIFIER_SHA256" \
   "$EXPECTED_TARGET_CONTRACT_HELPER_SHA256" "$EXPECTED_TARGET_RECOVERY_RUNNER_SHA256" \
-  "$EXPECTED_TARGET_COMPOSE_SHA256" "$EXPECTED_BACKUP_AND_COPY_HOOK_SHA256" \
+  "$EXPECTED_TARGET_BACKUP_HOOK_SHA256" "$EXPECTED_TARGET_COMPOSE_SHA256" \
+  "$EXPECTED_POSTGRES_BACKUP_TOOL_SHA256" \
   "$EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256" \
   "$EXPECTED_RESULTS_VOLUME_IDENTITY_SHA256"; do
   [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "Every reviewed SHA-256 input must be exact lowercase hexadecimal." 2
@@ -139,16 +141,16 @@ canary_script="$staging_real/scripts/deploy/openfoam_2606_canary.py"
 migration_file="$staging_real/packages/db/migrations/0072_canary_evidence_database_ack.sql"
 migration_verifier="$staging_real/scripts/deploy/verify-opencfd2606-canary-migration.sh"
 recovery_runner="$staging_real/scripts/deploy/recover-pending-opencfd2606-canary-db-ack.sh"
+backup_and_copy_hook="$staging_real/scripts/deploy/create-verified-canary-postgres-backup.sh"
 compose_file="$staging_real/docker-compose.deploy.yml"
 
 for required in "$manifest_tool" "$contract_helper" "$rebuild_script" "$canary_script" \
   "$migration_file" "$migration_verifier" "$recovery_runner" "$compose_file" \
-  "$BACKUP_AND_COPY_HOOK"; do
+  "$backup_and_copy_hook" "$POSTGRES_BACKUP_TOOL"; do
   [[ -f "$required" && ! -L "$required" ]] || fail "Required bound/staged source file is missing or unsafe: $required" 2
 done
-[[ -x "$contract_helper" && -x "$rebuild_script" && -x "$migration_verifier" && -x "$recovery_runner" ]] || fail "Reviewed recovery executables lost their executable mode." 2
-[[ "$BACKUP_AND_COPY_HOOK" == /* ]] || fail "Reviewed backup/copy hook must use an absolute path." 2
-[[ -x "$BACKUP_AND_COPY_HOOK" ]] || fail "Reviewed backup/copy hook is not executable." 2
+[[ -x "$contract_helper" && -x "$rebuild_script" && -x "$migration_verifier" && -x "$recovery_runner" && -x "$backup_and_copy_hook" ]] || fail "Reviewed recovery executables lost their executable mode." 2
+[[ "$POSTGRES_BACKUP_TOOL" == /* ]] || fail "Reviewed Postgres backup tool must use an absolute path." 2
 
 [[ "$(sha256_file "$contract_helper")" == "$EXPECTED_TARGET_CONTRACT_HELPER_SHA256" ]] || fail "Recovery contract helper differs from its reviewed digest."
 [[ "$(sha256_file "$rebuild_script")" == "$EXPECTED_TARGET_REBUILD_SHA256" ]] || fail "Rebuild runner differs from its reviewed digest."
@@ -156,8 +158,9 @@ done
 [[ "$(sha256_file "$migration_file")" == "$EXPECTED_TARGET_MIGRATION_SHA256" ]] || fail "Migration 0072 differs from its reviewed digest."
 [[ "$(sha256_file "$migration_verifier")" == "$EXPECTED_TARGET_MIGRATION_VERIFIER_SHA256" ]] || fail "Migration verifier differs from its reviewed digest."
 [[ "$(sha256_file "$recovery_runner")" == "$EXPECTED_TARGET_RECOVERY_RUNNER_SHA256" ]] || fail "Recovery runner differs from its reviewed digest."
+[[ "$(sha256_file "$backup_and_copy_hook")" == "$EXPECTED_TARGET_BACKUP_HOOK_SHA256" ]] || fail "Canonical backup/copy hook differs from its reviewed digest."
 [[ "$(sha256_file "$compose_file")" == "$EXPECTED_TARGET_COMPOSE_SHA256" ]] || fail "Staged Compose definition differs from its reviewed digest."
-[[ "$(sha256_file "$BACKUP_AND_COPY_HOOK")" == "$EXPECTED_BACKUP_AND_COPY_HOOK_SHA256" ]] || fail "Backup/copy hook differs from its reviewed digest."
+[[ "$(sha256_file "$POSTGRES_BACKUP_TOOL")" == "$EXPECTED_POSTGRES_BACKUP_TOOL_SHA256" ]] || fail "Postgres backup tool differs from its reviewed digest."
 
 python3 - "$app_real" "$AIRFOILS_PRO_STATE_DIR" "$DATABASE_BACKUP_FILE" \
   "$DATABASE_BACKUP_MANIFEST" "$DATABASE_BACKUP_OFF_VPS_RECEIPT" <<'PY'
@@ -222,6 +225,7 @@ source_contract="$work_dir/source.json"
   --expected-file-hash "scripts/deploy/verify-opencfd2606-canary-migration.sh=$EXPECTED_TARGET_MIGRATION_VERIFIER_SHA256" \
   --expected-file-hash "scripts/deploy/pending-cutover-canary-db-ack-recovery.py=$EXPECTED_TARGET_CONTRACT_HELPER_SHA256" \
   --expected-file-hash "scripts/deploy/recover-pending-opencfd2606-canary-db-ack.sh=$EXPECTED_TARGET_RECOVERY_RUNNER_SHA256" \
+  --expected-file-hash "scripts/deploy/create-verified-canary-postgres-backup.sh=$EXPECTED_TARGET_BACKUP_HOOK_SHA256" \
   --expected-file-hash "docker-compose.deploy.yml=$EXPECTED_TARGET_COMPOSE_SHA256" \
   >"$source_contract"
 
@@ -320,7 +324,8 @@ capture_runtime() {
 media_identity="$work_dir/media-identity.json"
 python3 - "$source_contract" "$predecessors" \
   "$EXPECTED_CURRENT_MEDIA_REPAIR_CONTAINER_ID" "$EXPECTED_CURRENT_MEDIA_REPAIR_IMAGE_ID" \
-  "$EXPECTED_RESULTS_VOLUME_IDENTITY_SHA256" "$EXPECTED_BACKUP_AND_COPY_HOOK_SHA256" <<'PY' >"$media_identity"
+  "$EXPECTED_RESULTS_VOLUME_IDENTITY_SHA256" "$EXPECTED_TARGET_BACKUP_HOOK_SHA256" \
+  "$EXPECTED_POSTGRES_BACKUP_TOOL_SHA256" <<'PY' >"$media_identity"
 import json
 from pathlib import Path
 import sys
@@ -339,6 +344,7 @@ payload = {
     "mediaRepairImageId": sys.argv[4],
     "resultsVolumeIdentitySha256": sys.argv[5],
     "backupAndCopyHookSha256": sys.argv[6],
+    "postgresBackupToolSha256": sys.argv[7],
 }
 print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 PY
@@ -415,9 +421,6 @@ PY
 
 backup_not_before="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["stoppedAt"])' "$MEDIA_QUIESCE_JOURNAL")"
 if [[ "$media_status" == "stopped-for-backup" ]]; then
-  for path in "$DATABASE_BACKUP_FILE" "$DATABASE_BACKUP_MANIFEST" "$DATABASE_BACKUP_OFF_VPS_RECEIPT"; do
-    [[ ! -e "$path" && ! -L "$path" ]] || fail "Fresh backup hook refuses a preexisting artifact: $path"
-  done
   ENV_FILE="$ENV_FILE" COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" \
     COMPOSE_FILE="$app_real/docker-compose.deploy.yml" COMPOSE_PROJECT_DIRECTORY="$app_real" \
     DATABASE_BACKUP_FILE="$DATABASE_BACKUP_FILE" \
@@ -425,8 +428,10 @@ if [[ "$media_status" == "stopped-for-backup" ]]; then
     DATABASE_BACKUP_OFF_VPS_RECEIPT="$DATABASE_BACKUP_OFF_VPS_RECEIPT" \
     EXPECTED_POSTGRES_CONTAINER_ID="$EXPECTED_CURRENT_POSTGRES_CONTAINER_ID" \
     EXPECTED_POSTGRES_IMAGE_ID="$EXPECTED_CURRENT_POSTGRES_IMAGE_ID" \
+    POSTGRES_BACKUP_TOOL="$POSTGRES_BACKUP_TOOL" \
+    EXPECTED_POSTGRES_BACKUP_TOOL_SHA256="$EXPECTED_POSTGRES_BACKUP_TOOL_SHA256" \
     MEDIA_QUIESCE_JOURNAL="$MEDIA_QUIESCE_JOURNAL" DEPLOY_LOCK_HELD=1 \
-    "$BACKUP_AND_COPY_HOOK"
+    "$backup_and_copy_hook"
 elif [[ "$media_status" != "backup-verified" ]]; then
   fail "Media quiesce state cannot authorize backup creation."
 fi

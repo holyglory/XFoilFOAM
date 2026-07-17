@@ -254,17 +254,26 @@ def _backup_fixture(tmp_path: Path):
         "backupSha256": _sha(dump),
         "backupSize": dump.stat().st_size,
         "backupManifestSha256": _sha(manifest_path),
+        "backupManifestSize": manifest_path.stat().st_size,
         "sourceContainerId": container_id,
+        "sourceImageId": image_id,
         "destination": {
             "scheme": "gs",
             "locator": "gs://private-backups/aerodb.dump",
             "immutableVersion": "1780000000000000",
+            "manifestLocator": (
+                "gs://private-backups/aerodb.dump."
+                f"{_sha(manifest_path)}.manifest.json"
+            ),
+            "manifestImmutableVersion": "1780000000000001",
         },
         "verification": {
             "ok": True,
             "method": "remote-download-sha256",
             "sha256": _sha(dump),
             "size": dump.stat().st_size,
+            "manifestSha256": _sha(manifest_path),
+            "manifestSize": manifest_path.stat().st_size,
             "verifiedAt": "2026-07-17T03:14:00Z",
         },
     }
@@ -297,6 +306,19 @@ def test_backup_contract_requires_scratch_restore_and_verified_off_vps_copy(
     _private_json(args.manifest, manifest)
     args.expected_manifest_sha256 = _sha(args.manifest)
     with pytest.raises(helper.ContractError, match="strong verification"):
+        helper.validate_backup_contract(args)
+
+
+def test_backup_contract_requires_generation_locked_remote_manifest_proof(
+    tmp_path: Path,
+) -> None:
+    helper, args, _manifest = _backup_fixture(tmp_path)
+    receipt = json.loads(args.off_vps_receipt.read_text(encoding="utf-8"))
+    receipt["verification"].pop("manifestSha256")
+    _private_json(args.off_vps_receipt, receipt)
+    args.expected_receipt_sha256 = _sha(args.off_vps_receipt)
+
+    with pytest.raises(helper.ContractError, match="remote verification"):
         helper.validate_backup_contract(args)
 
 
@@ -535,13 +557,15 @@ def test_wrapper_is_incident_bound_and_never_recreates_or_overwrites_predecessor
     assert "pending-cutover-queue-probe-resume.json" in wrapper
     assert "pending-opencfd2606-rebuild-replay.json" in wrapper
     assert "EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256" in wrapper
-    assert "EXPECTED_BACKUP_AND_COPY_HOOK_SHA256" in wrapper
-    assert "Reviewed backup/copy hook must use an absolute path." in wrapper
-    hook_call = wrapper.rindex('\n    "$BACKUP_AND_COPY_HOOK"\n')
+    assert "EXPECTED_TARGET_BACKUP_HOOK_SHA256" in wrapper
+    assert "EXPECTED_POSTGRES_BACKUP_TOOL_SHA256" in wrapper
+    assert "scripts/deploy/create-verified-canary-postgres-backup.sh" in wrapper
+    hook_call = wrapper.rindex('\n    "$backup_and_copy_hook"\n')
     assert wrapper.index("flock -n 9") < wrapper.index("source_contract=")
     assert wrapper.index("flock -n 9") < wrapper.index("compose_bound stop media-repair")
     assert wrapper.index("compose_bound stop media-repair") < hook_call
-    assert wrapper.index("Fresh backup hook refuses a preexisting artifact") < hook_call
+    assert "Fresh backup hook refuses a preexisting artifact" not in wrapper
+    assert wrapper.index('if [[ "$media_status" == "stopped-for-backup" ]]') < hook_call
     assert hook_call < wrapper.index('"$contract_helper" backup')
     assert "DEPLOY_LOCK_HELD=1" in wrapper
     assert 'COMPOSE_PROJECT_DIRECTORY="$staging_real"' in wrapper

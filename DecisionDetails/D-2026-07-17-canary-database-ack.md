@@ -74,6 +74,16 @@ ambiguous marker state forbids image rollback and retains the exact database
 replay state. `media-repair` is recreated and returned to its initial running
 state only on the terminal successful path; every failure leaves it stopped.
 
+The database safety hook is itself part of the manifested target source. A
+retry while the media writer remains `stopped-for-backup` reconciles rather
+than rejects durable partial publication: exact strongly verified local bytes
+are reused; incomplete or hash-unmatched local pairs are moved into a private,
+fsynced, no-clobber quarantine; and complete provenance conflicts fail closed.
+Both the dump and its verification manifest use create-only GCS publication
+followed by numeric-generation-pinned download, SHA-256, and size verification.
+Only those two proofs can authorize an exclusively published, same-parent
+fsynced receipt, which an exact retry validates without rewriting.
+
 Unrelated old-contract canary jobs remain terminal engine evidence. They are
 not imported as canonical results, retrospectively registered, deleted, or
 included in a new attestation. A fresh repaired canary owns new job IDs and its
@@ -105,7 +115,10 @@ lost cleanup responses, exact ACK replay, local archive size/SHA mismatch,
 mixed/duplicate association kinds, cross-language digest parity, every-point
 remote rendering, and the presence of unrelated retained old-contract jobs.
 Migration verification also proves 0072 refuses to invent registrations for
-historical immutable attestations.
+historical immutable attestations. Backup fault-injection coverage interrupts
+local publication, dump upload, manifest upload, and receipt publication in
+turn, then proves exact replay, generation conservation, collision refusal,
+and preservation of every quarantined byte.
 
 Production remains incomplete until migration 0072, the matching Node
 control-plane services, and the matching Python gateway/worker are deployed
