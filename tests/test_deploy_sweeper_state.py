@@ -578,6 +578,12 @@ def test_deploy_scripts_preserve_sweeper_state(
     assert completed.returncode == 0, completed.stdout + completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     stopped_restore = " up --no-start --no-deps --force-recreate sweeper"
+    queue_probes = [call for call in calls if ":8000/queue" in call]
+    if script == "rebuild-engine.sh":
+        assert queue_probes
+        assert all("--max-time 15" in call for call in queue_probes)
+    else:
+        assert not queue_probes
     if initial_state == "stopped":
         assert any(stopped_restore in call for call in calls)
         assert not any(running_restore in call for call in calls)

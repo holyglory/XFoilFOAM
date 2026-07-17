@@ -72,6 +72,11 @@ ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS=15
 OPENCFD2606_CANARY_RECEIPT_FILE="${OPENCFD2606_CANARY_RECEIPT_FILE:-$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json}"
 OPENCFD_2606_POOL_ID="3f8bc764-09ae-4ff3-8fd2-260600000001"
 CUTOVER_API_BASE="http://127.0.0.1:4000/api/admin/solver-engine-cutovers/opencfd-2606"
+# Maintenance queue snapshots include authoritative Celery inspection and can
+# legitimately finish just after five seconds on the production 2606 worker.
+# Keep this reviewed, non-configurable timeout local to the destructive engine
+# idle guard; ordinary health/readiness probes retain their tighter limits.
+ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS=15
 CUTOVER_ATTESTATION_ID=""
 OPENCFD2606_FAIL_SAFE_ARMED=false
 OPENCFD2606_POOL_FAIL_SAFE_DISABLED=false
@@ -819,7 +824,7 @@ run_opencfd_2606_production_canaries() {
   local receipt_file="$1"
   local image_digest evidence_bucket evidence_prefix evidence_zstd_level
   local -a command=(
-    python3 "$APP_DIR/scripts/deploy/openfoam_2606_canary.py"
+    python3 "$DEPLOY_SCRIPT_DIR/openfoam_2606_canary.py"
     --gateway-url http://127.0.0.1:8000
     --expected-build-id "$BUILD_ID"
   )
@@ -860,7 +865,7 @@ verify_retained_opencfd_2606_receipt() {
   local receipt_file="$1"
   local build_id image_digest evidence_bucket evidence_prefix evidence_zstd_level
   local -a command=(
-    python3 "$APP_DIR/scripts/deploy/openfoam_2606_canary.py"
+    python3 "$DEPLOY_SCRIPT_DIR/openfoam_2606_canary.py"
     --gateway-url http://127.0.0.1:8000
     --verify-receipt "$receipt_file"
   )
