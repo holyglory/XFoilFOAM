@@ -31,6 +31,7 @@ import {
   simUransVerifyQueueRequests,
   simulationPresets,
   solverProfiles,
+  solverRuntimeBuilds,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import {
@@ -289,19 +290,34 @@ beforeAll(async () => {
     .returning();
   sourceResultAttemptId = sourceAttempt.id;
 
-  await db.insert(resultClassifications).values({
-    resultId: sourceResultId,
-    resultAttemptId: sourceResultAttemptId,
-    airfoilId,
-    simulationPresetRevisionId: revisionId,
-    aoaDeg: AOA,
-    regime: "rans",
-    classifierVersion: "three-stage-canary-live-db-v1",
-    state: "rejected",
-    region: "post_stall",
-    confidence: 1,
-    reasons: ["not-converged"],
-  });
+  await db.insert(resultClassifications).values([
+    {
+      resultId: null,
+      resultAttemptId: sourceResultAttemptId,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: AOA,
+      regime: "rans",
+      classifierVersion: "three-stage-canary-live-db-v1",
+      state: "rejected",
+      region: "post_stall",
+      confidence: 1,
+      reasons: ["not-converged"],
+    },
+    {
+      resultId: sourceResultId,
+      resultAttemptId: null,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: AOA,
+      regime: "rans",
+      classifierVersion: "three-stage-canary-live-db-v1",
+      state: "rejected",
+      region: "post_stall",
+      confidence: 1,
+      reasons: ["not-converged"],
+    },
+  ]);
   await db
     .update(results)
     .set({ currentResultAttemptId: sourceResultAttemptId })
@@ -780,7 +796,7 @@ describe("three-stage URANS canary production DB seam", () => {
               marker,
               rejectedPrecalc,
             ),
-          ).toThrow("does not pin accepted preliminary evidence");
+          ).toThrow("does not pin the expected preliminary evidence lifecycle");
         } finally {
           await db
             .update(resultClassifications)
@@ -788,6 +804,287 @@ describe("three-stage URANS canary production DB seam", () => {
             .where(
               eq(resultClassifications.id, acceptedPrecalcClassification.id),
             );
+        }
+
+        let runtimeBuildId: string | null = null;
+        let finalJobId: string | null = null;
+        let acceptedFinalAttemptId: string | null = null;
+        let acceptedFinalClassificationId: string | null = null;
+        try {
+          const runtimeProvenanceKey = Buffer.from(`${PREFIX}:terminal-runtime`)
+            .toString("hex")
+            .padEnd(64, "0")
+            .slice(0, 64);
+          const [runtimeBuild] = await db
+            .insert(solverRuntimeBuilds)
+            .values({
+              solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+              provenanceKey: runtimeProvenanceKey,
+              buildId: target.expectedEngineBuildId,
+              sourceRevision: `${PREFIX}-terminal-source`,
+              applicationSourceSha256: runtimeProvenanceKey,
+              architecture: "x86_64",
+            })
+            .returning();
+          runtimeBuildId = runtimeBuild.id;
+          const [finalJob] = await db
+            .insert(simJobs)
+            .values({
+              airfoilId,
+              bcIds: [bcId],
+              simulationPresetRevisionId: revisionId,
+              methodKey: "openfoam.urans",
+              solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+              solverExecutionPoolId: OPENCFD_2606_EXECUTION_POOL_ID,
+              solverRuntimeBuildId: runtimeBuild.id,
+              jobKind: "verify",
+              referenceChordM: CHORD,
+              wave: 2,
+              status: "done",
+              engineState: "completed",
+              engineJobId: `${PREFIX}-final-engine`,
+              totalCases: 1,
+              completedCases: 1,
+              requestPayload: {
+                aoas: [AOA],
+                uransFidelity: "full",
+                verifyQueueItemId: verify.id,
+                verifyPrecalcResultAttemptId: acceptedPrecalcAttempt.id,
+              },
+              submittedAt: new Date(),
+              ingestedAt: new Date(),
+              finishedAt: new Date(),
+            })
+            .returning();
+          finalJobId = finalJob.id;
+          const [acceptedFinalAttempt] = await db
+            .insert(resultAttempts)
+            .values({
+              resultId: sourceResultId,
+              airfoilId,
+              bcId,
+              simulationPresetRevisionId: revisionId,
+              aoaDeg: AOA,
+              simJobId: finalJob.id,
+              engineJobId: finalJob.engineJobId,
+              engineCaseSlug: `aoa_${AOA}_full`,
+              methodKey: "openfoam.urans",
+              solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+              solverRuntimeBuildId: runtimeBuild.id,
+              status: "done",
+              source: "solved",
+              regime: "urans",
+              validForPolar: true,
+              cl: 0.8,
+              cd: 0.084,
+              cm: -0.059,
+              clCd: 0.8 / 0.084,
+              stalled: true,
+              converged: true,
+              unsteady: true,
+              evidencePayload: { fidelity: "urans_full" },
+              solvedAt: new Date(),
+            })
+            .returning();
+          acceptedFinalAttemptId = acceptedFinalAttempt.id;
+          const [acceptedFinalClassification] = await db
+            .insert(resultClassifications)
+            .values({
+              resultId: null,
+              resultAttemptId: acceptedFinalAttempt.id,
+              airfoilId,
+              simulationPresetRevisionId: revisionId,
+              aoaDeg: AOA,
+              regime: "urans",
+              classifierVersion: "three-stage-canary-live-db-v1",
+              state: "accepted",
+              region: "post_stall",
+              confidence: 1,
+              reasons: [],
+            })
+            .returning();
+          acceptedFinalClassificationId = acceptedFinalClassification.id;
+          await db
+            .update(resultClassifications)
+            .set({
+              state: "superseded_by_urans",
+              supersededByResultId: sourceResultId,
+              reasons: ["urans-verify-replacement"],
+            })
+            .where(
+              eq(resultClassifications.id, acceptedPrecalcClassification.id),
+            );
+          await db
+            .update(results)
+            .set({
+              currentResultAttemptId: acceptedFinalAttempt.id,
+              status: "done",
+              source: "solved",
+              regime: "urans",
+              cl: 0.8,
+              cd: 0.084,
+              cm: -0.059,
+              clCd: 0.8 / 0.084,
+              stalled: true,
+              converged: true,
+              unsteady: true,
+              fidelity: "urans_full",
+              simJobId: finalJob.id,
+              engineJobId: finalJob.engineJobId,
+              engineCaseSlug: `aoa_${AOA}_full`,
+              methodKey: "openfoam.urans",
+              solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+              solverRuntimeBuildId: runtimeBuild.id,
+              error: null,
+            })
+            .where(eq(results.id, sourceResultId));
+          await db
+            .update(resultClassifications)
+            .set({
+              regime: "urans",
+              state: "accepted",
+              reasons: [],
+              supersededByResultId: null,
+            })
+            .where(eq(resultClassifications.resultId, sourceResultId));
+          await db
+            .update(simUransVerifyQueue)
+            .set({
+              state: "disagreed",
+              simJobId: finalJob.id,
+              verifyResultId: sourceResultId,
+              latestResultAttemptId: acceptedFinalAttempt.id,
+              deltaCl: -0.01,
+              deltaCd: 0.02,
+              deltaCm: -0.009,
+              freshAttemptCount: 1,
+              lastOutcome: "disagreed",
+            })
+            .where(eq(simUransVerifyQueue.id, verify.id));
+          await db
+            .update(simUransRequests)
+            .set({ state: "done" })
+            .where(eq(simUransRequests.id, requestId));
+
+          const terminal = await loadOwnershipSnapshot();
+          expect(terminal.verifyPrecalcAttempt).toMatchObject({
+            id: acceptedPrecalcAttempt.id,
+            classificationState: "superseded_by_urans",
+            supersededByResultId: sourceResultId,
+          });
+          expect(terminal.verify).toMatchObject({
+            state: "disagreed",
+            simJobId: finalJob.id,
+            verifyResultId: sourceResultId,
+            latestResultAttemptId: acceptedFinalAttempt.id,
+          });
+          expect(terminal.verifyLatestAttempt).toMatchObject({
+            id: acceptedFinalAttempt.id,
+            resultId: sourceResultId,
+            simJobId: finalJob.id,
+            fidelity: "urans_full",
+            classificationState: "accepted",
+            solverRuntimeBuildId: runtimeBuild.id,
+            solverRuntimeBuildLabel: target.expectedEngineBuildId,
+          });
+          expect(terminal.sourceResult).toMatchObject({
+            currentResultAttemptId: acceptedFinalAttempt.id,
+            status: "done",
+            source: "solved",
+            regime: "urans",
+            methodKey: "openfoam.urans",
+            fidelity: "urans_full",
+            classificationState: "accepted",
+            classificationRegime: "urans",
+            solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+            solverRuntimeBuildId: runtimeBuild.id,
+            solverRuntimeBuildLabel: target.expectedEngineBuildId,
+          });
+          expect(() =>
+            validateThreeStageUransCanarySnapshot(target, marker, terminal),
+          ).not.toThrow();
+        } finally {
+          await db
+            .update(simUransRequests)
+            .set({ state: "pending" })
+            .where(eq(simUransRequests.id, requestId));
+          await db
+            .update(simUransVerifyQueue)
+            .set({
+              state: "pending",
+              simJobId: null,
+              verifyResultId: null,
+              latestResultAttemptId: null,
+              deltaCl: null,
+              deltaCd: null,
+              deltaCm: null,
+              freshAttemptCount: 0,
+              lastOutcome: null,
+            })
+            .where(eq(simUransVerifyQueue.id, verify.id));
+          await db
+            .update(results)
+            .set({
+              currentResultAttemptId: sourceResultAttemptId,
+              status: "done",
+              source: "solved",
+              regime: "rans",
+              cl: 0.83,
+              cd: 0.061,
+              cm: -0.052,
+              clCd: 0.83 / 0.061,
+              stalled: true,
+              converged: false,
+              unsteady: false,
+              fidelity: "rans",
+              simJobId: parentJobId,
+              engineJobId: `${PREFIX}-rans-engine`,
+              engineCaseSlug: `aoa_${AOA}`,
+              methodKey: "openfoam.rans",
+              solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+              solverRuntimeBuildId: null,
+              error: "steady RANS did not converge",
+            })
+            .where(eq(results.id, sourceResultId));
+          await db
+            .update(resultClassifications)
+            .set({
+              regime: "rans",
+              state: "rejected",
+              reasons: ["not-converged"],
+              supersededByResultId: null,
+            })
+            .where(eq(resultClassifications.resultId, sourceResultId));
+          await db
+            .update(resultClassifications)
+            .set({
+              state: "accepted",
+              supersededByResultId: null,
+              reasons: [],
+            })
+            .where(
+              eq(resultClassifications.id, acceptedPrecalcClassification.id),
+            );
+          if (acceptedFinalClassificationId) {
+            await db
+              .delete(resultClassifications)
+              .where(
+                eq(resultClassifications.id, acceptedFinalClassificationId),
+              );
+          }
+          if (acceptedFinalAttemptId) {
+            await db
+              .delete(resultAttempts)
+              .where(eq(resultAttempts.id, acceptedFinalAttemptId));
+          }
+          if (finalJobId) {
+            await db.delete(simJobs).where(eq(simJobs.id, finalJobId));
+          }
+          if (runtimeBuildId) {
+            await db
+              .delete(solverRuntimeBuilds)
+              .where(eq(solverRuntimeBuilds.id, runtimeBuildId));
+          }
         }
       } finally {
         await db

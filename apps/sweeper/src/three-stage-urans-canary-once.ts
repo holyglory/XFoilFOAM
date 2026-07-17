@@ -131,6 +131,17 @@ export interface ThreeStageUransCanarySnapshot {
     airfoilId: string;
     revisionId: string | null;
     aoaDeg: number;
+    currentResultAttemptId: string | null;
+    status: string;
+    source: string;
+    regime: string | null;
+    methodKey: string | null;
+    fidelity: string | null;
+    classificationState: string | null;
+    classificationRegime: string | null;
+    solverImplementationId: string | null;
+    solverRuntimeBuildId: string | null;
+    solverRuntimeBuildLabel: string | null;
   } | null;
   sourceAttempt: {
     resultId: string | null;
@@ -202,6 +213,7 @@ export interface ThreeStageUransCanarySnapshot {
     state: string;
     simJobId: string | null;
     precalcResultId: string;
+    verifyResultId: string | null;
     precalcResultAttemptId: string | null;
     latestResultAttemptId: string | null;
     freshAttemptCount: number;
@@ -227,7 +239,25 @@ export interface ThreeStageUransCanarySnapshot {
     methodKey: string | null;
     fidelity: string | null;
     classificationState: string | null;
+    supersededByResultId: string | null;
     precalcObligationId: string | null;
+  } | null;
+  verifyLatestAttempt: {
+    id: string;
+    resultId: string | null;
+    simJobId: string | null;
+    airfoilId: string;
+    revisionId: string | null;
+    aoaDeg: number;
+    status: string;
+    source: string;
+    regime: string | null;
+    methodKey: string | null;
+    fidelity: string | null;
+    classificationState: string | null;
+    solverImplementationId: string | null;
+    solverRuntimeBuildId: string | null;
+    solverRuntimeBuildLabel: string | null;
   } | null;
   conflictingOpenVerifyIds: string[];
   targetOpenCriticalIncidentCount: number;
@@ -805,6 +835,15 @@ export function validateThreeStageUransCanarySnapshot(
           "the final-verification item is shared with a request outside the exact canary chain",
         );
       const preliminary = snapshot.verifyPrecalcAttempt;
+      const terminalVerifySucceeded = TERMINAL_VERIFY_SUCCESS_STATES.has(
+        verify.state,
+      );
+      const expectedPreliminaryClassification = terminalVerifySucceeded
+        ? "superseded_by_urans"
+        : "accepted";
+      const expectedPreliminarySupersession = terminalVerifySucceeded
+        ? verify.verifyResultId
+        : null;
       if (
         !preliminary ||
         preliminary.id !== verify.precalcResultAttemptId ||
@@ -817,11 +856,58 @@ export function validateThreeStageUransCanarySnapshot(
         preliminary.regime !== "urans" ||
         preliminary.methodKey !== "openfoam.urans" ||
         preliminary.fidelity !== "urans_precalc" ||
-        preliminary.classificationState !== "accepted" ||
+        preliminary.classificationState !== expectedPreliminaryClassification ||
+        preliminary.supersededByResultId !== expectedPreliminarySupersession ||
         preliminary.precalcObligationId !== target.precalcObligationId
       ) {
         throw canaryError(
-          "the final-verification item does not pin accepted preliminary evidence from the exact obligation",
+          "the final-verification item does not pin the expected preliminary evidence lifecycle from the exact obligation",
+        );
+      }
+      const latest = snapshot.verifyLatestAttempt;
+      if (
+        (verify.latestResultAttemptId == null) !== (latest == null) ||
+        (latest != null && latest.id !== verify.latestResultAttemptId)
+      ) {
+        throw canaryError(
+          "the final-verification latest-attempt pointer is missing or inconsistent",
+        );
+      }
+      if (
+        terminalVerifySucceeded &&
+        (!latest ||
+          !verify.simJobId ||
+          verify.verifyResultId !== target.sourceResultId ||
+          latest.resultId !== verify.verifyResultId ||
+          latest.simJobId !== verify.simJobId ||
+          latest.airfoilId !== target.airfoilId ||
+          latest.revisionId !== target.revisionId ||
+          !Object.is(latest.aoaDeg, target.aoaDeg) ||
+          latest.status !== "done" ||
+          latest.source !== "solved" ||
+          latest.regime !== "urans" ||
+          latest.methodKey !== "openfoam.urans" ||
+          latest.fidelity !== "urans_full" ||
+          latest.classificationState !== "accepted" ||
+          latest.solverImplementationId !==
+            OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
+          !latest.solverRuntimeBuildId ||
+          latest.solverRuntimeBuildLabel !== target.expectedEngineBuildId ||
+          sourceResult.currentResultAttemptId !== latest.id ||
+          sourceResult.status !== "done" ||
+          sourceResult.source !== "solved" ||
+          sourceResult.regime !== "urans" ||
+          sourceResult.methodKey !== "openfoam.urans" ||
+          sourceResult.fidelity !== "urans_full" ||
+          sourceResult.classificationState !== "accepted" ||
+          sourceResult.classificationRegime !== "urans" ||
+          sourceResult.solverImplementationId !==
+            OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
+          sourceResult.solverRuntimeBuildId !== latest.solverRuntimeBuildId ||
+          sourceResult.solverRuntimeBuildLabel !== target.expectedEngineBuildId)
+      ) {
+        throw canaryError(
+          "the terminal final-verification item does not publish one accepted full-URANS generation from the expected runtime",
         );
       }
       if (
@@ -871,7 +957,8 @@ export function validateThreeStageUransCanarySnapshot(
       }
     } else if (
       snapshot.verifyRequestIds.length > 0 ||
-      snapshot.verifyPrecalcAttempt != null
+      snapshot.verifyPrecalcAttempt != null ||
+      snapshot.verifyLatestAttempt != null
     ) {
       throw canaryError(
         "final-verification ownership or evidence exists without the exact queue item",
@@ -1374,8 +1461,27 @@ export function productionThreeStageUransCanaryDependencies(
             airfoilId: results.airfoilId,
             revisionId: results.simulationPresetRevisionId,
             aoaDeg: results.aoaDeg,
+            currentResultAttemptId: results.currentResultAttemptId,
+            status: results.status,
+            source: results.source,
+            regime: results.regime,
+            methodKey: results.methodKey,
+            fidelity: results.fidelity,
+            classificationState: resultClassifications.state,
+            classificationRegime: resultClassifications.regime,
+            solverImplementationId: results.solverImplementationId,
+            solverRuntimeBuildId: results.solverRuntimeBuildId,
+            solverRuntimeBuildLabel: solverRuntimeBuilds.buildId,
           })
           .from(results)
+          .leftJoin(
+            resultClassifications,
+            eq(resultClassifications.resultId, results.id),
+          )
+          .leftJoin(
+            solverRuntimeBuilds,
+            eq(solverRuntimeBuilds.id, results.solverRuntimeBuildId),
+          )
           .where(eq(results.id, target.sourceResultId))
           .limit(1),
         db
@@ -1651,6 +1757,7 @@ export function productionThreeStageUransCanaryDependencies(
                 state: simUransVerifyQueue.state,
                 simJobId: simUransVerifyQueue.simJobId,
                 precalcResultId: simUransVerifyQueue.precalcResultId,
+                verifyResultId: simUransVerifyQueue.verifyResultId,
                 precalcResultAttemptId:
                   simUransVerifyQueue.precalcResultAttemptId,
                 latestResultAttemptId:
@@ -1675,69 +1782,115 @@ export function productionThreeStageUransCanaryDependencies(
           ])
         : [[], [], []];
       const verify = verifyRows[0] ?? null;
-      const [verifyOwners, verifyRequestOwners, verifyPrecalcAttemptRows] =
-        verify
-          ? await Promise.all([
-              db
-                .select({ campaignId: simUransVerifyQueueCampaigns.campaignId })
-                .from(simUransVerifyQueueCampaigns)
-                .where(
-                  and(
-                    eq(simUransVerifyQueueCampaigns.queueId, verify.id),
-                    eq(simUransVerifyQueueCampaigns.state, "active"),
-                  ),
-                )
-                .orderBy(asc(simUransVerifyQueueCampaigns.campaignId)),
-              db
-                .select({ requestId: simUransVerifyQueueRequests.requestId })
-                .from(simUransVerifyQueueRequests)
-                .where(eq(simUransVerifyQueueRequests.queueId, verify.id))
-                .orderBy(asc(simUransVerifyQueueRequests.requestId)),
-              verify.precalcResultAttemptId
-                ? db
-                    .select({
-                      id: resultAttempts.id,
-                      resultId: resultAttempts.resultId,
-                      airfoilId: resultAttempts.airfoilId,
-                      revisionId: resultAttempts.simulationPresetRevisionId,
-                      aoaDeg: resultAttempts.aoaDeg,
-                      status: resultAttempts.status,
-                      source: resultAttempts.source,
-                      regime: resultAttempts.regime,
-                      methodKey: resultAttempts.methodKey,
-                      fidelity: sql<
-                        string | null
-                      >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
-                      classificationState: resultClassifications.state,
-                      precalcObligationId:
-                        simPrecalcObligationAttempts.obligationId,
-                    })
-                    .from(resultAttempts)
-                    .leftJoin(
-                      resultClassifications,
+      const [
+        verifyOwners,
+        verifyRequestOwners,
+        verifyPrecalcAttemptRows,
+        verifyLatestAttemptRows,
+      ] = verify
+        ? await Promise.all([
+            db
+              .select({ campaignId: simUransVerifyQueueCampaigns.campaignId })
+              .from(simUransVerifyQueueCampaigns)
+              .where(
+                and(
+                  eq(simUransVerifyQueueCampaigns.queueId, verify.id),
+                  eq(simUransVerifyQueueCampaigns.state, "active"),
+                ),
+              )
+              .orderBy(asc(simUransVerifyQueueCampaigns.campaignId)),
+            db
+              .select({ requestId: simUransVerifyQueueRequests.requestId })
+              .from(simUransVerifyQueueRequests)
+              .where(eq(simUransVerifyQueueRequests.queueId, verify.id))
+              .orderBy(asc(simUransVerifyQueueRequests.requestId)),
+            verify.precalcResultAttemptId
+              ? db
+                  .select({
+                    id: resultAttempts.id,
+                    resultId: resultAttempts.resultId,
+                    airfoilId: resultAttempts.airfoilId,
+                    revisionId: resultAttempts.simulationPresetRevisionId,
+                    aoaDeg: resultAttempts.aoaDeg,
+                    status: resultAttempts.status,
+                    source: resultAttempts.source,
+                    regime: resultAttempts.regime,
+                    methodKey: resultAttempts.methodKey,
+                    fidelity: sql<
+                      string | null
+                    >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+                    classificationState: resultClassifications.state,
+                    supersededByResultId:
+                      resultClassifications.supersededByResultId,
+                    precalcObligationId:
+                      simPrecalcObligationAttempts.obligationId,
+                  })
+                  .from(resultAttempts)
+                  .leftJoin(
+                    resultClassifications,
+                    eq(
+                      resultClassifications.resultAttemptId,
+                      resultAttempts.id,
+                    ),
+                  )
+                  .leftJoin(
+                    simPrecalcObligationAttempts,
+                    and(
                       eq(
-                        resultClassifications.resultAttemptId,
+                        simPrecalcObligationAttempts.resultAttemptId,
                         resultAttempts.id,
                       ),
-                    )
-                    .leftJoin(
-                      simPrecalcObligationAttempts,
-                      and(
-                        eq(
-                          simPrecalcObligationAttempts.resultAttemptId,
-                          resultAttempts.id,
-                        ),
-                        eq(
-                          simPrecalcObligationAttempts.obligationId,
-                          target.precalcObligationId,
-                        ),
+                      eq(
+                        simPrecalcObligationAttempts.obligationId,
+                        target.precalcObligationId,
                       ),
-                    )
-                    .where(eq(resultAttempts.id, verify.precalcResultAttemptId))
-                    .limit(1)
-                : Promise.resolve([]),
-            ])
-          : [[], [], []];
+                    ),
+                  )
+                  .where(eq(resultAttempts.id, verify.precalcResultAttemptId))
+                  .limit(1)
+              : Promise.resolve([]),
+            verify.latestResultAttemptId
+              ? db
+                  .select({
+                    id: resultAttempts.id,
+                    resultId: resultAttempts.resultId,
+                    simJobId: resultAttempts.simJobId,
+                    airfoilId: resultAttempts.airfoilId,
+                    revisionId: resultAttempts.simulationPresetRevisionId,
+                    aoaDeg: resultAttempts.aoaDeg,
+                    status: resultAttempts.status,
+                    source: resultAttempts.source,
+                    regime: resultAttempts.regime,
+                    methodKey: resultAttempts.methodKey,
+                    fidelity: sql<
+                      string | null
+                    >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+                    classificationState: resultClassifications.state,
+                    solverImplementationId:
+                      resultAttempts.solverImplementationId,
+                    solverRuntimeBuildId: resultAttempts.solverRuntimeBuildId,
+                    solverRuntimeBuildLabel: solverRuntimeBuilds.buildId,
+                  })
+                  .from(resultAttempts)
+                  .leftJoin(
+                    resultClassifications,
+                    eq(
+                      resultClassifications.resultAttemptId,
+                      resultAttempts.id,
+                    ),
+                  )
+                  .leftJoin(
+                    solverRuntimeBuilds,
+                    eq(
+                      solverRuntimeBuilds.id,
+                      resultAttempts.solverRuntimeBuildId,
+                    ),
+                  )
+                  .where(eq(resultAttempts.id, verify.latestResultAttemptId))
+                  .limit(1)
+              : Promise.resolve([]),
+          ])
+        : [[], [], [], []];
       const targetCriticalIncidents = targetOpenCriticalIncidents(
         target,
         request?.id ?? null,
@@ -1801,6 +1954,7 @@ export function productionThreeStageUransCanaryDependencies(
         verifyOwnerCampaignIds: verifyOwners.map((owner) => owner.campaignId),
         verifyRequestIds: verifyRequestOwners.map((owner) => owner.requestId),
         verifyPrecalcAttempt: verifyPrecalcAttemptRows[0] ?? null,
+        verifyLatestAttempt: verifyLatestAttemptRows[0] ?? null,
         conflictingOpenVerifyIds: conflictingOpenVerifies
           .map((row) => row.id)
           .filter((id) => id !== verify?.id),

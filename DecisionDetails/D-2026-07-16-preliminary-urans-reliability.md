@@ -269,6 +269,31 @@ and validated by the canary target. Unit and live-database seam regressions use
 this post-ingestion state so final admission cannot regress to the unrealistic
 pre-ingestion fixture.
 
+The linked production final generation then completed on the same exact chain.
+It retained five repeatable periods and 144 real field frames, published full
+URANS attempt `5a473347-0034-4cce-819c-d737066fd83b` as the canonical
+generation of result `54d62432-8ba2-4fdb-a27b-39f709f00712`, and archived its
+immutable evidence as a verified content-addressed Zstandard object in GCS.
+Its fast/final differences exceeded only the comparison tolerance, so queue
+item `2dd2508d-db51-4058-a1e8-2c9ac5d46548` truthfully settled `disagreed`
+while the accepted final generation remained publishable.
+
+That terminal transition exposed a fail-closed auditor defect rather than a
+solver defect. Final publication correctly changes the accepted preliminary
+attempt classification to `superseded_by_urans`, points that supersession at
+the same canonical result, and advances both the verification and canonical
+result pointers to the accepted full generation. The original one-shot
+validator still required the preliminary classification to remain `accepted`,
+so it rejected the already-correct terminal state. The terminal contract now
+requires all of those transitions together: the exact preliminary generation
+is superseded by the exact verified result; the verification item owns a
+non-null physical job and latest accepted `urans_full` attempt from the pinned
+runtime; and the source result publishes that same attempt with an accepted
+URANS classification. Realistic unit must-catch variants and a fresh
+0000-migrated live-database seam cover wrong supersession, null jobs, stale
+canonical pointers, rejected publication, changed result identity, and changed
+runtime provenance.
+
 Invoke once to admit or observe preliminary work. After that exact job is
 terminal and reconciled, repeat the same exclusive one-shot invocation to
 admit or observe final verification. Never loop the command unattended or

@@ -4,17 +4,23 @@
   currently has 26 unresolved preliminary-recovery obligations from the legacy
   OpenCFD 2406 path; preserve those histories unchanged and recover successor
   cells fresh on 2606. OpenCFD 2606 recovery version 2 is live and the exact
-  20-32C/Re≈102k/α15° fast-URANS canary has produced accepted, GCS-backed
-  preliminary evidence. The linked final-verification item is pending while
-  durable scheduling remains fenced at `enabled=false`,
-  `max_concurrent_jobs=0`, and `cpu_slots=0`. Deploy the live-window correction
-  (4.5-cycle preliminary certification plus merged-history continuation
-  cadence), the post-ingestion canary ownership fix, and the concise one-row
-  solver-sequence UI. Then admit and prove the exact final generation, reopen
-  only bounded campaign capacity, and monitor subsequent fast/final work for
-  recurrence. Any exhausted fast/final chain must remain a grouped red
-  system-owned incident with a remediation version, never a review task or an
-  unchanged user retry.
+  20-32C/Re≈102k/α15° canary has produced accepted preliminary and final
+  generations; the final result is canonical, publishable, and backed by a
+  verified content-addressed GCS Zstandard archive. Its stored fast/final
+  deltas correctly settled as a non-critical comparison disagreement. The
+  first terminal audit failed closed because its validator still expected the
+  preliminary classification to remain accepted after final publication had
+  correctly superseded it. Regression-backed terminal validation now binds the
+  superseded preliminary, exact accepted final attempt, physical job, canonical
+  result pointer/classification, and pinned runtime together. Deploy that
+  controller correction, repeat the exact terminal audit, take and test-restore
+  a fresh production backup, then perform the guarded engine upgrade and a
+  fresh bounded canary on the upgraded build. Durable scheduling remains
+  fenced at `enabled=false`, `max_concurrent_jobs=0`, and `cpu_slots=0` until
+  those gates pass. Reopen only bounded campaign capacity and monitor
+  subsequent fast/final work for recurrence. Any exhausted fast/final chain
+  must remain a grouped red system-owned incident with a remediation version,
+  never a review task or an unchanged user retry.
 
 - **GCS Zstandard evidence migration:** Implement and deploy content-addressed
   tar.zst finalization, verified GCS upload, temporary render hydration,

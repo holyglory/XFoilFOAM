@@ -50,6 +50,8 @@ const requestId = "47ba789e-e630-4df5-a8af-f52bb91737f8";
 const verifyId = "6d87fb23-2c83-48a0-8658-447db7c67093";
 const jobId = "46f658c5-900c-4d48-b6ed-274d3b3f88f8";
 const incidentId = "28f64512-74a2-4ab8-811b-20a25660a7ce";
+const finalAttemptId = "2e91fb46-7d79-4d2d-8fa3-55ab5fcc7edf";
+const runtimeBuildId = "d9a9237f-a49e-4e18-9a9a-b3ee19a50b91";
 
 function markCritical(
   snapshot: ThreeStageUransCanarySnapshot,
@@ -103,6 +105,17 @@ function baseSnapshot(): ThreeStageUransCanarySnapshot {
       airfoilId: target.airfoilId,
       revisionId: target.revisionId,
       aoaDeg: target.aoaDeg,
+      currentResultAttemptId: target.sourceResultAttemptId,
+      status: "done",
+      source: "solved",
+      regime: "rans",
+      methodKey: "openfoam.rans",
+      fidelity: "rans",
+      classificationState: "rejected",
+      classificationRegime: "rans",
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+      solverRuntimeBuildId: null,
+      solverRuntimeBuildLabel: null,
     },
     sourceAttempt: {
       resultId: target.sourceResultId,
@@ -159,6 +172,7 @@ function baseSnapshot(): ThreeStageUransCanarySnapshot {
     verifyOwnerCampaignIds: [],
     verifyRequestIds: [],
     verifyPrecalcAttempt: null,
+    verifyLatestAttempt: null,
     conflictingOpenVerifyIds: [],
     targetOpenCriticalIncidentCount: 0,
     targetOpenCriticalIncident: null,
@@ -217,6 +231,7 @@ function withVerify(state = "pending"): ThreeStageUransCanarySnapshot {
     state,
     simJobId: null,
     precalcResultId: target.sourceResultId,
+    verifyResultId: null,
     precalcResultAttemptId: "a977346b-7014-4240-8f18-9ecba223e407",
     latestResultAttemptId: null,
     freshAttemptCount: 0,
@@ -244,8 +259,52 @@ function withVerify(state = "pending"): ThreeStageUransCanarySnapshot {
     methodKey: "openfoam.urans",
     fidelity: "urans_precalc",
     classificationState: "accepted",
+    supersededByResultId: null,
     precalcObligationId: target.precalcObligationId,
   };
+  if (state === "done" || state === "disagreed") {
+    snapshot.verify = {
+      ...snapshot.verify,
+      simJobId: jobId,
+      verifyResultId: target.sourceResultId,
+      latestResultAttemptId: finalAttemptId,
+      freshAttemptCount: 1,
+      lastOutcome: state,
+    };
+    snapshot.verifyPrecalcAttempt.classificationState = "superseded_by_urans";
+    snapshot.verifyPrecalcAttempt.supersededByResultId = target.sourceResultId;
+    snapshot.verifyLatestAttempt = {
+      id: finalAttemptId,
+      resultId: target.sourceResultId,
+      simJobId: jobId,
+      airfoilId: target.airfoilId,
+      revisionId: target.revisionId,
+      aoaDeg: target.aoaDeg,
+      status: "done",
+      source: "solved",
+      regime: "urans",
+      methodKey: "openfoam.urans",
+      fidelity: "urans_full",
+      classificationState: "accepted",
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+      solverRuntimeBuildId: runtimeBuildId,
+      solverRuntimeBuildLabel: target.expectedEngineBuildId,
+    };
+    snapshot.sourceResult = {
+      ...snapshot.sourceResult!,
+      currentResultAttemptId: finalAttemptId,
+      status: "done",
+      source: "solved",
+      regime: "urans",
+      methodKey: "openfoam.urans",
+      fidelity: "urans_full",
+      classificationState: "accepted",
+      classificationRegime: "urans",
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+      solverRuntimeBuildId: runtimeBuildId,
+      solverRuntimeBuildLabel: target.expectedEngineBuildId,
+    };
+  }
   // Accepted preliminary evidence becomes the obligation's canonical source
   // attempt during ingestion. The original RANS attempt remains pinned by the
   // canary target and immutable result history.
@@ -633,6 +692,105 @@ describe("three-stage URANS one-shot canary", () => {
       runThreeStageUransCanaryOnce(target, preliminaryCriticalDeps),
     ).resolves.toMatchObject({ action: "critical", stage: "critical" });
     expect(preliminaryCriticalDeps.submitExactStep).not.toHaveBeenCalled();
+  });
+
+  it("binds terminal completion to the superseded preliminary and exact accepted final generation", () => {
+    const marker = threeStageUransCanaryMarker(target);
+    const completed = withVerify("disagreed");
+    completed.request = { ...completed.request!, state: "done" };
+    completed.overlappingOpenRequestIds = [];
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(target, marker, completed),
+    ).not.toThrow();
+
+    const invalid: Array<{
+      label: string;
+      mutate(snapshot: ThreeStageUransCanarySnapshot): void;
+    }> = [
+      {
+        label: "preliminary was not superseded",
+        mutate(snapshot) {
+          snapshot.verifyPrecalcAttempt!.classificationState = "accepted";
+        },
+      },
+      {
+        label: "preliminary was superseded by another result",
+        mutate(snapshot) {
+          snapshot.verifyPrecalcAttempt!.supersededByResultId =
+            crypto.randomUUID();
+        },
+      },
+      {
+        label: "missing accepted final attempt",
+        mutate(snapshot) {
+          snapshot.verifyLatestAttempt = null;
+        },
+      },
+      {
+        label: "final pointer changed",
+        mutate(snapshot) {
+          snapshot.verify!.latestResultAttemptId = crypto.randomUUID();
+        },
+      },
+      {
+        label: "final attempt is not accepted",
+        mutate(snapshot) {
+          snapshot.verifyLatestAttempt!.classificationState = "rejected";
+        },
+      },
+      {
+        label: "terminal verification has no physical job",
+        mutate(snapshot) {
+          snapshot.verify!.simJobId = null;
+          snapshot.verifyLatestAttempt!.simJobId = null;
+        },
+      },
+      {
+        label: "final attempt came from another runtime",
+        mutate(snapshot) {
+          snapshot.verifyLatestAttempt!.solverRuntimeBuildLabel =
+            "unexpected-build";
+        },
+      },
+      {
+        label: "final result identity changed",
+        mutate(snapshot) {
+          snapshot.verify!.verifyResultId = crypto.randomUUID();
+        },
+      },
+      {
+        label: "canonical result still publishes an older generation",
+        mutate(snapshot) {
+          snapshot.sourceResult!.currentResultAttemptId =
+            target.sourceResultAttemptId;
+        },
+      },
+      {
+        label: "canonical result classification is not accepted",
+        mutate(snapshot) {
+          snapshot.sourceResult!.classificationState = "rejected";
+        },
+      },
+    ];
+    for (const { label, mutate } of invalid) {
+      const snapshot = structuredClone(completed);
+      mutate(snapshot);
+      expect(
+        () => validateThreeStageUransCanarySnapshot(target, marker, snapshot),
+        label,
+      ).toThrow("three-stage URANS canary refused");
+    }
+
+    const prematureSupersession = withVerify("pending");
+    prematureSupersession.verifyPrecalcAttempt!.classificationState =
+      "superseded_by_urans";
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(
+        target,
+        marker,
+        prematureSupersession,
+      ),
+    ).toThrow("does not pin the expected preliminary evidence lifecycle");
   });
 
   it("reports a scoped no-op without claiming a second item", async () => {
