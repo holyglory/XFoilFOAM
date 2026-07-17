@@ -28,12 +28,38 @@
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
   [D-2026-07-16-preliminary-urans-reliability]
-- Confirmed intent: finalized solver evidence belongs in the private GCS
-  archive as content-addressed Zstandard bundles, while the VPS retains only
-  active solve state and bounded temporary render hydration. Complete solver
-  evidence is conserved, local raw VTK is removed only after verified remote
-  restore, and production uses attached workload identity rather than exported
-  credentials. [D-2026-07-15-gcs-zstd-evidence]
+- Confirmed intent: finalized canonical hub evidence belongs in the private GCS
+  archive as content-addressed Zstandard bundles, while the hub VPS retains
+  only active solve state and bounded temporary render hydration. A dedicated
+  remote solver is a transfer boundary: it keeps complete local Zstandard
+  evidence until the hub acknowledges the exact delivery, receives no hub GCS
+  credentials, and uses persistent deployment identity/capacity separate from
+  numerical solver identity. [D-2026-07-15-gcs-zstd-evidence]
+  [D-2026-07-17-hz-solver2-volume-cutover]
+
+## D-2026-07-17-hz-solver2-volume-cutover — hz-solver2 uses a separate 40-slot volume-backed cutover
+
+Detail: [DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md](DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md)
+
+- Decision: identify the dedicated server with deployment role
+  `remote-solver`, Compose project `hz-solver2`, and an external persistent
+  Compose override applied to every deployment operation. Keep its worker CPU
+  budget, case concurrency, Celery concurrency, and container CPU limit at 40.
+  Upgrade its executable OpenCFD pool from 2406 to 2606 through a dedicated
+  drain/backup/rollback/canary/attestation workflow that never runs the hub's
+  campaign-successor transition. Retain complete local tar.zst evidence with
+  no GCS credential and do not permit generic retention before the production
+  hub acknowledges the job-level delivery. Storage location is deployment and
+  transfer policy, not part of numerical solver compatibility identity.
+- Why: copying the hub's GCS credentials would widen secret and canonical-data
+  authority; using the base Compose file alone silently restores the 8-slot
+  defaults and can switch the Docker project/volumes; using the hub cutover on
+  a downstream solver would create the wrong campaign authority; and a raw
+  worker recreate can terminate active CFD work. Keeping 2406 avoids the
+  immediate transition but leaves runtime provenance incompatible with the
+  production hub. The selected role-specific profile preserves the existing
+  database and volumes, uses all 40 authorized CPU slots, makes rollback and
+  recovery durable, and transfers exact evidence before local reclamation.
 
 ## D-2026-07-16-preliminary-urans-reliability — Every point follows one automatic fidelity sequence
 

@@ -59,6 +59,87 @@ def _validate_opencfd2606_canary(payload: dict[str, Any]) -> None:
         )
 
 
+def _validate_opencfd2606_volume_canary(payload: dict[str, Any]) -> None:
+    jobs = payload.get("jobs")
+    scenarios = {
+        "serial-rans",
+        "mpi-2-rans",
+        "forced-urans-precalc-no-shedding",
+    }
+    storage = payload.get("evidence_storage")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("status") != "ok"
+        or payload.get("attestation_profile") != "hz-solver2-volume-v1"
+        or not isinstance(storage, dict)
+        or storage
+        != {
+            "backend": "volume",
+            "bucket": None,
+            "object_prefix": "solver-evidence/v1",
+            "archive_format": "tar+zstd",
+            "compression": "zstd",
+            "zstd_level": 10,
+            "local_disposition": "volume",
+        }
+        or not isinstance(jobs, list)
+        or len(jobs) != 3
+        or {job.get("scenario") for job in jobs if isinstance(job, dict)}
+        != scenarios
+        or any(
+            not isinstance(job, dict)
+            or not isinstance(job.get("job_id"), str)
+            or not job["job_id"].strip()
+            or not isinstance(job.get("volume_restore_proof"), dict)
+            or not isinstance(job["volume_restore_proof"].get("strip_bytes_freed"), int)
+            or job["volume_restore_proof"]["strip_bytes_freed"] <= 0
+            for job in jobs
+        )
+        or len({job["job_id"] for job in jobs}) != 3
+    ):
+        raise ValueError(
+            "OpenCFD 2606 volume canary receipt must contain the exact retained-volume scenarios and restore proofs"
+        )
+    for job in jobs:
+        points = job.get("points")
+        if not isinstance(points, list) or not points:
+            raise ValueError("volume canary job has no accepted point evidence")
+        for point in points:
+            artifacts = point.get("artifacts") if isinstance(point, dict) else None
+            if not isinstance(artifacts, list) or not artifacts:
+                raise ValueError("volume canary point has no artifact manifest")
+            for artifact in artifacts:
+                binding = artifact.get("storage") if isinstance(artifact, dict) else None
+                if (
+                    not isinstance(binding, dict)
+                    or binding.get("backend") != "volume"
+                    or binding.get("archive_format") != "tar+zstd"
+                    or binding.get("compression") != "zstd"
+                    or binding.get("zstd_level") != 10
+                    or binding.get("local_disposition") != "volume"
+                    or not isinstance(binding.get("stored_sha256"), str)
+                    or not SHA256.fullmatch(binding["stored_sha256"])
+                    or not isinstance(binding.get("stored_byte_size"), int)
+                    or binding["stored_byte_size"] <= 0
+                    or not isinstance(binding.get("uncompressed_tar_sha256"), str)
+                    or not SHA256.fullmatch(binding["uncompressed_tar_sha256"])
+                    or not isinstance(binding.get("uncompressed_tar_byte_size"), int)
+                    or binding["uncompressed_tar_byte_size"] <= 0
+                    or any(
+                        key in binding
+                        for key in (
+                            "bucket",
+                            "object_key",
+                            "generation",
+                            "crc32c",
+                            "pointer_path",
+                            "restore_verification",
+                        )
+                    )
+                ):
+                    raise ValueError("volume canary artifact has an invalid archive binding")
+
+
 def _validate_opencfd2406_rollback(payload: dict[str, Any]) -> None:
     sha_fields = (
         "context_tree_sha256",
@@ -101,6 +182,7 @@ def _validate_opencfd2406_rollback(payload: dict[str, Any]) -> None:
 
 VALIDATORS = {
     "opencfd2606-canary": _validate_opencfd2606_canary,
+    "opencfd2606-volume-canary": _validate_opencfd2606_volume_canary,
     "opencfd2406-rollback": _validate_opencfd2406_rollback,
 }
 

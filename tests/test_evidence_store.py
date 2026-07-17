@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import io
 import json
+import shutil
 import tarfile
 import threading
 import time
@@ -34,6 +35,7 @@ from airfoilfoam.evidence_store import (
 )
 from airfoilfoam.config import Settings
 from airfoilfoam.evidence_runtime import (
+    EVIDENCE_ARCHIVE_NAME,
     EVIDENCE_FINALIZATION_ACK_NAME,
     EVIDENCE_FINALIZATION_RECEIPT_NAME,
     EvidenceCleanupAuthorization,
@@ -41,6 +43,7 @@ from airfoilfoam.evidence_runtime import (
     EvidenceDatabaseAssociation,
     EvidencePublication,
     finalize_remote_evidence_cleanup,
+    hydrated_volume_render_source,
     verify_remote_evidence_restore,
 )
 
@@ -458,6 +461,71 @@ def test_tar_zst_upload_materialize_and_selective_hydration_round_trip(tmp_path:
         assert not (evidence / "openfoam").exists()
         for relative, payload in vtk_files.items():
             assert (evidence / relative).read_bytes() == payload
+
+
+def test_volume_render_hydration_restores_verified_vtk_and_removes_temporary_tree(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    expected_vtk = _write_source_tree(evidence)
+    create_tar_zst(
+        evidence,
+        evidence / EVIDENCE_ARCHIVE_NAME,
+        level=7,
+    )
+    shutil.rmtree(evidence / "VTK")
+    cache = tmp_path / "volume-hydration-cache"
+    settings = Settings(
+        data_dir=tmp_path,
+        evidence_zstd_level=7,
+        evidence_hydration_cache_dir=cache,
+    )
+
+    with hydrated_volume_render_source(evidence, settings) as restored:
+        assert restored.parent == cache
+        assert restored != evidence
+        assert restored.is_dir()
+        assert {
+            path.relative_to(restored).as_posix(): path.read_bytes()
+            for path in (restored / "VTK").rglob("*")
+            if path.is_file()
+        } == expected_vtk
+        assert list(cache.iterdir()) == [restored]
+
+    assert cache.is_dir()
+    assert list(cache.iterdir()) == []
+
+
+def test_volume_render_hydration_rejects_manifest_drift_and_cleans_partial_tree(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    _write_source_tree(evidence)
+    create_tar_zst(
+        evidence,
+        evidence / EVIDENCE_ARCHIVE_NAME,
+        level=7,
+    )
+    manifest = evidence / "evidence_manifest.json"
+    manifest.write_bytes(manifest.read_bytes() + b"\n")
+    cache = tmp_path / "volume-hydration-cache"
+    settings = Settings(
+        data_dir=tmp_path,
+        evidence_zstd_level=7,
+        evidence_hydration_cache_dir=cache,
+    )
+
+    with pytest.raises(
+        EvidenceHydrationError,
+        match="restored evidence manifest does not match local manifest",
+    ):
+        with hydrated_volume_render_source(evidence, settings):
+            pytest.fail("manifest drift must fail before yielding render evidence")
+
+    assert cache.is_dir()
+    assert list(cache.iterdir()) == []
 
 
 def test_remote_restore_proof_downloads_exact_generation_before_cleanup_authorization(

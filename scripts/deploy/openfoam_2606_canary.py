@@ -324,6 +324,29 @@ class GatewayClient:
 class OpenCfd2606Canary:
     def __init__(self, config: CanaryConfig) -> None:
         _require(bool(config.expected_build_id.strip()), "expected build id is required")
+        self._validate_evidence_config(config)
+        if config.expected_image_digest is not None:
+            _require(
+                bool(OCI_DIGEST.fullmatch(config.expected_image_digest)),
+                "expected image digest must be sha256:<64 lowercase hex>",
+            )
+        self.config = config
+        self.client = GatewayClient(config.gateway_url, config.request_timeout_s)
+        self.active_jobs: set[str] = set()
+        self.terminal_jobs: set[str] = set()
+        self.runtime: dict[str, Any] | None = None
+        self.mesh_recovery_version: int | None = None
+        self.airfoil_points = self._parse_airfoil_points(config.coordinates)
+
+    def _validate_evidence_config(self, config: CanaryConfig) -> None:
+        """Validate the production GCS contract used by this canonical canary.
+
+        The dedicated remote-solver volume canary subclasses this runner and
+        overrides only the storage hooks.  Keeping the GCS checks here (and
+        keeping this class as the production entry point) means adding that
+        deployment role cannot make the canonical hub certification accept a
+        volume-backed result.
+        """
         _require(
             bool(config.expected_evidence_bucket.strip()),
             "expected evidence bucket is required",
@@ -338,18 +361,6 @@ class OpenCfd2606Canary:
             1 <= config.expected_evidence_zstd_level <= 22,
             "expected evidence Zstandard level must be from 1 through 22",
         )
-        if config.expected_image_digest is not None:
-            _require(
-                bool(OCI_DIGEST.fullmatch(config.expected_image_digest)),
-                "expected image digest must be sha256:<64 lowercase hex>",
-            )
-        self.config = config
-        self.client = GatewayClient(config.gateway_url, config.request_timeout_s)
-        self.active_jobs: set[str] = set()
-        self.terminal_jobs: set[str] = set()
-        self.runtime: dict[str, Any] | None = None
-        self.mesh_recovery_version: int | None = None
-        self.airfoil_points = self._parse_airfoil_points(config.coordinates)
 
     def _evidence_storage_contract(self) -> dict[str, object]:
         return {
@@ -361,6 +372,20 @@ class OpenCfd2606Canary:
             "zstd_level": self.config.expected_evidence_zstd_level,
             "local_disposition": "remote-only",
         }
+
+    def _live_evidence_storage_contract(self) -> dict[str, object]:
+        return {
+            "backend": "gcs",
+            "bucket": self.config.expected_evidence_bucket,
+            "object_prefix": self.config.expected_evidence_object_prefix,
+            "archive_format": "tar+zstd",
+            "compression": "zstd",
+            "zstd_level": self.config.expected_evidence_zstd_level,
+            "remote_only": True,
+        }
+
+    def _render_source_mode(self) -> str:
+        return "auto"
 
     def _scenarios(self) -> list[Scenario]:
         return [
@@ -480,15 +505,7 @@ class OpenCfd2606Canary:
         health_storage = _mapping(
             health.get("evidence_storage"), "health.evidence_storage"
         )
-        expected_health_storage = {
-            "backend": "gcs",
-            "bucket": self.config.expected_evidence_bucket,
-            "object_prefix": self.config.expected_evidence_object_prefix,
-            "archive_format": "tar+zstd",
-            "compression": "zstd",
-            "zstd_level": self.config.expected_evidence_zstd_level,
-            "remote_only": True,
-        }
+        expected_health_storage = self._live_evidence_storage_contract()
         _require(
             health_storage == expected_health_storage,
             "live gateway evidence storage differs from the expected bucket/prefix/Zstandard/remote-only contract",
@@ -1087,6 +1104,9 @@ class OpenCfd2606Canary:
             "chord": scenario.chord_m,
             "speed": scenario.speed_mps,
         }
+        source_mode = self._render_source_mode()
+        if source_mode != "auto":
+            common["source_mode"] = source_mode
         extents = self.client.json(
             "POST",
             f"/jobs/{job_id}/field-extents",
