@@ -658,13 +658,32 @@ export function validateThreeStageUransCanarySnapshot(
     throw canaryError(
       `${snapshot.otherEnabledPoolCount} non-target execution pool(s) are enabled`,
     );
-  if (
-    snapshot.matchingRuntimeBuildCount > 1 ||
-    (snapshot.openJobs.length > 0 && snapshot.matchingRuntimeBuildCount !== 1)
-  )
+  if (snapshot.matchingRuntimeBuildCount > 1)
     throw canaryError(
-      "the expected OpenCFD 2606 runtime build registry is ambiguous or missing for submitted work",
+      "the expected OpenCFD 2606 runtime build registry is ambiguous",
     );
+  for (const job of snapshot.openJobs) {
+    if (job.solverRuntimeBuildId == null) {
+      if (
+        job.solverRuntimeBuildLabel != null ||
+        job.status !== "submitted" ||
+        job.engineState !== "pending" ||
+        !job.engineJobId
+      ) {
+        throw canaryError(
+          "an exact job lacks runtime provenance after leaving the acknowledged engine-pending state",
+        );
+      }
+    } else if (
+      snapshot.matchingRuntimeBuildCount !== 1 ||
+      job.solverRuntimeBuildLabel !== target.expectedEngineBuildId ||
+      !job.engineJobId
+    ) {
+      throw canaryError(
+        "an exact job does not acknowledge the one expected OpenCFD 2606 runtime build",
+      );
+    }
+  }
   if (snapshot.markerRequestCount > 1)
     throw canaryError("more than one request carries the exact canary marker");
   if (snapshot.verifyCount > 1)

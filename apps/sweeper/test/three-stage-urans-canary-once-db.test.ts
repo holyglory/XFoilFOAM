@@ -898,6 +898,45 @@ describe("three-stage URANS canary production DB seam", () => {
         meshRecoveryVersion: 2,
       });
 
+      const rawDelayedRuntimeAck = await dependencies.loadSnapshot(
+        target,
+        marker,
+      );
+      const delayedRuntimeAck: ThreeStageUransCanarySnapshot = {
+        ...rawDelayedRuntimeAck,
+        sweeperEnabled: false,
+        maxConcurrentJobs: 0,
+        cpuSlots: 0,
+        pool: rawDelayedRuntimeAck.pool
+          ? { ...rawDelayedRuntimeAck.pool, enabled: true }
+          : {
+              id: OPENCFD_2606_EXECUTION_POOL_ID,
+              solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+              routingKey: "openfoam-opencfd-2606",
+              enabled: true,
+            },
+        otherEnabledPoolCount: 0,
+        openJobs: rawDelayedRuntimeAck.openJobs.filter(
+          (job) => job.id === request.simJobId,
+        ),
+      };
+      expect(delayedRuntimeAck.matchingRuntimeBuildCount).toBe(0);
+      expect(delayedRuntimeAck.openJobs).toHaveLength(1);
+      expect(delayedRuntimeAck.openJobs[0]).toMatchObject({
+        status: "submitted",
+        engineState: "pending",
+        engineJobId: `${PREFIX}-precalc-engine`,
+        solverRuntimeBuildId: null,
+        solverRuntimeBuildLabel: null,
+      });
+      expect(() =>
+        validateThreeStageUransCanarySnapshot(
+          target,
+          marker,
+          delayedRuntimeAck,
+        ),
+      ).not.toThrow();
+
       expect(
         await db
           .select({

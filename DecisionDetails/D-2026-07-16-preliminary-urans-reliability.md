@@ -227,6 +227,17 @@ unless both OpenFOAM container identities remain unchanged. Its stdout remains
 empty until the one exact receipt has been validated and service restoration
 has succeeded.
 
+The engine's accepted `POST /polars` response may truthfully be `pending`
+before a worker publishes immutable runtime provenance. In that one state only,
+the receipt may report the exact submitted job while its runtime-build foreign
+key is still null, provided the job is `submitted`, its engine state is
+`pending`, and it already has the acknowledged engine job id. Once either
+state leaves pending, the same job must reference the one expected immutable
+OpenCFD 2606 runtime-build row and its build label must match the pinned build.
+This avoids falsely reporting a failed canary after an irreversible accepted
+submission without treating engine preflight identity as invented per-job
+provenance.
+
 Invoke once to admit or observe preliminary work. After that exact job is
 terminal and reconciled, repeat the same exclusive one-shot invocation to
 admit or observe final verification. Never loop the command unattended or

@@ -306,7 +306,11 @@ function submittedSnapshot(fidelity: "precalc" | "full" = "precalc") {
       },
     },
   ];
-  snapshot.matchingRuntimeBuildCount = 1;
+  // POST /polars truthfully returns an accepted `pending` job before the
+  // worker publishes its immutable runtime identity. The first one-shot
+  // receipt must preserve that acknowledged-pending state instead of
+  // reporting a false refusal after the irreversible submission.
+  snapshot.matchingRuntimeBuildCount = 0;
   return snapshot;
 }
 
@@ -501,6 +505,87 @@ describe("three-stage URANS one-shot canary", () => {
     expect(deps.loadEnginePreflight).not.toHaveBeenCalled();
     expect(deps.ensureFullRequest).not.toHaveBeenCalled();
     expect(deps.submitExactStep).not.toHaveBeenCalled();
+  });
+
+  it("accepts only the exact pending-to-runtime-acknowledged transition", () => {
+    const marker = threeStageUransCanaryMarker(target);
+    const pending = submittedSnapshot("precalc");
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(target, marker, pending),
+    ).not.toThrow();
+    const pendingWithPreviouslyKnownBuild = structuredClone(pending);
+    pendingWithPreviouslyKnownBuild.matchingRuntimeBuildCount = 1;
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(
+        target,
+        marker,
+        pendingWithPreviouslyKnownBuild,
+      ),
+    ).not.toThrow();
+
+    const acknowledged = submittedSnapshot("precalc");
+    acknowledged.matchingRuntimeBuildCount = 1;
+    acknowledged.openJobs[0] = {
+      ...acknowledged.openJobs[0],
+      status: "running",
+      engineState: "running",
+      solverRuntimeBuildId: crypto.randomUUID(),
+      solverRuntimeBuildLabel: target.expectedEngineBuildId,
+    };
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(target, marker, acknowledged),
+    ).not.toThrow();
+
+    const invalid = [
+      {
+        label: "missing runtime after pending",
+        mutate(snapshot: ThreeStageUransCanarySnapshot) {
+          snapshot.openJobs[0] = {
+            ...snapshot.openJobs[0],
+            status: "running",
+            engineState: "running",
+          };
+        },
+      },
+      {
+        label: "pending submission without engine acknowledgement",
+        mutate(snapshot: ThreeStageUransCanarySnapshot) {
+          snapshot.openJobs[0] = {
+            ...snapshot.openJobs[0],
+            engineJobId: null,
+          };
+        },
+      },
+      {
+        label: "runtime acknowledgement without its registry row",
+        mutate(snapshot: ThreeStageUransCanarySnapshot) {
+          snapshot.openJobs[0] = {
+            ...snapshot.openJobs[0],
+            solverRuntimeBuildId: crypto.randomUUID(),
+            solverRuntimeBuildLabel: target.expectedEngineBuildId,
+          };
+        },
+      },
+      {
+        label: "runtime acknowledgement for another build",
+        mutate(snapshot: ThreeStageUransCanarySnapshot) {
+          snapshot.matchingRuntimeBuildCount = 1;
+          snapshot.openJobs[0] = {
+            ...snapshot.openJobs[0],
+            solverRuntimeBuildId: crypto.randomUUID(),
+            solverRuntimeBuildLabel: "another-build",
+          };
+        },
+      },
+    ];
+    for (const { label, mutate } of invalid) {
+      const snapshot = submittedSnapshot("precalc");
+      mutate(snapshot);
+      expect(
+        () => validateThreeStageUransCanarySnapshot(target, marker, snapshot),
+        label,
+      ).toThrow("three-stage URANS canary refused");
+    }
   });
 
   it("returns terminal receipts without reopening completed or critical work", async () => {
