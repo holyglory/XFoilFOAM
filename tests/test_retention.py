@@ -10,8 +10,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import airfoilfoam.pipeline as pipeline
 from airfoilfoam.api.main import app
-from airfoilfoam.config import get_settings
+from airfoilfoam.config import Settings, get_settings
+from airfoilfoam.evidence_store import extract_verified_evidence_archive
+from airfoilfoam.models import CaseSpec
+from airfoilfoam.pipeline import CaseOutcome
 from airfoilfoam.retention import JobRetentionRefused, delete_job_dir, strip_job_dir
 
 
@@ -55,7 +59,6 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
         case / "mesh-evidence" / "system" / "blockMeshDict",
         b"archived-mesh-dictionary",
     )
-
     _write(case / "images" / "root.png", b"\x89PNG\r\n\x1a\nroot")
     _write(case / "frames" / "vorticity" / "f0000.png", b"\x89PNG\r\n\x1a\nroot-frame")
 
@@ -167,10 +170,133 @@ def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
         assert paths[key].is_file(), key
 
 
+def test_finished_urans_archives_start_marker_before_full_strip(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """MUST-CATCH: the second guarded OpenCFD 2606 canary completed its
+    physical URANS solve but full retention left both transient-root JSON files
+    as unknown.  The immutable trajectory boundary must be inside the real
+    archive before cleanup removes it; the mutable watchdog budget must not be
+    mistaken for evidence or restart state.
+    """
+
+    job_root = tmp_path / "job-forced-urans-retention"
+    job_id = job_root.name
+    _write_json(job_root / "request.json", {"job_id": job_id})
+    _write_json(job_root / "result.json", {"job_id": job_id, "state": "completed"})
+    _write_json(job_root / "status.json", {"job_id": job_id, "state": "completed"})
+    _write_json(job_root / "runtime.json", {"job_id": job_id, "process_count": 0})
+
+    case = job_root / "cases" / "c0p05_u166_a0"
+    transient = case / "transient"
+    _write(case / "system" / "controlDict", b"application simpleFoam;\n")
+    _write(case / "constant" / "polyMesh" / "points", b"steady mesh\n")
+    _write(transient / "system" / "controlDict", b"application pimpleFoam;\n")
+    _write(transient / "constant" / "polyMesh" / "points", b"transient mesh\n")
+    _write(transient / "0.4" / "U", b"final velocity field\n")
+    _write(transient / "0.4" / "p", b"final pressure field\n")
+
+    # Exact bytes and SHA observed in the preserved failed production job.
+    transient_start_bytes = b'{\n  "transient_start": 0.0\n}\n'
+    transient_start = _write(
+        transient / pipeline.TRANSIENT_START_MARKER,
+        transient_start_bytes,
+    )
+    assert hashlib.sha256(transient_start_bytes).hexdigest() == (
+        "b50f4dc750325e2969c0c8192e88592d7144f0680651ee69787dce9815b71bcf"
+    )
+    march_budget = _write_json(
+        transient / pipeline.MARCH_BUDGET_MARKER_FILENAME,
+        {"end_t": 0.4, "budget_s": 14400.0, "wall_start": 123.0},
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_settings",
+        lambda: Settings(
+            data_dir=tmp_path,
+            evidence_bucket=None,
+            evidence_remote_only=False,
+        ),
+    )
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=0.05, speed=166.0, aoa_deg=0.0),
+        reynolds=568_493,
+        unsteady=True,
+    )
+    pipeline._archive_case_evidence(case, transient, outcome)
+
+    evidence = case / "evidence"
+    manifest_path = evidence / "evidence_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    archived_path = "openfoam/transient/transient_start.json"
+    marker_entry = next(
+        entry for entry in manifest["files"] if entry["path"] == archived_path
+    )
+    assert marker_entry["role"] == "continuation_state"
+    assert marker_entry["sha256"] == hashlib.sha256(
+        transient_start_bytes
+    ).hexdigest()
+    assert marker_entry["byteSize"] == len(transient_start_bytes)
+    assert all(
+        entry["path"] != "openfoam/transient/march_budget.json"
+        for entry in manifest["files"]
+    )
+    marker_artifact = next(
+        artifact
+        for artifact in outcome.evidence_artifacts
+        if artifact.path == f"evidence/{archived_path}"
+    )
+    assert marker_artifact.kind == "dictionary"
+    assert marker_artifact.role == "continuation_state"
+    assert marker_artifact.sha256 == marker_entry["sha256"]
+
+    # Inspect the actual canonical tar.zst, not merely the unpacked staging
+    # copy or manifest claim.  The verified extractor authenticates all bundled
+    # members against the manifest before making the selected evidence visible.
+    restored = tmp_path / "restored-forced-urans-evidence"
+    extract_verified_evidence_archive(
+        evidence / "engine_evidence.tar.zst",
+        restored,
+        compression="zstd",
+        include_prefixes=(archived_path,),
+        expected_manifest=manifest_path.read_bytes(),
+    )
+    archived_transient_start = evidence / archived_path
+    assert archived_transient_start.read_bytes() == transient_start_bytes
+    assert (restored / archived_path).read_bytes() == transient_start_bytes
+    archive = evidence / "engine_evidence.tar.zst"
+    pointer = _write_remote_pointer(evidence, archive)
+    # Production remote-only finalization removes this unpacked duplicate only
+    # after a pinned all-member restore, while retaining the canonical archive,
+    # manifest and pointer until database acknowledgement.
+    shutil.rmtree(evidence / "openfoam")
+    assert not archived_transient_start.exists()
+
+    report = strip_job_dir(job_root)
+
+    assert not transient_start.exists()
+    assert not march_budget.exists()
+    assert archive.is_file()
+    assert manifest_path.is_file()
+    assert pointer.is_file()
+    assert (restored / archived_path).read_bytes() == transient_start_bytes
+    assert report.unknown_entries == []
+
+
 def test_keep_case_state_preserves_continuation_and_packaged_evidence(tmp_path: Path):
     job_root = tmp_path / "job-keep-state"
     paths = _make_realistic_job(job_root)
     case = paths["case"]
+    transient_start = _write(
+        case / "transient" / pipeline.TRANSIENT_START_MARKER,
+        b'{\n  "transient_start": 0.0\n}\n',
+    )
+    march_budget = _write_json(
+        case / "transient" / pipeline.MARCH_BUDGET_MARKER_FILENAME,
+        {"end_t": 0.4, "budget_s": 14400.0, "wall_start": 123.0},
+    )
 
     # Prod cases symlink constant/polyMesh into the shared job-root meshes/
     # store (jobs.py mesh_reuse_mode="symlink"); a dangling link makes the
@@ -189,6 +315,8 @@ def test_keep_case_state_preserves_continuation_and_packaged_evidence(tmp_path: 
     for rel in ("0", "141", "3.5", "constant", "system", "postProcessing", "processor0"):
         assert (case / rel).exists()
     assert paths["mesh_evidence"].is_file()
+    assert transient_start.is_file()
+    assert march_budget.is_file()
     assert not (case / "VTK").exists()
     assert (case / "log.simpleFoam").is_file()
     # MUST-CATCH (continuation restartability): the shared-mesh symlink still
@@ -302,6 +430,98 @@ def test_unknown_case_entries_are_retained_and_reported(tmp_path: Path):
 
     assert paths["unknown"].is_file()
     assert "cases/c1_u25/operator_notes.dat" in report.unknown_entries
+
+
+def test_unrecognized_transient_json_is_not_deleted_by_marker_allowlist(tmp_path: Path):
+    job_root = tmp_path / "job-unknown-transient-json"
+    paths = _make_realistic_job(job_root)
+    unknown = _write_json(
+        paths["case"] / "transient" / "operator_diagnostic.json",
+        {"must_survive": True},
+    )
+
+    report = strip_job_dir(job_root)
+
+    assert unknown.is_file()
+    assert (
+        "cases/c1_u25/transient/operator_diagnostic.json"
+        in report.unknown_entries
+    )
+
+
+def test_full_strip_retains_start_marker_without_exact_archive_member(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """False-positive guard for the preserved failed production generation.
+
+    The old engine left a real trajectory marker but its manifest/archive did
+    not contain that member.  A filename match alone must never authorize its
+    deletion; the unrelated mutable watchdog marker remains safe to remove.
+    """
+
+    job_root = tmp_path / "job-old-source-unarchived-start"
+    job_id = job_root.name
+    _write_json(job_root / "request.json", {"job_id": job_id})
+    _write_json(job_root / "result.json", {"job_id": job_id, "state": "completed"})
+    _write_json(job_root / "status.json", {"job_id": job_id, "state": "completed"})
+    _write_json(job_root / "runtime.json", {"job_id": job_id, "process_count": 0})
+    case = job_root / "cases" / "c0p05_u166_a0"
+    transient = case / "transient"
+    _write(case / "system" / "controlDict", b"application simpleFoam;\n")
+    _write(case / "constant" / "polyMesh" / "points", b"steady mesh\n")
+    _write(transient / "system" / "controlDict", b"application pimpleFoam;\n")
+    _write(transient / "constant" / "polyMesh" / "points", b"transient mesh\n")
+    _write(transient / "0.4" / "U", b"final velocity field\n")
+    _write(transient / "0.4" / "p", b"final pressure field\n")
+    monkeypatch.setattr(
+        pipeline,
+        "get_settings",
+        lambda: Settings(
+            data_dir=tmp_path,
+            evidence_bucket=None,
+            evidence_remote_only=False,
+        ),
+    )
+    pipeline._archive_case_evidence(
+        case,
+        transient,
+        CaseOutcome(
+            spec=CaseSpec(chord=0.05, speed=166.0, aoa_deg=0.0),
+            reynolds=568_493,
+            unsteady=True,
+        ),
+    )
+    manifest = json.loads(
+        (case / "evidence" / "evidence_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert all(
+        entry["path"] != "openfoam/transient/transient_start.json"
+        for entry in manifest["files"]
+    )
+    assert (case / "evidence" / "engine_evidence.tar.zst").is_file()
+
+    # Recreate the exact preserved old-engine condition: the live files exist,
+    # but the already-finalized immutable generation has no marker member.
+    transient_start = _write(
+        transient / pipeline.TRANSIENT_START_MARKER,
+        b'{\n  "transient_start": 0.0\n}\n',
+    )
+    march_budget = _write_json(
+        transient / pipeline.MARCH_BUDGET_MARKER_FILENAME,
+        {"end_t": 0.4, "budget_s": 14400.0, "wall_start": 123.0},
+    )
+
+    report = strip_job_dir(job_root)
+
+    assert transient_start.is_file()
+    assert not march_budget.exists()
+    assert (
+        "cases/c0p05_u166_a0/transient/transient_start.json"
+        in report.unknown_entries
+    )
 
 
 def test_running_guard_refuses_strip_and_delete(tmp_path: Path):
