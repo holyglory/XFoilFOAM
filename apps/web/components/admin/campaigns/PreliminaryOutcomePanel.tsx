@@ -510,6 +510,18 @@ export function PreliminaryOutcomePanel({
           background: ${C.panel2};
           border-radius: 7px;
         }
+        .detail-summary {
+          min-width: 0;
+          display: grid;
+          gap: 3px;
+          padding: 1px 2px;
+          font-size: 9px;
+          line-height: 1.4;
+          color: ${C.dim};
+        }
+        .detail-summary .rans-explanation {
+          color: ${C.text2};
+        }
         .stage-evidence-grid {
           display: grid;
           grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1006,6 +1018,16 @@ export function PreliminaryOutcomePanel({
                     <ChevronDown size={11} strokeWidth={1.7} aria-hidden />
                   </summary>
                   <div className="detail-body">
+                    <div
+                      className="detail-summary"
+                      data-testid={`cell-preliminary-detail-summary-${item.aoaDeg}`}
+                    >
+                      <span className="rans-explanation">
+                        {view.ransDiagnostic}
+                      </span>
+                      <span>{view.budgetLabel}</span>
+                      <span>{view.evidenceLabel}</span>
+                    </div>
                     <div
                       className="stage-evidence-grid"
                       aria-label={`Solver stage history for ${label}`}

@@ -800,12 +800,23 @@ export async function submitCampaignPrecalcRecoveries(
   meshRecoveryVersion?: number,
   uransRecoveryVersion?: number | null,
 ): Promise<boolean> {
+  // An explicitly supplied empty list is a closed-world scope, not the
+  // production-wide default. One-shot operators use this fence to prove that
+  // they cannot admit ordinary campaign recovery while targeting a single
+  // request/verify chain. Do this before any query or process-local fairness
+  // mutation so an empty canary scope is observably inert.
+  if (
+    (campaignIds !== undefined && campaignIds.length === 0) ||
+    (parentJobIds !== undefined && parentJobIds.length === 0)
+  ) {
+    return false;
+  }
   const statusFilter = inArray(simCampaigns.status, ["active", "attention"]);
   const campaigns = await db
     .select({ id: simCampaigns.id })
     .from(simCampaigns)
     .where(
-      campaignIds?.length
+      campaignIds !== undefined
         ? and(statusFilter, inArray(simCampaigns.id, campaignIds))
         : statusFilter,
     );
@@ -2043,6 +2054,58 @@ async function consumeVerifyItem(
   // preliminary result remains untouched and visible while verification is
   // terminally unavailable.
   return false;
+}
+
+/**
+ * Admit at most one physical step of one pre-validated three-stage canary.
+ *
+ * Unlike `uransLadderTick`, this entry point deliberately has no campaign,
+ * RANS-parent, promotion, or unscoped-admin lane. The caller supplies one
+ * exact FULL request and, once preliminary evidence creates it, the one exact
+ * verification item. Automatic same-case continuation remains enabled only
+ * inside those exact owners. This is the narrow operator boundary used while
+ * the normal sweeper's durable switch remains disabled.
+ */
+export async function submitExactUransCanaryStep(
+  db: DB,
+  engine: EngineClient,
+  input: {
+    requestId: string;
+    verifyId?: string | null;
+    cpuSlots?: number;
+    meshRecoveryVersion: number;
+    uransRecoveryVersion: number;
+  },
+): Promise<boolean> {
+  await healOrphanedUransRequests(db, { requestIds: [input.requestId] });
+  if (input.verifyId) {
+    await healOrphanedVerifyItems(db, { verifyIds: [input.verifyId] });
+  }
+
+  if (supportsDurableUransRecovery(input.uransRecoveryVersion)) {
+    await requeueRestartablePrecalcContinuations(db, {
+      requestIds: [input.requestId],
+    });
+  }
+
+  if (
+    await consumeUransRequest(
+      db,
+      engine,
+      input.cpuSlots ?? 0,
+      [input.requestId],
+      input.meshRecoveryVersion,
+      input.uransRecoveryVersion,
+    )
+  ) {
+    return true;
+  }
+
+  if (!input.verifyId) return false;
+  return consumeVerifyItem(db, engine, input.cpuSlots ?? 0, {
+    verifyIds: [input.verifyId],
+    uransRecoveryVersion: input.uransRecoveryVersion,
+  });
 }
 
 /** Give final verification its bounded restart-safe share of admission.

@@ -163,6 +163,75 @@ convection, Co<=1, and a smaller initial timestep. Generic non-zero exits,
 timeouts, mesh failures, and initialization failures remain infrastructure or
 their existing typed class and do not consume this numerical retry.
 
+## Exact production recovery canary gate
+
+The first production proof after deploying the one-shot controller is one
+closed-world 20-32C/Re≈102k/α15° chain. It pins the campaign, current condition
+generation, parent RANS job, airfoil, revision, AoA, source result and attempt,
+preliminary obligation, engine build, mesh recovery version, and URANS recovery
+version. It creates at most one marked aggregate FULL owner, requires zero
+request-obligation associations before first coverage and exactly the pinned
+obligation afterward, and admits only that request's preliminary job or its
+linked final-verification job.
+
+The production scheduler stays durably fenced at `enabled=false`,
+`max_concurrent_jobs=0`, and `cpu_slots=0`. Before each one-shot admission,
+stop the ordinary `node-api` and `sweeper` containers, run the CLI through an
+ephemeral `sweeper` service container, then restart those two Node services
+immediately after the single JSON receipt is written. This short exclusive
+operator window closes the HTTP campaign/request mutation surface and the
+ordinary scheduler across the last database/engine probes and exact claim. It
+does not stop or recreate the Python gateway or OpenFOAM worker. Keep the
+pinned campaign generation administratively frozen until the final receipt is
+terminal; if it changes, the next invocation refuses instead of retargeting.
+No other one-shot command or direct database writer may run in that window.
+
+The canary's closed-world incident fence is deliberately target-scoped.
+Pre-existing legacy incidents and obligations that do not own the pinned
+result, obligation, marked request, or verify item are inert because normal
+admission is disabled; they neither block nor become eligible through the
+canary. The exemption applies only to records that predate this canary and
+remain outside its exact ownership chain. A new target-owned blocked state
+must have one open critical incident and returns a `critical` receipt. A
+target-owned incident without blocked state, or blocked state without its
+incident, refuses as inconsistent. Existing legacy incidents remain unresolved
+campaign recovery work and must not be presented as cleared.
+
+The exact production invocation must go through the fail-closed wrapper:
+
+```bash
+/opt/airfoils-pro/app/scripts/deploy/run-three-stage-urans-canary-once.sh \
+  --campaign-id c24047fa-743f-4ae5-bcd6-f3071ff79fb4 \
+  --condition-id e2db6c43-2e4a-4b15-b99e-1e2d391543be \
+  --expected-campaign-generation 2 \
+  --parent-job-id 28d9ac1c-ad4d-4c60-a34b-f090842eeb54 \
+  --airfoil-id 4617c7ad-264e-48bf-926c-b24d33e4d7c0 \
+  --revision-id fba9c1f7-222f-4399-94ae-4f777b1ef868 \
+  --aoa-deg 15 \
+  --source-result-id 54d62432-8ba2-4fdb-a27b-39f709f00712 \
+  --source-result-attempt-id 266cc794-9498-4a77-baf0-0924e44e34fe \
+  --precalc-obligation-id 6515a96c-d80f-4f35-a98d-4a29f30c0d53 \
+  --expected-engine-build-id prod-20260717-8e6d9bd32615-r6 \
+  --expected-mesh-recovery-version 2 \
+  --expected-urans-recovery-version 2 \
+  >"$AUDIT_DIR/three-stage-urans-canary.json" \
+  2>"$AUDIT_DIR/three-stage-urans-canary.log"
+```
+
+The wrapper holds the shared deployment lock, runs the authoritative
+environment preflight, captures the exact `api`, `worker`, `node-api`, and
+`sweeper` container identities and initial states, and proves both ordinary
+Node writers stopped before invoking the one-shot CLI. It restores each Node
+service to its independent prior state on every exit path and refuses success
+unless both OpenFOAM container identities remain unchanged. Its stdout remains
+empty until the one exact receipt has been validated and service restoration
+has succeeded.
+
+Invoke once to admit or observe preliminary work. After that exact job is
+terminal and reconciled, repeat the same exclusive one-shot invocation to
+admit or observe final verification. Never loop the command unattended or
+widen its identifiers from an open-work query.
+
 ## Selected recovery architecture
 
 - Retention protects every recent restartable preliminary attempt, including a

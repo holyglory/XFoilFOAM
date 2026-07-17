@@ -440,140 +440,500 @@ Keep the same protected `ADMIN_COOKIE` procedure for both rebuild invocations.
 Never clear or edit the pending marker, reuse the canary as campaign evidence,
 or manually link a result to make certification pass.
 
-## 7. One-terminal-job three-pass trial
+## 7. Bounded result trial and orphan-quarantine eligibility gate
 
-Dry-run is the default for both migration commands. Select a terminal legacy
-job whose plan names an actual gzip source. `sourceFormats` and `sourcePaths`
-are ordered, parallel arrays, so this selection cannot accidentally choose a
-job that contains only an already-Zstandard archive:
+Dry-run is the default for both migration commands. Keep two proofs separate:
+
+1. migrate one legacy gzip archive that already has an exact result owner; and
+2. quarantine one exact terminal campaign-job/case only if the read-only
+   eligibility gate finds a genuine zero-owner archive.
+
+Do not turn a canary archive into campaign data to make proof 2 possible. The
+2026-07-17 production audit found three single-case gzip jobs, all with exact
+result and attempt owners. It also found 11 zero-owner filesystem archives,
+but all 11 have no `sim_jobs` owner and are canary-only Zstandard artifacts.
+They are ineligible for quarantine and remain under the separate
+attestation-backed canary cleanup in the completion ledger.
+
+### A. One result-owned legacy gzip trial
+
+Create a full dry plan, then shortlist only jobs represented by exactly one
+`planned` row with an actual legacy gzip source. A multi-case job is not a
+bounded trial candidate:
 
 ```bash
-compose exec -T api python3 -m airfoilfoam.evidence_migration --limit 50 \
-  2>&1 | tee "$AUDIT_DIR/trial-plan.jsonl"
+compose exec -T api python3 -m airfoilfoam.evidence_migration \
+  2>&1 | tee "$AUDIT_DIR/trial-full-plan.jsonl"
 
-export JOB_ID="$(python3 - "$AUDIT_DIR/trial-plan.jsonl" <<'PY'
-import json, sys
+python3 - "$AUDIT_DIR/trial-full-plan.jsonl" \
+  >"$AUDIT_DIR/trial-gzip-candidates.tsv" <<'PY'
+import collections, json, sys
+
+by_job = collections.defaultdict(list)
 for line in open(sys.argv[1], encoding="utf-8"):
     try:
         row = json.loads(line)
     except json.JSONDecodeError:
-        # stderr is intentionally co-captured for the audit record.
         continue
-    sources = zip(row.get("sourceFormats", []), row.get("sourcePaths", []))
-    if row.get("status") == "planned" and any(
-        compression == "gzip" and path in {
-            "engine_evidence.tar.gz", "openfoam_evidence.tar.gz"
-        }
-        for compression, path in sources
-    ):
-        print(row["jobId"])
-        break
+    if isinstance(row, dict) and isinstance(row.get("jobId"), str):
+        by_job[row["jobId"]].append(row)
+
+allowed = {"engine_evidence.tar.gz", "openfoam_evidence.tar.gz"}
+for job_id in sorted(by_job):
+    rows = by_job[job_id]
+    if len(rows) != 1 or rows[0].get("status") != "planned":
+        continue
+    formats = rows[0].get("sourceFormats", [])
+    paths = rows[0].get("sourcePaths", [])
+    assert len(formats) == len(paths)
+    gzip_paths = [
+        path for kind, path in zip(formats, paths)
+        if kind == "gzip" and path in allowed
+    ]
+    if gzip_paths:
+        print(job_id, rows[0]["evidencePath"], gzip_paths[0], sep="\t")
 PY
-)"
-test -n "$JOB_ID"
-printf '%s\n' "$JOB_ID" | tee "$AUDIT_DIR/trial-job-id.txt"
+
+test -s "$AUDIT_DIR/trial-gzip-candidates.tsv"
+IFS=$'\t' read -r JOB_ID EVIDENCE_PATH GZIP_NAME \
+  <"$AUDIT_DIR/trial-gzip-candidates.tsv"
+export JOB_ID EVIDENCE_PATH GZIP_NAME
+printf '%s\t%s\t%s\n' "$JOB_ID" "$EVIDENCE_PATH" "$GZIP_NAME" \
+  | tee "$AUDIT_DIR/trial-gzip-selection.tsv"
 ```
 
-One job may contain several evidence directories; `--job-id` intentionally
-processes every eligible evidence directory owned by that exact job.
+Rerun the dry plan at exact job scope. Stop unless it emits exactly one job
+row, that row is `planned`, its `evidencePath` is unchanged, and its parallel
+source arrays still name the selected gzip archive:
 
-### Pass 1: transcode, upload, restore-proof, receipt
+```bash
+compose exec -T api python3 -m airfoilfoam.evidence_migration \
+  --job-id "$JOB_ID" 2>&1 | tee "$AUDIT_DIR/trial-gzip-scoped-plan.jsonl"
+
+python3 - "$AUDIT_DIR/trial-gzip-scoped-plan.jsonl" \
+  "$JOB_ID" "$EVIDENCE_PATH" "$GZIP_NAME" <<'PY'
+import json, sys
+rows = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(row, dict) and "jobId" in row:
+        rows.append(row)
+assert len(rows) == 1, rows
+row = rows[0]
+assert (row["jobId"], row["evidencePath"], row["status"]) == (
+    sys.argv[2], sys.argv[3], "planned"
+)
+pairs = list(zip(row["sourceFormats"], row["sourcePaths"]))
+assert ("gzip", sys.argv[4]) in pairs, pairs
+PY
+```
+
+Immediately before pass 1, require a terminal filesystem status, a regular
+manifest and selected gzip file, and no local `tar.zst`, remote pointer,
+migration receipt, or database acknowledgement. Record which packaged raw
+directories existed so pass 1 can prove it retained them:
+
+```bash
+compose exec -T -e JOB_ID -e EVIDENCE_PATH -e GZIP_NAME api python3 - <<'PY' \
+  | tee "$AUDIT_DIR/trial-gzip-filesystem-preflight.json"
+import json, os, pathlib
+root = pathlib.Path("/data/airfoilfoam/jobs") / os.environ["JOB_ID"]
+evidence = root / os.environ["EVIDENCE_PATH"]
+evidence.resolve(strict=True).relative_to(root.resolve(strict=True))
+assert not root.is_symlink() and not evidence.is_symlink()
+status = json.loads((root / "status.json").read_text(encoding="utf-8"))
+assert status.get("state") in {"completed", "failed", "cancelled"}
+for name in ("evidence_manifest.json", os.environ["GZIP_NAME"]):
+    path = evidence / name
+    assert path.is_file() and not path.is_symlink(), name
+for name in (
+    "engine_evidence.tar.zst", "engine_evidence.remote.json",
+    "storage_migration.json", "storage_migration.database.json",
+):
+    assert not (evidence / name).exists(), name
+raw = [name for name in ("VTK", "openfoam", "time_directories")
+       if (evidence / name).exists()]
+assert all(not (evidence / name).is_symlink() for name in raw)
+print(json.dumps({"state": status["state"], "rawPaths": raw}, sort_keys=True))
+PY
+```
+
+The read-only database preflight must report exactly these counts for the
+selected job/case: `simJobs=1`, `terminalSimJobs=1`,
+`activeIngestLeases=0`, `exactAttempts=1`, `exactResults=1`, `sourceRows=1`,
+and `existingQuarantines=0`. Exact means the same `sim_job_id`,
+`engine_job_id`, and case slug parsed from
+`cases/<engine_case_slug>/...`; rounded AoA is never a lookup key:
+
+```bash
+export CASE_SLUG="$(python3 - "$EVIDENCE_PATH" <<'PY'
+import sys
+parts = sys.argv[1].split("/")
+assert len(parts) >= 3 and parts[0] == "cases" and parts[1]
+assert parts[1] not in {".", ".."} and "/" not in parts[1]
+print(parts[1])
+PY
+)"
+
+compose exec -T postgres psql -U aerodb -d aerodb -v ON_ERROR_STOP=1 -At \
+  -v "engine_job_id=$JOB_ID" -v "case_slug=$CASE_SLUG" \
+  -v "evidence_path=$EVIDENCE_PATH" -v "source_name=$GZIP_NAME" <<'SQL' \
+  | tee "$AUDIT_DIR/trial-gzip-database-preflight.json"
+WITH exact_jobs AS MATERIALIZED (
+  SELECT id, status, ingest_lease_expires_at
+    FROM sim_jobs
+   WHERE engine_job_id = :'engine_job_id'
+)
+SELECT json_build_object(
+  'simJobs', (SELECT count(*) FROM exact_jobs),
+  'terminalSimJobs', (SELECT count(*) FROM exact_jobs
+    WHERE status IN ('done', 'failed', 'cancelled')),
+  'activeIngestLeases', (SELECT count(*) FROM exact_jobs
+    WHERE status = 'ingesting' AND ingest_lease_expires_at > now()),
+  'exactAttempts', (SELECT count(*) FROM result_attempts a
+    JOIN exact_jobs j ON j.id = a.sim_job_id
+   WHERE a.engine_job_id = :'engine_job_id'
+     AND a.engine_case_slug = :'case_slug'),
+  'exactResults', (SELECT count(*) FROM results r
+    JOIN exact_jobs j ON j.id = r.sim_job_id
+   WHERE r.engine_job_id = :'engine_job_id'
+     AND r.engine_case_slug = :'case_slug'),
+  'sourceRows', (SELECT count(*) FROM solver_evidence_artifacts a
+   WHERE a.storage_key IN (
+     'jobs/' || :'engine_job_id' || '/' || :'evidence_path' ||
+       '/engine_evidence.tar.zst',
+     'jobs/' || :'engine_job_id' || '/' || :'evidence_path' ||
+       '/' || :'source_name'
+   )),
+  'existingQuarantines', (SELECT count(*)
+    FROM solver_evidence_orphan_quarantines q
+   WHERE q.engine_job_id = :'engine_job_id'
+     AND q.evidence_path = :'evidence_path')
+)::text;
+SQL
+
+python3 - "$AUDIT_DIR/trial-gzip-database-preflight.json" <<'PY'
+import json, sys
+actual = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = {
+    "simJobs": 1, "terminalSimJobs": 1, "activeIngestLeases": 0,
+    "exactAttempts": 1, "exactResults": 1, "sourceRows": 1,
+    "existingQuarantines": 0,
+}
+assert actual == expected, {"expected": expected, "actual": actual}
+PY
+```
+
+Stop on any other count. This is an ordinary result-owned migration, not
+quarantine.
+
+Run all three passes:
 
 ```bash
 compose exec -T api python3 -m airfoilfoam.evidence_migration \
   --execute --job-id "$JOB_ID" \
-  2>&1 | tee "$AUDIT_DIR/trial-pass1-python.jsonl"
-```
+  2>&1 | tee "$AUDIT_DIR/trial-gzip-pass1.jsonl"
 
-Every row must be `awaiting-database-registration` (or idempotently
-`already-complete`). In the awaiting state the exact GCS pointer and migration
-receipt are durable, but the generated local `tar.zst`, legacy gzip source, and
-packaged `VTK`, `openfoam`, and `time_directories` trees are all deliberately
-retained. This is the rollback/recovery copy until the exact database
-registration and second fresh remote restore both succeed in pass 3. Pass 1
-therefore reclaims no local packaged evidence bytes.
-
-### Pass 2: register the exact generation in Postgres
-
-Plan first, then execute the Node backfill:
-
-```bash
 compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
   src/evidence-storage-backfill.ts --job-id "$JOB_ID" \
-  2>&1 | tee "$AUDIT_DIR/trial-pass2-node-plan.jsonl"
+  2>&1 | tee "$AUDIT_DIR/trial-gzip-pass2-plan.jsonl"
 
 compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
   src/evidence-storage-backfill.ts --execute --job-id "$JOB_ID" \
-  2>&1 | tee "$AUDIT_DIR/trial-pass2-node.jsonl"
+  2>&1 | tee "$AUDIT_DIR/trial-gzip-pass2.jsonl"
+
+compose exec -T api python3 -m airfoilfoam.evidence_migration \
+  --execute --job-id "$JOB_ID" \
+  2>&1 | tee "$AUDIT_DIR/trial-gzip-pass3.jsonl"
 ```
 
-Every executed row must be either `registered` or `quarantined`.
-`registered` is the ordinary result-owned path: the backfill writes
-`storage_migration.database.json` atomically only after the current archive,
-blob, source bundle, and all logical archive-member mappings agree.
+Pass 1 must contain exactly one `awaiting-database-registration` row with
+`bytesDeleted=0`, a positive decimal `generation`, and
+`verification=archive+manifest+all-members-restore:N`; the selected gzip,
+generated `tar.zst`, manifest, pointer, receipt, and every raw path recorded by
+the preflight must still exist. The Node dry-run must contain exactly one
+`planned` row, and its execute pass exactly one `registered` row with nonempty
+`resultId`, `resultAttemptId`, `sourceArtifactId`, and `archiveId`. Pass 3 must
+contain exactly one `migrated` row with `bytesDeleted>0` and no `failed` row.
+After pass 3, require a `complete` receipt with a `registered`
+acknowledgement; no local gzip, `tar.zst`, `VTK`, `openfoam`, or
+`time_directories`; one current exact database archive backed by a `gcs` /
+`zstd` / `application/zstd` blob; and exact pointer/blob generation, SHA-256,
+CRC32C, stored size, tar SHA-256, and tar size equality.
 
-`quarantined` is the narrow zero-owner fallback. It is allowed only when one
-terminal `sim_jobs.engine_job_id` exactly owns the receipt, the
-`cases/<engine_case_slug>/...` path agrees, and no exact result or attempt
-exists for that job/case. It creates no result, coefficient, or AoA binding.
-Instead it records an unbound Zstandard bundle plus immutable
-`solver_evidence_orphan_quarantines` provenance with reason
-`terminal_engine_evidence_not_ingested`, the exact manifest/member set,
-source archive, receipt, GCS generation, and verification identities.
-Ambiguous jobs and any exact owned result remain errors. Quarantine is
-intentionally immutable-only; there is no generic resolved transition.
+### B. Fail-closed orphan-quarantine eligibility and trial
 
-### Pass 3: validate registration, re-restore, remove local packaged sources
+Build a separate shortlist from the full plan for exactly-one-row, already
+Zstandard candidates, then apply all owner predicates in one read-only query:
+
+```bash
+python3 - "$AUDIT_DIR/trial-full-plan.jsonl" \
+  >"$AUDIT_DIR/trial-orphan-filesystem-candidates.json" <<'PY'
+import collections, json, sys
+
+by_job = collections.defaultdict(list)
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(row, dict) and isinstance(row.get("jobId"), str):
+        by_job[row["jobId"]].append(row)
+
+candidates = []
+for job_id in sorted(by_job):
+    rows = by_job[job_id]
+    if len(rows) != 1 or rows[0].get("status") != "planned":
+        continue
+    row = rows[0]
+    pairs = list(zip(row.get("sourceFormats", []), row.get("sourcePaths", [])))
+    if pairs != [("zstd", "engine_evidence.tar.zst")]:
+        continue
+    parts = row["evidencePath"].split("/")
+    if len(parts) < 3 or parts[0] != "cases" or not parts[1]:
+        continue
+    candidates.append({
+        "job_id": job_id,
+        "evidence_path": row["evidencePath"],
+        "case_slug": parts[1],
+    })
+print(json.dumps(candidates, separators=(",", ":")))
+PY
+
+ORPHAN_CANDIDATES_JSON="$(
+  tr -d '\n' <"$AUDIT_DIR/trial-orphan-filesystem-candidates.json"
+)"
+compose exec -T postgres psql -U aerodb -d aerodb -v ON_ERROR_STOP=1 \
+  -At -F $'\t' -v "candidates_json=$ORPHAN_CANDIDATES_JSON" <<'SQL' \
+  | tee "$AUDIT_DIR/trial-orphan-database-candidates.tsv"
+WITH candidates AS MATERIALIZED (
+  SELECT * FROM jsonb_to_recordset(:'candidates_json'::jsonb) AS c(
+    job_id text, evidence_path text, case_slug text
+  )
+), stats AS (
+  SELECT c.*,
+    (SELECT count(*) FROM sim_jobs j
+      WHERE j.engine_job_id = c.job_id) AS sim_jobs,
+    (SELECT count(*) FROM sim_jobs j
+      WHERE j.engine_job_id = c.job_id
+        AND j.status IN ('done', 'failed', 'cancelled')) AS terminal_jobs,
+    (SELECT count(*) FROM sim_jobs j
+      WHERE j.engine_job_id = c.job_id AND j.status = 'ingesting'
+        AND j.ingest_lease_expires_at > now()) AS active_ingest_leases,
+    (SELECT count(*) FROM result_attempts a JOIN sim_jobs j
+       ON j.id = a.sim_job_id
+      WHERE j.engine_job_id = c.job_id AND a.engine_job_id = c.job_id
+        AND a.engine_case_slug = c.case_slug) AS exact_attempts,
+    (SELECT count(*) FROM results r JOIN sim_jobs j ON j.id = r.sim_job_id
+      WHERE j.engine_job_id = c.job_id AND r.engine_job_id = c.job_id
+        AND r.engine_case_slug = c.case_slug) AS exact_results,
+    (SELECT count(*) FROM solver_evidence_artifacts a
+      WHERE a.storage_key = 'jobs/' || c.job_id || '/' || c.evidence_path ||
+        '/engine_evidence.tar.zst') AS source_rows,
+    (SELECT count(*) FROM solver_evidence_orphan_quarantines q
+      WHERE q.engine_job_id = c.job_id
+        AND q.evidence_path = c.evidence_path) AS existing_quarantines
+  FROM candidates c
+)
+SELECT job_id, evidence_path, case_slug, sim_jobs, terminal_jobs,
+       active_ingest_leases, exact_attempts, exact_results, source_rows,
+       existing_quarantines
+  FROM stats
+ ORDER BY job_id;
+SQL
+
+python3 - "$AUDIT_DIR/trial-orphan-database-candidates.tsv" \
+  >"$AUDIT_DIR/trial-orphan-eligible.tsv" <<'PY'
+import sys
+expected = [1, 1, 0, 0, 0, 0, 0]
+for line in open(sys.argv[1], encoding="utf-8"):
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != 10:
+        raise SystemExit(f"malformed candidate row: {line!r}")
+    counts = [int(value) for value in fields[3:]]
+    if counts == expected:
+        print("\t".join(fields[:3]))
+PY
+
+if [[ -s "$AUDIT_DIR/trial-orphan-eligible.tsv" ]]; then
+  IFS=$'\t' read -r ORPHAN_JOB_ID ORPHAN_EVIDENCE_PATH ORPHAN_CASE_SLUG \
+    <"$AUDIT_DIR/trial-orphan-eligible.tsv"
+  export ORPHAN_JOB_ID ORPHAN_EVIDENCE_PATH ORPHAN_CASE_SLUG
+else
+  printf '%s\n' '{"status":"no-eligible-production-orphan"}' \
+    | tee "$AUDIT_DIR/trial-orphan-not-eligible.json"
+fi
+```
+
+An eligible row must freshly satisfy all seven predicates:
+
+- `simJobs=1` and `terminalSimJobs=1` (`done`, `failed`, or `cancelled`);
+- `activeIngestLeases=0`;
+- `exactAttempts=0` and `exactResults=0` for that same sim job, engine job, and
+  case slug;
+- `sourceRows=0`; and
+- `existingQuarantines=0` for the exact engine job and evidence path.
+
+The filesystem must independently have terminal `status.json`, one scoped dry
+plan row, a regular `evidence_manifest.json` and
+`engine_evidence.tar.zst`, and no gzip, pointer, receipt, or database
+acknowledgement. Re-run the scoped Python plan and all database predicates
+immediately before pass 1; a previously generated shortlist is not current
+state. Require the exact selected row to remain in the regenerated
+`trial-orphan-eligible.tsv`.
+
+If the selector returns no row, write
+`{"status":"no-eligible-production-orphan"}` to the audit directory and stop
+proof B. That is the truthful current production outcome, not permission to
+adopt one of the 11 canary-only archives, create a `sim_jobs` row, or bind an
+AoA/result. The gzip trial and bulk gzip migration may continue.
+
+Only for a row that passes every predicate, run a scoped dry plan and require
+exactly one unchanged `planned` row, then run pass 1:
 
 ```bash
 compose exec -T api python3 -m airfoilfoam.evidence_migration \
-  --execute --job-id "$JOB_ID" \
-  2>&1 | tee "$AUDIT_DIR/trial-pass3-python.jsonl"
+  --job-id "$ORPHAN_JOB_ID" \
+  2>&1 | tee "$AUDIT_DIR/trial-orphan-scoped-plan.jsonl"
+
+compose exec -T api python3 -m airfoilfoam.evidence_migration \
+  --execute --job-id "$ORPHAN_JOB_ID" \
+  2>&1 | tee "$AUDIT_DIR/trial-orphan-pass1.jsonl"
 ```
 
-Every row must be `migrated` or `already-complete`, with no `failed` result.
-The finalizer validates either acknowledgement shape, downloads the pinned
-generation again, revalidates the tar plus exact manifest and every bundled
-member, and only then removes the local Zstandard archive, legacy gzip, and
-packaged raw evidence directories. The manifest, immutable GCS pointer,
-migration receipt, database acknowledgement, and stored render media remain.
-Operators can discover and download quarantined archives through
-`GET /api/admin/evidence-quarantine`,
-`GET /api/admin/evidence-quarantine/:id`, and the stable admin-only
-`/download` route; they never appear as public polar results.
-
-### Trial download and UI proof
-
-Stream every trial archive through the gateway, which must hydrate GCS rather
-than find a local archive, and compare it with the receipt SHA-256:
+Require one `awaiting-database-registration` row, `bytesDeleted=0`, a positive
+decimal generation, and full `archive+manifest+all-members-restore:N` proof;
+the Zstandard source and any packaged raw directories must remain. Then dry-run
+the Node backfill before allowing its execute mode:
 
 ```bash
-compose exec -T api python3 - "$JOB_ID" <<'PY' >"$AUDIT_DIR/trial-archives.tsv"
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/evidence-storage-backfill.ts --job-id "$ORPHAN_JOB_ID" \
+  2>&1 | tee "$AUDIT_DIR/trial-orphan-pass2-plan.jsonl"
+```
+
+The dry run must emit exactly one `planned-quarantine` row for the expected job,
+case, and evidence path, with no error. Re-run the seven read-only database
+predicates once more. Only then execute pass 2 and pass 3:
+
+```bash
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/evidence-storage-backfill.ts --execute --job-id "$ORPHAN_JOB_ID" \
+  2>&1 | tee "$AUDIT_DIR/trial-orphan-pass2.jsonl"
+
+compose exec -T api python3 -m airfoilfoam.evidence_migration \
+  --execute --job-id "$ORPHAN_JOB_ID" \
+  2>&1 | tee "$AUDIT_DIR/trial-orphan-pass3.jsonl"
+```
+
+Pass 2 must emit exactly one `quarantined` row with
+`registrationKind=orphan_evidence_quarantine`,
+`quarantineReason=terminal_engine_evidence_not_ingested`, nonempty
+`quarantineId`, `sourceArtifactId`, and `blobId`, and no `resultId`,
+`resultAttemptId`, or `archiveId`. Pass 3 must emit exactly one `migrated` row
+with `bytesDeleted>0`. Its postconditions are a `complete` receipt and
+`quarantined` acknowledgement; no local archive or packaged raw directory; one
+immutable quarantine row whose source artifact has null result, attempt, and
+AoA; zero exact results/attempts and zero `solver_evidence_archives` owners;
+and an exact `gcs` / `zstd` blob identity matching the retained pointer.
+
+### Generation-pinned download and authenticated admin proof
+
+For every completed proof-A or proof-B trial, stream the archive through the
+gateway after local cleanup and compare it with the receipt SHA-256:
+
+```bash
+TRIAL_JOB_IDS=("$JOB_ID")
+if [[ -n "${ORPHAN_JOB_ID:-}" ]]; then
+  TRIAL_JOB_IDS+=("$ORPHAN_JOB_ID")
+fi
+: >"$AUDIT_DIR/trial-archives.tsv"
+for trial_job_id in "${TRIAL_JOB_IDS[@]}"; do
+compose exec -T api python3 - "$trial_job_id" <<'PY' \
+  >>"$AUDIT_DIR/trial-archives.tsv"
 import json, pathlib, sys
 root = pathlib.Path("/data/airfoilfoam/jobs") / sys.argv[1]
 for path in sorted(root.glob("cases/**/evidence/storage_migration.json")):
     row = json.loads(path.read_text(encoding="utf-8"))
     assert row["state"] == "complete"
     rel = path.parent.relative_to(root).as_posix()
-    print(rel, row["archive"]["storedSha256"], sep="\t")
+    print(sys.argv[1], rel, row["archive"]["storedSha256"], sep="\t")
 PY
+done
 
-while IFS=$'\t' read -r evidence_path expected_sha; do
+while IFS=$'\t' read -r trial_job_id evidence_path expected_sha; do
   actual_sha="$(
     curl -fsS --max-time 900 \
-      "http://127.0.0.1:8000/jobs/$JOB_ID/files/$evidence_path/engine_evidence.tar.zst" \
+      "http://127.0.0.1:8000/jobs/$trial_job_id/files/$evidence_path/engine_evidence.tar.zst" \
       | sha256sum | cut -d' ' -f1
   )"
   test "$actual_sha" = "$expected_sha"
 done <"$AUDIT_DIR/trial-archives.tsv"
 ```
 
-Open the exact migrated result through Admin/Detail and exercise one stored
-field or custom render. The deterministic API render gate is the stripped
-2606 canary above; the trial confirms the legacy result's exact archive can be
-downloaded through the same generation-pinned hydration layer. Stop if the
-page loses a previously registered artifact, or if a render/download returns
-404, 422, 502, or 503.
+If proof B has an eligible target, also use a protected authenticated admin
+session to exercise list, exact detail, and exact download at
+`GET /api/admin/evidence-quarantine`,
+`GET /api/admin/evidence-quarantine/:id`, and
+`GET /api/admin/evidence-quarantine/:id/download`. Require the list/detail
+objects to have `resultOwner=null`, the same immutable generation and SHA-256,
+and the download SHA-256 to match the receipt:
+
+```bash
+: "${ADMIN_COOKIE:?set the protected aero_admin session cookie as in section 6}"
+QUARANTINE_ID="$(python3 - "$AUDIT_DIR/trial-orphan-pass2.jsonl" <<'PY'
+import json, sys
+rows = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(row, dict) and row.get("status") == "quarantined":
+        rows.append(row)
+assert len(rows) == 1, rows
+print(rows[0]["quarantineId"])
+PY
+)"
+
+curl -fsS -H "Cookie: $ADMIN_COOKIE" \
+  'http://127.0.0.1:4000/api/admin/evidence-quarantine?limit=100' \
+  >"$AUDIT_DIR/trial-orphan-admin-list.json"
+curl -fsS -H "Cookie: $ADMIN_COOKIE" \
+  "http://127.0.0.1:4000/api/admin/evidence-quarantine/$QUARANTINE_ID" \
+  >"$AUDIT_DIR/trial-orphan-admin-detail.json"
+
+python3 - "$AUDIT_DIR/trial-orphan-admin-list.json" \
+  "$AUDIT_DIR/trial-orphan-admin-detail.json" "$QUARANTINE_ID" <<'PY'
+import json, sys
+listing, detail = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:3])
+matches = [row for row in listing["items"] if row["id"] == sys.argv[3]]
+assert len(matches) == 1, matches
+assert matches[0]["resultOwner"] is None and detail["resultOwner"] is None
+assert detail["id"] == sys.argv[3]
+assert detail["sourceArtifact"]["resultId"] is None
+assert detail["sourceArtifact"]["resultAttemptId"] is None
+assert detail["sourceArtifact"]["aoaDeg"] is None
+for key in ("generation", "storedSha256"):
+    assert matches[0][key] == detail["blob"][
+        "sha256" if key == "storedSha256" else key
+    ]
+PY
+
+EXPECTED_SHA="$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["blob"]["sha256"])' \
+  "$AUDIT_DIR/trial-orphan-admin-detail.json")"
+curl -fsS --max-time 900 -H "Cookie: $ADMIN_COOKIE" \
+  "http://127.0.0.1:4000/api/admin/evidence-quarantine/$QUARANTINE_ID/download" \
+  | sha256sum | grep -F "$EXPECTED_SHA"
+```
+
+The current product has this authenticated API surface but no `apps/web`
+quarantine list/detail UI. Do not claim a browser UI proof or send an operator
+looking for a page that does not exist.
 
 ## 8. Bulk three-pass migration
 
@@ -584,61 +944,292 @@ healthy.
 
 Do not page through the same sorted discovery set with `--limit`: completed
 targets remain discoverable for idempotency, so a repeated limit would keep
-selecting the same prefix. Instead, use explicit repeatable `--job-id` arguments
-for each state-derived batch. Define this read-only selector once:
+selecting the same prefix. Select exactly one legacy job, keep that job pinned
+through upload, database registration, and finalization, and only then select
+another. The `--job-id` executors process every discoverable evidence target
+under that job, so a selectable job must be homogeneous: every target returned
+by `discover_targets(..., job_ids={job_id})` must be legacy-gzip-owned. A job
+that mixes legacy evidence with native Zstandard/canary evidence is unsafe for
+this runbook even if only one target still needs migration.
+
+Write a complete read-only inventory before every cycle. The inventory is also
+the fail-closed incident artifact: any active mixed job, invalid receipt,
+missing/zero-byte legacy source, or exact job above the 4 GiB gzip-input cap
+stops selection before mutation. Do not skip such a row or repeatedly select it
+without resolving the recorded reason. Define the inventory, selector, capacity
+planner, and verifier once:
 
 ```bash
-next_migration_jobs() {
-  local phase="$1"
-  compose exec -T -e MIGRATION_PHASE="$phase" api python3 - <<'PY'
-import json, os
+write_migration_inventory() {
+  compose exec -T api python3 - <<'PY'
+import json, re, sys
+from collections import defaultdict
+from pathlib import Path
 from airfoilfoam.evidence_migration import discover_targets
+from airfoilfoam.evidence_store import read_remote_pointer
 
-phase = os.environ["MIGRATION_PHASE"]
-root = "/data/airfoilfoam/jobs"
-selected = []
-if phase not in {"upload", "register", "finalize"}:
-    raise SystemExit(f"unknown migration phase: {phase}")
-seen = set()
+root = Path("/data/airfoilfoam/jobs")
+phase_rank = {"upload": 0, "register": 1, "finalize": 2}
+max_upload_bytes = 4 * 1024 * 1024 * 1024
+gzip_names = ("engine_evidence.tar.gz", "openfoam_evidence.tar.gz")
+jobs = defaultdict(list)
+
+def read_json_object(path, errors, label):
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        errors.append(f"{label} is not a regular file")
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        errors.append(f"cannot parse {label}: {exc}")
+        return None
+    if not isinstance(value, dict):
+        errors.append(f"{label} is not a JSON object")
+        return None
+    return value
+
 for target in discover_targets(root):
     evidence = target.evidence_dir
-    try:
-        receipt = json.loads(
-            (evidence / "storage_migration.json").read_text(encoding="utf-8")
+    errors = []
+    receipt_path = evidence / "storage_migration.json"
+    ack_path = evidence / "storage_migration.database.json"
+    pointer_path = evidence / "engine_evidence.remote.json"
+    receipt_present = receipt_path.exists() or receipt_path.is_symlink()
+    ack_present = ack_path.exists() or ack_path.is_symlink()
+    receipt = read_json_object(receipt_path, errors, "migration receipt")
+    ack = read_json_object(ack_path, errors, "database acknowledgement")
+
+    local_gzip = []
+    local_gzip_sizes = {}
+    for name in gzip_names:
+        path = evidence / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.is_symlink() or not path.is_file():
+            errors.append(f"{name} is not a regular file")
+        else:
+            local_gzip.append(name)
+            try:
+                local_gzip_sizes[name] = path.stat().st_size
+            except OSError as exc:
+                errors.append(f"cannot stat {name}: {exc}")
+                local_gzip_sizes[name] = 0
+            if local_gzip_sizes[name] <= 0:
+                errors.append(f"{name} is zero bytes")
+
+    pointer = None
+    if pointer_path.exists() or pointer_path.is_symlink():
+        if pointer_path.is_symlink() or not pointer_path.is_file():
+            errors.append("remote pointer is not a regular file")
+        else:
+            try:
+                pointer = read_remote_pointer(pointer_path)
+            except Exception as exc:
+                errors.append(f"cannot parse canonical remote pointer: {exc}")
+
+    source_archives = []
+    if receipt is not None:
+        source_archives = receipt.get("sourceArchives", [])
+        if not isinstance(source_archives, list) or not all(
+            isinstance(row, dict) for row in source_archives
+        ):
+            errors.append("receipt sourceArchives is not an object array")
+            source_archives = []
+        allowed_sources = {
+            "engine_evidence.tar.zst": "zstd",
+            "engine_evidence.tar.gz": "gzip",
+            "openfoam_evidence.tar.gz": "gzip",
+        }
+        for source in source_archives:
+            path = source.get("path")
+            if path not in allowed_sources or (
+                source.get("compression") != allowed_sources[path]
+            ):
+                errors.append(f"invalid source archive identity: {source!r}")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256", ""))):
+                errors.append(f"invalid source archive SHA-256: {source!r}")
+            if not isinstance(source.get("byteSize"), int) or source["byteSize"] <= 0:
+                errors.append(f"invalid source archive byte size: {source!r}")
+    receipt_gzip = [
+        row for row in source_archives
+        if row.get("compression") == "gzip" and row.get("path") in gzip_names
+    ]
+    legacy_owned = bool(local_gzip or receipt_gzip)
+    state = receipt.get("state") if receipt is not None else None
+    if receipt is not None:
+        for key, expected in {
+            "schemaVersion": 1,
+            "jobId": target.job_id,
+            "evidencePath": target.relative_evidence_path,
+        }.items():
+            if receipt.get(key) != expected:
+                errors.append(f"receipt {key} does not match exact target")
+        if pointer is not None:
+            if receipt.get("remote") != pointer.to_dict():
+                errors.append("receipt remote identity does not match pointer")
+            if receipt.get("archive") != {
+                "storedSha256": pointer.stored_sha256,
+                "storedByteSize": pointer.stored_size,
+                "uncompressedTarSha256": pointer.tar_sha256,
+                "uncompressedTarByteSize": pointer.tar_size,
+                "zstdLevel": pointer.zstd_level,
+            }:
+                errors.append("receipt archive identity does not match pointer")
+    if ack is not None:
+        for key, expected in {
+            "schemaVersion": 1,
+            "jobId": target.job_id,
+            "evidencePath": target.relative_evidence_path,
+        }.items():
+            if ack.get(key) != expected:
+                errors.append(f"acknowledgement {key} does not match exact target")
+        if ack.get("state") not in {"registered", "quarantined"}:
+            errors.append(f"unsupported acknowledgement state: {ack.get('state')!r}")
+        if pointer is not None:
+            if ack.get("storedSha256") != pointer.stored_sha256:
+                errors.append("acknowledgement stored SHA-256 does not match pointer")
+            if ack.get("generation") != str(pointer.generation):
+                errors.append("acknowledgement generation does not match pointer")
+    required = None
+    if receipt_present and receipt is None:
+        errors.append("migration receipt exists but is invalid")
+        if legacy_owned:
+            required = "upload"
+    elif receipt is None and legacy_owned:
+        required = "upload"
+        if ack_present:
+            errors.append("database acknowledgement exists before a receipt")
+    elif receipt is not None:
+        if state == "awaiting_database_registration":
+            required = "finalize" if ack_present else "register"
+            if pointer_path.is_symlink() or not pointer_path.is_file():
+                errors.append("awaiting receipt lacks a regular remote pointer")
+        elif state == "complete":
+            if pointer_path.is_symlink() or not pointer_path.is_file():
+                errors.append("complete receipt lacks a regular remote pointer")
+            if not ack_present or ack is None:
+                errors.append("complete receipt lacks a valid database acknowledgement")
+        else:
+            errors.append(f"unsupported receipt state: {state!r}")
+            if legacy_owned:
+                required = "upload"
+    if state in {"awaiting_database_registration", "complete"} and (
+        legacy_owned and not receipt_gzip
+    ):
+        errors.append("legacy receipt does not retain gzip source provenance")
+    if state == "awaiting_database_registration":
+        for source in receipt_gzip:
+            if source["path"] not in local_gzip:
+                errors.append(
+                    f"receipt-recorded gzip source is missing: {source['path']}"
+                )
+    if receipt is None and ack_present and not legacy_owned:
+        errors.append("database acknowledgement exists without a valid receipt")
+
+    jobs[target.job_id].append({
+        "evidencePath": target.relative_evidence_path,
+        "legacyOwned": legacy_owned,
+        "localGzip": sorted(local_gzip),
+        "localGzipBytes": sum(local_gzip_sizes.values()),
+        "receiptState": state,
+        "requiredPhase": required,
+        "errors": errors,
+    })
+
+rows = []
+blocking_jobs = []
+for job_id in sorted(jobs):
+    targets = sorted(jobs[job_id], key=lambda row: row["evidencePath"])
+    legacy = [row for row in targets if row["legacyOwned"]]
+    corrupt = any(row["errors"] for row in targets)
+    if not legacy and not corrupt:
+        continue
+    required_rows = [row for row in legacy if row["requiredPhase"] is not None]
+    active = bool(required_rows)
+    required_phase = (
+        min(
+            (row["requiredPhase"] for row in required_rows),
+            key=phase_rank.__getitem__,
         )
-    except FileNotFoundError:
-        receipt = None
-    receipt_state = receipt.get("state") if isinstance(receipt, dict) else None
-    ack = (evidence / "storage_migration.database.json").is_file()
-    # Bulk migration owns the legacy gzip corpus only. New 2606 canary/runtime
-    # evidence can already have a tar.zst plus remote pointer but no canonical
-    # database result association. Canary retention has its own attestation
-    # path; this legacy selector must not absorb it into result migration or
-    # terminal-job orphan quarantine.
-    legacy_gzip_source = any((evidence / name).is_file() for name in (
-        "engine_evidence.tar.gz",
-        "openfoam_evidence.tar.gz",
-    ))
-    wanted = (
-        phase == "upload"
-        and legacy_gzip_source
-        and receipt_state not in {"awaiting_database_registration", "complete"}
-    ) or (
-        phase == "register"
-        and receipt_state == "awaiting_database_registration"
-        and not ack
-    ) or (
-        phase == "finalize"
-        and receipt_state == "awaiting_database_registration"
-        and ack
+        if active else None
     )
-    if wanted and target.job_id not in seen:
-        seen.add(target.job_id)
-        selected.append(target.job_id)
-        if len(selected) == 25:
-            break
-if selected:
-    print("\n".join(selected))
+    upload_bytes = sum(
+        row["localGzipBytes"]
+        for row in required_rows
+        if row["requiredPhase"] == "upload"
+    )
+    blockers = []
+    if active and len(legacy) != len(targets):
+        blockers.append("mixed_legacy_and_nonlegacy_targets")
+    if active or corrupt:
+        for row in targets:
+            blockers.extend(
+                f"{row['evidencePath']}: {message}" for message in row["errors"]
+            )
+    if active:
+        for row in required_rows:
+            if row["requiredPhase"] == "upload" and not row["localGzip"]:
+                blockers.append(
+                    f"{row['evidencePath']}: missing_or_zero_legacy_gzip_input"
+                )
+        if required_phase == "upload" and upload_bytes == 0:
+            blockers.append("exact_job_has_zero_legacy_gzip_input")
+        if upload_bytes > max_upload_bytes:
+            blockers.append("exact_job_exceeds_4_GiB_gzip_input_cap")
+    row = {
+        "kind": "job",
+        "jobId": job_id,
+        "active": active,
+        "requiredPhase": required_phase,
+        "uploadGzipBytes": upload_bytes,
+        "allTargetPaths": [row["evidencePath"] for row in targets],
+        "legacyTargetPaths": [row["evidencePath"] for row in legacy],
+        "nonLegacyTargetPaths": [
+            row["evidencePath"] for row in targets if not row["legacyOwned"]
+        ],
+        "targets": targets,
+        "blockingReasons": sorted(set(blockers)),
+    }
+    rows.append(row)
+    if blockers:
+        blocking_jobs.append(job_id)
+
+payload = {
+    "schemaVersion": 1,
+    "jobs": rows,
+    "blockingJobs": blocking_jobs,
+}
+print(json.dumps(payload, sort_keys=True))
+if blocking_jobs:
+    print(
+        "bulk migration inventory contains blocking jobs: "
+        + ", ".join(blocking_jobs),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
+next_migration_jobs() {
+  local phase="$1"
+  python3 - "$MIGRATION_INVENTORY" "$phase" <<'PY'
+import json, sys
+path, phase = sys.argv[1:]
+if phase not in {"upload", "register", "finalize"}:
+    raise SystemExit(f"unknown migration phase: {phase}")
+payload = json.load(open(path, encoding="utf-8"))
+assert payload.get("schemaVersion") == 1, payload
+assert payload.get("blockingJobs") == [], payload.get("blockingJobs")
+candidates = []
+for row in payload.get("jobs", []):
+    if row.get("active") and row.get("requiredPhase") == phase:
+        weight = row.get("uploadGzipBytes", 0) if phase == "upload" else 0
+        assert isinstance(weight, int) and weight >= 0, row
+        candidates.append((weight, row["jobId"]))
+if candidates:
+    print(min(candidates)[1])
 PY
 }
 
@@ -653,75 +1244,616 @@ load_migration_jobs() {
     mapfile -t MIGRATION_JOBS <<<"$output"
   fi
 }
+
+plan_migration_capacity() {
+  local job_id="$1" phase="$2" expected_targets_json="$3"
+  compose exec -T -e MIGRATION_JOB_ID="$job_id" \
+    -e MIGRATION_EXPECTED_PHASE="$phase" \
+    -e MIGRATION_EXPECTED_TARGETS_JSON="$expected_targets_json" \
+    api python3 - <<'PY'
+import ctypes
+import ctypes.util
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+from airfoilfoam.config import get_settings
+from airfoilfoam.evidence_migration import discover_targets
+from airfoilfoam.evidence_store import inspect_tar_zst, read_remote_pointer
+
+jobs_root = Path("/data/airfoilfoam/jobs")
+job_id = os.environ["MIGRATION_JOB_ID"]
+expected_phase = os.environ["MIGRATION_EXPECTED_PHASE"]
+expected_paths = json.loads(os.environ["MIGRATION_EXPECTED_TARGETS_JSON"])
+gzip_names = ("engine_evidence.tar.gz", "openfoam_evidence.tar.gz")
+max_gzip_input = 4 * 1024**3
+minimum_reserve = 80 * 1024**3
+phase_rank = {"upload": 0, "register": 1, "finalize": 2}
+settings = get_settings()
+cache_root = settings.resolved_evidence_hydration_cache_dir()
+assert settings.data_dir / "jobs" == jobs_root, settings.data_dir
+assert Path(tempfile.gettempdir()) == Path("/tmp"), tempfile.gettempdir()
+
+def strict_json(path):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(value, dict), path
+    return value
+
+def source_archives(receipt):
+    if receipt is None:
+        return []
+    rows = receipt.get("sourceArchives", [])
+    assert isinstance(rows, list) and rows
+    allowed = {
+        "engine_evidence.tar.zst": "zstd",
+        "engine_evidence.tar.gz": "gzip",
+        "openfoam_evidence.tar.gz": "gzip",
+    }
+    for row in rows:
+        assert isinstance(row, dict)
+        path = row.get("path")
+        assert path in allowed and row.get("compression") == allowed[path], row
+        assert re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))), row
+        assert isinstance(row.get("byteSize"), int) and row["byteSize"] > 0
+    return rows
+
+def legacy_owned(evidence, receipt):
+    local = any(
+        (evidence / name).is_file() and not (evidence / name).is_symlink()
+        for name in gzip_names
+    )
+    recorded = any(
+        row.get("compression") == "gzip" for row in source_archives(receipt)
+    )
+    return local or recorded
+
+def gzip_tar_identity(path):
+    digest = hashlib.sha256()
+    size = 0
+    with gzip.open(path, "rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    assert size > 0, f"empty tar stream in {path}"
+    return size, digest.hexdigest()
+
+def load_compress_bound():
+    candidates = [ctypes.util.find_library("zstd"), "libzstd.so.1", "libzstd.so"]
+    errors = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            library = ctypes.CDLL(candidate)
+            function = library.ZSTD_compressBound
+            function.argtypes = [ctypes.c_size_t]
+            function.restype = ctypes.c_size_t
+            return function, candidate
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+    raise RuntimeError("cannot load libzstd ZSTD_compressBound: " + "; ".join(errors))
+
+def nearest_existing(path):
+    candidate = Path(path)
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            raise RuntimeError(f"no existing parent for {path}")
+        candidate = parent
+    assert not candidate.is_symlink(), f"capacity path traverses a symlink: {candidate}"
+    return candidate
+
+def measurement(label, configured_path):
+    anchor = nearest_existing(configured_path)
+    usage = shutil.disk_usage(anchor)
+    return {
+        "label": label,
+        "configuredPath": str(configured_path),
+        "measuredAt": str(anchor),
+        "device": str(anchor.stat().st_dev),
+        "freeBytes": usage.free,
+        "totalBytes": usage.total,
+    }
+
+report = {
+    "schemaVersion": 1,
+    "jobId": job_id,
+    "expectedStartPhase": expected_phase,
+    "expectedTargetPaths": expected_paths,
+    "gzipInputBytes": 0,
+    "targets": [],
+    "filesystems": [],
+    "blockingReasons": [],
+}
+try:
+    assert expected_phase in {*phase_rank, "finalize_or_complete"}, expected_phase
+    assert isinstance(expected_paths, list) and expected_paths
+    assert expected_paths == sorted(set(expected_paths)), expected_paths
+    targets = list(discover_targets(jobs_root, job_ids={job_id}))
+    actual_paths = sorted(target.relative_evidence_path for target in targets)
+    assert actual_paths == expected_paths, {
+        "expected": expected_paths,
+        "actual": actual_paths,
+    }
+
+    measurements = {
+        "jobs": measurement("jobs", jobs_root),
+        "cache": measurement("hydration-cache", cache_root),
+        "tmp": measurement("fresh-restore-temp", Path("/tmp")),
+    }
+    jobs_device = measurements["jobs"]["device"]
+    assert all(
+        str(target.evidence_dir.stat().st_dev) == jobs_device for target in targets
+    ), "a target uses a nested filesystem not represented by the jobs measurement"
+    requirements = {"jobs": 0, "cache": 0, "tmp": 0}
+    required_phases = []
+    compress_bound, compress_bound_library = load_compress_bound()
+
+    for target in targets:
+        evidence = target.evidence_dir
+        receipt_path = evidence / "storage_migration.json"
+        assert not receipt_path.is_symlink(), receipt_path
+        receipt = strict_json(receipt_path) if receipt_path.is_file() else None
+        assert legacy_owned(evidence, receipt), (
+            f"nonlegacy target entered exact job scope: {target.relative_evidence_path}"
+        )
+        state = receipt.get("state") if receipt is not None else None
+        ack_present = (evidence / "storage_migration.database.json").is_file()
+        if receipt is None:
+            required = "upload"
+        elif state == "awaiting_database_registration":
+            required = "finalize" if ack_present else "register"
+        elif state == "complete":
+            required = None
+        else:
+            raise AssertionError(f"unsupported receipt state {state!r}")
+        pointer = None
+        if state in {"awaiting_database_registration", "complete"}:
+            pointer_path = evidence / "engine_evidence.remote.json"
+            assert pointer_path.is_file() and not pointer_path.is_symlink(), pointer_path
+            pointer = read_remote_pointer(pointer_path)
+            assert receipt is not None and receipt.get("remote") == pointer.to_dict()
+            assert receipt.get("archive") == {
+                "storedSha256": pointer.stored_sha256,
+                "storedByteSize": pointer.stored_size,
+                "uncompressedTarSha256": pointer.tar_sha256,
+                "uncompressedTarByteSize": pointer.tar_size,
+                "zstdLevel": pointer.zstd_level,
+            }
+        if required is not None:
+            required_phases.append(required)
+
+        target_row = {
+            "evidencePath": target.relative_evidence_path,
+            "requiredPhase": required,
+            "gzipInputBytes": 0,
+            "uncompressedTarBytes": None,
+            "zstdCompressBoundBytes": None,
+            "canonicalAdditionalBytes": 0,
+            "cacheAdditionalBytes": 0,
+            "freshRestoreAdditionalBytes": 0,
+        }
+        if required == "upload":
+            gzip_paths = []
+            for name in gzip_names:
+                path = evidence / name
+                if path.exists() or path.is_symlink():
+                    assert path.is_file() and not path.is_symlink(), path
+                    gzip_paths.append(path)
+            assert gzip_paths, "upload target has no regular legacy gzip source"
+            identities = [gzip_tar_identity(path) for path in gzip_paths]
+            assert len(set(identities)) == 1, (
+                f"legacy gzip tar identities disagree at {target.relative_evidence_path}"
+            )
+            tar_size, tar_sha256 = identities[0]
+            bound = int(compress_bound(tar_size))
+            assert bound >= tar_size and bound > 0, (tar_size, bound)
+            gzip_input = sum(path.stat().st_size for path in gzip_paths)
+            report["gzipInputBytes"] += gzip_input
+            target_row["gzipInputBytes"] = gzip_input
+            target_row["uncompressedTarBytes"] = tar_size
+            target_row["zstdCompressBoundBytes"] = bound
+
+            canonical = evidence / "engine_evidence.tar.zst"
+            if canonical.exists() or canonical.is_symlink():
+                assert canonical.is_file() and not canonical.is_symlink(), canonical
+                record = inspect_tar_zst(canonical, level=settings.evidence_zstd_level)
+                assert (record.tar_size, record.tar_sha256) == (tar_size, tar_sha256)
+                archive_upper_bound = record.stored_size
+            else:
+                archive_upper_bound = bound
+                requirements["jobs"] += bound
+                target_row["canonicalAdditionalBytes"] = bound
+
+            pointer_path = evidence / "engine_evidence.remote.json"
+            if pointer_path.exists() or pointer_path.is_symlink():
+                assert pointer_path.is_file() and not pointer_path.is_symlink()
+                pointer = read_remote_pointer(pointer_path)
+                assert (pointer.tar_size, pointer.tar_sha256) == (tar_size, tar_sha256)
+                if canonical.exists():
+                    assert (
+                        record.stored_sha256,
+                        record.stored_size,
+                        record.tar_sha256,
+                        record.tar_size,
+                    ) == (
+                        pointer.stored_sha256,
+                        pointer.stored_size,
+                        pointer.tar_sha256,
+                        pointer.tar_size,
+                    )
+                archive_upper_bound = max(archive_upper_bound, pointer.stored_size)
+            requirements["cache"] += archive_upper_bound
+            requirements["tmp"] += archive_upper_bound
+            target_row["cacheAdditionalBytes"] = archive_upper_bound
+            target_row["freshRestoreAdditionalBytes"] = archive_upper_bound
+        elif required in {"register", "finalize"}:
+            assert receipt is not None and pointer is not None
+            requirements["tmp"] += pointer.stored_size
+            target_row["freshRestoreAdditionalBytes"] = pointer.stored_size
+        report["targets"].append(target_row)
+
+    actual_phase = (
+        min(required_phases, key=phase_rank.__getitem__) if required_phases else None
+    )
+    if expected_phase == "finalize_or_complete":
+        assert actual_phase in {"finalize", None}, {
+            "expectedStartPhase": expected_phase,
+            "actualStartPhase": actual_phase,
+        }
+    else:
+        assert actual_phase == expected_phase, {
+            "expectedStartPhase": expected_phase,
+            "actualStartPhase": actual_phase,
+        }
+    report["compressBoundLibrary"] = compress_bound_library
+    if report["gzipInputBytes"] > max_gzip_input:
+        report["blockingReasons"].append("exact_job_exceeds_4_GiB_gzip_input_cap")
+
+    devices = {}
+    for role, item in measurements.items():
+        device = item["device"]
+        current = devices.setdefault(device, {
+            "device": device,
+            "freeBytes": item["freeBytes"],
+            "paths": [],
+            "requiredAdditionalBytes": 0,
+        })
+        current["freeBytes"] = min(current["freeBytes"], item["freeBytes"])
+        current["paths"].append(item)
+        current["requiredAdditionalBytes"] += requirements[role]
+    for device in sorted(devices):
+        item = devices[device]
+        item["projectedFreeBytes"] = (
+            item["freeBytes"] - item["requiredAdditionalBytes"]
+        )
+        item["minimumReserveBytes"] = minimum_reserve
+        if item["projectedFreeBytes"] < minimum_reserve:
+            report["blockingReasons"].append(
+                f"device_{device}_would_fall_below_80_GiB_reserve"
+            )
+        report["filesystems"].append(item)
+except Exception as exc:
+    report["blockingReasons"].append(f"capacity_preflight_error: {exc}")
+
+report["blockingReasons"] = sorted(set(report["blockingReasons"]))
+print(json.dumps(report, sort_keys=True))
+if report["blockingReasons"]:
+    raise SystemExit(1)
+PY
+}
+
+verify_migration_job() {
+  local job_id="$1" phase="$2" expected_targets_json="$3"
+  compose exec -T -e MIGRATION_JOB_ID="$job_id" \
+    -e MIGRATION_EXPECTED_PHASE="$phase" \
+    -e MIGRATION_EXPECTED_TARGETS_JSON="$expected_targets_json" \
+    api python3 - <<'PY'
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+from airfoilfoam.config import get_settings
+from airfoilfoam.evidence_migration import discover_targets
+from airfoilfoam.evidence_runtime import evidence_object_store
+from airfoilfoam.evidence_store import (
+    manifest_bundle_member_set_sha256,
+    read_remote_pointer,
+)
+
+root = Path("/data/airfoilfoam/jobs")
+job_id = os.environ["MIGRATION_JOB_ID"]
+phase = os.environ["MIGRATION_EXPECTED_PHASE"]
+expected_paths = json.loads(os.environ["MIGRATION_EXPECTED_TARGETS_JSON"])
+assert phase in {"uploaded", "registered", "finalized"}, phase
+assert isinstance(expected_paths, list) and expected_paths
+assert expected_paths == sorted(set(expected_paths)), expected_paths
+
+def strict_json(path):
+    assert path.is_file() and not path.is_symlink(), path
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(value, dict), path
+    return value
+
+def validate_sources(receipt):
+    sources = receipt.get("sourceArchives", [])
+    assert isinstance(sources, list) and sources
+    allowed = {
+        "engine_evidence.tar.zst": "zstd",
+        "engine_evidence.tar.gz": "gzip",
+        "openfoam_evidence.tar.gz": "gzip",
+    }
+    for source in sources:
+        assert isinstance(source, dict)
+        path = source.get("path")
+        assert path in allowed and source.get("compression") == allowed[path], source
+        assert re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256", ""))), source
+        assert isinstance(source.get("byteSize"), int) and source["byteSize"] > 0
+    return sources
+
+def legacy_owned(evidence, receipt):
+    sources = validate_sources(receipt)
+    return any(row.get("compression") == "gzip" for row in sources)
+
+def nonempty_string(value):
+    return isinstance(value, str) and value and value == value.strip()
+
+def file_identity(path):
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+def validate_ack(ack, target, pointer, receipt, receipt_path):
+    expected = {
+        "schemaVersion": 1,
+        "jobId": job_id,
+        "evidencePath": target.relative_evidence_path,
+        "storedSha256": pointer.stored_sha256,
+        "generation": str(pointer.generation),
+    }
+    for key, value in expected.items():
+        assert ack.get(key) == value, (target.relative_evidence_path, key)
+    state = ack.get("state")
+    if state == "registered":
+        for key in (
+            "resultId", "resultAttemptId", "sourceArtifactId", "archiveId",
+            "registeredAt",
+        ):
+            assert nonempty_string(ack.get(key)), (target.relative_evidence_path, key)
+    elif state == "quarantined":
+        assert ack.get("registrationKind") == "orphan_evidence_quarantine"
+        assert ack.get("quarantineReason") == "terminal_engine_evidence_not_ingested"
+        for key in (
+            "quarantineId", "sourceArtifactId", "blobId", "quarantinedAt",
+        ):
+            assert nonempty_string(ack.get(key)), (target.relative_evidence_path, key)
+        assert all(ack.get(key) is None for key in (
+            "resultId", "resultAttemptId", "archiveId",
+        ))
+        manifest_bytes = (target.evidence_dir / "evidence_manifest.json").read_bytes()
+        count, member_set_sha256 = manifest_bundle_member_set_sha256(manifest_bytes)
+        assert ack.get("manifestSha256") == hashlib.sha256(manifest_bytes).hexdigest()
+        assert ack.get("manifestByteSize") == len(manifest_bytes)
+        assert ack.get("archiveMemberSetSha256") == member_set_sha256
+        assert ack.get("archiveMemberCount") == count
+        if receipt.get("state") == "awaiting_database_registration":
+            receipt_bytes = receipt_path.read_bytes()
+            assert ack.get("migrationReceiptSha256") == hashlib.sha256(
+                receipt_bytes
+            ).hexdigest()
+            assert ack.get("migrationReceiptByteSize") == len(receipt_bytes)
+        else:
+            assert re.fullmatch(r"[0-9a-f]{64}", str(
+                ack.get("migrationReceiptSha256", "")
+            ))
+            assert isinstance(ack.get("migrationReceiptByteSize"), int)
+            assert ack["migrationReceiptByteSize"] > 0
+    else:
+        raise AssertionError((target.relative_evidence_path, state))
+    if receipt.get("state") == "complete":
+        assert receipt.get("databaseAcknowledgement") == ack
+
+rows = []
+targets = list(discover_targets(root, job_ids={job_id}))
+actual_paths = sorted(target.relative_evidence_path for target in targets)
+assert actual_paths == expected_paths, {"expected": expected_paths, "actual": actual_paths}
+store = evidence_object_store(get_settings())
+assert store is not None, "remote evidence store is not configured"
+for target in targets:
+    evidence = target.evidence_dir
+    receipt_path = evidence / "storage_migration.json"
+    receipt = strict_json(receipt_path)
+    assert legacy_owned(evidence, receipt), target.relative_evidence_path
+    sources = validate_sources(receipt)
+    state = receipt.get("state")
+    pointer = read_remote_pointer(evidence / "engine_evidence.remote.json")
+    store.verify_remote_pointer(pointer)
+    assert receipt.get("schemaVersion") == 1
+    assert receipt.get("jobId") == job_id
+    assert receipt.get("evidencePath") == target.relative_evidence_path
+    assert receipt.get("remote") == pointer.to_dict()
+    assert receipt.get("archive") == {
+        "storedSha256": pointer.stored_sha256,
+        "storedByteSize": pointer.stored_size,
+        "uncompressedTarSha256": pointer.tar_sha256,
+        "uncompressedTarByteSize": pointer.tar_size,
+        "zstdLevel": pointer.zstd_level,
+    }
+    assert state in {"awaiting_database_registration", "complete"}, (
+        target.relative_evidence_path, state
+    )
+    ack_path = evidence / "storage_migration.database.json"
+    ack = strict_json(ack_path) if ack_path.is_file() else None
+    if phase in {"registered", "finalized"} or state == "complete":
+        assert ack is not None, target.relative_evidence_path
+    if ack is not None:
+        validate_ack(ack, target, pointer, receipt, receipt_path)
+    if state == "awaiting_database_registration":
+        canonical = evidence / "engine_evidence.tar.zst"
+        assert canonical.is_file() and not canonical.is_symlink(), canonical
+        assert file_identity(canonical) == (
+            pointer.stored_size,
+            pointer.stored_sha256,
+        )
+        for source in sources:
+            source_path = evidence / source["path"]
+            assert source_path.is_file() and not source_path.is_symlink(), source_path
+            assert file_identity(source_path) == (
+                source["byteSize"],
+                source["sha256"],
+            )
+    if phase == "finalized":
+        assert state == "complete", target.relative_evidence_path
+        for name in (
+            "engine_evidence.tar.zst", "engine_evidence.tar.gz",
+            "openfoam_evidence.tar.gz", "openfoam", "time_directories", "VTK",
+        ):
+            assert not (evidence / name).exists(), (
+                target.relative_evidence_path, name
+            )
+    rows.append({
+        "evidencePath": target.relative_evidence_path,
+        "state": state,
+        "ackState": ack.get("state") if isinstance(ack, dict) else None,
+        "generation": str(pointer.generation),
+        "storedSha256": pointer.stored_sha256,
+    })
+assert len(rows) == len(expected_paths)
+print(json.dumps({
+    "jobId": job_id,
+    "phase": phase,
+    "targetCount": len(rows),
+    "targets": rows,
+}, sort_keys=True))
+PY
+}
 ```
 
 `load_migration_jobs` deliberately captures and checks the selector's exit
 status before populating the array. Do not replace it with
 `mapfile < <(next_migration_jobs ...)`: Bash reports `mapfile`'s status, not a
 failed process substitution, so a broken selector can otherwise look like an
-honestly empty batch.
+honestly empty batch. The inventory persists the exact homogeneous target set;
+the capacity planner and every phase verifier require the recomputed
+`discover_targets` set to match it exactly. The verifier also uses the canonical
+pointer parser, verifies the pinned remote generation, and compares receipt,
+pointer, acknowledgement, job, evidence path, hashes, and generation identity.
 
-### Bulk pass 1: Python upload and restore proof
+Capacity planning has one fail-closed runtime prerequisite: the deployed API
+image must expose libzstd's `ZSTD_compressBound` symbol. The planner deliberately
+has no compression-ratio estimate or hand-maintained formula fallback. If its
+capacity artifact reports that the symbol cannot be loaded, stop the migration
+and repair or rebuild the supported API image before retrying; do not substitute
+an approximation.
 
-```bash
-if ! load_migration_jobs upload; then exit 1; fi
-PASS1_JOBS=("${MIGRATION_JOBS[@]}")
-PASS1_ARGS=()
-for id in "${PASS1_JOBS[@]}"; do PASS1_ARGS+=(--job-id "$id"); done
-if ((${#PASS1_ARGS[@]} == 0)); then
-  echo 'no upload batch remains'
-else
-  compose exec -T api python3 -m airfoilfoam.evidence_migration \
-    --execute --continue-on-error "${PASS1_ARGS[@]}" \
-    2>&1 | tee -a "$AUDIT_DIR/bulk-pass1-python.jsonl"
-fi
-```
+### One exact three-pass cycle
 
-Repeat until the intended legacy set has receipts in
-`awaiting_database_registration` or is already complete. Investigate every
-`failed` row before proceeding; `--continue-on-error` records independent
-failures but does not make them acceptable.
-
-### Bulk pass 2: Node database registration
+Prioritize an already-started job (`finalize`, then `register`) before selecting
+a fresh upload. Every selector returns at most one ID. Pin that ID for the
+whole cycle:
 
 ```bash
-if ! load_migration_jobs register; then exit 1; fi
-PASS2_JOBS=("${MIGRATION_JOBS[@]}")
-PASS2_ARGS=()
-for id in "${PASS2_JOBS[@]}"; do PASS2_ARGS+=(--job-id "$id"); done
-if ((${#PASS2_ARGS[@]} == 0)); then
-  echo 'no database-registration batch remains'
-else
-  compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
-    src/evidence-storage-backfill.ts --execute --continue-on-error \
-    "${PASS2_ARGS[@]}" \
-    2>&1 | tee -a "$AUDIT_DIR/bulk-pass2-node.jsonl"
+set -Eeuo pipefail
+MIGRATION_INVENTORY="$AUDIT_DIR/bulk-selector-inventory.json"
+if ! write_migration_inventory | tee "$MIGRATION_INVENTORY"; then
+  echo "refusing bulk mutation; inspect $MIGRATION_INVENTORY" >&2
+  exit 1
 fi
+
+MIGRATION_JOB=
+MIGRATION_START_PHASE=
+for phase in finalize register upload; do
+  if ! load_migration_jobs "$phase"; then exit 1; fi
+  if ((${#MIGRATION_JOBS[@]})); then
+    MIGRATION_JOB="${MIGRATION_JOBS[0]}"
+    MIGRATION_START_PHASE="$phase"
+    break
+  fi
+done
+if [[ -z "$MIGRATION_JOB" ]]; then
+  echo 'no legacy migration job remains'
+  return 0 2>/dev/null || exit 0
+fi
+
+MIGRATION_EXPECTED_TARGETS_JSON="$(
+  python3 - "$MIGRATION_INVENTORY" "$MIGRATION_JOB" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+matches = [row for row in payload["jobs"] if row["jobId"] == sys.argv[2]]
+assert len(matches) == 1, matches
+row = matches[0]
+assert row["active"] and not row["blockingReasons"], row
+assert row["allTargetPaths"] == row["legacyTargetPaths"], row
+print(json.dumps(row["allTargetPaths"], separators=(",", ":")))
+PY
+)"
+test -n "$MIGRATION_EXPECTED_TARGETS_JSON"
+
+# The planner streams every upload-needed gzip to obtain the exact tar byte
+# count, asks libzstd for ZSTD_compressBound, and reserves simultaneous space
+# for a missing canonical archive, the pass-1 hydration-cache download, and the
+# pass-3 fresh-restore download. Paths that share st_dev share one aggregated
+# requirement. Measurements are taken inside the api container at the jobs
+# volume, configured hydration cache, and /tmp; every affected device must keep
+# at least 80 GiB free at the calculated peak.
+MIGRATION_CAPACITY="$AUDIT_DIR/bulk-capacity-$MIGRATION_JOB-$MIGRATION_START_PHASE.json"
+if ! plan_migration_capacity "$MIGRATION_JOB" "$MIGRATION_START_PHASE" \
+  "$MIGRATION_EXPECTED_TARGETS_JSON" | tee "$MIGRATION_CAPACITY"; then
+  echo "refusing bulk mutation; inspect $MIGRATION_CAPACITY" >&2
+  exit 1
+fi
+
+compose exec -T api python3 -m airfoilfoam.evidence_migration \
+  --execute --job-id "$MIGRATION_JOB" \
+  2>&1 | tee -a "$AUDIT_DIR/bulk-pass1-python.jsonl"
+verify_migration_job "$MIGRATION_JOB" uploaded \
+  "$MIGRATION_EXPECTED_TARGETS_JSON" \
+  | tee -a "$AUDIT_DIR/bulk-pass1-verified.jsonl"
+
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/evidence-storage-backfill.ts --execute --job-id "$MIGRATION_JOB" \
+  2>&1 | tee -a "$AUDIT_DIR/bulk-pass2-node.jsonl"
+verify_migration_job "$MIGRATION_JOB" registered \
+  "$MIGRATION_EXPECTED_TARGETS_JSON" \
+  | tee -a "$AUDIT_DIR/bulk-pass2-verified.jsonl"
+
+# Re-measure after upload/registration. The campaign remains live, so the
+# initial free-space snapshot is not sufficient evidence for the destructive
+# fresh-restore pass.
+MIGRATION_FINAL_CAPACITY="$AUDIT_DIR/bulk-capacity-$MIGRATION_JOB-finalize.json"
+if ! plan_migration_capacity "$MIGRATION_JOB" finalize_or_complete \
+  "$MIGRATION_EXPECTED_TARGETS_JSON" | tee "$MIGRATION_FINAL_CAPACITY"; then
+  echo "refusing finalization; inspect $MIGRATION_FINAL_CAPACITY" >&2
+  exit 1
+fi
+
+compose exec -T api python3 -m airfoilfoam.evidence_migration \
+  --execute --job-id "$MIGRATION_JOB" \
+  2>&1 | tee -a "$AUDIT_DIR/bulk-pass3-python.jsonl"
+verify_migration_job "$MIGRATION_JOB" finalized \
+  "$MIGRATION_EXPECTED_TARGETS_JSON" \
+  | tee -a "$AUDIT_DIR/bulk-pass3-verified.jsonl"
 ```
 
-Repeat until every awaiting receipt has an exact database acknowledgement.
-
-### Bulk pass 3: Python finalization
-
-```bash
-if ! load_migration_jobs finalize; then exit 1; fi
-PASS3_JOBS=("${MIGRATION_JOBS[@]}")
-PASS3_ARGS=()
-for id in "${PASS3_JOBS[@]}"; do PASS3_ARGS+=(--job-id "$id"); done
-if ((${#PASS3_ARGS[@]} == 0)); then
-  echo 'no finalization batch remains'
-else
-  compose exec -T api python3 -m airfoilfoam.evidence_migration \
-    --execute --continue-on-error "${PASS3_ARGS[@]}" \
-    2>&1 | tee -a "$AUDIT_DIR/bulk-pass3-python.jsonl"
-fi
-```
-
-Run only a command whose selected array is nonempty. Inspect each batch for
-failures, then repeat upload, register, and finalize until all three selectors
-return empty. End only when reconciliation shows every migration receipt
-complete, no awaiting database registration, and no legacy source bytes under
-those completed evidence directories.
+There is no `--continue-on-error`: this is one atomic operator cycle, and any
+failed target stops it on the same pinned job. Restarting the exact cycle is
+safe and idempotent. Select another job only after the final verifier succeeds.
+Repeat the inventory before each new cycle so state drift, mixed scope, and
+corrupt candidates cannot be hidden by an earlier snapshot. End only when all
+three selectors return empty, the inventory has no blocking job, and
+reconciliation shows no awaiting receipt or legacy source bytes.
 
 ## 9. Reconciliation and monitoring
 

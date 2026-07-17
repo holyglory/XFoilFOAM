@@ -1,7 +1,21 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+import { PreliminaryOutcomePanel } from "../components/admin/campaigns/PreliminaryOutcomePanel";
+import type {
+  AdminCampaignPreliminaryOutcome,
+  AdminCampaignPreliminaryOutcomes,
+} from "../lib/admin";
+
+vi.mock(
+  "@/lib/preliminary-outcomes",
+  async () => import("../lib/preliminary-outcomes"),
+);
+vi.mock("@/lib/tokens", async () => import("../lib/tokens"));
 
 const source = readFileSync(
   fileURLToPath(
@@ -45,6 +59,99 @@ describe("per-point solver sequence panel", () => {
     expect(source).not.toContain("FAILED POINTS");
     expect(source).not.toContain("no action required");
     expect(source).not.toContain("solver evidence rejected");
+  });
+
+  it("MUST-CATCH: renders the handoff, physical budget, and evidence accounting inside the existing disclosure", () => {
+    const item: AdminCampaignPreliminaryOutcome = {
+      aoaDeg: 10,
+      sourceAoaDeg: 10,
+      derivedBySymmetry: false,
+      affectedAoaDegs: [10],
+      affectedPointCount: 1,
+      state: "satisfied",
+      outcome: "accepted",
+      ransStage: "screened",
+      fastState: "accepted",
+      finalState: "accepted",
+      finalActivityState: null,
+      finalComparison: "within_tolerance",
+      finalDeltaCl: 0.002,
+      finalDeltaCd: 0.0001,
+      finalDeltaCm: null,
+      finalSource: "verify",
+      criticalStage: null,
+      fastResultId: "fast-result",
+      fastResultAttemptId: "fast-attempt",
+      finalResultId: "final-result",
+      finalResultAttemptId: "final-attempt",
+      finalEvidenceReasons: [],
+      finalSubmitError: null,
+      finalSubmitHttpStatus: null,
+      physicalAttemptsUsed: 1,
+      physicalAttemptsMax: 2,
+      recoverySubmissions: 2,
+      nonPhysicalSubmissions: 1,
+      interruptedPhysicalRuns: 0,
+      ransEvidenceRuns: 2,
+      preliminaryEvidenceRuns: 1,
+      fullUransEvidenceRuns: 1,
+      legacyUransEvidenceRuns: 0,
+      evidenceReasons: ["not-converged", "solver-stalled"],
+      updatedAt: "2026-07-17T00:00:00.000Z",
+    };
+    const outcomes: AdminCampaignPreliminaryOutcomes = {
+      total: 1,
+      recovering: 0,
+      critical: 0,
+      unavailable: 0,
+      verified: 1,
+      items: [item],
+    };
+
+    // Next's styled-jsx transform removes the boolean `jsx` marker in the
+    // browser build. Vitest renders the source TSX directly, so whitelist only
+    // that known harness warning while keeping every other React error fatal.
+    const reactError = vi
+      .spyOn(console, "error")
+      .mockImplementation((message, ...args) => {
+        const rendered = [message, ...args].map(String).join(" ");
+        if (
+          !rendered.includes("non-boolean attribute") ||
+          !rendered.includes("jsx")
+        ) {
+          throw new Error(`Unexpected React render error: ${rendered}`);
+        }
+      });
+    vi.stubGlobal("React", React);
+    let html: string;
+    try {
+      html = renderToStaticMarkup(
+        React.createElement(PreliminaryOutcomePanel, {
+          outcomes,
+          error: null,
+        }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      reactError.mockRestore();
+    }
+    const disclosureStart = html.indexOf("<details");
+
+    expect(disclosureStart).toBeGreaterThan(-1);
+    expect(html.slice(disclosureStart)).toContain(
+      "RANS screened; non-convergence hands off normally.",
+    );
+    expect(html.slice(disclosureStart)).toContain(
+      "Fast URANS runs · 1/2 physical",
+    );
+    expect(html.slice(disclosureStart)).toContain(
+      "Evidence · 2 RANS evidence records · 1 fast URANS · 1 final URANS",
+    );
+    expect(html.slice(disclosureStart)).toContain(
+      "1 engine submission ended before CFD; not a physical run.",
+    );
+    expect(html.match(/cell-preliminary-outcome-10/g)).toHaveLength(1);
+    expect(html.match(/<details[^>]*\sopen(?:=|\s|>)/g)).toBeNull();
   });
 
   it("separates evidence-record counts from confirmed physical work in the compact stage summaries", () => {

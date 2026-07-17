@@ -10,40 +10,18 @@
   seven ended before the required integration window. Complete archive-backed
   continuation hydration, attempt-preserving storage failure handling,
   adaptive same-case settling, and the per-angle
-  RANS → preliminary URANS → verified URANS interface. Deploy through the
-  guarded engine workflow. The repository now carries an explicit
-  `urans_recovery_version` capability contract: recovery requests pin their
-  expected version, the API and worker reject mismatches before solve work,
-  absent legacy capability is version 0, and malformed or unavailable
-  capability data fails closed. The current recovery controller requires the
-  version-2 contract; a known version 0 or 1 leaves continuation and corrective
-  final recovery pending while ordinary RANS and first-pass preliminary URANS
-  remain eligible. The OpenCFD 2606 cutover and exact successor-evidence
-  certification are complete. The successor campaign is currently ingesting
-  one deliberately admitted RANS batch while durable general admission remains
-  closed; deploy the matching version-2 engine before opening that admission.
-  Explicit admin final requests must remain aggregate owners of the same
-  per-point preliminary-plus-verification sequence; they must not create
-  direct full-fidelity bypass jobs.
-  Deterministic wave-1 RANS mesh failures must retain their immutable attempt,
-  reopen only for a strictly newer live `mesh_recovery_version`, return to the
-  exact campaign point once, and pin that version on the replacement job. They
-  must never trigger aerodynamic whole-polar promotion. Repository version 2
-  now recovers all 1,619 eligible closed seed profiles, including real
-  OpenFOAM 2606 full-ladder and transient canaries for GOE451 and FX79W660A;
-  production still must activate that engine version. If version 2 ever
-  exhausts, record one new grouped critical pre-solver incident rather than
-  replaying it unchanged.
-  Reopen checkpoints only on the exact solver implementation that produced
-  them; during the approved OpenCFD 2606 cutover, preserve all 26 affected 2406
-  histories unchanged and recompute their successor cells fresh. Prove that
-  cross-segment continuation cannot loop without measurable progress, that
-  failed final verification retains and automatically refines the accepted
-  preliminary generation, and that repeated fast/final incidents are durably
-  grouped for remediation. The local full-tier controller now applies strict
-  stationarity while the exact saved case can still extend and refine; deploy
-  that controller, recover accepted preliminary/final results, and monitor
-  subsequent URANS work for recurrence before removing this item.
+  RANS → preliminary URANS → verified URANS interface. OpenCFD 2606 recovery
+  version 2 is live in production, the deliberately admitted 78-case successor
+  RANS batch is 78/78 terminal, and both the engine queue and nonterminal
+  `sim_jobs` set are empty. Durable scheduling remains fenced at
+  `enabled=false`, `max_concurrent_jobs=0`, and `cpu_slots=0`.
+  Deploy the fail-closed exact one-angle canary controller, prove one
+  preliminary result and its linked final verification on the live version-2
+  runtime, then reopen only bounded campaign capacity. Preserve the 26 legacy
+  2406 histories unchanged; recover successor cells fresh on 2606. Monitor
+  subsequent fast/final work for recurrence, and keep any exhausted fast/final
+  chain as a grouped red system-owned incident rather than a review task or an
+  unchanged retry.
 
 - **GCS Zstandard evidence migration:** Implement and deploy content-addressed
   tar.zst finalization, verified GCS upload, temporary render hydration,
@@ -57,19 +35,23 @@
   PostgreSQL dump and its restore manifest now also have a private off-VPS copy
   whose SHA-256 matches the tested production backup. The OpenCFD 2606 engine
   now runs with that remote-only contract. At the 2026-07-17 reconciliation,
-  546 legacy evidence directories had complete three-pass migration receipts,
-  588 current GCS archive objects were registered in Postgres, and 605 local
-  remote pointers existed. The remaining corpus still contained 3,029 legacy
-  gzip files (147,646,075,989 bytes) plus 190,833,139,011 bytes of packaged raw
-  evidence, so migration and local reclamation are not complete. Canary jobs
+  549 receipt-covered legacy evidence directories were complete and none was
+  left mid-pass. The remaining corpus still contained 3,026 legacy gzip files
+  (145,861,216,428 bytes), 16 local Zstandard archives (216,240,757 bytes), and
+  60,471 packaged raw files (187,927,660,666 bytes). No terminal raw directory
+  lacked a protecting archive or remote pointer, but migration and local
+  reclamation are not complete. Canary jobs
   intentionally have no canonical result-attempt/database associations, so
   their per-artifact disposition remains
   `remote-copy-plus-local-archive-pending-database-ack`.
-  The local 0073 implementation now preserves a terminal campaign-job archive
-  with zero exact result owners as an immutable, admin-downloadable orphan
-  quarantine without creating coefficients or binding by AoA; deploy the
-  migration/backfill and exercise it against the audited orphan before any
-  corresponding local source is removed.
+  Migration 0073 now preserves a terminal campaign-job archive with zero exact
+  result owners as an immutable, admin-API-downloadable orphan quarantine
+  without creating coefficients or binding by AoA. It is deployed and
+  test-covered, but the 2026-07-17 read-only production audit found no eligible
+  terminal campaign orphan: all 11 zero-owner filesystem archives have no
+  `sim_jobs` owner and are canary-only. Do not force a quarantine trial or
+  claim a web UI proof; the authenticated list/detail/download API exists,
+  while a visible quarantine UI remains unimplemented.
   Add and verify a distinct attestation-backed cleanup for canary-only local
   archives after certification; do not invent a database acknowledgement or
   register canary evidence as campaign data.
@@ -85,14 +67,14 @@
   before deploying the Foundation worker to an arm64 host.
 
 - **Production evidence capacity:** The owner expanded the VPS disk from 300 to
-  500 GiB. The latest 2026-07-17 production measurement is 492 GiB usable,
-  about 385 GiB used, and 103 GiB free (79% used); the
+  500 GiB. The latest 2026-07-17 production measurement is 491.9 GiB usable,
+  387.9 GiB used, and 98.9 GiB free (79.9% used); the
   `/var/lib/docker/volumes/app_results` volume accounts for about 357 GiB.
-  One exact 78-case successor RANS batch is active and publishing partial
-  evidence; durable general admission remains disabled. The VPS cannot safely
-  retain the immutable artifacts for the complete 631,000-point campaign.
-  Complete the verified GCS migration before opening sustained campaign
-  admission, then remeasure active-case growth and the local hydration reserve.
+  The 78-case successor RANS batch is terminal and durable general admission
+  remains disabled. The VPS cannot safely retain the immutable artifacts for
+  the complete 631,000-point campaign. Continue the verified migration one
+  complete job at a time, preserve at least 80 GiB free, and remeasure
+  active-case growth before opening sustained campaign admission.
 
 - **A18 low-angle alternate-branch correction:** The control-plane classifier,
   cache reset, affected-cell preliminary-URANS requests, campaign-evidence
