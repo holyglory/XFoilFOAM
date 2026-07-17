@@ -229,6 +229,21 @@ export async function stripTerminalJobs(
       FROM sim_jobs j
       WHERE j.status IN ('done', 'failed', 'cancelled')
         AND j.engine_job_id IS NOT NULL
+        -- A remote-solver job owns upload source bytes until the hub has
+        -- acknowledged every exact generation and the delivery loop has
+        -- written its job-level terminal row. Generic stripping currently
+        -- retains packaged evidence too, but this explicit fence prevents a
+        -- future retention expansion from racing the federation ACK.
+        AND (
+          NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
+          OR EXISTS (
+            SELECT 1
+            FROM sync_remote_result_deliveries remote_delivery
+            WHERE remote_delivery.sim_job_id = j.id
+              AND remote_delivery.result_id IS NULL
+              AND remote_delivery.state IN ('delivered', 'superseded')
+          )
+        )
         AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
           ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
     )

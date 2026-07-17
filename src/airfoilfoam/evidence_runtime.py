@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -763,6 +764,77 @@ def hydrated_render_source(evidence_dir: Path, settings: Settings) -> Iterator[P
         yield source
 
 
+@contextmanager
+def hydrated_volume_render_source(
+    evidence_dir: Path, settings: Settings
+) -> Iterator[Path]:
+    """Yield VTK restored from the retained local tar.zst archive.
+
+    This is the dedicated-volume counterpart to GCS hydration.  It is used by
+    the remote-solver cutover canary and by explicit archive-only render
+    requests; ordinary volume-backed rendering still reads retained raw VTK.
+    The whole archive is decompressed and every bundled manifest member is
+    authenticated before the temporary VTK tree becomes visible.
+    """
+
+    evidence_dir = Path(evidence_dir)
+    archive_path = evidence_archive_path(evidence_dir)
+    manifest_path = evidence_dir / "evidence_manifest.json"
+    for label, path in (("archive", archive_path), ("manifest", manifest_path)):
+        if not path.is_file() or path.is_symlink():
+            raise EvidenceIntegrityError(
+                f"retained local evidence {label} is not a safe regular file"
+            )
+    try:
+        with manifest_path.open("rb") as manifest_stream:
+            manifest = manifest_stream.read(MAX_EVIDENCE_MANIFEST_BYTES + 1)
+    except OSError as exc:
+        raise EvidenceUnavailableError(
+            f"retained local evidence manifest cannot be read: {exc}"
+        ) from exc
+    if len(manifest) > MAX_EVIDENCE_MANIFEST_BYTES:
+        raise EvidenceIntegrityError(
+            "retained local evidence manifest exceeds the safety limit"
+        )
+    before = inspect_tar_zst(archive_path, level=settings.evidence_zstd_level)
+    cache_root = settings.resolved_evidence_hydration_cache_dir()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        raise EvidenceIntegrityError(
+            "volume evidence hydration cache is not a safe directory"
+        )
+    destination = Path(
+        tempfile.mkdtemp(
+            prefix=f".volume-{before.tar_sha256[:16]}-", dir=cache_root
+        )
+    )
+    # extract_verified_evidence_archive requires a destination that does not
+    # yet exist. mkdtemp reserves a collision-free name, then removal hands
+    # that exact path to the extractor without a predictable-name race.
+    destination.rmdir()
+    try:
+        extracted = extract_verified_evidence_archive(
+            archive_path,
+            destination,
+            compression="zstd",
+            include_prefixes=("VTK",),
+            expected_manifest=manifest,
+        )
+        if extracted <= 0 or not (destination / "VTK").is_dir():
+            raise EvidenceIntegrityError(
+                "retained local evidence archive contains no verified VTK members"
+            )
+        after = inspect_tar_zst(archive_path, level=settings.evidence_zstd_level)
+        if after != before:
+            raise EvidenceIntegrityError(
+                "retained local evidence archive changed during hydration"
+            )
+        yield destination
+    finally:
+        if destination.is_dir() and not destination.is_symlink():
+            shutil.rmtree(destination)
+
+
 @lru_cache(maxsize=8)
 def _cached_object_store(
     bucket: str,
@@ -926,6 +998,7 @@ __all__ = [
     "evidence_pointer_path",
     "finalize_remote_evidence_cleanup",
     "hydrated_render_source",
+    "hydrated_volume_render_source",
     "publish_evidence_directory",
     "publish_evidence_archive",
     "remove_verified_local_raw_evidence",

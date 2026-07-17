@@ -64,6 +64,19 @@
   snapshot is represented by its linked 2606 generation and the durable
   continuation proof reaches `evidence` or truthful `not_required`.
 
+- **hz-solver2 40-slot OpenCFD 2606 activation:** The role-separated Compose
+  profile, strict volume canary, archive-only render proof, restartable guarded
+  cutover, verified backup/rollback artifacts, private attestation, and
+  hub-acknowledgement retention fence are implemented in the repository. The
+  live dedicated server still requires an idle maintenance boundary and an
+  authorized run of `scripts/deploy/rebuild-remote-solver-engine.sh` with one
+  immutable build ID. Record the live merged 40-CPU profile, scratch-restored
+  backup and rollback hashes, three-scenario receipt/attestation hashes,
+  OpenCFD 2606 health, resumed sweeper state, new promised work, completed
+  evidence delivery, and production-hub acknowledgement before removing this
+  item. Do not place hub GCS credentials on the remote solver or use the hub's
+  campaign-successor cutover there.
+
 - **OpenFOAM Foundation 14 production activation:** The additive identity,
   adapter, isolated worker/pool, control-plane selection, compatibility split,
   guarded deployment path, and real amd64 serial plus two-rank MPI RANS

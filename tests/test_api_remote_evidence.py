@@ -136,6 +136,89 @@ def test_remote_only_render_endpoints_hold_hydration_lease(
     assert lease == {"active": False, "enters": 3, "exits": 3}
 
 
+def test_archive_source_mode_forces_volume_hydration_for_every_render_endpoint(
+    client, remote_case, tmp_path, monkeypatch
+):
+    job_id, _case_dir, evidence_dir = remote_case
+    (evidence_dir / EVIDENCE_POINTER_NAME).unlink()
+    (evidence_dir / "VTK").mkdir()
+    hydrated = tmp_path / "volume-hydrated"
+    (hydrated / "VTK").mkdir(parents=True)
+    lease = {"active": False, "enters": 0, "exits": 0}
+
+    @contextmanager
+    def exact_volume(actual_evidence_dir, _settings):
+        assert actual_evidence_dir == evidence_dir
+        assert lease["active"] is False
+        lease["active"] = True
+        lease["enters"] += 1
+        try:
+            yield hydrated
+        finally:
+            lease["active"] = False
+            lease["exits"] += 1
+
+    @contextmanager
+    def forbidden_remote(*_args, **_kwargs):
+        raise AssertionError("volume-backed evidence must not use GCS hydration")
+        yield  # pragma: no cover
+
+    def fake_custom(source_dir, out_dir, *_args, **_kwargs):
+        assert lease["active"] is True
+        assert source_dir == hydrated
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "custom.png").write_bytes(b"custom-image")
+        return "custom.png"
+
+    def fake_extents(source_dir, *_args, **_kwargs):
+        assert lease["active"] is True
+        assert source_dir == hydrated
+        return {"pressure": {"vmin": -1.0, "vmax": 1.0}}
+
+    def fake_contours(source_dir, out_dir, *_args, **_kwargs):
+        assert lease["active"] is True
+        assert source_dir == hydrated
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "pressure.png").write_bytes(b"default-image")
+        return {"pressure": "pressure.png"}
+
+    monkeypatch.setattr(api_main, "hydrated_volume_render_source", exact_volume)
+    monkeypatch.setattr(api_main, "hydrated_render_source", forbidden_remote)
+    monkeypatch.setattr(api_main, "render_custom_field", fake_custom)
+    monkeypatch.setattr(api_main, "compute_field_extents", fake_extents)
+    monkeypatch.setattr(api_main, "render_contours", fake_contours)
+
+    common = {
+        "case_slug": "case-1",
+        "airfoil_points": [[0.0, 0.0], [1.0, 0.0]],
+        "chord": 1.0,
+        "speed": 20.0,
+        "source_mode": "archive",
+    }
+    rendered = client.post(
+        f"/jobs/{job_id}/render-field",
+        json={**common, "field": "pressure"},
+    )
+    assert rendered.status_code == 200, rendered.text
+
+    extents = client.post(
+        f"/jobs/{job_id}/field-extents",
+        json={**common, "fields": ["pressure"]},
+    )
+    assert extents.status_code == 200, extents.text
+
+    defaults = client.post(
+        f"/jobs/{job_id}/render-default-media",
+        json={
+            **common,
+            "fields": ["pressure"],
+            "scales": {"pressure": {"vmin": -1.0, "vmax": 1.0}},
+        },
+    )
+    assert defaults.status_code == 200, defaults.text
+    assert lease == {"active": False, "enters": 3, "exits": 3}
+
+
 def test_render_prefers_existing_local_finalized_vtk(
     client, remote_case, monkeypatch
 ):
