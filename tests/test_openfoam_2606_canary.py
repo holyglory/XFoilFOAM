@@ -426,6 +426,7 @@ class FakeGatewayState:
                 "uncompressedTarByteSize": 4096,
                 "zstdLevel": 10,
                 "localEvidenceDisposition": "volume",
+                "bundledFileCount": 6,
                 "evidenceBase": "evidence",
             }
             if self.mode == "volume-gcs-leak":
@@ -905,6 +906,15 @@ def test_volume_canary_uses_strict_local_archive_receipt_and_archive_only_render
         "volume_restore_proof" in job and "remote_render_proof" not in job
         for job in summary["jobs"]
     )
+    assert all(
+        "volume_restore_proof" in point and "remote_render_proof" not in point
+        for job in summary["jobs"]
+        for point in job["points"]
+    )
+    assert all(
+        job["volume_restore_proof"] == job["points"][0]["volume_restore_proof"]
+        for job in summary["jobs"]
+    )
     expected_binding_keys = {
         "backend",
         "stored_sha256",
@@ -934,7 +944,16 @@ def test_volume_canary_uses_strict_local_archive_receipt_and_archive_only_render
         for binding in bindings
     )
     assert state.stripped == ["canary-job-1", "canary-job-2", "canary-job-3"]
-    assert len(state.remote_render_calls) == 9
+    assert state.remote_render_calls == [
+        (job["job_id"], operation, point["case_slug"], point["evidence_base"])
+        for job in summary["jobs"]
+        for point in job["points"]
+        for operation in (
+            "field-extents",
+            "render-field",
+            "render-default-media",
+        )
+    ]
 
 
 def test_volume_retained_receipt_reproof_has_no_submission_or_strip_side_effects():
@@ -943,7 +962,7 @@ def test_volume_retained_receipt_reproof_has_no_submission_or_strip_side_effects
         receipt = volume_canary.OpenCfd2606VolumeCanary(config).run()
         submissions = dict(state.submissions)
         stripped = list(state.stripped)
-        prior_render_calls = len(state.remote_render_calls)
+        prior_render_calls = list(state.remote_render_calls)
 
         verified = volume_canary.OpenCfd2606VolumeCanary(
             config
@@ -959,7 +978,34 @@ def test_volume_retained_receipt_reproof_has_no_submission_or_strip_side_effects
     }
     assert state.submissions == submissions
     assert state.stripped == stripped
-    assert len(state.remote_render_calls) == prior_render_calls + 9
+    assert state.remote_render_calls == prior_render_calls + [
+        (job["job_id"], operation, point["case_slug"], point["evidence_base"])
+        for job in receipt["jobs"]
+        for point in job["points"]
+        for operation in (
+            "field-extents",
+            "render-field",
+            "render-default-media",
+        )
+    ]
+
+
+def test_volume_retained_receipt_reproof_rejects_job_point_proof_drift_before_reads():
+    with fake_gateway(mode="volume-ok") as (state, url):
+        config = _volume_config(state, url)
+        receipt = volume_canary.OpenCfd2606VolumeCanary(config).run()
+        prior_render_calls = list(state.remote_render_calls)
+        receipt["jobs"][0]["volume_restore_proof"]["strip_bytes_freed"] += 1
+
+        with pytest.raises(
+            volume_canary._base.CanaryFailure,
+            match="job proof differs from its first point",
+        ):
+            volume_canary.OpenCfd2606VolumeCanary(
+                config
+            ).verify_retained_receipt(receipt)
+
+    assert state.remote_render_calls == prior_render_calls
 
 
 def test_volume_canary_rejects_gcs_metadata_leaking_into_volume_receipt():

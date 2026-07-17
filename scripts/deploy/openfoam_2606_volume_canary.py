@@ -148,12 +148,37 @@ class OpenCfd2606VolumeCanary(_base.OpenCfd2606Canary):
             "local_disposition": metadata["localEvidenceDisposition"],
         }
 
+    def _validate_complete_archive_restore(
+        self,
+        storage_binding: dict[str, object],
+        bundled_member_count: int,
+        label: str,
+    ) -> None:
+        # A volume deployment has no GCS generation or remote-restore token.
+        # Its complete-archive proof is the manifest/bundle member-count bind
+        # followed by the archive-only extents and render checks performed for
+        # every point after raw evidence is stripped.
+        _base._require(
+            storage_binding.get("backend") == "volume"
+            and bundled_member_count > 0,
+            f"{label} is not bound to a complete local volume archive",
+        )
+
     @staticmethod
     def _to_volume_receipt(base_receipt: dict[str, Any]) -> dict[str, Any]:
         receipt = json.loads(json.dumps(base_receipt))
         receipt["attestation_profile"] = VOLUME_ATTESTATION_PROFILE
         for job in receipt.get("jobs", []):
-            job["volume_restore_proof"] = job.pop("remote_render_proof")
+            points = job.get("points", [])
+            for point in points:
+                point["volume_restore_proof"] = point.pop("remote_render_proof")
+            # Keep the profile's established job-level proof for the cutover
+            # state and attestation consumers. It aliases the first point, as
+            # the pre-DB-ACK runner did, while every point now remains bound to
+            # its own exact case/evidence-base render proof.
+            job["volume_restore_proof"] = json.loads(
+                json.dumps(points[0]["volume_restore_proof"])
+            )
         return receipt
 
     @staticmethod
@@ -181,11 +206,34 @@ class OpenCfd2606VolumeCanary(_base.OpenCfd2606Canary):
         transformed = json.loads(json.dumps(receipt))
         transformed.pop("attestation_profile")
         for job in transformed.get("jobs", []):
+            points = _base._list(
+                job.get("points"), "retained volume receipt job points"
+            )
             _base._require(
                 "volume_restore_proof" in job and "remote_render_proof" not in job,
                 "retained volume receipt lacks its archive restore/render proof",
             )
-            job["remote_render_proof"] = job.pop("volume_restore_proof")
+            job_proof = job.pop("volume_restore_proof")
+            for point in points:
+                point_mapping = _base._mapping(
+                    point, "retained volume receipt point"
+                )
+                _base._require(
+                    "volume_restore_proof" in point_mapping
+                    and "remote_render_proof" not in point_mapping,
+                    "retained volume receipt point lacks its exact archive render proof",
+                )
+                point_mapping["remote_render_proof"] = point_mapping.pop(
+                    "volume_restore_proof"
+                )
+            _base._require(
+                points
+                and _base._mapping(
+                    points[0], "retained volume receipt first point"
+                ).get("remote_render_proof")
+                == job_proof,
+                "retained volume receipt job proof differs from its first point",
+            )
         return transformed
 
     def run(self) -> dict[str, Any]:

@@ -65,11 +65,12 @@
   migration 0072 and the control-plane/engine repair now implement a separate
   immutable preliminary registration, authenticated cleanup, four per-point
   database proofs, crash-safe replay, and a final attestation that cannot be
-  created from an incomplete or unrelated proof set. Integrate that repair with
-  the incident-bound staged deployment runner; verify migration 0072 before
-  activation; build and recreate the matching Node API, sweeper, gateway, and
-  worker artifacts; then run a fresh canary. Earlier failed direct-canary jobs
-  remain terminal, unregistered evidence and must not enter the new proof set.
+  created from an incomplete or unrelated proof set. The repair is integrated
+  with the incident-bound staged deployment runner; verify migration 0072
+  before activation; build and recreate the matching Node API, sweeper,
+  gateway, and worker artifacts; then run a fresh canary. Earlier failed
+  direct-canary jobs remain terminal, unregistered evidence and must not enter
+  the new proof set.
   Finish the successor-generation gates only after the new final attestation,
   then replace the temporary staged recovery path with the canonical release
   workflow. Keep the marker until every affected campaign's exact eligible
@@ -99,44 +100,30 @@
   pinned but that architecture has not been built or executed; validate it
   before deploying the Foundation worker to an arm64 host.
 
-- **Remote feature integration and evidence-delivery gate:** this isolated
-  branch is a patch source, not a deployable production head. Its committed
-  `remote-solver.ts` baseline is byte-identical to the deployed terminal and
-  PRECALC hotfix (SHA-256
-  `28c309329178a9421d0cdc852e2688a04253d34eb83a6ec7a0d03c781148f5ce`),
-  which must remain intact when the campaign, parallel-admission, and identity
-  changes are integrated onto the active OpenCFD 2606 branch. The integration
-  must also include the TypeScript/Python evidence-member code-point ordering
-  repair and uppercase-path golden vector before remote deliveries are
-  enabled. Rerun the complete hub/remote suites on a freshly migrated isolated
-  database after integration, including the historical cancelled/expired
-  blocked-delivery reconciliation and evidence-retention cases; do not deploy
-  this old-base branch directly.
-
 - **Remote solver engine-identity rollout:** the hub-side upload fence and the
-  remote claim/submission health fence are implemented and regression-covered
-  locally, but still need integration onto the active OpenCFD 2606 production
-  branch and coordinated control-plane deployment. After deployment, verify a
-  2406 runtime cannot mirror, submit, or publish a 2606 promise; verify a
-  matching 2606 runtime persists build provenance and fulfills one canary;
-  preserve the contained 2406 attempts as immutable history while re-solving
-  their quarantined cells under the promised implementation.
+  remote claim/submission health fence are integrated onto the active OpenCFD
+  2606 branch and regression-covered, but still need coordinated control-plane
+  deployment. After deployment, verify a 2406 runtime cannot mirror, submit,
+  or publish a 2606 promise; verify a matching 2606 runtime persists build
+  provenance and fulfills one canary; preserve the contained 2406 attempts as
+  immutable history while re-solving their quarantined cells under the
+  promised implementation.
 
 - **Remote solver campaign ownership:** `hz-solver2` is live again through the
   bounded five-airfoil public feed, but that canary revision is not the active
   campaign's immutable revision and therefore cannot settle campaign points.
-  Add campaign-native sync claims, terminal-link imported exact evidence through
-  the campaign ingest hook, deploy the hub control plane, and verify that the
-  next remote promise names the campaign revision before treating continuous
+  Campaign-native sync claims and terminal linking through the campaign ingest
+  hook are integrated; deploy the hub control plane and verify that the next
+  remote promise names the campaign revision before treating continuous
   production solving as complete.
 
 - **Remote solver capacity admission:** the live worker and engine are
   configured for 40 CPU slots, but the remote controller currently admits one
   single-condition marched polar at a time, so the active AG24 job truthfully
-  holds only one CPU token. Deploy multi-promise admission, verify multiple
-  independent complete polars run concurrently without changing their internal
-  AoA march, and confirm the engine token pool and hub lease counts remain
-  bounded before treating CPU utilization as complete.
+  holds only one CPU token. Multi-promise admission is integrated; deploy it,
+  verify multiple independent complete polars run concurrently without changing
+  their internal AoA march, and confirm the engine token pool and hub lease
+  counts remain bounded before treating CPU utilization as complete.
 
 - **Production evidence capacity:** The owner expanded the VPS disk from 300 to
   500 GiB. The latest 2026-07-16 production measurement is 492 GiB usable,

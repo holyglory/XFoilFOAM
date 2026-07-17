@@ -911,6 +911,23 @@ class OpenCfd2606Canary:
         _require(hashlib.sha256(payload).hexdigest() == artifact["sha256"], f"{label} checksum does not match metadata")
         return payload
 
+    def _validate_complete_archive_restore(
+        self,
+        storage_binding: dict[str, object],
+        bundled_member_count: int,
+        label: str,
+    ) -> None:
+        """Require the storage backend's complete-archive restore proof."""
+
+        restore_match = REMOTE_RESTORE_PROOF.fullmatch(
+            str(storage_binding["restore_verification"])
+        )
+        _require(
+            restore_match is not None
+            and int(restore_match.group(1)) == bundled_member_count,
+            f"{label} did not cover the complete manifest member set",
+        )
+
     def _fetch_media(self, path: object, label: str, kind: str) -> None:
         _require(isinstance(path, str) and bool(path), f"{label} URL is missing")
         _status, payload, content_type = self.client.bytes(
@@ -1073,13 +1090,10 @@ class OpenCfd2606Canary:
                 manifest_raw, f"{scenario.name} evidence manifest"
             )
         )
-        restore_match = REMOTE_RESTORE_PROOF.fullmatch(
-            str(storage_binding["restore_verification"])
-        )
-        _require(
-            restore_match is not None
-            and int(restore_match.group(1)) == bundled_member_count,
-            f"{scenario.name} remote restore proof did not cover the complete manifest member set",
+        self._validate_complete_archive_restore(
+            storage_binding,
+            bundled_member_count,
+            f"{scenario.name} remote restore proof",
         )
         bundle_metadata = _mapping(
             bundle_artifact.get("metadata"), f"{scenario.name} engine bundle metadata"
