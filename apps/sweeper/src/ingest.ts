@@ -184,14 +184,32 @@ export interface IngestedRansPrecalcPromotion {
   intentionallyOmittedAoas: number[];
 }
 
-function uniqueFiniteAoas(values: number[]): number[] {
-  return [...new Set(values.filter(Number.isFinite))].sort((a, b) => a - b);
+function uniqueFiniteAoasInOrder(values: number[]): number[] {
+  return [...new Set(values.filter(Number.isFinite))];
 }
 
 function sameAoas(left: number[], right: number[]): boolean {
   return (
     left.length === right.length && left.every((value, i) => value === right[i])
   );
+}
+
+/** Mirror the engine's primary steady-RANS marcher exactly: an available
+ * 0-degree attached-flow anchor runs first, then the positive branch, then
+ * the negative branch outward from zero. Sweeps without zero stay ascending.
+ *
+ * This order is evidence semantics, not presentation order. Sorting the
+ * engine's attempted AoAs numerically made a real 0..5-degree early abort look
+ * as though -5..-1 had also run, permanently trapping the terminal job in
+ * ingestion even though its typed omitted-angle list was exact. */
+function primaryRansMarchAoas(requestedAoas: number[]): number[] {
+  const sorted = [...requestedAoas].sort((a, b) => a - b);
+  if (!sorted.includes(0)) return sorted;
+  return [
+    ...sorted.filter((aoa) => aoa === 0),
+    ...sorted.filter((aoa) => aoa > 0),
+    ...sorted.filter((aoa) => aoa < 0).reverse(),
+  ];
 }
 
 /** Validate the engine's early-abort accounting against both exact staged
@@ -204,23 +222,35 @@ export function validateRansPrecalcPromotionSignal(opts: {
   triggerFailureDisposition: PolarPoint["failure_disposition"] | null;
   jobAoas: number[];
 }): { attemptedAoas: number[]; intentionallyOmittedAoas: number[] } | null {
-  const attemptedAoas = uniqueFiniteAoas(opts.promotion.attempted_aoas);
-  const intentionallyOmittedAoas = uniqueFiniteAoas(
+  const attemptedAoas = uniqueFiniteAoasInOrder(
+    opts.promotion.attempted_aoas,
+  );
+  const intentionallyOmittedAoas = uniqueFiniteAoasInOrder(
     opts.promotion.intentionally_omitted_aoas,
   );
-  const stagedAttemptAoas = uniqueFiniteAoas(opts.stagedAttemptAoas);
-  const jobAoas = uniqueFiniteAoas(opts.jobAoas);
-  const triggerIndex = jobAoas.indexOf(opts.promotion.trigger_aoa_deg);
+  const stagedAttemptAoas = uniqueFiniteAoasInOrder(opts.stagedAttemptAoas);
+  const jobAoas = uniqueFiniteAoasInOrder(opts.jobAoas);
+  const marchAoas = primaryRansMarchAoas(jobAoas);
+  const triggerIndex = marchAoas.indexOf(opts.promotion.trigger_aoa_deg);
   const expectedAttemptedAoas =
-    triggerIndex >= 0 ? jobAoas.slice(0, triggerIndex + 1) : [];
+    triggerIndex >= 0 ? marchAoas.slice(0, triggerIndex + 1) : [];
   const expectedOmittedAoas =
-    triggerIndex >= 0 ? jobAoas.slice(triggerIndex + 1) : [];
+    triggerIndex >= 0
+      ? [...jobAoas]
+          .sort((a, b) => a - b)
+          .filter((aoa) => !expectedAttemptedAoas.includes(aoa))
+      : [];
   if (
     opts.promotion.failure_disposition !== "hard_solver" ||
     opts.triggerFailureDisposition !== "hard_solver" ||
     !Number.isFinite(opts.promotion.trigger_aoa_deg) ||
     opts.promotion.trigger_aoa_deg < 0 ||
     opts.promotion.trigger_aoa_deg > 5 ||
+    jobAoas.length !== opts.jobAoas.length ||
+    attemptedAoas.length !== opts.promotion.attempted_aoas.length ||
+    intentionallyOmittedAoas.length !==
+      opts.promotion.intentionally_omitted_aoas.length ||
+    stagedAttemptAoas.length !== opts.stagedAttemptAoas.length ||
     triggerIndex < 0 ||
     !sameAoas(attemptedAoas, expectedAttemptedAoas) ||
     !sameAoas(intentionallyOmittedAoas, expectedOmittedAoas) ||

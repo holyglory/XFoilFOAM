@@ -397,6 +397,47 @@ describe("engine early-abort accounting", () => {
     ).toEqual({ attemptedAoas: [0, 2], intentionallyOmittedAoas: [4, 8] });
   });
 
+  it("MUST-CATCH: accepts the production zero-anchored 0..5 abort before the negative branch", () => {
+    const jobAoas = Array.from({ length: 26 }, (_, index) => index - 5);
+    const attemptedAoas = [0, 1, 2, 3, 4, 5];
+    const intentionallyOmittedAoas = [
+      -5, -4, -3, -2, -1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+      19, 20,
+    ];
+    expect(
+      validateRansPrecalcPromotionSignal({
+        promotion: {
+          trigger_aoa_deg: 5,
+          failure_disposition: "hard_solver",
+          attempted_aoas: attemptedAoas,
+          intentionally_omitted_aoas: intentionallyOmittedAoas,
+        },
+        stagedAttemptAoas: attemptedAoas,
+        triggerFailureDisposition: "hard_solver",
+        jobAoas,
+      }),
+    ).toEqual({ attemptedAoas, intentionallyOmittedAoas });
+  });
+
+  it("FALSE-POSITIVE GUARD: rejects numerically sorted attempts that contradict the zero-anchored marcher", () => {
+    const jobAoas = Array.from({ length: 26 }, (_, index) => index - 5);
+    expect(
+      validateRansPrecalcPromotionSignal({
+        promotion: {
+          trigger_aoa_deg: 5,
+          failure_disposition: "hard_solver",
+          attempted_aoas: [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5],
+          intentionally_omitted_aoas: [
+            6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+          ],
+        },
+        stagedAttemptAoas: [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5],
+        triggerFailureDisposition: "hard_solver",
+        jobAoas,
+      }),
+    ).toBeNull();
+  });
+
   it.each([
     {
       name: "missing staged attempt",
