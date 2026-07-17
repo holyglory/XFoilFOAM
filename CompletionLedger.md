@@ -12,15 +12,21 @@
   preliminary classification to remain accepted after final publication had
   correctly superseded it. Regression-backed terminal validation now binds the
   superseded preliminary, exact accepted final attempt, physical job, canonical
-  result pointer/classification, and pinned runtime together. Deploy that
-  controller correction, repeat the exact terminal audit, take and test-restore
-  a fresh production backup, then perform the guarded engine upgrade and a
-  fresh bounded canary on the upgraded build. Durable scheduling remains
-  fenced at `enabled=false`, `max_concurrent_jobs=0`, and `cpu_slots=0` until
-  those gates pass. Reopen only bounded campaign capacity and monitor
-  subsequent fast/final work for recurrence. Any exhausted fast/final chain
-  must remain a grouped red system-owned incident with a remediation version,
-  never a review task or an unchanged user retry.
+  result pointer/classification, and pinned runtime together. That correction
+  is deployed, the exact terminal audit passed, a fresh full production backup
+  passed strong scratch-database restore and was copied off-VPS, and the
+  guarded engine upgrade now serves
+  `prod-20260717-22c0d3f08d63-r7`. A fresh-target audit found that the
+  one-shot validator still rejected a legitimate no-shedding URANS generation
+  because its physical regime is `rans` even though method and fidelity prove
+  preliminary/final URANS execution. Deploy the regression-backed regime
+  correction, restore safe active-solve storage margin, and run the distinct
+  20-32C/Re≈102k/α14° preliminary-plus-final canary on r7. Durable scheduling
+  remains fenced at `enabled=false`, `max_concurrent_jobs=0`, and
+  `cpu_slots=0` until those gates pass. Reopen only bounded campaign capacity
+  and monitor subsequent fast/final work for recurrence. Any exhausted
+  fast/final chain must remain a grouped red system-owned incident with a
+  remediation version, never a review task or an unchanged user retry.
 
 - **GCS Zstandard evidence migration:** Implement and deploy content-addressed
   tar.zst finalization, verified GCS upload, temporary render hydration,
@@ -67,13 +73,16 @@
 
 - **Production evidence capacity:** The owner expanded the VPS disk from 300 to
   500 GiB. The latest 2026-07-17 production measurement is 491.9 GiB usable,
-  387.9 GiB used, and 98.9 GiB free (79.9% used); the
+  about 389 GiB used, and about 99 GiB free (80.0% used); the
   `/var/lib/docker/volumes/app_results` volume accounts for about 357 GiB.
   The 78-case successor RANS batch is terminal and durable general admission
-  remains disabled. The VPS cannot safely retain the immutable artifacts for
-  the complete 631,000-point campaign. Continue the verified migration one
-  complete job at a time, preserve at least 80 GiB free, and remeasure
-  active-case growth before opening sustained campaign admission.
+  remains disabled. The active-job admission check currently has only about
+  228 MiB of margin below its 80% ceiling; reclaim and remeasure at least one
+  full active-solve reserve before the fresh r7 canary. The VPS cannot safely
+  retain the immutable artifacts for the complete 631,000-point campaign.
+  Continue the verified migration one complete job at a time, preserve at
+  least 80 GiB free, and remeasure active-case growth before opening sustained
+  campaign admission.
 
 - **A18 low-angle alternate-branch correction:** The control-plane classifier,
   cache reset, affected-cell preliminary-URANS requests, campaign-evidence

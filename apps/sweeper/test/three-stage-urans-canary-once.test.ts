@@ -703,6 +703,30 @@ describe("three-stage URANS one-shot canary", () => {
       validateThreeStageUransCanarySnapshot(target, marker, completed),
     ).not.toThrow();
 
+    const noSheddingPreliminary = withVerify("pending");
+    noSheddingPreliminary.verifyPrecalcAttempt!.regime = "rans";
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(
+        target,
+        marker,
+        noSheddingPreliminary,
+      ),
+    ).not.toThrow();
+
+    const noSheddingTerminal = withVerify("done");
+    noSheddingTerminal.request = {
+      ...noSheddingTerminal.request!,
+      state: "done",
+    };
+    noSheddingTerminal.overlappingOpenRequestIds = [];
+    noSheddingTerminal.verifyPrecalcAttempt!.regime = "rans";
+    noSheddingTerminal.verifyLatestAttempt!.regime = "rans";
+    noSheddingTerminal.sourceResult!.regime = "rans";
+    noSheddingTerminal.sourceResult!.classificationRegime = "rans";
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(target, marker, noSheddingTerminal),
+    ).not.toThrow();
+
     const invalid: Array<{
       label: string;
       mutate(snapshot: ThreeStageUransCanarySnapshot): void;
@@ -753,6 +777,24 @@ describe("three-stage URANS one-shot canary", () => {
         },
       },
       {
+        label: "final attempt has an impossible physical regime",
+        mutate(snapshot) {
+          snapshot.verifyLatestAttempt!.regime = "xfoil";
+        },
+      },
+      {
+        label: "canonical result regime differs from its final attempt",
+        mutate(snapshot) {
+          snapshot.sourceResult!.regime = "rans";
+        },
+      },
+      {
+        label: "canonical classification regime differs from final evidence",
+        mutate(snapshot) {
+          snapshot.sourceResult!.classificationRegime = "rans";
+        },
+      },
+      {
         label: "final result identity changed",
         mutate(snapshot) {
           snapshot.verify!.verifyResultId = crypto.randomUUID();
@@ -789,6 +831,16 @@ describe("three-stage URANS one-shot canary", () => {
         target,
         marker,
         prematureSupersession,
+      ),
+    ).toThrow("does not pin the expected preliminary evidence lifecycle");
+
+    const impossiblePreliminaryRegime = withVerify("pending");
+    impossiblePreliminaryRegime.verifyPrecalcAttempt!.regime = "xfoil";
+    expect(() =>
+      validateThreeStageUransCanarySnapshot(
+        target,
+        marker,
+        impossiblePreliminaryRegime,
       ),
     ).toThrow("does not pin the expected preliminary evidence lifecycle");
   });

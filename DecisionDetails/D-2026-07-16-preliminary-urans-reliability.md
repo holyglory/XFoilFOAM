@@ -294,6 +294,17 @@ URANS classification. Realistic unit must-catch variants and a fresh
 canonical pointers, rejected publication, changed result identity, and changed
 runtime provenance.
 
+A fresh-target preflight then exposed the adjacent no-shedding audit case.
+`regime` records the measured physical outcome, so a transient URANS solve
+that resolves no shedding is intentionally published as physical `rans`;
+`method_key=openfoam.urans` plus `fidelity=urans_precalc|urans_full` proves
+which numerical stage actually executed. The one-shot auditor now accepts only
+the physical regimes `rans` or `urans` for those URANS fidelities, requires the
+terminal attempt, canonical result, and classification regimes to agree, and
+still rejects any other regime. Unit must-catch variants cover accepted
+no-shedding preliminary and final generations, impossible regimes, and
+attempt/result/classification disagreement.
+
 Invoke once to admit or observe preliminary work. After that exact job is
 terminal and reconciled, repeat the same exclusive one-shot invocation to
 admit or observe final verification. Never loop the command unattended or

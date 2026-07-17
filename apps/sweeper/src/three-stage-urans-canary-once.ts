@@ -56,6 +56,11 @@ const OPEN_JOB_STATUSES = [
 const TERMINAL_PARENT_STATUSES = new Set(["done", "failed", "cancelled"]);
 const OPEN_VERIFY_STATES = ["pending", "running", "blocked"] as const;
 const TERMINAL_VERIFY_SUCCESS_STATES = new Set(["done", "disagreed"]);
+// URANS is the numerical method/fidelity, while regime describes the measured
+// physical outcome. A URANS run with no resolved shedding is intentionally
+// published as physical `rans`; method_key + fidelity still prove that the
+// transient solver actually ran.
+const ACCEPTED_URANS_PHYSICAL_REGIMES = new Set(["rans", "urans"]);
 const TARGET_ROUTING_KEY = "openfoam-opencfd-2606";
 const EXPECTED_EVIDENCE_STORAGE = Object.freeze({
   backend: "gcs",
@@ -853,7 +858,8 @@ export function validateThreeStageUransCanarySnapshot(
         !Object.is(preliminary.aoaDeg, target.aoaDeg) ||
         preliminary.status !== "done" ||
         preliminary.source !== "solved" ||
-        preliminary.regime !== "urans" ||
+        !preliminary.regime ||
+        !ACCEPTED_URANS_PHYSICAL_REGIMES.has(preliminary.regime) ||
         preliminary.methodKey !== "openfoam.urans" ||
         preliminary.fidelity !== "urans_precalc" ||
         preliminary.classificationState !== expectedPreliminaryClassification ||
@@ -885,7 +891,8 @@ export function validateThreeStageUransCanarySnapshot(
           !Object.is(latest.aoaDeg, target.aoaDeg) ||
           latest.status !== "done" ||
           latest.source !== "solved" ||
-          latest.regime !== "urans" ||
+          !latest.regime ||
+          !ACCEPTED_URANS_PHYSICAL_REGIMES.has(latest.regime) ||
           latest.methodKey !== "openfoam.urans" ||
           latest.fidelity !== "urans_full" ||
           latest.classificationState !== "accepted" ||
@@ -896,11 +903,11 @@ export function validateThreeStageUransCanarySnapshot(
           sourceResult.currentResultAttemptId !== latest.id ||
           sourceResult.status !== "done" ||
           sourceResult.source !== "solved" ||
-          sourceResult.regime !== "urans" ||
+          sourceResult.regime !== latest.regime ||
           sourceResult.methodKey !== "openfoam.urans" ||
           sourceResult.fidelity !== "urans_full" ||
           sourceResult.classificationState !== "accepted" ||
-          sourceResult.classificationRegime !== "urans" ||
+          sourceResult.classificationRegime !== latest.regime ||
           sourceResult.solverImplementationId !==
             OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
           sourceResult.solverRuntimeBuildId !== latest.solverRuntimeBuildId ||
