@@ -369,44 +369,39 @@ describe("GCS Zstandard evidence ingestion", () => {
     });
     const mediaRoot = await mkdtemp(join(tmpdir(), "evidence-backfill-"));
     const evidencePath = `cases/${owner.caseSlug}/${owner.evidenceBase}`;
-    const receiptDir = join(
-      mediaRoot,
-      "jobs",
-      owner.engineJobId,
-      evidencePath,
-    );
+    const receiptDir = join(mediaRoot, "jobs", owner.engineJobId, evidencePath);
     await mkdir(receiptDir, { recursive: true });
     await writeFile(join(receiptDir, "evidence_manifest.json"), manifestBytes);
     const receiptPath = join(receiptDir, "storage_migration.json");
     const migratedSha = sha256("migrated-zstd");
     const tarSha = sha256("legacy-tar-stream");
     const receiptPayload = {
+      schemaVersion: 1,
+      state: "awaiting_database_registration",
+      jobId: owner.engineJobId,
+      evidencePath,
+      archive: {
+        storedSha256: migratedSha,
+        storedByteSize: 54_321,
+        uncompressedTarSha256: tarSha,
+        uncompressedTarByteSize: 98_765,
+        zstdLevel: 10,
+      },
+      remote: {
         schemaVersion: 1,
-        state: "awaiting_database_registration",
-        jobId: owner.engineJobId,
-        evidencePath,
-        archive: {
-          storedSha256: migratedSha,
-          storedByteSize: 54_321,
-          uncompressedTarSha256: tarSha,
-          uncompressedTarByteSize: 98_765,
-          zstdLevel: 10,
-        },
-        remote: {
-          schemaVersion: 1,
-          format: "tar+zstd",
-          bucket: BUCKET,
-          objectKey: `${PREFIX}/sha256/${migratedSha.slice(0, 2)}/${migratedSha}.tar.zst`,
-          generation: EXACT_GCS_GENERATION,
-          storedSha256: migratedSha,
-          storedSize: 54_321,
-          tarSha256: tarSha,
-          tarSize: 98_765,
-          crc32c: "AAAAAA==",
-          zstdLevel: 10,
-          createdAt: "2026-07-15T20:00:00.000Z",
-        },
-      };
+        format: "tar+zstd",
+        bucket: BUCKET,
+        objectKey: `${PREFIX}/sha256/${migratedSha.slice(0, 2)}/${migratedSha}.tar.zst`,
+        generation: EXACT_GCS_GENERATION,
+        storedSha256: migratedSha,
+        storedSize: 54_321,
+        tarSha256: tarSha,
+        tarSize: 98_765,
+        crc32c: "AAAAAA==",
+        zstdLevel: 10,
+        createdAt: "2026-07-15T20:00:00.000Z",
+      },
+    };
     expect(() =>
       parseEvidenceMigrationReceipt(
         {
@@ -460,7 +455,14 @@ describe("GCS Zstandard evidence ingestion", () => {
         resultId: owner.resultId,
         resultAttemptId: owner.resultAttemptId,
       });
-      expect(JSON.parse(await readFile(join(receiptDir, "storage_migration.database.json"), "utf8"))).toMatchObject(ack);
+      expect(
+        JSON.parse(
+          await readFile(
+            join(receiptDir, "storage_migration.database.json"),
+            "utf8",
+          ),
+        ),
+      ).toMatchObject(ack);
       expect(await archivesFor(owner)).toHaveLength(1);
       expect(await artifactsFor(owner, "engine_bundle")).toHaveLength(2);
       const replay = await registerEvidenceMigrationReceipt({
