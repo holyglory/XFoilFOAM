@@ -6,6 +6,12 @@ on:
       - master
       - main
   workflow_dispatch:
+    inputs:
+      pending_cutover_node_api_repair:
+        description: "Repair only Node API while a pre-attestation OpenCFD 2606 cutover is pending"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: airfoils-pro-vps-deploy
@@ -24,6 +30,7 @@ jobs:
       VPS_KNOWN_HOSTS: ${{ secrets.AIRFOILS_VPS_KNOWN_HOSTS }}
       VPS_APP_DIR: ${{ vars.AIRFOILS_VPS_APP_DIR }}
       PUBLIC_ORIGIN: ${{ vars.AIRFOILS_PUBLIC_ORIGIN }}
+      PENDING_CUTOVER_NODE_API_REPAIR: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_node_api_repair || false }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -41,6 +48,7 @@ jobs:
           set -euo pipefail
           bash -n scripts/deploy/vps-redeploy.sh
           bash -n scripts/deploy/promote-and-redeploy.sh
+          bash -n scripts/deploy/repair-pending-node-api.sh
           python3 scripts/deploy/deployment-source-manifest.py --help >/dev/null
           test -f docker-compose.deploy.yml
 
@@ -127,7 +135,7 @@ jobs:
             --exclude-from scripts/deploy/source-rsync-excludes.txt \
             ./ "${VPS_USER}@${VPS_HOST}:${VPS_STAGING_DIR}/"
 
-      - name: Promote source under deploy lock and redeploy control plane
+      - name: Promote source or repair pending cutover under deploy lock
         shell: bash
         run: |
           set -euo pipefail
@@ -137,8 +145,13 @@ jobs:
           printf -v APP_Q '%q' "$APP_DIR"
           printf -v ORIGIN_Q '%q' "$ORIGIN"
           printf -v REVISION_Q '%q' "$GITHUB_SHA"
-          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
-            "chmod +x $STAGING_Q/scripts/deploy/promote-and-redeploy.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q PUBLIC_ORIGIN=$ORIGIN_Q EXPECTED_SOURCE_REVISION=$REVISION_Q $STAGING_Q/scripts/deploy/promote-and-redeploy.sh"
+          if [[ "$PENDING_CUTOVER_NODE_API_REPAIR" == "true" ]]; then
+            ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+              "chmod +x $STAGING_Q/scripts/deploy/repair-pending-node-api.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q EXPECTED_TARGET_SOURCE_REVISION=$REVISION_Q $STAGING_Q/scripts/deploy/repair-pending-node-api.sh"
+          else
+            ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+              "chmod +x $STAGING_Q/scripts/deploy/promote-and-redeploy.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q PUBLIC_ORIGIN=$ORIGIN_Q EXPECTED_SOURCE_REVISION=$REVISION_Q $STAGING_Q/scripts/deploy/promote-and-redeploy.sh"
+          fi
 
       - name: Remove VPS staging payload
         if: always()
