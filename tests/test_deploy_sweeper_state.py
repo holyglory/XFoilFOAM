@@ -352,6 +352,10 @@ case "$url" in
     fi
     ;;
   */api/admin/solver-engine-cutovers/opencfd-2606/readiness)
+    if [[ "$request_body" != "{}" ]]; then
+      printf 'readiness request body is not exact JSON: <%s>\n' "$request_body" >&2
+      exit 65
+    fi
     if [[ "$FAKE_CUTOVER_API_AVAILABLE" != "true" ]]; then
       printf '{"error":"route unavailable"}\n'
       exit 22

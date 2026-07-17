@@ -659,7 +659,10 @@ validate_certified_evidence_contract() {
 admin_json_request() {
   local method="$1"
   local url="$2"
-  local body="${3:-{}}"
+  local body='{}'
+  if (($# >= 3)); then
+    body="$3"
+  fi
   if [[ -z "$ADMIN_COOKIE" ]]; then
     echo "ADMIN_COOKIE is required for authenticated solver cutover maintenance." >&2
     return 14
