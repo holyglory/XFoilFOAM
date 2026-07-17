@@ -10,6 +10,9 @@ import {
   flowConditions,
   forceHistory,
   hashtags,
+  laneKeyId,
+  laneTick,
+  lockPrecalcCells,
   mediumViscosityTablePoints,
   mediums,
   meshProfiles,
@@ -21,11 +24,16 @@ import {
   resultClassifications,
   resultFieldExtents,
   resultMedia,
+  onResultIngested,
   schedulingProfiles,
   results,
+  satisfyPrecalcObligationFromAcceptedResult,
+  satisfyPrecalcObligationFromAcceptedResultInTransaction,
   simulationPresetAirfoilTargets,
   simulationPresetRevisions,
   simulationPresets,
+  simPrecalcObligationCampaigns,
+  simPrecalcObligations,
   solverProfiles,
   solverEvidenceArtifacts,
   SYNC_BLOB_LOCK_NAMESPACE,
@@ -273,6 +281,52 @@ const forceHistorySchema = z
     }
   });
 
+/** Exact runtime identity reported by the solver that produced one evidence
+ * generation. This is deliberately separate from the requested setup: a
+ * remote worker must describe what actually ran instead of echoing the
+ * promise's immutable expectation. */
+const syncEngineRuntimeSchema = z
+  .object({
+    family: z.string().trim().min(1),
+    distribution: z.string().trim().min(1),
+    version: z.string().trim().min(1),
+    numericsRevision: z.string().trim().min(1),
+    adapterContractVersion: z.coerce.number().int().positive(),
+    buildId: z.string().trim().min(1),
+    sourceRevision: z.string().trim().nullable().optional(),
+    imageDigest: z.string().trim().nullable().optional(),
+    applicationSourceSha256: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i)
+      .nullable()
+      .optional(),
+    packageSha256: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i)
+      .nullable()
+      .optional(),
+    binarySha256: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i)
+      .nullable()
+      .optional(),
+    architecture: z.string().trim().nullable().optional(),
+  })
+  .transform((runtime) => ({
+    family: runtime.family,
+    distribution: runtime.distribution,
+    version: runtime.version,
+    numerics_revision: runtime.numericsRevision,
+    adapter_contract_version: runtime.adapterContractVersion,
+    build_id: runtime.buildId,
+    source_revision: runtime.sourceRevision ?? null,
+    image_digest: runtime.imageDigest ?? null,
+    application_source_sha256: runtime.applicationSourceSha256 ?? null,
+    package_sha256: runtime.packageSha256 ?? null,
+    binary_sha256: runtime.binarySha256 ?? null,
+    architecture: runtime.architecture ?? null,
+  }));
+
 const polarPointSchema = z.object({
   aoaDeg: z.coerce.number(),
   status: z
@@ -309,6 +363,7 @@ const polarPointSchema = z.object({
   qualityWarnings: z.array(z.string()).nullable().optional(),
   frameTrack: z.record(z.unknown()).nullable().optional(),
   steadyHistory: z.record(z.unknown()).nullable().optional(),
+  engine: syncEngineRuntimeSchema.nullable().optional(),
   engineJobId: z.string().nullable().optional(),
   engineCaseSlug: z.string().nullable().optional(),
   evidencePayload: z.record(z.unknown()).optional(),
@@ -365,6 +420,59 @@ type PolarPushPayload = z.infer<typeof polarPushSchema>;
 
 class PolarPromiseScopeError extends Error {}
 class PolarEvidenceBindingError extends Error {}
+
+function assertRemotePromiseEngineIdentity(
+  promise: typeof syncSweepPromises.$inferSelect | null,
+  snapshot: Record<string, unknown>,
+  points: PolarPushPayload["results"],
+): void {
+  const requestPayload = jsonObject(promise?.requestPayload);
+  if (requestPayload.remoteSolver !== true) return;
+
+  const expected = jsonObject(snapshot.engine);
+  const family = nullableText(expected.family);
+  const distribution = nullableText(expected.distribution);
+  const releaseVersion = nullableText(expected.releaseVersion);
+  const numericsRevision = nullableText(expected.numericsRevision);
+  const adapterContractVersion = nullableNumber(
+    expected.adapterContractVersion,
+  );
+  if (
+    !family ||
+    !distribution ||
+    !releaseVersion ||
+    !numericsRevision ||
+    !Number.isInteger(adapterContractVersion) ||
+    Number(adapterContractVersion) <= 0
+  ) {
+    throw new PolarPromiseScopeError(
+      `remote-solver promise ${promise?.id ?? "unknown"} has no complete immutable engine identity`,
+    );
+  }
+
+  for (const point of points) {
+    const runtime = point.engine;
+    if (!runtime) {
+      throw new PolarPromiseScopeError(
+        `remote-solver evidence at ${point.aoaDeg}° lacks authoritative engine runtime identity`,
+      );
+    }
+    const mismatches = [
+      runtime.family === family ? null : "family",
+      runtime.distribution === distribution ? null : "distribution",
+      runtime.version === releaseVersion ? null : "release",
+      runtime.numerics_revision === numericsRevision ? null : "numerics",
+      runtime.adapter_contract_version === adapterContractVersion
+        ? null
+        : "adapter contract",
+    ].filter((value): value is string => value !== null);
+    if (mismatches.length) {
+      throw new PolarPromiseScopeError(
+        `remote-solver evidence at ${point.aoaDeg}° engine identity mismatches promised setup (${mismatches.join(", ")})`,
+      );
+    }
+  }
+}
 
 function syncIdentityToken(value: string, label: string): string {
   const token = value.trim();
@@ -1813,6 +1921,7 @@ function remoteAttemptValues(opts: {
     quality_warnings: point.qualityWarnings ?? null,
     frame_track: point.frameTrack ?? null,
     steady_history: point.steadyHistory ?? null,
+    engine: point.engine ?? null,
     // forceHistory is transported separately to keep the public contract
     // typed, but the immutable attempt payload is the classifier/source of
     // truth. Always normalize it into the exact attempt generation.
@@ -3084,6 +3193,114 @@ async function promotePolarConflict(
   /* c8 ignore stop */
 }
 
+/** A rejected remote URANS continuation can truthfully leave the selected
+ * provisional RANS generation in place. Without a terminal hub-side
+ * obligation, campaign completion would interpret that needs_urans pointer as
+ * new unscheduled PRECALC work and remain open forever. Record the remote
+ * terminal verdict as blocked while preserving the hub's own physical attempt
+ * count (zero when it never ran CFD); the exact rejected attempt remains in
+ * result_attempts and the selected RANS attempt remains the campaign pointer. */
+async function recordRemoteCampaignTerminalPrecalc(
+  tx: DB,
+  args: {
+    airfoilId: string;
+    revisionId: string;
+    aoaDeg: number;
+    resultId: string;
+    selectedAttemptId: string;
+    rejectedAttemptId: string;
+  },
+): Promise<boolean> {
+  // Promise provenance is intentionally irrelevant here. One physical cell
+  // can be consumed by a public lease plus multiple live campaigns. A
+  // terminal physical verdict must close every live owner or a second campaign
+  // will reopen the same PRECALC work immediately.
+  const ownerRows = (await tx.execute(sql`
+    SELECT point.campaign_id, point.condition_id
+    FROM sim_campaigns campaign
+    JOIN sim_campaign_conditions condition
+      ON condition.campaign_id = campaign.id
+     AND condition.status IN ('active', 'kept')
+     AND condition.simulation_preset_revision_id = ${args.revisionId}
+    JOIN sim_campaign_points point
+      ON point.campaign_id = campaign.id
+     AND point.condition_id = condition.id
+     AND point.airfoil_id = ${args.airfoilId}
+     AND point.revision_id = ${args.revisionId}
+     AND point.aoa_deg = ${args.aoaDeg}
+     AND point.derived_by_symmetry = false
+    WHERE campaign.status IN ('active', 'attention', 'paused')
+      AND (
+        point.state = 'requested'
+        OR (point.state = 'terminal' AND point.result_id = ${args.resultId})
+      )
+    ORDER BY campaign.id, condition.id
+    FOR SHARE OF campaign, condition
+    FOR UPDATE OF point
+  `)) as unknown as Array<{ campaign_id: string; condition_id: string }>;
+  if (!ownerRows.length) return false;
+  await lockPrecalcCells(tx, [
+    {
+      airfoilId: args.airfoilId,
+      revisionId: args.revisionId,
+      aoaDeg: args.aoaDeg,
+    },
+  ]);
+  const terminalError = `remote solver returned exact terminal rejected URANS evidence (${args.rejectedAttemptId})`;
+  const [obligation] = await tx
+    .insert(simPrecalcObligations)
+    .values({
+      airfoilId: args.airfoilId,
+      revisionId: args.revisionId,
+      aoaDeg: args.aoaDeg,
+      sourceResultId: args.resultId,
+      sourceResultAttemptId: args.selectedAttemptId,
+      state: "blocked",
+      lastOutcome: "remote_terminal_rejected",
+      lastError: terminalError,
+      completedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: [
+        simPrecalcObligations.airfoilId,
+        simPrecalcObligations.revisionId,
+        simPrecalcObligations.aoaDeg,
+      ],
+      set: {
+        sourceResultId: sql`COALESCE(${simPrecalcObligations.sourceResultId}, EXCLUDED.source_result_id)`,
+        sourceResultAttemptId: sql`COALESCE(${simPrecalcObligations.sourceResultAttemptId}, EXCLUDED.source_result_attempt_id)`,
+        state: sql`CASE WHEN ${simPrecalcObligations.state} = 'satisfied' THEN 'satisfied' ELSE 'blocked' END`,
+        lastOutcome: sql`CASE WHEN ${simPrecalcObligations.state} = 'satisfied' THEN ${simPrecalcObligations.lastOutcome} ELSE 'remote_terminal_rejected' END`,
+        lastError: sql`CASE WHEN ${simPrecalcObligations.state} = 'satisfied' THEN ${simPrecalcObligations.lastError} ELSE ${terminalError} END`,
+        completedAt: sql`CASE WHEN ${simPrecalcObligations.state} = 'satisfied' THEN ${simPrecalcObligations.completedAt} ELSE now() END`,
+        updatedAt: new Date(),
+      },
+    })
+    .returning({
+      id: simPrecalcObligations.id,
+      state: simPrecalcObligations.state,
+    });
+  if (!obligation || obligation.state !== "blocked") return false;
+  await tx
+    .insert(simPrecalcObligationCampaigns)
+    .values(
+      ownerRows.map((owner) => ({
+        obligationId: obligation.id,
+        campaignId: owner.campaign_id,
+        state: "active" as const,
+        cancelledAt: null,
+      })),
+    )
+    .onConflictDoUpdate({
+      target: [
+        simPrecalcObligationCampaigns.obligationId,
+        simPrecalcObligationCampaigns.campaignId,
+      ],
+      set: { state: "active", cancelledAt: null, updatedAt: new Date() },
+    });
+  return true;
+}
+
 async function importPolarPush(
   payload: PolarPushPayload,
   files: Map<string, UploadedFileRef>,
@@ -3117,6 +3334,11 @@ async function importPolarPush(
   let bcId: string | null = payload.bcId ?? null;
   let promise: typeof syncSweepPromises.$inferSelect | null = null;
 
+  const campaignSettlements: Array<{
+    aoaDeg: number;
+    resultId: string;
+    resultAttemptId: string;
+  }> = [];
   if (payload.promiseId) {
     [promise] = await db
       .select()
@@ -3214,6 +3436,20 @@ async function importPolarPush(
     if (!localBc) bcId = null;
   }
   bcId = bcId ?? nullableText(snapshotPreset.legacyBoundaryConditionId);
+  if (!bcId && promise && revision?.presetId) {
+    // Campaign materialization historically pinned the immutable revision
+    // immediately before creating its deprecated boundary_conditions bridge.
+    // A promise still authoritatively names that exact revision, so resolve
+    // the bridge from the owning preset when the older snapshot predates it.
+    const [owningPreset] = await db
+      .select({
+        legacyBoundaryConditionId: simulationPresets.legacyBoundaryConditionId,
+      })
+      .from(simulationPresets)
+      .where(eq(simulationPresets.id, revision.presetId))
+      .limit(1);
+    bcId = owningPreset?.legacyBoundaryConditionId ?? null;
+  }
   if (!bcId) {
     conflictIds.push(
       await createConflict({
@@ -3249,6 +3485,13 @@ async function importPolarPush(
     rawSourceInstanceId,
     "sourceInstanceId",
   );
+
+  // A remote-solver promise pins one logical implementation. Validate the
+  // runtime that produced every point before any result, attempt, artifact,
+  // media, field scale, or promise settlement can be written. Missing
+  // provenance fails closed: copying the requested setup identity into an
+  // evidence payload is not proof that the promised engine executed it.
+  assertRemotePromiseEngineIdentity(promise, snapshot, payload.results);
 
   // Validate the ENTIRE promised batch before any canonical row, attempt,
   // artifact, media, or shared field-scale write. A mixed [owned, foreign]
@@ -4040,6 +4283,27 @@ async function importPolarPush(
     },
   });
 
+  // Accepted exact PRECALC evidence is authoritative even when it arrives
+  // after an older remote generation terminal-blocked the physical cell. For
+  // promise pushes, settle only the obligation state here so the subsequent
+  // exact campaign relink/recompute/probe never observes a stale blocked row.
+  // Direct pushes use the public wrapper because no promise settlement hook
+  // follows. Non-accepted/non-PRECALC results are no-ops.
+  for (const resultId of new Set(
+    committedPoints.map((committed) => committed.resultId),
+  )) {
+    if (payload.promiseId) {
+      await db.transaction((rawTx) =>
+        satisfyPrecalcObligationFromAcceptedResultInTransaction(
+          rawTx as unknown as DB,
+          resultId,
+        ),
+      );
+    } else {
+      await satisfyPrecalcObligationFromAcceptedResult(db, resultId);
+    }
+  }
+
   if (payload.promiseId) {
     for (const committed of committedPoints) {
       const pointSettled = await db.transaction(async (rawTx) => {
@@ -4168,7 +4432,7 @@ async function importPolarPush(
             ? classified.attempt_state
             : null;
         if (!acceptedOutcome && !terminalState) {
-          return false;
+          return null;
         }
         if (
           terminalState === "needs_urans" &&
@@ -4177,7 +4441,7 @@ async function importPolarPush(
           // needs_urans is a provisional selected generation, not a failed
           // attempt. It is terminal for this solver only when the canonical
           // pointer names this exact evidence generation.
-          return false;
+          return null;
         }
         let settlementAttemptId = committed.attemptId;
         if (terminalState === "rejected") {
@@ -4198,7 +4462,7 @@ async function importPolarPush(
                 ),
               )
               .returning({ id: results.id });
-            if (failed.length !== 1) return false;
+            if (failed.length !== 1) return null;
           } else if (classified.current_state === "needs_urans") {
             // A failed URANS continuation does not erase the selected
             // provisional RANS generation. The child attempt is retained as
@@ -4207,8 +4471,24 @@ async function importPolarPush(
             // unresolved cell.
             settlementAttemptId = classified.current_attempt_id;
           } else {
-            return false;
+            return null;
           }
+        }
+        if (
+          terminalState === "rejected" &&
+          committed.regime === "urans" &&
+          classified?.current_state === "needs_urans" &&
+          classified.current_attempt_id &&
+          classified.current_attempt_id !== committed.attemptId
+        ) {
+          await recordRemoteCampaignTerminalPrecalc(tx, {
+            airfoilId,
+            revisionId,
+            aoaDeg: committed.aoaDeg,
+            resultId: committed.resultId,
+            selectedAttemptId: settlementAttemptId,
+            rejectedAttemptId: committed.attemptId,
+          });
         }
         // A marched remote RANS job can publish early siblings before a typed
         // low-angle hard failure promotes its exact polar to preliminary
@@ -4274,14 +4554,26 @@ async function importPolarPush(
           )
           .returning({ id: syncSweepPromisePoints.id });
         return settled.length > 0
-          ? acceptedOutcome
-            ? ("fulfilled" as const)
-            : ("terminal" as const)
-          : false;
+          ? {
+              kind: acceptedOutcome
+                ? ("fulfilled" as const)
+                : ("terminal" as const),
+              resultAttemptId: settlementAttemptId,
+            }
+          : null;
       });
-      if (pointSettled === "fulfilled") fulfilledAoas.push(committed.aoaDeg);
-      else if (pointSettled === "terminal") terminalAoas.push(committed.aoaDeg);
+      if (pointSettled?.kind === "fulfilled")
+        fulfilledAoas.push(committed.aoaDeg);
+      else if (pointSettled?.kind === "terminal")
+        terminalAoas.push(committed.aoaDeg);
       else unfulfilledAoas.push(committed.aoaDeg);
+      if (pointSettled) {
+        campaignSettlements.push({
+          aoaDeg: committed.aoaDeg,
+          resultId: committed.resultId,
+          resultAttemptId: pointSettled.resultAttemptId,
+        });
+      }
     }
     const committedAoas = new Set(
       committedPoints.map((committed) => committed.aoaDeg),
@@ -4289,6 +4581,41 @@ async function importPolarPush(
     for (const point of payload.results) {
       if (!committedAoas.has(point.aoaDeg)) unfulfilledAoas.push(point.aoaDeg);
     }
+
+    // Campaign counters and lanes consume only the final canonical result
+    // state after classification/promotion and promise settlement. Keep the
+    // exact promise generation when the canonical pointer is intentionally
+    // null (terminal rejected evidence); otherwise follow the selected
+    // canonical pointer so accepted URANS upgrades repair older RANS links.
+    const dirtyLanes = new Map<
+      string,
+      Awaited<ReturnType<typeof onResultIngested>>[number]
+    >();
+    for (const settlement of campaignSettlements) {
+      const [canonical] = await db
+        .select({
+          status: results.status,
+          regime: results.regime,
+          currentResultAttemptId: results.currentResultAttemptId,
+        })
+        .from(results)
+        .where(eq(results.id, settlement.resultId))
+        .limit(1);
+      if (!canonical || !["done", "failed"].includes(canonical.status))
+        continue;
+      const lanes = await onResultIngested(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg: settlement.aoaDeg,
+        resultId: settlement.resultId,
+        resultAttemptId:
+          canonical.currentResultAttemptId ?? settlement.resultAttemptId,
+        status: canonical.status,
+        regime: canonical.regime,
+      });
+      for (const lane of lanes) dirtyLanes.set(laneKeyId(lane), lane);
+    }
+    for (const lane of dirtyLanes.values()) await laneTick(db, lane);
   }
 
   return {
@@ -5330,70 +5657,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     await expirePromises();
     const ttlHours = body.ttlHours ?? ctx.settings.defaultPromiseTtlHours;
     const expiresAt = new Date(Date.now() + ttlHours * 3600_000);
-    const rows = (await db.execute(sql`
-      WITH latest_revision AS (
-        SELECT DISTINCT ON (preset_id) preset_id, id, signature_hash, reynolds, mach, reference_length_m, snapshot
-        FROM simulation_preset_revisions
-        ORDER BY preset_id, revision_number DESC
-      ),
-      gap_rows AS (
-        SELECT
-          a.id AS airfoil_id,
-          a.slug AS airfoil_slug,
-          a.name AS airfoil_name,
-          a.source AS airfoil_source,
-          a.point_format AS point_format,
-          a.points AS points,
-          p.id AS preset_id,
-          p.legacy_boundary_condition_id AS bc_id,
-          rev.id AS revision_id,
-          rev.signature_hash,
-          rev.reynolds,
-          rev.mach,
-          rev.reference_length_m,
-          rev.snapshot,
-          g.aoa::float8 AS aoa_deg,
-          COALESCE(r.priority, 0)::int AS priority
-        FROM airfoils a
-        CROSS JOIN simulation_presets p
-        JOIN latest_revision rev ON rev.preset_id = p.id
-        JOIN sweep_definitions sw ON sw.id = p.sweep_definition_id
-        CROSS JOIN LATERAL (
-          SELECT jsonb_array_elements_text(sw.aoa_list)::numeric AS aoa WHERE sw.aoa_list IS NOT NULL
-          UNION ALL
-          SELECT generate_series(sw.aoa_start::numeric, sw.aoa_stop::numeric, sw.aoa_step::numeric) AS aoa WHERE sw.aoa_list IS NULL
-        ) AS g
-        LEFT JOIN results r ON r.airfoil_id = a.id AND r.simulation_preset_revision_id = rev.id AND r.aoa_deg = g.aoa
-        WHERE p.enabled = true
-          AND (
-            p.target_scope = 'all'
-            OR EXISTS (
-              SELECT 1
-              FROM simulation_preset_airfoil_targets target
-              WHERE target.preset_id = p.id AND target.airfoil_id = a.id
-            )
-          )
-          AND p.legacy_boundary_condition_id IS NOT NULL
-          AND a."archivedAt" IS NULL
-          AND a."deletedAt" IS NULL
-          AND (r.id IS NULL OR r.status IN ('pending', 'stale'))
-          AND NOT EXISTS (
-            SELECT 1
-            FROM sync_sweep_promise_points pp
-            JOIN sync_sweep_promises pr ON pr.id = pp.promise_id
-            WHERE pp.airfoil_id = a.id
-              AND pp.simulation_preset_revision_id = rev.id
-              AND pp.aoa_deg = g.aoa
-              AND pp.status = 'active'
-              AND pr.status = 'active'
-              AND pr."expiresAt" > now()
-          )
-      )
-      SELECT *
-      FROM gap_rows
-      ORDER BY priority DESC, reynolds ASC, airfoil_slug ASC, aoa_deg ASC
-      LIMIT ${Math.max(body.limit * 3, body.limit)}
-    `)) as unknown as {
+    type ClaimGapRow = {
       airfoil_id: string;
       airfoil_slug: string;
       airfoil_name: string;
@@ -5409,114 +5673,689 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       reference_length_m: number;
       snapshot: Record<string, unknown>;
       aoa_deg: number;
-    }[];
-    const first = rows[0];
-    if (!first) return { promise: null };
-    const aoas = rows
-      .filter(
-        (row) =>
-          row.airfoil_id === first.airfoil_id &&
-          row.revision_id === first.revision_id,
-      )
-      .slice(0, body.limit)
-      .map((row) => Number(row.aoa_deg))
-      .sort((a, b) => a - b);
-    const [promise] = await db
-      .insert(syncSweepPromises)
-      .values({
-        sourceInstanceId:
-          registeredSolver?.instanceId ?? body.sourceInstanceId ?? null,
-        sourceInstanceName:
-          registeredSolver?.instanceName ?? body.sourceInstanceName ?? null,
-        sourceBaseUrl:
-          registeredSolver?.publicEndpoint ?? body.sourceBaseUrl ?? null,
-        airfoilId: first.airfoil_id,
-        simulationPresetRevisionId: first.revision_id,
-        aoaCount: aoas.length,
-        expiresAt,
-        requestPayload: {
-          limit: body.limit,
-          ttlHours,
-          solverId: registeredSolver?.id ?? null,
+      priority: number;
+      work_source: "campaign" | "public";
+      campaign_id: string | null;
+      condition_id: string | null;
+    };
+    const claimed = await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      const candidateRows = (await tx.execute(sql`
+        WITH latest_revision AS (
+          SELECT DISTINCT ON (preset_id)
+                 preset_id, id, signature_hash, reynolds, mach,
+                 reference_length_m, snapshot
+          FROM simulation_preset_revisions
+          ORDER BY preset_id, revision_number DESC
+        ),
+        public_head AS (
+          SELECT
+            a.id AS airfoil_id,
+            a.slug AS airfoil_slug,
+            a.name AS airfoil_name,
+            a.source AS airfoil_source,
+            a.point_format AS point_format,
+            a.points AS points,
+            preset.id AS preset_id,
+            preset.legacy_boundary_condition_id AS bc_id,
+            revision.id AS revision_id,
+            revision.signature_hash,
+            revision.reynolds,
+            revision.mach,
+            revision.reference_length_m,
+            revision.snapshot,
+            gap.aoa::float8 AS aoa_deg,
+            CASE WHEN COALESCE(result.priority, 0) >= 10 THEN 10 ELSE 0 END::int AS priority,
+            'public'::text AS work_source,
+            NULL::uuid AS campaign_id,
+            NULL::uuid AS condition_id
+          FROM airfoils a
+          CROSS JOIN simulation_presets preset
+          JOIN latest_revision revision ON revision.preset_id = preset.id
+          JOIN sweep_definitions sweep ON sweep.id = preset.sweep_definition_id
+          CROSS JOIN LATERAL (
+            SELECT jsonb_array_elements_text(sweep.aoa_list)::numeric AS aoa
+            WHERE sweep.aoa_list IS NOT NULL
+            UNION ALL
+            SELECT generate_series(
+              sweep.aoa_start::numeric,
+              sweep.aoa_stop::numeric,
+              sweep.aoa_step::numeric
+            ) AS aoa
+            WHERE sweep.aoa_list IS NULL
+          ) gap
+          LEFT JOIN results result
+            ON result.airfoil_id = a.id
+           AND result.simulation_preset_revision_id = revision.id
+           AND result.aoa_deg = gap.aoa
+          LEFT JOIN sim_result_submit_retries submit_retry
+            ON submit_retry.result_id = result.id
+          WHERE preset.enabled = true
+            AND (
+              preset.target_scope = 'all'
+              OR EXISTS (
+                SELECT 1
+                FROM simulation_preset_airfoil_targets target
+                WHERE target.preset_id = preset.id
+                  AND target.airfoil_id = a.id
+              )
+            )
+            AND preset.legacy_boundary_condition_id IS NOT NULL
+            AND a."archivedAt" IS NULL
+            AND a."deletedAt" IS NULL
+            AND (
+              result.id IS NULL
+              OR (
+                result.status IN ('pending', 'stale')
+                AND (
+                  submit_retry.result_id IS NULL
+                  OR submit_retry.state <> 'retry_wait'
+                  OR submit_retry.next_attempt_at <= now()
+                )
+              )
+            )
+            AND (
+              result.id IS NULL
+              OR (
+                result.regime IS DISTINCT FROM 'urans'
+                AND COALESCE(result.fidelity, '') NOT LIKE 'urans%'
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_precalc_obligations obligation
+              WHERE obligation.airfoil_id = a.id
+                AND obligation.revision_id = revision.id
+                AND obligation.aoa_deg = gap.aoa
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sync_sweep_promise_points promise_point
+              JOIN sync_sweep_promises promise
+                ON promise.id = promise_point.promise_id
+              WHERE promise_point.airfoil_id = a.id
+                AND promise_point.simulation_preset_revision_id = revision.id
+                AND promise_point.aoa_deg = gap.aoa
+                AND promise_point.status = 'active'
+                AND promise.status = 'active'
+                AND promise."expiresAt" > now()
+            )
+          ORDER BY priority DESC, revision.reynolds ASC, a.slug ASC, gap.aoa ASC
+          LIMIT 1
+        ),
+        campaign_group_head AS (
+          SELECT
+            a.id AS airfoil_id,
+            a.slug AS airfoil_slug,
+            a.name AS airfoil_name,
+            a.source AS airfoil_source,
+            a.point_format AS point_format,
+            a.points AS points,
+            preset.id AS preset_id,
+            preset.legacy_boundary_condition_id AS bc_id,
+            revision.id AS revision_id,
+            revision.signature_hash,
+            revision.reynolds,
+            revision.mach,
+            revision.reference_length_m,
+            revision.snapshot,
+            selected.head_aoa::float8 AS aoa_deg,
+            selected.priority,
+            'campaign'::text AS work_source,
+            selected.campaign_id,
+            selected.condition_id
+          FROM (
+            SELECT ordered_group.*
+            FROM (
+              SELECT
+                campaign.id AS campaign_id,
+                condition.id AS condition_id,
+                progress.airfoil_id,
+                condition.preset_id,
+                condition.simulation_preset_revision_id AS revision_id,
+                LEAST(9, GREATEST(0, campaign.priority))::int AS priority,
+                revision.reynolds,
+                a.slug AS airfoil_slug,
+                (
+                  SELECT point.aoa_deg
+                  FROM sim_campaign_points point
+                  WHERE point.campaign_id = campaign.id
+                    AND point.condition_id = condition.id
+                    AND point.airfoil_id = progress.airfoil_id
+                    AND point.revision_id = condition.simulation_preset_revision_id
+                    AND point.derived_by_symmetry = false
+                    AND NOT (a.is_symmetric AND point.aoa_deg < 0)
+                  ORDER BY point.aoa_deg
+                  LIMIT 1
+                ) AS head_aoa,
+                a.is_symmetric
+              FROM sim_campaigns campaign
+              JOIN sim_campaign_conditions condition
+                ON condition.campaign_id = campaign.id
+               AND condition.status IN ('active', 'kept')
+              JOIN sim_campaign_progress progress
+                ON progress.campaign_id = campaign.id
+               AND progress.condition_id = condition.id
+              JOIN airfoils a ON a.id = progress.airfoil_id
+              JOIN simulation_presets preset ON preset.id = condition.preset_id
+              JOIN simulation_preset_revisions revision
+                ON revision.id = condition.simulation_preset_revision_id
+              WHERE campaign.status = 'active'
+                AND a."archivedAt" IS NULL
+                AND a."deletedAt" IS NULL
+                AND preset.legacy_boundary_condition_id IS NOT NULL
+                -- Completed/owned groups dominate a mature campaign ledger.
+                -- Progress is only a coarse zero-work prefilter; the fenced
+                -- lateral scan below remains the exact eligibility authority.
+                -- derived is intentionally absent because symmetric groups
+                -- can be untouched while already owning derived cells.
+                AND progress.solved = 0
+                AND progress.failed = 0
+                AND progress.running = 0
+                AND progress.superseded = 0
+                AND progress.rejected = 0
+                AND progress.blocked = 0
+                AND progress.precalc_mesh_repairing = 0
+              ORDER BY LEAST(9, GREATEST(0, campaign.priority)) DESC,
+                       revision.reynolds ASC, a.slug ASC, head_aoa ASC,
+                       campaign.id ASC, condition.id ASC
+              OFFSET 0
+            ) ordered_group
+            CROSS JOIN LATERAL (
+              SELECT
+                count(*)::int AS physical_count,
+                count(*) FILTER (
+                  WHERE point.state = 'requested'
+                    AND (
+                      result.id IS NULL
+                      OR (
+                        result.status IN ('pending', 'stale')
+                        AND NOT EXISTS (
+                          SELECT 1
+                          FROM sim_result_submit_retries submit_retry
+                          WHERE submit_retry.result_id = result.id
+                            AND submit_retry.state = 'retry_wait'
+                            AND submit_retry.next_attempt_at > now()
+                        )
+                      )
+                    )
+                    AND (
+                      result.id IS NULL
+                      OR (
+                        result.regime IS DISTINCT FROM 'urans'
+                        AND COALESCE(result.fidelity, '') NOT LIKE 'urans%'
+                      )
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM sim_precalc_obligations obligation
+                      WHERE obligation.airfoil_id = point.airfoil_id
+                        AND obligation.revision_id = point.revision_id
+                        AND obligation.aoa_deg = point.aoa_deg
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM sync_sweep_promise_points promise_point
+                      JOIN sync_sweep_promises promise
+                        ON promise.id = promise_point.promise_id
+                      WHERE promise_point.airfoil_id = point.airfoil_id
+                        AND promise_point.simulation_preset_revision_id = point.revision_id
+                        AND promise_point.aoa_deg = point.aoa_deg
+                        AND promise_point.status = 'active'
+                        AND promise.status = 'active'
+                        AND promise."expiresAt" > now()
+                    )
+                )::int AS eligible_count
+              FROM sim_campaign_points point
+              LEFT JOIN results result
+                ON result.airfoil_id = point.airfoil_id
+               AND result.simulation_preset_revision_id = point.revision_id
+               AND result.aoa_deg = point.aoa_deg
+              WHERE point.campaign_id = ordered_group.campaign_id
+                AND point.condition_id = ordered_group.condition_id
+                AND point.airfoil_id = ordered_group.airfoil_id
+                AND point.revision_id = ordered_group.revision_id
+                AND point.derived_by_symmetry = false
+                AND NOT (ordered_group.is_symmetric AND point.aoa_deg < 0)
+              OFFSET 0
+            ) scope
+            WHERE scope.physical_count BETWEEN 1 AND ${body.limit}
+              AND scope.eligible_count = scope.physical_count
+            LIMIT 1
+          ) selected
+          JOIN airfoils a ON a.id = selected.airfoil_id
+          JOIN simulation_presets preset ON preset.id = selected.preset_id
+          JOIN simulation_preset_revisions revision
+            ON revision.id = selected.revision_id
+        ),
+        ordered_heads AS (
+          SELECT * FROM public_head
+          UNION ALL
+          SELECT * FROM campaign_group_head
+        )
+        SELECT airfoil_id, airfoil_slug, airfoil_name, airfoil_source,
+               point_format, points, preset_id, bc_id, revision_id,
+               signature_hash, reynolds, mach, reference_length_m, snapshot,
+               aoa_deg, priority, work_source, campaign_id, condition_id
+        FROM ordered_heads
+        ORDER BY priority DESC,
+                 CASE work_source WHEN 'campaign' THEN 0 ELSE 1 END,
+                 reynolds ASC, airfoil_slug ASC, aoa_deg ASC,
+                 campaign_id NULLS LAST, condition_id NULLS LAST
+        LIMIT 1
+      `)) as unknown as ClaimGapRow[];
+      const candidate = candidateRows[0];
+      if (!candidate) return null;
+
+      let aoas: number[];
+      if (candidate.work_source === "campaign") {
+        if (!candidate.campaign_id || !candidate.condition_id) return null;
+        const [campaign] = (await tx.execute(sql`
+          SELECT campaign.id
+          FROM sim_campaigns campaign
+          JOIN sim_campaign_conditions condition
+            ON condition.id = ${candidate.condition_id}
+           AND condition.campaign_id = campaign.id
+          WHERE campaign.id = ${candidate.campaign_id}
+            AND campaign.status = 'active'
+            AND condition.status IN ('active', 'kept')
+            AND condition.simulation_preset_revision_id = ${candidate.revision_id}
+          FOR UPDATE OF campaign
+        `)) as unknown as Array<{ id: string }>;
+        if (!campaign) return null;
+        const physicalRows = (await tx.execute(sql`
+          SELECT point.aoa_deg::float8 AS aoa_deg
+          FROM sim_campaign_points point
+          JOIN airfoils a ON a.id = point.airfoil_id
+          WHERE point.campaign_id = ${candidate.campaign_id}
+            AND point.condition_id = ${candidate.condition_id}
+            AND point.airfoil_id = ${candidate.airfoil_id}
+            AND point.revision_id = ${candidate.revision_id}
+            AND point.derived_by_symmetry = false
+            AND NOT (a.is_symmetric AND point.aoa_deg < 0)
+          ORDER BY point.aoa_deg
+        `)) as unknown as Array<{ aoa_deg: number }>;
+        if (!physicalRows.length || physicalRows.length > body.limit)
+          return null;
+        const physicalAoas = physicalRows.map((row) => Number(row.aoa_deg));
+        await lockPrecalcCells(
+          tx,
+          physicalAoas.map((aoaDeg) => ({
+            airfoilId: candidate.airfoil_id,
+            revisionId: candidate.revision_id,
+            aoaDeg,
+          })),
+        );
+        const eligibleRows = (await tx.execute(sql`
+          SELECT point.aoa_deg::float8 AS aoa_deg
+          FROM sim_campaign_points point
+          JOIN sim_campaigns campaign
+            ON campaign.id = point.campaign_id AND campaign.status = 'active'
+          JOIN sim_campaign_conditions condition
+            ON condition.id = point.condition_id
+           AND condition.campaign_id = point.campaign_id
+           AND condition.status IN ('active', 'kept')
+           AND condition.simulation_preset_revision_id = point.revision_id
+          JOIN simulation_presets preset ON preset.id = condition.preset_id
+          JOIN airfoils a ON a.id = point.airfoil_id
+          LEFT JOIN results r
+            ON r.airfoil_id = point.airfoil_id
+           AND r.simulation_preset_revision_id = point.revision_id
+           AND r.aoa_deg = point.aoa_deg
+          LEFT JOIN sim_result_submit_retries submit_retry ON submit_retry.result_id = r.id
+          WHERE point.campaign_id = ${candidate.campaign_id}
+            AND point.condition_id = ${candidate.condition_id}
+            AND point.airfoil_id = ${candidate.airfoil_id}
+            AND point.revision_id = ${candidate.revision_id}
+            AND point.state = 'requested'
+            AND point.derived_by_symmetry = false
+            AND NOT (a.is_symmetric AND point.aoa_deg < 0)
+            AND a."archivedAt" IS NULL
+            AND a."deletedAt" IS NULL
+            AND preset.legacy_boundary_condition_id IS NOT NULL
+            AND (
+              r.id IS NULL
+              OR (
+                r.status IN ('pending', 'stale')
+                AND (
+                  submit_retry.result_id IS NULL
+                  OR submit_retry.state <> 'retry_wait'
+                  OR submit_retry.next_attempt_at <= now()
+                )
+              )
+            )
+            AND (r.id IS NULL OR (
+              r.regime IS DISTINCT FROM 'urans'
+              AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+            ))
+            AND NOT EXISTS (
+              SELECT 1 FROM sim_precalc_obligations obligation
+              WHERE obligation.airfoil_id = point.airfoil_id
+                AND obligation.revision_id = point.revision_id
+                AND obligation.aoa_deg = point.aoa_deg
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sync_sweep_promise_points promise_point
+              JOIN sync_sweep_promises promise ON promise.id = promise_point.promise_id
+              WHERE promise_point.airfoil_id = point.airfoil_id
+                AND promise_point.simulation_preset_revision_id = point.revision_id
+                AND promise_point.aoa_deg = point.aoa_deg
+                AND promise_point.status = 'active'
+                AND promise.status = 'active'
+                AND promise."expiresAt" > now()
+            )
+          ORDER BY point.aoa_deg
+        `)) as unknown as Array<{ aoa_deg: number }>;
+        if (eligibleRows.length !== physicalRows.length) return null;
+        aoas = eligibleRows.map((row) => Number(row.aoa_deg));
+      } else {
+        const selectedRows = (await tx.execute(sql`
+          SELECT gap.aoa::float8 AS aoa_deg
+          FROM simulation_presets preset
+          JOIN simulation_preset_revisions revision
+            ON revision.id = ${candidate.revision_id}
+           AND revision.preset_id = preset.id
+           AND revision.id = (
+             SELECT newest.id
+             FROM simulation_preset_revisions newest
+             WHERE newest.preset_id = preset.id
+             ORDER BY newest.revision_number DESC
+             LIMIT 1
+           )
+          JOIN sweep_definitions sweep ON sweep.id = preset.sweep_definition_id
+          JOIN airfoils a ON a.id = ${candidate.airfoil_id}
+          CROSS JOIN LATERAL (
+            SELECT jsonb_array_elements_text(sweep.aoa_list)::numeric AS aoa
+            WHERE sweep.aoa_list IS NOT NULL
+            UNION ALL
+            SELECT generate_series(
+              sweep.aoa_start::numeric,
+              sweep.aoa_stop::numeric,
+              sweep.aoa_step::numeric
+            ) AS aoa
+            WHERE sweep.aoa_list IS NULL
+          ) gap
+          LEFT JOIN results result
+            ON result.airfoil_id = a.id
+           AND result.simulation_preset_revision_id = revision.id
+           AND result.aoa_deg = gap.aoa
+          LEFT JOIN sim_result_submit_retries submit_retry
+            ON submit_retry.result_id = result.id
+          WHERE preset.id = ${candidate.preset_id}
+            AND preset.enabled = true
+            AND (
+              preset.target_scope = 'all'
+              OR EXISTS (
+                SELECT 1
+                FROM simulation_preset_airfoil_targets target
+                WHERE target.preset_id = preset.id
+                  AND target.airfoil_id = a.id
+              )
+            )
+            AND preset.legacy_boundary_condition_id IS NOT NULL
+            AND a."archivedAt" IS NULL
+            AND a."deletedAt" IS NULL
+            AND CASE
+              WHEN ${candidate.priority} >= 10
+                THEN COALESCE(result.priority, 0) >= 10
+              ELSE COALESCE(result.priority, 0) < 10
+            END
+            AND (
+              result.id IS NULL
+              OR (
+                result.status IN ('pending', 'stale')
+                AND (
+                  submit_retry.result_id IS NULL
+                  OR submit_retry.state <> 'retry_wait'
+                  OR submit_retry.next_attempt_at <= now()
+                )
+              )
+            )
+            AND (
+              result.id IS NULL
+              OR (
+                result.regime IS DISTINCT FROM 'urans'
+                AND COALESCE(result.fidelity, '') NOT LIKE 'urans%'
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_precalc_obligations obligation
+              WHERE obligation.airfoil_id = a.id
+                AND obligation.revision_id = revision.id
+                AND obligation.aoa_deg = gap.aoa
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sync_sweep_promise_points promise_point
+              JOIN sync_sweep_promises promise
+                ON promise.id = promise_point.promise_id
+              WHERE promise_point.airfoil_id = a.id
+                AND promise_point.simulation_preset_revision_id = revision.id
+                AND promise_point.aoa_deg = gap.aoa
+                AND promise_point.status = 'active'
+                AND promise.status = 'active'
+                AND promise."expiresAt" > now()
+            )
+          ORDER BY gap.aoa
+          LIMIT ${body.limit}
+        `)) as unknown as Array<{ aoa_deg: number }>;
+        aoas = selectedRows.map((row) => Number(row.aoa_deg));
+        if (!aoas.length) return null;
+        await lockPrecalcCells(
+          tx,
+          aoas.map((aoaDeg) => ({
+            airfoilId: candidate.airfoil_id,
+            revisionId: candidate.revision_id,
+            aoaDeg,
+          })),
+        );
+        const rechecked = (await tx.execute(sql`
+          SELECT g.aoa::float8 AS aoa_deg
+          FROM simulation_presets preset
+          JOIN simulation_preset_revisions rev ON rev.id = ${candidate.revision_id}
+           AND rev.preset_id = preset.id
+           AND rev.id = (
+             SELECT newest.id FROM simulation_preset_revisions newest
+             WHERE newest.preset_id = preset.id
+             ORDER BY newest.revision_number DESC LIMIT 1
+           )
+          JOIN sweep_definitions sweep ON sweep.id = preset.sweep_definition_id
+          JOIN airfoils a ON a.id = ${candidate.airfoil_id}
+          CROSS JOIN LATERAL (
+            SELECT jsonb_array_elements_text(sweep.aoa_list)::numeric AS aoa WHERE sweep.aoa_list IS NOT NULL
+            UNION ALL
+            SELECT generate_series(sweep.aoa_start::numeric, sweep.aoa_stop::numeric, sweep.aoa_step::numeric) AS aoa WHERE sweep.aoa_list IS NULL
+          ) g
+          LEFT JOIN results r
+            ON r.airfoil_id = a.id
+           AND r.simulation_preset_revision_id = rev.id
+           AND r.aoa_deg = g.aoa
+          LEFT JOIN sim_result_submit_retries submit_retry ON submit_retry.result_id = r.id
+          WHERE preset.id = ${candidate.preset_id}
+            AND preset.enabled = true
+            AND (
+              preset.target_scope = 'all'
+              OR EXISTS (
+                SELECT 1 FROM simulation_preset_airfoil_targets target
+                WHERE target.preset_id = preset.id AND target.airfoil_id = a.id
+              )
+            )
+            AND preset.legacy_boundary_condition_id IS NOT NULL
+            AND a."archivedAt" IS NULL
+            AND a."deletedAt" IS NULL
+            AND g.aoa::float8 IN (${sql.join(
+              aoas.map((aoa) => sql`${aoa}`),
+              sql`, `,
+            )})
+            AND CASE
+              WHEN ${candidate.priority} >= 10
+                THEN COALESCE(r.priority, 0) >= 10
+              ELSE COALESCE(r.priority, 0) < 10
+            END
+            AND (
+              r.id IS NULL
+              OR (
+                r.status IN ('pending', 'stale')
+                AND (
+                  submit_retry.result_id IS NULL
+                  OR submit_retry.state <> 'retry_wait'
+                  OR submit_retry.next_attempt_at <= now()
+                )
+              )
+            )
+            AND (r.id IS NULL OR (
+              r.regime IS DISTINCT FROM 'urans'
+              AND COALESCE(r.fidelity, '') NOT LIKE 'urans%'
+            ))
+            AND NOT EXISTS (
+              SELECT 1 FROM sim_precalc_obligations obligation
+              WHERE obligation.airfoil_id = a.id
+                AND obligation.revision_id = rev.id
+                AND obligation.aoa_deg = g.aoa
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sync_sweep_promise_points promise_point
+              JOIN sync_sweep_promises promise ON promise.id = promise_point.promise_id
+              WHERE promise_point.airfoil_id = a.id
+                AND promise_point.simulation_preset_revision_id = rev.id
+                AND promise_point.aoa_deg = g.aoa
+                AND promise_point.status = 'active'
+                AND promise.status = 'active'
+                AND promise."expiresAt" > now()
+            )
+          ORDER BY g.aoa
+        `)) as unknown as Array<{ aoa_deg: number }>;
+        const eligible = new Set(rechecked.map((row) => Number(row.aoa_deg)));
+        aoas = aoas.filter((aoa) => eligible.has(aoa));
+        if (!aoas.length) return null;
+      }
+
+      const [promise] = await tx
+        .insert(syncSweepPromises)
+        .values({
+          sourceInstanceId:
+            registeredSolver?.instanceId ?? body.sourceInstanceId ?? null,
+          sourceInstanceName:
+            registeredSolver?.instanceName ?? body.sourceInstanceName ?? null,
           sourceBaseUrl:
             registeredSolver?.publicEndpoint ?? body.sourceBaseUrl ?? null,
-        },
-      })
-      .returning();
-    const pointRows = await db
-      .insert(syncSweepPromisePoints)
-      .values(
-        aoas.map((aoaDeg) => ({
-          promiseId: promise.id,
-          airfoilId: first.airfoil_id,
-          simulationPresetRevisionId: first.revision_id,
-          aoaDeg,
-        })),
-      )
-      .onConflictDoNothing()
-      .returning({ aoaDeg: syncSweepPromisePoints.aoaDeg });
-    if (!pointRows.length) {
-      await db
+          airfoilId: candidate.airfoil_id,
+          simulationPresetRevisionId: candidate.revision_id,
+          aoaCount: aoas.length,
+          expiresAt,
+          requestPayload: {
+            remoteSolver: true,
+            limit: body.limit,
+            ttlHours,
+            solverId: registeredSolver?.id ?? null,
+            workSource: candidate.work_source,
+            ...(candidate.work_source === "campaign"
+              ? {
+                  campaignId: candidate.campaign_id,
+                  conditionId: candidate.condition_id,
+                }
+              : {}),
+            sourceBaseUrl:
+              registeredSolver?.publicEndpoint ?? body.sourceBaseUrl ?? null,
+          },
+        })
+        .returning();
+      const pointRows = await tx
+        .insert(syncSweepPromisePoints)
+        .values(
+          aoas.map((aoaDeg) => ({
+            promiseId: promise.id,
+            airfoilId: candidate.airfoil_id,
+            simulationPresetRevisionId: candidate.revision_id,
+            aoaDeg,
+          })),
+        )
+        .onConflictDoNothing()
+        .returning({ aoaDeg: syncSweepPromisePoints.aoaDeg });
+      if (!pointRows.length) {
+        await tx
+          .update(syncSweepPromises)
+          .set({ status: "cancelled", cancelledAt: new Date() })
+          .where(eq(syncSweepPromises.id, promise.id));
+        return null;
+      }
+      const promisedAoas = pointRows
+        .map((row) => Number(row.aoaDeg))
+        .sort((a, b) => a - b);
+      if (
+        candidate.work_source === "campaign" &&
+        promisedAoas.length !== aoas.length
+      ) {
+        // A concurrent exact-cell promise won despite the eligibility recheck.
+        // Never lease a truncated campaign polar: roll back this claim and let
+        // the committed owner or the local campaign scheduler finish it.
+        await tx
+          .delete(syncSweepPromises)
+          .where(eq(syncSweepPromises.id, promise.id));
+        return null;
+      }
+      await tx
         .update(syncSweepPromises)
-        .set({ status: "cancelled", cancelledAt: new Date() })
+        .set({ aoaCount: promisedAoas.length })
         .where(eq(syncSweepPromises.id, promise.id));
-      return { promise: null };
-    }
-    const promisedAoas = pointRows
-      .map((row) => Number(row.aoaDeg))
-      .sort((a, b) => a - b);
-    await db
-      .update(syncSweepPromises)
-      .set({ aoaCount: promisedAoas.length })
-      .where(eq(syncSweepPromises.id, promise.id));
-    if (registeredSolver) {
-      const [active] = await db
-        .select({
-          promises: count(),
-          aoas: sql<number>`COALESCE(SUM(${syncSweepPromises.aoaCount}), 0)::int`,
-        })
-        .from(syncSweepPromises)
-        .where(
-          and(
-            eq(syncSweepPromises.sourceInstanceId, registeredSolver.instanceId),
-            eq(syncSweepPromises.status, "active"),
-          ),
-        );
-      await db
-        .update(registeredRemoteSolvers)
-        .set({
-          status: "claiming",
-          lastHeartbeatAt: new Date(),
-          activePromiseCount: Number(active?.promises ?? 1),
-          activeAoaCount: Number(active?.aoas ?? promisedAoas.length),
-          updatedAt: new Date(),
-        })
-        .where(eq(registeredRemoteSolvers.id, registeredSolver.id));
-    }
+      if (registeredSolver) {
+        const [active] = await tx
+          .select({
+            promises: count(),
+            aoas: sql<number>`COALESCE(SUM(${syncSweepPromises.aoaCount}), 0)::int`,
+          })
+          .from(syncSweepPromises)
+          .where(
+            and(
+              eq(
+                syncSweepPromises.sourceInstanceId,
+                registeredSolver.instanceId,
+              ),
+              eq(syncSweepPromises.status, "active"),
+            ),
+          );
+        await tx
+          .update(registeredRemoteSolvers)
+          .set({
+            status: "claiming",
+            lastHeartbeatAt: new Date(),
+            activePromiseCount: Number(active?.promises ?? 1),
+            activeAoaCount: Number(active?.aoas ?? promisedAoas.length),
+            updatedAt: new Date(),
+          })
+          .where(eq(registeredRemoteSolvers.id, registeredSolver.id));
+      }
+      return { promise, promisedAoas, candidate };
+    });
+    if (!claimed) return { promise: null };
+    const { candidate } = claimed;
     return {
       promise: {
-        id: promise.id,
+        id: claimed.promise.id,
         expiresAt: expiresAt.toISOString(),
         ttlHours,
         airfoil: {
-          id: first.airfoil_id,
-          slug: first.airfoil_slug,
-          name: first.airfoil_name,
-          source: first.airfoil_source,
-          pointFormat: first.point_format,
-          points: first.points,
+          id: candidate.airfoil_id,
+          slug: candidate.airfoil_slug,
+          name: candidate.airfoil_name,
+          source: candidate.airfoil_source,
+          pointFormat: candidate.point_format,
+          points: candidate.points,
         },
         setupRevision: {
-          id: first.revision_id,
-          presetId: first.preset_id,
-          legacyBoundaryConditionId: first.bc_id,
-          signatureHash: first.signature_hash,
-          reynolds: Number(first.reynolds),
-          mach: first.mach == null ? null : Number(first.mach),
-          referenceLengthM: Number(first.reference_length_m),
-          snapshot: first.snapshot,
+          id: candidate.revision_id,
+          presetId: candidate.preset_id,
+          legacyBoundaryConditionId: candidate.bc_id,
+          signatureHash: candidate.signature_hash,
+          reynolds: Number(candidate.reynolds),
+          mach: candidate.mach == null ? null : Number(candidate.mach),
+          referenceLengthM: Number(candidate.reference_length_m),
+          snapshot: candidate.snapshot,
         },
-        aoas: promisedAoas,
+        aoas: claimed.promisedAoas,
       },
     };
   });

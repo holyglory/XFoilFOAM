@@ -1304,6 +1304,132 @@ interface RemotePromiseProvenance {
   syncPromiseId: string;
   remoteSolver: true;
   upstreamBaseUrl: string;
+  remoteSolverExpectedEngine: RemoteSolverExpectedEngine;
+  remoteSolverEngineRuntime: RemoteSolverEngineRuntime;
+}
+
+interface RemoteSolverExpectedEngine {
+  family: string;
+  distribution: string;
+  version: string;
+  numerics_revision: string;
+  adapter_contract_version: number;
+}
+
+interface RemoteSolverEngineRuntime {
+  family: string;
+  distribution: string;
+  version: string;
+  numericsRevision: string;
+  adapterContractVersion: number;
+  buildId: string;
+  sourceRevision: string | null;
+  imageDigest: string | null;
+  applicationSourceSha256: string | null;
+  packageSha256: string | null;
+  binarySha256: string | null;
+  architecture: string | null;
+}
+
+interface RemoteEngineAdmissionProof {
+  expectedEngine: RemoteSolverExpectedEngine;
+  runtime: RemoteSolverEngineRuntime;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function requiredString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function nullableString(value: unknown): string | null | undefined {
+  if (value == null) return null;
+  return requiredString(value) ?? undefined;
+}
+
+/** Normalize only a complete proof authored by the remote admission guard.
+ * A legacy/corrupt parent without this proof must wait for the remote scheduler
+ * to revalidate local /health before it can create a PRECALC child. */
+function normalizeRemoteEngineAdmissionProof(
+  value: unknown,
+): RemoteEngineAdmissionProof | null {
+  const proof = recordValue(value);
+  const expectedValue = recordValue(proof.expectedEngine);
+  const runtimeValue = recordValue(proof.runtime);
+  const expected: RemoteSolverExpectedEngine = {
+    family: requiredString(expectedValue.family) ?? "",
+    distribution: requiredString(expectedValue.distribution) ?? "",
+    version: requiredString(expectedValue.version) ?? "",
+    numerics_revision:
+      requiredString(
+        expectedValue.numerics_revision ?? expectedValue.numericsRevision,
+      ) ?? "",
+    adapter_contract_version: Number(
+      expectedValue.adapter_contract_version ??
+        expectedValue.adapterContractVersion,
+    ),
+  };
+  const runtime: RemoteSolverEngineRuntime = {
+    family: requiredString(runtimeValue.family) ?? "",
+    distribution: requiredString(runtimeValue.distribution) ?? "",
+    version: requiredString(runtimeValue.version) ?? "",
+    numericsRevision:
+      requiredString(
+        runtimeValue.numerics_revision ?? runtimeValue.numericsRevision,
+      ) ?? "",
+    adapterContractVersion: Number(
+      runtimeValue.adapter_contract_version ??
+        runtimeValue.adapterContractVersion,
+    ),
+    buildId:
+      requiredString(runtimeValue.build_id ?? runtimeValue.buildId) ?? "",
+    sourceRevision:
+      nullableString(
+        runtimeValue.source_revision ?? runtimeValue.sourceRevision,
+      ) ?? null,
+    imageDigest:
+      nullableString(runtimeValue.image_digest ?? runtimeValue.imageDigest) ??
+      null,
+    applicationSourceSha256:
+      nullableString(
+        runtimeValue.application_source_sha256 ??
+          runtimeValue.applicationSourceSha256,
+      ) ?? null,
+    packageSha256:
+      nullableString(
+        runtimeValue.package_sha256 ?? runtimeValue.packageSha256,
+      ) ?? null,
+    binarySha256:
+      nullableString(runtimeValue.binary_sha256 ?? runtimeValue.binarySha256) ??
+      null,
+    architecture: nullableString(runtimeValue.architecture) ?? null,
+  };
+  if (
+    !expected.family ||
+    !expected.distribution ||
+    !expected.version ||
+    !expected.numerics_revision ||
+    !Number.isInteger(expected.adapter_contract_version) ||
+    expected.adapter_contract_version <= 0 ||
+    !runtime.family ||
+    !runtime.distribution ||
+    !runtime.version ||
+    !runtime.numericsRevision ||
+    !Number.isInteger(runtime.adapterContractVersion) ||
+    runtime.adapterContractVersion <= 0 ||
+    !runtime.buildId ||
+    runtime.family !== expected.family ||
+    runtime.distribution !== expected.distribution ||
+    runtime.version !== expected.version ||
+    runtime.numericsRevision !== expected.numerics_revision ||
+    runtime.adapterContractVersion !== expected.adapter_contract_version
+  )
+    return null;
+  return { expectedEngine: expected, runtime };
 }
 
 /** Resolve remote ownership only from the durable local mirror. A scalar
@@ -1312,9 +1438,21 @@ interface RemotePromiseProvenance {
 async function remotePromiseProvenanceForJob(
   db: DB,
   job: SimJobRow,
+  freshEngineProof?: unknown,
 ): Promise<RemotePromiseProvenance | null> {
-  const payload = requestPayload(job) as { syncPromiseId?: unknown };
+  const payload = requestPayload(job) as {
+    syncPromiseId?: unknown;
+    remoteSolverExpectedEngine?: unknown;
+    remoteSolverEngineRuntime?: unknown;
+  };
   if (typeof payload.syncPromiseId !== "string") return null;
+  const engineProof = normalizeRemoteEngineAdmissionProof(
+    freshEngineProof ?? {
+      expectedEngine: payload.remoteSolverExpectedEngine,
+      runtime: payload.remoteSolverEngineRuntime,
+    },
+  );
+  if (!engineProof) return null;
   const [promise] = await db
     .select({
       id: syncSweepPromises.id,
@@ -1340,6 +1478,8 @@ async function remotePromiseProvenanceForJob(
     syncPromiseId: promise.id,
     remoteSolver: true,
     upstreamBaseUrl: promise.sourceBaseUrl,
+    remoteSolverExpectedEngine: engineProof.expectedEngine,
+    remoteSolverEngineRuntime: engineProof.runtime,
   };
 }
 
@@ -1482,6 +1622,9 @@ export async function submitUransRetryForJob(
     recordRoutesOnly?: boolean;
     /** Live engine capability prepared by the bounded scheduler tick. */
     meshRecoveryVersion?: number;
+    /** Fresh, locally health-verified identity for a remote-owned PRECALC
+     * admission. It also upgrades legacy parents that predate stored proof. */
+    remoteEngineProof?: unknown;
   } = {},
 ): Promise<void> {
   if (parent.wave !== 1 || parent.bcIds.length === 0) return;
@@ -1598,7 +1741,11 @@ export async function submitUransRetryForJob(
   const remotePromiseHint =
     typeof (parentPayload as { syncPromiseId?: unknown }).syncPromiseId ===
     "string";
-  const remoteProvenance = await remotePromiseProvenanceForJob(db, parent);
+  const remoteProvenance = await remotePromiseProvenanceForJob(
+    db,
+    parent,
+    opts.remoteEngineProof,
+  );
   if (remotePromiseHint && !remoteProvenance) return;
   const [existing] = await db
     .select({ id: simJobs.id })
@@ -1763,6 +1910,13 @@ export async function submitUransRetryForJob(
     uransFidelity: "precalc",
     cpuSlots: capacity?.cpuSlots ?? 0,
   });
+  if (remoteProvenance) {
+    (
+      request as typeof request & {
+        expected_engine?: RemoteSolverExpectedEngine;
+      }
+    ).expected_engine = remoteProvenance.remoteSolverExpectedEngine;
+  }
   request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;
   if (continuation) {
     request.continue_from = {

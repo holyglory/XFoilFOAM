@@ -37,6 +37,7 @@ import {
   simCampaignConditions,
   simCampaigns,
   simJobs,
+  simPrecalcObligations,
   simUransRequests,
   simUransVerifyQueue,
   simulationPresetRevisions,
@@ -279,6 +280,13 @@ export async function cleanupCampaignFixtures(
 
     // Campaign deletion above first removes lane/step FKs into fitted evidence.
     if (revisionIds.length) {
+      // Terminal remote PRECALC handoffs keep an exact source-attempt pointer.
+      // Remove the revision-owned obligation before deleting immutable result
+      // attempts; deleting the preset later would cascade it too late for the
+      // attempt FK's deliberate NO ACTION policy.
+      await db
+        .delete(simPrecalcObligations)
+        .where(inArray(simPrecalcObligations.revisionId, revisionIds));
       // Fit points do not own result FKs, so result/member cascades alone leave
       // a truthful-looking current aggregate backed by deleted fixture rows.
       // Retire affected aggregates in the same commit as evidence deletion;

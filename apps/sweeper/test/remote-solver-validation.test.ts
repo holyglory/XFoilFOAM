@@ -34,7 +34,8 @@ const { ensureSimulationPresetRevision } =
 const {
   claimResultDelivery,
   createProgressAwareAbort,
-  remoteSolverTick,
+  remoteSolverRuntimeForSetup,
+  remoteSolverTick: remoteSolverTickImpl,
   renewResultDeliveryClaim,
   settleResultDelivery,
 } = await import("../src/remote-solver");
@@ -88,6 +89,81 @@ const UPSTREAM = "http://hub.test/api/sync/v1";
 const SECRET = `${PREFIX}-secret`;
 const CHORD = 0.37;
 const SPEED = 24.5;
+const TEST_EXPECTED_ENGINE = {
+  key: "openfoam:opencfd:2606:rans-urans:1",
+  family: "openfoam",
+  distribution: "opencfd",
+  releaseVersion: "2606",
+  methodFamily: "rans-urans",
+  numericsRevision: "1",
+  adapterContractVersion: 1,
+};
+const TEST_ENGINE_RUNTIME = {
+  family: "openfoam",
+  distribution: "opencfd",
+  version: "2606",
+  numerics_revision: "1",
+  adapter_contract_version: 1,
+  build_id: `${PREFIX}-opencfd-2606-runtime`,
+  source_revision: `${PREFIX}-source`,
+  image_digest: null,
+  application_source_sha256: "a".repeat(64),
+  package_sha256: "b".repeat(64),
+  binary_sha256: null,
+  architecture: "x86_64",
+};
+const TEST_REQUEST_EXPECTED_ENGINE = {
+  family: "openfoam",
+  distribution: "opencfd",
+  version: "2606",
+  numerics_revision: "1",
+  adapter_contract_version: 1,
+};
+const TEST_NORMALIZED_ENGINE_RUNTIME = {
+  family: "openfoam",
+  distribution: "opencfd",
+  version: "2606",
+  numericsRevision: "1",
+  adapterContractVersion: 1,
+  buildId: `${PREFIX}-opencfd-2606-runtime`,
+  sourceRevision: `${PREFIX}-source`,
+  imageDigest: null,
+  applicationSourceSha256: "a".repeat(64),
+  packageSha256: "b".repeat(64),
+  binarySha256: null,
+  architecture: "x86_64",
+};
+
+/** Every tick-level fixture talks to an engine that exposes its own runtime
+ * identity. Individual tests still override healthDetails when they need to
+ * exercise a mismatch; legacy delivery-only stubs get the same truthful
+ * matching health instead of bypassing the production admission fence. */
+async function remoteSolverTick(
+  targetDb: typeof db,
+  engine: EngineClient,
+  allowEngineSubmission = true,
+) {
+  const providedHealth = (
+    engine as unknown as {
+      healthDetails?: EngineClient["healthDetails"];
+    }
+  ).healthDetails;
+  const engineWithHealth = {
+    ...engine,
+    healthDetails:
+      providedHealth ??
+      (async () => ({
+        status: "ok",
+        version: "test",
+        engine: TEST_ENGINE_RUNTIME,
+      })),
+  } as unknown as EngineClient;
+  return remoteSolverTickImpl(
+    targetDb,
+    engineWithHealth,
+    allowEngineSubmission,
+  );
+}
 const contour = [
   { x: 1, y: 0 },
   { x: 0.5, y: 0.06 },
@@ -329,6 +405,19 @@ async function createFixture() {
   const resolved = await ensureSimulationPresetRevision(db, presetId);
   if (!resolved) throw new Error("simulation preset revision required");
   revisionId = resolved.revision.id;
+  // Remote-solver promises pin an engine implementation as part of the
+  // immutable setup. This branch predates the schema-level engine field, so
+  // make the fixture explicit instead of letting admission tests exercise an
+  // impossible legacy snapshot.
+  await db
+    .update(dbSchema.simulationPresetRevisions)
+    .set({
+      snapshot: {
+        ...(resolved.revision.snapshot as Record<string, unknown>),
+        engine: TEST_EXPECTED_ENGINE,
+      },
+    })
+    .where(eq(dbSchema.simulationPresetRevisions.id, revisionId));
 }
 
 function writeMedia(storageKey: string, label: string) {
@@ -405,6 +494,8 @@ async function seedDoneRemoteJob(
         syncPromiseId: promiseId,
         remoteSolver: true,
         upstreamBaseUrl: UPSTREAM,
+        remoteSolverExpectedEngine: TEST_REQUEST_EXPECTED_ENGINE,
+        remoteSolverEngineRuntime: TEST_NORMALIZED_ENGINE_RUNTIME,
         speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
       },
     })
@@ -760,6 +851,8 @@ async function seedRemoteRejectedParent(label: string, aoaDeg: number) {
         syncPromiseId: promise.id,
         remoteSolver: true,
         upstreamBaseUrl: UPSTREAM,
+        remoteSolverExpectedEngine: TEST_REQUEST_EXPECTED_ENGINE,
+        remoteSolverEngineRuntime: TEST_NORMALIZED_ENGINE_RUNTIME,
         speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
         aoas: [aoaDeg],
       },
@@ -1029,6 +1122,54 @@ async function jobsForPromise(promiseId: string) {
   );
 }
 
+async function seedActiveRemoteJob(
+  promiseId: string,
+  label: string,
+  status: "pending" | "submitted" | "running" | "ingesting" = "running",
+) {
+  const [job] = await db
+    .insert(simJobs)
+    .values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      referenceChordM: CHORD,
+      wave: 1,
+      jobKind: "sweep",
+      status,
+      engineJobId:
+        status === "pending" ? null : `${PREFIX}-${label}-engine-job`,
+      totalCases: 1,
+      completedCases: 0,
+      submittedAt: status === "pending" ? null : new Date(),
+      requestPayload: {
+        remoteSolver: true,
+        syncPromiseId: promiseId,
+        upstreamBaseUrl: UPSTREAM,
+        aoas: [],
+      },
+    })
+    .returning();
+  return job;
+}
+
+async function makeMirroredPointBusyWithoutJob(
+  promiseId: string,
+  aoaDeg: number,
+) {
+  await db.insert(results).values({
+    airfoilId,
+    bcId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg,
+    status: "queued",
+    source: "queued",
+  });
+  expect((await readPromise(promiseId)).points).toMatchObject([
+    { aoaDeg, status: "active" },
+  ]);
+}
+
 async function resultForAoa(aoaDeg: number) {
   const [row] = await db
     .select({
@@ -1145,11 +1286,96 @@ afterAll(async () => {
   rmSync(MEDIA_DIR, { recursive: true, force: true });
 });
 
+describe("remote solver engine identity admission", () => {
+  const setup = {
+    engine: {
+      key: "openfoam:opencfd:2606:rans-urans:1",
+      family: "openfoam",
+      distribution: "opencfd",
+      releaseVersion: "2606",
+      methodFamily: "rans-urans",
+      numericsRevision: "1",
+      adapterContractVersion: 1,
+    },
+  } as never;
+  const matchingRuntime = {
+    family: "openfoam",
+    distribution: "opencfd",
+    version: "2606",
+    numerics_revision: "1",
+    adapter_contract_version: 1,
+    build_id: `${PREFIX}-opencfd-2606-runtime`,
+    source_revision: `${PREFIX}-source`,
+    image_digest: null,
+    application_source_sha256: "a".repeat(64),
+    package_sha256: "b".repeat(64),
+    binary_sha256: null,
+    architecture: "x86_64",
+  };
+
+  it.each([
+    ["distribution", { distribution: "foundation" }],
+    ["release", { version: "2406" }],
+    ["numerics", { numerics_revision: "legacy" }],
+    ["adapter contract", { adapter_contract_version: 2 }],
+  ])(
+    "MUST-CATCH: rejects a local %s mismatch before remote work is mirrored or submitted",
+    (label, patch) => {
+      expect(() =>
+        remoteSolverRuntimeForSetup(setup, {
+          engine: { ...matchingRuntime, ...patch },
+        }),
+      ).toThrow(new RegExp(String(label), "i"));
+    },
+  );
+
+  it("fails closed when local health has no runtime build acknowledgement", () => {
+    const { build_id: _buildId, ...logicalOnly } = matchingRuntime;
+    expect(() =>
+      remoteSolverRuntimeForSetup(setup, { default_engine: logicalOnly }),
+    ).toThrow(/authoritative logical\/runtime identity/i);
+  });
+
+  it("fails closed when a claimed setup has no immutable engine identity", () => {
+    expect(() =>
+      remoteSolverRuntimeForSetup({} as never, { engine: matchingRuntime }),
+    ).toThrow(/setup has no complete immutable engine identity/i);
+  });
+
+  it("accepts an exact local identity and returns health-authored upload provenance", () => {
+    expect(
+      remoteSolverRuntimeForSetup(setup, { engine: matchingRuntime }),
+    ).toEqual({
+      expectedEngine: {
+        family: "openfoam",
+        distribution: "opencfd",
+        version: "2606",
+        numerics_revision: "1",
+        adapter_contract_version: 1,
+      },
+      runtime: {
+        family: "openfoam",
+        distribution: "opencfd",
+        version: "2606",
+        numericsRevision: "1",
+        adapterContractVersion: 1,
+        buildId: `${PREFIX}-opencfd-2606-runtime`,
+        sourceRevision: `${PREFIX}-source`,
+        imageDigest: null,
+        applicationSourceSha256: "a".repeat(64),
+        packageSha256: "b".repeat(64),
+        binarySha256: null,
+        architecture: "x86_64",
+      },
+    });
+  });
+});
+
 describe("remote solver submit lifecycle", () => {
   it("keeps remote reconciliation live but does not submit an engine job while storage admission is blocked", async () => {
     const aoa = 900.501;
     const promise = await seedMirroredPromise("storage-blocked", [aoa]);
-    stubFetch();
+    const { fetchMock } = stubFetch();
     const submitPolar = vi.fn(async () => acceptedStatus("must-not-submit"));
 
     await remoteSolverTick(
@@ -1161,6 +1387,289 @@ describe("remote solver submit lifecycle", () => {
     expect(submitPolar).not.toHaveBeenCalled();
     expect(await jobsForPromise(promise.id)).toEqual([]);
     expect((await readPromise(promise.id)).promise.status).toBe("active");
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+    const [status] = await db
+      .select({
+        status: syncApiSettings.remoteSolverLastStatus,
+        error: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(status).toMatchObject({
+      status: "solving",
+      error: expect.stringContaining("storage admission is blocked"),
+    });
+  });
+
+  it("MUST-CATCH: an active oldest mirror does not block one later independent mirror from filling the next global job slot", async () => {
+    const first = await seedMirroredPromise("multi-busy-first", [940.001]);
+    await seedActiveRemoteJob(first.id, "multi-busy-first");
+    const second = await seedMirroredPromise("multi-ready-second", [940.002]);
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("multi-ready-second"),
+    );
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(submitPolar.mock.calls[0]?.[0]).toMatchObject({
+      aoa: { angles: [940.002] },
+    });
+    expect(await jobsForPromise(first.id)).toHaveLength(1);
+    expect(await jobsForPromise(second.id)).toMatchObject([
+      { status: "submitted" },
+    ]);
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+  });
+
+  it("MUST-CATCH: ramps exactly one idle mirror per tick and stops admitting when the global job count reaches capacity", async () => {
+    const promises = await Promise.all([
+      seedMirroredPromise("ramp-one", [941.001]),
+      seedMirroredPromise("ramp-two", [941.002]),
+      seedMirroredPromise("ramp-three", [941.003]),
+    ]);
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus(`ramp-${submitPolar.mock.calls.length}`),
+    );
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+    const admittedCounts = async () =>
+      Promise.all(
+        promises.map(
+          async (promise) => (await jobsForPromise(promise.id)).length,
+        ),
+      );
+
+    await remoteSolverTick(db, engine);
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(
+      (await admittedCounts()).reduce((sum, count) => sum + count, 0),
+    ).toBe(1);
+
+    await remoteSolverTick(db, engine);
+    expect(submitPolar).toHaveBeenCalledTimes(2);
+    expect(
+      (await admittedCounts()).reduce((sum, count) => sum + count, 0),
+    ).toBe(2);
+
+    await remoteSolverTick(db, engine);
+    expect(submitPolar).toHaveBeenCalledTimes(2);
+    expect(await admittedCounts()).toContain(0);
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+  });
+
+  it("counts unrelated in-flight jobs against the shared admission cap", async () => {
+    await db.insert(simJobs).values(
+      [942.001, 942.002].map((aoaDeg) => ({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "running" as const,
+        engineJobId: `${PREFIX}-local-cap-${aoaDeg}`,
+        totalCases: 1,
+        submittedAt: new Date(),
+        requestPayload: { localFixture: true, aoas: [aoaDeg] },
+      })),
+    );
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async () => acceptedStatus("global-cap"));
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+  });
+
+  it("claims at most once per tick below the two-window mirror cap, keeps aggregate solving on an empty claim, and stops claiming at the cap", async () => {
+    const aoas = [943.001, 943.002, 943.003, 943.004];
+    for (const [index, aoaDeg] of aoas.slice(0, 3).entries()) {
+      const promise = await seedMirroredPromise(`claim-window-${index}`, [
+        aoaDeg,
+      ]);
+      await makeMirroredPointBusyWithoutJob(promise.id, aoaDeg);
+    }
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async () => acceptedStatus("claim-window"));
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await remoteSolverTick(db, engine);
+    await remoteSolverTick(db, engine);
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(2);
+    const [working] = await db
+      .select({ status: syncApiSettings.remoteSolverLastStatus })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(working?.status).toBe("solving");
+
+    const fourth = await seedMirroredPromise("claim-window-cap", [aoas[3]!]);
+    await makeMirroredPointBusyWithoutJob(fourth.id, aoas[3]!);
+    await remoteSolverTick(db, engine);
+
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(2);
+  });
+
+  it("MUST-CATCH: authoritative lease rejection cancels one pending PRECALC mirror before recovery can submit attempt two", async () => {
+    const aoaDeg = 944.001;
+    const seeded = await seedRemoteRejectedParent(
+      "lease-rejected-precalc",
+      aoaDeg,
+    );
+    await db.insert(simPrecalcObligations).values({
+      airfoilId,
+      revisionId,
+      aoaDeg,
+      sourceResultId: seeded.result.id,
+      sourceResultAttemptId: seeded.attempt.id,
+      state: "pending",
+      attemptCount: 1,
+      maxAttempts: 2,
+      lastOutcome: "rejected",
+      nextSubmitAt: new Date(Date.now() - 1_000),
+    });
+    await db
+      .update(syncSweepPromises)
+      .set({
+        lastHeartbeatAt: new Date(Date.now() - 120_000),
+        expiresAt: new Date(Date.now() + 600_000),
+      })
+      .where(eq(syncSweepPromises.id, seeded.promise.id));
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/sweeps/${seeded.promise.id}/heartbeat`))
+        return new Response(JSON.stringify({ error: "lease lost" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      if (url.endsWith("/sweeps/claim"))
+        return new Response(JSON.stringify({ promise: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("lease-rejected-must-not-submit"),
+    );
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect((await readPromise(seeded.promise.id)).promise.status).toBe(
+      "cancelled",
+    );
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).endsWith(`/sweeps/${seeded.promise.id}/heartbeat`),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("MUST-CATCH: renews every due sibling after a transient heartbeat, applies exact rejection, and marks admission uncertain", async () => {
+    const promises = await Promise.all([
+      seedMirroredPromise("renew-transient", [945.001]),
+      seedMirroredPromise("renew-rejected", [945.002]),
+      seedMirroredPromise("renew-success", [945.003]),
+    ]);
+    const now = Date.now();
+    for (const [index, promise] of promises.entries()) {
+      await db
+        .update(syncSweepPromises)
+        .set({
+          lastHeartbeatAt: new Date(now - 120_000),
+          expiresAt: new Date(now + (index + 1) * 600_000),
+        })
+        .where(eq(syncSweepPromises.id, promise.id));
+    }
+    const renewedExpiry = new Date(now + 7_200_000).toISOString();
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith(`/sweeps/${promises[0]!.id}/heartbeat`))
+        throw new Error("temporary hub timeout");
+      if (url.endsWith(`/sweeps/${promises[1]!.id}/heartbeat`))
+        return new Response(JSON.stringify({ error: "lease lost" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      if (url.endsWith(`/sweeps/${promises[2]!.id}/heartbeat`))
+        return new Response(JSON.stringify({ expiresAt: renewedExpiry }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      if (url.endsWith("/sweeps/claim"))
+        return new Response(JSON.stringify({ promise: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("uncertain-must-not-submit"),
+    );
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    for (const promise of promises) {
+      expect(
+        fetchMock.mock.calls.filter(([url]) =>
+          String(url).endsWith(`/sweeps/${promise.id}/heartbeat`),
+        ),
+      ).toHaveLength(1);
+    }
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).endsWith("/sweeps/claim"),
+      ),
+    ).toHaveLength(0);
+    expect((await readPromise(promises[0]!.id)).promise.status).toBe("active");
+    expect((await readPromise(promises[1]!.id)).promise.status).toBe(
+      "cancelled",
+    );
+    expect((await readPromise(promises[2]!.id)).promise.expiresAt).toEqual(
+      new Date(renewedExpiry),
+    );
+    const [status] = await db
+      .select({
+        status: syncApiSettings.remoteSolverLastStatus,
+        error: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(status).toMatchObject({
+      status: "error",
+      error: expect.stringContaining("temporary hub timeout"),
+    });
   });
 
   it("MUST-CATCH: releases a mixed promise when its remaining URANS cell is locally terminal instead of creating cancelled placeholder jobs forever", async () => {
@@ -1343,7 +1852,7 @@ describe("remote solver submit lifecycle", () => {
     expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
   });
 
-  it("waits 30 seconds after the first answered 5xx, then recomposes the same promise without a new upstream claim", async () => {
+  it("waits 30 seconds after the first answered 5xx, permits one independent refill claim while waiting, then recomposes the same promise", async () => {
     const aoa = 902.001;
     const promise = await seedMirroredPromise("first-5xx", [aoa]);
     const { fetchMock } = stubFetch();
@@ -1387,7 +1896,7 @@ describe("remote solver submit lifecycle", () => {
       retryState: null,
       retryCount: null,
     });
-    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
     expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
   });
 
@@ -1512,6 +2021,198 @@ describe("remote solver submit lifecycle", () => {
     ).toBe(`${PREFIX}-rotated-secret`);
   });
 
+  it.each([
+    {
+      label: "cancelled mirror with a delivered cancellation",
+      status: "cancelled" as const,
+      pointStatus: "cancelled" as const,
+      deliveredCancellation: true,
+      authorityPayload: null,
+      aoa: 903.601,
+    },
+    {
+      label: "expired mirror with exact authority-loss evidence",
+      status: "expired" as const,
+      pointStatus: "expired" as const,
+      deliveredCancellation: false,
+      authorityPayload: {
+        authoritativeLeaseLoss: true,
+        error: "up-tier rejected the historical lease",
+      },
+      aoa: 903.602,
+    },
+  ])(
+    "MUST-CATCH: restart reconciliation supersedes a historical blocked delivery for a $label without deleting evidence",
+    async ({
+      label,
+      status,
+      pointStatus,
+      deliveredCancellation,
+      authorityPayload,
+      aoa,
+    }) => {
+      const promise = await seedMirroredPromise(`terminal-delivery-${label}`, [
+        aoa,
+      ]);
+      const job = await seedDoneRemoteJob(
+        `terminal-delivery-${label}`,
+        [aoa],
+        2,
+        promise.id,
+      );
+      const [result] = await db
+        .select()
+        .from(results)
+        .where(eq(results.simJobId, job.id));
+      const [attempt] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.resultId, result.id));
+      const artifactsBefore = await db
+        .select({ id: solverEvidenceArtifacts.id })
+        .from(solverEvidenceArtifacts)
+        .where(eq(solverEvidenceArtifacts.resultAttemptId, attempt.id));
+      const [delivery] = await db
+        .insert(syncRemoteResultDeliveries)
+        .values({
+          promiseId: promise.id,
+          simJobId: job.id,
+          resultId: result.id,
+          resultAttemptId: attempt.id,
+          aoaDeg: aoa,
+          generationKey: attempt.id,
+          state: "blocked",
+          attemptCount: 1,
+          lastHttpStatus: 409,
+          lastError: "historical delivery conflict",
+          remoteConflictIds: [randomUUID()],
+        })
+        .returning();
+      await db
+        .update(syncSweepPromises)
+        .set({
+          status,
+          ...(status === "cancelled"
+            ? { cancelledAt: new Date() }
+            : { expiredAt: new Date() }),
+          ...(authorityPayload ? { responsePayload: authorityPayload } : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(syncSweepPromises.id, promise.id));
+      await db
+        .update(syncSweepPromisePoints)
+        .set({ status: pointStatus, updatedAt: new Date() })
+        .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+      if (deliveredCancellation) {
+        await db.insert(syncRemotePromiseCancellations).values({
+          promiseId: promise.id,
+          state: "delivered",
+          attemptCount: 1,
+          lastHttpStatus: 200,
+          deliveredAt: new Date(),
+        });
+      }
+      const { fetchMock } = stubFetch();
+
+      await remoteSolverTick(db, {} as never);
+
+      const [settled] = await db
+        .select()
+        .from(syncRemoteResultDeliveries)
+        .where(eq(syncRemoteResultDeliveries.id, delivery.id));
+      expect(settled).toMatchObject({
+        state: "superseded",
+        claimToken: null,
+        claimExpiresAt: null,
+        remoteConflictIds: [],
+        lastError:
+          "authoritative remote promise is terminal; immutable local evidence retained",
+      });
+      expect(requests(fetchMock, "/polars")).toHaveLength(0);
+      expect(
+        await db.select().from(results).where(eq(results.id, result.id)),
+      ).toHaveLength(1);
+      expect(
+        await db
+          .select()
+          .from(resultAttempts)
+          .where(eq(resultAttempts.id, attempt.id)),
+      ).toHaveLength(1);
+      expect(
+        await db
+          .select({ id: solverEvidenceArtifacts.id })
+          .from(solverEvidenceArtifacts)
+          .where(eq(solverEvidenceArtifacts.resultAttemptId, attempt.id)),
+      ).toEqual(artifactsBefore);
+      const [remoteStatus] = await db
+        .select({
+          status: syncApiSettings.remoteSolverLastStatus,
+          error: syncApiSettings.remoteSolverLastError,
+        })
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1));
+      expect(remoteStatus).toEqual({ status: "idle", error: null });
+    },
+  );
+
+  it("does not supersede a blocked delivery from a locally expired mirror without terminal hub authority", async () => {
+    const aoa = 903.603;
+    const promise = await seedMirroredPromise("local-expiry-keeps-delivery", [
+      aoa,
+    ]);
+    const job = await seedDoneRemoteJob(
+      "local-expiry-keeps-delivery",
+      [aoa],
+      2,
+      promise.id,
+    );
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    const [delivery] = await db
+      .insert(syncRemoteResultDeliveries)
+      .values({
+        promiseId: promise.id,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg: aoa,
+        generationKey: attempt.id,
+        state: "blocked",
+        lastError: "hub ownership is not resolved",
+      })
+      .returning();
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "expired", expiredAt: new Date(), updatedAt: new Date() })
+      .where(eq(syncSweepPromises.id, promise.id));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "expired", updatedAt: new Date() })
+      .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+    const { fetchMock } = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    const [retained] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, delivery.id));
+    expect(retained).toMatchObject({
+      state: "blocked",
+      lastError: "hub ownership is not resolved",
+    });
+    expect(requests(fetchMock, "/polars")).toHaveLength(0);
+    expect(
+      await db.select().from(results).where(eq(results.id, result.id)),
+    ).toHaveLength(1);
+  });
+
   it("blocks an answered 4xx immediately without inventing solver evidence", async () => {
     const aoa = 904.001;
     const promise = await seedMirroredPromise("4xx", [aoa]);
@@ -1597,12 +2298,17 @@ describe("remote solver submit lifecycle", () => {
       .where(eq(syncApiSettings.id, 1));
     expect(remoteStatus?.error).toBeNull();
     expect(submitPolar).toHaveBeenCalledTimes(1);
-    const request = submitPolar.mock.calls[0]?.[0] as PolarRequest;
+    const request = submitPolar.mock.calls[0]?.[0] as PolarRequest & {
+      expected_engine?: typeof TEST_REQUEST_EXPECTED_ENGINE;
+    };
     expect(request.aoa.angles).toEqual([2, 8]);
     expect(request.solver?.rans_failure_policy).toBe("abort_for_precalc");
+    expect(request.expected_engine).toEqual(TEST_REQUEST_EXPECTED_ENGINE);
     const [job] = await jobsForPromise(promise.id);
     expect(job.requestPayload).toMatchObject({
       aoas: [2, 8],
+      remoteSolverExpectedEngine: TEST_REQUEST_EXPECTED_ENGINE,
+      remoteSolverEngineRuntime: TEST_NORMALIZED_ENGINE_RUNTIME,
       ransRetryScope: {
         origin: "continuous-polar",
         requestedAoas: [0, 2, 8],
@@ -2270,7 +2976,9 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       "derived-active",
       aoa,
     );
-    const submitPolar = vi.fn(async () => acceptedStatus("derived-active"));
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("derived-active"),
+    );
     const engine = {
       submitPolar,
       cancelJob: vi.fn(),
@@ -2292,6 +3000,8 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       syncPromiseId: string;
       remoteSolver: boolean;
       upstreamBaseUrl: string;
+      remoteSolverExpectedEngine: typeof TEST_REQUEST_EXPECTED_ENGINE;
+      remoteSolverEngineRuntime: typeof TEST_NORMALIZED_ENGINE_RUNTIME;
       aoas: number[];
       precalcObligationIds: string[];
     };
@@ -2299,8 +3009,17 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       syncPromiseId: promise.id,
       remoteSolver: true,
       upstreamBaseUrl: UPSTREAM,
+      remoteSolverExpectedEngine: TEST_REQUEST_EXPECTED_ENGINE,
+      remoteSolverEngineRuntime: TEST_NORMALIZED_ENGINE_RUNTIME,
       aoas: [aoa],
     });
+    expect(
+      (
+        submitPolar.mock.calls[0]?.[0] as PolarRequest & {
+          expected_engine?: typeof TEST_REQUEST_EXPECTED_ENGINE;
+        }
+      ).expected_engine,
+    ).toEqual(TEST_REQUEST_EXPECTED_ENGINE);
     expect(payload.precalcObligationIds).toHaveLength(1);
     const [obligation] = await db
       .select()
@@ -2475,6 +3194,20 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       lastOutcome: "rejected",
     });
 
+    // Emulate an admitted legacy parent from before proof was persisted. The
+    // recovery tick must use its fresh local /health check, not silently emit
+    // an unfenced PRECALC request or upload.
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          ...(parent.requestPayload as Record<string, unknown>),
+          remoteSolverExpectedEngine: undefined,
+          remoteSolverEngineRuntime: undefined,
+        },
+      })
+      .where(eq(simJobs.id, parent.id));
+
     const secondSubmit = vi.fn(async (_request: PolarRequest) =>
       acceptedStatus("derived-second-precalc-second"),
     );
@@ -2487,6 +3220,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
     expect(secondSubmit.mock.calls[0]?.[0]).toMatchObject({
       aoa: { angles: [aoaDeg] },
       solver: { force_transient: true, urans_fidelity: "precalc" },
+      expected_engine: TEST_REQUEST_EXPECTED_ENGINE,
     });
     const children = await db
       .select()
@@ -2499,6 +3233,8 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       syncPromiseId: promise.id,
       remoteSolver: true,
       upstreamBaseUrl: UPSTREAM,
+      remoteSolverExpectedEngine: TEST_REQUEST_EXPECTED_ENGINE,
+      remoteSolverEngineRuntime: TEST_NORMALIZED_ENGINE_RUNTIME,
       aoas: [aoaDeg],
       precalcObligationIds: [obligation.id],
       uransFidelity: "precalc",
@@ -2546,6 +3282,8 @@ describe("remote-owned derived PRECALC lifecycle", () => {
           syncPromiseId: promise.id,
           remoteSolver: true,
           upstreamBaseUrl: UPSTREAM,
+          remoteSolverExpectedEngine: TEST_REQUEST_EXPECTED_ENGINE,
+          remoteSolverEngineRuntime: TEST_NORMALIZED_ENGINE_RUNTIME,
           speedMap: [
             { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
           ],
@@ -2969,6 +3707,46 @@ describe("remote-owned derived PRECALC lifecycle", () => {
 });
 
 describe("remote solver push validation regressions", () => {
+  it("MUST-CATCH: one evidence upload does not starve one independent mirror admission in the same tick", async () => {
+    const deliveredAoa = 809.901;
+    const promiseId = randomUUID();
+    const completedJob = await seedDoneRemoteJob(
+      "delivery-refill",
+      [deliveredAoa],
+      2,
+      promiseId,
+    );
+    await seedMirroredPromise(
+      "delivery-refill-completed",
+      [deliveredAoa],
+      promiseId,
+    );
+    const refill = await seedMirroredPromise("delivery-refill-next", [809.902]);
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("delivery-refill-next"),
+    );
+
+    await remoteSolverTick(db, {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect(requests(fetchMock, "/polars")).toHaveLength(1);
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(submitPolar.mock.calls[0]?.[0]).toMatchObject({
+      aoa: { angles: [809.902] },
+    });
+    expect(await jobsForPromise(refill.id)).toMatchObject([
+      { status: "submitted" },
+    ]);
+    expect(
+      (await deliveriesForJob(completedJob.id)).filter(
+        (delivery) => delivery.resultId,
+      ),
+    ).toMatchObject([{ state: "delivered" }]);
+  });
+
   it("MUST-CATCH: streams one durable completed result per tick and completes only after every delivery", async () => {
     const job = await seedDoneRemoteJob(
       "chunking",
@@ -2996,6 +3774,11 @@ describe("remote solver push validation regressions", () => {
       airfoilSlug,
       airfoilSlug,
       airfoilSlug,
+    ]);
+    expect(polars.map((call) => call.body.results[0].engine)).toEqual([
+      TEST_NORMALIZED_ENGINE_RUNTIME,
+      TEST_NORMALIZED_ENGINE_RUNTIME,
+      TEST_NORMALIZED_ENGINE_RUNTIME,
     ]);
     expect(
       requests(
@@ -3326,6 +4109,17 @@ describe("remote solver push validation regressions", () => {
       byteSize: terminalManifest.byteSize,
       metadata: { terminalOutcome: true, attemptCount: 2 },
     });
+    await db.insert(resultFieldExtents).values({
+      resultId: terminalResult.id,
+      resultAttemptId: terminalAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      field: "pressure_0",
+      vmin: -1,
+      vmax: 1,
+      finiteCount: 10,
+      evidenceSha256: terminalManifest.sha256,
+    });
     const [obligation] = await db
       .insert(simPrecalcObligations)
       .values({
@@ -3386,6 +4180,52 @@ describe("remote solver push validation regressions", () => {
       { aoaDeg: terminalAoa, status: "active" },
     ]);
     expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
+
+    await remoteSolverTick(db, engine);
+
+    expect(requests(fetchMock, "/polars")).toHaveLength(1);
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+    expect((await readPromise(promise.id)).points).toMatchObject([
+      { aoaDeg: acceptedAoa, status: "fulfilled" },
+      { aoaDeg: terminalAoa, status: "active" },
+    ]);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
+    expect(
+      (await deliveriesForJob(terminalJob.id)).find(
+        (delivery) => delivery.resultId === terminalResult.id,
+      ),
+    ).toMatchObject({
+      state: "retry_wait",
+      lastError: expect.stringContaining(
+        "waiting for verified default pressure_0 media",
+      ),
+    });
+
+    const terminalImage = writeMedia(
+      `jobs/${terminalEngineJobId}/${terminalCaseSlug}/pressure_0.png`,
+      "mixed-terminal-handoff-pressure",
+    );
+    await db.insert(resultMedia).values({
+      resultId: terminalResult.id,
+      resultAttemptId: terminalAttempt.id,
+      kind: "image",
+      field: "pressure_0",
+      role: "instantaneous",
+      storageKey: terminalImage.storageKey,
+      mimeType: "image/png",
+      evidenceSha256: terminalManifest.sha256,
+      sha256: terminalImage.sha256,
+      byteSize: terminalImage.byteSize,
+    });
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(
+        and(
+          eq(syncRemoteResultDeliveries.promiseId, promise.id),
+          eq(syncRemoteResultDeliveries.resultId, terminalResult.id),
+        ),
+      );
 
     await remoteSolverTick(db, engine);
 
@@ -3593,7 +4433,7 @@ describe("remote solver push validation regressions", () => {
     );
     const firstPush = stubFetch();
 
-    await remoteSolverTick(db, {} as never);
+    await remoteSolverTick(db, {} as never, false);
 
     expect(requests(firstPush.fetchMock, "/polars")).toHaveLength(1);
     expect(
@@ -3618,7 +4458,7 @@ describe("remote solver push validation regressions", () => {
       promiseId,
     );
     const secondPush = stubFetch();
-    await remoteSolverTick(db, {} as never);
+    await remoteSolverTick(db, {} as never, false);
 
     expect(requests(secondPush.fetchMock, "/polars")).toHaveLength(1);
     expect(

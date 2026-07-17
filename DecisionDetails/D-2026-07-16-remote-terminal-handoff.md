@@ -37,6 +37,11 @@ remote delivery selected only the current accepted pointer.
 - A cancellation without result/attempt evidence remains an ordinary gap. A
   zero-claim fallback cancels one bad mirror instead of producing unbounded
   local placeholder jobs, but it does not synthesize hub evidence.
+- Restart reconciliation supersedes pending, pushing, retrying, or blocked
+  delivery metadata only when the mirror is already cancelled/expired and the
+  cancellation outbox was delivered or the hub supplied exact terminal
+  authority evidence. Result, attempt, artifact, and media evidence remains
+  immutable. A local expiry timestamp alone is not enough authority.
 - Solver heartbeat counts active mirrored promises and active promise angles;
   an empty engine queue no longer makes an owned lease look globally idle.
 
@@ -63,7 +68,10 @@ CPU activity.
 Regression coverage reproduces the zero-claim loop, historical accepted URANS
 selection, second bounded preliminary recovery, terminal evidence handoff,
 mixed-promise cancellation, exact replay/idempotency, accepted-only
-`/complete`, and the false-positive guard that a plain cancellation remains
-claimable. Production rollout verification must confirm the hub stores exact
-terminal evidence, the remote advances to another airfoil, and no new repeated
-placeholder-job sequence appears before AG24 is restored to the feed.
+`/complete`, historical blocked-delivery cleanup after both a delivered
+cancellation and exact authority loss, evidence-retention guards, and the
+false-positive guard that a plain cancellation remains claimable. Production
+rollout verification must confirm the hub stores exact terminal evidence, the
+remote advances to another airfoil, no terminal delivery row keeps database
+activity falsely open, and no new repeated placeholder-job sequence appears
+before AG24 is restored to the feed.

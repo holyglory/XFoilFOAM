@@ -29,6 +29,88 @@
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
   [D-2026-07-16-remote-terminal-handoff]
+  [D-2026-07-16-campaign-native-remote-claims]
+  [D-2026-07-17-remote-polar-parallel-admission]
+  [D-2026-07-17-remote-engine-identity-fence]
+  [D-2026-07-17-remote-rollout-preservation]
+
+## D-2026-07-17-remote-rollout-preservation — Integrate remote changes without regressing live recovery or evidence digests
+
+Detail: [DecisionDetails/D-2026-07-17-remote-rollout-preservation.md](DecisionDetails/D-2026-07-17-remote-rollout-preservation.md)
+
+- Decision: do not deploy the old-base remote feature branch or replace the
+  live sweeper source directly. Integrate campaign-native claims, parallel
+  admission, and engine-identity fencing onto the active OpenCFD 2606 branch
+  while preserving the deployed terminal/PRECALC recovery baseline. Include
+  the canonical cross-language evidence member-ordering repair before remote
+  result delivery is enabled, then rerun both hub and remote validation suites.
+- Why: the feature branch's committed `remote-solver.ts` exactly matches the
+  deployed hotfix, so its new controller is a reviewable extension rather than
+  a substitute; however, the branch predates current production integration.
+  Deploying it directly could discard newer control-plane work. Separately,
+  TypeScript locale ordering and Python code-point ordering disagree for
+  uppercase artifact paths, so enabling delivery without the shared digest
+  repair can reject truthful evidence. An active-branch integration preserves
+  recovery behavior, current production changes, and byte-compatible evidence.
+
+## D-2026-07-17-remote-engine-identity-fence — Remote evidence must prove the promised solver implementation
+
+Detail: [DecisionDetails/D-2026-07-17-remote-engine-identity-fence.md](DecisionDetails/D-2026-07-17-remote-engine-identity-fence.md)
+
+- Decision: remote-solver claims and submissions fail closed unless the local
+  engine's authoritative health identity exactly matches the promise's pinned
+  family, distribution, release, numerics revision, and adapter contract.
+  Remote result uploads must carry runtime/build provenance derived from the
+  executing engine and the hub validates it against the promised revision
+  before any canonical result, attempt, artifact, media, field scale, or lease
+  settlement write. Generic non-promise sync remains backward compatible.
+- Why: a 2406 worker accepted a revision labelled 2606 and six points reached
+  the hub with NULL implementation/runtime provenance because both boundaries
+  trusted the requested setup rather than the executing engine. Comparing only
+  setup signatures, trusting a remote echo, or relabelling historical evidence
+  would merge numerically different implementations and falsify provenance.
+  Health-gated admission plus runtime-authored upload validation stops wasted
+  incompatible work early and independently prevents publication if the
+  remote guard is stale or bypassed.
+
+## D-2026-07-17-remote-polar-parallel-admission — Remote capacity is filled with independent marched polars
+
+Detail: [DecisionDetails/D-2026-07-17-remote-polar-parallel-admission.md](DecisionDetails/D-2026-07-17-remote-polar-parallel-admission.md)
+
+- Decision: a remote solver admits independent full-polar promises up to the
+  narrowest remote, local, and worker job-cap setting, while OpenFOAM's shared
+  CPU-token pool remains the hard runtime capacity guard. Each polar preserves
+  its ordered warm-start AoA march. Admission ramps by at most one new job per
+  scheduler tick, PRECALC recovery has first use of a free slot, and active
+  compute plus settlement promises are bounded to two capacity windows.
+- Why: live process evidence on `hz-solver2` showed that a one-condition
+  marched polar correctly holds one CPU token even though its resource plan
+  advertises a larger case-concurrency ceiling; the remote controller was the
+  actual bottleneck because it required zero active jobs before taking another
+  promise. Parallel AoAs or changed MPI ranks would alter numerical behavior.
+  Independent polar admission follows the existing automatic job-admission
+  policy, uses all 40 slots without changing solver physics, and bounds hub
+  leases while large evidence uploads settle.
+
+## D-2026-07-16-campaign-native-remote-claims — Remote capacity advances exact production campaign work
+
+Detail: [DecisionDetails/D-2026-07-16-campaign-native-remote-claims.md](DecisionDetails/D-2026-07-16-campaign-native-remote-claims.md)
+
+- Decision: let remote sweep claims compete for complete, untouched physical
+  polar groups from active campaigns under the shared priority order. A
+  campaign promise uses the campaign condition's pinned revision and every
+  non-derived requested angle, fits wholly within the claim limit, and is
+  created under the campaign lifecycle lock. Exact imported result generations
+  terminal-link matching campaign points and drive the normal progress,
+  completion, and refinement hooks. Partial groups stay with local recovery.
+- Why: the five-airfoil public canary proved transport but its cloned revision
+  cannot settle the production campaign; widening it to all catalog airfoils
+  would duplicate roughly the campaign's work under a different revision.
+  Campaign-native leases advance authoritative work, while full-group-only
+  claims preserve whole-polar RANS-to-URANS promotion scope. This supersedes
+  the 2026-07-11 public-pool-only remote policy because the owner explicitly
+  requires the dedicated server to keep advancing production-hub work and the
+  live campaign now supplies a large safe queue.
 
 ## D-2026-07-16-remote-terminal-handoff — Remote terminal evidence advances the feed without fake fulfillment
 
@@ -41,8 +123,11 @@ Detail: [DecisionDetails/D-2026-07-16-remote-terminal-handoff.md](DecisionDetail
   the exact attempt and artifacts, keeps the point cancelled and out of valid
   polars, and continues to reserve `fulfilled` promises for all-accepted
   coverage. A mixed promise is durably cancelled only after every point is
-  accepted or terminally evidenced. Heartbeats count mirrored leases and their
-  active angles, not only currently running engine jobs.
+  accepted or terminally evidenced. On restart, an already terminal mirror
+  with delivered cancellation or exact authority-loss evidence supersedes
+  stale delivery work metadata without deleting result evidence. Heartbeats
+  count mirrored leases and their active angles, not only currently running
+  engine jobs.
 - Why: accepted-only delivery plus an obligation-unaware RANS composer created
   a live zero-CPU loop that repeatedly attempted to claim cells already owned
   by preliminary recovery. Fake-accepting rejected CFD would corrupt public
@@ -50,7 +135,10 @@ Detail: [DecisionDetails/D-2026-07-16-remote-terminal-handoff.md](DecisionDetail
   permanent solver-specific exclusions would hide evidence and strand work;
   unbounded CFD retries would discard the two-attempt reliability bound. Exact
   evidence handoff plus bounded recovery preserves provenance, acceptance
-  semantics, and continuous progress to the next airfoil.
+  semantics, and continuous progress to the next airfoil. Restart cleanup is
+  authority-gated so an old blocked delivery cannot keep a cancelled mirror
+  operationally active forever, while a local clock expiry alone cannot
+  discard an upload the hub may still own.
 
 ## D-2026-07-16-campaign-cell-evidence-dialog — Campaign cells explain automatic recovery without calling it failure
 
