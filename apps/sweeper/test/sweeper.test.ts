@@ -910,6 +910,148 @@ describe("sweeper: gap → claim → ingest", () => {
       );
   }, 60000);
 
+  it("lets an active remote promise defeat a stale local candidate while allowing that promise's own mirror job", async () => {
+    const batch = {
+      airfoilId,
+      bcId,
+      presetRevisionId: testPresetRevisionId,
+    };
+    expect(batch.airfoilId).toBeTruthy();
+    expect(batch.bcId).toBeTruthy();
+    expect(batch.presetRevisionId).toBeTruthy();
+    const aoa = 93.501;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, batch.airfoilId),
+          eq(results.simulationPresetRevisionId, batch.presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    const jobs = await db
+      .insert(simJobs)
+      .values([
+        {
+          airfoilId: batch.airfoilId,
+          bcIds: [batch.bcId],
+          simulationPresetRevisionId: batch.presetRevisionId,
+          referenceChordM: 1,
+          wave: 1,
+          status: "pending",
+        },
+        {
+          airfoilId: batch.airfoilId,
+          bcIds: [batch.bcId],
+          simulationPresetRevisionId: batch.presetRevisionId,
+          referenceChordM: 1,
+          wave: 1,
+          status: "pending",
+        },
+      ])
+      .returning({ id: simJobs.id });
+    jobs.forEach((job) => cleanupJobIds.add(job.id));
+
+    // Model the local composer having already selected this cell before the
+    // remote claim commits. The authoritative mutation boundary must recheck
+    // live promises instead of trusting that stale candidate list.
+    const staleCandidate = await db
+      .select({ id: results.id })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, batch.airfoilId),
+          eq(results.simulationPresetRevisionId, batch.presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    expect(staleCandidate).toEqual([]);
+    let releaseLocal!: () => void;
+    const remoteCommitted = new Promise<void>((resolve) => {
+      releaseLocal = resolve;
+    });
+    const staleLocalClaim = (async () => {
+      await remoteCommitted;
+      return claimAoas(
+        db,
+        batch.airfoilId,
+        batch.bcId,
+        batch.presetRevisionId,
+        [aoa],
+        jobs[0]!.id,
+      );
+    })();
+
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: `${testRunSlug}-claim-race`,
+        airfoilId: batch.airfoilId,
+        simulationPresetRevisionId: batch.presetRevisionId,
+        aoaCount: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+      })
+      .returning({ id: syncSweepPromises.id });
+    cleanupSyncPromiseIds.add(promise.id);
+    await db.insert(syncSweepPromisePoints).values({
+      promiseId: promise.id,
+      airfoilId: batch.airfoilId,
+      simulationPresetRevisionId: batch.presetRevisionId,
+      aoaDeg: aoa,
+    });
+    releaseLocal();
+    expect(await staleLocalClaim).toEqual([]);
+    expect(
+      await db
+        .select({ id: results.id })
+        .from(results)
+        .where(
+          and(
+            eq(results.airfoilId, batch.airfoilId),
+            eq(results.simulationPresetRevisionId, batch.presetRevisionId),
+            eq(results.aoaDeg, aoa),
+          ),
+        ),
+    ).toEqual([]);
+
+    const mirroredClaim = await claimAoas(
+      db,
+      batch.airfoilId,
+      batch.bcId,
+      batch.presetRevisionId,
+      [aoa],
+      jobs[1]!.id,
+      { allowedPromiseId: promise.id },
+    );
+    expect(mirroredClaim).toEqual([aoa]);
+    const [mirrored] = await db
+      .select({ id: results.id, simJobId: results.simJobId })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, batch.airfoilId),
+          eq(results.simulationPresetRevisionId, batch.presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    expect(mirrored?.simJobId).toBe(jobs[1]!.id);
+    cleanupResultIds.add(mirrored!.id);
+
+    await db.delete(results).where(eq(results.id, mirrored!.id));
+    cleanupResultIds.delete(mirrored!.id);
+    await db.delete(simJobs).where(
+      inArray(
+        simJobs.id,
+        jobs.map((job) => job.id),
+      ),
+    );
+    jobs.forEach((job) => cleanupJobIds.delete(job.id));
+    await db
+      .delete(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, promise.id));
+    cleanupSyncPromiseIds.delete(promise.id);
+  }, 60_000);
+
   it("refuses ledger-owned cells at the continuous and campaign claim boundaries", async () => {
     const batch = await testBatch(500);
     expect(batch).not.toBeNull();

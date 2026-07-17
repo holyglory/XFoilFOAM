@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql as drizzleSql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 
 const statfsControl = vi.hoisted(() => ({
   availableBytes: null as bigint | null,
@@ -45,12 +47,17 @@ process.env.SYNC_POLAR_MULTIPART_MAX_MANIFEST_BYTES = String(
 );
 
 const dbSchema = await import("@aerodb/db");
-const { ensureSimulationPresetRevision } =
-  await import("@aerodb/db/simulation-setup");
+const {
+  ensureSimulationPresetRevision,
+  flowConditionCanonicalKey,
+  referenceGeometryCanonicalKey,
+} = await import("@aerodb/db/simulation-setup");
 const { advisoryLockSql, db, sql } = await import("../src/db");
 const { buildServer } = await import("../src/server");
 const { assertMultipartDiskReserveAvailableBytes } =
   await import("../src/sync-routes");
+const { createExactResultAttemptFixture } =
+  await import("./exact-result-fixture");
 
 const {
   airfoils,
@@ -71,7 +78,16 @@ const {
   resultMedia,
   results,
   schedulingProfiles,
+  simCampaignConditions,
+  simCampaignLanes,
+  simCampaignPoints,
+  simCampaignProgress,
+  simCampaigns,
   simJobs,
+  simPrecalcObligationCampaigns,
+  simPrecalcObligations,
+  simResultSubmitRetries,
+  simulationPresetRevisions,
   simulationPresetAirfoilTargets,
   simulationPresets,
   solverEvidenceArtifacts,
@@ -87,6 +103,11 @@ const {
 } = dbSchema;
 
 const PREFIX = `sync-remote-validation-${process.pid}-${Date.now().toString(36)}`;
+const CAMPAIGN_PHYSICAL_DISCRIMINATOR =
+  Number.parseInt(
+    createHash("sha256").update(PREFIX).digest("hex").slice(0, 12),
+    16,
+  ) / 0xffffffffffff;
 const SECRET = `${PREFIX}-secret`;
 const SYNC_TYPES = [
   "sweeps",
@@ -125,9 +146,27 @@ let mach: number | null = null;
 let speed = 0;
 let kinematicViscosity = 0;
 const CHORD = 0.432;
+const TEST_EXPECTED_ENGINE = {
+  key: "openfoam:opencfd:2606:rans-urans:1",
+  family: "openfoam",
+  distribution: "opencfd",
+  releaseVersion: "2606",
+  methodFamily: "rans-urans",
+  numericsRevision: "1",
+  adapterContractVersion: 1,
+};
+const TEST_MATCHING_RUNTIME = {
+  family: "openfoam",
+  distribution: "opencfd",
+  version: "2606",
+  numericsRevision: "1",
+  adapterContractVersion: 1,
+  buildId: `${PREFIX}-matching-opencfd-2606`,
+};
 const TERMINAL_GAP_AOA = 739.101;
 const TERMINAL_ACCEPTED_AOA = 739.102;
 const CANCELLED_GAP_AOA = 739.201;
+const CAMPAIGN_FALLBACK_AOA = 739.301;
 const profileIds = {
   boundary: "",
   mesh: "",
@@ -139,6 +178,7 @@ const profileIds = {
 const cleanupPromiseIds = new Set<string>();
 const cleanupConflictIds = new Set<string>();
 const cleanupRuntimeBuildIds = new Set<string>();
+const cleanupCampaignIds: string[] = [];
 
 function sha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
@@ -326,7 +366,12 @@ async function createFixture() {
     .values({
       slug: `${PREFIX}-sweep`,
       name: `${PREFIX} sweep`,
-      aoaList: [TERMINAL_GAP_AOA, TERMINAL_ACCEPTED_AOA, CANCELLED_GAP_AOA],
+      aoaList: [
+        TERMINAL_GAP_AOA,
+        TERMINAL_ACCEPTED_AOA,
+        CANCELLED_GAP_AOA,
+        CAMPAIGN_FALLBACK_AOA,
+      ],
     })
     .returning();
   profileIds.boundary = boundary.id;
@@ -848,6 +893,308 @@ async function readPromise(promiseId: string) {
   return { promise, points };
 }
 
+let campaignFixtureSequence = 0;
+
+async function createCampaignCompatiblePublicPreset(
+  label: string,
+  aoas: number[],
+) {
+  const sequence = ++campaignFixtureSequence;
+  const speedMps =
+    0.137 + CAMPAIGN_PHYSICAL_DISCRIMINATOR * 10 + sequence * 0.01;
+  const chordM =
+    0.641 + CAMPAIGN_PHYSICAL_DISCRIMINATOR * 0.1 + sequence * 0.0001;
+  const [medium] = await db
+    .select()
+    .from(mediums)
+    .where(eq(mediums.id, mediumId))
+    .limit(1);
+  if (!medium) throw new Error("campaign fixture medium required");
+  const fixtureSlug = `campaign-${PREFIX.toLowerCase()}-${label}-${sequence}`;
+  const localMach = medium.speedOfSound ? speedMps / medium.speedOfSound : null;
+  const localReynolds = Math.round(
+    (speedMps * chordM) / medium.kinematicViscosity,
+  );
+  const [flow] = await db
+    .insert(flowConditions)
+    .values({
+      slug: `${fixtureSlug}-flow`,
+      name: `${PREFIX} ${label} flow`,
+      mediumId,
+      temperatureK: 288.15,
+      pressurePa: 101325,
+      speedMps,
+      density: medium.density,
+      dynamicViscosity: medium.dynamicViscosity,
+      kinematicViscosity: medium.kinematicViscosity,
+      mach: localMach,
+      origin: "campaign",
+      canonicalKey: flowConditionCanonicalKey({
+        mediumId,
+        temperatureK: 288.15,
+        pressurePa: 101325,
+        speedMps,
+      }),
+    })
+    .returning();
+  const [reference] = await db
+    .insert(referenceGeometryProfiles)
+    .values({
+      slug: `${fixtureSlug}-reference`,
+      name: `${PREFIX} ${label} reference`,
+      geometryType: "airfoil_2d",
+      referenceLengthKind: "chord",
+      referenceLengthM: chordM,
+      spanM: 1,
+      referenceAreaM2: null,
+      origin: "campaign",
+      canonicalKey: referenceGeometryCanonicalKey({
+        geometryType: "airfoil_2d",
+        referenceLengthKind: "chord",
+        referenceLengthM: chordM,
+        spanM: 1,
+        referenceAreaM2: null,
+      }),
+    })
+    .returning();
+  const [legacy] = await db
+    .insert(boundaryConditions)
+    .values({
+      slug: `${fixtureSlug}-legacy`,
+      name: `${PREFIX} ${label} legacy bridge`,
+      mediumId,
+      reynolds: localReynolds,
+      referenceChordM: chordM,
+      temperatureK: 288.15,
+      pressurePa: 101325,
+      speedMps,
+      density: medium.density,
+      dynamicViscosity: medium.dynamicViscosity,
+      kinematicViscosity: medium.kinematicViscosity,
+      mach: localMach,
+      enabled: true,
+    })
+    .returning();
+  const [sweep] = await db
+    .insert(sweepDefinitions)
+    .values({
+      slug: `${fixtureSlug}-sweep`,
+      name: `${PREFIX} ${label} sweep`,
+      aoaList: aoas,
+    })
+    .returning();
+  const [preset] = await db
+    .insert(simulationPresets)
+    .values({
+      slug: `${fixtureSlug}-preset`,
+      name: `${PREFIX} ${label} public preset`,
+      flowConditionId: flow.id,
+      referenceGeometryProfileId: reference.id,
+      boundaryProfileId: profileIds.boundary,
+      meshProfileId: profileIds.mesh,
+      solverProfileId: profileIds.solver,
+      schedulingProfileId: profileIds.scheduling,
+      outputProfileId: profileIds.output,
+      sweepDefinitionId: sweep.id,
+      legacyBoundaryConditionId: legacy.id,
+      targetScope: "airfoils",
+      origin: "campaign",
+      enabled: true,
+    })
+    .returning();
+  await db.insert(simulationPresetAirfoilTargets).values({
+    presetId: preset.id,
+    airfoilId,
+  });
+  const resolved = await ensureSimulationPresetRevision(db, preset.id);
+  if (!resolved) throw new Error("campaign-compatible revision required");
+  // This branch predates the schema-level engine field. Remote campaign
+  // promises nevertheless need the same immutable identity as production,
+  // so make that fixture contract explicit.
+  await db
+    .update(simulationPresetRevisions)
+    .set({
+      snapshot: {
+        ...(resolved.revision.snapshot as Record<string, unknown>),
+        engine: TEST_EXPECTED_ENGINE,
+      },
+    })
+    .where(eq(simulationPresetRevisions.id, resolved.revision.id));
+  return {
+    presetId: preset.id,
+    revisionId: resolved.revision.id,
+    speedMps,
+    chordM,
+  };
+}
+
+type RemoteCampaignCondition = {
+  id: string;
+  revisionId: string;
+  signatureHash: string;
+  presetId: string;
+  bcId: string;
+  snapshot: Record<string, any>;
+  reynolds: number;
+};
+
+async function launchRemoteCampaign(
+  label: string,
+  aoas: number[],
+  options: {
+    priority?: number;
+    speedCount?: number;
+    speedMps?: number;
+    chordM?: number;
+    objectivesEnabled?: boolean;
+  } = {},
+) {
+  const sequence = ++campaignFixtureSequence;
+  const speedCount = options.speedCount ?? 1;
+  const speeds = Array.from(
+    { length: speedCount },
+    (_, index) =>
+      (options.speedMps ??
+        0.337 + CAMPAIGN_PHYSICAL_DISCRIMINATOR * 10 + sequence * 0.02) +
+      index * 0.001,
+  );
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/admin/campaigns",
+    payload: {
+      name: `${PREFIX} ${label}`,
+      priority: options.priority ?? 9,
+      idempotencyKey: `${PREFIX}-${label}-${sequence}`,
+      airfoilIds: [airfoilId],
+      plan: {
+        mediumId,
+        ambients: [[288.15, 101325]],
+        speedsMps: speeds,
+        chordsM: [
+          options.chordM ??
+            0.731 + CAMPAIGN_PHYSICAL_DISCRIMINATOR * 0.1 + sequence * 0.0001,
+        ],
+        spanM: 1,
+        areaMode: "derived",
+        excludedConditions: [],
+        baseSweep: {
+          fromDeg: null,
+          toDeg: null,
+          stepDeg: null,
+          listDeg: aoas,
+        },
+        objectives: {
+          ldMax: {
+            enabled: options.objectivesEnabled ?? false,
+            toleranceDeg: 0.1,
+            maxRounds: 2,
+          },
+          clZero: {
+            enabled: options.objectivesEnabled ?? false,
+            toleranceDeg: 0.05,
+            maxRounds: 2,
+          },
+          clMax: {
+            enabled: options.objectivesEnabled ?? false,
+            toleranceDeg: 0.1,
+            maxRounds: 2,
+          },
+        },
+        numerics: {
+          boundaryProfileId: profileIds.boundary,
+          meshProfileId: profileIds.mesh,
+          solverProfileId: profileIds.solver,
+          outputProfileId: profileIds.output,
+        },
+      },
+    },
+  });
+  expect(response.statusCode, response.body).toBe(201);
+  const campaignId = response.json().campaign.id as string;
+  cleanupCampaignIds.push(campaignId);
+  const conditions = (await db.execute(drizzleSql`
+    SELECT condition.id,
+           condition.simulation_preset_revision_id AS revision_id,
+           revision.signature_hash,
+           condition.preset_id,
+           preset.legacy_boundary_condition_id AS bc_id,
+           revision.snapshot,
+           condition.reynolds
+    FROM sim_campaign_conditions condition
+    JOIN simulation_presets preset ON preset.id = condition.preset_id
+    JOIN simulation_preset_revisions revision
+      ON revision.id = condition.simulation_preset_revision_id
+    WHERE condition.campaign_id = ${campaignId}
+    ORDER BY condition.reynolds, condition.id
+  `)) as unknown as Array<{
+    id: string;
+    revision_id: string;
+    signature_hash: string;
+    preset_id: string;
+    bc_id: string;
+    snapshot: Record<string, any>;
+    reynolds: number;
+  }>;
+  return {
+    campaignId,
+    conditions: conditions.map(
+      (condition): RemoteCampaignCondition => ({
+        id: condition.id,
+        revisionId: condition.revision_id,
+        signatureHash: condition.signature_hash,
+        presetId: condition.preset_id,
+        bcId: condition.bc_id,
+        snapshot: condition.snapshot,
+        reynolds: Number(condition.reynolds),
+      }),
+    ),
+  };
+}
+
+function makeCampaignPoint(
+  aoaDeg: number,
+  condition: RemoteCampaignCondition,
+  patch: Record<string, unknown> = {},
+) {
+  const snapshot = condition.snapshot;
+  return makePoint(aoaDeg, {
+    reynolds: condition.reynolds,
+    speed: Number(snapshot.flowState.speedMps),
+    chord: Number(snapshot.referenceGeometry.referenceLengthM),
+    mach:
+      snapshot.flowState.mach == null ? null : Number(snapshot.flowState.mach),
+    engine: TEST_MATCHING_RUNTIME,
+    engineJobId: `${PREFIX}-campaign-engine-${condition.id}-${aoaDeg}`,
+    ...patch,
+  });
+}
+
+async function claimRemote(limit: number) {
+  const response = await postJson("/api/sync/v1/sweeps/claim", {
+    limit,
+    sourceInstanceId: `${PREFIX}-campaign-remote`,
+    sourceInstanceName: "campaign remote validation",
+  });
+  expect(response.statusCode, response.body).toBe(200);
+  const promise = response.json().promise as {
+    id: string;
+    aoas: number[];
+    airfoil: { id: string };
+    setupRevision: { id: string; presetId: string };
+  } | null;
+  if (promise) cleanupPromiseIds.add(promise.id);
+  return promise;
+}
+
+async function requestPayloadForPromise(promiseId: string) {
+  const [row] = await db
+    .select({ requestPayload: syncSweepPromises.requestPayload })
+    .from(syncSweepPromises)
+    .where(eq(syncSweepPromises.id, promiseId))
+    .limit(1);
+  return row?.requestPayload ?? null;
+}
+
 beforeAll(async () => {
   await configureSync();
   await createFixture();
@@ -881,6 +1228,10 @@ afterAll(async () => {
       .delete(syncSweepPromises)
       .where(inArray(syncSweepPromises.id, Array.from(cleanupPromiseIds)));
   }
+  await cleanupCampaignFixtures(db, {
+    campaignIds: cleanupCampaignIds,
+    presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
+  });
   await db
     .delete(results)
     .where(eq(results.simulationPresetRevisionId, revisionId));
@@ -1056,6 +1407,101 @@ describe("remote solver sync validation regressions", () => {
     });
   });
 
+  it("rejects remote-solver evidence whose runtime identity differs from the promised immutable engine", async () => {
+    const expectedEngine = TEST_EXPECTED_ENGINE;
+    const matchingRuntime = TEST_MATCHING_RUNTIME;
+    const cases = [
+      ["distribution", { ...matchingRuntime, distribution: "foundation" }],
+      ["release", { ...matchingRuntime, version: "2406" }],
+      ["numerics", { ...matchingRuntime, numericsRevision: "legacy" }],
+      ["adapter", { ...matchingRuntime, adapterContractVersion: 2 }],
+    ] as const;
+    const mismatchAoas = cases.map((_, index) => 698.11 + index / 1000);
+    const missingIdentityAoa = 698.12;
+    const matchingAoa = 698.13;
+    const promiseId = await createPromise("active", [
+      ...mismatchAoas,
+      missingIdentityAoa,
+      matchingAoa,
+    ]);
+    await db
+      .update(syncSweepPromises)
+      .set({ requestPayload: { remoteSolver: true }, updatedAt: new Date() })
+      .where(eq(syncSweepPromises.id, promiseId));
+    const [revisionBefore] = await db
+      .select({ snapshot: simulationPresetRevisions.snapshot })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId));
+    if (!revisionBefore) throw new Error("identity fixture revision missing");
+    await db
+      .update(simulationPresetRevisions)
+      .set({
+        snapshot: {
+          ...(revisionBefore.snapshot as Record<string, unknown>),
+          engine: expectedEngine,
+        },
+      })
+      .where(eq(simulationPresetRevisions.id, revisionId));
+
+    try {
+      for (const [index, [label, engine]] of cases.entries()) {
+        const aoaDeg = mismatchAoas[index]!;
+        const rejected = await postPolars(
+          polarPayload([makePoint(aoaDeg, { engine })], {
+            promiseId,
+            bcId: undefined,
+          }),
+        );
+        expect(rejected.statusCode, `${label}: ${rejected.body}`).toBe(409);
+        expect(rejected.json().error).toMatch(/engine.*identity|runtime/i);
+        expect(await resultAt(aoaDeg)).toBeNull();
+      }
+
+      const missingIdentity = await postPolars(
+        polarPayload([makePoint(missingIdentityAoa)], {
+          promiseId,
+          bcId: undefined,
+        }),
+      );
+      expect(missingIdentity.statusCode, missingIdentity.body).toBe(409);
+      expect(missingIdentity.json().error).toMatch(/engine.*identity|runtime/i);
+      expect(await resultAt(missingIdentityAoa)).toBeNull();
+
+      const accepted = await postPolars(
+        polarPayload([makePoint(matchingAoa, { engine: matchingRuntime })], {
+          promiseId,
+          bcId: undefined,
+        }),
+      );
+      expect(accepted.statusCode, accepted.body).toBe(200);
+      const stored = await resultAt(matchingAoa);
+      expect(stored?.currentResultAttemptId).toBeTruthy();
+      const [attempt] = await db
+        .select({ evidencePayload: resultAttempts.evidencePayload })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, stored!.currentResultAttemptId!));
+      expect(attempt?.evidencePayload).toMatchObject({
+        engine: {
+          family: matchingRuntime.family,
+          distribution: matchingRuntime.distribution,
+          version: matchingRuntime.version,
+          numerics_revision: matchingRuntime.numericsRevision,
+          adapter_contract_version: matchingRuntime.adapterContractVersion,
+          build_id: matchingRuntime.buildId,
+        },
+      });
+    } finally {
+      await db
+        .update(simulationPresetRevisions)
+        .set({ snapshot: revisionBefore.snapshot })
+        .where(eq(simulationPresetRevisions.id, revisionId));
+      await db
+        .delete(syncSweepPromises)
+        .where(eq(syncSweepPromises.id, promiseId));
+      cleanupPromiseIds.delete(promiseId);
+    }
+  });
+
   it("refuses an up-tier authority switch while mirrored work is unfinished", async () => {
     const oldBase = "http://old-hub.test/api/sync/v1";
     const oldSecret = `${PREFIX}-old-upstream-secret`;
@@ -1176,6 +1622,812 @@ describe("remote solver sync validation regressions", () => {
       })
       .where(eq(syncApiSettings.id, 1));
   });
+
+  it("orders public priority above an intact campaign, dedupes the shared cell, then terminal-links exact campaign evidence", async () => {
+    const aoas = [1.31, 2.31, 3.31];
+    const aoaDeg = aoas[1]!;
+    const publicFixture = await createCampaignCompatiblePublicPreset(
+      "campaign-priority-exact-link",
+      aoas,
+    );
+    const fixture = await launchRemoteCampaign(
+      "campaign-priority-exact-link",
+      aoas,
+      {
+        objectivesEnabled: true,
+        speedMps: publicFixture.speedMps,
+        chordM: publicFixture.chordM,
+      },
+    );
+    const condition = fixture.conditions[0]!;
+    expect(condition).toMatchObject({
+      presetId: publicFixture.presetId,
+      revisionId: publicFixture.revisionId,
+    });
+    let priorityResultId = "";
+    try {
+      const [priorityResult] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId: condition.bcId,
+          simulationPresetRevisionId: condition.revisionId,
+          aoaDeg,
+          status: "pending",
+          source: "queued",
+          priority: 10,
+        })
+        .returning({ id: results.id });
+      priorityResultId = priorityResult.id;
+
+      const publicClaim = await claimRemote(aoas.length);
+      const publicRequest = await requestPayloadForPromise(publicClaim!.id);
+      expect(publicRequest).toMatchObject({
+        remoteSolver: true,
+        workSource: "public",
+      });
+      expect(publicClaim).toMatchObject({
+        aoas: [aoaDeg],
+        airfoil: { id: airfoilId },
+        setupRevision: {
+          id: condition.revisionId,
+          presetId: condition.presetId,
+        },
+      });
+      expect(publicRequest as Record<string, unknown>).not.toHaveProperty(
+        "campaignId",
+      );
+      expect(
+        (await postJson(`/api/sync/v1/sweeps/${publicClaim!.id}/cancel`, {}))
+          .statusCode,
+      ).toBe(200);
+      await db.delete(results).where(eq(results.id, priorityResult.id));
+      priorityResultId = "";
+
+      const campaignClaim = await claimRemote(aoas.length);
+      expect(campaignClaim).toMatchObject({
+        aoas,
+        airfoil: { id: airfoilId },
+        setupRevision: {
+          id: condition.revisionId,
+          presetId: condition.presetId,
+        },
+      });
+      expect(await requestPayloadForPromise(campaignClaim!.id)).toMatchObject({
+        remoteSolver: true,
+        workSource: "campaign",
+        campaignId: fixture.campaignId,
+        conditionId: condition.id,
+      });
+      expect(Object.keys(campaignClaim!).sort()).toEqual(
+        [
+          "airfoil",
+          "aoas",
+          "expiresAt",
+          "id",
+          "setupRevision",
+          "ttlHours",
+        ].sort(),
+      );
+
+      const payload = polarPayload(
+        aoas.map((angle) => makeCampaignPoint(angle, condition)),
+        {
+          promiseId: campaignClaim!.id,
+          sourceInstanceId: `${PREFIX}-campaign-remote`,
+          bcId: undefined,
+          simulationPresetRevisionId: condition.revisionId,
+          simulationPresetSignatureHash: condition.signatureHash,
+        },
+      );
+      const pushed = await postPolars(payload);
+      expect(pushed.statusCode, pushed.body).toBe(200);
+      expect(pushed.json()).toMatchObject({
+        fulfilledAoas: aoas,
+        terminalAoas: [],
+        unfulfilledAoas: [],
+      });
+      const [point] = await db
+        .select()
+        .from(simCampaignPoints)
+        .where(
+          and(
+            eq(simCampaignPoints.campaignId, fixture.campaignId),
+            eq(simCampaignPoints.conditionId, condition.id),
+            eq(simCampaignPoints.airfoilId, airfoilId),
+            eq(simCampaignPoints.aoaDeg, aoaDeg),
+          ),
+        );
+      expect(point).toMatchObject({
+        state: "terminal",
+        resultId: expect.any(String),
+        resultAttemptId: expect.any(String),
+      });
+      const [progress] = await db
+        .select()
+        .from(simCampaignProgress)
+        .where(
+          and(
+            eq(simCampaignProgress.campaignId, fixture.campaignId),
+            eq(simCampaignProgress.conditionId, condition.id),
+            eq(simCampaignProgress.airfoilId, airfoilId),
+          ),
+        );
+      expect(progress).toMatchObject({
+        requested: aoas.length,
+        solved: aoas.length,
+        failed: 0,
+        blocked: 0,
+      });
+      const lanes = await db
+        .select({ state: simCampaignLanes.state })
+        .from(simCampaignLanes)
+        .where(eq(simCampaignLanes.campaignId, fixture.campaignId));
+      expect(lanes).toHaveLength(3);
+      expect(lanes.map((lane) => lane.state)).not.toContain("awaiting_seed");
+
+      const replay = await postPolars(payload);
+      expect(replay.statusCode, replay.body).toBe(200);
+      expect(replay.json()).toMatchObject({
+        attempts: 0,
+        fulfilledAoas: aoas,
+        unfulfilledAoas: [],
+      });
+      const [replayedPoint] = await db
+        .select()
+        .from(simCampaignPoints)
+        .where(
+          and(
+            eq(simCampaignPoints.campaignId, fixture.campaignId),
+            eq(simCampaignPoints.conditionId, condition.id),
+            eq(simCampaignPoints.airfoilId, airfoilId),
+            eq(simCampaignPoints.aoaDeg, aoaDeg),
+          ),
+        );
+      expect(replayedPoint.resultAttemptId).toBe(point.resultAttemptId);
+      expect(
+        (
+          await postJson(`/api/sync/v1/sweeps/${campaignClaim!.id}/complete`, {
+            accepted: true,
+          })
+        ).statusCode,
+      ).toBe(200);
+    } finally {
+      if (priorityResultId)
+        await db.delete(results).where(eq(results.id, priorityResultId));
+    }
+  }, 30_000);
+
+  it("leases only complete campaign polar groups and skips limited or partially owned groups", async () => {
+    const aoas = [3.21, 3.22];
+    const fixture = await launchRemoteCampaign(
+      "campaign-full-group-exclusions",
+      aoas,
+      { speedCount: 10, priority: 0 },
+    );
+    await db
+      .update(simulationPresets)
+      .set({ enabled: true, updatedAt: new Date() })
+      .where(eq(simulationPresets.id, presetId));
+    const [fallbackResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: legacyBcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: CAMPAIGN_FALLBACK_AOA,
+        status: "pending",
+        source: "queued",
+        priority: 8,
+      })
+      .returning({ id: results.id });
+    try {
+      const limited = await claimRemote(1);
+      expect(limited?.setupRevision.id).toBe(revisionId);
+      expect(await requestPayloadForPromise(limited!.id)).toMatchObject({
+        workSource: "public",
+      });
+      expect(
+        (await postJson(`/api/sync/v1/sweeps/${limited!.id}/cancel`, {}))
+          .statusCode,
+      ).toBe(200);
+
+      const intact = await claimRemote(2);
+      const head = fixture.conditions[0]!;
+      expect(intact).toMatchObject({
+        aoas,
+        setupRevision: { id: head.revisionId },
+      });
+      expect(await requestPayloadForPromise(intact!.id)).toMatchObject({
+        workSource: "campaign",
+        campaignId: fixture.campaignId,
+        conditionId: head.id,
+      });
+      expect(
+        (await postJson(`/api/sync/v1/sweeps/${intact!.id}/cancel`, {}))
+          .statusCode,
+      ).toBe(200);
+
+      const conditions = fixture.conditions;
+      await db
+        .update(simCampaignPoints)
+        .set({ state: "terminal" })
+        .where(eq(simCampaignPoints.conditionId, conditions[0]!.id));
+      await db
+        .update(simCampaignProgress)
+        .set({ solved: aoas.length })
+        .where(
+          and(
+            eq(simCampaignProgress.campaignId, fixture.campaignId),
+            eq(simCampaignProgress.conditionId, conditions[0]!.id),
+            eq(simCampaignProgress.airfoilId, airfoilId),
+          ),
+        );
+      const afterCompletedHead = await claimRemote(2);
+      expect(afterCompletedHead).toMatchObject({
+        aoas,
+        setupRevision: { id: conditions[1]!.revisionId },
+      });
+      expect(
+        await requestPayloadForPromise(afterCompletedHead!.id),
+      ).toMatchObject({
+        workSource: "campaign",
+        campaignId: fixture.campaignId,
+        conditionId: conditions[1]!.id,
+      });
+      expect(
+        (
+          await postJson(
+            `/api/sync/v1/sweeps/${afterCompletedHead!.id}/cancel`,
+            {},
+          )
+        ).statusCode,
+      ).toBe(200);
+
+      await db
+        .update(simCampaignPoints)
+        .set({ state: "released" })
+        .where(
+          and(
+            eq(simCampaignPoints.conditionId, conditions[0]!.id),
+            eq(simCampaignPoints.aoaDeg, aoas[1]!),
+          ),
+        );
+      await db
+        .update(simCampaignPoints)
+        .set({ derivedBySymmetry: true })
+        .where(eq(simCampaignPoints.conditionId, conditions[1]!.id));
+
+      const [activeJob] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [conditions[2]!.bcId, conditions[3]!.bcId],
+          simulationPresetRevisionId: conditions[2]!.revisionId,
+          campaignId: fixture.campaignId,
+          referenceChordM: Number(
+            conditions[2]!.snapshot.referenceGeometry.referenceLengthM,
+          ),
+          status: "running",
+          totalCases: 2,
+          requestPayload: { fixture: "campaign remote local ownership" },
+        })
+        .returning({ id: simJobs.id });
+      for (const [index, status] of [
+        [2, "queued"],
+        [3, "running"],
+        [4, "done"],
+        [5, "failed"],
+        [6, "pending"],
+      ] as const) {
+        const condition = conditions[index]!;
+        const [owned] = await db
+          .insert(results)
+          .values({
+            airfoilId,
+            bcId: condition.bcId,
+            simulationPresetRevisionId: condition.revisionId,
+            aoaDeg: aoas[1]!,
+            status,
+            source: status === "done" ? "solved" : "queued",
+            simJobId:
+              status === "queued" || status === "running" ? activeJob.id : null,
+          })
+          .returning({ id: results.id });
+        if (index === 6) {
+          await db.insert(simResultSubmitRetries).values({
+            resultId: owned.id,
+            state: "retry_wait",
+            attemptCount: 1,
+            nextAttemptAt: new Date(Date.now() + 3600_000),
+            lastError: "campaign remote retry backoff fixture",
+          });
+        }
+      }
+      await db.insert(simPrecalcObligations).values({
+        airfoilId,
+        revisionId: conditions[7]!.revisionId,
+        aoaDeg: aoas[1]!,
+        state: "pending",
+      });
+      const [existingPromise] = await db
+        .insert(syncSweepPromises)
+        .values({
+          sourceInstanceId: `${PREFIX}-existing-campaign-owner`,
+          airfoilId,
+          simulationPresetRevisionId: conditions[8]!.revisionId,
+          aoaCount: 1,
+          expiresAt: new Date(Date.now() + 3600_000),
+          requestPayload: { remoteSolver: true },
+        })
+        .returning({ id: syncSweepPromises.id });
+      cleanupPromiseIds.add(existingPromise.id);
+      await db.insert(syncSweepPromisePoints).values({
+        promiseId: existingPromise.id,
+        airfoilId,
+        simulationPresetRevisionId: conditions[8]!.revisionId,
+        aoaDeg: aoas[1]!,
+      });
+      await db
+        .update(simCampaignConditions)
+        .set({ status: "released" })
+        .where(eq(simCampaignConditions.id, conditions[9]!.id));
+
+      const partial = await claimRemote(2);
+      expect(partial?.setupRevision.id).toBe(revisionId);
+      expect(await requestPayloadForPromise(partial!.id)).toMatchObject({
+        workSource: "public",
+      });
+      expect(
+        (await postJson(`/api/sync/v1/sweeps/${partial!.id}/cancel`, {}))
+          .statusCode,
+      ).toBe(200);
+      const campaignPromiseRows = await db
+        .select({ id: syncSweepPromises.id })
+        .from(syncSweepPromises)
+        .where(
+          and(
+            inArray(
+              syncSweepPromises.simulationPresetRevisionId,
+              conditions.map((condition) => condition.revisionId),
+            ),
+            eq(syncSweepPromises.status, "active"),
+          ),
+        );
+      expect(campaignPromiseRows).toEqual([{ id: existingPromise.id }]);
+
+      const paused = await launchRemoteCampaign(
+        "campaign-paused-not-claimable",
+        [3.41],
+      );
+      await db
+        .update(simCampaigns)
+        .set({ status: "paused" })
+        .where(eq(simCampaigns.id, paused.campaignId));
+      const inactive = await claimRemote(1);
+      expect(inactive?.setupRevision.id).toBe(revisionId);
+      expect(await requestPayloadForPromise(inactive!.id)).toMatchObject({
+        workSource: "public",
+      });
+      expect(
+        (await postJson(`/api/sync/v1/sweeps/${inactive!.id}/cancel`, {}))
+          .statusCode,
+      ).toBe(200);
+    } finally {
+      await db.delete(results).where(eq(results.id, fallbackResult.id));
+      await db
+        .update(simulationPresets)
+        .set({ enabled: false, updatedAt: new Date() })
+        .where(eq(simulationPresets.id, presetId));
+    }
+  }, 30_000);
+
+  it("attaches a public promise's terminal rejected URANS obligation to every live campaign sharing the provisional RANS cell", async () => {
+    const hardFailureAoa = 0.25;
+    const aoaDeg = 1.25;
+    const aoas = [hardFailureAoa, aoaDeg];
+    const publicFixture = await createCampaignCompatiblePublicPreset(
+      "campaign-terminal-precalc",
+      aoas,
+    );
+    const fixture = await launchRemoteCampaign(
+      "campaign-terminal-precalc-a",
+      aoas,
+      {
+        speedMps: publicFixture.speedMps,
+        chordM: publicFixture.chordM,
+      },
+    );
+    const sharedFixture = await launchRemoteCampaign(
+      "campaign-terminal-precalc-b",
+      aoas,
+      {
+        speedMps: publicFixture.speedMps,
+        chordM: publicFixture.chordM,
+      },
+    );
+    const condition = fixture.conditions[0]!;
+    const sharedCondition = sharedFixture.conditions[0]!;
+    expect(condition).toMatchObject({
+      presetId: publicFixture.presetId,
+      revisionId: publicFixture.revisionId,
+    });
+    expect(sharedCondition).toMatchObject({
+      presetId: publicFixture.presetId,
+      revisionId: publicFixture.revisionId,
+    });
+    await db.insert(results).values(
+      aoas.map((angle) => ({
+        airfoilId,
+        bcId: condition.bcId,
+        simulationPresetRevisionId: condition.revisionId,
+        aoaDeg: angle,
+        status: "pending" as const,
+        source: "queued" as const,
+        priority: 10,
+      })),
+    );
+    const claim = await claimRemote(aoas.length);
+    expect(claim).toMatchObject({
+      aoas,
+      setupRevision: { id: condition.revisionId },
+    });
+    expect(await requestPayloadForPromise(claim!.id)).toMatchObject({
+      remoteSolver: true,
+      workSource: "public",
+    });
+
+    const marchedEngineJobId = `${PREFIX}-campaign-terminal-rans-march`;
+    const ransPayload = polarPayload(
+      [
+        makeCampaignPoint(hardFailureAoa, condition, {
+          engineJobId: marchedEngineJobId,
+          converged: false,
+          stalled: true,
+        }),
+        makeCampaignPoint(aoaDeg, condition, {
+          engineJobId: marchedEngineJobId,
+        }),
+      ],
+      {
+        promiseId: claim!.id,
+        sourceInstanceId: `${PREFIX}-campaign-remote`,
+        bcId: undefined,
+        simulationPresetRevisionId: condition.revisionId,
+        simulationPresetSignatureHash: condition.signatureHash,
+      },
+    );
+    const ransPushed = await postPolars(ransPayload);
+    expect(ransPushed.statusCode, ransPushed.body).toBe(200);
+    expect(ransPushed.json()).toMatchObject({
+      fulfilledAoas: [],
+      terminalAoas: aoas,
+      unfulfilledAoas: [],
+    });
+    const [provisionalPoint] = await db
+      .select()
+      .from(syncSweepPromisePoints)
+      .where(
+        and(
+          eq(syncSweepPromisePoints.promiseId, claim!.id),
+          eq(syncSweepPromisePoints.aoaDeg, aoaDeg),
+        ),
+      );
+    expect(provisionalPoint).toMatchObject({
+      status: "cancelled",
+      resultId: expect.any(String),
+      resultAttemptId: expect.any(String),
+    });
+    const provisionalResultId = provisionalPoint.resultId!;
+    const provisionalAttemptId = provisionalPoint.resultAttemptId!;
+    const [provisionalResult] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, provisionalResultId));
+    expect(provisionalResult.currentResultAttemptId).toBe(provisionalAttemptId);
+    const [provisionalClassification] = await db
+      .select({ state: resultClassifications.state })
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultAttemptId, provisionalAttemptId))
+      .limit(1);
+    expect(provisionalClassification?.state).toBe("needs_urans");
+
+    // A newer continuation may already own the cell when the older solver's
+    // late terminal evidence arrives. The old verdict must block all campaign
+    // owners now, while later accepted exact truth from this newer lease must
+    // satisfy the same physical obligation.
+    const [newerPromise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: `${PREFIX}-campaign-remote`,
+        sourceInstanceName: "campaign remote validation",
+        airfoilId,
+        simulationPresetRevisionId: condition.revisionId,
+        aoaCount: 1,
+        expiresAt: new Date(Date.now() + 24 * 3600_000),
+        requestPayload: { remoteSolver: true, workSource: "public" },
+      })
+      .returning({ id: syncSweepPromises.id });
+    cleanupPromiseIds.add(newerPromise.id);
+    await db.insert(syncSweepPromisePoints).values({
+      promiseId: newerPromise.id,
+      airfoilId,
+      simulationPresetRevisionId: condition.revisionId,
+      aoaDeg,
+      resultId: provisionalResultId,
+      resultAttemptId: provisionalAttemptId,
+    });
+
+    const terminalEvidence = uransEvidencePatch("campaign-terminal-precalc", [
+      "URANS integration stopped by the wall-clock budget guard before a stable period window",
+    ]);
+    const payload = polarPayload(
+      [
+        makeCampaignPoint(aoaDeg, condition, {
+          ...terminalEvidence,
+          engineJobId: `${PREFIX}-campaign-terminal-urans`,
+        }),
+      ],
+      {
+        promiseId: claim!.id,
+        sourceInstanceId: `${PREFIX}-campaign-remote`,
+        bcId: undefined,
+        simulationPresetRevisionId: condition.revisionId,
+        simulationPresetSignatureHash: condition.signatureHash,
+      },
+    );
+    const pushed = await postPolars(payload);
+    expect(pushed.statusCode, pushed.body).toBe(200);
+    const [canonicalAfterTerminal] = await db
+      .select({
+        currentResultAttemptId: results.currentResultAttemptId,
+        status: results.status,
+      })
+      .from(results)
+      .where(eq(results.id, provisionalResultId));
+    expect(canonicalAfterTerminal?.currentResultAttemptId).toBe(
+      provisionalAttemptId,
+    );
+    expect(pushed.json()).toMatchObject({
+      fulfilledAoas: [],
+      terminalAoas: [aoaDeg],
+      unfulfilledAoas: [],
+    });
+    const points = await db
+      .select()
+      .from(simCampaignPoints)
+      .where(
+        and(
+          eq(simCampaignPoints.revisionId, condition.revisionId),
+          eq(simCampaignPoints.airfoilId, airfoilId),
+          eq(simCampaignPoints.aoaDeg, aoaDeg),
+          inArray(simCampaignPoints.campaignId, [
+            fixture.campaignId,
+            sharedFixture.campaignId,
+          ]),
+        ),
+      );
+    expect(points).toHaveLength(2);
+    expect(
+      points.every(
+        (point) =>
+          point.state === "terminal" &&
+          point.resultId === provisionalResultId &&
+          point.resultAttemptId === provisionalAttemptId,
+      ),
+    ).toBe(true);
+    const [obligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(
+        and(
+          eq(simPrecalcObligations.airfoilId, airfoilId),
+          eq(simPrecalcObligations.revisionId, condition.revisionId),
+          eq(simPrecalcObligations.aoaDeg, aoaDeg),
+        ),
+      );
+    expect(obligation).toMatchObject({
+      state: "blocked",
+      attemptCount: 0,
+      sourceResultId: provisionalResultId,
+      sourceResultAttemptId: provisionalAttemptId,
+      lastOutcome: "remote_terminal_rejected",
+    });
+    const ownership = await db
+      .select()
+      .from(simPrecalcObligationCampaigns)
+      .where(eq(simPrecalcObligationCampaigns.obligationId, obligation.id));
+    expect(ownership.map((owner) => owner.campaignId).sort()).toEqual(
+      [fixture.campaignId, sharedFixture.campaignId].sort(),
+    );
+    expect(ownership.every((owner) => owner.state === "active")).toBe(true);
+    const progress = await db
+      .select()
+      .from(simCampaignProgress)
+      .where(
+        and(
+          eq(simCampaignProgress.airfoilId, airfoilId),
+          inArray(simCampaignProgress.campaignId, [
+            fixture.campaignId,
+            sharedFixture.campaignId,
+          ]),
+        ),
+      );
+    expect(progress).toHaveLength(2);
+    expect(progress.every((row) => row.solved === 0 && row.blocked === 1)).toBe(
+      true,
+    );
+
+    const replayed = await postPolars(payload);
+    expect(replayed.statusCode, replayed.body).toBe(200);
+    expect(replayed.json()).toMatchObject({
+      attempts: 0,
+      terminalAoas: [aoaDeg],
+    });
+    const [replayedObligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(replayedObligation).toMatchObject({
+      state: "blocked",
+      attemptCount: 0,
+    });
+    const replayedPoints = await db
+      .select()
+      .from(simCampaignPoints)
+      .where(
+        and(
+          inArray(simCampaignPoints.campaignId, [
+            fixture.campaignId,
+            sharedFixture.campaignId,
+          ]),
+          eq(simCampaignPoints.aoaDeg, aoaDeg),
+        ),
+      );
+    expect(replayedPoints).toHaveLength(2);
+    expect(
+      replayedPoints.every(
+        (point) => point.resultAttemptId === provisionalAttemptId,
+      ),
+    ).toBe(true);
+    const campaignStatesWhileReplacementIsActive = await db
+      .select({ status: simCampaigns.status })
+      .from(simCampaigns)
+      .where(
+        inArray(simCampaigns.id, [
+          fixture.campaignId,
+          sharedFixture.campaignId,
+        ]),
+      );
+    expect(
+      campaignStatesWhileReplacementIsActive.every(
+        (row) => row.status === "active",
+      ),
+    ).toBe(true);
+
+    // The low-angle hard RANS failure exists only to create the provisional
+    // promotion fixture. Remove that separate terminal scope before checking
+    // recovery of the target cell: an unresolved failed campaign point must
+    // truthfully keep the campaign in attention, independently of whether the
+    // target's newer accepted generation repairs its blocked obligation.
+    await db
+      .update(simCampaignPoints)
+      .set({ state: "released" })
+      .where(
+        and(
+          eq(simCampaignPoints.airfoilId, airfoilId),
+          eq(simCampaignPoints.revisionId, condition.revisionId),
+          eq(simCampaignPoints.aoaDeg, hardFailureAoa),
+          inArray(simCampaignPoints.campaignId, [
+            fixture.campaignId,
+            sharedFixture.campaignId,
+          ]),
+        ),
+      );
+
+    const acceptedPayload = polarPayload(
+      [
+        makeCampaignPoint(aoaDeg, condition, {
+          ...uransEvidencePatch("campaign-accepted-after-terminal"),
+          engineJobId: `${PREFIX}-campaign-accepted-after-terminal`,
+        }),
+      ],
+      {
+        promiseId: newerPromise.id,
+        sourceInstanceId: `${PREFIX}-campaign-remote`,
+        bcId: undefined,
+        simulationPresetRevisionId: condition.revisionId,
+        simulationPresetSignatureHash: condition.signatureHash,
+      },
+    );
+    const accepted = await postPolars(acceptedPayload);
+    expect(accepted.statusCode, accepted.body).toBe(200);
+    expect(accepted.json()).toMatchObject({
+      fulfilledAoas: [aoaDeg],
+      terminalAoas: [],
+      unfulfilledAoas: [],
+    });
+    const [satisfied] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(satisfied).toMatchObject({
+      state: "satisfied",
+      attemptCount: 0,
+      sourceResultId: provisionalResultId,
+      sourceResultAttemptId: expect.any(String),
+      lastOutcome: "accepted",
+      lastError: null,
+      nextSubmitAt: null,
+    });
+    expect(satisfied.sourceResultAttemptId).not.toBe(provisionalAttemptId);
+    const acceptedCampaignPoints = await db
+      .select({ resultAttemptId: simCampaignPoints.resultAttemptId })
+      .from(simCampaignPoints)
+      .where(
+        and(
+          eq(simCampaignPoints.airfoilId, airfoilId),
+          eq(simCampaignPoints.revisionId, condition.revisionId),
+          eq(simCampaignPoints.aoaDeg, aoaDeg),
+          inArray(simCampaignPoints.campaignId, [
+            fixture.campaignId,
+            sharedFixture.campaignId,
+          ]),
+        ),
+      );
+    expect(acceptedCampaignPoints).toHaveLength(2);
+    expect(
+      acceptedCampaignPoints.every(
+        (point) => point.resultAttemptId === satisfied.sourceResultAttemptId,
+      ),
+    ).toBe(true);
+    const satisfiedProgress = await db
+      .select()
+      .from(simCampaignProgress)
+      .where(
+        and(
+          eq(simCampaignProgress.airfoilId, airfoilId),
+          inArray(simCampaignProgress.campaignId, [
+            fixture.campaignId,
+            sharedFixture.campaignId,
+          ]),
+        ),
+      );
+    expect(satisfiedProgress).toHaveLength(2);
+    expect(
+      satisfiedProgress.every((row) => row.blocked === 0 && row.solved === 1),
+    ).toBe(true);
+    const campaignStates = await db
+      .select({ status: simCampaigns.status })
+      .from(simCampaigns)
+      .where(
+        inArray(simCampaigns.id, [
+          fixture.campaignId,
+          sharedFixture.campaignId,
+        ]),
+      );
+    expect(campaignStates).toHaveLength(2);
+    expect(campaignStates.every((row) => row.status === "completed")).toBe(
+      true,
+    );
+    const acceptedReplay = await postPolars(acceptedPayload);
+    expect(acceptedReplay.statusCode, acceptedReplay.body).toBe(200);
+    expect(acceptedReplay.json()).toMatchObject({
+      attempts: 0,
+      fulfilledAoas: [aoaDeg],
+      unfulfilledAoas: [],
+    });
+    const [replayedSatisfied] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(replayedSatisfied).toMatchObject({
+      state: "satisfied",
+      attemptCount: 0,
+      sourceResultAttemptId: satisfied.sourceResultAttemptId,
+      lastOutcome: "accepted",
+    });
+  }, 45_000);
 
   it("replays the selected attempt's sole manifest without a second row or download", async () => {
     const fixture = await createSelectedRemoteAssetGeneration(

@@ -2274,117 +2274,117 @@ export interface PrecalcRepairSatisfaction {
   changed: boolean;
 }
 
-/** Cross-ledger media repair may make already-stored preliminary evidence
- * publishable. This helper only projects accepted, exact-cell CFD truth into
- * the physical obligation ledger; it never creates or reopens solver work. */
-export async function satisfyPrecalcObligationFromAcceptedResult(
-  db: DB,
+/** State-only accepted-evidence projection for callers that already own the
+ * surrounding transaction/order. It deliberately does not recompute campaign
+ * progress or probe completion: ingestion must first exact-link the accepted
+ * attempt, then let its normal progress hook observe obligation + point as one
+ * coherent state. */
+export async function satisfyPrecalcObligationFromAcceptedResultInTransaction(
+  tx: DB,
   resultId: string,
 ): Promise<PrecalcRepairSatisfaction | null> {
-  const satisfaction = await db.transaction(async (rawTx) => {
-    const tx = rawTx as unknown as DB;
-    const [accepted] = await tx
-      .select({
-        resultId: results.id,
-        airfoilId: results.airfoilId,
-        revisionId: results.simulationPresetRevisionId,
-        aoaDeg: results.aoaDeg,
-        resultAttemptId: resultAttempts.id,
-        simJobId: resultAttempts.simJobId,
-      })
-      .from(results)
-      .innerJoin(
-        resultClassifications,
-        and(
-          eq(resultClassifications.resultId, results.id),
-          eq(resultClassifications.state, "accepted"),
-        ),
-      )
-      .innerJoin(
-        resultAttempts,
-        and(
-          eq(resultAttempts.resultId, results.id),
-          eq(resultAttempts.status, "done"),
-          sql`(
+  const [accepted] = await tx
+    .select({
+      resultId: results.id,
+      airfoilId: results.airfoilId,
+      revisionId: results.simulationPresetRevisionId,
+      aoaDeg: results.aoaDeg,
+      resultAttemptId: resultAttempts.id,
+      simJobId: resultAttempts.simJobId,
+    })
+    .from(results)
+    .innerJoin(
+      resultClassifications,
+      and(
+        eq(resultClassifications.resultId, results.id),
+        eq(resultClassifications.state, "accepted"),
+      ),
+    )
+    .innerJoin(
+      resultAttempts,
+      and(
+        eq(resultAttempts.resultId, results.id),
+        eq(resultAttempts.status, "done"),
+        sql`(
             ${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_precalc'
             OR (
               ${resultAttempts.evidencePayload} ->> 'fidelity' IS NULL
               AND ${resultAttempts.regime} = 'urans'
             )
           )`,
-        ),
-      )
-      .where(
-        and(
-          eq(results.id, resultId),
-          eq(results.status, "done"),
-          eq(results.fidelity, "urans_precalc"),
-          // A no-shedding preliminary URANS run is physically steady and is
-          // deliberately stored with `regime = rans` so downstream media does
-          // not claim unsteady fields that do not exist.  Fidelity, the exact
-          // accepted attempt, and the continuation guards above are the proof
-          // that this is still completed PRECALC evidence.
-          sql`NOT EXISTS (
+      ),
+    )
+    .where(
+      and(
+        eq(results.id, resultId),
+        eq(results.status, "done"),
+        eq(results.fidelity, "urans_precalc"),
+        // A no-shedding preliminary URANS run is physically steady and is
+        // deliberately stored with `regime = rans` so downstream media does
+        // not claim unsteady fields that do not exist.  Fidelity, the exact
+        // accepted attempt, and the continuation guards above are the proof
+        // that this is still completed PRECALC evidence.
+        sql`NOT EXISTS (
             SELECT 1
             FROM unnest(COALESCE(${results.qualityWarnings}, ARRAY[]::text[])) warning
             WHERE warning LIKE ${`%${URANS_BUDGET_STOP_MARKER}%`}
                OR warning LIKE ${`%${URANS_CONTINUATION_REQUIRED_MARKER}%`}
           )`,
-          sql`EXISTS (
+        sql`EXISTS (
             SELECT 1
             FROM result_classifications accepted_attempt_classification
             WHERE accepted_attempt_classification.result_attempt_id = ${resultAttempts.id}
               AND accepted_attempt_classification.state = 'accepted'
           )`,
-        ),
-      )
-      .orderBy(sql`${resultAttempts.createdAt} DESC`)
-      .limit(1);
-    if (!accepted?.revisionId) return null;
+      ),
+    )
+    .orderBy(sql`${resultAttempts.createdAt} DESC`)
+    .limit(1);
+  if (!accepted?.revisionId) return null;
 
-    const [obligation] = await tx
-      .select()
-      .from(simPrecalcObligations)
-      .where(
-        and(
-          eq(simPrecalcObligations.airfoilId, accepted.airfoilId),
-          eq(simPrecalcObligations.revisionId, accepted.revisionId),
-          eq(simPrecalcObligations.aoaDeg, accepted.aoaDeg),
-        ),
-      )
-      .for("update")
-      .limit(1);
-    if (!obligation) return null;
+  const [obligation] = await tx
+    .select()
+    .from(simPrecalcObligations)
+    .where(
+      and(
+        eq(simPrecalcObligations.airfoilId, accepted.airfoilId),
+        eq(simPrecalcObligations.revisionId, accepted.revisionId),
+        eq(simPrecalcObligations.aoaDeg, accepted.aoaDeg),
+      ),
+    )
+    .for("update")
+    .limit(1);
+  if (!obligation) return null;
 
-    const changed = !(
-      obligation.state === "satisfied" &&
-      obligation.sourceResultId === accepted.resultId &&
-      obligation.sourceResultAttemptId === accepted.resultAttemptId &&
-      obligation.lastOutcome === "accepted" &&
-      obligation.lastError == null &&
-      obligation.nextSubmitAt == null
-    );
-    if (changed) {
-      await tx
-        .update(simPrecalcObligations)
-        .set({
-          state: "satisfied",
-          sourceResultId: accepted.resultId,
-          sourceResultAttemptId: accepted.resultAttemptId,
-          lastOutcome: "accepted",
-          lastError: null,
-          nextSubmitAt: null,
-          completedAt: new Date(),
-        })
-        .where(eq(simPrecalcObligations.id, obligation.id));
-    }
-    await tx.update(simPrecalcObligationAttempts).set({
-      state: "accepted",
-      outcome: "accepted",
-      resultAttemptId: accepted.resultAttemptId,
-      error: null,
-      completedAt: new Date(),
-    }).where(sql`
+  const changed = !(
+    obligation.state === "satisfied" &&
+    obligation.sourceResultId === accepted.resultId &&
+    obligation.sourceResultAttemptId === accepted.resultAttemptId &&
+    obligation.lastOutcome === "accepted" &&
+    obligation.lastError == null &&
+    obligation.nextSubmitAt == null
+  );
+  if (changed) {
+    await tx
+      .update(simPrecalcObligations)
+      .set({
+        state: "satisfied",
+        sourceResultId: accepted.resultId,
+        sourceResultAttemptId: accepted.resultAttemptId,
+        lastOutcome: "accepted",
+        lastError: null,
+        nextSubmitAt: null,
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+  }
+  await tx.update(simPrecalcObligationAttempts).set({
+    state: "accepted",
+    outcome: "accepted",
+    resultAttemptId: accepted.resultAttemptId,
+    error: null,
+    completedAt: new Date(),
+  }).where(sql`
         ${simPrecalcObligationAttempts.obligationId} = ${obligation.id}
         AND (
           ${simPrecalcObligationAttempts.resultAttemptId} = ${accepted.resultAttemptId}
@@ -2394,15 +2394,29 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
           )
         )
       `);
-    await resolveSolverIncidentsForOwnerInTransaction(tx, {
-      precalcObligationId: obligation.id,
-    });
-    return {
-      obligationId: obligation.id,
-      resultAttemptId: accepted.resultAttemptId,
-      changed,
-    };
+  await resolveSolverIncidentsForOwnerInTransaction(tx, {
+    precalcObligationId: obligation.id,
   });
+  return {
+    obligationId: obligation.id,
+    resultAttemptId: accepted.resultAttemptId,
+    changed,
+  };
+}
+
+/** Cross-ledger media repair may make already-stored preliminary evidence
+ * publishable. This helper only projects accepted, exact-cell CFD truth into
+ * the physical obligation ledger; it never creates or reopens solver work. */
+export async function satisfyPrecalcObligationFromAcceptedResult(
+  db: DB,
+  resultId: string,
+): Promise<PrecalcRepairSatisfaction | null> {
+  const satisfaction = await db.transaction((rawTx) =>
+    satisfyPrecalcObligationFromAcceptedResultInTransaction(
+      rawTx as unknown as DB,
+      resultId,
+    ),
+  );
   if (!satisfaction?.changed) return satisfaction;
 
   // The result classification above changed a campaign-visible cell.  Keep

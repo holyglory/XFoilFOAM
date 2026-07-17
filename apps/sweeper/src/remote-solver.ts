@@ -24,7 +24,7 @@ import {
   solverEvidenceArtifacts,
   solverImplementations,
   solverProfiles,
-  solverRuntimeBuilds,
+  sweeperState,
   syncApiSettings,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
@@ -116,10 +116,251 @@ interface RemotePromiseWorkState {
   activePointCount: number;
 }
 
+interface RemoteAdmissionCapacity {
+  jobCap: number;
+  promiseCap: number;
+}
+
+interface LeaseRenewalResult {
+  admissionCertain: boolean;
+  errors: string[];
+}
+
+interface RemoteSolverRuntimeIdentity {
+  family: string;
+  distribution: string;
+  version: string;
+  numericsRevision: string;
+  adapterContractVersion: number;
+  buildId: string;
+  sourceRevision: string | null;
+  imageDigest: string | null;
+  applicationSourceSha256: string | null;
+  packageSha256: string | null;
+  binarySha256: string | null;
+  architecture: string | null;
+}
+
+interface RemoteSolverExpectedEngine {
+  family: string;
+  distribution: string;
+  version: string;
+  numerics_revision: string;
+  adapter_contract_version: number;
+}
+
 type RemotePromiseSubmitResult =
   | { kind: "submitted" | "busy" | "waiting" }
   | { kind: "terminal"; error: string }
   | { kind: "stopped"; error: string };
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function optionalString(value: unknown): string | null {
+  return value == null ? null : nonEmptyString(value);
+}
+
+function sha256OrNull(value: unknown, field: string): string | null {
+  const parsed = optionalString(value);
+  if (parsed && !/^[0-9a-f]{64}$/i.test(parsed)) {
+    throw new Error(
+      `local engine health contains malformed ${field} runtime provenance`,
+    );
+  }
+  return parsed;
+}
+
+function expectedEngineForSetup(
+  setup: SimulationSetupSnapshot,
+): RemoteSolverExpectedEngine {
+  const snapshotEngine = objectValue(
+    (setup as unknown as Record<string, unknown>).engine,
+  );
+  const family = nonEmptyString(snapshotEngine.family);
+  const distribution = nonEmptyString(snapshotEngine.distribution);
+  const version = nonEmptyString(snapshotEngine.releaseVersion);
+  const numericsRevision = nonEmptyString(snapshotEngine.numericsRevision);
+  const adapterContractVersion = Number(snapshotEngine.adapterContractVersion);
+  if (
+    !family ||
+    !distribution ||
+    !version ||
+    !numericsRevision ||
+    !Number.isInteger(adapterContractVersion) ||
+    adapterContractVersion <= 0
+  ) {
+    throw new Error(
+      "remote promise setup has no complete immutable engine identity",
+    );
+  }
+  return {
+    family,
+    distribution,
+    version,
+    numerics_revision: numericsRevision,
+    adapter_contract_version: adapterContractVersion,
+  };
+}
+
+/** Validate the immutable claimed setup against the local engine's own health
+ * response. The setup is only an expectation; runtime provenance is taken
+ * from /health and carried forward into the job/upload contract. */
+export function remoteSolverRuntimeForSetup(
+  setup: SimulationSetupSnapshot,
+  healthValue: unknown,
+): {
+  expectedEngine: RemoteSolverExpectedEngine;
+  runtime: RemoteSolverRuntimeIdentity;
+} {
+  const expectedEngine = expectedEngineForSetup(setup);
+  const health = objectValue(healthValue);
+  const runtimeHealth = objectValue(health.engine);
+  const advertised = Object.keys(runtimeHealth).length
+    ? runtimeHealth
+    : objectValue(health.default_engine ?? health.defaultEngine);
+  const family = nonEmptyString(advertised.family);
+  const distribution = nonEmptyString(advertised.distribution);
+  const version = nonEmptyString(advertised.version);
+  const numericsRevision = nonEmptyString(
+    advertised.numerics_revision ?? advertised.numericsRevision,
+  );
+  const adapterContractVersion = Number(
+    advertised.adapter_contract_version ?? advertised.adapterContractVersion,
+  );
+  const buildId = nonEmptyString(
+    runtimeHealth.build_id ??
+      runtimeHealth.buildId ??
+      health.build_id ??
+      health.buildId,
+  );
+  if (
+    !family ||
+    !distribution ||
+    !version ||
+    !numericsRevision ||
+    !Number.isInteger(adapterContractVersion) ||
+    adapterContractVersion <= 0 ||
+    !buildId
+  ) {
+    throw new Error(
+      "local engine health lacks authoritative logical/runtime identity",
+    );
+  }
+  const mismatches = [
+    family === expectedEngine.family ? null : "family",
+    distribution === expectedEngine.distribution ? null : "distribution",
+    version === expectedEngine.version ? null : "release",
+    numericsRevision === expectedEngine.numerics_revision ? null : "numerics",
+    adapterContractVersion === expectedEngine.adapter_contract_version
+      ? null
+      : "adapter contract",
+  ].filter((value): value is string => value !== null);
+  if (mismatches.length) {
+    throw new Error(
+      `local engine identity mismatches remote promise setup (${mismatches.join(", ")}); expected ${expectedEngine.family}/${expectedEngine.distribution}/${expectedEngine.version}/numerics-${expectedEngine.numerics_revision}/adapter-${expectedEngine.adapter_contract_version}, got ${family}/${distribution}/${version}/numerics-${numericsRevision}/adapter-${adapterContractVersion}`,
+    );
+  }
+  return {
+    expectedEngine,
+    runtime: {
+      family,
+      distribution,
+      version,
+      numericsRevision,
+      adapterContractVersion,
+      buildId,
+      sourceRevision: optionalString(
+        runtimeHealth.source_revision ?? runtimeHealth.sourceRevision,
+      ),
+      imageDigest: optionalString(
+        runtimeHealth.image_digest ?? runtimeHealth.imageDigest,
+      ),
+      applicationSourceSha256: sha256OrNull(
+        runtimeHealth.application_source_sha256 ??
+          runtimeHealth.applicationSourceSha256,
+        "application source sha256",
+      ),
+      packageSha256: sha256OrNull(
+        runtimeHealth.package_sha256 ?? runtimeHealth.packageSha256,
+        "package sha256",
+      ),
+      binarySha256: sha256OrNull(
+        runtimeHealth.binary_sha256 ?? runtimeHealth.binarySha256,
+        "binary sha256",
+      ),
+      architecture: optionalString(runtimeHealth.architecture),
+    },
+  };
+}
+
+function runtimeIdentityForUpload(
+  value: unknown,
+): RemoteSolverRuntimeIdentity | null {
+  const runtime = objectValue(value);
+  if (!Object.keys(runtime).length) return null;
+  const family = nonEmptyString(runtime.family);
+  const distribution = nonEmptyString(runtime.distribution);
+  const version = nonEmptyString(runtime.version);
+  const numericsRevision = nonEmptyString(
+    runtime.numerics_revision ?? runtime.numericsRevision,
+  );
+  const adapterContractVersion = Number(
+    runtime.adapter_contract_version ?? runtime.adapterContractVersion,
+  );
+  const buildId = nonEmptyString(runtime.build_id ?? runtime.buildId);
+  if (
+    !family ||
+    !distribution ||
+    !version ||
+    !numericsRevision ||
+    !Number.isInteger(adapterContractVersion) ||
+    adapterContractVersion <= 0 ||
+    !buildId
+  ) {
+    throw new Error("result carries malformed engine runtime identity");
+  }
+  return {
+    family,
+    distribution,
+    version,
+    numericsRevision,
+    adapterContractVersion,
+    buildId,
+    sourceRevision: optionalString(
+      runtime.source_revision ?? runtime.sourceRevision,
+    ),
+    imageDigest: optionalString(runtime.image_digest ?? runtime.imageDigest),
+    applicationSourceSha256: sha256OrNull(
+      runtime.application_source_sha256 ?? runtime.applicationSourceSha256,
+      "application source sha256",
+    ),
+    packageSha256: sha256OrNull(
+      runtime.package_sha256 ?? runtime.packageSha256,
+      "package sha256",
+    ),
+    binarySha256: sha256OrNull(
+      runtime.binary_sha256 ?? runtime.binarySha256,
+      "binary sha256",
+    ),
+    architecture: optionalString(runtime.architecture),
+  };
+}
+
+async function localRuntimeForSetup(
+  engine: EngineClient,
+  setup: SimulationSetupSnapshot,
+) {
+  const health = await engine.healthDetails();
+  return remoteSolverRuntimeForSetup(setup, health);
+}
 
 function syncBase(settings: Settings): string {
   if (!settings.upstreamBaseUrl)
@@ -686,6 +927,94 @@ async function activeRemoteJobs(db: DB) {
   );
 }
 
+function positiveCapacity(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Remote work shares the same global engine token pool as every local job.
+ * The controller therefore admits by the count of all in-flight sim jobs,
+ * bounded by the narrowest configured remote, local, and worker capacity.
+ * A separate two-window promise cap keeps enough leased work to refill slots
+ * while the previous window is publishing evidence without hoarding the hub. */
+async function remoteAdmissionCapacity(
+  db: DB,
+  settings: Settings,
+): Promise<RemoteAdmissionCapacity> {
+  const workerBudget = positiveCapacity(
+    process.env.AIRFOILFOAM_WORKER_CPU_BUDGET,
+    2,
+  );
+  const [local] = await db
+    .select({
+      maxConcurrentJobs: sweeperState.maxConcurrentJobs,
+      cpuSlots: sweeperState.cpuSlots,
+    })
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1))
+    .limit(1);
+  const effectiveLocalCap = positiveCapacity(
+    local?.maxConcurrentJobs,
+    positiveCapacity(local?.cpuSlots, workerBudget),
+  );
+  const remoteCap = positiveCapacity(
+    settings.remoteSolverCpuBudget,
+    workerBudget,
+  );
+  const jobCap = Math.max(
+    1,
+    Math.min(remoteCap, effectiveLocalCap, workerBudget),
+  );
+  return { jobCap, promiseCap: jobCap * 2 };
+}
+
+async function activeSimJobCount(db: DB): Promise<number> {
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(simJobs)
+    .where(
+      or(
+        inArray(simJobs.status, [
+          "pending",
+          "submitted",
+          "running",
+          "ingesting",
+        ]),
+        and(
+          eq(simJobs.status, "cancelled"),
+          inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+        ),
+      ),
+    );
+  return Number(row?.count ?? 0);
+}
+
+async function remotePromiseJobCount(
+  db: DB,
+  promiseId: string,
+): Promise<number> {
+  const [row] = (await db.execute(sql`
+    SELECT count(*)::int AS count
+    FROM sim_jobs job
+    WHERE job.request_payload ->> 'syncPromiseId' = ${promiseId}
+  `)) as unknown as Array<{ count: number }>;
+  return Number(row?.count ?? 0);
+}
+
+function activeRemotePromiseIds(
+  jobs: Array<typeof simJobs.$inferSelect>,
+): Set<string> {
+  return new Set(
+    jobs
+      .map(
+        (job) =>
+          (job.requestPayload as { syncPromiseId?: string } | null)
+            ?.syncPromiseId,
+      )
+      .filter((promiseId): promiseId is string => Boolean(promiseId)),
+  );
+}
+
 async function remotePromiseWorkState(
   db: DB,
   promiseId: string,
@@ -947,7 +1276,7 @@ async function renewMirroredPromiseLeases(
   db: DB,
   engine: EngineClient,
   settings: Settings,
-): Promise<void> {
+): Promise<LeaseRenewalResult> {
   const intervalMs = Math.max(
     5_000,
     settings.remoteSolverHeartbeatIntervalSeconds * 1_000,
@@ -973,6 +1302,7 @@ async function renewMirroredPromiseLeases(
     )
     .orderBy(syncSweepPromises.expiresAt, syncSweepPromises.id)
     .limit(100);
+  const errors: string[] = [];
   for (const promise of rows) {
     let response: Response;
     try {
@@ -986,11 +1316,12 @@ async function renewMirroredPromiseLeases(
         },
       );
     } catch (error) {
-      throw new Error(
+      errors.push(
         `remote promise ${promise.id} heartbeat failed transiently: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      continue;
     }
     if (response.status === 404 || response.status === 409) {
       await cancelAuthoritativelyExpiredPromise(
@@ -1002,9 +1333,10 @@ async function renewMirroredPromiseLeases(
       continue;
     }
     if (!response.ok) {
-      throw new Error(
+      errors.push(
         `remote promise ${promise.id} heartbeat failed (${response.status})`,
       );
+      continue;
     }
     const payload = (await response.json().catch(() => null)) as {
       expiresAt?: unknown;
@@ -1014,9 +1346,10 @@ async function renewMirroredPromiseLeases(
         ? new Date(payload.expiresAt)
         : null;
     if (!expiresAt || !Number.isFinite(expiresAt.getTime())) {
-      throw new Error(
+      errors.push(
         `remote promise ${promise.id} heartbeat omitted a valid expiry`,
       );
+      continue;
     }
     await db
       .update(syncSweepPromises)
@@ -1028,6 +1361,7 @@ async function renewMirroredPromiseLeases(
         ),
       );
   }
+  return { admissionCertain: errors.length === 0, errors };
 }
 
 async function cancelMirroredRemotePromise(
@@ -1104,7 +1438,58 @@ async function cancelMirroredRemotePromise(
   });
   if (queued) {
     await processPendingPromiseCancellations(db, settings, promiseId);
+    await supersedeAuthoritativelyTerminalRemoteDeliveries(db);
   }
+}
+
+/** Restart-safe delivery cleanup for mirrors whose upstream authority is
+ * already terminal. Result, attempt, artifact, and media evidence remains
+ * immutable; only the obsolete delivery work item is superseded. Requiring a
+ * delivered cancellation or an exact authority response prevents a local
+ * clock expiry from silently discarding an upload that the hub may still own. */
+async function supersedeAuthoritativelyTerminalRemoteDeliveries(
+  db: DB,
+): Promise<number> {
+  const rows = await db
+    .update(syncRemoteResultDeliveries)
+    .set({
+      state: "superseded",
+      nextAttemptAt: new Date(),
+      claimToken: null,
+      claimedAt: null,
+      claimExpiresAt: null,
+      lastError:
+        "authoritative remote promise is terminal; immutable local evidence retained",
+      remoteConflictIds: [],
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        inArray(syncRemoteResultDeliveries.state, [
+          "pending",
+          "pushing",
+          "retry_wait",
+          "blocked",
+        ]),
+        sql`EXISTS (
+          SELECT 1
+          FROM sync_sweep_promises terminal_promise
+          LEFT JOIN sync_remote_promise_cancellations cancellation
+            ON cancellation.promise_id = terminal_promise.id
+           AND cancellation.state = 'delivered'
+          WHERE terminal_promise.id = ${syncRemoteResultDeliveries.promiseId}
+            AND terminal_promise.status IN ('cancelled', 'expired')
+            AND terminal_promise.request_payload ->> 'remoteSolver' = 'true'
+            AND (
+              cancellation.promise_id IS NOT NULL
+              OR terminal_promise.response_payload ->> 'authoritativeLeaseLoss' = 'true'
+              OR terminal_promise.response_payload ->> 'authoritativeCompletionRejection' = 'true'
+            )
+        )`,
+      ),
+    )
+    .returning({ id: syncRemoteResultDeliveries.id });
+  return rows.length;
 }
 
 async function cancelMirroredPromisesForDisabledSolver(
@@ -1239,10 +1624,35 @@ async function processPendingPromiseCancellations(
   }
 }
 
+async function localRuntimeForMirroredPromise(
+  db: DB,
+  engine: EngineClient,
+  promiseId: string,
+) {
+  const [row] = await db
+    .select({ snapshot: simulationPresetRevisions.snapshot })
+    .from(syncSweepPromises)
+    .innerJoin(
+      simulationPresetRevisions,
+      eq(
+        simulationPresetRevisions.id,
+        syncSweepPromises.simulationPresetRevisionId,
+      ),
+    )
+    .where(eq(syncSweepPromises.id, promiseId))
+    .limit(1);
+  if (!row) throw new Error(`remote promise ${promiseId} has no pinned setup`);
+  return localRuntimeForSetup(
+    engine,
+    row.snapshot as unknown as SimulationSetupSnapshot,
+  );
+}
+
 async function composeRemotePromiseJob(
   db: DB,
   settings: Settings,
   promiseId: string,
+  engineProof: Awaited<ReturnType<typeof localRuntimeForSetup>>,
 ): Promise<
   | {
       kind: "composed";
@@ -1346,6 +1756,13 @@ async function composeRemotePromiseJob(
       cpu_budget:
         settings.remoteSolverCpuBudget || request.resources?.cpu_budget,
     };
+    if (engineProof) {
+      (
+        request as typeof request & {
+          expected_engine?: RemoteSolverExpectedEngine;
+        }
+      ).expected_engine = engineProof.expectedEngine;
+    }
     const payload = {
       remoteSolver: true,
       syncPromiseId: promiseId,
@@ -1362,6 +1779,12 @@ async function composeRemotePromiseJob(
       ransRetryScope: retryScopeForRequestedPolar(state.requestedAoas),
       resources: request.resources,
       setupSnapshot: setup,
+      ...(engineProof
+        ? {
+            remoteSolverExpectedEngine: engineProof.expectedEngine,
+            remoteSolverEngineRuntime: engineProof.runtime,
+          }
+        : {}),
     };
     const [job] = await tx
       .insert(simJobs)
@@ -1387,6 +1810,7 @@ async function composeRemotePromiseJob(
       revision.id,
       state.dueAoas,
       job.id,
+      { allowedPromiseId: promiseId },
     );
     if (!claimed.length) {
       await tx
@@ -1432,6 +1856,7 @@ async function submitRemotePrecalcRecovery(
   engine: EngineClient,
   settings: Settings,
   promiseId: string,
+  engineProof: Awaited<ReturnType<typeof localRuntimeForSetup>>,
 ): Promise<boolean> {
   const [candidate] = (await db.execute(sql`
     SELECT DISTINCT parent.id
@@ -1486,7 +1911,9 @@ async function submitRemotePrecalcRecovery(
     .where(eq(simJobs.id, candidate.id))
     .limit(1);
   if (!parent) return false;
-  await submitUransRetryForJob(db, engine, parent);
+  await submitUransRetryForJob(db, engine, parent, {
+    remoteEngineProof: engineProof,
+  });
   return true;
 }
 
@@ -1501,11 +1928,35 @@ async function submitMirroredRemotePromise(
     await setStatus(db, "error", error);
     return { kind: "waiting" };
   }
-  if (await submitRemotePrecalcRecovery(db, engine, settings, promiseId)) {
+  let engineProof: Awaited<ReturnType<typeof localRuntimeForSetup>>;
+  try {
+    engineProof = await localRuntimeForMirroredPromise(db, engine, promiseId);
+  } catch (error) {
+    const reason = `remote promise ${promiseId} engine identity guard blocked admission: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    await cancelMirroredRemotePromise(db, settings, promiseId, reason);
+    await setStatus(db, "error", reason);
+    return { kind: "terminal", error: reason };
+  }
+  if (
+    await submitRemotePrecalcRecovery(
+      db,
+      engine,
+      settings,
+      promiseId,
+      engineProof,
+    )
+  ) {
     await setStatus(db, "solving", null);
     return { kind: "busy" };
   }
-  const composition = await composeRemotePromiseJob(db, settings, promiseId);
+  const composition = await composeRemotePromiseJob(
+    db,
+    settings,
+    promiseId,
+    engineProof,
+  );
   if (composition.kind === "stopped") {
     return { kind: "stopped", error: "remote promise is no longer active" };
   }
@@ -1578,7 +2029,7 @@ async function claimRemoteWork(
   db: DB,
   engine: EngineClient,
   settings: Settings,
-): Promise<void> {
+): Promise<"claimed" | "empty"> {
   const solverId =
     settings.remoteSolverRegisteredId ?? (await registerSolver(db, settings));
   await setStatus(db, "claiming", null);
@@ -1593,10 +2044,43 @@ async function claimRemoteWork(
     .catch(() => null)) as RemoteClaimResponse | null;
   if (!res.ok) throw new Error(`remote sweep claim failed (${res.status})`);
   if (!payload?.promise) {
-    await setStatus(db, "idle", null);
-    return;
+    return "empty";
   }
   const claim = payload.promise;
+  try {
+    await localRuntimeForSetup(engine, claim.setupRevision.snapshot);
+  } catch (error) {
+    const reason = `claimed remote promise ${claim.id} engine identity guard rejected local execution: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    let releaseStatus: number | null = null;
+    try {
+      const released = await fetch(
+        `${syncBase(settings)}/sweeps/${claim.id}/cancel`,
+        {
+          method: "POST",
+          signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+          headers: headers(settings),
+          body: JSON.stringify({ reason }),
+        },
+      );
+      releaseStatus = released.status;
+      if (!released.ok && released.status !== 404) {
+        throw new Error(`claim release failed (${released.status})`);
+      }
+    } catch (releaseError) {
+      throw new Error(
+        `${reason}; authoritative claim release is uncertain: ${
+          releaseError instanceof Error
+            ? releaseError.message
+            : String(releaseError)
+        }`,
+      );
+    }
+    throw new Error(
+      `${reason}; authoritative claim released (${releaseStatus})`,
+    );
+  }
   const airfoil = await ensureRemoteAirfoil(db, claim);
   const setup = await ensureRemoteRevision(db, claim, settings);
   await db
@@ -1637,6 +2121,7 @@ async function claimRemoteWork(
     )
     .onConflictDoNothing();
   await submitMirroredRemotePromise(db, engine, settings, claim.id);
+  return "claimed";
 }
 
 interface StreamUpload {
@@ -2264,6 +2749,10 @@ async function completeMirroredPromiseIfReady(
             .set({
               status: "cancelled",
               cancelledAt: new Date(),
+              responsePayload: {
+                authoritativeCompletionRejection: true,
+                error: payload.error,
+              },
               updatedAt: new Date(),
             })
             .where(eq(syncSweepPromises.id, promiseId));
@@ -2340,23 +2829,6 @@ async function pushOneRemoteResult(
 ): Promise<boolean> {
   const attempt =
     options.attempt ?? (await currentAttemptForResult(db, job, result));
-  const [runtime] = attempt.solverRuntimeBuildId
-    ? await db
-        .select({
-          runtime: solverRuntimeBuilds,
-          implementation: solverImplementations,
-        })
-        .from(solverRuntimeBuilds)
-        .innerJoin(
-          solverImplementations,
-          eq(
-            solverImplementations.id,
-            solverRuntimeBuilds.solverImplementationId,
-          ),
-        )
-        .where(eq(solverRuntimeBuilds.id, attempt.solverRuntimeBuildId))
-        .limit(1)
-    : [];
   const [classification] = await db
     .select({
       id: resultClassifications.id,
@@ -2520,6 +2992,10 @@ async function pushOneRemoteResult(
         : {};
     const setupSnapshot =
       revision.snapshot as unknown as SimulationSetupSnapshot;
+    const jobPayload = objectValue(job.requestPayload);
+    const deliveredEngineRuntime = runtimeIdentityForUpload(
+      attemptPayload.engine ?? jobPayload.remoteSolverEngineRuntime,
+    );
     const payloadNumber = (key: string, fallback: number | null) =>
       typeof attemptPayload[key] === "number"
         ? (attemptPayload[key] as number)
@@ -2564,23 +3040,7 @@ async function pushOneRemoteResult(
       steadyHistory:
         attemptPayload.steady_history ?? attemptPayload.steadyHistory ?? null,
       methodKey: attempt.methodKey,
-      engine: runtime
-        ? {
-            family: runtime.implementation.family,
-            distribution: runtime.implementation.distribution,
-            version: runtime.implementation.releaseVersion,
-            numericsRevision: runtime.implementation.numericsRevision,
-            adapterContractVersion:
-              runtime.implementation.adapterContractVersion,
-            buildId: runtime.runtime.buildId,
-            sourceRevision: runtime.runtime.sourceRevision,
-            imageDigest: runtime.runtime.imageDigest,
-            applicationSourceSha256: runtime.runtime.applicationSourceSha256,
-            packageSha256: runtime.runtime.packageSha256,
-            binarySha256: runtime.runtime.binarySha256,
-            architecture: runtime.runtime.architecture,
-          }
-        : null,
+      engine: deliveredEngineRuntime,
       engineJobId: attempt.engineJobId,
       engineCaseSlug: attempt.engineCaseSlug,
       evidencePayload: attempt.evidencePayload,
@@ -3459,6 +3919,91 @@ async function reopenResolvedConflictDeliveries(
   }
 }
 
+async function submitOneRemotePrecalcRecovery(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+  promiseIds: string[],
+  jobCap: number,
+): Promise<boolean> {
+  const busyPromiseIds = activeRemotePromiseIds(await activeRemoteJobs(db));
+  for (const promiseId of promiseIds) {
+    if (busyPromiseIds.has(promiseId)) continue;
+    if ((await activeSimJobCount(db)) >= jobCap) return false;
+    let engineProof: Awaited<ReturnType<typeof localRuntimeForSetup>>;
+    try {
+      engineProof = await localRuntimeForMirroredPromise(db, engine, promiseId);
+    } catch (error) {
+      const reason = `remote promise ${promiseId} engine identity guard blocked PRECALC admission: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      await cancelMirroredRemotePromise(db, settings, promiseId, reason);
+      await setStatus(db, "error", reason);
+      // This tick performed a terminal ownership transition. Keep the
+      // one-admission cadence and let the next tick inspect the next mirror.
+      return true;
+    }
+    if (
+      await submitRemotePrecalcRecovery(
+        db,
+        engine,
+        settings,
+        promiseId,
+        engineProof,
+      )
+    )
+      return true;
+  }
+  return false;
+}
+
+async function submitOneIdleMirroredPromise(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+  promiseIds: string[],
+  jobCap: number,
+  allowTerminalRelease: boolean,
+): Promise<boolean> {
+  let busyPromiseIds = activeRemotePromiseIds(await activeRemoteJobs(db));
+  for (const promiseId of promiseIds) {
+    if (busyPromiseIds.has(promiseId)) continue;
+    if ((await activeSimJobCount(db)) >= jobCap) return false;
+    const state = await remotePromiseWorkState(db, promiseId);
+    if (state.activePointCount === 0) continue;
+    if (!state.dueAoas.length) {
+      if (state.waitingUntil || state.busy || state.completed) continue;
+      if (state.terminal && !allowTerminalRelease) continue;
+    }
+    const jobCountBefore = await remotePromiseJobCount(db, promiseId);
+    const outcome = await submitMirroredRemotePromise(
+      db,
+      engine,
+      settings,
+      promiseId,
+    );
+    if (outcome.kind === "submitted") return true;
+    if ((await remotePromiseJobCount(db, promiseId)) > jobCountBefore) {
+      // Composition crossed the one-admission boundary even when the engine
+      // answered with a retryable rejection or lifecycle compensation.
+      return true;
+    }
+    const refreshedBusyPromiseIds = activeRemotePromiseIds(
+      await activeRemoteJobs(db),
+    );
+    if (
+      !busyPromiseIds.has(promiseId) &&
+      refreshedBusyPromiseIds.has(promiseId)
+    ) {
+      // A concurrent tick or the lifecycle guard now owns this admission.
+      // Stop here so this tick cannot ramp a second engine job.
+      return true;
+    }
+    busyPromiseIds = refreshedBusyPromiseIds;
+  }
+  return false;
+}
+
 export async function remoteSolverTick(
   db: DB,
   engine: EngineClient,
@@ -3477,46 +4022,72 @@ export async function remoteSolverTick(
     if (settings?.upstreamSecret) {
       await processPendingPromiseCancellations(db, settings);
     }
-    // A completed mixed PRECALC wave can expose accepted siblings for durable
-    // delivery while rejected siblings remain pending for their one bounded
-    // continuation. Give those obligations the next engine slot before any
-    // delivery/completion path can release the mirror. The ordinary submit
-    // path also performs this check, but it runs after result delivery and is
-    // therefore too late for this transition.
-    if (
+    await supersedeAuthoritativelyTerminalRemoteDeliveries(db);
+    const hasAuthority = Boolean(
+      settings?.upstreamBaseUrl && settings.upstreamSecret,
+    );
+    let leaseRenewal: LeaseRenewalResult = {
+      admissionCertain: true,
+      errors: [],
+    };
+    if (settings && hasAuthority) {
+      // Every due mirror is renewed before physical recovery, evidence upload,
+      // completion, or admission. Transient uncertainty is collected across
+      // siblings: it blocks only new admission for this tick, while exact
+      // 404/409 responses still cancel their own local work immediately.
+      leaseRenewal = await renewMirroredPromiseLeases(db, engine, settings);
+      await expireMirroredRemotePromises(db, settings);
+    }
+
+    const enabled = Boolean(
       settings?.remoteSolverEnabled &&
       settings.upstreamBaseUrl &&
-      settings.upstreamSecret &&
-      allowEngineSubmission
-    ) {
-      // Preserve the normal authority fence even though recovery is moving
-      // ahead of durable result delivery. A due 404/409 renewal must cancel
-      // local ownership before another physical attempt reaches the engine.
-      await renewMirroredPromiseLeases(db, engine, settings);
-      await expireMirroredRemotePromises(db, settings);
-      if ((await activeRemoteJobs(db)).length === 0) {
-        const recoveryMirrors = await mirroredRemotePromiseIds(db, settings);
-        if (
-          recoveryMirrors.length > 0 &&
-          (await submitRemotePrecalcRecovery(
-            db,
-            engine,
-            settings,
-            recoveryMirrors[0]!,
-          ))
-        ) {
-          await setStatus(db, "solving", null);
-          return;
-        }
+      settings.upstreamSecret,
+    );
+    const controllerErrors = [...leaseRenewal.errors];
+    let capacity: RemoteAdmissionCapacity | null = null;
+    let admitted = false;
+
+    if (settings && enabled) {
+      await releaseUnacceptedPromiseResults(db, settings);
+      capacity = await remoteAdmissionCapacity(db, settings);
+      // A completed mixed PRECALC wave can expose accepted siblings for
+      // delivery while rejected siblings still own one bounded continuation.
+      // Scan every idle mirror before uploading so a busy oldest promise can
+      // never hide another promise's exact recovery.
+      if (
+        allowEngineSubmission &&
+        leaseRenewal.admissionCertain &&
+        !engineBackoffActive() &&
+        (await activeSimJobCount(db)) < capacity.jobCap
+      ) {
+        admitted = await submitOneRemotePrecalcRecovery(
+          db,
+          engine,
+          settings,
+          await mirroredRemotePromiseIds(db, settings),
+          capacity.jobCap,
+        );
       }
     }
-    let processedDurableDelivery = false;
-    if (settings?.upstreamBaseUrl && settings.upstreamSecret) {
-      await reopenResolvedConflictDeliveries(db, settings);
-      processedDurableDelivery = await processRemoteResultDeliveries(
-        db,
-        settings,
-      );
+
+    // Publish at most one result generation per tick, then continue into
+    // completion and admission so a large evidence backlog cannot drain the
+    // controller's compute slots between uploads.
+    let uploaded = false;
+    if (settings && hasAuthority) {
+      try {
+        await reopenResolvedConflictDeliveries(db, settings);
+        uploaded = await processRemoteResultDeliveries(db, settings);
+        if (!uploaded)
+          uploaded = await processReusablePromiseEvidence(db, settings);
+        if (!uploaded)
+          uploaded = await processTerminalPromiseEvidence(db, settings);
+      } catch (error) {
+        controllerErrors.push(
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     }
     if (
       !settings?.remoteSolverEnabled ||
@@ -3530,53 +4101,79 @@ export async function remoteSolverTick(
         await setStatus(db, "disabled", null);
       return;
     }
-    if (processedDurableDelivery) return;
     if (!settings.remoteSolverRegisteredId) {
       await registerSolver(db, settings);
     }
-    await renewMirroredPromiseLeases(db, engine, settings);
-    await expireMirroredRemotePromises(db, settings);
-    await releaseUnacceptedPromiseResults(db, settings);
-    const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
-    if (readyPromiseId) {
-      await setStatus(db, "pushing", null);
-      await completeMirroredPromiseIfReady(db, settings, readyPromiseId, null);
-      await setStatus(db, "idle", null, {
-        remoteSolverLastPushAt: new Date(),
-      });
-      return;
-    }
-    const active = await activeRemoteJobs(db);
-    const mirrored = await mirroredRemotePromiseIds(db, settings);
-    const mirroredAoaCount = await mirroredRemoteActiveAoaCount(db, mirrored);
-    await heartbeat(
-      settings,
-      active.length || mirrored.length ? "solving" : "idle",
-      mirrored.length,
-      mirroredAoaCount,
-    );
-    if (await processReusablePromiseEvidence(db, settings)) return;
-    if (await processTerminalPromiseEvidence(db, settings)) return;
-    if (active.length === 0) {
-      if (!allowEngineSubmission) {
-        await setStatus(
+    try {
+      const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
+      if (readyPromiseId) {
+        await completeMirroredPromiseIfReady(
           db,
-          "idle",
-          "storage admission is blocked; remote reconciliation continues but no new engine job will be submitted",
+          settings,
+          readyPromiseId,
+          null,
         );
-        return;
       }
-      if (mirrored.length) {
-        await submitMirroredRemotePromise(db, engine, settings, mirrored[0]);
-      } else if (engineBackoffActive()) {
-        await setStatus(
-          db,
-          "error",
+    } catch (error) {
+      controllerErrors.push(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
+    if (!admitted && allowEngineSubmission && leaseRenewal.admissionCertain) {
+      if (engineBackoffActive()) {
+        controllerErrors.push(
           "remote solver is waiting for the shared engine connection backoff",
         );
-      } else {
-        await claimRemoteWork(db, engine, settings);
+      } else if (capacity && (await activeSimJobCount(db)) < capacity.jobCap) {
+        let mirrored = await mirroredRemotePromiseIds(db, settings);
+        admitted = await submitOneIdleMirroredPromise(
+          db,
+          engine,
+          settings,
+          mirrored,
+          capacity.jobCap,
+          !uploaded,
+        );
+        if (
+          !admitted &&
+          !engineBackoffActive() &&
+          (await activeSimJobCount(db)) < capacity.jobCap
+        ) {
+          mirrored = await mirroredRemotePromiseIds(db, settings);
+          if (mirrored.length < capacity.promiseCap) {
+            admitted =
+              (await claimRemoteWork(db, engine, settings)) === "claimed";
+          }
+        }
       }
+    }
+
+    const finalRemoteJobs = await activeRemoteJobs(db);
+    const finalMirrors = await mirroredRemotePromiseIds(db, settings);
+    const finalStatus =
+      finalRemoteJobs.length > 0 || finalMirrors.length > 0
+        ? "solving"
+        : "idle";
+    await heartbeat(
+      settings,
+      finalStatus,
+      finalMirrors.length,
+      await mirroredRemoteActiveAoaCount(db, finalMirrors),
+    );
+
+    if (!allowEngineSubmission) {
+      await setStatus(
+        db,
+        finalStatus,
+        "storage admission is blocked; remote reconciliation continues but no new engine job will be submitted",
+      );
+    } else if (controllerErrors.length) {
+      await setStatus(db, "error", controllerErrors.join("; "));
+    } else {
+      await setStatus(db, finalStatus, null, {
+        ...(admitted ? { remoteSolverLastPromiseAt: new Date() } : {}),
+      });
     }
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));

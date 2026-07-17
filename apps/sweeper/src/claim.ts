@@ -15,6 +15,7 @@ async function claimAoasInTransaction(
   presetRevisionId: string,
   aoas: number[],
   simJobId: string,
+  allowedPromiseId: string | null,
 ): Promise<number[]> {
   await lockPrecalcCells(
     tx,
@@ -39,6 +40,22 @@ async function claimAoasInTransaction(
           AND obligation.revision_id = ${presetRevisionId}
           AND obligation.aoa_deg = ${aoa}
       )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_sweep_promise_points promise_point
+        JOIN sync_sweep_promises promise
+          ON promise.id = promise_point.promise_id
+        WHERE promise_point.airfoil_id = ${airfoilId}
+          AND promise_point.simulation_preset_revision_id = ${presetRevisionId}
+          AND promise_point.aoa_deg = ${aoa}
+          AND promise_point.status = 'active'
+          AND promise.status = 'active'
+          AND promise."expiresAt" > now()
+          AND (
+            ${allowedPromiseId}::uuid IS NULL
+            OR promise_point.promise_id <> ${allowedPromiseId}::uuid
+          )
+      )
       ON CONFLICT (airfoil_id, simulation_preset_revision_id, aoa_deg)
       DO UPDATE SET
         status = 'queued', source = 'queued', sim_job_id = ${simJobId}::uuid,
@@ -57,6 +74,22 @@ async function claimAoasInTransaction(
           WHERE submit_retry.result_id = results.id
             AND submit_retry.state = 'retry_wait'
             AND submit_retry.next_attempt_at > now()
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sync_sweep_promise_points promise_point
+          JOIN sync_sweep_promises promise
+            ON promise.id = promise_point.promise_id
+          WHERE promise_point.airfoil_id = results.airfoil_id
+            AND promise_point.simulation_preset_revision_id = results.simulation_preset_revision_id
+            AND promise_point.aoa_deg = results.aoa_deg
+            AND promise_point.status = 'active'
+            AND promise.status = 'active'
+            AND promise."expiresAt" > now()
+            AND (
+              ${allowedPromiseId}::uuid IS NULL
+              OR promise_point.promise_id <> ${allowedPromiseId}::uuid
+            )
         )
       RETURNING id
     `)) as unknown as Array<{ id: string }>;
@@ -79,7 +112,9 @@ export async function claimAoas(
   presetRevisionId: string,
   aoas: number[],
   simJobId: string,
+  options: { allowedPromiseId?: string | null } = {},
 ): Promise<number[]> {
+  const allowedPromiseId = options.allowedPromiseId ?? null;
   if (typeof db.transaction === "function") {
     return db.transaction((tx) =>
       claimAoasInTransaction(
@@ -89,6 +124,7 @@ export async function claimAoas(
         presetRevisionId,
         aoas,
         simJobId,
+        allowedPromiseId,
       ),
     );
   }
@@ -99,5 +135,6 @@ export async function claimAoas(
     presetRevisionId,
     aoas,
     simJobId,
+    allowedPromiseId,
   );
 }

@@ -599,6 +599,9 @@ export interface ResultIngestSignal {
   revisionId: string | null;
   aoaDeg: number;
   resultId: string;
+  /** Exact immutable generation selected for this campaign handoff. Older
+   *  ingest callers may omit it; remote imports always provide it. */
+  resultAttemptId?: string | null;
   status: string;
   regime?: string | null;
 }
@@ -1195,7 +1198,7 @@ export async function probeCampaignCompletion(
           AND lane_condition.status IN ('active', 'kept')
           AND l.state IN ('awaiting_seed', 'iterating')
       ) AS lanes_open,
-      EXISTS (
+      (EXISTS (
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results live
@@ -1203,7 +1206,28 @@ export async function probeCampaignCompletion(
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
           AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND live.status IN ('queued', 'running', 'pending', 'stale')
-      ) AS in_flight,
+      ) OR EXISTS (
+        -- An external promise is the remote equivalent of a queued/running
+        -- local generation. In particular, a newer accepted-URANS lease may
+        -- still own a cell when an older generation reports a late terminal
+        -- verdict. The older verdict remains evidence, but must not close the
+        -- campaign while the authoritative replacement is still in flight.
+        SELECT 1
+        FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN sync_sweep_promise_points promise_point
+          ON promise_point.airfoil_id = p.airfoil_id
+         AND promise_point.simulation_preset_revision_id = p.revision_id
+         AND promise_point.aoa_deg = p.aoa_deg
+         AND promise_point.status = 'active'
+        JOIN sync_sweep_promises promise
+          ON promise.id = promise_point.promise_id
+         AND promise.status = 'active'
+         AND promise."expiresAt" > now()
+        WHERE p.campaign_id = ${campaignId}
+          AND p.state <> 'released'
+          AND c.status IN ('active', 'kept')
+      )) AS in_flight,
       EXISTS (
         -- Mirrors are NOT filtered out here (unlike the failed COUNTER, which
         -- excludes them): an EXISTS is truth-equivalent either way because a
@@ -1445,7 +1469,8 @@ export async function onResultIngested(
     // condition's "gained evidence" state is derived at read time.
     const direct = (await db.execute(sql`
       UPDATE sim_campaign_points
-      SET state = 'terminal', result_id = ${signal.resultId}, "updatedAt" = now()
+      SET state = 'terminal', result_id = ${signal.resultId},
+          result_attempt_id = ${signal.resultAttemptId ?? null}, "updatedAt" = now()
       WHERE airfoil_id = ${signal.airfoilId} AND revision_id = ${signal.revisionId}
         AND aoa_deg = ${aoa} AND derived_by_symmetry = false AND state = 'requested'
       RETURNING campaign_id, condition_id, airfoil_id
@@ -1457,7 +1482,8 @@ export async function onResultIngested(
     if (aoa > 0) {
       const mirrored = (await db.execute(sql`
         UPDATE sim_campaign_points p
-        SET state = 'terminal', result_id = ${signal.resultId}, "updatedAt" = now()
+        SET state = 'terminal', result_id = ${signal.resultId},
+            result_attempt_id = ${signal.resultAttemptId ?? null}, "updatedAt" = now()
         FROM airfoils a
         WHERE a.id = p.airfoil_id AND a.is_symmetric = true
           AND p.airfoil_id = ${signal.airfoilId} AND p.revision_id = ${signal.revisionId}
@@ -1465,6 +1491,29 @@ export async function onResultIngested(
         RETURNING p.campaign_id, p.condition_id, p.airfoil_id
       `)) as unknown as ProgressKeyRow[];
       affected.push(...mirrored);
+    }
+
+    if (signal.resultAttemptId) {
+      // Exact-generation replay repairs legacy/null links. A terminal point may
+      // advance to a different generation only when that generation is the
+      // canonical selected pointer (for example accepted URANS superseding a
+      // provisional RANS generation). Retained competing/rejected attempts
+      // therefore cannot silently retarget campaign evidence.
+      const relinked = (await db.execute(sql`
+        UPDATE sim_campaign_points p
+        SET result_attempt_id = ${signal.resultAttemptId}, "updatedAt" = now()
+        FROM results canonical
+        WHERE canonical.id = ${signal.resultId}
+          AND p.result_id = canonical.id
+          AND p.state = 'terminal'
+          AND (
+            p.result_attempt_id IS NULL
+            OR p.result_attempt_id = ${signal.resultAttemptId}
+            OR canonical.current_result_attempt_id = ${signal.resultAttemptId}
+          )
+        RETURNING p.campaign_id, p.condition_id, p.airfoil_id
+      `)) as unknown as ProgressKeyRow[];
+      affected.push(...relinked);
     }
 
     // Idempotent re-ingest: rows already linked to this result still need
