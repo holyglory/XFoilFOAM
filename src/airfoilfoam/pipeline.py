@@ -4148,6 +4148,20 @@ def _archive_case_evidence(
                 "continuation_state",
                 manifest_base=evidence_dir,
             )
+        early_stop_marker = post_dir / URANS_EARLY_STOP_MARKER
+        if early_stop_marker.is_file():
+            # This is not mutable process arming.  It is the controller's
+            # immutable certification of the exact retained averaging window
+            # (period, phase window, similarity, drift, and retain_from), and
+            # directly determines the coefficients and quality verdict.
+            _copy_file_preserving_rel(
+                post_dir,
+                early_stop_marker,
+                raw_dir / "transient",
+                entries,
+                "quality_evidence",
+                manifest_base=evidence_dir,
+            )
 
     for log in sorted(set(case_dir.glob("log*")) | set(post_dir.glob("log*"))):
         if log.is_file():
