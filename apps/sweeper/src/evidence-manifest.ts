@@ -2,6 +2,16 @@ import { createHash } from "node:crypto";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 
+function compareUtf8Paths(
+  left: Pick<EvidenceManifestEntry, "path">,
+  right: Pick<EvidenceManifestEntry, "path">,
+): number {
+  return Buffer.compare(
+    Buffer.from(left.path, "utf8"),
+    Buffer.from(right.path, "utf8"),
+  );
+}
+
 export interface EvidenceManifestEntry {
   path: string;
   sha256: string;
@@ -133,9 +143,7 @@ export function manifestMemberSetSha256(
   // Match Python's deterministic Unicode/code-point ordering and the
   // PostgreSQL C-collation trigger. UTF-8 byte order preserves Unicode scalar
   // value order, unlike localeCompare (which is host-locale dependent).
-  for (const entry of [...entries].sort((a, b) =>
-    Buffer.compare(Buffer.from(a.path, "utf8"), Buffer.from(b.path, "utf8")),
-  )) {
+  for (const entry of [...entries].sort(compareUtf8Paths)) {
     hash.update(entry.path);
     hash.update("\0");
     hash.update(entry.sha256);
@@ -150,9 +158,7 @@ export function databaseMemberAssociationsSha256(
   entries: ReadonlyArray<EvidenceManifestEntry & { artifactId: string }>,
 ): string {
   const hash = createHash("sha256");
-  for (const entry of [...entries].sort((a, b) =>
-    a.path.localeCompare(b.path),
-  )) {
+  for (const entry of [...entries].sort(compareUtf8Paths)) {
     hash.update(entry.path);
     hash.update("\0");
     hash.update(entry.artifactId);
