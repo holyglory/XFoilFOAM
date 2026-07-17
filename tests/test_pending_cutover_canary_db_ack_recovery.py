@@ -51,21 +51,25 @@ def _private_json(path: Path, payload: dict) -> None:
     path.chmod(0o600)
 
 
-def test_source_contract_binds_both_manifests_and_exact_changed_hashes(
+def test_source_contract_binds_bound_current_target_and_exact_changed_hashes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     helper = _load_helper()
     bound = tmp_path / "bound"
+    current = tmp_path / "current"
     target = tmp_path / "target"
     bound.mkdir()
     (bound / "a.txt").write_text("bound\n", encoding="utf-8")
+    shutil.copytree(bound, current)
     shutil.copytree(bound, target)
     (target / "b.txt").write_text("reviewed\n", encoding="utf-8")
     manifest_tool = ROOT / "scripts" / "deploy" / "deployment-source-manifest.py"
     model = helper.load_manifest_model(manifest_tool)
     bound_tree, bound_count = model._source_tree(bound)
+    current_tree, current_count = model._source_tree(current)
     target_tree, target_count = model._source_tree(target)
     bound_revision = "1" * 40
+    current_revision = "3" * 40
     target_revision = "2" * 40
     _private_json(
         bound / ".deployment-source.json",
@@ -77,6 +81,16 @@ def test_source_contract_binds_both_manifests_and_exact_changed_hashes(
         },
     )
     (bound / ".deployment-source.json").chmod(0o644)
+    _private_json(
+        current / ".deployment-source.json",
+        {
+            "schemaVersion": 1,
+            "sourceRevision": current_revision,
+            "sourceTreeSha256": current_tree,
+            "fileCount": current_count,
+        },
+    )
+    (current / ".deployment-source.json").chmod(0o644)
     _private_json(
         target / ".deployment-source.json",
         {
@@ -90,6 +104,9 @@ def test_source_contract_binds_both_manifests_and_exact_changed_hashes(
     monkeypatch.setattr(helper, "BOUND_REVISION", bound_revision)
     monkeypatch.setattr(helper, "BOUND_TREE", bound_tree)
     monkeypatch.setattr(helper, "BOUND_COUNT", bound_count)
+    monkeypatch.setattr(helper, "CURRENT_SOURCE_REVISION", current_revision)
+    monkeypatch.setattr(helper, "CURRENT_SOURCE_TREE", current_tree)
+    monkeypatch.setattr(helper, "CURRENT_SOURCE_COUNT", current_count)
     b_sha = _sha(target / "b.txt")
     changeset = hashlib.sha256(
         f"b.txt\tfile\t0\t{b_sha}\n".encode("utf-8")
@@ -98,6 +115,8 @@ def test_source_contract_binds_both_manifests_and_exact_changed_hashes(
         manifest_tool=manifest_tool,
         bound_root=bound,
         bound_manifest=bound / ".deployment-source.json",
+        current_root=current,
+        current_manifest=current / ".deployment-source.json",
         target_root=target,
         target_manifest=target / ".deployment-source.json",
         expected_target_revision=target_revision,
@@ -114,9 +133,19 @@ def test_source_contract_binds_both_manifests_and_exact_changed_hashes(
     (target / "b.txt").write_text("drift\n", encoding="utf-8")
     with pytest.raises(helper.ContractError, match="deployment source does not match"):
         helper.validate_source_contract(args)
+    (target / "b.txt").write_text("reviewed\n", encoding="utf-8")
+    (current / "a.txt").write_text("wrong-r3-source\n", encoding="utf-8")
+    with pytest.raises(helper.ContractError, match="deployment source does not match"):
+        helper.validate_source_contract(args)
 
 
-def _predecessor_payloads(helper, node_path: Path, queue_path: Path, replay_path: Path):
+def _predecessor_payloads(
+    helper,
+    node_path: Path,
+    queue_path: Path,
+    replay_path: Path,
+    retention_path: Path,
+):
     node = {
         "schemaVersion": 1,
         "purpose": "pending-opencfd2606-node-api-timeout-repair",
@@ -141,7 +170,7 @@ def _predecessor_payloads(helper, node_path: Path, queue_path: Path, replay_path
         "runnerSourceRevision": helper.QUEUE_RUNNER_REVISION,
         "runnerSourceTreeSha256": helper.QUEUE_RUNNER_TREE,
         "rebuildScriptSha256": helper.QUEUE_REBUILD_SHA256,
-        "buildId": helper.CURRENT_BUILD_ID,
+        "buildId": helper.PREVIOUS_BUILD_ID,
         "updatedAt": "2026-07-17T02:30:00+00:00",
     }
     _private_json(queue_path, queue)
@@ -157,7 +186,7 @@ def _predecessor_payloads(helper, node_path: Path, queue_path: Path, replay_path
         "boundSourceTreeSha256": helper.BOUND_TREE,
         "replaySourceRevision": helper.SAME_BUILD_REPLAY_REVISION,
         "replaySourceTreeSha256": helper.SAME_BUILD_REPLAY_TREE,
-        "buildId": helper.CURRENT_BUILD_ID,
+        "buildId": helper.PREVIOUS_BUILD_ID,
         "nodeRepairReceiptSha256": helper.NODE_REPAIR_JOURNAL_SHA256,
         "nodeApiImageBefore": helper.SAME_BUILD_REPLAY_NODE_BEFORE,
         "nodeApiImageAfter": helper.SAME_BUILD_REPLAY_NODE_AFTER,
@@ -174,27 +203,83 @@ def _predecessor_payloads(helper, node_path: Path, queue_path: Path, replay_path
         "failedAt": "2026-07-17T03:04:30+00:00",
     }
     _private_json(replay_path, replay)
-    return replay
+    replay_sha = _sha(replay_path)
+    retention = {
+        "schemaVersion": 1,
+        "purpose": "pending-opencfd2606-retention-retry",
+        "status": "failed",
+        "preparedAt": "2026-07-17T03:42:00+00:00",
+        "updatedAt": "2026-07-17T03:49:00+00:00",
+        "completedAt": None,
+        "failureCount": 1,
+        "lastExitCode": 14,
+        "priorFailedReplayJournalSha256": replay_sha,
+        "boundReleaseSourceRevision": helper.BOUND_REVISION,
+        "boundReleaseSourceTreeSha256": helper.BOUND_TREE,
+        "priorReplaySourceRevision": helper.SAME_BUILD_REPLAY_REVISION,
+        "engineSourceRevision": helper.CURRENT_SOURCE_REVISION,
+        "engineSourceTreeSha256": helper.CURRENT_SOURCE_TREE,
+        "engineSourceFileCount": helper.CURRENT_SOURCE_COUNT,
+        "engineApplicationSourceSha256": "5" * 64,
+        "nodeSourceRevision": helper.SAME_BUILD_REPLAY_REVISION,
+        "nodeApiImage": helper.CURRENT_NODE_IMAGE,
+        "nodeApiAdminRoutesSha256": helper.SAME_BUILD_REPLAY_ADMIN_ROUTES_SHA256,
+        "nodeApiAttestationSha256": helper.SAME_BUILD_REPLAY_ATTESTATION_SHA256,
+        "nodeApiContainerBefore": "6" * 64,
+        "nodeApiContainerAfter": "7" * 64,
+        "buildId": helper.CURRENT_BUILD_ID,
+        "action": "rebuild_and_canary",
+        "deploymentEnvironmentBeforeSha256": "8" * 64,
+        "sourceBoundDeploymentEnvironmentSha256": "9" * 64,
+        "promotionEligible": False,
+        "currentDeploymentEnvironmentSha256": "a" * 64,
+        "currentApiImage": helper.CURRENT_API_IMAGE,
+        "currentWorkerImage": helper.CURRENT_WORKER_IMAGE,
+        "currentDatabaseSnapshotSha256": "b" * 64,
+        "currentCanaryReceiptSha256": "absent",
+        "currentCutoverStateKind": "pending-pristine",
+        "currentNodeApiImage": helper.CURRENT_NODE_IMAGE,
+        "currentNodeExpectedBuildId": helper.CURRENT_BUILD_ID,
+    }
+    _private_json(retention_path, retention)
+    helper.RETENTION_RETRY_JOURNAL_SHA256 = _sha(retention_path)
+    return replay, retention
 
 
-def test_predecessor_contract_preserves_all_three_failed_recovery_records(
+def test_predecessor_contract_requires_all_four_failed_recovery_records(
     tmp_path: Path,
 ) -> None:
     helper = _load_helper()
     node = tmp_path / "node.json"
     queue = tmp_path / "queue.json"
     replay = tmp_path / "replay.json"
-    replay_payload = _predecessor_payloads(helper, node, queue, replay)
+    retention = tmp_path / "retention.json"
+    replay_payload, retention_payload = _predecessor_payloads(
+        helper, node, queue, replay, retention
+    )
     replay_sha = _sha(replay)
 
-    result = helper.validate_predecessor_journals(node, queue, replay, replay_sha)
+    result = helper.validate_predecessor_journals(
+        node, queue, replay, retention, replay_sha
+    )
 
     assert result["sameBuildReplayJournalSha256"] == replay_sha
     assert result["sameBuildReplayNodeContainerAfter"] == "4" * 64
+    assert result["retentionRetryJournalSha256"] == _sha(retention)
+    assert result["retentionRetryNodeContainerAfter"] == "7" * 64
+    retention_payload["currentApiImage"] = "sha256:" + "f" * 64
+    _private_json(retention, retention_payload)
+    with pytest.raises(helper.ContractError, match="fourth incident record"):
+        helper.validate_predecessor_journals(node, queue, replay, retention, replay_sha)
+    _private_json(retention, {**retention_payload, "currentApiImage": helper.CURRENT_API_IMAGE})
     replay_payload["status"] = "completed"
     _private_json(replay, replay_payload)
     with pytest.raises(helper.ContractError, match="same-build replay journal differs"):
-        helper.validate_predecessor_journals(node, queue, replay, replay_sha)
+        helper.validate_predecessor_journals(node, queue, replay, retention, replay_sha)
+
+    retention.unlink()
+    with pytest.raises(helper.ContractError, match="required file is missing"):
+        helper.validate_predecessor_journals(node, queue, replay, retention, replay_sha)
 
 
 def _backup_fixture(tmp_path: Path):
@@ -336,7 +421,11 @@ def _runtime_fixture(helper):
     for service in ids:
         identity_environment = {}
         if service in {"api", "worker", "sweeper", "media-repair"}:
-            identity_environment["AIRFOILFOAM_BUILD_ID"] = helper.CURRENT_BUILD_ID
+            identity_environment["AIRFOILFOAM_BUILD_ID"] = (
+                helper.CURRENT_BUILD_ID
+                if service in {"api", "worker"}
+                else helper.PREVIOUS_BUILD_ID
+            )
         if service == "node-api":
             identity_environment["ENGINE_EXPECTED_BUILD_ID"] = helper.CURRENT_BUILD_ID
         mounts = []
@@ -389,6 +478,7 @@ def _runtime_fixture(helper):
         },
         "workerTop": "PID COMMAND\n1 celery worker",
         "poolEnabled": False,
+        "attestationCount": 0,
         "resultsVolume": volume,
     }
     expected = {service: (ids[service], images[service]) for service in ids}
@@ -405,6 +495,16 @@ def test_runtime_contract_detects_image_and_results_volume_drift() -> None:
     ] == volume_sha
     snapshot["services"]["worker"]["imageId"] = "sha256:" + "f" * 64
     with pytest.raises(helper.ContractError, match="runtime service worker"):
+        helper.validate_runtime_snapshot(snapshot, expected, volume_sha)
+    snapshot, expected, volume_sha = _runtime_fixture(helper)
+    snapshot["services"]["api"]["identityEnvironment"][
+        "AIRFOILFOAM_BUILD_ID"
+    ] = helper.PREVIOUS_BUILD_ID
+    with pytest.raises(helper.ContractError, match="exact incident build"):
+        helper.validate_runtime_snapshot(snapshot, expected, volume_sha)
+    snapshot, expected, volume_sha = _runtime_fixture(helper)
+    snapshot["attestationCount"] = 1
+    with pytest.raises(helper.ContractError, match="already has a canary attestation"):
         helper.validate_runtime_snapshot(snapshot, expected, volume_sha)
     snapshot, expected, volume_sha = _runtime_fixture(helper)
     snapshot["resultsVolume"]["CreatedAt"] = "2026-07-17T00:00:00Z"
@@ -441,6 +541,50 @@ def test_rollback_boundary_is_irreversible_after_receipt_or_db_attestation() -> 
         helper.classify_rollback_boundary(attested, False)
         == "post-receipt-rollback-forbidden"
     )
+
+
+def test_final_marker_keeps_current_source_and_requires_exact_r4_build_pair() -> None:
+    helper = _load_helper()
+    target_revision = "d" * 40
+    target_tree = "e" * 64
+    target_build = f"prod-20260717-{target_revision[:12]}-r4"
+    pending = {
+        "OPENCFD2606_CUTOVER_PENDING": "1",
+        "OPENCFD2606_CUTOVER_COMPLETE": "0",
+        "OPENCFD2606_CUTOVER_SOURCE_REVISION": helper.CURRENT_SOURCE_REVISION,
+        "OPENCFD2606_CUTOVER_SOURCE_TREE_SHA256": helper.CURRENT_SOURCE_TREE,
+        "AIRFOILFOAM_BUILD_ID": target_build,
+        "ENGINE_EXPECTED_BUILD_ID": target_build,
+    }
+
+    assert helper.validate_final_marker_state(
+        pending,
+        expected_target_revision=target_revision,
+        expected_target_tree=target_tree,
+        expected_target_build_id=target_build,
+    )["stateKind"] == "pending-current-r3"
+
+    wrong_build = dict(pending, ENGINE_EXPECTED_BUILD_ID=helper.CURRENT_BUILD_ID)
+    with pytest.raises(helper.ContractError, match="target r4 build"):
+        helper.validate_final_marker_state(
+            wrong_build,
+            expected_target_revision=target_revision,
+            expected_target_tree=target_tree,
+            expected_target_build_id=target_build,
+        )
+
+    target_substitution = dict(
+        pending,
+        OPENCFD2606_CUTOVER_SOURCE_REVISION=target_revision,
+        OPENCFD2606_CUTOVER_SOURCE_TREE_SHA256=target_tree,
+    )
+    with pytest.raises(helper.ContractError, match="incorrectly substituted"):
+        helper.validate_final_marker_state(
+            target_substitution,
+            expected_target_revision=target_revision,
+            expected_target_tree=target_tree,
+            expected_target_build_id=target_build,
+        )
 
 
 def test_recovery_journal_is_private_fsynced_and_immutable(tmp_path: Path) -> None:
@@ -556,20 +700,28 @@ def test_wrapper_is_incident_bound_and_never_recreates_or_overwrites_predecessor
     assert "pending-cutover-node-api-repair.json" in wrapper
     assert "pending-cutover-queue-probe-resume.json" in wrapper
     assert "pending-opencfd2606-rebuild-replay.json" in wrapper
+    assert "pending-opencfd2606-retention-retry.json" in wrapper
+    assert 'CURRENT_REVISION="cd0967a1ba4ef82113d6b1eae9e38f0a7baec3a2"' in wrapper
+    assert 'CURRENT_BUILD_ID="prod-20260717-cd0967a1ba4e-r3"' in wrapper
     assert "EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256" in wrapper
     assert "EXPECTED_TARGET_BACKUP_HOOK_SHA256" in wrapper
     assert "EXPECTED_POSTGRES_BACKUP_TOOL_SHA256" in wrapper
     assert "scripts/deploy/create-verified-canary-postgres-backup.sh" in wrapper
     hook_call = wrapper.rindex('\n    "$backup_and_copy_hook"\n')
     assert wrapper.index("flock -n 9") < wrapper.index("source_contract=")
-    assert wrapper.index("flock -n 9") < wrapper.index("compose_bound stop media-repair")
-    assert wrapper.index("compose_bound stop media-repair") < hook_call
+    assert wrapper.index("flock -n 9") < wrapper.index("compose_current stop media-repair")
+    assert wrapper.index("compose_current stop media-repair") < hook_call
     assert "Fresh backup hook refuses a preexisting artifact" not in wrapper
     assert wrapper.index('if [[ "$media_status" == "stopped-for-backup" ]]') < hook_call
     assert hook_call < wrapper.index('"$contract_helper" backup')
     assert "DEPLOY_LOCK_HELD=1" in wrapper
     assert 'COMPOSE_PROJECT_DIRECTORY="$staging_real"' in wrapper
-    assert 'DEPLOYMENT_MANIFEST_FILE="$app_real/.deployment-source.json"' in wrapper
+    assert 'APP_DIR="$current_real"' in wrapper
+    assert 'DEPLOYMENT_MANIFEST_FILE="$current_real/.deployment-source.json"' in wrapper
+    assert 'DEPLOY_SOURCE_REVISION="$CURRENT_REVISION"' in wrapper
+    assert 'DEPLOY_SOURCE_TREE_SHA256="$CURRENT_TREE"' in wrapper
+    assert 'DEPLOY_SOURCE_REVISION="$EXPECTED_TARGET_SOURCE_REVISION"' not in wrapper
+    assert '--current-root "$current_real"' in wrapper
     assert "force-recreate" not in wrapper
     assert "compose_target up" not in wrapper
     assert 'compose_target stop sweeper' in wrapper
@@ -591,7 +743,7 @@ def test_rollback_images_get_collision_safe_target_bound_tags_before_rebuild() -
     tag_call = wrapper.index('docker image tag "$image_id" "$rollback_tag"')
     rebuild_call = wrapper.index('"$rebuild_script" "$BUILD_ID"')
 
-    assert "airfoils-pro-rollback-{service}:r2-" in wrapper
+    assert "airfoils-pro-rollback-{service}:r3-to-r4-" in wrapper
     assert "source['targetSourceRevision'][:12]" in wrapper
     assert "source['sourceChangeSha256'][:12]" in wrapper
     assert "Rollback tag collision" in wrapper

@@ -66,10 +66,11 @@
   immutable preliminary registration, authenticated cleanup, four per-point
   database proofs, crash-safe replay, and a final attestation that cannot be
   created from an incomplete or unrelated proof set. The repair is integrated
-  with the incident-bound staged deployment runner. Re-inventory and bind the
-  latest failed same-build replay journal and all six current container/image
-  identities, stop the running media-repair writer under the inherited
-  deployment lock, create and strongly restore-test a
+  with the incident-bound staged deployment runner. Bind the original release,
+  the exact cd0967 current source, the reviewed r4
+  successor, all four immutable failed recovery journals, and all six current
+  container/image identities; stop the running media-repair writer under the
+  inherited deployment lock, create and strongly restore-test a
   fresh or exactly resumed PostgreSQL backup plus independently
   generation-verified immutable dump and manifest copies in GCS, and preserve
   collision-checked rollback image tags before any build. Verify migration

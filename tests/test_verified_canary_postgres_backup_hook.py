@@ -253,7 +253,7 @@ def hook_env(tmp_path: Path) -> dict[str, str]:
         json.dumps(
             {
                 "schemaVersion": 1,
-                "purpose": "pending-opencfd2606-canary-db-ack-media-quiesce",
+                "purpose": "pending-opencfd2606-canary-db-ack-r4-media-quiesce",
                 "status": "stopped-for-backup",
                 "stoppedAt": datetime.now(timezone.utc).isoformat(),
             }

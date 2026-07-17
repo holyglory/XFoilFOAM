@@ -76,7 +76,7 @@ payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 if (
     payload.get("schemaVersion") != 1
     or payload.get("purpose")
-    != "pending-opencfd2606-canary-db-ack-media-quiesce"
+    != "pending-opencfd2606-canary-db-ack-r4-media-quiesce"
     or payload.get("status") != "stopped-for-backup"
     or not payload.get("stoppedAt")
 ):

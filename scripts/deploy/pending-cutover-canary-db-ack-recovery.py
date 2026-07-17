@@ -44,7 +44,15 @@ SAME_BUILD_REPLAY_DATABASE_SHA256 = "8421c15692afc6e36a834e481734411db61ecf18a95
 SAME_BUILD_REPLAY_ENV_SHA256 = "c4ff073a4ee698a02cdc70f535f930c93898b69e5f382bf6ac05f965b840acad"
 SAME_BUILD_REPLAY_ADMIN_ROUTES_SHA256 = "e3e1782f0517ea29e451fd89661a1a54f982673cd62ad5502e5d45eaaa6a94f4"
 SAME_BUILD_REPLAY_ATTESTATION_SHA256 = "928986cd328e7af647cefe7c241ed1a5ce9a6446907061055a28f28392c0944e"
-CURRENT_BUILD_ID = "prod-20260717-63385777be73-r2"
+RETENTION_RETRY_JOURNAL_SHA256 = "b99ca862100542593f7d8fc24dd47b9d62eb3e4d657dbc1c1590ce6c90050224"
+CURRENT_SOURCE_REVISION = "cd0967a1ba4ef82113d6b1eae9e38f0a7baec3a2"
+CURRENT_SOURCE_TREE = "1a7cadf8a0981c3894ced26458cdf373a428e28592070fc7f81cc873b2a9af1f"
+CURRENT_SOURCE_COUNT = 2204
+PREVIOUS_BUILD_ID = "prod-20260717-63385777be73-r2"
+CURRENT_BUILD_ID = "prod-20260717-cd0967a1ba4e-r3"
+CURRENT_API_IMAGE = "sha256:236cb522879087a412103b3dceb1ef83fa7964e5c628497dbeb251c60d5cca98"
+CURRENT_WORKER_IMAGE = "sha256:2705edcca4d60c0fc81f7cab0635d582e14cdc08a8ce97e7d78a89857451dccc"
+CURRENT_NODE_IMAGE = "sha256:89069188e2e57cad231dcf3527eaba2e5151b0886921eac4f720d589d09e66af"
 POOL_ID = "3f8bc764-09ae-4ff3-8fd2-260600000001"
 RESULTS_VOLUME = "app_results"
 SHA_RE = re.compile(r"[0-9a-f]{64}")
@@ -181,14 +189,18 @@ def parse_expected_hashes(values: list[str]) -> dict[str, str]:
 
 def validate_source_contract(args: argparse.Namespace) -> dict[str, Any]:
     bound_root = args.bound_root.resolve(strict=True)
+    current_root = args.current_root.resolve(strict=True)
     target_root = args.target_root.resolve(strict=True)
-    if bound_root == target_root:
-        fail("bound and target source directories must be distinct")
+    if len({bound_root, current_root, target_root}) != 3:
+        fail("bound, current, and target source directories must be distinct")
     model = load_manifest_model(args.manifest_tool)
     bound = verify_manifest(model, bound_root, args.bound_manifest)
+    current = verify_manifest(model, current_root, args.current_manifest)
     target = verify_manifest(model, target_root, args.target_manifest)
     if bound != (BOUND_REVISION, BOUND_TREE, BOUND_COUNT):
         fail("bound production source differs from the incident tuple")
+    if current != (CURRENT_SOURCE_REVISION, CURRENT_SOURCE_TREE, CURRENT_SOURCE_COUNT):
+        fail("current r3 source differs from the exact retention-retry tuple")
     expected_target = (
         args.expected_target_revision,
         args.expected_target_tree,
@@ -235,6 +247,9 @@ def validate_source_contract(args: argparse.Namespace) -> dict[str, Any]:
         "boundSourceRevision": bound[0],
         "boundSourceTreeSha256": bound[1],
         "boundSourceFileCount": bound[2],
+        "currentSourceRevision": current[0],
+        "currentSourceTreeSha256": current[1],
+        "currentSourceFileCount": current[2],
         "targetSourceRevision": target[0],
         "targetSourceTreeSha256": target[1],
         "targetSourceFileCount": target[2],
@@ -248,20 +263,25 @@ def validate_predecessor_journals(
     node_path: Path,
     queue_path: Path,
     same_build_path: Path,
+    retention_path: Path,
     expected_same_build_sha256: str,
 ) -> dict[str, Any]:
     require_regular(node_path, mode=0o600)
     require_regular(queue_path, mode=0o600)
     require_regular(same_build_path, mode=0o600)
+    require_regular(retention_path, mode=0o600)
     if sha256_file(node_path) != NODE_REPAIR_JOURNAL_SHA256:
         fail("applied Node repair journal bytes differ from the incident record")
     if sha256_file(queue_path) != QUEUE_REPAIR_JOURNAL_SHA256:
         fail("failed queue-probe journal bytes differ from the incident record")
     if sha256_file(same_build_path) != expected_same_build_sha256:
         fail("failed same-build replay journal differs from its live preflight digest")
+    if sha256_file(retention_path) != RETENTION_RETRY_JOURNAL_SHA256:
+        fail("failed retention-retry journal differs from the fourth incident record")
     node = load_json(node_path)
     queue = load_json(queue_path)
     same_build = load_json(same_build_path)
+    retention = load_json(retention_path)
     require_fields(
         node,
         {
@@ -295,7 +315,7 @@ def validate_predecessor_journals(
             "runnerSourceRevision": QUEUE_RUNNER_REVISION,
             "runnerSourceTreeSha256": QUEUE_RUNNER_TREE,
             "rebuildScriptSha256": QUEUE_REBUILD_SHA256,
-            "buildId": CURRENT_BUILD_ID,
+            "buildId": PREVIOUS_BUILD_ID,
         },
         "failed queue-probe journal",
     )
@@ -315,7 +335,7 @@ def validate_predecessor_journals(
             "boundSourceTreeSha256": BOUND_TREE,
             "replaySourceRevision": SAME_BUILD_REPLAY_REVISION,
             "replaySourceTreeSha256": SAME_BUILD_REPLAY_TREE,
-            "buildId": CURRENT_BUILD_ID,
+            "buildId": PREVIOUS_BUILD_ID,
             "nodeRepairReceiptSha256": NODE_REPAIR_JOURNAL_SHA256,
             "nodeApiImageBefore": SAME_BUILD_REPLAY_NODE_BEFORE,
             "nodeApiImageAfter": SAME_BUILD_REPLAY_NODE_AFTER,
@@ -341,19 +361,92 @@ def validate_predecessor_journals(
         replay_node_container
     ) is None:
         fail("failed same-build replay journal lacks its exact Node container")
+
+    retention_expected = {
+        "schemaVersion": 1,
+        "purpose": "pending-opencfd2606-retention-retry",
+        "status": "failed",
+        "completedAt": None,
+        "failureCount": 1,
+        "lastExitCode": 14,
+        "priorFailedReplayJournalSha256": expected_same_build_sha256,
+        "boundReleaseSourceRevision": BOUND_REVISION,
+        "boundReleaseSourceTreeSha256": BOUND_TREE,
+        "priorReplaySourceRevision": SAME_BUILD_REPLAY_REVISION,
+        "engineSourceRevision": CURRENT_SOURCE_REVISION,
+        "engineSourceTreeSha256": CURRENT_SOURCE_TREE,
+        "engineSourceFileCount": CURRENT_SOURCE_COUNT,
+        "nodeSourceRevision": SAME_BUILD_REPLAY_REVISION,
+        "nodeApiImage": CURRENT_NODE_IMAGE,
+        "nodeApiAdminRoutesSha256": SAME_BUILD_REPLAY_ADMIN_ROUTES_SHA256,
+        "nodeApiAttestationSha256": SAME_BUILD_REPLAY_ATTESTATION_SHA256,
+        "buildId": CURRENT_BUILD_ID,
+        "action": "rebuild_and_canary",
+        "promotionEligible": False,
+        "currentApiImage": CURRENT_API_IMAGE,
+        "currentWorkerImage": CURRENT_WORKER_IMAGE,
+        "currentCanaryReceiptSha256": "absent",
+        "currentCutoverStateKind": "pending-pristine",
+        "currentNodeApiImage": CURRENT_NODE_IMAGE,
+        "currentNodeExpectedBuildId": CURRENT_BUILD_ID,
+    }
+    require_fields(retention, retention_expected, "failed retention-retry journal")
+    expected_retention_fields = set(retention_expected) | {
+        "preparedAt",
+        "updatedAt",
+        "engineApplicationSourceSha256",
+        "nodeApiContainerBefore",
+        "nodeApiContainerAfter",
+        "deploymentEnvironmentBeforeSha256",
+        "sourceBoundDeploymentEnvironmentSha256",
+        "currentDeploymentEnvironmentSha256",
+        "currentDatabaseSnapshotSha256",
+    }
+    if set(retention) != expected_retention_fields:
+        fail("failed retention-retry journal has unexpected or omitted fields")
+    retention_prepared = parse_timestamp(
+        retention.get("preparedAt"), "retention retry preparedAt"
+    )
+    retention_updated = parse_timestamp(
+        retention.get("updatedAt"), "retention retry updatedAt"
+    )
+    if retention_prepared < same_build_failed_at or retention_updated < retention_prepared:
+        fail("failed retention-retry journal chronology is invalid")
+    for key in (
+        "engineApplicationSourceSha256",
+        "deploymentEnvironmentBeforeSha256",
+        "sourceBoundDeploymentEnvironmentSha256",
+        "currentDeploymentEnvironmentSha256",
+        "currentDatabaseSnapshotSha256",
+    ):
+        if not isinstance(retention.get(key), str) or SHA_RE.fullmatch(retention[key]) is None:
+            fail(f"failed retention-retry journal has invalid {key}")
+    for key in ("nodeApiContainerBefore", "nodeApiContainerAfter"):
+        if not isinstance(retention.get(key), str) or CONTAINER_RE.fullmatch(
+            retention[key]
+        ) is None:
+            fail(f"failed retention-retry journal has invalid {key}")
     return {
         "schemaVersion": 1,
         "nodeRepairJournalSha256": sha256_file(node_path),
         "queueRepairJournalSha256": sha256_file(queue_path),
         "sameBuildReplayJournalSha256": sha256_file(same_build_path),
+        "retentionRetryJournalSha256": sha256_file(retention_path),
         "nodeRepairAppliedAt": applied_at.isoformat(),
         "queueRepairUpdatedAt": queue_updated.isoformat(),
         "sameBuildReplayFailedAt": same_build_failed_at.isoformat(),
-        "latestPredecessorAt": same_build_failed_at.isoformat(),
+        "retentionRetryPreparedAt": retention_prepared.isoformat(),
+        "retentionRetryUpdatedAt": retention_updated.isoformat(),
+        "latestPredecessorAt": retention_updated.isoformat(),
         "sameBuildReplayNodeContainerAfter": replay_node_container,
         "sameBuildReplayNodeImageAfter": same_build["nodeApiImageAfter"],
         "sameBuildReplayApiImage": same_build["currentApiImage"],
         "sameBuildReplayWorkerImage": same_build["currentWorkerImage"],
+        "retentionRetryNodeContainerAfter": retention["nodeApiContainerAfter"],
+        "retentionRetryNodeImage": retention["currentNodeApiImage"],
+        "retentionRetryApiImage": retention["currentApiImage"],
+        "retentionRetryWorkerImage": retention["currentWorkerImage"],
+        "retentionRetryDatabaseSha256": retention["currentDatabaseSnapshotSha256"],
     }
 
 
@@ -632,14 +725,17 @@ def validate_runtime_snapshot(
             f"runtime service {service}",
         )
         environment = actual.get("identityEnvironment") or {}
+        expected_service_build = (
+            CURRENT_BUILD_ID if service in {"api", "worker"} else PREVIOUS_BUILD_ID
+        )
         if service in {"api", "worker", "sweeper", "media-repair"} and environment.get(
             "AIRFOILFOAM_BUILD_ID"
-        ) != CURRENT_BUILD_ID:
-            fail(f"runtime service {service} does not carry the exact r2 build")
+        ) != expected_service_build:
+            fail(f"runtime service {service} does not carry its exact incident build")
         if service == "node-api" and environment.get(
             "ENGINE_EXPECTED_BUILD_ID"
         ) != CURRENT_BUILD_ID:
-            fail("runtime Node API does not carry the exact r2 engine expectation")
+            fail("runtime Node API does not carry the exact r3 engine expectation")
 
     for service, expected_rw in (
         ("api", True),
@@ -662,7 +758,7 @@ def validate_runtime_snapshot(
 
     health = snapshot.get("health")
     if not isinstance(health, dict) or health.get("build_id") != CURRENT_BUILD_ID:
-        fail("runtime engine health does not report the exact r2 build")
+        fail("runtime engine health does not report the exact r3 build")
     engine = health.get("default_engine")
     if not isinstance(engine, dict) or engine.get("version") != "2606":
         fail("runtime engine health does not report OpenCFD 2606")
@@ -696,6 +792,8 @@ def validate_runtime_snapshot(
         fail("runtime worker still has an OpenFOAM process")
     if snapshot.get("poolEnabled") is not False:
         fail("OpenCFD 2606 execution pool is not fail-safe disabled")
+    if snapshot.get("attestationCount") != 0:
+        fail("r3 incident runtime already has a canary attestation")
 
     volume = snapshot.get("resultsVolume")
     if not isinstance(volume, dict):
@@ -839,7 +937,7 @@ def capture_runtime_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     with urlopen("http://127.0.0.1:8000/queue", timeout=15) as response:
         queue = json.load(response)
     worker_top = command(["docker", "top", expected["worker"][0], "-eo", "pid,args"])
-    pool_value = command(
+    database_state_raw = command(
         compose
         + [
             "exec",
@@ -847,13 +945,21 @@ def capture_runtime_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             "postgres",
             "sh",
             "-ec",
-            "psql -X -A -t -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -c \"SELECT enabled::text FROM solver_execution_pools WHERE id = '$1'::uuid\"",
+            "psql -X -A -t -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -c \"SELECT json_build_object('poolEnabled', enabled, 'attestationCount', (SELECT count(*) FROM solver_engine_canary_attestations))::text FROM solver_execution_pools WHERE id = '$1'::uuid\"",
             "sh",
             POOL_ID,
         ]
     ).strip()
-    if pool_value not in {"true", "false"}:
-        fail("execution-pool database probe returned an invalid value")
+    try:
+        database_state = json.loads(database_state_raw)
+    except json.JSONDecodeError as exc:
+        raise ContractError("execution-pool database probe returned invalid JSON") from exc
+    if (
+        not isinstance(database_state, dict)
+        or type(database_state.get("poolEnabled")) is not bool
+        or type(database_state.get("attestationCount")) is not int
+    ):
+        fail("execution-pool database probe returned an invalid shape")
     snapshot = {
         "schemaVersion": 1,
         "stage": args.stage,
@@ -862,7 +968,8 @@ def capture_runtime_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "health": health,
         "queue": queue,
         "workerTop": worker_top,
-        "poolEnabled": pool_value == "true",
+        "poolEnabled": database_state["poolEnabled"],
+        "attestationCount": database_state["attestationCount"],
         "resultsVolume": volume_payload[0],
     }
     return validate_runtime_snapshot(
@@ -892,7 +999,7 @@ def persist_media_quiesce_journal(
         if (
             payload.get("schemaVersion") != 1
             or payload.get("purpose")
-            != "pending-opencfd2606-canary-db-ack-media-quiesce"
+            != "pending-opencfd2606-canary-db-ack-r4-media-quiesce"
             or payload.get("identity") != identity
         ):
             fail("existing media-quiesce journal identity changed")
@@ -910,7 +1017,7 @@ def persist_media_quiesce_journal(
             fail("media-quiesce journal must begin in prepared state")
         payload = {
             "schemaVersion": 1,
-            "purpose": "pending-opencfd2606-canary-db-ack-media-quiesce",
+            "purpose": "pending-opencfd2606-canary-db-ack-r4-media-quiesce",
             "createdAt": now,
             "identity": identity,
         }
@@ -971,6 +1078,46 @@ def classify_rollback_boundary(state: dict[str, Any], receipt_exists: bool) -> s
     return "unknown-rollback-forbidden"
 
 
+def validate_final_marker_state(
+    state: dict[str, Any],
+    *,
+    expected_target_revision: str,
+    expected_target_tree: str,
+    expected_target_build_id: str,
+) -> dict[str, Any]:
+    build_pair = (
+        state.get("AIRFOILFOAM_BUILD_ID"),
+        state.get("ENGINE_EXPECTED_BUILD_ID"),
+    )
+    if build_pair != (expected_target_build_id, expected_target_build_id):
+        fail("final deployment build-id pair is not the exact target r4 build")
+    pending = state.get("OPENCFD2606_CUTOVER_PENDING")
+    complete = state.get("OPENCFD2606_CUTOVER_COMPLETE")
+    source = (
+        state.get("OPENCFD2606_CUTOVER_SOURCE_REVISION"),
+        state.get("OPENCFD2606_CUTOVER_SOURCE_TREE_SHA256"),
+    )
+    if source == (expected_target_revision, expected_target_tree):
+        fail("target r4 source was incorrectly substituted into the live cutover marker")
+    if pending == "1":
+        if complete != "0" or source != (CURRENT_SOURCE_REVISION, CURRENT_SOURCE_TREE):
+            fail("pending cutover marker lost its exact cd0967 r3 source binding")
+        state_kind = "pending-current-r3"
+    elif pending == "0":
+        if complete != "1" or source != ("", ""):
+            fail("terminal cutover marker did not clear its source binding exactly")
+        state_kind = "terminal-cleared"
+    else:
+        fail("cutover marker has an invalid pending state")
+    return {
+        "schemaVersion": 1,
+        "stateKind": state_kind,
+        "buildId": expected_target_build_id,
+        "sourceRevision": source[0],
+        "sourceTreeSha256": source[1],
+    }
+
+
 def persist_recovery_journal(
     path: Path,
     identity: dict[str, Any],
@@ -994,7 +1141,11 @@ def persist_recovery_journal(
     if os.path.lexists(path):
         require_regular(path, mode=0o600)
         payload = load_json(path)
-        if payload.get("schemaVersion") != 1 or payload.get("purpose") != "pending-opencfd2606-canary-db-ack-recovery":
+        if (
+            payload.get("schemaVersion") != 1
+            or payload.get("purpose")
+            != "pending-opencfd2606-canary-db-ack-r4-recovery"
+        ):
             fail("existing recovery journal has an unexpected identity")
         if payload.get("identity") != identity:
             fail("existing recovery journal immutable identity changed")
@@ -1006,7 +1157,7 @@ def persist_recovery_journal(
     else:
         payload = {
             "schemaVersion": 1,
-            "purpose": "pending-opencfd2606-canary-db-ack-recovery",
+            "purpose": "pending-opencfd2606-canary-db-ack-r4-recovery",
             "createdAt": now,
             "identity": identity,
             "events": [],
@@ -1067,6 +1218,8 @@ def parser() -> argparse.ArgumentParser:
     source.add_argument("--manifest-tool", type=Path, required=True)
     source.add_argument("--bound-root", type=Path, required=True)
     source.add_argument("--bound-manifest", type=Path, required=True)
+    source.add_argument("--current-root", type=Path, required=True)
+    source.add_argument("--current-manifest", type=Path, required=True)
     source.add_argument("--target-root", type=Path, required=True)
     source.add_argument("--target-manifest", type=Path, required=True)
     source.add_argument("--expected-target-revision", required=True)
@@ -1079,6 +1232,7 @@ def parser() -> argparse.ArgumentParser:
     predecessor.add_argument("--node-journal", type=Path, required=True)
     predecessor.add_argument("--queue-journal", type=Path, required=True)
     predecessor.add_argument("--same-build-journal", type=Path, required=True)
+    predecessor.add_argument("--retention-journal", type=Path, required=True)
     predecessor.add_argument("--expected-same-build-journal-sha256", required=True)
 
     backup = sub.add_parser("backup")
@@ -1105,6 +1259,12 @@ def parser() -> argparse.ArgumentParser:
     boundary = sub.add_parser("boundary")
     boundary.add_argument("--state-json", type=Path, required=True)
     boundary.add_argument("--receipt-exists", choices=("true", "false"), required=True)
+
+    marker = sub.add_parser("marker")
+    marker.add_argument("--state-json", type=Path, required=True)
+    marker.add_argument("--expected-target-revision", required=True)
+    marker.add_argument("--expected-target-tree", required=True)
+    marker.add_argument("--expected-target-build-id", required=True)
 
     media = sub.add_parser("media-quiesce")
     media.add_argument("--path", type=Path, required=True)
@@ -1146,6 +1306,7 @@ def main() -> int:
             args.node_journal,
             args.queue_journal,
             args.same_build_journal,
+            args.retention_journal,
             args.expected_same_build_journal_sha256,
         )
     elif args.command == "backup":
@@ -1183,6 +1344,17 @@ def main() -> int:
                 load_json(args.state_json), args.receipt_exists == "true"
             )
         }
+    elif args.command == "marker":
+        if REVISION_RE.fullmatch(args.expected_target_revision) is None:
+            fail("invalid target revision for final marker validation")
+        if SHA_RE.fullmatch(args.expected_target_tree) is None:
+            fail("invalid target tree for final marker validation")
+        result = validate_final_marker_state(
+            load_json(args.state_json),
+            expected_target_revision=args.expected_target_revision,
+            expected_target_tree=args.expected_target_tree,
+            expected_target_build_id=args.expected_target_build_id,
+        )
     elif args.command == "media-quiesce":
         if SHA_RE.fullmatch(args.runtime_snapshot_sha256) is None:
             fail("invalid media-quiesce runtime snapshot SHA-256")

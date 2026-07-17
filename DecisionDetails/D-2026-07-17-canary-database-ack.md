@@ -74,6 +74,16 @@ ambiguous marker state forbids image rollback and retains the exact database
 replay state. `media-repair` is recreated and returned to its initial running
 state only on the terminal successful path; every failure leaves it stopped.
 
+After the later retention retry created the cd0967 r3 engine runtime and then
+failed before any receipt or attestation, recovery uses three independent
+source identities. The sealed 6338577 release remains the comparison baseline;
+the exact cd0967 release owns the live r3 runtime and pending marker; and the
+reviewed successor supplies r4 scripts and Compose build context. The delegated
+rebuild therefore verifies `APP_DIR` against cd0967, not against the successor,
+and keeps that marker tuple until continuation clears it, while the recreated
+containers must carry the exact successor-bound r4 build-ID pair. The fourth
+immutable retention journal is required alongside all earlier repair records.
+
 The database safety hook is itself part of the manifested target source. A
 retry while the media writer remains `stopped-for-backup` reconciles rather
 than rejects durable partial publication: exact strongly verified local bytes
@@ -118,7 +128,10 @@ Migration verification also proves 0072 refuses to invent registrations for
 historical immutable attestations. Backup fault-injection coverage interrupts
 local publication, dump upload, manifest upload, and receipt publication in
 turn, then proves exact replay, generation conservation, collision refusal,
-and preservation of every quarantined byte.
+and preservation of every quarantined byte. Source/runtime tests also reject a
+missing or changed fourth journal, any non-cd0967 current release, the wrong r3
+container/runtime tuple, successor-source marker substitution, and mismatched
+final r4 build IDs.
 
 Production remains incomplete until migration 0072, the matching Node
 control-plane services, and the matching Python gateway/worker are deployed

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Incident-specific recovery for the third 2026-07-17 OpenCFD 2606 cutover
-# attempt.  The production APP_DIR remains bound to the original 6338577
-# source while one explicitly reviewed staging tree supplies the Compose build
-# context, canary, migration, verifier, and rebuild runner.  Every mutable
-# transition is delegated to rebuild-engine.sh under inherited descriptor 9.
+# Incident-specific r4 recovery after the failed 2026-07-17 retention retry.
+# APP_DIR remains the sealed 6338577 production symlink, CURRENT_SOURCE_DIR is
+# the exact cd0967 r3 release that owns the live marker/runtime, and STAGING_DIR
+# is the reviewed r4 successor supplying Compose build context and runners.
 set -Eeuo pipefail
 umask 077
 
 STAGING_DIR="${STAGING_DIR:?STAGING_DIR is required}"
+CURRENT_SOURCE_DIR="${CURRENT_SOURCE_DIR:?CURRENT_SOURCE_DIR is required}"
 BUILD_ID="${BUILD_ID:?BUILD_ID is required}"
 APP_DIR="${APP_DIR:-/opt/airfoils-pro/app}"
 AIRFOILS_PRO_STATE_DIR="${AIRFOILS_PRO_STATE_DIR:-/opt/airfoils-pro/state}"
@@ -57,13 +57,26 @@ DEPLOY_LOCK_HELD="${DEPLOY_LOCK_HELD:-0}"
 BOUND_REVISION="63385777be7323777906fde44bdb9fa9b5cc0d6d"
 BOUND_TREE="52c8bd3aa6d5a05dcd70a90d8896fb771f7fc36d129e698be0c935680e3fff36"
 BOUND_COUNT="2198"
-CURRENT_BUILD_ID="prod-20260717-63385777be73-r2"
+CURRENT_REVISION="cd0967a1ba4ef82113d6b1eae9e38f0a7baec3a2"
+CURRENT_TREE="1a7cadf8a0981c3894ced26458cdf373a428e28592070fc7f81cc873b2a9af1f"
+CURRENT_COUNT="2204"
+CURRENT_BUILD_ID="prod-20260717-cd0967a1ba4e-r3"
+CURRENT_API_CONTAINER_ID="8c09f2cf019c568b459fcdb7af595a5e13ad8c59f0ed55ff58f34bb506b848a5"
+CURRENT_WORKER_CONTAINER_ID="41ae0007b8c19f0d29616d7304b86a38f23346b3940a5178f565dfe2b9ff931f"
+CURRENT_NODE_CONTAINER_ID="23f5f7b9ed07eea74f7eca57247fd9cf03ebf9c179620f3fc3e628be806b2016"
+CURRENT_SWEEPER_CONTAINER_ID="3826d16a6b7f40aea3518bee6b1e36ee8721ec48c3cf284e7269f30e44fcdd7e"
+CURRENT_MEDIA_CONTAINER_ID="5c3fb047e7e67fddbeb79163576035c6b53821f69e7950df7ee2511130eedb42"
+CURRENT_POSTGRES_CONTAINER_ID="11bdf1c7443dbe16f5c974be430d8c9624a6819b7e322103f75230944aba1f1d"
+CURRENT_API_IMAGE_ID="sha256:236cb522879087a412103b3dceb1ef83fa7964e5c628497dbeb251c60d5cca98"
+CURRENT_WORKER_IMAGE_ID="sha256:2705edcca4d60c0fc81f7cab0635d582e14cdc08a8ce97e7d78a89857451dccc"
+CURRENT_NODE_IMAGE_ID="sha256:89069188e2e57cad231dcf3527eaba2e5151b0886921eac4f720d589d09e66af"
 POOL_ID="3f8bc764-09ae-4ff3-8fd2-260600000001"
 NODE_REPAIR_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-cutover-node-api-repair.json"
 QUEUE_REPAIR_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-cutover-queue-probe-resume.json"
 SAME_BUILD_REPLAY_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-opencfd2606-rebuild-replay.json"
-RECOVERY_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-cutover-canary-db-ack-recovery.json"
-MEDIA_QUIESCE_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-cutover-canary-db-ack-media-quiesce.json"
+RETENTION_RETRY_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-opencfd2606-retention-retry.json"
+RECOVERY_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-cutover-canary-db-ack-r4-recovery.json"
+MEDIA_QUIESCE_JOURNAL="$AIRFOILS_PRO_STATE_DIR/pending-cutover-canary-db-ack-r4-media-quiesce.json"
 CANARY_RECEIPT="$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json"
 
 fail() {
@@ -88,7 +101,7 @@ for value in \
 done
 [[ "$EXPECTED_TARGET_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail "Target revision must be an exact lowercase commit SHA." 2
 [[ "$EXPECTED_TARGET_SOURCE_FILE_COUNT" =~ ^[1-9][0-9]*$ ]] || fail "Target source file count must be a positive integer." 2
-[[ "$BUILD_ID" =~ ^[A-Za-z0-9._-]+$ && "$BUILD_ID" != "$CURRENT_BUILD_ID" ]] || fail "BUILD_ID must be a new safe identifier." 2
+[[ "$BUILD_ID" == "prod-20260717-${EXPECTED_TARGET_SOURCE_REVISION:0:12}-r4" ]] || fail "BUILD_ID must be the exact target-bound r4 identifier." 2
 for value in \
   "$EXPECTED_CURRENT_API_CONTAINER_ID" "$EXPECTED_CURRENT_WORKER_CONTAINER_ID" \
   "$EXPECTED_CURRENT_NODE_API_CONTAINER_ID" "$EXPECTED_CURRENT_SWEEPER_CONTAINER_ID" \
@@ -96,6 +109,17 @@ for value in \
   "$EXPECTED_CURRENT_POSTGRES_CONTAINER_ID"; do
   [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "Current container identities must be full 64-character IDs." 2
 done
+[[ "$EXPECTED_CURRENT_API_CONTAINER_ID" == "$CURRENT_API_CONTAINER_ID" \
+  && "$EXPECTED_CURRENT_WORKER_CONTAINER_ID" == "$CURRENT_WORKER_CONTAINER_ID" \
+  && "$EXPECTED_CURRENT_NODE_API_CONTAINER_ID" == "$CURRENT_NODE_CONTAINER_ID" \
+  && "$EXPECTED_CURRENT_SWEEPER_CONTAINER_ID" == "$CURRENT_SWEEPER_CONTAINER_ID" \
+  && "$EXPECTED_CURRENT_MEDIA_REPAIR_CONTAINER_ID" == "$CURRENT_MEDIA_CONTAINER_ID" \
+  && "$EXPECTED_CURRENT_POSTGRES_CONTAINER_ID" == "$CURRENT_POSTGRES_CONTAINER_ID" ]] \
+  || fail "Current container identities differ from the failed r3 retention journal inventory."
+[[ "$EXPECTED_CURRENT_API_IMAGE_ID" == "$CURRENT_API_IMAGE_ID" \
+  && "$EXPECTED_CURRENT_WORKER_IMAGE_ID" == "$CURRENT_WORKER_IMAGE_ID" \
+  && "$EXPECTED_CURRENT_NODE_API_IMAGE_ID" == "$CURRENT_NODE_IMAGE_ID" ]] \
+  || fail "Current API/worker/Node images differ from the failed r3 retention runtime."
 for value in \
   "$EXPECTED_CURRENT_API_IMAGE_ID" "$EXPECTED_CURRENT_WORKER_IMAGE_ID" \
   "$EXPECTED_CURRENT_NODE_API_IMAGE_ID" "$EXPECTED_CURRENT_SWEEPER_IMAGE_ID" \
@@ -128,11 +152,14 @@ fi
 [[ -d "$AIRFOILS_PRO_STATE_DIR" && ! -L "$AIRFOILS_PRO_STATE_DIR" ]] || fail "Protected state directory is missing or unsafe." 2
 [[ "$(stat -c '%a' "$AIRFOILS_PRO_STATE_DIR")" == "700" && "$(stat -c '%u' "$AIRFOILS_PRO_STATE_DIR")" == "$(id -u)" ]] || fail "Protected state directory must be owner-controlled mode 0700." 2
 [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" && "$(stat -c '%a' "$ENV_FILE")" == "600" && "$(stat -c '%u' "$ENV_FILE")" == "$(id -u)" ]] || fail "Deployment environment must be an owner-controlled mode-0600 regular file." 2
+[[ -d "$CURRENT_SOURCE_DIR" && ! -L "$CURRENT_SOURCE_DIR" ]] || fail "Current r3 source is missing or unsafe." 2
 [[ -d "$STAGING_DIR" && ! -L "$STAGING_DIR" ]] || fail "Staging source is missing or unsafe." 2
 
 app_real="$(readlink -f "$APP_DIR")"
+current_real="$(realpath "$CURRENT_SOURCE_DIR")"
 staging_real="$(realpath "$STAGING_DIR")"
-[[ -d "$app_real" && ! -L "$app_real" && "$app_real" != "$staging_real" ]] || fail "Bound and staged source directories must be distinct real directories." 2
+[[ -d "$app_real" && ! -L "$app_real" ]] || fail "Bound source is missing or unsafe." 2
+[[ "$app_real" != "$current_real" && "$app_real" != "$staging_real" && "$current_real" != "$staging_real" ]] || fail "Bound, current, and target source directories must be distinct." 2
 
 manifest_tool="$app_real/scripts/deploy/deployment-source-manifest.py"
 contract_helper="$staging_real/scripts/deploy/pending-cutover-canary-db-ack-recovery.py"
@@ -146,7 +173,9 @@ compose_file="$staging_real/docker-compose.deploy.yml"
 
 for required in "$manifest_tool" "$contract_helper" "$rebuild_script" "$canary_script" \
   "$migration_file" "$migration_verifier" "$recovery_runner" "$compose_file" \
-  "$backup_and_copy_hook" "$POSTGRES_BACKUP_TOOL"; do
+  "$backup_and_copy_hook" "$POSTGRES_BACKUP_TOOL" \
+  "$app_real/.deployment-source.json" "$current_real/.deployment-source.json" \
+  "$current_real/docker-compose.deploy.yml"; do
   [[ -f "$required" && ! -L "$required" ]] || fail "Required bound/staged source file is missing or unsafe: $required" 2
 done
 [[ -x "$contract_helper" && -x "$rebuild_script" && -x "$migration_verifier" && -x "$recovery_runner" && -x "$backup_and_copy_hook" ]] || fail "Reviewed recovery executables lost their executable mode." 2
@@ -162,26 +191,26 @@ done
 [[ "$(sha256_file "$compose_file")" == "$EXPECTED_TARGET_COMPOSE_SHA256" ]] || fail "Staged Compose definition differs from its reviewed digest."
 [[ "$(sha256_file "$POSTGRES_BACKUP_TOOL")" == "$EXPECTED_POSTGRES_BACKUP_TOOL_SHA256" ]] || fail "Postgres backup tool differs from its reviewed digest."
 
-python3 - "$app_real" "$AIRFOILS_PRO_STATE_DIR" "$DATABASE_BACKUP_FILE" \
+python3 - "$app_real" "$current_real" "$staging_real" "$AIRFOILS_PRO_STATE_DIR" "$DATABASE_BACKUP_FILE" \
   "$DATABASE_BACKUP_MANIFEST" "$DATABASE_BACKUP_OFF_VPS_RECEIPT" <<'PY'
 from pathlib import Path
 import os
 import stat
 import sys
 
-app = Path(sys.argv[1]).resolve(strict=True)
-state = Path(sys.argv[2]).resolve(strict=True)
-paths = [Path(value) for value in sys.argv[3:]]
+sources = [Path(value).resolve(strict=True) for value in sys.argv[1:4]]
+state = Path(sys.argv[4]).resolve(strict=True)
+paths = [Path(value) for value in sys.argv[5:]]
 for path in paths:
     if not path.is_absolute():
         raise SystemExit("backup and receipt destinations must be absolute")
     resolved_parent = path.parent.resolve(strict=True)
-    try:
-        resolved_parent.relative_to(app)
-    except ValueError:
-        pass
-    else:
-        raise SystemExit("backup and receipt destinations cannot live in APP_DIR")
+    for source in sources:
+        try:
+            resolved_parent.relative_to(source)
+        except ValueError:
+            continue
+        raise SystemExit("backup and receipt destinations cannot live in a source tree")
     current = Path(path.anchor)
     for component in path.parts[1:]:
         current /= component
@@ -214,6 +243,7 @@ source_contract="$work_dir/source.json"
 "$contract_helper" source \
   --manifest-tool "$manifest_tool" \
   --bound-root "$app_real" --bound-manifest "$app_real/.deployment-source.json" \
+  --current-root "$current_real" --current-manifest "$current_real/.deployment-source.json" \
   --target-root "$staging_real" --target-manifest "$staging_real/.deployment-source.json" \
   --expected-target-revision "$EXPECTED_TARGET_SOURCE_REVISION" \
   --expected-target-tree "$EXPECTED_TARGET_SOURCE_TREE_SHA256" \
@@ -234,6 +264,7 @@ predecessors="$work_dir/predecessors.json"
   --node-journal "$NODE_REPAIR_JOURNAL" \
   --queue-journal "$QUEUE_REPAIR_JOURNAL" \
   --same-build-journal "$SAME_BUILD_REPLAY_JOURNAL" \
+  --retention-journal "$RETENTION_RETRY_JOURNAL" \
   --expected-same-build-journal-sha256 "$EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256" \
   >"$predecessors"
 
@@ -251,6 +282,8 @@ keys = {
     "OPENCFD2606_CANARY_RECEIPT_EXPECTED",
     "OPENCFD2606_CUTOVER_SOURCE_REVISION",
     "OPENCFD2606_CUTOVER_SOURCE_TREE_SHA256",
+    "AIRFOILFOAM_BUILD_ID",
+    "ENGINE_EXPECTED_BUILD_ID",
 }
 values = {}
 for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
@@ -268,7 +301,7 @@ PY
 
 initial_state="$work_dir/state-initial.json"
 read_state >"$initial_state"
-python3 - "$initial_state" "$BOUND_REVISION" "$BOUND_TREE" <<'PY'
+python3 - "$initial_state" "$CURRENT_REVISION" "$CURRENT_TREE" "$CURRENT_BUILD_ID" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -282,9 +315,11 @@ expected = {
     "OPENCFD2606_CANARY_RECEIPT_EXPECTED": "0",
     "OPENCFD2606_CUTOVER_SOURCE_REVISION": sys.argv[2],
     "OPENCFD2606_CUTOVER_SOURCE_TREE_SHA256": sys.argv[3],
+    "AIRFOILFOAM_BUILD_ID": sys.argv[4],
+    "ENGINE_EXPECTED_BUILD_ID": sys.argv[4],
 }
 if state != expected:
-    raise SystemExit("recovery requires the exact failed-r2 pending-pristine marker tuple")
+    raise SystemExit("recovery requires the exact failed-r3 pending-pristine marker tuple")
 PY
 [[ ! -e "$CANARY_RECEIPT" && ! -L "$CANARY_RECEIPT" ]] || fail "A canary receipt exists; this pristine incident runner cannot select its replay semantics."
 
@@ -302,9 +337,9 @@ if docker compose version >/dev/null 2>&1; then
 else
   COMPOSE=(docker-compose)
 fi
-compose_bound() {
+compose_current() {
   "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" \
-    --project-directory "$app_real" -f "$app_real/docker-compose.deploy.yml" "$@"
+    --project-directory "$current_real" -f "$current_real/docker-compose.deploy.yml" "$@"
 }
 compose_target() {
   "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" \
@@ -314,8 +349,8 @@ compose_target() {
 capture_runtime() {
   local destination="$1" stage="$2" media_running="$3"
   "$contract_helper" runtime \
-    --env-file "$ENV_FILE" --compose-file "$app_real/docker-compose.deploy.yml" \
-    --project-directory "$app_real" --stage "$stage" \
+    --env-file "$ENV_FILE" --compose-file "$current_real/docker-compose.deploy.yml" \
+    --project-directory "$current_real" --stage "$stage" \
     "${service_args[@]}" --expected-running "media-repair=$media_running" \
     --expected-volume-sha256 "$EXPECTED_RESULTS_VOLUME_IDENTITY_SHA256" \
     >"$destination"
@@ -363,7 +398,7 @@ if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metad
     raise SystemExit("media-quiesce journal is unsafe")
 payload = json.loads(path.read_text())
 identity = json.loads(Path(sys.argv[2]).read_text())
-if payload.get("schemaVersion") != 1 or payload.get("purpose") != "pending-opencfd2606-canary-db-ack-media-quiesce" or payload.get("identity") != identity:
+if payload.get("schemaVersion") != 1 or payload.get("purpose") != "pending-opencfd2606-canary-db-ack-r4-media-quiesce" or payload.get("identity") != identity:
     raise SystemExit("media-quiesce journal identity changed")
 status = payload.get("status")
 if status not in {"prepared", "stopped-for-backup", "backup-verified"}:
@@ -383,7 +418,7 @@ fi
 
 runtime_one="$work_dir/runtime-one.json"
 if [[ "$media_status" == "prepared" ]]; then
-  compose_bound stop media-repair
+  compose_current stop media-repair
   capture_runtime "$runtime_one" media-stopped-before-backup false
   runtime_one_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshotSha256"])' "$runtime_one")"
   "$contract_helper" media-quiesce --path "$MEDIA_QUIESCE_JOURNAL" \
@@ -404,25 +439,25 @@ predecessors = json.loads(Path(sys.argv[1]).read_text())
 runtime = json.loads(Path(sys.argv[2]).read_text())
 expected = {
     "node-api": (
-        predecessors["sameBuildReplayNodeContainerAfter"],
-        predecessors["sameBuildReplayNodeImageAfter"],
+        predecessors["retentionRetryNodeContainerAfter"],
+        predecessors["retentionRetryNodeImage"],
     ),
-    "api": (runtime["services"]["api"]["containerId"], predecessors["sameBuildReplayApiImage"]),
+    "api": (runtime["services"]["api"]["containerId"], predecessors["retentionRetryApiImage"]),
     "worker": (
         runtime["services"]["worker"]["containerId"],
-        predecessors["sameBuildReplayWorkerImage"],
+        predecessors["retentionRetryWorkerImage"],
     ),
 }
 for service, (container_id, image_id) in expected.items():
     actual = runtime["services"][service]
     if actual["containerId"] != container_id or actual["imageId"] != image_id:
-        raise SystemExit(f"live {service} does not match the failed same-build replay journal")
+        raise SystemExit(f"live {service} does not match the failed retention-retry journal")
 PY
 
 backup_not_before="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["stoppedAt"])' "$MEDIA_QUIESCE_JOURNAL")"
 if [[ "$media_status" == "stopped-for-backup" ]]; then
   ENV_FILE="$ENV_FILE" COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" \
-    COMPOSE_FILE="$app_real/docker-compose.deploy.yml" COMPOSE_PROJECT_DIRECTORY="$app_real" \
+    COMPOSE_FILE="$current_real/docker-compose.deploy.yml" COMPOSE_PROJECT_DIRECTORY="$current_real" \
     DATABASE_BACKUP_FILE="$DATABASE_BACKUP_FILE" \
     DATABASE_BACKUP_MANIFEST="$DATABASE_BACKUP_MANIFEST" \
     DATABASE_BACKUP_OFF_VPS_RECEIPT="$DATABASE_BACKUP_OFF_VPS_RECEIPT" \
@@ -465,7 +500,7 @@ fi
 
 # A second independent idle/container/image/volume sample closes the interval
 # between backup proof and the delegated build.  Both samples must resolve to
-# the exact current r2 identities supplied by the operator.
+# the exact current r3 identities bound to the fourth incident journal.
 runtime_two="$work_dir/runtime-two.json"
 capture_runtime "$runtime_two" immediately-before-delegation false
 
@@ -474,6 +509,7 @@ predecessors_second="$work_dir/predecessors-second.json"
   --node-journal "$NODE_REPAIR_JOURNAL" \
   --queue-journal "$QUEUE_REPAIR_JOURNAL" \
   --same-build-journal "$SAME_BUILD_REPLAY_JOURNAL" \
+  --retention-journal "$RETENTION_RETRY_JOURNAL" \
   --expected-same-build-journal-sha256 "$EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256" \
   >"$predecessors_second"
 cmp -s "$predecessors" "$predecessors_second" || fail "Predecessor journals changed during recovery preflight."
@@ -502,7 +538,7 @@ payload = {
     },
     "rollbackImageTags": {
         service: (
-            f"airfoils-pro-rollback-{service}:r2-"
+            f"airfoils-pro-rollback-{service}:r3-to-r4-"
             f"{source['targetSourceRevision'][:12]}-{source['sourceChangeSha256'][:12]}"
         )
         for service in ("api", "worker", "node-api", "sweeper", "media-repair")
@@ -581,11 +617,11 @@ trap enforce_fail_safe EXIT
   --runtime-snapshot-sha256 "$runtime_two_sha" >/dev/null
 
 set +e
-APP_DIR="$APP_DIR" AIRFOILS_PRO_STATE_DIR="$AIRFOILS_PRO_STATE_DIR" ENV_FILE="$ENV_FILE" \
+APP_DIR="$current_real" AIRFOILS_PRO_STATE_DIR="$AIRFOILS_PRO_STATE_DIR" ENV_FILE="$ENV_FILE" \
   COMPOSE_FILE="$compose_file" COMPOSE_PROJECT_DIRECTORY="$staging_real" \
   COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" LOCK_FILE="$LOCK_FILE" \
-  DEPLOY_LOCK_HELD=1 DEPLOYMENT_MANIFEST_FILE="$app_real/.deployment-source.json" \
-  DEPLOY_SOURCE_REVISION="$BOUND_REVISION" DEPLOY_SOURCE_TREE_SHA256="$BOUND_TREE" \
+  DEPLOY_LOCK_HELD=1 DEPLOYMENT_MANIFEST_FILE="$current_real/.deployment-source.json" \
+  DEPLOY_SOURCE_REVISION="$CURRENT_REVISION" DEPLOY_SOURCE_TREE_SHA256="$CURRENT_TREE" \
   OPENCFD2606_POST_NODE_HEALTH_VERIFIER="$migration_verifier" \
   OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE=running \
   EXPECTED_OPENCFD2606_MIGRATION_SHA256="$EXPECTED_TARGET_MIGRATION_SHA256" \
@@ -595,6 +631,13 @@ rebuild_rc=$?
 set -e
 
 read_state >"$work_dir/state-final.json"
+marker_integrity=true
+if ! "$contract_helper" marker --state-json "$work_dir/state-final.json" \
+  --expected-target-revision "$EXPECTED_TARGET_SOURCE_REVISION" \
+  --expected-target-tree "$EXPECTED_TARGET_SOURCE_TREE_SHA256" \
+  --expected-target-build-id "$BUILD_ID" >"$work_dir/marker-final.json"; then
+  marker_integrity=false
+fi
 receipt_exists=false
 if [[ -e "$CANARY_RECEIPT" || -L "$CANARY_RECEIPT" ]]; then
   receipt_exists=true
@@ -606,6 +649,7 @@ predecessor_integrity=true
 if ! "$contract_helper" predecessors --node-journal "$NODE_REPAIR_JOURNAL" \
   --queue-journal "$QUEUE_REPAIR_JOURNAL" \
   --same-build-journal "$SAME_BUILD_REPLAY_JOURNAL" \
+  --retention-journal "$RETENTION_RETRY_JOURNAL" \
   --expected-same-build-journal-sha256 "$EXPECTED_SAME_BUILD_REPLAY_JOURNAL_SHA256" \
   >"$work_dir/predecessors-final.json" || \
   ! cmp -s "$predecessors" "$work_dir/predecessors-final.json"; then
@@ -613,7 +657,7 @@ if ! "$contract_helper" predecessors --node-journal "$NODE_REPAIR_JOURNAL" \
   rollback_boundary="unknown-rollback-forbidden"
 fi
 
-if ((rebuild_rc == 0)) && [[ "$predecessor_integrity" == "true" ]]; then
+if ((rebuild_rc == 0)) && [[ "$predecessor_integrity" == "true" && "$marker_integrity" == "true" ]]; then
   restored_media_ids="$(compose_target ps --status running -q media-repair)"
   [[ -n "$restored_media_ids" && "$(wc -l <<<"$restored_media_ids")" == "1" ]] || fail "Successful rebuild did not restore exactly one media-repair container."
   "$contract_helper" media-quiesce --path "$MEDIA_QUIESCE_JOURNAL" \
@@ -632,11 +676,16 @@ if [[ "$predecessor_integrity" != "true" ]]; then
   echo "Predecessor repair journals changed during delegated recovery." >&2
   failure_rc=14
 fi
+if [[ "$marker_integrity" != "true" ]]; then
+  echo "Cutover marker no longer obeys the cd0967-until-terminal source contract." >&2
+  failure_rc=14
+  rollback_boundary="unknown-rollback-forbidden"
+fi
 "$contract_helper" journal --path "$RECOVERY_JOURNAL" --identity-json "$identity" \
   --status failed --phase rebuild-failed --exit-code "$failure_rc" \
   --rollback-boundary "$rollback_boundary" >/dev/null
 if [[ "$rollback_boundary" == "pre-receipt-rollback-eligible" ]]; then
-  echo "Failure occurred before a durable canary receipt; captured r2 image IDs remain eligible for an explicit reviewed rollback. No wrapper-side recreate was attempted." >&2
+  echo "Failure occurred before a durable canary receipt; captured r3 image IDs remain eligible for an explicit reviewed rollback. No wrapper-side recreate was attempted." >&2
 else
   echo "Failure crossed or could not disprove the durable canary-receipt boundary; image rollback is forbidden and exact receipt/DB replay state is retained." >&2
 fi

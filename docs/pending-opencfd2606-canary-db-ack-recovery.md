@@ -1,10 +1,11 @@
 # Pending OpenCFD 2606 canary DB-ACK recovery
 
 `scripts/deploy/recover-pending-opencfd2606-canary-db-ack.sh` is the
-incident-specific launcher for the failed 2026-07-17 r2 cutover. It is not a
-general deployment command. It accepts only the original bound production
-release, the three exact predecessor journals, the failed-r2 pristine marker
-tuple, and one fully manifested reviewed target tree.
+incident-specific launcher for the failed 2026-07-17 r3 retention retry. It is
+not a general deployment command. It accepts only the original bound 6338577
+production symlink, a separately staged exact cd0967 current-source release,
+all four immutable predecessor journals, the failed-r3 pristine marker tuple,
+and one fully manifested reviewed r4 target tree.
 
 ## Transaction boundary
 
@@ -18,7 +19,7 @@ The descriptor is inherited by the rebuild runner and remains locked across:
 2. stopping the initially running `media-repair` service;
 3. the fresh database backup, strong scratch restore, immutable off-VPS copy,
    and remote-download checksum proof;
-4. collision-checked preservation of every replaceable r2 service image;
+4. collision-checked preservation of every replaceable r3 service image;
 5. target image builds, migration, service recreation, repaired four-point
    canary, database cleanup acknowledgements, and cutover finalization.
 
@@ -31,7 +32,12 @@ disabled.
 
 ## Required bindings
 
-Before invocation, re-inventory production while holding descriptor 9 and
+Before invocation, set `CURRENT_SOURCE_DIR` to the exact manifested cd0967
+release. It is neither the bound 6338577 symlink nor the r4 target. The source
+contract verifies all three directories independently while continuing to
+compute the reviewed target changeset from the original 6338577 baseline.
+
+Re-inventory production while holding descriptor 9 and
 supply the full 64-character container IDs and exact `sha256:` image IDs for
 `api`, `worker`, `node-api`, `sweeper`, `media-repair`, and `postgres`. Supply
 the exact results-volume identity digest and re-hash the latest failed
@@ -45,7 +51,8 @@ digest, and independent file digests for the rebuild runner, canary, migration
 backup-and-copy hook, and Compose definition. The launcher refuses any byte or
 executable-mode drift.
 
-The target build ID must be new. The admin cookie is passed only through the
+The target build ID must be exactly
+`prod-20260717-<target-revision-12>-r4`. The admin cookie is passed only through the
 environment and is never written to a journal. All state journals and backup
 proofs are owner-controlled mode 0600; their directories are mode 0700.
 
@@ -98,7 +105,7 @@ build begins.
 ## Rollback boundary and records
 
 Before building, the launcher tags the exact current images as
-`airfoils-pro-rollback-<service>:r2-<target-revision-12>-<changeset-12>`.
+`airfoils-pro-rollback-<service>:r3-to-r4-<target-revision-12>-<changeset-12>`.
 A pre-existing tag is accepted only when it resolves to the same exact image;
 a collision fails closed. No image pruning or automatic rollback is allowed.
 The recovery journal identity contains all tag-to-image and container
@@ -110,3 +117,12 @@ Failure before a durable canary receipt is recorded as
 the preserved tags. Once a receipt exists—or when the marker/receipt state is
 ambiguous—image rollback is forbidden because database acknowledgement state
 may already have crossed the cutover boundary.
+
+The delegated rebuild verifies `APP_DIR` and its deployment manifest against
+the exact cd0967 current source while using only the r4 target as the Compose
+build context and deployment-script source. `DEPLOY_SOURCE_REVISION` and
+`DEPLOY_SOURCE_TREE_SHA256` remain cd0967, so a pending cutover marker must keep
+that exact source tuple. Only terminal continuation may clear it; substituting
+the r4 target tuple is a hard failure. The final environment must nevertheless
+carry the exact matching r4 `AIRFOILFOAM_BUILD_ID` and
+`ENGINE_EXPECTED_BUILD_ID` pair.
