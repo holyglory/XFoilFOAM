@@ -3390,21 +3390,27 @@ export async function remoteSolverTick(
       settings?.remoteSolverEnabled &&
       settings.upstreamBaseUrl &&
       settings.upstreamSecret &&
-      allowEngineSubmission &&
-      (await activeRemoteJobs(db)).length === 0
+      allowEngineSubmission
     ) {
-      const recoveryMirrors = await mirroredRemotePromiseIds(db, settings);
-      if (
-        recoveryMirrors.length > 0 &&
-        (await submitRemotePrecalcRecovery(
-          db,
-          engine,
-          settings,
-          recoveryMirrors[0]!,
-        ))
-      ) {
-        await setStatus(db, "solving", null);
-        return;
+      // Preserve the normal authority fence even though recovery is moving
+      // ahead of durable result delivery. A due 404/409 renewal must cancel
+      // local ownership before another physical attempt reaches the engine.
+      await renewMirroredPromiseLeases(db, engine, settings);
+      await expireMirroredRemotePromises(db, settings);
+      if ((await activeRemoteJobs(db)).length === 0) {
+        const recoveryMirrors = await mirroredRemotePromiseIds(db, settings);
+        if (
+          recoveryMirrors.length > 0 &&
+          (await submitRemotePrecalcRecovery(
+            db,
+            engine,
+            settings,
+            recoveryMirrors[0]!,
+          ))
+        ) {
+          await setStatus(db, "solving", null);
+          return;
+        }
       }
     }
     let processedDurableDelivery = false;
