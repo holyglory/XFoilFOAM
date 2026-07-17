@@ -232,7 +232,7 @@ assert_engine_identity_unchanged ||
 # This is the sole mutation path inside the exclusive window. Its stdout is
 # quarantined until it has been validated and every service is restored.
 if ! compose run --rm --no-deps -T sweeper \
-  pnpm --filter @aerodb/sweeper urans-canary:admit-once -- "$@" \
+  pnpm --silent --filter @aerodb/sweeper urans-canary:admit-once "$@" \
   >"$receipt_raw"; then
   die 14 "The exact three-stage URANS canary invocation failed."
 fi

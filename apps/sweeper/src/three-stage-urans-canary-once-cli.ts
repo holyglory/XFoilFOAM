@@ -13,7 +13,7 @@ const UUID =
 const BUILD_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
 export const THREE_STAGE_URANS_CANARY_USAGE = `Usage:
-  pnpm --filter @aerodb/sweeper urans-canary:admit-once -- \\
+  pnpm --silent --filter @aerodb/sweeper urans-canary:admit-once \\
     --campaign-id UUID --condition-id UUID \\
     --expected-campaign-generation INTEGER --parent-job-id UUID \\
     --airfoil-id UUID --revision-id UUID --aoa-deg DECIMAL \\

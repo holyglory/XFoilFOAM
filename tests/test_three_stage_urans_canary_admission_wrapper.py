@@ -299,10 +299,10 @@ def test_runs_one_exact_cli_only_after_both_writers_stop_and_restores_them(
         "-T",
         "sweeper",
         "pnpm",
+        "--silent",
         "--filter",
         "@aerodb/sweeper",
         "urans-canary:admit-once",
-        "--",
         *_target_args(),
     ]
 

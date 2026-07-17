@@ -1122,4 +1122,31 @@ describe("three-stage URANS canary CLI", () => {
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("Unknown option");
   });
+
+  it("transports CLI options through the production pnpm form without an option terminator", () => {
+    const root = fileURLToPath(new URL("../../..", import.meta.url));
+    const result = spawnSync(
+      "corepack",
+      [
+        "pnpm",
+        "--silent",
+        "--filter",
+        "@aerodb/sweeper",
+        "urans-canary:admit-once",
+        "--help",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 30_000,
+      },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout.startsWith("Usage:\n")).toBe(true);
+    expect(result.stdout).not.toContain(
+      "\n> @aerodb/sweeper@0.1.0 urans-canary:admit-once",
+    );
+  });
 });
