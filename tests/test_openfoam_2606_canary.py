@@ -231,6 +231,26 @@ class FakeGatewayState:
         yplus_meta = self._asset(yplus_url, yplus_bytes, "text/plain")
         dictionary_meta = self._asset(dictionary_url, dictionary_bytes, "application/octet-stream")
         solver_log_meta = self._asset(solver_log_url, solver_log_bytes, "text/plain")
+        auxiliary_manifest_files: list[dict[str, str]] = []
+        auxiliary_artifacts: list[dict[str, Any]] = []
+        # The first production 2606 RANS canary contained 42 archive members.
+        # Preserve that concrete producer shape instead of testing only a tiny
+        # hand-made bundle that could hide count-contract drift.
+        for index in range(36):
+            relative = f"openfoam/logs/canary/auxiliary-{index:02d}.log"
+            url = f"{base}/evidence/{relative}"
+            meta = self._asset(url, f"OpenFOAM auxiliary {index}\n".encode(), "text/plain")
+            auxiliary_manifest_files.append(
+                {"path": relative, "role": "auxiliary"}
+            )
+            auxiliary_artifacts.append(
+                {
+                    "kind": "log",
+                    "path": f"evidence/{relative}",
+                    "role": "auxiliary",
+                    **meta,
+                }
+            )
         if self.mode == "corrupt-bundle":
             self.assets[bundle_url] = (b"evil-engine-bundle", "application/zstd")
 
@@ -263,6 +283,7 @@ class FakeGatewayState:
                 {"path": "openfoam/postProcessing/yPlus/1/yPlus.dat", "role": "y_plus"},
                 {"path": "openfoam/system/controlDict", "role": "dictionary"},
                 {"path": f"openfoam/logs/canary/log.{solver_name}", "role": "log"},
+                *auxiliary_manifest_files,
             ],
         }
         manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
@@ -325,6 +346,7 @@ class FakeGatewayState:
                     **vtk_meta,
                 }
             )
+        artifacts.extend(auxiliary_artifacts)
         for artifact in artifacts:
             artifact["metadata"] = {
                 "engineNamespace": canary.ENGINE_NAMESPACE,
@@ -350,16 +372,30 @@ class FakeGatewayState:
                 "zstdLevel": 10,
                 "verifiedAt": "2026-07-15T20:50:14+00:00",
                 "pointerPath": "engine_evidence.remote.json",
-                "localEvidenceDisposition": "remote-only",
-                "remoteRestoreVerification": "archive+vtk-restore",
+                "bundledFileCount": 42,
+                "localEvidenceDisposition": (
+                    "remote-copy-plus-local-archive-pending-database-ack"
+                ),
+                "rawLocalEvidenceDisposition": "removed",
+                "rawLocalBytesRemoved": 16384,
+                "localArchiveRetainedUntilDatabaseAck": True,
+                "remoteRestoreVerification": (
+                    "archive+manifest+all-members-restore:42"
+                ),
                 "evidenceBase": "evidence",
             }
         )
         if self.mode == "volume-bundle":
             bundle_artifact["metadata"]["storageBackend"] = "volume"
-        elif self.mode == "local-cleanup-pending":
+        elif self.mode == "local-retained":
             bundle_artifact["metadata"]["localEvidenceDisposition"] = (
-                "remote-copy-plus-local-pending-cleanup"
+                "remote-copy-plus-local-retained"
+            )
+        elif self.mode == "premature-remote-only":
+            bundle_artifact["metadata"]["localEvidenceDisposition"] = "remote-only"
+        elif self.mode == "wrong-member-count":
+            bundle_artifact["metadata"]["remoteRestoreVerification"] = (
+                "archive+manifest+all-members-restore:41"
             )
 
         point = {
@@ -681,6 +717,11 @@ def test_canary_submits_all_three_exact_2606_workloads_and_checks_evidence():
                 "solver-evidence/v1/sha256/"
             )
             and artifact["storage"]["generation"] == "1752612345678901"
+            and artifact["storage"]["bundled_file_count"] == 42
+            and artifact["storage"]["local_disposition"]
+            == "remote-copy-plus-local-archive-pending-database-ack"
+            and artifact["storage"]["restore_verification"]
+            == "archive+manifest+all-members-restore:42"
             for artifact in point["artifacts"]
         )
         for job in summary["jobs"]
@@ -746,6 +787,39 @@ def test_retained_receipt_reproof_rejects_current_storage_prefix_drift_before_re
     assert len(state.remote_render_calls) == prior_render_calls
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "local_disposition",
+            "remote-only",
+            "must remain pending database acknowledgement",
+        ),
+        (
+            "restore_verification",
+            "archive+manifest+all-members-restore:5",
+            "restore proof member count differs from bundled_file_count",
+        ),
+    ],
+)
+def test_retained_receipt_reproof_rejects_forged_artifact_cleanup_before_gateway_reads(
+    field: str,
+    value: object,
+    message: str,
+):
+    with fake_gateway() as (state, url):
+        receipt = canary.OpenCfd2606Canary(_config(state, url)).run()
+        prior_render_calls = len(state.remote_render_calls)
+        receipt["jobs"][0]["points"][0]["artifacts"][0]["storage"][field] = value
+
+        with pytest.raises(canary.CanaryFailure, match=message):
+            canary.OpenCfd2606Canary(_config(state, url)).verify_retained_receipt(
+                receipt
+            )
+
+    assert len(state.remote_render_calls) == prior_render_calls
+
+
 def test_canary_rejects_periodic_metadata_on_a_no_shedding_result():
     with fake_gateway(mode="false-periodic-no-shedding") as (state, url):
         with pytest.raises(
@@ -801,11 +875,38 @@ def test_canary_rejects_a_bundle_that_was_not_published_to_gcs():
     assert state.cancelled == []
 
 
-def test_canary_rejects_remote_evidence_whose_local_cleanup_is_pending():
-    with fake_gateway(mode="local-cleanup-pending") as (state, url):
-        with pytest.raises(canary.CanaryFailure, match="local packaged evidence was not removed"):
+def test_canary_rejects_remote_evidence_that_retained_raw_local_data():
+    with fake_gateway(mode="local-retained") as (state, url):
+        with pytest.raises(
+            canary.CanaryFailure,
+            match="must retain its local archive pending the database acknowledgement",
+        ):
             canary.OpenCfd2606Canary(_config(state, url)).run()
 
+    assert state.cancelled == []
+
+
+def test_canary_rejects_remote_only_artifact_claim_before_database_ack():
+    with fake_gateway(mode="premature-remote-only") as (state, url):
+        with pytest.raises(
+            canary.CanaryFailure,
+            match="must retain its local archive pending the database acknowledgement",
+        ):
+            canary.OpenCfd2606Canary(_config(state, url)).run()
+
+    assert state.stripped == []
+    assert state.cancelled == []
+
+
+def test_canary_rejects_restore_proof_with_the_wrong_member_count():
+    with fake_gateway(mode="wrong-member-count") as (state, url):
+        with pytest.raises(
+            canary.CanaryFailure,
+            match="restore proof member count differs from bundledFileCount",
+        ):
+            canary.OpenCfd2606Canary(_config(state, url)).run()
+
+    assert state.stripped == []
     assert state.cancelled == []
 
 

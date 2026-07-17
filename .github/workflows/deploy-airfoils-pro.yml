@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      pending_cutover_engine_rebuild_replay:
+        description: "Replay the exact same-build OpenCFD 2606 cutover after the maintenance queue-timeout repair"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: airfoils-pro-vps-deploy
@@ -21,7 +26,7 @@ jobs:
   deploy:
     name: Deploy control plane
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay && 360 || 45 }}
     env:
       VPS_HOST: ${{ secrets.AIRFOILS_VPS_HOST }}
       VPS_USER: ${{ secrets.AIRFOILS_VPS_USER }}
@@ -31,6 +36,7 @@ jobs:
       VPS_APP_DIR: ${{ vars.AIRFOILS_VPS_APP_DIR }}
       PUBLIC_ORIGIN: ${{ vars.AIRFOILS_PUBLIC_ORIGIN }}
       PENDING_CUTOVER_NODE_API_REPAIR: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_node_api_repair || false }}
+      PENDING_CUTOVER_ENGINE_REBUILD_REPLAY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay || false }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -49,6 +55,7 @@ jobs:
           bash -n scripts/deploy/vps-redeploy.sh
           bash -n scripts/deploy/promote-and-redeploy.sh
           bash -n scripts/deploy/repair-pending-node-api.sh
+          bash -n scripts/deploy/replay-pending-opencfd2606-rebuild.sh
           python3 scripts/deploy/deployment-source-manifest.py --help >/dev/null
           test -f docker-compose.deploy.yml
 
@@ -145,7 +152,16 @@ jobs:
           printf -v APP_Q '%q' "$APP_DIR"
           printf -v ORIGIN_Q '%q' "$ORIGIN"
           printf -v REVISION_Q '%q' "$GITHUB_SHA"
-          if [[ "$PENDING_CUTOVER_NODE_API_REPAIR" == "true" ]]; then
+          if [[ "$PENDING_CUTOVER_NODE_API_REPAIR" == "true" && "$PENDING_CUTOVER_ENGINE_REBUILD_REPLAY" == "true" ]]; then
+            echo "Select only one pending-cutover recovery action per workflow dispatch." >&2
+            exit 2
+          fi
+          if [[ "$PENDING_CUTOVER_ENGINE_REBUILD_REPLAY" == "true" ]]; then
+            ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" \
+              -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+              "${VPS_USER}@${VPS_HOST}" \
+              "chmod +x $STAGING_Q/scripts/deploy/replay-pending-opencfd2606-rebuild.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q EXPECTED_TARGET_SOURCE_REVISION=$REVISION_Q $STAGING_Q/scripts/deploy/replay-pending-opencfd2606-rebuild.sh"
+          elif [[ "$PENDING_CUTOVER_NODE_API_REPAIR" == "true" ]]; then
             ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
               "chmod +x $STAGING_Q/scripts/deploy/repair-pending-node-api.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q EXPECTED_TARGET_SOURCE_REVISION=$REVISION_Q $STAGING_Q/scripts/deploy/repair-pending-node-api.sh"
           else

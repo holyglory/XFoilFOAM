@@ -35,6 +35,12 @@ const OFFICIAL_PACKAGE_SHA256_BY_ARCH: Readonly<Record<string, string>> = {
 const sha256 = z.string().regex(/^[0-9a-f]{64}$/);
 const positiveDecimal = z.string().regex(/^[1-9][0-9]*$/);
 const crc32cBase64 = z.string().regex(/^[A-Za-z0-9+/]{6}==$/);
+const pendingDatabaseAck = z.literal(
+  "remote-copy-plus-local-archive-pending-database-ack",
+);
+const allMembersRestore = z
+  .string()
+  .regex(/^archive\+manifest\+all-members-restore:([1-9][0-9]*)$/);
 const runtimeSchema = z
   .object({
     family: z.literal("openfoam"),
@@ -71,11 +77,69 @@ const storageBindingSchema = z
     uncompressed_tar_byte_size: z.number().int().positive(),
     zstd_level: z.number().int().min(1).max(22),
     pointer_path: z.literal("engine_evidence.remote.json"),
-    local_disposition: z.literal("remote-only"),
-    restore_verification: z.enum([
-      "archive+vtk-restore",
-      "archive+manifest-restore",
-    ]),
+    bundled_file_count: z.number().int().positive(),
+    local_disposition: pendingDatabaseAck,
+    restore_verification: allMembersRestore,
+  })
+  .strict()
+  .superRefine((binding, context) => {
+    const restored = Number(binding.restore_verification.split(":").at(-1));
+    if (restored !== binding.bundled_file_count) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["restore_verification"],
+        message:
+          "all-members restore proof count differs from bundled_file_count",
+      });
+    }
+  });
+
+const liveStorageBindingSchema = z
+  .object({
+    backend: z.literal("gcs"),
+    bucket: z.string().trim().min(3),
+    object_key: z.string().trim().min(1),
+    generation: positiveDecimal,
+    stored_sha256: sha256,
+    stored_byte_size: z.number().int().positive(),
+    crc32c: crc32cBase64,
+    archive_format: z.literal("tar+zstd"),
+    compression: z.literal("zstd"),
+    uncompressed_tar_sha256: sha256,
+    uncompressed_tar_byte_size: z.number().int().positive(),
+    zstd_level: z.number().int().min(1).max(22),
+    pointer_path: z.literal("engine_evidence.remote.json"),
+    bundled_file_count: z.number().int().positive(),
+    local_disposition: pendingDatabaseAck,
+    restore_verification: allMembersRestore,
+    raw_local_disposition: z.literal("removed"),
+    raw_local_bytes_removed: z.number().int().positive(),
+    local_archive_retained_until_database_ack: z.literal(true),
+  })
+  .strict()
+  .superRefine((binding, context) => {
+    const restored = Number(binding.restore_verification.split(":").at(-1));
+    if (restored !== binding.bundled_file_count) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["restore_verification"],
+        message:
+          "all-members restore proof count differs from bundled_file_count",
+      });
+    }
+  });
+
+const idempotentFullStripProofSchema = z
+  .object({
+    job_id: z.string().regex(/^[0-9A-Za-z-]{8,64}$/),
+    kept_case_state: z.literal(false),
+    bytes_freed: z.literal(0),
+    files_removed: z.literal(0),
+    dirs_removed: z.literal(0),
+    no_op: z.literal(true),
+    marker_path: z.string().trim().min(1),
+    unknown_entries_count: z.literal(0),
+    unknown_entries: z.array(z.never()).length(0),
   })
   .strict();
 
@@ -293,7 +357,7 @@ function normalizedArtifacts(
   const metadata = bundle.metadata ?? {};
   let storage: z.infer<typeof storageBindingSchema>;
   try {
-    storage = storageBindingSchema.parse({
+    const liveStorage = liveStorageBindingSchema.parse({
       backend: metadata.storageBackend,
       bucket: metadata.bucket,
       object_key: metadata.objectKey,
@@ -307,8 +371,31 @@ function normalizedArtifacts(
       uncompressed_tar_byte_size: metadata.uncompressedTarByteSize,
       zstd_level: metadata.zstdLevel,
       pointer_path: metadata.pointerPath,
+      bundled_file_count: metadata.bundledFileCount,
       local_disposition: metadata.localEvidenceDisposition,
       restore_verification: metadata.remoteRestoreVerification,
+      raw_local_disposition: metadata.rawLocalEvidenceDisposition,
+      raw_local_bytes_removed: metadata.rawLocalBytesRemoved,
+      local_archive_retained_until_database_ack:
+        metadata.localArchiveRetainedUntilDatabaseAck,
+    });
+    storage = storageBindingSchema.parse({
+      backend: liveStorage.backend,
+      bucket: liveStorage.bucket,
+      object_key: liveStorage.object_key,
+      generation: liveStorage.generation,
+      stored_sha256: liveStorage.stored_sha256,
+      stored_byte_size: liveStorage.stored_byte_size,
+      crc32c: liveStorage.crc32c,
+      archive_format: liveStorage.archive_format,
+      compression: liveStorage.compression,
+      uncompressed_tar_sha256: liveStorage.uncompressed_tar_sha256,
+      uncompressed_tar_byte_size: liveStorage.uncompressed_tar_byte_size,
+      zstd_level: liveStorage.zstd_level,
+      pointer_path: liveStorage.pointer_path,
+      bundled_file_count: liveStorage.bundled_file_count,
+      local_disposition: liveStorage.local_disposition,
+      restore_verification: liveStorage.restore_verification,
     });
   } catch (error) {
     throw new CampaignError(
@@ -359,8 +446,29 @@ function assertRequiredArtifacts(
 
 type LiveClient = Pick<
   EngineClient,
-  "capabilities" | "getQueue" | "getResult" | "healthDetails"
+  "capabilities" | "getQueue" | "getResult" | "healthDetails" | "stripJob"
 >;
+
+function assertIdempotentFullStripProof(value: unknown, jobId: string): void {
+  let proof: z.infer<typeof idempotentFullStripProofSchema>;
+  try {
+    proof = idempotentFullStripProofSchema.parse(value);
+  } catch (error) {
+    throw new CampaignError(
+      "conflict",
+      `canary job ${jobId} lacks an idempotent full-strip marker proof: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (
+    proof.job_id !== jobId ||
+    !proof.marker_path.endsWith(`/${jobId}/.stripped.json`)
+  ) {
+    throw new CampaignError(
+      "conflict",
+      `canary job ${jobId} full-strip marker targets a different job`,
+    );
+  }
+}
 
 export function assertOpenCfd2606EvidenceStorageContract(
   receiptStorage: OpenCfd2606CanaryReceipt["evidence_storage"],
@@ -565,6 +673,7 @@ export function validateOpenCfd2606LiveJobResult(
   result: JobResult,
   job: OpenCfd2606CanaryReceipt["jobs"][number],
   liveRuntime: EngineRuntimeIdentity,
+  stripProof?: unknown,
 ): void {
   if (
     result.job_id !== job.job_id ||
@@ -582,6 +691,7 @@ export function validateOpenCfd2606LiveJobResult(
     liveRuntime,
     `${job.scenario} result runtime`,
   );
+  assertIdempotentFullStripProof(stripProof, job.job_id);
   const scheduling = result.scheduling;
   if (
     !scheduling ||
@@ -692,6 +802,30 @@ export function validateOpenCfd2606LiveJobResult(
   }
 }
 
+/** Re-read one Python-produced canary job and independently prove that its
+ * full case strip already happened.  A first-time strip is deliberately
+ * rejected: it would prove that the submitted receipt claimed a remote render
+ * before the Python canary completed its own strip-and-rehydrate sequence. */
+export async function verifyOpenCfd2606LiveCanaryJob(
+  client: Pick<EngineClient, "getResult" | "stripJob">,
+  job: OpenCfd2606CanaryReceipt["jobs"][number],
+  liveRuntime: EngineRuntimeIdentity,
+): Promise<void> {
+  const result = await client.getResult(job.job_id, {
+    expectedEngine: OPENCFD_2606_ENGINE,
+    expectedExecutionPool: OPENCFD_2606_EXECUTION_POOL,
+  });
+  const stripProof = await client.stripJob(
+    job.job_id,
+    { keep_case_state: false },
+    {
+      expectedEngine: OPENCFD_2606_ENGINE,
+      expectedExecutionPool: OPENCFD_2606_EXECUTION_POOL,
+    },
+  );
+  validateOpenCfd2606LiveJobResult(result, job, liveRuntime, stripProof);
+}
+
 export async function attestOpenCfd2606CanaryReceipt(
   db: DB,
   client: LiveClient,
@@ -715,11 +849,7 @@ export async function attestOpenCfd2606CanaryReceipt(
       liveRuntime,
       `${job.scenario} receipt runtime`,
     );
-    const result = await client.getResult(job.job_id, {
-      expectedEngine: OPENCFD_2606_ENGINE,
-      expectedExecutionPool: OPENCFD_2606_EXECUTION_POOL,
-    });
-    validateOpenCfd2606LiveJobResult(result, job, liveRuntime);
+    await verifyOpenCfd2606LiveCanaryJob(client, job, liveRuntime);
   }
   const resolved = await resolveEngineRuntimeBuild(
     db,

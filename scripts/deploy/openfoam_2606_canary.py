@@ -59,6 +59,12 @@ MEDIA_FIELD = "velocity_magnitude"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 OCI_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 CRC32C_BASE64 = re.compile(r"^[A-Za-z0-9+/]{6}==$")
+ALL_MEMBERS_RESTORE = re.compile(
+    r"^archive\+manifest\+all-members-restore:([1-9][0-9]*)$"
+)
+LIVE_PENDING_DATABASE_ACK = (
+    "remote-copy-plus-local-archive-pending-database-ack"
+)
 OFFICIAL_PACKAGE_SHA256_BY_ARCH = {
     "amd64": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
     "x86_64": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
@@ -134,6 +140,14 @@ def _finite(value: object, label: str) -> float:
     number = float(value)
     _require(math.isfinite(number), f"{label} must be finite")
     return number
+
+
+def _all_members_restore_count(value: object, label: str) -> int:
+    _require(
+        isinstance(value, str) and bool(match := ALL_MEMBERS_RESTORE.fullmatch(value)),
+        f"{label} must be an exact all-members restore proof",
+    )
+    return int(match.group(1))
 
 
 def _logical_identity(value: object, label: str) -> dict[str, object]:
@@ -767,13 +781,36 @@ class OpenCfd2606Canary:
             f"{label} pointer path is not canonical",
         )
         _require(
-            metadata.get("localEvidenceDisposition") == "remote-only",
-            f"{label} local packaged evidence was not removed",
+            metadata.get("localEvidenceDisposition") == LIVE_PENDING_DATABASE_ACK,
+            f"{label} must retain its local archive pending the database acknowledgement",
         )
         _require(
-            metadata.get("remoteRestoreVerification")
-            in {"archive+vtk-restore", "archive+manifest-restore"},
-            f"{label} has no generation-pinned remote restore proof",
+            metadata.get("rawLocalEvidenceDisposition") == "removed"
+            and metadata.get("localArchiveRetainedUntilDatabaseAck") is True,
+            f"{label} did not remove raw local evidence while retaining its database-ack archive",
+        )
+        raw_bytes_removed = metadata.get("rawLocalBytesRemoved")
+        _require(
+            isinstance(raw_bytes_removed, int)
+            and not isinstance(raw_bytes_removed, bool)
+            and raw_bytes_removed > 0,
+            f"{label} has no positive raw local evidence removal proof",
+        )
+        bundled_file_count = metadata.get("bundledFileCount")
+        _require(
+            isinstance(bundled_file_count, int)
+            and not isinstance(bundled_file_count, bool)
+            and bundled_file_count > 0,
+            f"{label} bundledFileCount is invalid",
+        )
+        restore_verification = metadata.get("remoteRestoreVerification")
+        restored_member_count = _all_members_restore_count(
+            restore_verification,
+            f"{label} remoteRestoreVerification",
+        )
+        _require(
+            restored_member_count == bundled_file_count,
+            f"{label} restore proof member count differs from bundledFileCount",
         )
         # This immutable binding is copied onto every receipt artifact.  The
         # non-bundle artifacts are members of this exact archive generation,
@@ -793,9 +830,61 @@ class OpenCfd2606Canary:
             "uncompressed_tar_byte_size": metadata["uncompressedTarByteSize"],
             "zstd_level": metadata["zstdLevel"],
             "pointer_path": metadata["pointerPath"],
+            "bundled_file_count": bundled_file_count,
+            # A full solver-tree strip deliberately retains this archive until
+            # the control plane proves every database association.  A canary
+            # has no canonical result/attempt rows, so its artifact receipt
+            # must remain truthfully pending that acknowledgement even after
+            # remote hydration/rendering succeeds.
             "local_disposition": metadata["localEvidenceDisposition"],
-            "restore_verification": metadata["remoteRestoreVerification"],
+            "restore_verification": restore_verification,
         }
+
+    @staticmethod
+    def _validate_retained_receipt_bindings(raw_jobs: list[Any]) -> None:
+        """Fail before gateway reads if a retained receipt invents cleanup."""
+
+        for job_index, job_value in enumerate(raw_jobs):
+            job = _mapping(job_value, f"retained receipt job {job_index}")
+            points = _list(job.get("points"), f"retained receipt job {job_index} points")
+            for point_index, point_value in enumerate(points):
+                point = _mapping(
+                    point_value,
+                    f"retained receipt job {job_index} point {point_index}",
+                )
+                artifacts = _list(
+                    point.get("artifacts"),
+                    f"retained receipt job {job_index} point {point_index} artifacts",
+                )
+                for artifact_index, artifact_value in enumerate(artifacts):
+                    artifact = _mapping(
+                        artifact_value,
+                        f"retained receipt artifact {job_index}/{point_index}/{artifact_index}",
+                    )
+                    storage = _mapping(
+                        artifact.get("storage"),
+                        f"retained receipt artifact {job_index}/{point_index}/{artifact_index} storage",
+                    )
+                    _require(
+                        storage.get("local_disposition")
+                        == LIVE_PENDING_DATABASE_ACK,
+                        "retained canary artifact bindings must remain pending database acknowledgement",
+                    )
+                    bundled_file_count = storage.get("bundled_file_count")
+                    _require(
+                        isinstance(bundled_file_count, int)
+                        and not isinstance(bundled_file_count, bool)
+                        and bundled_file_count > 0,
+                        "retained canary receipt bundled_file_count is invalid",
+                    )
+                    restored_member_count = _all_members_restore_count(
+                        storage.get("restore_verification"),
+                        "retained canary receipt restore_verification",
+                    )
+                    _require(
+                        restored_member_count == bundled_file_count,
+                        "retained canary receipt restore proof member count differs from bundled_file_count",
+                    )
 
     def _fetch_artifact(self, artifact: dict[str, Any], label: str) -> bytes:
         self._validate_artifact_metadata(artifact, label)
@@ -963,6 +1052,25 @@ class OpenCfd2606Canary:
         _require(manifest.get("unsteady") is point.get("unsteady"), f"{scenario.name} manifest unsteady flag differs from point")
 
         manifest_files = _list(manifest.get("files"), f"{scenario.name} manifest files")
+        _require(
+            all(
+                isinstance(item, dict)
+                and isinstance(item.get("path"), str)
+                and bool(item["path"])
+                for item in manifest_files
+            ),
+            f"{scenario.name} evidence manifest contains a malformed member",
+        )
+        bundled_manifest_members = [
+            item
+            for item in manifest_files
+            if str(item["path"]).split("/", 1)[0] != "frames"
+        ]
+        _require(
+            storage_binding.get("bundled_file_count")
+            == len(bundled_manifest_members),
+            f"{scenario.name} bundledFileCount differs from the evidence manifest member count",
+        )
         roles = {item.get("role") for item in manifest_files if isinstance(item, dict)}
         _require(
             {"mesh", "force_coefficients", "vtk_window", "y_plus", "dictionary", "log"}.issubset(roles),
@@ -1279,7 +1387,9 @@ class OpenCfd2606Canary:
         replay static JSON.  This path performs no submissions and no strip;
         it rechecks the current worker, downloads every artifact (including
         each exact generation-bound archive), and reruns both field-extents
-        and render operations from the already remote-only evidence.
+        and render operations from generation-pinned GCS evidence.  The local
+        archive remains truthfully pending a database acknowledgement because
+        canary jobs have no canonical result/attempt associations.
         """
 
         receipt = _mapping(value, "retained canary receipt")
@@ -1312,12 +1422,14 @@ class OpenCfd2606Canary:
             "retained canary receipt evidence storage differs from the current bucket/prefix/Zstandard configuration",
         )
 
+        raw_jobs = _list(receipt.get("jobs"), "retained canary receipt jobs")
+        self._validate_retained_receipt_bindings(raw_jobs)
+
         preflight = self._preflight()
         _require(
             receipt.get("runtime") == preflight["runtime"],
             "retained canary receipt runtime differs from the current worker",
         )
-        raw_jobs = _list(receipt.get("jobs"), "retained canary receipt jobs")
         jobs_by_scenario: dict[str, dict[str, Any]] = {}
         for raw_job in raw_jobs:
             job = _mapping(raw_job, "retained canary receipt job")

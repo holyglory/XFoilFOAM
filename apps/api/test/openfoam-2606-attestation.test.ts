@@ -5,6 +5,7 @@ import {
   liveOpenCfd2606Runtime,
   validateOpenCfd2606CanaryReceiptShape,
   validateOpenCfd2606LiveJobResult,
+  verifyOpenCfd2606LiveCanaryJob,
 } from "../src/openfoam-2606-attestation";
 
 const OFFICIAL_PACKAGE =
@@ -67,8 +68,10 @@ function artifacts(suffix: string) {
     uncompressed_tar_byte_size: 4096,
     zstd_level: 10,
     pointer_path: "engine_evidence.remote.json" as const,
-    local_disposition: "remote-only" as const,
-    restore_verification: "archive+vtk-restore" as const,
+    bundled_file_count: 6,
+    local_disposition:
+      "remote-copy-plus-local-archive-pending-database-ack" as const,
+    restore_verification: "archive+manifest+all-members-restore:6" as const,
   };
   return result.map((artifact) => ({ ...artifact, storage }));
 }
@@ -98,8 +101,26 @@ function liveArtifact(artifact: ReturnType<typeof artifacts>[number]) {
             pointerPath: artifact.storage.pointer_path,
             localEvidenceDisposition: artifact.storage.local_disposition,
             remoteRestoreVerification: artifact.storage.restore_verification,
+            bundledFileCount: artifact.storage.bundled_file_count,
+            rawLocalEvidenceDisposition: "removed",
+            rawLocalBytesRemoved: 16_384,
+            localArchiveRetainedUntilDatabaseAck: true,
           }
         : {},
+  };
+}
+
+function fullStripProof(jobId: string) {
+  return {
+    job_id: jobId,
+    kept_case_state: false,
+    bytes_freed: 0,
+    files_removed: 0,
+    dirs_removed: 0,
+    no_op: true,
+    marker_path: `/data/jobs/${jobId}/.stripped.json`,
+    unknown_entries_count: 0,
+    unknown_entries: [],
   };
 }
 
@@ -313,6 +334,27 @@ describe("OpenCFD 2606 canary attestation", () => {
       custom_sha256: "c".repeat(64),
       default_sha256: "d".repeat(64),
     });
+    expect(parsed.jobs[0].points[0].artifacts[0].storage).toMatchObject({
+      bundled_file_count: 6,
+      local_disposition: "remote-copy-plus-local-archive-pending-database-ack",
+      restore_verification: "archive+manifest+all-members-restore:6",
+    });
+  });
+
+  it("rejects a receipt that invents remote-only artifact cleanup", () => {
+    const forged = receipt();
+    forged.jobs[0].points[0].artifacts[0].storage.local_disposition =
+      "remote-only" as never;
+    expect(() => validateOpenCfd2606CanaryReceiptShape(forged)).toThrow();
+  });
+
+  it("rejects a receipt whose all-members proof has the wrong count", () => {
+    const forged = receipt();
+    forged.jobs[0].points[0].artifacts[0].storage.restore_verification =
+      "archive+manifest+all-members-restore:5" as never;
+    expect(() => validateOpenCfd2606CanaryReceiptShape(forged)).toThrow(
+      /differs from bundled_file_count/,
+    );
   });
 
   it("rejects a receipt whose artifact generation is not bound to its bundle", () => {
@@ -448,7 +490,12 @@ describe("OpenCFD 2606 canary attestation", () => {
       ],
     };
     expect(() =>
-      validateOpenCfd2606LiveJobResult(result as never, forced, runtime),
+      validateOpenCfd2606LiveJobResult(
+        result as never,
+        forced,
+        runtime,
+        fullStripProof(forced.job_id),
+      ),
     ).toThrow(/physical no-shedding observation window/);
   });
 
@@ -477,6 +524,7 @@ describe("OpenCFD 2606 canary attestation", () => {
         periodicWindow as never,
         forced,
         runtime,
+        fullStripProof(forced.job_id),
       ),
     ).toThrow(/physical no-shedding observation window/);
 
@@ -491,7 +539,12 @@ describe("OpenCFD 2606 canary attestation", () => {
       }
     ).strouhal = 0.2;
     expect(() =>
-      validateOpenCfd2606LiveJobResult(periodicPoint as never, forced, runtime),
+      validateOpenCfd2606LiveJobResult(
+        periodicPoint as never,
+        forced,
+        runtime,
+        fullStripProof(forced.job_id),
+      ),
     ).toThrow(/physical no-shedding observation window/);
   });
 
@@ -507,7 +560,12 @@ describe("OpenCFD 2606 canary attestation", () => {
       cm: [0, 0],
     });
     expect(() =>
-      validateOpenCfd2606LiveJobResult(result as never, rans, runtime),
+      validateOpenCfd2606LiveJobResult(
+        result as never,
+        rans,
+        runtime,
+        fullStripProof(rans.job_id),
+      ),
     ).toThrow(/invented a transient force history/);
   });
 
@@ -522,7 +580,150 @@ describe("OpenCFD 2606 canary attestation", () => {
     )!;
     bundle.metadata.generation = "1752612345678902";
     expect(() =>
-      validateOpenCfd2606LiveJobResult(result as never, rans, runtime),
+      validateOpenCfd2606LiveJobResult(
+        result as never,
+        rans,
+        runtime,
+        fullStripProof(rans.job_id),
+      ),
     ).toThrow(/live artifact checksums differ from the canary receipt/);
+  });
+
+  it("accepts the real producer pending-ack and all-members evidence shape", () => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    expect(() =>
+      validateOpenCfd2606LiveJobResult(
+        result as never,
+        rans,
+        runtime,
+        fullStripProof(rans.job_id),
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects a forged receipt replay without an idempotent full-strip proof", () => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    expect(() =>
+      validateOpenCfd2606LiveJobResult(result as never, rans, runtime),
+    ).toThrow(/lacks an idempotent full-strip marker proof/);
+  });
+
+  it("rejects a first-time strip because Python did not prove the prior strip", () => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    expect(() =>
+      validateOpenCfd2606LiveJobResult(result as never, rans, runtime, {
+        ...fullStripProof(rans.job_id),
+        no_op: false,
+        bytes_freed: 8192,
+        files_removed: 12,
+        dirs_removed: 4,
+      }),
+    ).toThrow(/lacks an idempotent full-strip marker proof/);
+  });
+
+  it("re-proves Python's prior full strip through the live engine client", async () => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    const calls: Array<{ jobId: string; keepCaseState: boolean | undefined }> =
+      [];
+    const client = {
+      getResult: async () => result,
+      stripJob: async (
+        jobId: string,
+        request: { keep_case_state?: boolean },
+      ) => {
+        calls.push({
+          jobId,
+          keepCaseState: request.keep_case_state,
+        });
+        return fullStripProof(jobId);
+      },
+    };
+
+    await expect(
+      verifyOpenCfd2606LiveCanaryJob(client as never, rans, runtime),
+    ).resolves.toBeUndefined();
+    expect(calls).toEqual([{ jobId: rans.job_id, keepCaseState: false }]);
+  });
+
+  it("rejects live-client attestation when the independent strip is not a no-op", async () => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    const client = {
+      getResult: async () => result,
+      stripJob: async () => ({
+        ...fullStripProof(rans.job_id),
+        no_op: false,
+        bytes_freed: 8192,
+        files_removed: 12,
+        dirs_removed: 4,
+      }),
+    };
+
+    await expect(
+      verifyOpenCfd2606LiveCanaryJob(client as never, rans, runtime),
+    ).rejects.toThrow(/lacks an idempotent full-strip marker proof/);
+  });
+
+  it.each([
+    ["remote-copy-plus-local-retained", "local retained"],
+    ["remote-only", "premature remote-only"],
+  ])("rejects live %s artifact evidence (%s)", (disposition) => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    const bundle = result.polars[0].points[0].evidence_artifacts.find(
+      (artifact) => artifact.kind === "engine_bundle",
+    )!;
+    bundle.metadata.localEvidenceDisposition = disposition as never;
+    expect(() =>
+      validateOpenCfd2606LiveJobResult(
+        result as never,
+        rans,
+        runtime,
+        fullStripProof(rans.job_id),
+      ),
+    ).toThrow(/lacks an exact GCS generation binding/);
+  });
+
+  it("rejects a live all-members proof whose count is wrong", () => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    const bundle = result.polars[0].points[0].evidence_artifacts.find(
+      (artifact) => artifact.kind === "engine_bundle",
+    )!;
+    bundle.metadata.remoteRestoreVerification =
+      "archive+manifest+all-members-restore:5" as never;
+    expect(() =>
+      validateOpenCfd2606LiveJobResult(
+        result as never,
+        rans,
+        runtime,
+        fullStripProof(rans.job_id),
+      ),
+    ).toThrow(/differs from bundled_file_count/);
   });
 });
