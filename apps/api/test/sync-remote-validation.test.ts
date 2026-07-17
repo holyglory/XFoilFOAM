@@ -162,6 +162,7 @@ const TEST_MATCHING_RUNTIME = {
   numericsRevision: "1",
   adapterContractVersion: 1,
   buildId: `${PREFIX}-matching-opencfd-2606`,
+  applicationSourceSha256: "a".repeat(64),
 };
 const TERMINAL_GAP_AOA = 739.101;
 const TERMINAL_ACCEPTED_AOA = 739.102;
@@ -1488,6 +1489,8 @@ describe("remote solver sync validation regressions", () => {
           numerics_revision: matchingRuntime.numericsRevision,
           adapter_contract_version: matchingRuntime.adapterContractVersion,
           build_id: matchingRuntime.buildId,
+          application_source_sha256:
+            matchingRuntime.applicationSourceSha256,
         },
       });
     } finally {

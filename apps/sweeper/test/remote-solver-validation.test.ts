@@ -3555,7 +3555,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
 
     expect(secondSubmit).toHaveBeenCalledTimes(1);
     expect(secondSubmit.mock.calls[0]?.[0]).toMatchObject({
-      aoa: { angles: [retryAoas[0]] },
+      aoa: { angles: retryAoas },
       solver: { force_transient: true, urans_fidelity: "precalc" },
     });
     expect(requests(fetchMock, "/polars")).toHaveLength(0);
@@ -3573,8 +3573,8 @@ describe("remote-owned derived PRECALC lifecycle", () => {
     expect(children[1]?.requestPayload).toMatchObject({
       syncPromiseId: promise.id,
       remoteSolver: true,
-      aoas: [retryAoas[0]],
-      precalcObligationIds: [expect.any(String)],
+      aoas: retryAoas,
+      precalcObligationIds: retryAoas.map(() => expect.any(String)),
     });
   });
 

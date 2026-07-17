@@ -62,4 +62,3 @@ configure_deployment_compose_profile() {
     COMPOSE_FILE_ARGS+=(-f "$COMPOSE_OVERRIDE_FILE")
   fi
 }
-

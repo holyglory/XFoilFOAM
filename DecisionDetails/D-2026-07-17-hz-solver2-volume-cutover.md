@@ -104,4 +104,3 @@ no-clobber receipt publication, and acknowledgement-gated retention. Live
 activation, backup hashes, receipt hashes, worker utilization, promise flow,
 and hub acknowledgement remain production evidence and must be recorded during
 the actual maintenance window.
-
