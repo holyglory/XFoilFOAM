@@ -170,15 +170,15 @@ def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
         assert paths[key].is_file(), key
 
 
-def test_finished_urans_archives_start_marker_before_full_strip(
+def test_finished_urans_archives_immutable_transient_markers_before_full_strip(
     tmp_path: Path,
     monkeypatch,
 ):
-    """MUST-CATCH: the second guarded OpenCFD 2606 canary completed its
-    physical URANS solve but full retention left both transient-root JSON files
-    as unknown.  The immutable trajectory boundary must be inside the real
-    archive before cleanup removes it; the mutable watchdog budget must not be
-    mistaken for evidence or restart state.
+    """MUST-CATCH: guarded OpenCFD 2606 canaries completed physical URANS,
+    then retention found immutable transient-root JSON records missing from
+    their canonical archives.  Both the trajectory boundary and certified
+    early-stop averaging window must be in the real archive before cleanup;
+    the mutable watchdog budget must not be mistaken for immutable evidence.
     """
 
     job_root = tmp_path / "job-forced-urans-retention"
@@ -206,6 +206,30 @@ def test_finished_urans_archives_start_marker_before_full_strip(
     assert hashlib.sha256(transient_start_bytes).hexdigest() == (
         "b50f4dc750325e2969c0c8192e88592d7144f0680651ee69787dce9815b71bcf"
     )
+    # Exact bytes and SHA observed in the third failed production canary
+    # (job b57cb2d8cee741eaa146b528d6fbdc6f).  This record owns the retained
+    # window used to compute the published result; it is not process arming.
+    early_stop_bytes = (
+        b'{\n'
+        b'  "cycles": 2,\n'
+        b'  "frame_count": 58,\n'
+        b'  "frames_per_cycle": 29.0,\n'
+        b'  "mean_drift": 0.014638154531983683,\n'
+        b'  "period_s": 0.004088886963848821,\n'
+        b'  "reason": "two stable periods with sufficient frames",\n'
+        b'  "retain_from": 0.0013769880265579494,\n'
+        b'  "similarity": 0.02387152845931142,\n'
+        b'  "window_end": 0.0179609,\n'
+        b'  "window_start": 0.009783126072302356\n'
+        b'}\n'
+    )
+    early_stop = _write(
+        transient / pipeline.URANS_EARLY_STOP_MARKER,
+        early_stop_bytes,
+    )
+    assert hashlib.sha256(early_stop_bytes).hexdigest() == (
+        "fb4225b911b1713d05163ced26291eaa0610a1e80b7c2ffdbb37641ecc293fb3"
+    )
     march_budget = _write_json(
         transient / pipeline.MARCH_BUDGET_MARKER_FILENAME,
         {"end_t": 0.4, "budget_s": 14400.0, "wall_start": 123.0},
@@ -230,27 +254,48 @@ def test_finished_urans_archives_start_marker_before_full_strip(
     evidence = case / "evidence"
     manifest_path = evidence / "evidence_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    archived_path = "openfoam/transient/transient_start.json"
-    marker_entry = next(
-        entry for entry in manifest["files"] if entry["path"] == archived_path
+    archived_start_path = "openfoam/transient/transient_start.json"
+    start_entry = next(
+        entry
+        for entry in manifest["files"]
+        if entry["path"] == archived_start_path
     )
-    assert marker_entry["role"] == "continuation_state"
-    assert marker_entry["sha256"] == hashlib.sha256(
+    assert start_entry["role"] == "continuation_state"
+    assert start_entry["sha256"] == hashlib.sha256(
         transient_start_bytes
     ).hexdigest()
-    assert marker_entry["byteSize"] == len(transient_start_bytes)
+    assert start_entry["byteSize"] == len(transient_start_bytes)
+    archived_early_stop_path = "openfoam/transient/urans_early_stop.json"
+    early_stop_entry = next(
+        entry
+        for entry in manifest["files"]
+        if entry["path"] == archived_early_stop_path
+    )
+    assert early_stop_entry["role"] == "quality_evidence"
+    assert early_stop_entry["sha256"] == hashlib.sha256(
+        early_stop_bytes
+    ).hexdigest()
+    assert early_stop_entry["byteSize"] == len(early_stop_bytes)
     assert all(
         entry["path"] != "openfoam/transient/march_budget.json"
         for entry in manifest["files"]
     )
-    marker_artifact = next(
+    start_artifact = next(
         artifact
         for artifact in outcome.evidence_artifacts
-        if artifact.path == f"evidence/{archived_path}"
+        if artifact.path == f"evidence/{archived_start_path}"
     )
-    assert marker_artifact.kind == "dictionary"
-    assert marker_artifact.role == "continuation_state"
-    assert marker_artifact.sha256 == marker_entry["sha256"]
+    assert start_artifact.kind == "dictionary"
+    assert start_artifact.role == "continuation_state"
+    assert start_artifact.sha256 == start_entry["sha256"]
+    early_stop_artifact = next(
+        artifact
+        for artifact in outcome.evidence_artifacts
+        if artifact.path == f"evidence/{archived_early_stop_path}"
+    )
+    assert early_stop_artifact.kind == "field_data"
+    assert early_stop_artifact.role == "quality_evidence"
+    assert early_stop_artifact.sha256 == early_stop_entry["sha256"]
 
     # Inspect the actual canonical tar.zst, not merely the unpacked staging
     # copy or manifest claim.  The verified extractor authenticates all bundled
@@ -260,12 +305,15 @@ def test_finished_urans_archives_start_marker_before_full_strip(
         evidence / "engine_evidence.tar.zst",
         restored,
         compression="zstd",
-        include_prefixes=(archived_path,),
+        include_prefixes=(archived_start_path, archived_early_stop_path),
         expected_manifest=manifest_path.read_bytes(),
     )
-    archived_transient_start = evidence / archived_path
+    archived_transient_start = evidence / archived_start_path
+    archived_early_stop = evidence / archived_early_stop_path
     assert archived_transient_start.read_bytes() == transient_start_bytes
-    assert (restored / archived_path).read_bytes() == transient_start_bytes
+    assert archived_early_stop.read_bytes() == early_stop_bytes
+    assert (restored / archived_start_path).read_bytes() == transient_start_bytes
+    assert (restored / archived_early_stop_path).read_bytes() == early_stop_bytes
     archive = evidence / "engine_evidence.tar.zst"
     pointer = _write_remote_pointer(evidence, archive)
     # Production remote-only finalization removes this unpacked duplicate only
@@ -277,11 +325,13 @@ def test_finished_urans_archives_start_marker_before_full_strip(
     report = strip_job_dir(job_root)
 
     assert not transient_start.exists()
+    assert not early_stop.exists()
     assert not march_budget.exists()
     assert archive.is_file()
     assert manifest_path.is_file()
     assert pointer.is_file()
-    assert (restored / archived_path).read_bytes() == transient_start_bytes
+    assert (restored / archived_start_path).read_bytes() == transient_start_bytes
+    assert (restored / archived_early_stop_path).read_bytes() == early_stop_bytes
     assert report.unknown_entries == []
 
 
@@ -292,6 +342,10 @@ def test_keep_case_state_preserves_continuation_and_packaged_evidence(tmp_path: 
     transient_start = _write(
         case / "transient" / pipeline.TRANSIENT_START_MARKER,
         b'{\n  "transient_start": 0.0\n}\n',
+    )
+    early_stop = _write_json(
+        case / "transient" / pipeline.URANS_EARLY_STOP_MARKER,
+        {"retain_from": 0.1, "period_s": 0.02, "cycles": 2},
     )
     march_budget = _write_json(
         case / "transient" / pipeline.MARCH_BUDGET_MARKER_FILENAME,
@@ -316,6 +370,7 @@ def test_keep_case_state_preserves_continuation_and_packaged_evidence(tmp_path: 
         assert (case / rel).exists()
     assert paths["mesh_evidence"].is_file()
     assert transient_start.is_file()
+    assert early_stop.is_file()
     assert march_budget.is_file()
     assert not (case / "VTK").exists()
     assert (case / "log.simpleFoam").is_file()
@@ -417,6 +472,9 @@ def test_strip_idempotency_uses_marker(tmp_path: Path):
 
     assert first.no_op is False
     assert (job_root / ".stripped.json").is_file()
+    marker = json.loads((job_root / ".stripped.json").read_text())
+    assert marker["schemaVersion"] == 2
+    assert marker["complete"] is True
     assert second.no_op is True
     assert second.bytes_freed == 0
     assert second.files_removed == 0
@@ -430,6 +488,47 @@ def test_unknown_case_entries_are_retained_and_reported(tmp_path: Path):
 
     assert paths["unknown"].is_file()
     assert "cases/c1_u25/operator_notes.dat" in report.unknown_entries
+    # An incomplete pass must remain retryable.  A strength-only success marker
+    # hid this unknown forever in production, even after a later engine learned
+    # how to archive/remove it.
+    assert not (job_root / ".stripped.json").exists()
+
+    paths["unknown"].unlink()
+    retried = strip_job_dir(job_root)
+    assert retried.no_op is False
+    assert retried.unknown_entries == []
+    assert (job_root / ".stripped.json").is_file()
+
+
+def test_legacy_strength_marker_is_not_complete_retention_proof(tmp_path: Path):
+    """MUST-CATCH: schema-1 wrote a marker despite retained unknown entries.
+
+    A legacy full-strength marker must get one real fail-safe re-evaluation,
+    not suppress cleanup solely because its requested mode was already full.
+    """
+
+    job_root = tmp_path / "job-legacy-strip-marker"
+    paths = _make_realistic_job(job_root)
+    _write_json(
+        job_root / ".stripped.json",
+        {
+            "timestamp": "2026-07-17T00:00:00+00:00",
+            "mode": "full",
+            "keep_case_state": False,
+            "bytes_freed": 1,
+            "files_removed": 1,
+            "dirs_removed": 1,
+        },
+    )
+
+    report = strip_job_dir(job_root)
+
+    assert report.no_op is False
+    assert report.unknown_entries == []
+    assert not paths["case"].joinpath("constant").exists()
+    marker = json.loads((job_root / ".stripped.json").read_text())
+    assert marker["schemaVersion"] == 2
+    assert marker["complete"] is True
 
 
 def test_unrecognized_transient_json_is_not_deleted_by_marker_allowlist(tmp_path: Path):
@@ -449,14 +548,14 @@ def test_unrecognized_transient_json_is_not_deleted_by_marker_allowlist(tmp_path
     )
 
 
-def test_full_strip_retains_start_marker_without_exact_archive_member(
+def test_full_strip_retains_immutable_markers_without_exact_archive_members(
     tmp_path: Path,
     monkeypatch,
 ):
     """False-positive guard for the preserved failed production generation.
 
-    The old engine left a real trajectory marker but its manifest/archive did
-    not contain that member.  A filename match alone must never authorize its
+    Old engines left real trajectory/quality records but their manifest/archive
+    did not contain those members.  A filename match alone must never authorize
     deletion; the unrelated mutable watchdog marker remains safe to remove.
     """
 
@@ -498,7 +597,11 @@ def test_full_strip_retains_start_marker_without_exact_archive_member(
         )
     )
     assert all(
-        entry["path"] != "openfoam/transient/transient_start.json"
+        entry["path"]
+        not in {
+            "openfoam/transient/transient_start.json",
+            "openfoam/transient/urans_early_stop.json",
+        }
         for entry in manifest["files"]
     )
     assert (case / "evidence" / "engine_evidence.tar.zst").is_file()
@@ -509,6 +612,10 @@ def test_full_strip_retains_start_marker_without_exact_archive_member(
         transient / pipeline.TRANSIENT_START_MARKER,
         b'{\n  "transient_start": 0.0\n}\n',
     )
+    early_stop = _write(
+        transient / pipeline.URANS_EARLY_STOP_MARKER,
+        b'{\n  "retain_from": 0.0,\n  "period_s": 0.01\n}\n',
+    )
     march_budget = _write_json(
         transient / pipeline.MARCH_BUDGET_MARKER_FILENAME,
         {"end_t": 0.4, "budget_s": 14400.0, "wall_start": 123.0},
@@ -517,11 +624,13 @@ def test_full_strip_retains_start_marker_without_exact_archive_member(
     report = strip_job_dir(job_root)
 
     assert transient_start.is_file()
+    assert early_stop.is_file()
     assert not march_budget.exists()
-    assert (
-        "cases/c0p05_u166_a0/transient/transient_start.json"
-        in report.unknown_entries
-    )
+    assert report.unknown_entries == [
+        "cases/c0p05_u166_a0/transient/transient_start.json",
+        "cases/c0p05_u166_a0/transient/urans_early_stop.json",
+    ]
+    assert not (job_root / ".stripped.json").exists()
 
 
 def test_running_guard_refuses_strip_and_delete(tmp_path: Path):

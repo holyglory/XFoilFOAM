@@ -38,14 +38,15 @@ Keep-set derivation:
   finalization has already copied its exact files into the canonical engine
   archive as ``openfoam/mesh_evidence``. Full strip removes that duplicate;
   case-state-preserving strip keeps it with the rest of the restartable case.
-* A finished URANS transient can leave two small JSON controls beside its time
-  directories. ``transient_start.json`` is copied byte-for-byte into the
-  canonical archive as ``openfoam/transient/transient_start.json`` before the
-  result is returned. ``march_budget.json`` is mutable process-local watchdog
-  arming and continuation staging deliberately does not copy it. Full strip
-  removes the budget marker and removes the start marker only after proving
-  exact manifest and tar.zst membership; case-state-preserving strip retains
-  both.
+* A finished URANS transient can leave small JSON records beside its time
+  directories. ``transient_start.json`` records the trajectory merge boundary;
+  ``urans_early_stop.json`` certifies the exact stable averaging window that
+  produced the coefficients and quality verdict. Both are copied byte-for-byte
+  into the canonical archive before the result is returned. ``march_budget.json``
+  is mutable process-local watchdog arming and continuation staging deliberately
+  does not copy it. Full strip removes the budget marker and removes either
+  immutable record only after proving exact manifest and tar.zst membership;
+  case-state-preserving strip retains all three.
 
 Unknown entries are fail-safe: they are retained and reported instead of being
 deleted by a broad "everything not in the keep set" rule.
@@ -75,6 +76,7 @@ from .evidence_store import (
 
 
 STRIP_MARKER = ".stripped.json"
+STRIP_MARKER_SCHEMA_VERSION = 2
 
 _ROOT_JSON_KEEP = {"request.json", "result.json", "status.json", "runtime.json"}
 _CASE_DELETE_DIRS = {
@@ -88,8 +90,20 @@ _CASE_DELETE_DIRS = {
 _CASE_KEEP_DIRS = {"images", "frames", "evidence", "custom_renders"}
 _TRANSIENT_START_FILENAME = "transient_start.json"
 _TRANSIENT_START_ARCHIVE_MEMBER = "openfoam/transient/transient_start.json"
+_URANS_EARLY_STOP_FILENAME = "urans_early_stop.json"
+_URANS_EARLY_STOP_ARCHIVE_MEMBER = "openfoam/transient/urans_early_stop.json"
 _MARCH_BUDGET_FILENAME = "march_budget.json"
-_MAX_TRANSIENT_START_BYTES = 64 * 1024
+_MAX_TRANSIENT_MARKER_BYTES = 64 * 1024
+_IMMUTABLE_TRANSIENT_MARKERS = {
+    _TRANSIENT_START_FILENAME: (
+        _TRANSIENT_START_ARCHIVE_MEMBER,
+        "continuation_state",
+    ),
+    _URANS_EARLY_STOP_FILENAME: (
+        _URANS_EARLY_STOP_ARCHIVE_MEMBER,
+        "quality_evidence",
+    ),
+}
 _EVIDENCE_KEEP_NAMES = {
     "evidence_manifest.json",
     "openfoam_evidence.tar.gz",
@@ -192,7 +206,15 @@ def strip_job_dir(job_root: Path, keep_case_state: bool = False) -> StripReport:
             for case_dir in sorted(p for p in cases_root.iterdir() if p.is_dir()):
                 _strip_case_dir(job_root, case_dir, report, keep_case_state=keep_case_state)
 
-        _write_marker(marker, keep_case_state, report)
+        if report.unknown_entries:
+            # An incomplete classification is not a successful strip.  In
+            # particular, never let a strength-only marker turn the next pass
+            # into a no-op after a later engine learns how to archive/reclaim
+            # the retained entry.  Remove a stale weaker/legacy marker so the
+            # case is re-evaluated and the same unknowns remain visible.
+            marker.unlink(missing_ok=True)
+        else:
+            _write_marker(marker, keep_case_state, report)
         return report
 
 
@@ -224,12 +246,24 @@ def _read_marker_mode(marker: Path) -> bool | None:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except Exception:
         return None
+    # Schema-1 markers were written even when unknown entries remained.  They
+    # therefore cannot prove a complete pass and must be re-evaluated once
+    # under the fail-safe schema rather than hiding old retained files forever.
+    if (
+        data.get("schemaVersion") != STRIP_MARKER_SCHEMA_VERSION
+        or data.get("complete") is not True
+    ):
+        return None
     value = data.get("keep_case_state")
     return value if isinstance(value, bool) else None
 
 
 def _write_marker(marker: Path, keep_case_state: bool, report: StripReport) -> None:
+    if report.unknown_entries:
+        raise ValueError("cannot mark an incomplete retention pass as stripped")
     payload = {
+        "schemaVersion": STRIP_MARKER_SCHEMA_VERSION,
+        "complete": True,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mode": "keep_case_state" if keep_case_state else "full",
         "keep_case_state": keep_case_state,
@@ -433,15 +467,19 @@ def _strip_solver_state_dir(
             # Continuation staging deliberately excludes it and rewrites a
             # fresh budget for every new chunk.
             _remove_path(child, report)
-        elif child.is_file() and child.name == _TRANSIENT_START_FILENAME:
-            # An old engine can leave this marker without putting it in the
-            # immutable bundle (2026-07-17 guarded canary).  Delete it only
-            # when this exact case's manifest and canonical tar.zst both prove
-            # the byte-identical member.  Otherwise retain/report it fail-safe.
-            if _transient_start_has_exact_archive_proof(
+        elif child.is_file() and child.name in _IMMUTABLE_TRANSIENT_MARKERS:
+            # Two guarded 2026-07-17 canaries proved that an older engine can
+            # leave immutable trajectory/quality records outside its bundle.
+            # Delete one only when this exact case's manifest and canonical
+            # tar.zst both prove the byte-identical member.  Otherwise
+            # retain/report it fail-safe.
+            archive_member, role = _IMMUTABLE_TRANSIENT_MARKERS[child.name]
+            if _transient_marker_has_exact_archive_proof(
                 case_dir,
                 solver_dir,
                 child,
+                archive_member=archive_member,
+                role=role,
             ):
                 _remove_path(child, report)
             else:
@@ -454,12 +492,15 @@ def _strip_solver_state_dir(
             _record_unknown(job_root, child, report)
 
 
-def _transient_start_has_exact_archive_proof(
+def _transient_marker_has_exact_archive_proof(
     case_dir: Path,
     solver_dir: Path,
     marker: Path,
+    *,
+    archive_member: str,
+    role: str,
 ) -> bool:
-    """Prove the exact live trajectory boundary is inside canonical evidence.
+    """Prove an exact live transient record is inside canonical evidence.
 
     This intentionally reads the retained tar.zst rather than trusting only an
     unpacked staging copy or mutable sidecar manifest.  It streams just far
@@ -489,7 +530,7 @@ def _transient_start_has_exact_archive_proof(
             list,
         ):
             return False
-        if marker.stat().st_size > _MAX_TRANSIENT_START_BYTES:
+        if marker.stat().st_size > _MAX_TRANSIENT_MARKER_BYTES:
             return False
         marker_bytes = marker.read_bytes()
         marker_sha256 = hashlib.sha256(marker_bytes).hexdigest()
@@ -497,13 +538,13 @@ def _transient_start_has_exact_archive_proof(
             entry
             for entry in manifest["files"]
             if isinstance(entry, dict)
-            and entry.get("path") == _TRANSIENT_START_ARCHIVE_MEMBER
+            and entry.get("path") == archive_member
         ]
         if len(matching_entries) != 1:
             return False
         entry = matching_entries[0]
         if (
-            entry.get("role") != "continuation_state"
+            entry.get("role") != role
             or entry.get("sha256") != marker_sha256
             or entry.get("byteSize") != len(marker_bytes)
         ):
@@ -521,10 +562,11 @@ def _transient_start_has_exact_archive_proof(
             ):
                 return False
 
-        return _tar_zst_contains_exact_transient_start(
+        return _tar_zst_contains_exact_transient_marker(
             archive_path,
             manifest_bytes,
             marker_bytes,
+            archive_member=archive_member,
         )
     except (EvidenceStoreError, OSError, ValueError, json.JSONDecodeError):
         return False
@@ -540,14 +582,16 @@ def _transient_evidence_dir(case_dir: Path, solver_dir: Path) -> Path:
     return case_dir / "evidence"
 
 
-def _tar_zst_contains_exact_transient_start(
+def _tar_zst_contains_exact_transient_marker(
     archive_path: Path,
     manifest_bytes: bytes,
     marker_bytes: bytes,
+    *,
+    archive_member: str,
 ) -> bool:
     expected = {
         "evidence_manifest.json": manifest_bytes,
-        _TRANSIENT_START_ARCHIVE_MEMBER: marker_bytes,
+        archive_member: marker_bytes,
     }
     seen: set[str] = set()
     try:

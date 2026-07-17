@@ -27,6 +27,11 @@ on:
         required: false
         default: false
         type: boolean
+      pending_cutover_early_stop_retention_retry:
+        description: "Retry the third exact failed OpenCFD 2606 canary with the reviewed URANS early-stop retention correction"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: airfoils-pro-vps-deploy
@@ -36,7 +41,7 @@ jobs:
   deploy:
     name: Deploy control plane
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.pending_cutover_engine_rebuild_replay || inputs.pending_cutover_retention_retry || inputs.pending_cutover_transient_retention_retry) && 360 || 45 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.pending_cutover_retention_retry || inputs.pending_cutover_transient_retention_retry || inputs.pending_cutover_early_stop_retention_retry) && 360 || (github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay && 360 || 45) }}
     env:
       VPS_HOST: ${{ secrets.AIRFOILS_VPS_HOST }}
       VPS_USER: ${{ secrets.AIRFOILS_VPS_USER }}
@@ -49,6 +54,7 @@ jobs:
       PENDING_CUTOVER_ENGINE_REBUILD_REPLAY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay || false }}
       PENDING_CUTOVER_RETENTION_RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_retention_retry || false }}
       PENDING_CUTOVER_TRANSIENT_RETENTION_RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_transient_retention_retry || false }}
+      PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_early_stop_retention_retry || false }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -75,6 +81,7 @@ jobs:
           bash -n scripts/deploy/replay-pending-opencfd2606-rebuild.sh
           bash -n scripts/deploy/retry-pending-opencfd2606-retention.sh
           bash -n scripts/deploy/retry-pending-opencfd2606-transient-retention.sh
+          bash -n scripts/deploy/retry-pending-opencfd2606-early-stop-retention.sh
           python3 scripts/deploy/deployment-source-manifest.py --help >/dev/null
           test -f docker-compose.deploy.yml
 
@@ -208,6 +215,35 @@ jobs:
             "umask 077 && cat >$REMOTE_TARGET_Q && chmod 600 -- $REMOTE_TARGET_Q" \
             <"$TARGET_INVENTORY"
 
+      - name: Upload exact source inventories for early-stop-retention retry
+        if: ${{ env.PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_REVISION="2ab861cb4ce603a14b82722a0f63cbc0fd42276c"
+          EXPECTED_BASE_INVENTORY_SHA256="cfc14fb3990219b323e9349a2054734ec9ef72f638d44658f50cfc89b8f258dd"
+          BASE_INVENTORY="$RUNNER_TEMP/opencfd2606-early-stop-retention-base-ls-tree.txt"
+          TARGET_INVENTORY="$RUNNER_TEMP/opencfd2606-early-stop-retention-target-ls-tree.txt"
+          git cat-file -e "${BASE_REVISION}^{commit}"
+          git cat-file -e "${GITHUB_SHA}^{commit}"
+          git ls-tree -r --full-tree "$BASE_REVISION" >"$BASE_INVENTORY"
+          git ls-tree -r --full-tree "$GITHUB_SHA" >"$TARGET_INVENTORY"
+          printf '%s  %s\n' "$EXPECTED_BASE_INVENTORY_SHA256" "$BASE_INVENTORY" | sha256sum -c -
+          TARGET_INVENTORY_SHA256="$(sha256sum "$TARGET_INVENTORY" | awk '{print $1}')"
+          [[ "$TARGET_INVENTORY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'PENDING_CUTOVER_EARLY_STOP_RETENTION_TARGET_INVENTORY_SHA256=%s\n' "$TARGET_INVENTORY_SHA256" >>"$GITHUB_ENV"
+          printf -v STAGING_Q '%q' "$VPS_STAGING_DIR"
+          REMOTE_BASE="$VPS_STAGING_DIR/.codex-artifacts/opencfd2606-early-stop-retention-base-ls-tree.txt"
+          REMOTE_TARGET="$VPS_STAGING_DIR/.codex-artifacts/opencfd2606-early-stop-retention-target-ls-tree.txt"
+          printf -v REMOTE_BASE_Q '%q' "$REMOTE_BASE"
+          printf -v REMOTE_TARGET_Q '%q' "$REMOTE_TARGET"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "install -d -m 700 -- $STAGING_Q/.codex-artifacts && umask 077 && cat >$REMOTE_BASE_Q && chmod 600 -- $REMOTE_BASE_Q" \
+            <"$BASE_INVENTORY"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "umask 077 && cat >$REMOTE_TARGET_Q && chmod 600 -- $REMOTE_TARGET_Q" \
+            <"$TARGET_INVENTORY"
+
       - name: Promote source or repair pending cutover under deploy lock
         shell: bash
         run: |
@@ -223,11 +259,19 @@ jobs:
           [[ "$PENDING_CUTOVER_ENGINE_REBUILD_REPLAY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
           [[ "$PENDING_CUTOVER_RETENTION_RETRY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
           [[ "$PENDING_CUTOVER_TRANSIENT_RETENTION_RETRY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
+          [[ "$PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
           if ((RECOVERY_ACTIONS > 1)); then
             echo "Select only one pending-cutover recovery action per workflow dispatch." >&2
             exit 2
           fi
-          if [[ "$PENDING_CUTOVER_TRANSIENT_RETENTION_RETRY" == "true" ]]; then
+          if [[ "$PENDING_CUTOVER_EARLY_STOP_RETENTION_RETRY" == "true" ]]; then
+            : "${PENDING_CUTOVER_EARLY_STOP_RETENTION_TARGET_INVENTORY_SHA256:?Target inventory SHA was not prepared}"
+            printf -v TARGET_INVENTORY_SHA_Q '%q' "$PENDING_CUTOVER_EARLY_STOP_RETENTION_TARGET_INVENTORY_SHA256"
+            ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" \
+              -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+              "${VPS_USER}@${VPS_HOST}" \
+              "chmod +x $STAGING_Q/scripts/deploy/retry-pending-opencfd2606-early-stop-retention.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q EXPECTED_TARGET_SOURCE_REVISION=$REVISION_Q EXPECTED_TARGET_GIT_INVENTORY_SHA256=$TARGET_INVENTORY_SHA_Q $STAGING_Q/scripts/deploy/retry-pending-opencfd2606-early-stop-retention.sh"
+          elif [[ "$PENDING_CUTOVER_TRANSIENT_RETENTION_RETRY" == "true" ]]; then
             : "${PENDING_CUTOVER_TRANSIENT_RETENTION_TARGET_INVENTORY_SHA256:?Target inventory SHA was not prepared}"
             printf -v TARGET_INVENTORY_SHA_Q '%q' "$PENDING_CUTOVER_TRANSIENT_RETENTION_TARGET_INVENTORY_SHA256"
             ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" \
