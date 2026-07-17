@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      pending_cutover_retention_retry:
+        description: "Retry the exact failed OpenCFD 2606 canary with the reviewed mesh-evidence retention correction"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: airfoils-pro-vps-deploy
@@ -26,7 +31,7 @@ jobs:
   deploy:
     name: Deploy control plane
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay && 360 || 45 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.pending_cutover_engine_rebuild_replay || inputs.pending_cutover_retention_retry) && 360 || 45 }}
     env:
       VPS_HOST: ${{ secrets.AIRFOILS_VPS_HOST }}
       VPS_USER: ${{ secrets.AIRFOILS_VPS_USER }}
@@ -37,9 +42,15 @@ jobs:
       PUBLIC_ORIGIN: ${{ vars.AIRFOILS_PUBLIC_ORIGIN }}
       PENDING_CUTOVER_NODE_API_REPAIR: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_node_api_repair || false }}
       PENDING_CUTOVER_ENGINE_REBUILD_REPLAY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_engine_rebuild_replay || false }}
+      PENDING_CUTOVER_RETENTION_RETRY: ${{ github.event_name == 'workflow_dispatch' && inputs.pending_cutover_retention_retry || false }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # The incident wrapper compares the staged source to the exact
+          # failed-replay commit.  Full history is used only to produce that
+          # authenticated, read-only Git-tree inventory below.
+          fetch-depth: 0
 
       - name: Ensure deploy tools are available
         shell: bash
@@ -56,6 +67,7 @@ jobs:
           bash -n scripts/deploy/promote-and-redeploy.sh
           bash -n scripts/deploy/repair-pending-node-api.sh
           bash -n scripts/deploy/replay-pending-opencfd2606-rebuild.sh
+          bash -n scripts/deploy/retry-pending-opencfd2606-retention.sh
           python3 scripts/deploy/deployment-source-manifest.py --help >/dev/null
           test -f docker-compose.deploy.yml
 
@@ -142,6 +154,24 @@ jobs:
             --exclude-from scripts/deploy/source-rsync-excludes.txt \
             ./ "${VPS_USER}@${VPS_HOST}:${VPS_STAGING_DIR}/"
 
+      - name: Upload exact failed-replay source inventory for retention retry
+        if: ${{ env.PENDING_CUTOVER_RETENTION_RETRY == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_REVISION="1f815f89c523cbf667725c1cd681d729c06a10c9"
+          EXPECTED_INVENTORY_SHA256="168acd3453ae8472ed841ed390f455902267e27f2c47ba15c182f94f3b52fb01"
+          INVENTORY="$RUNNER_TEMP/opencfd2606-retention-base-ls-tree.txt"
+          git cat-file -e "${BASE_REVISION}^{commit}"
+          git ls-tree -r --full-tree "$BASE_REVISION" >"$INVENTORY"
+          printf '%s  %s\n' "$EXPECTED_INVENTORY_SHA256" "$INVENTORY" | sha256sum -c -
+          printf -v STAGING_Q '%q' "$VPS_STAGING_DIR"
+          REMOTE_INVENTORY="$VPS_STAGING_DIR/.codex-artifacts/opencfd2606-retention-base-ls-tree.txt"
+          printf -v REMOTE_INVENTORY_Q '%q' "$REMOTE_INVENTORY"
+          ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" "${VPS_USER}@${VPS_HOST}" \
+            "install -d -m 700 -- $STAGING_Q/.codex-artifacts && umask 077 && cat >$REMOTE_INVENTORY_Q && chmod 600 -- $REMOTE_INVENTORY_Q" \
+            <"$INVENTORY"
+
       - name: Promote source or repair pending cutover under deploy lock
         shell: bash
         run: |
@@ -152,11 +182,20 @@ jobs:
           printf -v APP_Q '%q' "$APP_DIR"
           printf -v ORIGIN_Q '%q' "$ORIGIN"
           printf -v REVISION_Q '%q' "$GITHUB_SHA"
-          if [[ "$PENDING_CUTOVER_NODE_API_REPAIR" == "true" && "$PENDING_CUTOVER_ENGINE_REBUILD_REPLAY" == "true" ]]; then
+          RECOVERY_ACTIONS=0
+          [[ "$PENDING_CUTOVER_NODE_API_REPAIR" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
+          [[ "$PENDING_CUTOVER_ENGINE_REBUILD_REPLAY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
+          [[ "$PENDING_CUTOVER_RETENTION_RETRY" == "true" ]] && RECOVERY_ACTIONS=$((RECOVERY_ACTIONS + 1))
+          if ((RECOVERY_ACTIONS > 1)); then
             echo "Select only one pending-cutover recovery action per workflow dispatch." >&2
             exit 2
           fi
-          if [[ "$PENDING_CUTOVER_ENGINE_REBUILD_REPLAY" == "true" ]]; then
+          if [[ "$PENDING_CUTOVER_RETENTION_RETRY" == "true" ]]; then
+            ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" \
+              -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+              "${VPS_USER}@${VPS_HOST}" \
+              "chmod +x $STAGING_Q/scripts/deploy/retry-pending-opencfd2606-retention.sh && STAGING_DIR=$STAGING_Q APP_DIR=$APP_Q EXPECTED_TARGET_SOURCE_REVISION=$REVISION_Q $STAGING_Q/scripts/deploy/retry-pending-opencfd2606-retention.sh"
+          elif [[ "$PENDING_CUTOVER_ENGINE_REBUILD_REPLAY" == "true" ]]; then
             ssh -i ~/.ssh/airfoils_pro_vps -p "${VPS_PORT}" \
               -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
               "${VPS_USER}@${VPS_HOST}" \

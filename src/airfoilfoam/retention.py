@@ -34,6 +34,10 @@ Keep-set derivation:
   migration flow requires a database acknowledgement and a fresh
   generation-pinned restore immediately before cleanup. A filename, local
   bundle, or remote pointer alone is never deletion authority.
+* A case-root ``mesh-evidence`` directory is live duplicate state. Result
+  finalization has already copied its exact files into the canonical engine
+  archive as ``openfoam/mesh_evidence``. Full strip removes that duplicate;
+  case-state-preserving strip keeps it with the rest of the restartable case.
 
 Unknown entries are fail-safe: they are retained and reported instead of being
 deleted by a broad "everything not in the keep set" rule.
@@ -58,7 +62,14 @@ from .evidence_store import EvidenceStoreError, read_remote_pointer
 STRIP_MARKER = ".stripped.json"
 
 _ROOT_JSON_KEEP = {"request.json", "result.json", "status.json", "runtime.json"}
-_CASE_DELETE_DIRS = {"constant", "system", "postProcessing", "VTK", "dynamicCode"}
+_CASE_DELETE_DIRS = {
+    "constant",
+    "system",
+    "postProcessing",
+    "VTK",
+    "dynamicCode",
+    "mesh-evidence",
+}
 _CASE_KEEP_DIRS = {"images", "frames", "evidence", "custom_renders"}
 _EVIDENCE_KEEP_NAMES = {
     "evidence_manifest.json",
