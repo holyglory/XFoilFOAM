@@ -650,6 +650,21 @@ function stubFetch(
       });
     if (url.includes("/sweeps/") && url.endsWith("/cancel")) {
       cancelIndex += 1;
+      const body = await parsedRequestBody(init);
+      if (
+        new Headers(init?.headers).get("content-type") === "application/json" &&
+        body === null
+      ) {
+        return new Response(
+          JSON.stringify({
+            error: "Body cannot be empty when content-type is application/json",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
       if (cancelIndex <= (opts.failCancelCount ?? 0)) {
         return new Response(JSON.stringify({ error: "cancel unavailable" }), {
           status: 503,
@@ -1481,6 +1496,11 @@ describe("remote solver submit lifecycle", () => {
       `${UPSTREAM}/sweeps/${promise.id}/cancel`,
       `${UPSTREAM}/sweeps/${promise.id}/cancel`,
     ]);
+    expect(
+      requests(fetchMock, `/sweeps/${promise.id}/cancel`).map(
+        (request) => request.body,
+      ),
+    ).toEqual([{}, {}]);
     expect(requests(fetchMock, `/sweeps/${promise.id}/heartbeat`)).toEqual([]);
     const retryCall = [...fetchMock.mock.calls]
       .reverse()
@@ -2498,6 +2518,323 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       state: "running",
       attemptCount: 2,
       latestSimJobId: children[1]?.id,
+    });
+  });
+
+  it("MUST-CATCH: mixed first PRECALC evidence schedules rejected cells' second bounded attempt before accepted sibling delivery can release the mirror", async () => {
+    const aoas = [924.016, 924.017, 924.018, 924.019, 924.02];
+    const acceptedAoas = new Set([924.017, 924.018]);
+    const retryAoas = [924.016, 924.019, 924.02];
+    const promise = await seedMirroredPromise("mixed-precalc-recovery", aoas);
+    const parentEngineJobId = `${PREFIX}-mixed-precalc-recovery-rans`;
+    const [parent] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 1,
+        jobKind: "sweep",
+        status: "done",
+        engineJobId: parentEngineJobId,
+        totalCases: aoas.length,
+        completedCases: aoas.length,
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        requestPayload: {
+          syncPromiseId: promise.id,
+          remoteSolver: true,
+          upstreamBaseUrl: UPSTREAM,
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas,
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: aoas,
+          },
+        },
+      })
+      .returning();
+    const canonicalByAoa = new Map<number, typeof results.$inferSelect>();
+    for (const aoaDeg of aoas) {
+      const [result] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          fidelity: "rans",
+          simJobId: parent.id,
+          engineJobId: parentEngineJobId,
+          engineCaseSlug: `mixed_precalc_rans_${aoaDeg}`,
+          cl: 0.8,
+          cd: 0.04,
+          cm: -0.05,
+          clCd: 20,
+          converged: true,
+          stalled: true,
+          unsteady: false,
+          solvedAt: new Date(),
+        })
+        .returning();
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: result.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg,
+          simJobId: parent.id,
+          engineJobId: parentEngineJobId,
+          engineCaseSlug: result.engineCaseSlug,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          validForPolar: false,
+          cl: result.cl,
+          cd: result.cd,
+          cm: result.cm,
+          clCd: result.clCd,
+          converged: true,
+          stalled: true,
+          unsteady: false,
+          solvedAt: new Date(),
+        })
+        .returning();
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: attempt.id })
+        .where(eq(results.id, result.id));
+      await db.insert(resultClassifications).values({
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        regime: "rans",
+        classifierVersion: "remote-mixed-precalc-rans-test-v1",
+        state: "needs_urans",
+        reasons: ["post-stall RANS needs preliminary URANS"],
+      });
+      canonicalByAoa.set(aoaDeg, {
+        ...result,
+        currentResultAttemptId: attempt.id,
+      });
+    }
+
+    const firstSubmit = vi.fn(async () =>
+      acceptedStatus("mixed-precalc-recovery-first", aoas.length),
+    );
+    await submitUransRetryForJob(
+      db,
+      {
+        submitPolar: firstSubmit,
+        cancelJob: vi.fn(),
+      } as unknown as EngineClient,
+      parent,
+    );
+    const [firstChild] = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+    expect(firstChild).toMatchObject({ status: "submitted", totalCases: 5 });
+
+    for (const aoaDeg of aoas) {
+      const result = canonicalByAoa.get(aoaDeg)!;
+      const accepted = acceptedAoas.has(aoaDeg);
+      const warning = accepted
+        ? null
+        : "URANS integration stopped by the wall-clock budget guard: retained 1.5 of 3 periods";
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: result.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg,
+          simJobId: firstChild.id,
+          engineJobId: firstChild.engineJobId,
+          engineCaseSlug: `mixed_precalc_urans_${aoaDeg}`,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          validForPolar: accepted,
+          cl: 0.82,
+          cd: 0.05,
+          cm: -0.052,
+          clCd: 16.4,
+          converged: true,
+          stalled: true,
+          unsteady: true,
+          qualityWarnings: warning ? [warning] : [],
+          evidencePayload: {
+            fidelity: "urans_precalc",
+            frame_track: {
+              stationary: false,
+              periods_retained: accepted ? 2 : 1.5,
+              selected_frame_count: accepted ? 40 : 30,
+            },
+          },
+          solvedAt: new Date(),
+        })
+        .returning();
+      // The first PRECALC composition refreshes the result-level projection
+      // onto the immutable RANS classification. Preserve that attempt-owned
+      // history before projecting the newer URANS generation.
+      await db
+        .update(resultClassifications)
+        .set({ resultId: null })
+        .where(eq(resultClassifications.resultId, result.id));
+      await db.insert(resultClassifications).values({
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        regime: "urans",
+        classifierVersion: "remote-mixed-precalc-urans-test-v1",
+        state: accepted ? "accepted" : "rejected",
+        reasons: warning ? [warning] : [],
+      });
+      await db
+        .update(results)
+        .set({
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          fidelity: "urans_precalc",
+          simJobId: firstChild.id,
+          engineJobId: firstChild.engineJobId,
+          engineCaseSlug: attempt.engineCaseSlug,
+          currentResultAttemptId: attempt.id,
+          cl: attempt.cl,
+          cd: attempt.cd,
+          cm: attempt.cm,
+          clCd: attempt.clCd,
+          converged: true,
+          stalled: true,
+          unsteady: true,
+          qualityWarnings: warning ? [warning] : [],
+          error: null,
+          solvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(results.id, result.id));
+      if (accepted) {
+        const manifest = writeMedia(
+          `jobs/${firstChild.engineJobId}/${attempt.engineCaseSlug}/manifest.json`,
+          `mixed-precalc:${aoaDeg}:manifest`,
+        );
+        await db.insert(solverEvidenceArtifacts).values({
+          resultId: result.id,
+          resultAttemptId: attempt.id,
+          airfoilId,
+          simJobId: firstChild.id,
+          engineJobId: firstChild.engineJobId,
+          engineCaseSlug: attempt.engineCaseSlug,
+          aoaDeg,
+          kind: "manifest",
+          role: "raw",
+          storageKey: manifest.storageKey,
+          mimeType: "application/json",
+          sha256: manifest.sha256,
+          byteSize: manifest.byteSize,
+          metadata: { fixture: "mixed-precalc-recovery" },
+        });
+      }
+    }
+    await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        engineState: "completed",
+        completedCases: aoas.length,
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(simJobs.id, firstChild.id));
+    const [settlementChild] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, firstChild.id));
+    await settlePrecalcObligationsForJob(db, settlementChild);
+    expect(
+      await db
+        .select({
+          aoaDeg: simPrecalcObligations.aoaDeg,
+          state: simPrecalcObligations.state,
+          attemptCount: simPrecalcObligations.attemptCount,
+          maxAttempts: simPrecalcObligations.maxAttempts,
+          lastOutcome: simPrecalcObligations.lastOutcome,
+        })
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.revisionId, revisionId))
+        .orderBy(simPrecalcObligations.aoaDeg),
+    ).toMatchObject([
+      {
+        aoaDeg: retryAoas[0],
+        state: "pending",
+        attemptCount: 1,
+        maxAttempts: 2,
+        lastOutcome: "rejected",
+      },
+      { aoaDeg: 924.017, state: "satisfied", attemptCount: 1 },
+      { aoaDeg: 924.018, state: "satisfied", attemptCount: 1 },
+      {
+        aoaDeg: retryAoas[1],
+        state: "pending",
+        attemptCount: 1,
+        maxAttempts: 2,
+        lastOutcome: "rejected",
+      },
+      {
+        aoaDeg: retryAoas[2],
+        state: "pending",
+        attemptCount: 1,
+        maxAttempts: 2,
+        lastOutcome: "rejected",
+      },
+    ]);
+
+    const { fetchMock } = stubFetch();
+    const secondSubmit = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("mixed-precalc-recovery-second"),
+    );
+    await remoteSolverTick(db, {
+      submitPolar: secondSubmit,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient);
+
+    expect(secondSubmit).toHaveBeenCalledTimes(1);
+    expect(secondSubmit.mock.calls[0]?.[0]).toMatchObject({
+      aoa: { angles: [retryAoas[0]] },
+      solver: { force_transient: true, urans_fidelity: "precalc" },
+    });
+    expect(requests(fetchMock, "/polars")).toHaveLength(0);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
+    expect((await readPromise(promise.id)).points).toSatisfy(
+      (points: Array<{ status: string }>) =>
+        points.every((point) => point.status === "active"),
+    );
+    const children = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)))
+      .orderBy(simJobs.createdAt, simJobs.id);
+    expect(children).toHaveLength(2);
+    expect(children[1]?.requestPayload).toMatchObject({
+      syncPromiseId: promise.id,
+      remoteSolver: true,
+      aoas: [retryAoas[0]],
+      precalcObligationIds: [expect.any(String)],
     });
   });
 
