@@ -231,12 +231,16 @@ compose config >/dev/null
 
 Generate `AIRFOILFOAM_CONTROL_PLANE_TOKEN` with a cryptographically secure
 generator (for example, `openssl rand -hex 32`) and write it directly into the
-mode-0600 state file without printing it into an audit log. The Compose files
-map that one authoritative value to `ENGINE_CONTROL_PLANE_TOKEN` only inside
-the sweeper and media-repair processes that acknowledge database registration;
-do not maintain a second independently editable copy. The deployment preflight
-rejects remote-only evidence when the token is missing, quoted, contains
-whitespace, or is shorter than 32 characters.
+mode-0600 state file without printing it into an audit log. Write as the
+deployment user; an atomic root-owned replacement must restore the existing
+file's uid/gid before promotion, because the deployment preflight deliberately
+rejects owner drift before any service mutation. The Compose files map that one
+authoritative value to `ENGINE_CONTROL_PLANE_TOKEN` only inside the sweeper and
+media-repair processes that acknowledge database registration; do not maintain
+a second independently editable copy. The deployment preflight rejects
+remote-only evidence when the token is missing, quoted, contains whitespace,
+is shorter than 32 characters, or leaves the protected file under another
+owner.
 
 The empty certified-contract marker is valid only for this exact pristine,
 pre-canary state. The guarded cutover writes it atomically with the durable
