@@ -353,6 +353,10 @@ async function activeSolverImplementation(id: string) {
 const QUEUE_REVISION_ENSURE_TTL_MS = 10_000;
 const ENGINE_QUEUE_FRESH_TTL_MS = 5_000;
 const ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS = 750;
+// Pool admission is a one-off maintenance handshake, not a polled UI probe.
+// The engine's authoritative Celery queue snapshot may consume its full
+// five-second inspector window, so the caller must leave transport margin.
+const ENGINE_POOL_ADMISSION_TIMEOUT_MS = 15_000;
 const ENGINE_HEALTH_FRESH_TTL_MS = 15_000;
 const ENGINE_CACHE_STATS_FRESH_TTL_MS = 30_000;
 const ENGINE_RUNTIME_UNSUPPORTED_TTL_MS = 60_000;
@@ -2518,7 +2522,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
             timeoutMs: 5_000,
             expectedEngine: expected,
           }),
-          engine.getQueue({ timeoutMs: 5_000 }),
+          engine.getQueue({ timeoutMs: ENGINE_POOL_ADMISSION_TIMEOUT_MS }),
         ]);
         const capabilities =
           capabilityProbe.status === "fulfilled" ? capabilityProbe.value : null;

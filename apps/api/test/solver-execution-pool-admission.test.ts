@@ -110,6 +110,7 @@ describe("solver execution-pool live admission", () => {
       expect(response.json()).toMatchObject({
         error: expect.stringContaining("execution pool has been disabled"),
       });
+      expect(queueSpy).toHaveBeenCalledWith({ timeoutMs: 15_000 });
       const [persisted] = await db
         .select({ enabled: solverExecutionPools.enabled })
         .from(solverExecutionPools)
