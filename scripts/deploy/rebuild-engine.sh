@@ -51,7 +51,8 @@ APP_DIR="${APP_DIR:-/opt/airfoils-pro/app}"
 AIRFOILS_PRO_STATE_DIR="${AIRFOILS_PRO_STATE_DIR:-/opt/airfoils-pro/state}"
 ENV_FILE="${ENV_FILE:-$AIRFOILS_PRO_STATE_DIR/.env.deploy}"
 COMPOSE_FILE="${COMPOSE_FILE:-$APP_DIR/docker-compose.deploy.yml}"
-COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-app}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
+COMPOSE_OVERRIDE_FILE="${COMPOSE_OVERRIDE_FILE:-}"
 LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
 DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-source.json}"
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
@@ -86,6 +87,15 @@ fi
 python3 "$DEPLOY_SCRIPT_DIR/deployment-env-preflight.py" \
   --app-dir "$APP_DIR" --state-dir "$AIRFOILS_PRO_STATE_DIR" --env-file "$ENV_FILE" \
   >/dev/null || exit 2
+# shellcheck source=scripts/deploy/deployment-compose-profile.sh
+source "$DEPLOY_SCRIPT_DIR/deployment-compose-profile.sh"
+configure_deployment_compose_profile || exit $?
+
+if [[ "$DEPLOYMENT_ROLE" != "hub" ]]; then
+  echo "The canonical production-hub engine workflow cannot run for AIRFOILFOAM_DEPLOYMENT_ROLE=$DEPLOYMENT_ROLE." >&2
+  echo "Use scripts/deploy/rebuild-remote-solver-engine.sh for the volume-backed hz-solver2 cutover." >&2
+  exit 2
+fi
 
 if docker compose version >/dev/null 2>&1; then
   COMPOSE=(docker compose)
@@ -94,7 +104,7 @@ else
 fi
 
 compose() {
-  "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+  "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" "$@"
 }
 
 verify_deployment_source() {

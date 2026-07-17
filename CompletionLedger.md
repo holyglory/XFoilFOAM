@@ -48,17 +48,19 @@
   migration, and remeasure active-case growth before increasing solver
   concurrency.
 
-- **Parallel remote-solver GCS delivery:** The existing cross-instance result
-  push still transports large evidence through the control plane and its
-  former shared-secret read model exposed credentials. Keep remote admission
-  disabled until the redaction fix and the brokered, generation-pinned GCS
-  upload contract are committed, deployed, and proven with one exact promise
-  canary. The hub must issue only bounded resumable upload capabilities,
-  independently verify the uploaded Zstandard bundle and manifest, bind the
-  exact remote attempt idempotently, and revoke/expire stale credentials and
-  uploads. Then upgrade the 96-vCPU remote worker, enable bounded capacity,
-  and confirm real evidence reaches the hub without copying a Google service
-  account key to that host.
+- **Parallel remote-solver GCS delivery:** The credential-redacted,
+  generation-pinned brokered upload path and the role-separated `hz-solver2`
+  cutover are implemented in the repository. The strict volume canary,
+  archive-only render proof, restartable guarded cutover, verified
+  backup/rollback artifacts, private attestation, and hub-acknowledgement
+  retention fence preserve complete local evidence without giving the remote
+  node a Google credential. The live server still requires an idle maintenance
+  run of `scripts/deploy/rebuild-remote-solver-engine.sh` with one immutable
+  build ID, followed by one exact brokered promise canary. Record the merged
+  40-CPU profile, scratch-restored backup and rollback hashes, three-scenario
+  receipt/attestation hashes, OpenCFD 2606 health, exact GCS generation binding,
+  generation-pinned readback, local reclaim acknowledgement, and resumed
+  bounded capacity before removing this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation

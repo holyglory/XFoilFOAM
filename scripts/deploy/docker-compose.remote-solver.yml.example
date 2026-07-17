@@ -1,0 +1,36 @@
+# Install as /opt/airfoils-pro/state/docker-compose.remote-solver.yml on
+# hz-solver2. The deployment environment points COMPOSE_OVERRIDE_FILE at that
+# external, release-independent path. Do not add GCS credentials here.
+services:
+  api:
+    environment:
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX: solver-evidence/v1
+      AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL: "10"
+      AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: "false"
+
+  worker:
+    environment:
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX: solver-evidence/v1
+      AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL: "10"
+      AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: "false"
+      AIRFOILFOAM_WORKER_CPU_BUDGET: "40"
+      AIRFOILFOAM_CASE_CONCURRENCY: "40"
+      AIRFOILFOAM_CELERY_CONCURRENCY: "40"
+    deploy:
+      resources:
+        limits:
+          cpus: "40"
+
+  sweeper:
+    environment:
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: "false"
+      AIRFOILFOAM_WORKER_CPU_BUDGET: "40"
+
+  media-repair:
+    environment:
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: "false"
+

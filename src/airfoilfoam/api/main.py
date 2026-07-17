@@ -14,7 +14,7 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import ContextManager, Iterator
+from typing import ContextManager, Iterator, Literal
 
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException
@@ -39,6 +39,7 @@ from ..evidence_runtime import (
     finalize_remote_evidence_cleanup,
     hydrated_render_source,
     reclaim_brokered_remote_evidence,
+    hydrated_volume_render_source,
 )
 from ..evidence_store import (
     MAX_EVIDENCE_MANIFEST_BYTES,
@@ -99,6 +100,7 @@ class RenderFieldRequest(BaseModel):
     width_px: int = Field(default=990, ge=320, le=2400)
     height_px: int = Field(default=660, ge=240, le=1800)
     params_hash: str | None = None
+    source_mode: Literal["auto", "archive"] = "auto"
 
 
 class FieldScaleRequest(BaseModel):
@@ -115,6 +117,7 @@ class FieldExtentsRequest(BaseModel):
     fields: list[ImageField] = Field(default_factory=list)
     zoom_chords: float = Field(default=2.0, gt=0)
     max_frames: int | None = Field(default=220, ge=1, le=500)
+    source_mode: Literal["auto", "archive"] = "auto"
 
 
 class RenderDefaultMediaRequest(BaseModel):
@@ -129,6 +132,7 @@ class RenderDefaultMediaRequest(BaseModel):
     zoom_chords: float = Field(default=2.0, gt=0)
     scale_version: int = Field(default=1, ge=1)
     render_profile_key: str = Field(default="default:v1:zoom2")
+    source_mode: Literal["auto", "archive"] = "auto"
 
 
 class StripJobRequest(BaseModel):
@@ -497,7 +501,13 @@ def _evidence_window(evidence_dir: Path) -> tuple[float | None, float | None]:
 
 
 @contextmanager
-def _render_source(case_dir: Path, evidence_dir: Path, settings) -> Iterator[Path]:
+def _render_source(
+    case_dir: Path,
+    evidence_dir: Path,
+    settings,
+    *,
+    source_mode: Literal["auto", "archive"] = "auto",
+) -> Iterator[Path]:
     """Yield the best real VTK source, holding remote cache protection in use.
 
     Finalized remote-only evidence is hydrated only after both the immutable
@@ -505,6 +515,31 @@ def _render_source(case_dir: Path, evidence_dir: Path, settings) -> Iterator[Pat
     Keeping this context open around the renderer prevents the bounded cache
     cleanup pass from evicting that evidence mid-render.
     """
+
+    if source_mode == "archive":
+        pointer_path = evidence_pointer_path(evidence_dir)
+        try:
+            if pointer_path.is_file():
+                with hydrated_render_source(evidence_dir, settings) as source_dir:
+                    if not (source_dir / "VTK").is_dir():
+                        raise EvidenceStoreError(
+                            "verified remote evidence has no VTK directory"
+                        )
+                    yield source_dir
+                return
+            with hydrated_volume_render_source(evidence_dir, settings) as source_dir:
+                yield source_dir
+            return
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Retained evidence archive is unavailable: {exc}",
+            ) from exc
+        except (EvidenceStoreError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Retained evidence archive could not be verified: {exc}",
+            ) from exc
 
     if (evidence_dir / "VTK").is_dir():
         yield evidence_dir
@@ -1708,7 +1743,12 @@ def create_app() -> FastAPI:
         out_dir = evidence_dir / "custom_renders" / params_hash
         contour = np.asarray(request.airfoil_points, dtype=float)
         try:
-            with _render_source(case_dir, evidence_dir, settings) as source_dir:
+            with _render_source(
+                case_dir,
+                evidence_dir,
+                settings,
+                source_mode=request.source_mode,
+            ) as source_dir:
                 filename = render_custom_field(
                     source_dir,
                     out_dir,
@@ -1759,7 +1799,12 @@ def create_app() -> FastAPI:
         contour = np.asarray(request.airfoil_points, dtype=float)
         fields = request.fields or list(ImageField)
         try:
-            with _render_source(case_dir, evidence_dir, settings) as source_dir:
+            with _render_source(
+                case_dir,
+                evidence_dir,
+                settings,
+                source_mode=request.source_mode,
+            ) as source_dir:
                 start_time, end_time = _evidence_window(evidence_dir)
                 if start_time is None and end_time is None:
                     start_time, end_time = _evidence_window(source_dir)
@@ -1805,7 +1850,12 @@ def create_app() -> FastAPI:
         scales = _field_scales(request.scales)
         title_suffix = f"track scale v{request.scale_version}"
         try:
-            with _render_source(case_dir, evidence_dir, settings) as source_dir:
+            with _render_source(
+                case_dir,
+                evidence_dir,
+                settings,
+                source_mode=request.source_mode,
+            ) as source_dir:
                 start_time, end_time = _evidence_window(evidence_dir)
                 if start_time is None and end_time is None:
                     start_time, end_time = _evidence_window(source_dir)

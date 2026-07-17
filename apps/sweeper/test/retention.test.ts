@@ -22,6 +22,8 @@ import {
   simUransRequests,
   solverEvidenceArtifacts,
   solverProfiles,
+  syncRemoteResultDeliveries,
+  syncSweepPromises,
   sweepDefinitions,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
@@ -484,6 +486,95 @@ describe("terminal strip reaper", () => {
       files_removed: 2,
       kept_case_state: false,
     });
+  });
+
+  it("keeps remote-solver source bytes until the job-level delivery is acknowledged", async () => {
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: `${PREFIX}-upstream`,
+        sourceInstanceName: `${PREFIX} upstream`,
+        sourceBaseUrl: "https://hub.invalid/api/sync/v1",
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaCount: 2,
+        expiresAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+        lastHeartbeatAt: NOW,
+        requestPayload: { fixture: PREFIX },
+      })
+      .returning();
+    const deliveredJob = await insertTerminalJob(
+      `${PREFIX}-remote-await-delivered`,
+      { requestPayload: { syncPromiseId: promise.id, remoteSolver: true } },
+    );
+    const supersededJob = await insertTerminalJob(
+      `${PREFIX}-remote-await-superseded`,
+      { requestPayload: { syncPromiseId: promise.id, remoteSolver: true } },
+    );
+    await db.insert(syncRemoteResultDeliveries).values([
+      {
+        promiseId: promise.id,
+        simJobId: deliveredJob.id,
+        generationKey: `${PREFIX}-delivered-generation`,
+        state: "pending",
+        nextAttemptAt: OLD,
+      },
+      {
+        promiseId: promise.id,
+        simJobId: supersededJob.id,
+        generationKey: `${PREFIX}-superseded-generation`,
+        state: "pending",
+        nextAttemptAt: OLD,
+      },
+    ]);
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([]);
+    expect((await readJob(deliveredJob.id)).strippedAt).toBeNull();
+    expect((await readJob(supersededJob.id)).strippedAt).toBeNull();
+
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({ state: "delivered", deliveredAt: NOW })
+      .where(eq(syncRemoteResultDeliveries.simJobId, deliveredJob.id));
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({ state: "superseded" })
+      .where(eq(syncRemoteResultDeliveries.simJobId, supersededJob.id));
+
+    const afterAck = new Date(NOW.getTime() + 60_000);
+    await stripTerminalJobs(db, engine, {
+      now: afterAck,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    const acknowledgedCalls = own(engine.stripCalls);
+    expect(acknowledgedCalls).toHaveLength(2);
+    expect(acknowledgedCalls).toEqual(
+      expect.arrayContaining([
+        {
+          jobId: `${PREFIX}-remote-await-delivered`,
+          keepCaseState: false,
+        },
+        {
+          jobId: `${PREFIX}-remote-await-superseded`,
+          keepCaseState: false,
+        },
+      ]),
+    );
+    expect((await readJob(deliveredJob.id)).strippedAt?.toISOString()).toBe(
+      afterAck.toISOString(),
+    );
+    expect((await readJob(supersededJob.id)).strippedAt?.toISOString()).toBe(
+      afterAck.toISOString(),
+    );
   });
 
   it("keeps case state for a budget-stop continuable row, then fully strips after supersession", async () => {

@@ -24,6 +24,19 @@ canary = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = canary
 SPEC.loader.exec_module(canary)
 
+VOLUME_CANARY_PATH = (
+    ROOT / "scripts" / "deploy" / "openfoam_2606_volume_canary.py"
+)
+VOLUME_SPEC = importlib.util.spec_from_file_location(
+    "openfoam_2606_volume_canary_test", VOLUME_CANARY_PATH
+)
+assert VOLUME_SPEC is not None and VOLUME_SPEC.loader is not None
+volume_canary = importlib.util.module_from_spec(VOLUME_SPEC)
+sys.modules[VOLUME_SPEC.name] = volume_canary
+VOLUME_SPEC.loader.exec_module(volume_canary)
+
+VOLUME_CANARY_MODES = frozenset({"volume-ok", "volume-gcs-leak"})
+
 
 def _sha(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
@@ -49,6 +62,26 @@ class FakeGatewayState:
         self.remote_render_calls: list[tuple[str, str]] = []
 
     def health(self) -> dict[str, Any]:
+        if self.mode in VOLUME_CANARY_MODES:
+            evidence_storage = {
+                "backend": "volume",
+                "bucket": None,
+                "object_prefix": "solver-evidence/v1",
+                "archive_format": "tar+zstd",
+                "compression": "zstd",
+                "zstd_level": 10,
+                "remote_only": False,
+            }
+        else:
+            evidence_storage = {
+                "backend": "gcs",
+                "bucket": "airfoils-pro-storage-bucket",
+                "object_prefix": "solver-evidence/v1",
+                "archive_format": "tar+zstd",
+                "compression": "zstd",
+                "zstd_level": 10,
+                "remote_only": True,
+            }
         return {
             "status": "ok",
             "role": "solver_gateway",
@@ -58,15 +91,7 @@ class FakeGatewayState:
             "default_engine": dict(canary.ENGINE),
             "supported_engines": [dict(canary.ENGINE)],
             "registered_disabled_engines": [],
-            "evidence_storage": {
-                "backend": "gcs",
-                "bucket": "airfoils-pro-storage-bucket",
-                "object_prefix": "solver-evidence/v1",
-                "archive_format": "tar+zstd",
-                "compression": "zstd",
-                "zstd_level": 10,
-                "remote_only": True,
-            },
+            "evidence_storage": evidence_storage,
         }
 
     def capabilities(self) -> dict[str, Any]:
@@ -385,7 +410,24 @@ class FakeGatewayState:
                 "evidenceBase": "evidence",
             }
         )
-        if self.mode == "volume-bundle":
+        if self.mode in VOLUME_CANARY_MODES:
+            bundle_artifact["metadata"] = {
+                "engineNamespace": canary.ENGINE_NAMESPACE,
+                "methodKey": method,
+                "storageBackend": "volume",
+                "archiveFormat": "tar+zstd",
+                "compression": "zstd",
+                "uncompressedTarSha256": _sha(b"fake-uncompressed-tar"),
+                "uncompressedTarByteSize": 4096,
+                "zstdLevel": 10,
+                "localEvidenceDisposition": "volume",
+                "evidenceBase": "evidence",
+            }
+            if self.mode == "volume-gcs-leak":
+                bundle_artifact["metadata"]["bucket"] = (
+                    "airfoils-pro-storage-bucket"
+                )
+        elif self.mode == "volume-bundle":
             bundle_artifact["metadata"]["storageBackend"] = "volume"
         elif self.mode == "local-retained":
             bundle_artifact["metadata"]["localEvidenceDisposition"] = (
@@ -561,6 +603,10 @@ def fake_gateway(*, mode: str = "ok") -> Iterator[tuple[FakeGatewayState, str]]:
             if match and match.group(1) in state.submissions:
                 job_id = match.group(1)
                 assert job_id in state.stripped
+                if state.mode in VOLUME_CANARY_MODES:
+                    assert payload["source_mode"] == "archive"
+                else:
+                    assert "source_mode" not in payload
                 state.remote_render_calls.append((job_id, "field-extents"))
                 self.send_json(
                     200,
@@ -581,6 +627,10 @@ def fake_gateway(*, mode: str = "ok") -> Iterator[tuple[FakeGatewayState, str]]:
             if match and match.group(1) in state.submissions:
                 job_id = match.group(1)
                 assert job_id in state.stripped
+                if state.mode in VOLUME_CANARY_MODES:
+                    assert payload["source_mode"] == "archive"
+                else:
+                    assert "source_mode" not in payload
                 state.remote_render_calls.append((job_id, "render-field"))
                 png = b"\x89PNG\r\n\x1a\nremote-custom-render"
                 url = (
@@ -606,6 +656,10 @@ def fake_gateway(*, mode: str = "ok") -> Iterator[tuple[FakeGatewayState, str]]:
             if match and match.group(1) in state.submissions:
                 job_id = match.group(1)
                 assert job_id in state.stripped
+                if state.mode in VOLUME_CANARY_MODES:
+                    assert payload["source_mode"] == "archive"
+                else:
+                    assert "source_mode" not in payload
                 state.remote_render_calls.append((job_id, "render-default-media"))
                 png = b"\x89PNG\r\n\x1a\nremote-default-render"
                 url = (
@@ -660,6 +714,22 @@ def _config(state: FakeGatewayState, url: str) -> Any:
         coordinates=(ROOT / "examples" / "naca0012.dat").read_text(),
         expected_build_id=state.runtime["build_id"],
         expected_evidence_bucket="airfoils-pro-storage-bucket",
+        expected_evidence_object_prefix="solver-evidence/v1",
+        expected_evidence_zstd_level=10,
+        expected_image_digest=state.runtime["image_digest"],
+        poll_interval_s=0.001,
+        rans_timeout_s=1.0,
+        urans_timeout_s=1.0,
+        request_timeout_s=1.0,
+    )
+
+
+def _volume_config(state: FakeGatewayState, url: str) -> Any:
+    return volume_canary._base.CanaryConfig(
+        gateway_url=url,
+        coordinates=(ROOT / "examples" / "naca0012.dat").read_text(),
+        expected_build_id=state.runtime["build_id"],
+        expected_evidence_bucket="",
         expected_evidence_object_prefix="solver-evidence/v1",
         expected_evidence_zstd_level=10,
         expected_image_digest=state.runtime["image_digest"],
@@ -767,6 +837,119 @@ def test_retained_receipt_reproof_downloads_and_renders_without_new_jobs_or_stri
     assert state.submissions == submissions
     assert state.stripped == stripped
     assert len(state.remote_render_calls) == prior_render_calls + 9
+
+
+def test_volume_canary_uses_strict_local_archive_receipt_and_archive_only_rendering():
+    with fake_gateway(mode="volume-ok") as (state, url):
+        summary = volume_canary.OpenCfd2606VolumeCanary(
+            _volume_config(state, url)
+        ).run()
+
+    assert summary["status"] == "ok"
+    assert summary["attestation_profile"] == "hz-solver2-volume-v1"
+    assert summary["evidence_storage"] == {
+        "backend": "volume",
+        "bucket": None,
+        "object_prefix": "solver-evidence/v1",
+        "archive_format": "tar+zstd",
+        "compression": "zstd",
+        "zstd_level": 10,
+        "local_disposition": "volume",
+    }
+    assert [job["scenario"] for job in summary["jobs"]] == [
+        "serial-rans",
+        "mpi-2-rans",
+        "forced-urans-precalc-no-shedding",
+    ]
+    assert all(
+        "volume_restore_proof" in job and "remote_render_proof" not in job
+        for job in summary["jobs"]
+    )
+    expected_binding_keys = {
+        "backend",
+        "stored_sha256",
+        "stored_byte_size",
+        "archive_format",
+        "compression",
+        "uncompressed_tar_sha256",
+        "uncompressed_tar_byte_size",
+        "zstd_level",
+        "local_disposition",
+    }
+    bindings = [
+        artifact["storage"]
+        for job in summary["jobs"]
+        for point in job["points"]
+        for artifact in point["artifacts"]
+    ]
+    assert bindings
+    assert all(set(binding) == expected_binding_keys for binding in bindings)
+    assert all(
+        binding["backend"] == "volume"
+        and binding["local_disposition"] == "volume"
+        and binding["stored_sha256"]
+        and binding["stored_byte_size"] > 0
+        and binding["uncompressed_tar_sha256"]
+        and binding["uncompressed_tar_byte_size"] > 0
+        for binding in bindings
+    )
+    assert state.stripped == ["canary-job-1", "canary-job-2", "canary-job-3"]
+    assert len(state.remote_render_calls) == 9
+
+
+def test_volume_retained_receipt_reproof_has_no_submission_or_strip_side_effects():
+    with fake_gateway(mode="volume-ok") as (state, url):
+        config = _volume_config(state, url)
+        receipt = volume_canary.OpenCfd2606VolumeCanary(config).run()
+        submissions = dict(state.submissions)
+        stripped = list(state.stripped)
+        prior_render_calls = len(state.remote_render_calls)
+
+        verified = volume_canary.OpenCfd2606VolumeCanary(
+            config
+        ).verify_retained_receipt(receipt)
+
+    assert verified == {
+        "schema_version": 1,
+        "status": "verified",
+        "engine_handshake_key": canary.ENGINE_HANDSHAKE_KEY,
+        "evidence_storage": receipt["evidence_storage"],
+        "job_ids": ["canary-job-1", "canary-job-2", "canary-job-3"],
+        "attestation_profile": "hz-solver2-volume-v1",
+    }
+    assert state.submissions == submissions
+    assert state.stripped == stripped
+    assert len(state.remote_render_calls) == prior_render_calls + 9
+
+
+def test_volume_canary_rejects_gcs_metadata_leaking_into_volume_receipt():
+    with fake_gateway(mode="volume-gcs-leak") as (state, url):
+        with pytest.raises(
+            volume_canary._base.CanaryFailure,
+            match="leaked remote-object metadata",
+        ):
+            volume_canary.OpenCfd2606VolumeCanary(
+                _volume_config(state, url)
+            ).run()
+
+    assert state.cancelled == []
+    assert state.stripped == []
+
+
+def test_volume_canary_refuses_an_evidence_bucket_before_contacting_gateway():
+    state = FakeGatewayState(mode="volume-ok")
+    config = replace(
+        _volume_config(state, "http://127.0.0.1:1"),
+        expected_evidence_bucket="airfoils-pro-storage-bucket",
+    )
+
+    with pytest.raises(
+        volume_canary._base.CanaryFailure,
+        match="refuses an evidence bucket",
+    ):
+        volume_canary.OpenCfd2606VolumeCanary(config)
+
+    assert state.submissions == {}
 
 
 def test_retained_receipt_reproof_rejects_current_storage_prefix_drift_before_reads():

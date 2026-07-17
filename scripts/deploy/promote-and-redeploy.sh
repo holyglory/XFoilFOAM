@@ -33,7 +33,9 @@ fsync_tool="$staging_real/scripts/deploy/fsync-release.py"
 env_preflight_tool="$staging_real/scripts/deploy/deployment-env-preflight.py"
 bootstrap_env_tool="$staging_real/scripts/deploy/bootstrap-opencfd-env.py"
 cutover_state_tool="$staging_real/scripts/deploy/opencfd2606_cutover_state.py"
-for required in "$manifest_tool" "$exclude_file" "$manifest_file" "$switch_tool" "$fsync_tool" "$env_preflight_tool" "$bootstrap_env_tool" "$cutover_state_tool" "$staging_real/scripts/deploy/vps-redeploy.sh"; do
+remote_cutover_state_tool="$staging_real/scripts/deploy/remote-solver2606-cutover-state.py"
+compose_profile_tool="$staging_real/scripts/deploy/deployment-compose-profile.sh"
+for required in "$manifest_tool" "$exclude_file" "$manifest_file" "$switch_tool" "$fsync_tool" "$env_preflight_tool" "$bootstrap_env_tool" "$cutover_state_tool" "$remote_cutover_state_tool" "$compose_profile_tool" "$staging_real/scripts/deploy/vps-redeploy.sh"; do
   if [[ ! -f "$required" || -L "$required" ]]; then
     echo "Deployment staging payload is missing a required regular file: $required" >&2
     exit 2
@@ -88,7 +90,13 @@ if [[ -e "$SHARED_ENV_FILE" || -L "$SHARED_ENV_FILE" ]]; then
   # A crash from an older two-transaction bootstrap may have durably copied a
   # wholly markerless legacy env. Canonicalizing only that all-absent state is
   # safe and retryable; any partial tuple fails without being overwritten.
-  python3 "$bootstrap_env_tool" --env-file "$SHARED_ENV_FILE"
+  # The helper owns the production hub's GCS/campaign tuple only. A dedicated
+  # remote solver must never acquire that tuple merely by promoting source.
+  existing_role="$(awk -F= '$1 == "AIRFOILFOAM_DEPLOYMENT_ROLE" { sub(/^[^=]*=/, ""); print; exit }' "$SHARED_ENV_FILE")"
+  existing_role="${existing_role:-hub}"
+  if [[ "$existing_role" != "remote-solver" ]]; then
+    python3 "$bootstrap_env_tool" --env-file "$SHARED_ENV_FILE"
+  fi
 else
   legacy_env="$APP_DIR/.env.deploy"
   if [[ -L "$APP_DIR" ]]; then
@@ -99,14 +107,25 @@ else
   env_temp="$(mktemp "$AIRFOILS_PRO_STATE_DIR/.env.deploy.new.XXXXXX")"
   trap 'rm -f "${env_temp:-}" "${release_temp:-}"' EXIT
   install -m 600 "$legacy_env" "$env_temp"
-  # Canonicalize in the unpublished temp file. SHARED_ENV_FILE therefore
-  # appears for the first time with a complete durable recovery tuple.
-  python3 "$bootstrap_env_tool" --env-file "$env_temp"
-  python3 "$cutover_state_tool" \
-    --env-file "$env_temp" \
-    --receipt-file "$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json" \
-    --require-state non-pending \
-    >/dev/null || exit $?
+  # Validate/canonicalize in the unpublished temp file. SHARED_ENV_FILE
+  # therefore appears for the first time with the role-appropriate state.
+  initial_role="$(awk -F= '$1 == "AIRFOILFOAM_DEPLOYMENT_ROLE" { sub(/^[^=]*=/, ""); print; exit }' "$env_temp")"
+  initial_role="${initial_role:-hub}"
+  if [[ "$initial_role" == "remote-solver" ]]; then
+    python3 "$remote_cutover_state_tool" \
+      --env-file "$env_temp" \
+      --receipt-file "$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-canary-receipt.json" \
+      --attestation-file "$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-attestation.json" \
+      --require-state non-pending \
+      >/dev/null || exit $?
+  else
+    python3 "$bootstrap_env_tool" --env-file "$env_temp"
+    python3 "$cutover_state_tool" \
+      --env-file "$env_temp" \
+      --receipt-file "$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json" \
+      --require-state non-pending \
+      >/dev/null || exit $?
+  fi
   python3 - "$env_temp" "$AIRFOILS_PRO_STATE_DIR" <<'PY'
 import os
 import sys
@@ -138,11 +157,22 @@ python3 "$env_preflight_tool" \
   --env-file "$SHARED_ENV_FILE" \
   >/dev/null
 
-python3 "$cutover_state_tool" \
-  --env-file "$SHARED_ENV_FILE" \
-  --receipt-file "$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json" \
-  --require-state non-pending \
-  >/dev/null || exit $?
+deployment_role="$(awk -F= '$1 == "AIRFOILFOAM_DEPLOYMENT_ROLE" { sub(/^[^=]*=/, ""); print; exit }' "$SHARED_ENV_FILE")"
+deployment_role="${deployment_role:-hub}"
+if [[ "$deployment_role" == "remote-solver" ]]; then
+  python3 "$remote_cutover_state_tool" \
+    --env-file "$SHARED_ENV_FILE" \
+    --receipt-file "$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-canary-receipt.json" \
+    --attestation-file "$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-attestation.json" \
+    --require-state non-pending \
+    >/dev/null || exit $?
+else
+  python3 "$cutover_state_tool" \
+    --env-file "$SHARED_ENV_FILE" \
+    --receipt-file "$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json" \
+    --require-state non-pending \
+    >/dev/null || exit $?
+fi
 
 install -d -m 755 "$RELEASES_DIR"
 

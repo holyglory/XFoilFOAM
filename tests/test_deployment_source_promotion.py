@@ -82,6 +82,8 @@ def _staged_payload(root: Path, log: Path) -> None:
         "deployment-env-preflight.py",
         "fsync-release.py",
         "opencfd2606_cutover_state.py",
+        "remote-solver2606-cutover-state.py",
+        "deployment-compose-profile.sh",
     ):
         shutil.copy2(ROOT / "scripts" / "deploy" / name, deploy / name)
     vps_script = deploy / "vps-redeploy.sh"
