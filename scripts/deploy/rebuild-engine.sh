@@ -212,6 +212,27 @@ capture_sweeper_state() {
   fi
 }
 
+capture_media_repair_state() {
+  local configured_services running_ids
+  if ! configured_services="$(compose config --services)"; then
+    echo "Could not determine whether media-repair is configured; refusing engine rebuild." >&2
+    return 12
+  fi
+  if ! grep -Fxq media-repair <<<"$configured_services"; then
+    printf 'absent\n'
+    return 0
+  fi
+  if ! running_ids="$(compose ps --status running -q media-repair)"; then
+    echo "Could not determine whether media-repair is running; refusing engine rebuild." >&2
+    return 12
+  fi
+  if [[ -n "$running_ids" ]]; then
+    printf 'running\n'
+  else
+    printf 'stopped\n'
+  fi
+}
+
 restore_sweeper_after_refusal() {
   local initial_state="$1"
   if [[ "$initial_state" == "running" ]]; then
@@ -219,6 +240,24 @@ restore_sweeper_after_refusal() {
   else
     compose stop sweeper || true
   fi
+}
+
+restore_media_repair_after_refusal() {
+  local initial_state="$1"
+  case "$initial_state" in
+    running) compose up -d --no-deps media-repair || true ;;
+    stopped|absent) ;;
+    *)
+      echo "Unknown pre-rebuild media-repair state '$initial_state'; leaving it stopped." >&2
+      ;;
+  esac
+}
+
+restore_pre_migration_writers_after_refusal() {
+  local sweeper_initial_state="$1"
+  local media_repair_initial_state="$2"
+  restore_media_repair_after_refusal "$media_repair_initial_state"
+  restore_sweeper_after_refusal "$sweeper_initial_state"
 }
 
 restore_sweeper_after_rebuild() {
@@ -233,6 +272,29 @@ restore_sweeper_after_rebuild() {
     # same verified engine generation without a stale-id transition.
     compose up --no-start --no-deps --force-recreate sweeper
   fi
+}
+
+restore_media_repair_after_rebuild() {
+  local initial_state="$1"
+  case "$initial_state" in
+    running)
+      echo "Restoring the previously running media-repair writer..."
+      compose up -d --no-deps --force-recreate media-repair
+      ;;
+    stopped)
+      echo "Preserving the intentionally stopped media-repair writer..."
+      # media-repair reads AIRFOILFOAM_BUILD_ID. Recreate it without starting
+      # so a later intentional start cannot retain the previous engine id.
+      compose up --no-start --no-deps --force-recreate media-repair
+      ;;
+    absent)
+      echo "media-repair is not configured in this deployment source; no writer to restore."
+      ;;
+    *)
+      echo "Unknown pre-rebuild media-repair state '$initial_state'; refusing to restore it." >&2
+      return 12
+      ;;
+  esac
 }
 
 configured_engine_worker_services() {
@@ -1557,10 +1619,12 @@ main() {
   # packaged local copy after verification.
   validate_remote_evidence_configuration
 
-  local sweeper_initial_state sweeper_restore_state
+  local sweeper_initial_state sweeper_restore_state media_repair_initial_state
   sweeper_initial_state="$(capture_sweeper_state)"
   sweeper_restore_state="$sweeper_initial_state"
   echo "Sweeper state before engine rebuild: $sweeper_initial_state"
+  media_repair_initial_state="$(capture_media_repair_state)"
+  echo "Media-repair state before engine rebuild: $media_repair_initial_state"
 
   # Never leave a still-running optional worker on an older build merely
   # because its profile was removed from .env.deploy. Restore the profile (or
@@ -1658,14 +1722,26 @@ main() {
   fi
   AIRFOILFOAM_BUILD_ID="$BUILD_ID" compose build api "${worker_services[@]}"
 
-  # Freeze scheduling before the final idle proof. Leaving the old sweeper
-  # live between that proof and force-recreate would let it submit a new solve
-  # which the worker recreate then kills. A refused maintenance action occurs
-  # before either build-id setting changes, so it is safe to restore the old
-  # sweeper's prior running/stopped state in that one path.
+  # Freeze scheduling and every old-schema database writer before the final
+  # idle proof. Leaving the old sweeper live between that proof and
+  # force-recreate would let it submit a new solve which the worker recreate
+  # then kills. Leaving media-repair live while node-api starts would let that
+  # old writer publish evidence across node-api's schema migration. A refused
+  # maintenance action occurs before either build-id setting changes, so it is
+  # safe to restore both writers' prior running/stopped state in that path.
   compose stop sweeper
+  local media_repair_stop_rc=0
+  if [[ "$media_repair_initial_state" != "absent" ]]; then
+    compose stop media-repair || media_repair_stop_rc=$?
+  fi
+  if ((media_repair_stop_rc != 0)); then
+    restore_pre_migration_writers_after_refusal \
+      "$sweeper_restore_state" "$media_repair_initial_state"
+    exit "$media_repair_stop_rc"
+  fi
   if ! require_idle_worker "before service recreate"; then
-    restore_sweeper_after_refusal "$sweeper_restore_state"
+    restore_pre_migration_writers_after_refusal \
+      "$sweeper_restore_state" "$media_repair_initial_state"
     exit 12
   fi
   # A submit HTTP request sent just before the sweeper stopped can finish in
@@ -1673,7 +1749,8 @@ main() {
   # before mutating env or recreating either engine service.
   sleep 2
   if ! require_idle_worker "stabilized before service recreate"; then
-    restore_sweeper_after_refusal "$sweeper_restore_state"
+    restore_pre_migration_writers_after_refusal \
+      "$sweeper_restore_state" "$media_repair_initial_state"
     exit 12
   fi
 
@@ -1688,7 +1765,8 @@ main() {
     local migrated_enabled_engine_keys
     if ! migrated_enabled_engine_keys="$(compute_migrated_opencfd_enabled_engine_keys)"; then
       echo "Could not derive the OpenCFD v2606 gateway engine allow-list; refusing the identity cutover." >&2
-      restore_sweeper_after_refusal "$sweeper_restore_state"
+      restore_pre_migration_writers_after_refusal \
+        "$sweeper_restore_state" "$media_repair_initial_state"
       exit 14
     fi
     engine_identity_updates+=(
@@ -1706,13 +1784,15 @@ main() {
   #      api, engine workers -> AIRFOILFOAM_BUILD_ID (build arg + env)
   #      node-api     -> ENGINE_EXPECTED_BUILD_ID (env)
   #      sweeper      -> AIRFOILFOAM_BUILD_ID (env)
+  #      media-repair -> AIRFOILFOAM_BUILD_ID (env)
   #    web reads neither var and is intentionally left alone.
   #    The two idle guards above make an in-flight solver termination a refused
   #    maintenance action. Recovery below is still required for stale rows
   #    left by an earlier crash or interrupted deployment.
   # node-api may apply a pending schema migration as it starts. The old
-  # sweeper is already quiescent from the final idle proof above, so no
-  # pre-migration writer can publish evidence during that cutover.
+  # sweeper and media-repair processes are already quiescent from the final
+  # idle proof above, so no pre-migration writer can publish evidence during
+  # that cutover. media-repair is restored only after node-api is healthy.
   compose up -d --no-deps --force-recreate api "${worker_services[@]}" node-api
 
   # 5. Verify the engine actually serves the new build.
@@ -1735,6 +1815,7 @@ main() {
   if [[ "$cutover_active" == "true" ]]; then
     finish_opencfd_2606_cutover
   fi
+  restore_media_repair_after_rebuild "$media_repair_initial_state"
   restore_sweeper_after_rebuild "$sweeper_restore_state"
   if [[ "$cutover_active" == "true" ]]; then
     if [[ "$sweeper_restore_state" == "running" ]]; then

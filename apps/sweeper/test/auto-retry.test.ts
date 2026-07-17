@@ -701,7 +701,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     ).toHaveLength(0);
   }, 240000);
 
-  it("MUST-CATCH: done-but-rejected non-handoff RANS records one critical incident while normal needs-URANS handoff records none", async () => {
+  it("MUST-CATCH: completed physical RANS rejection is normal URANS handoff evidence, never a critical preflight incident", async () => {
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -804,25 +804,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
           seeded.map((row) => row.resultId),
         ),
       );
-    const rejected = seeded.find((row) => row.state === "rejected")!;
-    expect(incidents).toHaveLength(1);
-    expect(incidents[0]).toMatchObject({
-      stage: "rans",
-      reason: "non-publishable-rans-evidence",
-      severity: "critical",
-      status: "open",
-      resultId: rejected.resultId,
-      resultAttemptId: rejected.attemptId,
-      simJobId: job.id,
-      remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
-      metadata: expect.objectContaining({
-        classificationReasons: ["missing-coefficients"],
-        recovery: "evidence-rejected",
-      }),
-    });
-    expect(incidents[0]?.occurrenceKey).toBe(
-      `rans:${rejected.resultId}:${job.id}:evidence-rejected`,
-    );
+    expect(incidents).toHaveLength(0);
   }, 240000);
 
   it("MUST-CATCH: durable whole-polar promotion events recover campaign and background parents after a crash before child composition", async () => {

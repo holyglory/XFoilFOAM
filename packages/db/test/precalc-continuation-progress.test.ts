@@ -1,6 +1,5 @@
 import { URANS_CONTINUATION_REQUIRED_MARKER } from "@aerodb/core";
 import {
-  MAX_PRECALC_CONTINUATION_SEGMENTS,
   MAX_PRECALC_NO_PROGRESS_SEGMENTS,
   airfoils,
   createClient,
@@ -191,12 +190,14 @@ describe("cross-segment preliminary URANS progress", () => {
       precalcContinuationMadeProgress(baseline, {
         ...baseline,
         periodsRetained: 1.25,
+        simulatedTimeS: baseline.simulatedTimeS! + baseline.periodS! / 4,
       }),
     ).toBe(true);
     expect(
       precalcContinuationMadeProgress(baseline, {
         ...baseline,
         driftFrac: 0.35,
+        simulatedTimeS: baseline.simulatedTimeS! + 0.001,
       }),
     ).toBe(true);
   });
@@ -291,7 +292,7 @@ describe("cross-segment preliminary URANS progress", () => {
     ).toHaveLength(1);
   }, 120_000);
 
-  it("stops a trajectory that keeps changing but never becomes publishable at the total continuation cap", async () => {
+  it("keeps a measurably productive trajectory schedulable beyond the former fixed continuation cap", async () => {
     const cappedAoaDeg = aoaDeg + 0.1;
     const [cappedObligation] = await ensurePrecalcObligations(
       db,
@@ -306,13 +307,10 @@ describe("cross-segment preliminary URANS progress", () => {
       targetObligationId: cappedObligation.id,
       targetAoaDeg: cappedAoaDeg,
     });
-    for (
-      let segment = 1;
-      segment <= MAX_PRECALC_CONTINUATION_SEGMENTS;
-      segment += 1
-    ) {
+    const productiveSegments = 7;
+    for (let segment = 1; segment <= productiveSegments; segment += 1) {
       checkpoint = await completeRejectedSegment({
-        suffix: `cap-continuation-${segment}`,
+        suffix: `productive-continuation-${segment}`,
         continueFromResultAttemptId: checkpoint.id,
         targetObligationId: cappedObligation.id,
         targetAoaDeg: cappedAoaDeg,
@@ -332,14 +330,20 @@ describe("cross-segment preliminary URANS progress", () => {
       .from(simPrecalcObligations)
       .where(eq(simPrecalcObligations.id, cappedObligation.id));
     expect(settled).toMatchObject({
-      state: "blocked",
-      lastOutcome: "continuation_segment_exhausted",
-      continuationSegmentCount: MAX_PRECALC_CONTINUATION_SEGMENTS,
+      state: "pending",
+      lastOutcome: "rejected",
+      continuationSegmentCount: productiveSegments,
       continuationNoProgressCount: 0,
     });
-    expect(
-      await precalcContinuationsForObligations(db, [cappedObligation.id]),
-    ).toEqual([]);
+    const continuations = await precalcContinuationsForObligations(db, [
+      cappedObligation.id,
+    ]);
+    expect(continuations).toEqual([
+      expect.objectContaining({
+        obligationId: cappedObligation.id,
+        resultAttemptId: checkpoint.id,
+      }),
+    ]);
 
     const incidents = await db
       .select()
@@ -347,32 +351,36 @@ describe("cross-segment preliminary URANS progress", () => {
       .where(eq(simSolverIncidents.precalcObligationId, cappedObligation.id));
     expect(
       incidents.filter((incident) => incident.severity === "critical"),
-    ).toEqual([
-      expect.objectContaining({
-        reason: "continuation-segment-limit",
-        status: "open",
-      }),
-    ]);
+    ).toEqual([]);
 
     await db
       .update(simPrecalcObligations)
-      .set({ lastOutcome: "rejected_exhausted" })
+      .set({
+        state: "blocked",
+        lastOutcome: "continuation_segment_exhausted",
+        completedAt: new Date(),
+      })
       .where(eq(simPrecalcObligations.id, cappedObligation.id));
     expect(
       await requeueRestartablePrecalcContinuations(db, {
         obligationIds: [cappedObligation.id],
       }),
     ).toEqual({
-      obligationIds: [],
+      obligationIds: [cappedObligation.id],
       campaignIds: [],
       requestIds: [],
       repairedSubmissionIds: [],
     });
-    const [stillBlocked] = await db
+    const [reopened] = await db
       .select()
       .from(simPrecalcObligations)
       .where(eq(simPrecalcObligations.id, cappedObligation.id));
-    expect(stillBlocked.state).toBe("blocked");
+    expect(reopened).toMatchObject({
+      state: "pending",
+      lastOutcome: "continuation_recovery_pending",
+      continuationSegmentCount: productiveSegments,
+      continuationNoProgressCount: 0,
+    });
 
     const [legacyActiveJob] = await db
       .insert(simJobs)
@@ -428,9 +436,10 @@ describe("cross-segment preliminary URANS progress", () => {
       .from(simPrecalcObligations)
       .where(eq(simPrecalcObligations.id, cappedObligation.id));
     expect(legacySettlement).toMatchObject({
-      state: "blocked",
-      lastOutcome: "continuation_segment_exhausted",
-      continuationSegmentCount: MAX_PRECALC_CONTINUATION_SEGMENTS,
+      state: "pending",
+      lastOutcome: "infrastructure_retry_wait",
+      continuationSegmentCount: productiveSegments,
+      continuationNoProgressCount: 0,
     });
   }, 120_000);
 });

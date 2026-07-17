@@ -218,7 +218,7 @@ const item = (
 });
 
 describe("buildStoryDigest", () => {
-  it("renders the RANS reject → repeated URANS timeout chain with ×N grouping", () => {
+  it("MUST-CATCH: renders ordinary RANS nonconvergence as a neutral handoff, never a failed point", () => {
     const digest = buildStoryDigest(
       item({
         status: "failed",
@@ -235,7 +235,8 @@ describe("buildStoryDigest", () => {
         ],
       }),
     );
-    expect(digest).toBe("RANS ✗ → URANS ⏱ timeout ×3");
+    expect(digest).toBe("RANS handoff → URANS ⏱ timeout ×3");
+    expect(digest).not.toContain("RANS ✗");
   });
 
   it("renders the escalation-to-steady-URANS success chain", () => {
@@ -254,7 +255,7 @@ describe("buildStoryDigest", () => {
         ],
       }),
     );
-    expect(digest).toBe("RANS ✗ → URANS ✓ steady (no shedding)");
+    expect(digest).toBe("RANS handoff → URANS ✓ steady (no shedding)");
   });
 
   it("labels a shedding URANS with a measured Strouhal as shedding", () => {
@@ -385,11 +386,12 @@ describe("assembleTimeline", () => {
         attempts: [attempt({ stalled: true })],
       }),
     );
-    expect(events.at(-2)?.title).toBe(
-      "RANS did not converge — preliminary URANS queued",
-    );
-    expect(events.at(-1)?.title).toBe("NOW: preliminary URANS queued");
-    expect(events.at(-1)?.tone).toBe("amber");
+    expect(events[0]?.title).toBe("RANS screen · physical run 1 · handed off");
+    expect(events[0]?.tone).toBe("muted");
+    expect(events[0]?.detail).toContain("normal handoff to URANS fast");
+    expect(events.at(-2)?.title).toBe("RANS screen · handed off to URANS fast");
+    expect(events.at(-1)?.title).toBe("NOW: URANS fast queued");
+    expect(events.at(-1)?.tone).toBe("muted");
   });
 
   it("orders attempts + interruptions chronologically, then classification, then NOW", () => {
@@ -460,7 +462,7 @@ describe("assembleTimeline", () => {
     expect(events[4].detail).toContain("open for 3 of 12 airfoils");
   });
 
-  it("escalation semantics: stalled RANS is amber (normal), errors are red, valid is teal", () => {
+  it("MUST-CATCH: stage labels and physical ordinals distinguish RANS, fast URANS, and final URANS", () => {
     const events = assembleTimeline(
       storyPayload({
         attempts: [
@@ -473,6 +475,14 @@ describe("assembleTimeline", () => {
             id: "t",
             regime: "urans",
             error: "URANS timed out",
+            simJob: {
+              id: "fast-job",
+              wave: 1,
+              jobKind: "targeted",
+              status: "done",
+              campaignId: "campaign",
+              engineJobId: "engine-fast",
+            },
             createdAt: "2026-07-06T10:00:00.000Z",
           }),
           attempt({
@@ -480,16 +490,54 @@ describe("assembleTimeline", () => {
             regime: "urans",
             validForPolar: true,
             converged: true,
+            simJob: {
+              id: "final-job",
+              wave: 1,
+              jobKind: "verify",
+              status: "done",
+              campaignId: "campaign",
+              engineJobId: "engine-final",
+            },
             createdAt: "2026-07-06T11:00:00.000Z",
           }),
         ],
       }),
     );
-    expect(events[0].tone).toBe("amber");
-    expect(events[0].title).toContain("escalation evidence");
+    expect(events[0].tone).toBe("muted");
+    expect(events[0].title).toBe("RANS screen · physical run 1 · handed off");
     expect(events[1].tone).toBe("red");
-    expect(events[1].title).toContain("timeout");
+    expect(events[1].title).toBe("URANS fast · physical run 1 · timeout");
     expect(events[2].tone).toBe("teal");
+    expect(events[2].title).toBe(
+      "URANS final · physical run 1 · accepted · steady",
+    );
+  });
+
+  it("MUST-CATCH: exhausted final URANS is red, critical, and explicitly system-owned", () => {
+    const events = assembleTimeline(
+      storyPayload({
+        point: {
+          fidelity: "urans_precalc",
+          verify: {
+            state: "blocked",
+            deltaCl: null,
+            deltaCd: null,
+            deltaCm: null,
+            submitError: "automatic final recovery exhausted",
+            submitHttpStatus: 422,
+          },
+        } as never,
+      }),
+    );
+    const critical = events.find((event) => event.title.startsWith("CRITICAL"));
+    expect(critical).toMatchObject({
+      tone: "red",
+      title: "CRITICAL · URANS final unavailable",
+    });
+    expect(critical?.whyLines.join(" ")).toContain("system-owned incident");
+    expect(critical?.whyLines.join(" ")).toContain(
+      "accepted URANS fast evidence is retained",
+    );
   });
 
   it("surfaces persisted quality warnings as the attempt's why-lines", () => {

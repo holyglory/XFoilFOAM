@@ -10,13 +10,14 @@ import {
 /** Bump when the recovery decision itself changes. Incident summaries keep
  * versions separate so recurrence before and after a correction is visible. */
 export const URANS_RECOVERY_REMEDIATION_VERSION =
-  "urans-recovery-2026-07-16-v1";
-export const RANS_RECOVERY_REMEDIATION_VERSION =
-  "rans-recovery-2026-07-16-v1";
+  "urans-recovery-2026-07-16-v2";
+export const RANS_RECOVERY_REMEDIATION_VERSION = "rans-recovery-2026-07-16-v1";
 
 export function ransMeshRecoveryRemediationVersion(version: number): string {
   if (!Number.isSafeInteger(version) || version < 0) {
-    throw new Error("RANS mesh recovery version must be a non-negative integer");
+    throw new Error(
+      "RANS mesh recovery version must be a non-negative integer",
+    );
   }
   return `rans-mesh-recovery-v${version}`;
 }
@@ -269,11 +270,10 @@ export async function resolveOlderRansMeshIncidentsInTransaction(
   resultIds: string[],
   meshRecoveryVersion: number,
 ): Promise<number> {
-  if (
-    !Number.isSafeInteger(meshRecoveryVersion) ||
-    meshRecoveryVersion <= 0
-  ) {
-    throw new Error("new RANS mesh recovery version must be a positive integer");
+  if (!Number.isSafeInteger(meshRecoveryVersion) || meshRecoveryVersion <= 0) {
+    throw new Error(
+      "new RANS mesh recovery version must be a positive integer",
+    );
   }
   const uniqueIds = [...new Set(resultIds)];
   if (!uniqueIds.length) return 0;

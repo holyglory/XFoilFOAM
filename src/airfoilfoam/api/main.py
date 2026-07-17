@@ -36,7 +36,11 @@ from ..evidence_runtime import (
     finalize_remote_evidence_cleanup,
     hydrated_render_source,
 )
-from ..evidence_store import EvidenceStoreError, RemoteEvidencePointer
+from ..evidence_store import (
+    EvidenceStoreError,
+    RemoteEvidencePointer,
+    read_remote_pointer,
+)
 from ..meshing.base import list_meshers
 from ..models import (
     AirfoilInput,
@@ -143,6 +147,125 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _evidence_identity_headers(pointer: RemoteEvidencePointer) -> dict[str, str]:
+    return {
+        "x-content-sha256": pointer.stored_sha256,
+        "x-gcs-generation": str(pointer.generation),
+    }
+
+
+def _evidence_dir_for_target(job_root: Path, target: Path) -> Path | None:
+    current = target.parent
+    while current != job_root and job_root in current.parents:
+        if evidence_pointer_path(current).is_file():
+            return current
+        current = current.parent
+    return None
+
+
+def _expected_archive_pointer(
+    evidence_dir: Path,
+    *,
+    expected_bucket: str | None,
+    expected_object_key: str | None,
+    expected_generation: int | None,
+    expected_stored_sha256: str | None,
+    expected_stored_size: int | None,
+) -> RemoteEvidencePointer | None:
+    values = (
+        expected_bucket,
+        expected_object_key,
+        expected_generation,
+        expected_stored_sha256,
+        expected_stored_size,
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise HTTPException(
+            status_code=400,
+            detail="Expected evidence identity must include bucket, object, generation, SHA-256 and size",
+        )
+    if (
+        not expected_bucket
+        or not expected_object_key
+        or expected_generation is None
+        or expected_generation <= 0
+        or expected_stored_sha256 is None
+        or len(expected_stored_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_stored_sha256)
+        or expected_stored_size is None
+        or expected_stored_size <= 0
+    ):
+        raise HTTPException(status_code=400, detail="Expected evidence identity is invalid")
+    try:
+        pointer = read_remote_pointer(evidence_pointer_path(evidence_dir))
+    except (EvidenceStoreError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Stored evidence pointer could not be verified: {exc}",
+        ) from exc
+    if (
+        pointer.bucket != expected_bucket
+        or pointer.object_key != expected_object_key
+        or pointer.generation != expected_generation
+        or pointer.stored_sha256 != expected_stored_sha256
+        or pointer.stored_size != expected_stored_size
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Stored evidence pointer does not match the expected immutable generation",
+        )
+    return pointer
+
+
+def _stream_verified_local_archive(
+    path: Path,
+    pointer: RemoteEvidencePointer,
+) -> StreamingResponse:
+    if not path.is_file() or path.is_symlink():
+        raise HTTPException(
+            status_code=502,
+            detail="Local evidence archive is not a regular file",
+        )
+    try:
+        handle = path.open("rb")
+        size = os.fstat(handle.fileno()).st_size
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if size != pointer.stored_size or digest.hexdigest() != pointer.stored_sha256:
+            handle.close()
+            raise HTTPException(
+                status_code=502,
+                detail="Local evidence archive size or SHA-256 does not match the immutable generation",
+            )
+        handle.seek(0)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Local evidence archive is unavailable: {exc}",
+        ) from exc
+
+    def body() -> Iterator[bytes]:
+        try:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                yield chunk
+        finally:
+            handle.close()
+
+    return StreamingResponse(
+        body(),
+        media_type=ARCHIVE_MIME_TYPE,
+        headers={
+            "content-length": str(size),
+            **_evidence_identity_headers(pointer),
+        },
+    )
+
+
 def _render_hash(req: RenderFieldRequest) -> str:
     payload = req.model_dump(mode="json", exclude={"params_hash"})
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -241,6 +364,7 @@ def _stream_remote_evidence(
     source: ContextManager[Path],
     *,
     media_type: str,
+    identity: RemoteEvidencePointer | None = None,
 ) -> StreamingResponse:
     """Enter a verified cache lease before responding and hold it to EOF."""
 
@@ -285,10 +409,22 @@ def _stream_remote_evidence(
         finally:
             source.__exit__(None, None, None)
 
+    headers = {"content-length": str(content_length)}
+    if identity is not None:
+        if (
+            content_length != identity.stored_size
+            or _sha256_file(path) != identity.stored_sha256
+        ):
+            source.__exit__(None, None, None)
+            raise HTTPException(
+                status_code=502,
+                detail="Verified remote evidence does not match the expected immutable generation",
+            )
+        headers.update(_evidence_identity_headers(identity))
     return StreamingResponse(
         body(),
         media_type=media_type,
-        headers={"content-length": str(content_length)},
+        headers=headers,
     )
 
 
@@ -1028,28 +1164,56 @@ def create_app() -> FastAPI:
         return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
     @app.get("/jobs/{job_id}/files/{path:path}")
-    def job_file(job_id: str, path: str):
+    def job_file(
+        job_id: str,
+        path: str,
+        expected_bucket: str | None = None,
+        expected_object_key: str | None = None,
+        expected_generation: int | None = None,
+        expected_stored_sha256: str | None = None,
+        expected_stored_size: int | None = None,
+    ):
         if not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         try:
             target = store.file_path(job_id, path)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid path")
+        job_root = safe_job_root(job_id)
+        evidence_dir = _evidence_dir_for_target(job_root, target)
+        expected_pointer: RemoteEvidencePointer | None = None
+        if any(
+            value is not None
+            for value in (
+                expected_bucket,
+                expected_object_key,
+                expected_generation,
+                expected_stored_sha256,
+                expected_stored_size,
+            )
+        ):
+            if target.name != EVIDENCE_ARCHIVE_NAME or evidence_dir is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Expected immutable evidence identity does not match an archive path",
+                )
+            expected_pointer = _expected_archive_pointer(
+                evidence_dir,
+                expected_bucket=expected_bucket,
+                expected_object_key=expected_object_key,
+                expected_generation=expected_generation,
+                expected_stored_sha256=expected_stored_sha256,
+                expected_stored_size=expected_stored_size,
+            )
         if target.is_file():
+            if expected_pointer is not None:
+                return _stream_verified_local_archive(target, expected_pointer)
             return FileResponse(target)
 
         # Finalized evidence retains only its manifest, separately stored frame
         # PNGs, and a verified remote pointer.  Resolve a missing packaged path
         # against that exact case-evidence directory; never rediscover an
         # archive by rounded solver values or a different job.
-        job_root = safe_job_root(job_id)
-        evidence_dir: Path | None = None
-        current = target.parent
-        while current != job_root and job_root in current.parents:
-            if evidence_pointer_path(current).is_file():
-                evidence_dir = current
-                break
-            current = current.parent
         if evidence_dir is None:
             raise HTTPException(status_code=404, detail="File not found")
 
@@ -1073,8 +1237,9 @@ def create_app() -> FastAPI:
         pointer_path = evidence_pointer_path(evidence_dir)
         if member == EVIDENCE_ARCHIVE_NAME:
             return _stream_remote_evidence(
-                remote_store.archive_source(pointer_path),
+                remote_store.archive_source(expected_pointer or pointer_path),
                 media_type=ARCHIVE_MIME_TYPE,
+                identity=expected_pointer,
             )
 
         top_level = member.split("/", 1)[0]

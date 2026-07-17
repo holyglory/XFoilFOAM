@@ -726,6 +726,9 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         aoaDeg: 2,
         state: "pending",
         precalcResultId: provisional.id,
+        precalcResultAttemptId: exactAttempts.find(
+          (attempt) => attempt.resultId === provisional.id,
+        )!.id,
       })
       .returning({ id: simUransVerifyQueue.id });
     cleanup.verifyIds.push(verify.id);

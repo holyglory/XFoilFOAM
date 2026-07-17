@@ -1,16 +1,20 @@
 import {
   type DB,
+  resultAttempts,
+  results,
+  simJobs,
   solverEvidenceArchives,
   solverEvidenceArtifactMembers,
   solverEvidenceArtifacts,
   solverEvidenceBlobs,
+  solverEvidenceOrphanQuarantines,
 } from "@aerodb/db";
 import type {
   EngineClient,
   EngineEvidenceArtifact,
   PolarPoint,
 } from "@aerodb/engine-client";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Dirent } from "node:fs";
 import {
   mkdir,
@@ -26,7 +30,10 @@ import { pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 
 import { makeContext } from "./config";
-import { parseEvidenceManifest } from "./evidence-manifest";
+import {
+  manifestMemberSetSha256,
+  parseEvidenceManifest,
+} from "./evidence-manifest";
 import { registerEvidenceArtifacts } from "./ingest";
 
 export const MIGRATION_RECEIPT_NAME = "storage_migration.json";
@@ -71,9 +78,19 @@ interface MigrationReceipt {
     zstdLevel: number;
     createdAt: string;
   };
+  sourceArchives: Array<{
+    path: string;
+    compression: "gzip" | "zstd";
+    sha256: string;
+    byteSize: number;
+    uncompressedTarSha256?: string;
+    uncompressedTarByteSize?: number;
+  }>;
+  verificationMode: string | null;
+  verifiedAt: string | null;
 }
 
-export interface EvidenceStorageDatabaseAck {
+export interface RegisteredEvidenceStorageDatabaseAck {
   schemaVersion: 1;
   state: "registered";
   jobId: string;
@@ -85,6 +102,43 @@ export interface EvidenceStorageDatabaseAck {
   sourceArtifactId: string;
   archiveId: string;
   registeredAt: string;
+  quarantineId?: never;
+  blobId?: never;
+}
+
+export interface OrphanEvidenceStorageDatabaseAck {
+  schemaVersion: 1;
+  state: "quarantined";
+  registrationKind: "orphan_evidence_quarantine";
+  quarantineReason: "terminal_engine_evidence_not_ingested";
+  jobId: string;
+  evidencePath: string;
+  storedSha256: string;
+  generation: string;
+  quarantineId: string;
+  sourceArtifactId: string;
+  blobId: string;
+  manifestSha256: string;
+  manifestByteSize: number;
+  archiveMemberSetSha256: string;
+  archiveMemberCount: number;
+  migrationReceiptSha256: string;
+  migrationReceiptByteSize: number;
+  quarantinedAt: string;
+  resultId?: never;
+  resultAttemptId?: never;
+  archiveId?: never;
+  registeredAt?: never;
+}
+
+export type EvidenceStorageDatabaseAck =
+  | RegisteredEvidenceStorageDatabaseAck
+  | OrphanEvidenceStorageDatabaseAck;
+
+interface MigrationReceiptDocument {
+  receipt: MigrationReceipt;
+  bytes: Buffer;
+  sha256: string;
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -112,6 +166,14 @@ function positiveSafeInteger(value: unknown, label: string): number {
     throw new Error(`${label} must be a positive safe integer`);
   }
   return value;
+}
+
+function isoTimestamp(value: unknown, label: string): string {
+  const text = exactString(value, label);
+  if (!Number.isFinite(new Date(text).getTime())) {
+    throw new Error(`${label} must be an ISO timestamp`);
+  }
+  return text;
 }
 
 function safeRelative(value: unknown, label: string): string {
@@ -144,7 +206,8 @@ export function parseEvidenceMigrationReceipt(
   mediaRoot: string,
 ): MigrationReceipt {
   const raw = object(value, "migration receipt");
-  if (raw.schemaVersion !== 1) throw new Error("unsupported migration receipt schema");
+  if (raw.schemaVersion !== 1)
+    throw new Error("unsupported migration receipt schema");
   if (
     raw.state !== "awaiting_database_registration" &&
     raw.state !== "complete"
@@ -156,6 +219,45 @@ export function parseEvidenceMigrationReceipt(
   const evidencePath = safeRelative(raw.evidencePath, "evidencePath");
   const archive = object(raw.archive, "archive");
   const remote = object(raw.remote, "remote");
+  const rawSources = raw.sourceArchives ?? [];
+  if (!Array.isArray(rawSources)) {
+    throw new Error("sourceArchives must be an array");
+  }
+  const sourceArchives = rawSources.map((value, index) => {
+    const source = object(value, `source archive ${index}`);
+    const compression = source.compression;
+    if (compression !== "gzip" && compression !== "zstd") {
+      throw new Error(`source archive ${index} compression is unsupported`);
+    }
+    const parsed: MigrationReceipt["sourceArchives"][number] = {
+      path: safeRelative(source.path, `source archive ${index} path`),
+      compression,
+      sha256: pattern(source.sha256, `source archive ${index} sha256`, SHA256),
+      byteSize: positiveSafeInteger(
+        source.byteSize,
+        `source archive ${index} byteSize`,
+      ),
+    };
+    const hasTarSha = source.uncompressedTarSha256 != null;
+    const hasTarSize = source.uncompressedTarByteSize != null;
+    if (hasTarSha !== hasTarSize) {
+      throw new Error(
+        `source archive ${index} uncompressed tar identity is incomplete`,
+      );
+    }
+    if (hasTarSha) {
+      parsed.uncompressedTarSha256 = pattern(
+        source.uncompressedTarSha256,
+        `source archive ${index} uncompressedTarSha256`,
+        SHA256,
+      );
+      parsed.uncompressedTarByteSize = positiveSafeInteger(
+        source.uncompressedTarByteSize,
+        `source archive ${index} uncompressedTarByteSize`,
+      );
+    }
+    return parsed;
+  });
   const remoteStoredSha256 = pattern(
     remote.storedSha256,
     "remote storedSha256",
@@ -173,7 +275,11 @@ export function parseEvidenceMigrationReceipt(
     jobId,
     evidencePath,
     archive: {
-      storedSha256: pattern(archive.storedSha256, "archive storedSha256", SHA256),
+      storedSha256: pattern(
+        archive.storedSha256,
+        "archive storedSha256",
+        SHA256,
+      ),
       storedByteSize: positiveSafeInteger(
         archive.storedByteSize,
         "archive storedByteSize",
@@ -190,12 +296,18 @@ export function parseEvidenceMigrationReceipt(
       zstdLevel: positiveSafeInteger(archive.zstdLevel, "archive zstdLevel"),
     },
     remote: {
-      schemaVersion: remote.schemaVersion === 1 ? 1 : (() => {
-        throw new Error("unsupported remote pointer schema");
-      })(),
-      format: remote.format === "tar+zstd" ? "tar+zstd" : (() => {
-        throw new Error("remote format must be tar+zstd");
-      })(),
+      schemaVersion:
+        remote.schemaVersion === 1
+          ? 1
+          : (() => {
+              throw new Error("unsupported remote pointer schema");
+            })(),
+      format:
+        remote.format === "tar+zstd"
+          ? "tar+zstd"
+          : (() => {
+              throw new Error("remote format must be tar+zstd");
+            })(),
       bucket: exactString(remote.bucket, "remote bucket"),
       objectKey: remoteObjectKey,
       generation: pattern(remote.generation, "remote generation", GENERATION),
@@ -207,6 +319,15 @@ export function parseEvidenceMigrationReceipt(
       zstdLevel: positiveSafeInteger(remote.zstdLevel, "remote zstdLevel"),
       createdAt: exactString(remote.createdAt, "remote createdAt"),
     },
+    sourceArchives,
+    verificationMode:
+      raw.verificationMode == null
+        ? null
+        : exactString(raw.verificationMode, "verificationMode"),
+    verifiedAt:
+      raw.verifiedAt == null
+        ? null
+        : isoTimestamp(raw.verifiedAt, "verifiedAt"),
   };
   if (!Number.isFinite(new Date(parsed.remote.createdAt).getTime())) {
     throw new Error("remote createdAt must be an ISO timestamp");
@@ -228,17 +349,24 @@ export function parseEvidenceMigrationReceipt(
     MIGRATION_RECEIPT_NAME,
   );
   if (resolve(receiptPath) !== expectedPath) {
-    throw new Error("migration receipt path does not match its job/evidence identity");
+    throw new Error(
+      "migration receipt path does not match its job/evidence identity",
+    );
   }
   return parsed;
 }
 
-async function readReceipt(
+async function readReceiptDocument(
   receiptPath: string,
   mediaRoot: string,
-): Promise<MigrationReceipt> {
-  const raw = JSON.parse(await readFile(receiptPath, "utf8"));
-  return parseEvidenceMigrationReceipt(raw, receiptPath, mediaRoot);
+): Promise<MigrationReceiptDocument> {
+  const bytes = await readFile(receiptPath);
+  const raw = JSON.parse(bytes.toString("utf8"));
+  return {
+    receipt: parseEvidenceMigrationReceipt(raw, receiptPath, mediaRoot),
+    bytes,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
 }
 
 function sourceKeys(receipt: MigrationReceipt): string[] {
@@ -278,7 +406,9 @@ function memberPathOf(
   ).split("/");
   const offsets: number[] = [];
   for (let index = 0; index <= storedParts.length - baseParts.length; index++) {
-    if (baseParts.every((part, offset) => storedParts[index + offset] === part)) {
+    if (
+      baseParts.every((part, offset) => storedParts[index + offset] === part)
+    ) {
       offsets.push(index);
     }
   }
@@ -321,7 +451,9 @@ async function validateManifestArtifacts(
   });
   const manifestPath = join(dirname(receiptPath), "evidence_manifest.json");
   const manifestBytes = await readFile(manifestPath);
-  const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+  const manifestSha256 = createHash("sha256")
+    .update(manifestBytes)
+    .digest("hex");
   const manifestArtifact = owned.filter(
     (artifact) => artifact.kind === "manifest",
   );
@@ -345,7 +477,10 @@ async function validateManifestArtifacts(
     Array<typeof solverEvidenceArtifacts.$inferSelect>
   >();
   for (const artifact of owned) {
-    if (artifact.kind === "engine_bundle" || artifact.kind === "openfoam_bundle") {
+    if (
+      artifact.kind === "engine_bundle" ||
+      artifact.kind === "openfoam_bundle"
+    ) {
       continue;
     }
     const memberPath = memberPathOf(artifact, receipt);
@@ -397,7 +532,9 @@ async function validateManifestArtifacts(
       );
     }
   }
-  const allowedMemberPaths = new Set(parsed.memberSet.map((entry) => entry.path));
+  const allowedMemberPaths = new Set(
+    parsed.memberSet.map((entry) => entry.path),
+  );
   for (const artifact of owned.filter((row) => MEMBER_KINDS.has(row.kind))) {
     const memberPath = memberPathOf(artifact, receipt);
     if (!allowedMemberPaths.has(memberPath)) {
@@ -409,8 +546,8 @@ async function validateManifestArtifacts(
   return { expected, memberPaths };
 }
 
-async function findExactSource(db: DB, receipt: MigrationReceipt) {
-  const rows = await db
+async function exactSourceRows(db: DB, receipt: MigrationReceipt) {
+  return db
     .select()
     .from(solverEvidenceArtifacts)
     .where(
@@ -423,6 +560,10 @@ async function findExactSource(db: DB, receipt: MigrationReceipt) {
         ]),
       ),
     );
+}
+
+async function findExactSource(db: DB, receipt: MigrationReceipt) {
+  const rows = await exactSourceRows(db, receipt);
   const owned = rows.filter(
     (row) => row.resultId && row.resultAttemptId && row.simJobId,
   );
@@ -450,9 +591,433 @@ async function findExactSource(db: DB, receipt: MigrationReceipt) {
   if (source.aoaDeg == null || !Number.isFinite(source.aoaDeg)) {
     throw new Error("source artifact has no exact AoA");
   }
-  if (!source.engineCaseSlug) throw new Error("source artifact has no case slug");
+  if (!source.engineCaseSlug)
+    throw new Error("source artifact has no case slug");
   evidenceBaseOf(source, receipt);
   return source;
+}
+
+function exactEvidencePathIdentity(receipt: MigrationReceipt): {
+  engineCaseSlug: string;
+  evidenceBase: string;
+} {
+  const parts = receipt.evidencePath.split("/");
+  if (parts[0] !== "cases" || parts.length < 3) {
+    throw new Error(
+      "orphan evidence path must be cases/<exact-case-slug>/<evidence-base>",
+    );
+  }
+  const engineCaseSlug = safeRelative(parts[1], "engine case slug");
+  if (engineCaseSlug.includes("/")) {
+    throw new Error("engine case slug must be one path segment");
+  }
+  const evidenceBase = safeRelative(
+    parts.slice(2).join("/"),
+    "orphan evidence base",
+  );
+  return { engineCaseSlug, evidenceBase };
+}
+
+interface OrphanManifestProvenance {
+  manifestSha256: string;
+  manifestByteSize: number;
+  archiveMembers: Array<{ path: string; sha256: string; byteSize: number }>;
+  archiveMemberSetSha256: string;
+}
+
+async function orphanManifestProvenance(
+  receipt: MigrationReceipt,
+  receiptPath: string,
+): Promise<OrphanManifestProvenance> {
+  if (!receipt.sourceArchives.length) {
+    throw new Error(
+      "orphan quarantine requires exact retained source archive provenance",
+    );
+  }
+  const manifestBytes = await readFile(
+    join(dirname(receiptPath), "evidence_manifest.json"),
+  );
+  const parsed = parseEvidenceManifest(manifestBytes);
+  const expectedVerification = `archive+manifest+all-members-restore:${parsed.bundled.length}`;
+  if (receipt.verificationMode !== expectedVerification) {
+    throw new Error(
+      `orphan receipt must prove ${expectedVerification}; got ${receipt.verificationMode ?? "none"}`,
+    );
+  }
+  if (!receipt.verifiedAt) {
+    throw new Error(
+      "orphan receipt lacks the remote all-member verification time",
+    );
+  }
+  return {
+    manifestSha256: createHash("sha256").update(manifestBytes).digest("hex"),
+    manifestByteSize: manifestBytes.byteLength,
+    archiveMembers: parsed.memberSet,
+    archiveMemberSetSha256: manifestMemberSetSha256(parsed.memberSet),
+  };
+}
+
+function orphanAckFromRow(
+  row: typeof solverEvidenceOrphanQuarantines.$inferSelect,
+  receipt: MigrationReceipt,
+): OrphanEvidenceStorageDatabaseAck {
+  return {
+    schemaVersion: 1,
+    state: "quarantined",
+    registrationKind: "orphan_evidence_quarantine",
+    quarantineReason: "terminal_engine_evidence_not_ingested",
+    jobId: receipt.jobId,
+    evidencePath: receipt.evidencePath,
+    storedSha256: receipt.remote.storedSha256,
+    generation: receipt.remote.generation,
+    quarantineId: row.id,
+    sourceArtifactId: row.sourceArtifactId,
+    blobId: row.blobId,
+    manifestSha256: row.manifestSha256,
+    manifestByteSize: row.manifestByteSize,
+    archiveMemberSetSha256: row.archiveMemberSetSha256,
+    archiveMemberCount: row.archiveMemberCount,
+    migrationReceiptSha256: row.migrationReceiptSha256,
+    migrationReceiptByteSize: row.migrationReceiptByteSize,
+    quarantinedAt: row.createdAt.toISOString(),
+  };
+}
+
+function requireOrphanRowMatchesReceipt(
+  row: typeof solverEvidenceOrphanQuarantines.$inferSelect,
+  receipt: MigrationReceipt,
+  provenance: OrphanManifestProvenance,
+): void {
+  if (
+    row.engineJobId !== receipt.jobId ||
+    row.evidencePath !== receipt.evidencePath ||
+    row.manifestSha256 !== provenance.manifestSha256 ||
+    row.manifestByteSize !== provenance.manifestByteSize ||
+    row.archiveMemberSetSha256 !== provenance.archiveMemberSetSha256 ||
+    row.archiveMemberCount !== provenance.archiveMembers.length ||
+    manifestMemberSetSha256(row.archiveMembers) !==
+      provenance.archiveMemberSetSha256
+  ) {
+    throw new Error(
+      "existing orphan quarantine conflicts with migration receipt",
+    );
+  }
+}
+
+async function exactOrphanOwnerContext(
+  db: DB,
+  receipt: MigrationReceipt,
+): Promise<{
+  simJob: typeof simJobs.$inferSelect;
+  engineCaseSlug: string;
+  evidenceBase: string;
+}> {
+  const { engineCaseSlug, evidenceBase } = exactEvidencePathIdentity(receipt);
+  const jobs = await db
+    .select()
+    .from(simJobs)
+    .where(eq(simJobs.engineJobId, receipt.jobId));
+  if (jobs.length !== 1) {
+    throw new Error(
+      `orphan receipt must resolve to one exact sim job; found ${jobs.length}`,
+    );
+  }
+  const simJob = jobs[0]!;
+  if (!new Set<string>(["done", "failed", "cancelled"]).has(simJob.status)) {
+    throw new Error(`orphan sim job is ${simJob.status}, not terminal`);
+  }
+
+  const [attemptOwner, resultOwner] = await Promise.all([
+    db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.simJobId, simJob.id),
+          eq(resultAttempts.engineJobId, receipt.jobId),
+          eq(resultAttempts.engineCaseSlug, engineCaseSlug),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: results.id })
+      .from(results)
+      .where(
+        and(
+          eq(results.simJobId, simJob.id),
+          eq(results.engineJobId, receipt.jobId),
+          eq(results.engineCaseSlug, engineCaseSlug),
+        ),
+      )
+      .limit(1),
+  ]);
+  if (attemptOwner.length || resultOwner.length) {
+    throw new Error(
+      "exact result ownership exists; receipt cannot use orphan quarantine",
+    );
+  }
+  return { simJob, engineCaseSlug, evidenceBase };
+}
+
+function requireOrphanBlobMatches(
+  blob: typeof solverEvidenceBlobs.$inferSelect,
+  receipt: MigrationReceipt,
+): void {
+  if (
+    blob.backend !== "gcs" ||
+    blob.bucket !== receipt.remote.bucket ||
+    blob.objectKey !== receipt.remote.objectKey ||
+    blob.generation !== receipt.remote.generation ||
+    blob.compression !== "zstd" ||
+    blob.mimeType !== "application/zstd" ||
+    blob.sha256 !== receipt.remote.storedSha256 ||
+    blob.byteSize !== receipt.remote.storedSize ||
+    blob.crc32c !== receipt.remote.crc32c ||
+    blob.uncompressedTarSha256 !== receipt.remote.tarSha256 ||
+    blob.uncompressedTarByteSize !== receipt.remote.tarSize
+  ) {
+    throw new Error(
+      "orphan quarantine GCS blob conflicts with migration receipt",
+    );
+  }
+}
+
+function requireOrphanArtifactMatches(
+  artifact: typeof solverEvidenceArtifacts.$inferSelect,
+  receipt: MigrationReceipt,
+  context: Awaited<ReturnType<typeof exactOrphanOwnerContext>>,
+  blob: typeof solverEvidenceBlobs.$inferSelect,
+): void {
+  const metadata = artifact.metadata ?? {};
+  if (
+    artifact.resultId !== null ||
+    artifact.resultAttemptId !== null ||
+    artifact.aoaDeg !== null ||
+    artifact.airfoilId !== context.simJob.airfoilId ||
+    artifact.simJobId !== context.simJob.id ||
+    artifact.engineJobId !== receipt.jobId ||
+    artifact.engineCaseSlug !== context.engineCaseSlug ||
+    artifact.methodKey !== context.simJob.methodKey ||
+    artifact.solverImplementationId !== context.simJob.solverImplementationId ||
+    artifact.solverRuntimeBuildId !== context.simJob.solverRuntimeBuildId ||
+    artifact.kind !== "engine_bundle" ||
+    artifact.storageKey !== sourceKeys(receipt)[0] ||
+    artifact.mimeType !== "application/zstd" ||
+    artifact.sha256 !== blob.sha256 ||
+    artifact.byteSize !== blob.byteSize ||
+    metadata.evidenceBase !== context.evidenceBase ||
+    metadata.storageBackend !== "gcs" ||
+    metadata.bucket !== receipt.remote.bucket ||
+    metadata.objectKey !== receipt.remote.objectKey ||
+    metadata.generation !== receipt.remote.generation ||
+    metadata.crc32c !== receipt.remote.crc32c ||
+    metadata.uncompressedTarSha256 !== receipt.remote.tarSha256 ||
+    metadata.uncompressedTarByteSize !== receipt.remote.tarSize
+  ) {
+    throw new Error(
+      "orphan quarantine source artifact conflicts with exact job/path/blob provenance",
+    );
+  }
+}
+
+async function registerOrphanEvidenceQuarantine(opts: {
+  db: DB;
+  engine: EngineClient;
+  document: MigrationReceiptDocument;
+  receiptPath: string;
+}): Promise<OrphanEvidenceStorageDatabaseAck> {
+  const { receipt } = opts.document;
+  const provenance = await orphanManifestProvenance(receipt, opts.receiptPath);
+  return opts.db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    // This one-time backfill takes a short table-level writer fence so a
+    // concurrent delayed ingest cannot create an exact result owner between
+    // the zero-owner check and quarantine insert.  No aerodynamic lookup or
+    // rounded AoA participates in the decision.
+    await tx.execute(
+      sql.raw(`
+      LOCK TABLE sim_jobs, results, result_attempts,
+        solver_evidence_artifacts, solver_evidence_blobs,
+        solver_evidence_orphan_quarantines
+      IN SHARE ROW EXCLUSIVE MODE
+    `),
+    );
+
+    const sourceRows = await exactSourceRows(tx, receipt);
+    const owned = sourceRows.filter(
+      (row) => row.resultId || row.resultAttemptId,
+    );
+    if (owned.length) {
+      throw new Error(
+        `orphan fallback requires zero exact source owners; found ${owned.length}`,
+      );
+    }
+    const context = await exactOrphanOwnerContext(tx, receipt);
+    const [existing] = await tx
+      .select()
+      .from(solverEvidenceOrphanQuarantines)
+      .where(
+        and(
+          eq(solverEvidenceOrphanQuarantines.engineJobId, receipt.jobId),
+          eq(
+            solverEvidenceOrphanQuarantines.evidencePath,
+            receipt.evidencePath,
+          ),
+        ),
+      )
+      .limit(1);
+    if (existing) {
+      requireOrphanRowMatchesReceipt(existing, receipt, provenance);
+      const [[blob], [artifact]] = await Promise.all([
+        tx
+          .select()
+          .from(solverEvidenceBlobs)
+          .where(eq(solverEvidenceBlobs.id, existing.blobId))
+          .limit(1),
+        tx
+          .select()
+          .from(solverEvidenceArtifacts)
+          .where(eq(solverEvidenceArtifacts.id, existing.sourceArtifactId))
+          .limit(1),
+      ]);
+      if (!blob || !artifact) {
+        throw new Error("existing orphan quarantine lost its blob or artifact");
+      }
+      requireOrphanBlobMatches(blob, receipt);
+      requireOrphanArtifactMatches(artifact, receipt, context, blob);
+      return orphanAckFromRow(existing, receipt);
+    }
+
+    const blobValues = {
+      backend: "gcs" as const,
+      bucket: receipt.remote.bucket,
+      objectKey: receipt.remote.objectKey,
+      generation: receipt.remote.generation,
+      compression: "zstd" as const,
+      mimeType: "application/zstd",
+      sha256: receipt.remote.storedSha256,
+      byteSize: receipt.remote.storedSize,
+      crc32c: receipt.remote.crc32c,
+      uncompressedTarSha256: receipt.remote.tarSha256,
+      uncompressedTarByteSize: receipt.remote.tarSize,
+      verifiedAt: new Date(receipt.verifiedAt!),
+      metadata: {
+        preservationKind: "orphan_evidence_quarantine",
+        engineJobId: receipt.jobId,
+        evidencePath: receipt.evidencePath,
+        manifestSha256: provenance.manifestSha256,
+        archiveMemberSetSha256: provenance.archiveMemberSetSha256,
+      },
+    };
+    const [insertedBlob] = await tx
+      .insert(solverEvidenceBlobs)
+      .values(blobValues)
+      .onConflictDoNothing()
+      .returning();
+    let blob = insertedBlob;
+    if (!blob) {
+      [blob] = await tx
+        .select()
+        .from(solverEvidenceBlobs)
+        .where(
+          and(
+            eq(solverEvidenceBlobs.backend, "gcs"),
+            eq(solverEvidenceBlobs.bucket, receipt.remote.bucket),
+            eq(solverEvidenceBlobs.objectKey, receipt.remote.objectKey),
+            eq(solverEvidenceBlobs.generation, receipt.remote.generation),
+          ),
+        )
+        .limit(1);
+    }
+    if (!blob) throw new Error("failed to register orphan GCS blob");
+    requireOrphanBlobMatches(blob, receipt);
+
+    const canonicalStorageKey = sourceKeys(receipt)[0]!;
+    const existingCanonicalArtifacts = sourceRows.filter(
+      (row) =>
+        row.storageKey === canonicalStorageKey && row.kind === "engine_bundle",
+    );
+    if (existingCanonicalArtifacts.length > 1) {
+      throw new Error(
+        "orphan receipt has ambiguous unbound canonical bundle artifacts",
+      );
+    }
+    let artifact = existingCanonicalArtifacts[0];
+    if (!artifact) {
+      [artifact] = await tx
+        .insert(solverEvidenceArtifacts)
+        .values({
+          resultId: null,
+          resultAttemptId: null,
+          airfoilId: context.simJob.airfoilId,
+          simJobId: context.simJob.id,
+          engineJobId: receipt.jobId,
+          engineCaseSlug: context.engineCaseSlug,
+          methodKey: context.simJob.methodKey,
+          solverImplementationId: context.simJob.solverImplementationId,
+          solverRuntimeBuildId: context.simJob.solverRuntimeBuildId,
+          aoaDeg: null,
+          kind: "engine_bundle",
+          field: null,
+          role: "evidence",
+          storageKey: canonicalStorageKey,
+          mimeType: "application/zstd",
+          sha256: receipt.remote.storedSha256,
+          byteSize: receipt.remote.storedSize,
+          engineUrl: `${opts.engine.baseUrl.replace(/\/$/, "")}/jobs/${encodeURIComponent(receipt.jobId)}/files/${receipt.evidencePath}/engine_evidence.tar.zst`,
+          metadata: {
+            evidenceBase: context.evidenceBase,
+            preservationKind: "orphan_evidence_quarantine",
+            storageBackend: "gcs",
+            bucket: receipt.remote.bucket,
+            objectKey: receipt.remote.objectKey,
+            generation: receipt.remote.generation,
+            crc32c: receipt.remote.crc32c,
+            compression: "zstd",
+            archiveFormat: "tar+zstd",
+            zstdLevel: receipt.remote.zstdLevel,
+            uncompressedTarSha256: receipt.remote.tarSha256,
+            uncompressedTarByteSize: receipt.remote.tarSize,
+            verifiedAt: receipt.verifiedAt,
+            pointerPath: "engine_evidence.remote.json",
+            migrationReceipt: MIGRATION_RECEIPT_NAME,
+            manifestSha256: provenance.manifestSha256,
+            archiveMemberSetSha256: provenance.archiveMemberSetSha256,
+            archiveMemberCount: provenance.archiveMembers.length,
+          },
+        })
+        .returning();
+    }
+    if (!artifact) throw new Error("failed to register orphan bundle artifact");
+    requireOrphanArtifactMatches(artifact, receipt, context, blob);
+
+    const [quarantine] = await tx
+      .insert(solverEvidenceOrphanQuarantines)
+      .values({
+        simJobId: context.simJob.id,
+        engineJobId: receipt.jobId,
+        engineCaseSlug: context.engineCaseSlug,
+        evidencePath: receipt.evidencePath,
+        quarantineReason: "terminal_engine_evidence_not_ingested",
+        sourceArtifactId: artifact.id,
+        blobId: blob.id,
+        manifestSha256: provenance.manifestSha256,
+        manifestByteSize: provenance.manifestByteSize,
+        archiveMemberSetSha256: provenance.archiveMemberSetSha256,
+        archiveMemberCount: provenance.archiveMembers.length,
+        archiveMembers: provenance.archiveMembers,
+        sourceArchives: receipt.sourceArchives,
+        migrationReceiptSha256: opts.document.sha256,
+        migrationReceiptByteSize: opts.document.bytes.byteLength,
+        verificationMode: receipt.verificationMode!,
+        remoteVerifiedAt: new Date(receipt.verifiedAt!),
+      })
+      .returning();
+    if (!quarantine) {
+      throw new Error("failed to register immutable orphan quarantine");
+    }
+    return orphanAckFromRow(quarantine, receipt);
+  });
 }
 
 function artifactForReceipt(
@@ -496,7 +1061,7 @@ async function currentArchiveAck(
   db: DB,
   receipt: MigrationReceipt,
   source: typeof solverEvidenceArtifacts.$inferSelect,
-): Promise<EvidenceStorageDatabaseAck> {
+): Promise<RegisteredEvidenceStorageDatabaseAck> {
   const rows = await db
     .select({
       archive: solverEvidenceArchives,
@@ -510,10 +1075,7 @@ async function currentArchiveAck(
     )
     .innerJoin(
       solverEvidenceArtifacts,
-      eq(
-        solverEvidenceArtifacts.id,
-        solverEvidenceArchives.sourceArtifactId,
-      ),
+      eq(solverEvidenceArtifacts.id, solverEvidenceArchives.sourceArtifactId),
     )
     .where(
       and(
@@ -522,7 +1084,8 @@ async function currentArchiveAck(
         eq(solverEvidenceArchives.state, "current"),
       ),
     );
-  if (rows.length !== 1) throw new Error("database has no unique current evidence archive");
+  if (rows.length !== 1)
+    throw new Error("database has no unique current evidence archive");
   const row = rows[0];
   if (
     row.blob.backend !== "gcs" ||
@@ -537,7 +1100,9 @@ async function currentArchiveAck(
     row.artifact.resultId !== source.resultId ||
     row.artifact.resultAttemptId !== source.resultAttemptId
   ) {
-    throw new Error("current database archive does not match migration receipt");
+    throw new Error(
+      "current database archive does not match migration receipt",
+    );
   }
   return {
     schemaVersion: 1,
@@ -556,7 +1121,7 @@ async function currentArchiveAck(
 
 async function validateMemberCoverage(
   db: DB,
-  ack: EvidenceStorageDatabaseAck,
+  ack: RegisteredEvidenceStorageDatabaseAck,
   manifest: ManifestValidation,
 ): Promise<void> {
   const rows = await db
@@ -567,17 +1132,9 @@ async function validateMemberCoverage(
     .from(solverEvidenceArtifactMembers)
     .innerJoin(
       solverEvidenceArtifacts,
-      eq(
-        solverEvidenceArtifactMembers.artifactId,
-        solverEvidenceArtifacts.id,
-      ),
+      eq(solverEvidenceArtifactMembers.artifactId, solverEvidenceArtifacts.id),
     )
-    .where(
-      eq(
-        solverEvidenceArtifactMembers.archiveId,
-        ack.archiveId,
-      ),
-    );
+    .where(eq(solverEvidenceArtifactMembers.archiveId, ack.archiveId));
   const expectedIds = new Set(manifest.expected.map((artifact) => artifact.id));
   if (
     rows.length !== manifest.expected.length ||
@@ -602,19 +1159,57 @@ export async function registerEvidenceMigrationReceipt(opts: {
   mediaRoot: string;
   writeAck?: boolean;
 }): Promise<EvidenceStorageDatabaseAck> {
-  const receipt = await readReceipt(opts.receiptPath, opts.mediaRoot);
+  const document = await readReceiptDocument(opts.receiptPath, opts.mediaRoot);
+  const { receipt } = document;
   const ackPath = join(dirname(opts.receiptPath), DATABASE_ACK_NAME);
   try {
     const existing = JSON.parse(await readFile(ackPath, "utf8"));
     const parsed = object(existing, "database acknowledgement");
     if (
-      parsed.state !== "registered" ||
       parsed.storedSha256 !== receipt.remote.storedSha256 ||
       parsed.generation !== receipt.remote.generation ||
       parsed.jobId !== receipt.jobId ||
       parsed.evidencePath !== receipt.evidencePath
     ) {
-      throw new Error("existing database acknowledgement conflicts with receipt");
+      throw new Error(
+        "existing database acknowledgement conflicts with receipt",
+      );
+    }
+    if (parsed.state === "quarantined") {
+      if (parsed.registrationKind !== "orphan_evidence_quarantine") {
+        throw new Error("existing orphan acknowledgement has the wrong kind");
+      }
+      if (parsed.quarantineReason !== "terminal_engine_evidence_not_ingested") {
+        throw new Error("existing orphan acknowledgement has the wrong reason");
+      }
+      const current = await registerOrphanEvidenceQuarantine({
+        db: opts.db,
+        engine: opts.engine,
+        document,
+        receiptPath: opts.receiptPath,
+      });
+      for (const key of [
+        "quarantineId",
+        "sourceArtifactId",
+        "blobId",
+        "manifestSha256",
+        "manifestByteSize",
+        "archiveMemberSetSha256",
+        "archiveMemberCount",
+        "migrationReceiptSha256",
+        "migrationReceiptByteSize",
+        "quarantinedAt",
+      ] as const) {
+        if (parsed[key] !== current[key]) {
+          throw new Error(
+            `existing orphan acknowledgement no longer matches ${key}`,
+          );
+        }
+      }
+      return existing as OrphanEvidenceStorageDatabaseAck;
+    }
+    if (parsed.state !== "registered") {
+      throw new Error("existing database acknowledgement has an unknown state");
     }
     const source = await findExactSource(opts.db, receipt);
     const manifest = await validateManifestArtifacts(
@@ -638,9 +1233,31 @@ export async function registerEvidenceMigrationReceipt(opts: {
       }
     }
     await validateMemberCoverage(opts.db, current, manifest);
-    return existing as EvidenceStorageDatabaseAck;
+    return existing as RegisteredEvidenceStorageDatabaseAck;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const sourceRows = await exactSourceRows(opts.db, receipt);
+  const ownerKeys = new Set(
+    sourceRows
+      .filter((row) => row.resultId && row.resultAttemptId && row.simJobId)
+      .map((row) => `${row.resultId}:${row.resultAttemptId}:${row.simJobId}`),
+  );
+  if (ownerKeys.size === 0) {
+    const ack = await registerOrphanEvidenceQuarantine({
+      db: opts.db,
+      engine: opts.engine,
+      document,
+      receiptPath: opts.receiptPath,
+    });
+    if (opts.writeAck !== false) await atomicWriteJson(ackPath, ack);
+    return ack;
+  }
+  if (ownerKeys.size !== 1) {
+    throw new Error(
+      `receipt must resolve to one exact result attempt; found ${ownerKeys.size}`,
+    );
   }
   const source = await findExactSource(opts.db, receipt);
   const manifest = await validateManifestArtifacts(
@@ -651,7 +1268,9 @@ export async function registerEvidenceMigrationReceipt(opts: {
     source.resultAttemptId!,
   );
   const artifact = artifactForReceipt(receipt, source);
-  const engineOrigin = source.engineUrl?.match(/^(.*)\/jobs\/[^/]+\/files\//)?.[1];
+  const engineOrigin = source.engineUrl?.match(
+    /^(.*)\/jobs\/[^/]+\/files\//,
+  )?.[1];
   const registrationEngine = {
     baseUrl: engineOrigin ?? opts.engine.baseUrl,
   } as EngineClient;
@@ -685,7 +1304,10 @@ export async function registerEvidenceMigrationReceipt(opts: {
 
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  const temporary = join(dirname(path), `.${DATABASE_ACK_NAME}.${randomUUID()}.tmp`);
+  const temporary = join(
+    dirname(path),
+    `.${DATABASE_ACK_NAME}.${randomUUID()}.tmp`,
+  );
   const handle = await open(temporary, "wx", 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
@@ -738,7 +1360,8 @@ export async function discoverEvidenceMigrationReceipts(
   const limit = opts.limit ?? null;
   const requested = [...(opts.jobIds ?? [])].map((jobId) => {
     const safe = safeRelative(jobId, "--job-id");
-    if (safe.includes("/")) throw new Error("--job-id must be one path segment");
+    if (safe.includes("/"))
+      throw new Error("--job-id must be one path segment");
     return safe;
   });
   let jobRoots: string[];
@@ -799,6 +1422,14 @@ export async function discoverEvidenceMigrationReceipts(
   return found;
 }
 
+export function evidenceMigrationExecutionLog(
+  acknowledgement: EvidenceStorageDatabaseAck,
+): EvidenceStorageDatabaseAck & {
+  status: EvidenceStorageDatabaseAck["state"];
+} {
+  return { status: acknowledgement.state, ...acknowledgement };
+}
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const execute = args.includes("--execute");
@@ -825,8 +1456,44 @@ async function main(): Promise<number> {
     for (const receiptPath of receipts) {
       processed += 1;
       try {
-        const receipt = await readReceipt(receiptPath, mediaRoot);
+        const document = await readReceiptDocument(receiptPath, mediaRoot);
+        const { receipt } = document;
         if (!execute) {
+          const sourceRows = await exactSourceRows(db, receipt);
+          const ownerKeys = new Set(
+            sourceRows
+              .filter(
+                (row) => row.resultId && row.resultAttemptId && row.simJobId,
+              )
+              .map(
+                (row) =>
+                  `${row.resultId}:${row.resultAttemptId}:${row.simJobId}`,
+              ),
+          );
+          if (ownerKeys.size === 0) {
+            const context = await exactOrphanOwnerContext(db, receipt);
+            const provenance = await orphanManifestProvenance(
+              receipt,
+              receiptPath,
+            );
+            console.log(
+              JSON.stringify({
+                status: "planned-quarantine",
+                jobId: receipt.jobId,
+                simJobId: context.simJob.id,
+                engineCaseSlug: context.engineCaseSlug,
+                evidencePath: receipt.evidencePath,
+                manifestSha256: provenance.manifestSha256,
+                archiveMemberCount: provenance.archiveMembers.length,
+              }),
+            );
+            continue;
+          }
+          if (ownerKeys.size !== 1) {
+            throw new Error(
+              `receipt must resolve to one exact result attempt; found ${ownerKeys.size}`,
+            );
+          }
           const source = await findExactSource(db, receipt);
           console.log(
             JSON.stringify({
@@ -845,7 +1512,7 @@ async function main(): Promise<number> {
           receiptPath,
           mediaRoot,
         });
-        console.log(JSON.stringify({ status: "registered", ...ack }));
+        console.log(JSON.stringify(evidenceMigrationExecutionLog(ack)));
       } catch (error) {
         failed += 1;
         console.error(
@@ -861,7 +1528,13 @@ async function main(): Promise<number> {
   } finally {
     await sql.end();
   }
-  console.error(JSON.stringify({ mode: execute ? "execute" : "dry-run", processed, failed }));
+  console.error(
+    JSON.stringify({
+      mode: execute ? "execute" : "dry-run",
+      processed,
+      failed,
+    }),
+  );
   return failed ? 1 : 0;
 }
 

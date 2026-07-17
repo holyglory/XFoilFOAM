@@ -1569,7 +1569,8 @@ async function linkPresolvedEvidence(
 ): Promise<{ linkedSolver: number; linkedDerived: number }> {
   const solverRows = (await asDb(tx).execute(sql`
     UPDATE sim_campaign_points p
-    SET state = 'terminal', result_id = r.id, "updatedAt" = now()
+    SET state = 'terminal', result_id = r.id,
+        result_attempt_id = r.current_result_attempt_id, "updatedAt" = now()
     FROM results r
     WHERE p.campaign_id = ${campaignId}
       AND p.state = 'requested'
@@ -1581,7 +1582,8 @@ async function linkPresolvedEvidence(
   `)) as unknown as unknown[];
   const derivedRows = (await asDb(tx).execute(sql`
     UPDATE sim_campaign_points p
-    SET state = 'terminal', result_id = src.result_id, "updatedAt" = now()
+    SET state = 'terminal', result_id = src.result_id,
+        result_attempt_id = src.result_attempt_id, "updatedAt" = now()
     FROM sim_campaign_points src
     WHERE p.campaign_id = ${campaignId}
       AND p.derived_by_symmetry
@@ -1707,56 +1709,103 @@ async function reconcileLinkedCampaignLadderWork(
       SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
   `);
 
-  // Verification ownership and the pending-owner healer serialize on the
-  // accepted preliminary result. enqueuePrecalcVerifications already takes
-  // this same result lock; keep launch/plan-growth reconciliation on the same
-  // boundary so a healer can never cancel a queue row between its discovery
-  // here and the owner-association insert below.
+  // Verification ownership is the exact accepted preliminary attempt, not
+  // its mutable natural-cell result row. Keep the result lock for lifecycle
+  // ordering and take the same generation advisory lock used by ordinary
+  // enqueue/full-request coverage before creating or reattaching a ledger.
   await db.execute(sql`
     SELECT r.id
     FROM sim_campaign_points p
     JOIN results r ON r.id = p.result_id
-    JOIN result_classifications rc ON rc.result_id = r.id
+    JOIN result_attempts precalc_attempt
+      ON precalc_attempt.id = p.result_attempt_id
+     AND precalc_attempt.result_id = r.id
+     AND precalc_attempt.id = r.current_result_attempt_id
+    JOIN result_classifications rc
+      ON rc.result_attempt_id = precalc_attempt.id
     WHERE p.campaign_id = ${campaignId}
       AND p.state = 'terminal'
       AND p.derived_by_symmetry = false
       AND r.status = 'done'
-      AND r.fidelity = 'urans_precalc'
+      AND precalc_attempt.status = 'done'
+      AND precalc_attempt.source = 'solved'
+      AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
       AND rc.state = 'accepted'
     ORDER BY r.id
     FOR UPDATE OF r
   `);
-
-  // Contract 4 survives campaign churn: historical done/cancelled queue rows
-  // do not satisfy a future campaign that newly links accepted preliminary
-  // evidence. Create a fresh campaign-owned physical obligation whenever no
-  // open row exists; the partial unique index is the final race guard.
   await db.execute(sql`
-    INSERT INTO sim_urans_verify_queue (
-      airfoil_id, revision_id, aoa_deg, background_owner, state,
-      precalc_result_id
+    SELECT pg_advisory_xact_lock(
+      hashtextextended(
+        'final-verify-generation:' || precalc_attempt.id::text,
+        0
+      )
     )
-    SELECT DISTINCT p.airfoil_id, p.revision_id, p.aoa_deg,
-           false, 'pending', r.id
     FROM sim_campaign_points p
     JOIN results r ON r.id = p.result_id
-    JOIN result_classifications rc ON rc.result_id = r.id
+    JOIN result_attempts precalc_attempt
+      ON precalc_attempt.id = p.result_attempt_id
+     AND precalc_attempt.result_id = r.id
+     AND precalc_attempt.id = r.current_result_attempt_id
+    JOIN result_classifications rc
+      ON rc.result_attempt_id = precalc_attempt.id
     WHERE p.campaign_id = ${campaignId}
       AND p.state = 'terminal'
       AND p.derived_by_symmetry = false
       AND r.status = 'done'
-      AND r.fidelity = 'urans_precalc'
+      AND precalc_attempt.status = 'done'
+      AND precalc_attempt.source = 'solved'
+      AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      AND rc.state = 'accepted'
+    ORDER BY precalc_attempt.id
+  `);
+
+  // Contract 4 survives campaign churn without resetting physical budget.
+  // Reuse any ledger for this exact generation; only a genuinely new accepted
+  // preliminary attempt receives a new queue row.
+  await db.execute(sql`
+    INSERT INTO sim_urans_verify_queue (
+      airfoil_id, revision_id, aoa_deg, background_owner, state,
+      precalc_result_id, precalc_result_attempt_id
+    )
+    SELECT DISTINCT p.airfoil_id, p.revision_id, p.aoa_deg,
+           false, 'pending', r.id, precalc_attempt.id
+    FROM sim_campaign_points p
+    JOIN results r ON r.id = p.result_id
+    JOIN result_attempts precalc_attempt
+      ON precalc_attempt.id = p.result_attempt_id
+     AND precalc_attempt.result_id = r.id
+     AND precalc_attempt.id = r.current_result_attempt_id
+    JOIN result_classifications rc
+      ON rc.result_attempt_id = precalc_attempt.id
+    WHERE p.campaign_id = ${campaignId}
+      AND p.state = 'terminal'
+      AND p.derived_by_symmetry = false
+      AND r.status = 'done'
+      AND precalc_attempt.status = 'done'
+      AND precalc_attempt.source = 'solved'
+      AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
       AND rc.state = 'accepted'
       AND NOT EXISTS (
         SELECT 1
-        FROM sim_urans_verify_queue open_queue
-        WHERE open_queue.airfoil_id = p.airfoil_id
-          AND open_queue.revision_id = p.revision_id
-          AND open_queue.aoa_deg = p.aoa_deg
-          AND open_queue.state IN ('pending', 'running')
+        FROM sim_urans_verify_queue generation_queue
+        WHERE generation_queue.precalc_result_attempt_id = precalc_attempt.id
       )
-    ON CONFLICT (airfoil_id, revision_id, aoa_deg)
-      WHERE state IN ('pending', 'running') DO NOTHING
+    ON CONFLICT (precalc_result_attempt_id)
+      WHERE precalc_result_attempt_id IS NOT NULL
+        AND state IN ('pending', 'running')
+      DO NOTHING
+  `);
+  await db.execute(sql`
+    UPDATE sim_urans_verify_queue q
+    SET state = 'pending', sim_job_id = NULL, next_submit_at = NULL,
+        "updatedAt" = now()
+    FROM sim_campaign_points point
+    WHERE point.campaign_id = ${campaignId}
+      AND point.result_attempt_id = q.precalc_result_attempt_id
+      AND point.state = 'terminal'
+      AND point.derived_by_symmetry = false
+      AND q.state = 'cancelled'
   `);
 
   // A verification may already exist for a preliminary result linked during
@@ -1770,11 +1819,13 @@ async function reconcileLinkedCampaignLadderWork(
      AND trigger_point.airfoil_id = q.airfoil_id
      AND trigger_point.revision_id = q.revision_id
      AND trigger_point.aoa_deg = q.aoa_deg
+     AND trigger_point.result_attempt_id = q.precalc_result_attempt_id
      AND trigger_point.derived_by_symmetry = false
     JOIN sim_campaign_points owner_point
       ON owner_point.airfoil_id = q.airfoil_id
      AND owner_point.revision_id = q.revision_id
      AND owner_point.aoa_deg = q.aoa_deg
+     AND owner_point.result_attempt_id = q.precalc_result_attempt_id
      AND owner_point.state = 'terminal'
      AND owner_point.derived_by_symmetry = false
     JOIN sim_campaigns owner_campaign
@@ -1786,7 +1837,7 @@ async function reconcileLinkedCampaignLadderWork(
          AND owner_campaign.status = 'completed'
        )
      )
-    WHERE q.state IN ('pending', 'running')
+    WHERE q.state IN ('pending', 'running', 'done', 'disagreed', 'blocked')
     ON CONFLICT (queue_id, campaign_id) DO UPDATE
       SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
   `);
@@ -5438,6 +5489,7 @@ export type CampaignPreliminaryFastState =
 
 export type CampaignPreliminaryRansStage =
   | "screened"
+  | "attempted"
   | "polar_handoff"
   | "skipped"
   | "not_started";
@@ -5480,7 +5532,7 @@ export interface CampaignPreliminaryOutcome {
   finalDeltaCd: number | null;
   finalDeltaCm: number | null;
   finalSource: CampaignPreliminaryFinalSource | null;
-  criticalStage: "preflight" | "fast" | "final" | null;
+  criticalStage: "preflight" | "rans" | "fast" | "final" | null;
   fastResultId: string | null;
   fastResultAttemptId: string | null;
   finalResultId: string | null;
@@ -5493,6 +5545,8 @@ export interface CampaignPreliminaryOutcome {
   recoverySubmissions: number;
   nonPhysicalSubmissions: number;
   interruptedPhysicalRuns: number;
+  /** Stored RANS result-attempt/evidence records. This is not proof that every
+   * record reached a physical CFD solve. */
   ransEvidenceRuns: number;
   preliminaryEvidenceRuns: number;
   fullUransEvidenceRuns: number;
@@ -5953,6 +6007,11 @@ export async function campaignPreliminaryOutcomes(
       WHERE request.airfoil_id = obligation.airfoil_id
         AND request.revision_id = obligation.revision_id
         AND request.fidelity = 'full'
+        -- An aggregate request may be cancelled without ever launching a
+        -- physical final run. Ignore that lifecycle record when deriving the
+        -- point's current final-work state; exact accepted evidence is joined
+        -- independently below and is therefore still retained.
+        AND request.state <> 'cancelled'
         AND (
           request.aoa_deg = obligation.aoa_deg
           OR request.aoa_deg IS NULL
@@ -6149,10 +6208,11 @@ export async function campaignPreliminaryOutcomes(
     evidence_reasons: string[] | null;
   }>;
 
-  // A preflight incident has no PRECALC obligation by definition: automatic
-  // mesh/runtime repair exhausted before aerodynamic RANS screening could
-  // execute. Surface it in the same per-point journey model, but never label
-  // it as RANS non-convergence or imply a fast-URANS physical-attempt budget.
+  // A critical RANS incident without a PRECALC obligation is either a true
+  // preflight stop (no RANS attempt evidence) or exhausted RANS recovery
+  // (attempt evidence exists). Surface both in the per-point journey, while
+  // keeping ordinary non-publishable RANS evidence on the normal fast-URANS
+  // handoff path rather than relabeling it as critical.
   const ransIncidentRows = (await db.execute(sql`
     WITH latest_incident AS (
       SELECT DISTINCT ON (incident.result_id)
@@ -6218,6 +6278,10 @@ export async function campaignPreliminaryOutcomes(
       AND NOT EXISTS (
         SELECT 1
         FROM sim_precalc_obligations obligation
+        JOIN sim_precalc_obligation_campaigns obligation_owner
+          ON obligation_owner.obligation_id = obligation.id
+         AND obligation_owner.campaign_id = ${campaignId}
+         AND obligation_owner.state = 'active'
         WHERE obligation.airfoil_id = r.airfoil_id
           AND obligation.revision_id = r.simulation_preset_revision_id
           AND obligation.aoa_deg = r.aoa_deg
@@ -6231,6 +6295,69 @@ export async function campaignPreliminaryOutcomes(
     updated_at: Date | string;
     affected_aoa_degs: Array<number | string>;
     rans_evidence_runs: number;
+  }>;
+
+  // POINT RESULTS is a requested-point read model. PRECALC obligations only
+  // exist after RANS hands a point to fast URANS, so they cannot be the row
+  // seed: ordinary queued or accepted RANS points would disappear. Read the
+  // bounded campaign cell first and let exact machine-owned ladder records
+  // replace these base rows below.
+  const campaignPointRows = (await db.execute(sql`
+    SELECT
+      point.aoa_deg::float8 AS aoa_deg,
+      COALESCE(
+        attempt.aoa_deg,
+        source_result.aoa_deg,
+        CASE
+          WHEN point.derived_by_symmetry THEN -point.aoa_deg
+          ELSE point.aoa_deg
+        END
+      )::float8 AS source_aoa_deg,
+      point.state,
+      point.derived_by_symmetry,
+      point.result_id,
+      point.result_attempt_id,
+      attempt.status AS attempt_status,
+      attempt.source AS attempt_source,
+      attempt.regime AS attempt_regime,
+      attempt.evidence_payload ->> 'fidelity' AS attempt_fidelity,
+      classification.state AS classification_state,
+      classification.reasons AS classification_reasons,
+      point."updatedAt" AS updated_at
+    FROM sim_campaign_points point
+    LEFT JOIN results source_result
+      ON source_result.id = point.result_id
+    LEFT JOIN result_attempts attempt
+      ON attempt.id = point.result_attempt_id
+     AND attempt.result_id = point.result_id
+     AND attempt.airfoil_id = point.airfoil_id
+     AND attempt.simulation_preset_revision_id = point.revision_id
+    LEFT JOIN result_classifications classification
+      ON classification.result_attempt_id = attempt.id
+     AND classification.airfoil_id = attempt.airfoil_id
+     AND classification.simulation_preset_revision_id =
+         attempt.simulation_preset_revision_id
+     AND classification.aoa_deg = attempt.aoa_deg
+     AND classification.regime IS NOT DISTINCT FROM attempt.regime
+    WHERE point.campaign_id = ${campaignId}
+      AND point.condition_id = ${scope.conditionId}
+      AND point.airfoil_id = ${scope.airfoilId}
+      AND point.state <> 'released'
+    ORDER BY point.aoa_deg ASC
+  `)) as unknown as Array<{
+    aoa_deg: number;
+    source_aoa_deg: number;
+    state: "requested" | "terminal";
+    derived_by_symmetry: boolean;
+    result_id: string | null;
+    result_attempt_id: string | null;
+    attempt_status: string | null;
+    attempt_source: string | null;
+    attempt_regime: string | null;
+    attempt_fidelity: string | null;
+    classification_state: string | null;
+    classification_reasons: string[] | null;
+    updated_at: Date | string;
   }>;
 
   const timestampMs = (value: Date | string | null): number => {
@@ -6339,14 +6466,16 @@ export async function campaignPreliminaryOutcomes(
           }
         : null,
     ];
-    const acceptedEvidence = acceptedEvidenceCandidates
-      .filter(
-        (candidate): candidate is AcceptedFinalEvidence => candidate !== null,
-      )
-      .sort((a, b) => timestampMs(b.createdAt) - timestampMs(a.createdAt))[0];
+    // Whole-polar requests own aggregate audit/scheduling. Once they create an
+    // exact verify child, that child alone owns this point's visible state and
+    // evidence. A newer aggregate timestamp may describe a sibling angle and
+    // must never paint every row running or critical.
+    const acceptedEvidence = row.verify_id
+      ? acceptedEvidenceCandidates[0]
+      : acceptedEvidenceCandidates[1];
 
-    const finalWork = [
-      row.verify_id
+    const verifyWork =
+      row.verify_id && row.verify_state !== "cancelled"
         ? {
             source: "verify" as const,
             ownerId: row.verify_id,
@@ -6356,37 +6485,22 @@ export async function campaignPreliminaryOutcomes(
             submitError: row.verify_submit_error,
             submitHttpStatus: row.verify_submit_http_status,
           }
-        : null,
-      row.full_request_id
-        ? {
-            source: "full_request" as const,
-            ownerId: row.full_request_id,
-            state: row.full_request_state,
-            createdAt: row.full_request_created_at,
-            updatedAt: row.full_request_updated_at,
-            submitError: row.full_request_submit_error,
-            submitHttpStatus: row.full_request_submit_http_status,
-          }
-        : null,
-    ]
-      .filter(
-        (
-          candidate,
-        ): candidate is {
-          source: CampaignPreliminaryFinalSource;
-          ownerId: string;
-          state: string | null;
-          createdAt: Date | string | null;
-          updatedAt: Date | string | null;
-          submitError: string | null;
-          submitHttpStatus: number | null;
-        } => candidate !== null,
-      )
-      .sort(
-        (a, b) =>
-          timestampMs(b.createdAt) - timestampMs(a.createdAt) ||
-          timestampMs(b.updatedAt) - timestampMs(a.updatedAt),
-      )[0];
+        : null;
+    const legacyDirectRequestWork = row.full_request_id
+      ? {
+          source: "full_request" as const,
+          ownerId: row.full_request_id,
+          state: row.full_request_state,
+          createdAt: row.full_request_created_at,
+          updatedAt: row.full_request_updated_at,
+          submitError: row.full_request_submit_error,
+          submitHttpStatus: row.full_request_submit_http_status,
+        }
+      : null;
+    // A cancelled exact child still proves that the aggregate request has
+    // been decomposed. It suppresses aggregate sibling state without becoming
+    // critical work itself.
+    const finalWork = row.verify_id ? verifyWork : legacyDirectRequestWork;
 
     let finalState: CampaignPreliminaryFinalState = "not_started";
     if (acceptedEvidence) {
@@ -6397,7 +6511,8 @@ export async function campaignPreliminaryOutcomes(
       finalState = "running";
     } else if (finalWork) {
       // done/disagreed without an exact accepted selected full attempt is not
-      // a final result. blocked/cancelled are terminal machine incidents too.
+      // a final result. Blocked work remains a terminal machine incident;
+      // cancelled ownership was excluded from the current-work read model.
       finalState = "critical";
     }
 
@@ -6432,14 +6547,19 @@ export async function campaignPreliminaryOutcomes(
             ? "within_tolerance"
             : null
         : null;
+    // An exact accepted URANS-full attempt is the publishable final result.
+    // A fast/final delta outside the comparison tolerance is useful quality
+    // context, not missing evidence, and a later failed refresh does not
+    // invalidate an already accepted immutable generation. Reserve critical
+    // state for a stage that exhausted without obtaining its required result.
     const criticalStage =
-      finalComparison === "disagreed" ||
-      finalState === "critical" ||
-      finalActivityState === "critical"
-        ? ("final" as const)
-        : fastState === "critical"
-          ? ("fast" as const)
-          : null;
+      finalState === "accepted"
+        ? null
+        : finalState === "critical"
+          ? ("final" as const)
+          : fastState === "critical"
+            ? ("fast" as const)
+            : null;
     const selectedFinalReasons =
       finalState === "critical" || finalActivityState === "critical"
         ? finalWork?.source === "verify"
@@ -6456,7 +6576,7 @@ export async function campaignPreliminaryOutcomes(
       affectedAoaDegs,
       affectedPointCount: affectedAoaDegs.length,
       state: row.state,
-      outcome,
+      outcome: finalState === "accepted" ? "accepted" : outcome,
       ransStage,
       fastState,
       finalState,
@@ -6490,6 +6610,8 @@ export async function campaignPreliminaryOutcomes(
   const ransIncidentItems = ransIncidentRows.map(
     (row): CampaignPreliminaryOutcome => {
       const affectedAoaDegs = row.affected_aoa_degs.map(Number);
+      const ransEvidenceRecords = Number(row.rans_evidence_runs);
+      const ransAttempted = ransEvidenceRecords > 0;
       const metadataReasons = Array.isArray(row.metadata?.classificationReasons)
         ? row.metadata.classificationReasons.filter(
             (value): value is string => typeof value === "string",
@@ -6507,7 +6629,7 @@ export async function campaignPreliminaryOutcomes(
           row.reason === "mesh-quality-failure"
             ? "mesh_unavailable"
             : "recovery_unavailable",
-        ransStage: "not_started",
+        ransStage: ransAttempted ? "attempted" : "not_started",
         fastState: "not_started",
         finalState: "not_started",
         finalActivityState: null,
@@ -6516,7 +6638,7 @@ export async function campaignPreliminaryOutcomes(
         finalDeltaCd: null,
         finalDeltaCm: null,
         finalSource: null,
-        criticalStage: "preflight",
+        criticalStage: ransAttempted ? "rans" : "preflight",
         fastResultId: null,
         fastResultAttemptId: null,
         finalResultId: null,
@@ -6529,11 +6651,100 @@ export async function campaignPreliminaryOutcomes(
         recoverySubmissions: 0,
         nonPhysicalSubmissions: 0,
         interruptedPhysicalRuns: 0,
-        ransEvidenceRuns: Number(row.rans_evidence_runs),
+        ransEvidenceRuns: ransEvidenceRecords,
         preliminaryEvidenceRuns: 0,
         fullUransEvidenceRuns: 0,
         legacyUransEvidenceRuns: 0,
         evidenceReasons,
+        updatedAt: isoOf(row.updated_at)!,
+      };
+    },
+  );
+  const basePointItems = campaignPointRows.map(
+    (row): CampaignPreliminaryOutcome => {
+      const fidelity =
+        row.attempt_fidelity ?? (row.attempt_regime === "rans" ? "rans" : null);
+      const accepted = Boolean(
+        row.state === "terminal" &&
+        row.result_id &&
+        row.result_attempt_id &&
+        row.attempt_status === "done" &&
+        row.attempt_source === "solved" &&
+        row.classification_state === "accepted",
+      );
+      const acceptedRans = accepted && fidelity === "rans";
+      const acceptedFast = accepted && fidelity === "urans_precalc";
+      const acceptedFinal = accepted && fidelity === "urans_full";
+      const requested = row.state === "requested";
+      const terminalGap = !requested && !accepted;
+      const ransStage: CampaignPreliminaryRansStage = requested
+        ? "not_started"
+        : row.attempt_regime === "rans"
+          ? "screened"
+          : "skipped";
+      const fastState: CampaignPreliminaryFastState =
+        requested || acceptedRans
+          ? "not_started"
+          : acceptedFast
+            ? "accepted"
+            : acceptedFinal
+              ? "not_started"
+              : "critical";
+      const finalState: CampaignPreliminaryFinalState = acceptedFinal
+        ? "accepted"
+        : "not_started";
+      const criticalStage = terminalGap
+        ? row.attempt_regime === "urans" && fidelity === "urans_full"
+          ? ("final" as const)
+          : row.attempt_regime === "rans" || row.attempt_regime === "urans"
+            ? ("fast" as const)
+            : ("preflight" as const)
+        : null;
+
+      return {
+        aoaDeg: Number(row.aoa_deg),
+        sourceAoaDeg: Number(row.source_aoa_deg),
+        derivedBySymmetry: Boolean(row.derived_by_symmetry),
+        affectedAoaDegs: [Number(row.aoa_deg)],
+        affectedPointCount: 1,
+        state: requested ? "pending" : terminalGap ? "blocked" : "satisfied",
+        outcome: requested
+          ? "recovering"
+          : terminalGap
+            ? "recovery_unavailable"
+            : "accepted",
+        ransStage,
+        fastState,
+        finalState,
+        finalActivityState: null,
+        finalComparison: null,
+        finalDeltaCl: null,
+        finalDeltaCd: null,
+        finalDeltaCm: null,
+        finalSource: null,
+        criticalStage,
+        fastResultId: acceptedFast ? row.result_id : null,
+        fastResultAttemptId: acceptedFast ? row.result_attempt_id : null,
+        finalResultId: acceptedFinal ? row.result_id : null,
+        finalResultAttemptId: acceptedFinal ? row.result_attempt_id : null,
+        finalEvidenceReasons: [],
+        finalSubmitError: null,
+        finalSubmitHttpStatus: null,
+        physicalAttemptsUsed: 0,
+        physicalAttemptsMax: 0,
+        recoverySubmissions: 0,
+        nonPhysicalSubmissions: 0,
+        interruptedPhysicalRuns: 0,
+        ransEvidenceRuns: row.attempt_regime === "rans" ? 1 : 0,
+        preliminaryEvidenceRuns: fidelity === "urans_precalc" ? 1 : 0,
+        fullUransEvidenceRuns: fidelity === "urans_full" ? 1 : 0,
+        legacyUransEvidenceRuns:
+          row.attempt_regime === "urans" &&
+          fidelity !== "urans_precalc" &&
+          fidelity !== "urans_full"
+            ? 1
+            : 0,
+        evidenceReasons: row.classification_reasons ?? [],
         updatedAt: isoOf(row.updated_at)!,
       };
     },
@@ -6543,35 +6754,43 @@ export async function campaignPreliminaryOutcomes(
   // source result, but each requested point still owns one visible row and one
   // count. Stable source ids and sourceAoaDeg preserve the exact evidence
   // relationship without collapsing the user-facing journey.
-  const items = [...obligationItems, ...ransIncidentItems]
-    .flatMap((item) => {
-      const requestedAoaDegs = [
-        ...new Set(
-          (item.affectedAoaDegs.length
-            ? item.affectedAoaDegs
-            : [item.aoaDeg]
-          ).map(Number),
-        ),
-      ].sort((left, right) => left - right);
-      return requestedAoaDegs.map(
-        (requestedAoaDeg): CampaignPreliminaryOutcome => ({
-          ...item,
-          aoaDeg: requestedAoaDeg,
-          sourceAoaDeg: item.aoaDeg,
-          derivedBySymmetry: requestedAoaDeg !== item.aoaDeg,
-          affectedAoaDegs: [requestedAoaDeg],
-          affectedPointCount: 1,
-        }),
-      );
-    })
-    .sort((left, right) => {
-      const aoaOrder = left.aoaDeg - right.aoaDeg;
-      if (aoaOrder !== 0) return aoaOrder;
-      if (left.criticalStage === right.criticalStage) return 0;
-      if (left.criticalStage === "preflight") return -1;
-      if (right.criticalStage === "preflight") return 1;
-      return 0;
-    });
+  const machineJourneyItems = [
+    ...obligationItems,
+    ...ransIncidentItems,
+  ].flatMap((item) => {
+    const requestedAoaDegs = [
+      ...new Set(
+        (item.affectedAoaDegs.length
+          ? item.affectedAoaDegs
+          : [item.aoaDeg]
+        ).map(Number),
+      ),
+    ].sort((left, right) => left - right);
+    return requestedAoaDegs.map(
+      (requestedAoaDeg): CampaignPreliminaryOutcome => ({
+        ...item,
+        aoaDeg: requestedAoaDeg,
+        sourceAoaDeg: item.aoaDeg,
+        derivedBySymmetry: requestedAoaDeg !== item.aoaDeg,
+        affectedAoaDegs: [requestedAoaDeg],
+        affectedPointCount: 1,
+      }),
+    );
+  });
+  const pointItems = new Map(
+    basePointItems.map((item) => [item.aoaDeg, item] as const),
+  );
+  for (const machineItem of machineJourneyItems) {
+    pointItems.set(machineItem.aoaDeg, machineItem);
+  }
+  const items = [...pointItems.values()].sort((left, right) => {
+    const aoaOrder = left.aoaDeg - right.aoaDeg;
+    if (aoaOrder !== 0) return aoaOrder;
+    if (left.criticalStage === right.criticalStage) return 0;
+    if (left.criticalStage === "preflight") return -1;
+    if (right.criticalStage === "preflight") return 1;
+    return 0;
+  });
   return {
     total: items.reduce((sum, item) => sum + item.affectedPointCount, 0),
     recovering: items
@@ -6579,6 +6798,7 @@ export async function campaignPreliminaryOutcomes(
         (item) =>
           item.fastState === "queued" ||
           item.fastState === "running" ||
+          (item.ransStage === "not_started" && item.criticalStage === null) ||
           item.finalState === "queued" ||
           item.finalState === "running" ||
           item.finalActivityState === "queued" ||
@@ -6591,9 +6811,10 @@ export async function campaignPreliminaryOutcomes(
     unavailable: items
       .filter(
         (item) =>
-          item.criticalStage === "preflight" ||
-          item.fastState === "critical" ||
-          item.finalState === "critical",
+          item.finalState !== "accepted" &&
+          (item.criticalStage !== null ||
+            item.fastState === "critical" ||
+            item.finalState === "critical"),
       )
       .reduce((sum, item) => sum + item.affectedPointCount, 0),
     verified: items

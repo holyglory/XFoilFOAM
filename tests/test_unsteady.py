@@ -703,6 +703,69 @@ def test_transient_attempt_accepts_force_coefficients_under_zero_folder(tmp_path
     assert result.avg.cd == pytest.approx(0.02)
 
 
+def test_finalizer_archives_first_pass_failure_before_propagating(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: a terminal automatic URANS failure still reaches the
+    immutable evidence archiver before the batch records its critical result."""
+
+    from airfoilfoam.models import FluidProperties, MeshParams, RoughnessParams, SolverParams
+
+    captured: dict[str, object] = {}
+
+    def failed_transient(case_dir, *_args, subdir="transient", **_kwargs):
+        failed = (
+            Path(case_dir)
+            / subdir
+            / pipeline.URANS_NUMERICAL_RECOVERY_DIR
+            / "v2"
+            / "event_001"
+            / "pass_1_numerical"
+        )
+        failed.mkdir(parents=True)
+        (failed / "failure.json").write_text('{"classification":"numerical"}\n')
+        raise HardSolverError("version-2 conservative retry exhausted")
+
+    def capture_archive(case_dir, post_dir, outcome, **kwargs):
+        captured["case_dir"] = Path(case_dir)
+        captured["post_dir"] = Path(post_dir)
+        captured["outcome"] = outcome
+        captured["failure_exists"] = (
+            Path(post_dir)
+            / pipeline.URANS_NUMERICAL_RECOVERY_DIR
+            / "v2"
+            / "event_001"
+            / "pass_1_numerical"
+            / "failure.json"
+        ).is_file()
+
+    monkeypatch.setattr(pipeline, "_run_transient", failed_transient)
+    monkeypatch.setattr(pipeline, "_archive_case_evidence", capture_archive)
+    spec = CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0)
+    outcome = CaseOutcome(spec=spec, reynolds=666_666)
+
+    with pytest.raises(HardSolverError, match="conservative retry exhausted"):
+        _finalize_outcome(
+            tmp_path,
+            outcome,
+            airfoil=SimpleNamespace(name="unit", contour=[]),
+            resolved=MeshParams(),
+            spec=spec,
+            fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(force_transient=True, write_images=[]),
+            runner=SimpleNamespace(),
+            n_proc=1,
+            render_images=False,
+            solver_timeout=7200,
+        )
+
+    assert captured["post_dir"] == tmp_path / "transient"
+    assert captured["failure_exists"] is True
+    assert outcome.unsteady and not outcome.converged
+    assert outcome.fidelity == "urans_full"
+
+
 def test_transient_attempt_early_stop_retains_gate_minimum_periods(tmp_path, monkeypatch):
     """Early stop fires only after URANS_STABLE_RETAINED_CYCLES (+margin)
     periods of certified-stable data exist past the FIRST stable window start,

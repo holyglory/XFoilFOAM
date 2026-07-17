@@ -29,6 +29,7 @@ import {
   solverProfiles,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -1096,15 +1097,23 @@ describe("fidelity ladder fields + verify filter (migration 0034)", () => {
     await db.execute(
       sql`UPDATE results SET fidelity = 'urans_precalc' WHERE id = ${resultIdByAoa.get(-1)}`,
     );
-    await selectAcceptedPrecalcFixture();
+    const pendingPrecalcAttemptId = await selectAcceptedPrecalcFixture();
+    const verifiedPrecalcAttemptId = await createAcceptedPrecalcAttemptFixture(
+      db,
+      resultIdByAoa.get(1)!,
+    );
+    const negativePrecalcAttemptId = await createAcceptedPrecalcAttemptFixture(
+      db,
+      resultIdByAoa.get(-1)!,
+    );
     const rows = (await db.execute(sql`
       INSERT INTO sim_urans_verify_queue
-        (airfoil_id, revision_id, aoa_deg, campaign_id, state, precalc_result_id, delta_cl, delta_cd, "createdAt")
+        (airfoil_id, revision_id, aoa_deg, campaign_id, state, precalc_result_id, precalc_result_attempt_id, delta_cl, delta_cd, "createdAt")
       VALUES
-        (${airfoilId}, ${revisionId}, 2, ${campaignId}, 'pending', ${resultIdByAoa.get(2)}, NULL, NULL, now()),
-        (${airfoilId}, ${revisionId}, 1, ${campaignId}, 'disagreed', ${resultIdByAoa.get(1)}, 0.06, 0.002, now()),
-        (${airfoilId}, ${revisionId}, -1, ${campaignId}, 'disagreed', ${resultIdByAoa.get(-1)}, 0.09, NULL, now() - interval '1 hour'),
-        (${airfoilId}, ${revisionId}, -1, ${campaignId}, 'done', ${resultIdByAoa.get(-1)}, 0.01, 0.001, now())
+        (${airfoilId}, ${revisionId}, 2, ${campaignId}, 'pending', ${resultIdByAoa.get(2)}, ${pendingPrecalcAttemptId}, NULL, NULL, now()),
+        (${airfoilId}, ${revisionId}, 1, ${campaignId}, 'disagreed', ${resultIdByAoa.get(1)}, ${verifiedPrecalcAttemptId}, 0.06, 0.002, now()),
+        (${airfoilId}, ${revisionId}, -1, ${campaignId}, 'disagreed', ${resultIdByAoa.get(-1)}, ${negativePrecalcAttemptId}, 0.09, NULL, now() - interval '1 hour'),
+        (${airfoilId}, ${revisionId}, -1, ${campaignId}, 'done', ${resultIdByAoa.get(-1)}, ${negativePrecalcAttemptId}, 0.01, 0.001, now())
       RETURNING id
     `)) as unknown as Array<{ id: string }>;
     for (const r of rows) verifyItemIds.push(r.id);

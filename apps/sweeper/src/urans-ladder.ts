@@ -1890,10 +1890,11 @@ async function consumeVerifyItem(
   if (!item) return false;
   const precalc = await precalcSnapshotForVerifyItem(db, item);
   if (!precalc) {
-    // The precalc row is gone / no longer a done precalc solve (re-solved,
-    // failed, or already verified) — the item is stale, not verifiable.
+    // Runnable queue rows own one exact immutable accepted preliminary
+    // attempt. Missing/mismatched evidence is a controller invariant breach;
+    // never fall back to whichever generation the mutable results row selects.
     console.error(
-      `[sweeper] verify item ${item.id} cancelled: precalc result ${item.precalcResultId} is no longer a done urans_precalc row`,
+      `[sweeper] verify item ${item.id} cancelled: exact preliminary attempt ${item.precalcResultAttemptId ?? "missing"} is not accepted urans_precalc evidence for result ${item.precalcResultId}`,
     );
     await db
       .update(simUransVerifyQueue)
@@ -2001,7 +2002,12 @@ async function consumeVerifyItem(
     campaignId: null,
     payloadExtras: {
       verifyQueueItemId: item.id,
-      verifyPrecalc: precalc,
+      verifyPrecalcResultAttemptId: precalc.resultAttemptId,
+      verifyPrecalc: {
+        cl: precalc.cl,
+        cd: precalc.cd,
+        cm: precalc.cm,
+      },
       finalRecoveryMode: recovery.mode,
       ...(recovery.mode === "continuation"
         ? {

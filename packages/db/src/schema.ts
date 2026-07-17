@@ -1940,6 +1940,126 @@ export const solverEvidenceArtifactMembers = pgTable(
   }),
 );
 
+/**
+ * Immutable quarantine for a genuine solver archive whose exact engine
+ * job/case has no result or result-attempt owner.  This is preservation and
+ * operator discovery only: it deliberately carries no coefficients, AoA, or
+ * polar/result ownership.  The exact manifest member set is retained as JSON
+ * because no logical result-artifact rows existed when the worker died.
+ */
+export const solverEvidenceOrphanQuarantines = pgTable(
+  "solver_evidence_orphan_quarantines",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references((): AnyPgColumn => simJobs.id),
+    engineJobId: text("engine_job_id").notNull(),
+    engineCaseSlug: text("engine_case_slug").notNull(),
+    evidencePath: text("evidence_path").notNull(),
+    quarantineReason: text("quarantine_reason")
+      .notNull()
+      .default("terminal_engine_evidence_not_ingested"),
+    sourceArtifactId: uuid("source_artifact_id")
+      .notNull()
+      .references(() => solverEvidenceArtifacts.id),
+    blobId: uuid("blob_id")
+      .notNull()
+      .references(() => solverEvidenceBlobs.id),
+    manifestSha256: text("manifest_sha256").notNull(),
+    manifestByteSize: bigint("manifest_byte_size", {
+      mode: "number",
+    }).notNull(),
+    archiveMemberSetSha256: text("archive_member_set_sha256").notNull(),
+    archiveMemberCount: integer("archive_member_count").notNull(),
+    archiveMembers: jsonb("archive_members")
+      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
+      .notNull(),
+    sourceArchives: jsonb("source_archives")
+      .$type<
+        Array<{
+          path: string;
+          compression: "gzip" | "zstd";
+          sha256: string;
+          byteSize: number;
+          uncompressedTarSha256?: string;
+          uncompressedTarByteSize?: number;
+        }>
+      >()
+      .notNull(),
+    migrationReceiptSha256: text("migration_receipt_sha256").notNull(),
+    migrationReceiptByteSize: bigint("migration_receipt_byte_size", {
+      mode: "number",
+    }).notNull(),
+    verificationMode: text("verification_mode").notNull(),
+    remoteVerifiedAt: ts().notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    jobEvidenceUq: unique(
+      "solver_evidence_orphan_quarantines_job_evidence_uq",
+    ).on(t.engineJobId, t.evidencePath),
+    sourceArtifactUq: unique(
+      "solver_evidence_orphan_quarantines_source_artifact_uq",
+    ).on(t.sourceArtifactId),
+    simJobIdx: index("solver_evidence_orphan_quarantines_sim_job_idx").on(
+      t.simJobId,
+    ),
+    blobIdx: index("solver_evidence_orphan_quarantines_blob_idx").on(t.blobId),
+    createdIdx: index("solver_evidence_orphan_quarantines_created_idx").on(
+      t.createdAt,
+    ),
+    jobIdCheck: check(
+      "solver_evidence_orphan_quarantines_job_id_check",
+      sql`btrim(${t.engineJobId}) <> '' AND ${t.engineJobId} !~ '[/\\\\]'`,
+    ),
+    caseSlugCheck: check(
+      "solver_evidence_orphan_quarantines_case_slug_check",
+      sql`btrim(${t.engineCaseSlug}) <> '' AND ${t.engineCaseSlug} !~ '[/\\\\]' AND ${t.engineCaseSlug} NOT IN ('.', '..')`,
+    ),
+    evidencePathCheck: check(
+      "solver_evidence_orphan_quarantines_evidence_path_check",
+      sql`btrim(${t.evidencePath}) <> '' AND ${t.evidencePath} NOT LIKE '/%' AND ${t.evidencePath} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.evidencePath}) = 0`,
+    ),
+    reasonCheck: check(
+      "solver_evidence_orphan_quarantines_reason_check",
+      sql`${t.quarantineReason} = 'terminal_engine_evidence_not_ingested'`,
+    ),
+    manifestShaCheck: check(
+      "solver_evidence_orphan_quarantines_manifest_sha_check",
+      sql`${t.manifestSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    manifestSizeCheck: check(
+      "solver_evidence_orphan_quarantines_manifest_size_check",
+      sql`${t.manifestByteSize} > 0`,
+    ),
+    memberSetShaCheck: check(
+      "solver_evidence_orphan_quarantines_member_set_sha_check",
+      sql`${t.archiveMemberSetSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    memberCountCheck: check(
+      "solver_evidence_orphan_quarantines_member_count_check",
+      sql`${t.archiveMemberCount} > 0`,
+    ),
+    archiveMembersCheck: check(
+      "solver_evidence_orphan_quarantines_archive_members_check",
+      sql`jsonb_typeof(${t.archiveMembers}) = 'array'`,
+    ),
+    sourceArchivesCheck: check(
+      "solver_evidence_orphan_quarantines_source_archives_check",
+      sql`jsonb_typeof(${t.sourceArchives}) = 'array' AND jsonb_array_length(${t.sourceArchives}) > 0`,
+    ),
+    receiptShaCheck: check(
+      "solver_evidence_orphan_quarantines_receipt_sha_check",
+      sql`${t.migrationReceiptSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    receiptSizeCheck: check(
+      "solver_evidence_orphan_quarantines_receipt_size_check",
+      sql`${t.migrationReceiptByteSize} > 0`,
+    ),
+  }),
+);
+
 export const fieldRenderCache = pgTable(
   "field_render_cache",
   {
@@ -3182,6 +3302,12 @@ export const simUransVerifyQueue = pgTable(
     precalcResultId: uuid("precalc_result_id")
       .notNull()
       .references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
+    /** Exact immutable accepted preliminary generation whose coefficients and
+     * evidence this verification owns. A mutable results row is only the
+     * natural-cell container and must never be used as the comparison source.
+     * NULL is reserved for terminal projections of legacy direct-FULL evidence
+     * that never had a preliminary generation; such rows are not runnable. */
+    precalcResultAttemptId: uuid("precalc_result_attempt_id"),
     verifyResultId: uuid("verify_result_id").references(
       (): AnyPgColumn => results.id,
       { onDelete: "set null" },
@@ -3194,8 +3320,17 @@ export const simUransVerifyQueue = pgTable(
      * fresh-start allowance. */
     freshAttemptCount: integer("fresh_attempt_count").notNull().default(0),
     maxFreshAttempts: integer("max_fresh_attempts").notNull().default(2),
-    /** At most one continuation is authorized for each fresh trajectory. */
+    /** Physical same-case continuation segments completed across all fresh
+     * trajectories. Productive trajectories may exceed one segment; repeated
+     * measured no-progress is tracked separately. */
     continuationAttemptCount: integer("continuation_attempt_count")
+      .notNull()
+      .default(0),
+    /** Consecutive physical continuation segments whose immutable evidence did
+     * not advance monotonically. Reset by meaningful progress or a fresh
+     * trajectory; two consecutive misses invoke the bounded fallback/incident
+     * path instead of looping unchanged. */
+    continuationNoProgressCount: integer("continuation_no_progress_count")
       .notNull()
       .default(0),
     /** Admin-requested budget for a seeded same-case final continuation.
@@ -3221,6 +3356,20 @@ export const simUransVerifyQueue = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    precalcAttemptOwnerFk: foreignKey({
+      columns: [t.precalcResultAttemptId, t.precalcResultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sim_urans_verify_queue_precalc_attempt_owner_fk",
+    }).onDelete("cascade"),
+    precalcAttemptRequiredCheck: check(
+      "sim_urans_verify_queue_precalc_attempt_required_check",
+      sql`${t.precalcResultAttemptId} IS NOT NULL
+        OR ${t.state} = 'cancelled'
+        OR (
+          ${t.state} IN ('done', 'disagreed')
+          AND ${t.verifyResultId} IS NOT NULL
+        )`,
+    ),
     freshAttemptCountCheck: check(
       "sim_urans_verify_queue_fresh_attempt_count_check",
       sql`${t.freshAttemptCount} >= 0`,
@@ -3231,16 +3380,30 @@ export const simUransVerifyQueue = pgTable(
     ),
     continuationAttemptCountCheck: check(
       "sim_urans_verify_queue_continuation_attempt_count_check",
-      sql`${t.continuationAttemptCount} >= 0 AND ${t.continuationAttemptCount} <= ${t.freshAttemptCount}`,
+      sql`${t.continuationAttemptCount} >= 0`,
+    ),
+    continuationNoProgressCountCheck: check(
+      "sim_urans_verify_queue_continuation_no_progress_count_check",
+      sql`${t.continuationNoProgressCount} >= 0 AND ${t.continuationNoProgressCount} <= ${t.continuationAttemptCount}`,
     ),
     continuationBudgetOverrideCheck: check(
       "sim_urans_verify_queue_continuation_budget_override_check",
       sql`${t.continuationBudgetOverrideS} IS NULL OR ${t.continuationBudgetOverrideS} > 0`,
     ),
-    // Idempotent enqueue: one open item per cell (partial unique).
-    openCellUq: uniqueIndex("sim_urans_verify_queue_open_cell_uq")
-      .on(t.airfoilId, t.revisionId, t.aoaDeg)
-      .where(sql`${t.state} IN ('pending', 'running')`),
+    // Retry budget and execution ownership belong to one immutable accepted
+    // preliminary generation. A newer accepted attempt in the same natural
+    // cell receives an independent ledger instead of inheriting an older
+    // generation's blocked/exhausted budget.
+    openPrecalcAttemptUq: uniqueIndex(
+      "sim_urans_verify_queue_open_precalc_attempt_uq",
+    )
+      .on(t.precalcResultAttemptId)
+      .where(
+        sql`${t.precalcResultAttemptId} IS NOT NULL AND ${t.state} IN ('pending', 'running')`,
+      ),
+    precalcAttemptIdx: index("sim_urans_verify_queue_precalc_attempt_idx").on(
+      t.precalcResultAttemptId,
+    ),
     simJobUq: uniqueIndex("sim_urans_verify_queue_sim_job_uq")
       .on(t.simJobId)
       .where(sql`${t.simJobId} IS NOT NULL`),
@@ -4519,6 +4682,8 @@ export type SolverEvidenceBlob = typeof solverEvidenceBlobs.$inferSelect;
 export type SolverEvidenceArchive = typeof solverEvidenceArchives.$inferSelect;
 export type SolverEvidenceArtifactMember =
   typeof solverEvidenceArtifactMembers.$inferSelect;
+export type SolverEvidenceOrphanQuarantine =
+  typeof solverEvidenceOrphanQuarantines.$inferSelect;
 export type FieldRenderCache = typeof fieldRenderCache.$inferSelect;
 export type ForceHistoryRow = typeof forceHistory.$inferSelect;
 export type ResultClassification = typeof resultClassifications.$inferSelect;

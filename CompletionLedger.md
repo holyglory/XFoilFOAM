@@ -15,9 +15,13 @@
   `urans_recovery_version` capability contract: recovery requests pin their
   expected version, the API and worker reject mismatches before solve work,
   absent legacy capability is version 0, and malformed or unavailable
-  capability data fails closed. Until production has a matching version-1
-  engine, continuation and final-recovery obligations must remain pending;
-  ordinary RANS screening and first-pass preliminary URANS may continue.
+  capability data fails closed. The current recovery controller requires the
+  version-2 contract; a known version 0 or 1 leaves continuation and corrective
+  final recovery pending while ordinary RANS and first-pass preliminary URANS
+  remain eligible. The OpenCFD 2606 cutover and exact successor-evidence
+  certification are complete. The successor campaign is currently ingesting
+  one deliberately admitted RANS batch while durable general admission remains
+  closed; deploy the matching version-2 engine before opening that admission.
   Explicit admin final requests must remain aggregate owners of the same
   per-point preliminary-plus-verification sequence; they must not create
   direct full-fidelity bypass jobs.
@@ -36,8 +40,10 @@
   cross-segment continuation cannot loop without measurable progress, that
   failed final verification retains and automatically refines the accepted
   preliminary generation, and that repeated fast/final incidents are durably
-  grouped for remediation. Recover accepted preliminary results and monitor
-  subsequent preliminary work for recurrence before removing this item.
+  grouped for remediation. The local full-tier controller now applies strict
+  stationarity while the exact saved case can still extend and refine; deploy
+  that controller, recover accepted preliminary/final results, and monitor
+  subsequent URANS work for recurrence before removing this item.
 
 - **GCS Zstandard evidence migration:** Implement and deploy content-addressed
   tar.zst finalization, verified GCS upload, temporary render hydration,
@@ -49,20 +55,24 @@
   production deployment environment is configured for remote-only Zstandard
   evidence with a bounded 50 GiB hydration cache. The verified pre-migration
   PostgreSQL dump and its restore manifest now also have a private off-VPS copy
-  whose SHA-256 matches the tested production backup. Those values are not
-  active in the unchanged running containers; no production evidence has yet
-  been migrated or deleted.
-
-- **OpenCFD 2606 production campaign cutover:** The repository implementation,
-  digest-pinned worker, isolated serial/MPI/forced-URANS canary, exact
-  campaign-successor migration, fail-closed deployment workflow, and isolated
-  2406 rollback reconstruction are complete. Production still runs OpenCFD
-  2406 build `prod-20260715-9a933ec`; its API and worker containers have not
-  been restarted or replaced. An authorized operator must run the guarded VPS
-  cutover, verify that the live 2406 process/container is drained and removed,
-  and retain the marker until every affected campaign's exact eligible source
-  snapshot is represented by its linked 2606 generation and the durable
-  continuation proof reaches `evidence` or truthful `not_required`.
+  whose SHA-256 matches the tested production backup. The OpenCFD 2606 engine
+  now runs with that remote-only contract. At the 2026-07-17 reconciliation,
+  546 legacy evidence directories had complete three-pass migration receipts,
+  588 current GCS archive objects were registered in Postgres, and 605 local
+  remote pointers existed. The remaining corpus still contained 3,029 legacy
+  gzip files (147,646,075,989 bytes) plus 190,833,139,011 bytes of packaged raw
+  evidence, so migration and local reclamation are not complete. Canary jobs
+  intentionally have no canonical result-attempt/database associations, so
+  their per-artifact disposition remains
+  `remote-copy-plus-local-archive-pending-database-ack`.
+  The local 0073 implementation now preserves a terminal campaign-job archive
+  with zero exact result owners as an immutable, admin-downloadable orphan
+  quarantine without creating coefficients or binding by AoA; deploy the
+  migration/backfill and exercise it against the audited orphan before any
+  corresponding local source is removed.
+  Add and verify a distinct attestation-backed cleanup for canary-only local
+  archives after certification; do not invent a database acknowledgement or
+  register canary evidence as campaign data.
 
 - **OpenFOAM Foundation 14 production activation:** The additive identity,
   adapter, isolated worker/pool, control-plane selection, compatibility split,
@@ -75,15 +85,14 @@
   before deploying the Foundation worker to an arm64 host.
 
 - **Production evidence capacity:** The owner expanded the VPS disk from 300 to
-  500 GiB. The latest 2026-07-16 production measurement is 492 GiB usable,
-  about 416 GiB used, and 72 GiB free (86% used); the
-  `/var/lib/docker/volumes/app_results` volume accounts for about 380 GiB.
-  Two steady solves were still active at that measurement. Keep the storage
-  safeguard closed to new admission while already-admitted work and ingestion
-  drain. The VPS cannot safely retain the immutable artifacts for the complete
-  631,000-point campaign. Complete the verified GCS migration before materially
-  increasing campaign admission, then remeasure active-case growth and the
-  local hydration reserve.
+  500 GiB. The latest 2026-07-17 production measurement is 492 GiB usable,
+  about 385 GiB used, and 103 GiB free (79% used); the
+  `/var/lib/docker/volumes/app_results` volume accounts for about 357 GiB.
+  One exact 78-case successor RANS batch is active and publishing partial
+  evidence; durable general admission remains disabled. The VPS cannot safely
+  retain the immutable artifacts for the complete 631,000-point campaign.
+  Complete the verified GCS migration before opening sustained campaign
+  admission, then remeasure active-case growth and the local hydration reserve.
 
 - **A18 low-angle alternate-branch correction:** The control-plane classifier,
   cache reset, affected-cell preliminary-URANS requests, campaign-evidence

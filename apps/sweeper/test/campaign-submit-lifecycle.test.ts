@@ -76,6 +76,7 @@ import {
   URANS_BUDGET_STOP_MARKER,
 } from "@aerodb/core";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
 import {
   EngineError,
   MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
@@ -367,6 +368,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         state: "running",
         backgroundOwner: true,
         precalcResultId: precalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          precalc.id,
+        ),
       })
       .returning();
     const requestPayload = { verifyQueueItemId: verify.id, aoas: [aoaDeg] };
@@ -718,7 +723,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
     });
   }, 120000);
 
-  it("commits normal RANS rejection and its campaign PRECALC owner as one visible handoff", async () => {
+  it("commits a completed legacy physical RANS rejection and its campaign PRECALC owner as one visible handoff", async () => {
     const campaignId = await launch("atomic-rans-precalc-handoff", 35.137);
     const setup = await setupFor(campaignId);
     const aoaDeg = ANGLES[1];
@@ -752,14 +757,14 @@ describe("campaign compose→submit lifecycle boundary", () => {
         bcId: setup.bcId,
         simulationPresetRevisionId: setup.revisionId,
         aoaDeg,
-        status: "failed",
-        source: "queued",
+        status: "done",
+        source: "solved",
         regime: "rans",
         fidelity: "rans",
         simJobId: parent.id,
-        error: "RANS did not converge",
-        converged: false,
-        stalled: true,
+        error: null,
+        converged: true,
+        stalled: false,
         solvedAt: new Date(),
       })
       .returning();
@@ -773,15 +778,15 @@ describe("campaign compose→submit lifecycle boundary", () => {
         aoaDeg,
         simJobId: parent.id,
         engineJobId: parent.engineJobId,
-        status: "failed",
-        source: "queued",
+        status: "done",
+        source: "solved",
         regime: "rans",
         validForPolar: false,
-        converged: false,
-        stalled: true,
+        converged: true,
+        stalled: false,
         unsteady: false,
-        error: "RANS did not converge",
-        evidencePayload: { failure_disposition: "hard_solver" },
+        error: null,
+        evidencePayload: {},
         solvedAt: new Date(),
       })
       .returning();
@@ -794,7 +799,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       regime: "rans",
       classifierVersion: `${PREFIX}-atomic-rans-precalc-handoff`,
       state: "rejected",
-      reasons: ["not-converged", "solver-stalled"],
+      reasons: ["missing-coefficients"],
     });
 
     let midTransaction:
@@ -816,7 +821,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         resultId: failed.id,
         resultAttemptId: attempt.id,
         simJobId: parent.id,
-        status: "failed",
+        status: "done",
         regime: "rans",
       },
       {
@@ -1383,20 +1388,38 @@ describe("campaign compose→submit lifecycle boundary", () => {
       conditionId: setup.conditionId,
       airfoilId,
     });
+    expect(criticalJourney).toMatchObject({
+      total: 2,
+      recovering: 1,
+      critical: 1,
+      unavailable: 1,
+      verified: 0,
+    });
     expect(criticalJourney.items).toEqual([
       expect.objectContaining({
         aoaDeg,
         sourceAoaDeg: aoaDeg,
         derivedBySymmetry: false,
         state: "blocked",
-        ransStage: "not_started",
+        ransStage: "attempted",
         fastState: "not_started",
         finalState: "not_started",
-        criticalStage: "preflight",
+        criticalStage: "rans",
         physicalAttemptsUsed: 0,
         physicalAttemptsMax: 0,
         ransEvidenceRuns: 1,
         evidenceReasons: ["mesh-quality-failure"],
+      }),
+      expect.objectContaining({
+        aoaDeg: ANGLES[1],
+        sourceAoaDeg: ANGLES[1],
+        derivedBySymmetry: false,
+        state: "pending",
+        outcome: "recovering",
+        ransStage: "not_started",
+        fastState: "not_started",
+        finalState: "not_started",
+        criticalStage: null,
       }),
     ]);
 
@@ -1459,14 +1482,34 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(eq(simSolverIncidents.id, v1Incident.id));
     expect(resolvedV1Incident.status).toBe("resolved");
     expect(resolvedV1Incident.resolvedAt).toBeInstanceOf(Date);
-    expect(
-      (
-        await campaignPreliminaryOutcomes(db, campaignId, {
-          conditionId: setup.conditionId,
-          airfoilId,
-        })
-      ).items,
-    ).toEqual([]);
+    const reopenedJourney = await campaignPreliminaryOutcomes(db, campaignId, {
+      conditionId: setup.conditionId,
+      airfoilId,
+    });
+    expect(reopenedJourney).toMatchObject({
+      total: 2,
+      recovering: 2,
+      critical: 0,
+      unavailable: 0,
+      verified: 0,
+    });
+    // POINT RESULTS is one row per requested AoA. Reopening the exact failed
+    // cell removes its critical machine overlay; it does not remove either
+    // requested point from the list.
+    expect(reopenedJourney.items).toEqual([
+      expect.objectContaining({
+        aoaDeg: ANGLES[0],
+        state: "pending",
+        ransStage: "not_started",
+        criticalStage: null,
+      }),
+      expect.objectContaining({
+        aoaDeg: ANGLES[1],
+        state: "pending",
+        ransStage: "not_started",
+        criticalStage: null,
+      }),
+    ]);
 
     const batch = await findCampaignGapBatch(db, {
       limit: 500,
@@ -2173,6 +2216,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         aoaDeg: ANGLES[0],
         state: "running",
         precalcResultId: precalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          precalc.id,
+        ),
       })
       .returning();
     await db
@@ -2379,10 +2426,22 @@ describe("campaign compose→submit lifecycle boundary", () => {
       state: "accepted",
       reasons: [],
     });
+    const acceptedAttemptId = await createAcceptedPrecalcAttemptFixture(
+      db,
+      accepted.id,
+    );
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: acceptedAttemptId })
+      .where(eq(results.id, accepted.id));
     for (const campaignId of [campaignA, campaignB]) {
       await db
         .update(simCampaignPoints)
-        .set({ state: "terminal", resultId: accepted.id })
+        .set({
+          state: "terminal",
+          resultId: accepted.id,
+          resultAttemptId: acceptedAttemptId,
+        })
         .where(
           and(
             eq(simCampaignPoints.campaignId, campaignId),
@@ -2663,6 +2722,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         aoaDeg: ANGLES[0],
         state: "running",
         precalcResultId: survivorPrecalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          survivorPrecalc.id,
+        ),
       })
       .returning();
     await db.insert(simUransVerifyQueueCampaigns).values([
@@ -2765,6 +2828,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         aoaDeg: ANGLES[1],
         state: "running",
         precalcResultId: pausedPrecalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          pausedPrecalc.id,
+        ),
       })
       .returning();
     await db.insert(simUransVerifyQueueCampaigns).values([
@@ -2887,6 +2954,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         aoaDeg,
         state: "running",
         precalcResultId: precalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          precalc.id,
+        ),
       })
       .returning();
     await db.insert(simUransVerifyQueueRequests).values({
@@ -3013,6 +3084,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
           aoaDeg: aoas[0],
           state: "pending" as const,
           precalcResultId: precalc[0].id,
+          precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+            db,
+            precalc[0].id,
+          ),
         },
         {
           airfoilId,
@@ -3020,6 +3095,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
           aoaDeg: aoas[1],
           state: "running" as const,
           precalcResultId: precalc[1].id,
+          precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+            db,
+            precalc[1].id,
+          ),
         },
       ])
       .returning();
@@ -3199,6 +3278,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         aoaDeg,
         state: "pending",
         precalcResultId: precalc.id,
+        precalcResultAttemptId: precalcAttempt.id,
       })
       .returning();
     await db.insert(simUransVerifyQueueRequests).values({
@@ -3210,13 +3290,29 @@ describe("campaign compose→submit lifecycle boundary", () => {
       airfoilId,
       conditionId: setup.conditionId,
     });
-    expect(queued.items).toHaveLength(1);
+    expect(queued).toMatchObject({
+      total: 2,
+      recovering: 2,
+      critical: 0,
+      unavailable: 0,
+      verified: 0,
+    });
+    expect(queued.items).toHaveLength(2);
     expect(queued.items[0]).toMatchObject({
       aoaDeg,
       fastState: "accepted",
       finalState: "queued",
       finalSource: "verify",
       fullUransEvidenceRuns: 0,
+    });
+    expect(queued.items[1]).toMatchObject({
+      aoaDeg: ANGLES[1],
+      state: "pending",
+      outcome: "recovering",
+      ransStage: "not_started",
+      fastState: "not_started",
+      finalState: "not_started",
+      criticalStage: null,
     });
 
     const [job] = await db
@@ -3297,7 +3393,14 @@ describe("campaign compose→submit lifecycle boundary", () => {
       airfoilId,
       conditionId: setup.conditionId,
     });
-    expect(accepted.items).toHaveLength(1);
+    expect(accepted).toMatchObject({
+      total: 2,
+      recovering: 1,
+      critical: 0,
+      unavailable: 0,
+      verified: 1,
+    });
+    expect(accepted.items).toHaveLength(2);
     expect(accepted.items[0]).toMatchObject({
       aoaDeg,
       fastState: "accepted",
@@ -3309,6 +3412,15 @@ describe("campaign compose→submit lifecycle boundary", () => {
       finalDeltaCd: 0.001,
       finalDeltaCm: -0.001,
       fullUransEvidenceRuns: 1,
+    });
+    expect(accepted.items[1]).toMatchObject({
+      aoaDeg: ANGLES[1],
+      state: "pending",
+      outcome: "recovering",
+      ransStage: "not_started",
+      fastState: "not_started",
+      finalState: "not_started",
+      criticalStage: null,
     });
   }, 120000);
 
@@ -3367,6 +3479,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         aoaDeg,
         state: "running",
         precalcResultId: precalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          precalc.id,
+        ),
       })
       .returning();
     await db.insert(simUransVerifyQueueRequests).values({
@@ -3476,6 +3592,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         state: "running",
         backgroundOwner: false,
         precalcResultId: precalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          precalc.id,
+        ),
       })
       .returning();
     await db.insert(simUransRequestCampaigns).values([
@@ -4462,9 +4582,21 @@ describe("campaign compose→submit lifecycle boundary", () => {
       state: "accepted",
       reasons: [],
     });
+    const acceptedAttemptId = await createAcceptedPrecalcAttemptFixture(
+      db,
+      accepted.id,
+    );
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: acceptedAttemptId })
+      .where(eq(results.id, accepted.id));
     await db
       .update(simCampaignPoints)
-      .set({ state: "terminal", resultId: accepted.id })
+      .set({
+        state: "terminal",
+        resultId: accepted.id,
+        resultAttemptId: acceptedAttemptId,
+      })
       .where(
         and(
           eq(simCampaignPoints.campaignId, campaignId),
@@ -4649,9 +4781,25 @@ describe("campaign compose→submit lifecycle boundary", () => {
         reasons: [],
       })),
     );
+    const acceptedAttemptIds = new Map<number, string>();
+    for (const result of accepted) {
+      const resultAttemptId = await createAcceptedPrecalcAttemptFixture(
+        db,
+        result.id,
+      );
+      acceptedAttemptIds.set(result.aoaDeg, resultAttemptId);
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: resultAttemptId })
+        .where(eq(results.id, result.id));
+    }
     await db
       .update(simCampaignPoints)
-      .set({ state: "terminal", resultId: accepted[0].id })
+      .set({
+        state: "terminal",
+        resultId: accepted[0].id,
+        resultAttemptId: acceptedAttemptIds.get(accepted[0].aoaDeg)!,
+      })
       .where(
         and(
           eq(simCampaignPoints.campaignId, campaignId),
@@ -5325,6 +5473,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
         state: "running",
         backgroundOwner: true,
         precalcResultId: precalc.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          precalc.id,
+        ),
         freshAttemptCount: 1,
         continuationAttemptCount: 0,
         lastOutcome: "fresh_retry_pending",

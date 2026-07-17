@@ -41,6 +41,7 @@ from .evidence_store import (
     EvidenceStoreError,
     RemoteEvidencePointer,
     inspect_tar_zst,
+    manifest_bundle_member_set_sha256,
     read_remote_pointer,
     transcode_gzip_tar_to_zst,
 )
@@ -286,7 +287,13 @@ def migrate_target(
                     source_formats=source_formats,
                     source_paths=source_paths,
                 )
-            _validate_database_ack(ack, target, pointer)
+            _validate_database_ack(
+                ack,
+                target,
+                pointer,
+                manifest_path=manifest_path,
+                receipt_path=receipt_path,
+            )
             verification_mode = _verify_remote_restore(
                 store,
                 pointer,
@@ -302,11 +309,18 @@ def migrate_target(
                 0,
                 bytes_before - sum(_tree_size(path) for path in deleted_paths),
             )
+            acknowledgement_fields: dict[str, Any] = {
+                "databaseAcknowledgement": ack,
+            }
+            if ack.get("state") == "quarantined":
+                acknowledgement_fields["databaseQuarantine"] = ack
+            else:
+                acknowledgement_fields["databaseRegistration"] = ack
             existing_receipt.update(
                 {
                     "state": "complete",
                     "completedAt": datetime.now(timezone.utc).isoformat(),
-                    "databaseRegistration": ack,
+                    **acknowledgement_fields,
                     "verificationMode": verification_mode,
                     "deletedPaths": sorted(
                         set(existing_receipt.get("deletedPaths", []))
@@ -649,10 +663,12 @@ def _validate_database_ack(
     ack: Mapping[str, Any],
     target: MigrationTarget,
     pointer: RemoteEvidencePointer,
+    *,
+    manifest_path: Path,
+    receipt_path: Path,
 ) -> None:
     expected = {
         "schemaVersion": RECEIPT_SCHEMA_VERSION,
-        "state": "registered",
         "jobId": target.job_id,
         "evidencePath": target.relative_evidence_path,
         "storedSha256": pointer.stored_sha256,
@@ -663,16 +679,71 @@ def _validate_database_ack(
             raise EvidenceMigrationError(
                 f"database registration acknowledgement mismatch for {key}"
             )
-    for key in ("resultId", "resultAttemptId", "sourceArtifactId", "archiveId"):
+    state = ack.get("state")
+    if state == "registered":
+        required_identity = (
+            "resultId",
+            "resultAttemptId",
+            "sourceArtifactId",
+            "archiveId",
+        )
+        timestamp_key = "registeredAt"
+    elif state == "quarantined":
+        if ack.get("registrationKind") != "orphan_evidence_quarantine":
+            raise EvidenceMigrationError(
+                "orphan database acknowledgement has the wrong registrationKind"
+            )
+        if ack.get("quarantineReason") != "terminal_engine_evidence_not_ingested":
+            raise EvidenceMigrationError(
+                "orphan database acknowledgement has the wrong quarantineReason"
+            )
+        if any(
+            ack.get(key) is not None
+            for key in ("resultId", "resultAttemptId", "archiveId")
+        ):
+            raise EvidenceMigrationError(
+                "orphan database acknowledgement must not claim result ownership"
+            )
+        required_identity = (
+            "quarantineId",
+            "sourceArtifactId",
+            "blobId",
+        )
+        timestamp_key = "quarantinedAt"
+
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_member_count, manifest_member_set_sha256 = (
+            manifest_bundle_member_set_sha256(manifest_bytes)
+        )
+        receipt_bytes = receipt_path.read_bytes()
+        orphan_expected = {
+            "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "manifestByteSize": len(manifest_bytes),
+            "archiveMemberSetSha256": manifest_member_set_sha256,
+            "archiveMemberCount": manifest_member_count,
+            "migrationReceiptSha256": hashlib.sha256(receipt_bytes).hexdigest(),
+            "migrationReceiptByteSize": len(receipt_bytes),
+        }
+        for key, value in orphan_expected.items():
+            if ack.get(key) != value:
+                raise EvidenceMigrationError(
+                    f"orphan database acknowledgement mismatch for {key}"
+                )
+    else:
+        raise EvidenceMigrationError(
+            "database acknowledgement state must be registered or quarantined"
+        )
+
+    for key in required_identity:
         value = ack.get(key)
         if not isinstance(value, str) or not value.strip():
             raise EvidenceMigrationError(
                 f"database registration acknowledgement lacks {key}"
             )
-    registered_at = ack.get("registeredAt")
-    if not isinstance(registered_at, str) or registered_at != registered_at.strip():
+    acknowledged_at = ack.get(timestamp_key)
+    if not isinstance(acknowledged_at, str) or acknowledged_at != acknowledged_at.strip():
         raise EvidenceMigrationError(
-            "database registration acknowledgement lacks a valid UTC registeredAt"
+            f"database registration acknowledgement lacks a valid UTC {timestamp_key}"
         )
     try:
         # ``Date.toISOString()`` (the registration writer) uses ``Z`` while
@@ -681,22 +752,22 @@ def _validate_database_ack(
         # evidence deletion is permitted only after an attributable database
         # registration event.
         iso_value = (
-            registered_at[:-1] + "+00:00"
-            if registered_at.endswith("Z")
-            else registered_at
+            acknowledged_at[:-1] + "+00:00"
+            if acknowledged_at.endswith("Z")
+            else acknowledged_at
         )
-        parsed_registered_at = datetime.fromisoformat(iso_value)
+        parsed_acknowledged_at = datetime.fromisoformat(iso_value)
     except ValueError as exc:
         raise EvidenceMigrationError(
-            "database registration acknowledgement has an invalid registeredAt"
+            f"database registration acknowledgement has an invalid {timestamp_key}"
         ) from exc
     if (
-        "T" not in registered_at
-        or parsed_registered_at.tzinfo is None
-        or parsed_registered_at.utcoffset() != timedelta(0)
+        "T" not in acknowledged_at
+        or parsed_acknowledged_at.tzinfo is None
+        or parsed_acknowledged_at.utcoffset() != timedelta(0)
     ):
         raise EvidenceMigrationError(
-            "database registration acknowledgement registeredAt must be UTC ISO-8601"
+            f"database registration acknowledgement {timestamp_key} must be UTC ISO-8601"
         )
 
 

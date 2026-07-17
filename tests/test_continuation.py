@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import pytest
 
 from airfoilfoam import evidence_runtime, jobs, pipeline
+from airfoilfoam.capabilities import URANS_RECOVERY_VERSION
 from airfoilfoam.celery_app import TASK_TIME_LIMIT_MARGIN_S, task_hard_time_limit_s
 from airfoilfoam.config import get_settings
 from airfoilfoam.evidence_store import RemoteEvidencePointer, create_tar_zst
@@ -61,7 +62,7 @@ from airfoilfoam.openfoam.dialects import (
     OPENCFD_2406_IDENTITY,
     OPENCFD_2606_IDENTITY,
 )
-from airfoilfoam.openfoam.runner import OpenFOAMError
+from airfoilfoam.openfoam.runner import InfrastructureError, OpenFOAMError
 from airfoilfoam.pipeline import (
     CaseOutcome,
     ContinuationPermanentError,
@@ -251,6 +252,9 @@ def _write_source_job_metadata(
     engine_identity: EngineIdentity | None,
     aoa_deg: float = SPEC.aoa_deg,
     include_identity: bool = True,
+    quality_warnings: list[str] | None = None,
+    frame_track: dict[str, object] | None = None,
+    continuation_transient_subdir: str | None = None,
 ) -> None:
     cases_root = next(parent for parent in case_dir.parents if parent.name == "cases")
     job_root = cases_root.parent
@@ -278,6 +282,15 @@ def _write_source_job_metadata(
         status["requested_engine"] = identity
         result["requested_engine"] = identity
         result["polars"][0]["attempts"][0]["engine"] = identity
+    source_attempt = result["polars"][0]["attempts"][0]
+    if quality_warnings is not None:
+        source_attempt["quality_warnings"] = quality_warnings
+    if frame_track is not None:
+        source_attempt["frame_track"] = frame_track
+    if continuation_transient_subdir is not None:
+        source_attempt["continuation_transient_subdir"] = (
+            continuation_transient_subdir
+        )
     job_root.mkdir(parents=True, exist_ok=True)
     (job_root / "request.json").write_text(json.dumps(request), encoding="utf-8")
     (job_root / "status.json").write_text(json.dumps(status), encoding="utf-8")
@@ -293,6 +306,7 @@ def _continuation_request(naca0012_selig_text, **overrides) -> PolarRequest:
         solver=SolverParams(force_transient=True, write_images=[]),
         continue_from=ContinueFrom(engine_job_id="a" * 32, case_slug="c0p1_u25_a15"),
         budget_override_s=21600,
+        expected_urans_recovery_version=URANS_RECOVERY_VERSION,
     )
     kwargs.update(overrides)
     return PolarRequest(**kwargs)
@@ -325,6 +339,12 @@ def test_continue_from_request_contract(naca0012_selig_text):
     # ...and exactly one case.
     with pytest.raises(ValueError, match="exactly one"):
         _continuation_request(naca0012_selig_text, aoa=AoASpec(angles=[10.0, 15.0]))
+    # ...and a fail-closed exact recovery capability pin.
+    with pytest.raises(ValueError, match="expected_urans_recovery_version"):
+        _continuation_request(
+            naca0012_selig_text,
+            expected_urans_recovery_version=None,
+        )
 
     # Budget override bounds: 24 h cap, sane floor.
     with pytest.raises(ValueError):
@@ -937,6 +957,218 @@ def test_archived_init_seeded_trajectory_infers_positive_transient_start(tmp_pat
     assert read_transient_start_marker(dst / "transient") == pytest.approx(600.0)
 
 
+def test_archived_continuation_preserves_exact_transient_start_marker(tmp_path):
+    """MUST-CATCH: the immutable archive owns the exact coefficient-history
+    boundary.  Inferring it after restore can silently merge an in-case steady
+    initialization segment into the continued transient.
+    """
+
+    src = tmp_path / "src-job" / "cases" / "exact-marker"
+    tcase = _make_saved_case(src)
+    write_transient_start_marker(tcase, 0.012345)
+    early_stop_bytes = (
+        '{"period_s": 0.02, "retain_from": 0.25, "reason": "certified"}\n'
+    )
+    (tcase / pipeline.URANS_EARLY_STOP_MARKER).write_text(early_stop_bytes)
+    failed_pass = (
+        tcase
+        / pipeline.URANS_NUMERICAL_RECOVERY_DIR
+        / "v2"
+        / "event_001"
+        / "pass_1_numerical"
+    )
+    failed_pass.mkdir(parents=True)
+    (failed_pass / "failure.json").write_text(
+        '{"classification":"numerical","uransRecoveryVersion":2}\n'
+    )
+    (failed_pass / "log.pimpleFoam").write_text("first pass divergence\n")
+    recovery_checkpoint = tcase / pipeline.URANS_RECOVERY_CHECKPOINT_DIR
+    (recovery_checkpoint / "latest_time").mkdir(parents=True)
+    (recovery_checkpoint / "checkpoint.json").write_text(
+        '{"uransRecoveryVersion":2,"latestTime":"0"}\n'
+    )
+    (recovery_checkpoint / "latest_time" / "U").write_text("safe U")
+    outcome = CaseOutcome(spec=SPEC, reynolds=166_666, unsteady=True)
+    pipeline._archive_case_evidence(src, tcase, outcome)
+    manifest = json.loads(
+        (src / "evidence" / "evidence_manifest.json").read_text()
+    )
+    entries = {entry["path"]: entry["role"] for entry in manifest["files"]}
+    assert (
+        entries["openfoam/transient/transient_start.json"]
+        == "continuation_state"
+    )
+    assert (
+        entries["openfoam/transient/urans_early_stop.json"]
+        == "quality_evidence"
+    )
+    assert entries[
+        "openfoam/transient/numerical_recovery/v2/event_001/"
+        "pass_1_numerical/failure.json"
+    ] == "dictionary"
+    assert entries[
+        "openfoam/transient/numerical_recovery/v2/event_001/"
+        "pass_1_numerical/log.pimpleFoam"
+    ] == "log"
+    assert entries[
+        "openfoam/transient/recovery_checkpoint/checkpoint.json"
+    ] == "dictionary"
+    assert entries[
+        "openfoam/transient/recovery_checkpoint/latest_time/U"
+    ] == "time_directory"
+    marker_artifact = next(
+        artifact
+        for artifact in outcome.evidence_artifacts
+        if artifact.path == "evidence/openfoam/transient/transient_start.json"
+    )
+    assert marker_artifact.kind == "dictionary"
+    assert marker_artifact.role == "continuation_state"
+    shutil.rmtree(tcase)
+    shutil.rmtree(src / "postProcessing")
+
+    dst = tmp_path / "new-job" / "cases" / "exact-marker"
+    source = stage_continuation_case(src, dst, settings=get_settings())
+
+    assert source.transient_start == pytest.approx(0.012345)
+    assert read_transient_start_marker(dst / "transient") == pytest.approx(
+        0.012345
+    )
+    assert (
+        dst / "transient" / pipeline.URANS_EARLY_STOP_MARKER
+    ).read_text() == early_stop_bytes
+
+
+def test_live_continuation_resumes_exact_selected_refined_trajectory(tmp_path):
+    """MUST-CATCH: rejected refined FULL evidence must resume the refined
+    latestTime, not the older base transient retained beside it."""
+
+    src = tmp_path / "jobs" / ("ab" * 16) / "cases" / "selected-refined"
+    base = _make_saved_case(src, latest="0.1")
+    refined = src / "transient_refined"
+    shutil.copytree(base, refined)
+    (refined / "0.2").mkdir()
+    (refined / "0.2" / "U").write_text("selected refined latest state")
+    (refined / "0.2" / "p").write_text("selected refined pressure state")
+    write_transient_start_marker(refined, 0.012345)
+    _write_source_job_metadata(
+        src,
+        engine_identity=OPENCFD_2606_IDENTITY,
+        quality_warnings=[
+            f"URANS {pipeline.URANS_CONTINUATION_REQUIRED_MARKER}"
+        ],
+        continuation_transient_subdir="transient_refined",
+    )
+
+    dst = tmp_path / "continued-selected-refined"
+    source = stage_continuation_case(
+        src,
+        dst,
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+
+    assert source.transient_subdir == "transient_refined"
+    assert source.resume_from == pytest.approx(0.2)
+    assert source.transient_start == pytest.approx(0.012345)
+    assert (dst / "transient_refined" / "0.2" / "U").read_text() == (
+        "selected refined latest state"
+    )
+
+
+def test_refined_trajectory_archive_preserves_exact_start_marker(tmp_path):
+    """Archive hydration canonicalises the selected refined child to
+    ``transient`` while preserving its exact coefficient merge boundary."""
+
+    src = tmp_path / "jobs" / ("cd" * 16) / "cases" / "archived-refined"
+    base = _make_saved_case(src, latest="0.1")
+    refined = src / "transient_refined"
+    shutil.copytree(base, refined)
+    (refined / "0.25").mkdir()
+    (refined / "0.25" / "U").write_text("archived refined latest state")
+    (refined / "0.25" / "p").write_text("archived refined pressure state")
+    write_transient_start_marker(refined, 0.023456)
+    runtime = EngineRuntimeIdentity(
+        **OPENCFD_2606_IDENTITY.model_dump(),
+        build_id="refined-archive-test",
+        application_source_sha256="c" * 64,
+    )
+    outcome = CaseOutcome(
+        spec=SPEC,
+        reynolds=166_666,
+        engine=runtime,
+        unsteady=True,
+        continuation_transient_subdir="transient_refined",
+    )
+    pipeline._archive_case_evidence(src, refined, outcome)
+    _write_source_job_metadata(
+        src,
+        engine_identity=runtime,
+        quality_warnings=[
+            f"URANS {pipeline.URANS_CONTINUATION_REQUIRED_MARKER}"
+        ],
+        continuation_transient_subdir="transient_refined",
+    )
+    shutil.rmtree(src / "transient")
+    shutil.rmtree(src / "transient_refined")
+
+    dst = tmp_path / "continued-archived-refined"
+    source = stage_continuation_case(
+        src,
+        dst,
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+
+    assert source.transient_subdir == "transient"
+    assert source.resume_from == pytest.approx(0.25)
+    assert source.transient_start == pytest.approx(0.023456)
+    assert read_transient_start_marker(dst / "transient") == pytest.approx(
+        0.023456
+    )
+
+
+def test_continuation_source_carries_only_evidence_backed_corrective_tail(tmp_path):
+    nonstationary = (
+        tmp_path / "jobs" / ("c1" * 16) / "cases" / "nonstationary"
+    )
+    _make_saved_case(nonstationary)
+    _write_source_job_metadata(
+        nonstationary,
+        engine_identity=OPENCFD_2606_IDENTITY,
+        quality_warnings=[
+            "URANS window not stationary (precalc established-oscillation test)"
+        ],
+        frame_track={"stationary": False},
+    )
+    nonstationary_source = stage_continuation_case(
+        nonstationary,
+        tmp_path / "continued-nonstationary",
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+    assert nonstationary_source.corrective_tail_periods == pytest.approx(
+        pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS
+    )
+
+    budget_only = tmp_path / "jobs" / ("c2" * 16) / "cases" / "budget-only"
+    _make_saved_case(budget_only)
+    _write_source_job_metadata(
+        budget_only,
+        engine_identity=OPENCFD_2606_IDENTITY,
+        quality_warnings=[
+            "URANS integration stopped by the wall-clock budget guard"
+        ],
+        frame_track={"periods_retained": 3, "stationary": True},
+    )
+    budget_source = stage_continuation_case(
+        budget_only,
+        tmp_path / "continued-budget",
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+    assert budget_source.corrective_tail_periods == pytest.approx(1.0)
+
+
 def test_stage_continuation_rejects_archive_that_disagrees_with_manifest(tmp_path):
     src = tmp_path / "src_job" / "cases" / "corrupt"
     _make_saved_case(src)
@@ -1128,6 +1360,133 @@ def test_resume_restarts_from_latest_time_and_merges_both_segments(tmp_path):
     assert avg.cl == pytest.approx(0.7, abs=0.02)
 
 
+def test_resume_first_chunk_uses_evidence_backed_corrective_tail_for_both_tiers(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: a non-stationary source needs the same meaningful
+    three-period correction as the in-run controller.  An
+    insufficient-period-only source keeps the smaller deficit-sized chunk so
+    the reliability fix cannot create avoidable wall-budget timeouts.
+    """
+
+    case_dir = tmp_path / "case"
+    _make_saved_case(case_dir, latest="0.1")
+    captured: list[float] = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_mesher",
+        lambda _name: SimpleNamespace(patches=lambda _mesh: {}),
+    )
+
+    def fake_attempt(tcase, *_args, **kwargs):
+        captured.append(float(kwargs["run_time"]))
+        return pipeline.TransientResult(
+            avg=SimpleNamespace(
+                cl=0.7,
+                cd=0.2,
+                cm=-0.1,
+                cl_cd=3.5,
+                cl_std=0.0,
+                cd_std=0.0,
+                cm_std=0.0,
+            ),
+            case_dir=Path(tcase),
+            force_history=None,
+            quality=pipeline.UransQuality(
+                ok=True,
+                can_refine=False,
+                reason="corrective window accepted",
+            ),
+            start_time=0.1,
+            end_time=0.16,
+            run_time=float(kwargs["run_time"]),
+        )
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    def run(
+        target_case: Path,
+        resume_from: float,
+        corrective_tail_periods: float,
+        fidelity: str = "precalc",
+    ):
+        return pipeline._run_transient(
+            target_case,
+            airfoil=None,
+            resolved=MeshParams(),
+            spec=SPEC,
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(
+                force_transient=True,
+                urans_fidelity=fidelity,
+                urans_min_periods=3 if fidelity == "precalc" else 7,
+                transient_discard_fraction=0.4,
+                transient_auto_refine=False,
+            ),
+            runner=None,
+            n_proc=1,
+            timeout=7200,
+            resume=TransientResume(
+                transient_start=0.0,
+                resume_from=resume_from,
+                corrective_tail_periods=corrective_tail_periods,
+            ),
+        )
+
+    assert run(case_dir, 0.1, 1.0) is not None
+    assert captured[-1] == pytest.approx(PERIOD_S, rel=0.05)
+    assert (
+        run(
+            case_dir,
+            0.1,
+            pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS,
+        )
+        is not None
+    )
+    assert captured[-1] == pytest.approx(
+        pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS * PERIOD_S,
+        rel=0.05,
+    )
+
+    # Full verification owns the same evidence-backed corrective tail.  The
+    # source already satisfies its seven-period retention target, so strict
+    # mean drift replaces three measured periods instead of the old one-period
+    # continuation that repeatedly returned to the final rejection gate.
+    full_case = tmp_path / "full-case"
+    _make_saved_case(full_case, latest="0.3")
+    assert (
+        run(
+            full_case,
+            0.3,
+            pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS,
+            "full",
+        )
+        is not None
+    )
+    assert captured[-1] == pytest.approx(
+        pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS * PERIOD_S,
+        rel=0.05,
+    )
+
+    # Real short-source shape: K < target also reports stationary=false.  The
+    # retained deficit owns sizing until K reaches the target; the corrective
+    # three-period tail must not turn this ordinary shortfall into excess work.
+    short_case = tmp_path / "short-case"
+    short_resume = 0.093333
+    _make_saved_case(short_case, latest=f"{short_resume:g}")
+    assert (
+        run(
+            short_case,
+            short_resume,
+            pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS,
+        )
+        is not None
+    )
+    assert captured[-1] == pytest.approx(PERIOD_S, rel=0.08)
+
+
 # --------------------------------------------------------------------------- #
 # Budget override + resume wiring through _finalize_outcome / run_case / jobs
 # --------------------------------------------------------------------------- #
@@ -1220,7 +1579,12 @@ def test_run_case_resume_skips_mesh_and_steady_stages(tmp_path, monkeypatch):
 
 def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     captured = {}
-    source = ContinuationSource(transient_subdir="transient", transient_start=0.42, resume_from=1.1)
+    source = ContinuationSource(
+        transient_subdir="transient",
+        transient_start=0.42,
+        resume_from=1.1,
+        corrective_tail_periods=pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS,
+    )
 
     def fake_stage(
         src_case,
@@ -1245,6 +1609,7 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
         return CaseOutcome(
             spec=spec, reynolds=166_666, cl=0.9, cd=0.11, cm=-0.05,
             converged=True, unsteady=True, fidelity="urans_full",
+            continuation_transient_subdir="transient_refined",
         )
 
     def forbid_mesh(*_args, **_kwargs):
@@ -1270,6 +1635,9 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     resume = captured["resume"]
     assert isinstance(resume, TransientResume)
     assert resume.transient_start == 0.42 and resume.resume_from == 1.1
+    assert resume.corrective_tail_periods == pytest.approx(
+        pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS
+    )
     assert captured["urans_budget_s"] == 21600
     # The continuation point ingests as a NORMAL polar point (same cell).
     assert len(result.polars) == 1
@@ -1278,6 +1646,7 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     assert points[0].aoa_deg == SPEC.aoa_deg
     assert points[0].case_slug == SPEC.slug
     assert points[0].fidelity == "urans_full"
+    assert points[0].continuation_transient_subdir == "transient_refined"
 
 
 def test_execute_job_continuation_missing_source_fails_honestly(monkeypatch, naca0012_selig_text):
@@ -1544,24 +1913,23 @@ def test_mpi_reconstruction_non_timeout_failure_remains_a_real_failure(
     tcase = tmp_path / "transient"
     (tcase / "0").mkdir(parents=True)
 
-    result = _run_transient_attempt(
-        tcase,
-        airfoil=None,
-        tmesh=None,
-        patches={},
-        spec=SPEC,
-        fluid=FLUID,
-        roughness=RoughnessParams(),
-        solver_params=SolverParams(force_transient=True),
-        runner=ReconstructionFailureRunner(),
-        n_proc=2,
-        timeout=120,
-        run_time=0.3,
-        delta_t=1e-5,
-        coeff_start_time=0.0,
-    )
-
-    assert result is None
+    with pytest.raises(InfrastructureError, match="MPI reconstruction failed"):
+        _run_transient_attempt(
+            tcase,
+            airfoil=None,
+            tmesh=None,
+            patches={},
+            spec=SPEC,
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(force_transient=True),
+            runner=ReconstructionFailureRunner(),
+            n_proc=2,
+            timeout=120,
+            run_time=0.3,
+            delta_t=1e-5,
+            coeff_start_time=0.0,
+        )
 
 
 # --------------------------------------------------------------------------- #

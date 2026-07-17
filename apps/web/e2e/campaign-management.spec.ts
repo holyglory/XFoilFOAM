@@ -472,6 +472,7 @@ test.describe
       | "fast-critical"
       | "final-critical"
       | "accepted"
+      | "accepted-disagreed"
       | "accepted-with-running-rerun"
       | "accepted-with-critical-rerun" = "rans-critical";
     let solverFlowRequestCount = 0;
@@ -493,8 +494,10 @@ test.describe
         const finalCritical = solverFlowPhase === "final-critical";
         const accepted =
           solverFlowPhase === "accepted" ||
+          solverFlowPhase === "accepted-disagreed" ||
           solverFlowPhase === "accepted-with-running-rerun" ||
           solverFlowPhase === "accepted-with-critical-rerun";
+        const disagreed = solverFlowPhase === "accepted-disagreed";
         const runningRerun = solverFlowPhase === "accepted-with-running-rerun";
         const criticalRerun =
           solverFlowPhase === "accepted-with-critical-rerun";
@@ -511,14 +514,9 @@ test.describe
               // The UI header must derive mutually exclusive CURRENT totals from
               // the item state below instead of presenting these as one partition.
               recovering: running || queued ? 1 : 0,
-              critical:
-                ransCritical || fastCritical || finalCritical || criticalRerun
-                  ? 1
-                  : 0,
+              critical: ransCritical || fastCritical || finalCritical ? 1 : 0,
               unavailable:
-                ransCritical || fastCritical || finalCritical || criticalRerun
-                  ? 1
-                  : 0,
+                ransCritical || fastCritical || finalCritical ? 1 : 0,
               verified: accepted ? 1 : 0,
               items: [
                 {
@@ -546,7 +544,7 @@ test.describe
                         : queued || running
                           ? "recovering"
                           : "accepted",
-                  ransStage: ransCritical ? "not_started" : "screened",
+                  ransStage: ransCritical ? "attempted" : "screened",
                   fastState: ransCritical
                     ? "not_started"
                     : fastCritical
@@ -566,20 +564,22 @@ test.describe
                     : runningRerun
                       ? "running"
                       : null,
-                  finalComparison: accepted ? "within_tolerance" : null,
-                  finalDeltaCl: accepted ? 0.004 : null,
-                  finalDeltaCd: accepted ? 0.0002 : null,
+                  finalComparison: disagreed
+                    ? "disagreed"
+                    : accepted
+                      ? "within_tolerance"
+                      : null,
+                  finalDeltaCl: disagreed ? 0.061 : accepted ? 0.004 : null,
+                  finalDeltaCd: disagreed ? -0.012 : accepted ? 0.0002 : null,
                   finalDeltaCm: null,
                   finalSource: accepted || finalCritical ? "verify" : null,
                   criticalStage: ransCritical
-                    ? "preflight"
+                    ? "rans"
                     : fastCritical
                       ? "fast"
                       : finalCritical
                         ? "final"
-                        : criticalRerun
-                          ? "final"
-                          : null,
+                        : null,
                   fastResultId: fastAccepted
                     ? `${state.stamp}-fast-result`
                     : null,
@@ -747,23 +747,22 @@ test.describe
     const handoffRail = preliminary.getByTestId(
       "cell-preliminary-handoff-rail",
     );
-    await expect(handoffRail).toContainText("RANS screening");
-    await expect(handoffRail).toContainText("non-convergence → fast");
-    await expect(handoffRail).toContainText("Preliminary URANS");
-    await expect(handoffRail).toContainText("fast usable result");
-    await expect(handoffRail).toContainText("Verified URANS");
-    await expect(handoffRail).toContainText("final result");
-    await expect(
-      handoffRail.getByText("RANS screening", { exact: true }),
-    ).toHaveCount(1);
-    await expect(
-      handoffRail.getByText("Preliminary URANS", { exact: true }),
-    ).toHaveCount(1);
-    await expect(
-      handoffRail.getByText("Verified URANS", { exact: true }),
-    ).toHaveCount(1);
+    await expect(handoffRail).toHaveAccessibleName(
+      "RANS screen, normal handoff to fast preliminary URANS, then final verified URANS",
+    );
+    await expect(handoffRail.locator('[data-flow-stage="rans"]')).toHaveCount(
+      1,
+    );
+    await expect(handoffRail.locator('[data-flow-stage="fast"]')).toHaveCount(
+      1,
+    );
+    await expect(handoffRail.locator('[data-flow-stage="final"]')).toHaveCount(
+      1,
+    );
+    await expect(handoffRail).toContainText("normal handoff");
     const pointTrack = preliminary.getByTestId("cell-preliminary-track-0");
     const pointRow = preliminary.getByTestId("cell-preliminary-outcome-0");
+    const finalStage = preliminary.getByTestId("cell-preliminary-final-0");
     const currentCounts = preliminary.getByTestId(
       "cell-preliminary-current-counts",
     );
@@ -779,9 +778,9 @@ test.describe
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/not_started/);
-    await expect(preliminary).toContainText("Pre-solver repair critical");
+    await expect(preliminary).toContainText("CRITICAL · AUTO-REPAIR");
     await expect(currentCounts).toHaveAccessibleName(
-      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+      "Current states: 0 active, 0 RANS accepted, 0 fast ready, 0 verified, 1 critical",
     );
 
     // The open dialog revalidates this point without page interaction. Each
@@ -795,21 +794,21 @@ test.describe
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveAttribute("aria-current", "step");
     await expect(currentCounts).toHaveAccessibleName(
-      "Current states: 1 active, 0 fast ready, 0 verified, 0 critical",
+      "Current states: 1 active, 0 RANS accepted, 0 fast ready, 0 verified, 0 critical",
     );
 
     solverFlowPhase = "running";
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/running/, { timeout: 8_000 });
-    await expect(preliminary).toContainText("Fast running");
+    await expect(preliminary).toContainText("URANS fast · running");
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
 
     solverFlowPhase = "fast-critical";
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/critical/, { timeout: 8_000 });
-    await expect(preliminary).toContainText("Fast critical");
+    await expect(preliminary).toContainText("CRITICAL · FAST URANS");
     await expect(
       preliminary.getByTestId("cell-preliminary-rans-0"),
     ).toHaveClass(/screened/);
@@ -817,20 +816,20 @@ test.describe
     await expect(preliminary).not.toContainText("RANS failure");
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
     await expect(currentCounts).toHaveAccessibleName(
-      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+      "Current states: 0 active, 0 RANS accepted, 0 fast ready, 0 verified, 1 critical",
     );
 
     solverFlowPhase = "accepted";
     await expect(
       preliminary.getByTestId("cell-preliminary-final-0"),
     ).toContainText("Verified", { timeout: 8_000 });
-    await expect(preliminary).toContainText("Final verified");
+    await expect(preliminary).toContainText("URANS final · verified");
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
     await expect(
       preliminary.getByTestId("cell-preliminary-final-0"),
     ).toHaveAttribute("aria-current", "step");
     await expect(currentCounts).toHaveAccessibleName(
-      "Current states: 0 active, 0 fast ready, 1 verified, 0 critical",
+      "Current states: 0 active, 0 RANS accepted, 0 fast ready, 1 verified, 0 critical",
     );
 
     const exactFinalResultRequest = page.waitForRequest((request) => {
@@ -850,17 +849,30 @@ test.describe
       preliminary.getByTestId("cell-preliminary-final-0"),
     ).toBeFocused();
 
+    solverFlowPhase = "accepted-disagreed";
+    await expect(finalStage).toHaveClass(/comparison-warning/, {
+      timeout: 8_000,
+    });
+    await expect(finalStage.locator(".accepted-mark")).toBeVisible();
+    await expect(finalStage.locator(".activity-mark.warning")).toBeVisible();
+    await expect(preliminary).toContainText("VERIFIED · DIFFERS FROM FAST");
+    await expect(pointRow).toHaveClass(/is-verified/);
+    await expect(pointRow).not.toHaveClass(/is-critical/);
+    await expect(currentCounts).toHaveAccessibleName(
+      "Current states: 0 active, 0 RANS accepted, 0 fast ready, 1 verified, 0 critical",
+    );
+
     solverFlowPhase = "final-critical";
     await expect(
       preliminary.getByTestId("cell-preliminary-final-0"),
     ).toHaveClass(/critical/, { timeout: 8_000 });
-    await expect(preliminary).toContainText("Final critical");
+    await expect(preliminary).toContainText("CRITICAL · FINAL URANS");
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/accepted/);
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
     await expect(currentCounts).toHaveAccessibleName(
-      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+      "Current states: 0 active, 0 RANS accepted, 0 fast ready, 0 verified, 1 critical",
     );
 
     solverFlowPhase = "accepted";
@@ -869,27 +881,27 @@ test.describe
     ).toHaveClass(/accepted/, { timeout: 8_000 });
 
     solverFlowPhase = "accepted-with-running-rerun";
-    const finalStage = preliminary.getByTestId("cell-preliminary-final-0");
     await expect(finalStage.locator(".activity-mark.running")).toBeVisible({
       timeout: 8_000,
     });
     await expect(finalStage.locator(".accepted-mark")).toBeVisible();
-    await expect(preliminary).toContainText("Verified · rerun running");
+    await expect(preliminary).toContainText("URANS final · update running");
     await expect(pointRow).toHaveClass(/is-active/);
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
     await expect(currentCounts).toHaveAccessibleName(
-      "Current states: 1 active, 0 fast ready, 0 verified, 0 critical",
+      "Current states: 1 active, 0 RANS accepted, 0 fast ready, 0 verified, 0 critical",
     );
 
     solverFlowPhase = "accepted-with-critical-rerun";
-    await expect(finalStage).toHaveClass(/critical/, { timeout: 8_000 });
-    await expect(preliminary).toContainText("Verified · rerun critical");
+    await expect(finalStage).toHaveClass(/update-warning/, { timeout: 8_000 });
+    await expect(preliminary).toContainText("VERIFIED · UPDATE UNAVAILABLE");
     await expect(finalStage.locator(".accepted-mark")).toBeVisible();
-    await expect(finalStage.locator(".activity-mark.critical")).toBeVisible();
-    await expect(pointRow).toHaveClass(/is-critical/);
+    await expect(finalStage.locator(".activity-mark.warning")).toBeVisible();
+    await expect(pointRow).toHaveClass(/is-verified/);
+    await expect(pointRow).not.toHaveClass(/is-critical/);
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
     await expect(currentCounts).toHaveAccessibleName(
-      "Current states: 0 active, 0 fast ready, 0 verified, 1 critical",
+      "Current states: 0 active, 0 RANS accepted, 0 fast ready, 1 verified, 0 critical",
     );
     expect(maxConcurrentSolverFlowRequests).toBe(1);
 
@@ -921,15 +933,17 @@ test.describe
       "cell-preliminary-diagnostics-0",
     );
     await expect(diagnostics).not.toHaveAttribute("open", "");
-    await diagnostics.getByLabel("Diagnostics for α 0.0°").click();
+    await diagnostics.getByLabel("Technical details for α 0.0°").click();
     await expect(diagnostics).toHaveAttribute("open", "");
-    await expect(diagnostics).toContainText("RANS handed off automatically");
-    await expect(diagnostics).toContainText("Stored evidence: 2 RANS");
+    await expect(diagnostics).toContainText(
+      "non-convergence hands off normally",
+    );
+    await expect(diagnostics).toContainText("Evidence · 2 RANS");
     await expect(diagnostics).toContainText("1 fast URANS");
     await expect(diagnostics).toContainText("1 final URANS");
-    await expect(diagnostics).toContainText("Fast URANS physical runs: 1 of 2");
+    await expect(diagnostics).toContainText("Fast URANS runs · 1/2 physical");
     await expect(diagnostics).toContainText(
-      "newer final run ended critically and requires automatic investigation",
+      "Verified result retained; newer update is unavailable",
     );
 
     const lockedScrollY = await page.evaluate(() => window.scrollY);
@@ -1091,7 +1105,7 @@ test.describe
     ).toHaveAttribute("d", expectedProfile.profilePath);
     const narrowTrack = preliminary.getByTestId("cell-preliminary-track-0");
     await expect(narrowTrack).toBeVisible();
-    await expect(handoffRail.getByText("non-convergence → fast")).toBeVisible();
+    await expect(handoffRail.getByText("normal handoff")).toBeVisible();
     await expect(narrowTrack).toHaveAccessibleName(/RANS screened/i);
     const narrowConnectors = narrowTrack.locator(".connector");
     await expect(narrowConnectors).toHaveCount(2);

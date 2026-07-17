@@ -20,7 +20,10 @@ from airfoilfoam.evidence_migration import (
     migrate_target,
     plan_target,
 )
-from airfoilfoam.evidence_store import EvidenceObjectStore
+from airfoilfoam.evidence_store import (
+    EvidenceObjectStore,
+    manifest_bundle_member_set_sha256,
+)
 
 
 class FakePreconditionFailed(Exception):
@@ -276,6 +279,112 @@ def test_legacy_gzip_migrates_verifies_restores_and_only_then_deletes(tmp_path: 
     assert again.source_formats == ("gzip",)
     assert again.source_paths == ("openfoam_evidence.tar.gz",)
     assert again.verification == "remote-metadata"
+
+
+def _orphan_ack(target: MigrationTarget) -> dict[str, object]:
+    evidence = target.evidence_dir
+    pointer = json.loads((evidence / "engine_evidence.remote.json").read_text())
+    manifest_bytes = (evidence / "evidence_manifest.json").read_bytes()
+    member_count, member_set_sha256 = manifest_bundle_member_set_sha256(
+        manifest_bytes
+    )
+    receipt_bytes = (evidence / "storage_migration.json").read_bytes()
+    return {
+        "schemaVersion": 1,
+        "state": "quarantined",
+        "registrationKind": "orphan_evidence_quarantine",
+        "quarantineReason": "terminal_engine_evidence_not_ingested",
+        "jobId": target.job_id,
+        "evidencePath": target.relative_evidence_path,
+        "storedSha256": pointer["storedSha256"],
+        "generation": pointer["generation"],
+        "quarantineId": "quarantine-one",
+        "sourceArtifactId": "artifact-one",
+        "blobId": "blob-one",
+        "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "manifestByteSize": len(manifest_bytes),
+        "archiveMemberSetSha256": member_set_sha256,
+        "archiveMemberCount": member_count,
+        "migrationReceiptSha256": hashlib.sha256(receipt_bytes).hexdigest(),
+        "migrationReceiptByteSize": len(receipt_bytes),
+        "quarantinedAt": "2026-07-17T08:00:00.123Z",
+    }
+
+
+def test_distinct_orphan_quarantine_ack_allows_only_fresh_verified_cleanup(
+    tmp_path: Path,
+) -> None:
+    target, settings = _fixture(tmp_path)
+    evidence = target.evidence_dir
+    client = _FakeClient()
+    store = _store(settings, client)
+
+    assert migrate_target(target, settings, store=store).status == (
+        "awaiting-database-registration"
+    )
+    ack = _orphan_ack(target)
+    (evidence / "storage_migration.database.json").write_text(
+        json.dumps(ack), encoding="utf-8"
+    )
+
+    finalized = migrate_target(target, settings, store=store)
+    assert finalized.status == "migrated"
+    assert client.download_count == 2
+    receipt = json.loads((evidence / "storage_migration.json").read_text())
+    assert receipt["databaseQuarantine"] == ack
+    assert receipt["databaseAcknowledgement"] == ack
+    assert "databaseRegistration" not in receipt
+    for name in (
+        "engine_evidence.tar.zst",
+        "openfoam_evidence.tar.gz",
+        "VTK",
+        "openfoam",
+        "time_directories",
+    ):
+        assert not (evidence / name).exists(), name
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"resultId": "invented-result"}, "must not claim result ownership"),
+        ({"archiveMemberSetSha256": "0" * 64}, "archiveMemberSetSha256"),
+        ({"migrationReceiptSha256": "1" * 64}, "migrationReceiptSha256"),
+        ({"registrationKind": "canonical_result"}, "registrationKind"),
+        ({"quarantineReason": "unknown"}, "quarantineReason"),
+    ],
+)
+def test_orphan_ack_mismatch_never_deletes_local_evidence(
+    tmp_path: Path,
+    mutation: dict[str, object],
+    message: str,
+) -> None:
+    target, settings = _fixture(tmp_path)
+    evidence = target.evidence_dir
+    client = _FakeClient()
+    store = _store(settings, client)
+    assert migrate_target(target, settings, store=store).status == (
+        "awaiting-database-registration"
+    )
+    ack = {**_orphan_ack(target), **mutation}
+    (evidence / "storage_migration.database.json").write_text(
+        json.dumps(ack), encoding="utf-8"
+    )
+
+    with pytest.raises(EvidenceMigrationError, match=message):
+        migrate_target(target, settings, store=store)
+
+    for name in (
+        "engine_evidence.tar.zst",
+        "openfoam_evidence.tar.gz",
+        "VTK",
+        "openfoam",
+        "time_directories",
+    ):
+        assert (evidence / name).exists(), name
+    assert json.loads((evidence / "storage_migration.json").read_text())[
+        "state"
+    ] == "awaiting_database_registration"
 
 
 def test_completed_migration_rechecks_pinned_remote_generation(tmp_path: Path) -> None:

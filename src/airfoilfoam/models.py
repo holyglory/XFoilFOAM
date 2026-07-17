@@ -751,6 +751,11 @@ class PolarRequest(BaseModel):
         if any(s <= 0 for s in self.speeds):
             raise ValueError("speeds must be positive.")
         if self.continue_from is not None:
+            if self.expected_urans_recovery_version is None:
+                raise ValueError(
+                    "continue_from requires expected_urans_recovery_version so "
+                    "recovery fails closed across mixed engine versions."
+                )
             if not self.solver.force_transient:
                 raise ValueError(
                     "continue_from resumes a saved URANS transient; solver.force_transient must be true."
@@ -923,6 +928,12 @@ class EvidenceArtifact(BaseModel):
 
 class PolarPoint(BaseModel):
     case_slug: Optional[str] = Field(default=None, description="Engine case directory slug for this AoA evidence.")
+    continuation_transient_subdir: Optional[str] = Field(
+        default=None,
+        description="Exact transient trajectory inside the engine case that produced this "
+        "attempt. Used only to resume rejected URANS evidence without selecting an older "
+        "sibling trajectory.",
+    )
     aoa_deg: float
     cl: Optional[float] = None
     cd: Optional[float] = None

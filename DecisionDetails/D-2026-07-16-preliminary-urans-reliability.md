@@ -47,11 +47,27 @@ reference one immutable positive-angle solve, but it never collapses the
 requested rows or their counts; the derived row identifies its exact source
 angle and opens that exact stored result. Queued/running preliminary work is
 active automatic recovery.
+An accepted RANS point ends the sequence without inventing URANS work. Ordinary
+non-publishable RANS evidence hands the point to fast URANS; that handoff is not
+a failure. Exceptional RANS recovery exhaustion is critical, and its row must
+distinguish a true preflight stop with no attempt evidence from RANS that was
+attempted before recovery exhausted. Counts of RANS attempt/evidence rows must
+not be presented as confirmed physical runs.
 Failure to obtain a preliminary or final result after its automatic recovery
 path is exhausted is red, critical, and owned by the system—not a normal user
 review or setup-change task. Detailed evidence remains available behind
 disclosure, but raw classifier strings, batch names, and mixed attempt counts
 are not primary user content.
+
+An accepted exact final URANS generation is the authoritative publishable
+result even when its coefficients differ from the earlier fast estimate beyond
+the comparison tolerance. Preserve both generations and their stored deltas,
+show a concise amber quality/comparison warning, and keep the final result
+openable by its stable result id. The warning does not increase critical or
+unavailable counts. Likewise, a failed later refresh does not invalidate an
+already accepted immutable final generation. This supersedes the older red
+`verify disagreed` presentation; red is reserved for automatic preliminary or
+final recovery that exhausts without obtaining the required publishable result.
 
 ## Production evidence
 
@@ -90,6 +106,26 @@ failures. Archive hydration repairs the five missing-source cases; adaptive
 same-case extension aligns the early-stop and publication windows for the 21
 physical results.
 
+The retained α2° archive also exposed a restart-seam defect: an older
+`coefficient.dat` segment could end with one inconsistent force row at the
+exact nominal start time of its successor. The old merger kept that row and
+could mint a periodic impulse train in an otherwise flat wake. The newer
+physical restart segment now owns its nominal boundary; raw evidence remains
+unchanged and every genuine earlier sample remains in the analysis history.
+
+At α3°, `frame_track` progress fields were null while immutable force history
+had advanced to `window_end=0.0746722`. The old no-progress circuit breaker
+ignored that real work. Frame tracking remains authoritative, with per-field
+fallbacks to force-history time, period, and retained-cycle measurements.
+
+Finally, the exact live `transient_start.json` merge boundary was not included
+in immutable evidence, and a cross-job resume always began with a one-period
+floor even when its exact source result proved a non-stationary or sparse tail.
+The marker is now archived and restored as checksummed continuation state. A
+source-proven corrective tail receives three new measured periods only after
+its retained-cycle target is met; ordinary shortfall and wall-budget recovery
+remain deficit-sized so the fix does not create avoidable timeouts.
+
 The version-2 deterministic mesh ladder was replayed across the 1,621 source
 records. It accepts all 1,619 eligible closed airfoils and truthfully excludes
 the two open, one-sided source components. GOE451 and FX79W660A, the only
@@ -112,14 +148,20 @@ recovery:
   production runtime, is treated as legacy version 0;
 - malformed capability data or a failed capability probe is unknown and fails
   closed;
-- continuation and final-recovery work that needs version 1 remains pending on
-  version 0, while ordinary RANS screening and first-pass preliminary URANS
+- continuation and final-recovery work pins the exact live version. Version-2
+  numerical recovery remains pending on version 0 or 1, while ordinary RANS
+  screening and a version-compatible first-pass preliminary URANS request
   remain eligible.
 
 This permits a control-plane-first deployment without accidentally applying
 new recovery semantics to a still-running legacy engine. The guarded OpenCFD
-2606 cutover activates version-1 recovery only after the engine advertises and
-enforces the matching contract.
+2606 cutover activated version-1 cross-job recovery only after the engine
+advertised and enforced the matching contract. Version 2 adds a materially new
+in-engine numerical remediation: one structured watchdog/SIGFPE failure
+restores a last-known-good same-case checkpoint and retries with first-order
+convection, Co<=1, and a smaller initial timestep. Generic non-zero exits,
+timeouts, mesh failures, and initialization failures remain infrastructure or
+their existing typed class and do not consume this numerical retry.
 
 ## Selected recovery architecture
 
@@ -157,9 +199,27 @@ enforces the matching contract.
   deadline remains bounded, but a fixed small chunk count or blanket percentage
   reserve cannot create a false terminal result while measurable progress
   continues.
+- Restart segments have deterministic boundary ownership, and immutable
+  continuation evidence carries the exact transient-start marker.
+- Cross-job progress uses the strongest available real measurement: frame-track
+  values first, then force-history values only for missing individual fields.
+- Corrective sizing is evidence-specific: a K-satisfied non-stationary or sparse
+  tail gets three new periods, while a short or budget-limited source keeps its
+  ordinary deficit-sized continuation.
 - Fresh starts remain bounded. Same-case continuation segments preserve one
   physical solve’s accumulated state and immutable audit sequence rather than
   masquerading as independent solver attempts.
+- Each pimpleFoam chunk checkpoints its last-known-good time fields and force
+  history. A structured numerical failure preserves its failed dictionaries,
+  log, force history, and last written fields before the version-2 conservative
+  retry restores that checkpoint. A second numerical failure is a critical
+  exhausted-recovery result; an ambiguous process exit is infrastructure.
+- Same-job extension requires monotonic physical progress from saved simulated
+  time or force history. A zero-progress chunk stops immediately with
+  restartable state instead of spending the emergency chunk allowance.
+- The recorded averaging contract is unchanged by version 2: an ordinary full
+  run targets seven retained periods, while an early stop may certify only
+  after the established five-period stable floor (plus its existing margin).
 - Admin final requests materialize and own the ordinary per-angle preliminary
   and final ledgers for their immutable scope. An existing accepted
   preliminary point is linked directly to its verification item; a missing
@@ -170,6 +230,9 @@ enforces the matching contract.
   incidents with the same signature trigger investigation of the algorithm,
   runtime, storage, or mesh recovery path and a regression before normal
   campaign processing is considered reliable.
+- Fast/final coefficient disagreement is stored comparison evidence, not a
+  solver incident. The accepted final generation remains canonical and the UI
+  presents the real deltas as a non-critical quality warning.
 
 ## Rejected alternatives
 
@@ -215,8 +278,8 @@ Regression coverage must prove:
   unavailable capability data fails closed, and a request/runtime recovery
   mismatch is refused by both the API and worker before solve work;
 - ordinary RANS screening and first-pass preliminary URANS remain admissible
-  on a legacy version-0 runtime while version-1 continuation/final recovery
-  stays pending;
+  on a version-0 or version-1 runtime while version-2 continuation/final
+  recovery stays pending;
 - missing checkpoint state is typed non-physical infrastructure work and does
   not consume solver budget;
 - transient continuation loss retries with backoff, while permanent
@@ -224,6 +287,11 @@ Regression coverage must prove:
   unchanged again;
 - a relaxing periodic signal reaches acceptance through adaptive same-case
   extension;
+- restart seams cannot mint false shedding, archive restore preserves the exact
+  transient boundary, and force-history advancement cannot be miscounted as no
+  progress;
+- source-proven non-stationarity adds a three-period corrective tail only after
+  K is satisfied, with a false-positive guard for ordinary shortfall;
 - blocked restartable attempts remain protected from destructive retention;
 - a pending final-verification point is admitted after no more than eight new
   wave-1 RANS admissions, and the fairness proof survives a sweeper restart;
@@ -231,8 +299,16 @@ Regression coverage must prove:
   verification children, never submit a direct full bypass, and settle only
   after every owned child settles;
 - the UI uses one three-stage per-point sequence and reserves red critical
-  treatment for exceptional preliminary- or final-URANS failure, never normal
-  RANS handoff;
+  treatment for exceptional preflight, RANS-recovery, preliminary-, or
+  final-URANS exhaustion, never normal RANS handoff;
+- an accepted final result remains verified, publishable, countable, and
+  openable when the fast/final comparison exceeds tolerance; its real deltas
+  appear as a non-critical warning, while exhausted final recovery with no
+  accepted exact result remains critical;
+- an old cancelled or otherwise inactive preliminary obligation cannot hide a
+  current campaign-owned RANS critical incident for the same natural cell; its
+  row distinguishes attempted RANS from genuinely never-started preflight and
+  labels attempt/evidence counts without claiming physical solver runs;
 - every requested AoA remains one visible/countable row even when a symmetric
   counterpart reuses the same exact result, and fast/final result nodes open by
   stable result id rather than rounded display values;

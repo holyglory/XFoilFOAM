@@ -22,6 +22,9 @@ import {
   simulationPresetRevisions,
   simulationPresets,
   solverProfiles,
+  solverEvidenceArtifacts,
+  solverEvidenceBlobs,
+  solverEvidenceOrphanQuarantines,
   solverImplementations,
   solverExecutionPools,
   sweeperState,
@@ -98,6 +101,7 @@ import {
 import { makeEngineClient } from "./engine-client";
 import { db } from "./db";
 import { env } from "./env";
+import { mediaStore, type MediaStore } from "./media-store";
 import { categoriesTree } from "./services/catalog";
 import {
   hashtagsByAirfoilIds,
@@ -1782,6 +1786,43 @@ function normalizeTargetAirfoilIds(ids: string[] | undefined): string[] {
   return Array.from(new Set(ids ?? []));
 }
 
+const evidenceQuarantineListQuery = z.object({
+  cursor: z.string().min(3).max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+const evidenceQuarantineIdParams = z.object({ id: z.string().uuid() });
+
+interface EvidenceQuarantineCursor {
+  createdAt: string;
+  id: string;
+}
+
+/**
+ * Cursor values are emitted from PostgreSQL with all six fractional timestamp
+ * digits intact.  Keeping the exact database sort key avoids losing or
+ * repeating quarantines that were inserted within the same millisecond.
+ */
+function parseEvidenceQuarantineCursor(
+  raw: string,
+): EvidenceQuarantineCursor | null {
+  const separator = raw.lastIndexOf("|");
+  if (separator <= 0) return null;
+  const createdAt = raw.slice(0, separator);
+  const id = raw.slice(separator + 1);
+  const parsedCreatedAt = new Date(createdAt);
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(createdAt) ||
+    Number(createdAt.slice(0, 4)) === 0 ||
+    Number.isNaN(parsedCreatedAt.getTime()) ||
+    parsedCreatedAt.toISOString() !== `${createdAt.slice(0, 23)}Z` ||
+    !z.string().uuid().safeParse(id).success
+  ) {
+    return null;
+  }
+  return { createdAt, id };
+}
+
 async function validatePresetTargetAirfoils(
   ids: string[],
 ): Promise<string | null> {
@@ -1816,6 +1857,269 @@ async function replacePresetTargets(
       .insert(simulationPresetAirfoilTargets)
       .values(values)
       .onConflictDoNothing();
+}
+
+/** Register the immutable orphan-evidence read surface.  The database and
+ * media gateway are injectable so tests can run the whole route contract in a
+ * rollback-only transaction without weakening the production DELETE fence. */
+export async function registerEvidenceQuarantineRoutes(
+  app: FastifyInstance,
+  routeDb: DB = db,
+  store: MediaStore = mediaStore,
+): Promise<void> {
+  app.get(
+    "/api/admin/evidence-quarantine",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      reply.header("cache-control", "private, no-store");
+      const parsed = evidenceQuarantineListQuery.safeParse(req.query ?? {});
+      if (!parsed.success) {
+        return reply.code(400).send({
+          error:
+            "invalid query — expected { cursor? from a previous page, limit? 1..100 }",
+        });
+      }
+      const query = parsed.data;
+      const cursor =
+        query.cursor == null
+          ? null
+          : parseEvidenceQuarantineCursor(query.cursor);
+      if (query.cursor != null && cursor == null) {
+        return reply.code(400).send({
+          error:
+            "invalid cursor — expected the exact cursor returned by a previous quarantine page",
+        });
+      }
+      const rows = await routeDb
+        .select({
+          quarantine: solverEvidenceOrphanQuarantines,
+          artifact: solverEvidenceArtifacts,
+          blob: solverEvidenceBlobs,
+          airfoilSlug: airfoils.slug,
+          airfoilName: airfoils.name,
+          cursorCreatedAt: sql<string>`to_char(${solverEvidenceOrphanQuarantines.createdAt} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
+        })
+        .from(solverEvidenceOrphanQuarantines)
+        .innerJoin(
+          solverEvidenceArtifacts,
+          eq(
+            solverEvidenceArtifacts.id,
+            solverEvidenceOrphanQuarantines.sourceArtifactId,
+          ),
+        )
+        .innerJoin(
+          solverEvidenceBlobs,
+          eq(solverEvidenceBlobs.id, solverEvidenceOrphanQuarantines.blobId),
+        )
+        .innerJoin(airfoils, eq(airfoils.id, solverEvidenceArtifacts.airfoilId))
+        .where(
+          cursor == null
+            ? undefined
+            : sql`(${solverEvidenceOrphanQuarantines.createdAt}, ${solverEvidenceOrphanQuarantines.id}) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`,
+        )
+        .orderBy(
+          desc(solverEvidenceOrphanQuarantines.createdAt),
+          desc(solverEvidenceOrphanQuarantines.id),
+        )
+        .limit(query.limit + 1);
+      const page = rows.slice(0, query.limit);
+      const last = page.at(-1);
+      const hasMore = rows.length > query.limit;
+      return {
+        items: page.map(
+          ({ quarantine, artifact, blob, cursorCreatedAt: _, ...airfoil }) => ({
+            id: quarantine.id,
+            preservationKind: "orphan_evidence_quarantine",
+            quarantineReason: quarantine.quarantineReason,
+            resultOwner: null,
+            engineJobId: quarantine.engineJobId,
+            engineCaseSlug: quarantine.engineCaseSlug,
+            evidencePath: quarantine.evidencePath,
+            simJobId: quarantine.simJobId,
+            ...airfoil,
+            manifestSha256: quarantine.manifestSha256,
+            archiveMemberSetSha256: quarantine.archiveMemberSetSha256,
+            archiveMemberCount: quarantine.archiveMemberCount,
+            storedSha256: blob.sha256,
+            storedByteSize: blob.byteSize,
+            bucket: blob.bucket,
+            objectKey: blob.objectKey,
+            generation: blob.generation,
+            quarantinedAt: quarantine.createdAt.toISOString(),
+            downloadUrl: `/api/admin/evidence-quarantine/${quarantine.id}/download`,
+            detailsUrl: `/api/admin/evidence-quarantine/${quarantine.id}`,
+            sourceArtifactId: artifact.id,
+          }),
+        ),
+        nextCursor:
+          hasMore && last != null
+            ? `${last.cursorCreatedAt}|${last.quarantine.id}`
+            : null,
+      };
+    },
+  );
+
+  app.get(
+    "/api/admin/evidence-quarantine/:id",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      reply.header("cache-control", "private, no-store");
+      const params = evidenceQuarantineIdParams.safeParse(req.params);
+      if (!params.success) {
+        return reply.code(400).send({ error: "invalid quarantine id" });
+      }
+      const { id } = params.data;
+      const [row] = await routeDb
+        .select({
+          quarantine: solverEvidenceOrphanQuarantines,
+          artifact: solverEvidenceArtifacts,
+          blob: solverEvidenceBlobs,
+        })
+        .from(solverEvidenceOrphanQuarantines)
+        .innerJoin(
+          solverEvidenceArtifacts,
+          eq(
+            solverEvidenceArtifacts.id,
+            solverEvidenceOrphanQuarantines.sourceArtifactId,
+          ),
+        )
+        .innerJoin(
+          solverEvidenceBlobs,
+          eq(solverEvidenceBlobs.id, solverEvidenceOrphanQuarantines.blobId),
+        )
+        .where(eq(solverEvidenceOrphanQuarantines.id, id))
+        .limit(1);
+      if (!row) return reply.code(404).send({ error: "quarantine not found" });
+      const { quarantine, artifact, blob } = row;
+      return {
+        id: quarantine.id,
+        preservationKind: "orphan_evidence_quarantine",
+        quarantineReason: quarantine.quarantineReason,
+        resultOwner: null,
+        simJobId: quarantine.simJobId,
+        engineJobId: quarantine.engineJobId,
+        engineCaseSlug: quarantine.engineCaseSlug,
+        evidencePath: quarantine.evidencePath,
+        manifestSha256: quarantine.manifestSha256,
+        manifestByteSize: quarantine.manifestByteSize,
+        archiveMemberSetSha256: quarantine.archiveMemberSetSha256,
+        archiveMemberCount: quarantine.archiveMemberCount,
+        archiveMembers: quarantine.archiveMembers,
+        sourceArchives: quarantine.sourceArchives,
+        migrationReceipt: {
+          sha256: quarantine.migrationReceiptSha256,
+          byteSize: quarantine.migrationReceiptByteSize,
+        },
+        sourceArtifact: {
+          id: artifact.id,
+          resultId: artifact.resultId,
+          resultAttemptId: artifact.resultAttemptId,
+          airfoilId: artifact.airfoilId,
+          simJobId: artifact.simJobId,
+          engineJobId: artifact.engineJobId,
+          engineCaseSlug: artifact.engineCaseSlug,
+          methodKey: artifact.methodKey,
+          solverImplementationId: artifact.solverImplementationId,
+          solverRuntimeBuildId: artifact.solverRuntimeBuildId,
+          aoaDeg: artifact.aoaDeg,
+          kind: artifact.kind,
+          field: artifact.field,
+          role: artifact.role,
+          storageKey: artifact.storageKey,
+          mimeType: artifact.mimeType,
+          sha256: artifact.sha256,
+          byteSize: artifact.byteSize,
+          createdAt: artifact.createdAt.toISOString(),
+        },
+        blob: {
+          id: blob.id,
+          backend: blob.backend,
+          bucket: blob.bucket,
+          objectKey: blob.objectKey,
+          generation: blob.generation,
+          compression: blob.compression,
+          mimeType: blob.mimeType,
+          sha256: blob.sha256,
+          byteSize: blob.byteSize,
+          crc32c: blob.crc32c,
+          uncompressedTarSha256: blob.uncompressedTarSha256,
+          uncompressedTarByteSize: blob.uncompressedTarByteSize,
+          verifiedAt: blob.verifiedAt.toISOString(),
+          createdAt: blob.createdAt.toISOString(),
+        },
+        verificationMode: quarantine.verificationMode,
+        remoteVerifiedAt: quarantine.remoteVerifiedAt.toISOString(),
+        quarantinedAt: quarantine.createdAt.toISOString(),
+        downloadUrl: `/api/admin/evidence-quarantine/${quarantine.id}/download`,
+      };
+    },
+  );
+
+  app.get(
+    "/api/admin/evidence-quarantine/:id/download",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      reply.header("cache-control", "private, no-store");
+      const params = evidenceQuarantineIdParams.safeParse(req.params);
+      if (!params.success) {
+        return reply.code(400).send({ error: "invalid quarantine id" });
+      }
+      const { id } = params.data;
+      const [row] = await routeDb
+        .select({
+          quarantine: solverEvidenceOrphanQuarantines,
+          artifact: solverEvidenceArtifacts,
+          blob: solverEvidenceBlobs,
+        })
+        .from(solverEvidenceOrphanQuarantines)
+        .innerJoin(
+          solverEvidenceArtifacts,
+          eq(
+            solverEvidenceArtifacts.id,
+            solverEvidenceOrphanQuarantines.sourceArtifactId,
+          ),
+        )
+        .innerJoin(
+          solverEvidenceBlobs,
+          eq(solverEvidenceBlobs.id, solverEvidenceOrphanQuarantines.blobId),
+        )
+        .where(eq(solverEvidenceOrphanQuarantines.id, id))
+        .limit(1);
+      if (!row) return reply.code(404).send({ error: "quarantine not found" });
+      if (
+        row.artifact.resultId !== null ||
+        row.artifact.resultAttemptId !== null ||
+        row.artifact.aoaDeg !== null ||
+        row.artifact.sha256 !== row.blob.sha256 ||
+        row.artifact.byteSize !== row.blob.byteSize ||
+        row.blob.backend !== "gcs" ||
+        row.blob.bucket == null ||
+        row.blob.objectKey.length === 0 ||
+        row.blob.generation == null
+      ) {
+        return reply.code(409).send({
+          error: "quarantine provenance no longer matches its unbound archive",
+        });
+      }
+      const file = await store.streamVerifiedEvidence(row.artifact.storageKey, {
+        bucket: row.blob.bucket,
+        objectKey: row.blob.objectKey,
+        generation: row.blob.generation,
+        sha256: row.blob.sha256,
+        byteSize: row.blob.byteSize,
+      });
+      reply
+        .header("content-type", "application/zstd")
+        .header("content-length", String(file.size))
+        .header("x-content-sha256", row.blob.sha256)
+        .header("x-gcs-generation", row.blob.generation)
+        .header(
+          "content-disposition",
+          `attachment; filename="orphan-evidence-${row.quarantine.id}.tar.zst"`,
+        );
+      return reply.send(file.stream);
+    },
+  );
 }
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
@@ -1951,6 +2255,11 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     ]);
     return { ...system, solverIncidents };
   });
+
+  // Genuine solver archives whose exact job/case never produced an ingested
+  // result remain operator-discoverable without being exposed as aerodynamic
+  // results. Downloads are pinned to the immutable database/GCS identity.
+  await registerEvidenceQuarantineRoutes(app);
 
   // ---- mediums + setup state (protected writes) ----
   app.get("/api/admin/mediums", { preHandler: requireAdmin }, async () => {

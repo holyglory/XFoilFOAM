@@ -880,9 +880,9 @@ export function PointHistoryPanel() {
             }
             style={selectStyle}
           >
-            <option value="">verify: any</option>
-            <option value="pending">verify pending</option>
-            <option value="disagreed">verify disagreed</option>
+            <option value="">final stage: any</option>
+            <option value="pending">final URANS queued</option>
+            <option value="disagreed">final differs from fast</option>
             <option value="blocked">final URANS critical</option>
           </select>
           <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>

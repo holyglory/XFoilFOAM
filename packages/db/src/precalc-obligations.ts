@@ -59,10 +59,9 @@ export interface PrecalcObligationOwnership {
   backgroundOwner?: boolean;
 }
 
-/** Same-case continuation is an exceptional recovery path. Each segment gets
- * the engine's own bounded extension controller; four completed segments are
- * ample recovery headroom without permitting an unbounded cross-job loop. */
-export const MAX_PRECALC_CONTINUATION_SEGMENTS = 4;
+/** Same-case continuation remains open while immutable physical measurements
+ * advance. Only repeated measured no-progress is terminal; a fixed segment
+ * count cannot discard a slowly settling trajectory. */
 export const MAX_PRECALC_NO_PROGRESS_SEGMENTS = 2;
 
 const liveOwnerSql = (obligationId: string | SQLWrapper) => sql`(
@@ -1104,14 +1103,10 @@ export async function requeueRestartablePrecalcContinuations(
       ) checkpoint ON true
       WHERE (${scopeSql})
         AND obligation.state = 'blocked'
-        AND obligation.continuation_segment_count <
-          ${MAX_PRECALC_CONTINUATION_SEGMENTS}
         AND obligation.continuation_no_progress_count <
           ${MAX_PRECALC_NO_PROGRESS_SEGMENTS}
-        AND COALESCE(obligation.last_outcome, '') NOT IN (
-          'continuation_no_progress_exhausted',
-          'continuation_segment_exhausted'
-        )
+        AND COALESCE(obligation.last_outcome, '') <>
+          'continuation_no_progress_exhausted'
         AND NOT EXISTS (
           SELECT 1
           FROM sim_jobs active_job
@@ -1261,14 +1256,10 @@ export async function requeueRestartablePrecalcContinuations(
           "updatedAt" = now()
       WHERE obligation.id = ANY(${candidateIdArray})
         AND obligation.state = 'blocked'
-        AND obligation.continuation_segment_count <
-          ${MAX_PRECALC_CONTINUATION_SEGMENTS}
         AND obligation.continuation_no_progress_count <
           ${MAX_PRECALC_NO_PROGRESS_SEGMENTS}
-        AND COALESCE(obligation.last_outcome, '') NOT IN (
-          'continuation_no_progress_exhausted',
-          'continuation_segment_exhausted'
-        )
+        AND COALESCE(obligation.last_outcome, '') <>
+          'continuation_no_progress_exhausted'
         AND ${restartablePrecalcCheckpointSql(sql`obligation.id`)}
         AND NOT EXISTS (
           SELECT 1
@@ -1552,6 +1543,11 @@ const finiteMetric = (value: unknown): number | null =>
     ? value
     : null;
 
+const positiveMetric = (value: unknown): number | null => {
+  const metric = finiteMetric(value);
+  return metric != null && metric > 0 ? metric : null;
+};
+
 /** Extract only real engine measurements from the immutable PolarPoint
  * evidence payload. Missing/legacy data stays null. */
 export function precalcContinuationProgressFromEvidence(
@@ -1575,10 +1571,26 @@ export function precalcContinuationProgressFromEvidence(
     !Array.isArray(frameTrack.window)
       ? (frameTrack.window as Record<string, unknown>)
       : null;
+  const forceHistory =
+    payload?.force_history != null &&
+    typeof payload.force_history === "object" &&
+    !Array.isArray(payload.force_history)
+      ? (payload.force_history as Record<string, unknown>)
+      : null;
+  // Field-frame tracking is the strongest phase-repeatability evidence, but
+  // it can legitimately be incomplete while the immutable force history has
+  // advanced.  Use those physical force measurements only as per-field
+  // fallbacks so a productive continuation cannot be counted as a heartbeat
+  // and exhausted by the no-progress circuit breaker.
   return {
-    periodsRetained: finiteMetric(frameTrack?.periods_retained),
-    simulatedTimeS: finiteMetric(window?.t_end),
-    periodS: finiteMetric(frameTrack?.period_s),
+    periodsRetained:
+      finiteMetric(frameTrack?.periods_retained) ??
+      finiteMetric(forceHistory?.retained_cycles),
+    simulatedTimeS:
+      finiteMetric(window?.t_end) ?? finiteMetric(forceHistory?.window_end),
+    periodS:
+      positiveMetric(frameTrack?.period_s) ??
+      positiveMetric(forceHistory?.period_s),
     driftFrac: finiteMetric(frameTrack?.drift_frac),
     stationary:
       typeof frameTrack?.stationary === "boolean"
@@ -1587,45 +1599,86 @@ export function precalcContinuationProgressFromEvidence(
   };
 }
 
-/** Meaningful progress is phase evidence, not a heartbeat. A continuation
- * must add at least a quarter measured period (or a conservative time floor
- * when no period is measurable), materially lower drift, or become
- * stationary. */
+/** Progress is immutable physical advancement, not a worker heartbeat. When
+ * consecutive evidence snapshots agree on the measured period, any positive
+ * simulation-time advance keeps the same trajectory alive: infrastructure
+ * can interrupt a period into arbitrarily small segments. A changed/partial
+ * period estimate retains the conservative quarter-period gate so estimator
+ * churn cannot manufacture progress. */
 export function precalcContinuationMadeProgress(
   previous: PrecalcContinuationProgress | null,
   current: PrecalcContinuationProgress,
 ): boolean {
-  if (current.stationary === true && previous?.stationary !== true) return true;
-  if (!previous) {
-    return (
-      current.periodsRetained != null ||
-      current.simulatedTimeS != null ||
-      current.driftFrac != null ||
-      current.stationary != null
+  // A continuation without an immutable prior measurement has no proven
+  // physical baseline. Treat it as no progress rather than allowing a single
+  // reclassified snapshot to reset the circuit breaker.
+  if (!previous) return false;
+
+  const previousTime = previous.simulatedTimeS;
+  const currentTime = current.simulatedTimeS;
+  if (previousTime != null || currentTime != null) {
+    // Partial disappearance of the strongest measurement, or a restart onto
+    // an older trajectory, fails closed. Drift/stationarity improvements from
+    // that regressed snapshot cannot mint physical progress.
+    if (previousTime == null || currentTime == null) return false;
+    const timeTolerance = Math.max(1e-9, Math.abs(previousTime) * 1e-9);
+    const delta = currentTime - previousTime;
+    if (delta <= timeTolerance) return false;
+    // Compatible consecutive period estimates prove that this is the same
+    // measured trajectory. A positive immutable time delta is then real CFD
+    // progress even when an interruption split the period below 25%.
+    const periodScale =
+      current.periodS != null && previous.periodS != null
+        ? Math.max(current.periodS, previous.periodS)
+        : null;
+    const periodCompatible = Boolean(
+      periodScale != null &&
+      Math.abs(current.periodS! - previous.periodS!) / periodScale <= 0.05,
     );
-  }
-  if (
-    current.periodsRetained != null &&
-    previous.periodsRetained != null &&
-    current.periodsRetained - previous.periodsRetained >= 0.25
-  ) {
-    return true;
-  }
-  if (current.simulatedTimeS != null && previous.simulatedTimeS != null) {
-    const measuredPeriod = current.periodS ?? previous.periodS;
+    if (periodCompatible) return true;
+
+    // A missing or materially changed period estimate is weaker evidence.
+    // Keep the larger positive estimate so a shortened estimate cannot lower
+    // the gate and manufacture advancement from a tiny time delta.
+    const measuredPeriod =
+      current.periodS != null && previous.periodS != null
+        ? Math.max(current.periodS, previous.periodS)
+        : (current.periodS ?? previous.periodS);
     const requiredDelta =
       measuredPeriod != null
         ? Math.max(1e-6, measuredPeriod * 0.25)
-        : Math.max(1e-4, Math.abs(previous.simulatedTimeS) * 0.01);
-    if (current.simulatedTimeS - previous.simulatedTimeS >= requiredDelta) {
+        : Math.max(1e-4, Math.abs(previousTime) * 0.01);
+    if (delta >= requiredDelta) return true;
+    if (current.stationary === true && previous.stationary !== true)
+      return true;
+    if (
+      current.driftFrac != null &&
+      previous.driftFrac != null &&
+      previous.driftFrac > 0 &&
+      current.driftFrac <= previous.driftFrac * 0.9
+    ) {
       return true;
     }
+    return false;
   }
+
+  // Legacy evidence can lack the window end. Retained-cycle growth is usable
+  // only when both positive period estimates remain materially compatible;
+  // otherwise a changed estimator denominator can fabricate cycle progress.
+  if (
+    current.periodsRetained == null ||
+    previous.periodsRetained == null ||
+    current.periodS == null ||
+    previous.periodS == null
+  ) {
+    return false;
+  }
+  const periodScale = Math.max(current.periodS, previous.periodS);
+  const periodCompatible =
+    Math.abs(current.periodS - previous.periodS) / periodScale <= 0.05;
   return Boolean(
-    current.driftFrac != null &&
-    previous.driftFrac != null &&
-    previous.driftFrac > 0 &&
-    current.driftFrac <= previous.driftFrac * 0.9,
+    periodCompatible &&
+    current.periodsRetained - previous.periodsRetained >= 0.25,
   );
 }
 
@@ -1668,7 +1721,13 @@ export async function settlePrecalcObligationsForJobInTransaction(
     precalcObligationIds?: unknown;
     uransFidelity?: unknown;
     executedMeshRecoveryVersion?: unknown;
+    continueFromResultAttemptId?: unknown;
   };
+  const exactContinuationSourceAttemptId =
+    typeof payload.continueFromResultAttemptId === "string" &&
+    payload.continueFromResultAttemptId.length > 0
+      ? payload.continueFromResultAttemptId
+      : null;
   const acknowledgedMeshRecoveryVersion =
     typeof payload.executedMeshRecoveryVersion === "number" &&
     Number.isSafeInteger(payload.executedMeshRecoveryVersion) &&
@@ -1909,6 +1968,11 @@ export async function settlePrecalcObligationsForJobInTransaction(
         WHERE prior.obligation_id = ${obligation.id}
           AND prior.result_attempt_id IS NOT NULL
           ${
+            exactContinuationSourceAttemptId
+              ? sql`AND prior.result_attempt_id = ${exactContinuationSourceAttemptId}`
+              : sql`AND FALSE`
+          }
+          ${
             submission
               ? sql`AND prior.attempt_number < ${submission.attemptNumber}`
               : sql``
@@ -1955,16 +2019,6 @@ export async function settlePrecalcObligationsForJobInTransaction(
       restartable &&
       continuationNoProgressCount >= MAX_PRECALC_NO_PROGRESS_SEGMENTS,
     );
-    const continuationSegmentExhausted = Boolean(
-      sameCaseContinuation &&
-      !accepted &&
-      (obligation.continuationSegmentCount >=
-        MAX_PRECALC_CONTINUATION_SEGMENTS ||
-        (physicalContinuationSegment &&
-          restartable &&
-          continuationSegmentCount >= MAX_PRECALC_CONTINUATION_SEGMENTS)),
-    );
-
     // Engine acceptance proves a submission happened, not that a physical CFD
     // attempt happened. Release the reserved solver ordinal only for typed
     // continuation-stage, infrastructure, or deterministic setup/mesh
@@ -1995,19 +2049,14 @@ export async function settlePrecalcObligationsForJobInTransaction(
       state = "blocked";
       attemptState = "failed";
       lastOutcome = "continuation_permanent_failure";
-    } else if (
-      continuationNoProgressExhausted ||
-      continuationSegmentExhausted
-    ) {
+    } else if (continuationNoProgressExhausted) {
       state = "blocked";
       attemptState = infrastructure
         ? "cancelled"
         : judged?.classification
           ? "rejected"
           : "failed";
-      lastOutcome = continuationNoProgressExhausted
-        ? "continuation_no_progress_exhausted"
-        : "continuation_segment_exhausted";
+      lastOutcome = "continuation_no_progress_exhausted";
     } else if (infrastructure) {
       state = "pending";
       attemptState = "cancelled";
@@ -2134,7 +2183,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
     if (
       owner?.live &&
       state !== "cancelled" &&
-      (judged != null || continuationPermanent || continuationSegmentExhausted)
+      (judged != null || continuationPermanent)
     ) {
       const [revision] = await tx
         .select({
@@ -2153,18 +2202,16 @@ export async function settlePrecalcObligationsForJobInTransaction(
       }
       const reason = continuationNoProgressExhausted
         ? "continuation-no-progress"
-        : continuationSegmentExhausted
-          ? "continuation-segment-limit"
-          : continuationPermanent
-            ? "continuation-source-unavailable"
-            : solverIncidentReason(
-                judged?.reasons,
-                failureDisposition && failureDisposition !== "none"
-                  ? failureDisposition
-                  : transientFailure
-                    ? "solver-execution-failed"
-                    : "non-publishable-evidence",
-              );
+        : continuationPermanent
+          ? "continuation-source-unavailable"
+          : solverIncidentReason(
+              judged?.reasons,
+              failureDisposition && failureDisposition !== "none"
+                ? failureDisposition
+                : transientFailure
+                  ? "solver-execution-failed"
+                  : "non-publishable-evidence",
+            );
       await recordSolverIncidentInTransaction(tx, {
         stage: "preliminary",
         reason,
@@ -2516,8 +2563,6 @@ export async function precalcContinuationsForObligations(
       sql`, `,
     )}]`})
       AND obligation.state = 'pending'
-      AND obligation.continuation_segment_count <
-        ${MAX_PRECALC_CONTINUATION_SEGMENTS}
       AND obligation.continuation_no_progress_count <
         ${MAX_PRECALC_NO_PROGRESS_SEGMENTS}
     ORDER BY obligation.aoa_deg

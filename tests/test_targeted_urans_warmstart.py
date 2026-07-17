@@ -625,6 +625,113 @@ def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_pa
     assert (tcase / "log.simpleFoam.init").read_text() == "standalone init ok"
 
 
+def test_potential_foam_failure_is_infrastructure_before_urans_solver(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: initialization is checked and never reclassified as a
+    physical URANS failure or allowed to feed an uninitialized pimpleFoam."""
+
+    calls: list[str] = []
+
+    class FakeMesher:
+        def patches(self, _resolved):
+            return {}
+
+        def write_inputs(self, *_args, **_kwargs):
+            pass
+
+        def run_mesh(self, *_args, **_kwargs):
+            return SimpleNamespace(n_cells=1)
+
+    class FailedPotentialRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            if cmd.startswith("potentialFoam"):
+                return SimpleNamespace(
+                    ok=False,
+                    returncode=127,
+                    timed_out=False,
+                    stdout="potentialFoam executable unavailable",
+                )
+            return SimpleNamespace(
+                ok=True,
+                returncode=0,
+                timed_out=False,
+                stdout="Mesh non-orthogonality Max: 20 average: 5\nMesh OK.\n",
+            )
+
+        def solver(self, *_args, **_kwargs):
+            raise AssertionError("pimpleFoam/simpleFoam must not run")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "get_mesher", lambda _name: FakeMesher())
+
+    with pytest.raises(InfrastructureError, match="potentialFoam initialization failed"):
+        _prepare_transient_case(
+            tmp_path / "case" / "transient",
+            airfoil=None,
+            resolved=MeshParams(),
+            spec=CaseSpec(chord=0.25, speed=15.0, aoa_deg=4.0),
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(force_transient=True),
+            runner=FailedPotentialRunner(),
+            n_proc=1,
+            timeout=60,
+        )
+
+    assert calls[-1] == "potentialFoam"
+
+
+def test_cold_rans_potential_failure_remains_infrastructure(
+    tmp_path, monkeypatch
+):
+    calls: list[str] = []
+
+    class FailedPotentialRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            if cmd.startswith("potentialFoam"):
+                return SimpleNamespace(
+                    ok=False,
+                    returncode=1,
+                    timed_out=False,
+                    stdout="initial field creation failed",
+                )
+            return SimpleNamespace(ok=True, returncode=0, stdout="ok")
+
+        def solver(self, *_args, **_kwargs):
+            raise AssertionError("simpleFoam must not run without initialization")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_try_seed_initial_field", lambda *a, **k: False)
+    mesh_dir = tmp_path / "mesh"
+    mesh_dir.mkdir()
+
+    outcome = run_case(
+        tmp_path / "case",
+        airfoil=SimpleNamespace(name="n12", contour=[]),
+        spec=CaseSpec(chord=0.25, speed=15.0, aoa_deg=0.0),
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        mesh_params=MeshParams(),
+        solver_params=SolverParams(force_transient=False, write_images=[]),
+        mesher=SimpleNamespace(
+            patches=lambda _resolved: {},
+            cell_count=lambda _resolved: 1,
+        ),
+        runner=FailedPotentialRunner(),
+        mesh_dir=mesh_dir,
+        render_images=False,
+    )
+
+    assert outcome.failure_disposition.value == "infrastructure"
+    assert outcome.error is not None
+    assert "potentialFoam initialization failed" in outcome.error
+    assert calls == ["potentialFoam"]
+
+
 def _run_transient_with_checkmesh(tmp_path, monkeypatch, checkmesh_stdout: str):
     calls: list[str] = []
     quality_warnings: list[str] = []
@@ -916,21 +1023,22 @@ def test_chunk_restart_attempt_keeps_real_transient_uniform_time(tmp_path, monke
 
     monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
 
-    assert _run_transient_attempt(
-        tcase,
-        airfoil=None,
-        tmesh=None,
-        patches={},
-        spec=CaseSpec(chord=1.0, speed=50.0, aoa_deg=25.0),
-        fluid=FLUID,
-        roughness=RoughnessParams(),
-        solver_params=SolverParams(),
-        runner=FakeRunner(),
-        n_proc=1,
-        timeout=60,
-        run_time=0.4,
-        delta_t=8e-6,
-    ) is None
+    with pytest.raises(InfrastructureError, match="transient process failed"):
+        _run_transient_attempt(
+            tcase,
+            airfoil=None,
+            tmesh=None,
+            patches={},
+            spec=CaseSpec(chord=1.0, speed=50.0, aoa_deg=25.0),
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(),
+            runner=FakeRunner(),
+            n_proc=1,
+            timeout=60,
+            run_time=0.4,
+            delta_t=8e-6,
+        )
     assert time_state.read_text() == before
 
 
@@ -1070,9 +1178,9 @@ def test_timed_out_transient_with_unusable_rows_raises_truthful_timeout_message(
     assert "produced no coefficient.dat" not in str(err.value)
 
 
-def test_non_timeout_solver_failure_still_returns_none(tmp_path, monkeypatch):
-    """False-positive guard: a genuine crash (non-timeout) keeps the existing
-    'attempt failed' behaviour and does not fabricate a partial grade."""
+def test_ambiguous_non_timeout_solver_failure_is_infrastructure(tmp_path, monkeypatch):
+    """False-positive guard: an untyped non-zero exit is infrastructure and
+    does not fabricate a numerical recovery attempt or partial grade."""
 
     class FakeRunner:
         def solver(self, case_dir, *_args, monitor=None, **_kwargs):
@@ -1082,7 +1190,8 @@ def test_non_timeout_solver_failure_still_returns_none(tmp_path, monkeypatch):
     tcase = tmp_path / "transient"
     (tcase / "0").mkdir(parents=True)
 
-    assert _timeout_attempt(tcase, FakeRunner()) is None
+    with pytest.raises(InfrastructureError, match="transient process failed"):
+        _timeout_attempt(tcase, FakeRunner())
 
 
 def test_refined_pass_timeout_falls_back_to_base_result(tmp_path, monkeypatch):
@@ -1100,7 +1209,10 @@ def test_refined_pass_timeout_falls_back_to_base_result(tmp_path, monkeypatch):
     def fake_attempt(tcase, *_args, refined=False, **_kwargs):
         attempts.append(refined)
         if refined:
-            raise OpenFOAMError("URANS transient timed out after 7200s at t=0.31 of 3s (dt collapsed to 1e-06)")
+            raise pipeline.TransientTimeoutError(
+                "URANS transient timed out after 7200s at t=0.31 of 3s "
+                "(dt collapsed to 1e-06)"
+            )
         (tcase / "0.3").mkdir(exist_ok=True)
         return TransientResult(
             avg=SimpleNamespace(cl=0.5, cd=0.02, cm=-0.01, cl_cd=25.0, cl_std=0.0, cd_std=0.0, cm_std=0.0),
@@ -1133,6 +1245,61 @@ def test_refined_pass_timeout_falls_back_to_base_result(tmp_path, monkeypatch):
     assert result is not None
     assert not result.refined
     assert "auto-refinement failed after first pass" in result.quality.reason
+
+
+def test_refined_pass_infrastructure_failure_propagates(tmp_path, monkeypatch):
+    """An optional second trajectory does not turn runtime failure into a
+    physical URANS rejection merely because a base window already exists."""
+
+    def fake_prepare(tcase, *_args, **_kwargs):
+        tcase.mkdir(parents=True, exist_ok=True)
+        (tcase / "0").mkdir(exist_ok=True)
+        return (None, {})
+
+    def fake_attempt(tcase, *_args, refined=False, **_kwargs):
+        if refined:
+            raise InfrastructureError("MPI admission unavailable")
+        (tcase / "0.3").mkdir(exist_ok=True)
+        return TransientResult(
+            avg=SimpleNamespace(
+                cl=0.5,
+                cd=0.02,
+                cm=-0.01,
+                cl_cd=25.0,
+                cl_std=0.0,
+                cd_std=0.0,
+                cm_std=0.0,
+            ),
+            case_dir=tcase,
+            force_history=None,
+            quality=UransQuality(
+                ok=False,
+                can_refine=True,
+                reason="retained cycles 2.0 < 7.0",
+                measured_period_s=0.1,
+            ),
+            start_time=0.0,
+            end_time=0.3,
+            run_time=0.3,
+            wall_seconds=10.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    with pytest.raises(InfrastructureError, match="MPI admission unavailable"):
+        pipeline._run_transient(
+            tmp_path,
+            airfoil=None,
+            resolved=None,
+            spec=CaseSpec(chord=1.0, speed=7.3, aoa_deg=0.0),
+            fluid=None,
+            roughness=None,
+            solver_params=SolverParams(),
+            runner=None,
+            n_proc=1,
+            timeout=7200,
+        )
 
 
 def test_runner_marks_timeout_results(tmp_path):

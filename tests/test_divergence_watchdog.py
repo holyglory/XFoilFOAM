@@ -470,6 +470,178 @@ def test_condemned_transient_raises_truthful_error_not_graded(tmp_path, monkeypa
     with pytest.raises(OpenFOAMError, match="transient diverged at t=0.069"):
         _transient_attempt(tcase, KilledRunner())
 
+    # Both physical passes are retained; the second condemnation proves the
+    # bounded recovery was exhausted rather than silently repeating forever.
+    event = tcase / "numerical_recovery" / "v2" / "event_001"
+    assert (event / "pass_1_numerical" / "failure.json").is_file()
+    assert (event / "pass_2_numerical" / "failure.json").is_file()
+
+
+def test_condemned_transient_restores_checkpoint_and_recovers_conservatively(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: one structured numerical failure restores the exact safe
+    trajectory before a single upwind/Co<=1 retry, and pass-1 bytes survive."""
+
+    import json
+    from types import SimpleNamespace
+
+    from airfoilfoam import pipeline
+    from airfoilfoam.pipeline import write_divergence_condemnation
+
+    captured_params = []
+
+    class CapturingCaseBuilder:
+        def __init__(self, *args, **_kwargs):
+            captured_params.append(args[6])
+
+        def write_transient(self, *_args, **_kwargs):
+            pass
+
+    class RecoveringRunner:
+        calls = 0
+
+        def solver(self, case_dir, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                failed_time = case_dir / "0.1"
+                failed_time.mkdir()
+                (failed_time / "U").write_text("diverged U")
+                (failed_time / "p").write_text("diverged p")
+                _write_coeff(
+                    case_dir
+                    / "postProcessing"
+                    / "forceCoeffs1"
+                    / "0"
+                    / "coefficient.dat",
+                    _diverged_rows(),
+                )
+                write_divergence_condemnation(
+                    case_dir,
+                    "transient diverged at t=0.1: |Cl|=9e5, dt=5e-08",
+                )
+                return SimpleNamespace(
+                    ok=False,
+                    returncode=143,
+                    stdout="first pass killed",
+                    timed_out=False,
+                )
+
+            assert not (case_dir / "0.1").exists()
+            assert (case_dir / "0" / "U").read_text() == "safe U"
+            _write_coeff(
+                case_dir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat",
+                _post_stall_rows(t0=0.0, n=2000),
+            )
+            recovered_time = case_dir / "0.333"
+            recovered_time.mkdir()
+            (recovered_time / "U").write_text("recovered U")
+            (recovered_time / "p").write_text("recovered p")
+            return SimpleNamespace(
+                ok=True,
+                returncode=0,
+                stdout="conservative retry completed",
+                timed_out=False,
+            )
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", CapturingCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    (tcase / "0" / "U").write_text("safe U")
+    (tcase / "0" / "p").write_text("safe p")
+    runner = RecoveringRunner()
+
+    result = _transient_attempt(tcase, runner)
+
+    assert result is not None
+    assert runner.calls == 2
+    assert captured_params[0].momentum_scheme == "linearUpwind"
+    assert captured_params[1].momentum_scheme == "upwind"
+    assert captured_params[1].transient_max_courant == pytest.approx(1.0)
+    assert not (tcase / pipeline.URANS_RECOVERY_CHECKPOINT_DIR).exists()
+    failed = (
+        tcase
+        / "numerical_recovery"
+        / "v2"
+        / "event_001"
+        / "pass_1_numerical"
+    )
+    assert (failed / "last_time" / "0.1" / "U").read_text() == "diverged U"
+    metadata = json.loads((failed / "failure.json").read_text())
+    assert metadata["uransRecoveryVersion"] == 2
+    assert metadata["classification"] == "numerical"
+
+
+def test_generic_transient_exit_is_infrastructure_and_does_not_retry(
+    tmp_path, monkeypatch
+):
+    """False-positive guard: an ambiguous process exit never consumes the
+    numerical recovery pass or masquerades as exhausted URANS physics."""
+
+    from types import SimpleNamespace
+
+    from airfoilfoam import pipeline
+    from airfoilfoam.openfoam.runner import InfrastructureError
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", _FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    calls = 0
+
+    class BrokenRuntimeRunner:
+        def solver(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                ok=False,
+                returncode=1,
+                stdout="MPI runtime exited before a CFD step",
+                timed_out=False,
+            )
+
+    with pytest.raises(InfrastructureError, match="transient process failed"):
+        _transient_attempt(tcase, BrokenRuntimeRunner())
+
+    assert calls == 1
+    assert (
+        tcase
+        / "numerical_recovery"
+        / "v2"
+        / "event_001"
+        / "pass_1_infrastructure"
+        / "failure.json"
+    ).is_file()
+    assert not (tcase / pipeline.URANS_RECOVERY_CHECKPOINT_DIR).exists()
+
+
+def test_stale_recovery_checkpoint_is_never_overwritten(tmp_path, monkeypatch):
+    """An interrupted restore leaves the only known-good state in this tree;
+    a retry must fail closed instead of silently replacing those bytes."""
+
+    from airfoilfoam import pipeline
+    from airfoilfoam.openfoam.runner import InfrastructureError
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", _FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    checkpoint = tcase / pipeline.URANS_RECOVERY_CHECKPOINT_DIR
+    checkpoint.mkdir()
+    sentinel = checkpoint / "do-not-overwrite"
+    sentinel.write_text("last known good")
+
+    class MustNotRun:
+        def solver(self, *_args, **_kwargs):
+            raise AssertionError("solver must not run over an unresolved checkpoint")
+
+    with pytest.raises(InfrastructureError, match="stale last-known-good checkpoint"):
+        _transient_attempt(tcase, MustNotRun())
+
+    assert sentinel.read_text() == "last known good"
+
 
 def test_stale_marker_is_cleared_before_a_fresh_attempt(tmp_path, monkeypatch):
     """A marker left by a condemned earlier stage (e.g. the steady init) must

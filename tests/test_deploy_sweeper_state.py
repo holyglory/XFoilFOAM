@@ -836,6 +836,72 @@ def test_control_plane_deploy_fails_before_migration_when_media_repair_cannot_st
     assert not any(" up -d --no-deps node-api" in call for call in calls)
 
 
+@pytest.mark.parametrize("media_repair_running", [False, True])
+def test_engine_rebuild_quiesces_and_restores_media_repair_around_node_migration(
+    tmp_path: Path, media_repair_running: bool
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        media_repair_running=media_repair_running,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    media_stop_index = next(
+        index for index, call in enumerate(calls) if " stop media-repair" in call
+    )
+    node_restart_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up -d --no-deps --force-recreate api worker node-api" in call
+    )
+    if media_repair_running:
+        media_restore = " up -d --no-deps --force-recreate media-repair"
+    else:
+        media_restore = " up --no-start --no-deps --force-recreate media-repair"
+    media_restore_index = next(
+        index for index, call in enumerate(calls) if media_restore in call
+    )
+    assert media_stop_index < node_restart_index < media_restore_index
+
+
+def test_engine_rebuild_fails_before_migration_when_media_repair_cannot_stop(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        media_repair_stop_fails=True,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 41
+    assert "simulated media-repair stop failure" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any(" stop media-repair" in call for call in calls)
+    assert any(" up -d --no-deps sweeper" in call for call in calls)
+    assert not any(
+        " up -d --no-deps --force-recreate api worker node-api" in call
+        for call in calls
+    )
+
+
 @pytest.mark.parametrize("initial_state", ["stopped", "running"])
 def test_engine_rebuild_refusal_restores_exact_prior_sweeper_state(
     tmp_path: Path, initial_state: str
@@ -859,7 +925,11 @@ def test_engine_rebuild_refusal_restores_exact_prior_sweeper_state(
         assert not any(running_restore in call for call in calls)
     else:
         assert any(running_restore in call for call in calls)
-    assert not any(" up -d --no-deps --force-recreate api worker node-api" in call for call in calls)
+    assert any(" up -d --no-deps media-repair" in call for call in calls)
+    assert not any(
+        " up -d --no-deps --force-recreate api worker node-api" in call
+        for call in calls
+    )
     assert Path(env["ENV_FILE"]).read_text() == initial_env
 
 

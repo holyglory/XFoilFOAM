@@ -535,11 +535,25 @@ describe("GCS Zstandard evidence ingestion", () => {
     ]);
 
     const vtk = logicalArtifact(owner, "vtk_window", "VTK/pressure_0.vtu");
+    const continuationState = {
+      ...logicalArtifact(
+        owner,
+        "dictionary",
+        "openfoam/transient/transient_start.json",
+      ),
+      mime_type: "application/json",
+      role: "continuation_state",
+    };
     await register(vtk);
     await register(vtk);
+    await register(continuationState);
     expect(await memberRows()).toEqual([
       { kind: "vtk_window", memberPath: "VTK/pressure_0.vtu" },
       { kind: "manifest", memberPath: "evidence_manifest.json" },
+      {
+        kind: "dictionary",
+        memberPath: "openfoam/transient/transient_start.json",
+      },
     ]);
   });
 

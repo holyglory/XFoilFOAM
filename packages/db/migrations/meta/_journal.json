@@ -505,6 +505,27 @@
       "when": 1787011200000,
       "tag": "0071_result_owned_rans_incidents",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1787097600000,
+      "tag": "0072_monotonic_final_urans_continuation",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1787184000000,
+      "tag": "0073_solver_evidence_orphan_quarantine",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1787270400000,
+      "tag": "0074_verify_precalc_attempt_ownership",
+      "breakpoints": true
     }
   ]
 }

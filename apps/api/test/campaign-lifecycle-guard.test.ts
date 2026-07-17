@@ -50,6 +50,7 @@ import {
   type DB,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
 import {
   EngineClient,
   type EngineQueueState,
@@ -60,6 +61,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { db, sql as pgClient } from "../src/db";
 import { buildServer } from "../src/server";
+import { createExactResultAttemptFixture } from "./exact-result-fixture";
 
 const PREFIX = `api-campaign-life-${process.pid}-${Date.now().toString(36)}`;
 // File-unique physical value: campaign registries dedupe by canonical values
@@ -188,6 +190,30 @@ async function insertPrecalc(setup: CampaignSetup, aoaDeg: number) {
     })
     .returning();
   return row;
+}
+
+async function selectExactFixtureGeneration(
+  result: typeof results.$inferSelect,
+  state: "accepted" | "rejected",
+  reasons: string[] = [],
+): Promise<string> {
+  const resultAttemptId = await createExactResultAttemptFixture(db, result.id, {
+    publication:
+      state === "accepted"
+        ? "selected-eligible"
+        : "legacy-selected-reclassified",
+  });
+  await db.insert(resultClassifications).values({
+    resultAttemptId,
+    airfoilId: result.airfoilId,
+    simulationPresetRevisionId: result.simulationPresetRevisionId!,
+    aoaDeg: result.aoaDeg,
+    regime: result.regime ?? "urans",
+    classifierVersion: `${PREFIX}-exact-${state}-${result.aoaDeg}`,
+    state,
+    reasons,
+  });
+  return resultAttemptId;
 }
 
 type SettledOperation =
@@ -436,6 +462,10 @@ describe("campaign verification lifecycle guard", () => {
       state: "accepted",
       reasons: [],
     });
+    const acceptedAttemptId = await selectExactFixtureGeneration(
+      accepted,
+      "accepted",
+    );
     const rejected = await insertPrecalc(setupA, 2);
     await db
       .update(results)
@@ -457,10 +487,19 @@ describe("campaign verification lifecycle guard", () => {
       state: "rejected",
       reasons: ["insufficient-periods"],
     });
+    const rejectedAttemptId = await selectExactFixtureGeneration(
+      rejected,
+      "rejected",
+      ["insufficient-periods"],
+    );
     for (const campaignId of [campaigns.sharedA, campaigns.sharedB]) {
       await db
         .update(simCampaignPoints)
-        .set({ state: "terminal", resultId: accepted.id })
+        .set({
+          state: "terminal",
+          resultId: accepted.id,
+          resultAttemptId: acceptedAttemptId,
+        })
         .where(
           and(
             eq(simCampaignPoints.campaignId, campaignId),
@@ -469,7 +508,11 @@ describe("campaign verification lifecycle guard", () => {
         );
       await db
         .update(simCampaignPoints)
-        .set({ state: "terminal", resultId: rejected.id })
+        .set({
+          state: "terminal",
+          resultId: rejected.id,
+          resultAttemptId: rejectedAttemptId,
+        })
         .where(
           and(
             eq(simCampaignPoints.campaignId, campaignId),
@@ -770,14 +813,17 @@ describe("campaign verification lifecycle guard", () => {
       .select()
       .from(simUransVerifyQueue)
       .where(eq(simUransVerifyQueue.precalcResultId, accepted.id));
-    expect(verifyHistory.map((item) => item.state).sort()).toEqual([
-      "cancelled",
-      "pending",
-    ]);
+    // The immutable preliminary generation owns one durable ledger. A
+    // pre-submit cancellation may reopen that same ledger, but must not mint a
+    // second retry budget for the same exact attempt.
+    expect(verifyHistory.map((item) => item.state)).toEqual(["pending"]);
     const replacementVerify = verifyHistory.find(
       (item) => item.state === "pending",
     )!;
-    expect(replacementVerify.backgroundOwner).toBe(false);
+    expect(replacementVerify.id).toBe(verifyItem.id);
+    // Reopening preserves every owner already attached to this exact
+    // generation, including the independent background catalog owner.
+    expect(replacementVerify.backgroundOwner).toBe(true);
     const replacementVerifyOwners = await db
       .select({ campaignId: simUransVerifyQueueCampaigns.campaignId })
       .from(simUransVerifyQueueCampaigns)
@@ -955,7 +1001,12 @@ describe("campaign verification lifecycle guard", () => {
         state: input.state,
         reasons: input.state === "rejected" ? ["fixture-rejected"] : [],
       });
-      return row;
+      const currentResultAttemptId = await selectExactFixtureGeneration(
+        row,
+        input.state,
+        input.state === "rejected" ? ["fixture-rejected"] : [],
+      );
+      return { ...row, currentResultAttemptId };
     };
     const acceptedPrecalc = await evidence({
       aoaDeg: 0,
@@ -1075,6 +1126,10 @@ describe("campaign verification lifecycle guard", () => {
         aoaDeg: 0,
         state: "pending",
         precalcResultId: pausedResult.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          pausedResult.id,
+        ),
         createdAt: new Date(Date.now() - 60_000),
       })
       .returning();
@@ -1087,6 +1142,10 @@ describe("campaign verification lifecycle guard", () => {
         aoaDeg: 0,
         state: "pending",
         precalcResultId: activeResult.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          activeResult.id,
+        ),
       })
       .returning();
     await db.insert(simUransVerifyQueueCampaigns).values([
@@ -1208,6 +1267,10 @@ describe("campaign verification lifecycle guard", () => {
           aoaDeg: 0,
           state: "pending",
           precalcResultId: pendingResult.id,
+          precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+            db,
+            pendingResult.id,
+          ),
         },
         {
           airfoilId,
@@ -1215,6 +1278,10 @@ describe("campaign verification lifecycle guard", () => {
           aoaDeg: 1,
           state: "done",
           precalcResultId: historyResult.id,
+          precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+            db,
+            historyResult.id,
+          ),
           verifyResultId: historyResult.id,
           deltaCl: 0.012,
           deltaCd: 0.001,
@@ -1225,6 +1292,10 @@ describe("campaign verification lifecycle guard", () => {
           aoaDeg: 2,
           state: "running",
           precalcResultId: runningResult.id,
+          precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+            db,
+            runningResult.id,
+          ),
         },
       ])
       .returning();
@@ -1378,6 +1449,10 @@ describe("campaign verification lifecycle guard", () => {
         backgroundOwner: true,
         state: "pending",
         precalcResultId: runningResult.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          runningResult.id,
+        ),
       })
       .onConflictDoNothing()
       .returning({ id: simUransVerifyQueue.id });
@@ -1428,6 +1503,10 @@ describe("campaign verification lifecycle guard", () => {
           aoaDeg: 1,
           state: "running",
           precalcResultId: orphanResult.id,
+          precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+            db,
+            orphanResult.id,
+          ),
           updatedAt: staleAt,
         },
         {
@@ -1436,6 +1515,10 @@ describe("campaign verification lifecycle guard", () => {
           aoaDeg: 2,
           state: "running",
           precalcResultId: freshResult.id,
+          precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+            db,
+            freshResult.id,
+          ),
           // Deliberately old queue claim but a fresh composition lease below:
           // the healer must not race a valid in-flight submit.
           updatedAt: staleAt,
@@ -1545,6 +1628,10 @@ describe("terminal verification ownership healing", () => {
       state: "accepted",
       reasons: [],
     });
+    const acceptedPrecalcAttemptId = await selectExactFixtureGeneration(
+      acceptedPrecalc,
+      "accepted",
+    );
     const solved = [acceptedPrecalc];
     for (const aoaDeg of [1, 2, 3]) {
       const [row] = await db
@@ -1581,7 +1668,12 @@ describe("terminal verification ownership healing", () => {
     for (const row of solved) {
       await db
         .update(simCampaignPoints)
-        .set({ state: "terminal", resultId: row.id })
+        .set({
+          state: "terminal",
+          resultId: row.id,
+          resultAttemptId:
+            row.id === acceptedPrecalc.id ? acceptedPrecalcAttemptId : null,
+        })
         .where(
           and(
             eq(simCampaignPoints.campaignId, historicalId),
@@ -1637,6 +1729,10 @@ describe("terminal verification ownership healing", () => {
         state: "pending",
         backgroundOwner: false,
         precalcResultId: legacyResult.id,
+        precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+          db,
+          legacyResult.id,
+        ),
       })
       .returning();
     await db.insert(simUransVerifyQueueCampaigns).values({

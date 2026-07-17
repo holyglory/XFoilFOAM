@@ -16,13 +16,14 @@ WRAPPER = ROOT / "scripts/deploy/replay-pending-opencfd2606-rebuild.sh"
 MANIFEST = ROOT / "scripts/deploy/deployment-source-manifest.py"
 BOUND_REVISION = "63385777be7323777906fde44bdb9fa9b5cc0d6d"
 TARGET_REVISION = "c" * 40
+SEALED_TARGET_REVISION = "1357897ad7baa77add52738fe5afa022c28bd726"
 BUILD_ID = "prod-20260717-63385777be73-r2"
 API_IMAGE = "sha256:bc8e23648e9e76424ea36a584f8a825d65fe82a23aa4e4ad89b019197dcc735c"
 WORKER_IMAGE = "sha256:42120ef817af19510830d18f99be2b0f8d8739a4b9b235d2ee294e558f64229a"
 NODE_IMAGE = "sha256:64ee90e0045a36eace3c57aeb5b3467c1e1f46c5eafb2466b98f8b754cbade32"
 NEW_NODE_IMAGE = "sha256:" + "7" * 64
 NODE_API_SHA = "e3e1782f0517ea29e451fd89661a1a54f982673cd62ad5502e5d45eaaa6a94f4"
-NODE_ATTESTATION_SHA = "928986cd328e7af647cefe7c241ed1a5ce9a6446907061055a28f28392c0944e"
+NODE_ATTESTATION_SHA = "6f10619510378451e47e8aaa6579e663b879e47ce0af98097680c2b4462ddc62"
 FIRST_REPAIR_ENV_SHA = "6891290db1f293b1e4bfca62eacf588b1ad8c110d238ffdcfcd6a952d35eda8c"
 COOKIE = "aero_admin=fixture_payload.fixture_signature"
 FAILED_RESUME_JOURNAL = (
@@ -143,7 +144,12 @@ def _fixture_sources(tmp_path: Path) -> tuple[Path, Path, Path, str, str]:
         "tests/test_pending_cutover_node_api_repair.py",
     ):
         source = ROOT / relative
-        _write(target / relative, source.read_bytes(), executable=os.access(source, os.X_OK))
+        source_bytes = (
+            _git_file(SEALED_TARGET_REVISION, relative)
+            if relative == "apps/api/src/admin-routes.ts"
+            else source.read_bytes()
+        )
+        _write(target / relative, source_bytes, executable=os.access(source, os.X_OK))
 
     fake_rebuild = rb"""#!/usr/bin/env bash
 set -euo pipefail
@@ -797,8 +803,11 @@ def test_production_timeout_and_workflow_contract_are_exact() -> None:
     assert "ServerAliveCountMax=20" in workflow
     assert "Select only one pending-cutover recovery action" in workflow
     assert "replay-pending-opencfd2606-rebuild.sh" in workflow
-    assert "928986cd328e7af647cefe7c241ed1a5ce9a6446907061055a28f28392c0944e" in wrapper
-    assert "25452e17a7714911151cb13c5f88e2b91485a126387baf3514080e9f3ac1bb44" in wrapper
+    assert NODE_API_SHA == _sha(
+        _git_file(SEALED_TARGET_REVISION, "apps/api/src/admin-routes.ts")
+    )
+    assert "6f10619510378451e47e8aaa6579e663b879e47ce0af98097680c2b4462ddc62" in wrapper
+    assert "6046af2febe268060afcf7eff386a99ab5c6d0930e5eea2d70f10a715805b65b" in wrapper
     assert "df6f7558e3d53e1f7fd6158c171d02a1d62fe74ce721eb6cdb0132e6efff8f48" in wrapper
     assert "9324e40c112e662fa78cbcd7b1bb782b23f439150f59618f1119faf26d50034a" in wrapper
     assert '".github"' in MANIFEST.read_text()

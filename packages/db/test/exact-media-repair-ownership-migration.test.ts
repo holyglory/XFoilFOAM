@@ -419,6 +419,16 @@ beforeAll(async () => {
   await client.unsafe(`
     UPDATE polar_fit_sets SET is_current = true;
     UPDATE polar_compatibility_fit_sets SET is_current = true;
+
+    -- These 0055-era verification fixtures deliberately reference ordinary
+    -- RANS rows so migration 0056 can exercise its legacy job-owner
+    -- disambiguation. They are not valid active three-stage verification work:
+    -- migration 0074 requires an exact accepted preliminary-URANS attempt.
+    -- Retain their immutable ownership history as cancelled rows before
+    -- exercising the complete current migration chain.
+    UPDATE sim_urans_verify_queue
+       SET state = 'cancelled', "updatedAt" = now()
+     WHERE id IN ('${ID.verifyExact}', '${ID.verifyAmbiguous}');
   `);
   await migrate(drizzle(client), { migrationsFolder: migrations });
 }, 180_000);
@@ -621,18 +631,18 @@ describe("0056-0057 exact repair, verification, and selected-generation cleanup"
     expect(eligible.current_result_attempt_id).toBe(ID.acceptedAttempt);
   });
 
-  it("backfills only one unambiguous running verification owner", async () => {
+  it("retains only the one unambiguous legacy verification owner after cancellation", async () => {
     const rows = await client!.unsafe<
-      Array<{ id: string; sim_job_id: string | null }>
+      Array<{ id: string; sim_job_id: string | null; state: string }>
     >(`
-      SELECT id, sim_job_id
+      SELECT id, sim_job_id, state::text
       FROM sim_urans_verify_queue
       WHERE id IN ('${ID.verifyExact}', '${ID.verifyAmbiguous}')
       ORDER BY id
     `);
     expect(rows).toEqual([
-      { id: ID.verifyExact, sim_job_id: ID.jobExact },
-      { id: ID.verifyAmbiguous, sim_job_id: null },
+      { id: ID.verifyExact, sim_job_id: ID.jobExact, state: "cancelled" },
+      { id: ID.verifyAmbiguous, sim_job_id: null, state: "cancelled" },
     ]);
   });
 

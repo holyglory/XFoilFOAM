@@ -25,7 +25,7 @@ from typing import Callable, Optional
 from . import physics
 from .airfoil import Airfoil, max_concave_curvature
 from .cache import EngineCache, SeedHit
-from .capabilities import MESH_RECOVERY_VERSION
+from .capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
 from .config import Settings, get_settings
@@ -167,6 +167,10 @@ class CaseOutcome:
     video: dict[str, str] = field(default_factory=dict)  # field -> mp4 path relative to case dir
     mean_images: dict[str, str] = field(default_factory=dict)  # field -> mean png path
     evidence_artifacts: list[EvidenceArtifact] = field(default_factory=list)
+    #: Exact trajectory that produced this attempt. A case may retain both a
+    #: base and cadence-refined transient; cross-job continuation must resume
+    #: this selected child rather than rediscovering one by directory name.
+    continuation_transient_subdir: Optional[str] = None
     force_history: Optional[ForceHistory] = None
     frame_track: Optional[FrameTrack] = None
     #: Solve tier that produced the reported values (contract echo):
@@ -282,6 +286,15 @@ def _transient_timeout_message(
 #: detector's whole-job kill, and never a graded window of garbage.
 DIVERGENCE_MARKER_FILENAME = "divergence_condemned.json"
 
+#: Version-2 transient numerical recovery owns exactly one conservative retry.
+#: The retry is not a new physical attempt: it restores the byte-for-byte
+#: last-known-good same-case state, then reruns the failed chunk with first-order
+#: convection and a Co<=1 cap.  Both failed passes remain immutable evidence.
+URANS_NUMERICAL_RECOVERY_DIR = "numerical_recovery"
+URANS_RECOVERY_CHECKPOINT_DIR = "_urans_recovery_checkpoint_v2"
+URANS_NUMERICAL_RECOVERY_MAX_COURANT = 1.0
+URANS_NUMERICAL_RECOVERY_DELTA_T_FACTOR = 0.25
+
 
 def write_divergence_condemnation(case_dir: Path, reason: str) -> None:
     """Persist the watchdog's truthful condemnation for the solving pipeline."""
@@ -353,6 +366,250 @@ def _checked_solver_result(case_dir: Path, result: RunResult) -> RunResult:
             # closed into the infrastructure retry path.
             raise InfrastructureError(str(exc)) from exc
     return result.check()
+
+
+def _checked_initialization_result(
+    case_dir: Path,
+    result: RunResult | object,
+    *,
+    stage: str,
+) -> RunResult | object:
+    """Require a successful initialization command and classify it as infra.
+
+    ``potentialFoam`` prepares an initial field; it is not aerodynamic evidence.
+    A launcher, executable, timeout, or generic non-zero failure here must be
+    retried as infrastructure instead of being allowed to poison pimpleFoam or
+    widening a polar as a numerical RANS/URANS failure.
+    """
+
+    if bool(getattr(result, "ok", False)):
+        return result
+    command = str(getattr(result, "command", stage))
+    returncode = getattr(result, "returncode", "unknown")
+    stdout = str(getattr(result, "stdout", ""))
+    try:
+        check = getattr(result, "check", None)
+        if callable(check):
+            check()
+    except InfrastructureError as exc:
+        raise InfrastructureError(f"{stage} initialization failed: {exc}") from exc
+    except OpenFOAMError as exc:
+        raise InfrastructureError(f"{stage} initialization failed: {exc}") from exc
+    tail = "\n".join(stdout.splitlines()[-20:])
+    detail = f"\n{tail}" if tail else ""
+    raise InfrastructureError(
+        f"{stage} initialization failed ({returncode}): {command}{detail}"
+    )
+
+
+def _transient_process_failure(
+    case_dir: Path,
+    result: RunResult | object,
+    *,
+    march_stop: str | None,
+) -> OpenFOAMError | None:
+    """Return the typed failure for one pimpleFoam process, if any.
+
+    Only the structured divergence watchdog marker and SIGFPE prove a
+    numerical failure eligible for conservative recovery.  A timeout or the
+    explicit march-rate stop is graded by the existing partial-window path;
+    every other non-zero exit is infrastructure and must not consume the
+    numerical recovery pass.
+    """
+
+    timed_out = (
+        bool(getattr(result, "timed_out", False))
+        or (
+            not bool(getattr(result, "ok", False))
+            and getattr(result, "returncode", None) == 124
+        )
+        or march_stop is not None
+    )
+    if timed_out:
+        return None
+    condemnation = read_divergence_condemnation(case_dir)
+    if condemnation:
+        return HardSolverError(condemnation)
+    if bool(getattr(result, "ok", False)):
+        return None
+    command = str(getattr(result, "command", "pimpleFoam"))
+    returncode = getattr(result, "returncode", None)
+    if returncode == -signal.SIGFPE:
+        return HardSolverError(
+            f"OpenFOAM solver terminated with SIGFPE: {command}"
+        )
+    stdout = str(getattr(result, "stdout", ""))
+    tail = "\n".join(stdout.splitlines()[-40:])
+    detail = f"\n{tail}" if tail else ""
+    return InfrastructureError(
+        f"OpenFOAM transient process failed ({returncode}): {command}{detail}"
+    )
+
+
+def _numeric_time_names(case_dir: Path) -> list[str]:
+    names: list[tuple[float, str]] = []
+    for child in case_dir.iterdir() if case_dir.exists() else []:
+        if not child.is_dir():
+            continue
+        try:
+            value = float(child.name)
+        except ValueError:
+            continue
+        names.append((value, child.name))
+    return [name for _, name in sorted(names)]
+
+
+def _create_transient_recovery_checkpoint(case_dir: Path) -> Path:
+    """Snapshot the minimum restartable state immediately before pimpleFoam."""
+
+    checkpoint = case_dir / URANS_RECOVERY_CHECKPOINT_DIR
+    if checkpoint.exists():
+        raise InfrastructureError(
+            "URANS numerical recovery found a stale last-known-good checkpoint; "
+            "refusing to overwrite evidence from an interrupted restoration"
+        )
+    latest = _latest_time_dir(case_dir)
+    if latest is None:
+        raise InfrastructureError(
+            "URANS numerical recovery cannot checkpoint a case without a time directory"
+        )
+    checkpoint.mkdir(parents=True)
+    baseline_times = _numeric_time_names(case_dir)
+    (checkpoint / "checkpoint.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "uransRecoveryVersion": URANS_RECOVERY_VERSION,
+                "baselineTimes": baseline_times,
+                "latestTime": latest.name,
+                "createdAt": time.time(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shutil.copytree(latest, checkpoint / "latest_time", symlinks=True)
+    for name in ("system", "postProcessing"):
+        source = case_dir / name
+        if source.is_dir():
+            shutil.copytree(source, checkpoint / name, symlinks=True)
+    return checkpoint
+
+
+def _restore_transient_recovery_checkpoint(case_dir: Path, checkpoint: Path) -> None:
+    """Restore the exact last-known-good trajectory and remove failed output."""
+
+    try:
+        metadata = json.loads((checkpoint / "checkpoint.json").read_text())
+        baseline_times = metadata["baselineTimes"]
+        latest_name = metadata["latestTime"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise InfrastructureError(
+            f"URANS numerical recovery checkpoint is unreadable: {exc}"
+        ) from exc
+    if (
+        not isinstance(baseline_times, list)
+        or not all(isinstance(name, str) for name in baseline_times)
+        or not isinstance(latest_name, str)
+    ):
+        raise InfrastructureError("URANS numerical recovery checkpoint metadata is invalid")
+    baseline = set(baseline_times)
+    for name in _numeric_time_names(case_dir):
+        path = case_dir / name
+        if name not in baseline or name == latest_name:
+            shutil.rmtree(path)
+    latest_snapshot = checkpoint / "latest_time"
+    if not latest_snapshot.is_dir():
+        raise InfrastructureError(
+            "URANS numerical recovery checkpoint is missing its latest-time fields"
+        )
+    shutil.copytree(latest_snapshot, case_dir / latest_name, symlinks=True)
+    for name in ("system", "postProcessing"):
+        destination = case_dir / name
+        if destination.exists():
+            shutil.rmtree(destination)
+        source = checkpoint / name
+        if source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+    for processor in case_dir.glob("processor*"):
+        if processor.is_dir():
+            shutil.rmtree(processor)
+    clear_divergence_condemnation(case_dir)
+    clear_march_markers(case_dir)
+
+
+def _remove_transient_recovery_checkpoint(checkpoint: Path) -> None:
+    try:
+        shutil.rmtree(checkpoint)
+    except FileNotFoundError:
+        pass
+
+
+def _next_transient_recovery_event(case_dir: Path) -> Path:
+    root = case_dir / URANS_NUMERICAL_RECOVERY_DIR / f"v{URANS_RECOVERY_VERSION}"
+    root.mkdir(parents=True, exist_ok=True)
+    existing = []
+    for child in root.iterdir():
+        match = re.fullmatch(r"event_(\d+)", child.name)
+        if child.is_dir() and match:
+            existing.append(int(match.group(1)))
+    event = root / f"event_{(max(existing, default=0) + 1):03d}"
+    event.mkdir()
+    return event
+
+
+def _preserve_transient_failure_evidence(
+    case_dir: Path,
+    event_dir: Path,
+    *,
+    pass_number: int,
+    classification: str,
+    result: RunResult | object,
+    failure: OpenFOAMError,
+    start_time: float,
+    target_end_time: float,
+) -> None:
+    """Copy immutable failed-pass evidence before restoring the checkpoint."""
+
+    pass_dir = event_dir / f"pass_{pass_number}_{classification}"
+    pass_dir.mkdir()
+    stdout = str(getattr(result, "stdout", ""))
+    (pass_dir / "log.pimpleFoam").write_text(stdout, encoding="utf-8")
+    (pass_dir / "failure.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "uransRecoveryVersion": URANS_RECOVERY_VERSION,
+                "pass": pass_number,
+                "classification": classification,
+                "failureType": type(failure).__name__,
+                "failure": str(failure),
+                "command": str(getattr(result, "command", "pimpleFoam")),
+                "returnCode": getattr(result, "returncode", None),
+                "timedOut": bool(getattr(result, "timed_out", False)),
+                "startTime": start_time,
+                "targetEndTime": target_end_time,
+                "lastWrittenTime": _latest_time(case_dir),
+                "capturedAt": time.time(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for name in ("system", "postProcessing"):
+        source = case_dir / name
+        if source.is_dir():
+            shutil.copytree(source, pass_dir / name, symlinks=True)
+    latest = _latest_time_dir(case_dir)
+    if latest is not None:
+        shutil.copytree(latest, pass_dir / "last_time" / latest.name, symlinks=True)
+    marker = case_dir / DIVERGENCE_MARKER_FILENAME
+    if marker.is_file():
+        shutil.copy2(marker, pass_dir / marker.name)
 
 
 def _record_outcome_failure(outcome: CaseOutcome, exc: BaseException) -> None:
@@ -1313,7 +1570,18 @@ TRANSIENT_START_MARKER = "transient_start.json"
 #: derived media and evidence are rebuilt from scratch after the resumed
 #: solve, VTK frames are re-converted by foamToVTK, and stale decompositions
 #: are re-created by the runner's ``decomposePar -latestTime -force``.
-CONTINUATION_SKIP_DIRS = frozenset({"evidence", "images", "frames", "VTK", "custom_renders", "_seed_stage"})
+CONTINUATION_SKIP_DIRS = frozenset(
+    {
+        "evidence",
+        "images",
+        "frames",
+        "VTK",
+        "custom_renders",
+        "_seed_stage",
+        URANS_NUMERICAL_RECOVERY_DIR,
+        URANS_RECOVERY_CHECKPOINT_DIR,
+    }
+)
 
 
 class ContinuationPermanentError(OpenFOAMError):
@@ -1334,6 +1602,10 @@ class TransientResume:
     #: latestTime of the saved case at staging — this job's own integration
     #: starts here, so wall-rate projections must measure from this origin.
     resume_from: float
+    #: Minimum measured-period tail justified by the immutable source result.
+    #: Ordinary shortfall/budget continuation stays at one period; a source
+    #: that explicitly failed stationarity or field cadence requires three.
+    corrective_tail_periods: float = 1.0
 
 
 @dataclass
@@ -1343,6 +1615,7 @@ class ContinuationSource:
     transient_subdir: str
     transient_start: float
     resume_from: float
+    corrective_tail_periods: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -1642,9 +1915,9 @@ def _require_same_continuation_engine(
 def _require_exact_source_result_point(
     metadata: ContinuationJobMetadata,
     aoa_deg: float | None,
-) -> None:
+) -> dict[str, object] | None:
     if aoa_deg is None or metadata.result is None or metadata.case_slug is None:
-        return
+        return None
     polars = metadata.result.get("polars")
     if not isinstance(polars, list):
         raise _continuation_permanent(
@@ -1654,7 +1927,10 @@ def _require_exact_source_result_point(
     for polar in polars:
         if not isinstance(polar, dict):
             continue
-        for collection_name in ("points", "attempts"):
+        # A continuation normally targets a rejected attempt. Prefer that row
+        # if a legacy result document happens to expose the same case in both
+        # collections, because its quality warnings own corrective sizing.
+        for collection_name in ("attempts", "points"):
             rows = polar.get(collection_name, [])
             if not isinstance(rows, list):
                 continue
@@ -1675,7 +1951,7 @@ def _require_exact_source_result_point(
                         abs_tol=1e-9,
                     )
                 ):
-                    return
+                    return row
     if matching_case_seen:
         raise _continuation_permanent(
             f"source result case {metadata.case_slug!r} has no point at exact "
@@ -1685,6 +1961,42 @@ def _require_exact_source_result_point(
         f"source result does not contain continuation case "
         f"{metadata.case_slug!r} at AoA {aoa_deg:g}"
     )
+
+
+def _continuation_corrective_tail_periods(
+    source_result: dict[str, object] | None,
+) -> float:
+    """Return only the corrective tail justified by immutable source evidence.
+
+    Three newly measured periods are needed to replace a non-stationary or
+    sparse published tail.  A pure retained-cycle deficit or wall-budget stop
+    keeps the ordinary one-period floor; blindly giving every continuation
+    three periods can itself create a timeout under the bounded tier budget.
+    """
+
+    if source_result is None:
+        return 1.0
+    frame_track = source_result.get("frame_track")
+    if (
+        isinstance(frame_track, dict)
+        and frame_track.get("stationary") is False
+    ):
+        return URANS_NONSTATIONARY_EXTENSION_PERIODS
+    warnings = source_result.get("quality_warnings")
+    if not isinstance(warnings, list):
+        return 1.0
+    corrective_markers = (
+        "not stationary",
+        "established-oscillation",
+        "frames/cycle",
+    )
+    if any(
+        isinstance(warning, str)
+        and any(marker in warning.lower() for marker in corrective_markers)
+        for warning in warnings
+    ):
+        return URANS_NONSTATIONARY_EXTENSION_PERIODS
+    return 1.0
 
 
 def _restored_manifest_payload(restored: Path) -> dict[str, object]:
@@ -1815,14 +2127,39 @@ def _infer_transient_start(tcase: Path) -> float:
     return seg_times[0] if seg_times else 0.0
 
 
-def _find_continuable_transient(src_case: Path) -> str:
-    """The transient subdir of a saved case, or a truthful OpenFOAMError."""
-    if (src_case / "transient").is_dir():
-        return "transient"
+def _find_continuable_transient(
+    src_case: Path,
+    expected_subdir: str | None = None,
+) -> str:
+    """Return the exact selected transient or fail rather than guessing.
+
+    A full-fidelity attempt can retain both ``transient`` and
+    ``transient_refined``.  The result row identifies which one produced its
+    evidence.  Legacy rows without that provenance may continue only when the
+    case has one unambiguous trajectory; archive hydration remains safe because
+    the selected archived trajectory is materialised as the sole ``transient``.
+    """
+
+    if expected_subdir is not None:
+        if (
+            not expected_subdir.startswith("transient")
+            or Path(expected_subdir).name != expected_subdir
+            or expected_subdir in {".", ".."}
+        ):
+            raise OpenFOAMError(
+                f"saved case {src_case.name} records unsafe transient trajectory "
+                f"{expected_subdir!r}"
+            )
+        if (src_case / expected_subdir).is_dir():
+            return expected_subdir
+        raise OpenFOAMError(
+            f"saved case {src_case.name} does not contain its selected transient "
+            f"trajectory {expected_subdir!r}"
+        )
     candidates = sorted(
         d.name
         for d in src_case.iterdir()
-        if d.is_dir() and d.name.startswith("transient") and not d.name.endswith("_refined")
+        if d.is_dir() and d.name.startswith("transient")
     )
     if len(candidates) == 1:
         return candidates[0]
@@ -1898,10 +2235,13 @@ def _copy_case_tree(src_case: Path, dst_case: Path) -> None:
             shutil.copy2(src, dst, follow_symlinks=True)
 
 
-def _validate_restartable_continuation_case(src_case: Path) -> str:
+def _validate_restartable_continuation_case(
+    src_case: Path,
+    expected_subdir: str | None = None,
+) -> str:
     """Return the exact restartable transient subdir or fail truthfully."""
 
-    transient_subdir = _find_continuable_transient(src_case)
+    transient_subdir = _find_continuable_transient(src_case, expected_subdir)
     src_t = src_case / transient_subdir
     latest = _latest_time_dir(src_t)
     if latest is None:
@@ -1958,6 +2298,11 @@ def _materialize_archived_continuation_case(
         copy_tree(openfoam / "system", staged_transient / "system")
     if not copy_tree(archived_transient / "constant", staged_transient / "constant"):
         copy_tree(openfoam / "constant", staged_transient / "constant")
+    for marker_name in (TRANSIENT_START_MARKER, URANS_EARLY_STOP_MARKER):
+        archived_marker = archived_transient / marker_name
+        if archived_marker.is_file():
+            staged_transient.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(archived_marker, staged_transient / marker_name)
     copy_tree(openfoam / "postProcessing", staged_transient / "postProcessing")
     copy_tree(restored_evidence / "time_directories", staged_transient)
 
@@ -2167,6 +2512,7 @@ def _finish_staged_continuation(
     transient_subdir: str,
     *,
     source_description: str,
+    corrective_tail_periods: float = 1.0,
 ) -> ContinuationSource:
     dst_t = dst_case / transient_subdir
     transient_start = read_transient_start_marker(dst_t)
@@ -2195,6 +2541,7 @@ def _finish_staged_continuation(
         transient_subdir=transient_subdir,
         transient_start=transient_start,
         resume_from=resume_from,
+        corrective_tail_periods=corrective_tail_periods,
     )
 
 
@@ -2244,12 +2591,24 @@ def stage_continuation_case(
                 "source job has no result.json proving the exact continuation "
                 f"case and AoA {aoa_deg:g}"
             )
-    _require_exact_source_result_point(metadata, aoa_deg)
+    source_result = _require_exact_source_result_point(metadata, aoa_deg)
+    corrective_tail_periods = _continuation_corrective_tail_periods(source_result)
+    selected_transient_subdir = None
+    if source_result is not None:
+        recorded_subdir = source_result.get("continuation_transient_subdir")
+        if recorded_subdir is not None and not isinstance(recorded_subdir, str):
+            raise _continuation_permanent(
+                "source result continuation trajectory is not a string"
+            )
+        selected_transient_subdir = recorded_subdir
 
     live_error: OpenFOAMError
     if src_case.is_dir():
         try:
-            transient_subdir = _validate_restartable_continuation_case(src_case)
+            transient_subdir = _validate_restartable_continuation_case(
+                src_case,
+                selected_transient_subdir,
+            )
         except OpenFOAMError as exc:
             live_error = exc
         else:
@@ -2264,6 +2623,7 @@ def stage_continuation_case(
                 dst_case,
                 transient_subdir,
                 source_description="live saved case",
+                corrective_tail_periods=corrective_tail_periods,
             )
     else:
         live_error = InfrastructureError(
@@ -2330,6 +2690,7 @@ def stage_continuation_case(
         dst_case,
         transient_subdir,
         source_description=source_description,
+        corrective_tail_periods=corrective_tail_periods,
     )
 
 
@@ -2707,6 +3068,156 @@ def _grade_precalc_established_oscillation(
     )
 
 
+def _full_strict_stationarity_reason(
+    stats: PeriodWindowStats,
+    drift_tolerance: float,
+) -> str:
+    """Canonical full-tier stationarity rejection shared by live/final grades."""
+
+    return (
+        f"URANS window not stationary: Cl drift {stats.drift_frac:.3f} "
+        f"exceeds tolerance {drift_tolerance:g} over "
+        f"{stats.whole_periods} whole periods"
+    )
+
+
+def _grade_full_strict_stationarity(
+    case_dir: Path,
+    coeff_paths: list[Path],
+    spec: CaseSpec,
+    solver_params: SolverParams,
+    quality: UransQuality,
+    *,
+    early_stopped: bool,
+) -> UransQuality:
+    """Apply the final full-tier mean-drift gate while the case is live.
+
+    The finalizer has always published the strict integer-period verdict, but
+    discovering a drift there is too late for the same-case controller to add
+    evidence.  Grade the byte-identical signal/window here.  Unlike precalc,
+    full fidelity deliberately keeps the historical strict two-half mean gate
+    and may use the force-history period when the corroborated estimator is
+    unavailable, matching the final frame-track path exactly.
+    """
+
+    if (
+        solver_params.urans_fidelity != UransFidelity.full
+        or quality.no_shedding
+        or URANS_APPARENT_FLAT_OBSERVATION_MARKER in quality.reason.lower()
+    ):
+        return quality
+
+    period: Optional[float] = quality.measured_period_s
+    if not coeff_paths:
+        return _quality_with(
+            quality,
+            ok=False,
+            can_refine=False,
+            reason=(
+                "URANS strict stationarity verdict unavailable: coefficient "
+                f"evidence is missing; prior force-history grade: {quality.reason}"
+            ),
+        )
+    try:
+        t_all, cl_all, cd_all, cm_all = coefficient_series(coeff_paths)
+        if early_stopped:
+            t_c, cl_c, cd_c, cm_c = _early_stop_retained_series(
+                case_dir, t_all, cl_all, cd_all, cm_all
+            )
+        else:
+            t_c, cl_c, cd_c, cm_c = discard_startup(
+                t_all,
+                cl_all,
+                cd_all,
+                cm_all,
+                fraction=solver_params.transient_discard_fraction,
+            )
+        estimate = estimate_period(
+            t_c,
+            cl_c,
+            speed=spec.speed,
+            chord=spec.chord,
+            alpha_deg=spec.aoa_deg,
+        )
+        if estimate is not None:
+            period = estimate.period_s
+        if period is None or not math.isfinite(period) or period <= 0:
+            return _quality_with(
+                quality,
+                ok=False,
+                can_refine=False,
+                reason=(
+                    "URANS strict stationarity verdict unavailable: no valid "
+                    f"shedding period; prior force-history grade: {quality.reason}"
+                ),
+            )
+        stats = period_window_stats(
+            t_c,
+            cl_c,
+            cd_c,
+            cm_c,
+            period,
+            drift_tolerance=solver_params.urans_drift_tolerance,
+            established_oscillation=False,
+            # The strict full-tier verdict is drift-only, but pass the same
+            # period-stability value as the final frame-track path so these two
+            # grades remain structurally identical as that contract evolves.
+            period_stable=(
+                estimate is not None and not estimate.ambiguous
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed before finalization
+        logger.warning(
+            "full strict stationarity grading failed for %s",
+            case_dir,
+            exc_info=True,
+        )
+        valid_period = (
+            period
+            if period is not None and math.isfinite(period) and period > 0
+            else None
+        )
+        return _quality_with(
+            quality,
+            ok=False,
+            can_refine=valid_period is not None,
+            measured_period_s=valid_period,
+            reason=(
+                "URANS strict stationarity verdict unavailable: grading error "
+                f"({type(exc).__name__}); prior force-history grade: {quality.reason}"
+            ),
+        )
+    if stats is None:
+        return _quality_with(
+            quality,
+            ok=False,
+            can_refine=True,
+            measured_period_s=period,
+            reason=(
+                "URANS strict stationarity verdict unavailable: no whole-period "
+                f"statistics; prior force-history grade: {quality.reason}"
+            ),
+        )
+    if stats.stationary:
+        return quality
+
+    strict_reason = _full_strict_stationarity_reason(
+        stats,
+        solver_params.urans_drift_tolerance,
+    )
+    prior_reason = "" if quality.ok else quality.reason.strip()
+    return _quality_with(
+        quality,
+        ok=False,
+        can_refine=True,
+        reason=(f"{prior_reason}; {strict_reason}" if prior_reason else strict_reason),
+        measured_period_s=stats.period_s,
+        retained_cycles=float(stats.whole_periods),
+        retained_start_time=stats.window_start,
+        retained_end_time=stats.window_end,
+    )
+
+
 def refined_transient_timing(
     measured_period_s: float,
     original_run_time_s: float,
@@ -2760,6 +3271,10 @@ def _copy_initialized_transient_case(src: Path, dst: Path, start_time: float) ->
     # auto-refine with a degenerate retained window -> FileExistsError).
     if start_dir is not None and not (dst / start_dir.name).exists():
         shutil.copytree(start_dir, dst / start_dir.name, symlinks=True)
+    # The copied trajectory starts at the exact same coefficient-history
+    # boundary as its source.  Persist it immediately so both live and archived
+    # continuation paths remain byte-for-byte deterministic.
+    write_transient_start_marker(dst, start_time)
 
 
 def _seed_transient_from_steady(steady_time_dir: Path, tcase: Path) -> bool:
@@ -2873,10 +3388,16 @@ def _prepare_transient_case(
             "skipping the in-case short simpleFoam init",
             tcase,
         )
-        runner.application(tcase, dialect.potential_foam_command, timeout=600)
+        potential = runner.application(
+            tcase, dialect.potential_foam_command, timeout=600
+        )
+        _checked_initialization_result(
+            tcase, potential, stage="potentialFoam"
+        )
         _check_cancel(cancel_check)
         return tmesh, patches
-    runner.application(tcase, dialect.potential_foam_command, timeout=600)
+    potential = runner.application(tcase, dialect.potential_foam_command, timeout=600)
+    _checked_initialization_result(tcase, potential, stage="potentialFoam")
     _check_cancel(cancel_check)
     # Unconditional steady (RANS) initialisation stage, for the URANS-only path
     # too: even a short, non-converged SIMPLE field gives the transient a
@@ -2919,80 +3440,197 @@ def _run_transient_attempt(
     clear_march_markers(tcase)
     start_t = _latest_time(tcase)
     end_t = start_t + run_time
-    remaining_timeout = float(timeout)
+    initial_remaining_timeout = float(timeout)
     if deadline is not None:
-        remaining_timeout = min(
-            remaining_timeout,
+        initial_remaining_timeout = min(
+            initial_remaining_timeout,
             max(0.0, float(deadline) - time.monotonic()),
         )
-    if remaining_timeout <= 0.0:
+    if initial_remaining_timeout <= 0.0:
         raise TransientTimeoutError(
             "URANS integration stopped by the wall-clock budget guard before "
             "the next same-case chunk could start"
         )
-    CaseBuilder(
-        airfoil,
-        patches,
-        tmesh,
-        spec,
-        fluid,
-        roughness,
-        solver_params,
-        n_proc=n_proc,
-        dialect=dialect,
-    ).write_transient(
-        tcase,
-        start_t,
-        end_t,
-        delta_t,
-        write_interval=write_interval,
-        max_delta_t=max_delta_t,
-    )
-    # Arm the heartbeat march-rate watchdog for this chunk: it projects the
-    # trailing simulated-time rate against this target/budget and stops a
-    # provably hopeless march early (graded below as a continuable budget
-    # stop — restartable state, honest reason).
-    write_march_budget_marker(
-        tcase,
-        end_t=end_t,
-        budget_s=remaining_timeout,
-        wall_start=time.time(),
-    )
-    solve_started = time.monotonic()
-    res = runner.solver(
-        tcase,
-        dialect.transient_solver_command,
-        n_proc,
-        timeout=remaining_timeout,
-        restart=True,
-        monitor=_make_urans_monitor(
-            tcase,
+    checkpoint = _create_transient_recovery_checkpoint(tcase)
+    wall_seconds = 0.0
+
+    def run_solver_pass(
+        pass_params: SolverParams,
+        *,
+        pass_delta_t: float,
+        pass_max_delta_t: float | None,
+    ) -> tuple[object, float, str | None, bool, OpenFOAMError | None]:
+        nonlocal wall_seconds
+        remaining = float(timeout)
+        if deadline is not None:
+            remaining = min(
+                remaining,
+                max(0.0, float(deadline) - time.monotonic()),
+            )
+        if remaining <= 0.0:
+            raise TransientTimeoutError(
+                "URANS integration stopped by the wall-clock budget guard before "
+                "the numerical recovery pass could start"
+            )
+        CaseBuilder(
+            airfoil,
+            patches,
+            tmesh,
             spec,
-            coeff_start_time,
-            solver_params=solver_params,
-        ),
-    )
-    wall_seconds = max(0.0, time.monotonic() - solve_started)
-    _check_cancel(cancel_check)
-    (tcase / "log.pimpleFoam").write_text(res.stdout)
-    # Divergence watchdog condemnation: the heartbeat thread killed a solver
-    # whose coefficients blew past the sanity bound (or whose dt collapsed
-    # persistently). The partial window is GARBAGE — never grade it like a
-    # timeout; fail the case with the watchdog's truthful message instead.
-    _raise_if_condemned(tcase)
-    # A solver TIMEOUT is not a crash: the run may have written a gradable
-    # partial coefficient window. Only a genuine solver failure aborts here.
-    # A march-rate guard stop is the SAME class of outcome (wall-clock
-    # grounds, restartable state) — it just arrived early instead of at the
-    # budget wall, so it takes the same honest partial-grade path.
-    march_stop = read_march_stop(tcase)
-    timed_out = (
-        bool(getattr(res, "timed_out", False))
-        or (not res.ok and getattr(res, "returncode", None) == 124)
-        or march_stop is not None
-    )
-    if not res.ok and not timed_out:
-        return None
+            fluid,
+            roughness,
+            pass_params,
+            n_proc=n_proc,
+            dialect=dialect,
+        ).write_transient(
+            tcase,
+            start_t,
+            end_t,
+            pass_delta_t,
+            write_interval=write_interval,
+            max_delta_t=pass_max_delta_t,
+        )
+        # Arm the heartbeat march-rate watchdog for this chunk: it projects
+        # trailing simulated-time progress against the bounded tier budget.
+        write_march_budget_marker(
+            tcase,
+            end_t=end_t,
+            budget_s=remaining,
+            wall_start=time.time(),
+        )
+        solve_started = time.monotonic()
+        pass_result = runner.solver(
+            tcase,
+            dialect.transient_solver_command,
+            n_proc,
+            timeout=remaining,
+            restart=True,
+            monitor=_make_urans_monitor(
+                tcase,
+                spec,
+                coeff_start_time,
+                solver_params=pass_params,
+            ),
+        )
+        wall_seconds += max(0.0, time.monotonic() - solve_started)
+        _check_cancel(cancel_check)
+        (tcase / "log.pimpleFoam").write_text(
+            str(getattr(pass_result, "stdout", "")), encoding="utf-8"
+        )
+        pass_march_stop = read_march_stop(tcase)
+        pass_timed_out = (
+            bool(getattr(pass_result, "timed_out", False))
+            or (
+                not bool(getattr(pass_result, "ok", False))
+                and getattr(pass_result, "returncode", None) == 124
+            )
+            or pass_march_stop is not None
+        )
+        pass_failure = _transient_process_failure(
+            tcase, pass_result, march_stop=pass_march_stop
+        )
+        return (
+            pass_result,
+            remaining,
+            pass_march_stop,
+            pass_timed_out,
+            pass_failure,
+        )
+
+    try:
+        res, remaining_timeout, march_stop, timed_out, failure = run_solver_pass(
+            solver_params,
+            pass_delta_t=delta_t,
+            pass_max_delta_t=max_delta_t,
+        )
+    except BaseException:
+        _remove_transient_recovery_checkpoint(checkpoint)
+        raise
+
+    if failure is not None:
+        event_dir = _next_transient_recovery_event(tcase)
+        classification = (
+            "numerical" if isinstance(failure, HardSolverError) else "infrastructure"
+        )
+        _preserve_transient_failure_evidence(
+            tcase,
+            event_dir,
+            pass_number=1,
+            classification=classification,
+            result=res,
+            failure=failure,
+            start_time=start_t,
+            target_end_time=end_t,
+        )
+        try:
+            _restore_transient_recovery_checkpoint(tcase, checkpoint)
+        except BaseException:
+            # The checkpoint is the only last-known-good state if restoration
+            # itself fails. Keep it for immutable failure archival/repair.
+            raise
+        if not isinstance(failure, HardSolverError):
+            _remove_transient_recovery_checkpoint(checkpoint)
+            raise failure
+
+        recovery_params = solver_params.model_copy(
+            update={
+                "momentum_scheme": "upwind",
+                "transient_max_courant": min(
+                    float(solver_params.transient_max_courant),
+                    URANS_NUMERICAL_RECOVERY_MAX_COURANT,
+                ),
+            }
+        )
+        recovery_delta_t = max(
+            1e-12, float(delta_t) * URANS_NUMERICAL_RECOVERY_DELTA_T_FACTOR
+        )
+        recovery_max_delta_t = recovery_delta_t * STARTUP_MAX_DELTA_T_FACTOR
+        if max_delta_t is not None:
+            recovery_max_delta_t = min(
+                recovery_max_delta_t, float(max_delta_t)
+            )
+        try:
+            clear_divergence_condemnation(tcase)
+            clear_march_markers(tcase)
+            (
+                res,
+                remaining_timeout,
+                march_stop,
+                timed_out,
+                retry_failure,
+            ) = run_solver_pass(
+                recovery_params,
+                pass_delta_t=recovery_delta_t,
+                pass_max_delta_t=recovery_max_delta_t,
+            )
+        except BaseException:
+            _remove_transient_recovery_checkpoint(checkpoint)
+            raise
+        if retry_failure is not None:
+            retry_classification = (
+                "numerical"
+                if isinstance(retry_failure, HardSolverError)
+                else "infrastructure"
+            )
+            _preserve_transient_failure_evidence(
+                tcase,
+                event_dir,
+                pass_number=2,
+                classification=retry_classification,
+                result=res,
+                failure=retry_failure,
+                start_time=start_t,
+                target_end_time=end_t,
+            )
+            _restore_transient_recovery_checkpoint(tcase, checkpoint)
+            _remove_transient_recovery_checkpoint(checkpoint)
+            if isinstance(retry_failure, HardSolverError):
+                raise HardSolverError(
+                    "URANS numerical recovery v2 exhausted after the "
+                    f"conservative same-case retry: {retry_failure}"
+                ) from retry_failure
+            raise retry_failure
+
     if n_proc > 1:
         reconstruct_timeout = remaining_timeout
         if deadline is not None:
@@ -3002,7 +3640,8 @@ def _run_transient_attempt(
             )
         if reconstruct_timeout <= 0.0:
             _check_cancel(cancel_check)
-            raise OpenFOAMError(
+            _remove_transient_recovery_checkpoint(checkpoint)
+            raise InfrastructureError(
                 "URANS MPI reconstruction could not start before the shared "
                 "tier deadline; decomposed processor field state was not "
                 "reconstructed and is not safely continuable"
@@ -3022,7 +3661,8 @@ def _run_transient_attempt(
             )
             if reconstruction_timed_out:
                 _check_cancel(cancel_check)
-                raise OpenFOAMError(
+                _remove_transient_recovery_checkpoint(checkpoint)
+                raise InfrastructureError(
                     "URANS MPI reconstruction timed out before decomposed "
                     "processor field state could be published; the result is "
                     "not safely continuable"
@@ -3030,8 +3670,13 @@ def _run_transient_attempt(
             elif not reconstruction.ok:
                 # A deterministic reconstruction failure is not a wall-budget
                 # outcome, even when pimpleFoam itself had already timed out.
-                return None
+                _remove_transient_recovery_checkpoint(checkpoint)
+                raise InfrastructureError(
+                    "URANS MPI reconstruction failed; decomposed processor "
+                    "field state was not published and is not safely continuable"
+                )
         _check_cancel(cancel_check)
+    _remove_transient_recovery_checkpoint(checkpoint)
 
     def _timeout_error() -> OpenFOAMError:
         files_now = _coeff_files(tcase)
@@ -3109,6 +3754,14 @@ def _run_transient_attempt(
         ),
     )
     quality = _grade_precalc_established_oscillation(
+        tcase,
+        list(coeff_paths),
+        spec,
+        solver_params,
+        quality,
+        early_stopped=bool(early_stop),
+    )
+    quality = _grade_full_strict_stationarity(
         tcase,
         list(coeff_paths),
         spec,
@@ -3265,6 +3918,27 @@ def _quality_allows_more_integration(quality: UransQuality, target_cycles: float
     )
     not_stationary = "not stationary" in reason or "established-oscillation" in reason
     return too_short or too_sparse or not_stationary
+
+
+def _transient_physical_progress_time(
+    case_dir: Path,
+    result: TransientResult | None = None,
+) -> float:
+    """Strongest measured same-case progress token (never a requested endTime)."""
+
+    values = [_latest_time(case_dir)]
+    if result is not None and result.force_history is not None:
+        history = result.force_history
+        if history.t:
+            values.append(float(history.t[-1]))
+        if history.window_end is not None:
+            values.append(float(history.window_end))
+    files = _coeff_files(case_dir)
+    if files:
+        coefficient_end = _coeff_last_time(files[-1])
+        if coefficient_end is not None:
+            values.append(float(coefficient_end))
+    return max(value for value in values if math.isfinite(value))
 
 
 def _quality_needs_period_acquisition(
@@ -3469,8 +4143,17 @@ def _extend_transient_until_periods(
                 result.quality.frames_per_cycle + 1e-9 < URANS_MIN_FRAMES_PER_CYCLE
                 or "frames/cycle" in reason
             )
-            not_stationary = precalc and (
-                "not stationary" in reason or "established-oscillation" in reason
+            # Both tiers own a live stationarity verdict.  Precalc uses the
+            # established-oscillation test; full uses the strict mean-drift
+            # gate.  Either needs a meaningful measured same-case tail before
+            # the attempt can become terminal.
+            not_stationary = (
+                "not stationary" in reason
+                or "established-oscillation" in reason
+                or (
+                    solver_params.urans_fidelity == UransFidelity.full
+                    and "strict stationarity verdict unavailable" in reason
+                )
             )
             if target_deficit <= 1e-6 and not (sparse or not_stationary):
                 break
@@ -3564,6 +4247,7 @@ def _extend_transient_until_periods(
                 reason=reason,
             )
             break
+        progress_before = _transient_physical_progress_time(tcase, result)
         try:
             nxt = _run_transient_attempt(
                 tcase, airfoil, tmesh, patches, spec, fluid, roughness, solver_params,
@@ -3572,11 +4256,12 @@ def _extend_transient_until_periods(
                 delta_t=min(initial_delta_t, period / 5000.0),
                 write_interval=write_interval,
                 max_delta_t=write_interval,
+                refined=result.refined,
                 coeff_start_time=transient_start,
                 cancel_check=cancel_check,
                 deadline=deadline,
             )
-        except OpenFOAMError as exc:
+        except TransientTimeoutError as exc:
             # A chunk that timed out without gradable data must not discard the
             # already-graded window; the point keeps its honest partial grade.
             # A TIMEOUT (unlike a crash/divergence) leaves the previous chunk's
@@ -3585,8 +4270,6 @@ def _extend_transient_until_periods(
             budget_note = (
                 f" URANS integration {URANS_BUDGET_STOP_MARKER} mid-continuation — "
                 f"the saved case state resumes from the last written time step;"
-                if isinstance(exc, TransientTimeoutError)
-                else ""
             )
             result.quality = _quality_with(
                 result.quality,
@@ -3595,6 +4278,22 @@ def _extend_transient_until_periods(
                 reason=(
                     f"URANS continuation chunk failed after retaining {retained:.1f} of "
                     f"{target:g} periods: {exc};{budget_note} {result.quality.reason}"
+                ),
+            )
+            break
+        except InfrastructureError:
+            # Runtime/launcher/storage failures do not become aerodynamic
+            # evidence merely because they happened during an extension chunk.
+            raise
+        except OpenFOAMError as exc:
+            result.quality = _quality_with(
+                result.quality,
+                ok=False,
+                can_refine=False,
+                reason=(
+                    f"URANS continuation numerical recovery failed after retaining "
+                    f"{retained:.1f} of {target:g} periods: {exc}; "
+                    f"{result.quality.reason}"
                 ),
             )
             break
@@ -3613,9 +4312,23 @@ def _extend_transient_until_periods(
         total_wall += max(0.0, nxt.wall_seconds)
         end_time = nxt.end_time
         result = nxt
+        progress_after = _transient_physical_progress_time(tcase, nxt)
+        progress_tolerance = max(1e-12, abs(progress_before) * 1e-9)
+        if progress_after <= progress_before + progress_tolerance:
+            end_time = progress_after
+            result.quality = _quality_with(
+                result.quality,
+                ok=False,
+                can_refine=False,
+                reason=(
+                    f"URANS {URANS_CONTINUATION_REQUIRED_MARKER}: the same-case "
+                    "chunk produced no measurable simulated-time or force-history "
+                    f"advance (t={progress_before:.9g}); {result.quality.reason}"
+                ),
+            )
+            break
     if (
         chunks >= URANS_CONTINUATION_MAX_CHUNKS
-        and solver_params.urans_fidelity == UransFidelity.precalc
         and _quality_allows_more_integration(result.quality, target)
     ):
         if result.early_stopped:
@@ -3707,14 +4420,34 @@ def _run_transient(
                     period = estimate.period_s
         except Exception:  # noqa: BLE001 - chunk sizing must never block the resume
             period = None
+        requested_corrective_periods = float(resume.corrective_tail_periods)
+        evidence_corrective_periods = (
+            max(1.0, requested_corrective_periods)
+            if math.isfinite(requested_corrective_periods)
+            else 1.0
+        )
         if period is not None and math.isfinite(period) and period > 0:
             retained = span * (1.0 - discard) / period
-            chunk_sim = max(period, (target - retained) * period / max(1e-6, 1.0 - discard))
+            # K < target makes the stationarity model report false even for an
+            # otherwise healthy short window.  The ordinary retained deficit
+            # owns that case.  The evidence-backed three-period replacement is
+            # applied only after the target exists and the source still needs a
+            # stationary/dense corrective tail.
+            minimum_corrective_periods = (
+                evidence_corrective_periods
+                if retained + 1e-9 >= target
+                else 1.0
+            )
+            chunk_sim = max(
+                minimum_corrective_periods * period,
+                (target - retained) * period / max(1e-6, 1.0 - discard),
+            )
             write_interval: Optional[float] = period / URANS_FRAME_WRITE_PER_CYCLE
             delta_t = min(initial_delta_t, period / 5000.0)
         else:
             chunk_sim = max(
-                2.0 * initial_period, solver_params.transient_cycles * initial_period - span
+                2.0 * initial_period,
+                solver_params.transient_cycles * initial_period - span,
             )
             write_interval = None
             delta_t = initial_delta_t
@@ -3793,17 +4526,17 @@ def _run_transient(
         first.end_time = max(first.end_time, _latest_time(tcase))
         first.run_time = max(0.0, first.end_time - transient_start)
     if (
-        solver_params.urans_fidelity == UransFidelity.precalc
-        and (
-            URANS_CONTINUATION_REQUIRED_MARKER in first.quality.reason
-            or _quality_allows_more_integration(
+        URANS_CONTINUATION_REQUIRED_MARKER in first.quality.reason
+        or (
+            solver_params.urans_fidelity == UransFidelity.precalc
+            and _quality_allows_more_integration(
                 first.quality, float(solver_params.urans_min_periods)
             )
         )
     ):
-        # Precalc correctable-quality work is handled only by bounded same-case
-        # continuation above.  A separate copied rerun wastes the already-built
-        # trajectory and was the source of slow, terminal "review" outcomes.
+        # Stationarity/retention work is handled by bounded same-case
+        # continuation above. A separate copied rerun wastes the already-built
+        # trajectory; a cap-marked full-tier result must remain restartable too.
         return first
     if (
         first.quality.ok
@@ -3921,10 +4654,23 @@ def _run_transient(
             cancel_check=cancel_check,
             deadline=tier_deadline,
         )
-    except OpenFOAMError:
+    except TransientTimeoutError:
         # A refined pass that timed out without gradable data must not discard
         # the completed base pass — fall back to the base result below.
         refined = None
+    except InfrastructureError:
+        raise
+    except HardSolverError:
+        # Both failed numerical passes are a critical exhausted-recovery
+        # outcome. Propagate so the finalizer archives the refined trajectory's
+        # immutable pass evidence instead of hiding it behind the older base.
+        raise
+    except OpenFOAMError as exc:
+        # Every internal pimple/reconstruction path should already be typed.
+        # Fail closed if a new ambiguous OpenFOAM path appears.
+        raise InfrastructureError(
+            f"URANS refined trajectory failed without typed numerical evidence: {exc}"
+        ) from exc
     if refined is None:
         first.quality = UransQuality(
             ok=False,
@@ -3938,6 +4684,24 @@ def _run_transient(
             retained_end_time=first.quality.retained_end_time,
         )
         return first
+    refined = _extend_transient_until_periods(
+        refined_case,
+        refined,
+        first.start_time,
+        airfoil,
+        tmesh,
+        patches,
+        spec,
+        fluid,
+        roughness,
+        solver_params,
+        runner,
+        n_proc,
+        timeout,
+        refined_timing.delta_t,
+        cancel_check=cancel_check,
+        deadline=tier_deadline,
+    )
     return refined
 
 
@@ -4036,6 +4800,28 @@ def _post_processing_evidence_role(relative_path: Path) -> str:
         return "force_coefficients"
     if function_name == "yPlus":
         return "y_plus"
+    return "field_data"
+
+
+def _numerical_recovery_evidence_role(relative_path: Path) -> str:
+    """Classify the immutable failed-pass bundle without inventing new kinds."""
+
+    if relative_path.name.startswith("log."):
+        return "log"
+    if "postProcessing" in relative_path.parts:
+        index = relative_path.parts.index("postProcessing")
+        function_name = (
+            relative_path.parts[index + 1]
+            if index + 1 < len(relative_path.parts)
+            else ""
+        )
+        if function_name.startswith("forceCoeffs"):
+            return "force_coefficients"
+        return "field_data"
+    if "last_time" in relative_path.parts or "latest_time" in relative_path.parts:
+        return "time_directory"
+    if relative_path.suffix == ".json" or "system" in relative_path.parts:
+        return "dictionary"
     return "field_data"
 
 
@@ -4162,6 +4948,20 @@ def _archive_case_evidence(
                 "quality_evidence",
                 manifest_base=evidence_dir,
             )
+        _copy_tree_files_classified(
+            post_dir / URANS_NUMERICAL_RECOVERY_DIR,
+            raw_dir / "transient" / URANS_NUMERICAL_RECOVERY_DIR,
+            entries,
+            _numerical_recovery_evidence_role,
+            manifest_base=evidence_dir,
+        )
+        _copy_tree_files_classified(
+            post_dir / URANS_RECOVERY_CHECKPOINT_DIR,
+            raw_dir / "transient" / "recovery_checkpoint",
+            entries,
+            _numerical_recovery_evidence_role,
+            manifest_base=evidence_dir,
+        )
 
     for log in sorted(set(case_dir.glob("log*")) | set(post_dir.glob("log*"))):
         if log.is_file():
@@ -4237,6 +5037,9 @@ def _archive_case_evidence(
         "speedMps": outcome.spec.speed,
         "chordM": outcome.spec.chord,
         "unsteady": outcome.unsteady,
+        "uransRecoveryVersion": (
+            URANS_RECOVERY_VERSION if outcome.method_key == "openfoam.urans" else None
+        ),
         "windowStart": start_time,
         "windowEnd": end_time,
         "media": {
@@ -4522,17 +5325,60 @@ def _finalize_outcome(
         # A continuation's per-job override (PolarRequest.budget_override_s)
         # replaces the tier budget for this job only (24 h cap).
         urans_timeout = urans_budget_seconds(solver_params, urans_budget_s)
-        transient = _run_transient(
-            case_dir, airfoil, resolved, spec, fluid, roughness, urans_params,
-            runner, n_proc, urans_timeout, subdir=transient_subdir, shared_mesh_dir=shared_mesh_dir,
-            steady_field_dir=steady_field_dir,
-            steady_field_accepted=steady_field_accepted,
-            cancel_check=cancel_check,
-            resume=resume,
-            quality_warnings=outcome.quality_warnings,
-            urans_mesh=urans_mesh,
-            urans_precalc_mesh=urans_precalc_mesh,
-        )
+        failure_post_dir = case_dir / transient_subdir
+        try:
+            transient = _run_transient(
+                case_dir, airfoil, resolved, spec, fluid, roughness, urans_params,
+                runner, n_proc, urans_timeout, subdir=transient_subdir, shared_mesh_dir=shared_mesh_dir,
+                steady_field_dir=steady_field_dir,
+                steady_field_accepted=steady_field_accepted,
+                cancel_check=cancel_check,
+                resume=resume,
+                quality_warnings=outcome.quality_warnings,
+                urans_mesh=urans_mesh,
+                urans_precalc_mesh=urans_precalc_mesh,
+            )
+        except JobCancelled:
+            raise
+        except OpenFOAMError as exc:
+            # A failed pimpleFoam pass is still immutable solver evidence.  In
+            # particular, the version-2 conservative retry preserves pass 1
+            # before restoring its checkpoint; archive that bundle before the
+            # outer batch catcher turns this into a typed unavailable result.
+            refined_failure_dir = case_dir / f"{transient_subdir}_refined"
+            if (
+                refined_failure_dir.is_dir()
+                and (
+                    refined_failure_dir / URANS_NUMERICAL_RECOVERY_DIR
+                ).is_dir()
+            ):
+                failure_post_dir = refined_failure_dir
+            outcome.fidelity = urans_point_fidelity(solver_params)
+            outcome.unsteady = True
+            outcome.converged = False
+            outcome.continuation_transient_subdir = failure_post_dir.name
+            outcome.quality_warnings.append(
+                f"URANS automatic recovery did not produce a publishable result: {exc}"
+            )
+            if failure_post_dir.is_dir():
+                try:
+                    _archive_case_evidence(
+                        case_dir,
+                        failure_post_dir,
+                        outcome,
+                        image_subdir=image_subdir,
+                        requested_fields=[],
+                    )
+                except Exception as archive_exc:  # noqa: BLE001 - retain live bytes
+                    logger.exception(
+                        "failed to archive URANS failure evidence for %s",
+                        failure_post_dir,
+                    )
+                    outcome.quality_warnings.append(
+                        "URANS failure evidence remains on the engine volume; "
+                        f"immutable archival failed: {archive_exc}"
+                    )
+            raise
         _check_cancel(cancel_check)
         if transient is not None:
             avg = transient.avg
@@ -4549,6 +5395,7 @@ def _finalize_outcome(
             # mean is STILL a URANS-produced value, so it echoes urans_*).
             outcome.fidelity = urans_point_fidelity(solver_params)
             post_dir = transient.case_dir
+            outcome.continuation_transient_subdir = transient.case_dir.name
             outcome.force_history = transient.force_history
             if transient.force_history is not None and not transient.quality.no_shedding:
                 outcome.strouhal = transient.force_history.strouhal
@@ -4629,9 +5476,10 @@ def _finalize_outcome(
                         )
                     else:
                         outcome.quality_warnings.append(
-                            f"URANS window not stationary: Cl drift {frame_stats.drift_frac:.3f} "
-                            f"exceeds tolerance {solver_params.urans_drift_tolerance:g} over "
-                            f"{frame_stats.whole_periods} whole periods"
+                            _full_strict_stationarity_reason(
+                                frame_stats,
+                                solver_params.urans_drift_tolerance,
+                            )
                         )
                 elif precalc_tier:
                     # Acceptance under the established-oscillation gate is a
@@ -5047,7 +5895,12 @@ def run_case(
             )
             if not seeded:
                 # Potential-flow initialisation greatly stabilises the cold RANS start.
-                runner.application(case_dir, dialect.potential_foam_command, timeout=600)
+                potential = runner.application(
+                    case_dir, dialect.potential_foam_command, timeout=600
+                )
+                _checked_initialization_result(
+                    case_dir, potential, stage="potentialFoam"
+                )
             _check_cancel(cancel_check)
             res = runner.solver(
                 case_dir, dialect.steady_solver_command, n_proc, timeout=steady_timeout
@@ -6040,7 +6893,12 @@ def _solve_cold_marched(
             runner, cache, cancel_check=cancel_check,
         )
         if not seeded:
-            runner.application(polar_dir, dialect.potential_foam_command, timeout=600)
+            potential = runner.application(
+                polar_dir, dialect.potential_foam_command, timeout=600
+            )
+            _checked_initialization_result(
+                polar_dir, potential, stage="potentialFoam"
+            )
         _check_cancel(cancel_check)
         res = runner.solver(
             polar_dir, dialect.steady_solver_command, n_proc, timeout=solver_timeout

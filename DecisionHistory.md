@@ -42,6 +42,9 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
 - Decision: present and execute each requested angle as one sequence:
   RANS screening → fast preliminary URANS → final verified URANS. A rejected
   or non-converged RANS screen is normal handoff evidence, not point failure.
+  An accepted RANS point completes without unnecessary URANS. A critical RANS
+  row must distinguish never-started preflight from attempted recovery, and an
+  attempt/evidence-row count must not be labeled as physical-run count.
   Deterministic mesh or runtime failure is not aerodynamic handoff evidence:
   repair it automatically under a versioned strategy and show a red system
   incident only if the current strategy cannot reach fast URANS.
@@ -62,7 +65,10 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   Storage/setup loss and same-case continuation do not spend a new fresh solve.
   Exhausted or non-progressing preliminary/final recovery is one critical
   system incident, and repeated signatures require investigation plus a
-  remediation version.
+  remediation version. An accepted final URANS generation remains publishable
+  when it differs from the fast estimate; show the stored deltas as a
+  non-critical quality warning, and keep red for a stage that exhausted without
+  producing its required result.
 - Why: a per-point list is not a matrix of independent failure categories, and
   exposing RANS rejection, continuation submissions, and evidence records as
   peer outcomes made normal handoff look terminal. Leaving unavailable results
@@ -72,7 +78,8 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   cross-version continuation falsifies provenance. The selected sequence keeps
   the common path legible, conserves compatible evidence and mesh work, makes
   rare failures unmistakable, and lets the control plane deploy safely before
-  the recovery-capable engine.
+  the recovery-capable engine. Treating an accepted final/fast comparison as a
+  red failure would misstate an available authoritative result as missing.
 
 ## D-2026-07-16-campaign-cell-evidence-dialog — Campaign cells explain automatic recovery without calling it failure
 

@@ -80,12 +80,11 @@ export function parseEvidenceManifest(
       `evidence manifest file ${index} path`,
     );
     if (entries.has(path)) {
-      throw new Error(`evidence manifest contains duplicate member path ${path}`);
+      throw new Error(
+        `evidence manifest contains duplicate member path ${path}`,
+      );
     }
-    if (
-      typeof entry.sha256 !== "string" ||
-      !SHA256.test(entry.sha256)
-    ) {
+    if (typeof entry.sha256 !== "string" || !SHA256.test(entry.sha256)) {
       throw new Error(`evidence manifest file ${index} sha256 is malformed`);
     }
     if (
@@ -131,7 +130,12 @@ export function manifestMemberSetSha256(
   entries: ReadonlyArray<EvidenceManifestEntry>,
 ): string {
   const hash = createHash("sha256");
-  for (const entry of [...entries].sort((a, b) => a.path.localeCompare(b.path))) {
+  // Match Python's deterministic Unicode/code-point ordering and the
+  // PostgreSQL C-collation trigger. UTF-8 byte order preserves Unicode scalar
+  // value order, unlike localeCompare (which is host-locale dependent).
+  for (const entry of [...entries].sort((a, b) =>
+    Buffer.compare(Buffer.from(a.path, "utf8"), Buffer.from(b.path, "utf8")),
+  )) {
     hash.update(entry.path);
     hash.update("\0");
     hash.update(entry.sha256);
@@ -146,7 +150,9 @@ export function databaseMemberAssociationsSha256(
   entries: ReadonlyArray<EvidenceManifestEntry & { artifactId: string }>,
 ): string {
   const hash = createHash("sha256");
-  for (const entry of [...entries].sort((a, b) => a.path.localeCompare(b.path))) {
+  for (const entry of [...entries].sort((a, b) =>
+    a.path.localeCompare(b.path),
+  )) {
     hash.update(entry.path);
     hash.update("\0");
     hash.update(entry.artifactId);

@@ -553,6 +553,9 @@ export interface JobRuntimeResponse {
 
 export interface PolarPoint {
   case_slug?: string | null;
+  /** Exact child transient that produced this attempt. Required for new
+   * restartable URANS evidence; absent on legacy engine results. */
+  continuation_transient_subdir?: string | null;
   aoa_deg: number;
   cl?: number | null;
   cd?: number | null;

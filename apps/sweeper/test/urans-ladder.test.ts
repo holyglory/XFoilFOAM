@@ -34,6 +34,7 @@ import {
   meshProfiles,
   outputProfiles,
   precalcContinuationsForObligations,
+  precalcSnapshotForVerifyItem,
   probeCampaignCompletion,
   recordPrecalcObligationSubmission,
   requeueRestartablePrecalcContinuations,
@@ -141,6 +142,60 @@ function stubEngine(
       };
     },
   } as unknown as EngineClient;
+}
+
+async function createAcceptedPrecalcGeneration(input: {
+  resultId: string;
+  aoaDeg: number;
+  label: string;
+  cl: number;
+  cd: number;
+  cm: number;
+  createdAt?: Date;
+}): Promise<string> {
+  const [attempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId: input.resultId,
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: input.aoaDeg,
+      engineJobId: `${PREFIX}-${input.label}`,
+      engineCaseSlug: `aoa_${input.aoaDeg}_precalc`,
+      status: "done",
+      source: "solved",
+      regime: "urans",
+      validForPolar: true,
+      cl: input.cl,
+      cd: input.cd,
+      cm: input.cm,
+      clCd: input.cd === 0 ? null : input.cl / input.cd,
+      converged: true,
+      unsteady: true,
+      evidencePayload: { fidelity: "urans_precalc" },
+      solvedAt: input.createdAt ?? new Date(),
+      createdAt: input.createdAt ?? new Date(),
+    })
+    .returning({ id: resultAttempts.id });
+  await db.insert(resultClassifications).values({
+    resultId: input.resultId,
+    resultAttemptId: attempt.id,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg: input.aoaDeg,
+    regime: "urans",
+    classifierVersion: "verify-generation-fixture-v1",
+    state: "accepted",
+    region: "attached",
+    confidence: 1,
+    reasons: [],
+  });
+  await db
+    .update(results)
+    .set({ currentResultAttemptId: attempt.id })
+    .where(eq(results.id, input.resultId));
+  return attempt.id;
 }
 
 /** Closed scheduler scope for this file's physical fixtures. Vitest files run
@@ -363,8 +418,9 @@ describe("migration 0034 schema pin", () => {
       SELECT column_name FROM information_schema.columns WHERE table_name = 'sim_urans_verify_queue'
     `)) as unknown as { column_name: string }[];
     // Contract 4 plus migration 0056's exact execution-owner column and
-    // migration 0068's durable final-recovery ledger, pinned exactly. JSON
-    // request provenance never substitutes for sim_job_id.
+    // migration 0068's durable final-recovery ledger and migration 0072's
+    // monotonic no-progress breaker, pinned exactly. JSON request provenance
+    // never substitutes for sim_job_id.
     expect(verifyCols.map((c) => c.column_name).sort()).toEqual(
       [
         "id",
@@ -376,6 +432,7 @@ describe("migration 0034 schema pin", () => {
         "sim_job_id",
         "state",
         "precalc_result_id",
+        "precalc_result_attempt_id",
         "verify_result_id",
         "delta_cl",
         "delta_cd",
@@ -383,6 +440,7 @@ describe("migration 0034 schema pin", () => {
         "fresh_attempt_count",
         "max_fresh_attempts",
         "continuation_attempt_count",
+        "continuation_no_progress_count",
         "continuation_budget_override_s",
         "latest_result_attempt_id",
         "next_submit_at",
@@ -1303,6 +1361,19 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
         ),
       )
       .returning();
+    expect(row.currentResultAttemptId).toBeTruthy();
+    await db
+      .update(resultAttempts)
+      .set({
+        regime: "rans",
+        cl: 1.0,
+        cd: 0.05,
+        cm: -0.06,
+        clCd: 20,
+        unsteady: false,
+        converged: true,
+      })
+      .where(eq(resultAttempts.id, row.currentResultAttemptId!));
     await db
       .update(resultClassifications)
       .set({
@@ -1313,11 +1384,16 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
         confidence: 0.9,
         reasons: [],
       })
-      .where(eq(resultClassifications.resultId, row.id));
+      .where(
+        eq(resultClassifications.resultAttemptId, row.currentResultAttemptId!),
+      );
     // Link the campaign point so completion/tier logic sees the cell.
     await db
       .update(simCampaignPoints)
-      .set({ resultId: row.id })
+      .set({
+        resultId: row.id,
+        resultAttemptId: row.currentResultAttemptId!,
+      })
       .where(
         and(
           eq(simCampaignPoints.campaignId, campaignId),
@@ -1346,6 +1422,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     expect(items[0].campaignId).toBeNull();
     expect(items[0].backgroundOwner).toBe(false);
     expect(items[0].precalcResultId).toBe(row.id);
+    expect(items[0].precalcResultAttemptId).toBe(row.currentResultAttemptId);
     expect(
       await db
         .select({
@@ -1468,7 +1545,12 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
         };
       },
     } as unknown as EngineClient;
-    const submitted = await uransLadderTick(db, engine, 0, await ladderScope());
+    const submitted = await uransLadderTick(db, engine, 0, {
+      ...(await ladderScope()),
+      // A known version-1 engine remains eligible for ordinary first-pass
+      // PRECALC work. Only continuation/corrective recovery requires v2.
+      uransRecoveryVersion: 1,
+    });
     expect(submitted).toBe(true);
     expect(captured.length).toBe(1);
     expect(requestStateAtEngineCall).toBe("running");
@@ -1486,6 +1568,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       urans_fidelity: "precalc",
     });
     expect(captured[0].expected_mesh_recovery_version).toBe(0);
+    expect(captured[0].expected_urans_recovery_version).toBeUndefined();
     expect(captured[0].aoa?.angles).toEqual([REJECTED_AOA]);
     expect(captured[0].speeds).toEqual([SPEED]);
     // The node NEVER downscales the mesh: the composed request carries the
@@ -1971,13 +2054,102 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     );
   }, 60000);
 
-  it("consumes the verify item at FULL fidelity once no campaign RANS/precalc work exists, then records a DISAGREEMENT at ingest", async () => {
+  it("MUST-CATCH: a blocked final generation A yields to accepted preliminary generation B and verifies B against B", async () => {
     // Production's verify gate is machine-wide. This live-DB test supplies a
     // closed request/campaign scope so it proves this fixture's tier ordering
     // without waiting on or consuming another parallel file's legitimate work.
     // Keep one unrelated background obligation open deliberately: without the
     // campaign side of the test scope, this row reproduces the full-parallel
     // failure where another suite's preliminary work blocked this verify item.
+    const [generationA] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(
+        and(
+          eq(simUransVerifyQueue.revisionId, revisionId),
+          eq(simUransVerifyQueue.state, "pending"),
+        ),
+      )
+      .limit(1);
+    expect(generationA).toBeTruthy();
+    await db
+      .update(simUransVerifyQueue)
+      .set({
+        state: "blocked",
+        freshAttemptCount: 2,
+        maxFreshAttempts: 2,
+        continuationAttemptCount: 1,
+        lastOutcome: "final_recovery_exhausted",
+        lastError: "generation A exhausted",
+      })
+      .where(eq(simUransVerifyQueue.id, generationA!.id));
+    await db
+      .update(resultClassifications)
+      .set({ resultId: null })
+      .where(eq(resultClassifications.resultId, generationA!.precalcResultId));
+    const generationBAttemptId = await createAcceptedPrecalcGeneration({
+      resultId: generationA!.precalcResultId,
+      aoaDeg: REJECTED_AOA,
+      label: "generation-b-precalc",
+      cl: 1,
+      cd: 0.05,
+      cm: -0.06,
+    });
+    await db
+      .update(results)
+      .set({
+        currentResultAttemptId: generationBAttemptId,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        cl: 1,
+        cd: 0.05,
+        cm: -0.06,
+        clCd: 20,
+        converged: true,
+        unsteady: true,
+      })
+      .where(eq(results.id, generationA!.precalcResultId));
+    await db
+      .update(simCampaignPoints)
+      .set({
+        state: "terminal",
+        resultId: generationA!.precalcResultId,
+        resultAttemptId: generationBAttemptId,
+      })
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.aoaDeg, REJECTED_AOA),
+        ),
+      );
+    expect(
+      await enqueuePrecalcVerifications(db, {
+        airfoilId,
+        revisionId,
+        campaignId,
+        aoaDeg: REJECTED_AOA,
+      }),
+    ).toBe(1);
+    const [pendingVerify] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(
+        and(
+          eq(simUransVerifyQueue.precalcResultAttemptId, generationBAttemptId),
+          eq(simUransVerifyQueue.state, "pending"),
+        ),
+      )
+      .limit(1);
+    expect(pendingVerify).toMatchObject({
+      state: "pending",
+      freshAttemptCount: 0,
+      continuationAttemptCount: 0,
+      precalcResultId: generationA!.precalcResultId,
+      precalcResultAttemptId: generationBAttemptId,
+    });
+
     const [unrelatedObligation] = await db
       .insert(simPrecalcObligations)
       .values({
@@ -1990,17 +2162,48 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       .returning({ id: simPrecalcObligations.id });
     const captured: PolarRequest[] = [];
     let submitted = false;
-    const [pendingVerify] = await db
-      .select({ id: simUransVerifyQueue.id })
-      .from(simUransVerifyQueue)
-      .where(
-        and(
-          eq(simUransVerifyQueue.revisionId, revisionId),
-          eq(simUransVerifyQueue.state, "pending"),
-        ),
+    const [pinnedPrecalc] = await db
+      .select({
+        resultId: resultAttempts.resultId,
+        airfoilId: resultAttempts.airfoilId,
+        revisionId: resultAttempts.simulationPresetRevisionId,
+        aoaDeg: resultAttempts.aoaDeg,
+        status: resultAttempts.status,
+        source: resultAttempts.source,
+        fidelity: dsql<
+          string | null
+        >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+        classification: resultClassifications.state,
+      })
+      .from(resultAttempts)
+      .leftJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
       )
-      .limit(1);
-    expect(pendingVerify).toBeTruthy();
+      .where(eq(resultAttempts.id, pendingVerify!.precalcResultAttemptId!));
+    expect(pinnedPrecalc).toMatchObject({
+      resultId: pendingVerify!.precalcResultId,
+      airfoilId: pendingVerify!.airfoilId,
+      revisionId: pendingVerify!.revisionId,
+      aoaDeg: pendingVerify!.aoaDeg,
+      status: "done",
+      source: "solved",
+      fidelity: "urans_precalc",
+      classification: "accepted",
+    });
+    expect(await precalcSnapshotForVerifyItem(db, pendingVerify!)).toEqual({
+      resultAttemptId: pendingVerify!.precalcResultAttemptId,
+      cl: 1,
+      cd: 0.05,
+      cm: -0.06,
+    });
+    // The natural-cell projection is mutable and may already reflect another
+    // generation. Submission must still copy generation B's exact immutable
+    // coefficients into the final job.
+    await db
+      .update(results)
+      .set({ cl: 9.9, cd: 8.8, cm: 7.7 })
+      .where(eq(results.id, pendingVerify!.precalcResultId));
     try {
       submitted = await uransLadderTick(
         db,
@@ -2033,7 +2236,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     const [item] = await db
       .select()
       .from(simUransVerifyQueue)
-      .where(eq(simUransVerifyQueue.revisionId, revisionId));
+      .where(eq(simUransVerifyQueue.id, pendingVerify!.id));
     expect(item.state).toBe("running");
     const [verifyJob] = await db
       .select()
@@ -2042,10 +2245,21 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     expect(verifyJob).toBeTruthy();
     expect(verifyJob.jobKind).toBe("verify");
     expect(item.simJobId).toBe(verifyJob.id);
-    expect(
-      (verifyJob.requestPayload as { verifyPrecalc?: { cl?: number } })
-        .verifyPrecalc?.cl,
-    ).toBe(1.0);
+    expect(verifyJob.requestPayload).toMatchObject({
+      verifyPrecalcResultAttemptId: generationBAttemptId,
+      verifyPrecalc: { cl: 1, cd: 0.05, cm: -0.06 },
+    });
+    // Settlement also re-reads the queue-pinned attempt instead of trusting a
+    // mutable/stale coefficient copy on the job payload.
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          ...(verifyJob.requestPayload as Record<string, unknown>),
+          verifyPrecalc: { cl: -9, cd: -8, cm: -7 },
+        },
+      })
+      .where(eq(simJobs.id, verifyJob.id));
 
     // Completion blocking (contract 7): every cell terminal, but the open
     // verify item must keep the campaign from flipping completed.
@@ -2151,7 +2365,21 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       .select()
       .from(simUransVerifyQueue)
       .where(eq(simUransVerifyQueue.revisionId, revisionId));
-    expect(itemsAfter.length).toBe(1);
+    expect(itemsAfter).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: generationA!.id,
+          state: "blocked",
+          precalcResultAttemptId: generationA!.precalcResultAttemptId,
+        }),
+        expect.objectContaining({
+          id: item.id,
+          state: "disagreed",
+          precalcResultAttemptId: generationBAttemptId,
+        }),
+      ]),
+    );
+    expect(itemsAfter).toHaveLength(2);
 
     // All three tiers terminal now → the completion probe may settle the
     // campaign (the verified row classifies at refresh; whatever the verdict,
@@ -2189,6 +2417,15 @@ describe("bounded final-verification interleave during a live RANS backlog", () 
         createdAt,
       })
       .returning({ id: results.id });
+    const precalcResultAttemptId = await createAcceptedPrecalcGeneration({
+      resultId: precalc.id,
+      aoaDeg,
+      label: `${label}-precalc-attempt`,
+      cl: 0.72,
+      cd: 0.041,
+      cm: -0.038,
+      createdAt,
+    });
     const [queue] = await db
       .insert(simUransVerifyQueue)
       .values({
@@ -2197,6 +2434,7 @@ describe("bounded final-verification interleave during a live RANS backlog", () 
         aoaDeg,
         state: "pending",
         precalcResultId: precalc.id,
+        precalcResultAttemptId,
         backgroundOwner: false,
         createdAt,
       })
@@ -2487,7 +2725,15 @@ describe("final/full URANS automatic recovery", () => {
         })
         .returning();
       resultIds.push(precalc.id);
-      return precalc;
+      const precalcResultAttemptId = await createAcceptedPrecalcGeneration({
+        resultId: precalc.id,
+        aoaDeg,
+        label: `${label}-attempt`,
+        cl: 0.8,
+        cd: 0.05,
+        cm: -0.04,
+      });
+      return { ...precalc, precalcResultAttemptId };
     };
     try {
       const exhaustedPrecalc = await seedPrecalc(
@@ -2502,6 +2748,7 @@ describe("final/full URANS automatic recovery", () => {
           aoaDeg: 64.125,
           state: "pending",
           precalcResultId: exhaustedPrecalc.id,
+          precalcResultAttemptId: exhaustedPrecalc.precalcResultAttemptId,
           backgroundOwner: true,
           freshAttemptCount: 2,
           maxFreshAttempts: 2,
@@ -2520,7 +2767,7 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [exhaustedQueue.id],
             meshRecoveryVersion: null,
-            uransRecoveryVersion: 1,
+            uransRecoveryVersion: 2,
           },
         ),
       ).toBe(false);
@@ -2615,6 +2862,7 @@ describe("final/full URANS automatic recovery", () => {
           aoaDeg: 64.375,
           state: "pending",
           precalcResultId: mismatchPrecalc.id,
+          precalcResultAttemptId: mismatchPrecalc.precalcResultAttemptId,
           backgroundOwner: true,
           freshAttemptCount: 2,
           maxFreshAttempts: 2,
@@ -2634,7 +2882,7 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [mismatchQueue.id],
             meshRecoveryVersion: null,
-            uransRecoveryVersion: 1,
+            uransRecoveryVersion: 2,
           },
         ),
       ).toBe(false);
@@ -2698,6 +2946,14 @@ describe("final/full URANS automatic recovery", () => {
         solvedAt: new Date(),
       })
       .returning({ id: results.id });
+    const precalcResultAttemptId = await createAcceptedPrecalcGeneration({
+      resultId: precalc.id,
+      aoaDeg,
+      label: "migration-reopened-precalc-attempt",
+      cl: 0.78,
+      cd: 0.051,
+      cm: -0.039,
+    });
     const [queue] = await db
       .insert(simUransVerifyQueue)
       .values({
@@ -2706,6 +2962,7 @@ describe("final/full URANS automatic recovery", () => {
         aoaDeg,
         state: "pending",
         precalcResultId: precalc.id,
+        precalcResultAttemptId,
         backgroundOwner: true,
         freshAttemptCount: 1,
         maxFreshAttempts: 2,
@@ -2717,6 +2974,8 @@ describe("final/full URANS automatic recovery", () => {
     const captured: PolarRequest[] = [];
     let submittedJobId: string | null = null;
     try {
+      // Version 1 supported the older cross-job contract, but does not own the
+      // current conservative numerical remediation. Corrective work waits.
       expect(
         await uransLadderTick(
           db,
@@ -2729,7 +2988,7 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [queue.id],
             meshRecoveryVersion: 1,
-            uransRecoveryVersion: 0,
+            uransRecoveryVersion: 1,
           },
         ),
       ).toBe(false);
@@ -2751,7 +3010,8 @@ describe("final/full URANS automatic recovery", () => {
       // Expand/contract safety: an older controller can leave a pending row
       // with durable submitted-job history but no new last_outcome marker.
       // Physical-attempt counters still prove that this is recovery, not an
-      // initial final-verification submission.
+      // initial final-verification submission. An unknown live capability also
+      // fails closed instead of treating this as first-pass work.
       await db
         .update(simUransVerifyQueue)
         .set({ lastOutcome: null })
@@ -2771,7 +3031,7 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [queue.id],
             meshRecoveryVersion: 1,
-            uransRecoveryVersion: 0,
+            uransRecoveryVersion: null,
           },
         ),
       ).toBe(false);
@@ -2788,13 +3048,13 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [queue.id],
             meshRecoveryVersion: null,
-            uransRecoveryVersion: 1,
+            uransRecoveryVersion: 2,
           },
         ),
       ).toBe(true);
       expect(captured).toHaveLength(1);
       expect(captured[0].continue_from).toBeUndefined();
-      expect(captured[0].expected_urans_recovery_version).toBe(1);
+      expect(captured[0].expected_urans_recovery_version).toBe(2);
       const [running] = await db
         .select()
         .from(simUransVerifyQueue)
@@ -2813,7 +3073,7 @@ describe("final/full URANS automatic recovery", () => {
       expect(submittedJob.requestPayload).toMatchObject({
         verifyQueueItemId: queue.id,
         finalRecoveryMode: "fresh",
-        uransRecoveryVersion: 1,
+        uransRecoveryVersion: 2,
       });
     } finally {
       await db
@@ -2860,6 +3120,14 @@ describe("final/full URANS automatic recovery", () => {
         solvedAt: new Date(),
       })
       .returning({ id: results.id });
+    const precalcResultAttemptId = await createAcceptedPrecalcGeneration({
+      resultId: precalc.id,
+      aoaDeg,
+      label: "final-recovery-precalc-attempt",
+      cl: 0.82,
+      cd: 0.052,
+      cm: -0.041,
+    });
     const [queue] = await db
       .insert(simUransVerifyQueue)
       .values({
@@ -2868,9 +3136,14 @@ describe("final/full URANS automatic recovery", () => {
         aoaDeg,
         state: "pending",
         precalcResultId: precalc.id,
+        precalcResultAttemptId,
         backgroundOwner: true,
         freshAttemptCount: 1,
-        continuationAttemptCount: 0,
+        // Productive exact-state continuation is not bounded by the number
+        // of fresh starts. This fixture deliberately exceeds the historical
+        // one-continuation-per-fresh constraint.
+        continuationAttemptCount: 5,
+        continuationNoProgressCount: 0,
         lastOutcome: "continuation_pending",
       })
       .returning({ id: simUransVerifyQueue.id });
@@ -2932,9 +3205,9 @@ describe("final/full URANS automatic recovery", () => {
     const captured: PolarRequest[] = [];
     let submittedJobId: string | null = null;
     try {
-      // Rolling deploy safety: the legacy 2406 engine advertises mesh
-      // recovery v1 but has no durable archive-hydration/continuation
-      // contract. The newly reopened row must remain pending and untouched.
+      // Rolling deploy safety: a runtime advertising the older URANS recovery
+      // v1 contract lacks the current v2 numerical remediation. The newly
+      // reopened row must remain pending and untouched.
       expect(
         await uransLadderTick(
           db,
@@ -2947,7 +3220,7 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [queue.id],
             meshRecoveryVersion: 1,
-            uransRecoveryVersion: 0,
+            uransRecoveryVersion: 1,
           },
         ),
       ).toBe(false);
@@ -2962,7 +3235,7 @@ describe("final/full URANS automatic recovery", () => {
       ).toMatchObject({
         state: "pending",
         freshAttemptCount: 1,
-        continuationAttemptCount: 0,
+        continuationAttemptCount: 5,
         lastOutcome: "continuation_pending",
       });
 
@@ -2977,7 +3250,7 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [queue.id],
             meshRecoveryVersion: null,
-            uransRecoveryVersion: 1,
+            uransRecoveryVersion: 2,
           },
         ),
       ).toBe(true);
@@ -2987,7 +3260,7 @@ describe("final/full URANS automatic recovery", () => {
         case_slug: "aoa_63.88",
       });
       expect(captured[0].budget_override_s).toBe(21_600);
-      expect(captured[0].expected_urans_recovery_version).toBe(1);
+      expect(captured[0].expected_urans_recovery_version).toBe(2);
       const [claimed] = await db
         .select()
         .from(simUransVerifyQueue)
@@ -2995,7 +3268,7 @@ describe("final/full URANS automatic recovery", () => {
       expect(claimed).toMatchObject({
         state: "running",
         freshAttemptCount: 1,
-        continuationAttemptCount: 0,
+        continuationAttemptCount: 5,
       });
       submittedJobId = claimed.simJobId;
       expect(submittedJobId).toBeTruthy();
@@ -3008,7 +3281,7 @@ describe("final/full URANS automatic recovery", () => {
         finalRecoveryMode: "continuation",
         continueFromResultAttemptId: sourceAttempt.id,
         budgetOverrideS: 21_600,
-        uransRecoveryVersion: 1,
+        uransRecoveryVersion: 2,
       });
     } finally {
       await db
@@ -3602,14 +3875,14 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
           requestIds: [request.id],
           verifyIds: [],
           meshRecoveryVersion: 0,
-          uransRecoveryVersion: 1,
+          uransRecoveryVersion: 2,
         }),
       ).toBe(true);
       expect(captured[0].continue_from).toEqual({
         engine_job_id: checkpointJob.engineJobId,
         case_slug: checkpoint.engineCaseSlug,
       });
-      expect(captured[0].expected_urans_recovery_version).toBe(1);
+      expect(captured[0].expected_urans_recovery_version).toBe(2);
 
       const [runningRequest] = await db
         .select()
@@ -3760,7 +4033,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
       db,
       stubEngine(captured, `${PREFIX}-continuation-job`),
       0,
-      { ...(await ladderScope()), uransRecoveryVersion: 1 },
+      { ...(await ladderScope()), uransRecoveryVersion: 2 },
     );
     expect(submitted).toBe(true);
     expect(captured.length).toBe(1);
@@ -3772,7 +4045,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
       case_slug: "aoa_12.00",
     });
     expect(captured[0].budget_override_s).toBe(21600);
-    expect(captured[0].expected_urans_recovery_version).toBe(1);
+    expect(captured[0].expected_urans_recovery_version).toBe(2);
     // Still URANS-by-definition (prod job e89be2bb class).
     expect(captured[0].solver).toMatchObject({
       force_transient: true,
@@ -3802,7 +4075,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
     expect(payload.uransRequestId).toBe(request.id);
     expect(payload.continueFromResultId).toBe(sourceResultId);
     expect(payload.budgetOverrideS).toBe(21600);
-    expect(payload.uransRecoveryVersion).toBe(1);
+    expect(payload.uransRecoveryVersion).toBe(2);
 
     // Settle (continuation results ingest normally — same cell upsert; the
     // ingest path itself is covered by the ladder ingest tests above).
@@ -3849,7 +4122,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
       db,
       stubEngine(captured, `${PREFIX}-orphan-continuation`),
       0,
-      { ...(await ladderScope()), uransRecoveryVersion: 1 },
+      { ...(await ladderScope()), uransRecoveryVersion: 2 },
     );
     expect(submitted).toBe(false);
     expect(captured.length).toBe(0);
@@ -4263,7 +4536,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
             requestIds: [request.id],
             verifyIds: [],
             meshRecoveryVersion: 0,
-            uransRecoveryVersion: 1,
+            uransRecoveryVersion: 2,
           },
         ),
       ).toBe(true);
@@ -4451,7 +4724,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
         requestIds: [request.id],
         verifyIds: [],
         meshRecoveryVersion: 0,
-        uransRecoveryVersion: 1,
+        uransRecoveryVersion: 2,
       };
 
       resetUransLadderMemory();

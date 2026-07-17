@@ -104,37 +104,37 @@ describe("fidelityChipView", () => {
     expect(fidelityChipView("garbage-tier", null)).toBeNull(); // drifted value → plain, never guessed
   });
 
-  it("urans_precalc: amber 'precalc · verify pending' while an open verify item covers the cell", () => {
+  it("urans_precalc: labels the fast result and its final-stage state", () => {
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "pending" })),
-    ).toEqual({ label: "precalc · verify pending", tone: "amber" });
+    ).toEqual({ label: "URANS fast · final queued", tone: "amber" });
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "running" })),
-    ).toEqual({ label: "precalc · verify pending", tone: "amber" });
+    ).toEqual({ label: "URANS fast · final queued", tone: "amber" });
     expect(fidelityChipView("urans_precalc", null)).toEqual({
-      label: "precalc",
+      label: "URANS fast",
       tone: "amber",
     });
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "cancelled" })),
-    ).toEqual({ label: "precalc · verify cancelled", tone: "amber" });
+    ).toEqual({ label: "CRITICAL · URANS final", tone: "red" });
     expect(
       fidelityChipView(
         "urans_precalc",
         verifyInfo({ state: "blocked", submitError: "HTTP 422" }),
       ),
     ).toEqual({
-      label: "final URANS · critical",
+      label: "CRITICAL · URANS final",
       tone: "red",
     });
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "done" })),
-    ).toEqual({ label: "precalc · verified", tone: "teal" });
+    ).toEqual({ label: "URANS final · verified", tone: "teal" });
   });
 
-  it("urans_full: teal 'verified'", () => {
+  it("urans_full: teal final-URANS verification", () => {
     expect(fidelityChipView("urans_full", null)).toEqual({
-      label: "verified",
+      label: "URANS final · verified",
       tone: "teal",
     });
     expect(
@@ -142,28 +142,35 @@ describe("fidelityChipView", () => {
         "urans_full",
         verifyInfo({ state: "done", deltaCl: 0.01 }),
       ),
-    ).toEqual({ label: "verified", tone: "teal" });
+    ).toEqual({ label: "URANS final · verified", tone: "teal" });
   });
 
-  it("disagreed outranks everything: red chip with the REAL stored deltas", () => {
+  it("accepted final disagreement stays verified and amber with the REAL stored deltas", () => {
     const view = fidelityChipView(
       "urans_full",
       verifyInfo({ state: "disagreed", deltaCl: 0.06, deltaCd: 0.002 }),
     );
-    expect(view).toEqual({ label: "verify disagreed (Δcl 0.06)", tone: "red" });
-    // even a precalc-labelled row reads disagreed first
+    expect(view).toEqual({
+      label: "verified · differs from fast (Δcl 0.06)",
+      tone: "amber",
+    });
+    // Even when the selected projection still carries the preliminary tier,
+    // accepted final evidence remains authoritative and non-critical.
     expect(
       fidelityChipView(
         "urans_precalc",
         verifyInfo({ state: "disagreed", deltaCd: 0.02 }),
-      )?.tone,
-    ).toBe("red");
+      ),
+    ).toEqual({
+      label: "verified · differs from fast (Δcd 0.02)",
+      tone: "amber",
+    });
   });
 
-  it("disagreed without recorded deltas says so plainly (no invented numbers)", () => {
+  it("accepted final disagreement without recorded deltas invents no numbers", () => {
     expect(
       fidelityChipView("urans_full", verifyInfo({ state: "disagreed" })),
-    ).toEqual({ label: "verify disagreed", tone: "red" });
+    ).toEqual({ label: "verified · differs from fast", tone: "amber" });
   });
 });
 
@@ -234,30 +241,32 @@ function storyWith(verify: PointVerifyInfo | null): PointStoryPayload {
 }
 
 describe("assembleTimeline — verify events", () => {
-  it("open verify item → amber queued/running event before NOW", () => {
+  it("open final item → amber queued/running event before NOW", () => {
     const queued = assembleTimeline(
       storyWith(verifyInfo({ state: "pending" })),
     );
-    const ev = queued.find((e) => e.title.includes("verification"));
+    const ev = queued.find((e) => e.title.startsWith("URANS final"));
     expect(ev?.tone).toBe("amber");
-    expect(ev?.title).toBe("full-fidelity verification queued");
+    expect(ev?.title).toBe("URANS final · queued");
     expect(queued[queued.length - 1].kind).toBe("now");
     const running = assembleTimeline(
       storyWith(verifyInfo({ state: "running" })),
     );
-    expect(running.find((e) => e.title.includes("verification"))?.title).toBe(
-      "full-fidelity verification running",
+    expect(running.find((e) => e.title.startsWith("URANS final"))?.title).toBe(
+      "URANS final · physical run active",
     );
   });
 
-  it("disagreed → red event carrying the stored deltas", () => {
+  it("accepted final disagreement → amber comparison carrying stored deltas", () => {
     const events = assembleTimeline(
       storyWith(verifyInfo({ state: "disagreed", deltaCl: 0.06 })),
     );
-    const ev = events.find((e) => e.title.includes("DISAGREED"));
-    expect(ev?.tone).toBe("red");
+    const ev = events.find((e) => e.title.includes("differs from fast"));
+    expect(ev?.tone).toBe("amber");
+    expect(ev?.title).toBe("final URANS verified · differs from fast");
     expect(ev?.detail).toContain("Δcl 0.06");
-    expect(ev?.detail).toContain("classification stays on the verified");
+    expect(ev?.detail).toContain("final URANS result is authoritative");
+    expect(ev?.detail).not.toContain("flagged for review");
   });
 
   it("no verify item / settled clean → no verify event", () => {

@@ -590,6 +590,53 @@ def _write_flat_coeff(path: Path, cl: float, cd: float, cm: float, n: int = 60):
     path.write_text("\n".join(rows) + "\n")
 
 
+def test_restart_boundary_force_impulses_do_not_mint_false_shedding(tmp_path):
+    """Production-shaped integration guard: a flat trajectory split across
+    continuation segments remains no-shedding even when each older segment's
+    terminal boundary row is numerically inconsistent.
+
+    Raw evidence is retained unchanged; only the merged analysis series gives
+    ownership of a restart boundary to the newer segment.
+    """
+
+    header = "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    paths: list[Path] = []
+    for start, end in ((0.0, 0.04), (0.04, 0.08), (0.08, 0.12)):
+        path = (
+            tmp_path
+            / "postProcessing"
+            / "forceCoeffs1"
+            / f"{start:g}"
+            / "coefficient.dat"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [header]
+        for index in range(41):
+            t = start + index * 0.001
+            cl = 1.0 if index == 40 and end < 0.12 else 0.7
+            cd = 0.01 if index == 40 and end < 0.12 else 0.025
+            rows.append(
+                f"{t:.6f} {cd:.8g} 0 0 {cl:.8g} 0 0 -0.1 0 0 0 0 0"
+            )
+        path.write_text("\n".join(rows) + "\n")
+        paths.append(path)
+
+    history = force_history(
+        paths,
+        speed=30.0,
+        chord=0.05,
+        discard_fraction=0.0,
+        target_cycles=3,
+        alpha_deg=2.0,
+    )
+
+    assert is_no_shedding(history)
+    assert history.period_s is None
+    assert history.strouhal == 0.0
+    assert history.cl_mean == pytest.approx(0.7)
+    assert history.cd_mean == pytest.approx(0.025)
+
+
 def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch):
     cl_true, cd_true, cm_true = 0.0009, 0.0121, -0.0004
 
@@ -862,6 +909,7 @@ def test_finalize_rejects_short_flat_urans_before_publishing_transient_media(
     (transient_dir / "system" / "controlDict").write_text(
         "application pimpleFoam;\n"
     )
+    pipeline.write_transient_start_marker(transient_dir, 0.0)
     (transient_dir / "constant").mkdir()
     (transient_dir / "constant" / "transportProperties").write_text(
         "transportModel Newtonian;\n"
@@ -968,6 +1016,10 @@ def test_finalize_rejects_short_flat_urans_before_publishing_transient_media(
     assert manifest["media"]["requestedFields"] == []
     assert files["openfoam/system/controlDict"] == "dictionary"
     assert files["openfoam/transient/system/controlDict"] == "dictionary"
+    assert (
+        files["openfoam/transient/transient_start.json"]
+        == "continuation_state"
+    )
     assert files["openfoam/logs/transient/log.pimpleFoam"] == "log"
     assert (
         files["openfoam/postProcessing/forceCoeffs1/0/coefficient.dat"]

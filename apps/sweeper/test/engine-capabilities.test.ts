@@ -67,16 +67,28 @@ describe("engine mesh-recovery capability handshake", () => {
 });
 
 describe("engine durable URANS-recovery capability handshake", () => {
-  it("accepts the explicit recovery contract advertised by live health", async () => {
+  it("accepts the version-2 recovery contract advertised by live health", async () => {
     const engine = {
       healthDetails: async () => ({
         status: "ok",
         version: "test",
+        urans_recovery_version: 2,
+      }),
+    } as unknown as EngineClient;
+    await expect(engineUransRecoveryVersion(engine)).resolves.toBe(2);
+    expect(supportsDurableUransRecovery(2)).toBe(true);
+  });
+
+  it("parses version 1 but keeps version-2 continuation and corrective recovery closed", async () => {
+    const engine = {
+      healthDetails: async () => ({
+        status: "ok",
+        version: "cross-job-recovery-v1",
         urans_recovery_version: 1,
       }),
     } as unknown as EngineClient;
     await expect(engineUransRecoveryVersion(engine)).resolves.toBe(1);
-    expect(supportsDurableUransRecovery(1)).toBe(true);
+    expect(supportsDurableUransRecovery(1)).toBe(false);
   });
 
   it("treats the rolling-cutover legacy engine as version zero even when mesh recovery is v1", async () => {
@@ -90,6 +102,7 @@ describe("engine durable URANS-recovery capability handshake", () => {
     await expect(engineMeshRecoveryVersion(engine)).resolves.toBe(1);
     await expect(engineUransRecoveryVersion(engine)).resolves.toBe(0);
     expect(supportsDurableUransRecovery(0)).toBe(false);
+    expect(supportsDurableUransRecovery(null)).toBe(false);
   });
 
   it.each([-1, 1.5, Number.NaN, "1", null, 2_147_483_648])(

@@ -7,7 +7,10 @@ FileExistsError and failed the point.
 """
 from pathlib import Path
 
-from airfoilfoam.pipeline import _copy_initialized_transient_case
+from airfoilfoam.pipeline import (
+    _copy_initialized_transient_case,
+    read_transient_start_marker,
+)
 
 
 def _make_case(root: Path) -> Path:
@@ -26,6 +29,7 @@ def test_start_time_zero_does_not_collide(tmp_path):
     _copy_initialized_transient_case(src, dst, start_time=0.0)
     assert (dst / "0" / "marker").read_text() == "0"
     assert (dst / "constant" / "marker").exists()
+    assert read_transient_start_marker(dst) == 0.0
 
 
 def test_nonzero_start_time_still_copied(tmp_path):
@@ -34,6 +38,7 @@ def test_nonzero_start_time_still_copied(tmp_path):
     _copy_initialized_transient_case(src, dst, start_time=0.4)
     assert (dst / "0.4" / "U").exists()
     assert (dst / "0" / "marker").exists()
+    assert read_transient_start_marker(dst) == 0.4
 
 
 def test_existing_destination_is_replaced(tmp_path):

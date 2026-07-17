@@ -7,11 +7,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from airfoilfoam import jobs
+from airfoilfoam.capabilities import URANS_RECOVERY_VERSION
 from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
 from airfoilfoam.storage import JobStore
 from airfoilfoam.pipeline import CaseOutcome
 from airfoilfoam.models import (
+    AirfoilInput,
     ContinuationFailureKind,
     JobResult,
     JobState,
@@ -73,7 +75,7 @@ def test_health_and_capabilities(client):
     health = client.get("/health").json()
     assert health["status"] == "ok"
     assert health["mesh_recovery_version"] == 2
-    assert health["urans_recovery_version"] == 1
+    assert health["urans_recovery_version"] == URANS_RECOVERY_VERSION
     caps = client.get("/capabilities").json()
     assert "blockmesh-cgrid" in caps["meshers"]
     assert "kOmegaSST" in caps["turbulence_models"]
@@ -185,7 +187,7 @@ def test_polar_submit_rejects_urans_recovery_cutover_before_queueing(
         json={
             "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
             "aoa": {"angles": [0]},
-            "expected_urans_recovery_version": 2,
+            "expected_urans_recovery_version": 1,
         },
     )
 
@@ -193,11 +195,11 @@ def test_polar_submit_rejects_urans_recovery_cutover_before_queueing(
     detail = response.json()["detail"]
     assert detail == {
         "code": "urans_recovery_version_mismatch",
-        "requested_version": 2,
-        "actual_version": 1,
+        "requested_version": 1,
+        "actual_version": URANS_RECOVERY_VERSION,
         "message": (
             "Engine URANS-recovery capability changed before submission: "
-            "requested v2, API is v1. Refresh capability and retry."
+            "requested v1, API is v2. Refresh capability and retry."
         ),
     }
 
@@ -207,14 +209,72 @@ def test_worker_rejects_urans_recovery_mismatch_before_geometry_or_solver(tmp_pa
         {
             "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
             "aoa": {"angles": [0]},
-            "expected_urans_recovery_version": 2,
+            "expected_urans_recovery_version": 1,
         }
     )
 
-    with pytest.raises(RuntimeError, match="requested v2, worker is v1"):
+    with pytest.raises(RuntimeError, match="requested v1, worker is v2"):
         jobs.execute_job(
             "urans-recovery-capability-mismatch",
             request,
+            store=JobStore(),
+        )
+
+
+def test_polar_submit_rejects_continuation_without_recovery_version_pin(
+    client, naca0012_selig_text
+):
+    response = client.post(
+        "/polars",
+        json={
+            "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
+            "aoa": {"angles": [0]},
+            "solver": {"force_transient": True},
+            "continue_from": {
+                "engine_job_id": "a" * 32,
+                "case_slug": "c1_u10_a0",
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert "expected_urans_recovery_version" in response.text
+
+
+def test_worker_rejects_unpinned_continuation_before_geometry_or_solver(
+    naca0012_selig_text,
+):
+    valid = PolarRequest.model_validate(
+        {
+            "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
+            "aoa": {"angles": [0]},
+            "solver": {"force_transient": True},
+            "continue_from": {
+                "engine_job_id": "b" * 32,
+                "case_slug": "c1_u10_a0",
+            },
+            "expected_urans_recovery_version": URANS_RECOVERY_VERSION,
+        }
+    )
+    # Bypass model revalidation to prove the worker independently fails closed
+    # before trying to parse deliberately invalid geometry.
+    unsafe = valid.model_copy(
+        update={
+            "airfoil": AirfoilInput(
+                name="bad-on-purpose",
+                coordinates="not geometry",
+            ),
+            "expected_urans_recovery_version": None,
+        }
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires expected_urans_recovery_version",
+    ):
+        jobs.execute_job(
+            "unpinned-continuation",
+            unsafe,
             store=JobStore(),
         )
 

@@ -168,6 +168,32 @@ media artifacts. Its isolated containers, networks, volumes, and leased port
 were removed after verification; it is evidence for the deploy gate, not a
 claim that production has already crossed it.
 
+## Production completion evidence
+
+The guarded production cutover completed on 2026-07-17. The live worker
+reported build `prod-20260717-7a13801aa5b3-r5` and runtime row
+`a5d34ae1-4588-4780-a66a-f6683ca0e99c`; its OpenCFD source commit
+`481094fdf34f11ed6d0d603ee59a858a0124236d`, application source, installed
+package, and solver-binary fingerprints matched the sealed attestation.
+OpenCFD 2406 is no longer executable.
+
+The intentionally one-shot successor admission created exactly one database
+job, `28d9ac1c-ad4d-4c60-a34b-f090842eeb54`, bound to engine job
+`ab49d4a691cc451885c369f7971e4c44`. Normal reconciliation stamped the exact
+runtime and incrementally ingested real OpenFOAM 2606 evidence. Canonical
+certification then bound result `fa5ec6aa-cbd4-4035-900d-3f2dd44a92bc` to
+continuation `e59a73ff-c84a-473f-8f5e-1ce7ab5c7087`, whose durable proof state
+is `evidence`. The protected environment now records
+`OPENCFD2606_CUTOVER_PENDING=0` and `OPENCFD2606_CUTOVER_COMPLETE=1`.
+Certification did not submit a second job or recreate the engine gateway or
+worker. Its audit log is retained at
+`/opt/airfoils-pro/state/audit/2026-07-17-successor-continuation/certify-successor-continuation.log`.
+
+The execution pool is certified, but general sweeper admission remains
+durably disabled while the admitted successor batch finishes and the
+version-2 recovery controller is deployed. That operational fence is campaign
+rollout state, not an incomplete numerical-identity cutover.
+
 ## Cutover sequence
 
 1. Deploy the control-plane schema and register the checksum-pinned 2606
@@ -210,6 +236,27 @@ claim that production has already crossed it.
    2406 cells are being recomputed rather than silently counted. Publish final
    2606 curves only when the ordinary accepted-evidence and fit-cache gates are
    satisfied.
+
+An interrupted `pending-attested` recovery must not reopen the ordinary loop
+merely to obtain the first successor proof. The reviewed recovery path keeps
+the looping sweeper stopped and durably disabled, requires an exact campaign,
+attestation, plan revision, and generation allowlist, proves the stopped
+sweeper image's scheduler/package sources byte-for-byte against the sealed
+source named by the pending marker, and mounts only the digest-pinned additive
+one-shot helper into a disposable container. Before composition it atomically
+claims a durable, non-reusable lease on the target pool, quiesces the Node
+control plane, requires zero existing or recovery work and no other enabled
+pool, then re-reads the exact target and selected campaign gap. It composes one
+gap and proves exactly one new job row on the attested 2606 implementation,
+pool, airfoil, generation, and complete selected batch. A worker-authored
+runtime is either the exact attested build or is truthfully pending until the
+engine task leaves its queued state; normal reconciliation persists that
+immutable runtime before continuation evidence can qualify. Any mismatch
+closes both the durable sweeper switch and target pool; successful admission
+closes and directly reads back the same two fences immediately after the engine
+acknowledgment. The disabled sweeper may then run only to reconcile and ingest
+that job; the canonical certification path alone may recognize evidence and
+clear the marker.
 
 ## Alternatives
 

@@ -52,9 +52,45 @@ GCS upload idempotency, generation/CRC/SHA checks, malicious-path rejection,
 render-field/extents/default-media restoration with no local VTK, legacy gzip
 transcoding, and production storage reclamation.
 
-OpenCFD 2606 certification also binds the canary receipt to the live gateway's
-exact bucket, object prefix, Zstandard level, and remote-only disposition. The
-guarded workflow stores a canonical contract SHA-256 atomically with the
+The 2026-07-17 production reconciliation found 546 complete legacy migration
+receipts, 588 current GCS Zstandard objects registered in Postgres
+(29,519,552,851 stored bytes), and 605 local immutable remote pointers. The
+remaining local corpus still held 3,029 gzip bundles
+(147,646,075,989 bytes), 59 temporary/local Zstandard archives
+(1,633,338,784 bytes), and 190,833,139,011 bytes of packaged raw evidence.
+Those measurements prove that the remote-only write/read path is active and
+already reclaimed capacity, but not that the requested legacy migration is
+finished. Completion still requires three-pass migration and restore proof for
+every remaining eligible terminal bundle, distinct attested cleanup for
+canary-only archives, zero unprotected terminal raw evidence, and reconciled
+filesystem/database/GCS counts.
+
+A terminal engine job can contain genuine durable evidence even when its
+worker died before exact result-attempt ingestion. For that zero-owner case,
+the migration records an immutable orphan quarantine rather than inventing a
+result or rediscovering ownership from rounded AoA. The quarantine is pinned
+to the exact sim job, engine job/case/path, manifest/member set, source
+archives, migration receipt, and GCS generation, with fixed reason
+`terminal_engine_evidence_not_ingested`. Pass 3 accepts the distinct
+acknowledgement only after recomputing those identities and then performs the
+same fresh generation-pinned all-member restore before deleting local raw
+bytes. Quarantine is intentionally immutable-only: any future recovery must
+reference an independently ingested exact result/attempt rather than mutating
+preserved evidence into a result.
+
+OpenCFD 2606 certification binds the canary receipt to the live gateway's exact
+bucket, object prefix, Zstandard level, and top-level remote-only storage
+policy.  Fresh canary artifact bindings remain truthfully
+`remote-copy-plus-local-archive-pending-database-ack`: raw evidence has been
+removed, but the compressed archive is retained until the control plane proves
+every database association.  A full case strip deliberately does not perform
+that acknowledgement.  The receipt therefore preserves the pending-ack state,
+the exact `archive+manifest+all-members-restore:<count>` proof, and the matching
+bundle member count.  Node attestation independently requires the full strip to
+already be an idempotent no-op with no unknown entries; it never converts an
+artifact to `remote-only` merely because stripping or remote rendering worked.
+
+The guarded workflow stores a canonical contract SHA-256 atomically with the
 attestation; subsequent engine and control-plane deploys fail before mutation
 when that marker is missing or the otherwise-valid storage configuration has
 drifted. The only markerless paths are the explicit pristine pre-canary state

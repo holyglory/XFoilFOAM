@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import uuid
 from contextlib import contextmanager
@@ -51,6 +52,38 @@ def _write_manifest(evidence_dir: Path, members: list[str], *, start=1.0, end=2.
         ),
         encoding="utf-8",
     )
+
+
+def _write_pointer(evidence_dir: Path, archive: bytes) -> dict[str, object]:
+    stored_sha256 = hashlib.sha256(archive).hexdigest()
+    payload: dict[str, object] = {
+        "schemaVersion": 1,
+        "format": "tar+zstd",
+        "bucket": "airfoils-pro-storage-bucket",
+        "objectKey": f"sha256/{stored_sha256[:2]}/{stored_sha256}.tar.zst",
+        "generation": "18446744073709551615",
+        "storedSha256": stored_sha256,
+        "storedSize": len(archive),
+        "tarSha256": hashlib.sha256(b"tar stream").hexdigest(),
+        "tarSize": 128,
+        "crc32c": "AAAAAA==",
+        "zstdLevel": 10,
+        "createdAt": "2026-07-17T08:00:00.000Z",
+    }
+    (evidence_dir / EVIDENCE_POINTER_NAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    return payload
+
+
+def _expected_pointer_params(pointer: dict[str, object]) -> dict[str, object]:
+    return {
+        "expected_bucket": pointer["bucket"],
+        "expected_object_key": pointer["objectKey"],
+        "expected_generation": pointer["generation"],
+        "expected_stored_sha256": pointer["storedSha256"],
+        "expected_stored_size": pointer["storedSize"],
+    }
 
 
 def test_remote_only_render_endpoints_hold_hydration_lease(
@@ -204,6 +237,73 @@ def test_render_uses_remote_exact_generation_over_mutable_live_case(
     )
     assert response.status_code == 200, response.text
     assert calls == 1
+
+
+def test_job_archive_expected_identity_verifies_remote_bytes_and_generation(
+    client, remote_case, tmp_path, monkeypatch
+):
+    job_id, _case_dir, evidence_dir = remote_case
+    archive = b"verified-generation-pinned-zstandard"
+    pointer = _write_pointer(evidence_dir, archive)
+    cached = tmp_path / "verified-archive.tar.zst"
+    cached.write_bytes(archive)
+    seen = []
+
+    class ExactRemoteStore:
+        @contextmanager
+        def archive_source(self, exact_pointer):
+            seen.append(exact_pointer)
+            assert exact_pointer.bucket == pointer["bucket"]
+            assert exact_pointer.object_key == pointer["objectKey"]
+            assert str(exact_pointer.generation) == pointer["generation"]
+            yield cached
+
+    monkeypatch.setattr(
+        api_main, "evidence_object_store", lambda _settings: ExactRemoteStore()
+    )
+    response = client.get(
+        f"/jobs/{job_id}/files/cases/case-1/evidence/engine_evidence.tar.zst",
+        params=_expected_pointer_params(pointer),
+    )
+    assert response.status_code == 200, response.text
+    assert response.content == archive
+    assert response.headers["x-content-sha256"] == pointer["storedSha256"]
+    assert response.headers["x-gcs-generation"] == pointer["generation"]
+    assert len(seen) == 1
+
+    mismatched = _expected_pointer_params(pointer)
+    mismatched["expected_generation"] = "18446744073709551614"
+    response = client.get(
+        f"/jobs/{job_id}/files/cases/case-1/evidence/engine_evidence.tar.zst",
+        params=mismatched,
+    )
+    assert response.status_code == 409
+    assert "expected immutable generation" in response.json()["detail"]
+    assert len(seen) == 1
+
+
+def test_job_archive_expected_identity_rejects_corrupt_local_bytes(
+    client, remote_case, monkeypatch
+):
+    job_id, _case_dir, evidence_dir = remote_case
+    pointer = _write_pointer(evidence_dir, b"genuine-zstandard-archive")
+    (evidence_dir / "engine_evidence.tar.zst").write_bytes(
+        b"corrupt-local-archive-bytes"
+    )
+
+    class ForbiddenRemoteStore:
+        def archive_source(self, *_args):  # pragma: no cover - defensive
+            raise AssertionError("a present local archive must be verified locally")
+
+    monkeypatch.setattr(
+        api_main, "evidence_object_store", lambda _settings: ForbiddenRemoteStore()
+    )
+    response = client.get(
+        f"/jobs/{job_id}/files/cases/case-1/evidence/engine_evidence.tar.zst",
+        params=_expected_pointer_params(pointer),
+    )
+    assert response.status_code == 502
+    assert "does not match the immutable generation" in response.json()["detail"]
 
 
 def test_job_files_stream_archive_and_every_packaged_artifact_from_remote_cache(

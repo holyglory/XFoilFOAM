@@ -40,6 +40,7 @@ import {
   solverProfiles,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -316,6 +317,10 @@ beforeAll(async () => {
       campaignId,
       state: "pending",
       precalcResultId: verifyCoveredId,
+      precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+        db,
+        verifyCoveredId,
+      ),
     })
     .returning({ id: simUransVerifyQueue.id });
   verifyItemId = verifyItem.id;

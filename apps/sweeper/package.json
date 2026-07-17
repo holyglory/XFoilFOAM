@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "media-repair": "tsx src/media-repair-worker.ts",
     "evidence-storage-backfill": "tsx src/evidence-storage-backfill.ts",
+    "successor:admit-once": "tsx src/successor-continuation-once-cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "verify:queue": "tsx src/verify-queue.ts"

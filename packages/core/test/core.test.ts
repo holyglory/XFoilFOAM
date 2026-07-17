@@ -21,6 +21,7 @@ import {
   evaluateUransMediaQuality,
   FRAME_TRACK_MIN_PERIODS,
   INCOMPLETE_URANS_INTEGRATION_REASON,
+  isAutomaticRansPrecalcHandoffEvidence,
   isDeterministicMeshBlockerError,
   NON_PHYSICAL_COEFFICIENT_LIMIT,
   URANS_BUDGET_STOP_MARKER,
@@ -560,6 +561,94 @@ describe("RANS stall classification and fitted polar", () => {
     ]);
     expect(classified.hardRejectedAoas).toEqual([2]);
     expect(classified.lowAoaFailure).toBe(false);
+  });
+});
+
+describe("automatic RANS -> fast URANS handoff evidence", () => {
+  it.each([
+    "missing coefficients",
+    "non-positive drag",
+    "non-physical coefficients",
+  ])(
+    "MUST-CATCH: completed legacy physical RANS with %s hands off without reason-string routing",
+    () => {
+      expect(
+        isAutomaticRansPrecalcHandoffEvidence({
+          classificationState: "rejected",
+          failureDisposition: null,
+          status: "done",
+          source: "solved",
+          error: null,
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it("uses typed hard_solver provenance and accepts needs-URANS shape handoff", () => {
+    expect(
+      isAutomaticRansPrecalcHandoffEvidence({
+        classificationState: "rejected",
+        failureDisposition: "hard_solver",
+        status: "failed",
+        source: "queued",
+        error: "simpleFoam returned a hard numerical failure",
+      }),
+    ).toBe(true);
+    expect(
+      isAutomaticRansPrecalcHandoffEvidence({
+        classificationState: "needs_urans",
+        failureDisposition: "none",
+        status: "done",
+        source: "solved",
+        error: null,
+      }),
+    ).toBe(true);
+  });
+
+  it.each(["deterministic_mesh", "infrastructure"])(
+    "FALSE-POSITIVE GUARD: typed %s stays on its repair path",
+    (failureDisposition) => {
+      expect(
+        isAutomaticRansPrecalcHandoffEvidence({
+          classificationState: "needs_urans",
+          failureDisposition,
+          status: "done",
+          source: "solved",
+          error: null,
+        }),
+      ).toBe(false);
+    },
+  );
+
+  it.each([
+    { status: "failed", source: "solved", error: null },
+    { status: "done", source: "queued", error: null },
+    { status: "done", source: "solved", error: "invalid execution" },
+  ])(
+    "FALSE-POSITIVE GUARD: untyped invalid/pre-solver evidence fails closed ($status/$source)",
+    ({ status, source, error }) => {
+      expect(
+        isAutomaticRansPrecalcHandoffEvidence({
+          classificationState: "rejected",
+          failureDisposition: null,
+          status,
+          source,
+          error,
+        }),
+      ).toBe(false);
+    },
+  );
+
+  it("FALSE-POSITIVE GUARD: explicit typed-none rejection is a contract conflict, not legacy evidence", () => {
+    expect(
+      isAutomaticRansPrecalcHandoffEvidence({
+        classificationState: "rejected",
+        failureDisposition: "none",
+        status: "done",
+        source: "solved",
+        error: null,
+      }),
+    ).toBe(false);
   });
 });
 

@@ -371,19 +371,84 @@ def _coefficient_series(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Coefficient time series from one coefficient.dat, or MERGED from several
     restart segments (each pimpleFoam continuation writes its own
-    ``postProcessing/forceCoeffs1/<startTime>/coefficient.dat``). Merging sorts
-    by time and drops duplicate timestamps at the restart seams."""
+    ``postProcessing/forceCoeffs1/<startTime>/coefficient.dat``).
+
+    The newer segment owns its nominal ``startTime`` boundary.  OpenFOAM may
+    write one terminal force row into the older segment at exactly that time;
+    after solver reconfiguration that row can be numerically inconsistent with
+    both neighbouring states.  Treating those restart-seam rows as physical
+    samples minted a false impulse train in otherwise flat production traces.
+    Clip each older segment at the next numeric segment start, including a
+    header-only successor that has not written its first force row yet, then
+    sort and deduplicate the merged series.  The directory boundary owns the
+    restarted physical trajectory even while its coefficient file is empty.
+    Every genuine sample strictly before the boundary is preserved and the
+    newer segment wins an exact overlap."""
     if isinstance(path, (list, tuple)):
-        parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-        last_exc: Exception | None = None
-        for p in path:
+        segment_paths = [Path(item) for item in path]
+        numeric_boundaries: list[float] = []
+        for segment_path in segment_paths:
             try:
-                parts.append(_coefficient_series_one(Path(p)))
+                boundary = float(segment_path.parent.name)
+            except ValueError:
+                continue
+            if math.isfinite(boundary):
+                numeric_boundaries.append(boundary)
+        numeric_boundaries = sorted(set(numeric_boundaries))
+        parts: list[
+            tuple[
+                Path,
+                float | None,
+                tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+            ]
+        ] = []
+        last_exc: Exception | None = None
+        for segment_path in segment_paths:
+            try:
+                values = _coefficient_series_one(segment_path)
             except (OSError, ValueError) as exc:  # in-flight segment may be header-only
                 last_exc = exc
+                continue
+            try:
+                segment_start: float | None = float(segment_path.parent.name)
+            except ValueError:
+                segment_start = None
+            parts.append((segment_path, segment_start, values))
         if not parts:
             raise last_exc or ValueError("No coefficient data found (no segments)")
-        merged = tuple(np.concatenate([part[k] for part in parts]) for k in range(4))
+        # Numeric OpenFOAM restart segments have an authoritative physical
+        # order independent of filesystem/glob order.  Non-standard inputs
+        # retain their first-sample order and are never seam-clipped without a
+        # numeric boundary contract.
+        parts.sort(
+            key=lambda item: (
+                item[1] if item[1] is not None else float(item[2][0][0]),
+                str(item[0]),
+            )
+        )
+        clipped: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for _segment_path, segment_start, values in parts:
+            next_start = None
+            if segment_start is not None:
+                next_start = next(
+                    (
+                        boundary
+                        for boundary in numeric_boundaries
+                        if boundary > segment_start + max(1e-12, abs(segment_start) * 1e-12)
+                    ),
+                    None,
+                )
+            if next_start is not None:
+                tolerance = max(1e-12, abs(next_start) * 1e-12)
+                keep = values[0] < next_start - tolerance
+                if np.any(keep):
+                    values = tuple(array[keep] for array in values)
+                else:
+                    continue
+            clipped.append(values)
+        merged = tuple(
+            np.concatenate([part[k] for part in clipped]) for k in range(4)
+        )
         return _normalise_series(*merged)
     return _coefficient_series_one(Path(path))
 

@@ -1,3 +1,4 @@
+import { isAutomaticRansPrecalcHandoffEvidence } from "@aerodb/core";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import type { DB } from "./client";
@@ -36,7 +37,6 @@ export interface CampaignResultHandoffHooks {
 interface RansHandoffAttempt {
   id: string;
   state: string;
-  reasons: string[];
   failureDisposition: string | null;
   status: string;
   source: string;
@@ -44,19 +44,13 @@ interface RansHandoffAttempt {
 }
 
 function isAutomaticRansHandoff(attempt: RansHandoffAttempt): boolean {
-  if (attempt.state === "needs_urans") return true;
-  if (attempt.state !== "rejected") return false;
-  if (attempt.failureDisposition === "hard_solver") return true;
-  const aerodynamicTrouble =
-    attempt.reasons.includes("not-converged") ||
-    attempt.reasons.includes("solver-stalled");
-  return (
-    attempt.failureDisposition == null &&
-    aerodynamicTrouble &&
-    attempt.status === "done" &&
-    attempt.source === "solved" &&
-    (attempt.error == null || attempt.error.trim() === "")
-  );
+  return isAutomaticRansPrecalcHandoffEvidence({
+    classificationState: attempt.state,
+    failureDisposition: attempt.failureDisposition,
+    status: attempt.status,
+    source: attempt.source,
+    error: attempt.error,
+  });
 }
 
 async function exactRansHandoffAttempt(
@@ -78,7 +72,6 @@ async function exactRansHandoffAttempt(
     .select({
       id: resultAttempts.id,
       state: resultClassifications.state,
-      reasons: resultClassifications.reasons,
       failureDisposition: sql<
         string | null
       >`${resultAttempts.evidencePayload} ->> 'failure_disposition'`,

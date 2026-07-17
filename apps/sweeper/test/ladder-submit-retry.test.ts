@@ -25,6 +25,7 @@ import {
   solverProfiles,
   sweepDefinitions,
 } from "@aerodb/db";
+import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
 import {
   EngineError,
   type EngineClient,
@@ -124,6 +125,10 @@ async function createOwner(
       state,
       backgroundOwner: true,
       precalcResultId: precalc.id,
+      precalcResultAttemptId: await createAcceptedPrecalcAttemptFixture(
+        db,
+        precalc.id,
+      ),
     })
     .returning();
   return {

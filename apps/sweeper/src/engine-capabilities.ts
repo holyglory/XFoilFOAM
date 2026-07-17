@@ -4,7 +4,11 @@ import type { EngineClient, EngineHealth } from "@aerodb/engine-client";
  * recovery strategy. Values outside this range are not capabilities we can
  * safely acknowledge or persist. */
 export const MAX_MESH_RECOVERY_VERSION = 2_147_483_647;
-export const MIN_DURABLE_URANS_RECOVERY_VERSION = 1;
+/** Version 2 is the first recovery contract that includes the conservative
+ * same-case numerical retry required by the current controller. Version 1 can
+ * still execute ordinary first-pass RANS/PRECALC work, but it must not receive
+ * continuation or corrective-final recovery owned by the version-2 policy. */
+export const MIN_DURABLE_URANS_RECOVERY_VERSION = 2;
 export const MAX_URANS_RECOVERY_VERSION = 2_147_483_647;
 
 export function parsedMeshRecoveryVersion(value: unknown): number | null {
@@ -82,7 +86,9 @@ export async function engineMeshRecoveryVersion(
  * gateway which already advertises mesh-recovery v1. Unknown/malformed health
  * fails closed. Callers may continue ordinary RANS and initial URANS work, but
  * must not reopen or submit continuation/corrective-final recovery unless the
- * returned version is at least MIN_DURABLE_URANS_RECOVERY_VERSION.
+ * returned version is at least MIN_DURABLE_URANS_RECOVERY_VERSION. A known
+ * version 1 is intentionally below that gate: it predates the version-2
+ * conservative same-case numerical retry.
  */
 export async function engineUransRecoveryVersion(
   engine: EngineClient,
@@ -96,7 +102,5 @@ export async function engineUransRecoveryVersion(
 export function supportsDurableUransRecovery(
   version: number | null | undefined,
 ): version is number {
-  return (
-    version != null && version >= MIN_DURABLE_URANS_RECOVERY_VERSION
-  );
+  return version != null && version >= MIN_DURABLE_URANS_RECOVERY_VERSION;
 }

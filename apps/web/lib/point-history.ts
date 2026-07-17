@@ -367,11 +367,11 @@ export function formatBulkContinueOutcome(o: BulkContinueOutcome): string {
 // that renders a classification chip (Points rows, story header, cell panel,
 // solver-results modal). Pure so node vitest pins the truth table.
 //   rans / null            → no chip (plain — steady evidence needs no badge)
-//   urans_precalc          → amber 'precalc' (+ honest verify-queue suffix)
-//   urans_full             → teal 'verified' (full-fidelity tier)
-//   latest verify disagreed → red 'verify disagreed (Δcl 0.06)' — the deltas
-//     rendered are the REAL stored deltas, bound-annotated by the pinned
-//     contract limits below.
+//   urans_precalc          → amber 'URANS fast' (+ final-stage suffix)
+//   urans_full             → teal 'URANS final · verified'
+//   latest verify disagreed → amber 'verified · differs from fast
+//     (Δcl 0.06)' — accepted final URANS remains authoritative while the
+//     REAL stored deltas preserve comparison context.
 // ---------------------------------------------------------------------------
 /** Contract-4 disagreement bounds — pinned here for label emphasis only; the
  *  authoritative comparison lives in the sweeper (engine-client fidelity.ts).
@@ -389,9 +389,9 @@ function fmtDelta(v: number): string {
   return s.replace(/0+$/, "").replace(/\.$/, ".0");
 }
 
-/** Human label for the offending deltas of a disagreed verify item. Lists the
+/** Human label for the comparison deltas of a disagreed verify item. Lists the
  *  deltas that exceeded their contract bound; falls back to every recorded
- *  delta (a disagreement always stores its evidence — an empty suffix means
+ *  delta (the difference state retains its evidence — an empty suffix means
  *  the deltas were never recorded, and we say nothing rather than invent). */
 export function disagreedDeltaLabel(verify: PointVerifyInfo): string {
   const parts: string[] = [];
@@ -420,21 +420,24 @@ export function fidelityChipView(
   if (verify?.state === "disagreed") {
     const deltas = disagreedDeltaLabel(verify);
     return {
-      label: deltas ? `verify disagreed (${deltas})` : "verify disagreed",
-      tone: "red",
+      label: deltas
+        ? `verified · differs from fast (${deltas})`
+        : "verified · differs from fast",
+      tone: "amber",
     };
   }
   if (verify?.state === "blocked")
-    return { label: "final URANS · critical", tone: "red" };
-  if (fidelity === "urans_full") return { label: "verified", tone: "teal" };
+    return { label: "CRITICAL · URANS final", tone: "red" };
+  if (fidelity === "urans_full")
+    return { label: "URANS final · verified", tone: "teal" };
   if (fidelity === "urans_precalc") {
     if (verify?.state === "pending" || verify?.state === "running")
-      return { label: "precalc · verify pending", tone: "amber" };
+      return { label: "URANS fast · final queued", tone: "amber" };
     if (verify?.state === "done")
-      return { label: "precalc · verified", tone: "teal" };
+      return { label: "URANS final · verified", tone: "teal" };
     if (verify?.state === "cancelled")
-      return { label: "precalc · verify cancelled", tone: "amber" };
-    return { label: "precalc", tone: "amber" };
+      return { label: "CRITICAL · URANS final", tone: "red" };
+    return { label: "URANS fast", tone: "amber" };
   }
   return null;
 }
@@ -508,9 +511,10 @@ export function statusChipDisplay(
 }
 
 // ---------------------------------------------------------------------------
-// STORY digest: one line per table row summarizing the attempt chain, e.g.
-//   "RANS ✗ → URANS ⏱ timeout ×3"
-//   "RANS ✗ → URANS ✓ steady (no shedding)"
+// STORY digest: one line per table row summarizing the physical solver chain,
+// e.g.
+//   "RANS handoff → URANS ⏱ timeout ×3"
+//   "RANS handoff → URANS ✓ steady (no shedding)"
 //   "derived by symmetry — mirror of +4°"
 // Consecutive identical steps collapse into ×N. Honest fallbacks when there
 // are no attempt records (pre-attempt-era rows, still-queued backlog).
@@ -533,6 +537,11 @@ function digestStep(e: PointAttemptDigestEvent): string {
     }
     return `${regime} ✓`;
   }
+  // A completed aerodynamic RANS screen that is not publishable is the
+  // ordinary transition into fast URANS. It must never look like a failed
+  // point in the compact story chain. Typed runtime/mesh errors still use the
+  // explicit error branch above.
+  if (e.regime === "rans") return "RANS handoff";
   return e.stalled || !e.converged ? `${regime} ✗` : `${regime} ✗ invalid`;
 }
 
@@ -609,25 +618,51 @@ export interface TimelineEvent {
   interruption?: PointStoryInterruption;
 }
 
-function attemptTitle(a: PointStoryAttempt): string {
-  const regime =
-    a.regime === "urans" ? "URANS" : a.regime === "rans" ? "RANS" : "solve";
+type AttemptStageKey = "rans" | "fast" | "final" | "urans" | "solve";
+
+function attemptStage(a: PointStoryAttempt): {
+  key: AttemptStageKey;
+  label: string;
+} {
+  if (a.regime === "rans") return { key: "rans", label: "RANS screen" };
+  if (a.regime === "urans" && a.simJob?.jobKind === "verify") {
+    return { key: "final", label: "URANS final" };
+  }
+  if (a.regime === "urans" && a.simJob) {
+    return { key: "fast", label: "URANS fast" };
+  }
+  if (a.regime === "urans") {
+    // Pre-ladder evidence has no immutable tier marker in this payload. Keep
+    // that history truthful instead of guessing fast or final.
+    return { key: "urans", label: "URANS (tier unrecorded)" };
+  }
+  return { key: "solve", label: "solver" };
+}
+
+function attemptTitle(
+  a: PointStoryAttempt,
+  stage: ReturnType<typeof attemptStage>,
+  physicalOrdinal: number,
+): string {
+  const prefix = `${stage.label} · physical run ${physicalOrdinal}`;
   if (a.error)
-    return isTimeout(a.error)
-      ? `${regime} attempt — timeout`
-      : `${regime} attempt — failed`;
+    return isTimeout(a.error) ? `${prefix} · timeout` : `${prefix} · failed`;
   if (a.validForPolar) {
     if (a.regime === "urans")
       return a.unsteady && a.strouhal != null
-        ? `${regime} attempt — valid, shedding measured`
-        : `${regime} attempt — valid, steady (no shedding)`;
-    return `${regime} attempt — valid`;
+        ? `${prefix} · accepted · shedding`
+        : `${prefix} · accepted · steady`;
+    return `${prefix} · accepted`;
   }
-  return `${regime} attempt — ${a.stalled ? "stalled" : "invalid"} (escalation evidence)`;
+  if (a.regime === "rans") return `${prefix} · handed off`;
+  return `${prefix} · evidence not accepted`;
 }
 
 function attemptDetailLine(a: PointStoryAttempt): string {
   const bits: string[] = [];
+  if (a.regime === "rans" && !a.error && !a.validForPolar) {
+    bits.push("normal handoff to URANS fast");
+  }
   bits.push(a.converged ? "converged" : "not converged");
   if (a.stalled) bits.push("stalled");
   if (a.validForPolar) bits.push("valid for polar");
@@ -642,14 +677,30 @@ const WORKER_RESTART_RE = /worker restarted mid-solve/i;
 
 export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
   const timed: TimelineEvent[] = [];
+  const physicalRuns: Record<AttemptStageKey, number> = {
+    rans: 0,
+    fast: 0,
+    final: 0,
+    urans: 0,
+    solve: 0,
+  };
   for (const a of story.attempts) {
+    const stage = attemptStage(a);
+    const physicalOrdinal = ++physicalRuns[stage.key];
     timed.push({
       kind: "attempt",
       at: a.solvedAt ?? a.createdAt,
-      // Red strictly for crashes/timeouts; a rejected/stalled attempt that
-      // escalated to URANS is amber (normal operation); valid is teal.
-      tone: a.error ? "red" : a.validForPolar ? "teal" : "amber",
-      title: attemptTitle(a),
+      // Red strictly for physical/runtime failures. A completed RANS screen
+      // that hands off normally is neutral; accepted evidence is teal; a
+      // non-accepted URANS window remains amber while recovery continues.
+      tone: a.error
+        ? "red"
+        : a.validForPolar
+          ? "teal"
+          : a.regime === "rans"
+            ? "muted"
+            : "amber",
+      title: attemptTitle(a, stage, physicalOrdinal),
       detail: attemptDetailLine(a),
       whyLines: a.qualityWarnings,
       attempt: a,
@@ -679,7 +730,7 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     story.point.workDisposition === "scheduled";
   if (cls) {
     const tone: TimelineTone = uransQueued
-      ? "amber"
+      ? "muted"
       : cls.state === "accepted"
         ? "teal"
         : cls.state === "rejected"
@@ -690,10 +741,10 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
       at: null,
       tone,
       title: uransQueued
-        ? "RANS did not converge — preliminary URANS queued"
+        ? "RANS screen · handed off to URANS fast"
         : `classified ${cls.state.replaceAll("_", " ")} (confidence ${Math.round(cls.confidence * 100)}%)`,
       detail: uransQueued
-        ? "the steady-solver evidence is retained; targeted preliminary URANS is the next automatic calculation"
+        ? "normal automatic handoff · RANS evidence retained"
         : cls.reasons.length
           ? cls.reasons.join(", ")
           : null,
@@ -703,7 +754,8 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
 
   // Fidelity ladder verification (contract 4): the verify queue's REAL state
   // for this cell+angle. Pending/running = honest "scheduled last" note;
-  // disagreed = red event carrying the stored deltas.
+  // disagreed = accepted final evidence plus amber comparison context carrying
+  // the stored deltas. It is not a failed verification or review task.
   const verify = story.point.verify;
   if (verify && (verify.state === "pending" || verify.state === "running")) {
     events.push({
@@ -712,10 +764,9 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
       tone: "amber",
       title:
         verify.state === "running"
-          ? "full-fidelity verification running"
-          : "full-fidelity verification queued",
-      detail:
-        "precalc URANS evidence — a full-mesh 7-period re-solve verifies it at the lowest scheduler priority",
+          ? "URANS final · physical run active"
+          : "URANS final · queued",
+      detail: "background verification of the accepted URANS fast result",
       whyLines: [],
     });
   } else if (verify && verify.state === "disagreed") {
@@ -723,9 +774,9 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     events.push({
       kind: "classification",
       at: null,
-      tone: "red",
-      title: "full-fidelity verification DISAGREED",
-      detail: `${deltas ? `${deltas} — ` : ""}classification stays on the verified full-fidelity row; the precalc/full disagreement is flagged for review`,
+      tone: "amber",
+      title: "final URANS verified · differs from fast",
+      detail: `${deltas ? `${deltas} — ` : ""}the accepted final URANS result is authoritative; the fast result remains preliminary comparison evidence`,
       whyLines: [],
     });
   } else if (verify && verify.state === "blocked") {
@@ -733,16 +784,17 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
       kind: "classification",
       at: null,
       tone: "red",
-      title: "final URANS recovery failed",
+      title: "CRITICAL · URANS final unavailable",
       detail: `${verify.submitHttpStatus ? `HTTP ${verify.submitHttpStatus} — ` : ""}${verify.submitError ?? "the engine rejected the full-fidelity submit after its bounded automatic retry"}`,
       whyLines: [
-        "accepted preliminary evidence is retained; this critical system incident requires automatic recovery and investigation",
+        "system-owned incident · automatic recovery and investigation required",
+        "accepted URANS fast evidence is retained",
       ],
     });
   }
 
   const bucketTone: TimelineTone = uransQueued
-    ? "amber"
+    ? "muted"
     : story.point.status === "failed"
       ? "red"
       : cls?.state === "rejected"
@@ -763,7 +815,7 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     at: story.point.updatedAt,
     tone: bucketTone,
     title: uransQueued
-      ? "NOW: preliminary URANS queued"
+      ? "NOW: URANS fast queued"
       : `NOW: ${story.point.status}${cls ? ` · ${cls.state.replaceAll("_", " ")}` : ""}`,
     detail: [evidence, closureLine].filter(Boolean).join(" — "),
     whyLines: story.point.qualityWarnings,

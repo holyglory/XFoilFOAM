@@ -1760,6 +1760,7 @@ export type AdminCampaignPreliminaryFastState =
 
 export type AdminCampaignPreliminaryRansStage =
   | "screened"
+  | "attempted"
   | "polar_handoff"
   | "skipped"
   | "not_started";
@@ -1793,7 +1794,7 @@ export interface AdminCampaignPreliminaryOutcome {
   finalDeltaCd: number | null;
   finalDeltaCm: number | null;
   finalSource: "verify" | "full_request" | null;
-  criticalStage: "preflight" | "fast" | "final" | null;
+  criticalStage: "preflight" | "rans" | "fast" | "final" | null;
   fastResultId: string | null;
   fastResultAttemptId: string | null;
   finalResultId: string | null;
@@ -1806,6 +1807,8 @@ export interface AdminCampaignPreliminaryOutcome {
   recoverySubmissions: number;
   nonPhysicalSubmissions: number;
   interruptedPhysicalRuns: number;
+  /** Stored RANS result-attempt/evidence records, not necessarily physical
+   * solver runs. */
   ransEvidenceRuns: number;
   preliminaryEvidenceRuns: number;
   fullUransEvidenceRuns: number;

@@ -79,6 +79,7 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
     )
     return PolarPoint(
         case_slug=slug,
+        continuation_transient_subdir=outcome.continuation_transient_subdir,
         aoa_deg=outcome.spec.aoa_deg,
         cl=outcome.cl, cd=outcome.cd, cm=outcome.cm, cl_cd=outcome.cl_cd,
         cl_std=outcome.cl_std, cd_std=outcome.cd_std, cm_std=outcome.cm_std,
@@ -149,6 +150,14 @@ def execute_job(
             "worker mesh-recovery capability mismatch: "
             f"requested v{request.expected_mesh_recovery_version}, "
             f"worker is v{MESH_RECOVERY_VERSION}"
+        )
+    if (
+        request.continue_from is not None
+        and request.expected_urans_recovery_version is None
+    ):
+        raise RuntimeError(
+            "worker requires expected_urans_recovery_version for continuation "
+            "before staging or CFD"
         )
     if (
         request.expected_urans_recovery_version is not None
@@ -518,7 +527,9 @@ def execute_job(
             )
             return result
         resume = TransientResume(
-            transient_start=source.transient_start, resume_from=source.resume_from
+            transient_start=source.transient_start,
+            resume_from=source.resume_from,
+            corrective_tail_periods=source.corrective_tail_periods,
         )
 
         def continuation_phase_progress(

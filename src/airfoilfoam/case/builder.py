@@ -276,9 +276,14 @@ class CaseBuilder:
         )
 
     def _write_transient_schemes(self, turb) -> None:
+        u_scheme = (
+            "Gauss upwind"
+            if self.solver.momentum_scheme == "upwind"
+            else "Gauss linearUpwind grad(U)"
+        )
         div = {
             "default": "none",
-            "div(phi,U)": "Gauss linearUpwind grad(U)",
+            "div(phi,U)": u_scheme,
             "div((nuEff*dev2(T(grad(U)))))": "Gauss linear",
         }
         div.update(turb.div_schemes)

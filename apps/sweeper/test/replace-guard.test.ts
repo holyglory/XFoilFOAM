@@ -1468,6 +1468,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         aoaDeg: GATE_AOA,
         state: "running",
         precalcResultId: keptId,
+        precalcResultAttemptId: precalcAttempt.id,
         backgroundOwner: true,
       })
       .returning();
@@ -1708,7 +1709,231 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     ).toBe(true);
   }, 120000);
 
-  it("typed continuation infrastructure is retried without spending recovery budget, while permanent loss falls back to the corrective fresh solve", async () => {
+  it("keeps a final URANS trajectory on exact-state continuation while every segment advances physical time", async () => {
+    await cleanCell();
+    const seeded = await seedAcceptedPrecalcCell("productive-final-trajectory");
+    const [item] = await db
+      .insert(simUransVerifyQueue)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: GATE_AOA,
+        state: "running",
+        precalcResultId: seeded.result.id,
+        precalcResultAttemptId: seeded.result.currentResultAttemptId!,
+        backgroundOwner: true,
+      })
+      .returning();
+    const initialEngineJobId = `${PREFIX}-productive-final-initial`;
+    const [initialJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "verify",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "submitted",
+        engineJobId: initialEngineJobId,
+        totalCases: 1,
+        submittedAt: new Date(),
+        requestPayload: {
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          aoas: [GATE_AOA],
+          uransFidelity: "full",
+          verifyQueueItemId: item.id,
+          verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
+          finalRecoveryMode: "fresh",
+        },
+      })
+      .returning();
+    await db
+      .update(simUransVerifyQueue)
+      .set({ simJobId: initialJob.id })
+      .where(eq(simUransVerifyQueue.id, item.id));
+    await claimCellForJob(seeded.result.id, initialJob.id);
+
+    const initialRejected = {
+      ...rejectedPrecalcPoint(),
+      fidelity: "urans_full",
+    } as PolarPoint;
+    await reconcile(
+      db,
+      stubEngine(jobResult(initialEngineJobId, initialRejected)),
+      { jobIds: [initialJob.id], skipFailedRecovery: true },
+    );
+    let [settled] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, item.id));
+    expect(settled).toMatchObject({
+      state: "pending",
+      freshAttemptCount: 1,
+      continuationAttemptCount: 0,
+      continuationNoProgressCount: 0,
+      lastOutcome: "continuation_pending",
+    });
+
+    const initialWindowEnd = Number(
+      (initialRejected.frame_track as { window: { t_end: number } }).window
+        .t_end,
+    );
+    for (let segment = 1; segment <= 3; segment += 1) {
+      const sourceAttemptId = settled.latestResultAttemptId!;
+      const engineJobId = `${PREFIX}-productive-final-continuation-${segment}`;
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          jobKind: "verify",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "submitted",
+          engineJobId,
+          totalCases: 1,
+          submittedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+            ],
+            aoas: [GATE_AOA],
+            uransFidelity: "full",
+            verifyQueueItemId: item.id,
+            verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
+            finalRecoveryMode: "continuation",
+            continueFromResultAttemptId: sourceAttemptId,
+          },
+        })
+        .returning();
+      await db
+        .update(simUransVerifyQueue)
+        .set({ state: "running", simJobId: job.id })
+        .where(eq(simUransVerifyQueue.id, item.id));
+      const progressed = {
+        ...initialRejected,
+        frame_track: {
+          ...(initialRejected.frame_track as unknown as Record<
+            string,
+            unknown
+          >),
+          periods_retained: 1.4 + segment,
+          stationary: false,
+          window: {
+            t_start: 10.2154,
+            t_end: initialWindowEnd + segment * 0.2,
+          },
+        },
+      } as PolarPoint;
+      await reconcile(db, stubEngine(jobResult(engineJobId, progressed)), {
+        jobIds: [job.id],
+        skipFailedRecovery: true,
+      });
+      [settled] = await db
+        .select()
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      expect(settled).toMatchObject({
+        state: "pending",
+        freshAttemptCount: 1,
+        continuationAttemptCount: segment,
+        continuationNoProgressCount: 0,
+        lastOutcome: "continuation_pending",
+      });
+      expect(settled.latestResultAttemptId).not.toBe(sourceAttemptId);
+    }
+
+    // Productive segments are unbounded, but two consecutive unchanged
+    // checkpoints abandon only that trajectory and spend the bounded
+    // corrective fresh start.
+    for (let miss = 1; miss <= 2; miss += 1) {
+      const sourceAttemptId = settled.latestResultAttemptId!;
+      const engineJobId = `${PREFIX}-final-continuation-no-progress-${miss}`;
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          jobKind: "verify",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "submitted",
+          engineJobId,
+          totalCases: 1,
+          submittedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+            ],
+            aoas: [GATE_AOA],
+            uransFidelity: "full",
+            verifyQueueItemId: item.id,
+            verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
+            finalRecoveryMode: "continuation",
+            continueFromResultAttemptId: sourceAttemptId,
+          },
+        })
+        .returning();
+      await db
+        .update(simUransVerifyQueue)
+        .set({ state: "running", simJobId: job.id })
+        .where(eq(simUransVerifyQueue.id, item.id));
+      const unchanged = {
+        ...initialRejected,
+        frame_track: {
+          ...(initialRejected.frame_track as unknown as Record<
+            string,
+            unknown
+          >),
+          periods_retained: 4.4,
+          stationary: false,
+          window: {
+            t_start: 10.2154,
+            t_end: initialWindowEnd + 0.6,
+          },
+        },
+      } as PolarPoint;
+      await reconcile(db, stubEngine(jobResult(engineJobId, unchanged)), {
+        jobIds: [job.id],
+        skipFailedRecovery: true,
+      });
+      [settled] = await db
+        .select()
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      expect(settled.continuationAttemptCount).toBe(3 + miss);
+      if (miss === 1) {
+        expect(settled).toMatchObject({
+          state: "pending",
+          continuationNoProgressCount: 1,
+          lastOutcome: "continuation_pending",
+        });
+      } else {
+        expect(settled).toMatchObject({
+          state: "pending",
+          freshAttemptCount: 1,
+          continuationNoProgressCount: 0,
+          lastOutcome: "fresh_retry_pending",
+        });
+      }
+    }
+
+    const incidents = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(eq(simSolverIncidents.verifyQueueId, item.id));
+    expect(incidents).toHaveLength(6);
+    expect(incidents.every((incident) => incident.severity === "warning")).toBe(
+      true,
+    );
+  }, 120000);
+
+  it("typed continuation infrastructure retries the same source, while permanent loss becomes one stable critical incident", async () => {
     await cleanCell();
     const seeded = await seedAcceptedPrecalcCell("final-continuation-outcomes");
     const [sourceAttempt] = await db
@@ -1755,6 +1980,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         aoaDeg: GATE_AOA,
         state: "running",
         precalcResultId: seeded.result.id,
+        precalcResultAttemptId: seeded.result.currentResultAttemptId!,
         backgroundOwner: true,
         freshAttemptCount: 1,
         continuationAttemptCount: 0,
@@ -1876,27 +2102,28 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         .from(simUransVerifyQueue)
         .where(eq(simUransVerifyQueue.id, item.id));
       expect(afterPermanent).toMatchObject({
-        state: "pending",
-        simJobId: null,
+        state: "blocked",
+        simJobId: permanentJob.id,
         freshAttemptCount: 1,
         continuationAttemptCount: 1,
         latestResultAttemptId: sourceAttempt.id,
         nextSubmitAt: null,
-        lastOutcome: "fresh_retry_pending",
+        lastOutcome: "continuation_permanent_failure",
       });
       const incidents = await db
         .select()
         .from(simSolverIncidents)
         .where(eq(simSolverIncidents.verifyQueueId, item.id));
       expect(incidents).toHaveLength(2);
-      expect(
-        incidents.every((incident) => incident.severity === "warning"),
-      ).toBe(true);
+      expect(incidents.map((incident) => incident.severity).sort()).toEqual([
+        "critical",
+        "warning",
+      ]);
       expect(
         incidents.map((incident) => incident.occurrenceKey).sort(),
       ).toEqual(
         [
-          `final:${item.id}:${permanentJob.id}:fresh_retry_pending`,
+          `final:${item.id}:${permanentJob.id}:continuation_permanent_failure`,
           `final:${item.id}:${transientJob.id}:continuation_retry_wait`,
         ].sort(),
       );
@@ -2011,6 +2238,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         aoaDeg: GATE_AOA,
         state: "running",
         precalcResultId: seeded.result.id,
+        precalcResultAttemptId: selectedAttemptId!,
       })
       .returning();
     const requestPayload = {
@@ -2693,7 +2921,8 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
 
   it("fences a stale concurrent correction so projection and pointer stay one generation", async () => {
     await cleanCell();
-    const resultId = await seedAcceptedRansCell();
+    const seeded = await seedAcceptedPrecalcCell("concurrent-correction");
+    const resultId = seeded.result.id;
     await refreshPolarCacheForRevision(db, airfoilId, revisionId);
     const [verify] = await db
       .insert(simUransVerifyQueue)
@@ -2704,6 +2933,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         state: "running",
         backgroundOwner: true,
         precalcResultId: resultId,
+        precalcResultAttemptId: seeded.result.currentResultAttemptId!,
       })
       .returning();
     const jobs = await Promise.all(

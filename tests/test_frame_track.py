@@ -37,7 +37,7 @@ from airfoilfoam.models import (
     RoughnessParams,
     SolverParams,
 )
-from airfoilfoam.openfoam.runner import OpenFOAMError
+from airfoilfoam.openfoam.runner import HardSolverError, OpenFOAMError
 from airfoilfoam.pipeline import (
     CaseOutcome,
     TransientResult,
@@ -322,6 +322,77 @@ def test_coefficient_series_merges_restart_segments(tmp_path):
     assert np.all(np.diff(t) > 0)  # seam duplicate dropped, strictly increasing
     assert t.size == 601
     assert cl.size == cd.size == cm.size == t.size
+
+
+def test_coefficient_series_restart_segment_owns_its_nominal_start_boundary(tmp_path):
+    """MUST-CATCH: OpenFOAM may emit one numerically inconsistent force row
+    at a chunk's terminal ``endTime`` before opening the next restart segment.
+
+    The next segment directory is named by that exact restart time, so it owns
+    the boundary.  Keeping the older terminal row minted a false periodic
+    impulse train in production (20-32C/Re~102k/alpha=2) and made an otherwise
+    flat preliminary trajectory fail the stationarity gate forever.
+    """
+
+    f1 = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    f2 = tmp_path / "postProcessing" / "forceCoeffs1" / "1" / "coefficient.dat"
+    _write_coeff_rows(
+        f1,
+        [0.97, 0.98, 0.99, 1.0],
+        lambda t: 9.0 if t == 1.0 else 0.7,
+    )
+    # A real OpenFOAM restart may either repeat the exact start time or write
+    # its first force row a few solver steps later.  The newer segment is the
+    # authoritative owner in both cases.
+    _write_coeff_rows(f2, [1.0, 1.001, 1.002], lambda _t: 0.7)
+
+    t, cl, _cd, _cm = coefficient_series([f1, f2])
+
+    assert np.all(np.diff(t) > 0)
+    assert t.tolist() == pytest.approx([0.97, 0.98, 0.99, 1.0, 1.001, 1.002])
+    assert cl.tolist() == pytest.approx([0.7] * 6)
+
+
+def test_coefficient_series_header_only_restart_owns_its_boundary(tmp_path):
+    """MUST-CATCH: a newly opened restart segment owns its nominal boundary
+    before its first force row is written.  Otherwise the prior segment's
+    inconsistent terminal row survives until a later segment becomes parseable.
+    """
+
+    f1 = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    f2 = tmp_path / "postProcessing" / "forceCoeffs1" / "1" / "coefficient.dat"
+    f3 = tmp_path / "postProcessing" / "forceCoeffs1" / "2" / "coefficient.dat"
+    _write_coeff_rows(
+        f1,
+        [0.98, 0.99, 1.0, 1.01],
+        lambda t: 99.0 if t >= 1.0 else 0.7,
+    )
+    f2.parent.mkdir(parents=True, exist_ok=True)
+    f2.write_text(
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)\n"
+    )
+    _write_coeff_rows(f3, [2.0, 2.01], lambda _t: 0.7)
+
+    t, cl, _cd, _cm = coefficient_series([f1, f2, f3])
+
+    assert t.tolist() == pytest.approx([0.98, 0.99, 2.0, 2.01])
+    assert cl.tolist() == pytest.approx([0.7] * 4)
+
+
+def test_coefficient_series_keeps_real_samples_before_restart_boundary(tmp_path):
+    """False-positive guard: seam ownership removes only rows at/after the
+    next segment's nominal start, never a genuine sample immediately before it.
+    """
+
+    f1 = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    f2 = tmp_path / "postProcessing" / "forceCoeffs1" / "1" / "coefficient.dat"
+    _write_coeff_rows(f1, [0.998, 0.999, 1.0], lambda t: t)
+    _write_coeff_rows(f2, [1.0005, 1.001], lambda t: t)
+
+    t, cl, _cd, _cm = coefficient_series([f1, f2])
+
+    assert t.tolist() == pytest.approx([0.998, 0.999, 1.0005, 1.001])
+    assert cl.tolist() == pytest.approx(t.tolist())
 
 
 def test_transient_attempt_merges_only_transient_segments(tmp_path, monkeypatch):
@@ -699,6 +770,163 @@ def test_full_fidelity_does_not_enter_precalc_stationarity_grader(
     assert result is original
 
 
+@pytest.mark.parametrize("drifting", [False, True])
+def test_full_live_grade_applies_strict_stationarity_before_finalization(
+    tmp_path,
+    monkeypatch,
+    drifting,
+):
+    """MUST-CATCH: seven dense periods are not sufficient for a verified
+    point when their mean is still moving.  The strict verdict must reach the
+    live quality controller, while a clean full-tier limit cycle still passes.
+    """
+
+    period = 0.5
+    end = 7.0 * period
+    coeff = (
+        tmp_path
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat"
+    )
+    times = np.linspace(0.0, end, 3501)
+    _write_coeff_rows(
+        coeff,
+        times,
+        lambda t: (
+            0.7
+            + 0.08 * math.sin(2 * math.pi * t / period)
+            + (0.16 * t / end if drifting else 0.0)
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "estimate_period",
+        lambda *_args, **_kwargs: PeriodEstimate(
+            period_s=period,
+            ambiguous=False,
+            first_half_s=period,
+            second_half_s=period,
+        ),
+    )
+    original = UransQuality(
+        ok=True,
+        can_refine=False,
+        reason="URANS quality target met.",
+        measured_period_s=period,
+        retained_cycles=7.0,
+        retained_frame_count=210,
+        frames_per_cycle=30.0,
+    )
+
+    quality = pipeline._grade_full_strict_stationarity(
+        tmp_path,
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="full",
+            transient_discard_fraction=0.0,
+        ),
+        original,
+        early_stopped=False,
+    )
+
+    assert quality.ok is (not drifting)
+    assert quality.can_refine is drifting
+    if drifting:
+        assert quality.reason.startswith(
+            "URANS window not stationary: Cl drift"
+        )
+        assert "exceeds tolerance 0.05 over 7 whole periods" in quality.reason
+    else:
+        assert quality is original
+
+
+def test_full_transient_attempt_routes_strict_drift_to_live_controller(
+    tmp_path,
+    monkeypatch,
+):
+    """Integration pin: the real attempt path must not stop at the ordinary
+    periods/frames grade and defer strict drift discovery to finalization.
+    """
+
+    period = 0.5
+    end = 7.0 * period
+
+    class FakeCaseBuilder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def write_transient(self, *_args, **_kwargs):
+            pass
+
+    class FakeRunner:
+        def solver(self, case_dir, *_args, **_kwargs):
+            coeff = (
+                case_dir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat"
+            )
+            times = np.linspace(0.0, end, 3501)
+            _write_coeff_rows(
+                coeff,
+                times,
+                lambda t: (
+                    0.7
+                    + 0.08 * math.sin(2 * math.pi * t / period)
+                    + 0.16 * t / end
+                ),
+            )
+            for t in np.linspace(0.0, end, 211):
+                (case_dir / f"{t:.8g}").mkdir(exist_ok=True)
+            return SimpleNamespace(ok=True, stdout="pimple ok")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(
+        pipeline,
+        "estimate_period",
+        lambda *_args, **_kwargs: PeriodEstimate(
+            period_s=period,
+            ambiguous=False,
+            first_half_s=period,
+            second_half_s=period,
+        ),
+    )
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+
+    result = _run_transient_attempt(
+        tcase,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(
+            force_transient=True,
+            urans_fidelity="full",
+            transient_discard_fraction=0.0,
+        ),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=120,
+        run_time=end,
+        delta_t=period / 5000.0,
+        coeff_start_time=0.0,
+    )
+
+    assert result is not None
+    assert not result.quality.ok and result.quality.can_refine
+    assert result.quality.reason.startswith(
+        "URANS window not stationary: Cl drift"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Continuation until N whole periods + honest budget grading
 # --------------------------------------------------------------------------- #
@@ -761,6 +989,7 @@ def _install_continuation_fakes(
         k = len(calls)
         calls.append(
             {
+                "case": tcase.name,
                 "run_time": run_time,
                 "delta_t": delta_t,
                 "write_interval": write_interval,
@@ -1685,6 +1914,324 @@ def test_precalc_continues_same_case_after_period_target_for_sparse_or_nonstatio
     assert result is not None and result.quality.ok
 
 
+def test_full_strict_drift_gets_measured_same_case_tail_before_refinement(
+    tmp_path,
+    monkeypatch,
+):
+    """A target-satisfied full run that misses the strict mean-drift gate is
+    normal corrective integration, not a completed attempt or a copied fresh
+    trajectory.  Three measured periods must be added to the same case first.
+    """
+
+    period = 0.5
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[4.0, 5.5],
+        wall_seconds=1.0,
+        failure_reason=(
+            "URANS window not stationary: Cl drift 0.091 exceeds tolerance "
+            "0.05 over 8 whole periods"
+        ),
+    )
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="full",
+            transient_discard_fraction=0.0,
+        ),
+        timeout=43_200,
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["refined"] is False
+    assert calls[1]["coeff_start_time"] == pytest.approx(0.0)
+    assert calls[1]["run_time"] == pytest.approx(
+        pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS * period
+    )
+    assert calls[1]["write_interval"] == pytest.approx(
+        period / pipeline.URANS_FRAME_WRITE_PER_CYCLE
+    )
+    assert result is not None and result.quality.ok
+
+
+@pytest.mark.parametrize(
+    "failure_reason",
+    [
+        (
+            "URANS strict stationarity verdict unavailable: grading error "
+            "(ValueError); prior force-history grade: URANS quality target met."
+        ),
+        (
+            "URANS strict stationarity verdict unavailable: no whole-period "
+            "statistics; prior force-history grade: URANS quality target met."
+        ),
+    ],
+)
+def test_full_strict_unavailable_gets_same_case_tail_before_refinement(
+    tmp_path,
+    monkeypatch,
+    failure_reason,
+):
+    """A transient strict-grader disagreement is a request for more evidence,
+    not permission to discard a target-satisfied trajectory and copy a fresh
+    refined child."""
+
+    period = 0.5
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[4.0, 5.5],
+        wall_seconds=1.0,
+        failure_reason=failure_reason,
+    )
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="full",
+            transient_discard_fraction=0.0,
+        ),
+        timeout=43_200,
+    )
+
+    assert len(calls) == 2
+    assert all(call["case"] == "transient" for call in calls)
+    assert all(call["refined"] is False for call in calls)
+    assert calls[1]["run_time"] == pytest.approx(
+        pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS * period
+    )
+    assert result is not None and result.quality.ok
+
+
+def test_full_strict_drift_on_refined_pass_is_extended_before_return(
+    tmp_path,
+    monkeypatch,
+):
+    """A cadence-driven copied refinement has its own live strict verdict.
+    If that verdict still drifts, the refined case itself must continue rather
+    than escaping directly to the finalizer as rejected evidence.
+    """
+
+    period = pipeline.physics.shedding_period(
+        10.0,
+        1.0,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare(tcase, *_args, **_kwargs):
+        tcase.mkdir(parents=True, exist_ok=True)
+        (tcase / "0").mkdir(exist_ok=True)
+        return (None, {})
+
+    def fake_attempt(
+        tcase,
+        *_args,
+        run_time=None,
+        coeff_start_time=None,
+        refined=False,
+        **_kwargs,
+    ):
+        index = len(calls)
+        start = pipeline._latest_time(tcase)
+        end = start + float(run_time)
+        (tcase / f"{end:.10g}").mkdir(exist_ok=True)
+        calls.append(
+            {
+                "case": Path(tcase).name,
+                "refined": refined,
+                "run_time": run_time,
+                "coeff_start_time": coeff_start_time,
+            }
+        )
+        if index == 0:
+            quality = UransQuality(
+                ok=False,
+                can_refine=True,
+                reason="frames/cycle 10.00 < 20.00",
+                measured_period_s=period,
+                retained_cycles=8.0,
+                frames_per_cycle=10.0,
+            )
+        elif index == 1:
+            quality = UransQuality(
+                ok=False,
+                can_refine=True,
+                reason=(
+                    "URANS window not stationary: Cl drift 0.083 exceeds "
+                    "tolerance 0.05 over 8 whole periods"
+                ),
+                measured_period_s=period,
+                retained_cycles=8.0,
+                frames_per_cycle=30.0,
+            )
+        else:
+            quality = UransQuality(
+                ok=True,
+                can_refine=False,
+                reason="URANS quality target met.",
+                measured_period_s=period,
+                retained_cycles=11.0,
+                frames_per_cycle=30.0,
+            )
+        return TransientResult(
+            avg=SimpleNamespace(
+                cl=0.7,
+                cd=0.05,
+                cm=-0.02,
+                cl_cd=14.0,
+                cl_std=0.07,
+                cd_std=0.0,
+                cm_std=0.0,
+            ),
+            case_dir=Path(tcase),
+            force_history=_history_over(0.0, end, period),
+            quality=quality,
+            start_time=start,
+            end_time=end,
+            run_time=float(run_time),
+            refined=refined,
+            wall_seconds=1.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="full",
+            transient_discard_fraction=0.0,
+        ),
+        timeout=43_200,
+    )
+
+    assert [(call["case"], call["refined"]) for call in calls] == [
+        ("transient", False),
+        ("transient_refined", True),
+        ("transient_refined", True),
+    ]
+    assert calls[2]["run_time"] == pytest.approx(
+        pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS * period
+    )
+    assert result is not None and result.refined and result.quality.ok
+
+
+def test_persistent_full_strict_drift_stays_restartable_without_copied_rerun(
+    tmp_path,
+    monkeypatch,
+):
+    """The emergency bound is not permission to discard a full trajectory.
+    Preserve the same-case checkpoint for the durable final recovery lane.
+    """
+
+    period = 0.5
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[
+            4.0
+            + i * pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS * period
+            for i in range(pipeline.URANS_CONTINUATION_MAX_CHUNKS + 1)
+        ],
+        wall_seconds=1.0,
+        quality_ok_at_end=False,
+        failure_reason=(
+            "URANS window not stationary: Cl drift 0.083 exceeds tolerance "
+            "0.05 over 8 whole periods"
+        ),
+        failure_frames_per_cycle=30.0,
+    )
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="full",
+            transient_discard_fraction=0.0,
+        ),
+        timeout=43_200,
+    )
+
+    assert len(calls) == 1 + pipeline.URANS_CONTINUATION_MAX_CHUNKS
+    assert all(call["refined"] is False for call in calls)
+    assert result is not None and not result.quality.ok
+    assert pipeline.URANS_CONTINUATION_REQUIRED_MARKER in result.quality.reason
+    assert "restartable saved case state" in result.quality.reason
+
+
+def test_same_case_extension_stops_after_one_chunk_without_physical_progress(
+    tmp_path,
+    monkeypatch,
+):
+    """MUST-CATCH: a successful process exit that advances neither saved
+    simulated time nor force history cannot consume all 24 continuation chunks.
+    """
+
+    period = 0.5
+    calls = 0
+
+    def fake_prepare(tcase, *_args, **_kwargs):
+        tcase.mkdir(parents=True, exist_ok=True)
+        (tcase / "0").mkdir(exist_ok=True)
+        return (None, {})
+
+    def fake_attempt(tcase, *_args, run_time=None, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            (tcase / "4").mkdir(exist_ok=True)
+        history = _history_over(0.0, 4.0, period)
+        return TransientResult(
+            avg=SimpleNamespace(
+                cl=0.7,
+                cd=0.05,
+                cm=-0.02,
+                cl_cd=14.0,
+                cl_std=0.07,
+                cd_std=0.0,
+                cm_std=0.0,
+            ),
+            case_dir=Path(tcase),
+            force_history=history,
+            quality=UransQuality(
+                ok=False,
+                can_refine=True,
+                reason="URANS window not stationary",
+                measured_period_s=period,
+                retained_cycles=4.0,
+                frames_per_cycle=30.0,
+            ),
+            start_time=0.0 if calls == 1 else 4.0,
+            end_time=4.0,
+            run_time=float(run_time or 0.0),
+            wall_seconds=1.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="full",
+            transient_discard_fraction=0.0,
+        ),
+        timeout=43_200,
+    )
+
+    assert calls == 2
+    assert result is not None and not result.quality.ok
+    assert pipeline.URANS_CONTINUATION_REQUIRED_MARKER in result.quality.reason
+    assert "no measurable simulated-time or force-history advance" in result.quality.reason
+
+
 def test_sparse_only_tail_adds_three_periods_without_reapplying_startup_discard(
     tmp_path, monkeypatch
 ):
@@ -1825,7 +2372,7 @@ def test_continuation_chunk_crash_does_not_claim_continuable(tmp_path, monkeypat
 
     def crash_on_chunk(*args, **kwargs):
         if calls:
-            raise OpenFOAMError("pimpleFoam diverged: sigFpe in GAMG at t=1.31")
+            raise HardSolverError("pimpleFoam diverged: SIGFPE in GAMG at t=1.31")
         return fake(*args, **kwargs)
 
     monkeypatch.setattr(pipeline, "_run_transient_attempt", crash_on_chunk)
@@ -1833,7 +2380,7 @@ def test_continuation_chunk_crash_does_not_claim_continuable(tmp_path, monkeypat
 
     assert result is not None
     assert not result.quality.ok and not result.quality.can_refine
-    assert "continuation chunk failed after retaining 1.2 of 7 periods" in result.quality.reason
+    assert "numerical recovery failed after retaining 1.2 of 7 periods" in result.quality.reason
     assert pipeline.URANS_BUDGET_STOP_MARKER not in result.quality.reason
 
 

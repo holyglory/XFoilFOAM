@@ -12,11 +12,15 @@ The migration is intentionally fail-closed:
   job is skipped/refused rather than changed;
 - GCS uploads use create-only generation preconditions and record the exact
   generation, CRC32C, compressed SHA-256, and uncompressed-tar SHA-256;
-- an initial generation-pinned archive download plus exact manifest/VTK restore
-  proves the upload, but removes no local packaged source;
-- the generated `tar.zst`, legacy gzip bundle, and packaged raw directories all
-  remain local until Postgres has registered that exact GCS generation against
-  the exact result attempt; and
+- an initial generation-pinned archive download plus exact manifest and
+  all-member restore proves the upload; newly finalized results may then
+  remove their unpacked raw evidence, but retain the complete local
+  `tar.zst` until Postgres acknowledges every exact association;
+- the legacy migrator is stricter during pass 1: its generated `tar.zst`,
+  legacy gzip bundle, and packaged raw directories all remain local until
+  Postgres has either registered that exact GCS generation against the exact
+  result attempt or immutably quarantined a terminal engine-job/case archive
+  that has no exact result owner; and
 - a second fresh remote restore plus a validated database acknowledgement is
   required before any of those local packaged sources are deleted.
 
@@ -360,10 +364,17 @@ all of the following before the 2606 pool remains enabled:
 - the canonical artifact is `engine_evidence.tar.zst` with
   `application/zstd` and the expected bucket/content-addressed key;
 - generation, CRC32C, compressed/tar checksums and sizes match;
-- the generation-pinned remote restore reports `archive+vtk-restore` or
-  `archive+manifest-restore`;
+- every artifact carries the producer's exact
+  `remote-copy-plus-local-archive-pending-database-ack` disposition and an
+  `archive+manifest+all-members-restore:<count>` proof whose count equals the
+  archive's bundled-file count; a canary must not claim per-artifact
+  `remote-only` before database acknowledgement;
 - full local stripping removes the live solver/VTK bytes with no unknown
-  entries; and
+  entries while deliberately retaining the complete local archive pending
+  database acknowledgement;
+- the Node attestation independently repeats that full strip and requires the
+  idempotent marker response (`no_op=true`, `kept_case_state=false`, and zero
+  unknown entries) before accepting the producer-shaped receipt; and
 - `/field-extents`, `/render-field`, and `/render-default-media` hydrate GCS
   evidence and return checksum-validated PNGs after that strip.
 
@@ -496,9 +507,21 @@ compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
   2>&1 | tee "$AUDIT_DIR/trial-pass2-node.jsonl"
 ```
 
-Every executed row must be `registered`. The backfill writes
+Every executed row must be either `registered` or `quarantined`.
+`registered` is the ordinary result-owned path: the backfill writes
 `storage_migration.database.json` atomically only after the current archive,
 blob, source bundle, and all logical archive-member mappings agree.
+
+`quarantined` is the narrow zero-owner fallback. It is allowed only when one
+terminal `sim_jobs.engine_job_id` exactly owns the receipt, the
+`cases/<engine_case_slug>/...` path agrees, and no exact result or attempt
+exists for that job/case. It creates no result, coefficient, or AoA binding.
+Instead it records an unbound Zstandard bundle plus immutable
+`solver_evidence_orphan_quarantines` provenance with reason
+`terminal_engine_evidence_not_ingested`, the exact manifest/member set,
+source archive, receipt, GCS generation, and verification identities.
+Ambiguous jobs and any exact owned result remain errors. Quarantine is
+intentionally immutable-only; there is no generic resolved transition.
 
 ### Pass 3: validate registration, re-restore, remove local packaged sources
 
@@ -509,12 +532,15 @@ compose exec -T api python3 -m airfoilfoam.evidence_migration \
 ```
 
 Every row must be `migrated` or `already-complete`, with no `failed` result.
-The finalizer validates the acknowledgement identities, downloads the pinned
-generation again, revalidates the tar plus exact manifest and VTK restore
-(when VTK members exist), and only then
-removes the local Zstandard archive, legacy gzip, and packaged raw evidence
-directories. The manifest, immutable GCS pointer, migration receipt, database
-acknowledgement, and stored render media remain.
+The finalizer validates either acknowledgement shape, downloads the pinned
+generation again, revalidates the tar plus exact manifest and every bundled
+member, and only then removes the local Zstandard archive, legacy gzip, and
+packaged raw evidence directories. The manifest, immutable GCS pointer,
+migration receipt, database acknowledgement, and stored render media remain.
+Operators can discover and download quarantined archives through
+`GET /api/admin/evidence-quarantine`,
+`GET /api/admin/evidence-quarantine/:id`, and the stable admin-only
+`/download` route; they never appear as public polar results.
 
 ### Trial download and UI proof
 
@@ -584,15 +610,18 @@ for target in discover_targets(root):
         receipt = None
     receipt_state = receipt.get("state") if isinstance(receipt, dict) else None
     ack = (evidence / "storage_migration.database.json").is_file()
-    source_or_pointer = any((evidence / name).is_file() for name in (
-        "engine_evidence.tar.zst",
+    # Bulk migration owns the legacy gzip corpus only. New 2606 canary/runtime
+    # evidence can already have a tar.zst plus remote pointer but no canonical
+    # database result association. Canary retention has its own attestation
+    # path; this legacy selector must not absorb it into result migration or
+    # terminal-job orphan quarantine.
+    legacy_gzip_source = any((evidence / name).is_file() for name in (
         "engine_evidence.tar.gz",
         "openfoam_evidence.tar.gz",
-        "engine_evidence.remote.json",
     ))
     wanted = (
         phase == "upload"
-        and source_or_pointer
+        and legacy_gzip_source
         and receipt_state not in {"awaiting_database_registration", "complete"}
     ) or (
         phase == "register"

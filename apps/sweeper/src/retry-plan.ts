@@ -14,11 +14,13 @@
 // The decision core is a pure function so the scoping rules are unit-testable
 // without a database.
 
+import { isAutomaticRansPrecalcHandoffEvidence } from "@aerodb/core";
 import { type DB, resultAttempts, resultClassifications } from "@aerodb/db";
 import { and, eq } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 
 export type RansFailureDisposition =
+  | "none"
   | "hard_solver"
   | "deterministic_mesh"
   | "infrastructure";
@@ -40,6 +42,8 @@ export interface RetryEvidenceRow {
    * they can never authorize whole-polar promotion. */
   failureDisposition?: RansFailureDisposition | null;
   error?: string | null;
+  status?: string;
+  source?: string;
 }
 
 export interface RansRetryDecision {
@@ -119,12 +123,14 @@ function isHardSolverRejection(row: RetryEvidenceRow): boolean {
 }
 
 function isTargetableRansRejection(row: RetryEvidenceRow): boolean {
-  if (isHardSolverRejection(row)) return true;
-  if (row.state !== "rejected" || row.failureDisposition) return false;
-  const reasons = row.reasons ?? [];
-  const aerodynamicTrouble =
-    reasons.includes("not-converged") || reasons.includes("solver-stalled");
-  return aerodynamicTrouble && (row.error == null || row.error.trim() === "");
+  if (row.state !== "rejected") return false;
+  return isAutomaticRansPrecalcHandoffEvidence({
+    classificationState: row.state,
+    failureDisposition: row.failureDisposition,
+    status: row.status ?? "",
+    source: row.source ?? "",
+    error: row.error,
+  });
 }
 
 /**
@@ -215,10 +221,12 @@ export async function ransRetryPlanForJobScoped(
       state: resultClassifications.state,
       reasons: resultClassifications.reasons,
       error: resultAttempts.error,
+      status: resultAttempts.status,
+      source: resultAttempts.source,
       failureDisposition: sql<RansFailureDisposition | null>`
         CASE
           WHEN ${resultAttempts.evidencePayload} ->> 'failure_disposition'
-            IN ('hard_solver', 'deterministic_mesh', 'infrastructure')
+            IN ('none', 'hard_solver', 'deterministic_mesh', 'infrastructure')
           THEN ${resultAttempts.evidencePayload} ->> 'failure_disposition'
           ELSE NULL
         END

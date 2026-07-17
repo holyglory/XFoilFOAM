@@ -720,10 +720,9 @@ const NON_URANS_RESULT_SQL = sql`(
  * result-scoped classification projection. It fences the latest attempt to
  * the canonical result AND exact producing job/cell. Typed hard_solver
  * evidence is authoritative. The pre-contract fallback is intentionally much
- * narrower: only a completed, solved, error-free RANS attempt with an
- * aerodynamic rejection reason may enter the ladder. Failed/queued shells are
- * infrastructure-shaped even when a legacy classifier happened to stamp
- * "not-converged".
+ * narrower: only a completed, solved, error-free RANS attempt may enter the
+ * ladder. Failed/queued shells are infrastructure-shaped even when a legacy
+ * classifier happened to stamp an aerodynamic-looking reason.
  *
  * This fragment uses the canonical `r` alias shared by both progress paths and
  * the completion probe. */
@@ -756,7 +755,13 @@ const AUTOMATIC_RANS_HANDOFF_RESULT_SQL = sql`(
           )
       )
       AND (
-        handoff_classification.state = 'needs_urans'
+        (
+          handoff_classification.state = 'needs_urans'
+          AND COALESCE(
+            handoff_attempt.evidence_payload ->> 'failure_disposition',
+            ''
+          ) NOT IN ('deterministic_mesh', 'infrastructure')
+        )
         OR (
           handoff_classification.state = 'rejected'
           AND (
@@ -766,8 +771,6 @@ const AUTOMATIC_RANS_HANDOFF_RESULT_SQL = sql`(
               AND handoff_attempt.status = 'done'
               AND handoff_attempt.source = 'solved'
               AND NULLIF(btrim(handoff_attempt.error), '') IS NULL
-              AND handoff_classification.reasons
-                    && ARRAY['not-converged', 'solver-stalled']::text[]
             )
           )
         )
@@ -2129,10 +2132,11 @@ export async function autoRetryCrashedResultsForJob(
         },
       });
     }
-    // A completed RANS evidence row can still fail the canonical publication
-    // classifier for a non-aerodynamic reason (for example, malformed or
-    // incomplete evidence). Ordinary non-convergence/stall evidence is
-    // excluded by AUTOMATIC_RANS_HANDOFF_RESULT_SQL and remains normal
+    // A completed RANS row can still fail the classifier while lacking
+    // physical handoff provenance (for example, a typed-none contract conflict
+    // or an invalid/errored execution shell). Every completed, solved,
+    // error-free legacy physical rejection is excluded by
+    // AUTOMATIC_RANS_HANDOFF_RESULT_SQL and remains normal
     // RANS→preliminary-URANS input. Everything selected here has no automatic
     // fidelity owner and is therefore a critical machine incident, not a
     // user-review task.

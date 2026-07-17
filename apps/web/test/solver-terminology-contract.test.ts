@@ -23,6 +23,7 @@ describe("solver terminology contract", () => {
     );
     expect(pointHistory).not.toContain(">verify blocked<");
     expect(pointHistory).toContain(">final URANS critical<");
+    expect(pointHistory).toContain(">final URANS queued<");
   });
 
   it("keeps blocked terminology for the real storage-admission gate", () => {
@@ -53,6 +54,15 @@ describe("solver terminology contract", () => {
     expect(solverWorkModel).not.toContain('label: "Request full tier"');
   });
 
+  it("MUST-CATCH: an accepted final/fast difference is comparison context, not a failed verification", () => {
+    const pointHistory = source("components/admin/PointHistoryPanel.tsx");
+
+    expect(pointHistory).toContain(
+      '<option value="disagreed">final differs from fast</option>',
+    );
+    expect(pointHistory).not.toContain(">verify disagreed<");
+  });
+
   it("MUST-CATCH: campaign cell status is one per-point flow, not a separate RANS failure/requeue panel", () => {
     const cellPanel = source("components/admin/campaigns/CellSidePanel.tsx");
     const flowPanel = source(
@@ -64,9 +74,11 @@ describe("solver terminology contract", () => {
     expect(cellPanel).not.toContain("getCampaignFailures");
     expect(cellPanel).not.toContain("requeueCampaignFailed");
     expect(cellPanel).toContain("Whole-polar request");
-    expect(flowPanel).toContain("non-convergence → fast");
-    expect(flowPanel).toContain("fast usable result");
-    expect(flowModel).toContain("Pre-solver repair critical");
+    expect(flowPanel).toContain("RANS non-convergence is a normal handoff");
+    expect(flowPanel).toContain('data-flow-stage="fast"');
+    expect(flowPanel).toContain('data-flow-stage="final"');
+    expect(flowModel).toContain("CRITICAL · AUTO-REPAIR");
+    expect(flowModel).not.toMatch(/RANS (?:failed|failure)/i);
   });
 
   it("MUST-CATCH: incident UI is automatic/system-owned and never exposes recovery implementation labels", () => {

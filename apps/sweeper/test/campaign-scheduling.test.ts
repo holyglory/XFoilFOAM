@@ -281,14 +281,16 @@ describe("RANS→URANS retry scoping: conditional whole-polar preliminary URANS"
     },
   );
 
-  it("FALSE-POSITIVE GUARD: legacy error-free rejected evidence stays targeted and cannot widen the polar", () => {
+  it("MUST-CATCH: completed legacy physical rejection stays targeted even when its classifier reason is not convergence-shaped", () => {
     const decision = decideRansRetry({
       scope: { origin: "continuous-polar", requestedAoas: [0, 2, 4, 8] },
       jobRows: [
         {
           aoaDeg: 2,
           state: "rejected",
-          reasons: ["not-converged", "solver-stalled"],
+          reasons: ["missing-coefficients"],
+          status: "done",
+          source: "solved",
           error: null,
         },
       ],
@@ -297,6 +299,25 @@ describe("RANS→URANS retry scoping: conditional whole-polar preliminary URANS"
     expect(decision?.aoas).toEqual([2]);
     expect(decision?.queueCanonicalAoas).toEqual([2]);
     expect(decision?.hardRejectedCount).toBe(0);
+  });
+
+  it("FALSE-POSITIVE GUARD: explicit typed-none rejection is not treated as legacy physical handoff", () => {
+    expect(
+      decideRansRetry({
+        scope: { origin: "continuous-polar", requestedAoas: [0, 2, 4, 8] },
+        jobRows: [
+          {
+            aoaDeg: 2,
+            state: "rejected",
+            failureDisposition: "none",
+            reasons: ["missing-coefficients"],
+            status: "done",
+            source: "solved",
+            error: null,
+          },
+        ],
+      }),
+    ).toBeNull();
   });
 
   it.each([

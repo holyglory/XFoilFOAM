@@ -4,11 +4,14 @@ import {
   blockFinalUransVerificationAfterMediaRepair,
   createClient,
   createUransRequest,
+  enqueuePrecalcVerifications,
   ensureFullUransRequestCoverage,
   ensurePrecalcObligations,
   failClaimedResultMediaRepair,
+  finalUransRecoveryPlanForVerifyItem,
   healExpiredResultMediaRepairClaims,
   invalidateSatisfiedResultMediaRepair,
+  precalcSnapshotForVerifyItem,
   precalcContinuationsForObligations,
   reconcileBlockedFinalMediaRepairVerifications,
   recordSolverIncident,
@@ -136,6 +139,49 @@ async function createMediaPendingFixture(label: string, aoaDeg: number) {
     })
     .returning();
   resultIds.push(precalc.id);
+  const [precalcAttempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId: precalc.id,
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      engineJobId: `${PREFIX}-${label}-precalc`,
+      engineCaseSlug: `aoa_${aoaDeg}_precalc`,
+      solverImplementationId,
+      status: "done",
+      source: "solved",
+      regime: "urans",
+      validForPolar: true,
+      cl: precalc.cl,
+      cd: precalc.cd,
+      cm: precalc.cm,
+      clCd: precalc.clCd,
+      converged: true,
+      unsteady: true,
+      evidencePayload: { fidelity: "urans_precalc" },
+      solvedAt: new Date(),
+    })
+    .returning();
+  attemptIds.push(precalcAttempt.id);
+  await db.insert(resultClassifications).values({
+    resultId: precalc.id,
+    resultAttemptId: precalcAttempt.id,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg,
+    regime: "urans",
+    classifierVersion: "final-media-repair-precalc-test-v1",
+    state: "accepted",
+    region: "post_stall",
+    confidence: 1,
+    reasons: [],
+  });
+  await db
+    .update(results)
+    .set({ currentResultAttemptId: precalcAttempt.id })
+    .where(eq(results.id, precalc.id));
   const [job] = await db
     .insert(simJobs)
     .values({
@@ -156,6 +202,7 @@ async function createMediaPendingFixture(label: string, aoaDeg: number) {
       requestPayload: {
         aoas: [aoaDeg],
         uransFidelity: "full",
+        verifyPrecalcResultAttemptId: precalcAttempt.id,
         verifyPrecalc: { cl: 0.72, cd: 0.052, cm: -0.031 },
       },
     })
@@ -208,6 +255,7 @@ async function createMediaPendingFixture(label: string, aoaDeg: number) {
       aoaDeg,
       state: "pending",
       precalcResultId: precalc.id,
+      precalcResultAttemptId: precalcAttempt.id,
       backgroundOwner: true,
       freshAttemptCount: 1,
       continuationAttemptCount: 0,
@@ -226,7 +274,7 @@ async function createMediaPendingFixture(label: string, aoaDeg: number) {
       },
     })
     .where(eq(simJobs.id, job.id));
-  return { queue, attempt, job, precalc };
+  return { queue, attempt, job, precalc, precalcAttempt };
 }
 
 async function linkFullRequest(queueId: string, aoaDeg: number, label: string) {
@@ -389,7 +437,7 @@ describe("final URANS media-repair recovery", () => {
 
   it("MUST-CATCH: a final request reuses a critically blocked per-point verification and ignores the removed direct-submit retry ledger", async () => {
     const aoaDeg = 79.1 + (process.pid % 1000) / 100_000;
-    const { result } = await createAcceptedUransEvidence(
+    const { result, attempt } = await createAcceptedUransEvidence(
       "blocked-coverage-precalc",
       aoaDeg,
       "urans_precalc",
@@ -402,6 +450,7 @@ describe("final URANS media-repair recovery", () => {
         aoaDeg,
         state: "blocked",
         precalcResultId: result.id,
+        precalcResultAttemptId: attempt.id,
         backgroundOwner: false,
         freshAttemptCount: 2,
         maxFreshAttempts: 2,
@@ -455,6 +504,143 @@ describe("final URANS media-repair recovery", () => {
       .from(simUransRequests)
       .where(eq(simUransRequests.id, request.id));
     expect(projected).toMatchObject({ state: "blocked", simJobId: null });
+  });
+
+  it("MUST-CATCH: blocked final generation A cannot spend or compare generation B on the same result row", async () => {
+    const aoaDeg = 79.15 + (process.pid % 1000) / 100_000;
+    const { result, attempt: attemptA } = await createAcceptedUransEvidence(
+      "generation-a-precalc",
+      aoaDeg,
+      "urans_precalc",
+    );
+    expect(
+      await enqueuePrecalcVerifications(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg,
+      }),
+    ).toBe(1);
+    const [queueA] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultAttemptId, attemptA.id));
+    queueIds.push(queueA.id);
+    await db
+      .update(simUransVerifyQueue)
+      .set({
+        state: "blocked",
+        freshAttemptCount: 2,
+        maxFreshAttempts: 2,
+        continuationAttemptCount: 1,
+        lastOutcome: FINAL_URANS_OUTCOMES.recoveryExhausted,
+        lastError: "generation A exhausted",
+      })
+      .where(eq(simUransVerifyQueue.id, queueA.id));
+
+    const [attemptB] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        engineJobId: `${PREFIX}-generation-b-precalc`,
+        engineCaseSlug: `aoa_${aoaDeg}_precalc_b`,
+        solverImplementationId,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: true,
+        cl: 0.91,
+        cd: 0.037,
+        cm: -0.021,
+        clCd: 0.91 / 0.037,
+        converged: true,
+        unsteady: true,
+        evidencePayload: { fidelity: "urans_precalc" },
+        solvedAt: new Date(),
+      })
+      .returning();
+    attemptIds.push(attemptB.id);
+    await db
+      .update(resultClassifications)
+      .set({ resultId: null })
+      .where(eq(resultClassifications.resultAttemptId, attemptA.id));
+    await db.insert(resultClassifications).values({
+      resultId: result.id,
+      resultAttemptId: attemptB.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "urans",
+      classifierVersion: "verify-generation-owner-test-v1",
+      state: "accepted",
+      region: "attached",
+      confidence: 1,
+      reasons: [],
+    });
+    await db
+      .update(results)
+      .set({
+        currentResultAttemptId: attemptB.id,
+        fidelity: "urans_precalc",
+        cl: attemptB.cl,
+        cd: attemptB.cd,
+        cm: attemptB.cm,
+        clCd: attemptB.clCd,
+      })
+      .where(eq(results.id, result.id));
+
+    expect(
+      await enqueuePrecalcVerifications(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg,
+      }),
+    ).toBe(1);
+    const generationQueues = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultId, result.id));
+    expect(generationQueues).toHaveLength(2);
+    const queueB = generationQueues.find(
+      (queue) => queue.precalcResultAttemptId === attemptB.id,
+    );
+    expect(queueB).toMatchObject({
+      state: "pending",
+      freshAttemptCount: 0,
+      continuationAttemptCount: 0,
+      precalcResultId: result.id,
+      precalcResultAttemptId: attemptB.id,
+    });
+    queueIds.push(queueB!.id);
+
+    expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
+      resultAttemptId: attemptB.id,
+      cl: attemptB.cl,
+      cd: attemptB.cd,
+      cm: attemptB.cm,
+    });
+    // Simulate the natural-cell projection being overwritten after B was
+    // queued. The immutable queue owner and comparison coefficients stay B.
+    await db
+      .update(results)
+      .set({ fidelity: "urans_full", cl: 9.9, cd: 8.8, cm: 7.7 })
+      .where(eq(results.id, result.id));
+    expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
+      resultAttemptId: attemptB.id,
+      cl: attemptB.cl,
+      cd: attemptB.cd,
+      cm: attemptB.cm,
+    });
+    expect(
+      await enqueuePrecalcVerifications(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg,
+      }),
+    ).toBe(0);
   });
 
   it("MUST-CATCH: repeated final requests reuse accepted exact FULL evidence and its terminal queue projection without rerunning CFD", async () => {
@@ -600,6 +786,73 @@ describe("final URANS media-repair recovery", () => {
       lastOutcome: FINAL_URANS_OUTCOMES.continuationPending,
     });
     expect(await refreshFullUransRequestState(db, request.id)).toBe("running");
+  });
+
+  it("keeps the latest exact productive final trajectory continuable beyond the former one-segment cap", async () => {
+    const aoaDeg = 79.4 + (process.pid % 1000) / 100_000;
+    const { result, attempt } = await createAcceptedUransEvidence(
+      "productive-final-baseline",
+      aoaDeg,
+      "urans_precalc",
+    );
+    const [source] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        engineJobId: `${PREFIX}-productive-final-source`,
+        engineCaseSlug: `aoa_${aoaDeg}_full`,
+        solverImplementationId,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        converged: true,
+        unsteady: true,
+        evidencePayload: {
+          fidelity: "urans_full",
+          frame_track: {
+            period_s: 0.01,
+            periods_retained: 8,
+            stationary: false,
+            drift_frac: 0.08,
+            window: { t_start: 0.12, t_end: 0.2 },
+          },
+        },
+        solvedAt: new Date(),
+      })
+      .returning();
+    attemptIds.push(source.id);
+    const [queue] = await db
+      .insert(simUransVerifyQueue)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg,
+        state: "pending",
+        precalcResultId: result.id,
+        precalcResultAttemptId: attempt.id,
+        backgroundOwner: true,
+        freshAttemptCount: 1,
+        continuationAttemptCount: 7,
+        continuationNoProgressCount: 0,
+        latestResultAttemptId: source.id,
+        lastOutcome: FINAL_URANS_OUTCOMES.continuationPending,
+      })
+      .returning();
+    queueIds.push(queue.id);
+
+    await expect(
+      finalUransRecoveryPlanForVerifyItem(db, queue),
+    ).resolves.toMatchObject({
+      mode: "continuation",
+      resultAttemptId: source.id,
+      engineJobId: source.engineJobId,
+      engineCaseSlug: source.engineCaseSlug,
+    });
   });
 
   it("MUST-CATCH: migration projects accepted exact URANS evidence before preliminary exhaustion or incident backfill", async () => {
@@ -793,26 +1046,12 @@ describe("final URANS media-repair recovery", () => {
 
   it("MUST-CATCH: migration elects one same-cell recovery target and conserves every live owner", async () => {
     const aoaDeg = 80.5 + (process.pid % 1000) / 100_000;
-    const [precalc] = await db
-      .insert(results)
-      .values({
-        airfoilId,
-        bcId,
-        simulationPresetRevisionId: revisionId,
+    const { result: precalc, attempt: precalcAttempt } =
+      await createAcceptedUransEvidence(
+        "recovery-election-precalc",
         aoaDeg,
-        status: "done",
-        source: "solved",
-        regime: "urans",
-        fidelity: "urans_precalc",
-        cl: 0.7,
-        cd: 0.05,
-        cm: -0.03,
-        converged: true,
-        unsteady: true,
-        solvedAt: new Date(),
-      })
-      .returning();
-    resultIds.push(precalc.id);
+        "urans_precalc",
+      );
     const campaigns = await db
       .insert(simCampaigns)
       .values([
@@ -908,6 +1147,7 @@ describe("final URANS media-repair recovery", () => {
           aoaDeg,
           state: "cancelled",
           precalcResultId: precalc.id,
+          precalcResultAttemptId: precalcAttempt.id,
           backgroundOwner: false,
           freshAttemptCount: 1,
           maxFreshAttempts: 2,
@@ -920,6 +1160,7 @@ describe("final URANS media-repair recovery", () => {
           aoaDeg,
           state: "cancelled",
           precalcResultId: precalc.id,
+          precalcResultAttemptId: precalcAttempt.id,
           backgroundOwner: true,
           freshAttemptCount: 1,
           maxFreshAttempts: 2,
@@ -1095,10 +1336,10 @@ describe("final URANS media-repair recovery", () => {
       state: "done",
       verifyResultId: fixture.precalc.id,
       lastOutcome: FINAL_URANS_OUTCOMES.accepted,
-      deltaCl: null,
-      deltaCd: null,
-      deltaCm: null,
     });
+    expect(queue.deltaCl).toBeCloseTo(0.02, 12);
+    expect(queue.deltaCd).toBeCloseTo(0.002, 12);
+    expect(queue.deltaCm).toBeCloseTo(-0.001, 12);
   });
 
   it("marks exhausted media recovery critical with exact job, attempt, implementation, and stable outcome", async () => {

@@ -1,46 +1,40 @@
 import type { AdminCampaignPreliminaryOutcome } from "./admin";
 
 const reasonLabels: Record<string, string> = {
-  "non-stationary":
-    "The retained cycles did not settle into a repeatable stationary window.",
-  "insufficient-periods":
-    "Too few repeatable shedding periods were captured for preliminary acceptance.",
-  "incomplete-urans-integration":
-    "The saved transient needed more integration before it could be averaged.",
-  "missing-coefficients": "No usable aerodynamic coefficients were stored.",
-  "not-converged": "The URANS solve did not reach an acceptable solution.",
-  "solver-stalled": "The URANS solve stopped making measurable progress.",
-  "solver-error": "The URANS solve ended before usable evidence was stored.",
-  "not-solved": "The URANS run ended without a completed result.",
-  "non-positive-drag":
-    "The stored drag coefficient was zero or negative and could not be published.",
-  "non-physical-coefficients":
-    "The stored aerodynamic coefficients were outside the physical acceptance bounds.",
-  "missing-force-history":
-    "The run did not store the force history required to validate its averages.",
-  "missing-urans-video":
-    "The run did not store the transient field media required for this URANS evidence tier.",
-  "sparse-frame-track":
-    "Too few saved field frames were available across the retained periods.",
-  "selected-attempt-needs-more-evidence":
-    "The selected run still needs more evidence before it can be published.",
-  "selected-attempt-rejected":
-    "The selected run did not pass the publication gates.",
-  "mesh-quality-failure":
-    "Automatic mesh repair exhausted the available strategy.",
-  "engine-infrastructure-failure":
-    "The solver runtime stopped after automatic recovery.",
-  "solver-execution-failed":
-    "RANS screening could not execute after automatic recovery.",
-  "auto-retry-exhausted": "Automatic screening recovery was exhausted.",
+  "non-stationary": "Repeatable averaging window not reached.",
+  "insufficient-periods": "Too few repeatable shedding periods.",
+  "incomplete-urans-integration": "Transient continuation still needed.",
+  "missing-coefficients": "No usable coefficients stored.",
+  "not-converged": "URANS did not settle.",
+  "solver-stalled": "URANS stopped making measurable progress.",
+  "solver-error": "URANS stopped before evidence was stored.",
+  "not-solved": "No completed URANS result.",
+  "non-positive-drag": "Drag coefficient is not publishable.",
+  "non-physical-coefficients": "Coefficients failed physical checks.",
+  "missing-force-history": "Force history required for averaging is missing.",
+  "missing-urans-video": "Required transient field media is missing.",
+  "sparse-frame-track": "Too few saved field frames.",
+  "selected-attempt-needs-more-evidence": "More evidence is required.",
+  "selected-attempt-rejected": "Publication checks did not pass.",
+  "mesh-quality-failure": "Automatic mesh repair exhausted.",
+  "engine-infrastructure-failure": "Automatic runtime recovery exhausted.",
+  "solver-execution-failed": "Automatic screening recovery exhausted.",
+  "auto-retry-exhausted": "Automatic screening recovery exhausted.",
 };
 
 const plural = (value: number, singular: string, pluralForm = `${singular}s`) =>
   `${value} ${value === 1 ? singular : pluralForm}`;
 
 const diagnosticFor = (reason: string) =>
-  reasonLabels[reason] ??
-  `Solver diagnostic: ${reason.replace(/[-_]+/g, " ")}.`;
+  reasonLabels[reason] ?? `Solver · ${reason.replace(/[-_]+/g, " ")}.`;
+
+const NORMAL_RANS_HANDOFF_REASONS = new Set([
+  "not-converged",
+  "solver-stalled",
+  "missing-coefficients",
+  "not-solved",
+  "selected-attempt-rejected",
+]);
 
 export interface PreliminaryOutcomeView {
   ransStage: AdminCampaignPreliminaryOutcome["ransStage"];
@@ -51,43 +45,75 @@ export interface PreliminaryOutcomeView {
   fastLabel: string;
   finalLabel: string;
   statusLabel: string;
-  statusTone: "teal" | "violet" | "muted" | "critical";
+  statusTone: "teal" | "violet" | "muted" | "warning" | "critical";
   critical: boolean;
+  ransAcceptedResult: boolean;
+  ransHandoffPending: boolean;
+  fastRecoveredByFinal: boolean;
   budgetLabel: string;
   evidenceLabel: string;
   diagnostics: string[];
 }
 
-export type PreliminaryOutcomeCurrentStage = "preflight" | "fast" | "final";
+export type PreliminaryOutcomeCurrentStage = "rans" | "fast" | "final";
 
 export interface PreliminaryOutcomeCurrentCounts {
   active: number;
+  ransAccepted: number;
   fastReady: number;
   verified: number;
   critical: number;
   total: number;
 }
 
-export function preliminaryOutcomeIsCritical(
+function ransAcceptedWithoutUrans(
   item: AdminCampaignPreliminaryOutcome,
 ): boolean {
   return (
-    item.criticalStage !== null ||
-    item.fastState === "critical" ||
-    item.finalState === "critical" ||
-    item.finalActivityState === "critical" ||
-    item.finalComparison === "disagreed"
+    item.state === "satisfied" &&
+    item.outcome === "accepted" &&
+    item.ransStage === "screened" &&
+    item.fastState === "not_started" &&
+    item.finalState === "not_started" &&
+    item.criticalStage === null
   );
 }
 
-/** The rail describes one point's current solver journey. Normal rows have
- * already completed or skipped RANS, while a rare pre-URANS recovery incident
- * keeps the first stage current. */
+function ransHandoffAwaitingFast(
+  item: AdminCampaignPreliminaryOutcome,
+): boolean {
+  return (
+    item.ransStage === "screened" &&
+    item.fastState === "not_started" &&
+    item.finalState === "not_started" &&
+    item.criticalStage === null &&
+    !ransAcceptedWithoutUrans(item)
+  );
+}
+
+export function preliminaryOutcomeIsCritical(
+  item: AdminCampaignPreliminaryOutcome,
+): boolean {
+  if (item.finalState === "accepted") return false;
+  return (
+    item.criticalStage !== null ||
+    item.fastState === "critical" ||
+    item.finalState === "critical"
+  );
+}
+
+/** The rail describes one point's current solver journey. A queued, critical
+ * preflight/RANS, or terminal accepted-RANS row remains at RANS; only an
+ * actual handoff advances the current marker to fast URANS. */
 export function preliminaryOutcomeCurrentStage(
   item: AdminCampaignPreliminaryOutcome,
 ): PreliminaryOutcomeCurrentStage {
-  if (item.criticalStage === "preflight") {
-    return "preflight";
+  if (
+    item.ransStage === "not_started" ||
+    item.criticalStage === "rans" ||
+    ransAcceptedWithoutUrans(item)
+  ) {
+    return "rans";
   }
   return item.finalState !== "not_started" ||
     item.finalActivityState !== null ||
@@ -106,6 +132,7 @@ export function preliminaryOutcomeCurrentCounts(
 ): PreliminaryOutcomeCurrentCounts {
   const counts: PreliminaryOutcomeCurrentCounts = {
     active: 0,
+    ransAccepted: 0,
     fastReady: 0,
     verified: 0,
     critical: 0,
@@ -118,6 +145,8 @@ export function preliminaryOutcomeCurrentCounts(
     } else if (
       item.fastState === "queued" ||
       item.fastState === "running" ||
+      (item.ransStage === "not_started" && item.criticalStage === null) ||
+      ransHandoffAwaitingFast(item) ||
       item.finalState === "queued" ||
       item.finalState === "running" ||
       item.finalActivityState === "queued" ||
@@ -126,6 +155,8 @@ export function preliminaryOutcomeCurrentCounts(
       counts.active += 1;
     } else if (item.finalState === "accepted") {
       counts.verified += 1;
+    } else if (ransAcceptedWithoutUrans(item)) {
+      counts.ransAccepted += 1;
     } else {
       counts.fastReady += 1;
     }
@@ -137,26 +168,56 @@ export function preliminaryOutcomeCurrentCounts(
 export function preliminaryOutcomeView(
   item: AdminCampaignPreliminaryOutcome,
 ): PreliminaryOutcomeView {
-  const rans = {
+  const ransOnlyAccepted = ransAcceptedWithoutUrans(item);
+  const ransHandoff = ransHandoffAwaitingFast(item);
+  const ransQueued =
+    item.ransStage === "not_started" && item.criticalStage === null;
+  let rans = {
     screened: {
       label: "Screened",
-      diagnostic: "RANS handed off automatically.",
+      diagnostic: "RANS screened; non-convergence hands off normally.",
+    },
+    attempted: {
+      label: "Attempt recorded",
+      diagnostic:
+        "A RANS attempt/evidence record exists; this does not by itself prove a physical CFD run started.",
     },
     polar_handoff: {
       label: "Polar handoff",
-      diagnostic: "The parent polar handed this point to fast URANS.",
+      diagnostic: "Whole-polar RANS handoff to fast URANS.",
     },
     skipped: {
       label: "Skipped",
-      diagnostic: "Direct fast-URANS request; no RANS run for this point.",
+      diagnostic: "Direct fast-URANS request; RANS skipped.",
     },
     not_started: {
       label: "Not started",
-      diagnostic:
-        "Automatic mesh/runtime repair exhausted before RANS screening could start.",
+      diagnostic: "Auto-repair exhausted before RANS screening.",
     },
   }[item.ransStage];
-  const fastLabel = {
+  if (item.criticalStage === "rans") {
+    rans = {
+      label: "Recovery exhausted",
+      diagnostic:
+        "RANS attempt evidence exists; automatic recovery exhausted before fast URANS.",
+    };
+  } else if (ransQueued) {
+    rans = {
+      label: "Queued",
+      diagnostic: "RANS screening is queued.",
+    };
+  } else if (ransOnlyAccepted) {
+    rans = {
+      label: "Accepted",
+      diagnostic: "RANS produced an accepted point; URANS is not required.",
+    };
+  } else if (ransHandoff) {
+    rans = {
+      label: "Handed off",
+      diagnostic: "Normal aerodynamic handoff to URANS fast.",
+    };
+  }
+  let fastLabel = {
     not_started: "Next",
     queued: "Queued",
     running: "Running",
@@ -170,77 +231,98 @@ export function preliminaryOutcomeView(
     accepted: "Verified",
     critical: "Critical",
   }[item.finalState];
-  if (item.finalComparison === "disagreed") {
-    finalLabel = "Verified · mismatch";
+  const fastRecoveredByFinal =
+    item.fastState === "critical" && item.finalState === "accepted";
+  if (ransOnlyAccepted) {
+    fastLabel = "Not needed";
+    finalLabel = "Not needed";
+  } else if (ransQueued) {
+    fastLabel = "Waiting";
+    finalLabel = "Waiting";
+  } else if (ransHandoff) {
+    fastLabel = "Queued";
+    finalLabel = "Waiting";
+  } else if (
+    item.finalState === "accepted" &&
+    item.finalComparison === "disagreed"
+  ) {
+    finalLabel = "Verified · differs from fast";
   } else if (item.finalState === "accepted" && item.finalActivityState) {
     finalLabel =
       item.finalActivityState === "critical"
-        ? "Verified + incident"
-        : `Verified + ${item.finalActivityState}`;
+        ? "Verified · update unavailable"
+        : `Verified + update ${item.finalActivityState}`;
   }
+  if (fastRecoveredByFinal) fastLabel = "Recovered by final";
 
   let status: {
     label: string;
-    tone: "teal" | "violet" | "muted" | "critical";
+    tone: "teal" | "violet" | "muted" | "warning" | "critical";
   };
-  if (item.criticalStage === "preflight") {
-    status = { label: "Pre-solver repair critical", tone: "critical" };
-  } else if (item.finalComparison === "disagreed") {
-    status = { label: "Verified · mismatch", tone: "critical" };
+  if (item.finalState === "accepted" && item.finalComparison === "disagreed") {
+    status = { label: "VERIFIED · DIFFERS FROM FAST", tone: "warning" };
   } else if (
     item.finalState === "accepted" &&
     item.finalActivityState === "critical"
   ) {
-    status = { label: "Verified · rerun critical", tone: "critical" };
-  } else if (item.finalState === "accepted" && item.fastState === "critical") {
-    status = { label: "Verified · fast incident", tone: "critical" };
+    status = { label: "VERIFIED · UPDATE UNAVAILABLE", tone: "warning" };
+  } else if (fastRecoveredByFinal) {
+    status = { label: "VERIFIED · FAST PATH RECOVERED", tone: "warning" };
   } else if (
     item.finalState === "accepted" &&
     item.finalActivityState !== null
   ) {
     status = {
-      label: `Verified · rerun ${item.finalActivityState}`,
+      label: `URANS final · update ${item.finalActivityState}`,
       tone: "violet",
     };
+  } else if (item.finalState === "accepted") {
+    status = { label: "URANS final · verified", tone: "teal" };
+  } else if (item.criticalStage === "preflight") {
+    status = { label: "CRITICAL · AUTO-REPAIR", tone: "critical" };
+  } else if (item.criticalStage === "rans") {
+    status = { label: "CRITICAL · RANS RECOVERY", tone: "critical" };
   } else if (item.finalState === "critical") {
     status = {
       label:
         item.fastState === "critical"
-          ? "Fast + final critical"
-          : "Final critical",
+          ? "CRITICAL · FAST + FINAL"
+          : "CRITICAL · FINAL URANS",
       tone: "critical",
     };
-  } else if (item.finalState === "accepted") {
-    status = { label: "Final verified", tone: "teal" };
   } else if (item.finalState === "running") {
     status = {
       label:
         item.fastState === "critical"
-          ? "Fast critical · final running"
-          : "Final running",
+          ? "CRITICAL · FAST · FINAL RUNNING"
+          : "URANS final · running",
       tone: item.fastState === "critical" ? "critical" : "violet",
     };
   } else if (item.finalState === "queued") {
     status = {
       label:
         item.fastState === "critical"
-          ? "Fast critical · final queued"
-          : "Final queued",
+          ? "CRITICAL · FAST · FINAL QUEUED"
+          : "URANS final · queued",
       tone: item.fastState === "critical" ? "critical" : "violet",
     };
   } else if (item.fastState === "critical") {
-    status = { label: "Fast critical", tone: "critical" };
+    status = { label: "CRITICAL · FAST URANS", tone: "critical" };
   } else if (item.fastState === "accepted") {
-    status = { label: "Fast result ready", tone: "muted" };
+    status = { label: "URANS fast · ready", tone: "teal" };
   } else if (item.fastState === "running") {
-    status = { label: "Fast running", tone: "violet" };
+    status = { label: "URANS fast · running", tone: "violet" };
+  } else if (ransOnlyAccepted) {
+    status = { label: "RANS · accepted", tone: "teal" };
+  } else if (ransQueued) {
+    status = { label: "RANS · queued", tone: "violet" };
   } else {
-    status = { label: "Fast queued", tone: "violet" };
+    status = { label: "URANS fast · queued", tone: "violet" };
   }
 
   const evidence: string[] = [];
   if (item.ransEvidenceRuns > 0) {
-    evidence.push(`${item.ransEvidenceRuns} RANS`);
+    evidence.push(plural(item.ransEvidenceRuns, "RANS evidence record"));
   }
   if (item.preliminaryEvidenceRuns > 0) {
     evidence.push(`${item.preliminaryEvidenceRuns} fast URANS`);
@@ -260,35 +342,35 @@ export function preliminaryOutcomeView(
   }
 
   const diagnostics = [
-    ...item.evidenceReasons.map(diagnosticFor),
+    ...item.evidenceReasons
+      .filter(
+        (reason) => !ransHandoff || !NORMAL_RANS_HANDOFF_REASONS.has(reason),
+      )
+      .map(diagnosticFor),
     ...item.finalEvidenceReasons.map(diagnosticFor),
   ];
   if (item.fastState === "critical") {
-    if (item.outcome === "evidence_unavailable") {
+    if (fastRecoveredByFinal) {
       diagnostics.unshift(
-        "Fast URANS completed, but no run passed the publication checks.",
+        "Final URANS is authoritative; the fast path exhausted automatic recovery.",
       );
+    } else if (item.outcome === "evidence_unavailable") {
+      diagnostics.unshift("Fast URANS exhausted publication recovery.");
     } else if (item.outcome === "continuation_unavailable") {
-      diagnostics.unshift(
-        "The corrective fast run could not restart from its saved transient state.",
-      );
+      diagnostics.unshift("Saved-transient recovery exhausted.");
     } else if (item.outcome === "mesh_unavailable") {
-      diagnostics.unshift(
-        "Automatic mesh repair did not produce a usable fast-solver mesh.",
-      );
+      diagnostics.unshift("Automatic mesh recovery exhausted.");
     } else if (item.outcome === "submit_unavailable") {
-      diagnostics.unshift(
-        "The solver service rejected the automatic fast-run submission.",
-      );
+      diagnostics.unshift("Automatic fast-run submission recovery exhausted.");
     } else {
-      diagnostics.unshift(
-        "Automatic fast URANS ended without publishable evidence.",
-      );
+      diagnostics.unshift("Fast URANS recovery exhausted.");
     }
   }
   if (item.criticalStage === "preflight") {
+    diagnostics.unshift("RANS and fast URANS did not start.");
+  } else if (item.criticalStage === "rans") {
     diagnostics.unshift(
-      "RANS and fast URANS did not start because automatic mesh/runtime repair exhausted first.",
+      "RANS attempt evidence exists; automatic recovery exhausted before fast URANS.",
     );
   }
   if (item.finalComparison === "disagreed") {
@@ -304,18 +386,16 @@ export function preliminaryOutcomeView(
         : `ΔCm ${item.finalDeltaCm >= 0 ? "+" : ""}${item.finalDeltaCm.toFixed(4)}`,
     ].filter(Boolean);
     diagnostics.unshift(
-      `The final result exists, but it differs from the fast result${deltas.length ? ` (${deltas.join(", ")})` : ""}.`,
+      `Fast/final comparison differs${deltas.length ? ` · ${deltas.join(" · ")}` : ""}.`,
     );
   } else if (item.finalState === "critical") {
-    diagnostics.unshift(
-      "Final URANS did not produce an accepted result; automatic investigation is required.",
-    );
+    diagnostics.unshift("Final URANS recovery exhausted.");
   } else if (
     item.finalState === "accepted" &&
     item.finalActivityState === "critical"
   ) {
     diagnostics.unshift(
-      "Accepted final evidence is retained; a newer final run ended critically and requires automatic investigation.",
+      "Verified result retained; newer update is unavailable.",
     );
   }
   if (item.finalSubmitError) {
@@ -325,7 +405,7 @@ export function preliminaryOutcomeView(
   }
   if (item.nonPhysicalSubmissions > 0) {
     diagnostics.push(
-      `${plural(item.nonPhysicalSubmissions, "engine submission")} ended before CFD and did not count as a physical run.`,
+      `${plural(item.nonPhysicalSubmissions, "engine submission")} ended before CFD; not a physical run.`,
     );
   }
 
@@ -340,14 +420,22 @@ export function preliminaryOutcomeView(
     statusLabel: status.label,
     statusTone: status.tone,
     critical: preliminaryOutcomeIsCritical(item),
-    budgetLabel:
-      item.fastState === "not_started"
-        ? "Fast URANS has not started."
-        : `Fast URANS physical runs: ${item.physicalAttemptsUsed} of ${item.physicalAttemptsMax}`,
+    ransAcceptedResult: ransOnlyAccepted,
+    ransHandoffPending: ransHandoff,
+    fastRecoveredByFinal,
+    budgetLabel: ransOnlyAccepted
+      ? "Fast URANS · not required"
+      : ransQueued
+        ? "Fast URANS · waits for RANS handoff"
+        : ransHandoff
+          ? "Fast URANS · handoff pending"
+          : item.fastState === "not_started"
+            ? "Fast URANS · not started"
+            : `Fast URANS runs · ${item.physicalAttemptsUsed}/${item.physicalAttemptsMax} physical`,
     evidenceLabel:
       evidence.length > 0
-        ? `Stored evidence: ${evidence.join(" · ")}`
-        : "No solver evidence stored yet",
+        ? `Evidence · ${evidence.join(" · ")}`
+        : "Evidence · none yet",
     diagnostics: [...new Set(diagnostics)],
   };
 }

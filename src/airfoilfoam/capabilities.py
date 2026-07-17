@@ -10,11 +10,15 @@
 # repair for obligations that were terminal under the previous version.
 MESH_RECOVERY_VERSION = 2
 
-# Version 1 is the first engine/control-plane contract that supports durable
-# cross-job URANS recovery: immutable evidence archives can hydrate a saved
-# case after local retention, continuations use the adaptive extension budget,
-# and requests are rejected before CFD when controller and worker disagree.
+# Version 2 adds an in-engine numerical recovery pass for pimpleFoam: a
+# last-known-good same-case checkpoint is restored before one conservative
+# upwind/Co<=1 retry, failed-pass evidence remains immutable, and a retry that
+# does not advance the physical trajectory fails closed.  Version 1 was the
+# first engine/control-plane contract that supported durable cross-job URANS
+# recovery: immutable evidence archives could hydrate a saved case after local
+# retention, continuations used the adaptive extension budget, and requests
+# were rejected before CFD when controller and worker disagreed.
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 1
+URANS_RECOVERY_VERSION = 2

@@ -6,6 +6,7 @@ import {
   type DB,
   enqueuePrecalcVerifications,
   ensurePrecalcObligations,
+  FINAL_URANS_MAX_NO_PROGRESS_SEGMENTS,
   FINAL_URANS_OUTCOMES,
   FINAL_URANS_RETRY_BACKOFF_MS,
   inspectParentRansPolarPromotions,
@@ -14,6 +15,8 @@ import {
   onResultIngested,
   probeCampaignCompletion,
   precalcContinuationsForObligations,
+  precalcContinuationMadeProgress,
+  precalcContinuationProgressFromEvidence,
   reconcileCampaigns,
   recomputeProgressForCampaign,
   recordRansPolarPromotion,
@@ -732,6 +735,7 @@ export async function enqueueVerificationsForJob(
 
 interface VerifyJobPayload {
   verifyQueueItemId?: string;
+  verifyPrecalcResultAttemptId?: string;
   verifyPrecalc?: {
     cl?: number | null;
     cd?: number | null;
@@ -806,6 +810,43 @@ async function settleUransLadderForJob(
       return;
     }
 
+    const [precalc] = item.precalcResultAttemptId
+      ? await tx
+          .select({
+            resultAttemptId: resultAttempts.id,
+            cl: resultAttempts.cl,
+            cd: resultAttempts.cd,
+            cm: resultAttempts.cm,
+          })
+          .from(resultAttempts)
+          .where(
+            and(
+              eq(resultAttempts.id, item.precalcResultAttemptId),
+              eq(resultAttempts.resultId, item.precalcResultId),
+              eq(resultAttempts.airfoilId, item.airfoilId),
+              eq(resultAttempts.simulationPresetRevisionId, item.revisionId),
+              eq(resultAttempts.aoaDeg, item.aoaDeg),
+              eq(resultAttempts.status, "done"),
+              eq(resultAttempts.source, "solved"),
+              sql`${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_precalc'`,
+            ),
+          )
+          .limit(1)
+      : [];
+    if (!precalc) {
+      throw new Error(
+        `verify item ${item.id} lost its exact preliminary attempt ${item.precalcResultAttemptId ?? "missing"}`,
+      );
+    }
+    if (
+      payload.verifyPrecalcResultAttemptId &&
+      payload.verifyPrecalcResultAttemptId !== precalc.resultAttemptId
+    ) {
+      throw new Error(
+        `verify job ${job.id} preliminary attempt ${payload.verifyPrecalcResultAttemptId} does not match queue owner ${precalc.resultAttemptId}`,
+      );
+    }
+
     const [verified] = await tx
       .select({
         resultId: resultAttempts.resultId,
@@ -824,6 +865,7 @@ async function settleUransLadderForJob(
         solverImplementationId: resultAttempts.solverImplementationId,
         error: resultAttempts.error,
         qualityWarnings: resultAttempts.qualityWarnings,
+        evidencePayload: resultAttempts.evidencePayload,
         failureDisposition: sql<
           string | null
         >`${resultAttempts.evidencePayload} ->> 'failure_disposition'`,
@@ -858,7 +900,6 @@ async function settleUransLadderForJob(
       verified.classification === "accepted" &&
       verified.resultId,
     );
-    const precalc = payload.verifyPrecalc ?? {};
     const deltaOf = (a: unknown, b: number | null): number | null => {
       const pa = finiteOrNull(a);
       return pa !== null && b !== null ? b - pa : null;
@@ -885,6 +926,7 @@ async function settleUransLadderForJob(
           freshAttemptCount: item.freshAttemptCount + (isContinuation ? 0 : 1),
           continuationAttemptCount:
             item.continuationAttemptCount + (isContinuation ? 1 : 0),
+          continuationNoProgressCount: 0,
           latestResultAttemptId: verified.attemptId,
           nextSubmitAt: null,
           lastOutcome: disagreed
@@ -904,9 +946,9 @@ async function settleUransLadderForJob(
       });
       await refreshFullUransRequestsForVerifyQueueInTransaction(tx, item.id);
       if (disagreed) {
-        console.error(
+        console.warn(
           `[sweeper] urans-verify-disagreement: full-fidelity verification differs from precalc beyond bounds ` +
-            `(ΔCl=${deltaCl?.toFixed(4) ?? "n/a"}, ΔCd=${deltaCd?.toFixed(5) ?? "n/a"}; limits ${URANS_VERIFY_DELTA_CL_LIMIT}/${URANS_VERIFY_DELTA_CD_LIMIT}) — machine disagreement retained on queue item ${item.id}, selected attempt ${verified.attemptId}`,
+            `(ΔCl=${deltaCl?.toFixed(4) ?? "n/a"}, ΔCd=${deltaCd?.toFixed(5) ?? "n/a"}; limits ${URANS_VERIFY_DELTA_CL_LIMIT}/${URANS_VERIFY_DELTA_CD_LIMIT}) — accepted final result retained with a comparison warning on queue item ${item.id}, selected attempt ${verified.attemptId}`,
         );
       }
       return;
@@ -970,6 +1012,55 @@ async function settleUransLadderForJob(
     const continuationAttemptCount =
       item.continuationAttemptCount +
       (isContinuation && consumesRecoveryAttempt ? 1 : 0);
+    const continuationSourceAttemptId = isContinuation
+      ? typeof payload.continueFromResultAttemptId === "string"
+        ? payload.continueFromResultAttemptId
+        : item.latestResultAttemptId
+      : null;
+    const exactContinuationSourceAttemptId =
+      continuationSourceAttemptId != null &&
+      continuationSourceAttemptId === item.latestResultAttemptId
+        ? continuationSourceAttemptId
+        : null;
+    const [continuationSource] = exactContinuationSourceAttemptId
+      ? await tx
+          .select({
+            airfoilId: resultAttempts.airfoilId,
+            revisionId: resultAttempts.simulationPresetRevisionId,
+            aoaDeg: resultAttempts.aoaDeg,
+            evidencePayload: resultAttempts.evidencePayload,
+          })
+          .from(resultAttempts)
+          .where(eq(resultAttempts.id, exactContinuationSourceAttemptId))
+          .limit(1)
+      : [];
+    const continuationSourceMatchesCell = Boolean(
+      continuationSource &&
+      continuationSource.airfoilId === item.airfoilId &&
+      continuationSource.revisionId === item.revisionId &&
+      Number(continuationSource.aoaDeg) === Number(item.aoaDeg),
+    );
+    const continuationSourceProgress = continuationSourceMatchesCell
+      ? precalcContinuationProgressFromEvidence(
+          continuationSource!.evidencePayload,
+        )
+      : null;
+    const continuationProgressed = Boolean(
+      isContinuation &&
+      consumesRecoveryAttempt &&
+      verified &&
+      precalcContinuationMadeProgress(
+        continuationSourceProgress,
+        precalcContinuationProgressFromEvidence(verified?.evidencePayload),
+      ),
+    );
+    let continuationNoProgressCount = isContinuation
+      ? consumesRecoveryAttempt && verified
+        ? continuationProgressed
+          ? 0
+          : item.continuationNoProgressCount + 1
+        : item.continuationNoProgressCount
+      : 0;
     const restartable = Boolean(
       verified?.engineJobId &&
       verified.engineCaseSlug &&
@@ -988,6 +1079,14 @@ async function settleUransLadderForJob(
       verified?.classificationReasons?.join(", ") ||
       opts.terminalError?.trim() ||
       "full URANS completed without publishable evidence";
+    const continuationNoProgressExhausted = Boolean(
+      isContinuation &&
+      consumesRecoveryAttempt &&
+      restartable &&
+      !continuationProgressed &&
+      continuationNoProgressCount >= FINAL_URANS_MAX_NO_PROGRESS_SEGMENTS,
+    );
+    const observedContinuationNoProgressCount = continuationNoProgressCount;
 
     let state: "pending" | "blocked" | "cancelled";
     let lastOutcome: string;
@@ -1007,24 +1106,29 @@ async function settleUransLadderForJob(
     } else if (deterministic) {
       state = "blocked";
       lastOutcome = FINAL_URANS_OUTCOMES.deterministicFailure;
-    } else if (
-      continuationFailureKind === "permanent" &&
-      freshAttemptCount < item.maxFreshAttempts
-    ) {
-      state = "pending";
-      lastOutcome = FINAL_URANS_OUTCOMES.freshRetryPending;
-    } else if (
-      continuationFailureKind === "permanent" &&
-      freshAttemptCount >= item.maxFreshAttempts
-    ) {
+    } else if (continuationFailureKind === "permanent") {
+      // The exact saved trajectory is part of final-result provenance. A
+      // permanently missing source is therefore a critical evidence-loss
+      // incident, not permission to silently substitute a fresh trajectory.
       state = "blocked";
       lastOutcome = FINAL_URANS_OUTCOMES.continuationPermanentFailure;
-    } else if (restartable && continuationAttemptCount < freshAttemptCount) {
+    } else if (restartable && !continuationNoProgressExhausted) {
       state = "pending";
       lastOutcome = FINAL_URANS_OUTCOMES.continuationPending;
+    } else if (
+      continuationNoProgressExhausted &&
+      freshAttemptCount < item.maxFreshAttempts
+    ) {
+      // The saved trajectory stopped advancing twice. Spend the one bounded
+      // corrective fresh start instead of looping that immutable checkpoint;
+      // its first completed result becomes the new monotonic baseline.
+      state = "pending";
+      lastOutcome = FINAL_URANS_OUTCOMES.freshRetryPending;
+      continuationNoProgressCount = 0;
     } else if (freshAttemptCount < item.maxFreshAttempts) {
       state = "pending";
       lastOutcome = FINAL_URANS_OUTCOMES.freshRetryPending;
+      continuationNoProgressCount = 0;
     } else {
       state = "blocked";
       lastOutcome = FINAL_URANS_OUTCOMES.recoveryExhausted;
@@ -1038,6 +1142,7 @@ async function settleUransLadderForJob(
         verifyResultId: null,
         freshAttemptCount,
         continuationAttemptCount,
+        continuationNoProgressCount,
         latestResultAttemptId:
           verified?.attemptId ?? item.latestResultAttemptId,
         nextSubmitAt,
@@ -1070,16 +1175,18 @@ async function settleUransLadderForJob(
           `final verify item ${item.id} has no solver implementation for incident attribution`,
         );
       }
-      const reason = solverIncidentReason(
-        verified?.classificationReasons,
-        continuationFailureKind === "permanent"
-          ? "continuation-source-unavailable"
-          : failureDisposition && failureDisposition !== "none"
-            ? failureDisposition
-            : mediaOnly
-              ? MISSING_URANS_VIDEO_REASON
-              : "non-publishable-evidence",
-      );
+      const reason = continuationNoProgressExhausted
+        ? "continuation-no-progress"
+        : solverIncidentReason(
+            verified?.classificationReasons,
+            continuationFailureKind === "permanent"
+              ? "continuation-source-unavailable"
+              : failureDisposition && failureDisposition !== "none"
+                ? failureDisposition
+                : mediaOnly
+                  ? MISSING_URANS_VIDEO_REASON
+                  : "non-publishable-evidence",
+          );
       await recordSolverIncidentInTransaction(tx, {
         stage: "final",
         reason,
@@ -1098,6 +1205,8 @@ async function settleUransLadderForJob(
           freshAttemptCount,
           maxFreshAttempts: item.maxFreshAttempts,
           continuationAttemptCount,
+          continuationProgressed,
+          continuationNoProgressCount: observedContinuationNoProgressCount,
         },
       });
     }
@@ -1108,7 +1217,7 @@ async function settleUransLadderForJob(
       );
     } else if (state === "pending") {
       console.log(
-        `[sweeper] final URANS recovery queued (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}): ${lastOutcome}; fresh ${freshAttemptCount}/${item.maxFreshAttempts}, continuation ${continuationAttemptCount}/${freshAttemptCount}`,
+        `[sweeper] final URANS recovery queued (item ${item.id}, job ${job.id}, aoa ${item.aoaDeg}): ${lastOutcome}; fresh ${freshAttemptCount}/${item.maxFreshAttempts}, continuation ${continuationAttemptCount}, no-progress ${continuationNoProgressCount}/${FINAL_URANS_MAX_NO_PROGRESS_SEGMENTS}`,
       );
     }
   });

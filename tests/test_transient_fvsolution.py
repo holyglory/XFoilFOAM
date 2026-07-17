@@ -45,7 +45,10 @@ def _foam_dict(path: Path) -> dict:
     return parse_block()
 
 
-def _builder(naca0012_selig_text: str) -> CaseBuilder:
+def _builder(
+    naca0012_selig_text: str,
+    solver: SolverParams | None = None,
+) -> CaseBuilder:
     airfoil = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
     patches = [
         BoundaryPatch("airfoil", "wall"),
@@ -60,7 +63,7 @@ def _builder(naca0012_selig_text: str) -> CaseBuilder:
         CaseSpec(chord=1.0, speed=50.0, aoa_deg=12.0),
         FluidProperties(),
         RoughnessParams(),
-        SolverParams(write_images=[]),
+        solver or SolverParams(write_images=[]),
     )
 
 
@@ -90,3 +93,22 @@ def test_steady_fvsolution_pressure_solver_remains_unchanged(tmp_path, naca0012_
     solvers = _foam_dict(case_dir / "system" / "fvSolution")["solvers"]
 
     assert solvers["p"]["smoother"] == "GaussSeidel"
+
+
+def test_transient_upwind_recovery_writes_conservative_momentum_scheme(
+    tmp_path, naca0012_selig_text
+):
+    case_dir = tmp_path / "transient-recovery"
+    _builder(
+        naca0012_selig_text,
+        SolverParams(momentum_scheme="upwind", write_images=[]),
+    ).write_transient(
+        case_dir,
+        start_time=0.0,
+        end_time=0.1,
+        delta_t=0.001,
+    )
+
+    schemes = _foam_dict(case_dir / "system" / "fvSchemes")["divSchemes"]
+
+    assert schemes["div(phi,U)"] == "Gauss upwind"

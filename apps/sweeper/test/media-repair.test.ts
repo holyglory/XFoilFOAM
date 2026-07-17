@@ -1640,11 +1640,7 @@ describe("durable result media repair", () => {
       cd: 0.06,
       cm: -0.04,
     });
-    await refreshPolarCacheForRevision(
-      db,
-      fixture.airfoilId,
-      revisionId,
-    );
+    await refreshPolarCacheForRevision(db, fixture.airfoilId, revisionId);
     const rejected = await db
       .select({
         id: resultClassifications.resultAttemptId,
@@ -1736,6 +1732,13 @@ describe("durable result media repair", () => {
       .from(results)
       .where(eq(results.id, fixture.resultId));
     expect(selectedFinal.currentResultAttemptId).toBe(target.id);
+    const [supersededPreliminary] = await db
+      .select({ state: resultClassifications.state })
+      .from(resultClassifications)
+      .where(
+        eq(resultClassifications.resultAttemptId, fixture.resultAttemptId),
+      );
+    expect(supersededPreliminary.state).toBe("superseded_by_urans");
     const [settledVerify] = await db
       .select()
       .from(simUransVerifyQueue)

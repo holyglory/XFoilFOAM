@@ -354,21 +354,55 @@ function isSteadyRansEvidence(evidence: PolarEvidencePoint): boolean {
   );
 }
 
+export interface AutomaticRansPrecalcHandoffEvidence {
+  classificationState: string;
+  failureDisposition?: string | null;
+  status: string;
+  source: string;
+  error?: string | null;
+}
+
+/** Whether exact steady-RANS evidence belongs on the normal automatic
+ * RANS -> fast-URANS path.
+ *
+ * Modern engine evidence is decided by the structured failure disposition:
+ * `hard_solver` is physical aerodynamic/numerical evidence, while mesh and
+ * infrastructure dispositions remain on their versioned repair paths. A
+ * `needs_urans` verdict is already a physical polar-shape handoff. For
+ * pre-contract rows with no disposition, completed + solved + error-free
+ * provenance is the only admissible fallback; classifier reason strings do
+ * not define whether a physical solve happened. */
+export function isAutomaticRansPrecalcHandoffEvidence(
+  evidence: AutomaticRansPrecalcHandoffEvidence,
+): boolean {
+  if (
+    evidence.failureDisposition === "deterministic_mesh" ||
+    evidence.failureDisposition === "infrastructure"
+  ) {
+    return false;
+  }
+  if (evidence.classificationState === "needs_urans") return true;
+  if (evidence.classificationState !== "rejected") return false;
+  if (evidence.failureDisposition === "hard_solver") return true;
+  if (evidence.failureDisposition != null) return false;
+  return (
+    evidence.status === "done" &&
+    evidence.source === "solved" &&
+    (evidence.error == null || evidence.error.trim() === "")
+  );
+}
+
 export function isHardRansFailureEvidence(
   evidence: PolarEvidencePoint,
 ): boolean {
   if (!isSteadyRansEvidence(evidence)) return false;
-  if (evidence.failureDisposition === "hard_solver") return true;
-  if (evidence.failureDisposition != null) return false;
-  // Pre-contract compatibility: a finite/error-free RANS point that actually
-  // reached solved evidence but failed convergence/physics gates is a genuine
-  // numerical rejection. Queued/failed shells and errored attempts are
-  // ambiguous infrastructure and fail closed.
-  return (
-    evidence.status === "done" &&
-    evidence.source === "solved" &&
-    !evidence.error
-  );
+  return isAutomaticRansPrecalcHandoffEvidence({
+    classificationState: "rejected",
+    failureDisposition: evidence.failureDisposition,
+    status: evidence.status,
+    source: evidence.source,
+    error: evidence.error,
+  });
 }
 
 export interface PolarEvidenceClassifierOptions {
