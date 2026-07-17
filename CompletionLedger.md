@@ -66,7 +66,12 @@
   immutable preliminary registration, authenticated cleanup, four per-point
   database proofs, crash-safe replay, and a final attestation that cannot be
   created from an incomplete or unrelated proof set. The repair is integrated
-  with the incident-bound staged deployment runner; verify migration 0072
+  with the incident-bound staged deployment runner. Re-inventory and bind the
+  latest failed same-build replay journal and all six current container/image
+  identities, stop the running media-repair writer under the inherited
+  deployment lock, create and strongly restore-test a fresh PostgreSQL backup
+  plus verified immutable off-VPS copy, and preserve collision-checked rollback
+  image tags before any build. Verify migration 0072 after Node health and
   before activation; build and recreate the matching Node API, sweeper,
   gateway, and worker artifacts; then run a fresh canary. Earlier failed
   direct-canary jobs remain terminal, unregistered evidence and must not enter

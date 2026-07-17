@@ -55,6 +55,25 @@ with one additional minute for HTTP and receipt overhead. The TypeScript and
 Python manifest-member digests use deterministic Unicode code-point ordering
 so the database acknowledgement is identical across runtimes.
 
+The incident deployment closes the remaining operational boundary as one
+lock-scoped transaction. Descriptor 9 protects the exact production Compose
+project while the live `media-repair` writer is stopped, a new database-scope
+custom PostgreSQL backup is strongly restored into a scratch database, and an
+immutable off-VPS copy is downloaded and checksum-verified. Only after those
+proofs are fsynced may the target images be built or services recreated. The
+transaction preserves the exact current service images under collision-safe,
+target-bound rollback tags and records every tag-to-image mapping in its
+immutable recovery identity before the first build.
+
+The staged Compose source keeps project name `app` and an explicit project
+directory so existing named volumes are reused. The repair migration is
+verified after the recreated Node API becomes healthy and before the first
+execution-pool enable. A durable canary receipt is the rollback boundary: an
+image rollback can be considered only before that receipt, while a receipt or
+ambiguous marker state forbids image rollback and retains the exact database
+replay state. `media-repair` is recreated and returned to its initial running
+state only on the terminal successful path; every failure leaves it stopped.
+
 Unrelated old-contract canary jobs remain terminal engine evidence. They are
 not imported as canonical results, retrospectively registered, deleted, or
 included in a new attestation. A fresh repaired canary owns new job IDs and its

@@ -21,12 +21,21 @@
 #
 # Optional environment:
 #   APP_DIR (default /opt/airfoils-pro/app), ENV_FILE, COMPOSE_FILE,
-#   COMPOSE_PROJECT_NAME (default app), COMPOSE_PROFILES (for optional workers),
+#   COMPOSE_PROJECT_DIRECTORY (default APP_DIR), COMPOSE_PROJECT_NAME and
+#   COMPOSE_OVERRIDE_FILE (validated against the authoritative deployment
+#   profile), COMPOSE_PROFILES (for optional workers),
 #   ADMIN_COOKIE — a full Cookie header
 #   value ("aero_admin=<token>"). It is mandatory for the one-time OpenCFD
 #   v2406 -> v2606 cutover because the script pauses/drains/migrates/resumes
 #   campaigns through authenticated Node API maintenance endpoints.
 #   CUTOVER_DRAIN_TIMEOUT_SECONDS (default 7200).
+#   OPENCFD2606_POST_NODE_HEALTH_VERIFIER is an optional absolute executable
+#   hook. Incident recovery uses a hash-pinned staged verifier to prove the
+#   additive canary database-ACK migration after Node health and before the
+#   first execution-pool activation request.
+#   OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE is empty for ordinary maintenance.
+#   Incident recovery may set it to running or stopped only after it has
+#   journalled and quiesced media-repair under the inherited deployment lock.
 #   DEPLOY_LOCK_HELD=1 only when descriptor 9 is inherited from a parent that
 #   already opened the configured deployment lock. The script verifies and
 #   retains that lock for the complete maintenance transaction.
@@ -54,6 +63,7 @@ APP_DIR="${APP_DIR:-/opt/airfoils-pro/app}"
 AIRFOILS_PRO_STATE_DIR="${AIRFOILS_PRO_STATE_DIR:-/opt/airfoils-pro/state}"
 ENV_FILE="${ENV_FILE:-$AIRFOILS_PRO_STATE_DIR/.env.deploy}"
 COMPOSE_FILE="${COMPOSE_FILE:-$APP_DIR/docker-compose.deploy.yml}"
+COMPOSE_PROJECT_DIRECTORY="${COMPOSE_PROJECT_DIRECTORY:-$APP_DIR}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
 COMPOSE_OVERRIDE_FILE="${COMPOSE_OVERRIDE_FILE:-}"
 LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
@@ -70,13 +80,10 @@ CUTOVER_CONTINUATION_TIMEOUT_SECONDS="${CUTOVER_CONTINUATION_TIMEOUT_SECONDS:-36
 # bound. This is intentionally not operator-configurable.
 ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS=15
 OPENCFD2606_CANARY_RECEIPT_FILE="${OPENCFD2606_CANARY_RECEIPT_FILE:-$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json}"
+OPENCFD2606_POST_NODE_HEALTH_VERIFIER="${OPENCFD2606_POST_NODE_HEALTH_VERIFIER:-}"
+OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE="${OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE:-}"
 OPENCFD_2606_POOL_ID="3f8bc764-09ae-4ff3-8fd2-260600000001"
 CUTOVER_API_BASE="http://127.0.0.1:4000/api/admin/solver-engine-cutovers/opencfd-2606"
-# Maintenance queue snapshots include authoritative Celery inspection and can
-# legitimately finish just after five seconds on the production 2606 worker.
-# Keep this reviewed, non-configurable timeout local to the destructive engine
-# idle guard; ordinary health/readiness probes retain their tighter limits.
-ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS=15
 CUTOVER_ATTESTATION_ID=""
 OPENCFD2606_FAIL_SAFE_ARMED=false
 OPENCFD2606_POOL_FAIL_SAFE_DISABLED=false
@@ -113,7 +120,8 @@ else
 fi
 
 compose() {
-  "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" "$@"
+  "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" \
+    --project-directory "$COMPOSE_PROJECT_DIRECTORY" "${COMPOSE_FILE_ARGS[@]}" "$@"
 }
 
 acquire_deploy_lock() {
@@ -144,7 +152,7 @@ acquire_deploy_lock() {
 
 verify_deployment_source() {
   local tool fields revision tree_sha file_count
-  tool="$APP_DIR/scripts/deploy/deployment-source-manifest.py"
+  tool="$DEPLOY_SCRIPT_DIR/deployment-source-manifest.py"
   if [[ ! -f "$tool" || ! -f "$DEPLOYMENT_MANIFEST_FILE" ]]; then
     echo "Deployment source manifest or verifier is missing; refusing engine maintenance from unreviewed source." >&2
     return 2
@@ -277,6 +285,23 @@ restore_sweeper_after_rebuild() {
     # not start it. A later intentional `compose up -d sweeper` then uses the
     # same verified engine generation without a stale-id transition.
     compose up --no-start --no-deps --force-recreate sweeper
+  fi
+}
+
+restore_media_repair_after_rebuild() {
+  local initial_state="$OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE"
+  if [[ -z "$initial_state" ]]; then
+    return 0
+  fi
+  if [[ "$initial_state" == "running" ]]; then
+    echo "Restoring the previously running media-repair service..."
+    compose up -d --no-deps --force-recreate media-repair
+  elif [[ "$initial_state" == "stopped" ]]; then
+    echo "Preserving the intentionally stopped media-repair service..."
+    compose up --no-start --no-deps --force-recreate media-repair
+  else
+    echo "OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE must be running, stopped, or empty." >&2
+    return 14
   fi
 }
 
@@ -1502,6 +1527,24 @@ wait_http() {
   return 1
 }
 
+run_post_node_health_verifier() {
+  local verifier="$OPENCFD2606_POST_NODE_HEALTH_VERIFIER"
+  if [[ -z "$verifier" ]]; then
+    return 0
+  fi
+  if [[ "$verifier" != /* || ! -f "$verifier" || -L "$verifier" || ! -x "$verifier" ]]; then
+    echo "OPENCFD2606_POST_NODE_HEALTH_VERIFIER must be an absolute executable regular file." >&2
+    return 14
+  fi
+  echo "Verifying the staged OpenCFD v2606 canary database-ACK migration before pool activation..."
+  APP_DIR="$APP_DIR" AIRFOILS_PRO_STATE_DIR="$AIRFOILS_PRO_STATE_DIR" \
+    ENV_FILE="$ENV_FILE" COMPOSE_FILE="$COMPOSE_FILE" \
+    COMPOSE_PROJECT_DIRECTORY="$COMPOSE_PROJECT_DIRECTORY" \
+    COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" DEPLOY_SCRIPT_DIR="$DEPLOY_SCRIPT_DIR" \
+    "$verifier"
+  echo "Staged OpenCFD v2606 canary database-ACK migration is verified."
+}
+
 validate_normal_rebuild_cutover_markers() {
   local pending restore_state attestation complete receipt_expected
   pending="$(read_env_var OPENCFD2606_CUTOVER_PENDING || true)"
@@ -1585,6 +1628,13 @@ main() {
   verify_deployment_source || exit $?
   validate_recovery_state_paths || exit $?
   validate_opencfd_2606_cutover_state any || exit $?
+  case "$OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE" in
+    ""|running|stopped) ;;
+    *)
+      echo "OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE must be running, stopped, or empty." >&2
+      exit 14
+      ;;
+  esac
 
   echo "Engine rebuild starting: BUILD_ID=$BUILD_ID"
 
@@ -1693,7 +1743,16 @@ main() {
     echo "No configured engine worker services found; refusing rebuild." >&2
     exit 12
   fi
-  AIRFOILFOAM_BUILD_ID="$BUILD_ID" compose build api "${worker_services[@]}"
+  # Build every image that will be recreated before mutating the persistent
+  # identity tuple.  This is especially important when COMPOSE_FILE and its
+  # project directory point at an incident-reviewed staging tree while APP_DIR
+  # remains bound to the pending cutover source.
+  local -a control_plane_build_services=(node-api sweeper)
+  if [[ -n "$OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE" ]]; then
+    control_plane_build_services+=(media-repair)
+  fi
+  AIRFOILFOAM_BUILD_ID="$BUILD_ID" ENGINE_EXPECTED_BUILD_ID="$BUILD_ID" \
+    compose build api "${worker_services[@]}" "${control_plane_build_services[@]}"
 
   # Freeze scheduling before the final idle proof. Leaving the old sweeper
   # live between that proof and force-recreate would let it submit a new solve
@@ -1701,6 +1760,12 @@ main() {
   # before either build-id setting changes, so it is safe to restore the old
   # sweeper's prior running/stopped state in that one path.
   compose stop sweeper
+  if [[ -n "$OPENCFD2606_MEDIA_REPAIR_RESTORE_STATE" ]]; then
+    # The incident wrapper has already stopped this service before taking the
+    # strong database backup. Reassert the stop immediately before migration;
+    # a restart policy or operator must not reopen the writer window.
+    compose stop media-repair
+  fi
   if ! require_idle_worker "before service recreate"; then
     restore_sweeper_after_refusal "$sweeper_restore_state"
     exit 12
@@ -1769,6 +1834,7 @@ main() {
   fi
 
   wait_http "node-api" "http://127.0.0.1:4000/health" 90
+  run_post_node_health_verifier
   if [[ "$cutover_active" == "true" ]]; then
     finish_opencfd_2606_cutover
   fi
@@ -1809,6 +1875,12 @@ main() {
       fi
     fi
   fi
+
+  # Keep presentation-evidence writers stopped throughout canary registration,
+  # cleanup proof, attestation, successor finalization, and continuation gates.
+  # Only the terminal successful path restores/recreates the service according
+  # to the exact state journalled before backup.
+  restore_media_repair_after_rebuild
 
   # 6. Requeue jobs orphaned by the worker restart. Requires an admin session
   #    cookie (aero_admin=<token>) in ADMIN_COOKIE. Manual fallback: log into

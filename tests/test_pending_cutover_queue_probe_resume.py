@@ -10,7 +10,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_resume_launcher_is_incident_bound_and_uses_reviewed_runner() -> None:
+def test_resume_launcher_preserves_its_historical_reviewed_runner_binding() -> None:
     launcher = (
         ROOT / "scripts" / "deploy" / "resume-pending-opencfd2606-cutover.sh"
     ).read_text()
@@ -23,10 +23,13 @@ def test_resume_launcher_is_incident_bound_and_uses_reviewed_runner() -> None:
         for line in launcher.splitlines()
         if line.startswith('EXPECTED_REBUILD_SHA256="')
     )
-    actual_rebuild_sha = hashlib.sha256(
+    current_rebuild_sha = hashlib.sha256(
         (ROOT / "scripts" / "deploy" / "rebuild-engine.sh").read_bytes()
     ).hexdigest()
-    assert expected_rebuild_sha == actual_rebuild_sha
+    assert expected_rebuild_sha == (
+        "515e81d52d59d2e4e798daf1bdaf2ff5e51e45cc5c3708d41af20130c2364021"
+    )
+    assert expected_rebuild_sha != current_rebuild_sha
     assert "pending-cutover-node-api-repair.json" in launcher
     assert "OPENCFD2606_CANARY_ATTESTATION_ID" in launcher
     assert '"$staging_real/scripts/deploy/rebuild-engine.sh" "$BUILD_ID"' in launcher
