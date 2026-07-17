@@ -4057,6 +4057,12 @@ def _evidence_mime(path: Path) -> str:
 
 
 def _artifact_kind_for_role(role: str) -> str:
+    # `continuation_state` is the semantic manifest role of
+    # transient_start.json.  Keep its persisted artifact kind inside the
+    # existing cross-runtime enum/member contract: remote-only cleanup must
+    # register this bundled member before local evidence can be acknowledged.
+    if role == "continuation_state":
+        return "dictionary"
     return role if role in {
         "vtk_window",
         "time_directory",
@@ -4132,6 +4138,16 @@ def _archive_case_evidence(
             _constant_evidence_role,
             manifest_base=evidence_dir,
         )
+        marker = post_dir / TRANSIENT_START_MARKER
+        if marker.is_file():
+            _copy_file_preserving_rel(
+                post_dir,
+                marker,
+                raw_dir / "transient",
+                entries,
+                "continuation_state",
+                manifest_base=evidence_dir,
+            )
 
     for log in sorted(set(case_dir.glob("log*")) | set(post_dir.glob("log*"))):
         if log.is_file():

@@ -38,6 +38,14 @@ Keep-set derivation:
   finalization has already copied its exact files into the canonical engine
   archive as ``openfoam/mesh_evidence``. Full strip removes that duplicate;
   case-state-preserving strip keeps it with the rest of the restartable case.
+* A finished URANS transient can leave two small JSON controls beside its time
+  directories. ``transient_start.json`` is copied byte-for-byte into the
+  canonical archive as ``openfoam/transient/transient_start.json`` before the
+  result is returned. ``march_budget.json`` is mutable process-local watchdog
+  arming and continuation staging deliberately does not copy it. Full strip
+  removes the budget marker and removes the start marker only after proving
+  exact manifest and tar.zst membership; case-state-preserving strip retains
+  both.
 
 Unknown entries are fail-safe: they are retained and reported instead of being
 deleted by a broad "everything not in the keep set" rule.
@@ -50,13 +58,20 @@ import hashlib
 import json
 import os
 import shutil
+import tarfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .evidence_store import EvidenceStoreError, read_remote_pointer
+import zstandard
+
+from .evidence_store import (
+    MAX_EVIDENCE_MANIFEST_BYTES,
+    EvidenceStoreError,
+    read_remote_pointer,
+)
 
 
 STRIP_MARKER = ".stripped.json"
@@ -71,6 +86,10 @@ _CASE_DELETE_DIRS = {
     "mesh-evidence",
 }
 _CASE_KEEP_DIRS = {"images", "frames", "evidence", "custom_renders"}
+_TRANSIENT_START_FILENAME = "transient_start.json"
+_TRANSIENT_START_ARCHIVE_MEMBER = "openfoam/transient/transient_start.json"
+_MARCH_BUDGET_FILENAME = "march_budget.json"
+_MAX_TRANSIENT_START_BYTES = 64 * 1024
 _EVIDENCE_KEEP_NAMES = {
     "evidence_manifest.json",
     "openfoam_evidence.tar.gz",
@@ -285,7 +304,12 @@ def _strip_case_dir(job_root: Path, case_dir: Path, report: StripReport, *, keep
             continue
         if _is_transient_solver_dir(child):
             if not keep_case_state:
-                _strip_solver_state_dir(job_root, child, report)
+                _strip_solver_state_dir(
+                    job_root,
+                    child,
+                    report,
+                    case_dir=case_dir,
+                )
             continue
         if not keep_case_state and _is_case_solver_artifact(child):
             _remove_path(child, report)
@@ -387,18 +411,167 @@ def _storage_migration_pending(
     return False
 
 
-def _strip_solver_state_dir(job_root: Path, solver_dir: Path, report: StripReport) -> None:
+def _strip_solver_state_dir(
+    job_root: Path,
+    solver_dir: Path,
+    report: StripReport,
+    *,
+    case_dir: Path,
+) -> None:
     for child in sorted(solver_dir.iterdir()):
         if child.name == "evidence" and child.is_dir():
             _strip_evidence_dir(job_root, child, report)
         elif _is_transient_solver_dir(child):
-            _strip_solver_state_dir(job_root, child, report)
+            _strip_solver_state_dir(
+                job_root,
+                child,
+                report,
+                case_dir=case_dir,
+            )
+        elif child.is_file() and child.name == _MARCH_BUDGET_FILENAME:
+            # Mutable watchdog arming belongs only to the completed process.
+            # Continuation staging deliberately excludes it and rewrites a
+            # fresh budget for every new chunk.
+            _remove_path(child, report)
+        elif child.is_file() and child.name == _TRANSIENT_START_FILENAME:
+            # An old engine can leave this marker without putting it in the
+            # immutable bundle (2026-07-17 guarded canary).  Delete it only
+            # when this exact case's manifest and canonical tar.zst both prove
+            # the byte-identical member.  Otherwise retain/report it fail-safe.
+            if _transient_start_has_exact_archive_proof(
+                case_dir,
+                solver_dir,
+                child,
+            ):
+                _remove_path(child, report)
+            else:
+                _record_unknown(job_root, child, report)
         elif _is_case_solver_artifact(child):
             _remove_path(child, report)
         elif child.name in _CASE_KEEP_DIRS:
             continue
         else:
             _record_unknown(job_root, child, report)
+
+
+def _transient_start_has_exact_archive_proof(
+    case_dir: Path,
+    solver_dir: Path,
+    marker: Path,
+) -> bool:
+    """Prove the exact live trajectory boundary is inside canonical evidence.
+
+    This intentionally reads the retained tar.zst rather than trusting only an
+    unpacked staging copy or mutable sidecar manifest.  It streams just far
+    enough to compare the archive's manifest and marker bytes, so no temporary
+    extraction capacity is required during a storage-reclamation operation.
+    """
+
+    evidence_dir = _transient_evidence_dir(case_dir, solver_dir)
+    manifest_path = evidence_dir / "evidence_manifest.json"
+    archive_path = evidence_dir / "engine_evidence.tar.zst"
+    if (
+        not manifest_path.is_file()
+        or manifest_path.is_symlink()
+        or not archive_path.is_file()
+        or archive_path.is_symlink()
+        or not marker.is_file()
+        or marker.is_symlink()
+    ):
+        return False
+    try:
+        if manifest_path.stat().st_size > MAX_EVIDENCE_MANIFEST_BYTES:
+            return False
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("files"),
+            list,
+        ):
+            return False
+        if marker.stat().st_size > _MAX_TRANSIENT_START_BYTES:
+            return False
+        marker_bytes = marker.read_bytes()
+        marker_sha256 = hashlib.sha256(marker_bytes).hexdigest()
+        matching_entries = [
+            entry
+            for entry in manifest["files"]
+            if isinstance(entry, dict)
+            and entry.get("path") == _TRANSIENT_START_ARCHIVE_MEMBER
+        ]
+        if len(matching_entries) != 1:
+            return False
+        entry = matching_entries[0]
+        if (
+            entry.get("role") != "continuation_state"
+            or entry.get("sha256") != marker_sha256
+            or entry.get("byteSize") != len(marker_bytes)
+        ):
+            return False
+
+        pointer_path = evidence_dir / "engine_evidence.remote.json"
+        if pointer_path.exists() or pointer_path.is_symlink():
+            if not pointer_path.is_file() or pointer_path.is_symlink():
+                return False
+            pointer = read_remote_pointer(pointer_path)
+            archive_size, archive_sha256 = _file_size_sha256(archive_path)
+            if (
+                archive_size != pointer.stored_size
+                or archive_sha256 != pointer.stored_sha256
+            ):
+                return False
+
+        return _tar_zst_contains_exact_transient_start(
+            archive_path,
+            manifest_bytes,
+            marker_bytes,
+        )
+    except (EvidenceStoreError, OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _transient_evidence_dir(case_dir: Path, solver_dir: Path) -> Path:
+    name = solver_dir.name
+    suffix = name.removeprefix("transient_")
+    if suffix.endswith("_refined"):
+        suffix = suffix.removesuffix("_refined")
+    if suffix.startswith("a") and suffix[1:].isdigit():
+        return case_dir / suffix / "evidence"
+    return case_dir / "evidence"
+
+
+def _tar_zst_contains_exact_transient_start(
+    archive_path: Path,
+    manifest_bytes: bytes,
+    marker_bytes: bytes,
+) -> bool:
+    expected = {
+        "evidence_manifest.json": manifest_bytes,
+        _TRANSIENT_START_ARCHIVE_MEMBER: marker_bytes,
+    }
+    seen: set[str] = set()
+    try:
+        with archive_path.open("rb") as compressed:
+            with zstandard.ZstdDecompressor().stream_reader(compressed) as stream:
+                with tarfile.open(fileobj=stream, mode="r|") as archive:
+                    for member in archive:
+                        if member.name not in expected:
+                            continue
+                        if member.name in seen or not member.isfile():
+                            return False
+                        source = archive.extractfile(member)
+                        if source is None:
+                            return False
+                        wanted = expected[member.name]
+                        actual = source.read(len(wanted) + 1)
+                        if member.size != len(wanted) or actual != wanted:
+                            return False
+                        seen.add(member.name)
+                        if seen == set(expected):
+                            return True
+    except (OSError, tarfile.TarError, zstandard.ZstdError):
+        return False
+    return False
 
 
 def _is_case_solver_artifact(path: Path) -> bool:
