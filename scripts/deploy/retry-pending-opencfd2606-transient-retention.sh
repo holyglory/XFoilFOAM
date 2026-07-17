@@ -40,6 +40,7 @@ EXPECTED_INITIAL_WORKER_CONTAINER="41ae0007b8c19f0d29616d7304b86a38f23346b3940a5
 EXPECTED_INITIAL_API_IMAGE="sha256:236cb522879087a412103b3dceb1ef83fa7964e5c628497dbeb251c60d5cca98"
 EXPECTED_INITIAL_WORKER_IMAGE="sha256:2705edcca4d60c0fc81f7cab0635d582e14cdc08a8ce97e7d78a89857451dccc"
 EXPECTED_INITIAL_ENV_SHA256="a34fa01374905d4f037fb36ac0ca2981b89443c80d9ae6896bdb9f788608481a"
+EXPECTED_PRIOR_SOURCE_BOUND_ENV_SHA256="818da3d18a1368c7a25a37c741aba2a1acfc0969c43ad1a6d9c518fcda44b07b"
 EXPECTED_INITIAL_DATABASE_SHA256="8421c15692afc6e36a834e481734411db61ecf18a95ce4db3a46ec9c7f7ad96c"
 EXPECTED_INITIAL_BUILD_ID="prod-20260717-cd0967a1ba4e-r3"
 EXPECTED_APP_LINK="/opt/airfoils-pro/app"
@@ -525,7 +526,8 @@ prior_application_source_sha="$(python3 - "$PRIOR_RETENTION_JOURNAL_FILE" \
   "$EXPECTED_PRIOR_ENGINE_SOURCE_REVISION" "$EXPECTED_PRIOR_ENGINE_SOURCE_TREE_SHA256" \
   "$EXPECTED_NODE_SOURCE_REVISION" "$EXPECTED_NODE_IMAGE" "$EXPECTED_INITIAL_NODE_CONTAINER" \
   "$EXPECTED_INITIAL_API_IMAGE" "$EXPECTED_INITIAL_WORKER_IMAGE" "$EXPECTED_INITIAL_ENV_SHA256" \
-  "$EXPECTED_INITIAL_DATABASE_SHA256" "$EXPECTED_INITIAL_BUILD_ID" "$EXPECTED_BOUND_SOURCE_REVISION" \
+  "$EXPECTED_PRIOR_SOURCE_BOUND_ENV_SHA256" "$EXPECTED_INITIAL_DATABASE_SHA256" \
+  "$EXPECTED_INITIAL_BUILD_ID" "$EXPECTED_BOUND_SOURCE_REVISION" \
   "$EXPECTED_BOUND_SOURCE_TREE_SHA256" "$EXPECTED_NODE_ADMIN_ROUTES_SHA256" \
   "$EXPECTED_NODE_ATTESTATION_SHA256" <<'PY'
 import json,re,sys
@@ -537,11 +539,11 @@ expected={"schemaVersion":1,"purpose":"pending-opencfd2606-retention-retry","sta
 "currentNodeApiImage":sys.argv[5],"nodeApiContainerAfter":sys.argv[6],
 "currentApiImage":sys.argv[7],"currentWorkerImage":sys.argv[8],
 "currentDeploymentEnvironmentSha256":sys.argv[9],
-"sourceBoundDeploymentEnvironmentSha256":sys.argv[9],
-"currentDatabaseSnapshotSha256":sys.argv[10],"buildId":sys.argv[11],
-"currentNodeExpectedBuildId":sys.argv[11],"boundReleaseSourceRevision":sys.argv[12],
-"boundReleaseSourceTreeSha256":sys.argv[13],"nodeApiAdminRoutesSha256":sys.argv[14],
-"nodeApiAttestationSha256":sys.argv[15],"currentCanaryReceiptSha256":"absent",
+"sourceBoundDeploymentEnvironmentSha256":sys.argv[10],
+"currentDatabaseSnapshotSha256":sys.argv[11],"buildId":sys.argv[12],
+"currentNodeExpectedBuildId":sys.argv[12],"boundReleaseSourceRevision":sys.argv[13],
+"boundReleaseSourceTreeSha256":sys.argv[14],"nodeApiAdminRoutesSha256":sys.argv[15],
+"nodeApiAttestationSha256":sys.argv[16],"currentCanaryReceiptSha256":"absent",
 "currentCutoverStateKind":"pending-pristine","action":"rebuild_and_canary",
 "promotionEligible":False,"completedAt":None}
 for key,value in expected.items():

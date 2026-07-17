@@ -323,6 +323,15 @@ def harness(tmp_path: Path) -> tuple[dict[str, str], Path, Path, dict[str, Path]
         f"OPENCFD2606_CUTOVER_SOURCE_REVISION={BASE_REVISION}",
         f"OPENCFD2606_CUTOVER_SOURCE_TREE_SHA256={PRIOR_TREE}", "",
     ])); env_file.chmod(0o600)
+    source_bound_env = tmp_path / "source-bound.env"
+    source_bound_env.write_bytes(env_file.read_bytes())
+    _replace_env(
+        source_bound_env,
+        {
+            "AIRFOILFOAM_BUILD_ID": "prod-20260717-cd0967a1ba4e-r2",
+            "ENGINE_EXPECTED_BUILD_ID": "prod-20260717-cd0967a1ba4e-r2",
+        },
+    )
     prior_app_source = subprocess.check_output(
         ["python3", "-c", "from pathlib import Path; from airfoilfoam.provenance import application_source_sha256; import sys; print(application_source_sha256(Path(sys.argv[1])))", str(base)],
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(base / "src")}, text=True,
@@ -344,12 +353,16 @@ def harness(tmp_path: Path) -> tuple[dict[str, str], Path, Path, dict[str, Path]
         "nodeApiContainerBefore": "1" * 64, "nodeApiContainerAfter": NODE_CONTAINER,
         "buildId": OLD_BUILD, "action": "rebuild_and_canary",
         "deploymentEnvironmentBeforeSha256": "9" * 64,
-        "sourceBoundDeploymentEnvironmentSha256": _sha(env_file), "promotionEligible": False,
+        "sourceBoundDeploymentEnvironmentSha256": _sha(source_bound_env), "promotionEligible": False,
         "currentDeploymentEnvironmentSha256": _sha(env_file), "currentApiImage": OLD_API_IMAGE,
         "currentWorkerImage": OLD_WORKER_IMAGE, "currentDatabaseSnapshotSha256": db_sha,
         "currentCanaryReceiptSha256": "absent", "currentCutoverStateKind": "pending-pristine",
         "currentNodeApiImage": NODE_IMAGE, "currentNodeExpectedBuildId": OLD_BUILD,
     }
+    assert (
+        failed_payload["sourceBoundDeploymentEnvironmentSha256"]
+        != failed_payload["currentDeploymentEnvironmentSha256"]
+    )
     failed.write_text(json.dumps(failed_payload, sort_keys=True, separators=(",", ":")) + "\n"); failed.chmod(0o600)
     fake_bin, files = _fake_runtime(tmp_path)
     values = {files["api-image"]: OLD_API_IMAGE, files["worker-image"]: OLD_WORKER_IMAGE, files["api-tag"]: OLD_API_IMAGE, files["worker-tag"]: OLD_WORKER_IMAGE, files["node-image"]: NODE_IMAGE, files["node-tag"]: NODE_IMAGE, files["replay-tag"]: NODE_IMAGE, files["rollback-tag"]: NODE_ROLLBACK_IMAGE, files["node-container"]: NODE_CONTAINER, files["api-container"]: API_CONTAINER, files["worker-container"]: WORKER_CONTAINER, files["node-build"]: OLD_BUILD, files["engine-build"]: OLD_BUILD, files["api-source"]: prior_app_source, files["worker-source"]: prior_app_source, files["db"]: json.dumps(initial_db, sort_keys=True, separators=(",", ":")), files["calls"]: "", files["child-calls"]: ""}
@@ -364,6 +377,7 @@ def harness(tmp_path: Path) -> tuple[dict[str, str], Path, Path, dict[str, Path]
         'EXPECTED_ENV_FILE="/opt/airfoils-pro/state/.env.deploy"': f'EXPECTED_ENV_FILE="{env_file}"',
         'EXPECTED_CANONICAL_LOCK_FILE="/tmp/airfoils-pro-deploy.lock"': f'EXPECTED_CANONICAL_LOCK_FILE="{tmp_path / "deploy.lock"}"',
         'EXPECTED_INITIAL_ENV_SHA256="a34fa01374905d4f037fb36ac0ca2981b89443c80d9ae6896bdb9f788608481a"': f'EXPECTED_INITIAL_ENV_SHA256="{_sha(env_file)}"',
+        'EXPECTED_PRIOR_SOURCE_BOUND_ENV_SHA256="818da3d18a1368c7a25a37c741aba2a1acfc0969c43ad1a6d9c518fcda44b07b"': f'EXPECTED_PRIOR_SOURCE_BOUND_ENV_SHA256="{_sha(source_bound_env)}"',
         'EXPECTED_INITIAL_DATABASE_SHA256="8421c15692afc6e36a834e481734411db61ecf18a95ce4db3a46ec9c7f7ad96c"': f'EXPECTED_INITIAL_DATABASE_SHA256="{failed_payload["currentDatabaseSnapshotSha256"]}"',
         'EXPECTED_PRIOR_RETENTION_JOURNAL_SHA256="b99ca862100542593f7d8fc24dd47b9d62eb3e4d657dbc1c1590ce6c90050224"': f'EXPECTED_PRIOR_RETENTION_JOURNAL_SHA256="{_sha(failed)}"',
     }
@@ -551,6 +565,7 @@ def test_production_wrapper_and_workflow_contract_are_narrow() -> None:
     assert "0ec006a1db421bc8cfce5c4f422966913b9d477f1ca347ddd2ad6eaa3505a176" in wrapper
     assert "71c64e20c5b6b7a15b94a104819b3cb5639c42348b2a11ec822e1588e8805523" in wrapper
     assert "672a53783accaa66e806cbf3849bcdebf3377035e22400a7e3730f2318fcf84c" in wrapper
+    assert "818da3d18a1368c7a25a37c741aba2a1acfc0969c43ad1a6d9c518fcda44b07b" in wrapper
     assert WRAPPER.stat().st_mode & 0o111
     assert "pending_cutover_transient_retention_retry:" in workflow
     assert "retry-pending-opencfd2606-transient-retention.sh" in workflow
