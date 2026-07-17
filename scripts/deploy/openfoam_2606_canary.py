@@ -59,6 +59,9 @@ MEDIA_FIELD = "velocity_magnitude"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 OCI_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 CRC32C_BASE64 = re.compile(r"^[A-Za-z0-9+/]{6}==$")
+REMOTE_RESTORE_PROOF = re.compile(
+    r"^archive\+manifest\+all-members-restore:([1-9][0-9]*)$"
+)
 OFFICIAL_PACKAGE_SHA256_BY_ARCH = {
     "amd64": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
     "x86_64": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
@@ -160,6 +163,76 @@ def _require_utc_timestamp(value: object, label: str) -> str:
     _require(parsed.utcoffset() is not None, f"{label} has no UTC offset")
     _require(parsed.utcoffset().total_seconds() == 0, f"{label} is not UTC")
     return value
+
+
+def _manifest_member_binding(
+    payload: bytes, label: str
+) -> tuple[int, int, str]:
+    """Match the control-plane manifest+bundle member digest exactly."""
+
+    try:
+        manifest = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CanaryFailure(f"{label} is invalid JSON") from exc
+    manifest = _mapping(manifest, label)
+    files = _list(manifest.get("files"), f"{label}.files")
+    excludes = _list(manifest.get("bundleExcludes", []), f"{label}.bundleExcludes")
+    excluded_roots: set[str] = set()
+    for index, value in enumerate(excludes):
+        _require(
+            isinstance(value, str)
+            and bool(value)
+            and "/" not in value
+            and "\\" not in value
+            and value not in {".", ".."},
+            f"{label}.bundleExcludes[{index}] is unsafe",
+        )
+        _require(value not in excluded_roots, f"{label} repeats bundle exclusion {value}")
+        excluded_roots.add(value)
+
+    rows: dict[str, tuple[str, int]] = {
+        "evidence_manifest.json": (hashlib.sha256(payload).hexdigest(), len(payload))
+    }
+    for index, raw in enumerate(files):
+        entry = _mapping(raw, f"{label}.files[{index}]")
+        path = entry.get("path")
+        sha256 = entry.get("sha256")
+        byte_size = entry.get("byteSize")
+        _require(
+            isinstance(path, str)
+            and bool(path)
+            and not path.startswith("/")
+            and "\\" not in path
+            and "\0" not in path
+            and all(part not in {"", ".", ".."} for part in path.split("/")),
+            f"{label}.files[{index}].path is unsafe",
+        )
+        _require(
+            isinstance(sha256, str) and bool(HEX_64.fullmatch(sha256)),
+            f"{label}.files[{index}].sha256 is malformed",
+        )
+        _require(
+            isinstance(byte_size, int)
+            and not isinstance(byte_size, bool)
+            and byte_size >= 0,
+            f"{label}.files[{index}].byteSize is invalid",
+        )
+        if path.split("/", 1)[0] in excluded_roots:
+            continue
+        _require(path not in rows, f"{label} repeats member path {path}")
+        rows[path] = (sha256, byte_size)
+
+    digest = hashlib.sha256()
+    for path, (sha256, byte_size) in sorted(rows.items()):
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha256.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(byte_size).encode("ascii"))
+        digest.update(b"\n")
+    # The object-store restore proof reports bundled manifest entries only;
+    # the database association set additionally owns evidence_manifest.json.
+    return len(rows) - 1, len(rows), digest.hexdigest()
 
 
 class GatewayClient:
@@ -784,13 +857,20 @@ class OpenCfd2606Canary:
             f"{label} pointer path is not canonical",
         )
         _require(
-            metadata.get("localEvidenceDisposition") == "remote-only",
-            f"{label} local packaged evidence was not removed",
+            metadata.get("localEvidenceDisposition")
+            == "remote-copy-plus-local-archive-pending-database-ack",
+            f"{label} did not retain its archive pending durable database acknowledgement",
         )
         _require(
-            metadata.get("remoteRestoreVerification")
-            in {"archive+vtk-restore", "archive+manifest-restore"},
-            f"{label} has no generation-pinned remote restore proof",
+            metadata.get("rawLocalEvidenceDisposition") == "removed"
+            and metadata.get("localArchiveRetainedUntilDatabaseAck") is True,
+            f"{label} did not safely remove raw duplicates while retaining the complete archive",
+        )
+        restore_verification = metadata.get("remoteRestoreVerification")
+        _require(
+            isinstance(restore_verification, str)
+            and REMOTE_RESTORE_PROOF.fullmatch(restore_verification) is not None,
+            f"{label} has no all-member generation-pinned remote restore proof",
         )
         # This immutable binding is copied onto every receipt artifact.  The
         # non-bundle artifacts are members of this exact archive generation,
@@ -809,8 +889,13 @@ class OpenCfd2606Canary:
             "uncompressed_tar_sha256": metadata["uncompressedTarSha256"],
             "uncompressed_tar_byte_size": metadata["uncompressedTarByteSize"],
             "zstd_level": metadata["zstdLevel"],
+            "verified_at": metadata["verifiedAt"],
             "pointer_path": metadata["pointerPath"],
             "local_disposition": metadata["localEvidenceDisposition"],
+            "raw_local_disposition": metadata["rawLocalEvidenceDisposition"],
+            "local_archive_retained_until_database_ack": metadata[
+                "localArchiveRetainedUntilDatabaseAck"
+            ],
             "restore_verification": metadata["remoteRestoreVerification"],
         }
 
@@ -887,7 +972,7 @@ class OpenCfd2606Canary:
         point: dict[str, Any],
         scenario: Scenario,
         expected_aoa_deg: float,
-    ) -> list[dict[str, object | None]]:
+    ) -> dict[str, object]:
         artifacts = _list(point.get("evidence_artifacts"), f"{scenario.name} evidence_artifacts")
         _require(artifacts, f"{scenario.name} has no evidence artifacts")
         for index, item in enumerate(artifacts):
@@ -979,6 +1064,45 @@ class OpenCfd2606Canary:
         _require(_finite(manifest.get("aoaDeg"), f"{scenario.name} manifest AoA") == expected_aoa_deg, f"{scenario.name} manifest AoA is wrong")
         _require(manifest.get("unsteady") is point.get("unsteady"), f"{scenario.name} manifest unsteady flag differs from point")
 
+        (
+            bundled_member_count,
+            manifest_member_association_count,
+            manifest_member_set_sha256,
+        ) = (
+            _manifest_member_binding(
+                manifest_raw, f"{scenario.name} evidence manifest"
+            )
+        )
+        restore_match = REMOTE_RESTORE_PROOF.fullmatch(
+            str(storage_binding["restore_verification"])
+        )
+        _require(
+            restore_match is not None
+            and int(restore_match.group(1)) == bundled_member_count,
+            f"{scenario.name} remote restore proof did not cover the complete manifest member set",
+        )
+        bundle_metadata = _mapping(
+            bundle_artifact.get("metadata"), f"{scenario.name} engine bundle metadata"
+        )
+        _require(
+            bundle_metadata.get("bundledFileCount") == bundled_member_count,
+            f"{scenario.name} bundled file count differs from its manifest",
+        )
+        case_slug = point.get("case_slug")
+        evidence_base = bundle_metadata.get("evidenceBase")
+        for value, value_label in (
+            (case_slug, "case slug"),
+            (evidence_base, "evidence base"),
+        ):
+            _require(
+                isinstance(value, str)
+                and bool(value)
+                and not value.startswith("/")
+                and "\\" not in value
+                and all(part not in {"", ".", ".."} for part in value.split("/")),
+                f"{scenario.name} {value_label} is unsafe",
+            )
+
         manifest_files = _list(manifest.get("files"), f"{scenario.name} manifest files")
         roles = {item.get("role") for item in manifest_files if isinstance(item, dict)}
         _require(
@@ -1002,8 +1126,16 @@ class OpenCfd2606Canary:
                 "video" if role == "video" else "image",
             )
 
-        return sorted(
-            [
+        return {
+            "case_slug": case_slug,
+            "evidence_base": evidence_base,
+            "bundled_member_count": bundled_member_count,
+            "manifest_member_association_count": (
+                manifest_member_association_count
+            ),
+            "manifest_member_set_sha256": manifest_member_set_sha256,
+            "artifacts": sorted(
+                [
                 {
                     "kind": item.get("kind"),
                     "path": item.get("path"),
@@ -1013,16 +1145,17 @@ class OpenCfd2606Canary:
                     "byte_size": item.get("byte_size"),
                     "storage": dict(storage_binding),
                 }
-                for item in artifacts
-                if isinstance(item, dict)
-            ],
-            key=lambda item: (
-                str(item.get("kind") or ""),
-                str(item.get("path") or ""),
-                str(item.get("role") or ""),
-                str(item.get("field") or ""),
+                    for item in artifacts
+                    if isinstance(item, dict)
+                ],
+                key=lambda item: (
+                    str(item.get("kind") or ""),
+                    str(item.get("path") or ""),
+                    str(item.get("role") or ""),
+                    str(item.get("field") or ""),
+                ),
             ),
-        )
+        }
 
     def _remote_render_target(
         self,
@@ -1231,7 +1364,7 @@ class OpenCfd2606Canary:
             else:
                 _require(point.get("unsteady") is False, f"{scenario.name} RANS point unexpectedly became unsteady")
                 _require(point.get("force_history") is None, f"{scenario.name} RANS point invented a transient force history")
-            artifacts = self._validate_evidence(point, scenario, expected_aoa_deg)
+            evidence = self._validate_evidence(point, scenario, expected_aoa_deg)
             receipt_points.append(
                 {
                     "aoa_deg": expected_aoa_deg,
@@ -1239,18 +1372,23 @@ class OpenCfd2606Canary:
                     "cd": cd,
                     "cm": cm,
                     "n_cells": point["n_cells"],
-                    "artifacts": artifacts,
+                    **evidence,
                 }
             )
 
+        strip_bytes_freed = prior_strip_bytes_freed
+        for index, expected_aoa_deg in enumerate(scenario.aoa_degs):
+            render_proof = self._verify_remote_render(
+                job_id,
+                points_by_aoa[expected_aoa_deg],
+                scenario,
+                strip_before_render=strip_before_render and index == 0,
+                prior_strip_bytes_freed=strip_bytes_freed,
+            )
+            strip_bytes_freed = render_proof["strip_bytes_freed"]
+            receipt_points[index]["remote_render_proof"] = render_proof
+
         scheduling = _mapping(result.get("scheduling"), f"{scenario.name} result scheduling")
-        render_proof = self._verify_remote_render(
-            job_id,
-            points_by_aoa[scenario.aoa_degs[0]],
-            scenario,
-            strip_before_render=strip_before_render,
-            prior_strip_bytes_freed=prior_strip_bytes_freed,
-        )
         return {
             "runtime": dict(self.runtime or {}),
             "method_key": scenario.method_key,
@@ -1263,7 +1401,6 @@ class OpenCfd2606Canary:
                 "mesh_reuse_mode": scheduling.get("mesh_reuse_mode"),
             },
             "points": receipt_points,
-            "remote_render_proof": render_proof,
         }
 
     def _run_scenario(self, scenario: Scenario) -> dict[str, Any]:
@@ -1363,9 +1500,19 @@ class OpenCfd2606Canary:
                 and bool(re.fullmatch(r"[0-9A-Za-z-]{8,64}", job_id)),
                 f"retained {scenario.name} receipt has an unsafe job id",
             )
+            prior_points = _list(
+                job.get("points"), f"retained {scenario.name} points"
+            )
+            _require(
+                len(prior_points) == len(scenario.aoa_degs),
+                f"retained {scenario.name} has the wrong point count",
+            )
+            prior_first_point = _mapping(
+                prior_points[0], f"retained {scenario.name} first point"
+            )
             prior_proof = _mapping(
-                job.get("remote_render_proof"),
-                f"retained {scenario.name} remote render proof",
+                prior_first_point.get("remote_render_proof"),
+                f"retained {scenario.name} first-point remote render proof",
             )
             status = self.client.json(
                 "GET", f"/jobs/{job_id}", expected_status={200}

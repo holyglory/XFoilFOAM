@@ -666,6 +666,11 @@ export const solverEngineCanaryAttestations = pgTable(
     solverExecutionPoolId: uuid("solver_execution_pool_id")
       .notNull()
       .references(() => solverExecutionPools.id),
+    // Migration 0072 explicitly refuses historical immutable attestations;
+    // every successful attestation therefore owns a truthful registration.
+    evidenceRegistrationId: uuid("evidence_registration_id")
+      .notNull()
+      .references(() => solverEngineCanaryEvidenceRegistrations.id),
     receiptSha256: text("receipt_sha256").notNull().unique(),
     receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
     attestedBy: text("attested_by"),
@@ -695,6 +700,110 @@ export const solverEngineCanaryAttestations = pgTable(
     implementationCreatedIdx: index(
       "solver_engine_canary_attestations_implementation_created_idx",
     ).on(t.solverImplementationId, t.createdAt),
+    evidenceRegistrationUnique: uniqueIndex(
+      "solver_engine_canary_attestations_evidence_registration_idx",
+    ).on(t.evidenceRegistrationId),
+  }),
+);
+
+/** Durable pre-cleanup registration for one exact production canary receipt.
+ *
+ * Canary jobs are submitted directly to the engine while campaign scheduling
+ * is paused, so they intentionally have no normal result/result-attempt rows.
+ * This immutable row is the database acknowledgement that must exist before
+ * the engine may delete the retained local archive.  It is deliberately not a
+ * successful canary attestation and therefore cannot authorize a cutover. */
+export const solverEngineCanaryEvidenceRegistrations = pgTable(
+  "solver_engine_canary_evidence_registrations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    solverRuntimeBuildId: uuid("solver_runtime_build_id")
+      .notNull()
+      .references(() => solverRuntimeBuilds.id),
+    solverExecutionPoolId: uuid("solver_execution_pool_id")
+      .notNull()
+      .references(() => solverExecutionPools.id),
+    receiptSha256: text("receipt_sha256").notNull().unique(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    registeredBy: text("registered_by"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    runtimeBuildOwnerFk: foreignKey({
+      columns: [t.solverRuntimeBuildId, t.solverImplementationId],
+      foreignColumns: [
+        solverRuntimeBuilds.id,
+        solverRuntimeBuilds.solverImplementationId,
+      ],
+      name: "solver_engine_canary_evidence_registrations_runtime_owner_fk",
+    }),
+    executionPoolOwnerFk: foreignKey({
+      columns: [t.solverExecutionPoolId, t.solverImplementationId],
+      foreignColumns: [
+        solverExecutionPools.id,
+        solverExecutionPools.solverImplementationId,
+      ],
+      name: "solver_engine_canary_evidence_registrations_pool_owner_fk",
+    }),
+    receiptSha256Check: check(
+      "solver_engine_canary_evidence_registrations_receipt_sha256_check",
+      sql`${t.receiptSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    implementationCreatedIdx: index(
+      "solver_engine_canary_evidence_registrations_implementation_created_idx",
+    ).on(t.solverImplementationId, t.createdAt),
+  }),
+);
+
+/** Immutable, per-evidence-base proof that a registered canary archive passed
+ * a fresh exact-generation restore and the engine acknowledged local cleanup.
+ * Four rows (one for each canary point generation) are required before the
+ * successful attestation row may be created. */
+export const solverEngineCanaryEvidenceCleanupProofs = pgTable(
+  "solver_engine_canary_evidence_cleanup_proofs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    registrationId: uuid("registration_id")
+      .notNull()
+      .references(() => solverEngineCanaryEvidenceRegistrations.id),
+    jobId: text("job_id").notNull(),
+    scenario: text("scenario").notNull(),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    caseSlug: text("case_slug").notNull(),
+    evidenceBase: text("evidence_base").notNull(),
+    memberAssociationCount: integer("member_association_count").notNull(),
+    memberAssociationsSha256: text("member_associations_sha256").notNull(),
+    manifestMemberSetSha256: text("manifest_member_set_sha256").notNull(),
+    verification: text("verification").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    exactEvidenceBase: uniqueIndex(
+      "solver_engine_canary_evidence_cleanup_proofs_exact_base_idx",
+    ).on(t.registrationId, t.jobId, t.caseSlug, t.evidenceBase),
+    scenarioCheck: check(
+      "solver_engine_canary_evidence_cleanup_proofs_scenario_check",
+      sql`${t.scenario} IN ('serial-rans', 'mpi-2-rans', 'forced-urans-precalc-no-shedding')`,
+    ),
+    countCheck: check(
+      "solver_engine_canary_evidence_cleanup_proofs_count_check",
+      sql`${t.memberAssociationCount} > 0`,
+    ),
+    memberShaCheck: check(
+      "solver_engine_canary_evidence_cleanup_proofs_member_sha256_check",
+      sql`${t.memberAssociationsSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    manifestShaCheck: check(
+      "solver_engine_canary_evidence_cleanup_proofs_manifest_sha256_check",
+      sql`${t.manifestMemberSetSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    verificationCheck: check(
+      "solver_engine_canary_evidence_cleanup_proofs_verification_check",
+      sql`${t.verification} ~ '^archive\\+manifest\\+all-members-restore:[1-9][0-9]*$'`,
+    ),
   }),
 );
 

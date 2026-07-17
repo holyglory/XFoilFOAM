@@ -87,6 +87,64 @@ class EvidenceDatabaseAssociation:
             "manifestMemberSetSha256": self.manifest_member_set_sha256,
         }
 
+    def stable_identity(self) -> tuple[str, str, str, str]:
+        """Return the pre-existing database association identity.
+
+        Digests and counts are authenticated content, not identity.  Keeping
+        them out of this tuple ensures a repeated stable row with conflicting
+        content is rejected instead of being counted twice.
+        """
+
+        return (
+            self.result_id,
+            self.result_attempt_id,
+            self.archive_id,
+            self.source_artifact_id,
+        )
+
+
+@dataclass(frozen=True)
+class EvidenceCanaryRegistration:
+    """Durable DB acknowledgement for one direct-engine canary point.
+
+    Direct canaries intentionally do not create canonical result rows.  The
+    registration id instead names an immutable database row whose receipt
+    binds every point artifact and exact remote generation before cleanup.
+    """
+
+    registration_id: str
+    receipt_sha256: str
+    scenario: str
+    aoa_deg: float
+    member_association_count: int
+    member_associations_sha256: str
+    manifest_member_set_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "registrationId": self.registration_id,
+            "receiptSha256": self.receipt_sha256,
+            "scenario": self.scenario,
+            "aoaDeg": self.aoa_deg,
+            "memberAssociationCount": self.member_association_count,
+            "memberAssociationsSha256": self.member_associations_sha256,
+            "manifestMemberSetSha256": self.manifest_member_set_sha256,
+        }
+
+    def stable_identity(self) -> tuple[str, str, float]:
+        """Return the immutable registration plus exact point identity.
+
+        The receipt digest and member digests are authenticated content.  They
+        must stay outside the identity so two rows for the same registered
+        point with conflicting content are rejected instead of counted twice.
+        """
+
+        return (
+            self.registration_id,
+            self.scenario,
+            self.aoa_deg,
+        )
+
 
 @dataclass(frozen=True)
 class EvidenceCleanupAuthorization:
@@ -94,25 +152,55 @@ class EvidenceCleanupAuthorization:
     case_slug: str
     evidence_base: str
     pointer: RemoteEvidencePointer
-    associations: tuple[EvidenceDatabaseAssociation, ...]
+    associations: tuple[EvidenceDatabaseAssociation | EvidenceCanaryRegistration, ...]
 
     def to_dict(self) -> dict[str, Any]:
-        associations = sorted(
-            (association.to_dict() for association in self.associations),
-            key=lambda item: (
-                item["resultId"],
-                item["resultAttemptId"],
-                item["archiveId"],
-                item["sourceArtifactId"],
-            ),
+        database_only = all(
+            isinstance(association, EvidenceDatabaseAssociation)
+            for association in self.associations
         )
+        canary_only = all(
+            isinstance(association, EvidenceCanaryRegistration)
+            for association in self.associations
+        )
+        if not database_only and not canary_only:
+            raise EvidenceCleanupError(
+                "cleanup authorization may not mix result and canary associations"
+            )
+        if database_only:
+            # This exact ordering is part of the on-disk ACK contract.  Do not
+            # replace it with generic canonical-JSON sorting: older ACKs with
+            # multiple rows must remain replayable after an engine upgrade.
+            associations = sorted(
+                (association.to_dict() for association in self.associations),
+                key=lambda item: (
+                    item["resultId"],
+                    item["resultAttemptId"],
+                    item["archiveId"],
+                    item["sourceArtifactId"],
+                ),
+            )
+        else:
+            associations = sorted(
+                (association.to_dict() for association in self.associations),
+                key=lambda item: (
+                    item["registrationId"],
+                    item["receiptSha256"],
+                    item["scenario"],
+                    item["aoaDeg"],
+                ),
+            )
         return {
             "schemaVersion": 1,
             "jobId": self.job_id,
             "caseSlug": self.case_slug,
             "evidenceBase": self.evidence_base,
             "remote": self.pointer.to_dict(),
-            "databaseAssociations": associations,
+            (
+                "databaseAssociations"
+                if database_only
+                else "canaryEvidenceRegistrations"
+            ): associations,
         }
 
 
@@ -618,16 +706,13 @@ def finalize_remote_evidence_cleanup(
             "at least one durable database association is required"
         )
     association_identities = {
-        (
-            association.result_id,
-            association.result_attempt_id,
-            association.source_artifact_id,
-            association.archive_id,
-        )
+        association.stable_identity()
         for association in authorization.associations
     }
     if len(association_identities) != len(authorization.associations):
-        raise EvidenceCleanupError("duplicate database evidence association")
+        raise EvidenceCleanupError(
+            "duplicate or conflicting stable evidence cleanup association"
+        )
     job_root = Path(job_root)
     evidence_dir = Path(evidence_dir)
     _require_safe_cleanup_target(job_root, evidence_dir, authorization)
@@ -680,12 +765,59 @@ def finalize_remote_evidence_cleanup(
         canonical_authorization = authorization.to_dict()
         ack_path = evidence_dir / EVIDENCE_FINALIZATION_ACK_NAME
         existing_ack = _read_optional_json(ack_path)
-        if existing_ack is not None:
-            if existing_ack.get("authorization") != canonical_authorization:
-                raise EvidenceCleanupError(
-                    "existing database acknowledgement conflicts with cleanup request"
+        if existing_ack is not None and (
+            set(existing_ack)
+            != {"schemaVersion", "state", "authorization", "registeredAt"}
+            or existing_ack.get("schemaVersion") != 1
+            or existing_ack.get("state") != "registered"
+            or not isinstance(existing_ack.get("registeredAt"), str)
+            or existing_ack.get("authorization") != canonical_authorization
+        ):
+            raise EvidenceCleanupError(
+                "existing database acknowledgement conflicts with cleanup request"
+            )
+        acknowledgement_preexisted = existing_ack is not None
+        if not acknowledgement_preexisted:
+            archive_path = evidence_dir / EVIDENCE_ARCHIVE_NAME
+            archive_descriptor = -1
+            try:
+                archive_descriptor = os.open(
+                    archive_path, os.O_RDONLY | os.O_NOFOLLOW
                 )
-        else:
+            except OSError as exc:
+                if exc.errno not in {errno.ENOENT, errno.ELOOP}:
+                    raise EvidenceCleanupError(
+                        f"cannot open the exact local evidence archive: {exc}"
+                    ) from exc
+                raise EvidenceCleanupError(
+                    "the exact local evidence archive is required before the first "
+                    "database-acknowledged cleanup"
+                ) from exc
+            try:
+                archive_stat = os.fstat(archive_descriptor)
+                if not stat.S_ISREG(archive_stat.st_mode):
+                    raise EvidenceCleanupError(
+                        "the exact local evidence archive must be a regular file"
+                    )
+                if archive_stat.st_size != durable_pointer.stored_size:
+                    raise EvidenceCleanupError(
+                        "local evidence archive size differs from the remote pointer"
+                    )
+                archive_digest = hashlib.sha256()
+                with os.fdopen(archive_descriptor, "rb") as archive_file:
+                    archive_descriptor = -1
+                    for chunk in iter(
+                        lambda: archive_file.read(1024 * 1024), b""
+                    ):
+                        archive_digest.update(chunk)
+                if archive_digest.hexdigest() != durable_pointer.stored_sha256:
+                    raise EvidenceCleanupError(
+                        "local evidence archive checksum differs from the remote pointer"
+                    )
+            finally:
+                if archive_descriptor >= 0:
+                    os.close(archive_descriptor)
+        if existing_ack is None:
             _atomic_write_json(
                 ack_path,
                 {
@@ -992,6 +1124,7 @@ __all__ = [
     "EvidenceCleanupError",
     "EvidenceCleanupResult",
     "EvidenceDatabaseAssociation",
+    "EvidenceCanaryRegistration",
     "create_local_evidence_archive",
     "evidence_archive_path",
     "evidence_object_store",

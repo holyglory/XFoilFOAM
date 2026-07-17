@@ -59,7 +59,7 @@ class FakeGatewayState:
         self.assets: dict[str, tuple[bytes, str]] = {}
         self.cancelled: list[str] = []
         self.stripped: list[str] = []
-        self.remote_render_calls: list[tuple[str, str]] = []
+        self.remote_render_calls: list[tuple[str, str, str, str]] = []
 
     def health(self) -> dict[str, Any]:
         if self.mode in VOLUME_CANARY_MODES:
@@ -278,16 +278,44 @@ class FakeGatewayState:
                 "video": {},
                 "unavailable": {},
             },
+            "bundleExcludes": [],
             "files": [
-                {"path": "openfoam/constant/polyMesh/points", "role": "mesh"},
+                {
+                    "path": "openfoam/constant/polyMesh/points",
+                    "role": "mesh",
+                    "sha256": _sha(mesh_bytes),
+                    "byteSize": len(mesh_bytes),
+                },
                 {
                     "path": "openfoam/postProcessing/forceCoeffs1/1/coefficient.dat",
                     "role": "force_coefficients",
+                    "sha256": _sha(force_bytes),
+                    "byteSize": len(force_bytes),
                 },
-                {"path": "VTK/canary_1.vtu", "role": "vtk_window"},
-                {"path": "openfoam/postProcessing/yPlus/1/yPlus.dat", "role": "y_plus"},
-                {"path": "openfoam/system/controlDict", "role": "dictionary"},
-                {"path": f"openfoam/logs/canary/log.{solver_name}", "role": "log"},
+                {
+                    "path": "VTK/canary_1.vtu",
+                    "role": "vtk_window",
+                    "sha256": _sha(vtk_bytes),
+                    "byteSize": len(vtk_bytes),
+                },
+                {
+                    "path": "openfoam/postProcessing/yPlus/1/yPlus.dat",
+                    "role": "y_plus",
+                    "sha256": _sha(yplus_bytes),
+                    "byteSize": len(yplus_bytes),
+                },
+                {
+                    "path": "openfoam/system/controlDict",
+                    "role": "dictionary",
+                    "sha256": _sha(dictionary_bytes),
+                    "byteSize": len(dictionary_bytes),
+                },
+                {
+                    "path": f"openfoam/logs/canary/log.{solver_name}",
+                    "role": "log",
+                    "sha256": _sha(solver_log_bytes),
+                    "byteSize": len(solver_log_bytes),
+                },
             ],
         }
         manifest_bytes = json.dumps(manifest, sort_keys=True).encode()
@@ -375,8 +403,15 @@ class FakeGatewayState:
                 "zstdLevel": 10,
                 "verifiedAt": "2026-07-15T20:50:14+00:00",
                 "pointerPath": "engine_evidence.remote.json",
-                "localEvidenceDisposition": "remote-only",
-                "remoteRestoreVerification": "archive+vtk-restore",
+                "localEvidenceDisposition": (
+                    "remote-copy-plus-local-archive-pending-database-ack"
+                ),
+                "rawLocalEvidenceDisposition": "removed",
+                "localArchiveRetainedUntilDatabaseAck": True,
+                "bundledFileCount": 6,
+                "remoteRestoreVerification": (
+                    "archive+manifest+all-members-restore:6"
+                ),
                 "evidenceBase": "evidence",
             }
         )
@@ -400,9 +435,7 @@ class FakeGatewayState:
         elif self.mode == "volume-bundle":
             bundle_artifact["metadata"]["storageBackend"] = "volume"
         elif self.mode == "local-cleanup-pending":
-            bundle_artifact["metadata"]["localEvidenceDisposition"] = (
-                "remote-copy-plus-local-pending-cleanup"
-            )
+            bundle_artifact["metadata"]["rawLocalEvidenceDisposition"] = "retained"
 
         point = {
             "case_slug": "canary",
@@ -571,7 +604,14 @@ def fake_gateway(*, mode: str = "ok") -> Iterator[tuple[FakeGatewayState, str]]:
                     assert payload["source_mode"] == "archive"
                 else:
                     assert "source_mode" not in payload
-                state.remote_render_calls.append((job_id, "field-extents"))
+                state.remote_render_calls.append(
+                    (
+                        job_id,
+                        "field-extents",
+                        payload["case_slug"],
+                        payload["evidence_base"],
+                    )
+                )
                 self.send_json(
                     200,
                     {
@@ -595,7 +635,14 @@ def fake_gateway(*, mode: str = "ok") -> Iterator[tuple[FakeGatewayState, str]]:
                     assert payload["source_mode"] == "archive"
                 else:
                     assert "source_mode" not in payload
-                state.remote_render_calls.append((job_id, "render-field"))
+                state.remote_render_calls.append(
+                    (
+                        job_id,
+                        "render-field",
+                        payload["case_slug"],
+                        payload["evidence_base"],
+                    )
+                )
                 png = b"\x89PNG\r\n\x1a\nremote-custom-render"
                 url = (
                     f"/jobs/{job_id}/files/cases/{payload['case_slug']}/"
@@ -624,7 +671,14 @@ def fake_gateway(*, mode: str = "ok") -> Iterator[tuple[FakeGatewayState, str]]:
                     assert payload["source_mode"] == "archive"
                 else:
                     assert "source_mode" not in payload
-                state.remote_render_calls.append((job_id, "render-default-media"))
+                state.remote_render_calls.append(
+                    (
+                        job_id,
+                        "render-default-media",
+                        payload["case_slug"],
+                        payload["evidence_base"],
+                    )
+                )
                 png = b"\x89PNG\r\n\x1a\nremote-default-render"
                 url = (
                     f"/jobs/{job_id}/files/cases/{payload['case_slug']}/"
@@ -766,17 +820,35 @@ def test_canary_submits_all_three_exact_2606_workloads_and_checks_evidence():
     assert state.cancelled == []
     assert state.stripped == ["canary-job-1", "canary-job-2", "canary-job-3"]
     assert state.remote_render_calls == [
-        ("canary-job-1", "field-extents"),
-        ("canary-job-1", "render-field"),
-        ("canary-job-1", "render-default-media"),
-        ("canary-job-2", "field-extents"),
-        ("canary-job-2", "render-field"),
-        ("canary-job-2", "render-default-media"),
-        ("canary-job-3", "field-extents"),
-        ("canary-job-3", "render-field"),
-        ("canary-job-3", "render-default-media"),
+        (job["job_id"], operation, point["case_slug"], point["evidence_base"])
+        for job in summary["jobs"]
+        for point in job["points"]
+        for operation in (
+            "field-extents",
+            "render-field",
+            "render-default-media",
+        )
     ]
-    assert all(job["remote_render_proof"]["strip_bytes_freed"] == 8192 for job in summary["jobs"])
+    assert all(
+        point["remote_render_proof"]["strip_bytes_freed"] == 8192
+        for job in summary["jobs"]
+        for point in job["points"]
+    )
+
+
+def test_canary_ignores_unrelated_retained_old_contract_terminal_jobs():
+    with fake_gateway() as (state, url):
+        old_job_id = "old-contract-canary-job"
+        state.submissions[old_job_id] = {"retained_old_contract": True}
+
+        summary = canary.OpenCfd2606Canary(_config(state, url)).run()
+
+    fresh_job_ids = {job["job_id"] for job in summary["jobs"]}
+    assert old_job_id not in fresh_job_ids
+    assert old_job_id in state.submissions
+    assert old_job_id not in state.cancelled
+    assert old_job_id not in state.stripped
+    assert all(call[0] != old_job_id for call in state.remote_render_calls)
 
 
 def test_retained_receipt_reproof_downloads_and_renders_without_new_jobs_or_strip():
@@ -785,7 +857,7 @@ def test_retained_receipt_reproof_downloads_and_renders_without_new_jobs_or_stri
         receipt = runner.run()
         submissions = dict(state.submissions)
         stripped = list(state.stripped)
-        prior_render_calls = len(state.remote_render_calls)
+        prior_render_calls = list(state.remote_render_calls)
 
         verified = canary.OpenCfd2606Canary(_config(state, url)).verify_retained_receipt(
             receipt
@@ -795,7 +867,16 @@ def test_retained_receipt_reproof_downloads_and_renders_without_new_jobs_or_stri
     assert verified["evidence_storage"] == receipt["evidence_storage"]
     assert state.submissions == submissions
     assert state.stripped == stripped
-    assert len(state.remote_render_calls) == prior_render_calls + 9
+    assert state.remote_render_calls == prior_render_calls + [
+        (job["job_id"], operation, point["case_slug"], point["evidence_base"])
+        for job in receipt["jobs"]
+        for point in job["points"]
+        for operation in (
+            "field-extents",
+            "render-field",
+            "render-default-media",
+        )
+    ]
 
 
 def test_volume_canary_uses_strict_local_archive_receipt_and_archive_only_rendering():
@@ -986,7 +1067,10 @@ def test_canary_rejects_a_bundle_that_was_not_published_to_gcs():
 
 def test_canary_rejects_remote_evidence_whose_local_cleanup_is_pending():
     with fake_gateway(mode="local-cleanup-pending") as (state, url):
-        with pytest.raises(canary.CanaryFailure, match="local packaged evidence was not removed"):
+        with pytest.raises(
+            canary.CanaryFailure,
+            match="did not safely remove raw duplicates",
+        ):
             canary.OpenCfd2606Canary(_config(state, url)).run()
 
     assert state.cancelled == []

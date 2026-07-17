@@ -222,9 +222,7 @@ export function validateRansPrecalcPromotionSignal(opts: {
   triggerFailureDisposition: PolarPoint["failure_disposition"] | null;
   jobAoas: number[];
 }): { attemptedAoas: number[]; intentionallyOmittedAoas: number[] } | null {
-  const attemptedAoas = uniqueFiniteAoasInOrder(
-    opts.promotion.attempted_aoas,
-  );
+  const attemptedAoas = uniqueFiniteAoasInOrder(opts.promotion.attempted_aoas);
   const intentionallyOmittedAoas = uniqueFiniteAoasInOrder(
     opts.promotion.intentionally_omitted_aoas,
   );
@@ -1389,7 +1387,8 @@ async function insertResultAttempt(opts: {
         .limit(1);
       if (
         !raced ||
-        stableHash(raced.evidencePayload ?? null) !== stableHash(evidencePayload)
+        stableHash(raced.evidencePayload ?? null) !==
+          stableHash(evidencePayload)
       ) {
         throw new Error(
           `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
@@ -2050,9 +2049,7 @@ function stableHash(value: unknown): string {
     .slice(0, 24);
 }
 
-function attemptEvidenceRecord(
-  value: unknown,
-): Record<string, unknown> | null {
+function attemptEvidenceRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
@@ -2325,28 +2322,35 @@ async function acknowledgeTerminalRemoteEvidenceCleanups(
         a.evidenceBase.localeCompare(b.evidenceBase),
     )) {
       await validateRemoteEvidenceCleanupCoverage(db, cleanup);
+      const databaseAssociations = cleanup.associations.map((association) => {
+        if (
+          association.memberAssociationCount == null ||
+          !association.memberAssociationsSha256 ||
+          !association.manifestMemberSetSha256
+        ) {
+          throw new Error("cleanup member coverage was not attested");
+        }
+        return {
+          result_id: association.resultId,
+          result_attempt_id: association.resultAttemptId,
+          source_artifact_id: association.sourceArtifactId,
+          archive_id: association.archiveId,
+          member_association_count: association.memberAssociationCount,
+          member_associations_sha256: association.memberAssociationsSha256,
+          manifest_member_set_sha256: association.manifestMemberSetSha256,
+        };
+      });
+      if (databaseAssociations.length === 0) {
+        throw new Error("cleanup requires at least one database association");
+      }
       const response = await engine.finalizeRemoteEvidence(engineJobId, {
         case_slug: cleanup.caseSlug,
         evidence_base: cleanup.evidenceBase,
         remote: cleanup.pointer,
-        database_associations: cleanup.associations.map((association) => {
-          if (
-            association.memberAssociationCount == null ||
-            !association.memberAssociationsSha256 ||
-            !association.manifestMemberSetSha256
-          ) {
-            throw new Error("cleanup member coverage was not attested");
-          }
-          return {
-            result_id: association.resultId,
-            result_attempt_id: association.resultAttemptId,
-            source_artifact_id: association.sourceArtifactId,
-            archive_id: association.archiveId,
-            member_association_count: association.memberAssociationCount,
-            member_associations_sha256: association.memberAssociationsSha256,
-            manifest_member_set_sha256: association.manifestMemberSetSha256,
-          };
-        }),
+        database_associations: databaseAssociations as [
+          (typeof databaseAssociations)[number],
+          ...(typeof databaseAssociations)[number][],
+        ],
       });
       if (
         !["complete", "no_local_bytes"].includes(response.state) ||

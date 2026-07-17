@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import {
   assertOpenCfd2606EvidenceStorageContract,
   liveOpenCfd2606Runtime,
+  serializeCanaryPointCleanup,
   validateOpenCfd2606CanaryReceiptShape,
   validateOpenCfd2606LiveJobResult,
 } from "../src/openfoam-2606-attestation";
@@ -33,6 +35,7 @@ const engine = {
 } as const;
 
 function artifacts(suffix: string) {
+  const byteSizes = [701, 3, 509, 41, 997, 11, 307, 71];
   const result = [
     ["manifest", "evidence", "manifest.json"],
     ["engine_bundle", "evidence", "engine_evidence.tar.zst"],
@@ -47,8 +50,10 @@ function artifacts(suffix: string) {
     path: `${suffix}/${path}`,
     role,
     field: null,
-    sha256: String(index + 1).padStart(64, "0"),
-    byte_size: index + 1,
+    sha256: createHash("sha256")
+      .update(`${suffix}:${kind}:${path}`)
+      .digest("hex"),
+    byte_size: byteSizes[index]!,
   }));
   const bundle = result.find((artifact) => artifact.kind === "engine_bundle")!;
   const storage = {
@@ -57,7 +62,12 @@ function artifacts(suffix: string) {
     object_key:
       `solver-evidence/v1/sha256/${bundle.sha256.slice(0, 2)}/` +
       `${bundle.sha256}.tar.zst`,
-    generation: "1752612345678901",
+    generation: String(
+      1_752_612_345_678_901n +
+        BigInt(
+          `0x${createHash("sha256").update(suffix).digest("hex").slice(0, 10)}`,
+        ),
+    ),
     stored_sha256: bundle.sha256,
     stored_byte_size: bundle.byte_size,
     crc32c: "AAAAAA==",
@@ -66,11 +76,35 @@ function artifacts(suffix: string) {
     uncompressed_tar_sha256: "e".repeat(64),
     uncompressed_tar_byte_size: 4096,
     zstd_level: 10,
+    verified_at: "2026-07-17T00:00:00+00:00",
     pointer_path: "engine_evidence.remote.json" as const,
-    local_disposition: "remote-only" as const,
-    restore_verification: "archive+vtk-restore" as const,
+    local_disposition:
+      "remote-copy-plus-local-archive-pending-database-ack" as const,
+    raw_local_disposition: "removed" as const,
+    local_archive_retained_until_database_ack: true as const,
+    restore_verification: "archive+manifest+all-members-restore:7" as const,
   };
-  return result.map((artifact) => ({ ...artifact, storage }));
+  return result
+    .map((artifact) => ({ ...artifact, storage }))
+    .sort((left, right) => {
+      const leftIdentity = [
+        left.kind,
+        left.path,
+        left.role ?? "",
+        left.field ?? "",
+      ];
+      const rightIdentity = [
+        right.kind,
+        right.path,
+        right.role ?? "",
+        right.field ?? "",
+      ];
+      for (let index = 0; index < leftIdentity.length; index += 1) {
+        if (leftIdentity[index]! < rightIdentity[index]!) return -1;
+        if (leftIdentity[index]! > rightIdentity[index]!) return 1;
+      }
+      return 0;
+    });
 }
 
 function liveArtifact(artifact: ReturnType<typeof artifacts>[number]) {
@@ -95,9 +129,15 @@ function liveArtifact(artifact: ReturnType<typeof artifacts>[number]) {
             uncompressedTarByteSize:
               artifact.storage.uncompressed_tar_byte_size,
             zstdLevel: artifact.storage.zstd_level,
+            verifiedAt: artifact.storage.verified_at,
             pointerPath: artifact.storage.pointer_path,
             localEvidenceDisposition: artifact.storage.local_disposition,
+            rawLocalEvidenceDisposition: artifact.storage.raw_local_disposition,
+            localArchiveRetainedUntilDatabaseAck:
+              artifact.storage.local_archive_retained_until_database_ack,
             remoteRestoreVerification: artifact.storage.restore_verification,
+            evidenceBase: "evidence",
+            bundledFileCount: 7,
           }
         : {},
   };
@@ -109,9 +149,83 @@ function job(
 ) {
   const forced = scenario === "forced-urans-precalc-no-shedding";
   const mpi = scenario === "mpi-2-rans";
+  const jobId = `canary-${scenario}`;
+  const registrationId = "10000000-0000-4000-8000-000000000001";
+  const preliminaryReceiptSha256 = "f".repeat(64);
+  const points = aoas.map((aoa, pointIndex) => {
+    const pointArtifacts = artifacts(`${scenario}-${aoa}`);
+    const point = {
+      aoa_deg: aoa,
+      cl: forced ? 0.0002 : 0.45,
+      cd: 0.0101,
+      cm: 0,
+      n_cells: 7_600,
+      case_slug: `canary-${scenario}-${aoa}`,
+      evidence_base: "evidence",
+      bundled_member_count: 7,
+      manifest_member_association_count: 8,
+      manifest_member_set_sha256: createHash("sha256")
+        .update(`manifest:${scenario}:${aoa}`)
+        .digest("hex"),
+      artifacts: pointArtifacts,
+      remote_render_proof: {
+        strip_bytes_freed: 4_096,
+        field: "velocity_magnitude" as const,
+        finite_count: 128,
+        vmin: 0.01,
+        vmax: 52.5,
+        custom_sha256: createHash("sha256")
+          .update(`custom:${scenario}:${aoa}`)
+          .digest("hex"),
+        default_sha256: createHash("sha256")
+          .update(`default:${scenario}:${aoa}`)
+          .digest("hex"),
+      },
+    };
+    const memberAssociationsSha256 = createHash("sha256")
+      .update(
+        canonicalJson({
+          registrationId,
+          preliminaryReceiptSha256,
+          jobId,
+          scenario,
+          aoaDeg: point.aoa_deg,
+          caseSlug: point.case_slug,
+          evidenceBase: point.evidence_base,
+          bundledMemberCount: point.bundled_member_count,
+          manifestMemberAssociationCount:
+            point.manifest_member_association_count,
+          manifestMemberSetSha256: point.manifest_member_set_sha256,
+          artifacts: point.artifacts,
+        }),
+      )
+      .digest("hex");
+    return {
+      ...point,
+      cleanup: {
+        proof_id: `20000000-0000-4000-8000-${String(
+          (scenario === "serial-rans" ? 0 : scenario === "mpi-2-rans" ? 2 : 3) +
+            pointIndex +
+            1,
+        ).padStart(12, "0")}`,
+        registration_id: registrationId,
+        preliminary_receipt_sha256: preliminaryReceiptSha256,
+        job_id: jobId,
+        scenario,
+        aoa_deg: aoa,
+        case_slug: point.case_slug,
+        evidence_base: point.evidence_base,
+        member_association_count: point.manifest_member_association_count,
+        member_associations_sha256: memberAssociationsSha256,
+        manifest_member_set_sha256: point.manifest_member_set_sha256,
+        verification: "archive+manifest+all-members-restore:7",
+        local_archive_disposition: "removed-after-database-ack" as const,
+      },
+    };
+  });
   return {
     scenario,
-    job_id: `canary-${scenario}`,
+    job_id: jobId,
     runtime: { ...runtime },
     method_key: forced ? "openfoam.urans" : "openfoam.rans",
     fidelity: forced ? "urans_precalc" : "rans",
@@ -122,27 +236,20 @@ function job(
       aoa_case_count: aoas.length,
       mesh_reuse_mode: "symlink",
     },
-    points: aoas.map((aoa) => ({
-      aoa_deg: aoa,
-      cl: forced ? 0.0002 : 0.45,
-      cd: 0.0101,
-      cm: 0,
-      n_cells: 7_600,
-      artifacts: artifacts(`${scenario}-${aoa}`),
-    })),
-    // Literal snake_case shape emitted by openfoam_2606_canary.py after it
-    // strips every local solver/VTK source and renders from the pinned GCS
-    // archive.
-    remote_render_proof: {
-      strip_bytes_freed: 4_096,
-      field: "velocity_magnitude",
-      finite_count: 128,
-      vmin: 0.01,
-      vmax: 52.5,
-      custom_sha256: "c".repeat(64),
-      default_sha256: "d".repeat(64),
-    },
+    points,
   };
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
 }
 
 function receipt() {
@@ -161,6 +268,10 @@ function receipt() {
       compression: "zstd",
       zstd_level: 10,
       local_disposition: "remote-only",
+    },
+    evidence_registration: {
+      id: "10000000-0000-4000-8000-000000000001",
+      preliminary_receipt_sha256: "f".repeat(64),
     },
     jobs: [
       job("serial-rans", [2, 5]),
@@ -229,7 +340,7 @@ function liveResultFor(
         reynolds: 333_333,
         attempts: [],
         points: receiptJob.points.map((point) => ({
-          case_slug: `canary-${point.aoa_deg}`,
+          case_slug: point.case_slug,
           aoa_deg: point.aoa_deg,
           cl: point.cl,
           cd: point.cd,
@@ -254,6 +365,25 @@ function liveResultFor(
 }
 
 describe("OpenCFD 2606 canary attestation", () => {
+  it("serializes point cleanup inside one engine job", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const order: number[] = [];
+    const result = await serializeCanaryPointCleanup([2, 5], async (aoa) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (active > 1) throw new Error("same-job cleanup overlapped");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      order.push(aoa);
+      active -= 1;
+      return aoa;
+    });
+
+    expect(result).toEqual([2, 5]);
+    expect(order).toEqual([2, 5]);
+    expect(maxActive).toBe(1);
+  });
+
   it("accepts the exact live gateway evidence-storage contract", () => {
     const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
     expect(() =>
@@ -304,15 +434,13 @@ describe("OpenCFD 2606 canary attestation", () => {
   it("accepts and preserves the Python canary remote-render proof", () => {
     const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
     expect(parsed.jobs).toHaveLength(3);
-    expect(parsed.jobs[0].remote_render_proof).toEqual({
-      strip_bytes_freed: 4_096,
-      field: "velocity_magnitude",
-      finite_count: 128,
-      vmin: 0.01,
-      vmax: 52.5,
-      custom_sha256: "c".repeat(64),
-      default_sha256: "d".repeat(64),
-    });
+    const proofs = parsed.jobs.flatMap((candidate) =>
+      candidate.points.map((point) => point.remote_render_proof),
+    );
+    expect(proofs).toHaveLength(4);
+    expect(proofs.every((proof) => proof.strip_bytes_freed === 4_096)).toBe(
+      true,
+    );
   });
 
   it("rejects a receipt whose artifact generation is not bound to its bundle", () => {
@@ -419,7 +547,7 @@ describe("OpenCFD 2606 canary attestation", () => {
           attempts: [],
           points: [
             {
-              case_slug: "canary",
+              case_slug: pointReceipt.case_slug,
               aoa_deg: 0,
               cl: pointReceipt.cl,
               cd: pointReceipt.cd,
@@ -509,6 +637,20 @@ describe("OpenCFD 2606 canary attestation", () => {
     expect(() =>
       validateOpenCfd2606LiveJobResult(result as never, rans, runtime),
     ).toThrow(/invented a transient force history/);
+  });
+
+  it("matches shuffled live artifacts by the Python canary identity order, not byte size", () => {
+    const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+    for (const point of result.polars[0].points) {
+      point.evidence_artifacts.reverse();
+    }
+    expect(() =>
+      validateOpenCfd2606LiveJobResult(result as never, rans, runtime),
+    ).not.toThrow();
   });
 
   it("rejects live evidence that moved to another GCS generation", () => {

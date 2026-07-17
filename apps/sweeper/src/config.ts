@@ -28,6 +28,27 @@ export function configuredControlPlaneToken(): string | undefined {
   return token || undefined;
 }
 
+export function configuredEvidenceCleanupTimeoutMs(): number {
+  const gcsTimeoutSeconds = Number(
+    process.env.AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS ?? 900,
+  );
+  const minimum = gcsTimeoutSeconds * 1_000 + 60_000;
+  const configured = Number(
+    process.env.ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS ?? minimum,
+  );
+  if (
+    !Number.isSafeInteger(gcsTimeoutSeconds) ||
+    gcsTimeoutSeconds < 30 ||
+    !Number.isSafeInteger(configured) ||
+    configured < minimum
+  ) {
+    throw new Error(
+      "ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS must be an integer at least 60 seconds above AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS",
+    );
+  }
+  return configured;
+}
+
 export function makeContext() {
   const { db, sql } = createClient({ max: 4 });
   const engine = new EngineClient(
@@ -35,6 +56,7 @@ export function makeContext() {
     {
       expectedEngine: configuredEngineIdentity(),
       controlPlaneToken: configuredControlPlaneToken(),
+      evidenceCleanupTimeoutMs: configuredEvidenceCleanupTimeoutMs(),
     },
   );
   return { db, sql, engine };

@@ -17,7 +17,7 @@ from typing import ContextManager, Iterator, Literal
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .. import __version__, physics
 from ..airfoil import load_airfoil
@@ -30,6 +30,7 @@ from ..evidence_runtime import (
     PACKAGED_RAW_DIRS,
     EvidenceCleanupAuthorization,
     EvidenceCleanupError,
+    EvidenceCanaryRegistration,
     EvidenceDatabaseAssociation,
     evidence_object_store,
     evidence_pointer_path,
@@ -130,13 +131,61 @@ class EvidenceDatabaseAssociationRequest(BaseModel):
     manifest_member_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class EvidenceCanaryRegistrationRequest(BaseModel):
+    registration_id: uuid.UUID
+    receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scenario: Literal[
+        "serial-rans",
+        "mpi-2-rans",
+        "forced-urans-precalc-no-shedding",
+    ]
+    aoa_deg: float
+    member_association_count: int = Field(ge=1)
+    member_associations_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_member_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class FinalizeRemoteEvidenceRequest(BaseModel):
     case_slug: str = Field(min_length=1, max_length=240)
     evidence_base: str = Field(min_length=1, max_length=800)
     remote: dict[str, object]
     database_associations: list[EvidenceDatabaseAssociationRequest] = Field(
-        min_length=1, max_length=32
+        default_factory=list, max_length=32
     )
+    canary_evidence_registrations: list[EvidenceCanaryRegistrationRequest] = Field(
+        default_factory=list, max_length=32
+    )
+
+    @model_validator(mode="after")
+    def validate_association_identity(self) -> "FinalizeRemoteEvidenceRequest":
+        has_database = bool(self.database_associations)
+        has_canary = bool(self.canary_evidence_registrations)
+        if has_database == has_canary:
+            raise ValueError("exactly one cleanup association kind is required")
+        if has_database:
+            identities = [
+                (
+                    row.result_id,
+                    row.result_attempt_id,
+                    row.archive_id,
+                    row.source_artifact_id,
+                )
+                for row in self.database_associations
+            ]
+        else:
+            identities = [
+                (
+                    row.registration_id,
+                    row.scenario,
+                    row.aoa_deg,
+                )
+                for row in self.canary_evidence_registrations
+            ]
+        if len(set(identities)) != len(identities):
+            raise ValueError(
+                "duplicate or conflicting stable evidence cleanup association"
+            )
+        return self
 
 
 def _sha256_file(path: Path) -> str:
@@ -982,23 +1031,8 @@ def create_app() -> FastAPI:
                 f"cases/{request.case_slug}/{request.evidence_base}",
             )
             pointer = RemoteEvidencePointer.from_dict(request.remote)
-            association_identities = [
-                (
-                    row.result_id,
-                    row.result_attempt_id,
-                    row.source_artifact_id,
-                    row.archive_id,
-                )
-                for row in request.database_associations
-            ]
-            if len(set(association_identities)) != len(association_identities):
-                raise ValueError("duplicate database evidence association")
-            cleanup_authorization = EvidenceCleanupAuthorization(
-                job_id=job_id,
-                case_slug=request.case_slug,
-                evidence_base=request.evidence_base,
-                pointer=pointer,
-                associations=tuple(
+            if request.database_associations:
+                associations = tuple(
                     EvidenceDatabaseAssociation(
                         result_id=str(row.result_id),
                         result_attempt_id=str(row.result_attempt_id),
@@ -1009,7 +1043,26 @@ def create_app() -> FastAPI:
                         manifest_member_set_sha256=row.manifest_member_set_sha256,
                     )
                     for row in request.database_associations
-                ),
+                )
+            else:
+                associations = tuple(
+                    EvidenceCanaryRegistration(
+                        registration_id=str(row.registration_id),
+                        receipt_sha256=row.receipt_sha256,
+                        scenario=row.scenario,
+                        aoa_deg=row.aoa_deg,
+                        member_association_count=row.member_association_count,
+                        member_associations_sha256=row.member_associations_sha256,
+                        manifest_member_set_sha256=row.manifest_member_set_sha256,
+                    )
+                    for row in request.canary_evidence_registrations
+                )
+            cleanup_authorization = EvidenceCleanupAuthorization(
+                job_id=job_id,
+                case_slug=request.case_slug,
+                evidence_base=request.evidence_base,
+                pointer=pointer,
+                associations=associations,
             )
             return finalize_remote_evidence_cleanup(
                 job_root,

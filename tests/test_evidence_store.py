@@ -40,6 +40,7 @@ from airfoilfoam.evidence_runtime import (
     EVIDENCE_FINALIZATION_RECEIPT_NAME,
     EvidenceCleanupAuthorization,
     EvidenceCleanupError,
+    EvidenceCanaryRegistration,
     EvidenceDatabaseAssociation,
     EvidencePublication,
     finalize_remote_evidence_cleanup,
@@ -346,6 +347,9 @@ def test_database_ack_cleanup_fresh_restores_all_bundled_members_and_is_idempote
     completed = finalize_remote_evidence_cleanup(
         job_root, evidence, authorization, settings, store=store
     )
+    # The DB association owns the manifest itself plus four bundled files;
+    # the fresh restore proof reports only those four bundled file entries.
+    assert authorization.associations[0].member_association_count == 5
     assert completed.state == "complete"
     assert completed.association_count == 1
     assert completed.verification == "archive+manifest+all-members-restore:4"
@@ -364,6 +368,157 @@ def test_database_ack_cleanup_fresh_restores_all_bundled_members_and_is_idempote
     )
     assert replay.state == "no_local_bytes"
     assert client.downloads == downloads_after_first + 1
+
+
+def test_preupgrade_multi_database_association_ack_replays_with_legacy_order(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, _client = (
+        _cleanup_fixture(tmp_path)
+    )
+    original = authorization.associations[0]
+    first = EvidenceDatabaseAssociation(
+        result_id="22222222-2222-4222-8222-222222222222",
+        result_attempt_id=original.result_attempt_id,
+        source_artifact_id="44444444-4444-4444-8444-444444444441",
+        archive_id="99999999-9999-4999-8999-999999999999",
+        member_association_count=original.member_association_count,
+        member_associations_sha256="1" * 64,
+        manifest_member_set_sha256=original.manifest_member_set_sha256,
+    )
+    second = EvidenceDatabaseAssociation(
+        result_id="33333333-3333-4333-8333-333333333333",
+        result_attempt_id="33333333-3333-4333-8333-333333333334",
+        source_artifact_id="44444444-4444-4444-8444-444444444442",
+        archive_id="11111111-1111-4111-8111-111111111111",
+        member_association_count=original.member_association_count,
+        member_associations_sha256="2" * 64,
+        manifest_member_set_sha256=original.manifest_member_set_sha256,
+    )
+    multi = EvidenceCleanupAuthorization(
+        job_id=authorization.job_id,
+        case_slug=authorization.case_slug,
+        evidence_base=authorization.evidence_base,
+        pointer=authorization.pointer,
+        associations=(second, first),
+    )
+    canonical = multi.to_dict()
+    assert [row["resultId"] for row in canonical["databaseAssociations"]] == [
+        first.result_id,
+        second.result_id,
+    ]
+    assert canonical["databaseAssociations"] != sorted(
+        canonical["databaseAssociations"],
+        key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+    )
+    (evidence / EVIDENCE_FINALIZATION_ACK_NAME).write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "state": "registered",
+                "authorization": canonical,
+                "registeredAt": "2026-07-17T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (evidence / "engine_evidence.tar.zst").unlink()
+    for name in ("openfoam", "VTK"):
+        shutil.rmtree(evidence / name)
+
+    replay = finalize_remote_evidence_cleanup(
+        job_root, evidence, multi, settings, store=store
+    )
+
+    assert replay.state == "no_local_bytes"
+    assert replay.association_count == 2
+
+
+def test_cleanup_rejects_conflicting_content_for_one_stable_database_identity(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, _client = (
+        _cleanup_fixture(tmp_path)
+    )
+    original = authorization.associations[0]
+    conflicting = EvidenceDatabaseAssociation(
+        result_id=original.result_id,
+        result_attempt_id=original.result_attempt_id,
+        source_artifact_id=original.source_artifact_id,
+        archive_id=original.archive_id,
+        member_association_count=original.member_association_count,
+        member_associations_sha256="9" * 64,
+        manifest_member_set_sha256=original.manifest_member_set_sha256,
+    )
+    duplicated = EvidenceCleanupAuthorization(
+        job_id=authorization.job_id,
+        case_slug=authorization.case_slug,
+        evidence_base=authorization.evidence_base,
+        pointer=authorization.pointer,
+        associations=(original, conflicting),
+    )
+
+    with pytest.raises(EvidenceCleanupError, match="stable evidence cleanup"):
+        finalize_remote_evidence_cleanup(
+            job_root, evidence, duplicated, settings, store=store
+        )
+
+    assert (evidence / "engine_evidence.tar.zst").is_file()
+
+
+def test_cleanup_rejects_conflicting_content_for_one_stable_canary_point(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, _client = (
+        _cleanup_fixture(tmp_path)
+    )
+    database = authorization.associations[0]
+    registered = EvidenceCanaryRegistration(
+        registration_id="66666666-6666-4666-8666-666666666666",
+        receipt_sha256="7" * 64,
+        scenario="serial-rans",
+        aoa_deg=2.0,
+        member_association_count=database.member_association_count,
+        member_associations_sha256="8" * 64,
+        manifest_member_set_sha256=database.manifest_member_set_sha256,
+    )
+    conflicting = EvidenceCanaryRegistration(
+        registration_id=registered.registration_id,
+        receipt_sha256="6" * 64,
+        scenario=registered.scenario,
+        aoa_deg=registered.aoa_deg,
+        member_association_count=registered.member_association_count,
+        member_associations_sha256="9" * 64,
+        manifest_member_set_sha256=registered.manifest_member_set_sha256,
+    )
+    duplicated = EvidenceCleanupAuthorization(
+        job_id=authorization.job_id,
+        case_slug=authorization.case_slug,
+        evidence_base=authorization.evidence_base,
+        pointer=authorization.pointer,
+        associations=(registered, conflicting),
+    )
+
+    with pytest.raises(EvidenceCleanupError, match="stable evidence cleanup"):
+        finalize_remote_evidence_cleanup(
+            job_root, evidence, duplicated, settings, store=store
+        )
+
+    assert (evidence / "engine_evidence.tar.zst").is_file()
+
+
+def test_manifest_member_set_digest_matches_cross_runtime_code_point_golden() -> None:
+    manifest = (
+        b'{"schemaVersion":2,"bundleExcludes":[],"files":['
+        b'{"path":"openfoam/a","sha256":"' + b"b" * 64 + b'","byteSize":20},'
+        b'{"path":"VTK/Z.vtu","sha256":"' + b"a" * 64 + b'","byteSize":10},'
+        b'{"path":"Alpha/x","sha256":"' + b"c" * 64 + b'","byteSize":30}]}'
+    )
+
+    assert manifest_bundle_member_set_sha256(manifest) == (
+        4,
+        "651f22e3374d5e34361874add2aad3ba11bf6edc8d4f533812c64544acb82d98",
+    )
 
 
 def test_cleanup_member_count_mismatch_fails_before_ack_or_delete(
@@ -396,6 +551,160 @@ def test_cleanup_member_count_mismatch_fails_before_ack_or_delete(
         )
     assert not (evidence / EVIDENCE_FINALIZATION_ACK_NAME).exists()
     assert (evidence / "engine_evidence.tar.zst").is_file()
+
+
+def test_first_cleanup_rejects_missing_archive_even_when_raw_tree_remains(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, client = (
+        _cleanup_fixture(tmp_path)
+    )
+    (evidence / "engine_evidence.tar.zst").unlink()
+
+    with pytest.raises(
+        EvidenceCleanupError,
+        match="exact local evidence archive is required before the first",
+    ):
+        finalize_remote_evidence_cleanup(
+            job_root, evidence, authorization, settings, store=store
+        )
+
+    assert (evidence / "openfoam").is_dir()
+    assert not (evidence / EVIDENCE_FINALIZATION_ACK_NAME).exists()
+    assert client.downloads == 0
+    assert (
+        "test-bucket",
+        authorization.pointer.object_key,
+    ) in client.objects
+
+
+def test_first_cleanup_rejects_symlink_archive_before_ack(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, client = (
+        _cleanup_fixture(tmp_path)
+    )
+    archive = evidence / "engine_evidence.tar.zst"
+    outside = tmp_path / "outside-engine-evidence.tar.zst"
+    archive.replace(outside)
+    archive.symlink_to(outside)
+
+    with pytest.raises(
+        EvidenceCleanupError,
+        match="exact local evidence archive is required before the first",
+    ):
+        finalize_remote_evidence_cleanup(
+            job_root, evidence, authorization, settings, store=store
+        )
+
+    assert archive.is_symlink()
+    assert not (evidence / EVIDENCE_FINALIZATION_ACK_NAME).exists()
+    assert client.downloads == 0
+
+
+def test_first_cleanup_rejects_tampered_local_archive_before_ack(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, client = (
+        _cleanup_fixture(tmp_path)
+    )
+    archive = evidence / "engine_evidence.tar.zst"
+    original = archive.read_bytes()
+    archive.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+
+    with pytest.raises(
+        EvidenceCleanupError,
+        match="archive checksum differs from the remote pointer",
+    ):
+        finalize_remote_evidence_cleanup(
+            job_root, evidence, authorization, settings, store=store
+        )
+
+    assert archive.is_file()
+    assert not (evidence / EVIDENCE_FINALIZATION_ACK_NAME).exists()
+    assert client.downloads == 0
+
+
+def test_matching_preexisting_ack_recovers_crash_after_archive_deletion(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, _client = (
+        _cleanup_fixture(tmp_path)
+    )
+    (evidence / EVIDENCE_FINALIZATION_ACK_NAME).write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "state": "registered",
+                "authorization": authorization.to_dict(),
+                "registeredAt": "2026-07-17T00:00:00+00:00",
+            }
+        )
+    )
+    (evidence / "engine_evidence.tar.zst").unlink()
+    for name in ("openfoam", "VTK"):
+        shutil.rmtree(evidence / name)
+
+    recovered = finalize_remote_evidence_cleanup(
+        job_root, evidence, authorization, settings, store=store
+    )
+
+    assert recovered.state == "no_local_bytes"
+    assert recovered.verification == "archive+manifest+all-members-restore:4"
+    assert (evidence / EVIDENCE_FINALIZATION_RECEIPT_NAME).is_file()
+
+
+def test_incomplete_preexisting_ack_never_bypasses_first_archive_check(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, client = (
+        _cleanup_fixture(tmp_path)
+    )
+    (evidence / EVIDENCE_FINALIZATION_ACK_NAME).write_text(
+        json.dumps({"authorization": authorization.to_dict()}),
+        encoding="utf-8",
+    )
+    (evidence / "engine_evidence.tar.zst").unlink()
+
+    with pytest.raises(
+        EvidenceCleanupError,
+        match="existing database acknowledgement conflicts",
+    ):
+        finalize_remote_evidence_cleanup(
+            job_root, evidence, authorization, settings, store=store
+        )
+
+    assert client.downloads == 0
+
+
+def test_preexisting_ack_with_conflicting_registration_never_authorizes_replay(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, _publication, settings, store, authorization, _client = (
+        _cleanup_fixture(tmp_path)
+    )
+    conflicting = authorization.to_dict()
+    conflicting["databaseAssociations"][0]["archiveId"] = (
+        "66666666-6666-4666-8666-666666666666"
+    )
+    (evidence / EVIDENCE_FINALIZATION_ACK_NAME).write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "state": "registered",
+                "authorization": conflicting,
+                "registeredAt": "2026-07-17T00:00:00+00:00",
+            }
+        )
+    )
+
+    with pytest.raises(EvidenceCleanupError, match="conflicts with cleanup request"):
+        finalize_remote_evidence_cleanup(
+            job_root, evidence, authorization, settings, store=store
+        )
+
+    assert (evidence / "engine_evidence.tar.zst").is_file()
+    assert not (evidence / EVIDENCE_FINALIZATION_RECEIPT_NAME).exists()
 
 
 def test_cleanup_rejects_symlinked_ack_and_only_unlinks_packaged_child_symlink(

@@ -100,6 +100,9 @@ export interface EngineClientOptions {
   allowLegacyMissingIdentity?: boolean;
   /** Dedicated server-to-server bearer token for destructive evidence cleanup. */
   controlPlaneToken?: string;
+  /** Exact-generation remote evidence verification may download a large
+   * archive. This budget must exceed the engine object-store timeout. */
+  evidenceCleanupTimeoutMs?: number;
 }
 
 /** Status/runtime polls (health, job status, queue, cache stats, runtimes). */
@@ -108,6 +111,9 @@ export const ENGINE_POLL_TIMEOUT_MS = 15_000;
 export const ENGINE_SUBMIT_TIMEOUT_MS = 60_000;
 /** Field-extents / render round-trips (the engine rasterizes frames). */
 export const ENGINE_RENDER_TIMEOUT_MS = 120_000;
+/** GCS verification defaults to 900 s server-side; keep one minute for HTTP
+ * response/receipt overhead so a successful delete is not lost at 60 s. */
+export const ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS = 960_000;
 
 /** Thin typed client for the Python CFD solver API (FastAPI). Every call
  *  carries an AbortSignal timeout so a saturated engine can stall a caller
@@ -117,6 +123,7 @@ export class EngineClient {
   readonly expectedEngine: EngineIdentity;
   private readonly allowLegacyMissingIdentity: boolean;
   private readonly controlPlaneToken: string | null;
+  private readonly evidenceCleanupTimeoutMs: number;
 
   constructor(baseUrl: string, options: EngineClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
@@ -126,6 +133,16 @@ export class EngineClient {
     this.allowLegacyMissingIdentity =
       options.allowLegacyMissingIdentity ?? true;
     this.controlPlaneToken = options.controlPlaneToken?.trim() || null;
+    this.evidenceCleanupTimeoutMs =
+      options.evidenceCleanupTimeoutMs ?? ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(this.evidenceCleanupTimeoutMs) ||
+      this.evidenceCleanupTimeoutMs <= 0
+    ) {
+      throw new Error(
+        "evidenceCleanupTimeoutMs must be a positive safe integer",
+      );
+    }
   }
 
   private verifyEngineAcknowledgement(
@@ -528,7 +545,7 @@ export class EngineClient {
     }
     return this.json<FinalizeRemoteEvidenceResponse>(
       `/jobs/${encodeURIComponent(jobId)}/evidence/finalize-remote`,
-      opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+      opts?.timeoutMs ?? this.evidenceCleanupTimeoutMs,
       {
         method: "POST",
         headers: { authorization: `Bearer ${this.controlPlaneToken}` },

@@ -10,12 +10,14 @@
 
 import {
   ENGINE_POLL_TIMEOUT_MS,
+  ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS,
   ENGINE_RENDER_TIMEOUT_MS,
   ENGINE_SUBMIT_TIMEOUT_MS,
   MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
   EngineClient,
   EngineError,
   EngineTimeoutError,
+  type FinalizeRemoteEvidenceRequest,
   type PolarRequest,
 } from "@aerodb/engine-client";
 import { createServer, type Server } from "node:http";
@@ -28,6 +30,8 @@ let hungServer: Server; // accepts requests, never responds
 let liveServer: Server; // responds instantly (false-positive guard)
 let hungUrl = "";
 let liveUrl = "";
+let cleanupCalls = 0;
+let cleanupCommitObserver: (() => void) | null = null;
 
 function listen(server: Server): Promise<string> {
   return new Promise((resolve) => {
@@ -43,6 +47,28 @@ beforeAll(async () => {
     /* saturated engine: hold the request open forever */
   });
   liveServer = createServer((req, res) => {
+    if (
+      req.method === "POST" &&
+      req.url === "/jobs/cleanup-job/evidence/finalize-remote"
+    ) {
+      const callNumber = (cleanupCalls += 1);
+      cleanupCommitObserver?.();
+      const respond = () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            state: callNumber === 1 ? "complete" : "no_local_bytes",
+            evidence_base: "evidence",
+            bytes_freed: callNumber === 1 ? 100 : 0,
+            verification: "archive+manifest+all-members-restore:4",
+            association_count: 1,
+          }),
+        );
+      };
+      if (callNumber === 1) setTimeout(respond, 500);
+      else respond();
+      return;
+    }
     if (req.method === "POST" && req.url === "/polars") {
       res.writeHead(409, { "content-type": "application/json" });
       res.end(
@@ -81,10 +107,66 @@ afterAll(async () => {
 });
 
 describe("engine-client AbortSignal timeouts", () => {
-  it("pins the approved default budgets: polls 15 s, submit/result 60 s, extents/render 120 s", () => {
+  it("pins the approved default budgets including the 900 s GCS cleanup plus response overhead", () => {
     expect(ENGINE_POLL_TIMEOUT_MS).toBe(15_000);
     expect(ENGINE_SUBMIT_TIMEOUT_MS).toBe(60_000);
     expect(ENGINE_RENDER_TIMEOUT_MS).toBe(120_000);
+    expect(ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS).toBe(960_000);
+  });
+
+  it("replays a cleanup after the first response is lost without reverting to the 60 s submit budget", async () => {
+    cleanupCalls = 0;
+    const client = new EngineClient(liveUrl, {
+      controlPlaneToken: "engine-client-cleanup-test-token-at-least-32",
+      evidenceCleanupTimeoutMs: 200,
+    });
+    const firstCommitted = new Promise<void>((resolve) => {
+      cleanupCommitObserver = resolve;
+    });
+    const request: FinalizeRemoteEvidenceRequest = {
+      case_slug: "case-1",
+      evidence_base: "evidence",
+      remote: {
+        schemaVersion: 1,
+        format: "tar+zstd" as const,
+        bucket: "test-bucket",
+        objectKey: "solver-evidence/archive.tar.zst",
+        generation: "123",
+        storedSha256: "a".repeat(64),
+        storedSize: 10,
+        tarSha256: "b".repeat(64),
+        tarSize: 20,
+        crc32c: "AAAAAA==",
+        zstdLevel: 10,
+        createdAt: "2026-07-17T00:00:00Z",
+      },
+      canary_evidence_registrations: [
+        {
+          registration_id: "11111111-1111-4111-8111-111111111111",
+          receipt_sha256: "c".repeat(64),
+          scenario: "serial-rans" as const,
+          aoa_deg: 2,
+          member_association_count: 5,
+          member_associations_sha256: "d".repeat(64),
+          manifest_member_set_sha256: "e".repeat(64),
+        },
+      ],
+    };
+
+    const lostResponse = client.finalizeRemoteEvidence("cleanup-job", request);
+    await firstCommitted;
+    await expect(lostResponse).rejects.toMatchObject({
+      name: "EngineTimeoutError",
+      timeoutMs: 200,
+    });
+    cleanupCommitObserver = null;
+    expect(cleanupCalls).toBe(1);
+    const replay = await client.finalizeRemoteEvidence("cleanup-job", request, {
+      timeoutMs: 1_000,
+    });
+
+    expect(replay.state).toBe("no_local_bytes");
+    expect(cleanupCalls).toBe(2);
   });
 
   it("MUST-CATCH: a hung status poll aborts at its (overridden) timeout as EngineTimeoutError", async () => {

@@ -39,12 +39,42 @@
   [D-2026-07-17-remote-rollout-preservation]
 - Confirmed intent: finalized canonical hub evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the hub VPS retains
-  only active solve state and bounded temporary render hydration. A dedicated
-  remote solver is a transfer boundary: it keeps complete local Zstandard
-  evidence until the hub acknowledges the exact delivery, receives no hub GCS
-  credentials, and uses persistent deployment identity/capacity separate from
-  numerical solver identity. [D-2026-07-15-gcs-zstd-evidence]
+  only active solve state and bounded temporary render hydration. Complete
+  solver evidence is conserved, local raw VTK is removed only after verified
+  remote restore, and a direct canary's complete local archive is removed only
+  after its exact evidence receipt has a durable database acknowledgement. A
+  dedicated remote solver is a transfer boundary: it keeps complete local
+  Zstandard evidence until the hub acknowledges the exact delivery, receives
+  no hub GCS credentials, and uses persistent deployment identity/capacity
+  separate from numerical solver identity. Production uses attached workload
+  identity rather than exported credentials.
+  [D-2026-07-15-gcs-zstd-evidence]
+  [D-2026-07-17-canary-database-ack]
   [D-2026-07-17-hz-solver2-volume-cutover]
+
+## D-2026-07-17-canary-database-ack — Direct canary cleanup is a two-phase database-acknowledged transition
+
+Detail: [DecisionDetails/D-2026-07-17-canary-database-ack.md](DecisionDetails/D-2026-07-17-canary-database-ack.md)
+
+- Decision: persist a direct-engine canary's canonical preliminary receipt in
+  a separate immutable database registration before asking the engine to
+  remove its complete local archive. Bind the cleanup request to that
+  registration, exact point, manifest-member set, artifact inventory, and
+  pinned GCS generation; require a fresh all-member restore; then persist one
+  immutable cleanup proof per exact evidence base. Create the successful
+  cutover attestation only from the exact registered receipt plus the four
+  required proofs: serial RANS 2° and 5° from one job, MPI-2 RANS 5°, and
+  forced preliminary URANS 0° from distinct scenario jobs. Keep unrelated
+  failed direct-canary jobs as unregistered terminal evidence.
+- Why: treating a verified upload as already `remote-only` contradicted the
+  engine's deliberate database-acknowledgement guard, while deleting before a
+  durable control-plane record could orphan evidence. Using canonical result
+  rows would invent solver evidence for direct canaries; using the successful
+  attestation as the pre-cleanup acknowledgement is circular; and retaining
+  every local archive indefinitely defeats the storage design. The selected
+  two-phase contract preserves truthful result identity, makes crash replay
+  idempotent, and prevents pool activation until every required archive has
+  both remote restore evidence and a durable database cleanup proof.
 
 ## D-2026-07-17-hz-solver2-volume-cutover — hz-solver2 uses a separate 40-slot volume-backed cutover
 

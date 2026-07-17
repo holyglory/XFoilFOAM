@@ -505,6 +505,13 @@
       "when": 1787011200000,
       "tag": "0071_result_owned_rans_incidents",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1787097600000,
+      "tag": "0072_canary_evidence_database_ack",
+      "breakpoints": true
     }
   ]
 }
