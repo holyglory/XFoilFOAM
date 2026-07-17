@@ -58,15 +58,23 @@
   campaign-successor migration, fail-closed deployment workflow, and isolated
   2406 rollback reconstruction are complete. Production now runs the guarded
   OpenCFD 2606 engine, but the cutover marker remains pending and both execution
-  pools remain disabled after two fail-closed recovery attempts: first the
-  Node admission client and then the deployment queue probe raced the bounded
-  worker snapshot. The Node repair is applied and journalled. Deploy the
-  incident-bound 15-second queue-probe runner, retain its journal, finish the
-  real canary and successor-generation gates, and then replace this temporary
-  staged recovery path with the canonical release workflow. Keep the marker
-  until every affected campaign's exact eligible source snapshot is represented
-  by its linked 2606 generation and the durable continuation proof reaches
-  `evidence` or truthful `not_required`.
+  pools remain disabled after fail-closed recovery attempts. The latest attempt
+  proved that GCS upload, all-member restore, and raw-tree removal succeeded,
+  but the old canary verifier incorrectly required the complete local archive
+  to be removed before its database acknowledgement existed. Repository
+  migration 0072 and the control-plane/engine repair now implement a separate
+  immutable preliminary registration, authenticated cleanup, four per-point
+  database proofs, crash-safe replay, and a final attestation that cannot be
+  created from an incomplete or unrelated proof set. Integrate that repair with
+  the incident-bound staged deployment runner; verify migration 0072 before
+  activation; build and recreate the matching Node API, sweeper, gateway, and
+  worker artifacts; then run a fresh canary. Earlier failed direct-canary jobs
+  remain terminal, unregistered evidence and must not enter the new proof set.
+  Finish the successor-generation gates only after the new final attestation,
+  then replace the temporary staged recovery path with the canonical release
+  workflow. Keep the marker until every affected campaign's exact eligible
+  source snapshot is represented by its linked 2606 generation and the durable
+  continuation proof reaches `evidence` or truthful `not_required`.
 
 - **OpenFOAM Foundation 14 production activation:** The additive identity,
   adapter, isolated worker/pool, control-plane selection, compatibility split,

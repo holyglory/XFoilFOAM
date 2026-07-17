@@ -40,6 +40,20 @@ function object(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** Python's evidence engine orders paths by Unicode code point. JavaScript's
+ * localeCompare is host/locale dependent (and commonly moves lowercase before
+ * uppercase), so it cannot participate in a cross-runtime evidence digest. */
+function comparePathCodePoints(left: string, right: string): number {
+  const leftPoints = Array.from(left, (value) => value.codePointAt(0)!);
+  const rightPoints = Array.from(right, (value) => value.codePointAt(0)!);
+  const length = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < length; index += 1) {
+    if (leftPoints[index]! < rightPoints[index]!) return -1;
+    if (leftPoints[index]! > rightPoints[index]!) return 1;
+  }
+  return leftPoints.length - rightPoints.length;
+}
+
 export function parseEvidenceManifest(
   manifestBytes: Buffer,
 ): ParsedEvidenceManifest {
@@ -80,12 +94,11 @@ export function parseEvidenceManifest(
       `evidence manifest file ${index} path`,
     );
     if (entries.has(path)) {
-      throw new Error(`evidence manifest contains duplicate member path ${path}`);
+      throw new Error(
+        `evidence manifest contains duplicate member path ${path}`,
+      );
     }
-    if (
-      typeof entry.sha256 !== "string" ||
-      !SHA256.test(entry.sha256)
-    ) {
+    if (typeof entry.sha256 !== "string" || !SHA256.test(entry.sha256)) {
       throw new Error(`evidence manifest file ${index} sha256 is malformed`);
     }
     if (
@@ -104,7 +117,7 @@ export function parseEvidenceManifest(
     });
   }
   const ordered = [...entries.values()].sort((a, b) =>
-    a.path.localeCompare(b.path),
+    comparePathCodePoints(a.path, b.path),
   );
   const bundled = ordered.filter(
     (entry) => !excludedRoots.has(entry.path.split("/", 1)[0]!),
@@ -120,9 +133,9 @@ export function parseEvidenceManifest(
   return {
     bundled,
     excluded,
-    bundleExcludes: [...excludedRoots].sort(),
+    bundleExcludes: [...excludedRoots].sort(comparePathCodePoints),
     memberSet: [manifestEntry, ...bundled].sort((a, b) =>
-      a.path.localeCompare(b.path),
+      comparePathCodePoints(a.path, b.path),
     ),
   };
 }
@@ -131,7 +144,9 @@ export function manifestMemberSetSha256(
   entries: ReadonlyArray<EvidenceManifestEntry>,
 ): string {
   const hash = createHash("sha256");
-  for (const entry of [...entries].sort((a, b) => a.path.localeCompare(b.path))) {
+  for (const entry of [...entries].sort((a, b) =>
+    comparePathCodePoints(a.path, b.path),
+  )) {
     hash.update(entry.path);
     hash.update("\0");
     hash.update(entry.sha256);
@@ -146,7 +161,9 @@ export function databaseMemberAssociationsSha256(
   entries: ReadonlyArray<EvidenceManifestEntry & { artifactId: string }>,
 ): string {
   const hash = createHash("sha256");
-  for (const entry of [...entries].sort((a, b) => a.path.localeCompare(b.path))) {
+  for (const entry of [...entries].sort((a, b) =>
+    comparePathCodePoints(a.path, b.path),
+  )) {
     hash.update(entry.path);
     hash.update("\0");
     hash.update(entry.artifactId);

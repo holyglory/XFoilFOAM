@@ -9,9 +9,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from airfoilfoam.api import main as api_main
+from airfoilfoam.config import Settings
 from airfoilfoam.evidence_runtime import EVIDENCE_POINTER_NAME
 from airfoilfoam.evidence_store import EvidenceHydrationError
 from airfoilfoam.storage import JobStore
@@ -51,6 +53,162 @@ def _write_manifest(evidence_dir: Path, members: list[str], *, start=1.0, end=2.
         ),
         encoding="utf-8",
     )
+
+
+def test_cleanup_request_rejects_conflicting_duplicate_database_identity() -> None:
+    association = {
+        "result_id": "11111111-1111-4111-8111-111111111111",
+        "result_attempt_id": "22222222-2222-4222-8222-222222222222",
+        "source_artifact_id": "33333333-3333-4333-8333-333333333333",
+        "archive_id": "44444444-4444-4444-8444-444444444444",
+        "member_association_count": 5,
+        "member_associations_sha256": "a" * 64,
+        "manifest_member_set_sha256": "b" * 64,
+    }
+
+    with pytest.raises(ValueError, match="stable evidence cleanup association"):
+        api_main.FinalizeRemoteEvidenceRequest.model_validate(
+            {
+                "case_slug": "case-1",
+                "evidence_base": "evidence",
+                "remote": {},
+                "database_associations": [
+                    association,
+                    {**association, "member_associations_sha256": "c" * 64},
+                ],
+            }
+        )
+
+
+def test_cleanup_request_rejects_conflicting_duplicate_canary_point_identity() -> None:
+    registration = {
+        "registration_id": "55555555-5555-4555-8555-555555555555",
+        "receipt_sha256": "d" * 64,
+        "scenario": "serial-rans",
+        "aoa_deg": 2,
+        "member_association_count": 5,
+        "member_associations_sha256": "e" * 64,
+        "manifest_member_set_sha256": "f" * 64,
+    }
+
+    with pytest.raises(ValueError, match="stable evidence cleanup association"):
+        api_main.FinalizeRemoteEvidenceRequest.model_validate(
+            {
+                "case_slug": "case-1",
+                "evidence_base": "evidence",
+                "remote": {},
+                "canary_evidence_registrations": [
+                    registration,
+                    {
+                        **registration,
+                        "receipt_sha256": "0" * 64,
+                        "member_associations_sha256": "0" * 64,
+                    },
+                ],
+            }
+        )
+
+
+def test_finalize_remote_endpoint_requires_bearer_and_one_association_kind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    token = "endpoint-control-plane-token-at-least-32-bytes"
+    settings = Settings(data_dir=tmp_path, control_plane_token=token)
+    job_id = "api-finalize-remote-auth-job"
+    store = JobStore(settings)
+    job_root = store.job_dir(job_id)
+    evidence = job_root / "cases" / "case-1" / "evidence"
+    evidence.mkdir(parents=True)
+    (job_root / "status.json").write_text(
+        json.dumps({"job_id": job_id, "state": "completed"}), encoding="utf-8"
+    )
+    (job_root / "result.json").write_text(
+        json.dumps({"job_id": job_id, "state": "completed"}), encoding="utf-8"
+    )
+    calls = []
+
+    class FakeCleanupResult:
+        def to_dict(self):
+            return {
+                "state": "complete",
+                "evidence_base": "evidence",
+                "bytes_freed": 123,
+                "verification": "archive+manifest+all-members-restore:4",
+                "association_count": 1,
+            }
+
+    def fake_finalize(job_root_arg, evidence_arg, authorization, settings_arg):
+        calls.append((job_root_arg, evidence_arg, authorization, settings_arg))
+        return FakeCleanupResult()
+
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_main, "finalize_remote_evidence_cleanup", fake_finalize)
+    app = api_main.create_app()
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None)
+        == "/jobs/{job_id}/evidence/finalize-remote"
+    )
+    remote = {
+        "schemaVersion": 1,
+        "format": "tar+zstd",
+        "bucket": "test-bucket",
+        "objectKey": "solver-evidence/v1/sha256/aa/archive.tar.zst",
+        "generation": "123456789",
+        "storedSha256": "a" * 64,
+        "storedSize": 10,
+        "tarSha256": "b" * 64,
+        "tarSize": 20,
+        "crc32c": "AAAAAA==",
+        "zstdLevel": 10,
+        "createdAt": "2026-07-17T00:00:00+00:00",
+    }
+    canary = {
+        "registration_id": "55555555-5555-4555-8555-555555555555",
+        "receipt_sha256": "d" * 64,
+        "scenario": "serial-rans",
+        "aoa_deg": 2,
+        "member_association_count": 5,
+        "member_associations_sha256": "e" * 64,
+        "manifest_member_set_sha256": "f" * 64,
+    }
+    database = {
+        "result_id": "11111111-1111-4111-8111-111111111111",
+        "result_attempt_id": "22222222-2222-4222-8222-222222222222",
+        "source_artifact_id": "33333333-3333-4333-8333-333333333333",
+        "archive_id": "44444444-4444-4444-8444-444444444444",
+        "member_association_count": 5,
+        "member_associations_sha256": "a" * 64,
+        "manifest_member_set_sha256": "b" * 64,
+    }
+    payload = {
+        "case_slug": "case-1",
+        "evidence_base": "evidence",
+        "remote": remote,
+        "canary_evidence_registrations": [canary],
+    }
+
+    request = api_main.FinalizeRemoteEvidenceRequest.model_validate(payload)
+    for authorization in (None, "Bearer wrong-token"):
+        with pytest.raises(HTTPException) as refused:
+            endpoint(job_id, request, authorization)
+        assert refused.value.status_code == 401
+    for invalid in (
+        {"case_slug": "case-1", "evidence_base": "evidence", "remote": remote},
+        {**payload, "database_associations": [database]},
+    ):
+        with pytest.raises(ValueError, match="exactly one cleanup association kind"):
+            api_main.FinalizeRemoteEvidenceRequest.model_validate(invalid)
+    assert calls == []
+    assert not (evidence / "storage_finalization.database.json").exists()
+
+    accepted = endpoint(job_id, request, f"Bearer {token}")
+
+    assert accepted["association_count"] == 1
+    assert len(calls) == 1
+    assert calls[0][0] == job_root
+    assert calls[0][1] == evidence
 
 
 def test_remote_only_render_endpoints_hold_hydration_lease(

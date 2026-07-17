@@ -5,6 +5,7 @@ export * from "./lifecycle";
 export * from "./engine-identity";
 export {
   ENGINE_POLL_TIMEOUT_MS,
+  ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS,
   ENGINE_RENDER_TIMEOUT_MS,
   ENGINE_SUBMIT_TIMEOUT_MS,
   ENGINE_IDENTITY_MISMATCH_CODE,

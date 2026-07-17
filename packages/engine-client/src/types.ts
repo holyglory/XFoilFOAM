@@ -391,6 +391,16 @@ export interface EvidenceCleanupDatabaseAssociation {
   manifest_member_set_sha256: string;
 }
 
+export interface EvidenceCleanupCanaryRegistration {
+  registration_id: string;
+  receipt_sha256: string;
+  scenario: "serial-rans" | "mpi-2-rans" | "forced-urans-precalc-no-shedding";
+  aoa_deg: number;
+  member_association_count: number;
+  member_associations_sha256: string;
+  manifest_member_set_sha256: string;
+}
+
 export interface RemoteEvidencePointerPayload {
   schemaVersion: number;
   format: "tar+zstd";
@@ -406,12 +416,29 @@ export interface RemoteEvidencePointerPayload {
   createdAt: string;
 }
 
-export interface FinalizeRemoteEvidenceRequest {
+interface FinalizeRemoteEvidenceRequestBase {
   case_slug: string;
   evidence_base: string;
   remote: RemoteEvidencePointerPayload;
-  database_associations: EvidenceCleanupDatabaseAssociation[];
 }
+
+export type FinalizeRemoteEvidenceRequest = FinalizeRemoteEvidenceRequestBase &
+  (
+    | {
+        database_associations: [
+          EvidenceCleanupDatabaseAssociation,
+          ...EvidenceCleanupDatabaseAssociation[],
+        ];
+        canary_evidence_registrations?: never;
+      }
+    | {
+        database_associations?: never;
+        canary_evidence_registrations: [
+          EvidenceCleanupCanaryRegistration,
+          ...EvidenceCleanupCanaryRegistration[],
+        ];
+      }
+  );
 
 export interface FinalizeRemoteEvidenceResponse {
   state: "complete" | "no_local_bytes";

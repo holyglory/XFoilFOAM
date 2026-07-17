@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -28,7 +28,10 @@ import type { DB } from "../src/client";
 import { databaseUrl } from "../src/env";
 import { probeCampaignCompletion } from "../src/campaign-execution";
 import {
+  getOpenCfd2606CanaryAttestation,
   inspectOpenCfd2606Continuation,
+  persistOpenCfd2606CanaryEvidenceCleanupProof,
+  persistOpenCfd2606CanaryEvidenceRegistration,
   persistOpenCfd2606CanaryAttestation,
 } from "../src/solver-cutover-attestation";
 import { solverRuntimeProvenanceKey } from "../src/solver-runtime-provenance";
@@ -93,6 +96,22 @@ adminUrl.pathname = "/postgres";
 const targetUrl = new URL(baseUrl);
 targetUrl.pathname = `/${dbName}`;
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
+    .join(",")}}`;
+}
+
+function receiptSha256(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
 const IDS = {
   category: "66000000-0000-0000-0000-000000000001",
   airfoil: "66000000-0000-0000-0000-000000000002",
@@ -134,6 +153,179 @@ const OLD_ARTIFACT_SHA256 = "a".repeat(64);
 let admin: ReturnType<typeof postgres> | null = null;
 let client: ReturnType<typeof postgres> | null = null;
 let db: DB;
+
+async function createCanaryDatabaseAckFixture(
+  solverRuntimeBuildId: string,
+  label: string,
+  proofCount = 4,
+  scenarioShape: "required" | "four-serial" = "required",
+  proofSemantics: "matching" | "mismatched" = "matching",
+) {
+  const pointSpecs = (
+    scenarioShape === "four-serial"
+      ? [1, 2, 3, 4].map((aoaDeg) => ({
+          scenario: "serial-rans" as const,
+          jobId: `${label}-serial`,
+          aoaDeg,
+        }))
+      : [
+          {
+            scenario: "serial-rans" as const,
+            jobId: `${label}-serial`,
+            aoaDeg: 2,
+          },
+          {
+            scenario: "serial-rans" as const,
+            jobId: `${label}-serial`,
+            aoaDeg: 5,
+          },
+          {
+            scenario: "mpi-2-rans" as const,
+            jobId: `${label}-mpi`,
+            aoaDeg: 5,
+          },
+          {
+            scenario: "forced-urans-precalc-no-shedding" as const,
+            jobId: `${label}-forced`,
+            aoaDeg: 0,
+          },
+        ]
+  ).slice(0, proofCount);
+  const scenarioOrder = [
+    "serial-rans",
+    "mpi-2-rans",
+    "forced-urans-precalc-no-shedding",
+  ] as const;
+  const preliminaryReceipt = {
+    schema_version: 1,
+    status: "ok",
+    fixture: label,
+    jobs: scenarioOrder
+      .map((scenario) => ({
+        scenario,
+        job_id: pointSpecs.find((point) => point.scenario === scenario)?.jobId,
+        points: pointSpecs
+          .filter((point) => point.scenario === scenario)
+          .map((point) => ({
+            aoa_deg: point.aoaDeg,
+            case_slug: `${label}-${scenario}-${point.aoaDeg}`,
+            evidence_base: "evidence",
+            bundled_member_count: 7,
+            manifest_member_association_count: 8,
+            manifest_member_set_sha256: createHash("sha256")
+              .update(`${label}:${scenario}:${point.aoaDeg}:manifest`)
+              .digest("hex"),
+            artifacts: [
+              {
+                kind: "engine_bundle",
+                path: `${label}/${scenario}/${point.aoaDeg}/engine_evidence.tar.zst`,
+                sha256: createHash("sha256")
+                  .update(`${label}:${scenario}:${point.aoaDeg}:archive`)
+                  .digest("hex"),
+              },
+            ],
+          })),
+      }))
+      .filter((job) => job.job_id !== undefined),
+  };
+  const preliminaryReceiptSha256 = receiptSha256(preliminaryReceipt);
+  const registration = await persistOpenCfd2606CanaryEvidenceRegistration(db, {
+    solverRuntimeBuildId,
+    receiptSha256: preliminaryReceiptSha256,
+    receipt: preliminaryReceipt,
+    actor: "cutover-test",
+  });
+  const cleanupProofs = [];
+  for (const point of pointSpecs) {
+    const caseSlug = `${label}-${point.scenario}-${point.aoaDeg}`;
+    const preliminaryPoint = preliminaryReceipt.jobs
+      .find((job) => job.scenario === point.scenario)!
+      .points.find((candidate) => candidate.aoa_deg === point.aoaDeg)!;
+    const matchingMemberAssociationsSha256 = createHash("sha256")
+      .update(
+        canonicalJson({
+          registrationId: registration.id,
+          preliminaryReceiptSha256,
+          jobId: point.jobId,
+          scenario: point.scenario,
+          aoaDeg: point.aoaDeg,
+          caseSlug,
+          evidenceBase: "evidence",
+          bundledMemberCount: preliminaryPoint.bundled_member_count,
+          manifestMemberAssociationCount:
+            preliminaryPoint.manifest_member_association_count,
+          manifestMemberSetSha256: preliminaryPoint.manifest_member_set_sha256,
+          artifacts: preliminaryPoint.artifacts,
+        }),
+      )
+      .digest("hex");
+    cleanupProofs.push(
+      await persistOpenCfd2606CanaryEvidenceCleanupProof(db, {
+        registrationId: registration.id,
+        jobId: point.jobId,
+        scenario: point.scenario,
+        aoaDeg: point.aoaDeg,
+        caseSlug,
+        evidenceBase: "evidence",
+        memberAssociationCount: proofSemantics === "matching" ? 8 : 1,
+        memberAssociationsSha256:
+          proofSemantics === "matching"
+            ? matchingMemberAssociationsSha256
+            : "8".repeat(64),
+        manifestMemberSetSha256:
+          proofSemantics === "matching"
+            ? preliminaryPoint.manifest_member_set_sha256
+            : "7".repeat(64),
+        verification:
+          proofSemantics === "matching"
+            ? "archive+manifest+all-members-restore:7"
+            : "archive+manifest+all-members-restore:1",
+      }),
+    );
+  }
+  const byPoint = new Map(
+    cleanupProofs.map((proof) => [`${proof.scenario}:${proof.aoaDeg}`, proof]),
+  );
+  const receipt = {
+    ...preliminaryReceipt,
+    evidence_registration: {
+      id: registration.id,
+      preliminary_receipt_sha256: preliminaryReceiptSha256,
+    },
+    jobs: preliminaryReceipt.jobs.map((job) => ({
+      ...job,
+      points: job.points.map((point) => {
+        const proof = byPoint.get(`${job.scenario}:${point.aoa_deg}`)!;
+        return {
+          ...point,
+          cleanup: {
+            proof_id: proof.id,
+            registration_id: registration.id,
+            preliminary_receipt_sha256: preliminaryReceiptSha256,
+            job_id: proof.jobId,
+            scenario: proof.scenario,
+            aoa_deg: proof.aoaDeg,
+            case_slug: proof.caseSlug,
+            evidence_base: proof.evidenceBase,
+            member_association_count: proof.memberAssociationCount,
+            member_associations_sha256: proof.memberAssociationsSha256,
+            manifest_member_set_sha256: proof.manifestMemberSetSha256,
+            verification: proof.verification,
+            local_archive_disposition: "removed-after-database-ack",
+          },
+        };
+      }),
+    })),
+  };
+  return {
+    registration,
+    cleanupProofs,
+    preliminaryReceipt,
+    preliminaryReceiptSha256,
+    receipt,
+    receiptSha256: receiptSha256(receipt),
+  };
+}
 let sourceSnapshot: SimulationSetupSnapshot;
 
 function campaignPlan() {
@@ -1066,18 +1258,84 @@ describe("0066 OpenCFD 2606 campaign cutover", () => {
         metadata: { source: "cutover-test-canary" },
       })
       .returning();
-    const receiptSha256 = "3".repeat(64);
+    const canaryEvidence = await createCanaryDatabaseAckFixture(
+      runtimeBuild.id,
+      "successful-canary",
+    );
+    if (!client) throw new Error("test database is unavailable");
+    await expect(
+      client`
+        UPDATE solver_engine_canary_evidence_registrations
+        SET registered_by = 'forged-update'
+        WHERE id = ${canaryEvidence.registration.id}::uuid
+      `,
+    ).rejects.toThrow(/registrations are immutable/i);
+    await expect(
+      client`
+        UPDATE solver_engine_canary_evidence_cleanup_proofs
+        SET verification = 'archive+manifest+all-members-restore:1'
+        WHERE id = ${canaryEvidence.cleanupProofs[0]!.id}::uuid
+      `,
+    ).rejects.toThrow(/cleanup proofs are immutable/i);
+    await expect(
+      persistOpenCfd2606CanaryEvidenceRegistration(db, {
+        solverRuntimeBuildId: runtimeBuild.id,
+        receiptSha256: canaryEvidence.preliminaryReceiptSha256,
+        receipt: {
+          ...canaryEvidence.preliminaryReceipt,
+          fixture: "same-declared-digest-different-content",
+        },
+      }),
+    ).rejects.toThrow(/digest does not match/i);
+    await expect(
+      persistOpenCfd2606CanaryEvidenceCleanupProof(db, {
+        ...canaryEvidence.cleanupProofs[0]!,
+        memberAssociationsSha256: "9".repeat(64),
+      }),
+    ).rejects.toThrow(/changed immutable evidence identity/i);
+    const mismatchedFinalReceipt = {
+      ...canaryEvidence.receipt,
+      fixture: "not-the-registered-preliminary-receipt",
+    };
+    await expect(
+      persistOpenCfd2606CanaryAttestation(db, {
+        solverRuntimeBuildId: runtimeBuild.id,
+        evidenceRegistrationId: canaryEvidence.registration.id,
+        cleanupProofs: canaryEvidence.cleanupProofs,
+        receiptSha256: receiptSha256(mismatchedFinalReceipt),
+        receipt: mismatchedFinalReceipt,
+      }),
+    ).rejects.toThrow(/exact cleanup extension/i);
+    await expect(
+      persistOpenCfd2606CanaryAttestation(db, {
+        solverRuntimeBuildId: runtimeBuild.id,
+        evidenceRegistrationId: canaryEvidence.registration.id,
+        cleanupProofs: [
+          {
+            ...canaryEvidence.cleanupProofs[0]!,
+            registrationId: randomUUID(),
+          },
+          ...canaryEvidence.cleanupProofs.slice(1),
+        ],
+        receiptSha256: canaryEvidence.receiptSha256,
+        receipt: canaryEvidence.receipt,
+      }),
+    ).rejects.toThrow(/exact evidence registration/i);
     const attestation = await persistOpenCfd2606CanaryAttestation(db, {
       solverRuntimeBuildId: runtimeBuild.id,
-      receiptSha256,
-      receipt: { schemaVersion: 1, fixture: "successful-canary" },
+      evidenceRegistrationId: canaryEvidence.registration.id,
+      cleanupProofs: canaryEvidence.cleanupProofs,
+      receiptSha256: canaryEvidence.receiptSha256,
+      receipt: canaryEvidence.receipt,
       actor: "cutover-test",
     });
     expect(attestation.replayed).toBe(false);
     const attestationReplay = await persistOpenCfd2606CanaryAttestation(db, {
       solverRuntimeBuildId: runtimeBuild.id,
-      receiptSha256,
-      receipt: { schemaVersion: 1, fixture: "successful-canary" },
+      evidenceRegistrationId: canaryEvidence.registration.id,
+      cleanupProofs: canaryEvidence.cleanupProofs,
+      receiptSha256: canaryEvidence.receiptSha256,
+      receipt: canaryEvidence.receipt,
       actor: "cutover-test-replay",
     });
     expect(attestationReplay).toMatchObject({
@@ -1085,6 +1343,114 @@ describe("0066 OpenCFD 2606 campaign cutover", () => {
       solverRuntimeBuildId: runtimeBuild.id,
       replayed: true,
     });
+    await expect(
+      persistOpenCfd2606CanaryAttestation(db, {
+        solverRuntimeBuildId: runtimeBuild.id,
+        evidenceRegistrationId: canaryEvidence.registration.id,
+        cleanupProofs: canaryEvidence.cleanupProofs,
+        receiptSha256: canaryEvidence.receiptSha256,
+        receipt: { ...canaryEvidence.receipt, status: "forged" },
+      }),
+    ).rejects.toThrow(/digest does not match/i);
+
+    const incompleteEvidence = await createCanaryDatabaseAckFixture(
+      runtimeBuild.id,
+      "three-proof-direct-insert",
+      3,
+    );
+    const [incompleteAttestation] = await db
+      .insert(solverEngineCanaryAttestations)
+      .values({
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: runtimeBuild.id,
+        solverExecutionPoolId: OPENCFD_2606_EXECUTION_POOL_ID,
+        evidenceRegistrationId: incompleteEvidence.registration.id,
+        receiptSha256: incompleteEvidence.receiptSha256,
+        receipt: incompleteEvidence.receipt,
+        attestedBy: "direct-db-forgery-test",
+      })
+      .returning({ id: solverEngineCanaryAttestations.id });
+    await expect(
+      getOpenCfd2606CanaryAttestation(db, incompleteAttestation.id),
+    ).rejects.toThrow(/all four|exactly four/i);
+
+    const wrongCellsEvidence = await createCanaryDatabaseAckFixture(
+      runtimeBuild.id,
+      "four-wrong-canary-cells",
+      4,
+      "four-serial",
+    );
+    const [wrongCellsAttestation] = await db
+      .insert(solverEngineCanaryAttestations)
+      .values({
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: runtimeBuild.id,
+        solverExecutionPoolId: OPENCFD_2606_EXECUTION_POOL_ID,
+        evidenceRegistrationId: wrongCellsEvidence.registration.id,
+        receiptSha256: wrongCellsEvidence.receiptSha256,
+        receipt: wrongCellsEvidence.receipt,
+        attestedBy: "wrong-cells-direct-db-forgery-test",
+      })
+      .returning({ id: solverEngineCanaryAttestations.id });
+    await expect(
+      getOpenCfd2606CanaryAttestation(db, wrongCellsAttestation.id),
+    ).rejects.toThrow(/serial RANS 2°\/5°/i);
+
+    const mismatchedProofEvidence = await createCanaryDatabaseAckFixture(
+      runtimeBuild.id,
+      "mismatched-point-proof",
+      4,
+      "required",
+      "mismatched",
+    );
+    const [mismatchedProofAttestation] = await db
+      .insert(solverEngineCanaryAttestations)
+      .values({
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: runtimeBuild.id,
+        solverExecutionPoolId: OPENCFD_2606_EXECUTION_POOL_ID,
+        evidenceRegistrationId: mismatchedProofEvidence.registration.id,
+        receiptSha256: mismatchedProofEvidence.receiptSha256,
+        receipt: mismatchedProofEvidence.receipt,
+        attestedBy: "mismatched-proof-direct-db-forgery-test",
+      })
+      .returning({ id: solverEngineCanaryAttestations.id });
+    await expect(
+      getOpenCfd2606CanaryAttestation(db, mismatchedProofAttestation.id),
+    ).rejects.toThrow(/registered point evidence semantics/i);
+
+    const crossRuntimeProvenance = {
+      ...runtimeProvenance,
+      buildId: "cutover-openfoam-2606-cross-runtime",
+      applicationSourceSha256: "6".repeat(64),
+    };
+    const [crossRuntimeBuild] = await db
+      .insert(solverRuntimeBuilds)
+      .values({
+        ...crossRuntimeProvenance,
+        provenanceKey: solverRuntimeProvenanceKey(crossRuntimeProvenance),
+        metadata: { source: "cutover-test-cross-runtime" },
+      })
+      .returning();
+    const crossRuntimeEvidence = await createCanaryDatabaseAckFixture(
+      runtimeBuild.id,
+      "cross-runtime-direct-insert",
+    );
+    const [crossRuntimeAttestation] = await db
+      .insert(solverEngineCanaryAttestations)
+      .values({
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: crossRuntimeBuild.id,
+        solverExecutionPoolId: OPENCFD_2606_EXECUTION_POOL_ID,
+        evidenceRegistrationId: crossRuntimeEvidence.registration.id,
+        receiptSha256: crossRuntimeEvidence.receiptSha256,
+        receipt: crossRuntimeEvidence.receipt,
+        attestedBy: "cross-runtime-direct-db-forgery-test",
+      })
+      .returning({ id: solverEngineCanaryAttestations.id });
+    await expect(
+      getOpenCfd2606CanaryAttestation(db, crossRuntimeAttestation.id),
+    ).rejects.toThrow(/ownership differs/i);
 
     // Model the late-ingest race: terminal 2406 evidence creates new pending
     // background ladder work after preparation but before finalization.
@@ -1132,10 +1498,16 @@ describe("0066 OpenCFD 2606 campaign cutover", () => {
       targetPointsCreated: 0,
       latePendingLadderItemsCancelled: 0,
     });
+    const differentEvidence = await createCanaryDatabaseAckFixture(
+      runtimeBuild.id,
+      "different-canary",
+    );
     const differentAttestation = await persistOpenCfd2606CanaryAttestation(db, {
       solverRuntimeBuildId: runtimeBuild.id,
-      receiptSha256: "4".repeat(64),
-      receipt: { schemaVersion: 1, fixture: "different-canary" },
+      evidenceRegistrationId: differentEvidence.registration.id,
+      cleanupProofs: differentEvidence.cleanupProofs,
+      receiptSha256: differentEvidence.receiptSha256,
+      receipt: differentEvidence.receipt,
       actor: "cutover-test",
     });
     await expect(
@@ -1371,18 +1743,12 @@ describe("0066 OpenCFD 2606 campaign cutover", () => {
     await expect(
       persistOpenCfd2606CanaryAttestation(db, {
         solverRuntimeBuildId: runtimeBuild.id,
-        receiptSha256: "5".repeat(64),
-        receipt: { fixture: "must-rollback-while-pool-disabled" },
+        evidenceRegistrationId: canaryEvidence.registration.id,
+        cleanupProofs: canaryEvidence.cleanupProofs,
+        receiptSha256: canaryEvidence.receiptSha256,
+        receipt: canaryEvidence.receipt,
       }),
     ).rejects.toThrow(/must remain enabled/);
-    expect(
-      await db
-        .select({ id: solverEngineCanaryAttestations.id })
-        .from(solverEngineCanaryAttestations)
-        .where(
-          eq(solverEngineCanaryAttestations.receiptSha256, "5".repeat(64)),
-        ),
-    ).toEqual([]);
     await db
       .update(solverExecutionPools)
       .set({ enabled: true })

@@ -1,9 +1,13 @@
+import { createHash } from "node:crypto";
+
 import { and, eq, sql } from "drizzle-orm";
 
 import { CampaignError } from "./campaigns";
 import type { DB } from "./client";
 import {
   solverCutoverContinuationChecks,
+  solverEngineCanaryEvidenceCleanupProofs,
+  solverEngineCanaryEvidenceRegistrations,
   solverEngineCanaryAttestations,
   solverExecutionPools,
   solverRuntimeBuilds,
@@ -14,8 +18,245 @@ import {
   OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
 } from "./solver-implementations";
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function canonicalReceiptSha256(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function assertCanonicalReceiptDigest(
+  receiptSha256: string,
+  receipt: Record<string, unknown>,
+  label: string,
+): void {
+  if (canonicalReceiptSha256(receipt) !== receiptSha256) {
+    throw new CampaignError(
+      "conflict",
+      `${label} digest does not match its exact canonical receipt content`,
+    );
+  }
+}
+
+/** Prove that a final successful receipt is exactly the registered preliminary
+ * receipt plus its registration binding and the four supplied cleanup proofs.
+ * This guard lives in the database package so direct callers cannot bypass the
+ * API receipt validator and attest unrelated evidence. */
+function assertFinalReceiptRegistrationBinding(
+  receiptSha256: string,
+  receipt: Record<string, unknown>,
+  registration: OpenCfd2606CanaryEvidenceRegistration,
+  cleanupProofs: ReadonlyArray<
+    PersistOpenCfd2606CanaryEvidenceCleanupProofInput & { id: string }
+  >,
+): void {
+  assertCanonicalReceiptDigest(receiptSha256, receipt, "canary attestation");
+  assertCanonicalReceiptDigest(
+    registration.receiptSha256,
+    registration.receipt,
+    "canary evidence registration",
+  );
+  const binding = recordValue(receipt.evidence_registration);
+  const expectedBinding = {
+    id: registration.id,
+    preliminary_receipt_sha256: registration.receiptSha256,
+  };
+  if (!binding || canonicalJson(binding) !== canonicalJson(expectedBinding)) {
+    throw new CampaignError(
+      "conflict",
+      "canary attestation receipt does not identify its exact preliminary evidence registration",
+    );
+  }
+  if (!Array.isArray(receipt.jobs)) {
+    throw new CampaignError(
+      "conflict",
+      "canary attestation receipt has no registered job evidence",
+    );
+  }
+  const receiptCleanupProofs: unknown[] = [];
+  const preliminaryJobs = receipt.jobs.map((rawJob) => {
+    const job = recordValue(rawJob);
+    if (!job || !Array.isArray(job.points)) {
+      throw new CampaignError(
+        "conflict",
+        "canary attestation receipt contains an invalid job evidence shape",
+      );
+    }
+    const preliminaryPoints = job.points.map((rawPoint) => {
+      const point = recordValue(rawPoint);
+      const cleanup = point ? recordValue(point.cleanup) : null;
+      if (!point || !cleanup) {
+        throw new CampaignError(
+          "conflict",
+          "canary attestation receipt is missing a point cleanup proof",
+        );
+      }
+      const bundledMemberCount = point.bundled_member_count;
+      const memberAssociationCount = point.manifest_member_association_count;
+      const manifestMemberSetSha256 = point.manifest_member_set_sha256;
+      const jobId = job.job_id;
+      const scenario = job.scenario;
+      const aoaDeg = point.aoa_deg;
+      const caseSlug = point.case_slug;
+      const evidenceBase = point.evidence_base;
+      if (
+        typeof bundledMemberCount !== "number" ||
+        !Number.isInteger(bundledMemberCount) ||
+        bundledMemberCount <= 0 ||
+        memberAssociationCount !== bundledMemberCount + 1 ||
+        typeof manifestMemberSetSha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(manifestMemberSetSha256) ||
+        !Array.isArray(point.artifacts) ||
+        typeof jobId !== "string" ||
+        typeof scenario !== "string" ||
+        typeof aoaDeg !== "number" ||
+        typeof caseSlug !== "string" ||
+        typeof evidenceBase !== "string"
+      ) {
+        throw new CampaignError(
+          "conflict",
+          "registered canary point has invalid bundled/member evidence semantics",
+        );
+      }
+      const expectedMemberAssociationsSha256 = createHash("sha256")
+        .update(
+          canonicalJson({
+            registrationId: registration.id,
+            preliminaryReceiptSha256: registration.receiptSha256,
+            jobId,
+            scenario,
+            aoaDeg,
+            caseSlug,
+            evidenceBase,
+            bundledMemberCount,
+            manifestMemberAssociationCount: memberAssociationCount,
+            manifestMemberSetSha256,
+            artifacts: point.artifacts,
+          }),
+        )
+        .digest("hex");
+      if (
+        cleanup.registration_id !== registration.id ||
+        cleanup.preliminary_receipt_sha256 !== registration.receiptSha256 ||
+        cleanup.job_id !== jobId ||
+        cleanup.scenario !== scenario ||
+        cleanup.aoa_deg !== aoaDeg ||
+        cleanup.case_slug !== caseSlug ||
+        cleanup.evidence_base !== evidenceBase ||
+        cleanup.member_association_count !== memberAssociationCount ||
+        cleanup.manifest_member_set_sha256 !== manifestMemberSetSha256 ||
+        cleanup.member_associations_sha256 !==
+          expectedMemberAssociationsSha256 ||
+        cleanup.verification !==
+          `archive+manifest+all-members-restore:${bundledMemberCount}`
+      ) {
+        throw new CampaignError(
+          "conflict",
+          "canary cleanup proof does not match its exact registered point evidence semantics",
+        );
+      }
+      receiptCleanupProofs.push(cleanup);
+      const { cleanup: _cleanup, ...preliminaryPoint } = point;
+      return preliminaryPoint;
+    });
+    return { ...job, points: preliminaryPoints };
+  });
+  const { evidence_registration: _registration, ...preliminaryTop } = receipt;
+  const reconstructedPreliminary = {
+    ...preliminaryTop,
+    jobs: preliminaryJobs,
+  };
+  if (
+    canonicalJson(reconstructedPreliminary) !==
+    canonicalJson(registration.receipt)
+  ) {
+    throw new CampaignError(
+      "conflict",
+      "canary attestation receipt is not an exact cleanup extension of its registered preliminary receipt",
+    );
+  }
+  const expectedCleanupProofs = cleanupProofs.map((proof) => ({
+    proof_id: proof.id,
+    registration_id: registration.id,
+    preliminary_receipt_sha256: registration.receiptSha256,
+    job_id: proof.jobId,
+    scenario: proof.scenario,
+    aoa_deg: proof.aoaDeg,
+    case_slug: proof.caseSlug,
+    evidence_base: proof.evidenceBase,
+    member_association_count: proof.memberAssociationCount,
+    member_associations_sha256: proof.memberAssociationsSha256,
+    manifest_member_set_sha256: proof.manifestMemberSetSha256,
+    verification: proof.verification,
+    local_archive_disposition: "removed-after-database-ack",
+  }));
+  const actualProofSet = receiptCleanupProofs.map(canonicalJson).sort();
+  const expectedProofSet = expectedCleanupProofs.map(canonicalJson).sort();
+  if (canonicalJson(actualProofSet) !== canonicalJson(expectedProofSet)) {
+    throw new CampaignError(
+      "conflict",
+      "canary attestation receipt cleanup proofs differ from the durable database proof rows",
+    );
+  }
+}
+
+export interface PersistOpenCfd2606CanaryEvidenceRegistrationInput {
+  solverRuntimeBuildId: string;
+  receiptSha256: string;
+  receipt: Record<string, unknown>;
+  actor?: string | null;
+}
+
+export interface OpenCfd2606CanaryEvidenceRegistration {
+  id: string;
+  solverImplementationId: string;
+  solverRuntimeBuildId: string;
+  solverExecutionPoolId: string;
+  receiptSha256: string;
+  receipt: Record<string, unknown>;
+  registeredBy: string | null;
+  createdAt: Date;
+}
+
+export interface PersistOpenCfd2606CanaryEvidenceCleanupProofInput {
+  registrationId: string;
+  jobId: string;
+  scenario: "serial-rans" | "mpi-2-rans" | "forced-urans-precalc-no-shedding";
+  aoaDeg: number;
+  caseSlug: string;
+  evidenceBase: string;
+  memberAssociationCount: number;
+  memberAssociationsSha256: string;
+  manifestMemberSetSha256: string;
+  verification: string;
+}
+
+export interface OpenCfd2606CanaryEvidenceCleanupProof extends PersistOpenCfd2606CanaryEvidenceCleanupProofInput {
+  id: string;
+  createdAt: Date;
+}
+
 export interface PersistOpenCfd2606CanaryAttestationInput {
   solverRuntimeBuildId: string;
+  evidenceRegistrationId: string;
+  cleanupProofs: ReadonlyArray<
+    PersistOpenCfd2606CanaryEvidenceCleanupProofInput & { id: string }
+  >;
   receiptSha256: string;
   receipt: Record<string, unknown>;
   actor?: string | null;
@@ -26,6 +267,7 @@ export interface OpenCfd2606CanaryAttestation {
   solverImplementationId: string;
   solverRuntimeBuildId: string;
   solverExecutionPoolId: string;
+  evidenceRegistrationId: string;
   receiptSha256: string;
   receipt: Record<string, unknown>;
   attestedBy: string | null;
@@ -59,6 +301,292 @@ export interface OpenCfd2606ContinuationStatus {
   }>;
 }
 
+/** Persist the exact direct-engine receipt before authorizing cleanup.
+ *
+ * This row is intentionally distinct from a successful canary attestation:
+ * its existence proves only that the remote archive pointers and artifact
+ * identities are durably registered.  Cutover finalization never accepts a
+ * registration id as an attestation id. */
+export async function persistOpenCfd2606CanaryEvidenceRegistration(
+  db: DB,
+  input: PersistOpenCfd2606CanaryEvidenceRegistrationInput,
+): Promise<OpenCfd2606CanaryEvidenceRegistration & { replayed: boolean }> {
+  assertCanonicalReceiptDigest(
+    input.receiptSha256,
+    input.receipt,
+    "canary evidence registration",
+  );
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [pool] = await tx
+      .select({
+        id: solverExecutionPools.id,
+        enabled: solverExecutionPools.enabled,
+        solverImplementationId: solverExecutionPools.solverImplementationId,
+      })
+      .from(solverExecutionPools)
+      .where(eq(solverExecutionPools.id, OPENCFD_2606_EXECUTION_POOL_ID))
+      .for("update")
+      .limit(1);
+    const [runtime] = await tx
+      .select({ id: solverRuntimeBuilds.id })
+      .from(solverRuntimeBuilds)
+      .where(
+        and(
+          eq(solverRuntimeBuilds.id, input.solverRuntimeBuildId),
+          eq(
+            solverRuntimeBuilds.solverImplementationId,
+            OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+          ),
+        ),
+      )
+      .limit(1);
+    if (
+      !pool ||
+      !pool.enabled ||
+      pool.solverImplementationId !== OPENCFD_2606_SOLVER_IMPLEMENTATION_ID
+    ) {
+      throw new CampaignError(
+        "invalid_state",
+        "the exact OpenCFD 2606 execution pool must remain enabled while registering canary evidence",
+      );
+    }
+    if (!runtime) {
+      throw new CampaignError(
+        "validation",
+        "canary evidence runtime is not registered to OpenCFD 2606",
+      );
+    }
+    const [inserted] = await tx
+      .insert(solverEngineCanaryEvidenceRegistrations)
+      .values({
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        solverRuntimeBuildId: input.solverRuntimeBuildId,
+        solverExecutionPoolId: OPENCFD_2606_EXECUTION_POOL_ID,
+        receiptSha256: input.receiptSha256,
+        receipt: input.receipt,
+        registeredBy: input.actor?.trim() || null,
+      })
+      .onConflictDoNothing({
+        target: solverEngineCanaryEvidenceRegistrations.receiptSha256,
+      })
+      .returning({ id: solverEngineCanaryEvidenceRegistrations.id });
+    const [row] = inserted
+      ? await tx
+          .select()
+          .from(solverEngineCanaryEvidenceRegistrations)
+          .where(eq(solverEngineCanaryEvidenceRegistrations.id, inserted.id))
+          .limit(1)
+      : await tx
+          .select()
+          .from(solverEngineCanaryEvidenceRegistrations)
+          .where(
+            eq(
+              solverEngineCanaryEvidenceRegistrations.receiptSha256,
+              input.receiptSha256,
+            ),
+          )
+          .limit(1);
+    if (!row) {
+      throw new Error(
+        "failed to persist OpenCFD 2606 canary evidence registration",
+      );
+    }
+    if (
+      row.solverRuntimeBuildId !== input.solverRuntimeBuildId ||
+      row.solverImplementationId !== OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
+      row.solverExecutionPoolId !== OPENCFD_2606_EXECUTION_POOL_ID ||
+      canonicalJson(row.receipt) !== canonicalJson(input.receipt)
+    ) {
+      throw new CampaignError(
+        "conflict",
+        "canary evidence registration replay resolved to different receipt content, runtime, or pool",
+      );
+    }
+    return { ...row, replayed: !inserted };
+  });
+}
+
+/** Persist one successful engine cleanup acknowledgement per exact canary
+ * evidence base. Conflicting replays never relabel the immutable proof. */
+export async function persistOpenCfd2606CanaryEvidenceCleanupProof(
+  db: DB,
+  input: PersistOpenCfd2606CanaryEvidenceCleanupProofInput,
+): Promise<OpenCfd2606CanaryEvidenceCleanupProof & { replayed: boolean }> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [registration] = await tx
+      .select({ id: solverEngineCanaryEvidenceRegistrations.id })
+      .from(solverEngineCanaryEvidenceRegistrations)
+      .where(
+        eq(solverEngineCanaryEvidenceRegistrations.id, input.registrationId),
+      )
+      .for("key share")
+      .limit(1);
+    if (!registration) {
+      throw new CampaignError(
+        "validation",
+        "a durable canary evidence registration is required before cleanup proof persistence",
+      );
+    }
+    const values = {
+      registrationId: input.registrationId,
+      jobId: input.jobId,
+      scenario: input.scenario,
+      aoaDeg: input.aoaDeg,
+      caseSlug: input.caseSlug,
+      evidenceBase: input.evidenceBase,
+      memberAssociationCount: input.memberAssociationCount,
+      memberAssociationsSha256: input.memberAssociationsSha256,
+      manifestMemberSetSha256: input.manifestMemberSetSha256,
+      verification: input.verification,
+    };
+    const [inserted] = await tx
+      .insert(solverEngineCanaryEvidenceCleanupProofs)
+      .values(values)
+      .onConflictDoNothing({
+        target: [
+          solverEngineCanaryEvidenceCleanupProofs.registrationId,
+          solverEngineCanaryEvidenceCleanupProofs.jobId,
+          solverEngineCanaryEvidenceCleanupProofs.caseSlug,
+          solverEngineCanaryEvidenceCleanupProofs.evidenceBase,
+        ],
+      })
+      .returning({ id: solverEngineCanaryEvidenceCleanupProofs.id });
+    const [row] = inserted
+      ? await tx
+          .select()
+          .from(solverEngineCanaryEvidenceCleanupProofs)
+          .where(eq(solverEngineCanaryEvidenceCleanupProofs.id, inserted.id))
+          .limit(1)
+      : await tx
+          .select()
+          .from(solverEngineCanaryEvidenceCleanupProofs)
+          .where(
+            and(
+              eq(
+                solverEngineCanaryEvidenceCleanupProofs.registrationId,
+                input.registrationId,
+              ),
+              eq(solverEngineCanaryEvidenceCleanupProofs.jobId, input.jobId),
+              eq(
+                solverEngineCanaryEvidenceCleanupProofs.caseSlug,
+                input.caseSlug,
+              ),
+              eq(
+                solverEngineCanaryEvidenceCleanupProofs.evidenceBase,
+                input.evidenceBase,
+              ),
+            ),
+          )
+          .limit(1);
+    if (!row) {
+      throw new Error("failed to persist canary evidence cleanup proof");
+    }
+    const exact =
+      row.registrationId === values.registrationId &&
+      row.jobId === values.jobId &&
+      row.scenario === values.scenario &&
+      row.aoaDeg === values.aoaDeg &&
+      row.caseSlug === values.caseSlug &&
+      row.evidenceBase === values.evidenceBase &&
+      row.memberAssociationCount === values.memberAssociationCount &&
+      row.memberAssociationsSha256 === values.memberAssociationsSha256 &&
+      row.manifestMemberSetSha256 === values.manifestMemberSetSha256 &&
+      row.verification === values.verification;
+    if (!exact) {
+      throw new CampaignError(
+        "conflict",
+        "canary evidence cleanup proof replay changed immutable evidence identity",
+      );
+    }
+    return {
+      ...row,
+      scenario: input.scenario,
+      replayed: !inserted,
+    };
+  });
+}
+
+export async function requireCompleteOpenCfd2606CanaryCleanupProofSet(
+  db: DB,
+  registrationId: string,
+  expectedProofs: ReadonlyArray<
+    PersistOpenCfd2606CanaryEvidenceCleanupProofInput & { id: string }
+  >,
+): Promise<void> {
+  const proofIds = expectedProofs.map((proof) => proof.id);
+  if (
+    proofIds.length !== 4 ||
+    new Set(proofIds).size !== 4 ||
+    expectedProofs.some((proof) => proof.registrationId !== registrationId)
+  ) {
+    throw new CampaignError(
+      "invalid_state",
+      "all four distinct canary point cleanup proofs must belong to the exact evidence registration",
+    );
+  }
+  const requiredCells = [
+    "forced-urans-precalc-no-shedding:0",
+    "mpi-2-rans:5",
+    "serial-rans:2",
+    "serial-rans:5",
+  ];
+  const actualCells = expectedProofs
+    .map((proof) => `${proof.scenario}:${proof.aoaDeg}`)
+    .sort();
+  const jobIdsByScenario = new Map<string, Set<string>>();
+  for (const proof of expectedProofs) {
+    const jobIds = jobIdsByScenario.get(proof.scenario) ?? new Set<string>();
+    jobIds.add(proof.jobId);
+    jobIdsByScenario.set(proof.scenario, jobIds);
+  }
+  const scenarioJobIds = [...jobIdsByScenario.values()].flatMap((ids) => [
+    ...ids,
+  ]);
+  if (
+    canonicalJson(actualCells) !== canonicalJson(requiredCells) ||
+    [...jobIdsByScenario.values()].some((ids) => ids.size !== 1) ||
+    new Set(scenarioJobIds).size !== 3
+  ) {
+    throw new CampaignError(
+      "invalid_state",
+      "canary cleanup proofs must cover serial RANS 2°/5° in one job, MPI-2 RANS 5°, and forced URANS 0° in distinct scenario jobs",
+    );
+  }
+  const rows = await db
+    .select()
+    .from(solverEngineCanaryEvidenceCleanupProofs)
+    .where(
+      eq(
+        solverEngineCanaryEvidenceCleanupProofs.registrationId,
+        registrationId,
+      ),
+    );
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const exact = expectedProofs.every((expected) => {
+    const row = byId.get(expected.id);
+    return (
+      row?.registrationId === registrationId &&
+      row.jobId === expected.jobId &&
+      row.scenario === expected.scenario &&
+      row.aoaDeg === expected.aoaDeg &&
+      row.caseSlug === expected.caseSlug &&
+      row.evidenceBase === expected.evidenceBase &&
+      row.memberAssociationCount === expected.memberAssociationCount &&
+      row.memberAssociationsSha256 === expected.memberAssociationsSha256 &&
+      row.manifestMemberSetSha256 === expected.manifestMemberSetSha256 &&
+      row.verification === expected.verification
+    );
+  });
+  if (rows.length !== 4 || !exact) {
+    throw new CampaignError(
+      "invalid_state",
+      "successful canary attestation requires exactly four durable per-evidence-base cleanup proofs",
+    );
+  }
+}
+
 /** Fetches and validates the relational ownership of an attestation. This is
  * also the direct-DB guard used by cutover finalization; an API caller cannot
  * bypass the canary endpoint by supplying an arbitrary UUID. */
@@ -76,6 +604,8 @@ export async function getOpenCfd2606CanaryAttestation(
       solverExecutionPoolId:
         solverEngineCanaryAttestations.solverExecutionPoolId,
       receiptSha256: solverEngineCanaryAttestations.receiptSha256,
+      evidenceRegistrationId:
+        solverEngineCanaryAttestations.evidenceRegistrationId,
       receipt: solverEngineCanaryAttestations.receipt,
       attestedBy: solverEngineCanaryAttestations.attestedBy,
       createdAt: solverEngineCanaryAttestations.createdAt,
@@ -117,7 +647,8 @@ export async function getOpenCfd2606CanaryAttestation(
     row.solverImplementationId !== OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
     row.runtimeImplementationId !== OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
     row.poolImplementationId !== OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
-    row.solverExecutionPoolId !== OPENCFD_2606_EXECUTION_POOL_ID
+    row.solverExecutionPoolId !== OPENCFD_2606_EXECUTION_POOL_ID ||
+    !row.evidenceRegistrationId
   ) {
     throw new CampaignError(
       "conflict",
@@ -130,11 +661,67 @@ export async function getOpenCfd2606CanaryAttestation(
       "the attested OpenCFD 2606 execution pool is no longer enabled",
     );
   }
+  const [registration] = await db
+    .select()
+    .from(solverEngineCanaryEvidenceRegistrations)
+    .where(
+      eq(
+        solverEngineCanaryEvidenceRegistrations.id,
+        row.evidenceRegistrationId,
+      ),
+    )
+    .limit(1);
+  if (
+    !registration ||
+    registration.solverImplementationId !== row.solverImplementationId ||
+    registration.solverRuntimeBuildId !== row.solverRuntimeBuildId ||
+    registration.solverExecutionPoolId !== row.solverExecutionPoolId
+  ) {
+    throw new CampaignError(
+      "conflict",
+      "canary attestation evidence registration ownership differs from its runtime or execution pool",
+    );
+  }
+  const cleanupProofRows = await db
+    .select()
+    .from(solverEngineCanaryEvidenceCleanupProofs)
+    .where(
+      eq(
+        solverEngineCanaryEvidenceCleanupProofs.registrationId,
+        registration.id,
+      ),
+    );
+  const cleanupProofInputs = cleanupProofRows.map((proof) => ({
+    id: proof.id,
+    registrationId: proof.registrationId,
+    jobId: proof.jobId,
+    scenario:
+      proof.scenario as PersistOpenCfd2606CanaryEvidenceCleanupProofInput["scenario"],
+    aoaDeg: proof.aoaDeg,
+    caseSlug: proof.caseSlug,
+    evidenceBase: proof.evidenceBase,
+    memberAssociationCount: proof.memberAssociationCount,
+    memberAssociationsSha256: proof.memberAssociationsSha256,
+    manifestMemberSetSha256: proof.manifestMemberSetSha256,
+    verification: proof.verification,
+  }));
+  await requireCompleteOpenCfd2606CanaryCleanupProofSet(
+    db,
+    registration.id,
+    cleanupProofInputs,
+  );
+  assertFinalReceiptRegistrationBinding(
+    row.receiptSha256,
+    row.receipt,
+    registration as OpenCfd2606CanaryEvidenceRegistration,
+    cleanupProofInputs,
+  );
   return {
     id: row.id,
     solverImplementationId: row.solverImplementationId,
     solverRuntimeBuildId: row.solverRuntimeBuildId,
     solverExecutionPoolId: row.solverExecutionPoolId,
+    evidenceRegistrationId: row.evidenceRegistrationId,
     receiptSha256: row.receiptSha256,
     receipt: row.receipt,
     attestedBy: row.attestedBy,
@@ -158,6 +745,11 @@ export async function persistOpenCfd2606CanaryAttestation(
   db: DB,
   input: PersistOpenCfd2606CanaryAttestationInput,
 ): Promise<OpenCfd2606CanaryAttestation & { replayed: boolean }> {
+  assertCanonicalReceiptDigest(
+    input.receiptSha256,
+    input.receipt,
+    "canary attestation",
+  );
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     const [pool] = await tx
@@ -199,12 +791,47 @@ export async function persistOpenCfd2606CanaryAttestation(
         "canary runtime is not registered to OpenCFD 2606",
       );
     }
+    const [registration] = await tx
+      .select()
+      .from(solverEngineCanaryEvidenceRegistrations)
+      .where(
+        eq(
+          solverEngineCanaryEvidenceRegistrations.id,
+          input.evidenceRegistrationId,
+        ),
+      )
+      .for("key share")
+      .limit(1);
+    if (
+      !registration ||
+      registration.solverRuntimeBuildId !== input.solverRuntimeBuildId ||
+      registration.solverImplementationId !==
+        OPENCFD_2606_SOLVER_IMPLEMENTATION_ID ||
+      registration.solverExecutionPoolId !== OPENCFD_2606_EXECUTION_POOL_ID
+    ) {
+      throw new CampaignError(
+        "validation",
+        "successful canary attestation requires the exact durable evidence registration for its runtime and pool",
+      );
+    }
+    assertFinalReceiptRegistrationBinding(
+      input.receiptSha256,
+      input.receipt,
+      registration as OpenCfd2606CanaryEvidenceRegistration,
+      input.cleanupProofs,
+    );
+    await requireCompleteOpenCfd2606CanaryCleanupProofSet(
+      tx,
+      registration.id,
+      input.cleanupProofs,
+    );
     const [inserted] = await tx
       .insert(solverEngineCanaryAttestations)
       .values({
         solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
         solverRuntimeBuildId: input.solverRuntimeBuildId,
         solverExecutionPoolId: OPENCFD_2606_EXECUTION_POOL_ID,
+        evidenceRegistrationId: registration.id,
         receiptSha256: input.receiptSha256,
         receipt: input.receipt,
         attestedBy: input.actor?.trim() || null,
@@ -231,10 +858,15 @@ export async function persistOpenCfd2606CanaryAttestation(
     const attestation = await getOpenCfd2606CanaryAttestation(tx, existing.id, {
       requireEnabledPool: true,
     });
-    if (attestation.solverRuntimeBuildId !== input.solverRuntimeBuildId) {
+    if (
+      attestation.solverRuntimeBuildId !== input.solverRuntimeBuildId ||
+      attestation.evidenceRegistrationId !== input.evidenceRegistrationId ||
+      attestation.receiptSha256 !== input.receiptSha256 ||
+      canonicalJson(attestation.receipt) !== canonicalJson(input.receipt)
+    ) {
       throw new CampaignError(
         "conflict",
-        "canary receipt replay resolved to a different runtime build",
+        "canary receipt replay resolved to different receipt content, runtime, or evidence registration",
       );
     }
     return { ...attestation, replayed: !inserted };
