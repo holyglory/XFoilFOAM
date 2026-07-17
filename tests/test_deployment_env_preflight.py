@@ -68,6 +68,64 @@ def test_env_preflight_enforces_deploying_owner_in_source() -> None:
     assert "metadata.st_uid != os.geteuid()" in source
 
 
+@pytest.mark.parametrize(
+    "token",
+    [
+        "",
+        "too-short",
+        '"quoted-control-plane-token-at-least-32-bytes"',
+        "control-plane-token-with whitespace-at-least-32-bytes",
+    ],
+)
+def test_remote_only_deploy_rejects_unsafe_control_plane_token_before_compose(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    _replace_env_values(
+        Path(env["ENV_FILE"]),
+        {"AIRFOILFOAM_CONTROL_PLANE_TOKEN": token},
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "remote-only GCS evidence requires" in completed.stderr
+    call_log = Path(env["CALL_LOG"])
+    assert not call_log.exists() or call_log.read_text().splitlines() == []
+
+
+def test_remote_only_deploy_rejects_duplicate_control_plane_token_before_compose(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    env_file = Path(env["ENV_FILE"])
+    with env_file.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "AIRFOILFOAM_CONTROL_PLANE_TOKEN="
+            "second-control-plane-token-at-least-32-bytes\n"
+        )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "duplicates AIRFOILFOAM_CONTROL_PLANE_TOKEN" in completed.stderr
+    call_log = Path(env["CALL_LOG"])
+    assert not call_log.exists() or call_log.read_text().splitlines() == []
+
+
 def test_certification_refuses_pending_recovery_bound_to_other_source(
     tmp_path: Path,
 ) -> None:

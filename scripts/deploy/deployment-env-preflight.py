@@ -10,6 +10,54 @@ import stat
 import sys
 
 
+REMOTE_EVIDENCE_KEYS = {
+    "AIRFOILFOAM_EVIDENCE_BUCKET",
+    "AIRFOILFOAM_EVIDENCE_REMOTE_ONLY",
+    "AIRFOILFOAM_CONTROL_PLANE_TOKEN",
+}
+
+
+def _read_remote_evidence_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not raw_line or raw_line.lstrip().startswith("#") or "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        if key not in REMOTE_EVIDENCE_KEYS:
+            continue
+        if key in values:
+            raise ValueError(
+                f"deployment env line {line_number} duplicates {key}"
+            )
+        if value != value.strip():
+            raise ValueError(
+                f"deployment env line {line_number} gives {key} surrounding whitespace"
+            )
+        values[key] = value
+    return values
+
+
+def _validate_remote_evidence_auth(path: Path) -> None:
+    values = _read_remote_evidence_values(path)
+    bucket = values.get("AIRFOILFOAM_EVIDENCE_BUCKET", "")
+    remote_only = values.get("AIRFOILFOAM_EVIDENCE_REMOTE_ONLY", "").lower()
+    if not bucket or remote_only not in {"1", "true", "yes", "on"}:
+        return
+    token = values.get("AIRFOILFOAM_CONTROL_PLANE_TOKEN", "")
+    if (
+        len(token) < 32
+        or token[:1] in {"'", '"'}
+        or token[-1:] in {"'", '"'}
+        or any(character.isspace() for character in token)
+    ):
+        raise ValueError(
+            "remote-only GCS evidence requires an unquoted, whitespace-free "
+            "AIRFOILFOAM_CONTROL_PLANE_TOKEN of at least 32 characters"
+        )
+
+
 def _reject_symlink_components(path: Path) -> None:
     current = Path(path.anchor)
     for component in path.parts[1:]:
@@ -52,6 +100,7 @@ def main() -> int:
         raise ValueError("deployment env must have exact mode 0600")
     if metadata.st_uid != os.geteuid():
         raise ValueError("deployment env must be owned by the deploying user")
+    _validate_remote_evidence_auth(env)
     print(env.resolve(strict=True))
     return 0
 

@@ -190,6 +190,7 @@ AIRFOILFOAM_EVIDENCE_BUCKET=airfoils-pro-storage-bucket
 AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX=solver-evidence/v1
 AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL=10
 AIRFOILFOAM_EVIDENCE_REMOTE_ONLY=true
+AIRFOILFOAM_CONTROL_PLANE_TOKEN=<unquoted-random-secret-at-least-32-characters>
 AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_MAX_GB=50
 AIRFOILFOAM_EVIDENCE_HYDRATION_CACHE_TTL_SECONDS=86400
 AIRFOILFOAM_EVIDENCE_GCS_TIMEOUT_SECONDS=900
@@ -227,6 +228,15 @@ fi
 
 compose config >/dev/null
 ```
+
+Generate `AIRFOILFOAM_CONTROL_PLANE_TOKEN` with a cryptographically secure
+generator (for example, `openssl rand -hex 32`) and write it directly into the
+mode-0600 state file without printing it into an audit log. The Compose files
+map that one authoritative value to `ENGINE_CONTROL_PLANE_TOKEN` only inside
+the sweeper and media-repair processes that acknowledge database registration;
+do not maintain a second independently editable copy. The deployment preflight
+rejects remote-only evidence when the token is missing, quoted, contains
+whitespace, or is shorter than 32 characters.
 
 The empty certified-contract marker is valid only for this exact pristine,
 pre-canary state. The guarded cutover writes it atomically with the durable
@@ -374,6 +384,46 @@ chmod 0600 "$AUDIT_DIR/openfoam-2606-canary.json"
 ```
 
 Do not migrate legacy evidence unless this remote-only render proof succeeds.
+
+### High-storage first-cutover bridge
+
+The ordinary cutover restores a previously running sweeper and waits for a
+real result from the linked 2606 successor campaign. That proof requires a new
+solver submission; the production storage safeguard correctly refuses every
+new submission while the results volume is at or above 80% use. The standalone
+2606 canary cannot substitute for successor evidence because it is not owned
+by the campaign database.
+
+If the drain leaves storage admission closed, do not lower the threshold and
+do not let the ordinary one-hour continuation wait expire. Use the rebuild
+script's tested, intentionally-stopped scheduler path:
+
+1. Wait until every 2406 engine process is gone and every legacy database job
+   has left `submitted`, `running`, and `ingesting`.
+2. Stop the sweeper *before* invoking the guarded rebuild. The script records
+   that prior intent, performs the complete 2606 build, remote-render canary,
+   attestation, and successor-generation transaction, then leaves the sweeper
+   stopped with the exact continuation marker pending instead of claiming
+   success without evidence.
+3. Start the new sweeper. While storage remains at or above 80%, it continues
+   reconciliation and evidence cleanup but cannot admit CFD work. Run the
+   one-job three-pass trial below, then migrate one complete job at a time
+   through all three passes. Remeasure after every pass 3. Do not accumulate a
+   25-job upload phase while capacity is tight: pass 1 retains the old archive
+   and raw trees until database registration plus the fresh pass-3 restore.
+4. Continue until the measured used percentage is comfortably below 80% and
+   the full admission headroom check is open. The running sweeper may then
+   submit the real 2606 successor job; incremental checksummed result evidence
+   is sufficient for continuation proof, so the whole batch need not finish.
+5. Stop the sweeper, replay the exact attestation with
+   `scripts/deploy/rebuild-engine.sh --certify-opencfd-2606-continuation`, and
+   confirm the pending marker clears. Because the recorded pre-cutover
+   scheduler state was intentionally stopped, explicitly start the sweeper
+   after certification to continue the campaign.
+
+Keep the same protected `ADMIN_COOKIE` procedure for both rebuild invocations.
+Never clear or edit the pending marker, reuse the canary as campaign evidence,
+or manually link a result to make certification pass.
 
 ## 7. One-terminal-job three-pass trial
 

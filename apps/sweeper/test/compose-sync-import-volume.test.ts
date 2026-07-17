@@ -49,6 +49,49 @@ describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
   },
 );
 
+describe("remote-only evidence cleanup deployment wiring", () => {
+  const production = readFileSync(
+    resolve(repoRoot, "docker-compose.deploy.yml"),
+    "utf8",
+  );
+
+  it.each(["api", "worker", "worker-foundation14"])(
+    "passes the shared cleanup secret to Python service %s",
+    (service) => {
+      const block = serviceBlock(production, service);
+      expect(block).toContain(
+        "AIRFOILFOAM_CONTROL_PLANE_TOKEN: ${AIRFOILFOAM_CONTROL_PLANE_TOKEN:-}",
+      );
+      expect(block).toContain(
+        "AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}",
+      );
+    },
+  );
+
+  it.each(["sweeper", "media-repair"])(
+    "passes authenticated remote-cleanup context to Node service %s",
+    (service) => {
+      const block = serviceBlock(production, service);
+      expect(block).toContain(
+        "ENGINE_CONTROL_PLANE_TOKEN: ${AIRFOILFOAM_CONTROL_PLANE_TOKEN:-}",
+      );
+      expect(block).toContain(
+        "AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}",
+      );
+      expect(block).toContain(
+        "AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}",
+      );
+    },
+  );
+
+  it("does not expose the evidence-cleanup secret to unrelated services", () => {
+    for (const service of ["node-api", "web"]) {
+      const block = serviceBlock(production, service);
+      expect(block).not.toContain("CONTROL_PLANE_TOKEN");
+    }
+  });
+});
+
 describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
   "%s solver engine isolation",
   (filename) => {
