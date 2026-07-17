@@ -40,21 +40,30 @@ describe("per-point solver sequence panel", () => {
     expect(source).toContain(
       "testId={`cell-preliminary-final-${item.aoaDeg}`}",
     );
-    expect(source.match(/data-flow-stage="rans"/g)).toHaveLength(1);
-    expect(source.match(/data-flow-stage="fast"/g)).toHaveLength(1);
-    expect(source.match(/data-flow-stage="final"/g)).toHaveLength(1);
-    expect(source).toContain("RANS non-convergence is a normal handoff");
+    expect(source.match(/data-flow-stage="rans">/g)).toHaveLength(1);
+    expect(source.match(/data-flow-stage="fast">/g)).toHaveLength(1);
+    expect(source.match(/data-flow-stage="final">/g)).toHaveLength(1);
+    expect(source).toContain('data-flow-exit="accepted"');
+    expect(source).toContain('data-flow-exit="handoff"');
+    expect(source).toContain("accepted RANS stops here");
+    expect(source).toContain("if needed");
+    expect(source).toContain(
+      "RANS non-convergence is a normal handoff; fast URANS starts automatically",
+    );
   });
 
-  it("keeps technical evidence collapsed and makes critical rows system-owned and visually red", () => {
+  it("keeps technical evidence nested and collapsed, and makes critical rows system-owned and visually red", () => {
     expect(source).toContain("<details");
     expect(source).not.toMatch(/<details[^>]+open=/);
     expect(source).toContain("Technical details for ${label}");
-    expect(source).toContain("system investigation required");
+    expect(source).toContain("Technical evidence");
+    expect(source).toContain("investigation required");
     expect(source).toContain(
       "System-owned incident; automatic investigation required",
     );
     expect(source).toContain("box-shadow: inset 3px 0 ${C.red}");
+    expect(source).toContain("SYSTEM INCIDENT · INVESTIGATION REQUIRED");
+    expect(source).not.toContain("SYSTEM INCIDENT · AUTO-INVESTIGATE");
     expect(source).not.toMatch(/RANS (?:failed|failure)/i);
     expect(source).not.toContain("FAILED POINTS");
     expect(source).not.toContain("no action required");
@@ -138,16 +147,19 @@ describe("per-point solver sequence panel", () => {
     const disclosureStart = html.indexOf("<details");
 
     expect(disclosureStart).toBeGreaterThan(-1);
-    expect(html.slice(disclosureStart)).toContain(
-      "RANS screened; non-convergence hands off normally.",
-    );
-    expect(html.slice(disclosureStart)).toContain(
+    expect(html.slice(disclosureStart)).toContain("RANS SCREEN");
+    expect(html.slice(disclosureStart)).toContain("URANS FAST");
+    expect(html.slice(disclosureStart)).toContain("URANS FINAL");
+    expect(html.slice(disclosureStart)).toContain("Technical evidence");
+    const technicalStart = html.indexOf("Technical evidence", disclosureStart);
+    expect(technicalStart).toBeGreaterThan(disclosureStart);
+    expect(html.slice(technicalStart)).toContain(
       "Fast URANS runs · 1/2 physical",
     );
-    expect(html.slice(disclosureStart)).toContain(
+    expect(html.slice(technicalStart)).toContain(
       "Evidence · 2 RANS evidence records · 1 fast URANS · 1 final URANS",
     );
-    expect(html.slice(disclosureStart)).toContain(
+    expect(html.slice(technicalStart)).toContain(
       "1 engine submission ended before CFD; not a physical run.",
     );
     expect(html.match(/cell-preliminary-outcome-10/g)).toHaveLength(1);
@@ -161,12 +173,22 @@ describe("per-point solver sequence panel", () => {
     expect(source).toContain("RANS SCREEN");
     expect(source).toContain("URANS FAST");
     expect(source).toContain("URANS FINAL");
-    expect(source).toContain("evidence record");
+    expect(source).toContain("view.evidenceLabel");
     expect(source).not.toMatch(/ransEvidenceRuns\}\s*physical run/);
     expect(source).toContain("physical");
     expect(source).toContain("before CFD");
-    expect(source).toContain("SYSTEM INCIDENT · AUTO-INVESTIGATE");
+    expect(source).toContain("SYSTEM INCIDENT · INVESTIGATION REQUIRED");
     expect(source).not.toContain("physical runs counted separately");
+  });
+
+  it("renders normal RANS handoff as a neutral transition, not an accepted result", () => {
+    expect(source).toContain("const ransDidHandoff");
+    expect(source).toContain('"handoff"');
+    expect(source).toContain(".stage-node.handoff");
+    expect(source).toContain(".connector.handoff");
+    expect(source).not.toContain(
+      'view.ransStage === "screened" ? (\\n                      <CheckCircle2',
+    );
   });
 
   it("keeps accepted final comparison and update warnings amber, never red critical", () => {

@@ -1388,7 +1388,7 @@ def test_live_control_dict_update_is_atomic_and_preserves_force_function(
 
 @pytest.mark.parametrize(
     ("fidelity", "min_periods", "expected_certification_cycles"),
-    [("precalc", 3, 4.0), ("full", 7, 5.5)],
+    [("precalc", 3, 4.5), ("full", 7, 5.5)],
 )
 def test_early_stop_retention_is_fidelity_aware(
     tmp_path,
@@ -1454,15 +1454,16 @@ def test_early_stop_retention_is_fidelity_aware(
     }
 
 
-def test_precalc_four_period_early_stop_is_unambiguous_and_accepted(
+def test_precalc_early_stop_tolerates_monitor_period_undercut_and_is_accepted(
     tmp_path, monkeypatch
 ):
     """The live precalc stop span must satisfy its own final period check.
 
-    A 3.5-period tail cannot give the estimator two cycles in each independent
-    half.  Four real periods can, so the end-to-end attempt grade must retain an
-    unambiguous period and accept the established oscillation instead of
-    entering another same-case continuation loop.
+    The live two-period monitor and the final autocorrelation grader estimate
+    the same physical cadence independently.  A small monitor under-estimate
+    must not leave the final grader with fewer than two real periods in either
+    half, otherwise a stable case repeatedly early-stops, rejects its marker,
+    and starts another continuation chunk.
     """
 
     class FakeCaseBuilder:
@@ -1473,6 +1474,9 @@ def test_precalc_four_period_early_stop_is_unambiguous_and_accepted(
             pass
 
     period = 0.5
+    monitor_period = 0.98 * period
+    certification_cycles = 4.5
+    certified_span = certification_cycles * monitor_period
 
     class FakeRunner:
         def solver(self, case_dir, *_args, **_kwargs):
@@ -1483,13 +1487,13 @@ def test_precalc_four_period_early_stop_is_unambiguous_and_accepted(
                 / "0"
                 / "coefficient.dat"
             )
-            times = np.linspace(0.0, 4.0 * period, 2001)
+            times = np.linspace(0.0, certified_span, 2401)
             _write_coeff_rows(
                 coeff,
                 times,
                 lambda t: 0.7 + 0.08 * math.sin(2 * math.pi * t / period),
             )
-            for t in np.linspace(0.0, 4.0 * period, 121):
+            for t in np.linspace(0.0, certified_span, 140):
                 (case_dir / f"{t:.8g}").mkdir(exist_ok=True)
             pipeline._write_early_stop_marker(
                 case_dir,
@@ -1497,9 +1501,9 @@ def test_precalc_four_period_early_stop_is_unambiguous_and_accepted(
                     ok=True,
                     reason="two stable periods with sufficient frames",
                     stable=True,
-                    period_s=period,
-                    window_start=2.0 * period,
-                    window_end=4.0 * period,
+                    period_s=monitor_period,
+                    window_start=certified_span - 2.0 * monitor_period,
+                    window_end=certified_span,
                     cycles=2,
                     frame_count=61,
                     frames_per_cycle=30.5,
@@ -1530,18 +1534,95 @@ def test_precalc_four_period_early_stop_is_unambiguous_and_accepted(
         runner=FakeRunner(),
         n_proc=1,
         timeout=120,
-        run_time=4.0 * period,
+        run_time=certified_span,
         delta_t=0.001,
         coeff_start_time=0.0,
     )
 
-    assert pipeline._early_stop_certification_cycles(solver) == pytest.approx(4.0)
+    assert pipeline._early_stop_certification_cycles(solver) == pytest.approx(
+        certification_cycles
+    )
     assert result is not None and result.early_stopped
     assert result.quality.ok
     assert not result.quality.can_refine
     assert result.quality.measured_period_s == pytest.approx(period, rel=0.01)
     assert result.quality.retained_cycles >= 3.0
     assert "early-stop target met" in result.quality.reason
+
+
+def test_continuation_period_uses_full_merged_evidence_not_cropped_history(
+    tmp_path,
+):
+    """Continuation cadence must use the same merged window as live grading.
+
+    A preliminary ``ForceHistory`` intentionally keeps only the final three
+    periods.  Its independent halves can never satisfy the two-period
+    estimator floor, so using it for cadence produces a deterministic
+    "half-window estimates unavailable" warning even when the merged restart
+    evidence is long and settled.
+    """
+
+    period = 0.5
+    first = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    second = (
+        tmp_path
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "2.5"
+        / "coefficient.dat"
+    )
+    _write_coeff_rows(
+        first,
+        np.linspace(0.0, 2.5, 1501),
+        lambda t: 0.7 + 0.08 * math.sin(2 * math.pi * t / period),
+    )
+    _write_coeff_rows(
+        second,
+        np.linspace(2.5, 5.0, 1501),
+        lambda t: 0.7 + 0.08 * math.sin(2 * math.pi * t / period),
+    )
+    cropped = _history_over(3.5, 5.0, period)
+    cropped_estimate = estimate_period(
+        cropped.t,
+        cropped.cl,
+        speed=10.0,
+        chord=1.0,
+        alpha_deg=15.0,
+    )
+    assert cropped_estimate is not None and cropped_estimate.ambiguous
+    assert cropped_estimate.first_half_s is None
+    assert cropped_estimate.second_half_s is None
+
+    result = TransientResult(
+        avg=SimpleNamespace(),
+        case_dir=tmp_path,
+        force_history=cropped,
+        quality=UransQuality(
+            ok=False,
+            can_refine=True,
+            reason="URANS window not stationary",
+            measured_period_s=period,
+        ),
+        start_time=0.0,
+        end_time=5.0,
+        run_time=5.0,
+        coeff_paths=[first, second],
+    )
+    merged_estimate = pipeline._continuation_period_estimate(
+        tmp_path,
+        result,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            transient_discard_fraction=0.4,
+        ),
+    )
+
+    assert merged_estimate is not None
+    assert not merged_estimate.ambiguous
+    assert merged_estimate.first_half_s == pytest.approx(period, rel=0.02)
+    assert merged_estimate.second_half_s == pytest.approx(period, rel=0.02)
 
 
 def test_same_case_chunks_share_one_monotonic_tier_deadline(tmp_path, monkeypatch):

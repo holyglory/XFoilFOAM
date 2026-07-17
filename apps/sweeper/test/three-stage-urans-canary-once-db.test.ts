@@ -684,6 +684,7 @@ describe("three-stage URANS canary production DB seam", () => {
         .update(simPrecalcObligations)
         .set({
           state: "satisfied",
+          sourceResultAttemptId: acceptedPrecalcAttempt.id,
           attemptCount: 1,
           latestSimJobId: null,
           lastOutcome: "accepted",

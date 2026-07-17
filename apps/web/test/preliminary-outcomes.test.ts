@@ -142,7 +142,7 @@ describe("per-angle solver flow copy", () => {
     expect(view.fastLabel).toBe("Critical");
     expect(view.ransLabel).toBe("Screened");
     expect(view.finalLabel).toBe("Next");
-    expect(view.statusLabel).toBe("CRITICAL · FAST URANS");
+    expect(view.statusLabel).toBe("CRITICAL · FAST RESULT MISSING");
     expect(view.statusTone).toBe("critical");
     expect(view.critical).toBe(true);
     expect(view.budgetLabel).toBe("Fast URANS runs · 2/2 physical");
@@ -247,7 +247,7 @@ describe("per-angle solver flow copy", () => {
     expect(view.ransLabel).toBe("Recovery exhausted");
     expect(view.fastLabel).toBe("Next");
     expect(view.finalLabel).toBe("Next");
-    expect(view.statusLabel).toBe("CRITICAL · RANS RECOVERY");
+    expect(view.statusLabel).toBe("CRITICAL · SCREENING RECOVERY");
     expect(view.statusTone).toBe("critical");
     expect(view.evidenceLabel).toContain("2 RANS evidence records");
     expect(view.diagnostics.join(" ")).toContain(
@@ -629,7 +629,7 @@ describe("per-angle solver flow copy", () => {
     );
 
     expect(view.finalLabel).toBe("Critical");
-    expect(view.statusLabel).toBe("CRITICAL · FINAL URANS");
+    expect(view.statusLabel).toBe("CRITICAL · FINAL RESULT MISSING");
     expect(view.diagnostics.join(" ")).toContain(
       "Final URANS recovery exhausted",
     );

@@ -135,6 +135,26 @@ and real `potentialFoam` plus short `pimpleFoam` canaries on OpenCFD 2606.
 Missing tools, timeouts, process kills, unreadable output, and OOM signatures
 remain infrastructure errors and cannot be misreported as geometry failure.
 
+The first OpenCFD 2606 preliminary canary exposed one final live-window
+mismatch without losing any solver evidence. Its exact transient marker stayed
+at zero, all restart coefficient segments merged in physical order, and the
+recent 5–20-cycle tail passed the established-oscillation verdict. The live
+two-period monitor nevertheless stopped each continuation at exactly four of
+its estimated periods. A slightly longer independent autocorrelation estimate
+then saw fewer than two periods in each half, rejected that early-stop marker,
+and repeated another short continuation. The continuation log independently
+re-estimated cadence from the deliberately cropped three-period
+`ForceHistory`, so its half-window estimates were deterministically unavailable
+even though the full merged evidence was healthy.
+
+Preliminary early-stop certification now keeps the existing half-cycle margin
+*after* the four-period independent-half floor, for 4.5 monitor periods.
+Continuation cadence and its diagnostics use the same merged, post-startup
+coefficient window as live grading, with compact `ForceHistory` only as an
+in-flight fallback. Regression evidence covers a two-percent monitor-period
+undercut and multi-segment merged history; neither change relaxes the stable
+period, density, trend, amplitude, or final-verification gates.
+
 ## Mixed-version release gate
 
 The control plane and engine use an explicit integer
@@ -237,6 +257,17 @@ OpenCFD 2606 runtime-build row and its build label must match the pinned build.
 This avoids falsely reporting a failed canary after an irreversible accepted
 submission without treating engine preflight identity as invented per-job
 provenance.
+
+The accepted production preliminary generation also proved the real ingestion
+transition that the original canary fixture had omitted: once preliminary
+URANS is accepted, the obligation's source-attempt pointer advances from the
+rejected RANS handoff attempt to that accepted preliminary attempt. A repeated
+one-shot validation now permits that transition only when the linked final
+verification item pins the same accepted preliminary generation from the exact
+obligation. The original immutable RANS attempt remains independently pinned
+and validated by the canary target. Unit and live-database seam regressions use
+this post-ingestion state so final admission cannot regress to the unrealistic
+pre-ingestion fixture.
 
 Invoke once to admit or observe preliminary work. After that exact job is
 terminal and reconciled, repeat the same exclusive one-shot invocation to

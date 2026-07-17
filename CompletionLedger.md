@@ -2,26 +2,19 @@
 
 - **Preliminary-URANS reliability recovery:** The active production campaign
   currently has 26 unresolved preliminary-recovery obligations from the legacy
-  OpenCFD 2406 path. Five continuation submissions performed zero CFD because
-  retention had removed their live restart fields; 21 physical results
-  exhausted the former acceptance path.
-  Every affected cell still has immutable checkpoint evidence. Their latest
-  classifications all report non-stationarity; 12 also lack enough periods and
-  seven ended before the required integration window. Complete archive-backed
-  continuation hydration, attempt-preserving storage failure handling,
-  adaptive same-case settling, and the per-angle
-  RANS → preliminary URANS → verified URANS interface. OpenCFD 2606 recovery
-  version 2 is live in production, the deliberately admitted 78-case successor
-  RANS batch is 78/78 terminal, and both the engine queue and nonterminal
-  `sim_jobs` set are empty. Durable scheduling remains fenced at
-  `enabled=false`, `max_concurrent_jobs=0`, and `cpu_slots=0`.
-  Deploy the fail-closed exact one-angle canary controller, prove one
-  preliminary result and its linked final verification on the live version-2
-  runtime, then reopen only bounded campaign capacity. Preserve the 26 legacy
-  2406 histories unchanged; recover successor cells fresh on 2606. Monitor
-  subsequent fast/final work for recurrence, and keep any exhausted fast/final
-  chain as a grouped red system-owned incident rather than a review task or an
-  unchanged retry.
+  OpenCFD 2406 path; preserve those histories unchanged and recover successor
+  cells fresh on 2606. OpenCFD 2606 recovery version 2 is live and the exact
+  20-32C/Re≈102k/α15° fast-URANS canary has produced accepted, GCS-backed
+  preliminary evidence. The linked final-verification item is pending while
+  durable scheduling remains fenced at `enabled=false`,
+  `max_concurrent_jobs=0`, and `cpu_slots=0`. Deploy the live-window correction
+  (4.5-cycle preliminary certification plus merged-history continuation
+  cadence), the post-ingestion canary ownership fix, and the concise one-row
+  solver-sequence UI. Then admit and prove the exact final generation, reopen
+  only bounded campaign capacity, and monitor subsequent fast/final work for
+  recurrence. Any exhausted fast/final chain must remain a grouped red
+  system-owned incident with a remediation version, never a review task or an
+  unchanged user retry.
 
 - **GCS Zstandard evidence migration:** Implement and deploy content-addressed
   tar.zst finalization, verified GCS upload, temporary render hydration,

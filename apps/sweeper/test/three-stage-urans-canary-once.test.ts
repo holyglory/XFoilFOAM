@@ -246,6 +246,13 @@ function withVerify(state = "pending"): ThreeStageUransCanarySnapshot {
     classificationState: "accepted",
     precalcObligationId: target.precalcObligationId,
   };
+  // Accepted preliminary evidence becomes the obligation's canonical source
+  // attempt during ingestion. The original RANS attempt remains pinned by the
+  // canary target and immutable result history.
+  snapshot.obligation = {
+    ...snapshot.obligation!,
+    sourceResultAttemptId: snapshot.verify.precalcResultAttemptId,
+  };
   return snapshot;
 }
 

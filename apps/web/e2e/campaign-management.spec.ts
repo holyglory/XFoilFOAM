@@ -808,7 +808,7 @@ test.describe
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/critical/, { timeout: 8_000 });
-    await expect(preliminary).toContainText("CRITICAL · FAST URANS");
+    await expect(preliminary).toContainText("CRITICAL · FAST RESULT MISSING");
     await expect(
       preliminary.getByTestId("cell-preliminary-rans-0"),
     ).toHaveClass(/screened/);
@@ -866,7 +866,7 @@ test.describe
     await expect(
       preliminary.getByTestId("cell-preliminary-final-0"),
     ).toHaveClass(/critical/, { timeout: 8_000 });
-    await expect(preliminary).toContainText("CRITICAL · FINAL URANS");
+    await expect(preliminary).toContainText("CRITICAL · FINAL RESULT MISSING");
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/accepted/);

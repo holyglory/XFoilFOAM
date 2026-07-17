@@ -618,13 +618,24 @@ export function validateThreeStageUransCanarySnapshot(
     );
   }
   const obligation = snapshot.obligation;
+  // Ingestion replaces the obligation's source-attempt pointer with the
+  // accepted preliminary generation. Keep accepting the original immutable
+  // RANS pin only through the linked verify generation, which is fully
+  // validated below before any final work can be admitted.
+  const obligationPinsAcceptedPreliminary =
+    obligation?.state === "satisfied" &&
+    obligation.sourceResultId === target.sourceResultId &&
+    snapshot.verify?.precalcResultId === target.sourceResultId &&
+    snapshot.verify.precalcResultAttemptId != null &&
+    obligation.sourceResultAttemptId === snapshot.verify.precalcResultAttemptId;
   if (
     !obligation ||
     obligation.airfoilId !== target.airfoilId ||
     obligation.revisionId !== target.revisionId ||
     !Object.is(obligation.aoaDeg, target.aoaDeg) ||
     obligation.sourceResultId !== target.sourceResultId ||
-    obligation.sourceResultAttemptId !== target.sourceResultAttemptId
+    (obligation.sourceResultAttemptId !== target.sourceResultAttemptId &&
+      !obligationPinsAcceptedPreliminary)
   ) {
     throw canaryError(
       "the exact preliminary obligation does not pin the supplied RANS generation",

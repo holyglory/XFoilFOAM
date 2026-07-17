@@ -281,13 +281,13 @@ export function preliminaryOutcomeView(
   } else if (item.criticalStage === "preflight") {
     status = { label: "CRITICAL · AUTO-REPAIR", tone: "critical" };
   } else if (item.criticalStage === "rans") {
-    status = { label: "CRITICAL · RANS RECOVERY", tone: "critical" };
+    status = { label: "CRITICAL · SCREENING RECOVERY", tone: "critical" };
   } else if (item.finalState === "critical") {
     status = {
       label:
         item.fastState === "critical"
-          ? "CRITICAL · FAST + FINAL"
-          : "CRITICAL · FINAL URANS",
+          ? "CRITICAL · FAST + FINAL RESULTS MISSING"
+          : "CRITICAL · FINAL RESULT MISSING",
       tone: "critical",
     };
   } else if (item.finalState === "running") {
@@ -307,7 +307,7 @@ export function preliminaryOutcomeView(
       tone: item.fastState === "critical" ? "critical" : "violet",
     };
   } else if (item.fastState === "critical") {
-    status = { label: "CRITICAL · FAST URANS", tone: "critical" };
+    status = { label: "CRITICAL · FAST RESULT MISSING", tone: "critical" };
   } else if (item.fastState === "accepted") {
     status = { label: "URANS fast · ready", tone: "teal" };
   } else if (item.fastState === "running") {

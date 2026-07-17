@@ -1191,15 +1191,20 @@ def _early_stop_certification_cycles(
     """Total stable span required before the live monitor may stop.
 
     The accepted tier target still owns the force-history retention bar.  The
-    live certification span additionally includes the existing stop margin and
-    must contain enough data for the period estimator's two independent halves
-    to meet their own cycle floor.  This is 4.0 periods for precalc and leaves
-    full fidelity's existing 5.5-period span unchanged.
+    live certification span additionally includes the existing stop margin
+    *after* satisfying the period estimator's two-independent-halves floor.
+    The live phase comparator and final autocorrelation grader estimate cadence
+    independently, so stopping at the exact four-period floor can become fewer
+    than four re-measured periods after even a small estimator difference.
+    This is 4.5 periods for precalc and leaves full fidelity's existing
+    5.5-period span unchanged.
     """
-    return max(
-        _early_stop_retained_cycles(solver_params)
-        + URANS_STABLE_STOP_MARGIN_CYCLES,
-        2.0 * PERIOD_ESTIMATE_MIN_CYCLES,
+    return (
+        max(
+            _early_stop_retained_cycles(solver_params),
+            2.0 * PERIOD_ESTIMATE_MIN_CYCLES,
+        )
+        + URANS_STABLE_STOP_MARGIN_CYCLES
     )
 
 
@@ -4000,6 +4005,65 @@ def _period_acquisition_horizons(solver_params: SolverParams) -> tuple[float, ..
     )
 
 
+def _continuation_period_estimate(
+    tcase: Path,
+    result: TransientResult,
+    spec: CaseSpec,
+    solver_params: SolverParams,
+) -> Optional[PeriodEstimate]:
+    """Measure continuation cadence from the same evidence window as grading.
+
+    ``ForceHistory`` is a deliberately compact publication object: preliminary
+    fidelity keeps only its final three periods.  Splitting that object into
+    independent halves can therefore never satisfy the period estimator's
+    two-cycle-per-half floor, even when the underlying merged restart history
+    contains many settled cycles.  Prefer the full coefficient segments owned
+    by this transient and apply the same retained-window rule as the live
+    quality grader.  The compact history remains a safe sizing fallback when
+    the in-flight files cannot be read.
+    """
+
+    if result.coeff_paths:
+        try:
+            t_all, cl_all, cd_all, cm_all = coefficient_series(
+                result.coeff_paths
+            )
+            if result.early_stopped:
+                t_c, cl_c, _cd_c, _cm_c = _early_stop_retained_series(
+                    tcase, t_all, cl_all, cd_all, cm_all
+                )
+            else:
+                t_c, cl_c, _cd_c, _cm_c = discard_startup(
+                    t_all,
+                    cl_all,
+                    cd_all,
+                    cm_all,
+                    fraction=solver_params.transient_discard_fraction,
+                )
+            estimate = estimate_period(
+                t_c,
+                cl_c,
+                speed=spec.speed,
+                chord=spec.chord,
+                alpha_deg=spec.aoa_deg,
+            )
+            if estimate is not None:
+                return estimate
+        except Exception:  # noqa: BLE001 - in-flight evidence may be partial
+            pass
+
+    history = result.force_history
+    if history is None or len(history.t) < 8:
+        return None
+    return estimate_period(
+        history.t,
+        history.cl,
+        speed=spec.speed,
+        chord=spec.chord,
+        alpha_deg=spec.aoa_deg,
+    )
+
+
 def _period_ambiguity_detail(estimate: PeriodEstimate) -> str:
     """Human-readable half-window diagnostic that is safe for missing halves."""
 
@@ -4116,12 +4180,11 @@ def _extend_transient_until_periods(
         else:
             if history is None or len(history.t) < 8:
                 break
-            estimate = estimate_period(
-                history.t,
-                history.cl,
-                speed=spec.speed,
-                chord=spec.chord,
-                alpha_deg=spec.aoa_deg,
+            estimate = _continuation_period_estimate(
+                tcase,
+                result,
+                spec,
+                solver_params,
             )
             period = estimate.period_s if estimate is not None else None
             period_note = ""
