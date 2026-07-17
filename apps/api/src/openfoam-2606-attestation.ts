@@ -793,7 +793,15 @@ export function validateOpenCfd2606LiveJobResult(
     );
     const artifacts = normalizedArtifacts(point.evidence_artifacts);
     assertRequiredArtifacts(artifacts, `${job.scenario} live point`);
-    if (canonicalJson(artifacts) !== canonicalJson(receiptPoint.artifacts)) {
+    // Artifact inventory order is not evidence. The Python producer preserves
+    // manifest traversal order, while the live engine read model may emit the
+    // same immutable members in a different order after strip/rehydration.
+    // Compare the canonical member set without weakening any path, checksum,
+    // byte-size, or generation binding.
+    const receiptArtifacts = [...receiptPoint.artifacts].sort((left, right) =>
+      canonicalJson(left).localeCompare(canonicalJson(right)),
+    );
+    if (canonicalJson(artifacts) !== canonicalJson(receiptArtifacts)) {
       throw new CampaignError(
         "conflict",
         `${job.scenario} live artifact checksums differ from the canary receipt`,

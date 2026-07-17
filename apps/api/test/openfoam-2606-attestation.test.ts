@@ -661,6 +661,29 @@ describe("OpenCFD 2606 canary attestation", () => {
     expect(calls).toEqual([{ jobId: rans.job_id, keepCaseState: false }]);
   });
 
+  it("accepts an identical immutable artifact inventory in producer traversal order", () => {
+    const value = receipt();
+    for (const receiptJob of value.jobs) {
+      for (const point of receiptJob.points) {
+        point.artifacts.reverse();
+      }
+    }
+    const parsed = validateOpenCfd2606CanaryReceiptShape(value);
+    const rans = parsed.jobs.find(
+      (candidate) => candidate.scenario === "serial-rans",
+    )!;
+    const result = liveResultFor(rans as ReturnType<typeof job>, null);
+
+    expect(() =>
+      validateOpenCfd2606LiveJobResult(
+        result as never,
+        rans,
+        runtime,
+        fullStripProof(rans.job_id),
+      ),
+    ).not.toThrow();
+  });
+
   it("rejects live-client attestation when the independent strip is not a no-op", async () => {
     const parsed = validateOpenCfd2606CanaryReceiptShape(receipt());
     const rans = parsed.jobs.find(
