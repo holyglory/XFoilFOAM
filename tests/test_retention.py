@@ -48,6 +48,13 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
     _write(case / "dynamicCode" / "code.C", b"code")
     _write(case / "processor0" / "141" / "U", b"decomposed")
     _write(case / "log.simpleFoam", b"log")
+    # Production finalization snapshots this evidence into the canonical
+    # engine archive under openfoam/mesh_evidence.  The live case copy is
+    # therefore duplicate solver state after a full strip.
+    mesh_evidence = _write(
+        case / "mesh-evidence" / "system" / "blockMeshDict",
+        b"archived-mesh-dictionary",
+    )
 
     _write(case / "images" / "root.png", b"\x89PNG\r\n\x1a\nroot")
     _write(case / "frames" / "vorticity" / "f0000.png", b"\x89PNG\r\n\x1a\nroot-frame")
@@ -89,6 +96,7 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
         "archived_frame": archived_frame,
         "redundant_openfoam": redundant_openfoam,
         "redundant_time": redundant_time,
+        "mesh_evidence": mesh_evidence,
         "unknown": unknown_path,
     }
 
@@ -135,6 +143,10 @@ def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
     for rel in ("0", "141", "3.5", "constant", "system", "postProcessing", "VTK", "dynamicCode", "processor0"):
         assert not (case / rel).exists()
     assert not (case / "log.simpleFoam").exists()
+    # MUST-CATCH (2026-07-17 production canary): a full strip must not leave
+    # the archived live mesh-evidence copy as an unknown case entry.
+    assert not (case / "mesh-evidence").exists()
+    assert report.unknown_entries == []
     assert (case / "a0" / "evidence" / "openfoam").exists()
     assert (case / "a0" / "evidence" / "time_directories").exists()
 
@@ -176,6 +188,7 @@ def test_keep_case_state_preserves_continuation_and_packaged_evidence(tmp_path: 
     assert (job_root / "meshes").exists()
     for rel in ("0", "141", "3.5", "constant", "system", "postProcessing", "processor0"):
         assert (case / rel).exists()
+    assert paths["mesh_evidence"].is_file()
     assert not (case / "VTK").exists()
     assert (case / "log.simpleFoam").is_file()
     # MUST-CATCH (continuation restartability): the shared-mesh symlink still
