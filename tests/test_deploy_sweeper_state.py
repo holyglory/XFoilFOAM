@@ -140,6 +140,7 @@ def _deploy_harness(
     media_repair_stop_fails: bool = False,
     media_repair_running: bool = True,
     sweeper_dies_after_restore: bool = False,
+    queue_first_response_seconds: float = 0,
 ) -> dict[str, str]:
     app_dir = tmp_path / "app"
     fake_bin = tmp_path / "bin"
@@ -309,6 +310,9 @@ case "$url" in
     fi
     count=$((count + 1))
     printf '%s\n' "$count" >"$QUEUE_PROBE_COUNT"
+    if (( count == 1 )) && [[ "$FAKE_QUEUE_FIRST_RESPONSE_SECONDS" != "0" ]]; then
+      /bin/sleep "$FAKE_QUEUE_FIRST_RESPONSE_SECONDS"
+    fi
     disabled_depth="${FAKE_DISABLED_QUEUE_DEPTH:-0}"
     if { [[ "$FAKE_ENGINE_VERSION" == "2406" && ! -f "$ENGINE_RECREATED" ]] || [[ "$FAKE_FORCE_LEGACY_QUEUE_SHAPE" == "1" ]]; }; then
       if (( FAKE_QUEUE_ACTIVE_AFTER > 0 && count >= FAKE_QUEUE_ACTIVE_AFTER )); then
@@ -503,6 +507,7 @@ exec "$REAL_PYTHON" "$@"
             "FAKE_QUEUE_ACTIVE_AFTER": str(queue_active_after),
             "FAKE_DISABLED_QUEUE_DEPTH": str(disabled_queue_depth),
             "FAKE_QUEUE_OBSERVABILITY_MODE": queue_observability_mode,
+            "FAKE_QUEUE_FIRST_RESPONSE_SECONDS": str(queue_first_response_seconds),
             "FAKE_LEGACY_INSPECTOR_MODE": legacy_inspector_mode,
             "FAKE_FORCE_LEGACY_QUEUE_SHAPE": (
                 "1" if force_legacy_queue_shape else "0"
@@ -613,6 +618,46 @@ def test_control_plane_deploy_rejects_unproven_inherited_lock(tmp_path: Path) ->
     assert completed.returncode == 9
     assert "requires inherited descriptor 9" in completed.stderr
     assert Path(env["CALL_LOG"]).read_text().splitlines() == ["compose version"]
+
+
+def test_engine_maintenance_rejects_unproven_inherited_lock(tmp_path: Path) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    env["DEPLOY_LOCK_HELD"] = "1"
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 9
+    assert "requires inherited descriptor 9" in completed.stderr
+    assert Path(env["CALL_LOG"]).read_text().splitlines() == ["compose version"]
+
+
+def test_engine_maintenance_accepts_exact_inherited_lock(tmp_path: Path) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    env["ENGINE_REBUILD_SCRIPT"] = str(
+        ROOT / "scripts" / "deploy" / "rebuild-engine.sh"
+    )
+
+    completed = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'exec 9>"$LOCK_FILE"; flock -n 9; '
+            'DEPLOY_LOCK_HELD=1 exec "$ENGINE_REBUILD_SCRIPT" test-build',
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Engine rebuild finished." in completed.stdout
 
 
 @pytest.mark.parametrize("action", ["test-build", "--certify-opencfd-2606-continuation"])
@@ -855,6 +900,33 @@ def test_engine_rebuild_refusal_restores_exact_prior_sweeper_state(
         assert any(running_restore in call for call in calls)
     assert not any(" up -d --no-deps --force-recreate api worker node-api" in call for call in calls)
     assert Path(env["ENV_FILE"]).read_text() == initial_env
+
+
+def test_engine_queue_probe_allows_bounded_worker_inspection_window(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_first_response_seconds=5.1,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    queue_calls = [
+        call
+        for call in Path(env["CALL_LOG"]).read_text().splitlines()
+        if "curl " in call and ":8000/queue" in call
+    ]
+    assert queue_calls
+    assert all("--max-time 15" in call for call in queue_calls)
 
 
 def test_engine_rebuild_treats_disabled_pool_queue_as_draining_work(

@@ -27,6 +27,9 @@
 #   v2406 -> v2606 cutover because the script pauses/drains/migrates/resumes
 #   campaigns through authenticated Node API maintenance endpoints.
 #   CUTOVER_DRAIN_TIMEOUT_SECONDS (default 7200).
+#   DEPLOY_LOCK_HELD=1 only when descriptor 9 is inherited from a parent that
+#   already opened the configured deployment lock. The script verifies and
+#   retains that lock for the complete maintenance transaction.
 set -Eeuo pipefail
 
 ACTION="${1:-}"
@@ -53,12 +56,18 @@ ENV_FILE="${ENV_FILE:-$AIRFOILS_PRO_STATE_DIR/.env.deploy}"
 COMPOSE_FILE="${COMPOSE_FILE:-$APP_DIR/docker-compose.deploy.yml}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-app}"
 LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
+DEPLOY_LOCK_HELD="${DEPLOY_LOCK_HELD:-0}"
 DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-source.json}"
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
 DEPLOY_SOURCE_TREE_SHA256="${DEPLOY_SOURCE_TREE_SHA256:-}"
 ADMIN_COOKIE="${ADMIN_COOKIE:-}"
 CUTOVER_DRAIN_TIMEOUT_SECONDS="${CUTOVER_DRAIN_TIMEOUT_SECONDS:-7200}"
 CUTOVER_CONTINUATION_TIMEOUT_SECONDS="${CUTOVER_CONTINUATION_TIMEOUT_SECONDS:-3600}"
+# The authoritative queue snapshot includes bounded Celery worker inspection.
+# Production can legitimately return just after five seconds; the client race
+# cap must exceed that server-side window while remaining a strict deployment
+# bound. This is intentionally not operator-configurable.
+ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS=15
 OPENCFD2606_CANARY_RECEIPT_FILE="${OPENCFD2606_CANARY_RECEIPT_FILE:-$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json}"
 OPENCFD_2606_POOL_ID="3f8bc764-09ae-4ff3-8fd2-260600000001"
 CUTOVER_API_BASE="http://127.0.0.1:4000/api/admin/solver-engine-cutovers/opencfd-2606"
@@ -90,6 +99,32 @@ fi
 
 compose() {
   "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+}
+
+acquire_deploy_lock() {
+  if [[ "$DEPLOY_LOCK_HELD" == "1" ]]; then
+    local inherited_target expected_target
+    inherited_target="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
+    expected_target="$(readlink -f "$LOCK_FILE" 2>/dev/null || true)"
+    if [[ -z "$inherited_target" || -z "$expected_target" || "$inherited_target" != "$expected_target" ]]; then
+      echo "DEPLOY_LOCK_HELD=1 requires inherited descriptor 9 for the configured deployment lock." >&2
+      return 9
+    fi
+    flock -n 9 || {
+      echo "The inherited deployment lock is not held by this maintenance transaction." >&2
+      return 9
+    }
+    return 0
+  fi
+  if [[ "$DEPLOY_LOCK_HELD" != "0" ]]; then
+    echo "DEPLOY_LOCK_HELD must be either 0 or the inherited-lock value 1." >&2
+    return 9
+  fi
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || {
+    echo "Another Airfoils.Pro deploy is already running." >&2
+    return 9
+  }
 }
 
 verify_deployment_source() {
@@ -368,7 +403,7 @@ engine_queue_activity() {
       expected_worker_count=$((expected_worker_count + $(wc -l <<<"$running")))
     fi
   done <<<"$services"
-  payload="$(curl -fsS --max-time 5 http://127.0.0.1:8000/queue)" || return 1
+  payload="$(curl -fsS --max-time "$ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS" http://127.0.0.1:8000/queue)" || return 1
   if [[ "$LEGACY_2406_QUEUE_COMPATIBILITY" == "true" ]]; then
     local legacy_activity
     if ! legacy_activity="$(printf '%s' "$payload" | python3 -c '
@@ -1283,11 +1318,7 @@ print(error or "")
 }
 
 certify_opencfd_2606_continuation() {
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || {
-    echo "Another Airfoils.Pro deploy is already running." >&2
-    exit 9
-  }
+  acquire_deploy_lock || exit $?
   verify_deployment_source || exit $?
   validate_recovery_state_paths || exit $?
   validate_opencfd_2606_cutover_state pending-certifiable || exit $?
@@ -1535,11 +1566,7 @@ validate_normal_rebuild_cutover_markers() {
 }
 
 main() {
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || {
-    echo "Another Airfoils.Pro deploy is already running." >&2
-    exit 9
-  }
+  acquire_deploy_lock || exit $?
   verify_deployment_source || exit $?
   validate_recovery_state_paths || exit $?
   validate_opencfd_2606_cutover_state any || exit $?

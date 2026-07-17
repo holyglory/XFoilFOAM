@@ -56,13 +56,17 @@
 - **OpenCFD 2606 production campaign cutover:** The repository implementation,
   digest-pinned worker, isolated serial/MPI/forced-URANS canary, exact
   campaign-successor migration, fail-closed deployment workflow, and isolated
-  2406 rollback reconstruction are complete. Production still runs OpenCFD
-  2406 build `prod-20260715-9a933ec`; its API and worker containers have not
-  been restarted or replaced. An authorized operator must run the guarded VPS
-  cutover, verify that the live 2406 process/container is drained and removed,
-  and retain the marker until every affected campaign's exact eligible source
-  snapshot is represented by its linked 2606 generation and the durable
-  continuation proof reaches `evidence` or truthful `not_required`.
+  2406 rollback reconstruction are complete. Production now runs the guarded
+  OpenCFD 2606 engine, but the cutover marker remains pending and both execution
+  pools remain disabled after two fail-closed recovery attempts: first the
+  Node admission client and then the deployment queue probe raced the bounded
+  worker snapshot. The Node repair is applied and journalled. Deploy the
+  incident-bound 15-second queue-probe runner, retain its journal, finish the
+  real canary and successor-generation gates, and then replace this temporary
+  staged recovery path with the canonical release workflow. Keep the marker
+  until every affected campaign's exact eligible source snapshot is represented
+  by its linked 2606 generation and the durable continuation proof reaches
+  `evidence` or truthful `not_required`.
 
 - **OpenFOAM Foundation 14 production activation:** The additive identity,
   adapter, isolated worker/pool, control-plane selection, compatibility split,
