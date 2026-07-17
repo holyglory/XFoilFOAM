@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts/deploy/replay-pending-opencfd2606-rebuild.sh"
 MANIFEST = ROOT / "scripts/deploy/deployment-source-manifest.py"
 BOUND_REVISION = "63385777be7323777906fde44bdb9fa9b5cc0d6d"
+REPLAY_SOURCE_REVISION = "1f815f89c523cbf667725c1cd681d729c06a10c9"
 TARGET_REVISION = "c" * 40
 BUILD_ID = "prod-20260717-63385777be73-r2"
 API_IMAGE = "sha256:bc8e23648e9e76424ea36a584f8a825d65fe82a23aa4e4ad89b019197dcc735c"
@@ -142,8 +143,15 @@ def _fixture_sources(tmp_path: Path) -> tuple[Path, Path, Path, str, str]:
         "tests/test_openfoam_2606_canary.py",
         "tests/test_pending_cutover_node_api_repair.py",
     ):
-        source = ROOT / relative
-        _write(target / relative, source.read_bytes(), executable=os.access(source, os.X_OK))
+        # This incident runner is intentionally immutable and must continue to
+        # authenticate only the exact source it was written for. Reconstruct
+        # that archived target rather than silently teaching the legacy runner
+        # to trust the newer DB-ACK integration tree.
+        _write(
+            target / relative,
+            _git_file(REPLAY_SOURCE_REVISION, relative),
+            executable=relative.endswith(".sh"),
+        )
 
     fake_rebuild = rb"""#!/usr/bin/env bash
 set -euo pipefail
@@ -536,6 +544,37 @@ def test_replay_uses_bound_build_inputs_private_cookie_and_canonical_lock(
     assert not any("force-recreate api" in line or "force-recreate worker" in line for line in call_lines)
 
 
+def test_legacy_replay_refuses_integrated_db_ack_source_without_mutation(
+    harness: tuple[dict[str, str], Path, Path, Path, Path],
+) -> None:
+    """The same-build runner is historical, not an alias for later recovery.
+
+    MUST-CATCH: integrating the DB-ACK control plane changes the attestation
+    contract. The old runner must reject those bytes before it inspects or
+    mutates live runtime state; the current r5 runner owns executable coverage
+    for that newer source.
+    """
+
+    env, wrapper, marker, calls, _ = harness
+    target = Path(env["STAGING_DIR"])
+    attestation = target / "apps/api/src/openfoam-2606-attestation.ts"
+    attestation.write_bytes(
+        (ROOT / "apps/api/src/openfoam-2606-attestation.ts").read_bytes()
+    )
+    verifier = Path(env["EXPECTED_BOUND_DIR"]) / "scripts/deploy/deployment-source-manifest.py"
+    _seal(target, TARGET_REVISION, verifier=verifier)
+
+    completed = _run(env, wrapper)
+
+    assert completed.returncode == 14
+    assert "unreviewed bytes in apps/api/src/openfoam-2606-attestation.ts" in completed.stderr
+    assert not marker.exists()
+    assert not calls.exists()
+    assert Path(env["NODE_TAG_FILE"]).read_text() == NODE_IMAGE
+    assert Path(env["NODE_CONTAINER_IMAGE_FILE"]).read_text() == NODE_IMAGE
+    assert not Path(env["REPLAY_JOURNAL"]).exists()
+
+
 @pytest.mark.parametrize(
     ("flag", "message"),
     [
@@ -792,7 +831,8 @@ def test_production_timeout_and_workflow_contract_are_exact() -> None:
     assert "1f57f0e664682c22812de55de3be2ff58e205dd11a9eb6a1bd2c1a08545e0c92" in wrapper
     assert "008b8d8e92493b33eb7888b3dd6651696c512eddba377ee342b03dca6f51441f" in wrapper
     assert "pending_cutover_engine_rebuild_replay:" in workflow
-    assert "inputs.pending_cutover_engine_rebuild_replay && 360 || 45" in workflow
+    assert "inputs.pending_cutover_engine_rebuild_replay ||" in workflow
+    assert "&& 360 || 45" in workflow
     assert "ServerAliveInterval=30" in workflow
     assert "ServerAliveCountMax=20" in workflow
     assert "Select only one pending-cutover recovery action" in workflow

@@ -84,8 +84,18 @@ describe("remote-only evidence cleanup deployment wiring", () => {
     },
   );
 
+  it("passes the bounded authenticated canary-cleanup client context to node-api", () => {
+    const block = serviceBlock(production, "node-api");
+    expect(block).toContain(
+      "ENGINE_CONTROL_PLANE_TOKEN: ${AIRFOILFOAM_CONTROL_PLANE_TOKEN:-}",
+    );
+    expect(block).toContain(
+      "ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS: ${ENGINE_EVIDENCE_CLEANUP_TIMEOUT_MS:-960000}",
+    );
+  });
+
   it("does not expose the evidence-cleanup secret to unrelated services", () => {
-    for (const service of ["node-api", "web"]) {
+    for (const service of ["redis", "postgres", "storage-init", "web"]) {
       const block = serviceBlock(production, service);
       expect(block).not.toContain("CONTROL_PLANE_TOKEN");
     }
