@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "media-repair": "tsx src/media-repair-worker.ts",
     "evidence-storage-backfill": "tsx src/evidence-storage-backfill.ts",
+    "canary-evidence-cleanup": "tsx src/canary-evidence-cleanup-cli.ts",
     "successor:admit-once": "tsx src/successor-continuation-once-cli.ts",
     "urans-canary:admit-once": "tsx src/three-stage-urans-canary-once-cli.ts",
     "test": "vitest run",

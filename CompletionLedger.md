@@ -3,39 +3,61 @@
 - **Three-stage solver rollout and campaign burn-in:** The regression-backed
   RANS screening → fast preliminary URANS → final verified URANS controller,
   exact-generation continuation gate, automatic final scheduling, critical
-  incident model, and compact per-point rail are complete locally but are not
-  yet the production release. Preserve the immutable 2406 histories. Commit
-  and push the current tree, take a fresh strongly verified production backup,
-  apply migration 0076, deploy the control plane, and rebuild the 2606 engine
-  only through `scripts/deploy/rebuild-engine.sh` after its idle guard passes.
-  Then recover the exact 20-32C/Re≈102k/α20° continuation, obtain its accepted
-  fast and final generations, resume the active campaign at bounded capacity,
-  and monitor subsequent RANS handoffs plus fast/final results. Readiness
-  requires no recurring current-generation blocked/critical chain; any new
-  exhaustion remains a red system incident and must be investigated before
-  ordinary new admission continues.
+  incident model, and compact per-point rail are deployed with the guarded
+  OpenCFD 2606 engine. Scheduling remains durably disabled while the GCS
+  migration and remote-worker cutover are completed. Preserve immutable 2406
+  histories. Then recover the exact 20-32C/Re≈102k/α20° continuation, obtain
+  its accepted fast and final generations, resume the active campaign at
+  bounded capacity, and monitor subsequent RANS handoffs plus fast/final
+  results. Readiness requires no recurring current-generation blocked/critical
+  chain; any new exhaustion remains a red system incident and must be
+  investigated before ordinary new admission continues.
 
 - **GCS Zstandard evidence migration:** Remote-only Zstandard finalization and
   verified restore are live, but the legacy corpus migration and local
-  reclamation are incomplete. Keep the remaining 2,987 normal migration targets
-  unresolved and continue them one protected terminal job at a time. The one
-  AG26 a19 (manifest/DB AoA 14°) target has incomplete/corrupt terminal
-  packaging and remains a separate unresolved blob-only forensic quarantine.
-  Preserve its exact original gzip/raw bytes unchanged inside a lossless outer tar.zst,
-  together with retained/sibling-derived/missing conservation, until the new
-  quarantine has an exact database acknowledgement and a fresh pinned restore.
-  Delete local raw/archive duplicates only after their applicable proof and
-  report final object/evidence counts and reclaimed bytes. Add a distinct
-  attestation-backed cleanup for canary-only archives that have no canonical
-  database owner; never invent an acknowledgement or member, repair a partial
-  package into canonical evidence, or register canary/quarantine bytes as
-  campaign data.
+  reclamation are incomplete. The one AG26 a19 target (manifest/DB AoA 14°)
+  is now conserved in a generation-pinned forensic-quarantine object with an
+  exact database acknowledgement and fresh pinned restore; its local raw and
+  archive duplicates were removed only after that proof. Keep the remaining
+  2,777 normal migration targets unresolved and continue them one protected
+  terminal job at a time. The migration-0079 attestation-backed cleanup path
+  for the 11 canary-only archives is implemented and locally verified; deploy
+  it, freshly confirm all 11 still have zero canonical/quarantine ownership,
+  execute the operator-only generation-matched deletes, and persist all 11
+  immutable receipts. Then reconcile database ownership, GCS generations,
+  local legacy files, and reclaimed bytes. Never invent an acknowledgement or
+  member, repair a partial package into canonical evidence, or register
+  canary/quarantine bytes as campaign data.
 
 - **Production evidence capacity:** The 500 GiB VPS currently has about
-  113 GiB free (77% used). Preserve at least 80 GiB free while the campaign is
+  128.0 GiB free (74% used). Preserve at least 80 GiB free while the campaign is
   active, continue bounded hydration-cache cleanup and verified legacy
   migration, and remeasure active-case growth before increasing solver
   concurrency.
+
+- **Parallel remote-solver GCS delivery:** The existing cross-instance result
+  push still transports large evidence through the control plane and its
+  former shared-secret read model exposed credentials. Keep remote admission
+  disabled until the redaction fix and the brokered, generation-pinned GCS
+  upload contract are committed, deployed, and proven with one exact promise
+  canary. The hub must issue only bounded resumable upload capabilities,
+  independently verify the uploaded Zstandard bundle and manifest, bind the
+  exact remote attempt idempotently, and revoke/expire stale credentials and
+  uploads. Then upgrade the 96-vCPU remote worker, enable bounded capacity,
+  and confirm real evidence reaches the hub without copying a Google service
+  account key to that host.
+
+- **Multi-solver evidence comparison and custom polars:** Preserve every
+  OpenCFD 2406/2606 and future solver attempt under its immutable implementation
+  and runtime identity. Add a physical operating-cell comparison identity that
+  does not collapse solver/numerical settings; expose exact solver/version
+  series and per-AoA candidates on public Detail and in the admin cell panel;
+  and implement immutable custom-polar revisions that select at most one exact,
+  machine-eligible attempt per angle while retaining explicit exclusions and
+  full provenance. Public visitors need a non-mutating personal composition;
+  admins need durable named/published compositions. Native solver series must
+  remain distinct, and a custom mixed polar must never masquerade as native
+  campaign coverage or override machine rejection.
 
 - **A18 low-angle alternate-branch correction:** Deploy and verify the
   classifier/cache/request/public-chart correction together with the guarded

@@ -79,6 +79,19 @@ bytes. Quarantine is intentionally immutable-only: any future recovery must
 reference an independently ingested exact result/attempt rather than mutating
 preserved evidence into a result.
 
+Canary-only objects use a third, explicitly non-evidence lifecycle rather than
+canonical registration or orphan quarantine. Migration 0079 permits a cleanup
+reservation only when an exact bucket/key/generation/hash/size/CRC identity is
+present in the durable OpenCFD 2606 attestation and absent from every database
+ownership path. Reservation and reciprocal future-owner guards share an
+advisory identity lock, closing the ownership race and permanently preventing
+later adoption of a reserved generation. A separate operator identity performs
+only generation-matched deletes, proves the exact live generation absent with
+a fresh provider lookup, and returns an immutable receipt for database
+acknowledgement. Dry-run remains the default; the application identity retains
+no delete permission, prefix-wide deletion is outside the interface, and the
+bucket soft-delete window remains the recovery boundary.
+
 OpenCFD 2606 certification binds the canary receipt to the live gateway's exact
 bucket, object prefix, Zstandard level, and top-level remote-only storage
 policy. Fresh canary artifact bindings remain truthfully

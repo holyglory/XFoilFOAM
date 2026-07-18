@@ -455,6 +455,128 @@ but all 11 have no `sim_jobs` owner and are canary-only Zstandard artifacts.
 They are ineligible for quarantine and remain under the separate
 attestation-backed canary cleanup in the completion ledger.
 
+### Attestation-backed cleanup of canary-only GCS generations
+
+Migration `0079_canary_object_cleanup.sql` provides the only deletion path for
+these canary objects. It treats them as non-evidence: they must be exact
+`engine_bundle` generations named in the durable OpenCFD 2606 canary
+attestation and absent from every canonical blob/archive, pending artifact,
+orphan-quarantine, and incomplete-quarantine ownership path. Reservation takes
+the same transaction-scoped advisory identity lock as future blob/artifact
+adoption, then permanently fences that exact bucket/key/generation from later
+ownership. It never infers targets from an object prefix.
+
+The application VM identity remains create/read-only. Perform the GCS phase
+from a separate operator workstation whose ADC identity has only the approved
+bucket-level `storage.objects.get` and `storage.objects.delete` permissions.
+The database planner and GCS operator are both dry-run by default. Before
+reserving anything, deploy migration 0079 through the normal strongly verified
+backup/deployment procedure and obtain the attestation id from the protected
+state file:
+
+```bash
+umask 077
+ATTESTATION_ID="$(
+  sed -n 's/^OPENCFD2606_CANARY_ATTESTATION_ID=//p' "$ENV_FILE"
+)"
+test -n "$ATTESTATION_ID"
+
+CANARY_PLAN="$AUDIT_DIR/canary-object-cleanup-plan.jsonl"
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/canary-evidence-cleanup-cli.ts \
+  --attestation-id "$ATTESTATION_ID" >"$CANARY_PLAN"
+chmod 600 "$CANARY_PLAN"
+
+python3 - "$CANARY_PLAN" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert len(rows) == 11, rows
+for row in rows:
+    assert row["status"] == "eligible", row
+    assert row["reservationId"] is None and row["receiptId"] is None, row
+    assert set(row["ownership"].values()) == {0}, row
+print("11 attested canary generations are zero-owner and eligible")
+PY
+```
+
+Any other count or state is a stop condition. When the operator workstation is
+ready, reserve the complete set atomically and keep the exported documents
+protected; each document embeds the canonical attestation receipt and its
+digest so the delete tool does not trust an editable target list:
+
+```bash
+CANARY_RESERVATIONS="$AUDIT_DIR/canary-object-cleanup-reservations.jsonl"
+RESERVATION_ACTOR="${USER}@$(hostname -f)"
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/canary-evidence-cleanup-cli.ts \
+  --attestation-id "$ATTESTATION_ID" --reserve \
+  --actor "$RESERVATION_ACTOR" >"$CANARY_RESERVATIONS"
+chmod 600 "$CANARY_RESERVATIONS"
+test "$(wc -l <"$CANARY_RESERVATIONS")" -eq 11
+```
+
+Securely copy that one file to a verified checkout on the operator workstation.
+Authenticate ADC as the approved operator identity; do not export or copy a
+service-account key. First run the read-only generation-pinned metadata proof,
+then explicitly execute the deletes into a new mode-0700 receipt directory:
+
+```bash
+umask 077
+export CANARY_RESERVATIONS=/secure/audit/canary-object-cleanup-reservations.jsonl
+export CANARY_RECEIPT_DIR=/secure/audit/canary-object-cleanup-receipts
+install -d -m 0700 "$CANARY_RECEIPT_DIR"
+
+uv run python -m airfoilfoam.canary_evidence_cleanup \
+  --reservation-file "$CANARY_RESERVATIONS" \
+  --receipt-dir "$CANARY_RECEIPT_DIR" --operator "$USER"
+
+uv run python -m airfoilfoam.canary_evidence_cleanup \
+  --reservation-file "$CANARY_RESERVATIONS" \
+  --receipt-dir "$CANARY_RECEIPT_DIR" --operator "$USER" --execute \
+  | tee /secure/audit/canary-object-cleanup-receipts.jsonl
+```
+
+Each delete uses the attested generation as an `if_generation_match`
+precondition. After GCS returns success, the tool performs a fresh lookup of
+that exact generation and refuses to write a `deleted` receipt unless the live
+generation is absent. Existing immutable receipt files make a rerun
+idempotent. The bucket's soft-delete policy remains the recovery boundary; do
+not purge soft-deleted versions.
+
+Copy the receipt JSONL back to the protected VPS audit directory, then
+acknowledge it through the guarded database path by streaming it on standard
+input (the audit directory is intentionally not mounted in the container):
+
+```bash
+CANARY_RECEIPTS="$AUDIT_DIR/canary-object-cleanup-receipts.jsonl"
+test "$(wc -l <"$CANARY_RECEIPTS")" -eq 11
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/canary-evidence-cleanup-cli.ts \
+  --acknowledgement-file /dev/stdin <"$CANARY_RECEIPTS" \
+  | tee "$AUDIT_DIR/canary-object-cleanup-database-ack.jsonl"
+
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/canary-evidence-cleanup-cli.ts \
+  --attestation-id "$ATTESTATION_ID" \
+  | tee "$AUDIT_DIR/canary-object-cleanup-final-plan.jsonl"
+```
+
+Require 11 immutable database receipts and 11 `complete` final-plan rows. Run
+the operator dry-run once more; dry-run always performs a fresh pinned provider
+lookup even when an immutable execute receipt exists:
+
+```bash
+uv run python -m airfoilfoam.canary_evidence_cleanup \
+  --reservation-file "$CANARY_RESERVATIONS" \
+  --receipt-dir "$CANARY_RECEIPT_DIR" --operator "$USER" \
+  | tee /secure/audit/canary-object-cleanup-final-gcs-check.jsonl
+```
+
+Require all 11 exact generations to report `already_absent`. Reconcile
+canonical evidence ownership counts before and after; they must be unchanged.
+No command in this procedure lists or deletes a prefix, and no canary byte may
+be registered as campaign evidence.
+
 ### A. One result-owned legacy gzip trial
 
 Create a full dry plan, then shortlist only jobs represented by exactly one

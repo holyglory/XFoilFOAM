@@ -2215,6 +2215,108 @@ export const solverEvidenceIncompleteQuarantines = pgTable(
   }),
 );
 
+/**
+ * Permanent, immutable fence for one exact GCS generation that is proven by
+ * an OpenCFD 2606 canary attestation and has no solver-evidence owner.  It is
+ * deliberately not a solverEvidenceBlob: canary bytes are operational proof,
+ * not campaign/result evidence.
+ */
+export const solverCanaryObjectCleanupReservations = pgTable(
+  "solver_canary_object_cleanup_reservations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    canaryAttestationId: uuid("canary_attestation_id")
+      .notNull()
+      .references(() => solverEngineCanaryAttestations.id),
+    bucket: text("bucket").notNull(),
+    objectKey: text("object_key").notNull(),
+    /** GCS uint64 generation, stored as decimal text to avoid JS rounding. */
+    generation: text("generation").notNull(),
+    sha256: text("sha256").notNull(),
+    byteSize: bigint("byte_size", { mode: "number" }).notNull(),
+    crc32c: text("crc32c").notNull(),
+    reservedBy: text("reserved_by").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    targetUq: unique("solver_canary_cleanup_target_uq").on(
+      t.bucket,
+      t.objectKey,
+      t.generation,
+    ),
+    attestationIdx: index("solver_canary_cleanup_attestation_idx").on(
+      t.canaryAttestationId,
+      t.createdAt,
+    ),
+    bucketCheck: check(
+      "solver_canary_cleanup_bucket_check",
+      sql`btrim(${t.bucket}) <> ''`,
+    ),
+    objectKeyCheck: check(
+      "solver_canary_cleanup_object_key_check",
+      sql`btrim(${t.objectKey}) <> '' AND ${t.objectKey} NOT LIKE '/%' AND ${t.objectKey} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.objectKey}) = 0`,
+    ),
+    generationCheck: check(
+      "solver_canary_cleanup_generation_check",
+      sql`${t.generation} ~ '^[1-9][0-9]{0,19}$'`,
+    ),
+    sha256Check: check(
+      "solver_canary_cleanup_sha256_check",
+      sql`${t.sha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    byteSizeCheck: check(
+      "solver_canary_cleanup_byte_size_check",
+      sql`${t.byteSize} > 0`,
+    ),
+    crc32cCheck: check(
+      "solver_canary_cleanup_crc32c_check",
+      sql`${t.crc32c} ~ '^[A-Za-z0-9+/]{6}==$'`,
+    ),
+    actorCheck: check(
+      "solver_canary_cleanup_actor_check",
+      sql`btrim(${t.reservedBy}) <> ''`,
+    ),
+  }),
+);
+
+/** Append-only acknowledgement of an exact generation-matched GCS delete. */
+export const solverCanaryObjectCleanupReceipts = pgTable(
+  "solver_canary_object_cleanup_receipts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    cleanupReservationId: uuid("cleanup_reservation_id")
+      .notNull()
+      .unique()
+      .references(() => solverCanaryObjectCleanupReservations.id),
+    outcome: text("outcome")
+      .$type<"deleted" | "already_absent_after_reservation">()
+      .notNull(),
+    receiptSha256: text("receipt_sha256").notNull().unique(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    executedBy: text("executed_by").notNull(),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }).notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    outcomeCheck: check(
+      "solver_canary_cleanup_receipt_outcome_check",
+      sql`${t.outcome} IN ('deleted', 'already_absent_after_reservation')`,
+    ),
+    sha256Check: check(
+      "solver_canary_cleanup_receipt_sha256_check",
+      sql`${t.receiptSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    jsonCheck: check(
+      "solver_canary_cleanup_receipt_json_check",
+      sql`jsonb_typeof(${t.receipt}) = 'object'`,
+    ),
+    actorCheck: check(
+      "solver_canary_cleanup_receipt_actor_check",
+      sql`btrim(${t.executedBy}) <> ''`,
+    ),
+  }),
+);
+
 export const fieldRenderCache = pgTable(
   "field_render_cache",
   {
