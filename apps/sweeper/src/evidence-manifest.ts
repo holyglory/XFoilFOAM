@@ -16,6 +16,10 @@ export interface EvidenceManifestEntry {
   path: string;
   sha256: string;
   byteSize: number;
+  /** Exact semantic role written by the engine. Historical manifests may
+   * omit it, so callers that need to reconstruct a missing logical artifact
+   * must require it explicitly rather than infer provenance from a path. */
+  role?: string;
 }
 
 export interface ParsedEvidenceManifest {
@@ -48,6 +52,14 @@ function object(value: unknown, label: string): Record<string, unknown> {
     throw new Error(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function optionalRole(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(value)) {
+    throw new Error(`${label} must be a lower-snake-case evidence role`);
+  }
+  return value;
 }
 
 export function parseEvidenceManifest(
@@ -106,10 +118,15 @@ export function parseEvidenceManifest(
         `evidence manifest file ${index} byteSize must be a non-negative safe integer`,
       );
     }
+    const role = optionalRole(
+      entry.role,
+      `evidence manifest file ${index} role`,
+    );
     entries.set(path, {
       path,
       sha256: entry.sha256,
       byteSize: entry.byteSize,
+      ...(role ? { role } : {}),
     });
   }
   const ordered = [...entries.values()].sort((a, b) =>

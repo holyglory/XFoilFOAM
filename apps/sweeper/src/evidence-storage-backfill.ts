@@ -1,4 +1,6 @@
 import {
+  acquireEvidenceArtifactKeyLock,
+  acquireResultEvidenceLocks,
   type DB,
   resultAttempts,
   results,
@@ -15,7 +17,7 @@ import type {
   PolarPoint,
 } from "@aerodb/engine-client";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import type { Dirent } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import {
   mkdir,
   open,
@@ -25,9 +27,18 @@ import {
   stat,
   unlink,
 } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import { makeContext } from "./config";
 import {
@@ -428,9 +439,615 @@ function memberPathOf(
   return memberParts.join("/");
 }
 
+function ownsReceiptEvidenceBase(
+  row: typeof solverEvidenceArtifacts.$inferSelect,
+  receipt: MigrationReceipt,
+): boolean {
+  if (row.metadata?.evidenceBase == null) return false;
+  return evidenceBaseOf(row, receipt) === row.metadata.evidenceBase;
+}
+
 interface ManifestValidation {
   expected: Array<typeof solverEvidenceArtifacts.$inferSelect>;
   memberPaths: Map<string, string>;
+}
+
+type EvidenceArtifactKind =
+  (typeof solverEvidenceArtifacts.$inferInsert)["kind"];
+
+interface ManifestArtifactIdentity {
+  kind: EvidenceArtifactKind;
+  originalKind: string;
+}
+
+function manifestArtifactIdentity(role: string): ManifestArtifactIdentity {
+  if (role === "mesh_evidence") {
+    return { kind: "mesh", originalKind: "mesh_evidence" };
+  }
+  if (role === "continuation_state") {
+    return { kind: "dictionary", originalKind: "dictionary" };
+  }
+  if (role === "frame_image") {
+    throw new Error(
+      "bundled frame_image cannot be reconciled as an archive member; frames must remain separately stored evidence",
+    );
+  }
+  if (
+    role === "vtk_window" ||
+    role === "time_directory" ||
+    role === "log" ||
+    role === "force_coefficients" ||
+    role === "mesh" ||
+    role === "dictionary" ||
+    role === "field_data"
+  ) {
+    return { kind: role, originalKind: role };
+  }
+  // Match the engine's immutable manifest contract: semantic roles such as
+  // y_plus and quality_evidence are persisted under the existing field_data
+  // enum while their exact role remains on the artifact row.
+  return { kind: "field_data", originalKind: "field_data" };
+}
+
+function mimeTypeForManifestMember(path: string): string {
+  const suffix = extname(path).toLowerCase();
+  if (suffix === ".json") return "application/json";
+  if (suffix === ".gz") return "application/gzip";
+  if (suffix === ".zst") return "application/zstd";
+  if (suffix === ".vtu" || suffix === ".vtk" || suffix === ".vtp") {
+    return "application/vnd.vtk";
+  }
+  if (suffix === ".dat" || suffix === ".log" || suffix === ".txt") {
+    return "text/plain";
+  }
+  if (suffix === ".png") return "image/png";
+  return "application/octet-stream";
+}
+
+async function verifyLocalManifestMember(
+  evidenceRoot: string,
+  entry: { path: string; sha256: string; byteSize: number },
+): Promise<void> {
+  const parts = safeRelative(entry.path, "bundled manifest member path").split(
+    "/",
+  );
+  const handles: Awaited<ReturnType<typeof open>>[] = [];
+  try {
+    const root = await open(
+      evidenceRoot,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    ).catch((error: unknown) => {
+      throw new Error(
+        `bundled manifest member ${entry.path} has no safe local evidence root: ${String(error)}`,
+      );
+    });
+    handles.push(root);
+    let parent = root;
+    for (const [index, part] of parts.entries()) {
+      const final = index === parts.length - 1;
+      // Linux has no Node openat(2) binding. A live /proc/self/fd descriptor
+      // is the same race-free directory anchor: every ancestor handle remains
+      // open, and O_NOFOLLOW applies to each next path segment independently.
+      const descriptorPath = `/proc/self/fd/${parent.fd}/${part}`;
+      const flags =
+        constants.O_RDONLY |
+        constants.O_NOFOLLOW |
+        (final ? 0 : constants.O_DIRECTORY);
+      const child = await open(descriptorPath, flags).catch(
+        (error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            throw new Error(
+              `bundled manifest member ${entry.path} is missing locally`,
+            );
+          }
+          throw new Error(
+            `bundled manifest member ${entry.path} cannot be opened safely without symlink traversal: ${String(error)}`,
+          );
+        },
+      );
+      handles.push(child);
+      parent = child;
+    }
+    const handle = handles[handles.length - 1]!;
+    const before = await handle.stat();
+    if (!before.isFile()) {
+      throw new Error(
+        `bundled manifest member ${entry.path} local path is not a regular file`,
+      );
+    }
+    const digest = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    let byteSize = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      digest.update(chunk.subarray(0, bytesRead));
+      byteSize += bytesRead;
+    }
+    const after = await handle.stat();
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.ctimeMs !== after.ctimeMs
+    ) {
+      throw new Error(
+        `bundled manifest member ${entry.path} changed while it was authenticated`,
+      );
+    }
+    if (byteSize !== entry.byteSize || digest.digest("hex") !== entry.sha256) {
+      throw new Error(
+        `bundled manifest member ${entry.path} local bytes do not match its authenticated manifest identity`,
+      );
+    }
+  } finally {
+    for (const handle of handles.reverse()) {
+      await handle.close().catch(() => undefined);
+    }
+  }
+}
+
+function requireExactArtifactOwner(
+  artifact: typeof solverEvidenceArtifacts.$inferSelect,
+  source: typeof solverEvidenceArtifacts.$inferSelect,
+): void {
+  if (
+    artifact.resultId !== source.resultId ||
+    artifact.resultAttemptId !== source.resultAttemptId ||
+    artifact.airfoilId !== source.airfoilId ||
+    artifact.simJobId !== source.simJobId ||
+    artifact.engineJobId !== source.engineJobId ||
+    artifact.engineCaseSlug !== source.engineCaseSlug ||
+    artifact.methodKey !== source.methodKey ||
+    artifact.solverImplementationId !== source.solverImplementationId ||
+    artifact.solverRuntimeBuildId !== source.solverRuntimeBuildId ||
+    artifact.aoaDeg !== source.aoaDeg
+  ) {
+    throw new Error(
+      `database artifact ${artifact.id} does not share the bundle's exact immutable owner`,
+    );
+  }
+}
+
+async function requireSourceMatchesReferencedOwners(
+  db: DB,
+  source: typeof solverEvidenceArtifacts.$inferSelect,
+): Promise<void> {
+  if (!source.resultId || !source.resultAttemptId || !source.simJobId) {
+    throw new Error("source bundle lacks an exact result/attempt/job owner");
+  }
+  const owners = await db
+    .select({
+      resultId: results.id,
+      resultAirfoilId: results.airfoilId,
+      resultAoaDeg: results.aoaDeg,
+      resultSimJobId: results.simJobId,
+      resultEngineJobId: results.engineJobId,
+      resultEngineCaseSlug: results.engineCaseSlug,
+      resultMethodKey: results.methodKey,
+      resultSolverImplementationId: results.solverImplementationId,
+      resultSolverRuntimeBuildId: results.solverRuntimeBuildId,
+      attemptId: resultAttempts.id,
+      attemptResultId: resultAttempts.resultId,
+      attemptAirfoilId: resultAttempts.airfoilId,
+      attemptAoaDeg: resultAttempts.aoaDeg,
+      attemptSimJobId: resultAttempts.simJobId,
+      attemptEngineJobId: resultAttempts.engineJobId,
+      attemptEngineCaseSlug: resultAttempts.engineCaseSlug,
+      attemptMethodKey: resultAttempts.methodKey,
+      attemptSolverImplementationId: resultAttempts.solverImplementationId,
+      attemptSolverRuntimeBuildId: resultAttempts.solverRuntimeBuildId,
+      simJobId: simJobs.id,
+      simJobAirfoilId: simJobs.airfoilId,
+      simJobEngineJobId: simJobs.engineJobId,
+      simJobMethodKey: simJobs.methodKey,
+      simJobSolverImplementationId: simJobs.solverImplementationId,
+      simJobSolverRuntimeBuildId: simJobs.solverRuntimeBuildId,
+    })
+    .from(resultAttempts)
+    .innerJoin(results, eq(results.id, resultAttempts.resultId))
+    .innerJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
+    .where(
+      and(
+        eq(resultAttempts.id, source.resultAttemptId),
+        eq(results.id, source.resultId),
+        eq(simJobs.id, source.simJobId),
+      ),
+    )
+    .for("update")
+    .limit(2);
+  if (owners.length !== 1) {
+    throw new Error(
+      `source bundle must join one exact result/attempt/job owner; found ${owners.length}`,
+    );
+  }
+  const owner = owners[0]!;
+  if (
+    owner.resultId !== source.resultId ||
+    owner.attemptId !== source.resultAttemptId ||
+    owner.attemptResultId !== source.resultId ||
+    owner.simJobId !== source.simJobId ||
+    owner.resultAirfoilId !== source.airfoilId ||
+    owner.attemptAirfoilId !== source.airfoilId ||
+    owner.simJobAirfoilId !== source.airfoilId ||
+    owner.resultAoaDeg !== source.aoaDeg ||
+    owner.attemptAoaDeg !== source.aoaDeg ||
+    owner.resultSimJobId !== source.simJobId ||
+    owner.attemptSimJobId !== source.simJobId ||
+    owner.resultEngineJobId !== source.engineJobId ||
+    owner.attemptEngineJobId !== source.engineJobId ||
+    owner.simJobEngineJobId !== source.engineJobId ||
+    owner.resultEngineCaseSlug !== source.engineCaseSlug ||
+    owner.attemptEngineCaseSlug !== source.engineCaseSlug ||
+    owner.resultMethodKey !== source.methodKey ||
+    owner.attemptMethodKey !== source.methodKey ||
+    owner.simJobMethodKey !== source.methodKey ||
+    owner.resultSolverImplementationId !== source.solverImplementationId ||
+    owner.attemptSolverImplementationId !== source.solverImplementationId ||
+    owner.simJobSolverImplementationId !== source.solverImplementationId ||
+    owner.resultSolverRuntimeBuildId !== source.solverRuntimeBuildId ||
+    owner.attemptSolverRuntimeBuildId !== source.solverRuntimeBuildId ||
+    owner.simJobSolverRuntimeBuildId !== source.solverRuntimeBuildId
+  ) {
+    throw new Error(
+      "source bundle provenance does not exactly match its referenced result/attempt/job owners",
+    );
+  }
+}
+
+function requireManifestArtifactSemantics(
+  artifact: typeof solverEvidenceArtifacts.$inferSelect,
+  entry: { path: string; sha256: string; byteSize: number; role?: string },
+  source: typeof solverEvidenceArtifacts.$inferSelect,
+): void {
+  requireExactArtifactOwner(artifact, source);
+  if (entry.path === "evidence_manifest.json") {
+    if (artifact.kind !== "manifest") {
+      throw new Error(
+        `database artifact ${artifact.id} is not the exact evidence manifest`,
+      );
+    }
+    if (
+      artifact.sha256 !== entry.sha256 ||
+      artifact.byteSize !== entry.byteSize
+    ) {
+      throw new Error(
+        "database manifest artifact checksum or byte size does not match retained evidence_manifest.json",
+      );
+    }
+    return;
+  }
+  if (
+    artifact.sha256 !== entry.sha256 ||
+    artifact.byteSize !== entry.byteSize
+  ) {
+    throw new Error(
+      `database artifact ${artifact.id} does not match manifest member ${entry.path}`,
+    );
+  }
+  if (!entry.role) {
+    // Older manifests did not record semantic roles. Existing immutable rows
+    // remain valid by path/hash/size, but a missing row from such a manifest
+    // is never reconstructed because its original kind cannot be proven.
+    return;
+  }
+  const identity = manifestArtifactIdentity(entry.role);
+  if (artifact.kind !== identity.kind || artifact.role !== entry.role) {
+    throw new Error(
+      `database artifact ${artifact.id} does not preserve manifest role/kind for ${entry.path}`,
+    );
+  }
+  if (
+    identity.originalKind !== identity.kind &&
+    artifact.metadata?.engineArtifactKind !== identity.originalKind
+  ) {
+    throw new Error(
+      `database artifact ${artifact.id} does not preserve original engine kind ${identity.originalKind}`,
+    );
+  }
+}
+
+function engineOriginForSource(
+  source: typeof solverEvidenceArtifacts.$inferSelect,
+  fallback: string,
+): string {
+  return (
+    source.engineUrl?.match(/^(.*)\/jobs\/[^/]+\/files\//)?.[1] ?? fallback
+  ).replace(/\/$/, "");
+}
+
+function reconciledManifestAssociation(opts: {
+  receipt: MigrationReceipt;
+  source: typeof solverEvidenceArtifacts.$inferSelect;
+  entry: { path: string; sha256: string; byteSize: number; role?: string };
+  engineBaseUrl: string;
+}) {
+  const { receipt, source, entry } = opts;
+  if (!entry.role) {
+    throw new Error(
+      `unregistered bundled manifest member ${entry.path} has no exact engine role`,
+    );
+  }
+  const evidenceBase = evidenceBaseOf(source, receipt);
+  const identity = manifestArtifactIdentity(entry.role);
+  const sourceMetadata = source.metadata ?? {};
+  const metadata: Record<string, unknown> = {
+    evidenceBase,
+    manifestPath: `${evidenceBase}/evidence_manifest.json`,
+    engineNamespace: sourceMetadata.engineNamespace ?? null,
+    methodKey: sourceMetadata.methodKey ?? source.methodKey ?? null,
+    windowStart: sourceMetadata.windowStart ?? null,
+    windowEnd: sourceMetadata.windowEnd ?? null,
+  };
+  if (identity.originalKind !== identity.kind) {
+    metadata.engineArtifactKind = identity.originalKind;
+  }
+  const memberUrl = `/jobs/${receipt.jobId}/files/${receipt.evidencePath}/${entry.path}`;
+  return {
+    resultId: source.resultId,
+    resultAttemptId: source.resultAttemptId,
+    airfoilId: source.airfoilId,
+    simJobId: source.simJobId,
+    engineJobId: source.engineJobId,
+    engineCaseSlug: source.engineCaseSlug,
+    methodKey: source.methodKey,
+    solverImplementationId: source.solverImplementationId,
+    solverRuntimeBuildId: source.solverRuntimeBuildId,
+    aoaDeg: source.aoaDeg,
+    kind: identity.kind,
+    field: null,
+    role: entry.role,
+    storageKey: `jobs/${receipt.jobId}/${receipt.evidencePath}/${entry.path}`,
+    mimeType: mimeTypeForManifestMember(entry.path),
+    sha256: entry.sha256,
+    byteSize: entry.byteSize,
+    engineUrl: `${engineOriginForSource(source, opts.engineBaseUrl)}${memberUrl}`,
+    metadata,
+  };
+}
+
+function requireAssociationReplay(
+  artifact: typeof solverEvidenceArtifacts.$inferSelect,
+  association: ReturnType<typeof reconciledManifestAssociation>,
+): void {
+  if (
+    artifact.resultId !== association.resultId ||
+    artifact.resultAttemptId !== association.resultAttemptId ||
+    artifact.airfoilId !== association.airfoilId ||
+    artifact.simJobId !== association.simJobId ||
+    artifact.engineJobId !== association.engineJobId ||
+    artifact.engineCaseSlug !== association.engineCaseSlug ||
+    artifact.methodKey !== association.methodKey ||
+    artifact.solverImplementationId !== association.solverImplementationId ||
+    artifact.solverRuntimeBuildId !== association.solverRuntimeBuildId ||
+    artifact.aoaDeg !== association.aoaDeg ||
+    artifact.kind !== association.kind ||
+    artifact.field !== association.field ||
+    artifact.role !== association.role ||
+    artifact.storageKey !== association.storageKey ||
+    artifact.mimeType !== association.mimeType ||
+    artifact.sha256 !== association.sha256 ||
+    artifact.byteSize !== association.byteSize ||
+    artifact.engineUrl !== association.engineUrl ||
+    !isDeepStrictEqual(artifact.metadata, association.metadata)
+  ) {
+    throw new Error(
+      `legacy manifest artifact replay changed immutable association for ${association.storageKey}`,
+    );
+  }
+}
+
+/**
+ * Historical 2406 payloads could omit the individual shared-mesh artifacts
+ * even though the authenticated manifest, local retained files, and archive
+ * all contained those bytes. Reconcile only such exact missing logical rows.
+ * Every missing member is authenticated before the first database write, and
+ * the transaction revalidates complete exact-owner coverage before commit.
+ */
+async function reconcileVerifiedLegacyManifestArtifacts<T>(opts: {
+  db: DB;
+  receipt: MigrationReceipt;
+  receiptPath: string;
+  source: typeof solverEvidenceArtifacts.$inferSelect;
+  engineBaseUrl: string;
+  finalize: (
+    tx: DB,
+    source: typeof solverEvidenceArtifacts.$inferSelect,
+    manifest: ManifestValidation,
+  ) => Promise<T>;
+}): Promise<T> {
+  const manifestBytes = await readFile(
+    join(dirname(opts.receiptPath), "evidence_manifest.json"),
+  );
+  const parsed = parseEvidenceManifest(manifestBytes);
+  const initialArtifacts = await opts.db
+    .select()
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultId, opts.source.resultId!),
+        eq(
+          solverEvidenceArtifacts.resultAttemptId,
+          opts.source.resultAttemptId!,
+        ),
+      ),
+    );
+  const initialByMember = new Map<
+    string,
+    Array<typeof solverEvidenceArtifacts.$inferSelect>
+  >();
+  for (const artifact of initialArtifacts) {
+    if (
+      artifact.kind === "engine_bundle" ||
+      artifact.kind === "openfoam_bundle"
+    ) {
+      continue;
+    }
+    if (!ownsReceiptEvidenceBase(artifact, opts.receipt)) continue;
+    const memberPath = memberPathOf(artifact, opts.receipt);
+    const rows = initialByMember.get(memberPath) ?? [];
+    rows.push(artifact);
+    initialByMember.set(memberPath, rows);
+  }
+
+  const missing = parsed.memberSet.filter((entry) => {
+    const matches = initialByMember.get(entry.path) ?? [];
+    if (matches.length > 1) {
+      throw new Error(
+        `database has ambiguous artifacts for bundled manifest member ${entry.path}`,
+      );
+    }
+    if (matches.length === 1) {
+      requireManifestArtifactSemantics(matches[0]!, entry, opts.source);
+      return false;
+    }
+    if (entry.path === "evidence_manifest.json") {
+      throw new Error(
+        "database has no exact manifest artifact to authorize reconciliation",
+      );
+    }
+    if (!entry.role) {
+      throw new Error(
+        `unregistered bundled manifest member ${entry.path} has no exact engine role`,
+      );
+    }
+    manifestArtifactIdentity(entry.role);
+    return true;
+  });
+  // Authenticate every missing local file before the first row is inserted.
+  // One absent, unsafe, changing, or mismatched member therefore leaves the
+  // database and acknowledgement state untouched.
+  for (const entry of missing) {
+    await verifyLocalManifestMember(dirname(opts.receiptPath), entry);
+  }
+
+  return opts.db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const artifactLocks = [
+      ...missing.map((entry) => ({
+        storageKey: `jobs/${opts.receipt.jobId}/${opts.receipt.evidencePath}/${entry.path}`,
+        sha256: entry.sha256,
+      })),
+      {
+        storageKey: sourceKeys(opts.receipt)[0]!,
+        sha256: opts.receipt.remote.storedSha256,
+      },
+    ].sort((left, right) =>
+      `${left.storageKey}\0${left.sha256}`.localeCompare(
+        `${right.storageKey}\0${right.sha256}`,
+      ),
+    );
+    for (const identity of artifactLocks) {
+      await acquireEvidenceArtifactKeyLock(
+        tx,
+        identity.storageKey,
+        identity.sha256,
+      );
+    }
+    await acquireResultEvidenceLocks(tx, [opts.source.resultId]);
+    const selectedSource = await findExactSource(tx, opts.receipt);
+    if (selectedSource.id !== opts.source.id) {
+      throw new Error(
+        "exact bundle source changed during manifest reconciliation",
+      );
+    }
+    const [source] = await tx
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.id, selectedSource.id))
+      .for("update")
+      .limit(1);
+    if (!source) {
+      throw new Error("exact bundle source disappeared during reconciliation");
+    }
+    await requireSourceMatchesReferencedOwners(tx, source);
+
+    for (const entry of missing) {
+      const currentArtifacts = await tx
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, source.resultId!),
+            eq(
+              solverEvidenceArtifacts.resultAttemptId,
+              source.resultAttemptId!,
+            ),
+          ),
+        );
+      const matches = currentArtifacts.filter((artifact) => {
+        if (
+          artifact.kind === "engine_bundle" ||
+          artifact.kind === "openfoam_bundle"
+        ) {
+          return false;
+        }
+        if (!ownsReceiptEvidenceBase(artifact, opts.receipt)) return false;
+        return memberPathOf(artifact, opts.receipt) === entry.path;
+      });
+      if (matches.length > 1) {
+        throw new Error(
+          `database has ambiguous artifacts for bundled manifest member ${entry.path}`,
+        );
+      }
+      if (matches.length === 1) {
+        requireManifestArtifactSemantics(matches[0]!, entry, source);
+        continue;
+      }
+
+      const association = reconciledManifestAssociation({
+        receipt: opts.receipt,
+        source,
+        entry,
+        engineBaseUrl: opts.engineBaseUrl,
+      });
+      const [inserted] = await tx
+        .insert(solverEvidenceArtifacts)
+        .values(association)
+        .onConflictDoNothing()
+        .returning();
+      if (inserted) {
+        requireAssociationReplay(inserted, association);
+        continue;
+      }
+      const racedArtifacts = await tx
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, source.resultId!),
+            eq(
+              solverEvidenceArtifacts.resultAttemptId,
+              source.resultAttemptId!,
+            ),
+          ),
+        );
+      const raced = racedArtifacts.filter(
+        (artifact) =>
+          ownsReceiptEvidenceBase(artifact, opts.receipt) &&
+          memberPathOf(artifact, opts.receipt) === entry.path,
+      );
+      if (raced.length !== 1) {
+        throw new Error(
+          `failed to reconcile one exact artifact for bundled manifest member ${entry.path}`,
+        );
+      }
+      requireAssociationReplay(raced[0]!, association);
+    }
+
+    // This is the transaction's commit gate. No partial reconciliation can be
+    // committed unless every bundled and excluded manifest association still
+    // has exact checksum, size, semantic, and owner coverage.
+    const manifest = await validateManifestArtifacts(
+      tx,
+      opts.receipt,
+      opts.receiptPath,
+      source.resultId!,
+      source.resultAttemptId!,
+    );
+    return opts.finalize(tx, source, manifest);
+  });
 }
 
 async function validateManifestArtifacts(
@@ -449,10 +1066,22 @@ async function validateManifestArtifacts(
         eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId),
       ),
     );
-  const owned = artifacts.filter((artifact) => {
-    if (artifact.metadata?.evidenceBase == null) return false;
-    return evidenceBaseOf(artifact, receipt) === artifact.metadata.evidenceBase;
-  });
+  const owned = artifacts.filter((artifact) =>
+    ownsReceiptEvidenceBase(artifact, receipt),
+  );
+  const bundleSources = owned.filter(
+    (artifact) =>
+      artifact.kind === "engine_bundle" || artifact.kind === "openfoam_bundle",
+  );
+  if (!bundleSources.length) {
+    throw new Error(
+      "database has no exact bundle source for manifest validation",
+    );
+  }
+  const ownerSource = bundleSources[0]!;
+  for (const bundleSource of bundleSources.slice(1)) {
+    requireExactArtifactOwner(bundleSource, ownerSource);
+  }
   const manifestPath = join(dirname(receiptPath), "evidence_manifest.json");
   const manifestBytes = await readFile(manifestPath);
   const manifestSha256 = createHash("sha256")
@@ -474,6 +1103,7 @@ async function validateManifestArtifacts(
       "database manifest artifact checksum or byte size does not match retained evidence_manifest.json",
     );
   }
+  requireExactArtifactOwner(manifestArtifact[0], ownerSource);
 
   const parsed = parseEvidenceManifest(manifestBytes);
   const artifactsByMember = new Map<
@@ -515,6 +1145,7 @@ async function validateManifestArtifacts(
         `database artifact ${artifact.id} does not match manifest member ${entry.path}`,
       );
     }
+    requireManifestArtifactSemantics(artifact, entry, ownerSource);
     expected.push(artifact);
     const memberPath = entry.path;
     memberPaths.set(artifact.id, memberPath);
@@ -527,6 +1158,7 @@ async function validateManifestArtifacts(
       );
     }
     const artifact = matches[0]!;
+    requireExactArtifactOwner(artifact, ownerSource);
     if (
       artifact.sha256 !== entry.sha256 ||
       artifact.byteSize !== entry.byteSize
@@ -1264,44 +1896,45 @@ export async function registerEvidenceMigrationReceipt(opts: {
     );
   }
   const source = await findExactSource(opts.db, receipt);
-  const manifest = await validateManifestArtifacts(
-    opts.db,
-    receipt,
-    opts.receiptPath,
-    source.resultId!,
-    source.resultAttemptId!,
-  );
-  const artifact = artifactForReceipt(receipt, source);
-  const engineOrigin = source.engineUrl?.match(
-    /^(.*)\/jobs\/[^/]+\/files\//,
-  )?.[1];
-  const registrationEngine = {
-    baseUrl: engineOrigin ?? opts.engine.baseUrl,
-  } as EngineClient;
-  await registerEvidenceArtifacts({
+  const ack = await reconcileVerifiedLegacyManifestArtifacts({
     db: opts.db,
-    engine: registrationEngine,
-    resultId: source.resultId!,
-    resultAttemptId: source.resultAttemptId!,
-    airfoilId: source.airfoilId,
-    simJobId: source.simJobId!,
-    engineJobId: receipt.jobId,
-    point: {
-      aoa_deg: source.aoaDeg!,
-      case_slug: source.engineCaseSlug!,
-      method_key: source.methodKey ?? undefined,
-    } as PolarPoint,
-    artifact,
-    runtime:
-      source.solverImplementationId && source.solverRuntimeBuildId
-        ? {
-            solverImplementationId: source.solverImplementationId,
-            solverRuntimeBuildId: source.solverRuntimeBuildId,
-          }
-        : undefined,
+    receipt,
+    receiptPath: opts.receiptPath,
+    source,
+    engineBaseUrl: opts.engine.baseUrl,
+    finalize: async (tx, lockedSource, manifest) => {
+      const artifact = artifactForReceipt(receipt, lockedSource);
+      const registrationEngine = {
+        baseUrl: engineOriginForSource(lockedSource, opts.engine.baseUrl),
+      } as EngineClient;
+      await registerEvidenceArtifacts({
+        db: tx,
+        engine: registrationEngine,
+        resultId: lockedSource.resultId!,
+        resultAttemptId: lockedSource.resultAttemptId!,
+        airfoilId: lockedSource.airfoilId,
+        simJobId: lockedSource.simJobId!,
+        engineJobId: receipt.jobId,
+        point: {
+          aoa_deg: lockedSource.aoaDeg!,
+          case_slug: lockedSource.engineCaseSlug!,
+          method_key: lockedSource.methodKey ?? undefined,
+        } as PolarPoint,
+        artifact,
+        runtime:
+          lockedSource.solverImplementationId &&
+          lockedSource.solverRuntimeBuildId
+            ? {
+                solverImplementationId: lockedSource.solverImplementationId,
+                solverRuntimeBuildId: lockedSource.solverRuntimeBuildId,
+              }
+            : undefined,
+      });
+      const current = await currentArchiveAck(tx, receipt, lockedSource);
+      await validateMemberCoverage(tx, current, manifest);
+      return current;
+    },
   });
-  const ack = await currentArchiveAck(opts.db, receipt, source);
-  await validateMemberCoverage(opts.db, ack, manifest);
   if (opts.writeAck !== false) await atomicWriteJson(ackPath, ack);
   return ack;
 }

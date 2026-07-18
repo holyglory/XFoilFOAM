@@ -33,6 +33,7 @@ import {
   syncBlobLockStripe,
   syncApiPermissions,
   syncApiSettings,
+  syncBrokeredEvidenceUploads,
   syncImportConflicts,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
@@ -45,6 +46,7 @@ import {
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   METHOD_COMPATIBILITY_HASH_VERSION,
 } from "@aerodb/db";
+import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
 import {
   ensureEnabledSimulationPresetRevisions,
@@ -67,7 +69,13 @@ import {
   sql,
 } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { createHash, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { link, mkdir, statfs, unlink } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
@@ -84,6 +92,12 @@ import {
 } from "./engine-provenance";
 import { env } from "./env";
 import { mediaStore } from "./media-store";
+import {
+  fetchBoundBrokeredEvidenceArchive,
+  requestBrokeredEvidenceUpload,
+  revokeSolverEvidenceUploads,
+  verifyBrokeredEvidenceUpload,
+} from "./remote-evidence-broker";
 import {
   SYNC_POLAR_MULTIPART_MAX_FIELDS,
   SYNC_POLAR_MULTIPART_MAX_FILES,
@@ -140,6 +154,11 @@ const syncSettingsPatchSchema = z.object({
     .max(3600)
     .optional(),
   permissions: z.array(permissionPatchSchema).optional(),
+});
+
+const remoteSolverCredentialInstallSchema = z.object({
+  registeredSolverId: z.string().uuid(),
+  authToken: z.string().min(32).max(512),
 });
 
 const claimBodySchema = z.object({
@@ -202,6 +221,34 @@ const solverHeartbeatSchema = solverRegisterSchema.partial().extend({
   solvedCount: z.coerce.number().int().min(0).optional(),
   pushedCount: z.coerce.number().int().min(0).optional(),
   recentError: z.string().nullable().optional(),
+});
+
+const brokeredEvidenceRequestSchema = z.object({
+  idempotencyKey: z.string().uuid(),
+  promiseId: z.string().uuid(),
+  remoteResultId: z.string().uuid(),
+  remoteResultAttemptId: z.string().uuid(),
+  aoaDeg: z.number().finite(),
+  engineJobId: z.string().trim().min(1).max(240),
+  engineCaseSlug: z.string().trim().min(1).max(240).nullable().default(null),
+  storedSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  storedByteSize: z.number().int().positive(),
+  tarSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  tarByteSize: z.number().int().positive(),
+  manifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  manifestByteSize: z.number().int().positive(),
+  zstdLevel: z.number().int().min(1).max(22),
+  bundledFileCount: z.number().int().positive(),
+});
+
+const brokeredEvidenceVerifySchema = z.object({
+  generation: z
+    .string()
+    .regex(/^[1-9][0-9]{0,19}$/)
+    .refine(
+      (value) => BigInt(value) <= 18_446_744_073_709_551_615n,
+      "generation exceeds GCS uint64",
+    ),
 });
 
 const solverProgressSchema = z.object({
@@ -363,6 +410,8 @@ const polarPointSchema = z.object({
   engine: syncEngineRuntimeSchema.nullable().optional(),
   engineJobId: z.string().nullable().optional(),
   engineCaseSlug: z.string().nullable().optional(),
+  remoteResultId: z.string().uuid().optional(),
+  remoteResultAttemptId: z.string().uuid().optional(),
   evidencePayload: z.record(z.unknown()).optional(),
   forceHistory: forceHistorySchema.optional(),
   fieldExtents: z.array(z.record(z.unknown())).default([]),
@@ -435,6 +484,7 @@ interface UploadedFileRef {
   byteSize: number;
   tempFullPath?: string;
   newlyCommitted?: boolean;
+  brokeredUploadId?: string;
 }
 
 class SyncMultipartUploadError extends Error {
@@ -461,6 +511,33 @@ function stableHash(value: unknown): string {
   return createHash("sha256")
     .update(JSON.stringify(stable(value)))
     .digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const source = value as Record<string, unknown>;
+  return `{${Object.keys(source)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`)
+    .join(",")}}`;
+}
+
+const HUB_BINDING_RECEIPT_HMAC_DOMAIN =
+  "xfoilfoam-hub-canonical-evidence-binding-v1\n";
+
+function signHubBindingReceipt(
+  receipt: HubBindingReceipt,
+  solverToken: string,
+): { receipt: HubBindingReceipt; receiptHmac: string } {
+  return {
+    receipt,
+    receiptHmac: createHmac("sha256", solverToken)
+      .update(HUB_BINDING_RECEIPT_HMAC_DOMAIN)
+      .update(canonicalJson(receipt))
+      .digest("hex"),
+  };
 }
 
 function iso(value: Date | string | null | undefined): string | null {
@@ -601,6 +678,140 @@ async function requireSync(
       reply.code(403).send({ error: `${direction} disabled for ${dataType}` });
       return null;
     }
+  }
+  return ctx;
+}
+
+function remoteSolverToken(req: FastifyRequest): string | null {
+  const value = req.headers["x-xfoilfoam-solver-token"];
+  return typeof value === "string" && value.length ? value : null;
+}
+
+function solverTokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+async function requireRegisteredRemoteSolver(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  solverId?: string,
+): Promise<typeof registeredRemoteSolvers.$inferSelect | null> {
+  const token = remoteSolverToken(req);
+  if (!token) {
+    reply.code(401).send({ error: "remote solver credential required" });
+    return null;
+  }
+  const digest = solverTokenHash(token);
+  const rows = await db
+    .select()
+    .from(registeredRemoteSolvers)
+    .where(
+      solverId
+        ? and(
+            eq(registeredRemoteSolvers.id, solverId),
+            eq(registeredRemoteSolvers.authTokenHash, digest),
+            isNull(registeredRemoteSolvers.revokedAt),
+          )
+        : and(
+            eq(registeredRemoteSolvers.authTokenHash, digest),
+            isNull(registeredRemoteSolvers.revokedAt),
+          ),
+    )
+    .limit(2);
+  const [solver] = rows;
+  if (rows.length !== 1 || !solver?.authTokenHash) {
+    reply
+      .code(401)
+      .send({ error: "invalid or revoked remote solver credential" });
+    return null;
+  }
+  const supplied = Buffer.from(digest, "hex");
+  const expected = Buffer.from(solver.authTokenHash, "hex");
+  if (
+    supplied.length !== expected.length ||
+    !timingSafeEqual(supplied, expected)
+  ) {
+    reply
+      .code(401)
+      .send({ error: "invalid or revoked remote solver credential" });
+    return null;
+  }
+  return solver;
+}
+
+function remoteSolverStatusPayload(
+  solver: typeof registeredRemoteSolvers.$inferSelect,
+) {
+  return {
+    id: solver.id,
+    instanceId: solver.instanceId,
+    instanceName: solver.instanceName,
+    publicEndpoint: solver.publicEndpoint,
+    localEndpoint: solver.localEndpoint,
+    cpuCapacity: solver.cpuCapacity,
+    cpuBudget: solver.cpuBudget,
+    buildVersion: solver.buildVersion,
+    credentialVersion: solver.credentialVersion,
+    credentialActive: Boolean(solver.authTokenHash && !solver.revokedAt),
+    revokedAt: iso(solver.revokedAt),
+    status: solver.status,
+    lastHeartbeatAt: iso(solver.lastHeartbeatAt),
+    activePromiseCount: solver.activePromiseCount,
+    activeAoaCount: solver.activeAoaCount,
+    solvedCount: solver.solvedCount,
+    pushedCount: solver.pushedCount,
+    recentError: solver.recentError,
+    metadata: solver.metadata,
+    updatedAt: iso(solver.updatedAt),
+  };
+}
+
+async function requirePromiseSyncAccess(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  promiseId: string,
+): Promise<Awaited<ReturnType<typeof getSettings>> | null> {
+  if (!remoteSolverToken(req)) {
+    const [promise] = await db
+      .select({ requestPayload: syncSweepPromises.requestPayload })
+      .from(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, promiseId))
+      .limit(1);
+    if (
+      promise &&
+      typeof (promise.requestPayload as Record<string, unknown> | null)
+        ?.solverId === "string"
+    ) {
+      reply.code(401).send({ error: "remote solver credential required" });
+      return null;
+    }
+    return requireSync(req, reply, "sweeps", "fetch");
+  }
+  const solver = await requireRegisteredRemoteSolver(req, reply);
+  if (!solver) return null;
+  const [promise] = await db
+    .select()
+    .from(syncSweepPromises)
+    .where(eq(syncSweepPromises.id, promiseId))
+    .limit(1);
+  if (
+    !promise ||
+    promise.sourceInstanceId !== solver.instanceId ||
+    String(
+      (promise.requestPayload as Record<string, unknown> | null)?.solverId ??
+        "",
+    ) !== solver.id
+  ) {
+    reply.code(403).send({ error: "remote solver does not own this promise" });
+    return null;
+  }
+  const ctx = await getSettings();
+  if (
+    !ctx.settings.enabled ||
+    !ctx.permissions.find((row) => row.dataType === "sweeps")?.canFetch
+  ) {
+    reply.code(403).send({ error: "fetch disabled for sweeps" });
+    return null;
   }
   return ctx;
 }
@@ -981,6 +1192,9 @@ async function syncAdminPayload(req: FastifyRequest) {
       cpuCapacity: row.cpuCapacity,
       cpuBudget: row.cpuBudget,
       buildVersion: row.buildVersion,
+      credentialVersion: row.credentialVersion,
+      credentialActive: Boolean(row.authTokenHash && !row.revokedAt),
+      revokedAt: iso(row.revokedAt),
       status: row.status,
       lastHeartbeatAt: iso(row.lastHeartbeatAt),
       activePromiseCount: row.activePromiseCount,
@@ -1273,6 +1487,30 @@ async function acquireSyncBlobLocks(
         } finally {
           connection.release();
         }
+      }
+    },
+  };
+}
+
+async function acquireSolverCredentialRotationLock(
+  solverId: string,
+): Promise<{ release: () => Promise<void> }> {
+  const connection = await advisoryLockSql.reserve();
+  try {
+    await connection.unsafe(
+      "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+      [`remote-solver-credential-rotation:${solverId}`],
+    );
+  } catch (error) {
+    connection.release();
+    throw error;
+  }
+  return {
+    release: async () => {
+      try {
+        await connection.unsafe("SELECT pg_advisory_unlock_all()");
+      } finally {
+        connection.release();
       }
     },
   };
@@ -1718,6 +1956,46 @@ async function resolveUploadedArtifact(
   files: Map<string, UploadedFileRef>,
   capacityReservation?: SyncUploadCapacityReservation | null,
 ): Promise<UploadedFileRef> {
+  const brokeredUploadId = nullableText(item.remoteEvidenceUploadId);
+  if (brokeredUploadId) {
+    if (nullableText(item.uploadField) || nullableText(item.contentBase64))
+      throw new PolarEvidenceBindingError(
+        "brokered GCS evidence must not also carry inline or multipart bytes",
+      );
+    const [upload] = await db
+      .select()
+      .from(syncBrokeredEvidenceUploads)
+      .where(eq(syncBrokeredEvidenceUploads.id, brokeredUploadId))
+      .limit(1);
+    const metadata = jsonObject(item.metadata);
+    if (
+      !upload ||
+      !["verified", "bound"].includes(upload.state) ||
+      nullableText(item.kind) !== "engine_bundle" ||
+      nullableText(item.mimeType) !== "application/zstd" ||
+      nullableText(item.sha256) !== upload.storedSha256 ||
+      exactDeclaredByteSize(item) !== upload.storedByteSize ||
+      metadata.storageBackend !== "gcs" ||
+      metadata.bucket !== upload.bucket ||
+      metadata.objectKey !== upload.objectKey ||
+      metadata.generation !== upload.generation ||
+      metadata.crc32c !== upload.crc32c ||
+      metadata.tarSha256 !== upload.tarSha256 ||
+      metadata.tarByteSize !== String(upload.tarByteSize) ||
+      metadata.manifestSha256 !== upload.manifestSha256 ||
+      metadata.manifestByteSize !== String(upload.manifestByteSize)
+    )
+      throw new PolarEvidenceBindingError(
+        "brokered GCS evidence identity does not match its verified upload",
+      );
+    return {
+      storageKey: upload.objectKey,
+      mimeType: "application/zstd",
+      sha256: upload.storedSha256,
+      byteSize: upload.storedByteSize,
+      brokeredUploadId: upload.id,
+    };
+  }
   const uploadField = nullableText(item.uploadField);
   const fromFile = uploadField ? files.get(uploadField) : null;
   const fromBase64 = nullableText(item.contentBase64);
@@ -3208,6 +3486,41 @@ async function promotePolarConflict(
   /* c8 ignore stop */
 }
 
+interface HubBindingReceipt {
+  schemaVersion: 1;
+  kind: "hub-canonical-evidence-binding";
+  promiseId: string;
+  aoaDeg: number;
+  remoteResultId: string;
+  remoteResultAttemptId: string;
+  engineJobId: string;
+  engineCaseSlug: string | null;
+  brokeredUploadId: string;
+  bindingState: "bound";
+  promisePointState: "fulfilled";
+  remote: {
+    bucket: string;
+    objectKey: string;
+    generation: string;
+    crc32c: string;
+    storedSha256: string;
+    storedByteSize: number;
+    tarSha256: string;
+    tarByteSize: number;
+    manifestSha256: string;
+    manifestByteSize: number;
+    zstdLevel: number;
+    bundledFileCount: number;
+  };
+  canonical: {
+    resultId: string;
+    resultAttemptId: string;
+    artifactId: string;
+  };
+  boundAt: string;
+  fulfilledAt: string;
+}
+
 async function importPolarPush(
   payload: PolarPushPayload,
   files: Map<string, UploadedFileRef>,
@@ -3223,6 +3536,7 @@ async function importPolarPush(
   promiseId: string | null;
   fulfilledAoas: number[];
   unfulfilledAoas: number[];
+  bindingReceipts: HubBindingReceipt[];
 }> {
   await expirePromises();
   const conflictIds: string[] = [];
@@ -3234,6 +3548,7 @@ async function importPolarPush(
   let importedFieldColorScales = 0;
   const fulfilledAoas: number[] = [];
   const unfulfilledAoas: number[] = [];
+  const bindingReceipts: HubBindingReceipt[] = [];
   let airfoilId: string | null = null;
   let revisionId: string | null = null;
   let bcId: string | null = payload.bcId ?? null;
@@ -3311,6 +3626,7 @@ async function importPolarPush(
       promiseId: payload.promiseId ?? null,
       fulfilledAoas,
       unfulfilledAoas,
+      bindingReceipts,
     };
   }
 
@@ -3356,6 +3672,7 @@ async function importPolarPush(
       promiseId: payload.promiseId ?? null,
       fulfilledAoas,
       unfulfilledAoas,
+      bindingReceipts,
     };
   }
   const rawSourceInstanceId =
@@ -3425,6 +3742,7 @@ async function importPolarPush(
     incomingResult: Partial<typeof results.$inferInsert>;
     regime: "rans" | "urans";
     fidelity: string | null;
+    brokeredUploadId: string | null;
   }> = [];
   for (const point of payload.results) {
     const runtime = await resolveEngineRuntimeBuild(db, point.engine);
@@ -3575,6 +3893,38 @@ async function importPolarPush(
       await tx.execute(
         sql`SELECT pg_advisory_xact_lock(hashtextextended(${`sync-polar-cell:${airfoilId}:${revisionId}:${point.aoaDeg}`}, 0))`,
       );
+      const brokeredArtifacts = preparedArtifacts.filter(
+        ({ stored }) => stored.brokeredUploadId,
+      );
+      if (brokeredArtifacts.length > 1) {
+        throw new PolarEvidenceBindingError(
+          `point ${point.aoaDeg} carries more than one brokered engine bundle`,
+        );
+      }
+      for (const { stored } of brokeredArtifacts) {
+        const [upload] = await tx
+          .select()
+          .from(syncBrokeredEvidenceUploads)
+          .where(eq(syncBrokeredEvidenceUploads.id, stored.brokeredUploadId!))
+          .for("update")
+          .limit(1);
+        if (
+          !upload ||
+          !payload.promiseId ||
+          upload.promiseId !== payload.promiseId ||
+          upload.sourceInstanceId !== sourceInstanceId ||
+          upload.remoteResultId !== point.remoteResultId ||
+          upload.remoteResultAttemptId !== point.remoteResultAttemptId ||
+          upload.aoaDeg !== point.aoaDeg ||
+          upload.engineJobId !== point.engineJobId ||
+          upload.engineCaseSlug !== (point.engineCaseSlug ?? null) ||
+          !["verified", "bound"].includes(upload.state)
+        ) {
+          throw new PolarEvidenceBindingError(
+            `point ${point.aoaDeg} does not own the exact verified brokered evidence generation`,
+          );
+        }
+      }
       // Global lock order: immutable blob identities -> natural cell ->
       // current result evidence -> canonical row FOR UPDATE. Blob bytes may
       // have many owner associations, so an existing association on another
@@ -3817,6 +4167,7 @@ async function importPolarPush(
           .values(association)
           .onConflictDoNothing()
           .returning({ id: solverEvidenceArtifacts.id });
+        let canonicalArtifactId = insertedAssociation?.id ?? null;
         if (!insertedAssociation) {
           const [replayed] = await tx
             .select()
@@ -3851,6 +4202,55 @@ async function importPolarPush(
           ) {
             throw new PolarEvidenceBindingError(
               `point ${point.aoaDeg} exact-attempt artifact association changed immutable metadata`,
+            );
+          }
+          canonicalArtifactId = replayed.id;
+        }
+        if (preparedArtifact.stored.brokeredUploadId) {
+          const [upload] = await tx
+            .select()
+            .from(syncBrokeredEvidenceUploads)
+            .where(
+              eq(
+                syncBrokeredEvidenceUploads.id,
+                preparedArtifact.stored.brokeredUploadId,
+              ),
+            )
+            .for("update")
+            .limit(1);
+          if (!upload || !canonicalArtifactId)
+            throw new PolarEvidenceBindingError(
+              "brokered evidence upload disappeared before canonical binding",
+            );
+          if (upload.state === "verified") {
+            const [bound] = await tx
+              .update(syncBrokeredEvidenceUploads)
+              .set({
+                state: "bound",
+                canonicalResultId: existing.id,
+                canonicalResultAttemptId: attempt.id,
+                canonicalArtifactId,
+                boundAt: new Date(),
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(syncBrokeredEvidenceUploads.id, upload.id),
+                  eq(syncBrokeredEvidenceUploads.state, "verified"),
+                ),
+              )
+              .returning({ id: syncBrokeredEvidenceUploads.id });
+            if (!bound)
+              throw new PolarEvidenceBindingError(
+                "brokered evidence generation lost its bind race",
+              );
+          } else if (
+            upload.canonicalResultId !== existing.id ||
+            upload.canonicalResultAttemptId !== attempt.id ||
+            upload.canonicalArtifactId !== canonicalArtifactId
+          ) {
+            throw new PolarEvidenceBindingError(
+              "brokered evidence generation is already bound to different canonical evidence",
             );
           }
         }
@@ -4029,6 +4429,9 @@ async function importPolarPush(
       incomingResult: resolution.incomingResult,
       regime: attemptRegime,
       fidelity: point.fidelity ?? null,
+      brokeredUploadId:
+        preparedArtifacts.find(({ stored }) => stored.brokeredUploadId)?.stored
+          .brokeredUploadId ?? null,
     });
   }
 
@@ -4165,7 +4568,7 @@ async function importPolarPush(
 
   if (payload.promiseId) {
     for (const committed of committedPoints) {
-      const pointSettled = await db.transaction(async (rawTx) => {
+      const pointSettlement = await db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as DB;
         const [classified] = (await tx.execute(sql`
           SELECT
@@ -4242,7 +4645,7 @@ async function importPolarPush(
           !classified.media_bound ||
           !classified.extents_bound
         ) {
-          return false;
+          return { settled: false, receipt: null };
         }
         // A marched remote RANS job can publish early siblings before a typed
         // low-angle hard failure promotes its exact polar to preliminary
@@ -4260,13 +4663,14 @@ async function importPolarPush(
                   AND prior_attempt.regime = 'rans'
               )`
             : sql`false`;
+        const fulfilledAt = new Date();
         const settled = await tx
           .update(syncSweepPromisePoints)
           .set({
             status: "fulfilled",
             resultId: committed.resultId,
             resultAttemptId: committed.attemptId,
-            updatedAt: new Date(),
+            updatedAt: fulfilledAt,
           })
           .where(
             and(
@@ -4291,10 +4695,72 @@ async function importPolarPush(
             ),
           )
           .returning({ id: syncSweepPromisePoints.id });
-        return settled.length > 0;
+        if (settled.length !== 1) return { settled: false, receipt: null };
+        if (!committed.brokeredUploadId)
+          return { settled: true, receipt: null };
+        const [upload] = await tx
+          .select()
+          .from(syncBrokeredEvidenceUploads)
+          .where(eq(syncBrokeredEvidenceUploads.id, committed.brokeredUploadId))
+          .for("update")
+          .limit(1);
+        if (
+          !upload ||
+          upload.state !== "bound" ||
+          upload.promiseId !== payload.promiseId ||
+          upload.aoaDeg !== committed.aoaDeg ||
+          upload.canonicalResultId !== committed.resultId ||
+          upload.canonicalResultAttemptId !== committed.attemptId ||
+          !upload.canonicalArtifactId ||
+          !upload.boundAt ||
+          !upload.generation ||
+          !upload.crc32c
+        ) {
+          throw new PolarEvidenceBindingError(
+            `point ${committed.aoaDeg} was fulfilled without one exact canonical broker binding`,
+          );
+        }
+        const receipt: HubBindingReceipt = {
+          schemaVersion: 1,
+          kind: "hub-canonical-evidence-binding",
+          promiseId: upload.promiseId,
+          aoaDeg: upload.aoaDeg,
+          remoteResultId: upload.remoteResultId,
+          remoteResultAttemptId: upload.remoteResultAttemptId,
+          engineJobId: upload.engineJobId,
+          engineCaseSlug: upload.engineCaseSlug,
+          brokeredUploadId: upload.id,
+          bindingState: "bound",
+          promisePointState: "fulfilled",
+          remote: {
+            bucket: upload.bucket,
+            objectKey: upload.objectKey,
+            generation: upload.generation,
+            crc32c: upload.crc32c,
+            storedSha256: upload.storedSha256,
+            storedByteSize: upload.storedByteSize,
+            tarSha256: upload.tarSha256,
+            tarByteSize: upload.tarByteSize,
+            manifestSha256: upload.manifestSha256,
+            manifestByteSize: upload.manifestByteSize,
+            zstdLevel: upload.zstdLevel,
+            bundledFileCount: upload.bundledFileCount,
+          },
+          canonical: {
+            resultId: committed.resultId,
+            resultAttemptId: committed.attemptId,
+            artifactId: upload.canonicalArtifactId,
+          },
+          boundAt: upload.boundAt.toISOString(),
+          fulfilledAt: fulfilledAt.toISOString(),
+        };
+        return { settled: true, receipt };
       });
-      if (pointSettled) fulfilledAoas.push(committed.aoaDeg);
-      else unfulfilledAoas.push(committed.aoaDeg);
+      if (pointSettlement.settled) {
+        fulfilledAoas.push(committed.aoaDeg);
+        if (pointSettlement.receipt)
+          bindingReceipts.push(pointSettlement.receipt);
+      } else unfulfilledAoas.push(committed.aoaDeg);
     }
     const committedAoas = new Set(
       committedPoints.map((committed) => committed.aoaDeg),
@@ -4315,6 +4781,7 @@ async function importPolarPush(
     promiseId: payload.promiseId ?? null,
     fulfilledAoas: [...new Set(fulfilledAoas)].sort((a, b) => a - b),
     unfulfilledAoas: [...new Set(unfulfilledAoas)].sort((a, b) => a - b),
+    bindingReceipts,
   };
 }
 
@@ -4325,7 +4792,7 @@ function exportRow(type: SyncDataType, data: unknown) {
 function upstreamBase(settings: typeof syncApiSettings.$inferSelect): string {
   if (!settings.upstreamBaseUrl)
     throw new Error("up-tier API endpoint is not configured");
-  return settings.upstreamBaseUrl.replace(/\/+$/, "");
+  return canonicalRemoteHubBaseUrl(settings.upstreamBaseUrl);
 }
 
 function remoteHeaders(
@@ -4342,8 +4809,19 @@ function resolveRemoteDownloadUrl(
 ): string {
   const value = nullableText(raw);
   if (!value) throw new Error("remote asset payload lacks download URL");
-  if (/^https?:\/\//i.test(value)) return value;
-  return `${upstreamBase(settings)}/${value.replace(/^\/+/, "")}`;
+  const base = new URL(upstreamBase(settings));
+  const target = /^[a-z][a-z0-9+.-]*:/i.test(value)
+    ? new URL(value)
+    : new URL(`${base.toString()}/${value.replace(/^\/+/, "")}`);
+  if (
+    target.origin !== base.origin ||
+    target.username ||
+    target.password ||
+    target.hash
+  ) {
+    throw new Error("remote asset download URL changed hub authority");
+  }
+  return target.toString();
 }
 
 function extFromMime(mime: string): string {
@@ -5224,9 +5702,109 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/api/sync/v1/solvers/register", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "sweeps", "fetch");
-    if (!ctx) return;
     const body = solverRegisterSchema.parse(req.body ?? {});
+    const [registered] = await db
+      .select()
+      .from(registeredRemoteSolvers)
+      .where(eq(registeredRemoteSolvers.instanceId, body.instanceId))
+      .limit(1);
+    if (registered) {
+      if (
+        registered.authTokenHash === null &&
+        registered.credentialVersion === 0 &&
+        registered.revokedAt === null
+      ) {
+        const ctx = await requireSync(req, reply, "sweeps", "fetch");
+        if (!ctx) return;
+        const authToken = randomBytes(32).toString("base64url");
+        const [bootstrapped] = await db
+          .update(registeredRemoteSolvers)
+          .set({
+            instanceName: body.instanceName,
+            publicEndpoint: body.publicEndpoint ?? null,
+            localEndpoint: body.localEndpoint ?? null,
+            cpuCapacity: body.cpuCapacity,
+            cpuBudget: body.cpuBudget,
+            buildVersion: body.buildVersion ?? null,
+            authTokenHash: solverTokenHash(authToken),
+            credentialVersion: 1,
+            status: "idle",
+            lastHeartbeatAt: new Date(),
+            recentError: null,
+            metadata: body.metadata ?? {},
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(registeredRemoteSolvers.id, registered.id),
+              isNull(registeredRemoteSolvers.authTokenHash),
+              eq(registeredRemoteSolvers.credentialVersion, 0),
+              isNull(registeredRemoteSolvers.revokedAt),
+            ),
+          )
+          .returning();
+        if (!bootstrapped) {
+          return reply.code(409).send({
+            error:
+              "legacy solver credential was provisioned concurrently; retry with that credential or rotate it as an administrator",
+          });
+        }
+        return {
+          credentialRotated: true,
+          authToken,
+          solver: {
+            id: bootstrapped.id,
+            instanceId: bootstrapped.instanceId,
+            instanceName: bootstrapped.instanceName,
+            cpuBudget: bootstrapped.cpuBudget,
+            status: bootstrapped.status,
+          },
+        };
+      }
+      const authenticated = await requireRegisteredRemoteSolver(
+        req,
+        reply,
+        registered.id,
+      );
+      if (!authenticated) return;
+      const ctx = await getSettings();
+      if (
+        !ctx.settings.enabled ||
+        !ctx.permissions.find((row) => row.dataType === "sweeps")?.canFetch
+      )
+        return reply.code(403).send({ error: "fetch disabled for sweeps" });
+      const [refreshed] = await db
+        .update(registeredRemoteSolvers)
+        .set({
+          instanceName: body.instanceName,
+          publicEndpoint: body.publicEndpoint ?? null,
+          localEndpoint: body.localEndpoint ?? null,
+          cpuCapacity: body.cpuCapacity,
+          cpuBudget: body.cpuBudget,
+          buildVersion: body.buildVersion ?? null,
+          status: "idle",
+          lastHeartbeatAt: new Date(),
+          recentError: null,
+          metadata: body.metadata ?? {},
+          updatedAt: new Date(),
+        })
+        .where(eq(registeredRemoteSolvers.id, registered.id))
+        .returning();
+      return {
+        credentialRotated: false,
+        solver: {
+          id: refreshed.id,
+          instanceId: refreshed.instanceId,
+          instanceName: refreshed.instanceName,
+          cpuBudget: refreshed.cpuBudget,
+          status: refreshed.status,
+        },
+      };
+    } else {
+      const ctx = await requireSync(req, reply, "sweeps", "fetch");
+      if (!ctx) return;
+    }
+    const authToken = randomBytes(32).toString("base64url");
     const values = {
       instanceId: body.instanceId,
       instanceName: body.instanceName,
@@ -5235,6 +5813,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       cpuCapacity: body.cpuCapacity,
       cpuBudget: body.cpuBudget,
       buildVersion: body.buildVersion ?? null,
+      authTokenHash: solverTokenHash(authToken),
+      credentialVersion: 1,
+      revokedAt: null,
       status: "idle" as const,
       lastHeartbeatAt: new Date(),
       recentError: null,
@@ -5244,12 +5825,21 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     const [solver] = await db
       .insert(registeredRemoteSolvers)
       .values(values)
-      .onConflictDoUpdate({
-        target: registeredRemoteSolvers.instanceId,
-        set: values,
-      })
+      // Bootstrap is create-only. Two callers may both observe no row, but
+      // only the winner receives a credential; the loser must authenticate
+      // with that credential or use the explicit admin rotation flow. Never
+      // overwrite a token merely because registration raced.
+      .onConflictDoNothing({ target: registeredRemoteSolvers.instanceId })
       .returning();
+    if (!solver) {
+      return reply.code(409).send({
+        error:
+          "solver instance was registered concurrently; retry with its existing solver credential or rotate it as an administrator",
+      });
+    }
     return {
+      credentialRotated: true,
+      authToken,
       solver: {
         id: solver.id,
         instanceId: solver.instanceId,
@@ -5261,9 +5851,13 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/api/sync/v1/solvers/:id/heartbeat", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "sweeps", "fetch");
-    if (!ctx) return;
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const authenticated = await requireRegisteredRemoteSolver(
+      req,
+      reply,
+      params.id,
+    );
+    if (!authenticated) return;
     const body = solverHeartbeatSchema.parse(req.body ?? {});
     const update: Partial<typeof registeredRemoteSolvers.$inferInsert> = {
       status: body.status,
@@ -5292,13 +5886,17 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       .returning();
     if (!solver)
       return reply.code(404).send({ error: "registered solver not found" });
-    return { ok: true, solver };
+    return { ok: true, solver: remoteSolverStatusPayload(solver) };
   });
 
   app.post("/api/sync/v1/solvers/:id/progress", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "sweeps", "fetch");
-    if (!ctx) return;
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const authenticated = await requireRegisteredRemoteSolver(
+      req,
+      reply,
+      params.id,
+    );
+    if (!authenticated) return;
     const body = solverProgressSchema.parse(req.body ?? {});
     const [existing] = await db
       .select()
@@ -5325,15 +5923,108 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       .set(update)
       .where(eq(registeredRemoteSolvers.id, params.id))
       .returning();
-    return { ok: true, solver };
+    return { ok: true, solver: remoteSolverStatusPayload(solver) };
+  });
+
+  app.post("/api/sync/v1/evidence-uploads", async (req, reply) => {
+    const solver = await requireRegisteredRemoteSolver(req, reply);
+    if (!solver) return;
+    const ctx = await getSettings();
+    if (
+      !ctx.settings.enabled ||
+      !ctx.permissions.find((row) => row.dataType === "evidence_artifacts")
+        ?.canPush
+    )
+      return reply
+        .code(403)
+        .send({ error: "push disabled for evidence_artifacts" });
+    const body = brokeredEvidenceRequestSchema.parse(req.body ?? {});
+    try {
+      return await requestBrokeredEvidenceUpload(db, solver, body);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "evidence upload request failed";
+      const status = message.includes("quota") ? 429 : 409;
+      return reply.code(status).send({ error: message });
+    }
+  });
+
+  app.post("/api/sync/v1/evidence-uploads/:id/verify", async (req, reply) => {
+    const solver = await requireRegisteredRemoteSolver(req, reply);
+    if (!solver) return;
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const body = brokeredEvidenceVerifySchema.parse(req.body ?? {});
+    try {
+      return await verifyBrokeredEvidenceUpload(
+        db,
+        solver,
+        params.id,
+        body.generation,
+      );
+    } catch (error) {
+      return reply.code(409).send({
+        error:
+          error instanceof Error
+            ? error.message
+            : "evidence verification failed",
+      });
+    }
+  });
+
+  app.get("/api/sync/v1/evidence-uploads/:id/download", async (req, reply) => {
+    const solver = await requireRegisteredRemoteSolver(req, reply);
+    if (!solver) return;
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    try {
+      const archive = await fetchBoundBrokeredEvidenceArchive(
+        db,
+        solver,
+        params.id,
+      );
+      reply
+        .header("content-type", archive.mimeType)
+        .header("content-length", String(archive.size))
+        .header("x-content-sha256", archive.storedSha256)
+        .header("x-gcs-generation", archive.generation)
+        .header("cache-control", "private, no-store");
+      return reply.send(Readable.fromWeb(archive.body));
+    } catch (error) {
+      return reply.code(409).send({
+        error:
+          error instanceof Error
+            ? error.message
+            : "bound evidence archive is unavailable",
+      });
+    }
   });
 
   app.post("/api/sync/v1/sweeps/claim", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "sweeps", "fetch");
-    if (!ctx) return;
     const body = claimBodySchema.parse(req.body ?? {});
+    let ctx: Awaited<ReturnType<typeof getSettings>> | null;
+    let authenticatedSolver:
+      | typeof registeredRemoteSolvers.$inferSelect
+      | null = null;
+    if (body.solverId) {
+      authenticatedSolver = await requireRegisteredRemoteSolver(
+        req,
+        reply,
+        body.solverId,
+      );
+      if (!authenticatedSolver) return;
+      ctx = await getSettings();
+      const permitted = ctx.permissions.find(
+        (row) => row.dataType === "sweeps",
+      )?.canFetch;
+      if (!ctx.settings.enabled || !permitted)
+        return reply.code(403).send({ error: "fetch disabled for sweeps" });
+    } else {
+      ctx = await requireSync(req, reply, "sweeps", "fetch");
+      if (!ctx) return;
+    }
     let registeredSolver: typeof registeredRemoteSolvers.$inferSelect | null =
-      null;
+      authenticatedSolver;
     if (body.solverId) {
       [registeredSolver] = await db
         .select()
@@ -5539,9 +6230,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/api/sync/v1/sweeps/:promiseId/heartbeat", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "sweeps", "fetch");
-    if (!ctx) return;
     const params = z.object({ promiseId: z.string().uuid() }).parse(req.params);
+    const ctx = await requirePromiseSyncAccess(req, reply, params.promiseId);
+    if (!ctx) return;
     const body = heartbeatBodySchema.parse(req.body ?? {});
     const expiresAt = new Date(
       Date.now() +
@@ -5574,9 +6265,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/api/sync/v1/sweeps/:promiseId/cancel", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "sweeps", "fetch");
-    if (!ctx) return;
     const params = z.object({ promiseId: z.string().uuid() }).parse(req.params);
+    const ctx = await requirePromiseSyncAccess(req, reply, params.promiseId);
+    if (!ctx) return;
     const outcome = await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       const [promise] = (await tx.execute(sql`
@@ -5620,9 +6311,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/api/sync/v1/sweeps/:promiseId/complete", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "sweeps", "fetch");
-    if (!ctx) return;
     const params = z.object({ promiseId: z.string().uuid() }).parse(req.params);
+    const ctx = await requirePromiseSyncAccess(req, reply, params.promiseId);
+    if (!ctx) return;
     const outcome = await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       const [promise] = (await tx.execute(sql`
@@ -5986,8 +6677,23 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     "/api/sync/v1/polars",
     { bodyLimit: SYNC_POLAR_PUSH_BODY_LIMIT_BYTES },
     async (req, reply) => {
-      const ctx = await requireSync(req, reply, "polars", "push");
-      if (!ctx) return;
+      let authenticatedSolver:
+        | typeof registeredRemoteSolvers.$inferSelect
+        | null = null;
+      let ctx: Awaited<ReturnType<typeof getSettings>> | null;
+      if (remoteSolverToken(req)) {
+        authenticatedSolver = await requireRegisteredRemoteSolver(req, reply);
+        if (!authenticatedSolver) return;
+        ctx = await getSettings();
+        if (
+          !ctx.settings.enabled ||
+          !ctx.permissions.find((row) => row.dataType === "polars")?.canPush
+        )
+          return reply.code(403).send({ error: "push disabled for polars" });
+      } else {
+        ctx = await requireSync(req, reply, "polars", "push");
+        if (!ctx) return;
+      }
       let parsed: Awaited<ReturnType<typeof parsePolarRequest>>;
       try {
         parsed = await parsePolarRequest(req);
@@ -5998,6 +6704,48 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         throw error;
       }
       const { payload, files, capacityReservation } = parsed;
+      if (!authenticatedSolver && payload.promiseId) {
+        const [promise] = await db
+          .select({ requestPayload: syncSweepPromises.requestPayload })
+          .from(syncSweepPromises)
+          .where(eq(syncSweepPromises.id, payload.promiseId))
+          .limit(1);
+        if (
+          promise &&
+          typeof (promise.requestPayload as Record<string, unknown> | null)
+            ?.solverId === "string"
+        ) {
+          await cleanupMultipartTemps(files);
+          await capacityReservation?.release();
+          return reply
+            .code(401)
+            .send({ error: "remote solver credential required" });
+        }
+      }
+      if (authenticatedSolver) {
+        const [promise] = payload.promiseId
+          ? await db
+              .select()
+              .from(syncSweepPromises)
+              .where(eq(syncSweepPromises.id, payload.promiseId))
+              .limit(1)
+          : [];
+        if (
+          !promise ||
+          payload.sourceInstanceId !== authenticatedSolver.instanceId ||
+          promise.sourceInstanceId !== authenticatedSolver.instanceId ||
+          String(
+            (promise.requestPayload as Record<string, unknown> | null)
+              ?.solverId ?? "",
+          ) !== authenticatedSolver.id
+        ) {
+          await cleanupMultipartTemps(files);
+          await capacityReservation?.release();
+          return reply.code(403).send({
+            error: "remote solver does not own this exact promise payload",
+          });
+        }
+      }
       let conflictError: string | null = null;
       let permissionError: string | null = null;
       let blobLocks: Awaited<ReturnType<typeof acquireSyncBlobLocks>> | null =
@@ -6058,14 +6806,36 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       }
       if (permissionError)
         return reply.code(403).send({ error: permissionError });
-      if (response) return response;
+      if (response) {
+        if (!authenticatedSolver) {
+          return { ...response, bindingReceipts: [] };
+        }
+        const token = remoteSolverToken(req);
+        if (!token) {
+          return reply.code(401).send({
+            error: "remote solver credential required for binding receipt",
+          });
+        }
+        return {
+          ...response,
+          bindingReceipts: response.bindingReceipts.map((receipt) =>
+            signHubBindingReceipt(receipt, token),
+          ),
+        };
+      }
       return reply.code(409).send({ error: conflictError });
     },
   );
 
   app.post("/api/sync/v1/conflicts/status", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "polars", "push");
-    if (!ctx) return;
+    let solver: typeof registeredRemoteSolvers.$inferSelect | null = null;
+    if (remoteSolverToken(req)) {
+      solver = await requireRegisteredRemoteSolver(req, reply);
+      if (!solver) return;
+    } else {
+      const ctx = await requireSync(req, reply, "polars", "push");
+      if (!ctx) return;
+    }
     const body = conflictStatusBodySchema.parse(req.body ?? {});
     const rows = await db
       .select({
@@ -6073,7 +6843,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         status: syncImportConflicts.status,
       })
       .from(syncImportConflicts)
-      .where(inArray(syncImportConflicts.id, body.ids));
+      .where(
+        and(
+          inArray(syncImportConflicts.id, body.ids),
+          solver
+            ? eq(syncImportConflicts.sourceInstanceId, solver.instanceId)
+            : undefined,
+        ),
+      );
     return { conflicts: rows };
   });
 
@@ -6110,8 +6887,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/api/sync/v1/results/:resultId/render", async (req, reply) => {
-    const ctx = await requireSync(req, reply, "result_media", "fetch");
-    if (!ctx) return;
+    let solver: typeof registeredRemoteSolvers.$inferSelect | null = null;
+    if (remoteSolverToken(req)) {
+      solver = await requireRegisteredRemoteSolver(req, reply);
+      if (!solver) return;
+    } else {
+      const ctx = await requireSync(req, reply, "result_media", "fetch");
+      if (!ctx) return;
+    }
     const params = z.object({ resultId: z.string().uuid() }).parse(req.params);
     const renderBody = z
       .object({
@@ -6135,6 +6918,31 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       return reply
         .code(409)
         .send({ error: "remote result has no selected evidence generation" });
+    }
+    if (solver) {
+      const [ownedGeneration] = await db
+        .select({ id: syncBrokeredEvidenceUploads.id })
+        .from(syncBrokeredEvidenceUploads)
+        .where(
+          and(
+            eq(syncBrokeredEvidenceUploads.solverId, solver.id),
+            eq(syncBrokeredEvidenceUploads.state, "bound"),
+            eq(
+              syncBrokeredEvidenceUploads.canonicalResultId,
+              selected.result.id,
+            ),
+            eq(
+              syncBrokeredEvidenceUploads.canonicalResultAttemptId,
+              selected.result.currentResultAttemptId,
+            ),
+          ),
+        )
+        .limit(1);
+      if (!ownedGeneration)
+        return reply.code(403).send({
+          error:
+            "remote solver does not own this canonical evidence generation",
+        });
     }
     const manifests = await db
       .select()
@@ -6233,6 +7041,105 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     syncAdminPayload(req),
   );
 
+  app.post(
+    "/api/admin/sync/solvers/:id/revoke",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().uuid() }).parse(req.params);
+      const [solver] = await db
+        .select({ id: registeredRemoteSolvers.id })
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, params.id))
+        .limit(1);
+      if (!solver)
+        return reply.code(404).send({ error: "registered solver not found" });
+      await revokeSolverEvidenceUploads(db, solver.id);
+      return syncAdminPayload(req);
+    },
+  );
+
+  app.post(
+    "/api/admin/sync/solvers/:id/rotate-credential",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().uuid() }).parse(req.params);
+      const [solver] = await db
+        .select()
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, params.id))
+        .limit(1);
+      if (!solver)
+        return reply.code(404).send({ error: "registered solver not found" });
+
+      const rotationLock = await acquireSolverCredentialRotationLock(solver.id);
+      try {
+        const [current] = await db
+          .select()
+          .from(registeredRemoteSolvers)
+          .where(eq(registeredRemoteSolvers.id, solver.id))
+          .limit(1);
+        if (
+          !current ||
+          current.credentialVersion !== solver.credentialVersion
+        ) {
+          return reply.code(409).send({
+            error: "solver credential changed while this rotation was waiting",
+          });
+        }
+        // Revocation is durable before cancellation. A failed provider
+        // cancellation keeps the protected hub-only bearer for the periodic
+        // reconciler and leaves the solver disabled; no replacement token is
+        // issued until every old capability is acknowledged cancelled/gone.
+        const revoked = await revokeSolverEvidenceUploads(db, solver.id);
+        if (revoked.pendingSessionCount > 0) {
+          return reply.code(409).send({
+            error:
+              "solver credential remains revoked while old evidence upload sessions are being cancelled; retry rotation after reconciliation",
+            pendingSessionCount: revoked.pendingSessionCount,
+          });
+        }
+        const authToken = randomBytes(32).toString("base64url");
+        const [rotated] = await db
+          .update(registeredRemoteSolvers)
+          .set({
+            authTokenHash: solverTokenHash(authToken),
+            credentialVersion: current.credentialVersion + 1,
+            revokedAt: null,
+            status: "idle",
+            recentError: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(registeredRemoteSolvers.id, solver.id),
+              eq(
+                registeredRemoteSolvers.credentialVersion,
+                current.credentialVersion,
+              ),
+              isNotNull(registeredRemoteSolvers.revokedAt),
+              isNull(registeredRemoteSolvers.authTokenHash),
+            ),
+          )
+          .returning({
+            id: registeredRemoteSolvers.id,
+            credentialVersion: registeredRemoteSolvers.credentialVersion,
+          });
+        if (!rotated) {
+          return reply.code(409).send({
+            error: "solver credential rotation lost its serialized state",
+          });
+        }
+        return {
+          solverId: rotated.id,
+          credentialVersion: rotated.credentialVersion,
+          authToken,
+        };
+      } finally {
+        await rotationLock.release();
+      }
+    },
+  );
+
   app.patch(
     "/api/admin/sync",
     { preHandler: requireAdmin },
@@ -6240,17 +7147,47 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       const body = syncSettingsPatchSchema.parse(req.body ?? {});
       await ensureSyncRows();
       const { settings: currentSettings } = await getSettings();
+      let requestedUpstreamBaseUrl: string | null | undefined;
+      try {
+        requestedUpstreamBaseUrl =
+          body.upstreamBaseUrl === undefined
+            ? undefined
+            : body.upstreamBaseUrl
+              ? canonicalRemoteHubBaseUrl(body.upstreamBaseUrl)
+              : null;
+      } catch (error) {
+        return reply.code(400).send({
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       const nextUpstreamBaseUrl =
-        body.upstreamBaseUrl === undefined
+        requestedUpstreamBaseUrl === undefined
           ? currentSettings.upstreamBaseUrl
-          : body.upstreamBaseUrl
-            ? body.upstreamBaseUrl.replace(/\/+$/, "")
-            : null;
+          : requestedUpstreamBaseUrl;
+      const nextRemoteSolverEnabled =
+        body.remoteSolverEnabled ?? currentSettings.remoteSolverEnabled;
+      if (nextRemoteSolverEnabled) {
+        if (!nextUpstreamBaseUrl) {
+          return reply.code(400).send({
+            error:
+              "remote solver cannot be enabled before a remote hub URL is configured",
+          });
+        }
+        try {
+          canonicalRemoteHubBaseUrl(nextUpstreamBaseUrl);
+        } catch (error) {
+          return reply.code(400).send({
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       const authorityBaseChanges =
         nextUpstreamBaseUrl !== currentSettings.upstreamBaseUrl;
-      const clearsAuthoritySecret =
+      const clearsOnlyBootstrapSecret =
         body.upstreamSecret !== undefined && !body.upstreamSecret.trim();
-      if (authorityBaseChanges || clearsAuthoritySecret) {
+      const clearsLastRemoteCredential =
+        clearsOnlyBootstrapSecret && !currentSettings.remoteSolverAuthToken;
+      if (authorityBaseChanges || clearsLastRemoteCredential) {
         const [obligations] = (await db.execute(sql`
           SELECT (
             EXISTS (
@@ -6275,7 +7212,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           return reply.code(409).send({
             error: authorityBaseChanges
               ? "up-tier endpoint cannot change while remote promises, result deliveries, or cancellations are unfinished"
-              : "up-tier secret cannot be cleared while remote promises, result deliveries, or cancellations are unfinished",
+              : "up-tier bootstrap secret cannot be cleared before a per-solver credential is installed while remote work is unfinished",
           });
         }
       }
@@ -6290,9 +7227,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       if (body.defaultPromiseTtlHours !== undefined)
         settingsPatch.defaultPromiseTtlHours = body.defaultPromiseTtlHours;
       if (body.upstreamBaseUrl !== undefined)
-        settingsPatch.upstreamBaseUrl = body.upstreamBaseUrl
-          ? body.upstreamBaseUrl.replace(/\/+$/, "")
-          : null;
+        settingsPatch.upstreamBaseUrl = requestedUpstreamBaseUrl ?? null;
       if (body.upstreamSecret !== undefined)
         settingsPatch.upstreamSecret = body.upstreamSecret;
       if (body.syncMode !== undefined) settingsPatch.syncMode = body.syncMode;
@@ -6326,6 +7261,44 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           });
       }
       return syncAdminPayload(req);
+    },
+  );
+
+  app.post(
+    "/api/admin/sync/remote-solver/credential",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const body = remoteSolverCredentialInstallSchema.parse(req.body ?? {});
+      await ensureSyncRows();
+      const { settings } = await getSettings();
+      if (!settings.upstreamBaseUrl) {
+        return reply.code(400).send({
+          error:
+            "remote solver credential cannot be installed before a remote hub URL is configured",
+        });
+      }
+      try {
+        canonicalRemoteHubBaseUrl(settings.upstreamBaseUrl);
+      } catch (error) {
+        return reply.code(400).send({
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await db
+        .update(syncApiSettings)
+        .set({
+          remoteSolverRegisteredId: body.registeredSolverId,
+          remoteSolverAuthToken: body.authToken,
+          remoteSolverLastStatus: "idle",
+          remoteSolverLastError: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(syncApiSettings.id, 1));
+      return {
+        ok: true,
+        registeredSolverId: body.registeredSolverId,
+        credentialInstalled: true,
+      };
     },
   );
 

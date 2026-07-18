@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   databaseMemberAssociationsSha256,
   manifestMemberSetSha256,
+  parseEvidenceManifest,
   type EvidenceManifestEntry,
 } from "../src/evidence-manifest";
 
@@ -51,5 +52,25 @@ describe("evidence manifest member-set identity", () => {
     expect(databaseMemberAssociationsSha256([...associations].reverse())).toBe(
       databaseMemberAssociationsSha256(associations),
     );
+  });
+
+  it("retains an exact engine role and rejects malformed role provenance", () => {
+    const member = {
+      path: "openfoam/mesh_evidence/logs/log.blockMesh",
+      role: "mesh_evidence",
+      sha256: "d".repeat(64),
+      byteSize: 42,
+    };
+    expect(
+      parseEvidenceManifest(Buffer.from(JSON.stringify({ files: [member] })))
+        .bundled,
+    ).toEqual([member]);
+    for (const role of [null, "", " mesh_evidence", "MeshEvidence", "a/b"]) {
+      expect(() =>
+        parseEvidenceManifest(
+          Buffer.from(JSON.stringify({ files: [{ ...member, role }] })),
+        ),
+      ).toThrow(/lower-snake-case evidence role/);
+    }
   });
 });

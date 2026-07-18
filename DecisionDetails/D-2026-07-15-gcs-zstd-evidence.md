@@ -55,16 +55,16 @@ transcoding, and production storage reclamation.
 The latest 2026-07-17 production reconciliation found 549 complete
 receipt-covered legacy evidence directories and zero incomplete
 receipt-covered directories. The remaining local corpus still held 3,026 gzip
-bundles (145,861,216,428 bytes), 16 temporary/local Zstandard archives
-(216,240,757 bytes), and 60,471 packaged raw files
-(187,927,660,666 bytes). No terminal raw directory lacked a protecting archive
-or remote pointer.
+bundles (145,861,216,428 bytes), 16 cutover-canary Zstandard archives across
+11 completed engine-job directories (216,240,757 bytes), and 60,471 packaged
+raw files (187,927,660,666 bytes). No terminal raw directory lacked a
+protecting archive or remote pointer.
 Those measurements prove that the remote-only write/read path is active and
 already reclaimed capacity, but not that the requested legacy migration is
 finished. Completion still requires three-pass migration and restore proof for
-every remaining eligible terminal bundle, distinct attested cleanup for
-canary-only archives, zero unprotected terminal raw evidence, and reconciled
-filesystem/database/GCS counts.
+every remaining eligible terminal bundle, durable operational ownership and
+restore-verified local reclamation for the cutover canaries, zero unprotected
+terminal raw evidence, and reconciled filesystem/database/GCS counts.
 
 A terminal engine job can contain genuine durable evidence even when its
 worker died before exact result-attempt ingestion. For that zero-owner case,
@@ -79,18 +79,21 @@ bytes. Quarantine is intentionally immutable-only: any future recovery must
 reference an independently ingested exact result/attempt rather than mutating
 preserved evidence into a result.
 
-Canary-only objects use a third, explicitly non-evidence lifecycle rather than
-canonical registration or orphan quarantine. Migration 0079 permits a cleanup
-reservation only when an exact bucket/key/generation/hash/size/CRC identity is
-present in the durable OpenCFD 2606 attestation and absent from every database
-ownership path. Reservation and reciprocal future-owner guards share an
-advisory identity lock, closing the ownership race and permanently preventing
-later adoption of a reserved generation. A separate operator identity performs
-only generation-matched deletes, proves the exact live generation absent with
-a fresh provider lookup, and returns an immutable receipt for database
-acknowledgement. Dry-run remains the default; the application identity retains
-no delete permission, prefix-wide deletion is outside the interface, and the
-bucket soft-delete window remains the recovery boundary.
+Cutover-canary objects use a third, explicitly non-aerodynamic lifecycle rather
+than canonical registration or orphan quarantine. The protected inventories
+agree on 16 exact GCS generations across 11 completed zero-`sim_jobs` engine
+jobs: four r5 generations across three jobs are covered by durable attestation
+`112f52cd-eb8b-4908-bc79-6353daea6e12`, while twelve r2/r3/r4 generations are
+unattested cutover canaries with exact protected build, journal, operator,
+failure, runtime, pointer, archive, and manifest proofs. Migration 0081 records
+the two provenance classes in an append-only operational ledger and gives them
+no result, attempt, AoA, coefficient, or polar ownership. Its reciprocal GCS
+and engine-job locks supersede deletion through migration 0079 for these exact
+generations. GCS is retained permanently; only allowlisted local archive/raw
+copies may be reclaimed, after a fresh generation-pinned archive, manifest,
+and all-member restore plus immutable local and database receipts. Dry-run is
+the default, and neither the application nor this workflow exposes a GCS
+delete or prefix operation.
 
 OpenCFD 2606 certification binds the canary receipt to the live gateway's exact
 bucket, object prefix, Zstandard level, and top-level remote-only storage
@@ -132,8 +135,9 @@ campaign job `28d9ac1c-ad4d-4c60-a34b-f090842eeb54` produced canonical result
 `fa5ec6aa-cbd4-4035-900d-3f2dd44a92bc`, bound to exact continuation attempt
 `e59a73ff-c84a-473f-8f5e-1ce7ab5c7087`. Its retained certification log is
 `/opt/airfoils-pro/state/audit/2026-07-17-successor-continuation/certify-successor-continuation.log`.
-This makes the seven-case claim auditable while keeping the 11 zero-owner
-canary-only archives outside legacy registration and orphan quarantine.
+This makes the seven-case claim auditable while keeping all 16 zero-owner
+cutover-canary generations across 11 job directories outside legacy
+registration and orphan quarantine.
 
 The guarded workflow stores a canonical contract SHA-256 atomically with the
 attestation; subsequent engine and control-plane deploys fail before mutation
@@ -144,3 +148,25 @@ and recovery of an exact retained receipt that has not yet been attested.
 The guarded production sequence, three-pass legacy migration, reconciliation,
 and rollback procedure are defined in
 [the GCS Zstandard evidence migration runbook](../docs/evidence-object-storage-runbook.md).
+
+## Historical logical-member reconciliation
+
+The 2026-07-18 cycle-26 checkpoint exposed one historical OpenCFD 2406
+ingestion gap without losing or corrupting evidence. Its exact manifest listed
+42 bundled files and its retained gzip, generated Zstandard archive, and
+generation-pinned all-member restore agreed. Thirty-six logical member rows
+already matched the manifest; six real files under
+`openfoam/mesh_evidence/` had never received database artifact rows. The
+migrator stopped before archive registration, database acknowledgement, or
+local deletion.
+
+Registration may repair this narrow historical gap only from the exact retained
+manifest role, SHA-256, byte size, and matching local regular-file bytes under
+the exact result/attempt/job/case/evidence-base owner. It authenticates every
+missing bundled member before the first write, rejects symlinks, missing or
+changing bytes, ambiguous rows, role-less missing entries, excluded frames,
+and ownership conflicts, and commits the reconstructed associations only when
+complete manifest coverage revalidates in the same locked transaction. This is
+recovery of authenticated evidence metadata, not creation of evidence: a
+missing or mismatched byte remains a hard stop, and no GCS archive binding,
+database acknowledgement, or deletion authority is emitted.

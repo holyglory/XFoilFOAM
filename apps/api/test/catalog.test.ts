@@ -421,6 +421,7 @@ describe("catalog solved-metric evidence", () => {
       });
       expect(register.statusCode).toBe(200);
       const registered = register.json() as {
+        authToken: string;
         solver: {
           id: string;
           instanceId: string;
@@ -434,11 +435,33 @@ describe("catalog solved-metric evidence", () => {
         cpuBudget: 2,
         status: "idle",
       });
+      expect(registered.authToken).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+
+      const sharedSecretHeartbeat = await app.inject({
+        method: "POST",
+        url: `/api/sync/v1/solvers/${registered.solver.id}/heartbeat`,
+        headers: { "x-xfoilfoam-sync-secret": secret },
+        payload: { status: "idle" },
+      });
+      expect(sharedSecretHeartbeat.statusCode).toBe(401);
+
+      const sharedSecretRotation = await app.inject({
+        method: "POST",
+        url: "/api/sync/v1/solvers/register",
+        headers: { "x-xfoilfoam-sync-secret": secret },
+        payload: {
+          instanceId: `${sourceInstanceId}-solver`,
+          instanceName: "sync api test solver",
+          cpuCapacity: 4,
+          cpuBudget: 2,
+        },
+      });
+      expect(sharedSecretRotation.statusCode).toBe(401);
 
       const heartbeat = await app.inject({
         method: "POST",
         url: `/api/sync/v1/solvers/${registered.solver.id}/heartbeat`,
-        headers: { "x-xfoilfoam-sync-secret": secret },
+        headers: { "x-xfoilfoam-solver-token": registered.authToken },
         payload: {
           status: "solving",
           activePromiseCount: 1,
@@ -455,11 +478,12 @@ describe("catalog solved-metric evidence", () => {
           activeAoaCount: 36,
         },
       });
+      expect(JSON.stringify(heartbeat.json())).not.toContain("authTokenHash");
 
       const progress = await app.inject({
         method: "POST",
         url: `/api/sync/v1/solvers/${registered.solver.id}/progress`,
-        headers: { "x-xfoilfoam-sync-secret": secret },
+        headers: { "x-xfoilfoam-solver-token": registered.authToken },
         payload: {
           status: "pushing",
           solvedCountDelta: 2,
@@ -475,7 +499,7 @@ describe("catalog solved-metric evidence", () => {
       const claim = await app.inject({
         method: "POST",
         url: "/api/sync/v1/sweeps/claim",
-        headers: { "x-xfoilfoam-sync-secret": secret },
+        headers: { "x-xfoilfoam-solver-token": registered.authToken },
         payload: {
           limit: 1,
           solverId: registered.solver.id,

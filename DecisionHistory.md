@@ -41,9 +41,34 @@
   restore, and production uses attached workload identity rather than exported
   credentials. Full retention fails closed before deleting live mesh/state,
   and incomplete terminal packaging is preserved as immutable forensic blobs,
-  never reinterpreted as canonical solver evidence.
+  never reinterpreted as canonical solver evidence. OpenCFD 2606 cutover
+  canaries remain immutable operational evidence in their exact GCS
+  generations; they are neither deleted nor promoted into aerodynamic data.
   [D-2026-07-15-gcs-zstd-evidence]
   [D-2026-07-18-incomplete-evidence-quarantine]
+  [D-2026-07-18-operational-canary-evidence-retention]
+
+## D-2026-07-18-operational-canary-evidence-retention — Preserve cutover canaries without inventing aerodynamic ownership
+
+Detail: [DecisionDetails/D-2026-07-18-operational-canary-evidence-retention.md](DecisionDetails/D-2026-07-18-operational-canary-evidence-retention.md)
+
+- Decision: retain all 16 exact OpenCFD 2606 cutover-canary GCS generations
+  across their 11 completed engine-job directories as immutable operational
+  evidence. Record the four r5 generations covered by the durable canary
+  attestation as `attested_canary` and the twelve r2/r3/r4 generations with
+  their exact protected build, journal, operator, failure, runtime, pointer,
+  archive, and manifest proofs as `unattested_cutover_canary`. Give neither
+  class result, attempt, AoA, coefficient, or polar ownership. Reclaim only
+  allowlisted local packaged/raw copies after database ownership and a fresh
+  generation-pinned all-member restore; never delete or retarget GCS.
+- Why: deleting the generations through the older cleanup path would discard
+  irreplaceable rollout and failure evidence, while binding them as canonical
+  results, orphan results, or campaign evidence would invent aerodynamic
+  provenance that never existed. Keeping all bytes locally would preserve
+  truth but waste active-solver capacity. A separate append-only operational
+  ledger conserves the exact remote proof, distinguishes attested from failed
+  pre-attestation cutovers, closes delayed-owner races, and safely releases
+  only verified duplicate VPS bytes.
 
 ## D-2026-07-18-incomplete-evidence-quarantine — Corrupt terminal packaging remains forensic, not solver evidence
 

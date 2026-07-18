@@ -65,6 +65,7 @@ const {
   outputProfiles,
   polarFitSets,
   referenceGeometryProfiles,
+  registeredRemoteSolvers,
   remoteAssetReferences,
   resultAttempts,
   resultClassifications,
@@ -949,6 +950,282 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
+  it("exchanges the bootstrap secret exactly once for a legacy solver credential", async () => {
+    const instanceId = randomUUID();
+    const [legacy] = await db
+      .insert(registeredRemoteSolvers)
+      .values({
+        instanceId,
+        instanceName: `${PREFIX} legacy solver`,
+        cpuCapacity: 8,
+        cpuBudget: 6,
+        authTokenHash: null,
+        credentialVersion: 0,
+        revokedAt: null,
+        metadata: { test: PREFIX, legacy: true },
+      })
+      .returning();
+    const body = {
+      instanceId,
+      instanceName: `${PREFIX} provisioned legacy solver`,
+      cpuCapacity: 8,
+      cpuBudget: 5,
+      metadata: { test: PREFIX, legacy: true },
+    };
+    try {
+      const attempts = await Promise.all([
+        app.inject({
+          method: "POST",
+          url: "/api/sync/v1/solvers/register",
+          headers: {
+            "content-type": "application/json",
+            "x-xfoilfoam-sync-secret": SECRET,
+          },
+          payload: JSON.stringify(body),
+        }),
+        app.inject({
+          method: "POST",
+          url: "/api/sync/v1/solvers/register",
+          headers: {
+            "content-type": "application/json",
+            "x-xfoilfoam-sync-secret": SECRET,
+          },
+          payload: JSON.stringify(body),
+        }),
+      ]);
+      const winners = attempts.filter((response) => response.statusCode === 200);
+      const losers = attempts.filter((response) => response.statusCode !== 200);
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(1);
+      expect([401, 409]).toContain(losers[0]!.statusCode);
+
+      const credential = winners[0]!.json<{
+        authToken: string;
+        solver: { id: string };
+      }>();
+      expect(credential.authToken).toBeTruthy();
+      expect(credential.solver.id).toBe(legacy.id);
+
+      const [provisioned] = await db
+        .select()
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, legacy.id));
+      expect(provisioned).toMatchObject({
+        authTokenHash: sha256(Buffer.from(credential.authToken)),
+        credentialVersion: 1,
+        revokedAt: null,
+      });
+
+      const bootstrapReplay = await app.inject({
+        method: "POST",
+        url: "/api/sync/v1/solvers/register",
+        headers: {
+          "content-type": "application/json",
+          "x-xfoilfoam-sync-secret": SECRET,
+        },
+        payload: JSON.stringify(body),
+      });
+      expect(bootstrapReplay.statusCode, bootstrapReplay.body).toBe(401);
+      expect(bootstrapReplay.json()).toEqual({
+        error: "remote solver credential required",
+      });
+    } finally {
+      await db
+        .delete(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.instanceId, instanceId));
+    }
+  });
+
+  it("issues one bootstrap credential under concurrent registration and keeps refresh non-rotating", async () => {
+    const instanceId = randomUUID();
+    const body = {
+      instanceId,
+      instanceName: `${PREFIX} concurrent solver`,
+      cpuCapacity: 8,
+      cpuBudget: 6,
+      metadata: { test: PREFIX },
+    };
+    try {
+      const responses = await Promise.all([
+        app.inject({
+          method: "POST",
+          url: "/api/sync/v1/solvers/register",
+          headers: {
+            "content-type": "application/json",
+            "x-xfoilfoam-sync-secret": SECRET,
+          },
+          payload: JSON.stringify(body),
+        }),
+        app.inject({
+          method: "POST",
+          url: "/api/sync/v1/solvers/register",
+          headers: {
+            "content-type": "application/json",
+            "x-xfoilfoam-sync-secret": SECRET,
+          },
+          payload: JSON.stringify(body),
+        }),
+      ]);
+      expect(responses.map((response) => response.statusCode).sort()).toEqual([
+        200, 409,
+      ]);
+      const winner = responses.find((response) => response.statusCode === 200)!;
+      const credential = winner.json<{
+        authToken: string;
+        solver: { id: string };
+      }>();
+      expect(credential.authToken).toBeTruthy();
+
+      const [registered] = await db
+        .select()
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.instanceId, instanceId));
+      expect(registered).toMatchObject({
+        id: credential.solver.id,
+        credentialVersion: 1,
+        authTokenHash: sha256(Buffer.from(credential.authToken)),
+      });
+
+      const refreshed = await app.inject({
+        method: "POST",
+        url: "/api/sync/v1/solvers/register",
+        headers: {
+          "content-type": "application/json",
+          "x-xfoilfoam-solver-token": credential.authToken,
+        },
+        payload: JSON.stringify({
+          ...body,
+          instanceName: `${PREFIX} refreshed solver`,
+          cpuBudget: 5,
+        }),
+      });
+      expect(refreshed.statusCode, refreshed.body).toBe(200);
+      expect(refreshed.json()).toMatchObject({
+        credentialRotated: false,
+        solver: {
+          id: credential.solver.id,
+          instanceName: `${PREFIX} refreshed solver`,
+          cpuBudget: 5,
+        },
+      });
+      expect(refreshed.json()).not.toHaveProperty("authToken");
+      const [afterRefresh] = await db
+        .select()
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, credential.solver.id));
+      expect(afterRefresh.authTokenHash).toBe(registered.authTokenHash);
+      expect(afterRefresh.credentialVersion).toBe(1);
+    } finally {
+      await db
+        .delete(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.instanceId, instanceId));
+    }
+  });
+
+  it("reads a reclaimed remote-solver archive through the hub with only the solver credential", async () => {
+    const [settingsBefore] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    if (!settingsBefore) throw new Error("sync settings fixture missing");
+    const hubBaseUrl = "https://solver-hub.example.test/api/sync/v1";
+    const solverToken = `${PREFIX}-archive-solver-token`;
+    const uploadId = randomUUID();
+    const generation = "918273645";
+    const bytes = Buffer.from(`${PREFIX}:reclaimed-remote-engine-bundle`);
+    const storageKey = `jobs/${PREFIX}/cases/case/evidence/engine_evidence.tar.zst`;
+    await db
+      .update(syncApiSettings)
+      .set({
+        upstreamBaseUrl: hubBaseUrl,
+        upstreamSecret: `${PREFIX}-must-not-be-used`,
+        remoteSolverAuthToken: solverToken,
+        updatedAt: new Date(),
+      })
+      .where(eq(syncApiSettings.id, 1));
+    await db.insert(remoteAssetReferences).values({
+      localKind: "evidence_artifact",
+      localStorageKey: storageKey,
+      remoteDownloadUrl: `https://solver-hub.example.test/api/sync/v1/evidence-uploads/${uploadId}/download`,
+      sha256: sha256(bytes),
+      byteSize: bytes.byteLength,
+      mimeType: "application/zstd",
+      availability: "remote_only",
+      metadata: {
+        source: "remote-solver-hub",
+        authMode: "remote_solver_token",
+        hubBaseUrl,
+        brokeredUploadId: uploadId,
+        generation,
+      },
+    });
+    const fetchMock = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        if (new URL(String(input)).pathname.startsWith("/jobs/"))
+          return Response.json(
+            { detail: "local archive was reclaimed" },
+            { status: 404 },
+          );
+        const requestHeaders = new Headers(init?.headers);
+        expect(requestHeaders.get("x-xfoilfoam-solver-token")).toBe(
+          solverToken,
+        );
+        expect(requestHeaders.has("x-xfoilfoam-sync-secret")).toBe(false);
+        return new Response(bytes, {
+          status: 200,
+          headers: {
+            "content-type": "application/zstd",
+            "content-length": String(bytes.byteLength),
+            "x-content-sha256": sha256(bytes),
+            "x-gcs-generation": generation,
+          },
+        });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/media/${storageKey}`,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.rawPayload).toEqual(bytes);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      await db
+        .update(syncApiSettings)
+        .set({
+          upstreamBaseUrl: "http://unsafe-solver-hub.example.test/api/sync/v1",
+          updatedAt: new Date(),
+        })
+        .where(eq(syncApiSettings.id, 1));
+      fetchMock.mockClear();
+      const unsafeProxy = await app.inject({
+        method: "GET",
+        url: `/api/media/${storageKey}`,
+      });
+      expect(unsafeProxy.statusCode).toBe(502);
+      expect(
+        fetchMock.mock.calls.some(
+          ([input]) =>
+            new URL(String(input)).hostname ===
+            "unsafe-solver-hub.example.test",
+        ),
+      ).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+      await db
+        .delete(remoteAssetReferences)
+        .where(eq(remoteAssetReferences.localStorageKey, storageKey));
+      const { id: _id, createdAt: _createdAt, ...rest } = settingsBefore;
+      await db
+        .update(syncApiSettings)
+        .set({ ...rest, updatedAt: new Date() })
+        .where(eq(syncApiSettings.id, 1));
+    }
+  });
+
   it("keeps sync credentials server-side in every admin settings response", async () => {
     const [settingsBefore] = await db
       .select()
@@ -959,11 +1236,13 @@ describe("remote solver sync validation regressions", () => {
     const upstreamBaseUrl =
       "https://credential-redaction.example.test/api/sync/v1";
     const upstreamSecret = `${PREFIX}-credential-redaction-upstream-secret`;
+    const remoteSolverAuthToken = `${PREFIX}-credential-redaction-solver-token`;
     await db
       .update(syncApiSettings)
       .set({
         upstreamBaseUrl,
         upstreamSecret,
+        remoteSolverAuthToken,
         updatedAt: new Date(),
       })
       .where(eq(syncApiSettings.id, 1));
@@ -981,8 +1260,10 @@ describe("remote solver sync validation regressions", () => {
       });
       expect(payload.settings).not.toHaveProperty("secret");
       expect(payload.settings).not.toHaveProperty("upstreamSecret");
+      expect(payload.settings).not.toHaveProperty("remoteSolverAuthToken");
       expect(response.body).not.toContain(SECRET);
       expect(response.body).not.toContain(upstreamSecret);
+      expect(response.body).not.toContain(remoteSolverAuthToken);
     };
 
     try {
@@ -1034,6 +1315,117 @@ describe("remote solver sync validation regressions", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       vi.unstubAllGlobals();
+      const { id: _id, createdAt: _createdAt, ...restore } = settingsBefore;
+      await db
+        .update(syncApiSettings)
+        .set({ ...restore, updatedAt: new Date() })
+        .where(eq(syncApiSettings.id, 1));
+    }
+  });
+
+  it("stores only canonical HTTPS remote hubs while permitting literal loopback HTTP", async () => {
+    const [settingsBefore] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    if (!settingsBefore) throw new Error("sync settings fixture missing");
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverEnabled: false, updatedAt: new Date() })
+      .where(eq(syncApiSettings.id, 1));
+
+    try {
+      for (const upstreamBaseUrl of [
+        "http://public-hub.example.test/api/sync/v1",
+        "https://user:password@hub.example.test/api/sync/v1",
+        "https://hub.example.test/api/sync/v1?token=x",
+        "https://hub.example.test/api/sync/v1#fragment",
+        "https://hub.example.test/api/sync/v1/",
+        "https://hub.example.test/api/sync/v1/claim",
+      ]) {
+        const rejected = await app.inject({
+          method: "PATCH",
+          url: "/api/admin/sync",
+          headers: { "content-type": "application/json" },
+          payload: JSON.stringify({ upstreamBaseUrl }),
+        });
+        expect(
+          rejected.statusCode,
+          `${upstreamBaseUrl}: ${rejected.body}`,
+        ).toBe(400);
+      }
+
+      const acceptedLoopback = await app.inject({
+        method: "PATCH",
+        url: "/api/admin/sync",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({
+          upstreamBaseUrl: "http://127.0.0.1:4317/api/sync/v1",
+        }),
+      });
+      expect(acceptedLoopback.statusCode, acceptedLoopback.body).toBe(200);
+      const [stored] = await db
+        .select({ upstreamBaseUrl: syncApiSettings.upstreamBaseUrl })
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1));
+      expect(stored.upstreamBaseUrl).toBe("http://127.0.0.1:4317/api/sync/v1");
+
+      const enabledWithoutHub = await app.inject({
+        method: "PATCH",
+        url: "/api/admin/sync",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({
+          upstreamBaseUrl: null,
+          remoteSolverEnabled: true,
+        }),
+      });
+      expect(enabledWithoutHub.statusCode, enabledWithoutHub.body).toBe(400);
+    } finally {
+      const { id: _id, createdAt: _createdAt, ...restore } = settingsBefore;
+      await db
+        .update(syncApiSettings)
+        .set({ ...restore, updatedAt: new Date() })
+        .where(eq(syncApiSettings.id, 1));
+    }
+  });
+
+  it("refuses to install a solver credential for an unsafe stored hub", async () => {
+    const [settingsBefore] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    if (!settingsBefore) throw new Error("sync settings fixture missing");
+    const priorToken = `${PREFIX}-prior-remote-solver-token`;
+    await db
+      .update(syncApiSettings)
+      .set({
+        upstreamBaseUrl: "http://unsafe-hub.example.test/api/sync/v1",
+        remoteSolverAuthToken: priorToken,
+        updatedAt: new Date(),
+      })
+      .where(eq(syncApiSettings.id, 1));
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/admin/sync/remote-solver/credential",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({
+          registeredSolverId: randomUUID(),
+          authToken: `${PREFIX}-replacement-remote-solver-token-32chars`,
+        }),
+      });
+      expect(response.statusCode, response.body).toBe(400);
+      const [stored] = await db
+        .select({
+          remoteSolverAuthToken: syncApiSettings.remoteSolverAuthToken,
+        })
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1));
+      expect(stored.remoteSolverAuthToken).toBe(priorToken);
+    } finally {
       const { id: _id, createdAt: _createdAt, ...restore } = settingsBefore;
       await db
         .update(syncApiSettings)
@@ -1131,7 +1523,7 @@ describe("remote solver sync validation regressions", () => {
   });
 
   it("refuses an up-tier authority switch while mirrored work is unfinished", async () => {
-    const oldBase = "http://old-hub.test/api/sync/v1";
+    const oldBase = "https://old-hub.test/api/sync/v1";
     const oldSecret = `${PREFIX}-old-upstream-secret`;
     await db
       .update(syncApiSettings)
@@ -1159,7 +1551,7 @@ describe("remote solver sync validation regressions", () => {
         "x-xfoilfoam-sync-secret": SECRET,
       },
       payload: JSON.stringify({
-        upstreamBaseUrl: "http://new-hub.test/api/sync/v1",
+        upstreamBaseUrl: "https://new-hub.test/api/sync/v1",
         upstreamSecret: `${PREFIX}-new-upstream-secret`,
       }),
     });
@@ -1236,7 +1628,7 @@ describe("remote solver sync validation regressions", () => {
         "x-xfoilfoam-sync-secret": SECRET,
       },
       payload: JSON.stringify({
-        upstreamBaseUrl: "http://new-hub.test/api/sync/v1",
+        upstreamBaseUrl: "https://new-hub.test/api/sync/v1",
         upstreamSecret: rotatedSecret,
       }),
     });

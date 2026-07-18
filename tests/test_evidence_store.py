@@ -34,13 +34,17 @@ from airfoilfoam.evidence_store import (
 )
 from airfoilfoam.config import Settings
 from airfoilfoam.evidence_runtime import (
+    BROKERED_LOCAL_RECLAIM_INTENT_NAME,
+    BROKERED_LOCAL_RECLAIM_RECEIPT_NAME,
     EVIDENCE_FINALIZATION_ACK_NAME,
     EVIDENCE_FINALIZATION_RECEIPT_NAME,
     EvidenceCleanupAuthorization,
     EvidenceCleanupError,
     EvidenceDatabaseAssociation,
     EvidencePublication,
+    BrokeredRemoteEvidenceReclaim,
     finalize_remote_evidence_cleanup,
+    reclaim_brokered_remote_evidence,
     verify_remote_evidence_restore,
 )
 
@@ -422,6 +426,116 @@ def test_cleanup_rejects_symlinked_ack_and_only_unlinks_packaged_child_symlink(
         job_root, evidence, authorization, settings, store=store
     )
     assert (outside_raw / "keep.txt").read_text() == "keep"
+
+
+def _brokered_reclaim_authorization(
+    job_root: Path,
+    evidence: Path,
+    publication: EvidencePublication,
+) -> BrokeredRemoteEvidenceReclaim:
+    manifest = (evidence / "evidence_manifest.json").read_bytes()
+    return BrokeredRemoteEvidenceReclaim(
+        job_id=job_root.name,
+        case_slug="case-1",
+        evidence_base="evidence",
+        receipt={
+            "schemaVersion": 1,
+            "kind": "hub-canonical-evidence-binding",
+            "promiseId": "11111111-1111-4111-8111-111111111111",
+            "aoaDeg": 3,
+            "remoteResultId": "22222222-2222-4222-8222-222222222222",
+            "remoteResultAttemptId": "33333333-3333-4333-8333-333333333333",
+            "engineJobId": job_root.name,
+            "engineCaseSlug": "case-1",
+            "brokeredUploadId": "66666666-6666-4666-8666-666666666666",
+            "bindingState": "bound",
+            "promisePointState": "fulfilled",
+            "remote": {
+                "bucket": "test-bucket",
+                "objectKey": publication.pointer.object_key,
+                "generation": str(publication.pointer.generation),
+                "crc32c": publication.pointer.crc32c,
+                "storedSha256": publication.archive.stored_sha256,
+                "storedByteSize": publication.archive.stored_size,
+                "tarSha256": publication.archive.tar_sha256,
+                "tarByteSize": publication.archive.tar_size,
+                "manifestSha256": hashlib.sha256(manifest).hexdigest(),
+                "manifestByteSize": len(manifest),
+                "zstdLevel": publication.archive.zstd_level,
+                "bundledFileCount": 4,
+            },
+            "canonical": {
+                "resultId": "77777777-7777-4777-8777-777777777777",
+                "resultAttemptId": "88888888-8888-4888-8888-888888888888",
+                "artifactId": "99999999-9999-4999-8999-999999999999",
+            },
+            "boundAt": "2026-07-18T00:00:00+00:00",
+            "fulfilledAt": "2026-07-18T00:00:01+00:00",
+        },
+        receipt_hmac="a" * 64,
+    )
+
+
+def test_brokered_reclaim_intent_recovers_crash_before_and_during_delete(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
+    authorization = _brokered_reclaim_authorization(
+        job_root, evidence, publication
+    )
+    with pytest.raises(RuntimeError, match="injected"):
+        reclaim_brokered_remote_evidence(
+            job_root,
+            evidence,
+            authorization,
+            crash_after_deletions=0,
+        )
+    intent_path = evidence / BROKERED_LOCAL_RECLAIM_INTENT_NAME
+    intent_before = intent_path.read_bytes()
+    assert (evidence / "engine_evidence.tar.zst").is_file()
+
+    with pytest.raises(RuntimeError, match="injected"):
+        reclaim_brokered_remote_evidence(
+            job_root,
+            evidence,
+            authorization,
+            crash_after_deletions=1,
+        )
+    assert intent_path.read_bytes() == intent_before
+    completed = reclaim_brokered_remote_evidence(
+        job_root, evidence, authorization
+    )
+    assert completed.state == "complete"
+    assert completed.bytes_freed > 0
+    assert not (evidence / "engine_evidence.tar.zst").exists()
+    assert not (evidence / "openfoam").exists()
+    assert not (evidence / "VTK").exists()
+    immutable_receipt = (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).read_bytes()
+    replay = reclaim_brokered_remote_evidence(job_root, evidence, authorization)
+    assert replay.state == "no_local_bytes"
+    assert replay.bytes_freed == completed.bytes_freed
+    assert (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).read_bytes() == immutable_receipt
+
+
+def test_brokered_reclaim_refuses_repopulated_or_changed_intended_paths(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
+    authorization = _brokered_reclaim_authorization(
+        job_root, evidence, publication
+    )
+    with pytest.raises(RuntimeError, match="injected"):
+        reclaim_brokered_remote_evidence(
+            job_root,
+            evidence,
+            authorization,
+            crash_after_deletions=0,
+        )
+    (evidence / "VTK" / "changed.vtu").write_text("new bytes", encoding="utf-8")
+    with pytest.raises(EvidenceCleanupError, match="changed after cleanup intent"):
+        reclaim_brokered_remote_evidence(job_root, evidence, authorization)
+    assert (evidence / "engine_evidence.tar.zst").is_file()
+    assert not (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).exists()
 
 
 def test_tar_zst_upload_materialize_and_selective_hydration_round_trip(tmp_path: Path) -> None:

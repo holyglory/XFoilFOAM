@@ -10,6 +10,8 @@ export const env = {
   port: Number(process.env.API_PORT ?? 4000),
   host: process.env.API_HOST ?? "0.0.0.0",
   engineUrl: process.env.ENGINE_URL ?? "http://localhost:8000",
+  engineControlPlaneToken: process.env.ENGINE_CONTROL_PLANE_TOKEN ?? null,
+  evidenceBucket: process.env.AIRFOILFOAM_EVIDENCE_BUCKET ?? null,
   engineExpectedBuildId:
     process.env.ENGINE_EXPECTED_BUILD_ID ??
     process.env.AIRFOILFOAM_BUILD_ID ??

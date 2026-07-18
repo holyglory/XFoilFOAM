@@ -19,7 +19,14 @@ import type {
 } from "@aerodb/engine-client";
 import { and, eq, like } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -345,6 +352,370 @@ afterAll(async () => {
 });
 
 describe("GCS Zstandard evidence ingestion", () => {
+  it("MUST-CATCH: reconciles an omitted mesh-evidence row only from exact local bytes and withholds acknowledgement on mismatch", async () => {
+    const owner = fixture!;
+    const memberPath = "openfoam/mesh_evidence/logs/log.blockMesh";
+    const memberBytes = Buffer.from("legacy verified mesh evidence\n");
+    const companionPath = "openfoam/mesh_evidence/manifest.json";
+    const companionBytes = Buffer.from('{"verified":true}\n');
+    const manifestBytes = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 2,
+        bundleExcludes: [],
+        files: [
+          {
+            path: memberPath,
+            role: "mesh_evidence",
+            sha256: createHash("sha256").update(memberBytes).digest("hex"),
+            byteSize: memberBytes.byteLength,
+          },
+          {
+            path: companionPath,
+            role: "mesh_evidence",
+            sha256: createHash("sha256").update(companionBytes).digest("hex"),
+            byteSize: companionBytes.byteLength,
+          },
+        ],
+      }),
+    );
+    await register({
+      ...logicalArtifact(owner, "manifest", "evidence_manifest.json"),
+      sha256: createHash("sha256").update(manifestBytes).digest("hex"),
+      byte_size: manifestBytes.byteLength,
+    });
+    const legacyPath = `${owner.evidenceBase}/openfoam_evidence.tar.gz`;
+    await register({
+      kind: "engine_bundle",
+      path: legacyPath,
+      url: artifactUrl(owner, legacyPath),
+      mime_type: "application/gzip",
+      sha256: sha256("legacy-mesh-evidence-gzip"),
+      byte_size: 90_000,
+      role: "evidence",
+      metadata: { evidenceBase: owner.evidenceBase },
+    });
+
+    const mediaRoot = await mkdtemp(join(tmpdir(), "evidence-backfill-gap-"));
+    const evidencePath = `cases/${owner.caseSlug}/${owner.evidenceBase}`;
+    const receiptDir = join(mediaRoot, "jobs", owner.engineJobId, evidencePath);
+    const receiptPath = join(receiptDir, "storage_migration.json");
+    const migratedSha = sha256("migrated-mesh-evidence-zstd");
+    const tarSha = sha256("legacy-mesh-evidence-tar-stream");
+    await mkdir(join(receiptDir, "openfoam", "mesh_evidence", "logs"), {
+      recursive: true,
+    });
+    await writeFile(join(receiptDir, "evidence_manifest.json"), manifestBytes);
+    await writeFile(join(receiptDir, memberPath), Buffer.from("wrong bytes"));
+    await writeFile(join(receiptDir, companionPath), companionBytes);
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        state: "awaiting_database_registration",
+        jobId: owner.engineJobId,
+        evidencePath,
+        archive: {
+          storedSha256: migratedSha,
+          storedByteSize: 54_321,
+          uncompressedTarSha256: tarSha,
+          uncompressedTarByteSize: 98_765,
+          zstdLevel: 10,
+        },
+        remote: {
+          schemaVersion: 1,
+          format: "tar+zstd",
+          bucket: BUCKET,
+          objectKey: `${PREFIX}/sha256/${migratedSha.slice(0, 2)}/${migratedSha}.tar.zst`,
+          generation: EXACT_GCS_GENERATION,
+          storedSha256: migratedSha,
+          storedSize: 54_321,
+          tarSha256: tarSha,
+          tarSize: 98_765,
+          crc32c: "AAAAAA==",
+          zstdLevel: 10,
+          createdAt: "2026-07-18T20:00:00.000Z",
+        },
+      }),
+    );
+
+    try {
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(
+        /local bytes do not match its authenticated manifest identity/,
+      );
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+      expect(await artifactsFor(owner, "mesh")).toHaveLength(0);
+      expect(await archivesFor(owner)).toHaveLength(0);
+
+      const memberFile = join(receiptDir, memberPath);
+      await rm(memberFile, { force: true });
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(/is missing locally/);
+      expect(await archivesFor(owner)).toHaveLength(0);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+
+      const symlinkTarget = join(mediaRoot, "outside-member");
+      await writeFile(symlinkTarget, memberBytes);
+      await symlink(symlinkTarget, memberFile);
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(/without symlink traversal/);
+      expect(await archivesFor(owner)).toHaveLength(0);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+      await rm(memberFile, { force: true });
+
+      const memberParent = join(
+        receiptDir,
+        "openfoam",
+        "mesh_evidence",
+        "logs",
+      );
+      await rm(memberParent, { recursive: true, force: true });
+      const outsideParent = join(mediaRoot, "outside-parent");
+      await mkdir(outsideParent, { recursive: true });
+      await writeFile(join(outsideParent, "log.blockMesh"), memberBytes);
+      await symlink(outsideParent, memberParent, "dir");
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(/without symlink traversal/);
+      expect(await archivesFor(owner)).toHaveLength(0);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+      await rm(memberParent, { force: true });
+      await mkdir(memberParent, { recursive: true });
+      await writeFile(join(receiptDir, memberPath), memberBytes);
+
+      await db
+        .update(solverEvidenceArtifacts)
+        .set({ aoaDeg: 1 })
+        .where(
+          eq(solverEvidenceArtifacts.resultAttemptId, owner.resultAttemptId),
+        );
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(
+        /does not exactly match its referenced result\/attempt\/job owners/,
+      );
+      expect(await artifactsFor(owner, "mesh")).toHaveLength(0);
+      expect(await archivesFor(owner)).toHaveLength(0);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+      await db
+        .update(solverEvidenceArtifacts)
+        .set({ aoaDeg: 0 })
+        .where(
+          eq(solverEvidenceArtifacts.resultAttemptId, owner.resultAttemptId),
+        );
+
+      const memberArtifactPath = `${owner.evidenceBase}/${memberPath}`;
+      const memberSha = createHash("sha256").update(memberBytes).digest("hex");
+      await register({
+        kind: "mesh_evidence",
+        path: memberArtifactPath,
+        url: artifactUrl(owner, memberArtifactPath),
+        mime_type: "application/octet-stream",
+        sha256: memberSha,
+        byte_size: memberBytes.byteLength,
+        role: "mesh_evidence",
+        metadata: { evidenceBase: owner.evidenceBase },
+      });
+      await register({
+        kind: "field_data",
+        path: memberArtifactPath,
+        url: artifactUrl(owner, memberArtifactPath),
+        mime_type: "application/octet-stream",
+        sha256: memberSha,
+        byte_size: memberBytes.byteLength,
+        role: "quality_evidence",
+        metadata: { evidenceBase: owner.evidenceBase },
+      });
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(/ambiguous artifacts for bundled manifest member/);
+      expect(await archivesFor(owner)).toHaveLength(0);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+      await db
+        .delete(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultAttemptId, owner.resultAttemptId),
+            eq(
+              solverEvidenceArtifacts.storageKey,
+              `jobs/${owner.engineJobId}/${evidencePath}/${memberPath}`,
+            ),
+          ),
+        );
+
+      const conflictingBundle = gcsBundle(owner);
+      await register(conflictingBundle);
+      const archivesBeforeLateFailure = await archivesFor(owner);
+      const membersBeforeLateFailure = await db
+        .select()
+        .from(solverEvidenceArtifactMembers)
+        .where(
+          eq(
+            solverEvidenceArtifactMembers.archiveId,
+            archivesBeforeLateFailure[0]!.id,
+          ),
+        );
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(/different current evidence archive/);
+      expect(await artifactsFor(owner, "mesh")).toHaveLength(0);
+      expect(await blobsForSha(migratedSha)).toHaveLength(0);
+      expect((await archivesFor(owner)).map((row) => row.id)).toEqual(
+        archivesBeforeLateFailure.map((row) => row.id),
+      );
+      expect(
+        await db
+          .select()
+          .from(solverEvidenceArtifactMembers)
+          .where(
+            eq(
+              solverEvidenceArtifactMembers.archiveId,
+              archivesBeforeLateFailure[0]!.id,
+            ),
+          ),
+      ).toEqual(membersBeforeLateFailure);
+      expect(
+        (await artifactsFor(owner, "engine_bundle")).some(
+          (artifact) => artifact.sha256 === migratedSha,
+        ),
+      ).toBe(false);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+      const conflictingSources = await artifactsFor(owner, "engine_bundle");
+      const conflictingSource = conflictingSources.find(
+        (artifact) => artifact.sha256 === conflictingBundle.sha256,
+      );
+      expect(conflictingSource).toBeDefined();
+      await db
+        .delete(solverEvidenceArtifacts)
+        .where(eq(solverEvidenceArtifacts.id, conflictingSource!.id));
+
+      const ack = await registerEvidenceMigrationReceipt({
+        db,
+        engine: ENGINE,
+        receiptPath,
+        mediaRoot,
+      });
+      expect(ack).toMatchObject({
+        state: "registered",
+        resultId: owner.resultId,
+        resultAttemptId: owner.resultAttemptId,
+      });
+      const meshArtifacts = await artifactsFor(owner, "mesh");
+      const meshArtifact = meshArtifacts.find((artifact) =>
+        artifact.storageKey.endsWith(`/${memberPath}`),
+      )!;
+      expect(meshArtifacts).toHaveLength(2);
+      expect(meshArtifact).toMatchObject({
+        resultId: owner.resultId,
+        resultAttemptId: owner.resultAttemptId,
+        airfoilId: owner.airfoilId,
+        simJobId: owner.simJobId,
+        engineJobId: owner.engineJobId,
+        engineCaseSlug: owner.caseSlug,
+        aoaDeg: 0,
+        role: "mesh_evidence",
+        storageKey: `jobs/${owner.engineJobId}/${evidencePath}/${memberPath}`,
+        mimeType: "application/octet-stream",
+        sha256: memberSha,
+        byteSize: memberBytes.byteLength,
+        metadata: expect.objectContaining({
+          evidenceBase: owner.evidenceBase,
+          engineArtifactKind: "mesh_evidence",
+        }),
+      });
+      const [archive] = await archivesFor(owner);
+      const mappings = await db
+        .select()
+        .from(solverEvidenceArtifactMembers)
+        .where(eq(solverEvidenceArtifactMembers.archiveId, archive.id));
+      expect(mappings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            artifactId: meshArtifact.id,
+            memberPath,
+          }),
+        ]),
+      );
+
+      const replay = await registerEvidenceMigrationReceipt({
+        db,
+        engine: ENGINE,
+        receiptPath,
+        mediaRoot,
+      });
+      expect(replay).toEqual(ack);
+      expect(await artifactsFor(owner, "mesh")).toHaveLength(2);
+    } finally {
+      await rm(mediaRoot, { recursive: true, force: true });
+    }
+  });
+
   it("backfills a verified filesystem migration receipt and writes a DB acknowledgement", async () => {
     const owner = fixture!;
     const manifestBytes = Buffer.from(

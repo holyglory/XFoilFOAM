@@ -450,132 +450,242 @@ Dry-run is the default for both migration commands. Keep two proofs separate:
 
 Do not turn a canary archive into campaign data to make proof 2 possible. The
 2026-07-17 production audit found three single-case gzip jobs, all with exact
-result and attempt owners. It also found 11 zero-owner filesystem archives,
-but all 11 have no `sim_jobs` owner and are canary-only Zstandard artifacts.
-They are ineligible for quarantine and remain under the separate
-attestation-backed canary cleanup in the completion ledger.
+result and attempt owners. The protected 2026-07-18 inventories separately
+agree on 16 zero-owner cutover-canary GCS generations totaling 216,240,757
+bytes across 11 completed engine-job directories. All 11 jobs have zero
+`sim_jobs`; these archives are ineligible for canonical result registration or
+orphan quarantine.
 
-### Attestation-backed cleanup of canary-only GCS generations
+### Immutable ownership and local reclamation for cutover canaries
 
-Migration `0079_canary_object_cleanup.sql` provides the only deletion path for
-these canary objects. It treats them as non-evidence: they must be exact
-`engine_bundle` generations named in the durable OpenCFD 2606 canary
-attestation and absent from every canonical blob/archive, pending artifact,
-orphan-quarantine, and incomplete-quarantine ownership path. Reservation takes
-the same transaction-scoped advisory identity lock as future blob/artifact
-adoption, then permanently fences that exact bucket/key/generation from later
-ownership. It never infers targets from an object prefix.
+Do **not** run the migration-0079 deletion workflow for these 16 generations.
+They are retained as operational rollout evidence. Four r5 generations across
+three jobs are exact members of canary attestation
+`112f52cd-eb8b-4908-bc79-6353daea6e12`. The other twelve are r2/r3/r4
+pre-attestation cutover canaries and require exact protected source-build,
+source-journal, operator-receipt, failure, runtime, status, pointer, archive,
+and manifest identities. Migration 0081 stores these classes separately as
+`attested_canary` and `unattested_cutover_canary`; neither class receives a
+result, attempt, AoA, coefficient, campaign, or polar owner.
 
-The application VM identity remains create/read-only. Perform the GCS phase
-from a separate operator workstation whose ADC identity has only the approved
-bucket-level `storage.objects.get` and `storage.objects.delete` permissions.
-The database planner and GCS operator are both dry-run by default. Before
-reserving anything, deploy migration 0079 through the normal strongly verified
-backup/deployment procedure and obtain the attestation id from the protected
-state file:
+The registration path shares exact GCS advisory locks with migrations 0079 and
+0080 and an exact engine-job lock with every future `sim_jobs`, result,
+result-attempt, and artifact owner. A pre-existing cleanup reservation or any
+other owner is a stop condition. Do not execute a previously exported 0079
+reservation; preserve it and add a reviewed corrective migration before
+continuing.
+
+Start from the two protected inventories and the retained r2/r3/r4 audit
+bytes. The repository-sealed allowlist is
+`config/operational-canary-approved-inventory.json`; its canonical content
+seal is
+`1b9660eb8117bb9786abb6c4d50981781c738722e419ebc230b90fd02c0e275b`.
+It binds attestation `112f52cd-eb8b-4908-bc79-6353daea6e12` to two distinct
+receipt identities: the database-semantic canonical JSON has SHA-256
+`f6d17988ea40e96c885df709357806a097daa19948d8b02efc6df25e035f6149`
+and a measured canonical size of 2,211,018 bytes, while the exact retained raw
+receipt has SHA-256
+`505819f2c745425071cc7900967abaead0911f30ab6af1636a8af92baf7276e8`
+and size 2,313,736 bytes. The canonical size is a verifier constant, not an
+operator-supplied inventory field. Any change to either identity or to one of
+the 16 object rows is a new reviewed migration, not operator input.
+
+Generate the claims deterministically from those protected inputs. Do not
+infer targets from a prefix, copy an older claim file, or hand-edit a digest.
+The generator authenticates both inventories and first proves the exact raw
+SHA-256 and size of the retained 2,313,736-byte r5 attestation receipt. It then
+parses strict finite JSON, normalizes finite integral float spellings to their
+database numeric values (including `-0.0` to `0`), and proves the independent
+database-semantic canonical SHA-256 and measured size before inspecting the
+receipt's engine and bundle rows. It also authenticates the exact three
+failed-cutover journals, every
+completed job status, pointer, archive, manifest, and manifest member before
+emitting a claim. It creates every attestation-receipt, source-build,
+source-journal, and provider-inventory proof file under its SHA-256 name. The
+receipt path below must name the protected original file produced by the r5
+cutover audit; do not reconstruct it from PostgreSQL JSON or embed it in the
+repository:
 
 ```bash
 umask 077
-ATTESTATION_ID="$(
-  sed -n 's/^OPENCFD2606_CANARY_ATTESTATION_ID=//p' "$ENV_FILE"
-)"
-test -n "$ATTESTATION_ID"
+APPROVED_CANARY_INVENTORY="$APP_DIR/config/operational-canary-approved-inventory.json"
+# Set these three variables to the immutable outputs retained by the production
+# audit. The sealed inventory authenticates their exact SHA-256 and byte size.
+: "${CANARY_LOCAL_INVENTORY:?set the protected 16-row local inventory path}"
+: "${CANARY_GCS_INVENTORY:?set the protected 16-row provider inventory path}"
+: "${CANARY_ATTESTATION_RECEIPT:?set the protected original r5 receipt path}"
+CANARY_CLAIMS="$AUDIT_DIR/operational-canary-claims.jsonl"
+CANARY_PROOFS="$AUDIT_DIR/operational-canary-proofs"
+test -s "$APPROVED_CANARY_INVENTORY"
+test -s "$CANARY_LOCAL_INVENTORY"
+test -s "$CANARY_GCS_INVENTORY"
+test -s "$CANARY_ATTESTATION_RECEIPT"
+install -d -m 0700 "$CANARY_PROOFS"
 
-CANARY_PLAN="$AUDIT_DIR/canary-object-cleanup-plan.jsonl"
-compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
-  src/canary-evidence-cleanup-cli.ts \
-  --attestation-id "$ATTESTATION_ID" >"$CANARY_PLAN"
-chmod 600 "$CANARY_PLAN"
+API_CID="$(compose ps -q api)"
+test -n "$API_CID"
+docker exec "$API_CID" install -d -m 0700 \
+  /tmp/operational-canary-inputs \
+  /tmp/operational-canary-journals \
+  /tmp/operational-canary-proofs
+docker cp "$APPROVED_CANARY_INVENTORY" \
+  "$API_CID":/tmp/operational-canary-inputs/approved-inventory.json
+docker cp "$CANARY_LOCAL_INVENTORY" \
+  "$API_CID":/tmp/operational-canary-inputs/local-inventory.json
+docker cp "$CANARY_GCS_INVENTORY" \
+  "$API_CID":/tmp/operational-canary-inputs/gcs-inventory.json
+docker cp "$CANARY_ATTESTATION_RECEIPT" \
+  "$API_CID":/tmp/operational-canary-inputs/r5-attestation-receipt.json
+for journal in \
+  pending-opencfd2606-rebuild-replay.json \
+  pending-opencfd2606-retention-retry.json \
+  pending-opencfd2606-transient-retention-retry.json
+do
+  test -s "$AIRFOILS_PRO_STATE_DIR/$journal"
+  docker cp "$AIRFOILS_PRO_STATE_DIR/$journal" \
+    "$API_CID:/tmp/operational-canary-journals/$journal"
+done
 
-python3 - "$CANARY_PLAN" <<'PY'
+compose exec -T api python3 -m airfoilfoam.canary_evidence_ownership \
+  --approved-inventory /tmp/operational-canary-inputs/approved-inventory.json \
+  --generate-claims \
+  --local-inventory /tmp/operational-canary-inputs/local-inventory.json \
+  --gcs-inventory /tmp/operational-canary-inputs/gcs-inventory.json \
+  --attestation-receipt /tmp/operational-canary-inputs/r5-attestation-receipt.json \
+  --audit-journal-root /tmp/operational-canary-journals \
+  --protected-proof-root /tmp/operational-canary-proofs \
+  >"$CANARY_CLAIMS"
+docker cp "$API_CID":/tmp/operational-canary-proofs/. "$CANARY_PROOFS"/
+
+test -s "$CANARY_CLAIMS"
+chmod 600 "$CANARY_CLAIMS"
+chmod 700 "$CANARY_PROOFS"
+
+python3 - "$CANARY_CLAIMS" <<'PY'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-assert len(rows) == 11, rows
-for row in rows:
-    assert row["status"] == "eligible", row
-    assert row["reservationId"] is None and row["receiptId"] is None, row
-    assert set(row["ownership"].values()) == {0}, row
-print("11 attested canary generations are zero-owner and eligible")
+assert len(rows) == 16, len(rows)
+assert len({row["job"]["id"] for row in rows}) == 11
+assert sum(row["target"]["storedByteSize"] for row in rows) == 216_240_757
+assert sum(row["provenance"]["kind"] == "attested_canary" for row in rows) == 4
+assert sum(row["provenance"]["kind"] == "unattested_cutover_canary" for row in rows) == 12
+assert {
+    row["provenance"].get("attestationId")
+    for row in rows if row["provenance"]["kind"] == "attested_canary"
+} == {"112f52cd-eb8b-4908-bc79-6353daea6e12"}
+print("16 immutable operational-canary claims conserved across 11 jobs")
 PY
 ```
 
-Any other count or state is a stop condition. When the operator workstation is
-ready, reserve the complete set atomically and keep the exported documents
-protected; each document embeds the canonical attestation receipt and its
-digest so the delete tool does not trust an editable target list:
+Copy the exact claim/proof set into the running engine container only for the
+validation/reclamation operation. Python dry-run is the first gate: it checks
+the completed job status and runtime, protected proof digests, pointer,
+archive, manifest member set, and every local archive member without changing
+the filesystem or GCS.
 
 ```bash
-CANARY_RESERVATIONS="$AUDIT_DIR/canary-object-cleanup-reservations.jsonl"
-RESERVATION_ACTOR="${USER}@$(hostname -f)"
+docker cp "$CANARY_CLAIMS" "$API_CID":/tmp/operational-canary-claims.jsonl
+
+compose exec -T api python3 -m airfoilfoam.canary_evidence_ownership \
+  --approved-inventory /tmp/operational-canary-inputs/approved-inventory.json \
+  --claims /tmp/operational-canary-claims.jsonl \
+  --protected-proof-root /tmp/operational-canary-proofs \
+  | tee "$AUDIT_DIR/operational-canary-local-plan.jsonl"
+```
+
+Require 16 `planned` rows and zero failed rows. Then run the database planner,
+still read-only, and require 16 `eligible` rows, one exact runtime match per
+row, zero existing source/blob/artifact/broker/cleanup ownership, and the exact
+attestation match for only the four attested rows:
+
+```bash
+CANARY_DB_PLAN="$AUDIT_DIR/operational-canary-database-plan.jsonl"
 compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
-  src/canary-evidence-cleanup-cli.ts \
-  --attestation-id "$ATTESTATION_ID" --reserve \
-  --actor "$RESERVATION_ACTOR" >"$CANARY_RESERVATIONS"
-chmod 600 "$CANARY_RESERVATIONS"
-test "$(wc -l <"$CANARY_RESERVATIONS")" -eq 11
+  src/canary-evidence-ownership-cli.ts \
+  --input /dev/stdin <"$CANARY_CLAIMS" >"$CANARY_DB_PLAN"
+chmod 600 "$CANARY_DB_PLAN"
+
+python3 - "$CANARY_DB_PLAN" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert len(rows) == 16
+assert all(row["eligible"] and row["state"] in {"eligible", "already_owned"} for row in rows)
+assert all(sum(row["ownership"].get(k, 0) for k in (
+    "sim_jobs", "results", "attempts", "blobs", "artifacts", "brokered", "cleanup"
+)) == 0 for row in rows)
+print("database ownership gate passed for all 16 exact generations")
+PY
 ```
 
-Securely copy that one file to a verified checkout on the operator workstation.
-Authenticate ADC as the approved operator identity; do not export or copy a
-service-account key. First run the read-only generation-pinned metadata proof,
-then explicitly execute the deletes into a new mode-0700 receipt directory:
+Register all 16 append-only ownership rows and retain the exact
+acknowledgements. The operation is idempotent: an exact replay returns the
+original ownership; any changed identity fails.
 
 ```bash
-umask 077
-export CANARY_RESERVATIONS=/secure/audit/canary-object-cleanup-reservations.jsonl
-export CANARY_RECEIPT_DIR=/secure/audit/canary-object-cleanup-receipts
-install -d -m 0700 "$CANARY_RECEIPT_DIR"
-
-uv run python -m airfoilfoam.canary_evidence_cleanup \
-  --reservation-file "$CANARY_RESERVATIONS" \
-  --receipt-dir "$CANARY_RECEIPT_DIR" --operator "$USER"
-
-uv run python -m airfoilfoam.canary_evidence_cleanup \
-  --reservation-file "$CANARY_RESERVATIONS" \
-  --receipt-dir "$CANARY_RECEIPT_DIR" --operator "$USER" --execute \
-  | tee /secure/audit/canary-object-cleanup-receipts.jsonl
-```
-
-Each delete uses the attested generation as an `if_generation_match`
-precondition. After GCS returns success, the tool performs a fresh lookup of
-that exact generation and refuses to write a `deleted` receipt unless the live
-generation is absent. Existing immutable receipt files make a rerun
-idempotent. The bucket's soft-delete policy remains the recovery boundary; do
-not purge soft-deleted versions.
-
-Copy the receipt JSONL back to the protected VPS audit directory, then
-acknowledge it through the guarded database path by streaming it on standard
-input (the audit directory is intentionally not mounted in the container):
-
-```bash
-CANARY_RECEIPTS="$AUDIT_DIR/canary-object-cleanup-receipts.jsonl"
-test "$(wc -l <"$CANARY_RECEIPTS")" -eq 11
+CANARY_ACKS="$AUDIT_DIR/operational-canary-database-acks.jsonl"
 compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
-  src/canary-evidence-cleanup-cli.ts \
-  --acknowledgement-file /dev/stdin <"$CANARY_RECEIPTS" \
-  | tee "$AUDIT_DIR/canary-object-cleanup-database-ack.jsonl"
-
-compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
-  src/canary-evidence-cleanup-cli.ts \
-  --attestation-id "$ATTESTATION_ID" \
-  | tee "$AUDIT_DIR/canary-object-cleanup-final-plan.jsonl"
+  src/canary-evidence-ownership-cli.ts --register \
+  --input /dev/stdin <"$CANARY_CLAIMS" >"$CANARY_ACKS"
+chmod 600 "$CANARY_ACKS"
+test "$(wc -l <"$CANARY_ACKS")" -eq 16
+docker cp "$CANARY_ACKS" "$API_CID":/tmp/operational-canary-database-acks.jsonl
 ```
 
-Require 11 immutable database receipts and 11 `complete` final-plan rows. Run
-the operator dry-run once more; dry-run always performs a fresh pinned provider
-lookup even when an immutable execute receipt exists:
+Only after those acknowledgements exist may the Python execute phase reclaim
+the closed allowlist of local archives/raw trees. Each row performs a new
+generation-pinned GCS download and authenticates the archive, embedded
+manifest, and every manifest member. It writes a create-only fsynced intent
+before the first removal, so an interrupted pass resumes without widening the
+target. It never deletes or retargets a GCS object.
 
 ```bash
-uv run python -m airfoilfoam.canary_evidence_cleanup \
-  --reservation-file "$CANARY_RESERVATIONS" \
-  --receipt-dir "$CANARY_RECEIPT_DIR" --operator "$USER" \
-  | tee /secure/audit/canary-object-cleanup-final-gcs-check.jsonl
+CANARY_RECLAIM="$AUDIT_DIR/operational-canary-local-reclaim.jsonl"
+compose exec -T api python3 -m airfoilfoam.canary_evidence_ownership \
+  --approved-inventory /tmp/operational-canary-inputs/approved-inventory.json \
+  --claims /tmp/operational-canary-claims.jsonl \
+  --database-acks /tmp/operational-canary-database-acks.jsonl \
+  --protected-proof-root /tmp/operational-canary-proofs --execute \
+  | tee "$CANARY_RECLAIM"
+
+CANARY_RETENTION_RECEIPTS="$AUDIT_DIR/operational-canary-retention-receipts.jsonl"
+python3 - "$CANARY_RECLAIM" "$CANARY_RETENTION_RECEIPTS" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+receipts = [row["receipt"] for row in rows if row.get("receipt")]
+assert len(rows) == 16 and len(receipts) == 16
+assert all(row["status"] in {"retained", "already-retained"} for row in rows)
+with open(sys.argv[2], "x", encoding="utf-8") as out:
+    for receipt in receipts:
+        out.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+chmod 600 "$CANARY_RETENTION_RECEIPTS"
+
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/canary-evidence-ownership-cli.ts --acknowledge \
+  --input /dev/stdin <"$CANARY_RETENTION_RECEIPTS" \
+  | tee "$AUDIT_DIR/operational-canary-retention-database-acks.jsonl"
 ```
 
-Require all 11 exact generations to report `already_absent`. Reconcile
-canonical evidence ownership counts before and after; they must be unchanged.
-No command in this procedure lists or deletes a prefix, and no canary byte may
-be registered as campaign evidence.
+Rerun the Python execute command once. It still performs a fresh pinned remote
+restore before returning the immutable existing receipt and must report 16
+`already-retained` rows. Finish with exact database conservation counts:
+
+```bash
+compose exec -T postgres psql -U aerodb -d aerodb -v ON_ERROR_STOP=1 -Atc "
+SELECT count(*), count(DISTINCT engine_job_id), sum(stored_byte_size),
+       count(*) FILTER (WHERE provenance_kind='attested_canary'),
+       count(*) FILTER (WHERE provenance_kind='unattested_cutover_canary')
+FROM solver_operational_canary_evidence_objects;
+SELECT count(*) FROM solver_operational_canary_retention_receipts;
+" | tee "$AUDIT_DIR/operational-canary-final-counts.txt"
+grep -Fx '16|11|216240757|4|12' "$AUDIT_DIR/operational-canary-final-counts.txt"
+grep -Fx '16' "$AUDIT_DIR/operational-canary-final-counts.txt"
+```
+
+Reconcile the original 16 bucket/key/generation/SHA/size/CRC identities against
+fresh provider metadata and require every generation still present. No command
+in this procedure lists or deletes a prefix, no application identity receives
+delete permission, and no canary byte may enter a polar.
 
 ### A. One result-owned legacy gzip trial
 
@@ -910,8 +1020,9 @@ state. Require the exact selected row to remain in the regenerated
 If the selector returns no row, write
 `{"status":"no-eligible-production-orphan"}` to the audit directory and stop
 proof B. That is the truthful current production outcome, not permission to
-adopt one of the 11 canary-only archives, create a `sim_jobs` row, or bind an
-AoA/result. The gzip trial and bulk gzip migration may continue.
+adopt one of the 16 cutover-canary generations across 11 engine-job
+directories, create a `sim_jobs` row, or bind an AoA/result. The gzip trial and
+bulk gzip migration may continue.
 
 Only for a row that passes every predicate, run a scoped dry plan and require
 exactly one unchanged `planned` row, then run pass 1:
@@ -2571,6 +2682,72 @@ the gateway during approved maintenance before clearing disposable cache.
 - Pending/running jobs and their live continuation state are outside this
   legacy migration. Their live-case and evidence VTK remain untouched by the
   migration; do not count those local bytes as a migration failure.
+
+## 10.1 Hub-brokered evidence from a credentialless remote solver
+
+The hub and a remote solver have deliberately different storage contracts.
+The production hub owns `airfoils-pro-storage-bucket` through its workload
+identity and keeps the normal remote-only GCS evidence contract. A remote node
+such as `hz-solver2` receives neither a service-account JSON file nor ambient
+GCS credentials. It produces the same immutable `tar.zst`, retains that local
+file temporarily, and uploads it only through a short-lived resumable HTTPS
+capability issued by the hub for one exact active promise, point, attempt,
+solver identity, checksum, byte size, and canonical object key.
+
+The required remote engine environment is therefore:
+
+```dotenv
+AIRFOILFOAM_EVIDENCE_BUCKET=
+AIRFOILFOAM_EVIDENCE_REMOTE_ONLY=false
+```
+
+Do not copy the hub's service-account key, Application Default Credentials, or
+bucket setting to the remote node. `remote-only=true` would let a
+credentialless engine delete the only local archive before the brokered upload.
+The sweeper checks this contract at startup and again before remote
+reconciliation/admission, and refuses remote work when either the bucket is
+nonempty or remote-only retention is enabled.
+
+The remote node authenticates to the hub with its own revocable solver token.
+The opaque upload URL is a bounded capability, not a reusable GCS credential;
+it must never be logged, placed in configuration or error text, exposed to an
+admin/public/browser payload, or persisted on the remote solver. For crash-safe
+recovery and exact cancellation, the hub may retain it only in the protected
+`sync_brokered_evidence_uploads` control-plane row and the engine may retain it
+only in its mode-0600 owner-bound session ledger. Both copies must be cleared as
+soon as verification/binding succeeds or cancellation/expiry is acknowledged;
+settled and cancelled ledger records retain the outcome but not the bearer.
+After upload, the hub independently restores the exact generation, verifies
+CRC32C, stored and uncompressed SHA-256 and byte sizes, authenticates the
+manifest and every declared member, and only then permits the exact result
+generation to bind. Revocation, expiry, cancellation, identity drift, a cleanup
+reservation, or any mismatch fails closed. Keep the remote archive until the
+hub returns that verified binding; normal engine retention may remove it only
+after that acknowledgement.
+
+The remote solver renews the exact upstream promise with a one-hour TTL before
+transfer and at a bounded interval of at most 20 minutes throughout both the
+brokered GCS stream and the following multipart polar push. This timer is
+independent of byte progress. An authoritative heartbeat 404/409 aborts the
+transfer and cancels local job/promise/point ownership; a timeout, network
+failure, 408/429, or 5xx aborts only the delivery attempt and remains retryable.
+Do not weaken the hub's active-lease binding gate to accommodate a slow upload.
+
+A signed binding receipt is necessary but is not by itself permission to
+delete the remote solver's local evidence. Before every reclaim attempt, the
+remote solver must resolve the exact immutable bundle/attempt remote reference,
+authenticate to the configured same-origin hub with its current solver token,
+GET the exact bound-upload download path with redirects disabled, consume the
+body to EOF, and match declared and actual bytes, stored SHA-256, GCS generation,
+and `application/zstd` MIME type against both the reference and receipt. Only
+then may it call the local engine reclaim endpoint. Missing/rotated credentials,
+403/409, redirects, truncation, or any identity mismatch are persisted with
+backoff; all local archive and raw CFD bytes remain intact. The exact reclaim
+claim token is renewed at most every two minutes throughout the readback and
+engine acknowledgement, so the ten-minute claim cannot expire and be stolen by
+a second sweeper during a slow multi-hour stream. A sequential worker claims
+only one reclaim row at a time; additional rows remain pending and unclaimed
+until that readback settles. Horizontal workers coordinate with `SKIP LOCKED`.
 
 ## 11. Stop conditions and rollback
 

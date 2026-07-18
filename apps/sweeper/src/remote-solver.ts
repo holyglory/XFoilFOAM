@@ -9,6 +9,7 @@ import {
   meshProfiles,
   outputProfiles,
   referenceGeometryProfiles,
+  remoteAssetReferences,
   resultAttempts,
   resultClassifications,
   resultFieldExtents,
@@ -25,6 +26,7 @@ import {
   solverProfiles,
   solverRuntimeBuilds,
   syncApiSettings,
+  syncRemoteHubBindingReceipts,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
   syncSweepPromisePoints,
@@ -34,6 +36,10 @@ import {
   METHOD_COMPATIBILITY_HASH_VERSION,
 } from "@aerodb/db";
 import {
+  canonicalRemoteHubBaseUrl,
+  isGcsResumableUploadUrl,
+} from "@aerodb/core";
+import {
   methodCompatibilityHashForSnapshot,
   physicsHashForSnapshot,
   simulationSetupSignature,
@@ -41,8 +47,15 @@ import {
 } from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
 import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
-import { randomBytes, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 
@@ -51,7 +64,12 @@ import {
   solverImplementationIdForSetup,
 } from "./build-request";
 import { claimAoas } from "./claim";
-import { configuredEngineIdentity } from "./config";
+import {
+  assertRemoteSolverNodeEvidenceContract,
+  assertRemoteSolverHubUrlContract,
+  configuredControlPlaneToken,
+  configuredEngineIdentity,
+} from "./config";
 import {
   clearEngineUnreachable,
   engineBackoffActive,
@@ -83,8 +101,79 @@ const DELIVERY_CLAIM_RENEW_INTERVAL_MS = Number(
   process.env.REMOTE_DELIVERY_CLAIM_RENEW_INTERVAL_MS ??
     Math.min(5 * 60_000, Math.max(1_000, DELIVERY_CLAIM_MS / 3)),
 );
+const REMOTE_TRANSFER_PROMISE_TTL_HOURS = 1;
+const REMOTE_TRANSFER_PROMISE_RENEW_INTERVAL_MS = Math.min(
+  20 * 60_000,
+  Math.max(
+    1_000,
+    Number(
+      process.env.REMOTE_TRANSFER_PROMISE_RENEW_INTERVAL_MS ?? 15 * 60_000,
+    ),
+  ),
+);
+const REMOTE_RECLAIM_CLAIM_MS = 10 * 60_000;
+const REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS = Math.min(
+  2 * 60_000,
+  Math.max(
+    1_000,
+    Number(process.env.REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS ?? 2 * 60_000),
+  ),
+);
+const HUB_BINDING_RECEIPT_HMAC_DOMAIN =
+  "xfoilfoam-hub-canonical-evidence-binding-v1\n";
 
 type Settings = typeof syncApiSettings.$inferSelect;
+
+interface HubBindingReceipt {
+  schemaVersion: 1;
+  kind: "hub-canonical-evidence-binding";
+  promiseId: string;
+  aoaDeg: number;
+  remoteResultId: string;
+  remoteResultAttemptId: string;
+  engineJobId: string;
+  engineCaseSlug: string | null;
+  brokeredUploadId: string;
+  bindingState: "bound";
+  promisePointState: "fulfilled";
+  remote: {
+    bucket: string;
+    objectKey: string;
+    generation: string;
+    crc32c: string;
+    storedSha256: string;
+    storedByteSize: number;
+    tarSha256: string;
+    tarByteSize: number;
+    manifestSha256: string;
+    manifestByteSize: number;
+    zstdLevel: number;
+    bundledFileCount: number;
+  };
+  canonical: {
+    resultId: string;
+    resultAttemptId: string;
+    artifactId: string;
+  };
+  boundAt: string;
+  fulfilledAt: string;
+}
+
+interface SignedHubBindingReceipt {
+  receipt: HubBindingReceipt;
+  receiptHmac: string;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const source = value as Record<string, unknown>;
+  return `{${Object.keys(source)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`)
+    .join(",")}}`;
+}
 
 interface RemoteClaimResponse {
   promise: null | {
@@ -138,13 +227,124 @@ export type RemoteEngineAdmissionDecision =
 function syncBase(settings: Settings): string {
   if (!settings.upstreamBaseUrl)
     throw new Error("up-tier endpoint is not configured");
-  return settings.upstreamBaseUrl.replace(/\/+$/, "");
+  return canonicalRemoteHubBaseUrl(settings.upstreamBaseUrl);
 }
 
 function headers(settings: Settings) {
+  if (!settings.remoteSolverAuthToken)
+    throw new Error("remote solver credential is not registered");
   return {
     "content-type": "application/json",
-    "x-xfoilfoam-sync-secret": settings.upstreamSecret ?? "",
+    "x-xfoilfoam-solver-token": settings.remoteSolverAuthToken,
+  };
+}
+
+function bootstrapHeaders(settings: Settings) {
+  return {
+    "content-type": "application/json",
+    ...(settings.remoteSolverAuthToken
+      ? { "x-xfoilfoam-solver-token": settings.remoteSolverAuthToken }
+      : { "x-xfoilfoam-sync-secret": settings.upstreamSecret ?? "" }),
+  };
+}
+
+function exactSignedHubBindingReceipt(
+  value: unknown,
+  input: {
+    settings: Settings;
+    promiseId: string;
+    resultId: string;
+    resultAttemptId: string;
+    aoaDeg: number;
+    engineJobId: string;
+    engineCaseSlug: string | null;
+    brokeredUploadId: string;
+    brokerRequest: {
+      storedSha256: string;
+      storedByteSize: number;
+      tarSha256: string;
+      tarByteSize: number;
+      manifestSha256: string;
+      manifestByteSize: number;
+      zstdLevel: number;
+      bundledFileCount: number;
+    };
+    remotePointer: Record<string, unknown>;
+  },
+): SignedHubBindingReceipt {
+  if (!input.settings.remoteSolverAuthToken)
+    throw new Error(
+      "remote solver credential is unavailable for receipt verification",
+    );
+  if (!value || typeof value !== "object")
+    throw new Error("remote hub omitted its signed canonical binding receipt");
+  const wrapper = value as Record<string, unknown>;
+  if (
+    !wrapper.receipt ||
+    typeof wrapper.receipt !== "object" ||
+    typeof wrapper.receiptHmac !== "string" ||
+    !/^[0-9a-f]{64}$/.test(wrapper.receiptHmac)
+  )
+    throw new Error("remote hub returned an invalid binding receipt envelope");
+  const receipt = wrapper.receipt as unknown as HubBindingReceipt;
+  const expectedHmac = createHmac(
+    "sha256",
+    input.settings.remoteSolverAuthToken,
+  )
+    .update(HUB_BINDING_RECEIPT_HMAC_DOMAIN)
+    .update(canonicalJson(receipt))
+    .digest("hex");
+  const supplied = Buffer.from(wrapper.receiptHmac, "hex");
+  const expected = Buffer.from(expectedHmac, "hex");
+  if (
+    supplied.length !== expected.length ||
+    !timingSafeEqual(supplied, expected)
+  )
+    throw new Error("remote hub binding receipt authentication failed");
+  const remote = receipt.remote;
+  const canonical = receipt.canonical;
+  const exact =
+    receipt.schemaVersion === 1 &&
+    receipt.kind === "hub-canonical-evidence-binding" &&
+    receipt.promiseId === input.promiseId &&
+    receipt.aoaDeg === input.aoaDeg &&
+    receipt.remoteResultId === input.resultId &&
+    receipt.remoteResultAttemptId === input.resultAttemptId &&
+    receipt.engineJobId === input.engineJobId &&
+    receipt.engineCaseSlug === input.engineCaseSlug &&
+    receipt.brokeredUploadId === input.brokeredUploadId &&
+    receipt.bindingState === "bound" &&
+    receipt.promisePointState === "fulfilled" &&
+    remote?.bucket === input.remotePointer.bucket &&
+    remote?.objectKey === input.remotePointer.objectKey &&
+    remote?.generation === input.remotePointer.generation &&
+    remote?.crc32c === input.remotePointer.crc32c &&
+    remote?.storedSha256 === input.brokerRequest.storedSha256 &&
+    remote?.storedByteSize === input.brokerRequest.storedByteSize &&
+    remote?.tarSha256 === input.brokerRequest.tarSha256 &&
+    remote?.tarByteSize === input.brokerRequest.tarByteSize &&
+    remote?.manifestSha256 === input.brokerRequest.manifestSha256 &&
+    remote?.manifestByteSize === input.brokerRequest.manifestByteSize &&
+    remote?.zstdLevel === input.brokerRequest.zstdLevel &&
+    remote?.bundledFileCount === input.brokerRequest.bundledFileCount &&
+    canonical &&
+    typeof canonical.resultId === "string" &&
+    /^[0-9a-f-]{36}$/i.test(canonical.resultId) &&
+    typeof canonical.resultAttemptId === "string" &&
+    /^[0-9a-f-]{36}$/i.test(canonical.resultAttemptId) &&
+    typeof canonical.artifactId === "string" &&
+    /^[0-9a-f-]{36}$/i.test(canonical.artifactId) &&
+    typeof receipt.boundAt === "string" &&
+    Number.isFinite(Date.parse(receipt.boundAt)) &&
+    typeof receipt.fulfilledAt === "string" &&
+    Number.isFinite(Date.parse(receipt.fulfilledAt));
+  if (!exact)
+    throw new Error(
+      "remote hub binding receipt does not match the exact delivered generation",
+    );
+  return {
+    receipt,
+    receiptHmac: wrapper.receiptHmac,
   };
 }
 
@@ -620,7 +820,7 @@ async function registerSolver(db: DB, settings: Settings): Promise<string> {
   const res = await fetch(`${syncBase(settings)}/solvers/register`, {
     method: "POST",
     signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
-    headers: headers(settings),
+    headers: bootstrapHeaders(settings),
     body: JSON.stringify({
       instanceId: settings.instanceId,
       instanceName: settings.instanceName,
@@ -635,19 +835,23 @@ async function registerSolver(db: DB, settings: Settings): Promise<string> {
     }),
   });
   const payload = (await res.json().catch(() => null)) as {
+    authToken?: string;
     solver?: { id?: string };
   } | null;
-  if (!res.ok || !payload?.solver?.id)
+  if (!res.ok || !payload?.solver?.id || !payload.authToken)
     throw new Error(`remote solver registration failed (${res.status})`);
   await db
     .update(syncApiSettings)
     .set({
       remoteSolverRegisteredId: payload.solver.id,
+      remoteSolverAuthToken: payload.authToken,
       remoteSolverLastStatus: "idle",
       remoteSolverLastError: null,
       updatedAt: new Date(),
     })
     .where(eq(syncApiSettings.id, 1));
+  settings.remoteSolverRegisteredId = payload.solver.id;
+  settings.remoteSolverAuthToken = payload.authToken;
   return payload.solver.id;
 }
 
@@ -900,7 +1104,233 @@ async function cancelAuthoritativelyExpiredPromise(
       .update(syncSweepPromisePoints)
       .set({ status: "cancelled", updatedAt: new Date() })
       .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    await tx
+      .update(syncRemoteResultDeliveries)
+      .set({
+        state: "superseded",
+        claimToken: null,
+        claimedAt: null,
+        claimExpiresAt: null,
+        lastError: reason,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(syncRemoteResultDeliveries.promiseId, promiseId),
+          inArray(syncRemoteResultDeliveries.state, [
+            "pending",
+            "pushing",
+            "retry_wait",
+            "blocked",
+          ]),
+        ),
+      );
   });
+}
+
+class RemotePromiseTransferLeaseError extends Error {
+  constructor(
+    message: string,
+    readonly authoritative: boolean,
+  ) {
+    super(message);
+    this.name = "RemotePromiseTransferLeaseError";
+  }
+}
+
+async function renewExactRemotePromiseTransferLease(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+  promiseId: string,
+): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${syncBase(settings)}/sweeps/${promiseId}/heartbeat`,
+      {
+        method: "POST",
+        signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+        headers: headers(settings),
+        body: JSON.stringify({ ttlHours: REMOTE_TRANSFER_PROMISE_TTL_HOURS }),
+      },
+    );
+  } catch (error) {
+    throw new RemotePromiseTransferLeaseError(
+      `remote promise ${promiseId} transfer lease renewal failed transiently: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      false,
+    );
+  }
+  if (response.status === 404 || response.status === 409) {
+    const reason = `up-tier authoritatively rejected promise ${promiseId} transfer lease renewal (${response.status})`;
+    await cancelAuthoritativelyExpiredPromise(db, engine, promiseId, reason);
+    throw new RemotePromiseTransferLeaseError(reason, true);
+  }
+  if (!response.ok) {
+    throw new RemotePromiseTransferLeaseError(
+      `remote promise ${promiseId} transfer lease renewal failed transiently (${response.status})`,
+      false,
+    );
+  }
+  const payload = (await response.json().catch(() => null)) as {
+    expiresAt?: unknown;
+  } | null;
+  const expiresAt =
+    typeof payload?.expiresAt === "string" ? new Date(payload.expiresAt) : null;
+  if (
+    !expiresAt ||
+    !Number.isFinite(expiresAt.getTime()) ||
+    expiresAt <= new Date()
+  ) {
+    throw new RemotePromiseTransferLeaseError(
+      `remote promise ${promiseId} transfer lease renewal omitted a live expiry`,
+      false,
+    );
+  }
+  const updated = await db
+    .update(syncSweepPromises)
+    .set({ expiresAt, lastHeartbeatAt: new Date(), updatedAt: new Date() })
+    .where(
+      and(
+        eq(syncSweepPromises.id, promiseId),
+        eq(syncSweepPromises.status, "active"),
+      ),
+    )
+    .returning({ id: syncSweepPromises.id });
+  if (updated.length !== 1) {
+    throw new RemotePromiseTransferLeaseError(
+      `local ownership of remote promise ${promiseId} ended during transfer lease renewal`,
+      true,
+    );
+  }
+}
+
+interface RemotePromiseTransferLease {
+  signal: AbortSignal;
+  throwIfFailed: () => void;
+  stop: () => Promise<Error | null>;
+}
+
+interface RemoteReclaimClaimLease {
+  signal: AbortSignal;
+  throwIfFailed: () => void;
+  stop: () => Promise<Error | null>;
+}
+
+/** Renew the exact claim token independently of archive byte progress. A
+ * preflight may legitimately stream for hours; the 10-minute claim therefore
+ * cannot be a one-shot expiry that another sweeper can steal mid-read. */
+export function startRemoteReclaimClaimLease(
+  db: DB,
+  claim: { id: string; token: string },
+): RemoteReclaimClaimLease {
+  const controller = new AbortController();
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let inFlight: Promise<void> | null = null;
+  let failure: Error | null = null;
+  const renew = async () => {
+    const updated = await db
+      .update(syncRemoteHubBindingReceipts)
+      .set({
+        reclaimClaimExpiresAt: new Date(Date.now() + REMOTE_RECLAIM_CLAIM_MS),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(syncRemoteHubBindingReceipts.id, claim.id),
+          eq(syncRemoteHubBindingReceipts.reclaimState, "claiming"),
+          eq(syncRemoteHubBindingReceipts.reclaimClaimToken, claim.token),
+        ),
+      )
+      .returning({ id: syncRemoteHubBindingReceipts.id });
+    if (updated.length !== 1)
+      throw new Error(
+        "brokered evidence reclaim claim expired or changed during preflight",
+      );
+  };
+  const schedule = () => {
+    if (stopped || failure) return;
+    timer = setTimeout(() => {
+      inFlight = renew()
+        .catch((error) => {
+          failure = error instanceof Error ? error : new Error(String(error));
+          if (!controller.signal.aborted) controller.abort(failure);
+        })
+        .finally(() => {
+          inFlight = null;
+          schedule();
+        });
+    }, REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS);
+    timer.unref?.();
+  };
+  schedule();
+  return {
+    signal: controller.signal,
+    throwIfFailed: () => {
+      if (failure) throw failure;
+    },
+    stop: async () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      await inFlight;
+      return failure;
+    },
+  };
+}
+
+/** Keep the exact upstream promise authoritative while a potentially
+ * multi-hour GCS or multipart stream is in flight. The timer runs independently
+ * of byte progress, so one slow PUT/read cannot silently outlive a one-hour
+ * lease. Authoritative 404/409 responses cancel local ownership; transient
+ * failures abort only this delivery attempt and remain retryable. */
+export async function startRemotePromiseTransferLease(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+  promiseId: string,
+  onRenew: () => Promise<void>,
+): Promise<RemotePromiseTransferLease> {
+  const controller = new AbortController();
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let inFlight: Promise<void> | null = null;
+  let failure: Error | null = null;
+  const renew = async () => {
+    await renewExactRemotePromiseTransferLease(db, engine, settings, promiseId);
+    await onRenew();
+  };
+  const schedule = () => {
+    if (stopped || failure) return;
+    timer = setTimeout(() => {
+      inFlight = renew()
+        .catch((error) => {
+          failure = error instanceof Error ? error : new Error(String(error));
+          if (!controller.signal.aborted) controller.abort(failure);
+        })
+        .finally(() => {
+          inFlight = null;
+          schedule();
+        });
+    }, REMOTE_TRANSFER_PROMISE_RENEW_INTERVAL_MS);
+    timer.unref?.();
+  };
+  await renew();
+  schedule();
+  return {
+    signal: controller.signal,
+    throwIfFailed: () => {
+      if (failure) throw failure;
+    },
+    stop: async () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      await inFlight;
+      return failure;
+    },
+  };
 }
 
 async function renewMirroredPromiseLeases(
@@ -1062,7 +1492,7 @@ async function cancelMirroredRemotePromise(
       );
     return true;
   });
-  if (queued) {
+  if (queued && settings.remoteSolverAuthToken) {
     await processPendingPromiseCancellations(db, settings, promiseId);
   }
 }
@@ -1127,19 +1557,22 @@ async function processPendingPromiseCancellations(
     let response: Response | null = null;
     let failure: string | null = null;
     try {
+      const hubBaseUrl = syncBase(settings);
       if (!row.sourceBaseUrl) {
         throw new Error(
           `remote promise ${row.promiseId} has no stored authority endpoint`,
         );
       }
-      response = await fetch(
-        `${row.sourceBaseUrl.replace(/\/+$/, "")}/sweeps/${row.promiseId}/cancel`,
-        {
-          method: "POST",
-          signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
-          headers: headers(settings),
-        },
-      );
+      if (row.sourceBaseUrl !== hubBaseUrl) {
+        throw new Error(
+          `remote promise ${row.promiseId} cancellation authority no longer matches the configured hub`,
+        );
+      }
+      response = await fetch(`${hubBaseUrl}/sweeps/${row.promiseId}/cancel`, {
+        method: "POST",
+        signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+        headers: headers(settings),
+      });
       if (!response.ok && response.status !== 404) {
         failure = `remote promise cancellation failed (${response.status})`;
       }
@@ -1538,6 +1971,191 @@ interface StreamUpload {
   mimeType: string;
 }
 
+function completedUploadGeneration(
+  response: Response,
+  payload: unknown,
+): string | null {
+  const validGeneration = (value: string) =>
+    /^[1-9][0-9]{0,19}$/.test(value) &&
+    BigInt(value) <= 18_446_744_073_709_551_615n;
+  const header = response.headers.get("x-goog-generation");
+  if (header && validGeneration(header)) return header;
+  if (payload && typeof payload === "object") {
+    const generation = (payload as Record<string, unknown>).generation;
+    if (typeof generation === "string" && validGeneration(generation))
+      return generation;
+    if (
+      typeof generation === "number" &&
+      Number.isSafeInteger(generation) &&
+      generation > 0
+    )
+      return String(generation);
+  }
+  return null;
+}
+
+function resumableOffset(response: Response): number {
+  const range = response.headers.get("range");
+  const matched = range?.match(/^bytes=0-([0-9]+)$/i);
+  return matched ? Number(matched[1]) + 1 : 0;
+}
+
+class TerminalEvidenceUploadError extends Error {}
+
+function rejectedRedirect(error: unknown): boolean {
+  const messages: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 3 && current; depth += 1) {
+    if (current instanceof Error) messages.push(current.message);
+    if (typeof current !== "object") break;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return messages.some((message) => /redirect/i.test(message));
+}
+
+function rejectUploadRedirect(response: Response): void {
+  // 308 is GCS's documented "resume incomplete" response, not an HTTP
+  // redirect in this protocol. Every other 3xx response is terminal.
+  if (
+    response.status >= 300 &&
+    response.status < 400 &&
+    response.status !== 308
+  ) {
+    throw new TerminalEvidenceUploadError(
+      `GCS resumable evidence upload rejected a redirect (${response.status})`,
+    );
+  }
+}
+
+/** Upload to an opaque GCS resumable capability without any Google
+ * credential. The capability itself is never logged or persisted locally. */
+export async function uploadBrokeredEvidenceFile(
+  uploadUrl: string,
+  expected: { bucket: string; objectKey: string },
+  storageKey: string,
+  totalBytes: number,
+  onProgress: () => Promise<void>,
+  transferSignal?: AbortSignal,
+): Promise<string> {
+  if (!isGcsResumableUploadUrl(uploadUrl, expected))
+    throw new Error(
+      "remote evidence broker returned an invalid GCS upload capability",
+    );
+  if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0)
+    throw new Error("remote evidence bundle size is invalid");
+  const path = join(MEDIA_DIR, storageKey);
+  const source = await stat(path);
+  if (!source.isFile() || source.size !== totalBytes)
+    throw new Error(
+      "remote evidence bundle bytes do not match the declared size",
+    );
+  const chunkBytes = 8 * 1024 * 1024;
+  const absolute = AbortSignal.timeout(REMOTE_PUSH_ABSOLUTE_TIMEOUT_MS);
+  let offset = 0;
+  let transientFailures = 0;
+  while (offset < totalBytes) {
+    const end = Math.min(totalBytes - 1, offset + chunkBytes - 1);
+    try {
+      await onProgress();
+      const response = await fetch(uploadUrl, {
+        method: "PUT",
+        redirect: "error",
+        signal: AbortSignal.any([
+          absolute,
+          AbortSignal.timeout(REMOTE_PUSH_STALL_TIMEOUT_MS),
+          ...(transferSignal ? [transferSignal] : []),
+        ]),
+        headers: {
+          "content-type": "application/zstd",
+          "content-length": String(end - offset + 1),
+          "content-range": `bytes ${offset}-${end}/${totalBytes}`,
+        },
+        body: createReadStream(path, {
+          start: offset,
+          end,
+        }) as unknown as RequestInit["body"],
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+      await onProgress();
+      rejectUploadRedirect(response);
+      if (response.status === 308) {
+        const next = resumableOffset(response);
+        if (next <= offset || next > totalBytes)
+          throw new Error(
+            "GCS resumable upload returned an invalid committed range",
+          );
+        offset = next;
+        transientFailures = 0;
+        continue;
+      }
+      const payload = await response.json().catch(() => null);
+      if (!response.ok)
+        throw new Error(
+          `GCS resumable evidence upload failed (${response.status})`,
+        );
+      const generation = completedUploadGeneration(response, payload);
+      if (!generation)
+        throw new Error(
+          "GCS resumable upload response omitted the exact generation",
+        );
+      return generation;
+    } catch (error) {
+      if (transferSignal?.aborted)
+        throw transferSignal.reason instanceof Error
+          ? transferSignal.reason
+          : new Error("remote promise transfer lease ended during GCS upload");
+      if (
+        error instanceof TerminalEvidenceUploadError ||
+        rejectedRedirect(error)
+      )
+        throw error;
+      if (++transientFailures > 5) throw error;
+      let query: Response;
+      try {
+        query = await fetch(uploadUrl, {
+          method: "PUT",
+          redirect: "error",
+          signal: AbortSignal.any([
+            absolute,
+            AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+            ...(transferSignal ? [transferSignal] : []),
+          ]),
+          headers: {
+            "content-length": "0",
+            "content-range": `bytes */${totalBytes}`,
+          },
+        });
+        rejectUploadRedirect(query);
+      } catch (queryError) {
+        if (
+          queryError instanceof TerminalEvidenceUploadError ||
+          rejectedRedirect(queryError)
+        )
+          throw queryError;
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(4_000, 250 * 2 ** transientFailures)),
+        );
+        continue;
+      }
+      if (query.status === 308) {
+        offset = resumableOffset(query);
+        continue;
+      }
+      const payload = await query.json().catch(() => null);
+      if (query.ok) {
+        const generation = completedUploadGeneration(query, payload);
+        if (generation) return generation;
+      }
+      if (query.status === 404 || query.status === 410)
+        throw new Error("GCS resumable evidence upload capability expired");
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(4_000, 250 * 2 ** transientFailures)),
+      );
+    }
+  }
+  throw new Error("GCS resumable upload ended without a generation");
+}
+
 async function* multipartPolarBody(
   boundary: string,
   manifest: unknown,
@@ -1890,11 +2508,13 @@ async function markRemoteJobDeliveryTerminal(
 
 async function settleSuccessfulRemoteResultDelivery(
   db: DB,
+  settings: Settings,
   claim: DeliveryClaim,
   promiseId: string,
   job: typeof simJobs.$inferSelect,
   result: typeof results.$inferSelect,
   resultAttemptId: string,
+  signedReceipt: SignedHubBindingReceipt,
 ): Promise<"delivered" | "superseded"> {
   const revisionId = job.simulationPresetRevisionId;
   if (!revisionId)
@@ -1940,6 +2560,144 @@ async function settleSuccessfulRemoteResultDelivery(
       .where(eq(syncRemoteResultDeliveries.id, claim.id))
       .for("update")
       .limit(1);
+    const bundles = await tx
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, result.id),
+          eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId),
+          eq(solverEvidenceArtifacts.kind, "engine_bundle"),
+        ),
+      );
+    if (bundles.length !== 1)
+      throw new Error(
+        `remote result ${result.id} cannot bind one exact local engine bundle`,
+      );
+    const hubBaseUrl = syncBase(settings);
+    const bundle = bundles[0]!;
+    const remoteReference = {
+      localKind: "evidence_artifact",
+      localRowId: bundle.id,
+      localStorageKey: bundle.storageKey,
+      resultId: result.id,
+      resultAttemptId,
+      sourceInstanceId: null,
+      sourceInstanceName: "authoritative remote solver hub",
+      remoteResultId: signedReceipt.receipt.canonical.resultId,
+      remoteArtifactId: signedReceipt.receipt.canonical.artifactId,
+      remoteDownloadUrl: new URL(
+        `/api/sync/v1/evidence-uploads/${signedReceipt.receipt.brokeredUploadId}/download`,
+        hubBaseUrl,
+      ).toString(),
+      remoteRenderUrl: null,
+      sha256: signedReceipt.receipt.remote.storedSha256,
+      byteSize: signedReceipt.receipt.remote.storedByteSize,
+      mimeType: "application/zstd",
+      availability: "remote_only" as const,
+      cachedStorageKey: null,
+      metadata: {
+        source: "remote-solver-hub",
+        authMode: "remote_solver_token",
+        hubBaseUrl,
+        registeredSolverId: settings.remoteSolverRegisteredId,
+        brokeredUploadId: signedReceipt.receipt.brokeredUploadId,
+        bucket: signedReceipt.receipt.remote.bucket,
+        objectKey: signedReceipt.receipt.remote.objectKey,
+        generation: signedReceipt.receipt.remote.generation,
+        crc32c: signedReceipt.receipt.remote.crc32c,
+      },
+    };
+    const [insertedRemoteReference] = await tx
+      .insert(remoteAssetReferences)
+      .values(remoteReference)
+      .onConflictDoNothing()
+      .returning({ id: remoteAssetReferences.id });
+    if (!insertedRemoteReference) {
+      const [existingRemoteReference] = await tx
+        .select()
+        .from(remoteAssetReferences)
+        .where(eq(remoteAssetReferences.localStorageKey, bundle.storageKey))
+        .limit(1);
+      const immutable = (value: Record<string, unknown>) => ({
+        localKind: value.localKind,
+        localRowId: value.localRowId ?? null,
+        localStorageKey: value.localStorageKey,
+        resultId: value.resultId ?? null,
+        resultAttemptId: value.resultAttemptId ?? null,
+        sourceInstanceId: value.sourceInstanceId ?? null,
+        sourceInstanceName: value.sourceInstanceName ?? null,
+        remoteResultId: value.remoteResultId ?? null,
+        remoteArtifactId: value.remoteArtifactId ?? null,
+        remoteDownloadUrl: value.remoteDownloadUrl,
+        remoteRenderUrl: value.remoteRenderUrl ?? null,
+        sha256: value.sha256 ?? null,
+        byteSize: value.byteSize ?? null,
+        mimeType: value.mimeType,
+        metadata: value.metadata ?? {},
+      });
+      if (
+        !existingRemoteReference ||
+        canonicalJson(
+          immutable(
+            existingRemoteReference as unknown as Record<string, unknown>,
+          ),
+        ) !==
+          canonicalJson(
+            immutable(remoteReference as unknown as Record<string, unknown>),
+          )
+      )
+        throw new Error(
+          `remote result ${result.id} replayed a different hub archive reference`,
+        );
+    }
+    const receiptCanonical = canonicalJson(signedReceipt.receipt);
+    const [insertedReceipt] = await tx
+      .insert(syncRemoteHubBindingReceipts)
+      .values({
+        deliveryId: claim.id,
+        promiseId,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId,
+        aoaDeg: result.aoaDeg,
+        brokeredUploadId: signedReceipt.receipt.brokeredUploadId,
+        receiptCanonical,
+        receipt: signedReceipt.receipt as unknown as Record<string, unknown>,
+        receiptHmac: signedReceipt.receiptHmac,
+        receivedAt: now,
+        reclaimNextAttemptAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoNothing()
+      .returning({ id: syncRemoteHubBindingReceipts.id });
+    if (!insertedReceipt) {
+      const [existingReceipt] = await tx
+        .select()
+        .from(syncRemoteHubBindingReceipts)
+        .where(
+          and(
+            eq(syncRemoteHubBindingReceipts.promiseId, promiseId),
+            eq(syncRemoteHubBindingReceipts.resultAttemptId, resultAttemptId),
+          ),
+        )
+        .limit(1);
+      if (
+        !existingReceipt ||
+        existingReceipt.deliveryId !== claim.id ||
+        existingReceipt.simJobId !== job.id ||
+        existingReceipt.resultId !== result.id ||
+        existingReceipt.aoaDeg !== result.aoaDeg ||
+        existingReceipt.brokeredUploadId !==
+          signedReceipt.receipt.brokeredUploadId ||
+        existingReceipt.receiptCanonical !== receiptCanonical ||
+        existingReceipt.receiptHmac !== signedReceipt.receiptHmac
+      ) {
+        throw new Error(
+          `remote result ${result.id} replayed a different immutable hub binding receipt`,
+        );
+      }
+    }
     if (promotion) {
       if (delivery?.state === "superseded") return "superseded";
       const superseded = await tx
@@ -2138,6 +2896,7 @@ async function firstReadyMirroredPromiseId(
 
 async function pushOneRemoteResult(
   db: DB,
+  engine: EngineClient,
   settings: Settings,
   promiseId: string,
   job: typeof simJobs.$inferSelect,
@@ -2174,6 +2933,7 @@ async function pushOneRemoteResult(
   if (!accepted) return false;
   const claim = await claimResultDelivery(db, promiseId, job, result, attempt);
   if (!claim) return false;
+  let transferLease: RemotePromiseTransferLease | null = null;
   try {
     await touchHeartbeat(db);
     const artifacts = await db
@@ -2268,8 +3028,197 @@ async function pushOneRemoteResult(
       await settleResultDelivery(db, claim, { kind: "blocked", error });
       throw new Error(error);
     }
+    const bundles = artifacts.filter(
+      (artifact) => artifact.kind === "engine_bundle",
+    );
+    if (bundles.length !== 1) {
+      const error = `remote result ${result.id} has ${bundles.length} engine bundles; expected one`;
+      await settleResultDelivery(db, claim, { kind: "retry", error });
+      throw new Error(error);
+    }
+    const bundle = bundles[0]!;
+    const bundleMetadata =
+      bundle.metadata && typeof bundle.metadata === "object"
+        ? (bundle.metadata as Record<string, unknown>)
+        : {};
+    const tarSha256 =
+      typeof bundleMetadata.uncompressedTarSha256 === "string"
+        ? bundleMetadata.uncompressedTarSha256
+        : "";
+    const tarByteSize = Number(bundleMetadata.uncompressedTarByteSize ?? 0);
+    const zstdLevel = Number(bundleMetadata.zstdLevel ?? 0);
+    const bundledFileCount = Number(bundleMetadata.bundledFileCount ?? 0);
+    if (
+      !attempt.engineJobId ||
+      !/^[0-9a-f]{64}$/i.test(bundle.sha256) ||
+      !/^[0-9a-f]{64}$/i.test(tarSha256) ||
+      !Number.isSafeInteger(bundle.byteSize) ||
+      bundle.byteSize <= 0 ||
+      !Number.isSafeInteger(tarByteSize) ||
+      tarByteSize <= 0 ||
+      !Number.isInteger(zstdLevel) ||
+      zstdLevel < 1 ||
+      zstdLevel > 22 ||
+      !Number.isSafeInteger(bundledFileCount) ||
+      bundledFileCount <= 0
+    ) {
+      const error = `remote result ${result.id} engine bundle lacks exact archive identity`;
+      await settleResultDelivery(db, claim, { kind: "retry", error });
+      throw new Error(error);
+    }
+    let lastBrokerClaimRenewal = 0;
+    const brokerProgress = async () => {
+      transferLease?.throwIfFailed();
+      const now = Date.now();
+      if (now - lastBrokerClaimRenewal >= DELIVERY_CLAIM_RENEW_INTERVAL_MS) {
+        await renewResultDeliveryClaim(db, claim);
+        lastBrokerClaimRenewal = now;
+      }
+      await touchHeartbeat(db);
+    };
+    const brokerRequest = {
+      // A delivery row is intentionally reused when generationKey advances.
+      // The immutable result-attempt UUID is the per-generation broker key;
+      // using claim.id would alias later generations to the first archive.
+      idempotencyKey: attempt.id,
+      promiseId,
+      remoteResultId: result.id,
+      remoteResultAttemptId: attempt.id,
+      aoaDeg: attempt.aoaDeg,
+      engineJobId: attempt.engineJobId!,
+      engineCaseSlug: attempt.engineCaseSlug,
+      storedSha256: bundle.sha256.toLowerCase(),
+      storedByteSize: bundle.byteSize,
+      tarSha256: tarSha256.toLowerCase(),
+      tarByteSize,
+      manifestSha256: manifests[0]!.sha256.toLowerCase(),
+      manifestByteSize: manifests[0]!.byteSize,
+      zstdLevel,
+      bundledFileCount,
+    };
+    transferLease = await startRemotePromiseTransferLease(
+      db,
+      engine,
+      settings,
+      promiseId,
+      async () => {
+        await renewResultDeliveryClaim(db, claim);
+        await touchHeartbeat(db);
+      },
+    );
+    let brokerResponse = (await fetch(
+      `${syncBase(settings)}/evidence-uploads`,
+      {
+        method: "POST",
+        signal: AbortSignal.any([
+          AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+          transferLease.signal,
+        ]),
+        headers: headers(settings),
+        body: JSON.stringify(brokerRequest),
+      },
+    ).then(async (response) => {
+      const payload = (await response.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null;
+      if (!response.ok || !payload)
+        throw new Error(
+          `remote evidence broker request failed (${response.status})`,
+        );
+      return payload;
+    })) as Record<string, unknown>;
+    if (brokerResponse.state === "issued") {
+      if (
+        typeof brokerResponse.id !== "string" ||
+        typeof brokerResponse.uploadUrl !== "string" ||
+        typeof brokerResponse.bucket !== "string" ||
+        typeof brokerResponse.objectKey !== "string" ||
+        brokerResponse.objectKey !==
+          `solver-evidence/v1/sha256/${brokerRequest.storedSha256.slice(0, 2)}/${brokerRequest.storedSha256}.tar.zst`
+      )
+        throw new Error("remote evidence broker omitted its upload capability");
+      const generation = await uploadBrokeredEvidenceFile(
+        brokerResponse.uploadUrl,
+        {
+          bucket: brokerResponse.bucket,
+          objectKey: brokerResponse.objectKey,
+        },
+        bundle.storageKey,
+        bundle.byteSize,
+        brokerProgress,
+        transferLease.signal,
+      );
+      brokerResponse = await fetch(
+        `${syncBase(settings)}/evidence-uploads/${brokerResponse.id}/verify`,
+        {
+          method: "POST",
+          signal: AbortSignal.any([
+            AbortSignal.timeout(REMOTE_PUSH_ABSOLUTE_TIMEOUT_MS),
+            transferLease.signal,
+          ]),
+          headers: headers(settings),
+          body: JSON.stringify({ generation }),
+        },
+      ).then(async (response) => {
+        const payload = (await response.json().catch(() => null)) as Record<
+          string,
+          unknown
+        > | null;
+        if (!response.ok || !payload)
+          throw new Error(
+            `remote evidence verification failed (${response.status})`,
+          );
+        return payload;
+      });
+    }
+    const remotePointer = brokerResponse.remote as
+      | Record<string, unknown>
+      | undefined;
+    const remoteEvidenceUploadId =
+      typeof brokerResponse.id === "string" ? brokerResponse.id : null;
+    if (
+      !remoteEvidenceUploadId ||
+      !["verified", "bound"].includes(String(brokerResponse.state)) ||
+      !remotePointer ||
+      typeof remotePointer.generation !== "string" ||
+      typeof remotePointer.crc32c !== "string"
+    )
+      throw new Error(
+        "remote evidence broker did not return a verified generation",
+      );
     const uploads: StreamUpload[] = [];
-    const evidenceArtifacts = artifacts.map((artifact, index) => {
+    const pushedArtifacts = artifacts.filter(
+      (artifact) =>
+        artifact.kind === "manifest" ||
+        artifact.kind === "frame_image" ||
+        artifact.kind === "engine_bundle",
+    );
+    const evidenceArtifacts = pushedArtifacts.map((artifact, index) => {
+      if (artifact.kind === "engine_bundle") {
+        return {
+          kind: artifact.kind,
+          field: artifact.field,
+          role: artifact.role,
+          mimeType: artifact.mimeType,
+          sha256: artifact.sha256,
+          byteSize: artifact.byteSize,
+          remoteEvidenceUploadId,
+          metadata: {
+            ...bundleMetadata,
+            remoteEvidenceUploadId,
+            storageBackend: "gcs",
+            bucket: remotePointer.bucket,
+            objectKey: remotePointer.objectKey,
+            generation: remotePointer.generation,
+            crc32c: remotePointer.crc32c,
+            tarSha256: brokerRequest.tarSha256,
+            tarByteSize: String(brokerRequest.tarByteSize),
+            manifestSha256: brokerRequest.manifestSha256,
+            manifestByteSize: String(brokerRequest.manifestByteSize),
+          },
+        };
+      }
       const uploadField = `artifact_${index}`;
       uploads.push({
         fieldName: uploadField,
@@ -2383,6 +3332,8 @@ async function pushOneRemoteResult(
         : null,
       engineJobId: attempt.engineJobId,
       engineCaseSlug: attempt.engineCaseSlug,
+      remoteResultId: result.id,
+      remoteResultAttemptId: attempt.id,
       evidencePayload: attempt.evidencePayload,
       forceHistory: attemptForceHistory(attempt),
       fieldExtents: extents,
@@ -2404,6 +3355,7 @@ async function pushOneRemoteResult(
     let lastSweeperHeartbeat = 0;
     const onProgress = async () => {
       uploadAbort.progress();
+      transferLease?.throwIfFailed();
       const now = Date.now();
       if (now - lastClaimRenewal >= DELIVERY_CLAIM_RENEW_INTERVAL_MS) {
         await renewResultDeliveryClaim(db, claim);
@@ -2416,7 +3368,7 @@ async function pushOneRemoteResult(
     };
     const init: RequestInit & { duplex: "half" } = {
       method: "POST",
-      signal: uploadAbort.signal,
+      signal: AbortSignal.any([uploadAbort.signal, transferLease.signal]),
       headers: {
         ...headers(settings),
         "content-type": `multipart/form-data; boundary=${boundary}`,
@@ -2431,6 +3383,7 @@ async function pushOneRemoteResult(
       conflictIds?: unknown[];
       fulfilledAoas?: unknown[];
       unfulfilledAoas?: unknown[];
+      bindingReceipts?: unknown[];
       error?: unknown;
     } | null;
     try {
@@ -2442,6 +3395,9 @@ async function pushOneRemoteResult(
     } finally {
       uploadAbort.dispose();
     }
+    const transferFailure = await transferLease.stop();
+    transferLease = null;
+    if (transferFailure) throw transferFailure;
     if (!response.ok) {
       const error = `remote polar push failed (${response.status})`;
       if (
@@ -2499,13 +3455,38 @@ async function pushOneRemoteResult(
       }
       throw new Error(error);
     }
+    if (
+      !Array.isArray(responsePayload?.bindingReceipts) ||
+      responsePayload.bindingReceipts.length !== 1
+    ) {
+      throw new Error(
+        `remote hub did not return one exact signed binding receipt for ${result.aoaDeg}°`,
+      );
+    }
+    const signedReceipt = exactSignedHubBindingReceipt(
+      responsePayload.bindingReceipts[0],
+      {
+        settings,
+        promiseId,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg: result.aoaDeg,
+        engineJobId: attempt.engineJobId!,
+        engineCaseSlug: attempt.engineCaseSlug,
+        brokeredUploadId: remoteEvidenceUploadId,
+        brokerRequest,
+        remotePointer,
+      },
+    );
     const settlement = await settleSuccessfulRemoteResultDelivery(
       db,
+      settings,
       claim,
       promiseId,
       job,
       result,
       attempt.id,
+      signedReceipt,
     );
     if (settlement === "delivered") {
       await completeMirroredPromiseIfReady(db, settings, promiseId, job.id);
@@ -2543,6 +3524,8 @@ async function pushOneRemoteResult(
       if (superseded) return true;
     }
     throw error;
+  } finally {
+    if (transferLease) await transferLease.stop();
   }
 }
 
@@ -2582,8 +3565,416 @@ async function releaseUnacceptedPromiseResults(
   `);
 }
 
+function exactEvidenceBase(value: unknown): string {
+  if (typeof value !== "string" || !value.trim())
+    throw new Error("engine bundle is missing its exact evidenceBase");
+  const parts = value.split("/");
+  if (
+    value.startsWith("/") ||
+    value.includes("\\") ||
+    parts.some((part) => !part || part === "." || part === "..")
+  )
+    throw new Error("engine bundle evidenceBase is not a safe relative path");
+  return parts.join("/");
+}
+
+function exactRemoteHubArchiveUrl(
+  settings: Settings,
+  brokeredUploadId: string,
+  remoteDownloadUrl: string,
+): string {
+  const hub = new URL(syncBase(settings));
+  const expected = new URL(
+    `/api/sync/v1/evidence-uploads/${brokeredUploadId}/download`,
+    hub.origin,
+  );
+  const supplied = new URL(remoteDownloadUrl);
+  if (
+    !["http:", "https:"].includes(supplied.protocol) ||
+    supplied.origin !== expected.origin ||
+    supplied.username ||
+    supplied.password ||
+    supplied.search ||
+    supplied.hash ||
+    supplied.pathname !== expected.pathname ||
+    supplied.toString() !== expected.toString()
+  )
+    throw new Error(
+      "remote evidence reclaim download authority or path changed",
+    );
+  return expected.toString();
+}
+
+function exactStoredBindingReceipt(
+  row: typeof syncRemoteHubBindingReceipts.$inferSelect,
+): HubBindingReceipt {
+  if (
+    !row.receipt ||
+    typeof row.receipt !== "object" ||
+    Array.isArray(row.receipt) ||
+    row.receiptCanonical !== canonicalJson(row.receipt) ||
+    !/^[0-9a-f]{64}$/.test(row.receiptHmac)
+  )
+    throw new Error(
+      "remote evidence reclaim receipt is not the immutable signed payload",
+    );
+  const receipt = row.receipt as unknown as HubBindingReceipt;
+  if (
+    receipt.schemaVersion !== 1 ||
+    receipt.kind !== "hub-canonical-evidence-binding" ||
+    receipt.promiseId !== row.promiseId ||
+    receipt.remoteResultId !== row.resultId ||
+    receipt.remoteResultAttemptId !== row.resultAttemptId ||
+    receipt.brokeredUploadId !== row.brokeredUploadId ||
+    receipt.bindingState !== "bound" ||
+    receipt.promisePointState !== "fulfilled" ||
+    !receipt.canonical?.resultId ||
+    !receipt.canonical?.resultAttemptId ||
+    !receipt.canonical?.artifactId ||
+    !receipt.remote?.storedSha256 ||
+    !receipt.remote?.generation ||
+    receipt.remote.storedByteSize <= 0
+  )
+    throw new Error("remote evidence reclaim receipt identity changed");
+  return receipt;
+}
+
+async function preflightBoundRemoteEvidenceArchive(
+  db: DB,
+  settings: Settings,
+  row: typeof syncRemoteHubBindingReceipts.$inferSelect,
+  bundle: typeof solverEvidenceArtifacts.$inferSelect,
+  claimSignal: AbortSignal,
+): Promise<void> {
+  if (!settings.remoteSolverAuthToken || !settings.remoteSolverRegisteredId)
+    throw new Error(
+      "remote evidence reclaim requires the current registered solver token",
+    );
+  const receipt = exactStoredBindingReceipt(row);
+  const references = await db
+    .select()
+    .from(remoteAssetReferences)
+    .where(eq(remoteAssetReferences.localStorageKey, bundle.storageKey));
+  if (references.length !== 1)
+    throw new Error(
+      "remote evidence reclaim requires one exact remote archive reference",
+    );
+  const reference = references[0]!;
+  const metadata =
+    reference.metadata && typeof reference.metadata === "object"
+      ? reference.metadata
+      : {};
+  if (
+    reference.localKind !== "evidence_artifact" ||
+    reference.localRowId !== bundle.id ||
+    reference.resultId !== row.resultId ||
+    reference.resultAttemptId !== row.resultAttemptId ||
+    reference.remoteResultId !== receipt.canonical.resultId ||
+    reference.remoteArtifactId !== receipt.canonical.artifactId ||
+    reference.sha256 !== receipt.remote.storedSha256 ||
+    reference.byteSize !== receipt.remote.storedByteSize ||
+    reference.mimeType !== "application/zstd" ||
+    reference.availability !== "remote_only" ||
+    reference.cachedStorageKey !== null ||
+    metadata.source !== "remote-solver-hub" ||
+    metadata.authMode !== "remote_solver_token" ||
+    metadata.hubBaseUrl !== syncBase(settings) ||
+    metadata.registeredSolverId !== settings.remoteSolverRegisteredId ||
+    metadata.brokeredUploadId !== row.brokeredUploadId ||
+    metadata.bucket !== receipt.remote.bucket ||
+    metadata.objectKey !== receipt.remote.objectKey ||
+    metadata.generation !== receipt.remote.generation ||
+    metadata.crc32c !== receipt.remote.crc32c
+  )
+    throw new Error(
+      "remote evidence reclaim archive reference changed immutable identity",
+    );
+  const downloadUrl = exactRemoteHubArchiveUrl(
+    settings,
+    row.brokeredUploadId,
+    reference.remoteDownloadUrl,
+  );
+  const response = await fetch(downloadUrl, {
+    method: "GET",
+    redirect: "error",
+    signal: AbortSignal.any([
+      AbortSignal.timeout(REMOTE_PUSH_ABSOLUTE_TIMEOUT_MS),
+      claimSignal,
+    ]),
+    headers: {
+      accept: "application/zstd",
+      "x-xfoilfoam-solver-token": settings.remoteSolverAuthToken,
+    },
+  });
+  if (!response.ok || !response.body)
+    throw new Error(
+      `remote evidence reclaim archive preflight failed (${response.status})`,
+    );
+  const declaredLength = Number(response.headers.get("content-length"));
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0];
+  if (
+    !Number.isSafeInteger(declaredLength) ||
+    declaredLength !== reference.byteSize ||
+    response.headers.get("x-content-sha256") !== reference.sha256 ||
+    response.headers.get("x-gcs-generation") !== receipt.remote.generation ||
+    contentType !== reference.mimeType
+  ) {
+    await response.body.cancel().catch(() => undefined);
+    throw new Error(
+      "remote evidence reclaim archive headers changed immutable identity",
+    );
+  }
+  let actualBytes = 0;
+  const hash = createHash("sha256");
+  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    const bytes = Buffer.from(chunk);
+    actualBytes += bytes.length;
+    if (actualBytes > reference.byteSize)
+      throw new Error(
+        "remote evidence reclaim archive exceeded its signed size",
+      );
+    hash.update(bytes);
+  }
+  if (actualBytes !== reference.byteSize)
+    throw new Error(
+      "remote evidence reclaim archive ended before its signed size",
+    );
+  if (hash.digest("hex") !== reference.sha256)
+    throw new Error(
+      "remote evidence reclaim archive failed its stored SHA-256",
+    );
+}
+
+/** Drain the local-reclaim outbox independently from result delivery. The
+ * signed receipt and exact remote reference are immutable before this claim
+ * exists. Every attempt first authenticates to the current hub as the owning
+ * solver and reads the generation-pinned archive to EOF. Only that successful
+ * complete generation-pinned readback proof permits the local engine deletion
+ * call; any preflight error is
+ * persisted with backoff and leaves all local bytes intact. */
+export async function processBrokeredRemoteEvidenceReclaims(
+  db: DB,
+  settings: Settings,
+  limit = 8,
+): Promise<number> {
+  // This worker drains sequentially. Claim exactly one row so later rows do
+  // not spend their entire 10-minute claim waiting behind a multi-hour
+  // readback. Horizontal workers remain safe through SKIP LOCKED.
+  const sequentialClaimLimit = Math.min(1, Math.max(0, Math.trunc(limit)));
+  const claimedIds = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    await tx.execute(sql`
+      UPDATE sync_remote_hub_binding_receipts
+      SET reclaim_state = 'pending', reclaim_claim_token = NULL,
+          reclaim_claim_expires_at = NULL,
+          reclaim_next_attempt_at = now(),
+          reclaim_last_error = 'expired local-reclaim claim recovered',
+          "updatedAt" = now()
+      WHERE reclaim_state = 'claiming' AND reclaim_claim_expires_at <= now()
+    `);
+    const rows = (await tx.execute(sql`
+      SELECT id
+      FROM sync_remote_hub_binding_receipts
+      WHERE reclaim_state = 'pending' AND reclaim_next_attempt_at <= now()
+      ORDER BY reclaim_next_attempt_at, id
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${sequentialClaimLimit}
+    `)) as unknown as Array<{ id: string }>;
+    const claims: Array<{ id: string; token: string }> = [];
+    for (const row of rows) {
+      const token = randomUUID();
+      const updated = await tx
+        .update(syncRemoteHubBindingReceipts)
+        .set({
+          reclaimState: "claiming",
+          reclaimAttemptCount: sql`${syncRemoteHubBindingReceipts.reclaimAttemptCount} + 1`,
+          reclaimClaimToken: token,
+          reclaimClaimExpiresAt: new Date(Date.now() + REMOTE_RECLAIM_CLAIM_MS),
+          reclaimLastError: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(syncRemoteHubBindingReceipts.id, row.id),
+            eq(syncRemoteHubBindingReceipts.reclaimState, "pending"),
+          ),
+        )
+        .returning({ id: syncRemoteHubBindingReceipts.id });
+      if (updated.length === 1) claims.push({ id: row.id, token });
+    }
+    return claims;
+  });
+  if (!claimedIds.length) return 0;
+
+  const engineBase = (
+    process.env.ENGINE_URL ?? "http://localhost:8000"
+  ).replace(/\/+$/, "");
+  let completed = 0;
+  for (const claim of claimedIds) {
+    let reclaimLease: RemoteReclaimClaimLease | null = null;
+    try {
+      const [row] = await db
+        .select()
+        .from(syncRemoteHubBindingReceipts)
+        .where(
+          and(
+            eq(syncRemoteHubBindingReceipts.id, claim.id),
+            eq(syncRemoteHubBindingReceipts.reclaimState, "claiming"),
+            eq(syncRemoteHubBindingReceipts.reclaimClaimToken, claim.token),
+          ),
+        )
+        .limit(1);
+      if (!row) continue;
+      reclaimLease = startRemoteReclaimClaimLease(db, claim);
+      const [attempt] = await db
+        .select()
+        .from(resultAttempts)
+        .where(
+          and(
+            eq(resultAttempts.id, row.resultAttemptId),
+            eq(resultAttempts.resultId, row.resultId),
+          ),
+        )
+        .limit(1);
+      const bundles = await db
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, row.resultId),
+            eq(solverEvidenceArtifacts.resultAttemptId, row.resultAttemptId),
+            eq(solverEvidenceArtifacts.kind, "engine_bundle"),
+          ),
+        );
+      if (
+        !attempt?.engineJobId ||
+        !attempt.engineCaseSlug ||
+        bundles.length !== 1
+      )
+        throw new Error("reclaim cannot resolve one exact local engine bundle");
+      const bundle = bundles[0]!;
+      await preflightBoundRemoteEvidenceArchive(
+        db,
+        settings,
+        row,
+        bundle,
+        reclaimLease.signal,
+      );
+      reclaimLease.throwIfFailed();
+      const controlToken = configuredControlPlaneToken();
+      if (!controlToken)
+        throw new Error(
+          "ENGINE_CONTROL_PLANE_TOKEN is required for brokered evidence reclaim",
+        );
+      const evidenceBase = exactEvidenceBase(
+        (bundle.metadata as Record<string, unknown> | null)?.evidenceBase,
+      );
+      const response = await fetch(
+        `${engineBase}/internal/evidence-uploads/reclaim`,
+        {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.any([
+            AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+            reclaimLease.signal,
+          ]),
+          headers: {
+            authorization: `Bearer ${controlToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            jobId: attempt.engineJobId,
+            caseSlug: attempt.engineCaseSlug,
+            evidenceBase,
+            receipt: row.receipt,
+            receiptHmac: row.receiptHmac,
+          }),
+        },
+      );
+      const payload = (await response.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null;
+      if (
+        !response.ok ||
+        !payload ||
+        !["complete", "no_local_bytes"].includes(String(payload.state)) ||
+        typeof payload.bytes_freed !== "number" ||
+        payload.bytes_freed < 0
+      )
+        throw new Error(
+          `engine brokered evidence reclaim failed (${response.status})`,
+        );
+      const reclaimLeaseFailure = await reclaimLease.stop();
+      reclaimLease = null;
+      if (reclaimLeaseFailure) throw reclaimLeaseFailure;
+      const settled = await db
+        .update(syncRemoteHubBindingReceipts)
+        .set({
+          reclaimState: "reclaimed",
+          reclaimClaimToken: null,
+          reclaimClaimExpiresAt: null,
+          reclaimedAt: new Date(),
+          reclaimedBytes: payload.bytes_freed,
+          reclaimLastError: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(syncRemoteHubBindingReceipts.id, row.id),
+            eq(syncRemoteHubBindingReceipts.reclaimState, "claiming"),
+            eq(syncRemoteHubBindingReceipts.reclaimClaimToken, claim.token),
+          ),
+        )
+        .returning({ id: syncRemoteHubBindingReceipts.id });
+      if (settled.length !== 1)
+        throw new Error(
+          "brokered evidence reclaim claim changed before settlement",
+        );
+      completed += 1;
+    } catch (error) {
+      const [current] = await db
+        .select({
+          attemptCount: syncRemoteHubBindingReceipts.reclaimAttemptCount,
+        })
+        .from(syncRemoteHubBindingReceipts)
+        .where(eq(syncRemoteHubBindingReceipts.id, claim.id))
+        .limit(1);
+      const delay = Math.min(
+        6 * 60 * 60_000,
+        30_000 *
+          2 ** Math.min(8, Math.max(0, (current?.attemptCount ?? 1) - 1)),
+      );
+      await db
+        .update(syncRemoteHubBindingReceipts)
+        .set({
+          reclaimState: "pending",
+          reclaimClaimToken: null,
+          reclaimClaimExpiresAt: null,
+          reclaimNextAttemptAt: new Date(Date.now() + delay),
+          reclaimLastError:
+            error instanceof Error
+              ? error.message.slice(0, 1000)
+              : String(error),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(syncRemoteHubBindingReceipts.id, claim.id),
+            eq(syncRemoteHubBindingReceipts.reclaimState, "claiming"),
+            eq(syncRemoteHubBindingReceipts.reclaimClaimToken, claim.token),
+          ),
+        );
+    } finally {
+      if (reclaimLease) await reclaimLease.stop();
+    }
+  }
+  return completed;
+}
+
 async function processReusablePromiseEvidence(
   db: DB,
+  engine: EngineClient,
   settings: Settings,
 ): Promise<boolean> {
   const candidates = (await db.execute(sql`
@@ -2695,6 +4086,7 @@ async function processReusablePromiseEvidence(
       result &&
       (await pushOneRemoteResult(
         db,
+        engine,
         settings,
         candidate.promise_id,
         job,
@@ -2709,6 +4101,7 @@ async function processReusablePromiseEvidence(
 
 async function processRemoteResultDeliveries(
   db: DB,
+  engine: EngineClient,
   settings: Settings,
 ): Promise<boolean> {
   const jobs = await db
@@ -2878,7 +4271,9 @@ async function processRemoteResultDeliveries(
     const readyResultIds = new Set(readyRows.map((row) => row.id));
     for (const result of resultRows) {
       if (!readyResultIds.has(result.id)) continue;
-      if (await pushOneRemoteResult(db, settings, promiseId, job, result)) {
+      if (
+        await pushOneRemoteResult(db, engine, settings, promiseId, job, result)
+      ) {
         return true;
       }
     }
@@ -3102,27 +4497,33 @@ export async function reconcileRemoteSolverTick(
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
   try {
+    assertRemoteSolverHubUrlContract(settings?.upstreamBaseUrl);
+    assertRemoteSolverNodeEvidenceContract(
+      settings?.remoteSolverEnabled ?? false,
+    );
+    // Reclaim is its own durable outbox, but deletion still requires the
+    // current owning solver token to read back and authenticate the exact bound
+    // hub archive first. Missing/rotated credentials therefore back off with
+    // local bytes intact instead of turning an old receipt into delete power.
+    if (settings) await processBrokeredRemoteEvidenceReclaims(db, settings);
     // Cancellation is an authority-release outbox, not solver work. Drain it
     // before registration/claim gates and even while solving is disabled; a
     // local pause must never strand an upstream lease. Each row supplies its
     // stored hub URL, while the current same-authority credential is used.
-    if (settings?.upstreamSecret) {
+    if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
       await processPendingPromiseCancellations(db, settings);
     }
     let processedDurableDelivery = false;
-    if (settings?.upstreamBaseUrl && settings.upstreamSecret) {
+    if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
       await reopenResolvedConflictDeliveries(db, settings);
       processedDurableDelivery = await processRemoteResultDeliveries(
         db,
+        engine,
         settings,
       );
     }
-    if (
-      !settings?.remoteSolverEnabled ||
-      !settings.upstreamBaseUrl ||
-      !settings.upstreamSecret
-    ) {
-      if (settings?.upstreamBaseUrl && settings.upstreamSecret) {
+    if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
+      if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
         await cancelMirroredPromisesForDisabledSolver(db, engine, settings);
       }
       if (settings?.remoteSolverLastStatus !== "disabled")
@@ -3130,7 +4531,11 @@ export async function reconcileRemoteSolverTick(
       return false;
     }
     if (processedDurableDelivery) return false;
-    if (!settings.remoteSolverRegisteredId) {
+    if (!settings.remoteSolverRegisteredId || !settings.remoteSolverAuthToken) {
+      if (!settings.upstreamSecret)
+        throw new Error(
+          "remote solver has no credential; an admin must install a rotated solver token or temporarily configure the bootstrap secret for first registration",
+        );
       await registerSolver(db, settings);
     }
     await renewMirroredPromiseLeases(db, engine, settings);
@@ -3152,7 +4557,8 @@ export async function reconcileRemoteSolverTick(
       active.length,
       active.reduce((sum, job) => sum + job.totalCases, 0),
     );
-    if (await processReusablePromiseEvidence(db, settings)) return false;
+    if (await processReusablePromiseEvidence(db, engine, settings))
+      return false;
     return active.length === 0;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
@@ -3193,10 +4599,14 @@ export async function admitRemoteSolverTick(
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
   try {
+    assertRemoteSolverHubUrlContract(settings?.upstreamBaseUrl);
+    assertRemoteSolverNodeEvidenceContract(
+      settings?.remoteSolverEnabled ?? false,
+    );
     if (
       !settings?.remoteSolverEnabled ||
       !settings.upstreamBaseUrl ||
-      !settings.upstreamSecret
+      !settings.remoteSolverAuthToken
     ) {
       return false;
     }

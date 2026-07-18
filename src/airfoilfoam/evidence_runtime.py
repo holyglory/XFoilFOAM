@@ -46,6 +46,9 @@ EVIDENCE_ARCHIVE_NAME = "engine_evidence.tar.zst"
 EVIDENCE_POINTER_NAME = "engine_evidence.remote.json"
 EVIDENCE_FINALIZATION_ACK_NAME = "storage_finalization.database.json"
 EVIDENCE_FINALIZATION_RECEIPT_NAME = "storage_finalization.json"
+BROKERED_HUB_BINDING_ACK_NAME = "brokered_hub_binding.database.json"
+BROKERED_LOCAL_RECLAIM_INTENT_NAME = "brokered_local_reclaim.intent.json"
+BROKERED_LOCAL_RECLAIM_RECEIPT_NAME = "brokered_local_reclaim.json"
 PACKAGED_RAW_DIRS = ("openfoam", "time_directories", "VTK")
 LEGACY_EVIDENCE_ARCHIVE_NAMES = (
     "openfoam_evidence.tar.gz",
@@ -130,6 +133,25 @@ class EvidenceCleanupResult:
             "bytes_freed": self.bytes_freed,
             "verification": self.verification,
             "association_count": self.association_count,
+        }
+
+
+@dataclass(frozen=True)
+class BrokeredRemoteEvidenceReclaim:
+    job_id: str
+    case_slug: str
+    evidence_base: str
+    receipt: dict[str, Any]
+    receipt_hmac: str
+
+    def authorization(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": 1,
+            "jobId": self.job_id,
+            "caseSlug": self.case_slug,
+            "evidenceBase": self.evidence_base,
+            "receipt": self.receipt,
+            "receiptHmac": self.receipt_hmac,
         }
 
 
@@ -749,6 +771,342 @@ def finalize_remote_evidence_cleanup(
         )
 
 
+def reclaim_brokered_remote_evidence(
+    job_root: Path,
+    evidence_dir: Path,
+    authorization: BrokeredRemoteEvidenceReclaim,
+    *,
+    crash_after_deletions: int | None = None,
+) -> EvidenceCleanupResult:
+    """Reclaim credentialless remote-solver bytes after an exact hub receipt.
+
+    The Node control plane has already authenticated the receipt HMAC with the
+    per-solver credential.  This engine endpoint is control-plane protected and
+    independently proves the local manifest/archive bytes match that receipt
+    before writing a durable acknowledgement and deleting anything.  Replays
+    after a crash are safe because a missing archive is accepted only when the
+    exact acknowledgement was durably written first.
+    """
+
+    job_root = Path(job_root)
+    evidence_dir = Path(evidence_dir)
+    _require_safe_broker_reclaim_target(job_root, evidence_dir, authorization)
+    receipt = authorization.receipt
+    remote = receipt.get("remote")
+    canonical = receipt.get("canonical")
+    if (
+        receipt.get("schemaVersion") != 1
+        or receipt.get("kind") != "hub-canonical-evidence-binding"
+        or receipt.get("bindingState") != "bound"
+        or receipt.get("promisePointState") != "fulfilled"
+        or receipt.get("engineJobId") != authorization.job_id
+        or receipt.get("engineCaseSlug") != authorization.case_slug
+        or not isinstance(remote, dict)
+        or not isinstance(canonical, dict)
+        or not all(
+            isinstance(canonical.get(key), str) and canonical.get(key)
+            for key in ("resultId", "resultAttemptId", "artifactId")
+        )
+        or not isinstance(authorization.receipt_hmac, str)
+        or len(authorization.receipt_hmac) != 64
+        or any(c not in "0123456789abcdef" for c in authorization.receipt_hmac)
+    ):
+        raise EvidenceCleanupError(
+            "exact bound and fulfilled hub receipt is required for brokered reclaim"
+        )
+
+    required_hashes = ("storedSha256", "tarSha256", "manifestSha256")
+    if any(
+        not isinstance(remote.get(key), str)
+        or len(str(remote.get(key))) != 64
+        or any(c not in "0123456789abcdef" for c in str(remote.get(key)))
+        for key in required_hashes
+    ):
+        raise EvidenceCleanupError("hub receipt contains malformed evidence digests")
+    required_sizes = (
+        "storedByteSize",
+        "tarByteSize",
+        "manifestByteSize",
+        "bundledFileCount",
+    )
+    if any(
+        not isinstance(remote.get(key), int) or int(remote.get(key)) <= 0
+        for key in required_sizes
+    ):
+        raise EvidenceCleanupError("hub receipt contains malformed evidence sizes")
+    zstd_level = remote.get("zstdLevel")
+    if not isinstance(zstd_level, int) or not 1 <= zstd_level <= 22:
+        raise EvidenceCleanupError("hub receipt contains invalid zstd level")
+
+    canonical_authorization = authorization.authorization()
+    with _cleanup_job_guard(job_root):
+        ack_path = evidence_dir / BROKERED_HUB_BINDING_ACK_NAME
+        existing_ack = _read_optional_json(ack_path)
+        if existing_ack is not None and existing_ack.get("authorization") != canonical_authorization:
+            raise EvidenceCleanupError(
+                "existing hub binding acknowledgement conflicts with reclaim request"
+            )
+
+        manifest_path = evidence_dir / "evidence_manifest.json"
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise EvidenceCleanupError(
+                "retained local evidence manifest is required for brokered reclaim"
+            )
+        manifest_bytes = manifest_path.read_bytes()
+        if (
+            len(manifest_bytes) != int(remote["manifestByteSize"])
+            or hashlib.sha256(manifest_bytes).hexdigest()
+            != remote["manifestSha256"]
+        ):
+            raise EvidenceCleanupError(
+                "retained local evidence manifest does not match the hub receipt"
+            )
+
+        intent_path = evidence_dir / BROKERED_LOCAL_RECLAIM_INTENT_NAME
+        existing_intent = _read_optional_json(intent_path)
+        archive_path = evidence_dir / EVIDENCE_ARCHIVE_NAME
+        if archive_path.exists() or archive_path.is_symlink():
+            if archive_path.is_symlink() or not archive_path.is_file():
+                raise EvidenceCleanupError(
+                    "brokered local evidence archive must be a regular file"
+                )
+            try:
+                archive = inspect_tar_zst(archive_path, level=zstd_level)
+            except (OSError, ValueError, EvidenceStoreError) as exc:
+                raise EvidenceCleanupError(
+                    f"brokered local evidence archive is invalid: {exc}"
+                ) from exc
+            if (
+                archive.stored_sha256 != remote["storedSha256"]
+                or archive.stored_size != int(remote["storedByteSize"])
+                or archive.tar_sha256 != remote["tarSha256"]
+                or archive.tar_size != int(remote["tarByteSize"])
+            ):
+                raise EvidenceCleanupError(
+                    "brokered local evidence archive does not match the hub receipt"
+                )
+        elif existing_intent is None:
+            raise EvidenceCleanupError(
+                "brokered archive is missing without a durable cleanup intent"
+            )
+
+        if existing_ack is None:
+            _atomic_write_json(
+                ack_path,
+                {
+                    "schemaVersion": 1,
+                    "state": "hub_bound_and_fulfilled",
+                    "authorization": canonical_authorization,
+                    "registeredAt": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+        allowed_names = (*PACKAGED_RAW_DIRS, EVIDENCE_ARCHIVE_NAME)
+        if existing_intent is None:
+            inventories = [
+                _broker_reclaim_path_inventory(evidence_dir / name, name)
+                for name in allowed_names
+                if (evidence_dir / name).exists()
+                or (evidence_dir / name).is_symlink()
+            ]
+            intent = {
+                "schemaVersion": 1,
+                "kind": "brokered-local-evidence-reclaim-intent",
+                "authorization": canonical_authorization,
+                "paths": inventories,
+                "plannedPathCount": len(inventories),
+                "plannedBytes": sum(int(row["byteSize"]) for row in inventories),
+            }
+            _atomic_create_json(intent_path, intent)
+            existing_intent = _read_optional_json(intent_path)
+        if (
+            existing_intent is None
+            or existing_intent.get("authorization") != canonical_authorization
+            or existing_intent.get("kind")
+            != "brokered-local-evidence-reclaim-intent"
+            or not isinstance(existing_intent.get("paths"), list)
+        ):
+            raise EvidenceCleanupError(
+                "durable brokered reclaim intent conflicts with this request"
+            )
+        intended_rows = existing_intent["paths"]
+        intended_names = {
+            row.get("name")
+            for row in intended_rows
+            if isinstance(row, dict) and isinstance(row.get("name"), str)
+        }
+        if (
+            len(intended_names) != len(intended_rows)
+            or not intended_names.issubset(set(allowed_names))
+            or existing_intent.get("plannedPathCount") != len(intended_rows)
+            or existing_intent.get("plannedBytes")
+            != sum(int(row.get("byteSize", -1)) for row in intended_rows)
+        ):
+            raise EvidenceCleanupError("durable brokered reclaim intent is malformed")
+        for name in allowed_names:
+            path = evidence_dir / name
+            expected_inventory = next(
+                (row for row in intended_rows if row.get("name") == name), None
+            )
+            if path.exists() or path.is_symlink():
+                if expected_inventory is None:
+                    raise EvidenceCleanupError(
+                        f"brokered reclaim path {name} appeared after cleanup intent"
+                    )
+                if _broker_reclaim_path_inventory(path, name) != expected_inventory:
+                    raise EvidenceCleanupError(
+                        f"brokered reclaim path {name} changed after cleanup intent"
+                    )
+
+        intent_canonical = json.dumps(
+            existing_intent, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        final_receipt = {
+            "schemaVersion": 1,
+            "state": "complete",
+            "authorization": canonical_authorization,
+            "intentSha256": hashlib.sha256(intent_canonical).hexdigest(),
+            "deletedPaths": sorted(str(name) for name in intended_names),
+            "bytesDeleted": int(existing_intent["plannedBytes"]),
+        }
+        receipt_path = evidence_dir / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME
+        previous_receipt = _read_optional_json(receipt_path)
+        if previous_receipt is not None:
+            if previous_receipt != final_receipt:
+                raise EvidenceCleanupError(
+                    "immutable brokered reclaim receipt conflicts with cleanup intent"
+                )
+            if any(
+                (evidence_dir / str(name)).exists()
+                or (evidence_dir / str(name)).is_symlink()
+                for name in intended_names
+            ):
+                raise EvidenceCleanupError(
+                    "brokered reclaim receipt exists while intended paths remain"
+                )
+            return EvidenceCleanupResult(
+                state="no_local_bytes",
+                evidence_base=authorization.evidence_base,
+                bytes_freed=int(existing_intent["plannedBytes"]),
+                verification="hub-signed-bind+fulfillment+local-archive+intent",
+                association_count=1,
+            )
+
+        if crash_after_deletions == 0:
+            raise RuntimeError("injected brokered reclaim crash")
+        deleted = 0
+        for row in intended_rows:
+            path = evidence_dir / str(row["name"])
+            if path.exists() or path.is_symlink():
+                _remove_path(path)
+                deleted += 1
+                if (
+                    crash_after_deletions is not None
+                    and deleted >= crash_after_deletions
+                ):
+                    raise RuntimeError("injected brokered reclaim crash")
+        _atomic_create_json(receipt_path, final_receipt)
+        return EvidenceCleanupResult(
+            state="complete",
+            evidence_base=authorization.evidence_base,
+            bytes_freed=int(existing_intent["plannedBytes"]),
+            verification="hub-signed-bind+fulfillment+local-archive+intent",
+            association_count=1,
+        )
+
+
+def _require_safe_broker_reclaim_target(
+    job_root: Path,
+    evidence_dir: Path,
+    authorization: BrokeredRemoteEvidenceReclaim,
+) -> None:
+    if job_root.is_symlink() or evidence_dir.is_symlink():
+        raise EvidenceCleanupError("brokered reclaim path must not be a symlink")
+    try:
+        resolved_job = job_root.resolve(strict=True)
+        resolved_evidence = evidence_dir.resolve(strict=True)
+        relative = evidence_dir.relative_to(job_root)
+        resolved_evidence.relative_to(resolved_job)
+    except (OSError, ValueError) as exc:
+        raise EvidenceCleanupError(
+            "brokered reclaim evidence path must stay inside the job root"
+        ) from exc
+    expected = Path("cases") / authorization.case_slug / authorization.evidence_base
+    if relative != expected or authorization.job_id != job_root.name:
+        raise EvidenceCleanupError(
+            "brokered reclaim path does not match job/case/evidence identity"
+        )
+    current = job_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise EvidenceCleanupError(
+                "brokered reclaim path must not traverse a symlink"
+            )
+
+
+def _broker_reclaim_path_inventory(path: Path, name: str) -> dict[str, Any]:
+    path = Path(path)
+    if path.is_symlink():
+        raise EvidenceCleanupError(
+            f"brokered reclaim path {name} must not be a symlink"
+        )
+    digest = hashlib.sha256()
+    byte_size = 0
+    entry_count = 0
+    if path.is_file():
+        data_hash = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                byte_size += len(chunk)
+                data_hash.update(chunk)
+        digest.update(
+            f"file\0{name}\0{byte_size}\0{data_hash.hexdigest()}\n".encode("utf-8")
+        )
+        entry_count = 1
+        kind = "file"
+    elif path.is_dir():
+        kind = "directory"
+        for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+            relative = child.relative_to(path).as_posix()
+            if child.is_symlink():
+                raise EvidenceCleanupError(
+                    f"brokered reclaim path {name}/{relative} must not be a symlink"
+                )
+            if child.is_dir():
+                digest.update(f"dir\0{relative}\n".encode("utf-8"))
+                entry_count += 1
+                continue
+            if not child.is_file():
+                raise EvidenceCleanupError(
+                    f"brokered reclaim path {name}/{relative} is not a regular file"
+                )
+            child_hash = hashlib.sha256()
+            child_size = 0
+            with child.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    child_size += len(chunk)
+                    child_hash.update(chunk)
+            byte_size += child_size
+            entry_count += 1
+            digest.update(
+                f"file\0{relative}\0{child_size}\0{child_hash.hexdigest()}\n".encode(
+                    "utf-8"
+                )
+            )
+    else:
+        raise EvidenceCleanupError(
+            f"brokered reclaim path {name} is not a regular file or directory"
+        )
+    return {
+        "name": name,
+        "kind": kind,
+        "byteSize": byte_size,
+        "entryCount": entry_count,
+        "treeSha256": digest.hexdigest(),
+    }
+
+
 @contextmanager
 def hydrated_render_source(evidence_dir: Path, settings: Settings) -> Iterator[Path]:
     """Yield a verified temporary source directory containing ``VTK``."""
@@ -908,8 +1266,39 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _atomic_create_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish one immutable JSON ledger file without replacing a winner."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            existing = _read_optional_json(path)
+            if existing != payload:
+                raise EvidenceCleanupError(
+                    f"immutable cleanup state file {path} already has different content"
+                )
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 __all__ = [
     "ARCHIVE_MIME_TYPE",
+    "BROKERED_HUB_BINDING_ACK_NAME",
+    "BROKERED_LOCAL_RECLAIM_INTENT_NAME",
+    "BROKERED_LOCAL_RECLAIM_RECEIPT_NAME",
     "EVIDENCE_ARCHIVE_NAME",
     "EVIDENCE_FINALIZATION_ACK_NAME",
     "EVIDENCE_FINALIZATION_RECEIPT_NAME",
@@ -920,6 +1309,7 @@ __all__ = [
     "EvidenceCleanupError",
     "EvidenceCleanupResult",
     "EvidenceDatabaseAssociation",
+    "BrokeredRemoteEvidenceReclaim",
     "create_local_evidence_archive",
     "evidence_archive_path",
     "evidence_object_store",
@@ -928,6 +1318,7 @@ __all__ = [
     "hydrated_render_source",
     "publish_evidence_directory",
     "publish_evidence_archive",
+    "reclaim_brokered_remote_evidence",
     "remove_verified_local_raw_evidence",
     "remove_verified_local_packaged_evidence",
     "verify_remote_evidence_restore",

@@ -1,4 +1,9 @@
-import { exportCoordinates, type Point, RELIST } from "@aerodb/core";
+import {
+  canonicalRemoteHubBaseUrl,
+  exportCoordinates,
+  type Point,
+  RELIST,
+} from "@aerodb/core";
 import {
   airfoils,
   boundaryProfiles,
@@ -235,12 +240,21 @@ function resolveRemoteUrl(
   raw: string,
   upstreamBaseUrl?: string | null,
 ): string {
-  if (/^https?:\/\//i.test(raw)) return raw;
   if (!upstreamBaseUrl)
-    throw new Error(
-      "remote asset has relative URL but no upstream base URL is configured",
-    );
-  return `${upstreamBaseUrl.replace(/\/+$/, "")}/${raw.replace(/^\/+/, "")}`;
+    throw new Error("remote asset has no configured upstream hub authority");
+  const base = new URL(canonicalRemoteHubBaseUrl(upstreamBaseUrl));
+  const target = /^[a-z][a-z0-9+.-]*:/i.test(raw)
+    ? new URL(raw)
+    : new URL(`${base.toString()}/${raw.replace(/^\/+/, "")}`);
+  if (
+    target.origin !== base.origin ||
+    target.username ||
+    target.password ||
+    target.hash
+  ) {
+    throw new Error("remote asset URL changed configured hub authority");
+  }
+  return target.toString();
 }
 
 async function proxyRemoteAsset(storageKey: string) {
@@ -254,13 +268,61 @@ async function proxyRemoteAsset(storageKey: string) {
     ref.remoteDownloadUrl,
     settings?.upstreamBaseUrl,
   );
+  const metadata = (ref.metadata ?? {}) as Record<string, unknown>;
+  const remoteSolverHub =
+    metadata.source === "remote-solver-hub" &&
+    metadata.authMode === "remote_solver_token";
+  let proxyHeaders: Record<string, string> | undefined;
+  if (remoteSolverHub) {
+    const configuredBase = settings?.upstreamBaseUrl
+      ? canonicalRemoteHubBaseUrl(settings.upstreamBaseUrl)
+      : null;
+    if (
+      !configuredBase ||
+      !settings.remoteSolverAuthToken ||
+      metadata.hubBaseUrl !== configuredBase
+    )
+      throw new Error("remote solver hub archive credential is unavailable");
+    const configured = new URL(configuredBase);
+    const target = new URL(url);
+    if (
+      target.origin !== configured.origin ||
+      target.username ||
+      target.password ||
+      target.search ||
+      target.hash ||
+      !/^\/api\/sync\/v1\/evidence-uploads\/[0-9a-f-]{36}\/download$/.test(
+        target.pathname,
+      )
+    )
+      throw new Error("remote solver hub archive URL changed authority");
+    proxyHeaders = {
+      "x-xfoilfoam-solver-token": settings.remoteSolverAuthToken,
+    };
+  } else if (settings?.upstreamSecret) {
+    proxyHeaders = { "x-xfoilfoam-sync-secret": settings.upstreamSecret };
+  }
   const res = await fetch(url, {
-    headers: settings?.upstreamSecret
-      ? { "x-xfoilfoam-sync-secret": settings.upstreamSecret }
-      : undefined,
+    redirect: "error",
+    headers: proxyHeaders,
   });
   if (!res.ok || !res.body)
     throw new Error(`remote asset fetch failed (${res.status})`);
+  if (remoteSolverHub) {
+    const expectedGeneration = String(metadata.generation ?? "");
+    const contentLength = Number(res.headers.get("content-length"));
+    if (
+      !ref.sha256 ||
+      !Number.isSafeInteger(ref.byteSize) ||
+      contentLength !== ref.byteSize ||
+      res.headers.get("x-content-sha256") !== ref.sha256 ||
+      res.headers.get("x-gcs-generation") !== expectedGeneration ||
+      res.headers.get("content-type")?.split(";", 1)[0] !== ref.mimeType
+    ) {
+      await res.body.cancel().catch(() => undefined);
+      throw new Error("remote solver hub archive changed immutable identity");
+    }
+  }
   return {
     stream: Readable.fromWeb(res.body),
     size: Number(res.headers.get("content-length") ?? ref.byteSize ?? 0),
@@ -362,17 +424,54 @@ async function delegateRemoteRender(opts: {
   const renderUrl = ref.remoteRenderUrl
     ? resolveRemoteUrl(ref.remoteRenderUrl, settings?.upstreamBaseUrl)
     : resolveRemoteUrl(
-        `/api/sync/v1/results/${encodeURIComponent(ref.remoteResultId)}/render`,
+        `results/${encodeURIComponent(ref.remoteResultId)}/render`,
         settings?.upstreamBaseUrl,
       );
+  const renderMetadata = (ref.metadata ?? {}) as Record<string, unknown>;
+  const remoteSolverHub =
+    renderMetadata.source === "remote-solver-hub" &&
+    renderMetadata.authMode === "remote_solver_token";
+  let renderCredential: Record<string, string> = {};
+  if (remoteSolverHub) {
+    const configuredBase = settings?.upstreamBaseUrl
+      ? canonicalRemoteHubBaseUrl(settings.upstreamBaseUrl)
+      : null;
+    if (
+      !configuredBase ||
+      !settings.remoteSolverAuthToken ||
+      renderMetadata.hubBaseUrl !== configuredBase
+    )
+      throw new RemoteRenderIntegrityError(
+        "remote solver hub render credential is unavailable",
+      );
+    const configured = new URL(configuredBase);
+    const target = new URL(renderUrl);
+    if (
+      target.origin !== configured.origin ||
+      target.username ||
+      target.password ||
+      target.search ||
+      target.hash ||
+      !/^\/api\/sync\/v1\/results\/[0-9a-f-]{36}\/render$/.test(target.pathname)
+    )
+      throw new RemoteRenderIntegrityError(
+        "remote solver hub render URL changed authority",
+      );
+    renderCredential = {
+      "x-xfoilfoam-solver-token": settings.remoteSolverAuthToken,
+    };
+  } else if (settings?.upstreamSecret) {
+    renderCredential = {
+      "x-xfoilfoam-sync-secret": settings.upstreamSecret,
+    };
+  }
   const res = await fetch(renderUrl, {
     method: "POST",
+    redirect: "error",
     headers: {
       "content-type": "application/json",
       "x-xfoilfoam-expected-evidence-sha256": opts.evidenceSha256,
-      ...(settings?.upstreamSecret
-        ? { "x-xfoilfoam-sync-secret": settings.upstreamSecret }
-        : {}),
+      ...renderCredential,
     },
     body: JSON.stringify({
       ...opts.params,
@@ -1893,12 +1992,13 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         .header("cache-control", "public, max-age=31536000, immutable");
       return reply.send(stream);
     } catch (error) {
-      if (error instanceof MediaUpstreamError) {
-        return reply.code(error.statusCode).send({ error: error.message });
-      }
       try {
         const proxied = await proxyRemoteAsset(key);
-        if (!proxied) return reply.code(404).send({ error: "media not found" });
+        if (!proxied) {
+          if (error instanceof MediaUpstreamError)
+            return reply.code(error.statusCode).send({ error: error.message });
+          return reply.code(404).send({ error: "media not found" });
+        }
         reply
           .header("content-type", proxied.mime)
           .header("content-length", proxied.size)

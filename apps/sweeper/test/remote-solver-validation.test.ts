@@ -1,6 +1,6 @@
 import "./enabled-engine-pool-fixture";
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -29,6 +29,10 @@ const MEDIA_DIR = join(
 );
 mkdirSync(MEDIA_DIR, { recursive: true });
 process.env.MEDIA_DIR = MEDIA_DIR;
+process.env.ENGINE_CONTROL_PLANE_TOKEN =
+  "remote-solver-validation-control-plane-token";
+delete process.env.AIRFOILFOAM_EVIDENCE_BUCKET;
+process.env.AIRFOILFOAM_EVIDENCE_REMOTE_ONLY = "false";
 
 const dbSchema = await import("@aerodb/db");
 const { ensureSimulationPresetRevision } =
@@ -37,10 +41,13 @@ const {
   admitRemoteSolverTick,
   claimResultDelivery,
   createProgressAwareAbort,
+  processBrokeredRemoteEvidenceReclaims,
   reconcileRemoteSolverTick,
   remoteSolverTick,
   renewResultDeliveryClaim,
   settleResultDelivery,
+  startRemoteReclaimClaimLease,
+  startRemotePromiseTransferLease,
 } = await import("../src/remote-solver");
 const { registerEvidenceArtifacts } = await import("../src/ingest");
 const { resetEngineBackoffForTests } = await import("../src/engine-backoff");
@@ -62,6 +69,7 @@ const {
   polarFitSets,
   recordRansPolarPromotion,
   referenceGeometryProfiles,
+  remoteAssetReferences,
   resultAttempts,
   resultClassifications,
   resultFieldExtents,
@@ -83,6 +91,7 @@ const {
   syncApiSettings,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
+  syncRemoteHubBindingReceipts,
   syncSweepPromisePoints,
   syncSweepPromises,
   sweepDefinitions,
@@ -90,7 +99,7 @@ const {
 
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `sw-remote-validation-${process.pid}-${Date.now().toString(36)}`;
-const UPSTREAM = "http://hub.test/api/sync/v1";
+const UPSTREAM = "https://hub.test/api/sync/v1";
 const SECRET = `${PREFIX}-secret`;
 const CHORD = 0.37;
 const SPEED = 24.5;
@@ -126,6 +135,70 @@ const cleanupRuntimeBuildIds = new Set<string>();
 
 function sha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const source = value as Record<string, unknown>;
+  return `{${Object.keys(source)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`)
+    .join(",")}}`;
+}
+
+function fixtureBindingReceipt(manifest: Record<string, unknown>): {
+  receipt: Record<string, unknown>;
+  receiptHmac: string;
+} {
+  const point = (manifest.results as Array<Record<string, unknown>>)[0]!;
+  const artifact = (
+    point.evidenceArtifacts as Array<Record<string, unknown>>
+  ).find((item) => item.kind === "engine_bundle")!;
+  const metadata = artifact.metadata as Record<string, unknown>;
+  const now = new Date().toISOString();
+  const receipt = {
+    schemaVersion: 1,
+    kind: "hub-canonical-evidence-binding",
+    promiseId: manifest.promiseId,
+    aoaDeg: point.aoaDeg,
+    remoteResultId: point.remoteResultId,
+    remoteResultAttemptId: point.remoteResultAttemptId,
+    engineJobId: point.engineJobId,
+    engineCaseSlug: point.engineCaseSlug ?? null,
+    brokeredUploadId: artifact.remoteEvidenceUploadId,
+    bindingState: "bound",
+    promisePointState: "fulfilled",
+    remote: {
+      bucket: metadata.bucket,
+      objectKey: metadata.objectKey,
+      generation: metadata.generation,
+      crc32c: metadata.crc32c,
+      storedSha256: artifact.sha256,
+      storedByteSize: artifact.byteSize,
+      tarSha256: metadata.tarSha256,
+      tarByteSize: Number(metadata.tarByteSize),
+      manifestSha256: metadata.manifestSha256,
+      manifestByteSize: Number(metadata.manifestByteSize),
+      zstdLevel: Number(metadata.zstdLevel),
+      bundledFileCount: Number(metadata.bundledFileCount),
+    },
+    canonical: {
+      resultId: randomUUID(),
+      resultAttemptId: randomUUID(),
+      artifactId: randomUUID(),
+    },
+    boundAt: now,
+    fulfilledAt: now,
+  };
+  return {
+    receipt,
+    receiptHmac: createHmac("sha256", `${PREFIX}-solver-token`)
+      .update("xfoilfoam-hub-canonical-evidence-binding-v1\n")
+      .update(canonicalJson(receipt))
+      .digest("hex"),
+  };
 }
 
 async function deleteIds(table: any, column: any, ids: string[]) {
@@ -174,11 +247,14 @@ async function configureRemoteSolver() {
       enabled: true,
       secret: SECRET,
       upstreamBaseUrl: UPSTREAM,
-      upstreamSecret: SECRET,
+      // The shared secret is bootstrap-only. Every normal lifecycle assertion
+      // in this suite runs after it has been removed.
+      upstreamSecret: "",
       remoteSolverEnabled: true,
       remoteSolverCpuBudget: 2,
       remoteSolverClaimSize: 3,
       remoteSolverRegisteredId: randomUUID(),
+      remoteSolverAuthToken: `${PREFIX}-solver-token`,
       remoteSolverLastStatus: "idle",
       remoteSolverLastError: null,
       remoteSolverLastPushAt: null,
@@ -346,6 +422,49 @@ function writeMedia(storageKey: string, label: string) {
   return { storageKey, sha256: sha256(buf), byteSize: buf.byteLength };
 }
 
+async function seedEngineBundle(
+  owner: {
+    resultId: string;
+    resultAttemptId: string;
+    simJobId: string;
+    engineJobId: string;
+    engineCaseSlug: string | null;
+    aoaDeg: number;
+  },
+  label: string,
+) {
+  const tarBytes = Buffer.from(`${PREFIX}:${label}:uncompressed-tar`);
+  const bundle = writeMedia(
+    `jobs/${owner.engineJobId}/cases/${owner.engineCaseSlug ?? "case"}/engine-bundle.tar.zst`,
+    `${label}:engine-bundle-zstd`,
+  );
+  await db.insert(solverEvidenceArtifacts).values({
+    resultId: owner.resultId,
+    resultAttemptId: owner.resultAttemptId,
+    airfoilId,
+    simJobId: owner.simJobId,
+    engineJobId: owner.engineJobId,
+    engineCaseSlug: owner.engineCaseSlug,
+    aoaDeg: owner.aoaDeg,
+    kind: "engine_bundle",
+    role: "raw",
+    storageKey: bundle.storageKey,
+    mimeType: "application/zstd",
+    sha256: bundle.sha256,
+    byteSize: bundle.byteSize,
+    metadata: {
+      archiveFormat: "tar+zstd",
+      compression: "zstd",
+      evidenceBase: "evidence",
+      uncompressedTarSha256: sha256(tarBytes),
+      uncompressedTarByteSize: tarBytes.byteLength,
+      zstdLevel: 19,
+      bundledFileCount: 2,
+    },
+  });
+  return bundle;
+}
+
 async function cleanupRemoteRows() {
   if (!revisionId) return;
   const promiseIds = await db
@@ -353,10 +472,28 @@ async function cleanupRemoteRows() {
     .from(syncSweepPromises)
     .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
   if (promiseIds.length) {
+    await db.delete(syncRemoteHubBindingReceipts).where(
+      inArray(
+        syncRemoteHubBindingReceipts.promiseId,
+        promiseIds.map((row) => row.id),
+      ),
+    );
     await db.delete(syncRemotePromiseCancellations).where(
       inArray(
         syncRemotePromiseCancellations.promiseId,
         promiseIds.map((row) => row.id),
+      ),
+    );
+  }
+  const resultIds = await db
+    .select({ id: results.id })
+    .from(results)
+    .where(eq(results.simulationPresetRevisionId, revisionId));
+  if (resultIds.length) {
+    await db.delete(remoteAssetReferences).where(
+      inArray(
+        remoteAssetReferences.resultId,
+        resultIds.map((row) => row.id),
       ),
     );
   }
@@ -514,6 +651,17 @@ async function seedDoneRemoteJob(
       byteSize: manifest.byteSize,
       metadata: { fixture: label, index: idx },
     });
+    await seedEngineBundle(
+      {
+        resultId: row.id,
+        resultAttemptId: attempt.id,
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug: row.engineCaseSlug,
+        aoaDeg,
+      },
+      `${label}:${idx}`,
+    );
     const stored = writeMedia(
       `jobs/${engineJobId}/cases/${idx}/pressure.png`,
       `${label}:${idx}`,
@@ -579,6 +727,100 @@ async function parsedRequestBody(init?: RequestInit): Promise<unknown> {
   return parsed;
 }
 
+const brokerObjects = new Map<string, string>();
+const brokerArchives = new Map<
+  string,
+  { bytes: Buffer; sha256: string; byteSize: number }
+>();
+
+async function brokerFixtureResponse(
+  input: string | URL,
+  init?: RequestInit,
+): Promise<Response | null> {
+  const url = String(input);
+  if (url.endsWith("/evidence-uploads")) {
+    const body = (await parsedRequestBody(init)) as {
+      idempotencyKey?: string;
+      storedSha256?: string;
+      storedByteSize?: number;
+    };
+    const id = body.idempotencyKey ?? randomUUID();
+    const storedSha256 = body.storedSha256 ?? "0".repeat(64);
+    const objectKey = `solver-evidence/v1/sha256/${storedSha256.slice(0, 2)}/${storedSha256}.tar.zst`;
+    brokerObjects.set(id, objectKey);
+    brokerArchives.set(id, {
+      bytes: Buffer.alloc(0),
+      sha256: storedSha256,
+      byteSize: body.storedByteSize ?? 0,
+    });
+    const query = new URLSearchParams({
+      uploadType: "resumable",
+      name: objectKey,
+      upload_id: id,
+    });
+    return new Response(
+      JSON.stringify({
+        id,
+        state: "issued",
+        bucket: "airfoils-pro-storage-bucket",
+        objectKey,
+        uploadUrl: `https://storage.googleapis.com/upload/storage/v1/b/airfoils-pro-storage-bucket/o?${query.toString()}`,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }
+  if (
+    url.startsWith(
+      "https://storage.googleapis.com/upload/storage/v1/b/airfoils-pro-storage-bucket/o?",
+    )
+  ) {
+    const uploadId = new URL(url).searchParams.get("upload_id") ?? "";
+    const chunks: Buffer[] = [];
+    if (init?.body) {
+      for await (const chunk of init.body as unknown as AsyncIterable<unknown>) {
+        chunks.push(Buffer.from(chunk as Uint8Array));
+      }
+    }
+    const archive = brokerArchives.get(uploadId);
+    if (archive) archive.bytes = Buffer.concat(chunks);
+    return new Response(JSON.stringify({ generation: "9007199254740993123" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const verify = /\/evidence-uploads\/([^/]+)\/verify$/.exec(url);
+  if (verify) {
+    return new Response(
+      JSON.stringify({
+        id: verify[1],
+        state: "verified",
+        remote: {
+          bucket: "airfoils-pro-storage-bucket",
+          objectKey: brokerObjects.get(verify[1]!) ?? "missing",
+          generation: "9007199254740993123",
+          crc32c: "AAAAAA==",
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }
+  const download = /\/evidence-uploads\/([^/]+)\/download$/.exec(url);
+  if (download) {
+    const archive = brokerArchives.get(download[1]!);
+    if (!archive) return Response.json({ error: "missing" }, { status: 409 });
+    return new Response(archive.bytes, {
+      status: 200,
+      headers: {
+        "content-type": "application/zstd",
+        "content-length": String(archive.byteSize),
+        "x-content-sha256": archive.sha256,
+        "x-gcs-generation": "9007199254740993123",
+      },
+    });
+  }
+  return null;
+}
+
 function stubFetch(
   opts: {
     conflictIdsByPolarIndex?: Record<number, string[]>;
@@ -594,6 +836,8 @@ function stubFetch(
   const pushedAtDuringPosts: (string | undefined)[] = [];
   const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
+    const broker = await brokerFixtureResponse(input, init);
+    if (broker) return broker;
     if (
       opts.observeJobId &&
       (url.endsWith("/polars") || url.includes("/complete"))
@@ -608,7 +852,10 @@ function stubFetch(
         return new Response(JSON.stringify({ error: "chunk failed" }), {
           status: 500,
         });
-      const body = (await parsedRequestBody(init)) as {
+      const body = (await parsedRequestBody(init)) as Record<
+        string,
+        unknown
+      > & {
         results?: Array<{ aoaDeg?: unknown }>;
       };
       const pushedAoas = Array.isArray(body.results)
@@ -627,6 +874,11 @@ function stubFetch(
               : pushedAoas,
           unfulfilledAoas:
             opts.unfulfilledPolarIndex === polarIndex ? pushedAoas : [],
+          bindingReceipts:
+            opts.unfulfilledPolarIndex === polarIndex ||
+            Boolean(opts.conflictIdsByPolarIndex?.[polarIndex]?.length)
+              ? []
+              : [fixtureBindingReceipt(body)],
         }),
         {
           status: 200,
@@ -649,16 +901,24 @@ function stubFetch(
         },
       );
     }
+    if (url.endsWith("/internal/evidence-uploads/reclaim"))
+      return Response.json({ state: "complete", bytes_freed: 128 });
     if (url.includes("/complete"))
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
     if (url.includes("/heartbeat"))
-      return new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
     if (url.includes("/sweeps/") && url.endsWith("/cancel")) {
       cancelIndex += 1;
       if (cancelIndex <= (opts.failCancelCount ?? 0)) {
@@ -673,10 +933,16 @@ function stubFetch(
       });
     }
     if (url.endsWith("/solvers/register"))
-      return new Response(JSON.stringify({ solver: { id: randomUUID() } }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          authToken: `${PREFIX}-registered-solver-token`,
+          solver: { id: randomUUID() },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
     if (url.endsWith("/sweeps/claim"))
       return new Response(JSON.stringify({ promise: null }), {
         status: 200,
@@ -926,6 +1192,17 @@ async function seedRemoteWholePolarParent(label: string) {
     byteSize: acceptedManifest.byteSize,
     metadata: { fixture: label, promotionRace: true },
   });
+  await seedEngineBundle(
+    {
+      resultId: acceptedResult.id,
+      resultAttemptId: acceptedAttempt.id,
+      simJobId: parent.id,
+      engineJobId,
+      engineCaseSlug: "aoa_0",
+      aoaDeg: 0,
+    },
+    `${label}:accepted-rans`,
+  );
 
   const [triggerResult] = await db
     .insert(results)
@@ -1142,6 +1419,30 @@ afterAll(async () => {
 });
 
 describe("remote solver submit lifecycle", () => {
+  it("fails a tick before any claim or upload network call for an unsafe stored hub", async () => {
+    await db
+      .update(syncApiSettings)
+      .set({
+        upstreamBaseUrl: "http://unsafe-hub.example.test/api/sync/v1",
+        updatedAt: new Date(),
+      })
+      .where(eq(syncApiSettings.id, 1));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await reconcileRemoteSolverTick(db, {} as EngineClient)).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const [settings] = await db
+      .select({
+        status: syncApiSettings.remoteSolverLastStatus,
+        error: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(settings).toMatchObject({ status: "error" });
+    expect(settings?.error).toMatch(/must use HTTPS/i);
+  });
+
   it("keeps remote reconciliation live but does not submit an engine job while storage admission is blocked", async () => {
     const aoa = 900.501;
     const promise = await seedMirroredPromise("storage-blocked", [aoa]);
@@ -1396,7 +1697,7 @@ describe("remote solver submit lifecycle", () => {
     ).toHaveLength(0);
   });
 
-  it("durably retries an expired mirror cancellation against its stored hub", async () => {
+  it("does not send the current solver credential to a stale cancellation authority", async () => {
     const aoa = 903.501;
     const promise = await seedMirroredPromise("cancel-outbox", [aoa]);
     const { fetchMock } = stubFetch({ failCancelCount: 1 });
@@ -1440,7 +1741,7 @@ describe("remote solver submit lifecycle", () => {
     await db
       .update(syncApiSettings)
       .set({
-        upstreamBaseUrl: "http://new-hub.test/api/sync/v1",
+        upstreamBaseUrl: "https://new-hub.test/api/sync/v1",
         upstreamSecret: `${PREFIX}-rotated-secret`,
         remoteSolverEnabled: false,
         remoteSolverRegisteredId: null,
@@ -1450,28 +1751,21 @@ describe("remote solver submit lifecycle", () => {
 
     await remoteSolverTick(db, {} as never);
 
-    const [delivered] = await db
+    const [blockedRetry] = await db
       .select()
       .from(syncRemotePromiseCancellations)
       .where(eq(syncRemotePromiseCancellations.promiseId, promise.id));
-    expect(delivered).toMatchObject({ state: "delivered", attemptCount: 2 });
+    expect(blockedRetry).toMatchObject({
+      state: "retry_wait",
+      attemptCount: 2,
+    });
+    expect(blockedRetry.lastError).toMatch(/no longer matches/i);
     expect(
       requests(fetchMock, `/sweeps/${promise.id}/cancel`).map(
         (request) => request.url,
       ),
-    ).toEqual([
-      `${UPSTREAM}/sweeps/${promise.id}/cancel`,
-      `${UPSTREAM}/sweeps/${promise.id}/cancel`,
-    ]);
+    ).toEqual([`${UPSTREAM}/sweeps/${promise.id}/cancel`]);
     expect(requests(fetchMock, `/sweeps/${promise.id}/heartbeat`)).toEqual([]);
-    const retryCall = [...fetchMock.mock.calls]
-      .reverse()
-      .find((call) => String(call[0]).endsWith(`/sweeps/${promise.id}/cancel`));
-    expect(
-      new Headers((retryCall?.[1] as RequestInit | undefined)?.headers).get(
-        "x-xfoilfoam-sync-secret",
-      ),
-    ).toBe(`${PREFIX}-rotated-secret`);
   });
 
   it("blocks an answered 4xx immediately without inventing solver evidence", async () => {
@@ -1700,7 +1994,7 @@ describe("remote solver submit lifecycle", () => {
         requestPayload: {
           remoteSolver: true,
           syncPromiseId: promise.id,
-          upstreamBaseUrl: "http://different-hub.test/api/sync/v1",
+          upstreamBaseUrl: "https://different-hub.test/api/sync/v1",
           aoas: [aoa],
         },
       })
@@ -1983,6 +2277,8 @@ describe("remote-owned whole-polar promotion scope", () => {
     const fetchMock = vi.fn(
       async (input: string | URL, _init?: RequestInit) => {
         const url = String(input);
+        const broker = await brokerFixtureResponse(input, _init);
+        if (broker) return broker;
         if (url.endsWith("/polars")) {
           uploadStartedResolve();
           await releaseUpload;
@@ -1996,6 +2292,11 @@ describe("remote-owned whole-polar promotion scope", () => {
             { status: 200, headers: { "content-type": "application/json" } },
           );
         }
+        if (url.endsWith(`/sweeps/${seeded.promise.id}/heartbeat`))
+          return Response.json({
+            ok: true,
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          });
         return new Response(JSON.stringify({ ok: true }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -2519,7 +2820,14 @@ describe("remote solver push validation regressions", () => {
     await remoteSolverTick(db, {} as never);
 
     const polars = requests(fetchMock, "/polars");
-    expect(polars).toHaveLength(3);
+    const [remoteStatus] = await db
+      .select({ error: syncApiSettings.remoteSolverLastError })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(
+      polars,
+      remoteStatus?.error ?? "no remote solver error",
+    ).toHaveLength(3);
     expect(polars.map((call) => call.body.results.length)).toEqual([1, 1, 1]);
     expect(polars.map((call) => call.body.airfoilSlug)).toEqual([
       airfoilSlug,
@@ -2943,6 +3251,432 @@ describe("remote solver push validation regressions", () => {
     stalled.dispose();
   });
 
+  it("MUST-CATCH: a transfer lasting beyond one hour renews the exact upstream promise with a one-hour TTL throughout", async () => {
+    const promiseId = randomUUID();
+    const [settings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    const returning = vi.fn(async () => [{ id: promiseId }]);
+    const dbMock = {
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({ returning })),
+        })),
+      })),
+    };
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+    vi.useFakeTimers({ now: new Date("2026-07-18T00:00:00.000Z") });
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: string | URL, init?: RequestInit) => {
+          heartbeatBodies.push(JSON.parse(String(init?.body ?? "{}")));
+          return Response.json({
+            ok: true,
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          });
+        }),
+      );
+      const onRenew = vi.fn(async () => undefined);
+      const lease = await startRemotePromiseTransferLease(
+        dbMock as unknown as typeof db,
+        {} as EngineClient,
+        settings,
+        promiseId,
+        onRenew,
+      );
+      await vi.advanceTimersByTimeAsync(61 * 60_000);
+      expect(lease.signal.aborted).toBe(false);
+      expect(heartbeatBodies).toHaveLength(5);
+      expect(heartbeatBodies).toSatisfy(
+        (rows: Array<Record<string, unknown>>) =>
+          rows.every((row) => row.ttlHours === 1),
+      );
+      expect(onRenew).toHaveBeenCalledTimes(5);
+      expect(returning).toHaveBeenCalledTimes(5);
+      expect(await lease.stop()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps transfer-heartbeat failures retryable but authoritatively stops ownership on 404/409 before upload", async () => {
+    for (const [status, expectedState] of [
+      [503, "retry_wait"],
+      [404, "superseded"],
+      [409, "superseded"],
+    ] as const) {
+      vi.unstubAllGlobals();
+      await cleanupRemoteRows();
+      await configureRemoteSolver();
+      const aoa = 865 + status / 1000;
+      const job = await seedDoneRemoteJob(`transfer-heartbeat-${status}`, [
+        aoa,
+      ]);
+      const promiseId = (job.requestPayload as { syncPromiseId: string })
+        .syncPromiseId;
+      await seedMirroredPromise(
+        `transfer-heartbeat-${status}`,
+        [aoa],
+        promiseId,
+      );
+      const base = stubFetch().fetchMock;
+      const fetchMock = vi.fn(
+        async (input: string | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith(`/sweeps/${promiseId}/heartbeat`))
+            return Response.json(
+              { error: "lease renewal rejected" },
+              { status },
+            );
+          return base(input, init);
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      await remoteSolverTick(db, {} as EngineClient);
+      expect(requests(fetchMock, "/evidence-uploads")).toHaveLength(0);
+      expect(requests(fetchMock, "/polars")).toHaveLength(0);
+      const [delivery] = (await deliveriesForJob(job.id)).filter(
+        (row) => row.resultId,
+      );
+      expect(delivery.state).toBe(expectedState);
+      const mirror = await readPromise(promiseId);
+      if (status === 503) {
+        expect(mirror.promise.status).toBe("active");
+        expect(mirror.points[0]?.status).toBe("active");
+      } else {
+        expect(mirror.promise.status).toBe("cancelled");
+        expect(mirror.points[0]?.status).toBe("cancelled");
+      }
+    }
+  });
+
+  it("MUST-CATCH: a reclaim read lasting beyond the ten-minute claim cannot be stolen by another sweeper", async () => {
+    const returning = vi.fn(async () => [{ id: randomUUID() }]);
+    const dbMock = {
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({ returning })),
+        })),
+      })),
+    };
+    vi.useFakeTimers({ now: new Date("2026-07-18T00:00:00.000Z") });
+    try {
+      const lease = startRemoteReclaimClaimLease(
+        dbMock as unknown as typeof db,
+        { id: randomUUID(), token: randomUUID() },
+      );
+      await vi.advanceTimersByTimeAsync(21 * 60_000);
+      expect(lease.signal.aborted).toBe(false);
+      expect(returning).toHaveBeenCalledTimes(10);
+      expect(await lease.stop()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("MUST-CATCH: reads the exact bound hub archive to EOF before reclaim and keeps every preflight failure retryable without deletion", async () => {
+    type FailureCase =
+      | "missing-token"
+      | "unsafe-hub"
+      | "wrong-token"
+      | "forbidden"
+      | "cross-solver"
+      | "redirect"
+      | "truncated"
+      | "wrong-hash"
+      | "wrong-generation"
+      | "wrong-mime"
+      | "missing-reference"
+      | "mismatched-reference";
+
+    const seedPendingReclaim = async (label: string, aoa: number) => {
+      vi.unstubAllGlobals();
+      await cleanupRemoteRows();
+      await configureRemoteSolver();
+      brokerObjects.clear();
+      brokerArchives.clear();
+      const job = await seedDoneRemoteJob(label, [aoa]);
+      const promiseId = (job.requestPayload as { syncPromiseId: string })
+        .syncPromiseId;
+      await seedMirroredPromise(label, [aoa], promiseId);
+      stubFetch();
+      await remoteSolverTick(db, {} as EngineClient);
+      const [receipt] = await db
+        .select()
+        .from(syncRemoteHubBindingReceipts)
+        .where(eq(syncRemoteHubBindingReceipts.promiseId, promiseId));
+      const [reference] = await db
+        .select()
+        .from(remoteAssetReferences)
+        .where(
+          eq(remoteAssetReferences.resultAttemptId, receipt.resultAttemptId),
+        );
+      const [settings] = await db
+        .select()
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1));
+      const archive = brokerArchives.get(receipt.brokeredUploadId);
+      expect(receipt).toBeTruthy();
+      expect(reference).toBeTruthy();
+      expect(archive).toBeTruthy();
+      vi.unstubAllGlobals();
+      return { receipt, reference, settings, archive: archive! };
+    };
+
+    const failures: FailureCase[] = [
+      "missing-token",
+      "unsafe-hub",
+      "wrong-token",
+      "forbidden",
+      "cross-solver",
+      "redirect",
+      "truncated",
+      "wrong-hash",
+      "wrong-generation",
+      "wrong-mime",
+      "missing-reference",
+      "mismatched-reference",
+    ];
+    for (const [index, failure] of failures.entries()) {
+      const fixture = await seedPendingReclaim(
+        `reclaim-${failure}`,
+        870.001 + index,
+      );
+      if (failure === "missing-reference") {
+        await db
+          .delete(remoteAssetReferences)
+          .where(eq(remoteAssetReferences.id, fixture.reference.id));
+      }
+      if (failure === "mismatched-reference") {
+        await db
+          .update(remoteAssetReferences)
+          .set({
+            remoteDownloadUrl: `https://attacker.invalid/api/sync/v1/evidence-uploads/${fixture.receipt.brokeredUploadId}/download`,
+          })
+          .where(eq(remoteAssetReferences.id, fixture.reference.id));
+      }
+      const attemptedSettings =
+        failure === "missing-token"
+          ? { ...fixture.settings, remoteSolverAuthToken: "" }
+          : failure === "unsafe-hub"
+            ? {
+                ...fixture.settings,
+                upstreamBaseUrl: "http://unsafe-hub.example.test/api/sync/v1",
+              }
+            : failure === "wrong-token"
+              ? {
+                  ...fixture.settings,
+                  remoteSolverAuthToken:
+                    "wrong-current-registered-solver-token-value",
+                }
+              : fixture.settings;
+      const calls: string[] = [];
+      const fetchMock = vi.fn(
+        async (input: string | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith("/internal/evidence-uploads/reclaim")) {
+            calls.push("reclaim");
+            return Response.json({ state: "complete", bytes_freed: 128 });
+          }
+          if (!url.endsWith(`/${fixture.receipt.brokeredUploadId}/download`))
+            throw new Error(`unexpected reclaim preflight request ${url}`);
+          calls.push("download");
+          expect(init?.method).toBe("GET");
+          expect(init?.redirect).toBe("error");
+          const suppliedToken = new Headers(init?.headers).get(
+            "x-xfoilfoam-solver-token",
+          );
+          if (failure === "wrong-token") {
+            expect(suppliedToken).toBe(
+              "wrong-current-registered-solver-token-value",
+            );
+            return Response.json(
+              { error: "invalid solver token" },
+              { status: 403 },
+            );
+          }
+          expect(suppliedToken).toBe(fixture.settings.remoteSolverAuthToken);
+          if (failure === "forbidden")
+            return Response.json({ error: "forbidden" }, { status: 403 });
+          if (failure === "cross-solver")
+            return Response.json(
+              { error: "bound upload is owned by another solver" },
+              { status: 409 },
+            );
+          if (failure === "redirect")
+            return new Response(null, {
+              status: 302,
+              headers: { location: "https://attacker.invalid/archive" },
+            });
+          let bytes = fixture.archive.bytes;
+          if (failure === "truncated") bytes = bytes.subarray(0, -1);
+          if (failure === "wrong-hash") {
+            bytes = Buffer.from(bytes);
+            bytes[0] = (bytes[0] ?? 0) ^ 0xff;
+          }
+          return new Response(bytes, {
+            status: 200,
+            headers: {
+              "content-type":
+                failure === "wrong-mime"
+                  ? "application/gzip"
+                  : "application/zstd",
+              "content-length": String(fixture.archive.byteSize),
+              "x-content-sha256": fixture.archive.sha256,
+              "x-gcs-generation":
+                failure === "wrong-generation"
+                  ? "9007199254740993124"
+                  : "9007199254740993123",
+            },
+          });
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      expect(
+        await processBrokeredRemoteEvidenceReclaims(db, attemptedSettings, 1),
+        failure,
+      ).toBe(0);
+      expect(calls, failure).not.toContain("reclaim");
+      const [retained] = await db
+        .select()
+        .from(syncRemoteHubBindingReceipts)
+        .where(eq(syncRemoteHubBindingReceipts.id, fixture.receipt.id));
+      expect(retained, failure).toMatchObject({
+        reclaimState: "pending",
+        reclaimAttemptCount: 1,
+        reclaimedAt: null,
+        reclaimedBytes: null,
+      });
+      expect(retained.reclaimLastError, failure).toBeTruthy();
+    }
+
+    const fixture = await seedPendingReclaim("reclaim-success", 889.001);
+    const events: string[] = [];
+    let sent = false;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/${fixture.receipt.brokeredUploadId}/download`)) {
+        events.push("download");
+        expect(new Headers(init?.headers).get("x-xfoilfoam-solver-token")).toBe(
+          fixture.settings.remoteSolverAuthToken,
+        );
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (!sent) {
+              sent = true;
+              controller.enqueue(fixture.archive.bytes);
+              return;
+            }
+            events.push("eof");
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "content-type": "application/zstd",
+            "content-length": String(fixture.archive.byteSize),
+            "x-content-sha256": fixture.archive.sha256,
+            "x-gcs-generation": "9007199254740993123",
+          },
+        });
+      }
+      if (url.endsWith("/internal/evidence-uploads/reclaim")) {
+        events.push("reclaim");
+        return Response.json({ state: "complete", bytes_freed: 128 });
+      }
+      throw new Error(`unexpected successful reclaim request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(
+      await processBrokeredRemoteEvidenceReclaims(db, fixture.settings, 1),
+    ).toBe(1);
+    expect(events).toEqual(["download", "eof", "reclaim"]);
+    const [reclaimed] = await db
+      .select()
+      .from(syncRemoteHubBindingReceipts)
+      .where(eq(syncRemoteHubBindingReceipts.id, fixture.receipt.id));
+    expect(reclaimed).toMatchObject({
+      reclaimState: "reclaimed",
+      reclaimedBytes: 128,
+      reclaimLastError: null,
+    });
+  });
+
+  it("claims only the one reclaim row a sequential worker can actively renew", async () => {
+    vi.unstubAllGlobals();
+    await cleanupRemoteRows();
+    await configureRemoteSolver();
+    brokerObjects.clear();
+    brokerArchives.clear();
+    const aoas = [890.001, 891.001];
+    const job = await seedDoneRemoteJob("reclaim-sequential-queue", aoas);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("reclaim-sequential-queue", aoas, promiseId);
+    stubFetch();
+    await remoteSolverTick(db, {} as EngineClient);
+    await db
+      .update(syncRemoteHubBindingReceipts)
+      .set({ reclaimNextAttemptAt: new Date(Date.now() + 3_600_000) });
+    await remoteSolverTick(db, {} as EngineClient);
+    await db
+      .update(syncRemoteHubBindingReceipts)
+      .set({ reclaimNextAttemptAt: new Date(Date.now() - 1_000) });
+    const [settings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    const receipts = await db
+      .select()
+      .from(syncRemoteHubBindingReceipts)
+      .where(eq(syncRemoteHubBindingReceipts.promiseId, promiseId));
+    expect(receipts).toHaveLength(2);
+    vi.unstubAllGlobals();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = String(input);
+        const download = /\/evidence-uploads\/([^/]+)\/download$/.exec(url);
+        if (download) {
+          const archive = brokerArchives.get(download[1]!);
+          if (!archive)
+            return Response.json({ error: "missing" }, { status: 409 });
+          return new Response(archive.bytes, {
+            headers: {
+              "content-type": "application/zstd",
+              "content-length": String(archive.byteSize),
+              "x-content-sha256": archive.sha256,
+              "x-gcs-generation": "9007199254740993123",
+            },
+          });
+        }
+        if (url.endsWith("/internal/evidence-uploads/reclaim"))
+          return Response.json({ state: "complete", bytes_freed: 128 });
+        throw new Error(`unexpected sequential reclaim request ${url}`);
+      }),
+    );
+    expect(await processBrokeredRemoteEvidenceReclaims(db, settings, 8)).toBe(
+      1,
+    );
+    expect(
+      await db
+        .select({ state: syncRemoteHubBindingReceipts.reclaimState })
+        .from(syncRemoteHubBindingReceipts)
+        .where(eq(syncRemoteHubBindingReceipts.promiseId, promiseId)),
+    ).toSatisfy(
+      (rows: Array<{ state: string }>) =>
+        rows.filter((row) => row.state === "reclaimed").length === 1 &&
+        rows.filter((row) => row.state === "pending").length === 1,
+    );
+    expect(await processBrokeredRemoteEvidenceReclaims(db, settings, 8)).toBe(
+      1,
+    );
+  });
+
   it("renews a delivery claim that has streamed for more than 30 minutes and rejects a stale settlement token", async () => {
     const job = await seedDoneRemoteJob("long-claim", [850.001]);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
@@ -3156,6 +3890,154 @@ describe("remote solver push validation regressions", () => {
       (await deliveriesForJob(job.id)).find((row) => row.resultId)?.state,
     ).toBe("superseded");
     expect((await readPromise(promiseId)).points[0]?.status).toBe("cancelled");
+  });
+
+  it("uses the immutable result-attempt UUID when one delivery advances generations", async () => {
+    const aoas = [855.201, 855.202];
+    const job = await seedDoneRemoteJob("delivery-generation-advance", aoas);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("delivery-generation-advance", aoas, promiseId);
+    const deliveryFetch = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(and(eq(results.simJobId, job.id), eq(results.aoaDeg, aoas[0]!)));
+    const attemptA = result.currentResultAttemptId!;
+    const [deliveryA] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(
+        and(
+          eq(syncRemoteResultDeliveries.promiseId, promiseId),
+          eq(syncRemoteResultDeliveries.resultId, result.id),
+        ),
+      );
+    expect(deliveryA).toMatchObject({
+      state: "delivered",
+      generationKey: attemptA,
+      resultAttemptId: attemptA,
+    });
+
+    const caseSlug = "aoa_0_generation_b";
+    const [attemptB] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: aoas[0]!,
+        simJobId: job.id,
+        engineJobId: job.engineJobId,
+        engineCaseSlug: caseSlug,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: true,
+        cl: 0.61,
+        cd: 0.013,
+        cm: -0.021,
+        clCd: 46.9,
+        stalled: false,
+        unsteady: true,
+        converged: true,
+        evidencePayload: { fixture: "delivery-generation-b" },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db
+      .update(results)
+      .set({
+        currentResultAttemptId: attemptB.id,
+        engineCaseSlug: caseSlug,
+        cl: attemptB.cl,
+        cd: attemptB.cd,
+        cm: attemptB.cm,
+        clCd: attemptB.clCd,
+      })
+      .where(eq(results.id, result.id));
+    await db
+      .update(resultClassifications)
+      .set({
+        resultAttemptId: attemptB.id,
+        regime: "urans",
+        classifierVersion: "remote-delivery-generation-v1",
+        state: "accepted",
+        reasons: [],
+        updatedAt: new Date(),
+      })
+      .where(eq(resultClassifications.resultId, result.id));
+    const manifest = writeMedia(
+      `jobs/${job.engineJobId}/cases/${caseSlug}/manifest.json`,
+      "delivery-generation-b:manifest",
+    );
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: result.id,
+      resultAttemptId: attemptB.id,
+      airfoilId,
+      simJobId: job.id,
+      engineJobId: job.engineJobId,
+      engineCaseSlug: caseSlug,
+      aoaDeg: aoas[0]!,
+      kind: "manifest",
+      role: "raw",
+      storageKey: manifest.storageKey,
+      mimeType: "application/json",
+      sha256: manifest.sha256,
+      byteSize: manifest.byteSize,
+      metadata: { fixture: "delivery-generation-b" },
+    });
+    await seedEngineBundle(
+      {
+        resultId: result.id,
+        resultAttemptId: attemptB.id,
+        simJobId: job.id,
+        engineJobId: job.engineJobId!,
+        engineCaseSlug: caseSlug,
+        aoaDeg: aoas[0]!,
+      },
+      "delivery-generation-b",
+    );
+    const image = writeMedia(
+      `jobs/${job.engineJobId}/cases/${caseSlug}/pressure.png`,
+      "delivery-generation-b:pressure",
+    );
+    await db.insert(resultMedia).values({
+      resultId: result.id,
+      resultAttemptId: attemptB.id,
+      kind: "image",
+      field: "pressure_generation_b",
+      role: "instantaneous",
+      storageKey: image.storageKey,
+      mimeType: "image/png",
+      width: 4,
+      height: 4,
+      evidenceSha256: manifest.sha256,
+      sha256: image.sha256,
+      byteSize: image.byteSize,
+    });
+
+    await remoteSolverTick(db, {} as never);
+
+    const brokerRequests = requests(
+      deliveryFetch.fetchMock,
+      "/evidence-uploads",
+    );
+    expect(
+      brokerRequests.map((request) => request.body.idempotencyKey),
+    ).toEqual([attemptA, attemptB.id]);
+    const [deliveryB] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, deliveryA.id));
+    expect(deliveryB).toMatchObject({
+      state: "delivered",
+      generationKey: attemptB.id,
+      resultAttemptId: attemptB.id,
+    });
   });
 
   it("does not let more than 250 blocked or not-due jobs starve one ready result delivery", async () => {
@@ -3452,10 +4334,18 @@ describe("remote solver push validation regressions", () => {
     await remoteSolverTick(db, {} as never);
 
     const [polar] = requests(fetch.fetchMock, "/polars");
-    expect(polar.body.results[0].evidenceArtifacts).toHaveLength(1);
-    expect(polar.body.results[0].evidenceArtifacts[0].sha256).toBe(
-      childManifest.sha256,
-    );
+    expect(polar.body.results[0].evidenceArtifacts).toHaveLength(2);
+    expect(
+      polar.body.results[0].evidenceArtifacts.find(
+        (artifact: { kind: string }) => artifact.kind === "manifest",
+      ).sha256,
+    ).toBe(childManifest.sha256);
+    expect(
+      polar.body.results[0].evidenceArtifacts.some(
+        (artifact: { sha256: string }) =>
+          artifact.sha256 === staleManifest.sha256,
+      ),
+    ).toBe(false);
     expect(polar.body.results[0].media).toHaveLength(1);
     expect(polar.body.results[0].media[0].field).not.toBe("stale_parent_field");
     expect(polar.body.results[0].fieldExtents).toMatchObject([

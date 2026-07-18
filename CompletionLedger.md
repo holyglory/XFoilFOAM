@@ -18,19 +18,32 @@
   reclamation are incomplete. The one AG26 a19 target (manifest/DB AoA 14°)
   is now conserved in a generation-pinned forensic-quarantine object with an
   exact database acknowledgement and fresh pinned restore; its local raw and
-  archive duplicates were removed only after that proof. Keep the remaining
-  2,777 normal migration targets unresolved and continue them one protected
-  terminal job at a time. The migration-0079 attestation-backed cleanup path
-  for the 11 canary-only archives is implemented and locally verified; deploy
-  it, freshly confirm all 11 still have zero canonical/quarantine ownership,
-  execute the operator-only generation-matched deletes, and persist all 11
-  immutable receipts. Then reconcile database ownership, GCS generations,
+  archive duplicates were removed only after that proof. Of the original
+  2,987 normal targets, 2,051 are finalized and 936 remain. Cycle 26 uploaded
+  63 of those remaining targets but stopped before database acknowledgement or
+  local deletion when an authenticated historical `mesh_evidence` member had
+  no logical artifact row. Deploy and verify the exact-owner, byte-authenticated
+  legacy-member reconciliation, finish those 63 registrations/finalizations,
+  and continue the remaining targets one protected terminal job at a time. The
+  migration-0081 operational ownership path for
+  16 cutover-canary generations totaling 216,240,757 bytes across 11 completed
+  zero-`sim_jobs` engine-job directories is implemented and locally verified:
+  four generations are attested r5 evidence and twelve are protected
+  unattested r2/r3/r4 cutover evidence. Deploy it, reproduce every exact
+  protected claim, register all 16 immutable operational owners, freshly
+  restore every pinned GCS generation and manifest member, reclaim only the
+  allowlisted local archive/raw copies, and persist all 16 retention receipts.
+  Do not run the migration-0079 delete path for these generations: GCS remains
+  immutable and present. Then reconcile database ownership, GCS generations,
   local legacy files, and reclaimed bytes. Never invent an acknowledgement or
   member, repair a partial package into canonical evidence, or register
   canary/quarantine bytes as campaign data.
 
-- **Production evidence capacity:** The 500 GiB VPS currently has about
-  128.0 GiB free (74% used). Preserve at least 80 GiB free while the campaign is
+- **Production evidence capacity:** The 500 GB VPS had 271,509,491,712 bytes
+  (about 253 GiB) free at the final pre-deploy check after the safe cycle-26
+  checkpoint and the strongly
+  verified pre-deploy database backup. Preserve at least 80
+  GiB free while the campaign is
   active, continue bounded hydration-cache cleanup and verified legacy
   migration, and remeasure active-case growth before increasing solver
   concurrency.

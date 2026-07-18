@@ -2160,12 +2160,12 @@ export const solverEvidenceIncompleteQuarantines = pgTable(
     blobUq: unique("solver_evidence_incomplete_quarantines_blob_uq").on(
       t.blobId,
     ),
-    simJobIdx: index(
-      "solver_evidence_incomplete_quarantines_sim_job_idx",
-    ).on(t.simJobId),
-    createdIdx: index(
-      "solver_evidence_incomplete_quarantines_created_idx",
-    ).on(t.createdAt),
+    simJobIdx: index("solver_evidence_incomplete_quarantines_sim_job_idx").on(
+      t.simJobId,
+    ),
+    createdIdx: index("solver_evidence_incomplete_quarantines_created_idx").on(
+      t.createdAt,
+    ),
     jobIdCheck: check(
       "solver_evidence_incomplete_quarantines_job_id_check",
       sql`btrim(${t.engineJobId}) <> '' AND ${t.engineJobId} !~ '[/\\\\]'`,
@@ -2315,6 +2315,161 @@ export const solverCanaryObjectCleanupReceipts = pgTable(
       sql`btrim(${t.executedBy}) <> ''`,
     ),
   }),
+);
+
+/**
+ * Immutable ownership for OpenCFD 2606 cutover-canary archives that have no
+ * aerodynamic result owner. These rows preserve operational proof only: they
+ * intentionally carry no result, attempt, AoA, or coefficient identity.
+ */
+export const solverOperationalCanaryApprovedInventory = pgTable(
+  "solver_operational_canary_approved_inventory",
+  {
+    inventorySha256: text("inventory_sha256").notNull(),
+    engineJobId: text("engine_job_id").notNull(),
+    evidencePath: text("evidence_path").notNull(),
+    bucket: text("bucket").notNull(),
+    objectKey: text("object_key").notNull(),
+    generation: text("generation").notNull(),
+    rowSealSha256: text("row_seal_sha256").notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      columns: [t.engineJobId, t.evidencePath],
+      name: "solver_operational_canary_approved_inventory_pk",
+    }),
+    targetUq: unique("solver_operational_canary_approved_target_uq").on(
+      t.bucket,
+      t.objectKey,
+      t.generation,
+    ),
+  }),
+);
+
+export const solverOperationalCanaryEvidenceObjects = pgTable(
+  "solver_operational_canary_evidence_objects",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    approvedInventorySha256: text("approved_inventory_sha256").notNull(),
+    provenanceKind: text("provenance_kind")
+      .$type<"attested_canary" | "unattested_cutover_canary">()
+      .notNull(),
+    canaryAttestationId: uuid("canary_attestation_id").references(
+      () => solverEngineCanaryAttestations.id,
+    ),
+    solverImplementationId: uuid("solver_implementation_id")
+      .notNull()
+      .references(() => solverImplementations.id),
+    solverRuntimeBuildId: uuid("solver_runtime_build_id")
+      .notNull()
+      .references(() => solverRuntimeBuilds.id),
+    engineJobId: text("engine_job_id").notNull(),
+    evidencePath: text("evidence_path").notNull(),
+    bucket: text("bucket").notNull(),
+    objectKey: text("object_key").notNull(),
+    /** GCS uint64 generation, stored as decimal text to avoid JS rounding. */
+    generation: text("generation").notNull(),
+    storedSha256: text("stored_sha256").notNull(),
+    storedByteSize: bigint("stored_byte_size", { mode: "number" }).notNull(),
+    crc32c: text("crc32c").notNull(),
+    tarSha256: text("tar_sha256").notNull(),
+    tarByteSize: bigint("tar_byte_size", { mode: "number" }).notNull(),
+    zstdLevel: integer("zstd_level").notNull(),
+    pointerSha256: text("pointer_sha256").notNull(),
+    pointerByteSize: bigint("pointer_byte_size", { mode: "number" }).notNull(),
+    manifestSha256: text("manifest_sha256").notNull(),
+    manifestByteSize: bigint("manifest_byte_size", {
+      mode: "number",
+    }).notNull(),
+    archiveMemberSetSha256: text("archive_member_set_sha256").notNull(),
+    archiveMemberCount: integer("archive_member_count").notNull(),
+    statusSha256: text("status_sha256").notNull(),
+    statusByteSize: bigint("status_byte_size", { mode: "number" }).notNull(),
+    sourceBuildSha256: text("source_build_sha256"),
+    sourceBuildByteSize: bigint("source_build_byte_size", { mode: "number" }),
+    sourceJournalSha256: text("source_journal_sha256"),
+    sourceJournalByteSize: bigint("source_journal_byte_size", {
+      mode: "number",
+    }),
+    operatorReceiptSha256: text("operator_receipt_sha256"),
+    operatorReceiptByteSize: bigint("operator_receipt_byte_size", {
+      mode: "number",
+    }),
+    cutoverFailurePhase: text("cutover_failure_phase"),
+    cutoverFailureExitCode: integer("cutover_failure_exit_code"),
+    registrationReceiptSha256: text("registration_receipt_sha256")
+      .notNull()
+      .unique(),
+    registrationReceiptCanonical: text(
+      "registration_receipt_canonical",
+    ).notNull(),
+    registrationReceipt: jsonb("registration_receipt")
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    registeredBy: text("registered_by").notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    targetUq: unique("solver_operational_canary_evidence_target_uq").on(
+      t.bucket,
+      t.objectKey,
+      t.generation,
+    ),
+    jobPathUq: unique("solver_operational_canary_evidence_job_path_uq").on(
+      t.engineJobId,
+      t.evidencePath,
+    ),
+    approvedMemberFk: foreignKey({
+      columns: [t.engineJobId, t.evidencePath],
+      foreignColumns: [
+        solverOperationalCanaryApprovedInventory.engineJobId,
+        solverOperationalCanaryApprovedInventory.evidencePath,
+      ],
+      name: "solver_operational_canary_evidence_approved_member_fk",
+    }),
+    runtimeBuildOwnerFk: foreignKey({
+      columns: [t.solverRuntimeBuildId, t.solverImplementationId],
+      foreignColumns: [
+        solverRuntimeBuilds.id,
+        solverRuntimeBuilds.solverImplementationId,
+      ],
+      name: "solver_operational_canary_evidence_runtime_owner_fk",
+    }),
+    jobIdx: index("solver_operational_canary_evidence_job_idx").on(
+      t.engineJobId,
+      t.createdAt,
+    ),
+    runtimeIdx: index("solver_operational_canary_evidence_runtime_idx").on(
+      t.solverRuntimeBuildId,
+      t.createdAt,
+    ),
+  }),
+);
+
+/** Append-only proof that local canary bytes were stripped only after a fresh
+ * generation-pinned restore of the archive, manifest, and every member. The
+ * exact GCS generation remains retained. */
+export const solverOperationalCanaryRetentionReceipts = pgTable(
+  "solver_operational_canary_retention_receipts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    canaryEvidenceObjectId: uuid("canary_evidence_object_id")
+      .notNull()
+      .unique()
+      .references(() => solverOperationalCanaryEvidenceObjects.id),
+    outcome: text("outcome")
+      .$type<"local_evidence_stripped" | "already_remote_only">()
+      .notNull(),
+    verificationMode: text("verification_mode").notNull(),
+    verifiedMemberCount: integer("verified_member_count").notNull(),
+    bytesDeleted: bigint("bytes_deleted", { mode: "number" }).notNull(),
+    receiptSha256: text("receipt_sha256").notNull().unique(),
+    receiptCanonical: text("receipt_canonical").notNull(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    executedBy: text("executed_by").notNull(),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
 );
 
 export const fieldRenderCache = pgTable(
@@ -4518,6 +4673,10 @@ export const syncApiSettings = pgTable("sync_api_settings", {
     .notNull()
     .default(60),
   remoteSolverRegisteredId: uuid("remote_solver_registered_id"),
+  /** Per-solver credential returned once by the authoritative hub. It is a
+   * server-side secret and must never be serialized by an admin/public read
+   * model. The shared sync secret is bootstrap authority only. */
+  remoteSolverAuthToken: text("remote_solver_auth_token").notNull().default(""),
   remoteSolverLastSyncAt: timestamp("remote_solver_last_sync_at", {
     withTimezone: true,
   }),
@@ -4713,7 +4872,7 @@ export const syncRemoteResultDeliveries = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     promiseId: uuid("promise_id")
       .notNull()
-      .references(() => syncSweepPromises.id, { onDelete: "cascade" }),
+      .references(() => syncSweepPromises.id, { onDelete: "restrict" }),
     simJobId: uuid("sim_job_id")
       .notNull()
       .references((): AnyPgColumn => simJobs.id, { onDelete: "cascade" }),
@@ -4795,6 +4954,120 @@ export const syncRemoteResultDeliveries = pgTable(
   }),
 );
 
+/** Append-only, solver-token-authenticated hub receipt for one exact remote
+ * result-attempt generation. Delivery rows can advance to later generations,
+ * so the signed bind/fulfillment proof and local-reclaim lifecycle live in a
+ * separate immutable-identity ledger. */
+export const syncRemoteHubBindingReceipts = pgTable(
+  "sync_remote_hub_binding_receipts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    deliveryId: uuid("delivery_id")
+      .notNull()
+      .references(() => syncRemoteResultDeliveries.id, {
+        onDelete: "restrict",
+      }),
+    promiseId: uuid("promise_id")
+      .notNull()
+      .references(() => syncSweepPromises.id, { onDelete: "restrict" }),
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references((): AnyPgColumn => simJobs.id, { onDelete: "restrict" }),
+    resultId: uuid("result_id")
+      .notNull()
+      .references((): AnyPgColumn => results.id, { onDelete: "restrict" }),
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .references((): AnyPgColumn => resultAttempts.id, {
+        onDelete: "restrict",
+      }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    brokeredUploadId: uuid("brokered_upload_id").notNull(),
+    receiptCanonical: text("receipt_canonical").notNull(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    receiptHmac: text("receipt_hmac").notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    reclaimState: text("reclaim_state").notNull().default("pending"),
+    reclaimAttemptCount: integer("reclaim_attempt_count").notNull().default(0),
+    reclaimNextAttemptAt: timestamp("reclaim_next_attempt_at", {
+      withTimezone: true,
+    })
+      .notNull()
+      .defaultNow(),
+    reclaimClaimToken: uuid("reclaim_claim_token"),
+    reclaimClaimExpiresAt: timestamp("reclaim_claim_expires_at", {
+      withTimezone: true,
+    }),
+    reclaimedAt: timestamp("reclaimed_at", { withTimezone: true }),
+    reclaimedBytes: bigint("reclaimed_bytes", { mode: "number" }),
+    reclaimLastError: text("reclaim_last_error"),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sync_remote_hub_binding_receipts_attempt_owner_fk",
+    }).onDelete("restrict"),
+    attemptUq: uniqueIndex("sync_remote_hub_binding_receipts_attempt_uq").on(
+      t.promiseId,
+      t.resultAttemptId,
+    ),
+    uploadUq: uniqueIndex("sync_remote_hub_binding_receipts_upload_uq").on(
+      t.brokeredUploadId,
+    ),
+    reclaimReadyIdx: index(
+      "sync_remote_hub_binding_receipts_reclaim_ready_idx",
+    ).on(t.reclaimState, t.reclaimNextAttemptAt),
+    deliveryIdx: index("sync_remote_hub_binding_receipts_delivery_idx").on(
+      t.deliveryId,
+      t.receivedAt,
+    ),
+    shapeCheck: check(
+      "sync_remote_hub_binding_receipts_shape_check",
+      sql`
+        btrim(${t.receiptCanonical}) <> ''
+        AND ${t.receiptCanonical}::jsonb = ${t.receipt}
+        AND jsonb_typeof(${t.receipt}) = 'object'
+        AND ${t.receiptHmac} ~ '^[0-9a-f]{64}$'
+        AND ${t.receipt} ->> 'schemaVersion' = '1'
+        AND ${t.receipt} ->> 'kind' = 'hub-canonical-evidence-binding'
+        AND ${t.receipt} ->> 'promiseId' = ${t.promiseId}::text
+        AND ${t.receipt} ->> 'remoteResultId' = ${t.resultId}::text
+        AND ${t.receipt} ->> 'remoteResultAttemptId' = ${t.resultAttemptId}::text
+        AND ${t.receipt} ->> 'brokeredUploadId' = ${t.brokeredUploadId}::text
+        AND (${t.receipt} ->> 'aoaDeg')::double precision = ${t.aoaDeg}
+        AND ${t.receipt} ->> 'bindingState' = 'bound'
+        AND ${t.receipt} ->> 'promisePointState' = 'fulfilled'
+      `,
+    ),
+    reclaimStateCheck: check(
+      "sync_remote_hub_binding_receipts_reclaim_state_check",
+      sql`${t.reclaimState} IN ('pending', 'claiming', 'reclaimed') AND ${t.reclaimAttemptCount} >= 0 AND (${t.reclaimedBytes} IS NULL OR ${t.reclaimedBytes} >= 0)`,
+    ),
+    reclaimClaimCheck: check(
+      "sync_remote_hub_binding_receipts_reclaim_claim_check",
+      sql`(
+        (${t.reclaimState} = 'claiming' AND ${t.reclaimClaimToken} IS NOT NULL AND ${t.reclaimClaimExpiresAt} IS NOT NULL)
+        OR (${t.reclaimState} <> 'claiming' AND ${t.reclaimClaimToken} IS NULL AND ${t.reclaimClaimExpiresAt} IS NULL)
+      )`,
+    ),
+    reclaimedCheck: check(
+      "sync_remote_hub_binding_receipts_reclaimed_check",
+      sql`(
+        (${t.reclaimState} = 'reclaimed' AND ${t.reclaimedAt} IS NOT NULL AND ${t.reclaimedBytes} IS NOT NULL)
+        OR (${t.reclaimState} <> 'reclaimed' AND ${t.reclaimedAt} IS NULL AND ${t.reclaimedBytes} IS NULL)
+      )`,
+    ),
+  }),
+);
+
 /** Durable, idempotent upstream lease release after local terminal failure. */
 export const syncRemotePromiseCancellations = pgTable(
   "sync_remote_promise_cancellations",
@@ -4846,6 +5119,9 @@ export const registeredRemoteSolvers = pgTable(
     cpuCapacity: integer("cpu_capacity").notNull().default(0),
     cpuBudget: integer("cpu_budget").notNull().default(0),
     buildVersion: text("build_version"),
+    authTokenHash: text("auth_token_hash"),
+    credentialVersion: integer("credential_version").notNull().default(0),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
     status: remoteSolverStatusEnum("status").notNull().default("idle"),
     lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true }),
     activePromiseCount: integer("active_promise_count").notNull().default(0),
@@ -4870,6 +5146,163 @@ export const registeredRemoteSolvers = pgTable(
     statusIdx: index("registered_remote_solvers_status_idx").on(t.status),
     heartbeatIdx: index("registered_remote_solvers_heartbeat_idx").on(
       t.lastHeartbeatAt,
+    ),
+    authTokenHashCheck: check(
+      "registered_remote_solvers_auth_token_hash_check",
+      sql`${t.authTokenHash} IS NULL OR ${t.authTokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    credentialVersionCheck: check(
+      "registered_remote_solvers_credential_version_check",
+      sql`${t.credentialVersion} >= 0`,
+    ),
+  }),
+);
+
+/** One hub-authorized, exact-attempt GCS upload capability. The resumable URL
+ * is deliberately server-side state; it is returned only to the owning
+ * registered solver and never appears in admin/public payloads. Canonical
+ * evidence ownership is established only after independent generation-pinned
+ * verification and the exact artifact association bind in one transaction. */
+export const syncBrokeredEvidenceUploads = pgTable(
+  "sync_brokered_evidence_uploads",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    idempotencyKey: uuid("idempotency_key").notNull(),
+    promiseId: uuid("promise_id")
+      .notNull()
+      .references(() => syncSweepPromises.id, { onDelete: "restrict" }),
+    promisePointId: uuid("promise_point_id")
+      .notNull()
+      .references(() => syncSweepPromisePoints.id, { onDelete: "restrict" }),
+    solverId: uuid("solver_id")
+      .notNull()
+      .references(() => registeredRemoteSolvers.id, { onDelete: "restrict" }),
+    sourceInstanceId: text("source_instance_id").notNull(),
+    remoteResultId: uuid("remote_result_id").notNull(),
+    remoteResultAttemptId: uuid("remote_result_attempt_id").notNull(),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    engineJobId: text("engine_job_id").notNull(),
+    engineCaseSlug: text("engine_case_slug"),
+    /** Immutable object namespace. GCS generations are unique only within one
+     * bucket, so bucket is part of the evidence identity. */
+    bucket: text("bucket").notNull(),
+    objectKey: text("object_key").notNull(),
+    storedSha256: text("stored_sha256").notNull(),
+    storedByteSize: bigint("stored_byte_size", { mode: "number" }).notNull(),
+    tarSha256: text("tar_sha256").notNull(),
+    tarByteSize: bigint("tar_byte_size", { mode: "number" }).notNull(),
+    manifestSha256: text("manifest_sha256").notNull(),
+    manifestByteSize: bigint("manifest_byte_size", {
+      mode: "number",
+    }).notNull(),
+    zstdLevel: integer("zstd_level").notNull(),
+    bundledFileCount: integer("bundled_file_count").notNull(),
+    state: text("state").notNull().default("requested"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    uploadUrl: text("upload_url"),
+    uploadExpiresAt: timestamp("upload_expires_at", { withTimezone: true }),
+    sessionCancellationAcknowledgedAt: timestamp(
+      "session_cancellation_acknowledged_at",
+      { withTimezone: true },
+    ),
+    generation: text("generation"),
+    crc32c: text("crc32c"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    canonicalResultId: uuid("canonical_result_id").references(
+      (): AnyPgColumn => results.id,
+      { onDelete: "restrict" },
+    ),
+    canonicalResultAttemptId: uuid("canonical_result_attempt_id").references(
+      (): AnyPgColumn => resultAttempts.id,
+      { onDelete: "restrict" },
+    ),
+    canonicalArtifactId: uuid("canonical_artifact_id").references(
+      (): AnyPgColumn => solverEvidenceArtifacts.id,
+      { onDelete: "restrict" },
+    ),
+    boundAt: timestamp("bound_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    idempotencyUq: uniqueIndex(
+      "sync_brokered_evidence_uploads_idempotency_uq",
+    ).on(t.solverId, t.idempotencyKey),
+    attemptUq: uniqueIndex("sync_brokered_evidence_uploads_attempt_uq").on(
+      t.promiseId,
+      t.solverId,
+      t.remoteResultAttemptId,
+    ),
+    canonicalArtifactUq: uniqueIndex(
+      "sync_brokered_evidence_uploads_canonical_artifact_uq",
+    )
+      .on(t.canonicalArtifactId)
+      .where(sql`${t.canonicalArtifactId} IS NOT NULL`),
+    stateIdx: index("sync_brokered_evidence_uploads_state_idx").on(
+      t.state,
+      t.uploadExpiresAt,
+    ),
+    promiseIdx: index("sync_brokered_evidence_uploads_promise_idx").on(
+      t.promiseId,
+      t.promisePointId,
+    ),
+    canonicalAttemptOwnerFk: foreignKey({
+      columns: [t.canonicalResultAttemptId, t.canonicalResultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sync_brokered_evidence_uploads_canonical_attempt_owner_fk",
+    }).onDelete("restrict"),
+    hashCheck: check(
+      "sync_brokered_evidence_uploads_hash_check",
+      sql`${t.storedSha256} ~ '^[0-9a-f]{64}$' AND ${t.tarSha256} ~ '^[0-9a-f]{64}$' AND ${t.manifestSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    sizeCheck: check(
+      "sync_brokered_evidence_uploads_size_check",
+      sql`${t.storedByteSize} > 0 AND ${t.tarByteSize} > 0 AND ${t.manifestByteSize} > 0 AND ${t.bundledFileCount} > 0 AND ${t.zstdLevel} BETWEEN 1 AND 22`,
+    ),
+    stateCheck: check(
+      "sync_brokered_evidence_uploads_state_check",
+      sql`${t.state} IN ('requested', 'issuing', 'issued', 'verifying', 'verified', 'bound', 'failed', 'revoked', 'expired')`,
+    ),
+    claimShapeCheck: check(
+      "sync_brokered_evidence_uploads_claim_shape_check",
+      sql`(
+        (${t.state} IN ('issuing', 'verifying') AND ${t.claimToken} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL)
+        OR (${t.state} NOT IN ('issuing', 'verifying') AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL)
+      )`,
+    ),
+    issuedShapeCheck: check(
+      "sync_brokered_evidence_uploads_issued_shape_check",
+      sql`(${t.state} NOT IN ('issued', 'verifying') OR (${t.uploadUrl} IS NOT NULL AND ${t.uploadExpiresAt} IS NOT NULL))`,
+    ),
+    verifiedShapeCheck: check(
+      "sync_brokered_evidence_uploads_verified_shape_check",
+      sql`(${t.state} NOT IN ('verified', 'bound') OR (${t.generation} IS NOT NULL AND ${t.crc32c} IS NOT NULL AND ${t.verifiedAt} IS NOT NULL))`,
+    ),
+    remoteIdentityCheck: check(
+      "sync_brokered_evidence_uploads_remote_identity_check",
+      sql`(
+        CASE
+          WHEN ${t.generation} IS NULL THEN TRUE
+          WHEN ${t.generation} ~ '^[1-9][0-9]{0,19}$'
+            THEN ${t.generation}::numeric <= 18446744073709551615
+          ELSE FALSE
+        END
+        AND (${t.crc32c} IS NULL OR ${t.crc32c} ~ '^[A-Za-z0-9+/]{6}==$')
+      )`,
+    ),
+    boundShapeCheck: check(
+      "sync_brokered_evidence_uploads_bound_shape_check",
+      sql`(
+        (${t.state} = 'bound' AND ${t.canonicalResultId} IS NOT NULL AND ${t.canonicalResultAttemptId} IS NOT NULL AND ${t.canonicalArtifactId} IS NOT NULL AND ${t.boundAt} IS NOT NULL)
+        OR (${t.state} <> 'bound' AND ${t.canonicalResultId} IS NULL AND ${t.canonicalResultAttemptId} IS NULL AND ${t.canonicalArtifactId} IS NULL AND ${t.boundAt} IS NULL)
+      )`,
     ),
   }),
 );
@@ -4979,6 +5412,10 @@ export type SyncSweepPromisePoint = typeof syncSweepPromisePoints.$inferSelect;
 export type SyncImportConflict = typeof syncImportConflicts.$inferSelect;
 export type RegisteredRemoteSolver =
   typeof registeredRemoteSolvers.$inferSelect;
+export type SyncBrokeredEvidenceUpload =
+  typeof syncBrokeredEvidenceUploads.$inferSelect;
+export type SyncRemoteHubBindingReceipt =
+  typeof syncRemoteHubBindingReceipts.$inferSelect;
 export type RemoteAssetReference = typeof remoteAssetReferences.$inferSelect;
 export type SimulationPresetRevision =
   typeof simulationPresetRevisions.$inferSelect;

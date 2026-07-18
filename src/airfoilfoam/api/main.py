@@ -28,6 +28,7 @@ from ..evidence_runtime import (
     ARCHIVE_MIME_TYPE,
     EVIDENCE_ARCHIVE_NAME,
     PACKAGED_RAW_DIRS,
+    BrokeredRemoteEvidenceReclaim,
     EvidenceCleanupAuthorization,
     EvidenceCleanupError,
     EvidenceDatabaseAssociation,
@@ -35,11 +36,21 @@ from ..evidence_runtime import (
     evidence_pointer_path,
     finalize_remote_evidence_cleanup,
     hydrated_render_source,
+    reclaim_brokered_remote_evidence,
 )
 from ..evidence_store import (
     EvidenceStoreError,
     RemoteEvidencePointer,
     read_remote_pointer,
+)
+from ..evidence_upload_broker import (
+    BrokeredEvidenceIdentity,
+    BrokeredEvidenceSessionOwner,
+    cancel_brokered_upload_session,
+    cancel_brokered_upload_session_by_identity,
+    create_brokered_upload_session,
+    settle_brokered_upload_session_intent,
+    verify_brokered_upload,
 )
 from ..meshing.base import list_meshers
 from ..models import (
@@ -139,12 +150,134 @@ class FinalizeRemoteEvidenceRequest(BaseModel):
     )
 
 
+class BrokeredEvidenceIdentityRequest(BaseModel):
+    brokered_upload_id: uuid.UUID = Field(alias="brokeredUploadId")
+    promise_id: uuid.UUID = Field(alias="promiseId")
+    promise_point_id: uuid.UUID = Field(alias="promisePointId")
+    solver_id: uuid.UUID = Field(alias="solverId")
+    source_instance_id: str = Field(alias="sourceInstanceId", min_length=1, max_length=240)
+    remote_result_id: uuid.UUID = Field(alias="remoteResultId")
+    remote_result_attempt_id: uuid.UUID = Field(alias="remoteResultAttemptId")
+    aoa_deg: float = Field(alias="aoaDeg", ge=-180, le=180)
+    engine_job_id: str = Field(alias="engineJobId", min_length=1, max_length=240)
+    engine_case_slug: str | None = Field(alias="engineCaseSlug", default=None, max_length=240)
+    bucket: str = Field(min_length=1)
+    object_key: str = Field(alias="objectKey", min_length=1)
+    stored_sha256: str = Field(alias="storedSha256", pattern=r"^[0-9a-f]{64}$")
+    stored_size: int = Field(alias="storedSize", gt=0)
+    tar_sha256: str = Field(alias="tarSha256", pattern=r"^[0-9a-f]{64}$")
+    tar_size: int = Field(alias="tarSize", gt=0)
+    manifest_sha256: str = Field(alias="manifestSha256", pattern=r"^[0-9a-f]{64}$")
+    manifest_size: int = Field(alias="manifestSize", gt=0)
+    zstd_level: int = Field(alias="zstdLevel", ge=1, le=22)
+    bundled_file_count: int = Field(alias="bundledFileCount", gt=0)
+
+    def identity(self) -> BrokeredEvidenceIdentity:
+        return BrokeredEvidenceIdentity(
+            bucket=self.bucket,
+            object_key=self.object_key,
+            stored_sha256=self.stored_sha256,
+            stored_size=self.stored_size,
+            tar_sha256=self.tar_sha256,
+            tar_size=self.tar_size,
+            manifest_sha256=self.manifest_sha256,
+            manifest_size=self.manifest_size,
+            zstd_level=self.zstd_level,
+            bundled_file_count=self.bundled_file_count,
+        )
+
+    def owner(self) -> BrokeredEvidenceSessionOwner:
+        return BrokeredEvidenceSessionOwner(
+            brokered_upload_id=str(self.brokered_upload_id),
+            promise_id=str(self.promise_id),
+            promise_point_id=str(self.promise_point_id),
+            solver_id=str(self.solver_id),
+            source_instance_id=self.source_instance_id,
+            remote_result_id=str(self.remote_result_id),
+            remote_result_attempt_id=str(self.remote_result_attempt_id),
+            aoa_deg=self.aoa_deg,
+            engine_job_id=self.engine_job_id,
+            engine_case_slug=self.engine_case_slug,
+        )
+
+
+class BrokeredEvidenceVerifyRequest(BrokeredEvidenceIdentityRequest):
+    generation: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
+
+
+class BrokeredEvidenceCancelRequest(BaseModel):
+    upload_url: str = Field(alias="uploadUrl", min_length=1, max_length=8192)
+    bucket: str = Field(min_length=1, max_length=222)
+    object_key: str = Field(alias="objectKey", min_length=1, max_length=2048)
+
+
+class BrokeredEvidenceCancelIdentityRequest(BrokeredEvidenceIdentityRequest):
+    upload_url: str | None = Field(alias="uploadUrl", default=None, max_length=8192)
+
+
+class BrokeredEvidenceSessionSettlementRequest(BrokeredEvidenceIdentityRequest):
+    final: bool = False
+    generation: str | None = Field(
+        default=None,
+        pattern=r"^[1-9][0-9]{0,19}$",
+    )
+
+
+class BrokeredEvidenceDownloadRequest(BrokeredEvidenceIdentityRequest):
+    generation: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
+    crc32c: str = Field(pattern=r"^[A-Za-z0-9+/]{6}==$")
+    created_at: str = Field(alias="createdAt", min_length=1, max_length=80)
+
+    def pointer(self) -> RemoteEvidencePointer:
+        return RemoteEvidencePointer(
+            bucket=self.bucket,
+            object_key=self.object_key,
+            generation=int(self.generation),
+            stored_sha256=self.stored_sha256,
+            stored_size=self.stored_size,
+            tar_sha256=self.tar_sha256,
+            tar_size=self.tar_size,
+            crc32c=self.crc32c,
+            zstd_level=self.zstd_level,
+            created_at=self.created_at,
+        )
+
+
+class BrokeredEvidenceReclaimRequest(BaseModel):
+    job_id: str = Field(alias="jobId", min_length=1, max_length=240)
+    case_slug: str = Field(alias="caseSlug", min_length=1, max_length=240)
+    evidence_base: str = Field(alias="evidenceBase", min_length=1, max_length=800)
+    receipt: dict[str, object]
+    receipt_hmac: str = Field(
+        alias="receiptHmac", pattern=r"^[0-9a-f]{64}$"
+    )
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _require_control_plane_bearer(
+    expected_token: str | None,
+    authorization: str | None,
+) -> None:
+    supplied_token = ""
+    if authorization and authorization.startswith("Bearer "):
+        supplied_token = authorization.removeprefix("Bearer ")
+    if (
+        not expected_token
+        or not supplied_token
+        or not hmac.compare_digest(supplied_token, expected_token)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Valid control-plane bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def _evidence_identity_headers(pointer: RemoteEvidencePointer) -> dict[str, str]:
@@ -1047,20 +1180,7 @@ def create_app() -> FastAPI:
         request: FinalizeRemoteEvidenceRequest,
         authorization: str | None = Header(default=None),
     ) -> dict:
-        expected_token = settings.control_plane_token
-        supplied_token = ""
-        if authorization and authorization.startswith("Bearer "):
-            supplied_token = authorization.removeprefix("Bearer ")
-        if (
-            not expected_token
-            or not supplied_token
-            or not hmac.compare_digest(supplied_token, expected_token)
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="Valid control-plane bearer token required",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
         job_root = safe_job_root(job_id)
         if not job_root.is_dir() or job_root.is_symlink():
             raise HTTPException(status_code=404, detail="Job not found")
@@ -1123,6 +1243,201 @@ def create_app() -> FastAPI:
                 status_code=422,
                 detail=f"Invalid evidence cleanup request: {exc}",
             ) from exc
+        except EvidenceCleanupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-uploads/session")
+    def create_evidence_upload_session(
+        request: BrokeredEvidenceIdentityRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        try:
+            remote_store = evidence_object_store(settings)
+            if remote_store is None:
+                raise EvidenceStoreError("GCS evidence storage is not configured")
+            session = create_brokered_upload_session(
+                remote_store,
+                request.identity(),
+                owner=request.owner(),
+                ledger_dir=settings.data_dir / "brokered-upload-sessions",
+            )
+            if session.verified_pointer is not None:
+                return {
+                    "state": "verified",
+                    "remote": session.verified_pointer.to_dict(),
+                }
+            return {
+                "state": "issued",
+                # This URL is a bearer capability. The API is internal and the
+                # Node hub must return it only to the exact owning solver.
+                "uploadUrl": session.upload_url,
+                "expiresAt": session.expires_at,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except EvidenceStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-uploads/session-settled")
+    def settle_evidence_upload_session(
+        request: BrokeredEvidenceSessionSettlementRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        try:
+            settle_brokered_upload_session_intent(
+                settings.data_dir / "brokered-upload-sessions",
+                request.owner(),
+                request.identity(),
+                final=request.final,
+                verified_generation=(
+                    int(request.generation) if request.generation is not None else None
+                ),
+            )
+            return {"state": "settled" if request.final else "registered"}
+        except (ValueError, EvidenceStoreError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-uploads/verify")
+    def verify_evidence_upload(
+        request: BrokeredEvidenceVerifyRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        try:
+            remote_store = evidence_object_store(settings)
+            if remote_store is None:
+                raise EvidenceStoreError("GCS evidence storage is not configured")
+            verified = verify_brokered_upload(
+                remote_store,
+                request.identity(),
+                int(request.generation),
+            )
+            return {
+                "state": "verified",
+                "remote": verified.pointer.to_dict(),
+                "manifestSha256": verified.manifest_sha256,
+                "manifestSize": verified.manifest_size,
+                "bundledFileCount": verified.bundled_file_count,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except EvidenceStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-uploads/cancel")
+    def cancel_evidence_upload(
+        request: BrokeredEvidenceCancelRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        try:
+            cancelled = cancel_brokered_upload_session(
+                request.upload_url,
+                request.bucket,
+                request.object_key,
+                timeout_seconds=min(15, settings.evidence_gcs_timeout_seconds),
+            )
+            return {
+                "state": cancelled.state,
+                "statusCode": cancelled.status_code,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except EvidenceStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-uploads/cancel-identity")
+    def cancel_evidence_upload_by_identity(
+        request: BrokeredEvidenceCancelIdentityRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        try:
+            cancelled = cancel_brokered_upload_session_by_identity(
+                settings.data_dir / "brokered-upload-sessions",
+                request.owner(),
+                request.identity(),
+                supplied_upload_url=request.upload_url,
+                timeout_seconds=min(15, settings.evidence_gcs_timeout_seconds),
+            )
+            return {
+                "state": cancelled.state,
+                "statusCode": cancelled.status_code,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except EvidenceStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-uploads/download")
+    def download_brokered_evidence(
+        request: BrokeredEvidenceDownloadRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """Stream one generation-pinned brokered archive after verification.
+
+        Node exposes this only through the exact owning solver or the normal
+        local artifact route.  The GCS bearer credential never crosses this
+        internal control-plane boundary.
+        """
+
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        try:
+            remote_store = evidence_object_store(settings)
+            if remote_store is None:
+                raise EvidenceStoreError("GCS evidence storage is not configured")
+            pointer = request.pointer()
+            return _stream_remote_evidence(
+                remote_store.archive_source(pointer),
+                media_type=ARCHIVE_MIME_TYPE,
+                identity=pointer,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except EvidenceStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-uploads/reclaim")
+    def reclaim_remote_solver_evidence(
+        request: BrokeredEvidenceReclaimRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        job_root = safe_job_root(request.job_id)
+        if not job_root.is_dir() or job_root.is_symlink():
+            raise HTTPException(status_code=404, detail="Job not found")
+        status = store.read_status(request.job_id)
+        result = store.read_result(request.job_id)
+        terminal = {JobState.completed, JobState.failed, JobState.cancelled}
+        if status is None or status.state not in terminal:
+            raise HTTPException(
+                status_code=409,
+                detail="Brokered evidence reclaim requires a terminal engine job",
+            )
+        if result is None or result.state not in terminal:
+            raise HTTPException(
+                status_code=409,
+                detail="Brokered evidence reclaim requires a terminal result payload",
+            )
+        try:
+            evidence_dir = store.file_path(
+                request.job_id,
+                f"cases/{request.case_slug}/{request.evidence_base}",
+            )
+            authorization_record = BrokeredRemoteEvidenceReclaim(
+                job_id=request.job_id,
+                case_slug=request.case_slug,
+                evidence_base=request.evidence_base,
+                receipt=dict(request.receipt),
+                receipt_hmac=request.receipt_hmac,
+            )
+            return reclaim_brokered_remote_evidence(
+                job_root,
+                evidence_dir,
+                authorization_record,
+            ).to_dict()
         except EvidenceCleanupError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

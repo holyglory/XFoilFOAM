@@ -1,0 +1,259 @@
+{
+  "schemaVersion": 1,
+  "kind": "opencfd2606-operational-canary-approved-inventory",
+  "approvedCount": 16,
+  "approvedJobCount": 11,
+  "approvedStoredByteSize": 216240757,
+  "operator": "production-audit:2026-07-18-gcs-completion",
+  "inputs": {
+    "localInventory": {
+      "sha256": "1931d44b888d8e7d6b44595ad750ea526e4b697aeed0d872ed10bab41ed02abd",
+      "byteSize": 3697
+    },
+    "gcsInventory": {
+      "sha256": "87f5986c69b3e08e0a3a502d3fa327d43c6f036f173baebb26163542b7625e18",
+      "byteSize": 4102
+    },
+    "attestationReceipt": {
+      "attestationId": "112f52cd-eb8b-4908-bc79-6353daea6e12",
+      "databaseReceiptSha256": "f6d17988ea40e96c885df709357806a097daa19948d8b02efc6df25e035f6149",
+      "retainedReceiptSha256": "505819f2c745425071cc7900967abaead0911f30ab6af1636a8af92baf7276e8",
+      "retainedReceiptByteSize": 2313736
+    }
+  },
+  "runtimeBuilds": [
+    {
+      "id": "a5d34ae1-4588-4780-a66a-f6683ca0e902",
+      "provenanceKey": "ee66c48fe58131ac2013b11b1a8fb491f5fb0a615e6cea423d03d04e23af57c7",
+      "buildId": "prod-20260717-63385777be73-r2",
+      "sourceRevision": "481094fdf34f11ed6d0d603ee59a858a0124236d",
+      "imageDigest": null,
+      "applicationSourceSha256": "6b629a9b71685d94d756a91d1e7121a2774bb20da62522a10eeb46d4de401b2f",
+      "packageSha256": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
+      "binarySha256": "36b5e8b213ab5b968cd94bbbf464ea9681619192fe71550cfbd4bdb678108f6e",
+      "architecture": "x86_64",
+      "sourceJournal": {
+        "fileName": "pending-opencfd2606-rebuild-replay.json",
+        "sha256": "4ca469d5fa5daef9bb43b2e44793890e5cec6a65b60fdf8b415ee0a600e17aec",
+        "byteSize": 2089
+      },
+      "failure": {
+        "phase": "queue_probe_same_build_replay",
+        "exitCode": 14
+      }
+    },
+    {
+      "id": "a5d34ae1-4588-4780-a66a-f6683ca0e903",
+      "provenanceKey": "1043dc06840114a1a319beb9411904b3230adbb3d1787fc934f74811678bb004",
+      "buildId": "prod-20260717-cd0967a1ba4e-r3",
+      "sourceRevision": "481094fdf34f11ed6d0d603ee59a858a0124236d",
+      "imageDigest": null,
+      "applicationSourceSha256": "1926b961c19133370f0903c2394980bba782ccd91db03de9d432c735f368c56e",
+      "packageSha256": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
+      "binarySha256": "36b5e8b213ab5b968cd94bbbf464ea9681619192fe71550cfbd4bdb678108f6e",
+      "architecture": "x86_64",
+      "sourceJournal": {
+        "fileName": "pending-opencfd2606-retention-retry.json",
+        "sha256": "b99ca862100542593f7d8fc24dd47b9d62eb3e4d657dbc1c1590ce6c90050224",
+        "byteSize": 2325
+      },
+      "failure": {
+        "phase": "retention_retry",
+        "exitCode": 14
+      }
+    },
+    {
+      "id": "a5d34ae1-4588-4780-a66a-f6683ca0e904",
+      "provenanceKey": "eabbf99a08ba73748b98045ebb274afce43be84276c2359c393c633f1e509f54",
+      "buildId": "prod-20260717-2ab861cb4ce6-r4",
+      "sourceRevision": "481094fdf34f11ed6d0d603ee59a858a0124236d",
+      "imageDigest": null,
+      "applicationSourceSha256": "57bca7b4fee964f30d0a44a9a7e83967ed975357aee1f44f46d0d3865412439c",
+      "packageSha256": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
+      "binarySha256": "36b5e8b213ab5b968cd94bbbf464ea9681619192fe71550cfbd4bdb678108f6e",
+      "architecture": "x86_64",
+      "sourceJournal": {
+        "fileName": "pending-opencfd2606-transient-retention-retry.json",
+        "sha256": "f43b6b1621a41c2aae211a20ea163c2cc131df7a47252df80463190402bd390b",
+        "byteSize": 2518
+      },
+      "failure": {
+        "phase": "transient_retention",
+        "exitCode": 137
+      }
+    },
+    {
+      "id": "a5d34ae1-4588-4780-a66a-f6683ca0e99c",
+      "provenanceKey": "6a6348a0eaee9e8ebc5795fd157f51af2d4fcc93927a76054d3653ec01418851",
+      "buildId": "prod-20260717-7a13801aa5b3-r5",
+      "sourceRevision": "481094fdf34f11ed6d0d603ee59a858a0124236d",
+      "imageDigest": null,
+      "applicationSourceSha256": "661f7061ecd12932305c5a3c479e8d1680d1bcc3ab7e8cd020ab66f5a57075db",
+      "packageSha256": "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
+      "binarySha256": "36b5e8b213ab5b968cd94bbbf464ea9681619192fe71550cfbd4bdb678108f6e",
+      "architecture": "x86_64"
+    }
+  ],
+  "objects": [
+    {
+      "engineJobId": "007950b682e14a81a52d126c2f19f6a4",
+      "evidencePath": "cases/c0p05_u166_a0/evidence",
+      "buildId": "prod-20260717-7a13801aa5b3-r5",
+      "provenance": { "kind": "attested_canary", "attestationId": "112f52cd-eb8b-4908-bc79-6353daea6e12" },
+      "status": { "sha256": "a39fb8c1a1a04084b70a913c9dc057d8e06149d206f0b8534fe621829298282e", "byteSize": 1968 },
+      "pointer": { "sha256": "2165026d2de4d96890261244423e9a45a0594dd76e85d0aa306465b6ad50554d", "byteSize": 561 },
+      "manifest": { "sha256": "d27b0e332ef048947fd4f88d5bbe2d9aec794e47d92c001f0be7106a58c41966", "byteSize": 449522, "memberSetSha256": "b47cc126cc3bc29a3842d8bc5ad58af7a5be924099e0510f83ba2ab4ecd5b34b", "memberCount": 2139 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/22/227b88334a49b46ff96d9c88fd8c1bbf484eb3fc8c06692b64627b3cab1a4467.tar.zst", "generation": "1784265654400391", "storedSha256": "227b88334a49b46ff96d9c88fd8c1bbf484eb3fc8c06692b64627b3cab1a4467", "storedByteSize": 44352314, "crc32c": "t1wmzQ==", "tarSha256": "3a18470f6ef35fce13525f22eae7e332b30e41aa1c39a4ea79092b5af312d22f", "tarByteSize": 214794240, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "01b19001fff648c79fc7443ece7c59d2",
+      "evidencePath": "cases/c0p1_u50_a2/evidence",
+      "buildId": "prod-20260717-63385777be73-r2",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "96a6b4616dd25c4327cd7ed67d08e15d09f68d50e971ab81653d4b1d683627a1", "byteSize": 1968 },
+      "pointer": { "sha256": "51e666024ac94a477088ee3e7aa7b877fc2e993adb80c5dc8c5615d7a63f583e", "byteSize": 559 },
+      "manifest": { "sha256": "6668c80159619cf66be1dce530c6b4f1a3e37e86406e3cd286e2879436060296", "byteSize": 9783, "memberSetSha256": "d1863eccaff73f874ab95734c76a91341e3fbfc7bfd1cb6ce446ccb277b5a96a", "memberCount": 43 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/6f/6fd89977691a1fa2e1cac2e3d6f4935cae1eb744b4ae84f30d9242aa78fad942.tar.zst", "generation": "1784253860084375", "storedSha256": "6fd89977691a1fa2e1cac2e3d6f4935cae1eb744b4ae84f30d9242aa78fad942", "storedByteSize": 5710068, "crc32c": "SstiNA==", "tarSha256": "6540653e2346a3e7bf7853be6d9099c4c48256cf8d219a5d3ccb5ba129cd43e8", "tarByteSize": 19138560, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "01b19001fff648c79fc7443ece7c59d2",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-63385777be73-r2",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "96a6b4616dd25c4327cd7ed67d08e15d09f68d50e971ab81653d4b1d683627a1", "byteSize": 1968 },
+      "pointer": { "sha256": "68962ce467b450cf952ca752e3bfdccce78ec97172a54cf40a114e2ce5bfe0b2", "byteSize": 559 },
+      "manifest": { "sha256": "af09a53664d5a83fc1ea43ccf1389ba6c3475486ee153cee348a787762bfcc0c", "byteSize": 9783, "memberSetSha256": "4a4823ece36ad069b20ad2c93b6fc4159701cffdbee8b9a46dd80d4937ce3936", "memberCount": 43 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/0a/0a4054dfc5a05b83fb1fcd7eab0cf4fa0f9620fb67efd36cc2e7020c3caa3211.tar.zst", "generation": "1784253925692138", "storedSha256": "0a4054dfc5a05b83fb1fcd7eab0cf4fa0f9620fb67efd36cc2e7020c3caa3211", "storedByteSize": 5677593, "crc32c": "0gleGQ==", "tarSha256": "085bb43667f8c345cc24d1528c5fa1fd70dc3a58236e5d8b303a5fb5d74129f3", "tarByteSize": 18872320, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "4c64f7be8dcd4e8aa314a0cb593986a5",
+      "evidencePath": "cases/c0p1_u50_a2/evidence",
+      "buildId": "prod-20260717-2ab861cb4ce6-r4",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "95494a473f07af26a833f94c016c10be9d5b9979f5fcf5605bef99231c8086db", "byteSize": 1968 },
+      "pointer": { "sha256": "ee69968af3ad950801378ff50faea273e91370620277e476ddcb75ed22d627a7", "byteSize": 559 },
+      "manifest": { "sha256": "809cba8443b23bfb96b42c812773bf728b7974bce40111c5501208750a4a678e", "byteSize": 9971, "memberSetSha256": "ce9515e37038d4de2482715b0543e53a7903ba0e535c639f1d3fcacd611492a3", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/12/12f2f1bae8e6e750c1ad7d18f9f794d669794d24771a50a8ace52b59df698a75.tar.zst", "generation": "1784262728974059", "storedSha256": "12f2f1bae8e6e750c1ad7d18f9f794d669794d24771a50a8ace52b59df698a75", "storedByteSize": 6003989, "crc32c": "iqsWnw==", "tarSha256": "f488cca93e25a76b81c1ed5c14776f1ba71cdb84458e29f2a8397d62775390c7", "tarByteSize": 19425280, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "4c64f7be8dcd4e8aa314a0cb593986a5",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-2ab861cb4ce6-r4",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "95494a473f07af26a833f94c016c10be9d5b9979f5fcf5605bef99231c8086db", "byteSize": 1968 },
+      "pointer": { "sha256": "2c73294cb4c35eed0bf8e2c7508cb5f4bdc61e348c7621420bb0eeb662b62c2a", "byteSize": 559 },
+      "manifest": { "sha256": "85eb30f759c0ba9b541339333011c3316a19fec1f48083594fcea0653af7a112", "byteSize": 9970, "memberSetSha256": "70b9666a845e15a7b72aa31dce4cb412abef08ff16b321d1ee5f54e2486ebbf4", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/f9/f94c453a422e1cd589967de079578600db21a550c4c58922f9abfa9f3c0e563a.tar.zst", "generation": "1784262737223313", "storedSha256": "f94c453a422e1cd589967de079578600db21a550c4c58922f9abfa9f3c0e563a", "storedByteSize": 6010230, "crc32c": "yDvjDA==", "tarSha256": "d7a03338db7cbc16ce31b89bc9b3a15645ebb0bfe0f85453f560ffc8bb6b6b67", "tarByteSize": 19415040, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "6f5146938cde4c87957159b0214ed6b1",
+      "evidencePath": "cases/c0p05_u166_a0/evidence",
+      "buildId": "prod-20260717-cd0967a1ba4e-r3",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "06191e2777f95be63c1e5f6261f7c8f42b270059304d35b4cd695c64ee0c0a9b", "byteSize": 1968 },
+      "pointer": { "sha256": "d72917dd4dd6cb81640f27f1f5ac99282f1daeebe0b292a8ff859fb902fcbe0a", "byteSize": 561 },
+      "manifest": { "sha256": "2257e02c948069035711ba44f2ce34947d57117593819b3a951188cc7af163e7", "byteSize": 428874, "memberSetSha256": "e523fae04027af30066996bb503c2e62aab450032c1bb3138028d2c10cd2f8bf", "memberCount": 2039 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/51/51ff9fc2535dcac71fc2f5ad2e33f7ae07f7fc4a020751177a4d7d8dc7a84b02.tar.zst", "generation": "1784260130593934", "storedSha256": "51ff9fc2535dcac71fc2f5ad2e33f7ae07f7fc4a020751177a4d7d8dc7a84b02", "storedByteSize": 46968008, "crc32c": "7xNipg==", "tarSha256": "76bdfe9102cbaaeb8586d47c79b205d776397b902488a5884c1ccc97e834c955", "tarByteSize": 201492480, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "77960f1d5700411585ce8cc433ebc0cd",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-7a13801aa5b3-r5",
+      "provenance": { "kind": "attested_canary", "attestationId": "112f52cd-eb8b-4908-bc79-6353daea6e12" },
+      "status": { "sha256": "c7fa46daf9b0d66625fb96602a4e15d46ede9501332ffdf0823541a139d955a9", "byteSize": 1968 },
+      "pointer": { "sha256": "ac5cd4dd115f39eb8227dc20fd730d02cba122e67bcbf72ad8fa98c60a4887e0", "byteSize": 559 },
+      "manifest": { "sha256": "3fbd2c60342a23c0ed2822d6cd74ad8d225a6f9a45b6bc150d76901c056502da", "byteSize": 10167, "memberSetSha256": "7097676177d19e60af4a839f2757866804dd8697b14bf2dbe0b5618e2a97f0fb", "memberCount": 45 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/f9/f9569365e86ce5db8d305d5cb10d74b3ae2add71a39d350503172f9f645afe20.tar.zst", "generation": "1784265247146278", "storedSha256": "f9569365e86ce5db8d305d5cb10d74b3ae2add71a39d350503172f9f645afe20", "storedByteSize": 6011282, "crc32c": "aTwrcQ==", "tarSha256": "79b31256c01cfa960dfca340a7bba389425a726ebf0c571e94e138297a4745cc", "tarByteSize": 19415040, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "a68933577cb14f9584e15f617f8770d9",
+      "evidencePath": "cases/c0p1_u50_a2/evidence",
+      "buildId": "prod-20260717-cd0967a1ba4e-r3",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "92d258c4632e85846f8b71932c104b1a593532919f855a58948ec266de0d324e", "byteSize": 1968 },
+      "pointer": { "sha256": "ee950c10a2151e245e161f460733a1598e793b9691012b585f6eb3ddb425462a", "byteSize": 559 },
+      "manifest": { "sha256": "b8c81ded558bc99af44dfc89f91da7066a6043f5dc0b884c9e761bcdf6e1f016", "byteSize": 9971, "memberSetSha256": "a21f0c525e3c62cb163f08bfd2225faf9495fa95fc609504613f98f94e97ba3a", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/bd/bd9a3d70aead7584a371207036aed4296079dd584fa686bc5c052add0757a3c3.tar.zst", "generation": "1784259769646972", "storedSha256": "bd9a3d70aead7584a371207036aed4296079dd584fa686bc5c052add0757a3c3", "storedByteSize": 6009493, "crc32c": "nSoeRQ==", "tarSha256": "abdb66fb5952aeaec25ac1ccb352abeccc2c12ca26be5ee37c7816e2f0ef54b2", "tarByteSize": 19425280, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "a68933577cb14f9584e15f617f8770d9",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-cd0967a1ba4e-r3",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "92d258c4632e85846f8b71932c104b1a593532919f855a58948ec266de0d324e", "byteSize": 1968 },
+      "pointer": { "sha256": "80da42c106136273265913cfbb7a420eb69aca4d7a7a48183a1e9c073bc924a9", "byteSize": 559 },
+      "manifest": { "sha256": "a4ed2e8c0f931e3ebdcf121b8163c9fee3a82f1e998288ddfe9f1ccafdef85a0", "byteSize": 9970, "memberSetSha256": "bb05d0b4ffad7f1f36ec2f6bd5fd692de49cb6a58c43f81184d2ed04549936ad", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/83/835b5a6699b3d0c2cb80e49a4d815d1ec632493e1f58774a96fe2376fbdae9fc.tar.zst", "generation": "1784259777242845", "storedSha256": "835b5a6699b3d0c2cb80e49a4d815d1ec632493e1f58774a96fe2376fbdae9fc", "storedByteSize": 6008017, "crc32c": "Hx94Lg==", "tarSha256": "b3061201f1607878df5add5d177a0405d5ec4a08cd809ed6f40aa75077c1008d", "tarByteSize": 19404800, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "aed4ddc3441d4239afd32baba34db3ef",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-2ab861cb4ce6-r4",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "d6cf4fcdeec3979754b788f1d8bf071cd203c140ace2fa091f7d8e89dab98eee", "byteSize": 1968 },
+      "pointer": { "sha256": "fc23d36afecfd79a6574651504f697801b030aeb34545771e78a926e51fadf07", "byteSize": 559 },
+      "manifest": { "sha256": "908706a1c82ca2eeb554b74e455937e99f2e90b946de06a9aa169eea9113d7b7", "byteSize": 10167, "memberSetSha256": "d94787a1d3dfba1681d1f2e5b3cc08b71134e92386326c1dfc5784444215e9b0", "memberCount": 45 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/11/114dd2444a54c0e88126899ccf38e2910cf58bf9ce1dd471b73d05298a9f3378.tar.zst", "generation": "1784262752500802", "storedSha256": "114dd2444a54c0e88126899ccf38e2910cf58bf9ce1dd471b73d05298a9f3378", "storedByteSize": 6014476, "crc32c": "nHUMAA==", "tarSha256": "fe2088ce8feb130696b20c02552a1bdfff52c4970bb0af786f6760819253933b", "tarByteSize": 19425280, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "b57cb2d8cee741eaa146b528d6fbdc6f",
+      "evidencePath": "cases/c0p05_u166_a0/evidence",
+      "buildId": "prod-20260717-2ab861cb4ce6-r4",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "c7b006e667d0f8c6a601a0e19516788b7b87f9cdd000557dfc34e5543e356a14", "byteSize": 1968 },
+      "pointer": { "sha256": "2932cdaab08de2e51813b3467b36c294c4c3ef52d61d410e8a216b005c76bd7a", "byteSize": 561 },
+      "manifest": { "sha256": "f849355d6ffd654a3c4663ab97bd4c29c48bf787cd07e56650cbb6ef8953e653", "byteSize": 491086, "memberSetSha256": "90be4774ad1b6d19bf1032853fa8adaabc865f7acb5ca68f3ff5810755bed035", "memberCount": 2337 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/31/310d52e45aa127e078ec3c6b5e915903e62a5365aa96cf8e77896b9a247d343c.tar.zst", "generation": "1784263147857413", "storedSha256": "310d52e45aa127e078ec3c6b5e915903e62a5365aa96cf8e77896b9a247d343c", "storedByteSize": 47416885, "crc32c": "SLV5pA==", "tarSha256": "da874f3c69be1624f3f078b6b88eff40c2ff3f80f0211d3fba5650aba9b8f2df", "tarByteSize": 232949760, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "c7d09bb488584dd4a25b5209431d9034",
+      "evidencePath": "cases/c0p1_u50_a2/evidence",
+      "buildId": "prod-20260717-63385777be73-r2",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "27bb9eb12d5c2f301b81cc2dde8a95c62a24c6c49a3300bba58d078d66dd3c82", "byteSize": 1968 },
+      "pointer": { "sha256": "ff89d7ee6e0a54ce1bdffd7fddf8e22af7eb4c2b6bd837d5e455ba8fa6ce5af5", "byteSize": 559 },
+      "manifest": { "sha256": "d3368c187466ab43d5762683fd2c9157dd981006715b2858b17e5a9971bf85af", "byteSize": 9971, "memberSetSha256": "2ee095f244a7fe73111361e95d09880e72756c8effcd4986f37005d008ba9f38", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/82/824696f6e8b22a60cdfd53a653dbdd088fd741fac33252f8f0e90dea98ba5e79.tar.zst", "generation": "1784257459167967", "storedSha256": "824696f6e8b22a60cdfd53a653dbdd088fd741fac33252f8f0e90dea98ba5e79", "storedByteSize": 6021936, "crc32c": "ISTOWg==", "tarSha256": "7c69730288ced9ac4503c586f80fc12300b8a1bdf8b9272738576162400d33c8", "tarByteSize": 19425280, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "c7d09bb488584dd4a25b5209431d9034",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-63385777be73-r2",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "27bb9eb12d5c2f301b81cc2dde8a95c62a24c6c49a3300bba58d078d66dd3c82", "byteSize": 1968 },
+      "pointer": { "sha256": "2c8089a38a2874895fc3a4cc63c786c3892b2ea1b56081f9821bfbde84df87ef", "byteSize": 559 },
+      "manifest": { "sha256": "cdb60805b98648b06e4aafd445c3123e472ae99ec4f22559e42572baa759b4b0", "byteSize": 9971, "memberSetSha256": "250203c5219fb2527c4311071551d18b7130b560b95f0c6ec6bb7c3cf5a6ee54", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/ed/ed4dd030946854a2cde072fa2432869c465f53e81c1fd0459596527d825ec6c8.tar.zst", "generation": "1784257467754985", "storedSha256": "ed4dd030946854a2cde072fa2432869c465f53e81c1fd0459596527d825ec6c8", "storedByteSize": 6027083, "crc32c": "xXH7hA==", "tarSha256": "0d12c1ba6a84ce10bdef345332ae84845a06a654e71da4f6946e61a84bd27411", "tarByteSize": 19415040, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "ca41fc4c138a4141983a033e2a0f8749",
+      "evidencePath": "cases/c0p1_u50_a2/evidence",
+      "buildId": "prod-20260717-7a13801aa5b3-r5",
+      "provenance": { "kind": "attested_canary", "attestationId": "112f52cd-eb8b-4908-bc79-6353daea6e12" },
+      "status": { "sha256": "6d139189f15045a3946f11586314f8005a5889621386cce9d58dbf9cfee2425c", "byteSize": 1968 },
+      "pointer": { "sha256": "d1d91fa853809459a09d52f2f8b3d85d1efd622839fca042fe09bcd1844effad", "byteSize": 559 },
+      "manifest": { "sha256": "16ad7043d031b3175d7aad810d142965ef08ad43a68b82d5937b7b21a25a0c95", "byteSize": 9971, "memberSetSha256": "e3aeb5207377649ba538c831bbcc99e995df49a224d22cfb7edaa32a14790f13", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/58/58ea09d2ffe77322b499365708f109fb3f6e7f5e5b3ce6ed6dec061782ae06a4.tar.zst", "generation": "1784265224162242", "storedSha256": "58ea09d2ffe77322b499365708f109fb3f6e7f5e5b3ce6ed6dec061782ae06a4", "storedByteSize": 5997753, "crc32c": "3z81yw==", "tarSha256": "7f4e2513290bc30374bc0b4035122e28041d65fc8826580eb1807be8291f0e1b", "tarByteSize": 19425280, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "ca41fc4c138a4141983a033e2a0f8749",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-7a13801aa5b3-r5",
+      "provenance": { "kind": "attested_canary", "attestationId": "112f52cd-eb8b-4908-bc79-6353daea6e12" },
+      "status": { "sha256": "6d139189f15045a3946f11586314f8005a5889621386cce9d58dbf9cfee2425c", "byteSize": 1968 },
+      "pointer": { "sha256": "80172e943b3fb84f0d38ef74d574b96b58b26af51aa08f8c075ee8dae554dafd", "byteSize": 559 },
+      "manifest": { "sha256": "5f715d6ed5cc04aba34caa4ab18027f2e5e094644657843bf76c20c01f6d6a4f", "byteSize": 9969, "memberSetSha256": "8ec16e24afec4f579809d386181e3036b2520345e390ba3aaa656655c284de3c", "memberCount": 44 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/dc/dc4b754bf7b4ea53d6996c44a481d7a912556cdb4e76e72856ca8de936861672.tar.zst", "generation": "1784265232088893", "storedSha256": "dc4b754bf7b4ea53d6996c44a481d7a912556cdb4e76e72856ca8de936861672", "storedByteSize": 6009975, "crc32c": "5LU4cA==", "tarSha256": "c0a0a9de460ad3aed69fde2938f1dcc00f3277bfa84e16320abdd3a190d297a7", "tarByteSize": 19415040, "zstdLevel": 10 }
+    },
+    {
+      "engineJobId": "de3dbbef99e248549e9cbe7d76cc5714",
+      "evidencePath": "cases/c0p1_u50_a5/evidence",
+      "buildId": "prod-20260717-cd0967a1ba4e-r3",
+      "provenance": { "kind": "unattested_cutover_canary" },
+      "status": { "sha256": "675d7d3a4281cdb43d62e23413f73cb1e456887423d89334b989c60196b11d7e", "byteSize": 1968 },
+      "pointer": { "sha256": "a339ca256c029080a1c01d8e059f4676b33241780f777e2f4c19f524c11609ec", "byteSize": 559 },
+      "manifest": { "sha256": "e3e7e32552e1659f9481f977c548db72adc49cb8183e91dc888da0f9ca3e96fd", "byteSize": 10168, "memberSetSha256": "8ab5edc4f674e83c11dce49160d42fd519d332ac79c3dca9ba0b67151965ef8d", "memberCount": 45 },
+      "target": { "bucket": "airfoils-pro-storage-bucket", "objectKey": "solver-evidence/v1/sha256/71/71b618de5ccb19a049d1dff2ce13ac6d1222eb8d6d204583b7a1f2920787b47b.tar.zst", "generation": "1784259792662020", "storedSha256": "71b618de5ccb19a049d1dff2ce13ac6d1222eb8d6d204583b7a1f2920787b47b", "storedByteSize": 6001655, "crc32c": "OXFJQw==", "tarSha256": "808e9fadde52260ae35561d46b9aa177fd991e4eb4ce9503a417bbd02204c8e7", "tarByteSize": 19425280, "zstdLevel": 10 }
+    }
+  ]
+}

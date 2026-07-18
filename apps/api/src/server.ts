@@ -7,6 +7,8 @@ import { registerAdminRoutes } from "./admin-routes";
 import { registerCampaignRoutes } from "./campaign-routes";
 import { registerEngineCutoverRoutes } from "./engine-cutover-routes";
 import { registerPointHistoryRoutes } from "./point-history-routes";
+import { db } from "./db";
+import { createBrokeredEvidenceUploadReconciler } from "./remote-evidence-broker";
 import { registerRoutes } from "./routes";
 import { registerSolvedPointsRoutes } from "./solved-points-routes";
 import { registerSyncRoutes } from "./sync-routes";
@@ -20,6 +22,12 @@ import {
 
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
+  const evidenceUploadReconciler = createBrokeredEvidenceUploadReconciler(db, {
+    onError: (error) =>
+      app.log.error({ err: error }, "brokered evidence upload reconciliation failed"),
+  });
+  app.addHook("onReady", async () => evidenceUploadReconciler.start());
+  app.addHook("onClose", async () => evidenceUploadReconciler.stop());
   // credentials:true + reflected origin so the admin session cookie works cross-port in dev.
   await app.register(cors, { origin: true, credentials: true });
   await app.register(cookie);
