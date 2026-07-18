@@ -82,8 +82,17 @@ export async function enforceSweeperAdmissionFence(
          AND condition.campaign_id = campaign.id
          AND condition.generation = campaign.current_condition_generation
          AND condition.status IN ('active', 'kept')
+        JOIN results point_result
+          ON point_result.id = point.result_id
         WHERE incident.result_id IS NOT NULL
           AND point.result_id = incident.result_id
+          AND (
+            incident.result_attempt_id IS NULL
+            OR COALESCE(
+                 point.result_attempt_id,
+                 point_result.current_result_attempt_id
+               ) = incident.result_attempt_id
+          )
           AND point.campaign_id = campaign.id
           AND point.state <> 'released'
           AND point.derived_by_symmetry = false
@@ -92,6 +101,10 @@ export async function enforceSweeperAdmissionFence(
 
         SELECT 1
         FROM sim_precalc_obligations obligation
+        JOIN sim_precalc_obligation_campaigns active_owner
+          ON active_owner.obligation_id = obligation.id
+         AND active_owner.campaign_id = campaign.id
+         AND active_owner.state = 'active'
         JOIN sim_campaign_conditions condition
           ON condition.campaign_id = campaign.id
          AND condition.generation = campaign.current_condition_generation
@@ -121,16 +134,44 @@ export async function enforceSweeperAdmissionFence(
          AND point.airfoil_id = verification.airfoil_id
          AND point.aoa_deg = verification.aoa_deg
          AND point.revision_id = verification.revision_id
-         AND point.result_attempt_id = verification.precalc_result_attempt_id
+         AND point.result_id = verification.precalc_result_id
          AND point.state <> 'released'
          AND point.derived_by_symmetry = false
+        JOIN results point_result
+          ON point_result.id = point.result_id
+         AND COALESCE(
+               point.result_attempt_id,
+               point_result.current_result_attempt_id
+             ) = verification.precalc_result_attempt_id
         WHERE incident.verify_queue_id IS NOT NULL
           AND verification.id = incident.verify_queue_id
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_campaigns direct_owner
+              WHERE direct_owner.queue_id = verification.id
+                AND direct_owner.campaign_id = campaign.id
+                AND direct_owner.state = 'active'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue_requests coverage
+              JOIN sim_urans_request_campaigns request_owner
+                ON request_owner.request_id = coverage.request_id
+               AND request_owner.campaign_id = campaign.id
+               AND request_owner.state = 'active'
+              WHERE coverage.queue_id = verification.id
+            )
+          )
 
         UNION ALL
 
         SELECT 1
         FROM sim_urans_requests request
+        JOIN sim_urans_request_campaigns active_owner
+          ON active_owner.request_id = request.id
+         AND active_owner.campaign_id = campaign.id
+         AND active_owner.state = 'active'
         JOIN sim_campaign_conditions condition
           ON condition.campaign_id = campaign.id
          AND condition.generation = campaign.current_condition_generation
@@ -234,6 +275,8 @@ export async function enforceSweeperAdmissionFence(
           JOIN sim_campaign_points point
             ON point.campaign_id = campaign.id
            AND point.condition_id = condition.id
+          JOIN results point_result
+            ON point_result.id = point.result_id
           WHERE condition.campaign_id = campaign.id
             AND condition.generation = campaign.current_condition_generation
             AND condition.status IN ('active', 'kept')
@@ -242,7 +285,11 @@ export async function enforceSweeperAdmissionFence(
             AND point.airfoil_id = verification.airfoil_id
             AND point.revision_id = verification.revision_id
             AND point.aoa_deg = verification.aoa_deg
-            AND point.result_attempt_id = verification.precalc_result_attempt_id
+            AND point.result_id = verification.precalc_result_id
+            AND COALESCE(
+                  point.result_attempt_id,
+                  point_result.current_result_attempt_id
+                ) = verification.precalc_result_attempt_id
         )
 
       UNION ALL

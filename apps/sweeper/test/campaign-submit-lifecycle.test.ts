@@ -949,6 +949,266 @@ describe("campaign compose→submit lifecycle boundary", () => {
     expect((await campaignFailures(db, campaignId)).total).toBe(0);
   }, 120000);
 
+  it("reads the canonical accepted RANS attempt when a legacy campaign point has no attempt pin", async () => {
+    const campaignId = await launch("legacy-point-attempt-fallback", 35.167);
+    const setup = await setupFor(campaignId);
+    const seededResults = await db
+      .insert(results)
+      .values(
+        ANGLES.map((aoaDeg, index) => ({
+          airfoilId,
+          bcId: setup.bcId,
+          simulationPresetRevisionId: setup.revisionId,
+          aoaDeg,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          fidelity: "rans",
+          cl: 0.1 + index * 0.5,
+          cd: 0.02 + index * 0.01,
+          cm: -0.03,
+          converged: index === 0,
+          stalled: index === 1,
+          solvedAt: new Date(),
+        })),
+      )
+      .returning();
+    const seededAttempts = await db
+      .insert(resultAttempts)
+      .values(
+        seededResults.map((result, index) => ({
+          resultId: result.id,
+          airfoilId,
+          bcId: setup.bcId,
+          simulationPresetRevisionId: setup.revisionId,
+          aoaDeg: result.aoaDeg,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          validForPolar: index === 0,
+          cl: result.cl,
+          cd: result.cd,
+          cm: result.cm,
+          converged: index === 0,
+          stalled: index === 1,
+          evidencePayload:
+            index === 0
+              ? { fidelity: "rans" }
+              : {
+                  fidelity: "rans",
+                  failure_disposition: "hard_solver",
+                },
+          solvedAt: new Date(),
+        })),
+      )
+      .returning();
+    await db.insert(resultClassifications).values(
+      seededAttempts.map((attempt, index) => ({
+        resultId: seededResults[index].id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg: attempt.aoaDeg,
+        regime: "rans" as const,
+        classifierVersion: `${PREFIX}-legacy-point-attempt-fallback-${index}`,
+        state: index === 0 ? ("accepted" as const) : ("needs_urans" as const),
+        reasons: index === 0 ? [] : ["not-converged", "solver-stalled"],
+      })),
+    );
+    for (const [index, result] of seededResults.entries()) {
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: seededAttempts[index].id })
+        .where(eq(results.id, result.id));
+      await db
+        .update(simCampaignPoints)
+        .set({
+          state: "terminal",
+          resultId: result.id,
+          resultAttemptId: null,
+        })
+        .where(
+          and(
+            eq(simCampaignPoints.campaignId, campaignId),
+            eq(simCampaignPoints.conditionId, setup.conditionId),
+            eq(simCampaignPoints.aoaDeg, result.aoaDeg),
+          ),
+        );
+    }
+
+    const journey = await campaignPreliminaryOutcomes(db, campaignId, {
+      conditionId: setup.conditionId,
+      airfoilId,
+    });
+
+    expect(journey).toMatchObject({
+      total: 2,
+      recovering: 1,
+      critical: 0,
+      unavailable: 0,
+      verified: 0,
+    });
+    expect(journey.items).toEqual([
+      expect.objectContaining({
+        aoaDeg: ANGLES[0],
+        state: "satisfied",
+        outcome: "accepted",
+        ransStage: "screened",
+        fastState: "not_started",
+        finalState: "not_started",
+        criticalStage: null,
+        ransEvidenceRuns: 1,
+      }),
+      expect.objectContaining({
+        aoaDeg: ANGLES[1],
+        state: "pending",
+        outcome: "recovering",
+        ransStage: "screened",
+        fastState: "queued",
+        finalState: "not_started",
+        criticalStage: null,
+        ransEvidenceRuns: 1,
+        evidenceReasons: ["not-converged", "solver-stalled"],
+      }),
+    ]);
+  }, 120000);
+
+  it("keeps an explicit campaign-point attempt pin authoritative over the result current pointer", async () => {
+    const campaignId = await launch("point-attempt-pin-authority", 35.177);
+    const setup = await setupFor(campaignId);
+    const aoaDeg = ANGLES[0];
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: setup.bcId,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        cl: 0.1,
+        cd: 0.02,
+        cm: -0.03,
+        converged: true,
+        solvedAt: new Date(),
+      })
+      .returning();
+    const [pinnedAttempt, newerCurrentAttempt] = await db
+      .insert(resultAttempts)
+      .values([
+        {
+          resultId: result.id,
+          airfoilId,
+          bcId: setup.bcId,
+          simulationPresetRevisionId: setup.revisionId,
+          aoaDeg,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          validForPolar: true,
+          cl: 0.1,
+          cd: 0.02,
+          cm: -0.03,
+          converged: true,
+          evidencePayload: { fidelity: "rans" },
+          solvedAt: new Date(Date.now() - 1_000),
+        },
+        {
+          resultId: result.id,
+          airfoilId,
+          bcId: setup.bcId,
+          simulationPresetRevisionId: setup.revisionId,
+          aoaDeg,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          validForPolar: false,
+          cl: 0.11,
+          cd: 0.021,
+          cm: -0.031,
+          converged: false,
+          stalled: true,
+          evidencePayload: {
+            fidelity: "rans",
+            failure_disposition: "hard_solver",
+          },
+          solvedAt: new Date(),
+        },
+      ])
+      .returning();
+    await db.insert(resultClassifications).values([
+      {
+        resultAttemptId: pinnedAttempt.id,
+        airfoilId,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg,
+        regime: "rans",
+        classifierVersion: `${PREFIX}-point-pin-accepted`,
+        state: "accepted",
+        reasons: [],
+      },
+      {
+        resultAttemptId: newerCurrentAttempt.id,
+        airfoilId,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg,
+        regime: "rans",
+        classifierVersion: `${PREFIX}-point-pin-current`,
+        state: "needs_urans",
+        reasons: ["not-converged"],
+      },
+    ]);
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: newerCurrentAttempt.id })
+      .where(eq(results.id, result.id));
+    await db
+      .update(simCampaignPoints)
+      .set({
+        state: "terminal",
+        resultId: result.id,
+        resultAttemptId: pinnedAttempt.id,
+      })
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.conditionId, setup.conditionId),
+          eq(simCampaignPoints.aoaDeg, aoaDeg),
+        ),
+      );
+
+    const journey = await campaignPreliminaryOutcomes(db, campaignId, {
+      conditionId: setup.conditionId,
+      airfoilId,
+    });
+
+    expect(journey).toMatchObject({
+      total: 2,
+      recovering: 1,
+      critical: 0,
+      unavailable: 0,
+      verified: 0,
+    });
+    expect(journey.items[0]).toMatchObject({
+      aoaDeg,
+      state: "satisfied",
+      outcome: "accepted",
+      ransStage: "screened",
+      fastState: "not_started",
+      finalState: "not_started",
+      criticalStage: null,
+      ransEvidenceRuns: 1,
+    });
+    expect(journey.items[1]).toMatchObject({
+      aoaDeg: ANGLES[1],
+      state: "pending",
+      ransStage: "not_started",
+      criticalStage: null,
+    });
+  }, 120000);
+
   it("does not attach PRECALC when a signaled hard-solver attempt is no longer the canonical job", async () => {
     const campaignId = await launch("stale-rans-precalc-handoff", 35.197);
     const setup = await setupFor(campaignId);

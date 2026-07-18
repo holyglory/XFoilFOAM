@@ -6301,7 +6301,9 @@ export async function campaignPreliminaryOutcomes(
   // exist after RANS hands a point to fast URANS, so they cannot be the row
   // seed: ordinary queued or accepted RANS points would disappear. Read the
   // bounded campaign cell first and let exact machine-owned ladder records
-  // replace these base rows below.
+  // replace these base rows below. Older campaign rows may predate the attempt
+  // pin; in that case the result's canonical current attempt is authoritative.
+  // A stored point pin always wins so repeated solves cannot retarget history.
   const campaignPointRows = (await db.execute(sql`
     SELECT
       point.aoa_deg::float8 AS aoa_deg,
@@ -6316,7 +6318,10 @@ export async function campaignPreliminaryOutcomes(
       point.state,
       point.derived_by_symmetry,
       point.result_id,
-      point.result_attempt_id,
+      COALESCE(
+        point.result_attempt_id,
+        source_result.current_result_attempt_id
+      ) AS result_attempt_id,
       attempt.status AS attempt_status,
       attempt.source AS attempt_source,
       attempt.regime AS attempt_regime,
@@ -6331,7 +6336,10 @@ export async function campaignPreliminaryOutcomes(
     LEFT JOIN results source_result
       ON source_result.id = point.result_id
     LEFT JOIN result_attempts attempt
-      ON attempt.id = point.result_attempt_id
+      ON attempt.id = COALESCE(
+        point.result_attempt_id,
+        source_result.current_result_attempt_id
+      )
      AND attempt.result_id = point.result_id
      AND attempt.airfoil_id = point.airfoil_id
      AND attempt.simulation_preset_revision_id = point.revision_id
@@ -7304,7 +7312,10 @@ export async function campaignSummary(
   const progress = await campaignProgressSnapshot(db, campaignId);
   const totals = progress.totals;
   const tierCounts = await campaignOpenTierCounts(db, campaignId);
-  const solverIncidents = await solverIncidentSummary(db, { campaignId });
+  const solverIncidents = await solverIncidentSummary(db, {
+    campaignId,
+    currentGenerationOnly: true,
+  });
   const reviewBucketRows = await campaignReviewBucketRows(db, campaignId);
   const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
     (acc, row) => ({

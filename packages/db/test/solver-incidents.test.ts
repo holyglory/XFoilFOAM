@@ -11,10 +11,15 @@ import {
   resultAttempts,
   resultClassifications,
   results,
+  simCampaignConditions,
+  simCampaignPlanRevisions,
+  simCampaignPoints,
   simCampaigns,
   simSolverIncidents,
   simUransRequestCampaigns,
   simUransRequests,
+  simulationPresetRevisions,
+  simulationPresets,
   solverEvidenceArtifacts,
   solverIncidentSummary,
 } from "@aerodb/db";
@@ -30,6 +35,7 @@ const { db, sql } = createClient({ max: 2 });
 const PREFIX = `solver-incidents-${process.pid}-${Date.now().toString(36)}`;
 const requestIds: string[] = [];
 const resultIds: string[] = [];
+const scopedCampaignIds: string[] = [];
 let campaignId = "";
 let airfoilId = "";
 let fixture: MinimalSolverFixture;
@@ -94,11 +100,174 @@ afterAll(async () => {
   if (campaignId) {
     await db.delete(simCampaigns).where(eq(simCampaigns.id, campaignId));
   }
+  if (scopedCampaignIds.length) {
+    await db
+      .delete(simCampaigns)
+      .where(inArray(simCampaigns.id, scopedCampaignIds));
+  }
   await fixture?.cleanup();
   await sql.end();
 });
 
 describe("durable solver incident recurrence", () => {
+  it("separates current-generation campaign alerts from immutable incident history", async () => {
+    const [scopedCampaign] = await db
+      .insert(simCampaigns)
+      .values({
+        slug: `${PREFIX}-current-scope`,
+        name: `${PREFIX} current scope`,
+        idempotencyKey: `${PREFIX}-current-scope`,
+      })
+      .returning();
+    scopedCampaignIds.push(scopedCampaign.id);
+    const [planRevision] = await db
+      .insert(simCampaignPlanRevisions)
+      .values({
+        campaignId: scopedCampaign.id,
+        revisionNumber: 1,
+        kind: "initial",
+        plan: {},
+        summary: {},
+      })
+      .returning();
+    await db
+      .update(simCampaigns)
+      .set({ currentPlanRevisionId: planRevision.id })
+      .where(eq(simCampaigns.id, scopedCampaign.id));
+    const [revision] = await db
+      .select({
+        presetId: simulationPresetRevisions.presetId,
+        reynolds: simulationPresetRevisions.reynolds,
+        mach: simulationPresetRevisions.mach,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, fixture.revisionId));
+    const [preset] = await db
+      .select({
+        flowConditionId: simulationPresets.flowConditionId,
+        referenceGeometryProfileId:
+          simulationPresets.referenceGeometryProfileId,
+      })
+      .from(simulationPresets)
+      .where(eq(simulationPresets.id, revision.presetId));
+    const [condition] = await db
+      .insert(simCampaignConditions)
+      .values({
+        campaignId: scopedCampaign.id,
+        ord: 0,
+        generation: 1,
+        flowConditionId: preset.flowConditionId,
+        referenceGeometryProfileId: preset.referenceGeometryProfileId,
+        presetId: revision.presetId,
+        simulationPresetRevisionId: fixture.revisionId,
+        reynolds: revision.reynolds,
+        mach: revision.mach,
+        status: "active",
+        introducedInPlanRevisionId: planRevision.id,
+      })
+      .returning();
+    const aoaDeg = 90.5 + (process.pid % 1000) / 100_000;
+    await db.insert(simCampaignPoints).values({
+      campaignId: scopedCampaign.id,
+      conditionId: condition.id,
+      airfoilId,
+      aoaDeg,
+      revisionId: fixture.revisionId,
+      planRevisionNumber: 1,
+      state: "requested",
+    });
+    const [request] = await db
+      .insert(simUransRequests)
+      .values({
+        airfoilId,
+        revisionId: fixture.revisionId,
+        aoaDeg,
+        fidelity: "full",
+        state: "blocked",
+        requestedBy: `${PREFIX}-current-scope`,
+      })
+      .returning();
+    requestIds.push(request.id);
+    await db.insert(simUransRequestCampaigns).values({
+      requestId: request.id,
+      campaignId: scopedCampaign.id,
+      state: "active",
+    });
+    await recordSolverIncident(db, {
+      stage: "final",
+      reason: "current-generation-only",
+      severity: "critical",
+      owner: { uransRequestId: request.id },
+      solverImplementationId: fixture.solverImplementationId,
+      occurrenceKey: `${PREFIX}:current-generation-only`,
+    });
+
+    expect(
+      await solverIncidentSummary(db, {
+        campaignId: scopedCampaign.id,
+        currentGenerationOnly: true,
+      }),
+    ).toMatchObject({
+      occurrenceCount: 1,
+      openCount: 1,
+      criticalGroupCount: 1,
+      groups: [expect.objectContaining({ reason: "current-generation-only" })],
+    });
+
+    await db
+      .update(simUransRequestCampaigns)
+      .set({ state: "cancelled", cancelledAt: new Date() })
+      .where(eq(simUransRequestCampaigns.requestId, request.id));
+    expect(
+      await solverIncidentSummary(db, {
+        campaignId: scopedCampaign.id,
+        currentGenerationOnly: true,
+      }),
+    ).toMatchObject({
+      occurrenceCount: 0,
+      openCount: 0,
+      criticalGroupCount: 0,
+      groups: [],
+    });
+    expect(
+      await solverIncidentSummary(db, { campaignId: scopedCampaign.id }),
+    ).toMatchObject({
+      occurrenceCount: 1,
+      openCount: 1,
+      criticalGroupCount: 1,
+      groups: [expect.objectContaining({ reason: "current-generation-only" })],
+    });
+    await db
+      .update(simUransRequestCampaigns)
+      .set({ state: "active", cancelledAt: null })
+      .where(eq(simUransRequestCampaigns.requestId, request.id));
+
+    await db
+      .update(simCampaigns)
+      .set({ currentConditionGeneration: 2 })
+      .where(eq(simCampaigns.id, scopedCampaign.id));
+
+    expect(
+      await solverIncidentSummary(db, {
+        campaignId: scopedCampaign.id,
+        currentGenerationOnly: true,
+      }),
+    ).toMatchObject({
+      occurrenceCount: 0,
+      openCount: 0,
+      criticalGroupCount: 0,
+      groups: [],
+    });
+    expect(
+      await solverIncidentSummary(db, { campaignId: scopedCampaign.id }),
+    ).toMatchObject({
+      occurrenceCount: 1,
+      openCount: 1,
+      criticalGroupCount: 1,
+      groups: [expect.objectContaining({ reason: "current-generation-only" })],
+    });
+  });
+
   it("deduplicates immutable occurrences and raises a repeated-pattern alert by implementation/reason/remediation", async () => {
     const [first] = await db
       .select()

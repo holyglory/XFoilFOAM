@@ -66,6 +66,16 @@
   for recurrence. Any exhausted fast/final chain must remain a grouped red
   system-owned incident with a remediation version, never a review task or an
   unchanged user retry.
+  Production per-point verification also exposed a legacy-read compatibility
+  gap: terminal campaign rows without their optional attempt pin ignored the
+  canonical current result attempt and painted accepted RANS evidence as a
+  preflight critical incident. Keep scheduling fenced until a regression proves
+  the canonical fallback without weakening an explicit point pin, deploy the
+  correction, and retest the same production cell.
+  The same production read exposed 26 immutable generation-1 incidents in the
+  live generation-2 alert rail. Preserve them in engineering history, but scope
+  the operational campaign alert to exact current-generation owners before
+  resuming admission.
 
 - **GCS Zstandard evidence migration:** Implement and deploy content-addressed
   tar.zst finalization, verified GCS upload, temporary render hydration,

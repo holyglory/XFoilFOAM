@@ -19,8 +19,10 @@ import {
   simulationPresetRevisions,
   simulationPresets,
   simUransVerifyQueue,
+  simUransVerifyQueueCampaigns,
   simUransRequestCampaigns,
   simUransRequests,
+  solverIncidentSummary,
   sweeperState,
 } from "@aerodb/db";
 import type {
@@ -591,6 +593,277 @@ describe("global solver admission circuit breaker", () => {
           .update(simUransRequests)
           .set({ state: "blocked" })
           .where(eq(simUransRequests.id, requestId));
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: originalState.enabled,
+            maxConcurrentJobs: originalState.maxConcurrentJobs,
+            cpuSlots: originalState.cpuSlots,
+            pollIntervalMs: originalState.pollIntervalMs,
+            submitIntervalMs: originalState.submitIntervalMs,
+            admissionFenceActive: originalState.admissionFenceActive,
+            lastAdmissionFenceAt: originalState.lastAdmissionFenceAt,
+            lastAdmissionFenceReason: originalState.lastAdmissionFenceReason,
+            lastAdmissionFenceTriggerKey:
+              originalState.lastAdmissionFenceTriggerKey,
+            lastAdmissionFenceDetails: originalState.lastAdmissionFenceDetails,
+          })
+          .where(eq(sweeperState.id, 1));
+      }
+    });
+  });
+
+  it("fences exact blocked/final incident owners with a legacy null pin and ignores a cancelled owner", async () => {
+    const originalState = await readState();
+    const aoaDeg = AOA + 0.191;
+    let createdResultId: string | null = null;
+    let createdPoint = false;
+    let createdVerificationId: string | null = null;
+
+    await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await tx.execute(drizzleSql`
+        SELECT id FROM sweeper_state WHERE id = 1 FOR UPDATE
+      `);
+      try {
+        await tx
+          .update(simCampaigns)
+          .set({ currentConditionGeneration: 1 })
+          .where(eq(simCampaigns.id, campaignId));
+        await tx
+          .update(simUransRequests)
+          .set({ state: "pending" })
+          .where(eq(simUransRequests.id, requestId));
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: true,
+            maxConcurrentJobs: 2,
+            cpuSlots: 2,
+            admissionFenceActive: false,
+            lastAdmissionFenceAt: null,
+            lastAdmissionFenceReason: null,
+            lastAdmissionFenceTriggerKey: null,
+            lastAdmissionFenceDetails: null,
+          })
+          .where(eq(sweeperState.id, 1));
+        const [result] = await tx
+          .insert(results)
+          .values({
+            airfoilId,
+            bcId: solverFixture.bcId,
+            simulationPresetRevisionId: solverFixture.revisionId,
+            solverImplementationId: solverFixture.solverImplementationId,
+            aoaDeg,
+            status: "done",
+            source: "solved",
+            regime: "urans",
+            fidelity: "urans_precalc",
+            converged: true,
+            unsteady: true,
+            solvedAt: new Date(),
+          })
+          .returning({ id: results.id });
+        createdResultId = result.id;
+        const [attempt] = await tx
+          .insert(resultAttempts)
+          .values({
+            resultId: result.id,
+            airfoilId,
+            bcId: solverFixture.bcId,
+            simulationPresetRevisionId: solverFixture.revisionId,
+            solverImplementationId: solverFixture.solverImplementationId,
+            aoaDeg,
+            status: "done",
+            source: "solved",
+            regime: "urans",
+            validForPolar: true,
+            converged: true,
+            unsteady: true,
+            evidencePayload: { fidelity: "urans_precalc" },
+            solvedAt: new Date(),
+          })
+          .returning({ id: resultAttempts.id });
+        await tx
+          .update(results)
+          .set({ currentResultAttemptId: attempt.id })
+          .where(eq(results.id, result.id));
+        await tx.insert(resultClassifications).values({
+          resultId: result.id,
+          resultAttemptId: attempt.id,
+          airfoilId,
+          simulationPresetRevisionId: solverFixture.revisionId,
+          aoaDeg,
+          regime: "urans",
+          classifierVersion: `${PREFIX}-legacy-point-verify`,
+          state: "accepted",
+          reasons: [],
+        });
+        await tx.insert(simCampaignPoints).values({
+          campaignId,
+          conditionId,
+          airfoilId,
+          aoaDeg,
+          revisionId: solverFixture.revisionId,
+          planRevisionNumber: 1,
+          state: "terminal",
+          resultId: result.id,
+          resultAttemptId: null,
+        });
+        createdPoint = true;
+        const [verification] = await tx
+          .insert(simUransVerifyQueue)
+          .values({
+            airfoilId,
+            revisionId: solverFixture.revisionId,
+            aoaDeg,
+            state: "blocked",
+            precalcResultId: result.id,
+            precalcResultAttemptId: attempt.id,
+          })
+          .returning({ id: simUransVerifyQueue.id });
+        createdVerificationId = verification.id;
+        await tx.insert(simUransVerifyQueueCampaigns).values({
+          queueId: verification.id,
+          campaignId,
+          state: "active",
+        });
+
+        expect(await enforceSweeperAdmissionFence(tx)).toMatchObject({
+          hazardPresent: true,
+          fencedNow: true,
+          active: true,
+          trigger: {
+            reason: "blocked_final_urans",
+            campaignId,
+            generation: 1,
+          },
+        });
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: true,
+            maxConcurrentJobs: 2,
+            cpuSlots: 2,
+            admissionFenceActive: false,
+            lastAdmissionFenceAt: null,
+            lastAdmissionFenceReason: null,
+            lastAdmissionFenceTriggerKey: null,
+            lastAdmissionFenceDetails: null,
+          })
+          .where(eq(sweeperState.id, 1));
+        await tx
+          .update(simUransVerifyQueue)
+          .set({ state: "pending" })
+          .where(eq(simUransVerifyQueue.id, verification.id));
+
+        const [incident] = await tx
+          .insert(simSolverIncidents)
+          .values({
+            stage: "final",
+            reason: "legacy-point-final-unavailable",
+            severity: "critical",
+            status: "open",
+            verifyQueueId: verification.id,
+            solverImplementationId: solverFixture.solverImplementationId,
+            occurrenceKey: `${PREFIX}:legacy-point-final-unavailable`,
+            remediationVersion: "breaker-test-v1",
+          })
+          .returning({ id: simSolverIncidents.id });
+        await tx.insert(simSolverIncidentCampaigns).values({
+          incidentId: incident.id,
+          campaignId,
+        });
+
+        expect(
+          await solverIncidentSummary(tx, {
+            campaignId,
+            currentGenerationOnly: true,
+          }),
+        ).toMatchObject({
+          occurrenceCount: 1,
+          openCount: 1,
+          criticalGroupCount: 1,
+          groups: [
+            expect.objectContaining({
+              reason: "legacy-point-final-unavailable",
+            }),
+          ],
+        });
+        expect(await enforceSweeperAdmissionFence(tx)).toMatchObject({
+          hazardPresent: true,
+          fencedNow: true,
+          active: true,
+          trigger: {
+            reason: "critical_solver_incident",
+            campaignId,
+            generation: 1,
+          },
+        });
+
+        await tx
+          .update(simUransVerifyQueueCampaigns)
+          .set({ state: "cancelled", cancelledAt: new Date() })
+          .where(eq(simUransVerifyQueueCampaigns.queueId, verification.id));
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: true,
+            maxConcurrentJobs: 2,
+            cpuSlots: 2,
+            admissionFenceActive: false,
+            lastAdmissionFenceAt: null,
+            lastAdmissionFenceReason: null,
+            lastAdmissionFenceTriggerKey: null,
+            lastAdmissionFenceDetails: null,
+          })
+          .where(eq(sweeperState.id, 1));
+        expect(
+          await solverIncidentSummary(tx, {
+            campaignId,
+            currentGenerationOnly: true,
+          }),
+        ).toMatchObject({
+          occurrenceCount: 0,
+          openCount: 0,
+          criticalGroupCount: 0,
+          groups: [],
+        });
+        expect(await enforceSweeperAdmissionFence(tx)).toEqual({
+          hazardPresent: false,
+          fencedNow: false,
+          active: false,
+          trigger: null,
+        });
+      } finally {
+        if (createdVerificationId) {
+          await tx
+            .delete(simUransVerifyQueue)
+            .where(eq(simUransVerifyQueue.id, createdVerificationId));
+        }
+        if (createdPoint) {
+          await tx
+            .delete(simCampaignPoints)
+            .where(
+              and(
+                eq(simCampaignPoints.campaignId, campaignId),
+                eq(simCampaignPoints.conditionId, conditionId),
+                eq(simCampaignPoints.airfoilId, airfoilId),
+                eq(simCampaignPoints.aoaDeg, aoaDeg),
+              ),
+            );
+        }
+        if (createdResultId) {
+          await tx.delete(results).where(eq(results.id, createdResultId));
+        }
+        await tx
+          .update(simUransRequests)
+          .set({ state: "blocked" })
+          .where(eq(simUransRequests.id, requestId));
+        await tx
+          .update(simCampaigns)
+          .set({ currentConditionGeneration: 2 })
+          .where(eq(simCampaigns.id, campaignId));
         await tx
           .update(sweeperState)
           .set({
