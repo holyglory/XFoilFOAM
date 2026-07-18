@@ -949,6 +949,99 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
+  it("keeps sync credentials server-side in every admin settings response", async () => {
+    const [settingsBefore] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    if (!settingsBefore) throw new Error("sync settings fixture missing");
+    const upstreamBaseUrl =
+      "https://credential-redaction.example.test/api/sync/v1";
+    const upstreamSecret = `${PREFIX}-credential-redaction-upstream-secret`;
+    await db
+      .update(syncApiSettings)
+      .set({
+        upstreamBaseUrl,
+        upstreamSecret,
+        updatedAt: new Date(),
+      })
+      .where(eq(syncApiSettings.id, 1));
+
+    const expectRedacted = (response: {
+      statusCode: number;
+      body: string;
+      json: () => { settings: Record<string, unknown> };
+    }) => {
+      expect(response.statusCode, response.body).toBe(200);
+      const payload = response.json();
+      expect(payload.settings).toMatchObject({
+        secretConfigured: true,
+        upstreamSecretConfigured: true,
+      });
+      expect(payload.settings).not.toHaveProperty("secret");
+      expect(payload.settings).not.toHaveProperty("upstreamSecret");
+      expect(response.body).not.toContain(SECRET);
+      expect(response.body).not.toContain(upstreamSecret);
+    };
+
+    try {
+      const read = await app.inject({
+        method: "GET",
+        url: "/api/admin/sync",
+      });
+      expectRedacted(read);
+
+      const patched = await app.inject({
+        method: "PATCH",
+        url: "/api/admin/sync",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({
+          defaultPromiseTtlHours: settingsBefore.defaultPromiseTtlHours,
+        }),
+      });
+      expectRedacted(patched);
+
+      const authenticated = await app.inject({
+        method: "GET",
+        url: "/api/sync/v1/status",
+        headers: { "x-xfoilfoam-sync-secret": SECRET },
+      });
+      expect(authenticated.statusCode, authenticated.body).toBe(200);
+
+      const fetchMock = vi.fn(
+        async (_input: string | URL | Request, init?: RequestInit) => {
+          expect(
+            new Headers(init?.headers).get("x-xfoilfoam-sync-secret"),
+          ).toBe(upstreamSecret);
+          return new Response(
+            JSON.stringify({
+              instanceId: `${PREFIX}-redaction-source`,
+              instanceName: "credential redaction source",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const run = await app.inject({
+        method: "POST",
+        url: "/api/admin/sync/upstream/run",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({ types: [] }),
+      });
+      expectRedacted(run);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+      const { id: _id, createdAt: _createdAt, ...restore } = settingsBefore;
+      await db
+        .update(syncApiSettings)
+        .set({ ...restore, updatedAt: new Date() })
+        .where(eq(syncApiSettings.id, 1));
+    }
+  });
+
   it("preserves the generic cross-engine bundle kind during remote asset sync", async () => {
     const applicationSourceSha256 = sha256(
       Buffer.from(`${PREFIX}:remote-application-source`),

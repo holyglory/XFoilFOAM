@@ -3896,9 +3896,11 @@ type SyncDraft = {
   instanceName: string;
   publicEndpointOverride: string;
   secret: string;
+  clearSecret: boolean;
   defaultPromiseTtlHours: number;
   upstreamBaseUrl: string;
   upstreamSecret: string;
+  clearUpstreamSecret: boolean;
   syncMode: "full" | "db_only_remote_assets";
   remoteSolverEnabled: boolean;
   remoteSolverCpuBudget: number;
@@ -3912,10 +3914,12 @@ function syncDraftFromState(state: AdminSyncState): SyncDraft {
     enabled: state.settings.enabled,
     instanceName: state.settings.instanceName,
     publicEndpointOverride: state.settings.publicEndpointOverride ?? "",
-    secret: state.settings.secret,
+    secret: "",
+    clearSecret: false,
     defaultPromiseTtlHours: state.settings.defaultPromiseTtlHours,
     upstreamBaseUrl: state.settings.upstreamBaseUrl ?? "",
-    upstreamSecret: state.settings.upstreamSecret ?? "",
+    upstreamSecret: "",
+    clearUpstreamSecret: false,
     syncMode: state.settings.syncMode,
     remoteSolverEnabled: state.settings.remoteSolverEnabled,
     remoteSolverCpuBudget: state.settings.remoteSolverCpuBudget,
@@ -3954,10 +3958,18 @@ function SyncApiPanel() {
         enabled: draft.enabled,
         instanceName: draft.instanceName.trim() || "XFoilFOAM instance",
         publicEndpointOverride: draft.publicEndpointOverride.trim() || null,
-        secret: draft.secret,
+        ...(draft.secret.length
+          ? { secret: draft.secret }
+          : draft.clearSecret
+            ? { secret: "" }
+            : {}),
         defaultPromiseTtlHours: Number(draft.defaultPromiseTtlHours),
         upstreamBaseUrl: draft.upstreamBaseUrl.trim() || null,
-        upstreamSecret: draft.upstreamSecret,
+        ...(draft.upstreamSecret.length
+          ? { upstreamSecret: draft.upstreamSecret }
+          : draft.clearUpstreamSecret
+            ? { upstreamSecret: "" }
+            : {}),
         syncMode: draft.syncMode,
         remoteSolverEnabled: draft.remoteSolverEnabled,
         remoteSolverCpuBudget: Number(draft.remoteSolverCpuBudget),
@@ -4129,11 +4141,27 @@ function SyncApiPanel() {
                   setDraft((current) => current && { ...current, instanceName })
                 }
               />
-              <TextField
+              <CredentialField
                 label="Secret"
                 value={draft.secret}
+                configured={state.settings.secretConfigured}
+                clear={draft.clearSecret}
+                disabled={busy}
                 onChange={(secret) =>
-                  setDraft((current) => current && { ...current, secret })
+                  setDraft(
+                    (current) =>
+                      current && { ...current, secret, clearSecret: false },
+                  )
+                }
+                onToggleClear={() =>
+                  setDraft(
+                    (current) =>
+                      current && {
+                        ...current,
+                        secret: "",
+                        clearSecret: !current.clearSecret,
+                      },
+                  )
                 }
               />
               <TextField
@@ -4187,12 +4215,30 @@ function SyncApiPanel() {
                     )
                   }
                 />
-                <TextField
+                <CredentialField
                   label="Up-tier secret"
                   value={draft.upstreamSecret}
+                  configured={state.settings.upstreamSecretConfigured}
+                  clear={draft.clearUpstreamSecret}
+                  disabled={busy}
                   onChange={(upstreamSecret) =>
                     setDraft(
-                      (current) => current && { ...current, upstreamSecret },
+                      (current) =>
+                        current && {
+                          ...current,
+                          upstreamSecret,
+                          clearUpstreamSecret: false,
+                        },
+                    )
+                  }
+                  onToggleClear={() =>
+                    setDraft(
+                      (current) =>
+                        current && {
+                          ...current,
+                          upstreamSecret: "",
+                          clearUpstreamSecret: !current.clearUpstreamSecret,
+                        },
                     )
                   }
                 />
@@ -7007,11 +7053,17 @@ function TextField({
   value,
   onChange,
   error,
+  type = "text",
+  placeholder,
+  autoComplete,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   error?: string;
+  type?: "text" | "password";
+  placeholder?: string;
+  autoComplete?: string;
 }) {
   const id = `admin-field-${l.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
   return (
@@ -7019,7 +7071,10 @@ function TextField({
       <div style={miniLabel}>{l}</div>
       <input
         aria-label={l}
+        type={type}
         value={value}
+        placeholder={placeholder}
+        autoComplete={autoComplete}
         onChange={(e) => onChange(e.target.value)}
         aria-invalid={!!error}
         aria-describedby={error ? `${id}-error` : undefined}
@@ -7031,6 +7086,54 @@ function TextField({
         </div>
       )}
     </label>
+  );
+}
+
+function CredentialField({
+  label,
+  value,
+  configured,
+  clear,
+  disabled,
+  onChange,
+  onToggleClear,
+}: {
+  label: string;
+  value: string;
+  configured: boolean;
+  clear: boolean;
+  disabled: boolean;
+  onChange: (value: string) => void;
+  onToggleClear: () => void;
+}) {
+  return (
+    <div>
+      <TextField
+        label={label}
+        value={value}
+        type="password"
+        autoComplete="new-password"
+        placeholder={
+          configured ? "Stored — enter a replacement" : "Not configured"
+        }
+        onChange={onChange}
+      />
+      {configured && (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={onToggleClear}
+          style={{
+            ...ghostBtn,
+            marginTop: 6,
+            padding: "6px 9px",
+            fontSize: 10,
+          }}
+        >
+          {clear ? "keep stored secret" : "clear stored secret"}
+        </button>
+      )}
+    </div>
   );
 }
 

@@ -543,10 +543,10 @@ export interface AdminSyncState {
     instanceName: string;
     publicEndpointOverride: string | null;
     publicEndpoint: string;
-    secret: string;
+    secretConfigured: boolean;
     defaultPromiseTtlHours: number;
     upstreamBaseUrl: string | null;
-    upstreamSecret: string | null;
+    upstreamSecretConfigured: boolean;
     syncMode: "full" | "db_only_remote_assets";
     remoteSolverEnabled: boolean;
     remoteSolverCpuBudget: number;
@@ -814,6 +814,8 @@ export const getUransRequests = (airfoilId: string, revisionId: string) =>
 export const getAdminSync = () => aj<AdminSyncState>("/api/admin/sync");
 export const patchAdminSync = (
   body: Partial<AdminSyncState["settings"]> & {
+    secret?: string;
+    upstreamSecret?: string;
     permissions?: AdminSyncPermission[];
   },
 ) =>
