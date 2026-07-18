@@ -4192,6 +4192,343 @@ describe("tier-2a durable-obligation priority MUST-CATCH", () => {
     }
   }, 180000);
 
+  it("MUST-CATCH: campaign-priority projection preserves an unclaimed exact admin continuation's larger budget", async () => {
+    const targetAoa = 14.475;
+    const jobIds: string[] = [];
+    const standaloneAttemptIds: string[] = [];
+    let obligationId = "";
+    let checkpointResultId = "";
+    let checkpointResultAttemptId = "";
+    const requestIds: string[] = [];
+    try {
+      await db
+        .update(simCampaigns)
+        .set({ status: "active", completedAt: null })
+        .where(eq(simCampaigns.id, campaignId));
+
+      const [parent] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+          campaignId,
+          jobKind: "sweep",
+          referenceChordM: CHORD,
+          wave: 1,
+          status: "done",
+          engineState: "completed",
+          engineJobId: `${PREFIX}-priority-budget-parent`,
+          totalCases: 1,
+          completedCases: 1,
+          ingestedAt: new Date(),
+          finishedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              {
+                speed: SPEED,
+                bcId,
+                presetRevisionId: revisionId,
+                mach: SPEED / 340.3,
+              },
+            ],
+            aoas: [targetAoa],
+          },
+        })
+        .returning();
+      jobIds.push(parent.id);
+      const [sourceRansAttempt] = await db
+        .insert(resultAttempts)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: targetAoa,
+          simJobId: parent.id,
+          engineJobId: parent.engineJobId,
+          solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+          status: "failed",
+          source: "queued",
+          regime: "rans",
+          validForPolar: false,
+          converged: false,
+          stalled: true,
+          unsteady: false,
+          error: "RANS did not converge",
+          evidencePayload: { failure_disposition: "hard_solver" },
+          solvedAt: new Date(),
+        })
+        .returning();
+      standaloneAttemptIds.push(sourceRansAttempt.id);
+      const [obligation] = await ensurePrecalcObligations(
+        db,
+        [
+          {
+            airfoilId,
+            revisionId,
+            aoaDeg: targetAoa,
+            sourceResultAttemptId: sourceRansAttempt.id,
+          },
+        ],
+        { campaignIds: [campaignId] },
+      );
+      obligationId = obligation.id;
+
+      const [checkpointJob] = await db
+        .insert(simJobs)
+        .values({
+          parentJobId: parent.id,
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+          campaignId: null,
+          methodKey: "openfoam.urans",
+          jobKind: "targeted",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "done",
+          engineState: "completed",
+          engineJobId: `${PREFIX}-priority-budget-checkpoint`,
+          totalCases: 1,
+          completedCases: 1,
+          submittedAt: new Date(),
+          ingestedAt: new Date(),
+          finishedAt: new Date(),
+          requestPayload: {
+            aoas: [targetAoa],
+            uransFidelity: "precalc",
+            precalcObligationIds: [obligation.id],
+          },
+        })
+        .returning();
+      jobIds.push(checkpointJob.id);
+      const warnings = [
+        `URANS ${URANS_CONTINUATION_REQUIRED_MARKER}: retained restartable latestTime state`,
+      ];
+      const [checkpointResult] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: targetAoa,
+          simJobId: checkpointJob.id,
+          engineJobId: checkpointJob.engineJobId,
+          engineCaseSlug: "aoa_14.475",
+          methodKey: "openfoam.urans",
+          solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          fidelity: "urans_precalc",
+          converged: true,
+          unsteady: true,
+          qualityWarnings: warnings,
+          solvedAt: new Date(),
+        })
+        .returning();
+      checkpointResultId = checkpointResult.id;
+      checkpointResultAttemptId =
+        await attachRestartableContinuationAttempt({
+          resultId: checkpointResult.id,
+          aoaDeg: targetAoa,
+          simJobId: checkpointJob.id,
+          engineJobId: checkpointJob.engineJobId,
+          engineCaseSlug: "aoa_14.475",
+          qualityWarnings: warnings,
+        });
+      await db.insert(simPrecalcObligationAttempts).values({
+        obligationId: obligation.id,
+        simJobId: checkpointJob.id,
+        attemptNumber: 1,
+        solverAttemptNumber: 1,
+        consumesSolverAttempt: true,
+        state: "rejected",
+        outcome: "rejected",
+        resultAttemptId: checkpointResultAttemptId,
+        completedAt: new Date(),
+      });
+      await db
+        .update(simPrecalcObligations)
+        .set({
+          state: "pending",
+          attemptCount: 1,
+          latestSimJobId: checkpointJob.id,
+          lastOutcome: "rejected",
+        })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+
+      expect(
+        await precalcContinuationsForObligations(db, [obligation.id]),
+      ).toEqual([
+        expect.objectContaining({
+          obligationId: obligation.id,
+          resultId: checkpointResult.id,
+          resultAttemptId: checkpointResultAttemptId,
+          budgetOverrideS: AUTO_PRECALC_CONTINUATION_BUDGET_S,
+        }),
+      ]);
+
+      // A valid saved generation for the same physical cell is still a
+      // different trajectory unless its immutable attempt id is the one the
+      // obligation selected. Its larger request must neither retarget the
+      // campaign continuation nor leak its budget onto that checkpoint.
+      const [differentAttemptJob] = await db
+        .insert(simJobs)
+        .values({
+          parentJobId: parent.id,
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+          campaignId: null,
+          methodKey: "openfoam.urans",
+          jobKind: "targeted",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "done",
+          engineState: "completed",
+          engineJobId: `${PREFIX}-priority-budget-different-attempt`,
+          totalCases: 1,
+          completedCases: 1,
+          submittedAt: new Date(),
+          ingestedAt: new Date(),
+          finishedAt: new Date(),
+          requestPayload: {
+            aoas: [targetAoa],
+            uransFidelity: "precalc",
+          },
+        })
+        .returning();
+      jobIds.push(differentAttemptJob.id);
+      const differentAttemptId = await attachRestartableContinuationAttempt({
+        resultId: checkpointResult.id,
+        aoaDeg: targetAoa,
+        simJobId: differentAttemptJob.id,
+        engineJobId: differentAttemptJob.engineJobId,
+        engineCaseSlug: "aoa_14.475_different_attempt",
+        qualityWarnings: warnings,
+      });
+      const differentAttemptRequest = await createUransRequest(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg: targetAoa,
+        fidelity: "precalc",
+        requestedBy: "operator@airfoils.pro",
+        continueFromResultId: checkpointResult.id,
+        continueFromResultAttemptId: differentAttemptId,
+        budgetOverrideS: 86_400,
+      });
+      expect(differentAttemptRequest.created).toBe(true);
+      requestIds.push(differentAttemptRequest.request.id);
+      expect(
+        await precalcContinuationsForObligations(db, [obligation.id]),
+      ).toEqual([
+        expect.objectContaining({
+          resultAttemptId: checkpointResultAttemptId,
+          budgetOverrideS: AUTO_PRECALC_CONTINUATION_BUDGET_S,
+        }),
+      ]);
+      await db
+        .update(simUransRequests)
+        .set({ state: "cancelled" })
+        .where(eq(simUransRequests.id, differentAttemptRequest.request.id));
+
+      const lowerBudgetRequest = await createUransRequest(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg: targetAoa,
+        fidelity: "precalc",
+        requestedBy: "operator@airfoils.pro",
+        continueFromResultId: checkpointResult.id,
+        continueFromResultAttemptId: checkpointResultAttemptId,
+        budgetOverrideS: 3_600,
+      });
+      expect(lowerBudgetRequest.created).toBe(true);
+      requestIds.push(lowerBudgetRequest.request.id);
+      expect(
+        await precalcContinuationsForObligations(db, [obligation.id]),
+      ).toEqual([
+        expect.objectContaining({
+          resultAttemptId: checkpointResultAttemptId,
+          budgetOverrideS: AUTO_PRECALC_CONTINUATION_BUDGET_S,
+        }),
+      ]);
+      await db
+        .update(simUransRequests)
+        .set({ state: "cancelled" })
+        .where(eq(simUransRequests.id, lowerBudgetRequest.request.id));
+
+      const { request, created } = await createUransRequest(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg: targetAoa,
+        fidelity: "precalc",
+        requestedBy: "operator@airfoils.pro",
+        continueFromResultId: checkpointResult.id,
+        continueFromResultAttemptId: checkpointResultAttemptId,
+        budgetOverrideS: 21_600,
+      });
+      expect(created).toBe(true);
+      requestIds.push(request.id);
+      const requestCoverage = (await db.execute(dsql`
+        SELECT 1
+        FROM sim_precalc_obligation_requests
+        WHERE obligation_id = ${obligation.id}::uuid
+          AND request_id = ${request.id}::uuid
+      `)) as unknown as Array<{ present: number }>;
+      expect(requestCoverage).toEqual([]);
+      expect(
+        await precalcContinuationsForObligations(db, [obligation.id]),
+      ).toEqual([
+        expect.objectContaining({
+          obligationId: obligation.id,
+          resultId: checkpointResult.id,
+          resultAttemptId: checkpointResultAttemptId,
+          budgetOverrideS: 21_600,
+        }),
+      ]);
+      const [unchangedRequest] = await db
+        .select()
+        .from(simUransRequests)
+        .where(eq(simUransRequests.id, request.id));
+      expect(unchangedRequest).toMatchObject({
+        continueFromResultId: checkpointResult.id,
+        continueFromResultAttemptId: checkpointResultAttemptId,
+        budgetOverrideS: 21_600,
+      });
+    } finally {
+      resetUransLadderMemory();
+      if (requestIds.length) {
+        await db
+          .delete(simUransRequests)
+          .where(inArray(simUransRequests.id, requestIds));
+      }
+      if (obligationId) {
+        await db
+          .delete(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, obligationId));
+      }
+      if (checkpointResultId) {
+        await db
+          .update(results)
+          .set({ currentResultAttemptId: null })
+          .where(eq(results.id, checkpointResultId));
+        await db.delete(results).where(eq(results.id, checkpointResultId));
+      }
+      if (standaloneAttemptIds.length) {
+        await db
+          .delete(resultAttempts)
+          .where(inArray(resultAttempts.id, standaloneAttemptIds));
+      }
+      if (jobIds.length) {
+        await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
+      }
+    }
+  }, 120000);
+
   it("schedules a campaign-owned handoff from its exact background RANS attempt and honors the beneficiary lifecycle", async () => {
     const targetAoa = 17.625;
     const unrelatedAoa = 18.625;

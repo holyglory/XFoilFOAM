@@ -2953,7 +2953,21 @@ export async function precalcContinuationsForObligations(
            checkpoint.result_id,
            checkpoint.result_attempt_id,
            checkpoint.engine_job_id,
-           checkpoint.engine_case_slug
+           checkpoint.engine_case_slug,
+           GREATEST(
+             ${AUTO_PRECALC_CONTINUATION_BUDGET_S}::int,
+             COALESCE((
+               SELECT max(exact_request.budget_override_s)
+               FROM sim_urans_requests exact_request
+               WHERE exact_request.state IN ('pending', 'running')
+                 AND exact_request.fidelity = 'precalc'
+                 AND exact_request.airfoil_id = obligation.airfoil_id
+                 AND exact_request.revision_id = obligation.revision_id
+                 AND exact_request.aoa_deg IS NOT DISTINCT FROM obligation.aoa_deg
+                 AND exact_request.continue_from_result_id = checkpoint.result_id
+                 AND exact_request.continue_from_result_attempt_id = checkpoint.result_attempt_id
+             ), ${AUTO_PRECALC_CONTINUATION_BUDGET_S}::int)
+           )::int AS budget_override_s
     FROM sim_precalc_obligations obligation
     JOIN simulation_preset_revisions target_revision
       ON target_revision.id = obligation.revision_id
@@ -3055,6 +3069,7 @@ export async function precalcContinuationsForObligations(
     result_attempt_id: string;
     engine_job_id: string;
     engine_case_slug: string;
+    budget_override_s: number;
   }>;
   const continuations: PrecalcContinuationAddress[] = [];
   for (const row of rows) {
@@ -3077,7 +3092,12 @@ export async function precalcContinuationsForObligations(
       resultAttemptId: row.result_attempt_id,
       engineJobId: row.engine_job_id,
       engineCaseSlug: row.engine_case_slug,
-      budgetOverrideS: AUTO_PRECALC_CONTINUATION_BUDGET_S,
+      // The campaign recovery lane intentionally runs before the admin-request
+      // lane. An exact operator continuation can therefore exist before its
+      // request-coverage link is materialized. Preserve that exact immutable
+      // pair's larger budget here, while never retargeting a different attempt
+      // and never shrinking below the automatic continuation floor.
+      budgetOverrideS: Number(row.budget_override_s),
     });
   }
   return continuations;
