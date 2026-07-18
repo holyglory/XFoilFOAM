@@ -48,10 +48,12 @@ import {
   simUransRequests,
   simUransVerifyQueue,
   solverEvidenceArtifacts,
+  solverEvidenceBlobs,
   solverProfiles,
   sweepDefinitions,
   sweeperState,
 } from "@aerodb/db";
+import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import {
   INCOMPLETE_URANS_INTEGRATION_REASON,
@@ -117,6 +119,7 @@ let airfoilId = "";
 let bcId = "";
 let presetId = "";
 let revisionId = "";
+let solverImplementationId = "";
 let reynolds = 0;
 let mach: number | null = null;
 const profileIds = {
@@ -132,6 +135,7 @@ let sweepId = "";
 let restoreSweeperEnabled: boolean | null = null;
 let mediaRoot = "";
 const priorMediaDir = process.env.MEDIA_DIR;
+const continuationEvidenceBlobIds: string[] = [];
 
 const contour = [
   { x: 1, y: 0 },
@@ -291,6 +295,7 @@ beforeAll(async () => {
   const resolved = await ensureSimulationPresetRevision(db, preset.id);
   if (!resolved) throw new Error("guard fixture revision required");
   revisionId = resolved.revision.id;
+  solverImplementationId = resolved.revision.solverImplementationId;
   mediaRoot = await mkdtemp(join(tmpdir(), `${PREFIX}-media-`));
   const imageDir = join(mediaRoot, "jobs/guard-job/cases/a0/images");
   await mkdir(imageDir, { recursive: true });
@@ -326,6 +331,11 @@ afterAll(async () => {
     await db
       .delete(simJobs)
       .where(eq(simJobs.simulationPresetRevisionId, revisionId));
+  }
+  if (continuationEvidenceBlobIds.length) {
+    await db
+      .delete(solverEvidenceBlobs)
+      .where(inArray(solverEvidenceBlobs.id, continuationEvidenceBlobIds));
   }
   if (presetId)
     await db
@@ -628,6 +638,131 @@ function jobResult(jobId: string, point: PolarPoint): JobResult {
   };
 }
 
+async function attachExactRestartArchive(
+  resultAttemptId: string,
+): Promise<string> {
+  let [attempt] = await db
+    .select()
+    .from(resultAttempts)
+    .where(eq(resultAttempts.id, resultAttemptId))
+    .limit(1);
+  if (attempt && !attempt.resultId) {
+    const [cell] = await db
+      .select({ id: results.id })
+      .from(results)
+      .where(
+        and(
+          eq(results.airfoilId, attempt.airfoilId),
+          eq(results.bcId, attempt.bcId),
+          eq(
+            results.simulationPresetRevisionId,
+            attempt.simulationPresetRevisionId!,
+          ),
+          eq(results.aoaDeg, attempt.aoaDeg),
+        ),
+      )
+      .limit(1);
+    if (cell) {
+      await db
+        .update(resultAttempts)
+        .set({
+          resultId: cell.id,
+          solverImplementationId:
+            attempt.solverImplementationId ?? solverImplementationId,
+        })
+        .where(eq(resultAttempts.id, attempt.id));
+      await db
+        .update(solverEvidenceArtifacts)
+        .set({
+          resultId: cell.id,
+          solverImplementationId:
+            attempt.solverImplementationId ?? solverImplementationId,
+        })
+        .where(eq(solverEvidenceArtifacts.resultAttemptId, attempt.id));
+      [attempt] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, resultAttemptId))
+        .limit(1);
+    }
+  }
+  if (attempt && !attempt.solverImplementationId) {
+    await db
+      .update(resultAttempts)
+      .set({ solverImplementationId })
+      .where(eq(resultAttempts.id, attempt.id));
+    await db
+      .update(solverEvidenceArtifacts)
+      .set({ solverImplementationId })
+      .where(eq(solverEvidenceArtifacts.resultAttemptId, attempt.id));
+    [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.id, resultAttemptId))
+      .limit(1);
+  }
+  if (
+    !attempt?.resultId ||
+    !attempt.engineJobId ||
+    !attempt.engineCaseSlug ||
+    !attempt.solverImplementationId
+  ) {
+    throw new Error(
+      `restart fixture requires an exact result/job/case/implementation owner for ${resultAttemptId}: result=${attempt?.resultId ?? "missing"}, engineJob=${attempt?.engineJobId ?? "missing"}, case=${attempt?.engineCaseSlug ?? "missing"}, implementation=${attempt?.solverImplementationId ?? "missing"}`,
+    );
+  }
+  let [manifest] = await db
+    .select({ id: solverEvidenceArtifacts.id })
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultId, attempt.resultId),
+        eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+        eq(solverEvidenceArtifacts.kind, "manifest"),
+      ),
+    )
+    .limit(1);
+  if (!manifest) {
+    [manifest] = await db
+      .insert(solverEvidenceArtifacts)
+      .values({
+        resultId: attempt.resultId,
+        resultAttemptId: attempt.id,
+        airfoilId: attempt.airfoilId,
+        simJobId: attempt.simJobId,
+        engineJobId: attempt.engineJobId,
+        engineCaseSlug: attempt.engineCaseSlug,
+        methodKey: attempt.methodKey,
+        solverImplementationId: attempt.solverImplementationId,
+        solverRuntimeBuildId: attempt.solverRuntimeBuildId,
+        aoaDeg: attempt.aoaDeg,
+        kind: "manifest",
+        storageKey: `${PREFIX}/final-continuation/${attempt.id}/evidence_manifest.json`,
+        mimeType: "application/json",
+        sha256: "a".repeat(64),
+        byteSize: 128,
+      })
+      .returning({ id: solverEvidenceArtifacts.id });
+  } else {
+    await db
+      .update(solverEvidenceArtifacts)
+      .set({
+        airfoilId: attempt.airfoilId,
+        simJobId: attempt.simJobId,
+        engineJobId: attempt.engineJobId,
+        engineCaseSlug: attempt.engineCaseSlug,
+        aoaDeg: attempt.aoaDeg,
+      })
+      .where(eq(solverEvidenceArtifacts.id, manifest.id));
+  }
+  const archive = await createVerifiedRestartArchiveFixture(db, {
+    resultId: attempt.resultId,
+    resultAttemptId: attempt.id,
+  });
+  continuationEvidenceBlobIds.push(archive.blobId);
+  return attempt.resultId;
+}
+
 async function seedAcceptedPrecalcCell(label: string): Promise<{
   result: typeof results.$inferSelect;
   job: typeof simJobs.$inferSelect;
@@ -709,6 +844,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         airfoilId,
         bcIds: [bcId],
         simulationPresetRevisionId: revisionId,
+        solverImplementationId,
         jobKind: "targeted",
         referenceChordM: CHORD,
         wave: 2,
@@ -1576,6 +1712,9 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     expect(lines.some((l) => l.includes("REPLACE GUARD"))).toBe(true);
     expect(lines.some((l) => l.includes("FINAL URANS CRITICAL"))).toBe(false);
 
+    const continuationSourceResultId = await attachExactRestartArchive(
+      settledItem.latestResultAttemptId!,
+    );
     const nonRestartableFull = {
       ...rejectedFull,
       quality_warnings: [],
@@ -1587,6 +1726,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         airfoilId,
         bcIds: [bcId],
         simulationPresetRevisionId: revisionId,
+        solverImplementationId,
         jobKind: "verify",
         referenceChordM: CHORD,
         wave: 2,
@@ -1603,6 +1743,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
           verifyQueueItemId: item.id,
           verifyPrecalc: { cl: 0.7, cd: 0.2, cm: -0.03 },
           finalRecoveryMode: "continuation",
+          continueFromResultId: continuationSourceResultId,
           continueFromResultAttemptId: settledItem.latestResultAttemptId,
         },
       })
@@ -1644,6 +1785,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         airfoilId,
         bcIds: [bcId],
         simulationPresetRevisionId: revisionId,
+        solverImplementationId,
         jobKind: "verify",
         referenceChordM: CHORD,
         wave: 2,
@@ -1731,6 +1873,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         airfoilId,
         bcIds: [bcId],
         simulationPresetRevisionId: revisionId,
+        solverImplementationId,
         jobKind: "verify",
         referenceChordM: CHORD,
         wave: 2,
@@ -1783,6 +1926,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     );
     for (let segment = 1; segment <= 3; segment += 1) {
       const sourceAttemptId = settled.latestResultAttemptId!;
+      const sourceResultId = await attachExactRestartArchive(sourceAttemptId);
       const engineJobId = `${PREFIX}-productive-final-continuation-${segment}`;
       const [job] = await db
         .insert(simJobs)
@@ -1790,6 +1934,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
           airfoilId,
           bcIds: [bcId],
           simulationPresetRevisionId: revisionId,
+          solverImplementationId,
           jobKind: "verify",
           referenceChordM: CHORD,
           wave: 2,
@@ -1806,6 +1951,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
             verifyQueueItemId: item.id,
             verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
             finalRecoveryMode: "continuation",
+            continueFromResultId: sourceResultId,
             continueFromResultAttemptId: sourceAttemptId,
           },
         })
@@ -1852,6 +1998,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     // corrective fresh start.
     for (let miss = 1; miss <= 2; miss += 1) {
       const sourceAttemptId = settled.latestResultAttemptId!;
+      const sourceResultId = await attachExactRestartArchive(sourceAttemptId);
       const engineJobId = `${PREFIX}-final-continuation-no-progress-${miss}`;
       const [job] = await db
         .insert(simJobs)
@@ -1859,6 +2006,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
           airfoilId,
           bcIds: [bcId],
           simulationPresetRevisionId: revisionId,
+          solverImplementationId,
           jobKind: "verify",
           referenceChordM: CHORD,
           wave: 2,
@@ -1875,6 +2023,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
             verifyQueueItemId: item.id,
             verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
             finalRecoveryMode: "continuation",
+            continueFromResultId: sourceResultId,
             continueFromResultAttemptId: sourceAttemptId,
           },
         })
@@ -1933,6 +2082,318 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     );
   }, 120000);
 
+  it("MUST-CATCH: FINAL settlement counts only the exact current archived result/attempt pair as continuation", async () => {
+    await cleanCell();
+    const seeded = await seedAcceptedPrecalcCell("final-settlement-exact-pair");
+    const jobIds = [seeded.job.id];
+    const createContinuationSource = async (label: string) => {
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: seeded.result.id,
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: GATE_AOA,
+          simJobId: seeded.job.id,
+          engineJobId: `${PREFIX}-${label}`,
+          engineCaseSlug: "a0",
+          methodKey: "openfoam.urans",
+          solverImplementationId,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          validForPolar: false,
+          converged: true,
+          unsteady: true,
+          qualityWarnings: [
+            `URANS ${URANS_BUDGET_STOP_MARKER}: restartable same-case state retained`,
+          ],
+          evidencePayload: {
+            fidelity: "urans_full",
+            frame_track: frameTrackFixture(),
+          },
+          solvedAt: new Date(),
+        })
+        .returning({ id: resultAttempts.id });
+      await db.insert(resultClassifications).values({
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: GATE_AOA,
+        regime: "urans",
+        classifierVersion: "final-settlement-exact-pair-v1",
+        state: "rejected",
+        region: "post_stall",
+        confidence: 1,
+        reasons: ["insufficient-periods"],
+      });
+      await db.insert(solverEvidenceArtifacts).values({
+        resultId: seeded.result.id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simJobId: seeded.job.id,
+        engineJobId: `${PREFIX}-${label}`,
+        engineCaseSlug: "a0",
+        methodKey: "openfoam.urans",
+        solverImplementationId,
+        aoaDeg: GATE_AOA,
+        kind: "manifest",
+        storageKey: `${PREFIX}/final-settlement/${attempt.id}/manifest.json`,
+        mimeType: "application/json",
+        sha256: digest(`${PREFIX}-${label}-manifest`),
+        byteSize: 128,
+      });
+      return attempt.id;
+    };
+    const sourceAttemptId = await createContinuationSource("current-source");
+    const staleAttemptId = await createContinuationSource("stale-source");
+    const noArchiveAttemptId =
+      await createContinuationSource("unarchived-source");
+    const sourceResultId = await attachExactRestartArchive(sourceAttemptId);
+    const staleResultId = await attachExactRestartArchive(staleAttemptId);
+    const [item] = await db
+      .insert(simUransVerifyQueue)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: GATE_AOA,
+        state: "pending",
+        precalcResultId: seeded.result.id,
+        precalcResultAttemptId: seeded.result.currentResultAttemptId!,
+        backgroundOwner: true,
+        freshAttemptCount: 1,
+        maxFreshAttempts: 20,
+        continuationAttemptCount: 0,
+        latestResultAttemptId: sourceAttemptId,
+        lastOutcome: "continuation_pending",
+      })
+      .returning();
+    let expectedFresh = 1;
+    let expectedContinuation = 0;
+    const runSettlement = async (input: {
+      label: string;
+      payload: Record<string, unknown>;
+      latestResultAttemptId?: string;
+      bcIds?: string[];
+      jobSolverImplementationId?: string | null;
+      continuation: boolean;
+    }) => {
+      const engineJobId = `${PREFIX}-exact-pair-${input.label}`;
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: input.bcIds ?? [bcId],
+          simulationPresetRevisionId: revisionId,
+          solverImplementationId:
+            input.jobSolverImplementationId === undefined
+              ? solverImplementationId
+              : input.jobSolverImplementationId,
+          jobKind: "verify",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "submitted",
+          engineJobId,
+          totalCases: 1,
+          submittedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+            ],
+            aoas: [GATE_AOA],
+            uransFidelity: "full",
+            verifyQueueItemId: item.id,
+            verifyPrecalcResultAttemptId: seeded.result.currentResultAttemptId!,
+            verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
+            ...input.payload,
+          },
+        })
+        .returning();
+      jobIds.push(job.id);
+      await db
+        .update(simUransVerifyQueue)
+        .set({
+          state: "running",
+          simJobId: job.id,
+          latestResultAttemptId: input.latestResultAttemptId ?? sourceAttemptId,
+          lastOutcome: "continuation_pending",
+          nextSubmitAt: null,
+        })
+        .where(eq(simUransVerifyQueue.id, item.id));
+      await reconcile(
+        db,
+        stubEngine({
+          job_id: engineJobId,
+          state: "failed",
+          polars: [],
+          message: `terminal ${input.label}`,
+        }),
+        { jobIds: [job.id], skipFailedRecovery: true },
+      );
+      if (input.continuation) expectedContinuation += 1;
+      else expectedFresh += 1;
+      const [settled] = await db
+        .select()
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      expect(settled, input.label).toMatchObject({
+        state: "pending",
+        freshAttemptCount: expectedFresh,
+        continuationAttemptCount: expectedContinuation,
+      });
+    };
+    try {
+      await runSettlement({
+        label: "exact",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultId: sourceResultId,
+          continueFromResultAttemptId: sourceAttemptId,
+        },
+        continuation: true,
+      });
+      await runSettlement({
+        label: "mode-only",
+        payload: { finalRecoveryMode: "continuation" },
+        continuation: false,
+      });
+      await runSettlement({
+        label: "attempt-only",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultAttemptId: sourceAttemptId,
+        },
+        continuation: false,
+      });
+      await runSettlement({
+        label: "result-only",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultId: sourceResultId,
+        },
+        continuation: false,
+      });
+      await runSettlement({
+        label: "wrong-pair",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultId: "00000000-0000-4000-8000-000000000001",
+          continueFromResultAttemptId: sourceAttemptId,
+        },
+        continuation: false,
+      });
+      await runSettlement({
+        label: "non-latest",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultId: staleResultId,
+          continueFromResultAttemptId: staleAttemptId,
+        },
+        continuation: false,
+      });
+      await runSettlement({
+        label: "unarchived",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultId: seeded.result.id,
+          continueFromResultAttemptId: noArchiveAttemptId,
+        },
+        latestResultAttemptId: noArchiveAttemptId,
+        continuation: false,
+      });
+      await runSettlement({
+        label: "wrong-boundary-condition",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultId: sourceResultId,
+          continueFromResultAttemptId: sourceAttemptId,
+        },
+        bcIds: ["00000000-0000-4000-8000-000000000002"],
+        continuation: false,
+      });
+      await runSettlement({
+        label: "missing-implementation",
+        payload: {
+          finalRecoveryMode: "continuation",
+          continueFromResultId: sourceResultId,
+          continueFromResultAttemptId: sourceAttemptId,
+        },
+        jobSolverImplementationId: null,
+        continuation: false,
+      });
+
+      const acceptedEngineJobId = `${PREFIX}-exact-pair-accepted`;
+      const [acceptedJob] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          solverImplementationId,
+          jobKind: "verify",
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "submitted",
+          engineJobId: acceptedEngineJobId,
+          totalCases: 1,
+          submittedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+            ],
+            aoas: [GATE_AOA],
+            uransFidelity: "full",
+            verifyQueueItemId: item.id,
+            verifyPrecalcResultAttemptId: seeded.result.currentResultAttemptId!,
+            verifyPrecalc: { cl: 0.71, cd: 0.212, cm: -0.034 },
+            finalRecoveryMode: "continuation",
+            continueFromResultId: sourceResultId,
+            continueFromResultAttemptId: sourceAttemptId,
+          },
+        })
+        .returning();
+      jobIds.push(acceptedJob.id);
+      await db
+        .update(simUransVerifyQueue)
+        .set({
+          state: "running",
+          simJobId: acceptedJob.id,
+          latestResultAttemptId: sourceAttemptId,
+          lastOutcome: "continuation_pending",
+          nextSubmitAt: null,
+        })
+        .where(eq(simUransVerifyQueue.id, item.id));
+      await claimCellForJob(seeded.result.id, acceptedJob.id);
+      await reconcile(
+        db,
+        stubEngine(
+          jobResult(acceptedEngineJobId, {
+            ...acceptingPrecalcPoint(),
+            fidelity: "urans_full",
+          }),
+        ),
+        { jobIds: [acceptedJob.id], skipFailedRecovery: true },
+      );
+      expectedContinuation += 1;
+      const [accepted] = await db
+        .select()
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      expect(accepted).toMatchObject({
+        state: "done",
+        freshAttemptCount: expectedFresh,
+        continuationAttemptCount: expectedContinuation,
+      });
+    } finally {
+      await db
+        .delete(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.id, item.id));
+      await cleanCell();
+      await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
+    }
+  }, 120000);
+
   it("typed continuation infrastructure retries the same source, while permanent loss becomes one stable critical incident", async () => {
     await cleanCell();
     const seeded = await seedAcceptedPrecalcCell("final-continuation-outcomes");
@@ -1947,6 +2408,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         simJobId: seeded.job.id,
         engineJobId: `${PREFIX}-final-continuation-source`,
         engineCaseSlug: "a0",
+        solverImplementationId,
         status: "done",
         source: "solved",
         regime: "urans",
@@ -1972,6 +2434,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       confidence: 1,
       reasons: ["insufficient-periods"],
     });
+    const sourceResultId = await attachExactRestartArchive(sourceAttempt.id);
     const [item] = await db
       .insert(simUransVerifyQueue)
       .values({
@@ -1997,6 +2460,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
           airfoilId,
           bcIds: [bcId],
           simulationPresetRevisionId: revisionId,
+          solverImplementationId,
           jobKind: "verify",
           referenceChordM: CHORD,
           wave: 2,
@@ -2013,6 +2477,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
             verifyQueueItemId: item.id,
             verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
             finalRecoveryMode: "continuation",
+            continueFromResultId: sourceResultId,
             continueFromResultAttemptId: sourceAttempt.id,
           },
         })
@@ -2057,6 +2522,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
           airfoilId,
           bcIds: [bcId],
           simulationPresetRevisionId: revisionId,
+          solverImplementationId,
           jobKind: "verify",
           referenceChordM: CHORD,
           wave: 2,
@@ -2073,6 +2539,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
             verifyQueueItemId: item.id,
             verifyPrecalc: { cl: 0.71, cd: 0.2, cm: -0.03 },
             finalRecoveryMode: "continuation",
+            continueFromResultId: sourceResultId,
             continueFromResultAttemptId: sourceAttempt.id,
           },
         })
@@ -2945,6 +3412,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
             airfoilId,
             bcIds: [bcId],
             simulationPresetRevisionId: revisionId,
+            solverImplementationId,
             jobKind: "verify",
             referenceChordM: CHORD,
             wave: 2,

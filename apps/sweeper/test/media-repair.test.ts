@@ -40,6 +40,7 @@ import {
   polarFitSets,
   solverProfiles,
   solverEvidenceArtifacts,
+  solverEvidenceBlobs,
   sweepDefinitions,
   type DB,
   refreshPolarCacheForRevision,
@@ -47,6 +48,7 @@ import {
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
+import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
 import type {
   EngineClient,
   FieldExtentsResponse,
@@ -79,6 +81,7 @@ const frameTrack = JSON.parse(
 
 let bcId = "";
 let revisionId = "";
+let solverImplementationId = "";
 let presetId = "";
 let referenceGeometryId = "";
 let flowId = "";
@@ -94,6 +97,7 @@ const setupIds = {
 const airfoilIds: string[] = [];
 const categoryIds: string[] = [];
 const campaignIds: string[] = [];
+const evidenceBlobIds: string[] = [];
 
 interface Fixture {
   airfoilId: string;
@@ -191,6 +195,8 @@ async function createSolvedResult(
       frameTrack: unsteady ? frameTrack : null,
       engineJobId,
       engineCaseSlug: caseSlug,
+      methodKey: "openfoam.urans",
+      solverImplementationId,
       simJobId: opts.simJobId ?? null,
       solvedAt: new Date(),
     })
@@ -214,6 +220,8 @@ async function createSolvedResult(
       simJobId: opts.simJobId ?? null,
       engineJobId,
       engineCaseSlug: caseSlug,
+      methodKey: "openfoam.urans",
+      solverImplementationId,
       status: "done",
       source: "solved",
       regime,
@@ -244,6 +252,8 @@ async function createSolvedResult(
     simJobId: opts.simJobId ?? null,
     engineJobId,
     engineCaseSlug: caseSlug,
+    methodKey: "openfoam.urans",
+    solverImplementationId,
     aoaDeg: aoa,
     kind: "manifest",
     storageKey: `${PREFIX}/${label}/manifest.json`,
@@ -252,6 +262,13 @@ async function createSolvedResult(
     byteSize: 512,
     metadata: { evidenceBase: `evidence/${label}` },
   });
+  if (fidelity === "urans_precalc") {
+    const archive = await createVerifiedRestartArchiveFixture(db, {
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+    });
+    evidenceBlobIds.push(archive.blobId);
+  }
   if (unsteady) {
     await db.insert(forceHistory).values({
       resultId: result.id,
@@ -317,6 +334,8 @@ async function createBlockedPrecalcFixture(
       wave: 2,
       status: "done",
       engineJobId,
+      methodKey: "openfoam.urans",
+      solverImplementationId,
       totalCases: 1,
       completedCases: 1,
       ingestedAt: new Date(),
@@ -387,6 +406,8 @@ async function createNoSheddingBlockedPrecalcFixture(
       wave: 2,
       status: "done",
       engineJobId,
+      methodKey: "openfoam.urans",
+      solverImplementationId,
       totalCases: 1,
       completedCases: 1,
       ingestedAt: new Date(),
@@ -636,6 +657,10 @@ beforeAll(async () => {
   const resolved = await ensureSimulationPresetRevision(db, preset.id);
   if (!resolved) throw new Error("media repair test revision required");
   revisionId = resolved.revision.id;
+  if (!resolved.revision.solverImplementationId) {
+    throw new Error("media repair test solver implementation required");
+  }
+  solverImplementationId = resolved.revision.solverImplementationId;
 });
 
 afterAll(async () => {
@@ -659,6 +684,11 @@ afterAll(async () => {
     await db
       .delete(simJobs)
       .where(eq(simJobs.simulationPresetRevisionId, revisionId));
+  }
+  if (evidenceBlobIds.length) {
+    await db
+      .delete(solverEvidenceBlobs)
+      .where(inArray(solverEvidenceBlobs.id, evidenceBlobIds));
   }
   if (airfoilIds.length)
     await db.delete(airfoils).where(inArray(airfoils.id, airfoilIds));
@@ -1515,6 +1545,8 @@ describe("durable result media repair", () => {
         wave: 2,
         status: "done",
         engineJobId: `${PREFIX}-final-replace-guard-job`,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
         totalCases: 1,
         completedCases: 1,
         submittedAt: new Date(),
@@ -1523,6 +1555,7 @@ describe("durable result media repair", () => {
           aoas: [6],
           uransFidelity: "full",
           verifyQueueItemId: verify.id,
+          verifyPrecalcResultAttemptId: fixture.resultAttemptId,
           verifyPrecalc: { cl: 0.81, cd: 0.041, cm: -0.032 },
         },
       })
@@ -1548,6 +1581,8 @@ describe("durable result media repair", () => {
           simJobId: job.id,
           engineJobId,
           engineCaseSlug,
+          methodKey: "openfoam.urans",
+          solverImplementationId,
           status: "done",
           source: "solved",
           regime: "urans",
@@ -1596,6 +1631,8 @@ describe("durable result media repair", () => {
         simJobId: job.id,
         engineJobId,
         engineCaseSlug,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
         aoaDeg: 6,
         kind: "manifest",
         storageKey: `${PREFIX}/${label}/manifest.json`,

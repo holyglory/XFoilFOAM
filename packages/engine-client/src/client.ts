@@ -569,8 +569,10 @@ export class EngineClient {
     );
   }
 
-  /** Full result (the API returns 409 until the job completes). The payload
-   *  can be MBs of polar/frame evidence — budgeted like a submit, not a poll. */
+  /** Published result snapshot. The API returns 409 until the first case is
+   *  published, then serves state=running partials before the terminal result.
+   *  The payload can be MBs of polar/frame evidence — budgeted like a submit,
+   *  not a poll. */
   getResult(jobId: string, opts?: EngineCallOptions): Promise<JobResult> {
     return this.json<JobResult>(
       `/jobs/${encodeURIComponent(jobId)}/result`,

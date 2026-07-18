@@ -1413,53 +1413,78 @@ export function SimModal(props: {
             {latestHistory}
           </div>
         )}
-        {(canContinue6h || canRequestFullTier) && (
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-              gap: 7,
-            }}
-          >
-            {canContinue6h && (
-              <button
-                type="button"
-                data-testid="sim-review-continue-6h"
-                disabled={continueDisabled}
-                onClick={() => void runReviewRemediation("continue-6h")}
-                style={reviewButtonStyle("amber", continueDisabled)}
-              >
-                {reviewBusy === "continue-6h" ? "queueing…" : "Continue +6h"}
-              </button>
-            )}
-            {canRequestFullTier && (
-              <button
-                type="button"
-                data-testid="sim-review-request-full"
-                disabled={requestFullDisabled}
-                onClick={() => void runReviewRemediation("request-full-tier")}
-                style={reviewButtonStyle("amber", requestFullDisabled)}
-              >
-                {reviewBusy === "request-full-tier"
-                  ? "queueing…"
-                  : "Request final verification"}
-              </button>
-            )}
-          </div>
-        )}
-        {reviewError && (
-          <div
-            data-testid="sim-review-inline-message"
+        {(canContinue6h || canRequestFullTier || reviewError) && (
+          <details
+            data-testid="sim-review-operator-overrides"
             style={{
               fontFamily: MONO,
               fontSize: 10,
-              color: reviewError ? C.redText : C.teal,
-              lineHeight: 1.45,
-              overflowWrap: "anywhere",
+              color: C.dim,
             }}
           >
-            {reviewError}
-          </div>
+            <summary style={{ width: "fit-content", cursor: "pointer" }}>
+              Operator overrides
+            </summary>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                gap: 7,
+                marginTop: 7,
+                padding: 8,
+                border: `1px solid ${C.stroke}`,
+                borderRadius: 8,
+                background: C.panel3,
+              }}
+            >
+              <span
+                style={{
+                  gridColumn: "1 / -1",
+                  color: C.muted,
+                  lineHeight: 1.4,
+                }}
+              >
+                Normal recovery and verification are automatic.
+              </span>
+              {canContinue6h && (
+                <button
+                  type="button"
+                  data-testid="sim-review-continue-6h"
+                  disabled={continueDisabled}
+                  onClick={() => void runReviewRemediation("continue-6h")}
+                  style={reviewButtonStyle("amber", continueDisabled)}
+                >
+                  {reviewBusy === "continue-6h" ? "queueing…" : "Continue +6h"}
+                </button>
+              )}
+              {canRequestFullTier && (
+                <button
+                  type="button"
+                  data-testid="sim-review-request-full"
+                  disabled={requestFullDisabled}
+                  onClick={() => void runReviewRemediation("request-full-tier")}
+                  style={reviewButtonStyle("amber", requestFullDisabled)}
+                >
+                  {reviewBusy === "request-full-tier"
+                    ? "queueing…"
+                    : "Request final verification"}
+                </button>
+              )}
+              {reviewError && (
+                <div
+                  data-testid="sim-review-inline-message"
+                  style={{
+                    gridColumn: "1 / -1",
+                    color: C.redText,
+                    lineHeight: 1.45,
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {reviewError}
+                </div>
+              )}
+            </div>
+          </details>
         )}
         {reviewStepper && (
           <div

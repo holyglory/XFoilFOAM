@@ -68,6 +68,7 @@ import {
   settlePrecalcObligationsForJob,
   solverProfiles,
   solverEvidenceArtifacts,
+  solverEvidenceBlobs,
   sweeperState,
 } from "@aerodb/db";
 import {
@@ -76,7 +77,10 @@ import {
   URANS_BUDGET_STOP_MARKER,
 } from "@aerodb/core";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
-import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
+import {
+  createAcceptedPrecalcAttemptFixture,
+  createVerifiedRestartArchiveFixture,
+} from "@aerodb/db/test-fixtures";
 import {
   EngineError,
   MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
@@ -117,6 +121,7 @@ const profileIds = {
   output: "",
 };
 const campaignIds: string[] = [];
+const restartBlobIds: string[] = [];
 
 let categoryId = "";
 let airfoilId = "";
@@ -189,6 +194,21 @@ async function setupFor(campaignId: string) {
     revisionId: condition.revisionId,
     bcId: preset.bcId,
   };
+}
+
+async function createAcceptedPrecalcAttemptWithRestartArchive(
+  resultId: string,
+): Promise<string> {
+  const resultAttemptId = await createAcceptedPrecalcAttemptFixture(
+    db,
+    resultId,
+  );
+  const { blobId } = await createVerifiedRestartArchiveFixture(db, {
+    resultId,
+    resultAttemptId,
+  });
+  restartBlobIds.push(blobId);
+  return resultAttemptId;
 }
 
 async function requestedFailedOrphans(campaignId: string) {
@@ -298,6 +318,11 @@ afterAll(async () => {
     campaignIds,
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
   });
+  if (restartBlobIds.length) {
+    await db
+      .delete(solverEvidenceBlobs)
+      .where(inArray(solverEvidenceBlobs.id, restartBlobIds));
+  }
   if (profileIds.boundary)
     await db
       .delete(boundaryProfiles)
@@ -2710,10 +2735,8 @@ describe("campaign compose→submit lifecycle boundary", () => {
       state: "accepted",
       reasons: [],
     });
-    const acceptedAttemptId = await createAcceptedPrecalcAttemptFixture(
-      db,
-      accepted.id,
-    );
+    const acceptedAttemptId =
+      await createAcceptedPrecalcAttemptWithRestartArchive(accepted.id);
     await db
       .update(results)
       .set({ currentResultAttemptId: acceptedAttemptId })
@@ -4658,59 +4681,13 @@ describe("campaign compose→submit lifecycle boundary", () => {
         solvedAt: new Date(),
       })
       .returning();
-    const [acceptedAttempt] = await db
-      .insert(resultAttempts)
-      .values({
-        resultId: accepted.id,
-        airfoilId,
-        bcId: setup.bcId,
-        simulationPresetRevisionId: setup.revisionId,
-        aoaDeg: ANGLES[0],
-        status: "done",
-        source: "solved",
-        regime: "urans",
-        simJobId: job.id,
-        engineJobId,
-        engineCaseSlug: `${PREFIX}-manual-reuse-case`,
-        cl: 0.45,
-        cd: 0.025,
-        cm: -0.03,
-        converged: true,
-        unsteady: true,
-        evidencePayload: { fidelity: "urans_precalc" },
-        solvedAt: new Date(),
-      })
-      .returning({ id: resultAttempts.id });
+    const acceptedAttemptId =
+      await createAcceptedPrecalcAttemptWithRestartArchive(accepted.id);
     await db
       .update(results)
-      .set({ currentResultAttemptId: acceptedAttempt.id })
+      .set({ currentResultAttemptId: acceptedAttemptId })
       .where(eq(results.id, accepted.id));
     const manifestSha = "a".repeat(64);
-    await db.insert(solverEvidenceArtifacts).values({
-      resultId: accepted.id,
-      resultAttemptId: acceptedAttempt.id,
-      airfoilId,
-      simJobId: job.id,
-      engineJobId,
-      engineCaseSlug: `${PREFIX}-manual-reuse-case`,
-      aoaDeg: ANGLES[0],
-      kind: "manifest",
-      storageKey: `${PREFIX}/manual-reuse/manifest.json`,
-      mimeType: "application/json",
-      sha256: manifestSha,
-      byteSize: 128,
-    });
-    await db.insert(resultClassifications).values({
-      resultId: accepted.id,
-      resultAttemptId: acceptedAttempt.id,
-      airfoilId,
-      simulationPresetRevisionId: setup.revisionId,
-      aoaDeg: ANGLES[0],
-      regime: "urans",
-      classifierVersion: `${PREFIX}-manual-reuse-accepted-v1`,
-      state: "accepted",
-      reasons: [],
-    });
     const [submittedJob] = await db
       .select()
       .from(simJobs)
@@ -4734,7 +4711,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
     const repairRetryAt = new Date(Date.now() + 60_000);
     await db.insert(resultMediaRepairs).values({
       resultId: accepted.id,
-      resultAttemptId: acceptedAttempt.id,
+      resultAttemptId: acceptedAttemptId,
       state: "retry_wait",
       evidenceSignature: `${engineJobId}:${PREFIX}-manual-reuse-case:${manifestSha}`,
       backgroundOwner: false,
@@ -4899,10 +4876,8 @@ describe("campaign compose→submit lifecycle boundary", () => {
       state: "accepted",
       reasons: [],
     });
-    const acceptedAttemptId = await createAcceptedPrecalcAttemptFixture(
-      db,
-      accepted.id,
-    );
+    const acceptedAttemptId =
+      await createAcceptedPrecalcAttemptWithRestartArchive(accepted.id);
     await db
       .update(results)
       .set({ currentResultAttemptId: acceptedAttemptId })
@@ -5100,10 +5075,8 @@ describe("campaign compose→submit lifecycle boundary", () => {
     );
     const acceptedAttemptIds = new Map<number, string>();
     for (const result of accepted) {
-      const resultAttemptId = await createAcceptedPrecalcAttemptFixture(
-        db,
-        result.id,
-      );
+      const resultAttemptId =
+        await createAcceptedPrecalcAttemptWithRestartArchive(result.id);
       acceptedAttemptIds.set(result.aoaDeg, resultAttemptId);
       await db
         .update(results)

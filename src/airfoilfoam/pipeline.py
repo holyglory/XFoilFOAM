@@ -108,6 +108,8 @@ from .postprocess.images import (
 )
 from .postprocess.residuals import parse_convergence
 from .postprocess.unsteady import (
+    DRIFT_ABS_FLOOR,
+    ESTABLISHED_MIN_CYCLES,
     PERIOD_AMBIGUITY_TOLERANCE,
     PERIOD_ESTIMATE_MIN_CYCLES,
     SHEDDING_STROUHAL_BAND,
@@ -125,6 +127,7 @@ from .postprocess.unsteady import (
     is_no_shedding,
     period_window_stats,
     stable_two_period_window,
+    trailing_period_series,
 )
 
 CancelCheck = Optional[Callable[[], None]]
@@ -1159,6 +1162,14 @@ URANS_PERIOD_ACQUISITION_SLOW_PERIODS = 2.2
 URANS_APPARENT_FLAT_OBSERVATION_MARKER = "an apparently flat signal spans"
 #: Frame-export window pinned by the contract: last min(3, K) whole periods.
 URANS_FRAME_SPAN_PERIODS = 3
+#: A non-marker trailing certificate is intentionally short.  If its cycle
+#: means still move monotonically by more than this fraction of the honest Cl
+#: scale, the apparent flatness is too large to dismiss as coefficient-file
+#: precision: the longer retained trajectory must adjudicate persistent
+#: relaxation versus bounded slow modulation.  This is an evidence-selection
+#: trigger, not a looser acceptance tolerance; all existing period, amplitude,
+#: density, and established-oscillation gates still apply.
+PRECALC_SHORT_TAIL_CONTEXT_FRACTION = 1e-3
 #: Fraction of the per-attempt solver timeout the projected refined URANS pass
 #: may consume; beyond this the refinement is skipped (it would deterministically
 #: time out and burn hours of CPU) and the base window is graded honestly.
@@ -2243,6 +2254,7 @@ def _copy_case_tree(src_case: Path, dst_case: Path) -> None:
 def _validate_restartable_continuation_case(
     src_case: Path,
     expected_subdir: str | None = None,
+    expected_engine: EngineIdentity | None = None,
 ) -> str:
     """Return the exact restartable transient subdir or fail truthfully."""
 
@@ -2264,6 +2276,35 @@ def _validate_restartable_continuation_case(
         raise OpenFOAMError(
             f"saved transient {src_case.name}/{transient_subdir} has no system/controlDict; "
             f"not restartable"
+        )
+    open_cfd_dictionaries = ("transportProperties", "turbulenceProperties")
+    foundation_dictionaries = ("physicalProperties", "momentumTransport")
+    if expected_engine is not None:
+        if expected_engine.distribution == "opencfd":
+            required_dictionaries = open_cfd_dictionaries
+        elif expected_engine.distribution == "foundation":
+            required_dictionaries = foundation_dictionaries
+        else:
+            raise OpenFOAMError(
+                f"saved transient {src_case.name}/{transient_subdir} targets "
+                f"unsupported OpenFOAM distribution {expected_engine.distribution!r}; "
+                "not restartable"
+            )
+    else:
+        constant_dir = src_t / "constant"
+        has_foundation_marker = any(
+            (constant_dir / name).is_file() for name in foundation_dictionaries
+        )
+        required_dictionaries = (
+            foundation_dictionaries if has_foundation_marker else open_cfd_dictionaries
+        )
+    missing_dictionaries = [
+        name for name in required_dictionaries if not (src_t / "constant" / name).is_file()
+    ]
+    if missing_dictionaries:
+        raise OpenFOAMError(
+            f"saved transient {src_case.name}/{transient_subdir} is missing required "
+            f"constant dictionaries {', '.join(missing_dictionaries)}; not restartable"
         )
     if not (src_t / "constant" / "polyMesh" / "points").exists():
         raise OpenFOAMError(
@@ -2613,6 +2654,7 @@ def stage_continuation_case(
             transient_subdir = _validate_restartable_continuation_case(
                 src_case,
                 selected_transient_subdir,
+                expected_engine,
             )
         except OpenFOAMError as exc:
             live_error = exc
@@ -2651,7 +2693,10 @@ def stage_continuation_case(
             expected_engine=expected_engine,
         )
         _materialize_archived_continuation_case(restored, staged_case)
-        transient_subdir = _validate_restartable_continuation_case(staged_case)
+        transient_subdir = _validate_restartable_continuation_case(
+            staged_case,
+            expected_engine=expected_engine,
+        )
 
     try:
         evidence_location = _continuation_evidence_dir(src_case, aoa_deg)
@@ -2933,6 +2978,277 @@ def _precalc_stationarity_unavailable(
     )
 
 
+@dataclass(frozen=True)
+class _PrecalcCertifiedWindow:
+    """One byte-backed preliminary-URANS certification view.
+
+    ``source_series`` retains the complete merged coefficient trajectory for
+    evidence/frame interpolation.  ``certified_series`` is the exact trailing
+    window that owns the published coefficient means.  ``stationarity_stats``
+    normally aliases those certified-tail statistics; only a monotonic short
+    slice uses the longer retained trajectory to distinguish persistent
+    relaxation from a bounded slow modulation.  Keeping both byte-backed
+    views in one object prevents live grading and finalization from silently
+    choosing different evidence.
+    """
+
+    source_series: tuple
+    certified_series: tuple
+    source_estimate: PeriodEstimate
+    certified_estimate: PeriodEstimate
+    stats: PeriodWindowStats
+    stationarity_stats: PeriodWindowStats
+    total_retained_cycles: float
+
+
+class _PrecalcCertifiedWindowUnavailable(RuntimeError):
+    """Structured fail-closed result from preliminary window selection."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        period_s: Optional[float] = None,
+        allow_continuation: bool = True,
+    ) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.period_s = period_s
+        self.allow_continuation = allow_continuation
+
+
+def _precalc_certified_window(
+    case_dir: Path,
+    coeff_paths: list[Path],
+    spec: CaseSpec,
+    solver_params: SolverParams,
+    *,
+    early_stopped: bool,
+) -> _PrecalcCertifiedWindow:
+    """Select and grade the exact preliminary-URANS certification window.
+
+    A same-case continuation keeps startup in immutable evidence.  Once a
+    stable tail exists, only the trailing 4.5-cycle certification horizon owns
+    the published means.  A short horizon can, however, reverse the established
+    verdict in both directions: one monotonic phase of a bounded modulation
+    looks like drift, while the late part of an exponential relaxation can
+    slip below the absolute trend floor.  For only those monotonic-tail cases,
+    the complete retained byte-backed trajectory adjudicates whether the
+    motion is bounded or persistently relaxing; it never replaces the tail's
+    coefficient statistics.  Early-stopped cases already carry a monitor-
+    pinned stable interval and need no such offline adjudication.  Both the
+    live controller and finalizer call this function.
+    """
+
+    if not coeff_paths:
+        raise _PrecalcCertifiedWindowUnavailable(
+            "coefficient evidence is missing",
+            allow_continuation=False,
+        )
+
+    source_series = coefficient_series(coeff_paths)
+    t_all, cl_all, cd_all, cm_all = source_series
+    if early_stopped:
+        selected = _early_stop_retained_series(
+            case_dir, t_all, cl_all, cd_all, cm_all
+        )
+    else:
+        selected = discard_startup(
+            t_all,
+            cl_all,
+            cd_all,
+            cm_all,
+            fraction=solver_params.transient_discard_fraction,
+        )
+    t_c, cl_c, cd_c, cm_c = selected
+    source_estimate = estimate_period(
+        t_c,
+        cl_c,
+        speed=spec.speed,
+        chord=spec.chord,
+        alpha_deg=spec.aoa_deg,
+    )
+    if source_estimate is None:
+        raise _PrecalcCertifiedWindowUnavailable(
+            "no corroborated shedding period"
+        )
+    source_period = source_estimate.period_s
+    if (
+        source_period is None
+        or not math.isfinite(source_period)
+        or source_period <= 0
+    ):
+        raise _PrecalcCertifiedWindowUnavailable(
+            "no valid shedding period",
+            period_s=source_period,
+            allow_continuation=False,
+        )
+
+    certified_estimate = source_estimate
+    certified_series = selected
+    total_retained_cycles = 0.0
+    if not early_stopped:
+        certification_cycles = _early_stop_certification_cycles(solver_params)
+        available_span = float(t_c[-1]) - float(t_c[0])
+        span_epsilon = max(1e-9, abs(float(t_c[-1])) * 1e-9)
+        required_span = certification_cycles * float(source_period)
+        if available_span + span_epsilon < required_span:
+            raise _PrecalcCertifiedWindowUnavailable(
+                (
+                    "trailing certification window spans "
+                    f"{available_span / float(source_period):.2f} measured periods; "
+                    f"need >= {certification_cycles:g}"
+                ),
+                period_s=float(source_period),
+            )
+        provisional = trailing_period_series(
+            t_c,
+            cl_c,
+            cd_c,
+            cm_c,
+            float(source_period),
+            certification_cycles,
+        )
+        trailing_estimate = estimate_period(
+            provisional[0],
+            provisional[1],
+            speed=spec.speed,
+            chord=spec.chord,
+            alpha_deg=spec.aoa_deg,
+        )
+        if trailing_estimate is None:
+            raise _PrecalcCertifiedWindowUnavailable(
+                "no corroborated shedding period in the trailing certification window",
+                period_s=float(source_period),
+            )
+        trailing_period = trailing_estimate.period_s
+        if (
+            trailing_period is None
+            or not math.isfinite(trailing_period)
+            or trailing_period <= 0
+        ):
+            raise _PrecalcCertifiedWindowUnavailable(
+                "no valid shedding period in the trailing certification window",
+                period_s=trailing_period,
+                allow_continuation=False,
+            )
+        required_span = certification_cycles * float(trailing_period)
+        if available_span + span_epsilon < required_span:
+            raise _PrecalcCertifiedWindowUnavailable(
+                (
+                    "trailing certification window spans "
+                    f"{available_span / float(trailing_period):.2f} measured periods; "
+                    f"need >= {certification_cycles:g}"
+                ),
+                period_s=float(trailing_period),
+            )
+        certified_series = trailing_period_series(
+            t_c,
+            cl_c,
+            cd_c,
+            cm_c,
+            float(trailing_period),
+            certification_cycles,
+        )
+        certified_estimate = trailing_estimate
+        total_retained_cycles = float(
+            math.floor(available_span / float(trailing_period) + 1e-9)
+        )
+
+    t_cert, cl_cert, cd_cert, cm_cert = certified_series
+    stats = period_window_stats(
+        t_cert,
+        cl_cert,
+        cd_cert,
+        cm_cert,
+        certified_estimate.period_s,
+        drift_tolerance=solver_params.urans_drift_tolerance,
+        established_oscillation=True,
+        period_stable=not certified_estimate.ambiguous,
+    )
+    if stats is None:
+        raise _PrecalcCertifiedWindowUnavailable(
+            "no whole-period statistics",
+            period_s=certified_estimate.period_s,
+        )
+
+    stationarity_stats = stats
+    if not early_stopped:
+        cycle_mean_net_fraction = 0.0
+        if len(stats.cycle_means) >= 2:
+            drift_scale = max(
+                abs(stats.cl.mean),
+                abs(stats.cl.std),
+                DRIFT_ABS_FLOOR,
+            )
+            cycle_mean_net_fraction = (
+                abs(stats.cycle_means[-1] - stats.cycle_means[0])
+                / drift_scale
+            )
+        tail_reason = stats.stationary_reason.lower()
+        tail_is_cycle_mean_trend = (
+            not stats.stationary
+            and (
+                "cycle means trend" in tail_reason
+                or "cycle means drift" in tail_reason
+            )
+        )
+        tail_has_resolved_subfloor_drift = (
+            stats.stationary
+            and len(stats.cycle_means) >= ESTABLISHED_MIN_CYCLES
+            and (
+                all(
+                    b > a
+                    for a, b in zip(
+                        stats.cycle_means,
+                        stats.cycle_means[1:],
+                    )
+                )
+                or all(
+                    b < a
+                    for a, b in zip(
+                        stats.cycle_means,
+                        stats.cycle_means[1:],
+                    )
+                )
+            )
+            and cycle_mean_net_fraction
+            >= PRECALC_SHORT_TAIL_CONTEXT_FRACTION
+        )
+        if tail_is_cycle_mean_trend or tail_has_resolved_subfloor_drift:
+            source_stats = period_window_stats(
+                t_c,
+                cl_c,
+                cd_c,
+                cm_c,
+                source_estimate.period_s,
+                drift_tolerance=solver_params.urans_drift_tolerance,
+                established_oscillation=True,
+                period_stable=not source_estimate.ambiguous,
+            )
+            if source_stats is None:
+                raise _PrecalcCertifiedWindowUnavailable(
+                    "retained-context stationarity statistics unavailable",
+                    period_s=source_estimate.period_s,
+                )
+            # A longer trajectory may rescue a short monotonic slice only by
+            # proving bounded trendless modulation through the unchanged
+            # established-oscillation gate.  Conversely, it rejects a tail
+            # whose finite monotone relaxation was merely hidden by the 2%
+            # numerical trend floor.  Amplitude growth and period ambiguity
+            # never enter this override path.
+            stationarity_stats = source_stats
+    return _PrecalcCertifiedWindow(
+        source_series=source_series,
+        certified_series=certified_series,
+        source_estimate=source_estimate,
+        certified_estimate=certified_estimate,
+        stats=stats,
+        stationarity_stats=stationarity_stats,
+        total_retained_cycles=total_retained_cycles,
+    )
+
+
 def _grade_precalc_established_oscillation(
     case_dir: Path,
     coeff_paths: list[Path],
@@ -2953,68 +3269,73 @@ def _grade_precalc_established_oscillation(
     if (
         solver_params.urans_fidelity != UransFidelity.precalc
         or quality.no_shedding
-        or URANS_APPARENT_FLAT_OBSERVATION_MARKER in quality.reason.lower()
     ):
-        # An amplitude-flat trace below the physical observation floor belongs
-        # to guessed-period acquisition. Re-running spectral stationarity here
-        # could find a tiny in-band numerical ripple and wrongly bypass that
-        # floor as an established oscillation.
         return quality
-    if not coeff_paths:
-        return _precalc_stationarity_unavailable(
-            quality,
-            "coefficient evidence is missing",
-            allow_continuation=False,
-        )
+    apparent_flat = (
+        URANS_APPARENT_FLAT_OBSERVATION_MARKER in quality.reason.lower()
+    )
+    # An amplitude-flat trace below the physical observation floor ordinarily
+    # belongs to guessed-period acquisition.  A restart-local ForceHistory can,
+    # however, carry that marker while ``coeff_paths`` already owns a much
+    # longer merged same-case trajectory.  That local verdict may be replaced
+    # only by strong merged evidence below; missing evidence keeps the original
+    # acquisition state byte-for-byte.
+    if apparent_flat and not coeff_paths:
+        return quality
     period: Optional[float] = quality.measured_period_s
     try:
-        t_all, cl_all, cd_all, cm_all = coefficient_series(coeff_paths)
-        if early_stopped:
-            t_c, cl_c, cd_c, cm_c = _early_stop_retained_series(
-                case_dir, t_all, cl_all, cd_all, cm_all
-            )
-        else:
-            t_c, cl_c, cd_c, cm_c = discard_startup(
-                t_all,
-                cl_all,
-                cd_all,
-                cm_all,
-                fraction=solver_params.transient_discard_fraction,
-            )
-        estimate = estimate_period(
-            t_c,
-            cl_c,
-            speed=spec.speed,
-            chord=spec.chord,
-            alpha_deg=spec.aoa_deg,
+        certified = _precalc_certified_window(
+            case_dir,
+            coeff_paths,
+            spec,
+            solver_params,
+            early_stopped=early_stopped,
         )
-        if estimate is None:
-            # `quality.measured_period_s` is the looser FFT-derived history
-            # value. It may size a corrective chunk, but it is not a
-            # corroborated period and must never be promoted to a stable
-            # established-oscillation verdict.
-            return _precalc_stationarity_unavailable(
-                quality,
-                "no corroborated shedding period",
-                period_s=quality.measured_period_s,
-            )
-        period = estimate.period_s
-        if period is None or not math.isfinite(period) or period <= 0:
-            return _precalc_stationarity_unavailable(
-                quality,
-                "no valid shedding period",
-                period_s=period,
-                allow_continuation=False,
-            )
-        stats = period_window_stats(
-            t_c,
-            cl_c,
-            cd_c,
-            cm_c,
-            period,
-            drift_tolerance=solver_params.urans_drift_tolerance,
-            established_oscillation=True,
-            period_stable=not estimate.ambiguous,
+        period = certified.certified_estimate.period_s
+        if apparent_flat:
+            # Spectral repeatability alone is not enough: a tiny numerical
+            # ripple can have an impeccable autocorrelation peak.  Require both
+            # independent merged halves to agree AND the complete retained
+            # merged signal to exceed the existing physical no-shedding
+            # amplitude floor before the local marker may be overridden.
+            if certified.source_estimate.ambiguous:
+                return quality
+            try:
+                merged_history = compute_force_history(
+                    coeff_paths,
+                    spec.speed,
+                    spec.chord,
+                    (
+                        0.0
+                        if early_stopped
+                        else solver_params.transient_discard_fraction
+                    ),
+                    target_cycles=int(
+                        _early_stop_retained_cycles(solver_params)
+                        if early_stopped
+                        else solver_params.urans_min_periods
+                    ),
+                    alpha_deg=spec.aoa_deg,
+                )
+            except Exception:  # noqa: BLE001
+                # In-flight restart evidence may be partial; keep acquisition.
+                return quality
+            if is_no_shedding(merged_history):
+                return quality
+        stats = certified.stats
+        stationarity_stats = certified.stationarity_stats
+    except _PrecalcCertifiedWindowUnavailable as exc:
+        if apparent_flat:
+            return quality
+        return _precalc_stationarity_unavailable(
+            quality,
+            exc.detail,
+            period_s=(
+                exc.period_s
+                if exc.period_s is not None
+                else quality.measured_period_s
+            ),
+            allow_continuation=exc.allow_continuation,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed; log retains the diagnostic
         logger.warning(
@@ -3027,14 +3348,11 @@ def _grade_precalc_established_oscillation(
             f"grading error ({type(exc).__name__})",
             period_s=period,
         )
-    if stats is None:
-        return _precalc_stationarity_unavailable(
-            quality,
-            "no whole-period statistics",
-            period_s=period,
-        )
 
-    retained_cycles = float(stats.whole_periods)
+    retained_cycles = max(
+        float(stats.whole_periods),
+        certified.total_retained_cycles,
+    )
     # Media is published from exactly the last min(3, K) whole periods (see
     # frame_target_times in _finalize_outcome). Grade that same real-evidence
     # window: sparse startup states outside the published player must not
@@ -3054,10 +3372,10 @@ def _grade_precalc_established_oscillation(
         parts.append(
             f"frames/cycle {frames_per_cycle:.2f} < {URANS_MIN_FRAMES_PER_CYCLE:.2f}"
         )
-    if not stats.stationary:
+    if not stationarity_stats.stationary:
         parts.append(
             "URANS window not stationary (precalc established-oscillation test): "
-            f"{stats.stationary_reason}"
+            f"{stationarity_stats.stationary_reason}"
         )
     ok = not parts
     return UransQuality(
@@ -5377,6 +5695,7 @@ def _finalize_outcome(
     # transient (URANS) fallback for unsteady (e.g. post-stall) conditions
     post_dir = case_dir
     frame_stats: Optional[PeriodWindowStats] = None
+    frame_stationarity_stats: Optional[PeriodWindowStats] = None
     frame_series: Optional[tuple] = None  # merged (t, cl, cd, cm) coefficient arrays
     urans_rejection: Optional[HardSolverError] = None
     if solver_params.force_transient or (not outcome.converged and solver_params.transient_fallback):
@@ -5473,52 +5792,114 @@ def _finalize_outcome(
             # time-average path (frame_track stays None).
             if not transient.quality.no_shedding and transient.coeff_paths:
                 try:
-                    t_all, cl_all, cd_all, cm_all = coefficient_series(transient.coeff_paths)
-                    if transient.early_stopped:
-                        # Certified-stable tail only (marker retain_from):
-                        # a zero discard windowed the startup transient into
-                        # the means (+~9% Cl bias) and tripped the drift check.
-                        t_c, cl_c, cd_c, cm_c = _early_stop_retained_series(
-                            transient.case_dir, t_all, cl_all, cd_all, cm_all
-                        )
-                    else:
-                        t_c, cl_c, cd_c, cm_c = discard_startup(
-                            t_all, cl_all, cd_all, cm_all,
-                            fraction=solver_params.transient_discard_fraction,
-                        )
-                    frame_estimate: Optional[PeriodEstimate] = estimate_period(
-                        t_c, cl_c, speed=spec.speed, chord=spec.chord, alpha_deg=spec.aoa_deg
+                    precalc_tier = (
+                        solver_params.urans_fidelity == UransFidelity.precalc
                     )
-                    frame_period = frame_estimate.period_s if frame_estimate is not None else None
+                    frame_estimate: Optional[PeriodEstimate] = None
+                    if precalc_tier:
+                        try:
+                            certified = _precalc_certified_window(
+                                transient.case_dir,
+                                list(transient.coeff_paths),
+                                spec,
+                                solver_params,
+                                early_stopped=transient.early_stopped,
+                            )
+                        except _PrecalcCertifiedWindowUnavailable as exc:
+                            # Preserve a diagnostic frame track below when a
+                            # rejected live attempt lacks a certifiable window.
+                            # An accepted live attempt cannot reach this branch
+                            # without a byte-level evidence inconsistency, and
+                            # will therefore fail closed instead of publishing
+                            # startup-biased coefficients.
+                            certification_warning = (
+                                "preliminary URANS certification window unavailable "
+                                f"during finalization: {exc.detail}"
+                            )
+                            outcome.quality_warnings.append(certification_warning)
+                            if transient.quality.ok:
+                                # Live acceptance and finalization read the same
+                                # immutable coefficient bytes.  If the exact
+                                # certified view can no longer be reproduced,
+                                # retain diagnostic stats below but do not
+                                # publish a different whole-history answer.
+                                outcome.converged = False
+                                urans_rejection = HardSolverError(
+                                    "URANS evidence rejected: "
+                                    + certification_warning
+                                )
+                        else:
+                            frame_series = certified.source_series
+                            frame_estimate = certified.certified_estimate
+                            frame_stats = certified.stats
+                            frame_stationarity_stats = certified.stationarity_stats
+
+                    if frame_stats is None:
+                        t_all, cl_all, cd_all, cm_all = coefficient_series(
+                            transient.coeff_paths
+                        )
+                        if transient.early_stopped:
+                            # Certified-stable tail only (marker retain_from):
+                            # a zero discard windowed the startup transient into
+                            # the means (+~9% Cl bias) and tripped the drift check.
+                            t_c, cl_c, cd_c, cm_c = _early_stop_retained_series(
+                                transient.case_dir, t_all, cl_all, cd_all, cm_all
+                            )
+                        else:
+                            t_c, cl_c, cd_c, cm_c = discard_startup(
+                                t_all,
+                                cl_all,
+                                cd_all,
+                                cm_all,
+                                fraction=solver_params.transient_discard_fraction,
+                            )
+                        frame_estimate = estimate_period(
+                            t_c,
+                            cl_c,
+                            speed=spec.speed,
+                            chord=spec.chord,
+                            alpha_deg=spec.aoa_deg,
+                        )
+                        frame_period = (
+                            frame_estimate.period_s
+                            if frame_estimate is not None
+                            else None
+                        )
+                        if (
+                            frame_period is None
+                            and transient.force_history is not None
+                        ):
+                            frame_period = transient.force_history.period_s
+                        if frame_period is not None and frame_period > 0:
+                            # A failed certification still gets a diagnostic
+                            # frame track, but ``period_stable=False`` prevents
+                            # it from becoming accepted evidence. FULL keeps
+                            # the strict mean-drift contract.
+                            frame_stats = period_window_stats(
+                                t_c,
+                                cl_c,
+                                cd_c,
+                                cm_c,
+                                frame_period,
+                                drift_tolerance=solver_params.urans_drift_tolerance,
+                                established_oscillation=precalc_tier,
+                                period_stable=(
+                                    frame_estimate is not None
+                                    and not frame_estimate.ambiguous
+                                ),
+                            )
+                            frame_stationarity_stats = frame_stats
+                            frame_series = (t_all, cl_all, cd_all, cm_all)
                     if frame_estimate is not None and frame_estimate.ambiguous:
                         outcome.quality_warnings.append(
                             "URANS period ambiguous: "
                             f"{_period_ambiguity_detail(frame_estimate)}"
                         )
-                    if frame_period is None and transient.force_history is not None:
-                        frame_period = transient.force_history.period_s
-                    if frame_period is not None and frame_period > 0:
-                        # PRECALC tier stationarity = established-oscillation
-                        # test (trendless per-cycle means + stable period +
-                        # bounded amplitude — user decision 2026-07-08: the
-                        # rung certifies "converged to a stable oscillation").
-                        # FULL tier keeps the strict 5% mean-drift gate
-                        # ("verified" = converged mean), byte-identical.
-                        precalc_tier = solver_params.urans_fidelity == UransFidelity.precalc
-                        frame_stats = period_window_stats(
-                            t_c, cl_c, cd_c, cm_c, frame_period,
-                            drift_tolerance=solver_params.urans_drift_tolerance,
-                            established_oscillation=precalc_tier,
-                            period_stable=(
-                                frame_estimate is not None
-                                and not frame_estimate.ambiguous
-                            ),
-                        )
-                        frame_series = (t_all, cl_all, cd_all, cm_all)
                 except Exception as exc:  # noqa: BLE001 - stats loss is loud degradation
                     logger.warning("frame-track stats failed for %s: %s", case_dir, exc, exc_info=True)
                     outcome.quality_warnings.append(f"frame-track stats failed: {exc}")
             if frame_stats is not None:
+                stationarity_stats = frame_stationarity_stats or frame_stats
                 outcome.cl = frame_stats.cl.mean
                 outcome.cd = frame_stats.cd.mean
                 outcome.cm = frame_stats.cm.mean
@@ -5531,11 +5912,11 @@ def _finalize_outcome(
                 if spec.speed > 0 and frame_stats.period_s > 0:
                     outcome.strouhal = spec.chord / (frame_stats.period_s * spec.speed)
                 precalc_tier = solver_params.urans_fidelity == UransFidelity.precalc
-                if not frame_stats.stationary:
-                    if precalc_tier and frame_stats.stationary_reason:
+                if not stationarity_stats.stationary:
+                    if precalc_tier and stationarity_stats.stationary_reason:
                         outcome.quality_warnings.append(
                             "URANS window not stationary (precalc established-oscillation "
-                            f"test): {frame_stats.stationary_reason}"
+                            f"test): {stationarity_stats.stationary_reason}"
                         )
                     else:
                         outcome.quality_warnings.append(
@@ -5549,8 +5930,8 @@ def _finalize_outcome(
                     # looser bar than the full-tier converged mean: DISCLOSE
                     # the cycle-mean uncertainty on the accepted point.
                     outcome.quality_warnings.append(
-                        f"cycle means scatter ±{frame_stats.cycle_mean_std:.3g} over "
-                        f"{frame_stats.whole_periods} cycles (precalc)"
+                        f"cycle means scatter ±{stationarity_stats.cycle_mean_std:.3g} over "
+                        f"{stationarity_stats.whole_periods} cycles (precalc)"
                     )
             if not transient.quality.no_shedding and urans_rejection is None:
                 if frame_stats is None:
@@ -5782,7 +6163,7 @@ def _finalize_outcome(
         outcome.frame_track = FrameTrack(
             period_s=frame_stats.period_s,
             periods_retained=frame_stats.periods_retained,
-            stationary=frame_stats.stationary,
+            stationary=(frame_stationarity_stats or frame_stats).stationary,
             drift_frac=frame_stats.drift_frac,
             window=FrameTrackWindow(t_start=frame_stats.window_start, t_end=frame_stats.window_end),
             stats=FrameTrackStats(
@@ -7269,7 +7650,8 @@ def solve_polar_marched(
     solver_params, mesher, runner, aoas, n_cells=0, n_proc=1, render_images=True,
     solver_timeout=7200, rans_solver_timeout: Optional[int] = None,
     rans_max_iterations: Optional[int] = None, progress=None,
-    phase_progress=None, outcome_progress=None, cancel_check: CancelCheck = None,
+    phase_progress=None, outcome_progress=None,
+    precalc_promotion_progress=None, cancel_check: CancelCheck = None,
     cache: Optional[EngineCache] = None, media_budget_s: Optional[float] = None,
     mesh_quality_warnings: Optional[list[str]] = None,
 ) -> PolarMarchResult:
@@ -7409,12 +7791,6 @@ def solve_polar_marched(
             _record_unexceptional_rans_rejection(outcome)
             stored = StoredCaseOutcome(slug=polar_dir.name, outcome=outcome)
             attempts.append(stored)
-            if outcome_progress:
-                outcome_progress(stored, False)
-            if progress:
-                progress()
-            _check_cancel(cancel_check)
-            previous_execution_aoa = aoa
             # The policy separates the numerical decision from execution ownership:
             # Node-managed production sweeps stop immediately and emit a typed
             # external-PRECALC signal; direct multi-angle API sweeps may replace
@@ -7434,17 +7810,43 @@ def solve_polar_marched(
                     f"{RANS_CORE_ABORT_AOA_MAX:g} deg attached-range check; remaining RANS stopped "
                     "for external preliminary URANS."
                 )
+                promotion = RansPrecalcPromotion(
+                    trigger_aoa_deg=aoa,
+                    attempted_aoas=[
+                        item.outcome.spec.aoa_deg for item in attempts
+                    ],
+                    intentionally_omitted_aoas=_unattempted_march_aoas(
+                        sorted_aoas, attempts
+                    ),
+                )
+                # This is one atomic publication boundary for Node-owned
+                # escalation.  The hard-RANS attempt and the typed whole-polar
+                # promotion must reach the durable running result together,
+                # before completed_cases advances.  Otherwise a reconciler can
+                # observe the new counter, ingest only the rejected RANS row,
+                # and never look again when there is no sibling/terminal event.
+                if precalc_promotion_progress:
+                    precalc_promotion_progress(stored, promotion)
+                elif outcome_progress:
+                    # Direct pipeline callers have no durable job snapshot;
+                    # preserve their established attempt callback contract.
+                    outcome_progress(stored, False)
+                if progress:
+                    progress()
+                _check_cancel(cancel_check)
                 return PolarMarchResult(
                     points=sorted(final_points, key=lambda item: item.outcome.spec.aoa_deg),
                     attempts=attempts,
                     promoted_to_urans=False,
                     abort_reason=reason,
-                    precalc_promotion=RansPrecalcPromotion(
-                        trigger_aoa_deg=aoa,
-                        attempted_aoas=[item.outcome.spec.aoa_deg for item in attempts],
-                        intentionally_omitted_aoas=_unattempted_march_aoas(sorted_aoas, attempts),
-                    ),
+                    precalc_promotion=promotion,
                 )
+            if outcome_progress:
+                outcome_progress(stored, False)
+            if progress:
+                progress()
+            _check_cancel(cancel_check)
+            previous_execution_aoa = aoa
             if (
                 qualifying_core_failure
                 and solver_params.rans_failure_policy == RansFailurePolicy.replace_precalc

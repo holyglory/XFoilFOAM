@@ -26,6 +26,7 @@ import {
   results,
   requeueSinglePoint,
   schedulingProfiles,
+  settleAcceptedRunningPrecalcPartials,
   simJobs,
   simCampaigns,
   simCampaignConditions,
@@ -33,14 +34,21 @@ import {
   simCampaignPoints,
   simPrecalcObligationAttempts,
   simPrecalcObligationCampaigns,
+  simPrecalcObligationRequests,
   simPrecalcObligations,
   simRansPolarPromotionPoints,
   simRansPolarPromotions,
+  simUransRequests,
   simUransVerifyQueue,
+  simUransVerifyQueueRequests,
   simulationPresetAirfoilTargets,
+  simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
+  solverEvidenceBlobs,
+  solverImplementations,
   solverProfiles,
+  solverRuntimeBuilds,
   syncSweepPromises,
   syncSweepPromisePoints,
   syncRemotePromiseCancellations,
@@ -52,11 +60,14 @@ import {
   EngineClient,
   EngineError,
   WORKER_RESTART_ORPHAN_MESSAGE,
+  type EngineRuntimeIdentity,
   type EngineQueueState,
   type JobResult,
   type JobStatus,
 } from "@aerodb/engine-client";
+import { URANS_CONTINUATION_REQUIRED_MARKER } from "@aerodb/core";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
+import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
 import { and, asc, eq, inArray, isNotNull, notIlike } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -107,7 +118,101 @@ const cleanupOutputProfileIds = new Set<string>();
 const cleanupSweepIds = new Set<string>();
 const cleanupSyncPromiseIds = new Set<string>();
 const cleanupAirfoilIds = new Set<string>();
+const cleanupPrecalcObligationIds = new Set<string>();
+const cleanupVerifyQueueIds = new Set<string>();
+const cleanupUransRequestIds = new Set<string>();
+const cleanupEvidenceBlobIds = new Set<string>();
+const cleanupRuntimeBuildIds = new Set<string>();
 let restoreSweeperEnabled: boolean | null = null;
+
+async function attachVerifiedRestartArchive(
+  resultId: string,
+  resultAttemptId: string,
+): Promise<void> {
+  const archive = await createVerifiedRestartArchiveFixture(db, {
+    resultId,
+    resultAttemptId,
+  });
+  cleanupEvidenceBlobIds.add(archive.blobId);
+}
+
+async function runtimeForRevision(
+  revisionId: string,
+  label: string,
+): Promise<EngineRuntimeIdentity> {
+  const [implementation] = await db
+    .select({
+      family: solverImplementations.family,
+      distribution: solverImplementations.distribution,
+      version: solverImplementations.releaseVersion,
+      numericsRevision: solverImplementations.numericsRevision,
+      adapterContractVersion: solverImplementations.adapterContractVersion,
+    })
+    .from(simulationPresetRevisions)
+    .innerJoin(
+      solverImplementations,
+      eq(
+        solverImplementations.id,
+        simulationPresetRevisions.solverImplementationId,
+      ),
+    )
+    .where(eq(simulationPresetRevisions.id, revisionId))
+    .limit(1);
+  if (!implementation) {
+    throw new Error(`test runtime requires revision ${revisionId}`);
+  }
+  return {
+    family: implementation.family,
+    distribution: implementation.distribution,
+    version: implementation.version,
+    numerics_revision: implementation.numericsRevision,
+    adapter_contract_version: implementation.adapterContractVersion,
+    build_id: `${testRunSlug}-${label}`,
+    application_source_sha256: createHash("sha256")
+      .update(`${testRunSlug}:${label}:runtime`)
+      .digest("hex"),
+  };
+}
+
+async function rememberJobRuntimeBuild(jobId: string): Promise<void> {
+  const [job] = await db
+    .select({ solverRuntimeBuildId: simJobs.solverRuntimeBuildId })
+    .from(simJobs)
+    .where(eq(simJobs.id, jobId))
+    .limit(1);
+  if (job?.solverRuntimeBuildId) {
+    cleanupRuntimeBuildIds.add(job.solverRuntimeBuildId);
+  }
+}
+
+async function insertExactManifest(args: {
+  resultId: string;
+  resultAttemptId: string;
+  airfoilId: string;
+  simJobId?: string | null;
+  engineJobId?: string | null;
+  engineCaseSlug: string;
+  methodKey: string;
+  solverImplementationId: string;
+  aoaDeg: number;
+}) {
+  await db.insert(solverEvidenceArtifacts).values({
+    resultId: args.resultId,
+    resultAttemptId: args.resultAttemptId,
+    airfoilId: args.airfoilId,
+    simJobId: args.simJobId ?? null,
+    engineJobId: args.engineJobId ?? null,
+    engineCaseSlug: args.engineCaseSlug,
+    methodKey: args.methodKey,
+    solverImplementationId: args.solverImplementationId,
+    aoaDeg: args.aoaDeg,
+    kind: "manifest",
+    storageKey: `${testRunSlug}/manifest/${args.resultAttemptId}.json`,
+    mimeType: "application/json",
+    sha256: "a".repeat(64),
+    byteSize: 1,
+  });
+}
 
 async function createTestAirfoil(label: string) {
   if (!categoryId) {
@@ -611,6 +716,28 @@ afterAll(async () => {
       .delete(syncSweepPromises)
       .where(inArray(syncSweepPromises.id, Array.from(cleanupSyncPromiseIds)));
   }
+  if (cleanupVerifyQueueIds.size) {
+    await db
+      .delete(simUransVerifyQueue)
+      .where(
+        inArray(simUransVerifyQueue.id, Array.from(cleanupVerifyQueueIds)),
+      );
+  }
+  if (cleanupUransRequestIds.size) {
+    await db
+      .delete(simUransRequests)
+      .where(inArray(simUransRequests.id, Array.from(cleanupUransRequestIds)));
+  }
+  if (cleanupPrecalcObligationIds.size) {
+    await db
+      .delete(simPrecalcObligations)
+      .where(
+        inArray(
+          simPrecalcObligations.id,
+          Array.from(cleanupPrecalcObligationIds),
+        ),
+      );
+  }
   if (testPresetRevisionId) {
     await db
       .delete(polarFitSets)
@@ -647,6 +774,18 @@ afterAll(async () => {
     await db
       .delete(simJobs)
       .where(inArray(simJobs.id, Array.from(cleanupJobIds)));
+  if (cleanupEvidenceBlobIds.size)
+    await db
+      .delete(solverEvidenceBlobs)
+      .where(
+        inArray(solverEvidenceBlobs.id, Array.from(cleanupEvidenceBlobIds)),
+      );
+  if (cleanupRuntimeBuildIds.size)
+    await db
+      .delete(solverRuntimeBuilds)
+      .where(
+        inArray(solverRuntimeBuilds.id, Array.from(cleanupRuntimeBuildIds)),
+      );
   if (cleanupPresetIds.size)
     await db
       .delete(simulationPresets)
@@ -941,6 +1080,9 @@ describe("sweeper: gap → claim → ingest", () => {
         aoaDeg,
       })),
       { backgroundOwner: true },
+    );
+    obligations.forEach((obligation) =>
+      cleanupPrecalcObligationIds.add(obligation.id),
     );
     expect(obligations).toHaveLength(2);
     const [pending] = await db
@@ -2010,6 +2152,7 @@ describe("sweeper: gap → claim → ingest", () => {
   // MAX_SCALE_RENDER_ATTEMPTS and skip rows a newer version obsoleted.
   it("retries a failed scaled-media render (bounded) and activates the scale on recovery", async () => {
     const { bc, presetRevisionId } = await firstAirfoilBc();
+    const runtime = await runtimeForRevision(presetRevisionId, "scale-retry");
     // Color scales are polar-wide (airfoil + revision + field + profile), so
     // this retry test owns a separate airfoil instead of depending on scales
     // left by the earlier ingest test in this file.
@@ -2034,6 +2177,7 @@ describe("sweeper: gap → claim → ingest", () => {
         wave: 1,
         status: "running",
         engineJobId: "scale-retry-job",
+        methodKey: "openfoam.urans",
       })
       .returning({ id: simJobs.id });
     cleanupJobIds.add(job.id);
@@ -2076,6 +2220,7 @@ describe("sweeper: gap → claim → ingest", () => {
     const result: JobResult = {
       job_id: "scale-retry-job",
       state: "completed",
+      engine: runtime,
       polars: [
         {
           speed: bc.speedMps,
@@ -2085,6 +2230,7 @@ describe("sweeper: gap → claim → ingest", () => {
           points: [
             {
               case_slug: "srt1",
+              method_key: "openfoam.urans",
               aoa_deg: aoa,
               cl: 0.5,
               cd: 0.011,
@@ -2175,6 +2321,8 @@ describe("sweeper: gap → claim → ingest", () => {
           eq(resultAttempts.simJobId, job.id),
         ),
       );
+    await rememberJobRuntimeBuild(job.id);
+    await attachVerifiedRestartArchive(row.id, sourceAttempt.id);
 
     // The engine job must settle before the durable media worker starts its
     // expensive extent/render pass. Exercise that production path explicitly
@@ -4277,6 +4425,898 @@ describe("sweeper: gap → claim → ingest", () => {
         .from(simJobs)
         .where(and(eq(simJobs.parentJobId, job.id), eq(simJobs.wave, 2))),
     ).toHaveLength(0);
+  }, 60000);
+
+  it("MUST-CATCH: running PRECALC partial settles only its accepted point and queues exact FINAL after verified archival", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const runtime = await runtimeForRevision(
+      presetRevisionId,
+      "running-precalc-partial",
+    );
+    const aoas = [125.306, 126.306];
+    const engineJobId = `running-precalc-partial-${testRunSlug}`;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
+    const obligations = await ensurePrecalcObligations(
+      db,
+      aoas.map((aoaDeg) => ({
+        airfoilId: a.id,
+        revisionId: presetRevisionId,
+        aoaDeg,
+      })),
+      { backgroundOwner: true },
+    );
+    obligations.forEach((obligation) =>
+      cleanupPrecalcObligationIds.add(obligation.id),
+    );
+    const obligationByAoa = new Map(
+      obligations.map((obligation) => [obligation.aoaDeg, obligation]),
+    );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 2,
+        status: "running",
+        engineState: "running",
+        engineJobId,
+        methodKey: "openfoam.urans",
+        submittedAt: new Date(Date.now() - 60 * 60 * 1000),
+        totalCases: aoas.length,
+        completedCases: 0,
+        requestPayload: {
+          speedMap: [
+            {
+              speed: bc.speedMps,
+              bcId: bc.id,
+              presetRevisionId,
+              mach: bc.mach,
+            },
+          ],
+          aoas,
+          uransFidelity: "precalc",
+          precalcObligationIds: obligations.map((obligation) => obligation.id),
+        },
+      })
+      .returning();
+    cleanupJobIds.add(job.id);
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "running",
+        attemptCount: 1,
+        latestSimJobId: job.id,
+        lastOutcome: "submitted",
+        lastAttemptAt: new Date(),
+      })
+      .where(
+        inArray(
+          simPrecalcObligations.id,
+          obligations.map((obligation) => obligation.id),
+        ),
+      );
+    await db.insert(simPrecalcObligationAttempts).values(
+      obligations.map((obligation) => ({
+        obligationId: obligation.id,
+        simJobId: job.id,
+        attemptNumber: 1,
+        state: "submitted" as const,
+      })),
+    );
+    const seededResults = await db
+      .insert(results)
+      .values(
+        aoas.map((aoaDeg) => ({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg,
+          status: "running" as const,
+          source: "queued" as const,
+          regime: "rans" as const,
+          fidelity: "rans" as const,
+          simJobId: job.id,
+          engineJobId,
+        })),
+      )
+      .returning({ id: results.id, aoaDeg: results.aoaDeg });
+    seededResults.forEach((row) => cleanupResultIds.add(row.id));
+
+    const acceptedAoa = aoas[0];
+    const acceptedCase = "running-precalc-accepted";
+    const acceptedPoint = {
+      case_slug: acceptedCase,
+      method_key: "openfoam.urans",
+      aoa_deg: acceptedAoa,
+      cl: 0.74,
+      cd: 0.029,
+      cm: -0.036,
+      cl_cd: 25.5,
+      cl_std: 0.03,
+      cd_std: 0.002,
+      unsteady: true,
+      converged: true,
+      first_order_fallback: false,
+      fidelity: "urans_precalc" as const,
+      frame_track: {
+        period_s: 0.25,
+        periods_retained: 4.5,
+        stationary: true,
+        drift_frac: 0.01,
+        window: { t_start: 1, t_end: 2.125 },
+        stats: {
+          cl: { mean: 0.74, std: 0.03, min: 0.69, max: 0.79 },
+          cd: { mean: 0.029, std: 0.002, min: 0.026, max: 0.032 },
+          cm: { mean: -0.036, std: 0.002, min: -0.039, max: -0.033 },
+        },
+        fields: ["velocity_magnitude"],
+        frames: [],
+        image_pattern: "frames/{field}/f{i04}.png",
+      },
+      force_history: {
+        t: [1, 1.25, 1.5, 1.75, 2, 2.125],
+        cl: [0.72, 0.76, 0.73, 0.75, 0.74, 0.74],
+        cd: [0.028, 0.03, 0.029, 0.029, 0.029, 0.029],
+        cm: [-0.035, -0.037, -0.036, -0.036, -0.036, -0.036],
+        shedding_freq_hz: 4,
+        samples: 240,
+      },
+      images: {
+        velocity_magnitude: `/jobs/${engineJobId}/files/cases/${acceptedCase}/images/velocity_magnitude.png`,
+      },
+      mean_images: {
+        velocity_magnitude: `/jobs/${engineJobId}/files/cases/${acceptedCase}/images/velocity_magnitude_mean.png`,
+      },
+      video: {
+        velocity_magnitude: `/jobs/${engineJobId}/files/cases/${acceptedCase}/images/velocity_magnitude.mp4`,
+      },
+    };
+    const partialResult: JobResult = {
+      job_id: engineJobId,
+      state: "running",
+      engine: runtime,
+      polars: [
+        {
+          speed: bc.speedMps,
+          chord: bc.referenceChordM,
+          reynolds: bc.reynolds,
+          mach: bc.mach,
+          points: [acceptedPoint],
+        },
+      ],
+    };
+    const partialEngine = {
+      getQueue: async () => emptyQueue([engineJobId]),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: true,
+            cancelled: false,
+            process_count: 1,
+            status_readable: true,
+            status_error: null,
+            status_state: "running",
+            status_total_cases: aoas.length,
+            status_completed_cases: 1,
+            result_readable: true,
+            result_error: null,
+            has_result: true,
+            result_state: "running",
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: "running",
+        total_cases: aoas.length,
+        completed_cases: 1,
+      }),
+      getResult: async () => withExactManifestEvidence(partialResult),
+      fileUrl: (jobId: string, relPath: string) =>
+        `http://engine.test/jobs/${jobId}/files/${relPath}`,
+    } as unknown as EngineClient;
+
+    await reconcile(db, partialEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+
+    const exactAttempt = (
+      await db
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(
+          and(
+            eq(resultAttempts.simJobId, job.id),
+            eq(resultAttempts.aoaDeg, acceptedAoa),
+          ),
+        )
+    )[0];
+    expect(exactAttempt?.id).toBeTruthy();
+    if (exactAttempt?.id) cleanupAttemptIds.add(exactAttempt.id);
+    await rememberJobRuntimeBuild(job.id);
+    expect(
+      await db
+        .select({ id: simUransVerifyQueue.id })
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.precalcResultAttemptId, exactAttempt.id)),
+    ).toHaveLength(0);
+    await attachVerifiedRestartArchive(
+      seededResults.find((row) => row.aoaDeg === acceptedAoa)!.id,
+      exactAttempt.id,
+    );
+    await settleAcceptedRunningPrecalcPartials(db, {
+      simJobId: job.id,
+      obligationIds: obligations.map((obligation) => obligation.id),
+    });
+    const obligationStates = await db
+      .select({
+        id: simPrecalcObligations.id,
+        aoaDeg: simPrecalcObligations.aoaDeg,
+        state: simPrecalcObligations.state,
+        sourceResultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+        completedAt: simPrecalcObligations.completedAt,
+      })
+      .from(simPrecalcObligations)
+      .where(
+        inArray(
+          simPrecalcObligations.id,
+          obligations.map((obligation) => obligation.id),
+        ),
+      );
+    expect(
+      obligationStates.find((row) => row.aoaDeg === acceptedAoa),
+    ).toMatchObject({
+      state: "satisfied",
+      sourceResultAttemptId: exactAttempt.id,
+    });
+    expect(
+      obligationStates.find((row) => row.aoaDeg === aoas[1]),
+    ).toMatchObject({
+      state: "running",
+      sourceResultAttemptId: null,
+    });
+    const submissionStates = await db
+      .select({
+        obligationId: simPrecalcObligationAttempts.obligationId,
+        state: simPrecalcObligationAttempts.state,
+        resultAttemptId: simPrecalcObligationAttempts.resultAttemptId,
+      })
+      .from(simPrecalcObligationAttempts)
+      .where(
+        inArray(
+          simPrecalcObligationAttempts.obligationId,
+          obligations.map((obligation) => obligation.id),
+        ),
+      );
+    expect(
+      submissionStates.find(
+        (row) => row.obligationId === obligationByAoa.get(acceptedAoa)?.id,
+      ),
+    ).toMatchObject({ state: "accepted", resultAttemptId: exactAttempt.id });
+    expect(
+      submissionStates.find(
+        (row) => row.obligationId === obligationByAoa.get(aoas[1])?.id,
+      ),
+    ).toMatchObject({ state: "submitted", resultAttemptId: null });
+    let verifyRows = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultAttemptId, exactAttempt.id));
+    expect(verifyRows).toHaveLength(1);
+    cleanupVerifyQueueIds.add(verifyRows[0]!.id);
+    expect(verifyRows[0]).toMatchObject({
+      state: "pending",
+      backgroundOwner: true,
+      aoaDeg: acceptedAoa,
+    });
+    expect(
+      await db
+        .select({ id: simUransVerifyQueue.id })
+        .from(simUransVerifyQueue)
+        .where(eq(simUransVerifyQueue.aoaDeg, aoas[1])),
+    ).toHaveLength(0);
+    const [jobAfterPartial] = await db
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        completedCases: simJobs.completedCases,
+        finishedAt: simJobs.finishedAt,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    expect(jobAfterPartial).toEqual({
+      status: "running",
+      engineState: "running",
+      completedCases: 1,
+      finishedAt: null,
+    });
+
+    // Simulate the crash boundary that motivated this projection: evidence
+    // and its accepted classification committed, then the exact ladder
+    // transaction failed. The next engine poll has no point payload at all.
+    // Settlement must be driven by durable exact evidence, not points ingested
+    // in this particular call.
+    await db
+      .delete(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultAttemptId, exactAttempt.id));
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "running",
+        sourceResultId: null,
+        sourceResultAttemptId: null,
+        lastOutcome: "submitted",
+        completedAt: null,
+      })
+      .where(
+        eq(simPrecalcObligations.id, obligationByAoa.get(acceptedAoa)!.id),
+      );
+    await db
+      .update(simPrecalcObligationAttempts)
+      .set({
+        state: "submitted",
+        outcome: null,
+        resultAttemptId: null,
+        completedAt: null,
+      })
+      .where(
+        eq(
+          simPrecalcObligationAttempts.obligationId,
+          obligationByAoa.get(acceptedAoa)!.id,
+        ),
+      );
+    let replayResultFetches = 0;
+    const emptyReplayEngine = {
+      ...partialEngine,
+      getResult: async (): Promise<JobResult> => {
+        replayResultFetches += 1;
+        throw new Error(
+          "equal completed-case counts must not fetch result.json",
+        );
+      },
+    } as unknown as EngineClient;
+    await reconcile(db, emptyReplayEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+    expect(replayResultFetches).toBe(0);
+    const [acceptedAfterEmptyReplay] = await db
+      .select({
+        state: simPrecalcObligations.state,
+        sourceResultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+        completedAt: simPrecalcObligations.completedAt,
+      })
+      .from(simPrecalcObligations)
+      .where(
+        eq(simPrecalcObligations.id, obligationByAoa.get(acceptedAoa)!.id),
+      );
+    expect(acceptedAfterEmptyReplay).toMatchObject({
+      state: "satisfied",
+      sourceResultAttemptId: exactAttempt.id,
+    });
+    verifyRows = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultAttemptId, exactAttempt.id));
+    expect(verifyRows).toHaveLength(1);
+    cleanupVerifyQueueIds.add(verifyRows[0]!.id);
+    const [siblingAfterEmptyReplay] = await db
+      .select({ state: simPrecalcObligations.state })
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligationByAoa.get(aoas[1])!.id));
+    expect(siblingAfterEmptyReplay.state).toBe("running");
+
+    // Exercise the transaction once more after complete projection. A pure
+    // replay must neither mint another FINAL owner nor churn completedAt.
+    await settleAcceptedRunningPrecalcPartials(db, {
+      simJobId: job.id,
+      obligationIds: obligations.map((obligation) => obligation.id),
+    });
+    verifyRows = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultAttemptId, exactAttempt.id));
+    expect(verifyRows).toHaveLength(1);
+    const [acceptedAfterReplay] = await db
+      .select({ completedAt: simPrecalcObligations.completedAt })
+      .from(simPrecalcObligations)
+      .where(
+        eq(simPrecalcObligations.id, obligationByAoa.get(acceptedAoa)!.id),
+      );
+    expect(acceptedAfterReplay.completedAt).toEqual(
+      acceptedAfterEmptyReplay.completedAt,
+    );
+    const [siblingAfterReplay] = await db
+      .select({ state: simPrecalcObligations.state })
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligationByAoa.get(aoas[1])!.id));
+    expect(siblingAfterReplay.state).toBe("running");
+  }, 60000);
+
+  it("MUST-CATCH: running PRECALC partial preserves continuation work and does not duplicate an accepted current FINAL", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const [revision] = await db
+      .select({
+        solverImplementationId:
+          simulationPresetRevisions.solverImplementationId,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, presetRevisionId))
+      .limit(1);
+    if (!revision?.solverImplementationId) {
+      throw new Error("running PRECALC fixture requires solver implementation");
+    }
+    const solverImplementationId = revision.solverImplementationId;
+    const warningAoa = 127.306;
+    const finalSelectedAoa = 128.306;
+    const missingManifestAoa = 129.306;
+    const aoas = [warningAoa, finalSelectedAoa, missingManifestAoa];
+    const engineJobId = `running-precalc-acceptance-guards-${testRunSlug}`;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, aoas),
+        ),
+      );
+    const obligations = await ensurePrecalcObligations(
+      db,
+      aoas.map((aoaDeg) => ({
+        airfoilId: a.id,
+        revisionId: presetRevisionId,
+        aoaDeg,
+      })),
+      { backgroundOwner: true },
+    );
+    obligations.forEach((obligation) =>
+      cleanupPrecalcObligationIds.add(obligation.id),
+    );
+    const obligationByAoa = new Map(
+      obligations.map((obligation) => [obligation.aoaDeg, obligation]),
+    );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 2,
+        status: "running",
+        engineState: "running",
+        engineJobId,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
+        submittedAt: new Date(),
+        totalCases: aoas.length,
+        completedCases: aoas.length,
+        requestPayload: {
+          aoas,
+          uransFidelity: "precalc",
+          precalcObligationIds: obligations.map((obligation) => obligation.id),
+        },
+      })
+      .returning();
+    cleanupJobIds.add(job.id);
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "running",
+        attemptCount: 1,
+        latestSimJobId: job.id,
+        lastOutcome: "submitted",
+        lastAttemptAt: new Date(),
+      })
+      .where(
+        inArray(
+          simPrecalcObligations.id,
+          obligations.map((obligation) => obligation.id),
+        ),
+      );
+    await db.insert(simPrecalcObligationAttempts).values(
+      obligations.map((obligation) => ({
+        obligationId: obligation.id,
+        simJobId: job.id,
+        attemptNumber: 1,
+        state: "submitted" as const,
+      })),
+    );
+    const resultRows = await db
+      .insert(results)
+      .values(
+        aoas.map((aoaDeg) => ({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "urans" as const,
+          fidelity:
+            aoaDeg === finalSelectedAoa ? "urans_full" : "urans_precalc",
+          cl: 0.7,
+          cd: 0.03,
+          cm: -0.04,
+          unsteady: true,
+          converged: true,
+          simJobId: job.id,
+          engineJobId,
+          methodKey: "openfoam.urans",
+          solverImplementationId,
+          solvedAt: new Date(),
+        })),
+      )
+      .returning({ id: results.id, aoaDeg: results.aoaDeg });
+    resultRows.forEach((row) => cleanupResultIds.add(row.id));
+    const resultByAoa = new Map(resultRows.map((row) => [row.aoaDeg, row.id]));
+    const exactAttempts = await db
+      .insert(resultAttempts)
+      .values(
+        aoas.map((aoaDeg) => ({
+          resultId: resultByAoa.get(aoaDeg)!,
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg,
+          simJobId: job.id,
+          engineJobId,
+          engineCaseSlug: `aoa_${aoaDeg}_precalc`,
+          methodKey: "openfoam.urans",
+          solverImplementationId,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "urans" as const,
+          validForPolar: true,
+          cl: 0.7,
+          cd: 0.03,
+          cm: -0.04,
+          unsteady: true,
+          converged: true,
+          qualityWarnings:
+            aoaDeg === warningAoa
+              ? [
+                  `${URANS_CONTINUATION_REQUIRED_MARKER}: retained window needs another same-case segment`,
+                ]
+              : null,
+          evidencePayload: { fidelity: "urans_precalc" },
+          solvedAt: new Date(),
+        })),
+      )
+      .returning({ id: resultAttempts.id, aoaDeg: resultAttempts.aoaDeg });
+    exactAttempts.forEach((attempt) => cleanupAttemptIds.add(attempt.id));
+    const exactAttemptByAoa = new Map(
+      exactAttempts.map((attempt) => [attempt.aoaDeg, attempt.id]),
+    );
+    await db.insert(resultClassifications).values(
+      exactAttempts.map((attempt) => ({
+        resultAttemptId: attempt.id,
+        airfoilId: a.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: attempt.aoaDeg,
+        regime: "urans" as const,
+        classifierVersion: "running-precalc-acceptance-guards-v1",
+        state: "accepted" as const,
+        region: "post_stall" as const,
+        confidence: 1,
+        reasons: [],
+      })),
+    );
+    for (const attempt of exactAttempts) {
+      if (attempt.aoaDeg === missingManifestAoa) continue;
+      await insertExactManifest({
+        resultId: resultByAoa.get(attempt.aoaDeg)!,
+        resultAttemptId: attempt.id,
+        airfoilId: a.id,
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug: `aoa_${attempt.aoaDeg}_precalc`,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
+        aoaDeg: attempt.aoaDeg,
+      });
+    }
+    await attachVerifiedRestartArchive(
+      resultByAoa.get(finalSelectedAoa)!,
+      exactAttemptByAoa.get(finalSelectedAoa)!,
+    );
+    const [existingQueue] = await db
+      .insert(simUransVerifyQueue)
+      .values({
+        airfoilId: a.id,
+        revisionId: presetRevisionId,
+        aoaDeg: finalSelectedAoa,
+        backgroundOwner: true,
+        state: "pending",
+        precalcResultId: resultByAoa.get(finalSelectedAoa)!,
+        precalcResultAttemptId: exactAttemptByAoa.get(finalSelectedAoa)!,
+      })
+      .returning({ id: simUransVerifyQueue.id });
+    cleanupVerifyQueueIds.add(existingQueue.id);
+    const finalEngineJobId = `${engineJobId}-existing-final`;
+    const [finalJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 2,
+        status: "done",
+        engineState: "success",
+        engineJobId: finalEngineJobId,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
+        submittedAt: new Date(),
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        totalCases: 1,
+        completedCases: 1,
+        requestPayload: {
+          verifyQueueItemId: existingQueue.id,
+          verifyPrecalcResultAttemptId:
+            exactAttemptByAoa.get(finalSelectedAoa)!,
+          uransFidelity: "full",
+          aoas: [finalSelectedAoa],
+        },
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(finalJob.id);
+    const [acceptedFullAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: resultByAoa.get(finalSelectedAoa)!,
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: finalSelectedAoa,
+        simJobId: finalJob.id,
+        engineJobId: finalEngineJobId,
+        engineCaseSlug: `aoa_${finalSelectedAoa}_full`,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: true,
+        cl: 0.71,
+        cd: 0.031,
+        cm: -0.041,
+        unsteady: true,
+        converged: true,
+        evidencePayload: { fidelity: "urans_full" },
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    cleanupAttemptIds.add(acceptedFullAttempt.id);
+    await db.insert(resultClassifications).values({
+      resultAttemptId: acceptedFullAttempt.id,
+      airfoilId: a.id,
+      simulationPresetRevisionId: presetRevisionId,
+      aoaDeg: finalSelectedAoa,
+      regime: "urans",
+      classifierVersion: "running-precalc-existing-final-v1",
+      state: "accepted",
+      region: "post_stall",
+      confidence: 1,
+      reasons: [],
+    });
+    await db.insert(resultClassifications).values({
+      resultId: resultByAoa.get(finalSelectedAoa)!,
+      airfoilId: a.id,
+      simulationPresetRevisionId: presetRevisionId,
+      aoaDeg: finalSelectedAoa,
+      regime: "urans",
+      classifierVersion: "running-precalc-existing-final-canonical-v1",
+      state: "accepted",
+      region: "post_stall",
+      confidence: 1,
+      reasons: [],
+    });
+    await insertExactManifest({
+      resultId: resultByAoa.get(finalSelectedAoa)!,
+      resultAttemptId: acceptedFullAttempt.id,
+      airfoilId: a.id,
+      simJobId: finalJob.id,
+      engineJobId: finalEngineJobId,
+      engineCaseSlug: `aoa_${finalSelectedAoa}_full`,
+      methodKey: "openfoam.urans",
+      solverImplementationId,
+      aoaDeg: finalSelectedAoa,
+    });
+    await db
+      .update(resultClassifications)
+      .set({
+        state: "superseded_by_urans",
+        supersededByResultId: resultByAoa.get(finalSelectedAoa)!,
+      })
+      .where(
+        eq(
+          resultClassifications.resultAttemptId,
+          exactAttemptByAoa.get(finalSelectedAoa)!,
+        ),
+      );
+    await db
+      .update(results)
+      .set({
+        currentResultAttemptId: exactAttemptByAoa.get(warningAoa)!,
+      })
+      .where(eq(results.id, resultByAoa.get(warningAoa)!));
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: acceptedFullAttempt.id })
+      .where(eq(results.id, resultByAoa.get(finalSelectedAoa)!));
+    await db
+      .update(simUransVerifyQueue)
+      .set({
+        state: "done",
+        simJobId: finalJob.id,
+        verifyResultId: resultByAoa.get(finalSelectedAoa)!,
+        deltaCl: 0.01,
+        deltaCd: 0.001,
+        deltaCm: -0.001,
+        freshAttemptCount: 1,
+        latestResultAttemptId: acceptedFullAttempt.id,
+        lastOutcome: "accepted",
+      })
+      .where(eq(simUransVerifyQueue.id, existingQueue.id));
+
+    const [fullRequest] = await db
+      .insert(simUransRequests)
+      .values({
+        airfoilId: a.id,
+        revisionId: presetRevisionId,
+        aoaDeg: finalSelectedAoa,
+        fidelity: "full",
+        state: "pending",
+        backgroundOwner: true,
+        requestedBy: "test:running-precalc-existing-final",
+      })
+      .returning({ id: simUransRequests.id });
+    cleanupUransRequestIds.add(fullRequest.id);
+    await db.insert(simPrecalcObligationRequests).values({
+      obligationId: obligationByAoa.get(finalSelectedAoa)!.id,
+      requestId: fullRequest.id,
+    });
+
+    const settled = await settleAcceptedRunningPrecalcPartials(db, {
+      simJobId: job.id,
+      obligationIds: obligations.map((obligation) => obligation.id),
+    });
+    expect(settled).toEqual([
+      expect.objectContaining({
+        obligationId: obligationByAoa.get(finalSelectedAoa)!.id,
+        resultAttemptId: exactAttemptByAoa.get(finalSelectedAoa)!,
+        verifyQueueId: expect.any(String),
+        verifyQueueCreated: false,
+        changed: true,
+      }),
+    ]);
+    const obligationStates = await db
+      .select({
+        id: simPrecalcObligations.id,
+        state: simPrecalcObligations.state,
+        sourceResultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+      })
+      .from(simPrecalcObligations)
+      .where(
+        inArray(
+          simPrecalcObligations.id,
+          obligations.map((obligation) => obligation.id),
+        ),
+      );
+    expect(
+      obligationStates.find(
+        (row) => row.id === obligationByAoa.get(warningAoa)!.id,
+      ),
+    ).toMatchObject({ state: "running", sourceResultAttemptId: null });
+    expect(
+      obligationStates.find(
+        (row) => row.id === obligationByAoa.get(missingManifestAoa)!.id,
+      ),
+    ).toMatchObject({ state: "running", sourceResultAttemptId: null });
+    expect(
+      obligationStates.find(
+        (row) => row.id === obligationByAoa.get(finalSelectedAoa)!.id,
+      ),
+    ).toMatchObject({
+      state: "satisfied",
+      sourceResultAttemptId: exactAttemptByAoa.get(finalSelectedAoa),
+    });
+    const submissionStates = await db
+      .select({
+        obligationId: simPrecalcObligationAttempts.obligationId,
+        state: simPrecalcObligationAttempts.state,
+        resultAttemptId: simPrecalcObligationAttempts.resultAttemptId,
+      })
+      .from(simPrecalcObligationAttempts)
+      .where(
+        inArray(
+          simPrecalcObligationAttempts.obligationId,
+          obligations.map((obligation) => obligation.id),
+        ),
+      );
+    expect(
+      submissionStates.find(
+        (row) => row.obligationId === obligationByAoa.get(warningAoa)!.id,
+      ),
+    ).toMatchObject({ state: "submitted", resultAttemptId: null });
+    expect(
+      submissionStates.find(
+        (row) => row.obligationId === obligationByAoa.get(finalSelectedAoa)!.id,
+      ),
+    ).toMatchObject({
+      state: "accepted",
+      resultAttemptId: exactAttemptByAoa.get(finalSelectedAoa),
+    });
+    const queueRows = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(
+        inArray(
+          simUransVerifyQueue.precalcResultAttemptId,
+          exactAttempts.map((attempt) => attempt.id),
+        ),
+      );
+    expect(queueRows).toHaveLength(1);
+    expect(queueRows[0]).toMatchObject({
+      state: "done",
+      precalcResultAttemptId: exactAttemptByAoa.get(finalSelectedAoa),
+      verifyResultId: resultByAoa.get(finalSelectedAoa),
+      latestResultAttemptId: acceptedFullAttempt.id,
+      lastOutcome: "accepted",
+    });
+    expect(queueRows[0]!.deltaCl).toBeCloseTo(0.01, 10);
+    expect(queueRows[0]!.deltaCd).toBeCloseTo(0.001, 10);
+    expect(queueRows[0]!.deltaCm).toBeCloseTo(-0.001, 10);
+    cleanupVerifyQueueIds.add(queueRows[0]!.id);
+    expect(
+      await db
+        .select()
+        .from(simUransVerifyQueueRequests)
+        .where(
+          and(
+            eq(simUransVerifyQueueRequests.queueId, queueRows[0]!.id),
+            eq(simUransVerifyQueueRequests.requestId, fullRequest.id),
+          ),
+        ),
+    ).toHaveLength(1);
+    const [requestAfterProjection] = await db
+      .select({ state: simUransRequests.state })
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, fullRequest.id));
+    expect(requestAfterProjection.state).toBe("done");
+    expect(
+      await db
+        .select({ id: simUransVerifyQueue.id })
+        .from(simUransVerifyQueue)
+        .where(
+          and(
+            eq(simUransVerifyQueue.airfoilId, a.id),
+            eq(simUransVerifyQueue.revisionId, presetRevisionId),
+            eq(simUransVerifyQueue.aoaDeg, finalSelectedAoa),
+            inArray(simUransVerifyQueue.state, ["pending", "running"]),
+          ),
+        ),
+    ).toHaveLength(0);
+    const [jobAfterSettlement] = await db
+      .select({ status: simJobs.status, finishedAt: simJobs.finishedAt })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    expect(jobAfterSettlement).toEqual({ status: "running", finishedAt: null });
   }, 60000);
 
   it("MUST-CATCH: running partial ingest durably records a typed whole-polar promotion before terminal sibling work", async () => {

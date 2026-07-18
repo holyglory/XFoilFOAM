@@ -232,6 +232,7 @@ function storyWith(verify: PointVerifyInfo | null): PointStoryPayload {
       reviewBucket: null,
       workDisposition: null,
       continuable: false,
+      continuationResultAttemptId: null,
       verify,
     },
     attempts: [],

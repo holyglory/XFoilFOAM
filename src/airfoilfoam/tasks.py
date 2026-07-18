@@ -775,26 +775,43 @@ def _start_runtime_heartbeat(
         grace_s=settings.divergence_grace_minutes * 60.0,
     )
     march_watchdog = MarchRateWatchdog()
+    # request.json is immutable after submission.  Resolve case identity from
+    # it instead of ever combining a live process slug with another parallel
+    # future's singular status AoA.
+    request = store.read_request(job_id)
 
     def loop() -> None:
         while not stop.is_set():
             try:
                 status = store.read_status(job_id)
                 processes = store.job_process_details(job_id)
-                active = _active_process(processes)
+                active, active_case_slug, active_aoa_deg = _runtime_active_case(
+                    processes, status, request
+                )
+                active_phase = _runtime_active_phase(active, status)
+                token_mtime = _active_case_progress_mtime(
+                    store.job_dir(job_id), active_case_slug
+                )
+                last_progress = _runtime_last_progress_at(
+                    active,
+                    status,
+                    token_mtime,
+                )
                 store.write_runtime_heartbeat(
                     job_id,
                     os.getpid(),
                     len(processes),
                     process_details=processes,
-                    phase=status.phase.value if status else None,
+                    phase=active_phase.value if active_phase is not None else None,
                     active_solver=(active or {}).get("command") or (status.active_solver if status else None),
-                    active_case_slug=(active or {}).get("case_slug") or (status.active_case_slug if status else None),
-                    active_aoa_deg=status.active_aoa_deg if status else None,
+                    active_case_slug=active_case_slug,
+                    active_aoa_deg=active_aoa_deg,
                     cpu_tokens_waiting=status.cpu_tokens_waiting if status else None,
                     cpu_tokens_held=status.cpu_tokens_held if status else None,
                     current_case=(active or {}).get("case_slug"),
-                    last_progress_at=status.last_progress_at.isoformat() if status and status.last_progress_at else None,
+                    last_progress_at=(
+                        last_progress.isoformat() if last_progress is not None else None
+                    ),
                 )
             except Exception:
                 pass
@@ -835,6 +852,137 @@ def _active_process(processes: list[dict]) -> dict | None:
             if proc.get("solver_mode") == mode:
                 return proc
     return processes[0] if processes else None
+
+
+def _runtime_active_case(
+    processes: list[dict],
+    status: Optional[JobStatus],
+    request: Optional[PolarRequest],
+) -> tuple[dict | None, Optional[str], Optional[float]]:
+    """Return one internally-consistent representative active case.
+
+    The runtime API retains singular fields for backwards compatibility even
+    when ``case_parallel`` has several live futures.  A process cwd is stronger
+    evidence of the selected representative slug than the shared status
+    context.  Its AoA therefore comes from the same immutable request case;
+    an unknown/nested slug is reported with unknown AoA instead of borrowing a
+    different future's value.
+    """
+
+    active = _active_process(processes)
+    process_slug = (active or {}).get("case_slug")
+    status_slug = status.active_case_slug if status is not None else None
+    active_slug = process_slug or status_slug
+    if active_slug is None:
+        return active, None, None
+
+    if request is not None:
+        for case in request.cases():
+            if case.slug == active_slug:
+                return active, active_slug, case.aoa_deg
+
+    if status is not None and active_slug == status_slug:
+        return active, active_slug, status.active_aoa_deg
+    return active, active_slug, None
+
+
+def _runtime_active_phase(
+    active: Optional[dict], status: Optional[JobStatus]
+) -> Optional[JobPhase]:
+    """Phase belonging to the same representative process as runtime case.
+
+    Parallel futures may leave the singular persisted status on another
+    case's postprocessing callback while pimpleFoam is actively advancing the
+    representative case.  A known process mode is direct runtime evidence and
+    wins; status is retained only when process inspection cannot classify it.
+    """
+
+    phase_by_mode = {
+        "urans": JobPhase.solving_urans,
+        "rans": JobPhase.solving_rans,
+        "meshing": JobPhase.meshing,
+    }
+    mode = (active or {}).get("solver_mode")
+    if mode in phase_by_mode:
+        return phase_by_mode[mode]
+    return status.phase if status is not None else None
+
+
+def _active_case_progress_mtime(
+    job_dir: Path, case_slug: Optional[str]
+) -> Optional[float]:
+    """Newest real force-coefficient append for one selected active case.
+
+    This is intentionally a fixed-depth, case-local glob used every heartbeat;
+    it never walks the job's potentially huge VTK tree.  A missing token stays
+    ``None`` so heartbeats alone cannot invent solver progress.
+    """
+
+    if not case_slug:
+        return None
+    cases_root = (job_dir / "cases").resolve()
+    case_root = (cases_root / case_slug).resolve()
+    try:
+        case_root.relative_to(cases_root)
+    except ValueError:
+        return None
+    if not case_root.is_dir():
+        return None
+
+    newest: Optional[float] = None
+    for depth in ("", "*", "*/*", "*/*/*"):
+        prefix = f"{depth}/" if depth else ""
+        for filename in FORCE_COEFFICIENT_FILENAMES:
+            pattern = (
+                f"{prefix}postProcessing/forceCoeffs1/*/{filename}"
+            )
+            for coeff in case_root.glob(pattern):
+                try:
+                    mtime = coeff.stat().st_mtime
+                except OSError:
+                    continue
+                if newest is None or mtime > newest:
+                    newest = mtime
+    return newest
+
+
+def _runtime_last_progress_at(
+    active: Optional[dict],
+    status: Optional[JobStatus],
+    active_case_token_mtime: Optional[float],
+) -> Optional[datetime]:
+    """Newest progress token belonging to the representative runtime case.
+
+    In case-parallel jobs the singular status row may have just been updated
+    by a different future.  A real representative process therefore accepts
+    ``status.last_progress_at`` only when the status names that same case.  If
+    there is no active process, status remains the best available evidence.
+    The targeted coefficient mtime always belongs to the selected case.
+    """
+
+    process_slug = (active or {}).get("case_slug")
+    status_token: Optional[datetime] = None
+    if status is not None and (
+        active is None
+        or (
+            process_slug is not None
+            and status.active_case_slug == process_slug
+        )
+    ):
+        status_token = status.last_progress_at
+    coefficient_token = (
+        datetime.fromtimestamp(active_case_token_mtime, timezone.utc)
+        if active_case_token_mtime is not None
+        else None
+    )
+    return max(
+        (
+            stamp
+            for stamp in (status_token, coefficient_token)
+            if stamp is not None
+        ),
+        default=None,
+    )
 
 
 def _terminal_failure_disposition(

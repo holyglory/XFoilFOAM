@@ -3522,6 +3522,11 @@ export const simUransRequests = pgTable(
       (): AnyPgColumn => results.id,
       { onDelete: "set null" },
     ),
+    /** Exact immutable attempt resumed by a continuation action. New writes
+     * always persist this alongside continueFromResultId; legacy result-only
+     * rows remain nullable and must prove an exact retained queue/job link
+     * before the controller may reuse them. */
+    continueFromResultAttemptId: uuid("continue_from_result_attempt_id"),
     /** Continuation budget override [s]: replaces the fidelity-derived solver
      *  budget for the resumed run (+2h / +6h UI choices). NULL = tier default. */
     budgetOverrideS: integer("budget_override_s"),
@@ -3539,6 +3544,15 @@ export const simUransRequests = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    continuationAttemptOwnerFk: foreignKey({
+      columns: [t.continueFromResultAttemptId, t.continueFromResultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "sim_urans_requests_continuation_attempt_owner_fk",
+    }).onDelete("set null"),
+    continuationAttemptShapeCheck: check(
+      "sim_urans_requests_continuation_attempt_shape_check",
+      sql`${t.continueFromResultAttemptId} IS NULL OR ${t.continueFromResultId} IS NOT NULL`,
+    ),
     openCellUq: uniqueIndex("sim_urans_requests_open_cell_uq")
       .on(
         t.airfoilId,
@@ -3548,6 +3562,9 @@ export const simUransRequests = pgTable(
       )
       .where(sql`${t.state} IN ('pending', 'running')`),
     stateIdx: index("sim_urans_requests_state_idx").on(t.state),
+    continuationAttemptIdx: index(
+      "sim_urans_requests_continuation_attempt_idx",
+    ).on(t.continueFromResultAttemptId),
   }),
 );
 

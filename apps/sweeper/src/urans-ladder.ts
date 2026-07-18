@@ -42,7 +42,9 @@ import {
   releaseClaimedVerifyItem,
   recordPrecalcObligationSubmission,
   recordSolverIncidentInTransaction,
+  resultAttempts,
   restartablePrecalcCheckpointSql,
+  isExactRestartablePrecalcAttempt,
   results,
   simCampaigns,
   simJobs,
@@ -962,6 +964,7 @@ export async function submitRecordedPromotionRecovery(
       : undefined;
     let continueFrom: { engineJobId: string; caseSlug: string } | null = null;
     let budgetOverrideS: number | null = null;
+    let continuationResultId: string | null = null;
     let continuationResultAttemptId: string | null = null;
     if (continuation) {
       schedulable = schedulable.filter(
@@ -973,6 +976,7 @@ export async function submitRecordedPromotionRecovery(
         caseSlug: continuation.engineCaseSlug,
       };
       budgetOverrideS = continuation.budgetOverrideS;
+      continuationResultId = continuation.resultId;
       continuationResultAttemptId = continuation.resultAttemptId;
     }
     const remote = await remoteProvenanceForPromotionObligations(
@@ -1004,8 +1008,9 @@ export async function submitRecordedPromotionRecovery(
         precalcObligationIds: obligationIds,
         retryMode: "whole-polar-urans",
         promotionRequestedAoas: points.map((point) => point.aoaDeg),
-        ...(continuationResultAttemptId
+        ...(continuationResultId && continuationResultAttemptId
           ? {
+              continueFromResultId: continuationResultId,
               continueFromResultAttemptId: continuationResultAttemptId,
               budgetOverrideS,
             }
@@ -1850,6 +1855,16 @@ async function consumeUransRequest(
     requestedFidelity === "precalc" ? (request.budgetOverrideS ?? null) : null;
   let aoas: number[];
   if (requestedFidelity === "precalc" && request.continueFromResultId) {
+    if (!request.continueFromResultAttemptId) {
+      console.error(
+        `[sweeper] URANS request ${request.id} cancelled: legacy continuation ${request.continueFromResultId} does not pin an exact result attempt`,
+      );
+      await db
+        .update(simUransRequests)
+        .set({ state: "cancelled" })
+        .where(eq(simUransRequests.id, request.id));
+      return false;
+    }
     const sourceJob = alias(simJobs, "continuation_source_job");
     const sourceRevision = alias(
       simulationPresetRevisions,
@@ -1857,25 +1872,53 @@ async function consumeUransRequest(
     );
     const [source] = await db
       .select({
-        aoaDeg: results.aoaDeg,
-        engineJobId: results.engineJobId,
-        engineCaseSlug: results.engineCaseSlug,
-        revisionId: results.simulationPresetRevisionId,
-        solverImplementationId: results.solverImplementationId,
+        resultId: resultAttempts.resultId,
+        resultAttemptId: resultAttempts.id,
+        airfoilId: resultAttempts.airfoilId,
+        bcId: resultAttempts.bcId,
+        aoaDeg: resultAttempts.aoaDeg,
+        engineJobId: resultAttempts.engineJobId,
+        engineCaseSlug: resultAttempts.engineCaseSlug,
+        revisionId: resultAttempts.simulationPresetRevisionId,
+        solverImplementationId: resultAttempts.solverImplementationId,
         jobSolverImplementationId: sourceJob.solverImplementationId,
+        jobBoundaryConditionIds: sourceJob.bcIds,
         revisionSolverImplementationId: sourceRevision.solverImplementationId,
       })
-      .from(results)
-      .leftJoin(sourceJob, eq(sourceJob.id, results.simJobId))
+      .from(resultAttempts)
+      .innerJoin(
+        results,
+        and(
+          eq(results.id, request.continueFromResultId),
+          eq(resultAttempts.id, request.continueFromResultAttemptId),
+          eq(resultAttempts.resultId, results.id),
+          eq(resultAttempts.airfoilId, results.airfoilId),
+          eq(resultAttempts.bcId, results.bcId),
+          eq(
+            resultAttempts.simulationPresetRevisionId,
+            results.simulationPresetRevisionId,
+          ),
+          eq(resultAttempts.aoaDeg, results.aoaDeg),
+        ),
+      )
+      .leftJoin(sourceJob, eq(sourceJob.id, resultAttempts.simJobId))
       .leftJoin(
         sourceRevision,
-        eq(sourceRevision.id, results.simulationPresetRevisionId),
+        eq(sourceRevision.id, resultAttempts.simulationPresetRevisionId),
       )
-      .where(eq(results.id, request.continueFromResultId))
       .limit(1);
-    if (!source || !source.engineJobId || !source.engineCaseSlug) {
+    if (
+      !source ||
+      !source.engineJobId ||
+      !source.engineCaseSlug ||
+      !(await isExactRestartablePrecalcAttempt(
+        db,
+        request.continueFromResultId,
+        request.continueFromResultAttemptId,
+      ))
+    ) {
       console.error(
-        `[sweeper] URANS request ${request.id} cancelled: continuation source ${request.continueFromResultId} has no saved case state (row missing or engine ids absent)`,
+        `[sweeper] URANS request ${request.id} cancelled: continuation source ${request.continueFromResultId} has no exact verified restart archive`,
       );
       await db
         .update(simUransRequests)
@@ -1887,18 +1930,24 @@ async function consumeUransRequest(
       solverImplementationIdForSetup(target.snapshot),
     );
     const incompatibleSource =
+      source.airfoilId !== request.airfoilId ||
       source.revisionId !== request.revisionId ||
+      source.bcId !== target.bcId ||
+      !Array.isArray(source.jobBoundaryConditionIds) ||
+      source.jobBoundaryConditionIds.length !== 1 ||
+      source.jobBoundaryConditionIds[0] !== target.bcId ||
+      request.aoaDeg == null ||
+      Number(source.aoaDeg) !== Number(request.aoaDeg) ||
       normalizedContinuationImplementationId(
         source.revisionSolverImplementationId,
       ) !== targetImplementationId ||
-      (source.solverImplementationId != null &&
-        normalizedContinuationImplementationId(
-          source.solverImplementationId,
-        ) !== targetImplementationId) ||
-      (source.jobSolverImplementationId != null &&
-        normalizedContinuationImplementationId(
-          source.jobSolverImplementationId,
-        ) !== targetImplementationId);
+      source.solverImplementationId == null ||
+      normalizedContinuationImplementationId(source.solverImplementationId) !==
+        targetImplementationId ||
+      source.jobSolverImplementationId == null ||
+      normalizedContinuationImplementationId(
+        source.jobSolverImplementationId,
+      ) !== targetImplementationId;
     if (incompatibleSource) {
       console.error(
         `[sweeper] URANS request ${request.id} cancelled: continuation source ${request.continueFromResultId} does not match target revision ${request.revisionId} solver implementation`,
@@ -1913,7 +1962,10 @@ async function consumeUransRequest(
       engineJobId: source.engineJobId,
       caseSlug: source.engineCaseSlug,
     };
-    aoas = [request.aoaDeg ?? source.aoaDeg];
+    // The immutable source owns the physical angle. A mutable request value
+    // was checked above only as an exact-equality fence and is never used to
+    // retarget the saved CFD state.
+    aoas = [source.aoaDeg];
   } else {
     aoas =
       request.aoaDeg != null ? [request.aoaDeg] : snapshotAoas(target.snapshot);
@@ -1984,6 +2036,7 @@ async function consumeUransRequest(
     }
   }
   let obligationIds: string[] = [];
+  let obligationContinuationResultId: string | null = null;
   let obligationContinuationResultAttemptId: string | null = null;
   if (physicalFidelity === "precalc") {
     const campaignIds = await activeCampaignOwnersForUransRequest(
@@ -2059,13 +2112,22 @@ async function consumeUransRequest(
           obligationIds.includes(continuation.obligationId),
         )
       : undefined;
-    if (latestContinuation) {
+    // An explicit continuation request owns its exact immutable checkpoint
+    // pair and operator-selected budget. Do not silently retarget it to a
+    // different obligation checkpoint (or replace its budget with the
+    // automatic continuation default) merely because the same cell has a
+    // restartable audit row.
+    if (
+      latestContinuation &&
+      !(requestedFidelity === "precalc" && request.continueFromResultId)
+    ) {
       aoas = [latestContinuation.aoaDeg];
       obligationIds = [latestContinuation.obligationId];
       continueFrom = {
         engineJobId: latestContinuation.engineJobId,
         caseSlug: latestContinuation.engineCaseSlug,
       };
+      obligationContinuationResultId = latestContinuation.resultId;
       obligationContinuationResultAttemptId =
         latestContinuation.resultAttemptId;
       effectiveBudgetOverrideS = latestContinuation.budgetOverrideS;
@@ -2082,8 +2144,10 @@ async function consumeUransRequest(
     payloadExtras: {
       uransRequestId: request.id,
       ...(obligationIds.length ? { precalcObligationIds: obligationIds } : {}),
-      ...(obligationContinuationResultAttemptId
+      ...(obligationContinuationResultId &&
+      obligationContinuationResultAttemptId
         ? {
+            continueFromResultId: obligationContinuationResultId,
             continueFromResultAttemptId: obligationContinuationResultAttemptId,
             budgetOverrideS: effectiveBudgetOverrideS,
           }
@@ -2091,6 +2155,7 @@ async function consumeUransRequest(
       ...(requestedFidelity === "precalc" && request.continueFromResultId
         ? {
             continueFromResultId: request.continueFromResultId,
+            continueFromResultAttemptId: request.continueFromResultAttemptId,
             budgetOverrideS: request.budgetOverrideS ?? null,
           }
         : {}),
@@ -2299,6 +2364,7 @@ async function consumeVerifyItem(
       finalRecoveryMode: recovery.mode,
       ...(recovery.mode === "continuation"
         ? {
+            continueFromResultId: recovery.resultId,
             continueFromResultAttemptId: recovery.resultAttemptId,
             budgetOverrideS,
           }

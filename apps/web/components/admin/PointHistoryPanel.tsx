@@ -23,6 +23,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
   useRef,
@@ -62,6 +63,7 @@ import {
   type TimelineTone,
 } from "@/lib/point-history";
 import { C, MONO } from "@/lib/tokens";
+import { useModalLayer } from "@/lib/use-modal-layer";
 import { ago, f, formatRe } from "./campaigns/ui";
 import { SimModal } from "../detail/SimModal";
 
@@ -332,6 +334,9 @@ export function PointHistoryPanel() {
   const [simField, setSimField] = useState<FieldId>("vorticity");
   const [playing, setPlaying] = useState(true);
   const storyPanelRef = useRef<HTMLDivElement>(null);
+  const storyCloseButtonRef = useRef<HTMLButtonElement>(null);
+  const storyResultTriggerRef = useRef<HTMLButtonElement>(null);
+  const storyRestoreFocusRef = useRef<HTMLElement | null>(null);
   const openItemRef = useRef<PointHistoryItem | null>(null);
   openItemRef.current = openItem;
   const simOpenRef = useRef(false);
@@ -343,6 +348,9 @@ export function PointHistoryPanel() {
   // network completions must never render a previous filter's rows/counts.
   const requestSeqRef = useRef(0);
   const debounceRef = useRef<number | null>(null);
+  const storyOpen = openItem != null;
+
+  useModalLayer(storyOpen);
 
   const fetchFirstPage = useCallback(async (f: PointFilters) => {
     const seq = ++requestSeqRef.current;
@@ -467,34 +475,72 @@ export function PointHistoryPanel() {
     setSimMessage(null);
   }, []);
 
-  // Escape: SimModal open → back to the story panel; else close the panel.
+  useEffect(() => {
+    if (!storyOpen) return;
+    storyRestoreFocusRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const frame = requestAnimationFrame(() => {
+      storyCloseButtonRef.current?.focus({ preventScroll: true });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      const trigger = storyRestoreFocusRef.current;
+      if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+    };
+  }, [storyOpen]);
+
+  // A stacked evidence modal owns Escape while it is present. Otherwise this
+  // point dialog closes before a page-level Escape handler can race it.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || !openItemRef.current) return;
+      const dialogs = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          '[role="dialog"][aria-modal="true"]:not([aria-hidden="true"])',
+        ),
+      );
+      if (dialogs.at(-1) !== storyPanelRef.current) return;
+      e.preventDefault();
       e.stopPropagation();
-      if (simOpenRef.current) {
-        setSimOpen(false);
-        setSim(null);
-        setSimMessage(null);
-      } else {
-        closeStory();
-      }
+      closeStory();
     };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
   }, [closeStory]);
 
-  // Outside click closes the story panel (suspended while the SimModal is up).
-  useEffect(() => {
-    const onMouseDown = (e: MouseEvent) => {
-      if (!openItemRef.current || simOpenRef.current) return;
-      const panel = storyPanelRef.current;
-      if (panel && e.target instanceof Node && !panel.contains(e.target))
-        closeStory();
-    };
-    document.addEventListener("mousedown", onMouseDown);
-    return () => document.removeEventListener("mousedown", onMouseDown);
-  }, [closeStory]);
+  const trapStoryFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Tab" || simOpen) return;
+    const panel = storyPanelRef.current;
+    if (!panel) return;
+    const focusable = Array.from(
+      panel.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (element) =>
+        element.tabIndex >= 0 &&
+        element.getClientRects().length > 0 &&
+        !element.hasAttribute("hidden") &&
+        element.getAttribute("aria-hidden") !== "true" &&
+        !element.closest('[inert], [aria-hidden="true"]'),
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      panel.focus();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   // "solver results ▸": fetch the stored result via the existing sim endpoint
   // (resultId wins server-side) and open the existing SimModal in place.
@@ -547,7 +593,10 @@ export function PointHistoryPanel() {
     !isDeterministicMeshBlockerError(story.point.error);
   // Continue: restartable rejected urans rows with saved case state
   // (server-derived `continuable` — never guessed client-side).
-  const continueEligible = story != null && story.point.continuable;
+  const continueEligible =
+    story != null &&
+    story.point.continuable &&
+    story.point.continuationResultAttemptId != null;
   // Legacy requeue stays ONLY for red needs-review rejected rows that cannot
   // be continued (no saved case state). Calm awaiting-URANS rows and
   // rescheduled rejected rows get NO repair verbs — stage 2 handles them.
@@ -602,7 +651,18 @@ export function PointHistoryPanel() {
       setContinueBusy(true);
       setRequeueNotice(null);
       try {
-        const res = await continueUransResult(item.resultId, extraHours * 3600);
+        const resultAttemptId = story?.point.continuationResultAttemptId;
+        if (!resultAttemptId) {
+          setRequeueNotice(
+            "this saved solve has no exact restartable generation; refresh its evidence before continuing",
+          );
+          return;
+        }
+        const res = await continueUransResult(
+          item.resultId,
+          resultAttemptId,
+          extraHours * 3600,
+        );
         setRequeueNotice(
           res.created
             ? `continuation queued (+${extraHours} h) — resumes the saved URANS state automatically`
@@ -616,10 +676,10 @@ export function PointHistoryPanel() {
         setContinueBusy(false);
       }
     },
-    [continueBusy, openStory, fetchFirstPage],
+    [continueBusy, story, openStory, fetchFirstPage],
   );
 
-  // ---- request-URANS (fidelity ladder contract 6) ----
+  // ---- request final verification (FAST URANS is the automatic prerequisite) ----
   // Close any open row overflow menu on outside click.
   useEffect(() => {
     if (!rowMenuKey) return;
@@ -632,7 +692,7 @@ export function PointHistoryPanel() {
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, [rowMenuKey]);
 
-  const doRequestUrans = useCallback(
+  const doRequestFinalVerification = useCallback(
     async (
       target: {
         airfoilId: string;
@@ -640,19 +700,14 @@ export function PointHistoryPanel() {
         aoaDeg: number | null;
         label: string;
       },
-      fidelity: "precalc" | "full",
       opts?: { refreshStory?: PointHistoryItem },
     ) => {
       if (uransBusy) return;
       const scope =
         target.aoaDeg == null ? "the whole polar" : `α ${f(target.aoaDeg, 2)}°`;
-      const sequence =
-        fidelity === "precalc"
-          ? "This starts the fast preliminary stage."
-          : "If fast preliminary URANS is not accepted yet, it runs first; final verification follows automatically.";
       if (
         !window.confirm(
-          `Queue URANS for ${target.label} (${scope})? ${sequence}`,
+          `Request final verification for ${target.label} (${scope})? If FAST URANS is not accepted yet, it runs first automatically; FINAL URANS verification follows.`,
         )
       )
         return;
@@ -663,14 +718,12 @@ export function PointHistoryPanel() {
           airfoilId: target.airfoilId,
           revisionId: target.revisionId,
           ...(target.aoaDeg == null ? {} : { aoaDeg: target.aoaDeg }),
-          fidelity,
+          fidelity: "full",
         });
         setUransNotice(
           res.created
-            ? fidelity === "precalc"
-              ? `fast URANS requested for ${target.label} (${scope}) — queued automatically`
-              : `final verification requested for ${target.label} (${scope}) — fast URANS runs first when needed`
-            : `already requested — the open ${fidelity === "precalc" ? "fast-URANS" : "final-verification"} request for ${scope} is reused (${res.request.state})`,
+            ? `final verification requested for ${target.label} (${scope}) — FAST URANS runs first where needed`
+            : `already requested — the open final-verification sequence for ${scope} is reused (${res.request.state})`,
         );
         if (
           opts?.refreshStory &&
@@ -748,6 +801,9 @@ export function PointHistoryPanel() {
     openItem.kind === "result" &&
     openItem.status === "derived" &&
     !storyMatchesOpen;
+  const openFinalVerificationRequest = openItem
+    ? openRequestFor(openItem.aoaDeg, "full")
+    : null;
 
   return (
     <div data-testid="point-history-panel" style={{ display: "grid", gap: 12 }}>
@@ -1070,7 +1126,8 @@ export function PointHistoryPanel() {
                     type="button"
                     data-testid="point-row-overflow"
                     data-urans-menu
-                    aria-label={`Actions for ${item.airfoilName} α ${f(item.aoaDeg, 1)}°`}
+                    aria-label={`Operator overrides for ${item.airfoilName} α ${f(item.aoaDeg, 1)}°`}
+                    title="Operator overrides"
                     aria-expanded={rowMenuKey === item.rowKey}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -1102,52 +1159,65 @@ export function PointHistoryPanel() {
                       gap: 4,
                     }}
                   >
-                    {(["precalc", "full"] as const).map((fid) => {
-                      const eligible =
-                        item.kind === "result" && item.revisionId != null;
-                      const title =
+                    <div
+                      style={{
+                        padding: "2px 3px 4px",
+                        fontFamily: MONO,
+                        fontSize: 8.5,
+                        color: C.dim,
+                        letterSpacing: "0.08em",
+                      }}
+                    >
+                      OPERATOR OVERRIDE
+                    </div>
+                    <button
+                      type="button"
+                      data-testid="point-row-request-final-verification"
+                      disabled={
+                        item.kind !== "result" ||
+                        item.revisionId == null ||
+                        uransBusy
+                      }
+                      title={
                         item.kind === "derived"
-                          ? "Derived mirror — request URANS on the +α source point instead"
+                          ? "Derived mirror — request final verification on the +α source point instead"
                           : item.revisionId == null
-                            ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
-                            : undefined;
-                      return (
-                        <button
-                          key={fid}
-                          type="button"
-                          data-testid={`point-row-request-urans-${fid}`}
-                          disabled={!eligible || uransBusy}
-                          title={title}
-                          onClick={() =>
-                            void doRequestUrans(
-                              {
-                                airfoilId: item.airfoilId,
-                                revisionId: item.revisionId!,
-                                aoaDeg: item.aoaDeg,
-                                label: item.airfoilName,
-                              },
-                              fid,
-                              {
-                                refreshStory:
-                                  openItemRef.current?.rowKey === item.rowKey
-                                    ? item
-                                    : undefined,
-                              },
-                            )
-                          }
-                          style={{
-                            ...smallBtn,
-                            width: "100%",
-                            textAlign: "left",
-                            color: eligible ? C.teal : C.dimmest,
-                            borderColor: eligible ? C.tealBorder : C.stroke,
-                            opacity: uransBusy ? 0.6 : 1,
-                          }}
-                        >
-                          {uransBusy ? "requesting…" : `request URANS · ${fid}`}
-                        </button>
-                      );
-                    })}
+                            ? "No pinned setup revision recorded for this point — cannot request final verification"
+                            : "Request final verification; FAST URANS runs first automatically when needed"
+                      }
+                      onClick={() =>
+                        void doRequestFinalVerification(
+                          {
+                            airfoilId: item.airfoilId,
+                            revisionId: item.revisionId!,
+                            aoaDeg: item.aoaDeg,
+                            label: item.airfoilName,
+                          },
+                          {
+                            refreshStory:
+                              openItemRef.current?.rowKey === item.rowKey
+                                ? item
+                                : undefined,
+                          },
+                        )
+                      }
+                      style={{
+                        ...smallBtn,
+                        width: "100%",
+                        textAlign: "left",
+                        color:
+                          item.kind === "result" && item.revisionId != null
+                            ? C.teal
+                            : C.dimmest,
+                        borderColor:
+                          item.kind === "result" && item.revisionId != null
+                            ? C.tealBorder
+                            : C.stroke,
+                        opacity: uransBusy ? 0.6 : 1,
+                      }}
+                    >
+                      {uransBusy ? "requesting…" : "request final verification"}
+                    </button>
                   </div>
                 )}
               </div>
@@ -1175,206 +1245,81 @@ export function PointHistoryPanel() {
 
       {/* ---- story side panel (screen 2) ---- */}
       {openItem && (
-        <div
-          ref={storyPanelRef}
-          data-testid="point-story-panel"
-          role="dialog"
-          aria-label="Point story"
-          style={{
-            position: "fixed",
-            top: 0,
-            right: 0,
-            bottom: 0,
-            zIndex: 40,
-            width: `min(${PANEL_WIDTH}px, calc(100vw - 24px))`,
-            background: C.popover,
-            borderLeft: `1px solid ${C.stroke}`,
-            boxShadow: `-18px 0 50px ${C.shadow}`,
-            display: "grid",
-            gridTemplateRows: "auto 1fr",
-            overflow: "hidden",
-          }}
-        >
-          {/* header */}
+        <>
           <div
+            data-testid="point-story-backdrop"
+            aria-hidden
+            onClick={closeStory}
             style={{
-              padding: "12px 14px",
-              borderBottom: `1px solid ${C.borderSoft}`,
+              position: "fixed",
+              inset: 0,
+              zIndex: 39,
+              background: "rgba(0, 0, 0, 0.28)",
+              touchAction: "none",
+            }}
+          />
+          <div
+            ref={storyPanelRef}
+            data-testid="point-story-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="point-story-title"
+            aria-hidden={simOpen ? "true" : undefined}
+            inert={simOpen}
+            tabIndex={-1}
+            onKeyDown={trapStoryFocus}
+            style={{
+              position: "fixed",
+              top: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 40,
+              width: `min(${PANEL_WIDTH}px, calc(100vw - 24px))`,
+              height: "100dvh",
+              maxHeight: "100dvh",
+              background: C.popover,
+              borderLeft: `1px solid ${C.stroke}`,
+              boxShadow: `-18px 0 50px ${C.shadow}`,
               display: "grid",
-              gap: 8,
+              gridTemplateRows: "auto 1fr",
+              overflow: "hidden",
             }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span
-                style={{
-                  fontFamily: MONO,
-                  fontSize: 12,
-                  fontWeight: 700,
-                  color: C.text,
-                  minWidth: 0,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {openItem.airfoilName} · α {f(openItem.aoaDeg, 2)}°
-              </span>
-              <button
-                type="button"
-                aria-label="Close point story"
-                onClick={closeStory}
-                style={{ ...smallBtn, marginLeft: "auto" }}
-              >
-                ×
-              </button>
-            </div>
+            {/* header */}
             <div
               style={{
-                display: "flex",
-                gap: 6,
-                flexWrap: "wrap",
-                alignItems: "center",
+                padding: "12px 14px",
+                borderBottom: `1px solid ${C.borderSoft}`,
+                display: "grid",
+                gap: 8,
               }}
             >
-              {openItem.reynolds != null && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <span
+                  id="point-story-title"
                   style={{
                     fontFamily: MONO,
-                    fontSize: 9,
-                    color: C.muted,
-                    border: `1px solid ${C.stroke}`,
-                    borderRadius: 999,
-                    padding: "2px 7px",
-                  }}
-                >
-                  Re {formatRe(openItem.reynolds)}
-                </span>
-              )}
-              {openItem.regime && (
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 9,
-                    color: C.muted,
-                    border: `1px solid ${C.stroke}`,
-                    borderRadius: 999,
-                    padding: "2px 7px",
-                  }}
-                >
-                  {openItem.regime.toUpperCase()}
-                </span>
-              )}
-              {openItem.campaignName && (
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 9,
-                    color: C.muted,
-                    border: `1px solid ${C.stroke}`,
-                    borderRadius: 999,
-                    padding: "2px 7px",
-                    maxWidth: 180,
+                    fontSize: 12,
+                    fontWeight: 700,
+                    color: C.text,
+                    minWidth: 0,
                     overflow: "hidden",
                     textOverflow: "ellipsis",
                     whiteSpace: "nowrap",
                   }}
                 >
-                  {openItem.campaignName}
+                  {openItem.airfoilName} · α {f(openItem.aoaDeg, 2)}°
                 </span>
-              )}
-              {!headerChipsPending && headerItem && rowStatusChip(headerItem)}
-              {!headerChipsPending &&
-                headerItem &&
-                classificationChip(headerItem)}
-              {!headerChipsPending &&
-                headerItem &&
-                openItem.kind !== "derived" &&
-                fidelityChip(
-                  storyMatchesOpen ? story.point.fidelity : openItem.fidelity,
-                  storyMatchesOpen ? story.point.verify : openItem.verify,
-                )}
-            </div>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {/* Repair verbs (design D): Retry for crashes, Continue for
-                  restartable solves, and legacy requeue only for unavailable
-                  rejected evidence. Calm awaiting-URANS rows show none. */}
-              {requeueEligible && (
                 <button
+                  ref={storyCloseButtonRef}
                   type="button"
-                  data-testid="point-requeue"
-                  disabled={requeueBusy}
-                  title={
-                    retryEligible
-                      ? "This crash survived its automatic retry — send it back to the solve queue for a fresh attempt"
-                      : "Reset this point's rejected evidence back to the solve queue"
-                  }
-                  onClick={() => void doRequeue()}
-                  style={{
-                    ...smallBtn,
-                    color: C.redText,
-                    borderColor: "rgba(245, 101, 101, 0.4)",
-                    opacity: requeueBusy ? 0.6 : 1,
-                  }}
+                  aria-label="Close point story"
+                  onClick={closeStory}
+                  style={{ ...smallBtn, marginLeft: "auto" }}
                 >
-                  {requeueBusy
-                    ? "requeueing…"
-                    : retryEligible
-                      ? "Retry"
-                      : "requeue point"}
+                  ×
                 </button>
-              )}
-              {continueEligible &&
-                ([2, 6, 24] as const).map((h) => (
-                  <button
-                    key={h}
-                    type="button"
-                    data-testid={`point-continue-${h}h`}
-                    disabled={continueBusy}
-                    title={`This URANS solve has restartable saved case state — resume it from the last written time step with +${h} h of budget`}
-                    onClick={() => void doContinue(h)}
-                    style={{
-                      ...smallBtn,
-                      color: C.violet,
-                      borderColor: C.violetBorder,
-                      opacity: continueBusy ? 0.6 : 1,
-                    }}
-                  >
-                    {continueBusy ? "queueing…" : `Continue +${h}h`}
-                  </button>
-                ))}
-              <button
-                type="button"
-                data-testid="point-solver-results"
-                onClick={openSolverResults}
-                style={{
-                  ...smallBtn,
-                  color: C.teal,
-                  borderColor: C.tealBorder,
-                }}
-              >
-                solver results ▸
-              </button>
-              <Link
-                href={airfoilDetailHref(
-                  openItem.airfoilSlug,
-                  openItem.revisionId,
-                )}
-                data-testid="point-detail-link"
-                style={{
-                  ...smallBtn,
-                  color: C.teal,
-                  borderColor: C.tealBorder,
-                  textDecoration: "none",
-                  display: "inline-flex",
-                  alignItems: "center",
-                }}
-              >
-                detail page ↗
-              </Link>
-            </div>
-            {/* request-URANS (contract 6): single-point actions with
-                idempotent-aware state from the REAL open request items. */}
-            {openItem.kind !== "derived" && (
+              </div>
               <div
                 style={{
                   display: "flex",
@@ -1383,333 +1328,500 @@ export function PointHistoryPanel() {
                   alignItems: "center",
                 }}
               >
-                <span
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 9,
-                    color: C.dim,
-                    letterSpacing: "0.08em",
-                  }}
-                >
-                  URANS RECOVERY
-                </span>
-                {(["precalc", "full"] as const).map((fid) => {
-                  const open = openRequestFor(openItem.aoaDeg, fid);
-                  const eligible = openItem.revisionId != null && !open;
-                  const stageLabel =
-                    fid === "precalc" ? "fast URANS" : "final verification";
-                  return (
-                    <button
-                      key={fid}
-                      type="button"
-                      data-testid={`point-request-urans-${fid}`}
-                      disabled={!eligible || uransBusy}
-                      title={
-                        open
-                          ? `An open ${stageLabel} request already covers this ${open.aoaDeg == null ? "cell (whole polar)" : "angle"} — requests are idempotent`
-                          : openItem.revisionId == null
-                            ? "No pinned setup revision recorded for this point — cannot target a URANS solve"
-                            : fid === "precalc"
-                              ? "Run the fast preliminary URANS stage"
-                              : "Request final verification; fast URANS runs first when needed"
-                      }
-                      onClick={() =>
-                        void doRequestUrans(
-                          {
-                            airfoilId: openItem.airfoilId,
-                            revisionId: openItem.revisionId!,
-                            aoaDeg: openItem.aoaDeg,
-                            label: openItem.airfoilName,
-                          },
-                          fid,
-                          { refreshStory: openItem },
-                        )
-                      }
-                      style={{
-                        ...smallBtn,
-                        color: open ? C.dim : C.teal,
-                        borderColor: open ? C.stroke : C.tealBorder,
-                        opacity: uransBusy ? 0.6 : 1,
-                        cursor:
-                          eligible && !uransBusy ? "pointer" : "not-allowed",
-                      }}
-                    >
-                      {open
-                        ? `${stageLabel} requested (${open.state}${open.aoaDeg == null ? " · whole polar" : ""})`
-                        : stageLabel}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-            {requeueNotice && (
-              <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>
-                {requeueNotice}
-              </div>
-            )}
-            {uransNotice && openItem && (
-              <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber }}>
-                {uransNotice}
-              </div>
-            )}
-          </div>
-
-          {/* body */}
-          <div
-            style={{
-              overflowY: "auto",
-              minHeight: 0,
-              padding: "12px 14px",
-              display: "grid",
-              gap: 10,
-              alignContent: "start",
-            }}
-          >
-            {openItem.kind === "derived" ? (
-              // Derived mirrors have no solve timeline of their own — honest
-              // pointer to the +α source evidence instead.
-              <div
-                style={{
-                  fontFamily: MONO,
-                  fontSize: 11,
-                  color: C.muted,
-                  lineHeight: 1.6,
-                }}
-              >
-                This −α point is{" "}
-                <span style={{ color: C.text }}>derived by symmetry</span> from
-                the solved{" "}
-                <span style={{ color: C.text }}>
-                  α{" "}
-                  {openItem.sourceAoaDeg != null
-                    ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}°`
-                    : "source"}
-                </span>{" "}
-                result of the same symmetric airfoil. It has no solver timeline
-                of its own.
-                <div style={{ marginTop: 10 }}>
-                  <button
-                    type="button"
-                    data-testid="point-open-source"
-                    onClick={() => {
-                      const src = items.find(
-                        (i) =>
-                          i.kind === "result" &&
-                          i.resultId === openItem.resultId,
-                      );
-                      openStory(
-                        src ?? {
-                          ...openItem,
-                          kind: "result",
-                          rowKey: `r:${openItem.resultId}`,
-                          aoaDeg: openItem.sourceAoaDeg ?? openItem.aoaDeg,
-                          sourceAoaDeg: null,
-                        },
-                      );
-                    }}
+                {openItem.reynolds != null && (
+                  <span
                     style={{
-                      ...smallBtn,
-                      color: C.teal,
-                      borderColor: C.tealBorder,
+                      fontFamily: MONO,
+                      fontSize: 9,
+                      color: C.muted,
+                      border: `1px solid ${C.stroke}`,
+                      borderRadius: 999,
+                      padding: "2px 7px",
                     }}
                   >
-                    open source point α{" "}
-                    {openItem.sourceAoaDeg != null
-                      ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}`
-                      : ""}
-                    ° ▸
-                  </button>
-                </div>
+                    Re {formatRe(openItem.reynolds)}
+                  </span>
+                )}
+                {openItem.regime && (
+                  <span
+                    style={{
+                      fontFamily: MONO,
+                      fontSize: 9,
+                      color: C.muted,
+                      border: `1px solid ${C.stroke}`,
+                      borderRadius: 999,
+                      padding: "2px 7px",
+                    }}
+                  >
+                    {openItem.regime.toUpperCase()}
+                  </span>
+                )}
+                {openItem.campaignName && (
+                  <span
+                    style={{
+                      fontFamily: MONO,
+                      fontSize: 9,
+                      color: C.muted,
+                      border: `1px solid ${C.stroke}`,
+                      borderRadius: 999,
+                      padding: "2px 7px",
+                      maxWidth: 180,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {openItem.campaignName}
+                  </span>
+                )}
+                {!headerChipsPending && headerItem && rowStatusChip(headerItem)}
+                {!headerChipsPending &&
+                  headerItem &&
+                  classificationChip(headerItem)}
+                {!headerChipsPending &&
+                  headerItem &&
+                  openItem.kind !== "derived" &&
+                  fidelityChip(
+                    storyMatchesOpen ? story.point.fidelity : openItem.fidelity,
+                    storyMatchesOpen ? story.point.verify : openItem.verify,
+                  )}
               </div>
-            ) : storyError ? (
-              <div
-                style={{
-                  fontFamily: MONO,
-                  fontSize: 11,
-                  color: C.redText,
-                  lineHeight: 1.5,
-                }}
-              >
-                {storyError}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                 <button
+                  ref={storyResultTriggerRef}
                   type="button"
-                  onClick={() => openStory(openItem)}
-                  style={{ ...smallBtn, marginLeft: 8 }}
+                  data-testid="point-solver-results"
+                  onClick={openSolverResults}
+                  style={{
+                    ...smallBtn,
+                    color: C.teal,
+                    borderColor: C.tealBorder,
+                  }}
                 >
-                  retry
+                  solver results ▸
                 </button>
+                <Link
+                  href={airfoilDetailHref(
+                    openItem.airfoilSlug,
+                    openItem.revisionId,
+                  )}
+                  data-testid="point-detail-link"
+                  style={{
+                    ...smallBtn,
+                    color: C.teal,
+                    borderColor: C.tealBorder,
+                    textDecoration: "none",
+                    display: "inline-flex",
+                    alignItems: "center",
+                  }}
+                >
+                  detail page ↗
+                </Link>
               </div>
-            ) : !story ? (
-              <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted }}>
-                Loading point story…
-              </div>
-            ) : (
-              <>
-                <div
+              {(openItem.kind !== "derived" ||
+                requeueEligible ||
+                continueEligible) && (
+                <details
+                  data-testid="point-operator-overrides"
                   style={{
                     fontFamily: MONO,
                     fontSize: 9.5,
                     color: C.dim,
-                    letterSpacing: "0.08em",
                   }}
                 >
-                  TIMELINE
-                </div>
-                {timeline.map((ev, i) => (
-                  <div
-                    key={i}
-                    data-testid={`timeline-${ev.kind}`}
+                  <summary
                     style={{
-                      display: "grid",
-                      gridTemplateColumns: "14px 1fr",
-                      gap: 10,
+                      width: "fit-content",
+                      cursor: "pointer",
+                      letterSpacing: "0.08em",
                     }}
                   >
-                    <div
-                      style={{
-                        display: "grid",
-                        justifyItems: "center",
-                        gridTemplateRows: "14px 1fr",
-                        gap: 2,
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: 8,
-                          height: 8,
-                          marginTop: 3,
-                          borderRadius: "50%",
-                          background: toneColor(ev.tone),
-                        }}
-                      />
-                      {i < timeline.length - 1 && (
-                        <span
+                    OPERATOR DIAGNOSTICS &amp; OVERRIDES
+                  </summary>
+                  <div
+                    style={{
+                      display: "grid",
+                      gap: 7,
+                      marginTop: 7,
+                      padding: 8,
+                      border: `1px solid ${C.borderSoft}`,
+                      borderRadius: 7,
+                      background: C.panel2,
+                    }}
+                  >
+                    <span style={{ color: C.muted }}>
+                      Normal recovery and final verification are automatic.
+                    </span>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {requeueEligible && (
+                        <button
+                          type="button"
+                          data-testid="point-requeue"
+                          disabled={requeueBusy}
+                          title={
+                            retryEligible
+                              ? "This crash survived its automatic retry — send it back to the solve queue for a fresh attempt"
+                              : "Reset this point's rejected evidence back to the solve queue"
+                          }
+                          onClick={() => void doRequeue()}
                           style={{
-                            width: 1,
-                            background: C.borderRule,
-                            minHeight: 10,
+                            ...smallBtn,
+                            color: C.redText,
+                            borderColor: "rgba(245, 101, 101, 0.4)",
+                            opacity: requeueBusy ? 0.6 : 1,
                           }}
-                        />
+                        >
+                          {requeueBusy
+                            ? "requeueing…"
+                            : retryEligible
+                              ? "Retry"
+                              : "requeue point"}
+                        </button>
+                      )}
+                      {continueEligible &&
+                        ([2, 6, 24] as const).map((h) => (
+                          <button
+                            key={h}
+                            type="button"
+                            data-testid={`point-continue-${h}h`}
+                            disabled={continueBusy}
+                            title={`This URANS solve has restartable saved case state — resume it from the last written time step with +${h} h of budget`}
+                            onClick={() => void doContinue(h)}
+                            style={{
+                              ...smallBtn,
+                              color: C.violet,
+                              borderColor: C.violetBorder,
+                              opacity: continueBusy ? 0.6 : 1,
+                            }}
+                          >
+                            {continueBusy ? "queueing…" : `Continue +${h}h`}
+                          </button>
+                        ))}
+                      {openItem.kind !== "derived" && (
+                        <button
+                          type="button"
+                          data-testid="point-request-final-verification"
+                          disabled={
+                            openItem.revisionId == null ||
+                            !!openFinalVerificationRequest ||
+                            uransBusy
+                          }
+                          title={
+                            openFinalVerificationRequest
+                              ? `An open final-verification request already covers this ${openFinalVerificationRequest.aoaDeg == null ? "cell (whole polar)" : "angle"} — requests are idempotent`
+                              : openItem.revisionId == null
+                                ? "No pinned setup revision recorded for this point — cannot request final verification"
+                                : "Request final verification; FAST URANS runs first automatically when needed"
+                          }
+                          onClick={() =>
+                            void doRequestFinalVerification(
+                              {
+                                airfoilId: openItem.airfoilId,
+                                revisionId: openItem.revisionId!,
+                                aoaDeg: openItem.aoaDeg,
+                                label: openItem.airfoilName,
+                              },
+                              { refreshStory: openItem },
+                            )
+                          }
+                          style={{
+                            ...smallBtn,
+                            color: openFinalVerificationRequest
+                              ? C.dim
+                              : C.teal,
+                            borderColor: openFinalVerificationRequest
+                              ? C.stroke
+                              : C.tealBorder,
+                            opacity: uransBusy ? 0.6 : 1,
+                            cursor:
+                              openItem.revisionId != null &&
+                              !openFinalVerificationRequest &&
+                              !uransBusy
+                                ? "pointer"
+                                : "not-allowed",
+                          }}
+                        >
+                          {openFinalVerificationRequest
+                            ? `final verification requested (${openFinalVerificationRequest.state}${openFinalVerificationRequest.aoaDeg == null ? " · whole polar" : ""})`
+                            : "request final verification"}
+                        </button>
                       )}
                     </div>
+                    {requeueNotice && (
+                      <div style={{ color: C.amber }}>{requeueNotice}</div>
+                    )}
+                    {uransNotice && openItem && (
+                      <div style={{ color: C.amber }}>{uransNotice}</div>
+                    )}
+                  </div>
+                </details>
+              )}
+            </div>
+
+            {/* body */}
+            <div
+              style={{
+                overflowY: "auto",
+                overscrollBehaviorY: "contain",
+                touchAction: "pan-y",
+                WebkitOverflowScrolling: "touch",
+                minHeight: 0,
+                padding: "12px 14px",
+                display: "grid",
+                gap: 10,
+                alignContent: "start",
+              }}
+            >
+              {openItem.kind === "derived" ? (
+                // Derived mirrors have no solve timeline of their own — honest
+                // pointer to the +α source evidence instead.
+                <div
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 11,
+                    color: C.muted,
+                    lineHeight: 1.6,
+                  }}
+                >
+                  This −α point is{" "}
+                  <span style={{ color: C.text }}>derived by symmetry</span>{" "}
+                  from the solved{" "}
+                  <span style={{ color: C.text }}>
+                    α{" "}
+                    {openItem.sourceAoaDeg != null
+                      ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}°`
+                      : "source"}
+                  </span>{" "}
+                  result of the same symmetric airfoil. It has no solver
+                  timeline of its own.
+                  <div style={{ marginTop: 10 }}>
+                    <button
+                      type="button"
+                      data-testid="point-open-source"
+                      onClick={() => {
+                        const src = items.find(
+                          (i) =>
+                            i.kind === "result" &&
+                            i.resultId === openItem.resultId,
+                        );
+                        openStory(
+                          src ?? {
+                            ...openItem,
+                            kind: "result",
+                            rowKey: `r:${openItem.resultId}`,
+                            aoaDeg: openItem.sourceAoaDeg ?? openItem.aoaDeg,
+                            sourceAoaDeg: null,
+                          },
+                        );
+                      }}
+                      style={{
+                        ...smallBtn,
+                        color: C.teal,
+                        borderColor: C.tealBorder,
+                      }}
+                    >
+                      open source point α{" "}
+                      {openItem.sourceAoaDeg != null
+                        ? `${openItem.sourceAoaDeg > 0 ? "+" : ""}${openItem.sourceAoaDeg}`
+                        : ""}
+                      ° ▸
+                    </button>
+                  </div>
+                </div>
+              ) : storyError ? (
+                <div
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 11,
+                    color: C.redText,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {storyError}
+                  <button
+                    type="button"
+                    onClick={() => openStory(openItem)}
+                    style={{ ...smallBtn, marginLeft: 8 }}
+                  >
+                    retry
+                  </button>
+                </div>
+              ) : !story ? (
+                <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted }}>
+                  Loading point story…
+                </div>
+              ) : (
+                <>
+                  <div
+                    style={{
+                      fontFamily: MONO,
+                      fontSize: 9.5,
+                      color: C.dim,
+                      letterSpacing: "0.08em",
+                    }}
+                  >
+                    TIMELINE
+                  </div>
+                  {timeline.map((ev, i) => (
                     <div
+                      key={i}
+                      data-testid={`timeline-${ev.kind}`}
                       style={{
                         display: "grid",
-                        gap: 3,
-                        paddingBottom: 8,
-                        minWidth: 0,
+                        gridTemplateColumns: "14px 1fr",
+                        gap: 10,
                       }}
                     >
                       <div
                         style={{
-                          display: "flex",
-                          gap: 8,
-                          alignItems: "baseline",
-                          flexWrap: "wrap",
+                          display: "grid",
+                          justifyItems: "center",
+                          gridTemplateRows: "14px 1fr",
+                          gap: 2,
                         }}
                       >
                         <span
                           style={{
-                            fontFamily: MONO,
-                            fontSize: 10.5,
-                            color: toneColor(ev.tone),
-                            fontWeight: ev.kind === "now" ? 700 : 600,
+                            width: 8,
+                            height: 8,
+                            marginTop: 3,
+                            borderRadius: "50%",
+                            background: toneColor(ev.tone),
                           }}
-                        >
-                          {ev.title}
-                        </span>
-                        {ev.at && (
+                        />
+                        {i < timeline.length - 1 && (
                           <span
                             style={{
-                              fontFamily: MONO,
-                              fontSize: 9,
-                              color: C.dimmer,
+                              width: 1,
+                              background: C.borderRule,
+                              minHeight: 10,
                             }}
-                          >
-                            {ago(ev.at)}
-                          </span>
-                        )}
-                        {ev.kind === "attempt" && ev.attempt?.simJob && (
-                          <span
-                            style={{
-                              fontFamily: MONO,
-                              fontSize: 8.5,
-                              color: C.dim,
-                              border: `1px solid ${C.stroke}`,
-                              borderRadius: 999,
-                              padding: "1px 6px",
-                            }}
-                          >
-                            wave {ev.attempt.simJob.wave} ·{" "}
-                            {ev.attempt.simJob.jobKind}
-                            {ev.attempt.simJob.campaignId
-                              ? " · campaign"
-                              : " · background"}
-                          </span>
+                          />
                         )}
                       </div>
-                      {ev.detail && (
+                      <div
+                        style={{
+                          display: "grid",
+                          gap: 3,
+                          paddingBottom: 8,
+                          minWidth: 0,
+                        }}
+                      >
                         <div
                           style={{
-                            fontFamily: MONO,
-                            fontSize: 9.5,
-                            color: C.muted,
-                            lineHeight: 1.5,
-                            overflowWrap: "anywhere",
+                            display: "flex",
+                            gap: 8,
+                            alignItems: "baseline",
+                            flexWrap: "wrap",
                           }}
                         >
-                          {ev.detail}
+                          <span
+                            style={{
+                              fontFamily: MONO,
+                              fontSize: 10.5,
+                              color: toneColor(ev.tone),
+                              fontWeight: ev.kind === "now" ? 700 : 600,
+                            }}
+                          >
+                            {ev.title}
+                          </span>
+                          {ev.at && (
+                            <span
+                              style={{
+                                fontFamily: MONO,
+                                fontSize: 9,
+                                color: C.dimmer,
+                              }}
+                            >
+                              {ago(ev.at)}
+                            </span>
+                          )}
+                          {ev.kind === "attempt" && ev.attempt?.simJob && (
+                            <span
+                              style={{
+                                fontFamily: MONO,
+                                fontSize: 8.5,
+                                color: C.dim,
+                                border: `1px solid ${C.stroke}`,
+                                borderRadius: 999,
+                                padding: "1px 6px",
+                              }}
+                            >
+                              wave {ev.attempt.simJob.wave} ·{" "}
+                              {ev.attempt.simJob.jobKind}
+                              {ev.attempt.simJob.campaignId
+                                ? " · campaign"
+                                : " · background"}
+                            </span>
+                          )}
                         </div>
-                      )}
-                      {ev.whyLines.map((w) => (
-                        <div
-                          key={w}
-                          style={{
-                            fontFamily: MONO,
-                            fontSize: 9.5,
-                            color: C.amber,
-                            lineHeight: 1.5,
-                            overflowWrap: "anywhere",
-                          }}
-                        >
-                          ⚠ {w}
-                        </div>
-                      ))}
-                      {ev.kind === "attempt" && ev.attempt?.classification && (
-                        <div
-                          style={{
-                            fontFamily: MONO,
-                            fontSize: 9,
-                            color: C.dim,
-                          }}
-                        >
-                          attempt verdict:{" "}
-                          {ev.attempt.classification.state.replaceAll("_", " ")}
-                          {ev.attempt.classification.reasons.length
-                            ? ` — ${ev.attempt.classification.reasons.join(", ")}`
-                            : ""}
-                        </div>
-                      )}
+                        {ev.detail && (
+                          <div
+                            style={{
+                              fontFamily: MONO,
+                              fontSize: 9.5,
+                              color: C.muted,
+                              lineHeight: 1.5,
+                              overflowWrap: "anywhere",
+                            }}
+                          >
+                            {ev.detail}
+                          </div>
+                        )}
+                        {ev.whyLines.map((w) => (
+                          <div
+                            key={w}
+                            style={{
+                              fontFamily: MONO,
+                              fontSize: 9.5,
+                              color: C.amber,
+                              lineHeight: 1.5,
+                              overflowWrap: "anywhere",
+                            }}
+                          >
+                            ⚠ {w}
+                          </div>
+                        ))}
+                        {ev.kind === "attempt" &&
+                          ev.attempt?.classification && (
+                            <div
+                              style={{
+                                fontFamily: MONO,
+                                fontSize: 9,
+                                color: C.dim,
+                              }}
+                            >
+                              attempt verdict:{" "}
+                              {ev.attempt.classification.state.replaceAll(
+                                "_",
+                                " ",
+                              )}
+                              {ev.attempt.classification.reasons.length
+                                ? ` — ${ev.attempt.classification.reasons.join(", ")}`
+                                : ""}
+                            </div>
+                          )}
+                      </div>
                     </div>
-                  </div>
-                ))}
-                {timeline.length === 1 && (
-                  <div
-                    style={{
-                      fontFamily: MONO,
-                      fontSize: 10,
-                      color: C.dim,
-                      lineHeight: 1.5,
-                    }}
-                  >
-                    No attempt records for this point yet — evidence appears
-                    here as the solver reports it.
-                  </div>
-                )}
-              </>
-            )}
+                  ))}
+                  {timeline.length === 1 && (
+                    <div
+                      style={{
+                        fontFamily: MONO,
+                        fontSize: 10,
+                        color: C.dim,
+                        lineHeight: 1.5,
+                      }}
+                    >
+                      No attempt records for this point yet — evidence appears
+                      here as the solver reports it.
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
-        </div>
+        </>
       )}
 
       {/* ---- SimModal (existing viewer, opened in place) ---- */}
@@ -1740,6 +1852,7 @@ export function PointHistoryPanel() {
             setSim(null);
             setSimMessage(null);
           }}
+          restoreFocusTo={storyResultTriggerRef.current}
           unavailableMessage={simMessage}
         />
       )}

@@ -7,6 +7,12 @@ import {
 } from "@aerodb/core";
 
 import type { DB } from "./client";
+import {
+  exactValidSolverManifestSql,
+  exactVerifiedRestartableEvidenceArchiveSql,
+  hasExactValidSolverManifest,
+  hasExactVerifiedRestartableEvidenceArchive,
+} from "./evidence-manifest";
 import { lockPrecalcCells } from "./precalc-cell-lock";
 import {
   probeCampaignCompletion,
@@ -36,6 +42,7 @@ import {
 import {
   LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
 } from "./solver-implementations";
 
 export interface PrecalcObligationCell {
@@ -366,27 +373,52 @@ async function nextPrecalcSubmissionSequence(
   return next;
 }
 
-function isSameCasePrecalcContinuation(
+function precalcContinuationPayload(
   requestPayload: unknown,
   obligationCount: number,
-): boolean {
+): {
+  mentioned: boolean;
+  exactPair: boolean;
+  resultId: string | null;
+  resultAttemptId: string | null;
+} {
   if (
-    obligationCount !== 1 ||
     requestPayload == null ||
     typeof requestPayload !== "object"
   ) {
-    return false;
+    return {
+      mentioned: false,
+      exactPair: false,
+      resultId: null,
+      resultAttemptId: null,
+    };
   }
   const payload = requestPayload as {
     continueFromResultAttemptId?: unknown;
     continueFromResultId?: unknown;
   };
-  return Boolean(
-    (typeof payload.continueFromResultAttemptId === "string" &&
-      payload.continueFromResultAttemptId.length > 0) ||
-    (typeof payload.continueFromResultId === "string" &&
-      payload.continueFromResultId.length > 0),
-  );
+  const resultId =
+    typeof payload.continueFromResultId === "string" &&
+    payload.continueFromResultId.length > 0
+      ? payload.continueFromResultId
+      : null;
+  const resultAttemptId =
+    typeof payload.continueFromResultAttemptId === "string" &&
+    payload.continueFromResultAttemptId.length > 0
+      ? payload.continueFromResultAttemptId
+      : null;
+  const mentioned =
+    Object.prototype.hasOwnProperty.call(
+      payload,
+      "continueFromResultAttemptId",
+    ) || Object.prototype.hasOwnProperty.call(payload, "continueFromResultId");
+  return {
+    mentioned,
+    exactPair:
+      obligationCount === 1 && resultId !== null && resultAttemptId !== null,
+    resultId,
+    resultAttemptId,
+  };
 }
 
 /** Record only an engine-accepted submission. A cancelled composition or
@@ -404,23 +436,64 @@ export async function recordPrecalcObligationSubmission(
   if (!obligationIds.length) return;
   await db.transaction(async (tx) => {
     const [job] = await tx
-      .select({ requestPayload: simJobs.requestPayload })
+      .select({
+        requestPayload: simJobs.requestPayload,
+        solverImplementationId: simJobs.solverImplementationId,
+        bcIds: simJobs.bcIds,
+      })
       .from(simJobs)
       .where(eq(simJobs.id, simJobId))
       .limit(1);
     if (!job) {
       throw new Error(`precalc submission job ${simJobId} does not exist`);
     }
-    const sameCaseContinuation = isSameCasePrecalcContinuation(
+    const continuation = precalcContinuationPayload(
       job.requestPayload,
       obligationIds.length,
     );
+    if (continuation.mentioned && !continuation.exactPair) {
+      throw new Error(
+        `precalc submission job ${simJobId} has a malformed continuation pair`,
+      );
+    }
+    const sameCaseContinuation = continuation.exactPair;
     const obligations = await tx
       .select()
       .from(simPrecalcObligations)
       .where(inArray(simPrecalcObligations.id, obligationIds))
       .orderBy(asc(simPrecalcObligations.id))
       .for("update");
+    if (sameCaseContinuation) {
+      const targetBoundaryConditionIds = Array.isArray(job.bcIds)
+        ? job.bcIds.filter(
+            (id): id is string => typeof id === "string" && id.length > 0,
+          )
+        : [];
+      if (targetBoundaryConditionIds.length !== 1) {
+        throw new Error(
+          `precalc submission job ${simJobId} has no exact target boundary condition`,
+        );
+      }
+      const exact = (await tx.execute(sql`
+        SELECT obligation.id
+        FROM sim_precalc_obligations obligation
+        WHERE obligation.id = ANY(${sql`ARRAY[${sql.join(
+          obligationIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})
+          AND ${restartablePrecalcCheckpointSql(sql`obligation.id`, {
+            targetSolverImplementationId: job.solverImplementationId,
+            targetBoundaryConditionId: targetBoundaryConditionIds[0],
+            continuationResultId: continuation.resultId,
+            continuationResultAttemptId: continuation.resultAttemptId,
+          })}
+      `)) as unknown as Array<{ id: string }>;
+      if (exact.length !== obligationIds.length) {
+        throw new Error(
+          `precalc submission job ${simJobId} does not own an exact restartable checkpoint`,
+        );
+      }
+    }
     for (const obligation of obligations) {
       const [existing] = await tx
         .select({ id: simPrecalcObligationAttempts.id })
@@ -561,6 +634,162 @@ function restartablePrecalcWarningSql(warnings: SQLWrapper) {
   )`;
 }
 
+const LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT =
+  "period acquisition exhausted the physical slow-shedding horizon";
+
+/**
+ * Before the engine emitted the typed continuation marker, OpenCFD 2606 r7
+ * could preserve a perfectly restartable PRECALC case while reporting its
+ * physical slow-shedding horizon as a failed/rejected point. Recognize only
+ * that production semantic shape: a rejected physical window with measured
+ * forward progress and an exact retained transient directory. The shared
+ * checkpoint gate below independently requires one exact manifest and one
+ * verified complete restart archive. Generic solver failures and mesh/setup
+ * failures deliberately cannot match.
+ */
+function legacyRestartablePrecalcCheckpointSql(input: {
+  attemptId: SQLWrapper;
+  resultId: SQLWrapper;
+  status: SQLWrapper;
+  source: SQLWrapper;
+  error: SQLWrapper;
+  warnings: SQLWrapper;
+  evidencePayload: SQLWrapper;
+  solverImplementationId: SQLWrapper;
+}) {
+  const positiveMeasuredProgress = sql`(
+    CASE
+      WHEN jsonb_typeof(${input.evidencePayload} #> '{frame_track,window,t_end}') = 'number'
+        THEN (${input.evidencePayload} #>> '{frame_track,window,t_end}')::float8 > 0
+      ELSE false
+    END
+    OR CASE
+      WHEN jsonb_typeof(${input.evidencePayload} #> '{force_history,window_end}') = 'number'
+        THEN (${input.evidencePayload} #>> '{force_history,window_end}')::float8 > 0
+      ELSE false
+    END
+  )`;
+  return sql`(
+    ${input.attemptId} IS NOT NULL
+    AND ${input.resultId} IS NOT NULL
+    AND ${input.status} = 'failed'
+    AND ${input.source} = 'queued'
+    AND ${input.solverImplementationId}::uuid =
+      ${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid
+    AND ${input.evidencePayload} ->> 'fidelity' = 'urans_precalc'
+    AND ${input.evidencePayload} ->> 'failure_disposition' = 'hard_solver'
+    AND btrim(COALESCE(
+      ${input.evidencePayload} ->> 'continuation_transient_subdir',
+      ''
+    )) = 'transient'
+    AND lower(COALESCE(${input.error}, '')) LIKE
+      '%hardsolvererror: urans evidence rejected:%'
+    AND lower(COALESCE(${input.error}, '')) LIKE
+      ${"%" + LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT + "%"}
+    AND ${positiveMeasuredProgress}
+    AND EXISTS (
+      SELECT 1
+      FROM result_classifications legacy_classification
+      WHERE legacy_classification.result_attempt_id = ${input.attemptId}
+        AND legacy_classification.state = 'rejected'
+        AND 'non-stationary' = ANY(
+          COALESCE(legacy_classification.reasons, ARRAY[]::text[])
+        )
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM unnest(COALESCE(${input.warnings}, ARRAY[]::text[])) warning
+      WHERE lower(warning) LIKE
+        ${"%" + LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT + "%"}
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM unnest(COALESCE(${input.warnings}, ARRAY[]::text[])) warning
+      WHERE lower(warning) LIKE '%not stationary%'
+    )
+  )`;
+}
+
+function restartablePrecalcEvidenceSql(input: {
+  attemptId: SQLWrapper;
+  resultId: SQLWrapper;
+  status: SQLWrapper;
+  source: SQLWrapper;
+  error: SQLWrapper;
+  warnings: SQLWrapper;
+  evidencePayload: SQLWrapper;
+  solverImplementationId: SQLWrapper;
+}) {
+  return sql`(
+    (
+      ${input.attemptId} IS NOT NULL
+      AND ${input.resultId} IS NOT NULL
+      AND ${input.status} IN ('done', 'failed')
+      AND ${input.source} = 'solved'
+      AND ${input.evidencePayload} ->> 'fidelity' = 'urans_precalc'
+      AND ${restartablePrecalcWarningSql(input.warnings)}
+      AND EXISTS (
+        SELECT 1
+        FROM result_classifications typed_classification
+        WHERE typed_classification.result_attempt_id = ${input.attemptId}
+          AND typed_classification.state = 'rejected'
+      )
+    )
+    OR ${legacyRestartablePrecalcCheckpointSql(input)}
+  )`;
+}
+
+/** Final exact-generation trust gate for PRECALC continuation consumers.
+ * Typed engine evidence must be a solved rejected checkpoint; the only
+ * compatibility exception is the fully evidenced OpenCFD 2606 r7
+ * slow-shedding shape whose historical ingest source was `queued`. Both paths
+ * require one unambiguous manifest and a verified complete GCS restart archive.
+ * Target-cell and implementation compatibility remain caller-owned because
+ * they depend on the obligation/request being composed. */
+export async function isExactRestartablePrecalcAttempt(
+  db: Pick<DB, "execute">,
+  resultId: string,
+  resultAttemptId: string,
+): Promise<boolean> {
+  const rows = (await db.execute(sql`
+    SELECT EXISTS (
+      SELECT 1
+      FROM result_attempts exact_attempt
+      JOIN results exact_result
+        ON exact_result.id = exact_attempt.result_id
+       AND exact_result.airfoil_id = exact_attempt.airfoil_id
+       AND exact_result.bc_id = exact_attempt.bc_id
+       AND exact_result.simulation_preset_revision_id IS NOT DISTINCT FROM
+         exact_attempt.simulation_preset_revision_id
+       AND exact_result.aoa_deg IS NOT DISTINCT FROM exact_attempt.aoa_deg
+      WHERE exact_result.id = ${resultId}
+        AND exact_attempt.id = ${resultAttemptId}
+        AND exact_result.status = 'done'
+        AND exact_attempt.engine_job_id IS NOT NULL
+        AND exact_attempt.engine_case_slug IS NOT NULL
+        AND ${restartablePrecalcEvidenceSql({
+          attemptId: sql`exact_attempt.id`,
+          resultId: sql`exact_attempt.result_id`,
+          status: sql`exact_attempt.status`,
+          source: sql`exact_attempt.source`,
+          error: sql`exact_attempt.error`,
+          warnings: sql`exact_attempt.quality_warnings`,
+          evidencePayload: sql`exact_attempt.evidence_payload`,
+          solverImplementationId: sql`exact_attempt.solver_implementation_id`,
+        })}
+    ) AS valid
+  `)) as unknown as Array<{ valid: boolean }>;
+  if (rows[0]?.valid !== true) return false;
+  return (
+    (await hasExactValidSolverManifest(db, resultId, resultAttemptId)) &&
+    (await hasExactVerifiedRestartableEvidenceArchive(
+      db,
+      resultId,
+      resultAttemptId,
+    ))
+  );
+}
+
 function typedPrecalcInfrastructureInterruptionSql(input: {
   state: SQLWrapper;
   outcome: SQLWrapper;
@@ -599,8 +828,15 @@ function legacyPrecalcInfrastructureInterruptionSql(input: {
             = CAST(${input.checkpointResultAttemptId} AS text)
           OR (
             ${input.checkpointResultId} IS NOT NULL
-            AND legacy_continuation_job.request_payload ->> 'continueFromResultId'
-              = CAST(${input.checkpointResultId} AS text)
+            AND EXISTS (
+              SELECT 1
+              FROM sim_urans_requests exact_legacy_request
+              WHERE exact_legacy_request.sim_job_id = legacy_continuation_job.id
+                AND exact_legacy_request.continue_from_result_id =
+                  ${input.checkpointResultId}
+                AND exact_legacy_request.continue_from_result_attempt_id =
+                  ${input.checkpointResultAttemptId}
+            )
           )
         )
         AND position(
@@ -645,6 +881,9 @@ type RestartablePrecalcCheckpointSqlOptions = {
   /** Immutable numerical implementation the new continuation job will use.
    * Omit when the obligation's immutable preset revision is the target. */
   targetSolverImplementationId?: string | SQLWrapper | null;
+  /** Exact legacy boundary-condition identity resolved into the new job. When
+   * supplied, a missing/mismatched value is never treated as a wildcard. */
+  targetBoundaryConditionId?: string | SQLWrapper | null;
   /** When supplied, the selected checkpoint must be the exact immutable
    * attempt/result named by the continuation payload. */
   continuationResultAttemptId?: string | SQLWrapper | null;
@@ -677,20 +916,90 @@ const compatiblePrecalcCheckpointImplementationSql = (input: {
     AND ${normalizedPrecalcSolverImplementationSql(
       input.checkpointRevisionSolverImplementationId,
     )} = ${target}
-    AND (
-      ${input.checkpointAttemptSolverImplementationId}::uuid IS NULL
-      OR ${normalizedPrecalcSolverImplementationSql(
-        input.checkpointAttemptSolverImplementationId,
-      )} = ${target}
-    )
-    AND (
-      ${input.checkpointJobSolverImplementationId}::uuid IS NULL
-      OR ${normalizedPrecalcSolverImplementationSql(
-        input.checkpointJobSolverImplementationId,
-      )} = ${target}
-    )
+    AND ${input.checkpointAttemptSolverImplementationId}::uuid IS NOT NULL
+    AND ${normalizedPrecalcSolverImplementationSql(
+      input.checkpointAttemptSolverImplementationId,
+    )} = ${target}
+    AND ${input.checkpointJobSolverImplementationId}::uuid IS NOT NULL
+    AND ${normalizedPrecalcSolverImplementationSql(
+      input.checkpointJobSolverImplementationId,
+    )} = ${target}
   )`;
 };
+
+const revisionBoundaryConditionSql = (input: {
+  snapshot: SQLWrapper;
+  fallbackBoundaryConditionId: SQLWrapper;
+}) => sql`COALESCE(
+  CASE
+    WHEN COALESCE(
+      ${input.snapshot} #>> '{preset,legacyBoundaryConditionId}',
+      ''
+    ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      THEN (${input.snapshot} #>> '{preset,legacyBoundaryConditionId}')::uuid
+    ELSE NULL
+  END,
+  ${input.fallbackBoundaryConditionId}::uuid
+)`;
+
+/** Exact immutable source-generation check for a job that claims to resume a
+ * PRECALC cell. Unlike the schedulability predicate, this deliberately ignores
+ * newer submission rows so terminal settlement can validate the source after
+ * the continuation submission itself has been recorded. */
+export async function isExactPrecalcContinuationForTarget(
+  db: Pick<DB, "execute">,
+  input: {
+    resultId: string;
+    resultAttemptId: string;
+    airfoilId: string;
+    revisionId: string;
+    aoaDeg: number;
+    boundaryConditionId: string;
+    solverImplementationId: string;
+  },
+): Promise<boolean> {
+  const rows = (await db.execute(sql`
+    SELECT EXISTS (
+      SELECT 1
+      FROM result_attempts source_attempt
+      JOIN results source_result
+        ON source_result.id = source_attempt.result_id
+       AND source_result.airfoil_id = source_attempt.airfoil_id
+       AND source_result.bc_id = source_attempt.bc_id
+       AND source_result.simulation_preset_revision_id IS NOT DISTINCT FROM
+         source_attempt.simulation_preset_revision_id
+       AND source_result.aoa_deg IS NOT DISTINCT FROM source_attempt.aoa_deg
+      JOIN sim_jobs source_job
+        ON source_job.id = source_attempt.sim_job_id
+      JOIN simulation_preset_revisions target_revision
+        ON target_revision.id = ${input.revisionId}
+      JOIN simulation_presets target_preset
+        ON target_preset.id = target_revision.preset_id
+      WHERE source_result.id = ${input.resultId}
+        AND source_attempt.id = ${input.resultAttemptId}
+        AND source_attempt.airfoil_id = ${input.airfoilId}
+        AND source_attempt.simulation_preset_revision_id = ${input.revisionId}
+        AND source_attempt.aoa_deg = ${input.aoaDeg}
+        AND source_attempt.bc_id = ${input.boundaryConditionId}
+        AND source_attempt.bc_id = ${revisionBoundaryConditionSql({
+          snapshot: sql`target_revision.snapshot`,
+          fallbackBoundaryConditionId: sql`target_preset.legacy_boundary_condition_id`,
+        })}
+        AND source_attempt.solver_implementation_id =
+          ${input.solverImplementationId}
+        AND source_job.solver_implementation_id =
+          ${input.solverImplementationId}
+        AND jsonb_array_length(source_job.bc_ids) = 1
+        AND source_job.bc_ids ->> 0 = ${input.boundaryConditionId}
+    ) AS valid
+  `)) as unknown as Array<{ valid: boolean }>;
+  if (rows[0]?.valid !== true) return false;
+  return isExactRestartablePrecalcAttempt(
+    db,
+    input.resultId,
+    input.resultAttemptId,
+  );
+}
 
 /** SQL predicate shared by capability-upgrade repair and promotion scans.
  * A checkpoint remains schedulable across later submissions only when every
@@ -709,17 +1018,29 @@ export function restartablePrecalcCheckpointSql(
     opts.continuationResultAttemptId === undefined
       ? sql`true`
       : sql`(
-          NULLIF(CAST(${opts.continuationResultAttemptId} AS text), '') IS NULL
-          OR checkpoint_attempt.id::text =
+          NULLIF(CAST(${opts.continuationResultAttemptId} AS text), '') IS NOT NULL
+          AND checkpoint_attempt.id::text =
             CAST(${opts.continuationResultAttemptId} AS text)
         )`;
   const resultMatch =
     opts.continuationResultId === undefined
       ? sql`true`
       : sql`(
-          NULLIF(CAST(${opts.continuationResultId} AS text), '') IS NULL
-          OR checkpoint_attempt.result_id::text =
+          NULLIF(CAST(${opts.continuationResultId} AS text), '') IS NOT NULL
+          AND checkpoint_attempt.result_id::text =
             CAST(${opts.continuationResultId} AS text)
+        )`;
+  const targetBoundaryCondition = revisionBoundaryConditionSql({
+    snapshot: sql`checkpoint_target_revision.snapshot`,
+    fallbackBoundaryConditionId: sql`checkpoint_target_preset.legacy_boundary_condition_id`,
+  });
+  const requestedBoundaryConditionMatch =
+    opts.targetBoundaryConditionId === undefined
+      ? sql`true`
+      : sql`(
+          NULLIF(CAST(${opts.targetBoundaryConditionId} AS text), '') IS NOT NULL
+          AND checkpoint_attempt.bc_id::text =
+            CAST(${opts.targetBoundaryConditionId} AS text)
         )`;
   return sql`EXISTS (
     SELECT 1
@@ -728,6 +1049,8 @@ export function restartablePrecalcCheckpointSql(
       ON checkpoint_obligation.id = checkpoint_submission.obligation_id
     JOIN simulation_preset_revisions checkpoint_target_revision
       ON checkpoint_target_revision.id = checkpoint_obligation.revision_id
+    JOIN simulation_presets checkpoint_target_preset
+      ON checkpoint_target_preset.id = checkpoint_target_revision.preset_id
     JOIN result_attempts checkpoint_attempt
       ON checkpoint_attempt.id = checkpoint_submission.result_attempt_id
     JOIN simulation_preset_revisions checkpoint_revision
@@ -736,8 +1059,14 @@ export function restartablePrecalcCheckpointSql(
     LEFT JOIN sim_jobs checkpoint_job
       ON checkpoint_job.id = checkpoint_submission.sim_job_id
     WHERE checkpoint_submission.obligation_id = ${obligationId}
+      AND checkpoint_attempt.sim_job_id = checkpoint_submission.sim_job_id
+      AND checkpoint_attempt.airfoil_id = checkpoint_obligation.airfoil_id
+      AND checkpoint_attempt.aoa_deg = checkpoint_obligation.aoa_deg
       AND checkpoint_attempt.simulation_preset_revision_id =
         checkpoint_obligation.revision_id
+      AND ${targetBoundaryCondition} IS NOT NULL
+      AND checkpoint_attempt.bc_id = ${targetBoundaryCondition}
+      AND ${requestedBoundaryConditionMatch}
       AND checkpoint_attempt.engine_job_id IS NOT NULL
       AND checkpoint_attempt.engine_case_slug IS NOT NULL
       AND ${compatiblePrecalcCheckpointImplementationSql({
@@ -749,7 +1078,24 @@ export function restartablePrecalcCheckpointSql(
       })}
       AND ${resultAttemptMatch}
       AND ${resultMatch}
-      AND ${restartablePrecalcWarningSql(sql`checkpoint_attempt.quality_warnings`)}
+      AND ${restartablePrecalcEvidenceSql({
+        attemptId: sql`checkpoint_attempt.id`,
+        resultId: sql`checkpoint_attempt.result_id`,
+        status: sql`checkpoint_attempt.status`,
+        source: sql`checkpoint_attempt.source`,
+        error: sql`checkpoint_attempt.error`,
+        warnings: sql`checkpoint_attempt.quality_warnings`,
+        evidencePayload: sql`checkpoint_attempt.evidence_payload`,
+        solverImplementationId: sql`checkpoint_attempt.solver_implementation_id`,
+      })}
+      AND ${exactValidSolverManifestSql(
+        sql`checkpoint_attempt.result_id`,
+        sql`checkpoint_attempt.id`,
+      )}
+      AND ${exactVerifiedRestartableEvidenceArchiveSql(
+        sql`checkpoint_attempt.result_id`,
+        sql`checkpoint_attempt.id`,
+      )}
       AND NOT EXISTS (
         SELECT 1
         FROM sim_precalc_obligation_attempts newer_submission
@@ -1083,6 +1429,9 @@ export async function requeueRestartablePrecalcContinuations(
         LEFT JOIN sim_jobs checkpoint_job
           ON checkpoint_job.id = checkpoint_submission.sim_job_id
         WHERE checkpoint_submission.obligation_id = obligation.id
+          AND checkpoint_attempt.sim_job_id = checkpoint_submission.sim_job_id
+          AND checkpoint_attempt.airfoil_id = obligation.airfoil_id
+          AND checkpoint_attempt.aoa_deg = obligation.aoa_deg
           AND checkpoint_attempt.simulation_preset_revision_id =
             obligation.revision_id
           AND checkpoint_attempt.engine_job_id IS NOT NULL
@@ -1094,7 +1443,16 @@ export async function requeueRestartablePrecalcContinuations(
             checkpointAttemptSolverImplementationId: sql`checkpoint_attempt.solver_implementation_id`,
             checkpointJobSolverImplementationId: sql`checkpoint_job.solver_implementation_id`,
           })}
-          AND ${restartablePrecalcWarningSql(sql`checkpoint_attempt.quality_warnings`)}
+          AND ${restartablePrecalcEvidenceSql({
+            attemptId: sql`checkpoint_attempt.id`,
+            resultId: sql`checkpoint_attempt.result_id`,
+            status: sql`checkpoint_attempt.status`,
+            source: sql`checkpoint_attempt.source`,
+            error: sql`checkpoint_attempt.error`,
+            warnings: sql`checkpoint_attempt.quality_warnings`,
+            evidencePayload: sql`checkpoint_attempt.evidence_payload`,
+            solverImplementationId: sql`checkpoint_attempt.solver_implementation_id`,
+          })}
           AND NOT EXISTS (
             SELECT 1
             FROM sim_precalc_obligation_attempts newer_submission
@@ -1177,7 +1535,27 @@ export async function requeueRestartablePrecalcContinuations(
     }>;
     if (!candidates.length) return empty;
 
-    const candidateIds = candidates.map((row) => row.id);
+    // The SQL prefilter is intentionally cheap enough for the bounded repair
+    // scan, but mutation requires the same final immutable-generation gate as
+    // submission. Never reopen a checkpoint merely because it carries a
+    // marker: the exact pair must still own its manifest and complete verified
+    // restart archive.
+    const verifiedCandidates = [] as typeof candidates;
+    for (const candidate of candidates) {
+      if (
+        candidate.checkpoint_result_id &&
+        (await isExactRestartablePrecalcAttempt(
+          tx,
+          candidate.checkpoint_result_id,
+          candidate.checkpoint_result_attempt_id,
+        ))
+      ) {
+        verifiedCandidates.push(candidate);
+      }
+    }
+    if (!verifiedCandidates.length) return empty;
+
+    const candidateIds = verifiedCandidates.map((row) => row.id);
     const candidateIdArray = sql`ARRAY[${sql.join(
       candidateIds.map((id) => sql`${id}::uuid`),
       sql`, `,
@@ -1214,7 +1592,7 @@ export async function requeueRestartablePrecalcContinuations(
     `);
     await lockPrecalcCells(
       tx,
-      candidates.map((row) => ({
+      verifiedCandidates.map((row) => ({
         airfoilId: row.airfoil_id,
         revisionId: row.revision_id,
         aoaDeg: Number(row.aoa_deg),
@@ -1222,7 +1600,7 @@ export async function requeueRestartablePrecalcContinuations(
     );
 
     const checkpointValues = sql.join(
-      candidates.map(
+      verifiedCandidates.map(
         (row) =>
           sql`(${row.id}::uuid, ${row.checkpoint_submission_number}::int, ${row.checkpoint_result_attempt_id}::uuid, ${row.checkpoint_result_id}::uuid)`,
       ),
@@ -1540,7 +1918,9 @@ export async function recordPrecalcObligationSubmitFailure(
   return result;
 }
 
-function hasPrecalcContinuationWarning(warnings: string[] | null): boolean {
+export function hasPrecalcContinuationWarning(
+  warnings: string[] | null,
+): boolean {
   return (warnings ?? []).some(
     (warning) =>
       warning.includes(URANS_BUDGET_STOP_MARKER) ||
@@ -1730,6 +2110,8 @@ export async function settlePrecalcObligationsForJobInTransaction(
     | "airfoilId"
     | "simulationPresetRevisionId"
     | "requestPayload"
+    | "bcIds"
+    | "solverImplementationId"
     | "engineJobId"
     | "submittedAt"
   >,
@@ -1740,12 +2122,8 @@ export async function settlePrecalcObligationsForJobInTransaction(
     uransFidelity?: unknown;
     executedMeshRecoveryVersion?: unknown;
     continueFromResultAttemptId?: unknown;
+    continueFromResultId?: unknown;
   };
-  const exactContinuationSourceAttemptId =
-    typeof payload.continueFromResultAttemptId === "string" &&
-    payload.continueFromResultAttemptId.length > 0
-      ? payload.continueFromResultAttemptId
-      : null;
   const acknowledgedMeshRecoveryVersion =
     typeof payload.executedMeshRecoveryVersion === "number" &&
     Number.isSafeInteger(payload.executedMeshRecoveryVersion) &&
@@ -1758,7 +2136,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
         (id): id is string => typeof id === "string",
       )
     : [];
-  const sameCaseContinuation = isSameCasePrecalcContinuation(
+  const continuation = precalcContinuationPayload(
     job.requestPayload,
     obligationIds.length,
   );
@@ -1789,6 +2167,34 @@ export async function settlePrecalcObligationsForJobInTransaction(
     .where(inArray(simPrecalcObligations.id, obligationIds))
     .orderBy(asc(simPrecalcObligations.id))
     .for("update");
+  const targetBoundaryConditionIds = Array.isArray(job.bcIds)
+    ? job.bcIds.filter(
+        (id): id is string => typeof id === "string" && id.length > 0,
+      )
+    : [];
+  const continuationObligation = obligations[0];
+  const sameCaseContinuation = Boolean(
+    continuation.exactPair &&
+      continuation.resultId &&
+      continuation.resultAttemptId &&
+      continuationObligation &&
+      obligations.length === 1 &&
+      targetBoundaryConditionIds.length === 1 &&
+      job.solverImplementationId &&
+      job.simulationPresetRevisionId &&
+      (await isExactPrecalcContinuationForTarget(tx, {
+        resultId: continuation.resultId!,
+        resultAttemptId: continuation.resultAttemptId!,
+        airfoilId: job.airfoilId,
+        revisionId: job.simulationPresetRevisionId!,
+        aoaDeg: continuationObligation.aoaDeg,
+        boundaryConditionId: targetBoundaryConditionIds[0]!,
+        solverImplementationId: job.solverImplementationId!,
+      })),
+  );
+  const exactContinuationSourceAttemptId = sameCaseContinuation
+    ? continuation.resultAttemptId
+    : null;
   for (const obligation of obligations) {
     if (
       obligation.airfoilId !== job.airfoilId ||
@@ -1868,6 +2274,16 @@ export async function settlePrecalcObligationsForJobInTransaction(
         failureDisposition: sql<
           string | null
         >`${resultAttempts.evidencePayload} ->> 'failure_disposition'`,
+        legacyRestartable: legacyRestartablePrecalcCheckpointSql({
+          attemptId: resultAttempts.id,
+          resultId: resultAttempts.resultId,
+          status: resultAttempts.status,
+          source: resultAttempts.source,
+          error: resultAttempts.error,
+          warnings: resultAttempts.qualityWarnings,
+          evidencePayload: resultAttempts.evidencePayload,
+          solverImplementationId: resultAttempts.solverImplementationId,
+        }),
         classification: resultClassifications.state,
         reasons: resultClassifications.reasons,
       })
@@ -1912,7 +2328,8 @@ export async function settlePrecalcObligationsForJobInTransaction(
     const accepted = precalcEvidence.find(
       (row) =>
         row.classification === "accepted" &&
-        !hasPrecalcContinuationWarning(row.qualityWarnings),
+        !hasPrecalcContinuationWarning(row.qualityWarnings) &&
+        !row.legacyRestartable,
     );
     const judged =
       accepted ??
@@ -1939,7 +2356,8 @@ export async function settlePrecalcObligationsForJobInTransaction(
     const restartable = Boolean(
       judged?.engineJobId &&
       judged.engineCaseSlug &&
-      hasPrecalcContinuationWarning(judged.qualityWarnings),
+      (hasPrecalcContinuationWarning(judged.qualityWarnings) ||
+        judged.legacyRestartable),
     );
     // Cache refresh classifies every stored attempt, including execution
     // failures such as a divergence watchdog trip. Classification presence
@@ -2325,6 +2743,8 @@ export async function settlePrecalcObligationsForJob(
     | "airfoilId"
     | "simulationPresetRevisionId"
     | "requestPayload"
+    | "bcIds"
+    | "solverImplementationId"
     | "engineJobId"
     | "submittedAt"
   >,
@@ -2509,6 +2929,7 @@ export async function activeCampaignOwnersForUransRequest(
 export interface PrecalcContinuationAddress {
   obligationId: string;
   aoaDeg: number;
+  resultId: string;
   resultAttemptId: string;
   engineJobId: string;
   engineCaseSlug: string;
@@ -2529,27 +2950,51 @@ export async function precalcContinuationsForObligations(
   const rows = (await db.execute(sql`
     SELECT obligation.id AS obligation_id,
            obligation.aoa_deg::float8 AS aoa_deg,
+           checkpoint.result_id,
            checkpoint.result_attempt_id,
            checkpoint.engine_job_id,
            checkpoint.engine_case_slug
     FROM sim_precalc_obligations obligation
     JOIN simulation_preset_revisions target_revision
       ON target_revision.id = obligation.revision_id
+    JOIN simulation_presets target_preset
+      ON target_preset.id = target_revision.preset_id
     JOIN LATERAL (
-      SELECT candidate.result_attempt_id,
+      SELECT owner_result.id AS result_id,
+             candidate.result_attempt_id,
              result_attempt.engine_job_id,
              result_attempt.engine_case_slug
       FROM sim_precalc_obligation_attempts candidate
       JOIN result_attempts result_attempt
         ON result_attempt.id = candidate.result_attempt_id
+      JOIN results owner_result
+        ON owner_result.id = result_attempt.result_id
+       AND owner_result.airfoil_id = result_attempt.airfoil_id
+       AND owner_result.bc_id = result_attempt.bc_id
+       AND owner_result.simulation_preset_revision_id IS NOT DISTINCT FROM
+         result_attempt.simulation_preset_revision_id
+       AND owner_result.aoa_deg IS NOT DISTINCT FROM result_attempt.aoa_deg
+      JOIN result_classifications checkpoint_classification
+        ON checkpoint_classification.result_attempt_id = result_attempt.id
+       AND checkpoint_classification.state = 'rejected'
       JOIN simulation_preset_revisions checkpoint_revision
         ON checkpoint_revision.id =
           result_attempt.simulation_preset_revision_id
       LEFT JOIN sim_jobs checkpoint_job
         ON checkpoint_job.id = candidate.sim_job_id
       WHERE candidate.obligation_id = obligation.id
+        AND result_attempt.sim_job_id = candidate.sim_job_id
+        AND result_attempt.airfoil_id = obligation.airfoil_id
+        AND result_attempt.aoa_deg = obligation.aoa_deg
         AND result_attempt.simulation_preset_revision_id =
           obligation.revision_id
+        AND result_attempt.bc_id = ${revisionBoundaryConditionSql({
+          snapshot: sql`target_revision.snapshot`,
+          fallbackBoundaryConditionId: sql`target_preset.legacy_boundary_condition_id`,
+        })}
+        AND owner_result.status = 'done'
+        AND result_attempt.status IN ('done', 'failed')
+        AND result_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
         AND result_attempt.engine_job_id IS NOT NULL
         AND result_attempt.engine_case_slug IS NOT NULL
         AND ${compatiblePrecalcCheckpointImplementationSql({
@@ -2559,7 +3004,18 @@ export async function precalcContinuationsForObligations(
           checkpointAttemptSolverImplementationId: sql`result_attempt.solver_implementation_id`,
           checkpointJobSolverImplementationId: sql`checkpoint_job.solver_implementation_id`,
         })}
-        AND ${restartablePrecalcWarningSql(sql`result_attempt.quality_warnings`)}
+        AND jsonb_array_length(checkpoint_job.bc_ids) = 1
+        AND checkpoint_job.bc_ids ->> 0 = result_attempt.bc_id::text
+        AND ${restartablePrecalcEvidenceSql({
+          attemptId: sql`result_attempt.id`,
+          resultId: sql`result_attempt.result_id`,
+          status: sql`result_attempt.status`,
+          source: sql`result_attempt.source`,
+          error: sql`result_attempt.error`,
+          warnings: sql`result_attempt.quality_warnings`,
+          evidencePayload: sql`result_attempt.evidence_payload`,
+          solverImplementationId: sql`result_attempt.solver_implementation_id`,
+        })}
         AND NOT EXISTS (
           SELECT 1
           FROM sim_precalc_obligation_attempts newer
@@ -2595,16 +3051,34 @@ export async function precalcContinuationsForObligations(
   `)) as unknown as Array<{
     obligation_id: string;
     aoa_deg: number;
+    result_id: string;
     result_attempt_id: string;
     engine_job_id: string;
     engine_case_slug: string;
   }>;
-  return rows.map((row) => ({
-    obligationId: row.obligation_id,
-    aoaDeg: Number(row.aoa_deg),
-    resultAttemptId: row.result_attempt_id,
-    engineJobId: row.engine_job_id,
-    engineCaseSlug: row.engine_case_slug,
-    budgetOverrideS: AUTO_PRECALC_CONTINUATION_BUDGET_S,
-  }));
+  const continuations: PrecalcContinuationAddress[] = [];
+  for (const row of rows) {
+    // Engine-local job/case strings are mutable addressing, not proof that the
+    // immutable generation can still be resumed. Fail closed unless the exact
+    // pair owns one valid manifest and one verified complete restart archive.
+    if (
+      !(await isExactRestartablePrecalcAttempt(
+        db,
+        row.result_id,
+        row.result_attempt_id,
+      ))
+    ) {
+      continue;
+    }
+    continuations.push({
+      obligationId: row.obligation_id,
+      aoaDeg: Number(row.aoa_deg),
+      resultId: row.result_id,
+      resultAttemptId: row.result_attempt_id,
+      engineJobId: row.engine_job_id,
+      engineCaseSlug: row.engine_case_slug,
+      budgetOverrideS: AUTO_PRECALC_CONTINUATION_BUDGET_S,
+    });
+  }
+  return continuations;
 }

@@ -76,7 +76,64 @@ function engineResponseBody(url: string): string | null {
       oldest_last_used: null,
     });
   }
-  if (url === "/jobs/runtime") return JSON.stringify({ jobs: [] });
+  if (url === "/jobs/runtime")
+    return JSON.stringify({
+      jobs: [
+        {
+          job_id: `${PREFIX}-engine-1`,
+          exists: true,
+          cancelled: false,
+          process_count: 1,
+          processes: [
+            {
+              pid: 4101,
+              command: "pimpleFoam",
+              case_slug: "c0p05_u30_a19",
+              solver_mode: "urans",
+            },
+          ],
+          runtime_heartbeat_age_sec: 1,
+          runtime_phase: "solving_urans",
+          runtime_active_solver: "pimpleFoam",
+          runtime_active_case_slug: "c0p05_u30_a19",
+          runtime_active_aoa_deg: 19,
+          runtime_last_progress_at: "2026-07-18T04:47:30.000Z",
+          status_readable: true,
+          status_state: "running",
+          // Production-shaped parallel mismatch: another future's last
+          // persisted callback must not replace the live pimpleFoam tuple.
+          status_phase: "postprocessing",
+          status_active_solver: null,
+          status_active_case_slug: "c0p05_u30_a13",
+          status_active_aoa_deg: 13,
+          status_last_progress_at: "2026-07-18T04:18:00.000Z",
+          result_readable: false,
+          has_result: false,
+        },
+        {
+          job_id: `${PREFIX}-engine-2`,
+          exists: true,
+          cancelled: false,
+          process_count: 0,
+          processes: [],
+          runtime_heartbeat_age_sec: 1,
+          runtime_phase: null,
+          runtime_active_solver: null,
+          runtime_active_case_slug: null,
+          runtime_active_aoa_deg: null,
+          runtime_last_progress_at: null,
+          status_readable: true,
+          status_state: "running",
+          status_phase: "solving_rans",
+          status_active_solver: "simpleFoam",
+          status_active_case_slug: "c0p05_u30_a3",
+          status_active_aoa_deg: 3,
+          status_last_progress_at: "2026-07-18T04:40:00.000Z",
+          result_readable: false,
+          has_result: false,
+        },
+      ],
+    });
   return null;
 }
 
@@ -303,6 +360,31 @@ describe("queue payload with a saturated (3 s) engine", () => {
     // fetch time (stale data never presented as fresh).
     expect(typeof body.engineRuntimeAsOf).toBe("string");
     expect(Date.parse(body.engineRuntimeAsOf)).toBeGreaterThan(0);
+    const runtimePreferred = body.activeJobs.find(
+      (job: { engineJobId: string | null }) =>
+        job.engineJobId === `${PREFIX}-engine-1`,
+    );
+    expect(runtimePreferred).toMatchObject({
+      phase: "solving_urans",
+      activeSolver: "pimpleFoam",
+      activeCaseSlug: "c0p05_u30_a19",
+      activeAoaDeg: 19,
+      lastProgressAt: "2026-07-18T04:47:30.000Z",
+    });
+
+    // Backwards compatibility: runtimes from an older/quiet worker may carry
+    // null live fields; persisted status remains the honest fallback.
+    const statusFallback = body.activeJobs.find(
+      (job: { engineJobId: string | null }) =>
+        job.engineJobId === `${PREFIX}-engine-2`,
+    );
+    expect(statusFallback).toMatchObject({
+      phase: "solving_rans",
+      activeSolver: "simpleFoam",
+      activeCaseSlug: "c0p05_u30_a3",
+      activeAoaDeg: 3,
+      lastProgressAt: "2026-07-18T04:40:00.000Z",
+    });
   }, 15_000);
 });
 

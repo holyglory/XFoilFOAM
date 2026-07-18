@@ -100,6 +100,7 @@ export interface SolverWorkPoint {
   aoaDeg: number;
   state: SolverWorkState;
   resultId: string | null;
+  continuationResultAttemptId: string | null;
   fidelity: SolverWorkFidelity;
   cl: number | null;
   cd: number | null;
@@ -137,6 +138,17 @@ export function solverWorkStateForPoint(
   if (row.reviewVerdict === "exclude") return "excluded";
   if (row.classificationState === "superseded_by_urans") return "superseded";
 
+  // Missing output media is owned by the bounded automatic repair path, not
+  // by the solver ladder or the user.
+  if (["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? ""))
+    return "ladder";
+  if (row.mediaRepairState === "blocked") return "blocked";
+
+  // Mesh, execution-foundation, and crash evidence stays a critical system
+  // incident even if a malformed/stale FAST request happens to exist beside
+  // it. Only aerodynamic RANS trouble is a normal handoff.
+  if (isCriticalSystemProblem(row)) return "blocked";
+
   // The physical-cell obligation is authoritative for automatic preliminary
   // work. Canonical RANS evidence can remain done/needs_urans behind the
   // replace guard while a precalc attempt is running or has exhausted.
@@ -144,25 +156,20 @@ export function solverWorkStateForPoint(
     return "ladder";
   if (row.precalcObligationState === "blocked") return "blocked";
 
-  // A completed attempt can be temporarily pointer-null while the bounded
-  // media-repair queue reconstructs its default URANS media. The durable cell
-  // deliberately remains `failed` until that exact evidence is republished,
-  // but this is automatic output work, not a user-actionable solver block.
-  if (["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? ""))
-    return "ladder";
-  if (row.mediaRepairState === "blocked") return "blocked";
-
   if (row.status === "queued" || row.status === "running") return "solving";
   if (!row.resultId || row.status === "pending" || row.status === "stale")
     return "queued";
 
-  if (row.status === "failed") return "blocked";
+  if (row.status === "failed") {
+    return isAutomaticRansHandoff(row) ? "ladder" : "blocked";
+  }
 
   if (row.continuable) return "needs_time";
-  if (row.status === "done" && row.error) return "blocked";
 
   if (row.classificationState === "rejected") {
-    if (row.openVerify || row.openRequest) return "ladder";
+    if (row.openVerify || row.openRequest) {
+      return isCriticalSystemProblem(row) ? "blocked" : "ladder";
+    }
     if (
       row.classificationReasons?.length === 1 &&
       row.classificationReasons[0] === MISSING_URANS_VIDEO_REASON
@@ -173,9 +180,14 @@ export function solverWorkStateForPoint(
       row.fidelity === "rans" ||
       (row.fidelity == null && row.regime !== "urans")
     )
-      return "ladder";
+      // Without a live FAST owner this is no longer an automatic handoff. The
+      // solver system must recover it; presenting a calm ladder would claim a
+      // data flow that does not exist.
+      return "blocked";
     return "blocked";
   }
+
+  if (row.status === "done" && row.error) return "blocked";
 
   if (row.classificationState === "needs_urans") return "provisional";
   if (row.classificationState === "accepted") {
@@ -192,6 +204,7 @@ export function solverWorkStateForPoint(
 
 type ResultPointRow = {
   result_id: string;
+  result_attempt_id: string | null;
   revision_id: string;
   aoa_deg: number | string;
   status: string | null;
@@ -238,6 +251,7 @@ type CampaignPointRow = ResultPointRow & {
 type AttemptRow = {
   result_id: string;
   regime: string | null;
+  fidelity: string | null;
   status: string;
   valid_for_polar: boolean;
   error: string | null;
@@ -314,19 +328,68 @@ function negated(v: number | null): number | null {
   return v === 0 ? 0 : -v;
 }
 
-function blockerFromError(
-  error: string | null | undefined,
-  autoRetriedAt?: Date | string | null,
-): boolean {
-  const text = (error ?? "").toLowerCase();
-  if (!text.trim()) return Boolean(autoRetriedAt);
+type SolverProblemRow = Pick<
+  SolverWorkPointStateRow,
+  | "status"
+  | "regime"
+  | "fidelity"
+  | "classificationState"
+  | "classificationReasons"
+  | "precalcObligationState"
+  | "openRequest"
+  | "error"
+> & { qualityWarnings?: string[] | null };
+
+function solverProblemText(row: SolverProblemRow): string {
+  return [
+    ...(row.classificationReasons ?? []),
+    ...(row.qualityWarnings ?? []),
+    row.error ?? "",
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+function isRansProblem(row: SolverProblemRow): boolean {
+  return normalizeFidelity(row.fidelity, row.regime) === "rans";
+}
+
+/**
+ * Failures in the execution foundation are incidents, even if an accidentally
+ * queued URANS request exists beside them. They must never be softened into a
+ * normal aerodynamic RANS handoff.
+ */
+function isCriticalSystemProblem(row: SolverProblemRow): boolean {
+  const text = solverProblemText(row);
+  return /deterministic[- ]mesh|mesh(?:[- ][a-z]+){0,2}[- :](?:failed|failure|invalid|unusable|corrupt)|degenerate|negative (?:cell )?volume|(?:skew|non[- ]orthogonal|wall[- ]?rate).*(?:failed|fatal|invalid)|segmentation|sigsegv|core dumped|(?:solver|engine|worker) crash|worker (?:lost|unavailable|offline)|engine unavailable|infrastructure|database (?:unavailable|failed|offline)|storage (?:unavailable|failed|offline)|disk full|no space left|(?:upload|download) (?:failed|failure)|archive (?:missing|corrupt|failed|unavailable)|checkpoint (?:missing|corrupt)|permission denied|executable (?:missing|not found)|no such file|container (?:failed|unavailable)|docker (?:failed|unavailable)|out of memory|\boom\b|killed by signal/.test(
+    text,
+  );
+}
+
+function hasAutomaticFastHandoff(row: SolverProblemRow): boolean {
   return (
-    /mesh/.test(text) ||
-    /degenerate/.test(text) ||
-    /wall[- ]?rate/.test(text) ||
-    /crash|segmentation|sigsegv|core dumped/.test(text) ||
-    (Boolean(autoRetriedAt) &&
-      /diverg|residual|nan|timeout|timed out|solver|engine/.test(text))
+    row.openRequest === true ||
+    ["pending", "running"].includes(row.precalcObligationState ?? "")
+  );
+}
+
+/** A rejected/failed RANS screen is normal only when FAST URANS really owns it. */
+function isAutomaticRansHandoff(row: SolverProblemRow): boolean {
+  if (
+    !isRansProblem(row) ||
+    isCriticalSystemProblem(row) ||
+    !hasAutomaticFastHandoff(row)
+  ) {
+    return false;
+  }
+  const text = solverProblemText(row);
+  return (
+    row.status === "failed" ||
+    row.classificationState === "rejected" ||
+    row.classificationState === "needs_urans" ||
+    /not[- ]converg|did not converge|solver[- ]stalled|\bstalled\b|oscillat|residual|non[- ]stationar|missing[- ]coefficients|non[- ]physical|out[_ -]of[_ -]family|positive[- ]drag|separated flow|shedding/.test(
+      text,
+    )
   );
 }
 
@@ -509,15 +572,15 @@ function plainForPoint(
   gate: SolverWorkGate | null,
 ): string {
   if (gate?.detail === UNCLASSIFIED_EVIDENCE_DETAIL) {
-    return "Stored solver evidence is available, but its automatic classification is unavailable. This point is not used in the polar, and no human review is required.";
+    return "Classification missing; excluded from the polar. Engineering action required.";
   }
   if (
     gate?.name === "frame recorder" &&
     gate.detail.startsWith("Automatic media repair")
   ) {
     return state === "blocked"
-      ? `${gate.detail} The solver evidence is retained, but this point remains unavailable until its stored media can be rebuilt.`
-      : `${gate.detail} No manual review is required.`;
+      ? "Automatic media repair exhausted; engineering action required."
+      : "Stored media repair is automatic.";
   }
   switch (state) {
     case "verified":
@@ -529,7 +592,7 @@ function plainForPoint(
     case "queued":
       return "This point is queued and has not produced solver evidence yet.";
     case "ladder":
-      return "RANS found that this point needs unsteady treatment, so the URANS ladder is the next step.";
+      return "RANS → FAST URANS (automatic).";
     case "needs_time":
       if (gate?.name === "march-rate guard")
         return `URANS reached the time budget after ${gate.detail}; the saved case can be continued.`;
@@ -546,8 +609,8 @@ function plainForPoint(
         : "This point was excluded after review and is not used in the stored polar.";
     case "blocked":
       return gate
-        ? `The point is blocked by the ${gate.name}; change the setup or repair the blocker before trying again.`
-        : "The point is blocked by a solver or mesh issue; change the setup or repair the blocker before trying again.";
+        ? `Automatic recovery exhausted at the ${gate.name}; engineering action required.`
+        : "Automatic recovery exhausted; engineering action required.";
     case "superseded":
       return "A higher-fidelity result replaced this point, and the replacement is used instead.";
   }
@@ -571,14 +634,27 @@ function actionsForPoint(
   return [];
 }
 
-function attemptTone(attempt: AttemptRow): SolverWorkTone {
-  if (attempt.status === "failed")
-    return blockerFromError(attempt.error) ? "blocked" : "review";
-  if (attempt.valid_for_polar) return "ok";
-  if (attempt.regime === "rans") return "ladder";
-  return attempt.error || (attempt.quality_warnings?.length ?? 0) > 0
-    ? "review"
-    : "neutral";
+function attemptProblemRow(attempt: AttemptRow): SolverProblemRow {
+  return {
+    status: attempt.status,
+    regime: attempt.regime,
+    fidelity: attempt.fidelity,
+    classificationState: null,
+    classificationReasons: null,
+    precalcObligationState: null,
+    openRequest: null,
+    error: attempt.error,
+    qualityWarnings: attempt.quality_warnings,
+  };
+}
+
+function attemptLabelBase(attempt: AttemptRow): string {
+  const fidelity = normalizeFidelity(attempt.fidelity, attempt.regime);
+  if (fidelity === "rans") return "RANS";
+  if (fidelity === "urans_precalc") return "FAST";
+  if (fidelity === "urans_full") return "FINAL";
+  if (attempt.regime === "urans") return "URANS";
+  return "Attempt";
 }
 
 function chainForPoint(
@@ -595,17 +671,35 @@ function chainForPoint(
     return [{ label: "Media unavailable", tone: "blocked" }];
   }
   if (attempts.length > 0) {
-    return attempts.map((attempt) => {
-      const labelBase = attempt.regime
-        ? attempt.regime.toUpperCase()
-        : "Attempt";
-      const label =
-        attempt.status === "failed"
-          ? `${labelBase} blocked`
-          : attempt.valid_for_polar
-            ? `${labelBase} ok`
-            : `${labelBase} ladder`;
-      return { label, tone: attemptTone(attempt) };
+    return attempts.map((attempt, index) => {
+      const labelBase = attemptLabelBase(attempt);
+      if (attempt.valid_for_polar) {
+        return { label: `${labelBase} accepted`, tone: "ok" };
+      }
+
+      const problem = attemptProblemRow(attempt);
+      if (isCriticalSystemProblem(problem)) {
+        return { label: `${labelBase} system issue`, tone: "blocked" };
+      }
+
+      if (isRansProblem(problem)) {
+        const laterUrans = attempts
+          .slice(index + 1)
+          .some(
+            (candidate) =>
+              normalizeFidelity(candidate.fidelity, candidate.regime) !==
+                "rans" && candidate.regime === "urans",
+          );
+        return state === "ladder" || laterUrans || hasAutomaticFastHandoff(row)
+          ? { label: "RANS → FAST", tone: "ladder" }
+          : { label: "RANS system issue", tone: "blocked" };
+      }
+
+      const isLast = index === attempts.length - 1;
+      if (state === "blocked" && isLast) {
+        return { label: `${labelBase} exhausted`, tone: "blocked" };
+      }
+      return { label: `${labelBase} retry`, tone: "ladder" };
     });
   }
   if (state === "queued") return [{ label: "Queued", tone: "neutral" }];
@@ -726,6 +820,7 @@ function makePoint(
     aoaDeg: opts.displayAoa ?? Number(row.aoa_deg),
     state,
     resultId: row.result_id,
+    continuationResultAttemptId: row.continuable ? row.result_attempt_id : null,
     fidelity: normalizeFidelity(row.fidelity, row.regime),
     cl: opts.derivedBySymmetry ? negated(cl) : cl,
     cd,
@@ -762,6 +857,7 @@ function queuedPoint(aoaDeg: number): SolverWorkPoint {
     aoaDeg,
     state,
     resultId: null,
+    continuationResultAttemptId: null,
     fidelity: null,
     cl: null,
     cd: null,
@@ -817,6 +913,7 @@ async function loadResultRows(
   return (await db.execute(sql`
     SELECT
       r.id AS result_id,
+      selected_attempt.id AS result_attempt_id,
       r.simulation_preset_revision_id AS revision_id,
       r.aoa_deg::float8 AS aoa_deg,
       COALESCE(selected_attempt.status, r.status)::text AS status,
@@ -911,6 +1008,7 @@ async function loadCampaignPointRows(
       p.derived_by_symmetry,
       p."updatedAt" AS point_updated_at,
       r.id AS result_id,
+      selected_attempt.id AS result_attempt_id,
       r.aoa_deg::float8 AS source_aoa_deg,
       COALESCE(selected_attempt.status, r.status)::text AS status,
       CASE WHEN selected_attempt.id IS NOT NULL
@@ -1019,7 +1117,9 @@ async function loadAttempts(
 ): Promise<Map<string, AttemptRow[]>> {
   if (resultIds.length === 0) return new Map();
   const rows = (await db.execute(sql`
-    SELECT result_id, regime::text AS regime, status::text AS status, valid_for_polar,
+    SELECT result_id, regime::text AS regime,
+           evidence_payload ->> 'fidelity' AS fidelity,
+           status::text AS status, valid_for_polar,
            error, quality_warnings, "createdAt" AS created_at
     FROM result_attempts
     WHERE result_id = ANY(${`{${resultIds.join(",")}}`}::uuid[])

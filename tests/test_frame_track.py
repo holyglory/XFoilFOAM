@@ -566,6 +566,509 @@ def test_precalc_frame_density_matches_exported_last_three_periods(tmp_path):
     assert quality.frames_per_cycle >= pipeline.URANS_FRAME_WRITE_PER_CYCLE
 
 
+def _grade_precalc_trailing_signal(
+    tmp_path: Path,
+    *,
+    period: float,
+    times: np.ndarray,
+    cl_at,
+    frame_times,
+) -> UransQuality:
+    """Exercise the live preliminary grader with byte-backed coefficient rows.
+
+    The long prefix remains in the immutable force history; only the final
+    certification verdict is expected to use the settled trailing window.
+    """
+
+    coeff = (
+        tmp_path
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat"
+    )
+    _write_coeff_rows(coeff, times, cl_at)
+    for t in frame_times:
+        (tmp_path / f"{float(t):.10g}").mkdir(exist_ok=True)
+    return pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+        _accepted_precalc_quality(period),
+        early_stopped=False,
+    )
+
+
+def _write_restart_signal(
+    tmp_path: Path,
+    times: np.ndarray,
+    cl_at,
+    *,
+    segment_count: int,
+) -> list[Path]:
+    """Write one byte-backed force history split like OpenFOAM restarts."""
+
+    paths: list[Path] = []
+    for indices in np.array_split(np.arange(times.size), segment_count):
+        segment_times = times[indices]
+        path = (
+            tmp_path
+            / "postProcessing"
+            / "forceCoeffs1"
+            / f"{float(segment_times[0]):.10g}"
+            / "coefficient.dat"
+        )
+        _write_coeff_rows(path, segment_times, cl_at)
+        paths.append(path)
+    return paths
+
+
+def _segment_local_apparent_flat_quality(span_s: float) -> UransQuality:
+    return UransQuality(
+        ok=False,
+        can_refine=False,
+        no_shedding=False,
+        reason=(
+            "URANS quality could not be measured: "
+            f"{pipeline.URANS_APPARENT_FLAT_OBSERVATION_MARKER} {span_s:.7g}s, "
+            "below the physical slow-shedding observation horizon."
+        ),
+        measured_period_s=None,
+        retained_cycles=0.0,
+        retained_frame_count=0,
+        frames_per_cycle=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("segment_count", "end_time", "sample_count", "period", "aoa_deg"),
+    [
+        (11, 0.132188, 43_213, 0.003593869, 20.0),
+        (19, 0.184610, 60_361, 0.003159720, 19.0),
+    ],
+)
+def test_precalc_segment_local_false_flat_yields_to_credible_merged_history(
+    tmp_path,
+    segment_count,
+    end_time,
+    sample_count,
+    period,
+    aoa_deg,
+):
+    """MUST-CATCH: a local restart verdict cannot hide merged shedding.
+
+    These two production-shaped histories retain roughly 26k and 36k real
+    post-startup samples across many restart segments.  A stale/local
+    apparent-flat grade is replaced only after the merged halves independently
+    corroborate shedding and the existing trailing 4.5-cycle gate certifies
+    the final trajectory.
+    """
+
+    times = np.linspace(0.0, end_time, sample_count)
+    cl_at = lambda t: 1.02 + 0.02 * math.sin(2 * math.pi * float(t) / period)
+    paths = _write_restart_signal(
+        tmp_path,
+        times,
+        cl_at,
+        segment_count=segment_count,
+    )
+    for t in np.arange(
+        end_time - 5.0 * period,
+        end_time + period / 60.0,
+        period / pipeline.URANS_FRAME_WRITE_PER_CYCLE,
+    ):
+        (tmp_path / f"{float(t):.10g}").mkdir(exist_ok=True)
+
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        urans_min_periods=3,
+        transient_discard_fraction=0.4,
+    )
+    spec = CaseSpec(chord=0.05, speed=30.0, aoa_deg=aoa_deg)
+    retained = pipeline.discard_startup(
+        *coefficient_series(paths),
+        fraction=solver.transient_discard_fraction,
+    )
+    merged_estimate = estimate_period(
+        retained[0],
+        retained[1],
+        speed=spec.speed,
+        chord=spec.chord,
+        alpha_deg=spec.aoa_deg,
+    )
+    assert retained[0].size >= 25_000
+    assert merged_estimate is not None and not merged_estimate.ambiguous
+
+    prior = _segment_local_apparent_flat_quality(end_time - float(times[-3_500]))
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        paths,
+        spec,
+        solver,
+        prior,
+        early_stopped=False,
+    )
+
+    assert quality is not prior
+    assert quality.ok, quality.reason
+    assert quality.measured_period_s == pytest.approx(period, rel=0.03)
+    assert quality.retained_cycles >= 3.0
+    assert quality.frames_per_cycle >= pipeline.URANS_MIN_FRAMES_PER_CYCLE
+
+
+@pytest.mark.parametrize("signal_kind", ["tiny-ripple", "short", "noise"])
+def test_precalc_apparent_flat_override_remains_fail_closed_without_credible_shedding(
+    tmp_path,
+    signal_kind,
+):
+    """False-positive guards for the narrow merged-history override.
+
+    A perfectly periodic but amplitude-flat numerical ripple, fewer than two
+    independently measurable half windows, and broadband noise must all retain
+    the original acquisition verdict.  Spectral shape alone is not physical
+    shedding evidence.
+    """
+
+    period = 0.0035
+    if signal_kind == "short":
+        times = np.linspace(0.0, 3.5 * period, 3_000)
+        values = 1.0 + 0.02 * np.sin(2 * np.pi * times / period)
+    else:
+        times = np.linspace(0.0, 0.08, 12_000)
+        if signal_kind == "tiny-ripple":
+            values = 1.0 + 0.001 * np.sin(2 * np.pi * times / period)
+        else:
+            values = 1.0 + 0.02 * np.random.default_rng(411).standard_normal(
+                times.size
+            )
+    paths = _write_restart_signal(
+        tmp_path,
+        times,
+        lambda t: float(np.interp(float(t), times, values)),
+        segment_count=5,
+    )
+    spec = CaseSpec(chord=0.05, speed=30.0, aoa_deg=18.0)
+    estimate = estimate_period(
+        times,
+        values,
+        speed=spec.speed,
+        chord=spec.chord,
+        alpha_deg=spec.aoa_deg,
+    )
+    if signal_kind == "tiny-ripple":
+        # This is the dangerous case: correlation is impeccable, but the
+        # amplitude is still below the physical no-shedding floor.
+        assert estimate is not None and not estimate.ambiguous
+        merged = pipeline.compute_force_history(
+            paths,
+            spec.speed,
+            spec.chord,
+            0.0,
+            target_cycles=3,
+            alpha_deg=spec.aoa_deg,
+        )
+        assert pipeline.is_no_shedding(merged)
+    elif signal_kind == "short":
+        assert estimate is not None and estimate.ambiguous
+    else:
+        assert estimate is None or estimate.ambiguous
+
+    prior = _segment_local_apparent_flat_quality(float(times[-1] - times[0]))
+    quality = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        paths,
+        spec,
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.0,
+        ),
+        prior,
+        early_stopped=False,
+    )
+
+    assert quality is prior
+    assert not quality.ok
+    assert quality.measured_period_s is None
+
+
+def test_precalc_merged_false_flat_nonstationary_tail_keeps_restartable_continuation(
+    tmp_path,
+    monkeypatch,
+):
+    """A credible merged period may still need more SAME-case integration.
+
+    Once the local false-flat marker is displaced, an honestly drifting tail
+    must enter measured-period continuation.  If the emergency chunk cap is
+    reached, the exact durable-continuation marker and saved latest-time state
+    survive; the controller must not fall back to a fresh solve.
+    """
+
+    period = 0.2
+    end_time = 5.0
+    times = np.linspace(0.0, end_time, 15_001)
+
+    def cl_at(t):
+        return (
+            0.8
+            + 0.20 * float(t) / end_time
+            + 0.08 * math.sin(2 * math.pi * float(t) / period)
+        )
+
+    paths = _write_restart_signal(
+        tmp_path,
+        times,
+        cl_at,
+        segment_count=7,
+    )
+    for t in np.arange(0.0, end_time + period / 60.0, period / 30.0):
+        (tmp_path / f"{float(t):.10g}").mkdir(exist_ok=True)
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        urans_min_periods=3,
+        transient_discard_fraction=0.0,
+    )
+    spec = CaseSpec(chord=1.0, speed=10.0, aoa_deg=18.0)
+    graded = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        paths,
+        spec,
+        solver,
+        _segment_local_apparent_flat_quality(0.7),
+        early_stopped=False,
+    )
+    assert not graded.ok and graded.can_refine
+    assert graded.measured_period_s == pytest.approx(period, rel=0.03)
+    assert "not stationary" in graded.reason
+    assert not pipeline._quality_needs_period_acquisition(graded, solver)
+    assert pipeline._quality_allows_more_integration(
+        graded, float(solver.urans_min_periods)
+    )
+
+    first = TransientResult(
+        avg=SimpleNamespace(cl=0.9, cd=0.05, cm=-0.02, cl_cd=18.0),
+        case_dir=tmp_path,
+        force_history=_history_over(0.0, end_time, period),
+        quality=graded,
+        start_time=0.0,
+        end_time=end_time,
+        run_time=end_time,
+        wall_seconds=0.0,
+        coeff_paths=paths,
+    )
+    calls: list[float] = []
+
+    def keep_drifting(tcase, *_args, run_time=None, **_kwargs):
+        start = pipeline._latest_time(tcase)
+        end = start + float(run_time)
+        (tcase / f"{end:.10g}").mkdir(exist_ok=True)
+        calls.append(end)
+        return TransientResult(
+            avg=first.avg,
+            case_dir=tcase,
+            force_history=_history_over(0.0, end, period),
+            quality=graded,
+            start_time=start,
+            end_time=end,
+            run_time=float(run_time),
+            wall_seconds=0.001,
+            coeff_paths=paths,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", keep_drifting)
+    result = pipeline._extend_transient_until_periods(
+        tmp_path,
+        first,
+        0.0,
+        None,
+        None,
+        {},
+        spec,
+        None,
+        None,
+        solver,
+        None,
+        1,
+        14_400,
+        period / 5000.0,
+    )
+
+    assert len(calls) == pipeline.URANS_CONTINUATION_MAX_CHUNKS
+    assert pipeline.URANS_CONTINUATION_REQUIRED_MARKER in result.quality.reason
+    assert "restartable saved case state" in result.quality.reason
+    assert (tmp_path / f"{calls[-1]:.10g}").is_dir()
+
+
+def test_precalc_trailing_certification_replaces_relaxing_startup(tmp_path):
+    """MUST-CATCH: a long startup must not vote forever after a real 4.5-cycle
+    settled tail exists.
+
+    The full immutable trace has eight one-directionally relaxing cycles, so
+    grading all post-discard cycles rejects it.  The final 4.5 cycles are a
+    clean established oscillation with dense fields and are the preliminary
+    certification evidence promised by the same-case extension contract.
+    """
+
+    period = 0.5
+    settled_at = 8.0 * period
+    end = settled_at + 4.5 * period
+    times = np.linspace(0.0, end, 12_501)
+
+    def cl_at(t):
+        baseline = 0.7 + 0.18 * min(float(t) / settled_at, 1.0)
+        return baseline + 0.08 * math.sin(2 * math.pi * float(t) / period)
+
+    quality = _grade_precalc_trailing_signal(
+        tmp_path,
+        period=period,
+        times=times,
+        cl_at=cl_at,
+        frame_times=np.arange(0.0, end + 1e-9, period / 30.0),
+    )
+
+    assert quality.ok, quality.reason
+    assert quality.retained_cycles >= 3.0
+    assert quality.frames_per_cycle >= pipeline.URANS_MIN_FRAMES_PER_CYCLE
+
+
+def test_precalc_trailing_certification_requires_full_4p5_cycle_floor(tmp_path):
+    """False-positive guard: three accepted-tier cycles are not enough for
+    the two independent period halves plus the existing half-cycle margin."""
+
+    period = 0.5
+    end = 4.4 * period
+    times = np.linspace(0.0, end, 4_401)
+    quality = _grade_precalc_trailing_signal(
+        tmp_path,
+        period=period,
+        times=times,
+        cl_at=lambda t: 0.8 + 0.08 * math.sin(2 * math.pi * float(t) / period),
+        frame_times=np.arange(0.0, end + 1e-9, period / 30.0),
+    )
+
+    assert not quality.ok
+    assert quality.can_refine
+    assert "4.5" in quality.reason
+    assert "certification" in quality.reason
+
+
+@pytest.mark.parametrize("tail_kind", ["drifting", "growing"])
+def test_precalc_trailing_certification_rejects_unsettled_tail(
+    tmp_path,
+    tail_kind,
+):
+    """False-positive guards: trailing-window scope never relaxes the existing
+    trend or bounded-amplitude gates."""
+
+    period = 0.5
+    head = 4.0 * period
+    end = head + 4.5 * period
+    times = np.linspace(0.0, end, 8_501)
+
+    def cl_at(t):
+        tail_x = max(0.0, float(t) - head)
+        mean = 0.8 + (
+            0.12 * tail_x / (4.5 * period)
+            if tail_kind == "drifting"
+            else 0.0
+        )
+        amplitude = 0.05 + (
+            0.12 * tail_x / (4.5 * period)
+            if tail_kind == "growing"
+            else 0.0
+        )
+        return mean + amplitude * math.sin(2 * math.pi * float(t) / period)
+
+    quality = _grade_precalc_trailing_signal(
+        tmp_path,
+        period=period,
+        times=times,
+        cl_at=cl_at,
+        frame_times=np.arange(0.0, end + 1e-9, period / 30.0),
+    )
+
+    assert not quality.ok
+    assert quality.can_refine
+    assert "not stationary" in quality.reason
+    if tail_kind == "drifting":
+        assert "trend" in quality.reason or "drift" in quality.reason
+    else:
+        assert "amplitude growing" in quality.reason
+
+
+def test_precalc_trailing_certification_rejects_ambiguous_tail_period(
+    tmp_path,
+    monkeypatch,
+):
+    """False-positive guard: a full-history cadence may locate the tail, but
+    only independently corroborated trailing halves may certify it."""
+
+    period = 0.5
+    end = 8.0 * period
+    times = np.linspace(0.0, end, 8_001)
+    calls = 0
+
+    def full_then_ambiguous(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return PeriodEstimate(
+                period_s=period,
+                ambiguous=False,
+                first_half_s=period,
+                second_half_s=period,
+            )
+        return PeriodEstimate(
+            period_s=period,
+            ambiguous=True,
+            first_half_s=None,
+            second_half_s=period,
+        )
+
+    monkeypatch.setattr(pipeline, "estimate_period", full_then_ambiguous)
+    quality = _grade_precalc_trailing_signal(
+        tmp_path,
+        period=period,
+        times=times,
+        cl_at=lambda t: 0.8 + 0.08 * math.sin(2 * math.pi * float(t) / period),
+        frame_times=np.arange(0.0, end + 1e-9, period / 30.0),
+    )
+
+    assert calls >= 2
+    assert not quality.ok
+    assert quality.can_refine
+    assert "period unstable" in quality.reason
+
+
+def test_precalc_trailing_certification_keeps_dense_field_gate(tmp_path):
+    """False-positive guard: a stable aerodynamic tail without the required
+    real field cadence remains a same-case remediation, not an accepted point."""
+
+    period = 0.5
+    end = 6.0 * period
+    times = np.linspace(0.0, end, 6_001)
+    quality = _grade_precalc_trailing_signal(
+        tmp_path,
+        period=period,
+        times=times,
+        cl_at=lambda t: 0.8 + 0.08 * math.sin(2 * math.pi * float(t) / period),
+        frame_times=np.arange(0.0, end + 1e-9, period / 8.0),
+    )
+
+    assert not quality.ok
+    assert quality.can_refine
+    assert "frames/cycle" in quality.reason
+
+
 def _accepted_precalc_quality(period: float) -> UransQuality:
     return UransQuality(
         ok=True,
@@ -580,7 +1083,9 @@ def _accepted_precalc_quality(period: float) -> UransQuality:
 
 def _precalc_grade_fixture(tmp_path, period: float):
     coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
-    times = np.linspace(0.0, 2.0, 2001)
+    # Five cycles clear the shared 4.5-cycle live/final certification floor so
+    # tests below reach the specific ambiguity/error branches they advertise.
+    times = np.linspace(0.0, 2.5, 2501)
     _write_coeff_rows(
         coeff,
         times,
@@ -2797,23 +3302,41 @@ def test_finalize_does_not_mark_uncorroborated_fallback_period_stationary(
     period = 0.5
     transient = _fake_transient_with_series(tmp_path, period=period)
     monkeypatch.setattr(pipeline, "estimate_period", lambda *_args, **_kwargs: None)
-
-    outcome = _finalize_with(
-        tmp_path,
-        transient,
-        monkeypatch,
-        solver_params=SolverParams(
-            force_transient=True,
-            write_images=[],
-            urans_fidelity="precalc",
-            urans_min_periods=3,
-            transient_discard_fraction=0.0,
+    archived: dict[str, CaseOutcome] = {}
+    monkeypatch.setattr(
+        pipeline,
+        "_archive_case_evidence",
+        lambda _case_dir, _post_dir, outcome, **_kwargs: archived.setdefault(
+            "outcome", outcome
         ),
     )
 
+    with pytest.raises(
+        HardSolverError,
+        match="certification window unavailable during finalization",
+    ):
+        _finalize_with(
+            tmp_path,
+            transient,
+            monkeypatch,
+            solver_params=SolverParams(
+                force_transient=True,
+                write_images=[],
+                urans_fidelity="precalc",
+                urans_min_periods=3,
+                transient_discard_fraction=0.0,
+            ),
+        )
+
+    outcome = archived["outcome"]
     assert outcome.frame_track is not None
     assert outcome.frame_track.period_s == pytest.approx(period)
     assert not outcome.frame_track.stationary
+    assert not outcome.converged
+    assert any(
+        "certification window unavailable" in warning.lower()
+        for warning in outcome.quality_warnings
+    )
     assert any("not stationary" in warning.lower() for warning in outcome.quality_warnings)
 
 
@@ -3045,6 +3568,89 @@ def test_early_stopped_point_stats_exclude_startup_via_marker(tmp_path, monkeypa
     # (packages/core FRAME_TRACK_MIN_PERIODS = 5) worth of periods.
     assert ft.periods_retained >= 5.0
     assert pipeline.URANS_STABLE_RETAINED_CYCLES >= 5.0  # cross-runtime parity pin
+
+
+def test_precalc_finalizer_reuses_live_trailing_certification_window(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: live acceptance and publication use one exact tail.
+
+    The complete merged trajectory deliberately averages to 0.828264 because
+    it retains a long lower-mean startup.  Its final 4.5-cycle certification
+    horizon is a stationary limit cycle centred on 0.88.  Recomputing the full
+    post-discard history in ``_finalize_outcome`` used to replace the accepted
+    live value and emit a contradictory non-stationary warning.
+    """
+
+    period = 0.5
+    solver_params = SolverParams(
+        force_transient=True,
+        write_images=[],
+        urans_fidelity="precalc",
+        urans_min_periods=3,
+        transient_discard_fraction=0.0,
+    )
+    transient = _fake_transient_with_series(tmp_path, period=period)
+    coeff = transient.coeff_paths[0]
+    ts = np.linspace(600.0, 606.0, 2401)
+    startup_mean = 0.7972224
+    settled_at = 603.75
+    _write_coeff_rows(
+        coeff,
+        ts,
+        lambda t: (
+            startup_mean if t < settled_at else 0.88
+        )
+        + 0.05 * math.sin(2 * math.pi * t / period),
+    )
+    # The live gate grades field density over the same exported last-three-
+    # period player window.  These are real saved-state directories.
+    for t in np.linspace(604.5, 606.0, 91):
+        (transient.case_dir / f"{float(t):.10g}").mkdir(exist_ok=True)
+
+    t_all, cl_all, cd_all, cm_all = coefficient_series([coeff])
+    full_stats = period_window_stats(
+        t_all,
+        cl_all,
+        cd_all,
+        cm_all,
+        period,
+        established_oscillation=True,
+    )
+    assert full_stats is not None
+    assert full_stats.cl.mean == pytest.approx(0.828264, abs=3e-4)
+    assert not full_stats.stationary
+
+    quality = pipeline._grade_precalc_established_oscillation(
+        transient.case_dir,
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=12.0),
+        solver_params,
+        UransQuality(
+            ok=True,
+            can_refine=False,
+            reason="URANS quality target met.",
+            measured_period_s=period,
+        ),
+        early_stopped=False,
+    )
+    assert quality.ok, quality.reason
+
+    outcome = _finalize_with(
+        tmp_path,
+        replace(transient, quality=quality),
+        monkeypatch,
+        solver_params=solver_params,
+    )
+
+    assert outcome.cl == pytest.approx(0.88, abs=2e-3)
+    assert outcome.frame_track is not None
+    assert outcome.frame_track.stationary
+    assert outcome.frame_track.window.t_start >= settled_at - 1e-6
+    assert not any(
+        "not stationary" in warning.lower()
+        for warning in outcome.quality_warnings
+    )
 
 
 def test_multi_aoa_image_subdir_pattern_pin(tmp_path, monkeypatch):

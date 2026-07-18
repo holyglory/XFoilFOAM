@@ -18,6 +18,7 @@ import {
   results,
   schedulingProfiles,
   simJobs,
+  simUransRequests,
   simUransVerifyQueue,
   simulationPresets,
   solverProfiles,
@@ -45,6 +46,7 @@ const points: Point[] = [
 
 const cleanup = {
   verifyIds: [] as string[],
+  requestIds: [] as string[],
   resultIds: [] as string[],
   jobIds: [] as string[],
   presetIds: [] as string[],
@@ -298,6 +300,7 @@ describe("solverWorkStateForPoint", () => {
         classificationState: "rejected",
         regime: null,
         fidelity: null,
+        openRequest: true,
       }),
     ).toBe("ladder");
     expect(
@@ -346,6 +349,76 @@ describe("solverWorkStateForPoint", () => {
         fidelity: "rans",
       }),
     ).toBe("superseded");
+  });
+
+  it("MUST-CATCH: presents a failed aerodynamic RANS screen with an owned FAST request as a normal handoff", () => {
+    expect(
+      solverWorkStateForPoint({
+        resultId: "failed-rans",
+        status: "failed",
+        classificationState: "rejected",
+        classificationReasons: ["not-converged", "solver-stalled"],
+        regime: "rans",
+        fidelity: "rans",
+        openRequest: true,
+        error: "Steady RANS did not converge before the iteration cap.",
+      }),
+    ).toBe("ladder");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "failed-rans-obligation",
+        status: "failed",
+        classificationState: "rejected",
+        classificationReasons: ["not-converged"],
+        regime: "rans",
+        fidelity: "rans",
+        precalcObligationState: "pending",
+      }),
+    ).toBe("ladder");
+  });
+
+  it("keeps mesh, infrastructure, crash, and missing-handoff failures critical", () => {
+    for (const error of [
+      "deterministic mesh generation failed: degenerate leading edge",
+      "engine unavailable: worker lost",
+      "simpleFoam solver crash: segmentation fault",
+    ]) {
+      expect(
+        solverWorkStateForPoint({
+          resultId: `critical-${error}`,
+          status: "failed",
+          classificationState: "rejected",
+          classificationReasons: ["not-converged"],
+          regime: "rans",
+          fidelity: "rans",
+          openRequest: true,
+          precalcObligationState: "pending",
+          error,
+        }),
+      ).toBe("blocked");
+    }
+
+    expect(
+      solverWorkStateForPoint({
+        resultId: "orphaned-rans",
+        status: "failed",
+        classificationState: "rejected",
+        classificationReasons: ["not-converged", "solver-stalled"],
+        regime: "rans",
+        fidelity: "rans",
+        openRequest: false,
+      }),
+    ).toBe("blocked");
+    expect(
+      solverWorkStateForPoint({
+        resultId: "exhausted-fast",
+        status: "failed",
+        classificationState: "rejected",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        precalcObligationState: "blocked",
+      }),
+    ).toBe("blocked");
   });
 
   it("keeps accepted rows with unrelated live continuation requests verified", () => {
@@ -718,6 +791,149 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
       })),
     );
 
+    // Real read-model regression: the selected RANS attempt is durably failed,
+    // while FAST URANS already owns the same point. This is a normal stage
+    // transition, never a red/user-actionable solver failure.
+    const [ransHandoff] = await db
+      .insert(results)
+      .values({
+        airfoilId: airfoil.id,
+        bcId: conditionA.bcId,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 8,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        reynolds: conditionA.reynolds,
+        speed: conditionA.speedMps,
+        chord: conditionA.chordM,
+        mach: conditionA.mach,
+        converged: false,
+        error: "Steady RANS did not converge before the iteration cap.",
+        solvedAt: new Date(),
+      })
+      .returning();
+    cleanup.resultIds.push(ransHandoff.id);
+    const [ransHandoffAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: ransHandoff.id,
+        airfoilId: airfoil.id,
+        bcId: conditionA.bcId,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 8,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        error: "Steady RANS did not converge before the iteration cap.",
+        qualityWarnings: [
+          "mesh quality warning: max non-orthogonality 78.7 deg (heuristic waived)",
+          "solver-stalled",
+        ],
+        evidencePayload: { fidelity: "rans" },
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: ransHandoffAttempt.id })
+      .where(eq(results.id, ransHandoff.id));
+    await db.insert(resultClassifications).values({
+      resultAttemptId: ransHandoffAttempt.id,
+      airfoilId: airfoil.id,
+      simulationPresetRevisionId: revA,
+      aoaDeg: 8,
+      regime: "rans",
+      classifierVersion: "test",
+      state: "rejected",
+      reasons: ["not-converged", "solver-stalled"],
+      confidence: 1,
+    });
+    const [fastRequest] = await db
+      .insert(simUransRequests)
+      .values({
+        airfoilId: airfoil.id,
+        revisionId: revA,
+        aoaDeg: 8,
+        fidelity: "precalc",
+        state: "pending",
+        requestedBy: `${PREFIX}-automatic-rans-handoff`,
+      })
+      .returning({ id: simUransRequests.id });
+    cleanup.requestIds.push(fastRequest.id);
+
+    // False-positive guard: an open FAST row must not hide a deterministic
+    // mesh incident. That is a system-owned critical state, not a handoff.
+    const [meshFailure] = await db
+      .insert(results)
+      .values({
+        airfoilId: airfoil.id,
+        bcId: conditionA.bcId,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 9,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        reynolds: conditionA.reynolds,
+        speed: conditionA.speedMps,
+        chord: conditionA.chordM,
+        mach: conditionA.mach,
+        converged: false,
+        error: "Deterministic mesh generation failed: degenerate leading edge.",
+        solvedAt: new Date(),
+      })
+      .returning();
+    cleanup.resultIds.push(meshFailure.id);
+    const [meshFailureAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: meshFailure.id,
+        airfoilId: airfoil.id,
+        bcId: conditionA.bcId,
+        simulationPresetRevisionId: revA,
+        aoaDeg: 9,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        error: "Deterministic mesh generation failed: degenerate leading edge.",
+        evidencePayload: { fidelity: "rans" },
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: meshFailureAttempt.id })
+      .where(eq(results.id, meshFailure.id));
+    await db.insert(resultClassifications).values({
+      resultAttemptId: meshFailureAttempt.id,
+      airfoilId: airfoil.id,
+      simulationPresetRevisionId: revA,
+      aoaDeg: 9,
+      regime: "rans",
+      classifierVersion: "test",
+      state: "rejected",
+      reasons: ["deterministic-mesh-failure"],
+      confidence: 1,
+    });
+    const [invalidMeshFastRequest] = await db
+      .insert(simUransRequests)
+      .values({
+        airfoilId: airfoil.id,
+        revisionId: revA,
+        aoaDeg: 9,
+        fidelity: "precalc",
+        state: "pending",
+        requestedBy: `${PREFIX}-invalid-mesh-handoff`,
+      })
+      .returning({ id: simUransRequests.id });
+    cleanup.requestIds.push(invalidMeshFastRequest.id);
+
     const [verify] = await db
       .insert(simUransVerifyQueue)
       .values({
@@ -763,6 +979,7 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
 
   afterAll(async () => {
     await deleteIds(simUransVerifyQueue, cleanup.verifyIds);
+    await deleteIds(simUransRequests, cleanup.requestIds);
     if (cleanup.resultIds.length) {
       await db
         .update(results)
@@ -815,6 +1032,7 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
           gate: { name: string; detail: string } | null;
           gates: Array<{ name: string; detail: string; pass: boolean }>;
           plain: string;
+          chain: Array<{ label: string; tone: string }>;
           reviewed: boolean;
         }>;
         jobs: unknown[];
@@ -829,7 +1047,7 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     expect(conditionA.reynolds).toBeCloseTo(853000, -3); // fixture derives Re back from speed (852891)
     expect(conditionA.chordM).toBeCloseTo(0.5);
     expect(conditionA.speedMps).toBeCloseTo(25);
-    expect(conditionA.attentionCount).toBe(4);
+    expect(conditionA.attentionCount).toBe(5);
     const byAoa = new Map(conditionA.points.map((p) => [p.aoaDeg, p]));
     expect(byAoa.get(2)?.state).toBe("provisional");
     expect(byAoa.get(3)?.state).toBe("needs_time");
@@ -846,6 +1064,23 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     expect(byAoa.get(4)?.plain).toContain("needs more same-case integration");
     expect(byAoa.get(4)?.plain).not.toContain("time budget");
     expect(byAoa.get(5)).toMatchObject({ state: "queued", resultId: null });
+    expect(byAoa.get(8)).toMatchObject({
+      state: "ladder",
+      plain: "RANS → FAST URANS (automatic).",
+      chain: [{ label: "RANS → FAST", tone: "ladder" }],
+      actions: [],
+    });
+    expect(byAoa.get(8)?.plain).not.toMatch(
+      /blocked|review|change (?:the )?setup/i,
+    );
+    expect(byAoa.get(9)).toMatchObject({
+      state: "blocked",
+      plain:
+        "Automatic recovery exhausted at the mesh QA gate; engineering action required.",
+      chain: [{ label: "RANS system issue", tone: "blocked" }],
+      actions: [],
+    });
+    expect(byAoa.get(9)?.plain).not.toMatch(/review|change (?:the )?setup/i);
     for (const aoa of [6, 7]) {
       expect(byAoa.get(aoa)).toMatchObject({
         state: "blocked",
@@ -859,9 +1094,13 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
           detail:
             "Automatic evidence classification is unavailable; this stored result is not used in the polar.",
         },
+        plain:
+          "Classification missing; excluded from the polar. Engineering action required.",
       });
-      expect(byAoa.get(aoa)?.plain).toContain("no human review is required");
       expect(byAoa.get(aoa)?.plain).not.toContain("verified");
+      expect(byAoa.get(aoa)?.plain).not.toMatch(
+        /review|change (?:the )?setup/i,
+      );
       expect(byAoa.get(aoa)?.gates).toEqual([
         {
           name: "quality gate",

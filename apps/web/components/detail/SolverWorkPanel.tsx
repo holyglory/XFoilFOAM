@@ -1,10 +1,29 @@
 "use client";
 
-import { type CSSProperties, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type MouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-import { adminMe, continueUransResult, deleteResultReview, isAdminApiError, requestUrans, requeuePoint } from "@/lib/admin";
+import {
+  adminMe,
+  continueUransResult,
+  deleteResultReview,
+  isAdminApiError,
+  requestUrans,
+  requeuePoint,
+} from "@/lib/admin";
 import { getSolverWork } from "@/lib/api";
-import { buildReviewQueue, type ReviewQueueItem, type SimModalReviewContext } from "@/lib/result-review";
+import {
+  buildReviewQueue,
+  type ReviewQueueItem,
+  type SimModalReviewContext,
+} from "@/lib/result-review";
 import {
   buildSolverWorkConditionSummary,
   buildSolverWorkPopoverView,
@@ -75,22 +94,31 @@ export function SolverWorkPanel({
   slug: string;
   airfoilId: string;
   revisionId?: string | null;
-  onOpenResult: (ctx: SolverWorkResultContext, review?: SimModalReviewContext | null) => void;
+  onOpenResult: (
+    ctx: SolverWorkResultContext,
+    review?: SimModalReviewContext | null,
+  ) => void;
 }) {
   const [conditions, setConditions] = useState<SolverWorkCondition[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<SolverWorkFilter>("all");
   const [sort, setSort] = useState<SolverWorkSort>("re-asc");
-  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
-  const [showSuperseded, setShowSuperseded] = useState<Record<string, boolean>>({});
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>(
+    {},
+  );
+  const [showSuperseded, setShowSuperseded] = useState<Record<string, boolean>>(
+    {},
+  );
   const [engineOpen, setEngineOpen] = useState<Record<string, boolean>>({});
   const [openPoint, setOpenPoint] = useState<OpenPoint | null>(null);
   const [compactPopover, setCompactPopover] = useState(false);
   const [adminAuthed, setAdminAuthed] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
-  const [optimisticStates, setOptimisticStates] = useState<Record<string, SolverWorkPointState>>({});
+  const [optimisticStates, setOptimisticStates] = useState<
+    Record<string, SolverWorkPointState>
+  >({});
   const popoverRef = useRef<HTMLDivElement>(null);
   const latestConditionsRef = useRef<SolverWorkCondition[]>([]);
 
@@ -133,7 +161,8 @@ export function SolverWorkPanel({
     setExpandedGroups((prev) => {
       const next: Record<string, boolean> = {};
       for (const condition of conditions) {
-        next[condition.presetRevisionId] = prev[condition.presetRevisionId] ?? condition.attentionCount > 0;
+        next[condition.presetRevisionId] =
+          prev[condition.presetRevisionId] ?? condition.attentionCount > 0;
       }
       return next;
     });
@@ -152,9 +181,14 @@ export function SolverWorkPanel({
       if (e.key === "Escape") setOpenPoint(null);
     };
     const onMouseDown = (e: globalThis.MouseEvent) => {
-      if (e.target instanceof Element && e.target.closest("[data-solver-point-badge]")) return;
+      if (
+        e.target instanceof Element &&
+        e.target.closest("[data-solver-point-badge]")
+      )
+        return;
       const popover = popoverRef.current;
-      if (popover && e.target instanceof Node && popover.contains(e.target)) return;
+      if (popover && e.target instanceof Node && popover.contains(e.target))
+        return;
       setOpenPoint(null);
     };
     const onScroll = () => setOpenPoint(null);
@@ -189,36 +223,67 @@ export function SolverWorkPanel({
     [optimisticConditions, filter, sort],
   );
 
-  const attentionGroups = optimisticConditions.filter((condition) => condition.attentionCount > 0).length;
+  const attentionGroups = optimisticConditions.filter(
+    (condition) => condition.attentionCount > 0,
+  ).length;
   const solvingGroups = optimisticConditions.filter(conditionHasSolving).length;
-  const totalJobs = optimisticConditions.reduce((sum, condition) => sum + condition.jobs.length, 0);
+  const totalJobs = optimisticConditions.reduce(
+    (sum, condition) => sum + condition.jobs.length,
+    0,
+  );
 
   const openContext = useMemo(() => {
     if (!openPoint) return null;
-    const condition = optimisticConditions.find((item) => item.presetRevisionId === openPoint.conditionKey);
+    const condition = optimisticConditions.find(
+      (item) => item.presetRevisionId === openPoint.conditionKey,
+    );
     if (!condition) return null;
-    const point = condition.points.find((item) => solverWorkPointKey(condition, item) === openPoint.pointKey);
+    const point = condition.points.find(
+      (item) => solverWorkPointKey(condition, item) === openPoint.pointKey,
+    );
     if (!point) return null;
     return { condition, point };
   }, [openPoint, optimisticConditions]);
 
-  const openBadge = useCallback((e: MouseEvent<HTMLButtonElement>, condition: SolverWorkCondition, point: SolverWorkPoint) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    setActionNotice(null);
-    setOpenPoint({
-      conditionKey: condition.presetRevisionId,
-      pointKey: solverWorkPointKey(condition, point),
-      position: popoverPosition(rect),
-    });
-  }, []);
+  const openBadge = useCallback(
+    (
+      e: MouseEvent<HTMLButtonElement>,
+      condition: SolverWorkCondition,
+      point: SolverWorkPoint,
+    ) => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      setActionNotice(null);
+      setOpenPoint({
+        conditionKey: condition.presetRevisionId,
+        pointKey: solverWorkPointKey(condition, point),
+        position: popoverPosition(rect),
+      });
+    },
+    [],
+  );
 
-  const optimisticFlip = useCallback((condition: SolverWorkCondition, point: SolverWorkPoint, state: SolverWorkPointState) => {
-    setOptimisticStates((prev) => ({ ...prev, [solverWorkPointKey(condition, point)]: state }));
-  }, []);
+  const optimisticFlip = useCallback(
+    (
+      condition: SolverWorkCondition,
+      point: SolverWorkPoint,
+      state: SolverWorkPointState,
+    ) => {
+      setOptimisticStates((prev) => ({
+        ...prev,
+        [solverWorkPointKey(condition, point)]: state,
+      }));
+    },
+    [],
+  );
 
   const runContinue = useCallback(
-    async (condition: SolverWorkCondition, point: SolverWorkPoint, hours: 2 | 6 | 24) => {
-      if (!point.resultId || busyAction) return false;
+    async (
+      condition: SolverWorkCondition,
+      point: SolverWorkPoint,
+      hours: 2 | 6 | 24,
+    ) => {
+      if (!point.resultId || !point.continuationResultAttemptId || busyAction)
+        return false;
       if (
         !window.confirm(
           `Continue this URANS solve (α ${formatAoa(point.aoaDeg)}) from its saved case state with a +${hours} h wall-clock budget? It resumes from the last written time step (no work is redone) and re-enters the queue at precalc rank.`,
@@ -228,8 +293,16 @@ export function SolverWorkPanel({
       setBusyAction(`continue-${hours}h`);
       setActionNotice(null);
       try {
-        const res = await continueUransResult(point.resultId, hours * 3600);
-        optimisticFlip(condition, point, res.request.state === "running" ? "solving" : "queued");
+        const res = await continueUransResult(
+          point.resultId,
+          point.continuationResultAttemptId,
+          hours * 3600,
+        );
+        optimisticFlip(
+          condition,
+          point,
+          res.request.state === "running" ? "solving" : "queued",
+        );
         setActionNotice(
           res.created
             ? `continuation queued (+${hours} h) — resumes the saved URANS state automatically`
@@ -250,13 +323,20 @@ export function SolverWorkPanel({
   const runRetry = useCallback(
     async (condition: SolverWorkCondition, point: SolverWorkPoint) => {
       if (!point.resultId || busyAction) return;
-      if (!window.confirm(`Retry this point (α ${formatAoa(point.aoaDeg)})? The evidence returns to the solve queue for a fresh attempt.`)) return;
+      if (
+        !window.confirm(
+          `Retry this point (α ${formatAoa(point.aoaDeg)})? The evidence returns to the solve queue for a fresh attempt.`,
+        )
+      )
+        return;
       setBusyAction("retry");
       setActionNotice(null);
       try {
         const res = await requeuePoint(point.resultId);
         optimisticFlip(condition, point, "queued");
-        setActionNotice(`requeued (${res.scope}) — the point is back in the queue`);
+        setActionNotice(
+          `requeued (${res.scope}) — the point is back in the queue`,
+        );
         void refresh({ quiet: true });
       } catch (e) {
         setActionNotice(isAdminApiError(e) ? e.message : (e as Error).message);
@@ -285,7 +365,11 @@ export function SolverWorkPanel({
           aoaDeg: point.aoaDeg,
           fidelity: "full",
         });
-        optimisticFlip(condition, point, res.request.state === "running" ? "solving" : "queued");
+        optimisticFlip(
+          condition,
+          point,
+          res.request.state === "running" ? "solving" : "queued",
+        );
         setActionNotice(
           res.created
             ? "final verification requested — fast URANS runs first when needed"
@@ -325,15 +409,28 @@ export function SolverWorkPanel({
     (condition: SolverWorkCondition, point: SolverWorkPoint) => {
       const ctx = solverWorkResultContext(condition, point);
       if (!ctx) return;
-      const makeReviewContext = (reviewCondition: SolverWorkCondition, reviewPoint: SolverWorkPoint): SimModalReviewContext => ({
+      const makeReviewContext = (
+        reviewCondition: SolverWorkCondition,
+        reviewPoint: SolverWorkPoint,
+      ): SimModalReviewContext => ({
         admin: adminAuthed,
         condition: reviewCondition,
         point: reviewPoint,
         queue: buildReviewQueue(latestConditionsRef.current),
         onOpenQueueItem: (item: ReviewQueueItem) => {
-          const latestItem = buildReviewQueue(latestConditionsRef.current).find((candidate) => candidate.resultId === item.resultId) ?? item;
-          const nextCtx = solverWorkResultContext(latestItem.condition, latestItem.point);
-          if (nextCtx) onOpenResult(nextCtx, makeReviewContext(latestItem.condition, latestItem.point));
+          const latestItem =
+            buildReviewQueue(latestConditionsRef.current).find(
+              (candidate) => candidate.resultId === item.resultId,
+            ) ?? item;
+          const nextCtx = solverWorkResultContext(
+            latestItem.condition,
+            latestItem.point,
+          );
+          if (nextCtx)
+            onOpenResult(
+              nextCtx,
+              makeReviewContext(latestItem.condition, latestItem.point),
+            );
         },
         onRefresh: () => refresh({ quiet: true }),
         onContinue6h: () => runContinue(reviewCondition, reviewPoint, 6),
@@ -345,7 +442,15 @@ export function SolverWorkPanel({
   );
 
   return (
-    <section data-testid="solver-work-panel" style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+    <section
+      data-testid="solver-work-panel"
+      style={{
+        background: C.panel,
+        border: `1px solid ${C.border}`,
+        borderRadius: 12,
+        overflow: "hidden",
+      }}
+    >
       <div
         style={{
           display: "flex",
@@ -358,17 +463,37 @@ export function SolverWorkPanel({
         }}
       >
         <div style={{ display: "grid", gap: 2 }}>
-          <span style={{ fontFamily: MONO, fontSize: 11, color: C.dim, letterSpacing: "0.12em" }}>SOLVER WORK</span>
+          <span
+            style={{
+              fontFamily: MONO,
+              fontSize: 11,
+              color: C.dim,
+              letterSpacing: "0.12em",
+            }}
+          >
+            SOLVER WORK
+          </span>
           <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>
-            {optimisticConditions.length} condition{optimisticConditions.length === 1 ? "" : "s"} · {totalJobs} engine job{totalJobs === 1 ? "" : "s"}
+            {optimisticConditions.length} condition
+            {optimisticConditions.length === 1 ? "" : "s"} · {totalJobs} engine
+            job{totalJobs === 1 ? "" : "s"}
           </span>
         </div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-          {([
-            ["all", `All ${optimisticConditions.length}`],
-            ["attention", `Attention ${attentionGroups}`],
-            ["solving", `Solving ${solvingGroups}`],
-          ] as const).map(([key, label]) => (
+        <div
+          style={{
+            display: "flex",
+            gap: 6,
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
+          {(
+            [
+              ["all", `All ${optimisticConditions.length}`],
+              ["attention", `Attention ${attentionGroups}`],
+              ["solving", `Solving ${solvingGroups}`],
+            ] as const
+          ).map(([key, label]) => (
             <button
               key={key}
               type="button"
@@ -400,17 +525,47 @@ export function SolverWorkPanel({
       </div>
 
       {error && (
-        <div style={{ padding: "12px 16px", fontFamily: MONO, fontSize: 11, color: C.redText, borderBottom: `1px solid ${C.borderRow}` }}>
+        <div
+          style={{
+            padding: "12px 16px",
+            fontFamily: MONO,
+            fontSize: 11,
+            color: C.redText,
+            borderBottom: `1px solid ${C.borderRow}`,
+          }}
+        >
           {error}
-          <button type="button" onClick={() => void refresh()} style={{ ...smallBtn, marginLeft: 8 }}>
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            style={{ ...smallBtn, marginLeft: 8 }}
+          >
             retry
           </button>
         </div>
       )}
       {loading && !conditions.length && !error ? (
-        <div style={{ padding: "14px 16px", fontFamily: MONO, fontSize: 11, color: C.muted }}>Loading solver work…</div>
+        <div
+          style={{
+            padding: "14px 16px",
+            fontFamily: MONO,
+            fontSize: 11,
+            color: C.muted,
+          }}
+        >
+          Loading solver work…
+        </div>
       ) : filteredConditions.length === 0 && !error ? (
-        <div style={{ padding: "14px 16px", fontFamily: MONO, fontSize: 11, color: C.muted }}>No solver work matches this filter.</div>
+        <div
+          style={{
+            padding: "14px 16px",
+            fontFamily: MONO,
+            fontSize: 11,
+            color: C.muted,
+          }}
+        >
+          No solver work matches this filter.
+        </div>
       ) : (
         <div style={{ display: "grid" }}>
           {filteredConditions.map((condition) => {
@@ -422,9 +577,15 @@ export function SolverWorkPanel({
                 expanded={!!expandedGroups[key]}
                 showSuperseded={!!showSuperseded[key]}
                 engineOpen={!!engineOpen[key]}
-                onToggleExpanded={() => setExpandedGroups((prev) => ({ ...prev, [key]: !prev[key] }))}
-                onToggleSuperseded={() => setShowSuperseded((prev) => ({ ...prev, [key]: !prev[key] }))}
-                onToggleEngine={() => setEngineOpen((prev) => ({ ...prev, [key]: !prev[key] }))}
+                onToggleExpanded={() =>
+                  setExpandedGroups((prev) => ({ ...prev, [key]: !prev[key] }))
+                }
+                onToggleSuperseded={() =>
+                  setShowSuperseded((prev) => ({ ...prev, [key]: !prev[key] }))
+                }
+                onToggleEngine={() =>
+                  setEngineOpen((prev) => ({ ...prev, [key]: !prev[key] }))
+                }
                 onBadge={openBadge}
               />
             );
@@ -455,16 +616,28 @@ export function SolverWorkPanel({
           }
         >
           <PointPopoverBody
-            view={buildSolverWorkPopoverView(openContext.condition, openContext.point, adminAuthed)}
+            view={buildSolverWorkPopoverView(
+              openContext.condition,
+              openContext.point,
+              adminAuthed,
+            )}
             busyAction={busyAction}
             actionNotice={actionNotice}
             onOpenResults={() => {
               openResultWithReview(openContext.condition, openContext.point);
             }}
-            onContinue={(hours) => void runContinue(openContext.condition, openContext.point, hours)}
-            onRetry={() => void runRetry(openContext.condition, openContext.point)}
-            onRequestFull={() => void runRequestFull(openContext.condition, openContext.point)}
-            onRevokeReview={() => void runRevokeReview(openContext.condition, openContext.point)}
+            onContinue={(hours) =>
+              void runContinue(openContext.condition, openContext.point, hours)
+            }
+            onRetry={() =>
+              void runRetry(openContext.condition, openContext.point)
+            }
+            onRequestFull={() =>
+              void runRequestFull(openContext.condition, openContext.point)
+            }
+            onRevokeReview={() =>
+              void runRevokeReview(openContext.condition, openContext.point)
+            }
           />
         </div>
       )}
@@ -489,15 +662,26 @@ function ConditionGroup({
   onToggleExpanded: () => void;
   onToggleSuperseded: () => void;
   onToggleEngine: () => void;
-  onBadge: (e: MouseEvent<HTMLButtonElement>, condition: SolverWorkCondition, point: SolverWorkPoint) => void;
+  onBadge: (
+    e: MouseEvent<HTMLButtonElement>,
+    condition: SolverWorkCondition,
+    point: SolverWorkPoint,
+  ) => void;
 }) {
   const summary = buildSolverWorkConditionSummary(condition);
-  const visiblePoints = showSuperseded ? condition.points : condition.points.filter((point) => point.state !== "superseded");
-  const supersededCount = condition.points.length - condition.points.filter((point) => point.state !== "superseded").length;
+  const visiblePoints = showSuperseded
+    ? condition.points
+    : condition.points.filter((point) => point.state !== "superseded");
+  const supersededCount =
+    condition.points.length -
+    condition.points.filter((point) => point.state !== "superseded").length;
   const rollup = solverWorkRollup(condition.points, showSuperseded);
   const legend = solverWorkLegendStates(condition.points, showSuperseded);
   return (
-    <article data-testid="solver-work-condition" style={{ borderBottom: `1px solid ${C.borderRow}`, minWidth: 0 }}>
+    <article
+      data-testid="solver-work-condition"
+      style={{ borderBottom: `1px solid ${C.borderRow}`, minWidth: 0 }}
+    >
       <button
         type="button"
         data-testid="solver-work-condition-header"
@@ -518,21 +702,63 @@ function ConditionGroup({
         }}
       >
         <span style={{ display: "grid", gap: 5, minWidth: 0 }}>
-          <span style={{ fontFamily: MONO, fontSize: 12, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span
+            style={{
+              fontFamily: MONO,
+              fontSize: 12,
+              color: C.text,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
             <span aria-hidden style={{ color: C.dim, marginRight: 6 }}>
               {expanded ? "▾" : "▸"}
             </span>
-            <strong style={{ color: C.violet, fontWeight: 800 }}>Re {summary.titleParts.reynolds}</strong> · M {summary.titleParts.mach} · c {summary.titleParts.chord} · {summary.titleParts.speed}
+            <strong style={{ color: C.violet, fontWeight: 800 }}>
+              Re {summary.titleParts.reynolds}
+            </strong>{" "}
+            · M {summary.titleParts.mach} · c {summary.titleParts.chord} ·{" "}
+            {summary.titleParts.speed}
           </span>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>{summary.meta}</span>
+          <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>
+            {summary.meta}
+          </span>
           <RollupBar segments={rollup} />
         </span>
-        <span style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted, border: `1px solid ${C.stroke}`, borderRadius: 999, padding: "3px 8px" }}>
+        <span
+          style={{
+            display: "flex",
+            gap: 6,
+            alignItems: "center",
+            flexWrap: "wrap",
+            justifyContent: "flex-end",
+          }}
+        >
+          <span
+            style={{
+              fontFamily: MONO,
+              fontSize: 10,
+              color: C.muted,
+              border: `1px solid ${C.stroke}`,
+              borderRadius: 999,
+              padding: "3px 8px",
+            }}
+          >
             {summary.countLabel}
           </span>
           {summary.attentionLabel && (
-            <span style={{ fontFamily: MONO, fontSize: 10, color: C.amber, border: "1px solid rgba(245,158,11,0.45)", borderRadius: 999, padding: "3px 8px", background: "rgba(245,158,11,0.08)" }}>
+            <span
+              style={{
+                fontFamily: MONO,
+                fontSize: 10,
+                color: C.amber,
+                border: "1px solid rgba(245,158,11,0.45)",
+                borderRadius: 999,
+                padding: "3px 8px",
+                background: "rgba(245,158,11,0.08)",
+              }}
+            >
               {summary.attentionLabel}
             </span>
           )}
@@ -540,18 +766,40 @@ function ConditionGroup({
       </button>
       {expanded && (
         <div style={{ padding: "0 16px 14px", display: "grid", gap: 10 }}>
-          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              gap: 6,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
             {visiblePoints.map((point) => (
-              <PointBadge key={solverWorkPointKey(condition, point)} condition={condition} point={point} onClick={onBadge} />
+              <PointBadge
+                key={solverWorkPointKey(condition, point)}
+                condition={condition}
+                point={point}
+                onClick={onBadge}
+              />
             ))}
             {supersededCount > 0 && (
-              <button type="button" data-testid="solver-work-superseded-toggle" onClick={onToggleSuperseded} style={{ ...chipBtn, color: C.dim }}>
-                {showSuperseded ? "hide superseded" : `show superseded ${supersededCount}`}
+              <button
+                type="button"
+                data-testid="solver-work-superseded-toggle"
+                onClick={onToggleSuperseded}
+                style={{ ...chipBtn, color: C.dim }}
+              >
+                {showSuperseded
+                  ? "hide superseded"
+                  : `show superseded ${supersededCount}`}
               </button>
             )}
           </div>
           {legend.length > 0 && (
-            <div data-testid="solver-work-legend" style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+            <div
+              data-testid="solver-work-legend"
+              style={{ display: "flex", gap: 5, flexWrap: "wrap" }}
+            >
               {legend.map((state) => (
                 <StatePill key={state} state={state} compact />
               ))}
@@ -559,11 +807,23 @@ function ConditionGroup({
           )}
           {condition.jobs.length > 0 && (
             <div style={{ display: "grid", gap: 8 }}>
-              <button type="button" data-testid="solver-work-engine-toggle" onClick={onToggleEngine} style={{ ...smallBtn, width: "fit-content" }}>
+              <button
+                type="button"
+                data-testid="solver-work-engine-toggle"
+                onClick={onToggleEngine}
+                style={{ ...smallBtn, width: "fit-content" }}
+              >
                 {engineOpen ? "▾" : "▸"} engine jobs ({condition.jobs.length})
               </button>
               {engineOpen && (
-                <div style={{ background: C.panel2, border: `1px solid ${C.borderSoft}`, borderRadius: 9, overflow: "hidden" }}>
+                <div
+                  style={{
+                    background: C.panel2,
+                    border: `1px solid ${C.borderSoft}`,
+                    borderRadius: 9,
+                    overflow: "hidden",
+                  }}
+                >
                   {condition.jobs.map((job) => (
                     <EngineJobRow key={job.id} work={job} />
                   ))}
@@ -584,7 +844,11 @@ function PointBadge({
 }: {
   condition: SolverWorkCondition;
   point: SolverWorkPoint;
-  onClick: (e: MouseEvent<HTMLButtonElement>, condition: SolverWorkCondition, point: SolverWorkPoint) => void;
+  onClick: (
+    e: MouseEvent<HTMLButtonElement>,
+    condition: SolverWorkCondition,
+    point: SolverWorkPoint,
+  ) => void;
 }) {
   const presentation = solverWorkPointPresentation(point);
   const style = SOLVER_WORK_STATE_STYLES[presentation.visualState];
@@ -638,22 +902,47 @@ function PointBadge({
   );
 }
 
-function RollupBar({ segments }: { segments: ReturnType<typeof solverWorkRollup> }) {
+function RollupBar({
+  segments,
+}: {
+  segments: ReturnType<typeof solverWorkRollup>;
+}) {
   return (
-    <span data-testid="solver-work-rollup" style={{ display: "flex", height: 5, width: "min(260px, 100%)", borderRadius: 999, overflow: "hidden", background: C.panel3 }}>
+    <span
+      data-testid="solver-work-rollup"
+      style={{
+        display: "flex",
+        height: 5,
+        width: "min(260px, 100%)",
+        borderRadius: 999,
+        overflow: "hidden",
+        background: C.panel3,
+      }}
+    >
       {segments.map((segment) => (
         <span
           key={segment.state}
           data-state={segment.state}
           title={`${segment.style.label} ${segment.count}`}
-          style={{ width: `${segment.percent}%`, background: segment.style.color }}
+          style={{
+            width: `${segment.percent}%`,
+            background: segment.style.color,
+          }}
         />
       ))}
     </span>
   );
 }
 
-function StatePill({ state, compact = false, label }: { state: SolverWorkPointState; compact?: boolean; label?: string }) {
+function StatePill({
+  state,
+  compact = false,
+  label,
+}: {
+  state: SolverWorkPointState;
+  compact?: boolean;
+  label?: string;
+}) {
   const style = SOLVER_WORK_STATE_STYLES[state];
   return (
     <span
@@ -694,34 +983,100 @@ export function PointPopoverBody({
   onRevokeReview: () => void;
 }) {
   const [confirmRevoke, setConfirmRevoke] = useState(false);
-  const resultAction = view.actions.find((action) => action.kind === "open-results");
-  const adminActions = view.actions.filter((action) => action.adminOnly && action.kind !== "revoke-review");
-  const revokeAction = view.actions.find((action) => action.kind === "revoke-review");
+  const resultAction = view.actions.find(
+    (action) => action.kind === "open-results",
+  );
+  const adminActions = view.actions.filter(
+    (action) => action.adminOnly && action.kind !== "revoke-review",
+  );
+  const revokeAction = view.actions.find(
+    (action) => action.kind === "revoke-review",
+  );
   return (
-    <div style={{ width: "min(360px, calc(100vw - 24px))", display: "grid", gap: 10, color: C.text }}>
+    <div
+      style={{
+        width: "min(360px, calc(100vw - 24px))",
+        display: "grid",
+        gap: 10,
+        color: C.text,
+      }}
+    >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <strong style={{ fontFamily: MONO, fontSize: 13, color: C.text }}>{view.title}</strong>
+        <strong style={{ fontFamily: MONO, fontSize: 13, color: C.text }}>
+          {view.title}
+        </strong>
         <StatePill state={view.visualState} label={view.stateLabel} />
       </div>
       {view.reviewedDisclosure && (
-        <div data-testid="solver-work-reviewed-disclosure" style={{ fontFamily: MONO, fontSize: 10.5, color: C.muted, lineHeight: 1.45, border: `1px solid ${C.stroke}`, background: C.panel2, borderRadius: 8, padding: "7px 8px" }}>
+        <div
+          data-testid="solver-work-reviewed-disclosure"
+          style={{
+            fontFamily: MONO,
+            fontSize: 10.5,
+            color: C.muted,
+            lineHeight: 1.45,
+            border: `1px solid ${C.stroke}`,
+            background: C.panel2,
+            borderRadius: 8,
+            padding: "7px 8px",
+          }}
+        >
           {view.reviewedDisclosure}
         </div>
       )}
-      {view.plain && <div style={{ fontSize: 12, color: C.text2, lineHeight: 1.45 }}>{view.plain}</div>}
+      {view.plain && (
+        <div style={{ fontSize: 12, color: C.text2, lineHeight: 1.45 }}>
+          {view.plain}
+        </div>
+      )}
       {view.gate && (
-        <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.muted, lineHeight: 1.45, border: `1px solid ${C.stroke}`, background: C.panel3, borderRadius: 8, padding: "7px 8px" }}>
-          <strong style={{ color: C.text }}>{view.gate.name}</strong> {view.gate.detail}
+        <div
+          style={{
+            fontFamily: MONO,
+            fontSize: 10.5,
+            color: C.muted,
+            lineHeight: 1.45,
+            border: `1px solid ${C.stroke}`,
+            background: C.panel3,
+            borderRadius: 8,
+            padding: "7px 8px",
+          }}
+        >
+          <strong style={{ color: C.text }}>{view.gate.name}</strong>{" "}
+          {view.gate.detail}
         </div>
       )}
       {view.coefficients.length > 0 && (
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 6,
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
           {view.coefficients.map((item) => (
-            <span key={item.label} style={{ fontFamily: MONO, fontSize: 10, color: C.muted, background: C.panel3, border: `1px solid ${C.stroke}`, borderRadius: 7, padding: "4px 7px" }}>
-              <span style={{ color: C.dim }}>{item.label}</span> <span style={{ color: C.text }}>{item.value}</span>
+            <span
+              key={item.label}
+              style={{
+                fontFamily: MONO,
+                fontSize: 10,
+                color: C.muted,
+                background: C.panel3,
+                border: `1px solid ${C.stroke}`,
+                borderRadius: 7,
+                padding: "4px 7px",
+              }}
+            >
+              <span style={{ color: C.dim }}>{item.label}</span>{" "}
+              <span style={{ color: C.text }}>{item.value}</span>
             </span>
           ))}
-          {view.provisionalNote && <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.amber }}>provisional means</span>}
+          {view.provisionalNote && (
+            <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.amber }}>
+              provisional means
+            </span>
+          )}
         </div>
       )}
       {view.chain.length > 0 && (
@@ -744,69 +1099,150 @@ export function PointPopoverBody({
           ))}
         </div>
       )}
-      {(resultAction || adminActions.length > 0) && (
+      {resultAction && (
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {resultAction && (
-            <PopoverActionButton action={resultAction} busyAction={busyAction} onClick={onOpenResults} />
-          )}
-          {adminActions.map((action) => (
-            <PopoverActionButton
-              key={action.kind}
-              action={action}
-              busyAction={busyAction}
-              onClick={() => {
-                if (action.kind === "continue-2h") onContinue(2);
-                else if (action.kind === "continue-6h") onContinue(6);
-                else if (action.kind === "continue-24h") onContinue(24);
-                else if (action.kind === "retry") onRetry();
-                else if (action.kind === "request-full-tier") onRequestFull();
-              }}
-            />
-          ))}
-          {revokeAction && (
-            <PopoverActionButton
-              action={revokeAction}
-              busyAction={busyAction}
-              onClick={() => setConfirmRevoke(true)}
-            />
-          )}
+          <PopoverActionButton
+            action={resultAction}
+            busyAction={busyAction}
+            onClick={onOpenResults}
+          />
         </div>
       )}
-      {confirmRevoke && revokeAction && (
-        <div data-testid="solver-work-revoke-confirm" style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", fontFamily: MONO, fontSize: 10, color: C.amber }}>
-          confirm revoke?
-          <button
-            type="button"
-            disabled={!!busyAction}
-            onClick={() => {
-              setConfirmRevoke(false);
-              onRevokeReview();
+      {(adminActions.length > 0 || revokeAction || actionNotice) && (
+        <details
+          data-testid="solver-work-operator-overrides"
+          style={{
+            fontFamily: MONO,
+            fontSize: 10,
+            color: C.dim,
+          }}
+        >
+          <summary style={{ width: "fit-content", cursor: "pointer" }}>
+            Operator overrides
+          </summary>
+          <div
+            style={{
+              display: "grid",
+              gap: 7,
+              marginTop: 7,
+              padding: 8,
+              border: `1px solid ${C.stroke}`,
+              borderRadius: 8,
+              background: C.panel2,
             }}
-            style={{ ...smallBtn, color: C.redText, borderColor: "rgba(245,101,101,0.5)" }}
           >
-            revoke
-          </button>
-          <button type="button" disabled={!!busyAction} onClick={() => setConfirmRevoke(false)} style={smallBtn}>
-            cancel
-          </button>
-        </div>
+            <span style={{ color: C.muted }}>
+              Normal recovery and verification are automatic.
+            </span>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {adminActions.map((action) => (
+                <PopoverActionButton
+                  key={action.kind}
+                  action={action}
+                  busyAction={busyAction}
+                  onClick={() => {
+                    if (action.kind === "continue-2h") onContinue(2);
+                    else if (action.kind === "continue-6h") onContinue(6);
+                    else if (action.kind === "continue-24h") onContinue(24);
+                    else if (action.kind === "retry") onRetry();
+                    else if (action.kind === "request-full-tier")
+                      onRequestFull();
+                  }}
+                />
+              ))}
+              {revokeAction && (
+                <PopoverActionButton
+                  action={revokeAction}
+                  busyAction={busyAction}
+                  onClick={() => setConfirmRevoke(true)}
+                />
+              )}
+            </div>
+            {confirmRevoke && revokeAction && (
+              <div
+                data-testid="solver-work-revoke-confirm"
+                style={{
+                  display: "flex",
+                  gap: 6,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  color: C.amber,
+                }}
+              >
+                confirm revoke?
+                <button
+                  type="button"
+                  disabled={!!busyAction}
+                  onClick={() => {
+                    setConfirmRevoke(false);
+                    onRevokeReview();
+                  }}
+                  style={{
+                    ...smallBtn,
+                    color: C.redText,
+                    borderColor: "rgba(245,101,101,0.5)",
+                  }}
+                >
+                  revoke
+                </button>
+                <button
+                  type="button"
+                  disabled={!!busyAction}
+                  onClick={() => setConfirmRevoke(false)}
+                  style={smallBtn}
+                >
+                  cancel
+                </button>
+              </div>
+            )}
+            {actionNotice && (
+              <div style={{ color: C.amber, lineHeight: 1.4 }}>
+                {actionNotice}
+              </div>
+            )}
+          </div>
+        </details>
       )}
-      {actionNotice && <div style={{ fontFamily: MONO, fontSize: 10, color: C.amber, lineHeight: 1.4 }}>{actionNotice}</div>}
     </div>
   );
 }
 
-function PopoverActionButton({ action, busyAction, onClick }: { action: SolverWorkPopoverAction; busyAction?: string | null; onClick: () => void }) {
+function PopoverActionButton({
+  action,
+  busyAction,
+  onClick,
+}: {
+  action: SolverWorkPopoverAction;
+  busyAction?: string | null;
+  onClick: () => void;
+}) {
   const busy = busyAction === action.kind;
-  const color = action.kind === "retry" || action.kind === "revoke-review" ? C.redText : action.kind === "request-full-tier" || action.kind.startsWith("continue") ? C.violet : C.teal;
-  const borderColor = action.kind === "retry" || action.kind === "revoke-review" ? "rgba(245,101,101,0.5)" : action.kind === "request-full-tier" || action.kind.startsWith("continue") ? C.violetBorder : C.tealBorder;
+  const color =
+    action.kind === "retry" || action.kind === "revoke-review"
+      ? C.redText
+      : action.kind === "request-full-tier" ||
+          action.kind.startsWith("continue")
+        ? C.violet
+        : C.teal;
+  const borderColor =
+    action.kind === "retry" || action.kind === "revoke-review"
+      ? "rgba(245,101,101,0.5)"
+      : action.kind === "request-full-tier" ||
+          action.kind.startsWith("continue")
+        ? C.violetBorder
+        : C.tealBorder;
   return (
     <button
       type="button"
       data-testid={`solver-work-action-${action.kind}`}
       disabled={!!busyAction}
       onClick={onClick}
-      style={{ ...smallBtn, color, borderColor, opacity: busyAction ? 0.65 : 1 }}
+      style={{
+        ...smallBtn,
+        color,
+        borderColor,
+        opacity: busyAction ? 0.65 : 1,
+      }}
     >
       {busy ? "queueing…" : action.label}
     </button>
@@ -825,28 +1261,87 @@ function EngineJobRow({ work }: { work: SolverWorkJob }) {
       }}
     >
       <div style={{ minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: statusColor(work.status), border: `1px solid ${statusBorder(work.status)}`, borderRadius: 999, padding: "3px 8px" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexWrap: "wrap",
+            marginBottom: 6,
+          }}
+        >
+          <span
+            style={{
+              fontFamily: MONO,
+              fontSize: 10,
+              color: statusColor(work.status),
+              border: `1px solid ${statusBorder(work.status)}`,
+              borderRadius: 999,
+              padding: "3px 8px",
+            }}
+          >
             {work.status}
           </span>
-          <span style={{ fontWeight: 650, color: C.text }}>{work.kind === "urans-retry" ? "URANS retry" : "RANS sweep"}</span>
-          {work.retryMode && <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>{work.retryMode.replaceAll("-", " ")}</span>}
+          <span style={{ fontWeight: 650, color: C.text }}>
+            {work.kind === "urans-retry" ? "URANS retry" : "RANS sweep"}
+          </span>
+          {work.retryMode && (
+            <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>
+              {work.retryMode.replaceAll("-", " ")}
+            </span>
+          )}
         </div>
-        <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, lineHeight: 1.55 }}>
+        <div
+          style={{
+            fontFamily: MONO,
+            fontSize: 11,
+            color: C.muted,
+            lineHeight: 1.55,
+          }}
+        >
           α {formatAoas(work)} · {work.completedCases}/{work.totalCases} cases
           {work.reynolds ? ` · Re ${formatReynolds(work.reynolds)}` : ""}
           {work.mach != null ? ` · M ${formatCompactNumber(work.mach, 3)}` : ""}
         </div>
-        <div style={{ fontFamily: MONO, fontSize: 10, color: C.dim, lineHeight: 1.55 }}>
-          solved {work.solvedCount} · pending {work.pendingCount} · failed {work.failedCount}
+        <div
+          style={{
+            fontFamily: MONO,
+            fontSize: 10,
+            color: C.dim,
+            lineHeight: 1.55,
+          }}
+        >
+          solved {work.solvedCount} · pending {work.pendingCount} · failed{" "}
+          {work.failedCount}
           {work.acceptedRansCount || work.rejectedRansCount
             ? ` · RANS accepted ${work.acceptedRansCount}, rejected ${work.rejectedRansCount}`
             : ""}
-          {work.uransAttemptCount ? ` · URANS attempts ${work.uransAttemptCount}` : ""}
+          {work.uransAttemptCount
+            ? ` · URANS attempts ${work.uransAttemptCount}`
+            : ""}
         </div>
-        {work.error && <div style={{ fontFamily: MONO, fontSize: 10, color: C.redText, marginTop: 5 }}>{work.error}</div>}
+        {work.error && (
+          <div
+            style={{
+              fontFamily: MONO,
+              fontSize: 10,
+              color: C.redText,
+              marginTop: 5,
+            }}
+          >
+            {work.error}
+          </div>
+        )}
       </div>
-      <div style={{ textAlign: "right", fontFamily: MONO, fontSize: 10, color: C.dimmest, whiteSpace: "nowrap" }}>
+      <div
+        style={{
+          textAlign: "right",
+          fontFamily: MONO,
+          fontSize: 10,
+          color: C.dimmest,
+          whiteSpace: "nowrap",
+        }}
+      >
         wave {work.wave}
         <br />
         {work.engineState ?? "not submitted"}
@@ -858,7 +1353,9 @@ function EngineJobRow({ work }: { work: SolverWorkJob }) {
 function formatAoas(work: SolverWorkJob) {
   if (work.aoas.length) return compactRanges(work.aoas);
   if (work.aoaMin != null && work.aoaMax != null) {
-    return work.aoaMin === work.aoaMax ? `${work.aoaMin}°` : `${work.aoaMin}°…${work.aoaMax}°`;
+    return work.aoaMin === work.aoaMax
+      ? `${work.aoaMin}°`
+      : `${work.aoaMin}°…${work.aoaMax}°`;
   }
   return "—";
 }
@@ -879,14 +1376,17 @@ function compactRanges(values: number[]) {
 
 function statusColor(status: string) {
   if (status === "failed" || status === "cancelled") return C.redText;
-  if (status === "running" || status === "submitted" || status === "ingesting") return C.teal;
+  if (status === "running" || status === "submitted" || status === "ingesting")
+    return C.teal;
   if (status === "done") return C.muted;
   return C.amber;
 }
 
 function statusBorder(status: string) {
-  if (status === "failed" || status === "cancelled") return "rgba(239,68,68,0.45)";
-  if (status === "running" || status === "submitted" || status === "ingesting") return C.tealBorder;
+  if (status === "failed" || status === "cancelled")
+    return "rgba(239,68,68,0.45)";
+  if (status === "running" || status === "submitted" || status === "ingesting")
+    return C.tealBorder;
   if (status === "done") return C.stroke;
   return "rgba(245,158,11,0.45)";
 }
@@ -895,9 +1395,18 @@ function popoverPosition(rect: DOMRect): CSSProperties {
   const width = 360;
   const estimatedHeight = 280;
   const gutter = 12;
-  const left = Math.max(gutter, Math.min(window.innerWidth - width - gutter, rect.left + rect.width / 2 - width / 2));
+  const left = Math.max(
+    gutter,
+    Math.min(
+      window.innerWidth - width - gutter,
+      rect.left + rect.width / 2 - width / 2,
+    ),
+  );
   const below = rect.bottom + 10;
-  const top = below + estimatedHeight > window.innerHeight - gutter ? Math.max(gutter, rect.top - estimatedHeight - 10) : below;
+  const top =
+    below + estimatedHeight > window.innerHeight - gutter
+      ? Math.max(gutter, rect.top - estimatedHeight - 10)
+      : below;
   return {
     position: "fixed",
     left,

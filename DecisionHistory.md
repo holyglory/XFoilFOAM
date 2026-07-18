@@ -90,6 +90,14 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   capability is legacy version 0 and any mismatch fails before solve work,
   leaving recovery pending while ordinary RANS and first-pass preliminary
   URANS remain eligible.
+  A same-case continuation pins one exact result/result-attempt generation and
+  may run only from its exact manifest plus a verified, generation-pinned GCS
+  Zstandard restart archive containing the distribution-correct OpenFOAM
+  state. A mismatched, one-sided, incomplete, or later-lost generation fails
+  closed; ownership reconciliation cannot retarget an operator-pinned source
+  or reduce its corrective budget. Publish each accepted FAST generation and
+  its archive before advancing completed-case progress, and create exactly one
+  FINAL item only after that durable gate passes.
   An admin `full` request means “ensure final verification” for its exact or
   whole-polar scope: it owns the same preliminary and final per-point
   obligations and never launches a direct one-shot full solve that bypasses
@@ -109,11 +117,14 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   amber hides a reliability defect; waiting for campaign-wide RANS completion
   starves known escalations; asking users to retry or change setup transfers
   system-owned CFD work; fresh reruns discard transient progress; and
-  cross-version continuation falsifies provenance. The selected sequence keeps
-  the common path legible, conserves compatible evidence and mesh work, makes
-  rare failures unmistakable, and lets the control plane deploy safely before
-  the recovery-capable engine. Treating an accepted final/fast comparison as a
-  red failure would misstate an available authoritative result as missing.
+  cross-version, result-wide, or mutable-live-path continuation falsifies
+  provenance. Trusting an earlier archive decision after storage loss, or
+  advancing a progress counter before evidence publication, can schedule FINAL
+  from bytes that do not exist. The selected sequence keeps the common path
+  legible, conserves compatible evidence and mesh work, makes rare failures
+  unmistakable, and lets the control plane deploy safely before the
+  recovery-capable engine. Treating an accepted final/fast comparison as a red
+  failure would misstate an available authoritative result as missing.
   Process-local RANS/PRECALC alternation plus a bounded finished-parent scan let
   an already-durable obligation at rank 53 remain behind unrelated RANS again
   after restart. A manual campaign pause was also too broad and too late: it did

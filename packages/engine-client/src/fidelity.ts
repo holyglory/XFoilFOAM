@@ -44,10 +44,13 @@ export const URANS_PRECALC_SOLVER_BUDGET_S = 14400;
 export const URANS_FULL_SOLVER_BUDGET_S = 43200;
 export const URANS_PRECALC_MESH_SCALE = 0.5;
 
-/** Verify-queue disagreement bounds (contract 4): a full-fidelity verification
- *  differing from its precalc row beyond either bound flags `disagreed`. */
-export const URANS_VERIFY_DELTA_CL_LIMIT = 0.05;
-export const URANS_VERIFY_DELTA_CD_LIMIT = 0.01;
+/** Backward-compatible transport-package exports. The authoritative domain
+ * values live in @aerodb/core so DB projection and UI presentation cannot
+ * drift from engine-facing consumers. */
+export {
+  URANS_VERIFY_DELTA_CD_LIMIT,
+  URANS_VERIFY_DELTA_CL_LIMIT,
+} from "@aerodb/core";
 
 /** Strict literal parse of the PolarPoint.fidelity echo. Returns null on any
  *  unknown/absent value — callers decide the honest fallback and log drift. */

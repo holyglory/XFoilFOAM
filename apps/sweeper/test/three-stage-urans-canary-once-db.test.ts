@@ -12,6 +12,7 @@ import {
   boundaryProfiles,
   categories,
   createClient,
+  enqueuePrecalcVerifications,
   ensurePrecalcObligations,
   materializeCampaignLaunch,
   mediums,
@@ -31,9 +32,12 @@ import {
   simUransVerifyQueueRequests,
   simulationPresets,
   solverProfiles,
+  solverEvidenceArtifacts,
+  solverEvidenceBlobs,
   solverRuntimeBuilds,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
 import {
   type EngineClient,
   type JobStatus,
@@ -662,6 +666,22 @@ describe("three-stage URANS canary production DB seam", () => {
           solvedAt: new Date(),
         })
         .returning();
+      await db.insert(solverEvidenceArtifacts).values({
+        resultId: sourceResultId,
+        resultAttemptId: acceptedPrecalcAttempt.id,
+        airfoilId,
+        simJobId: null,
+        engineJobId: acceptedPrecalcAttempt.engineJobId,
+        engineCaseSlug: acceptedPrecalcAttempt.engineCaseSlug,
+        methodKey: "openfoam.urans",
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        aoaDeg: AOA,
+        kind: "manifest",
+        storageKey: `${PREFIX}/precalc/${acceptedPrecalcAttempt.id}/manifest.json`,
+        mimeType: "application/json",
+        sha256: "a".repeat(64),
+        byteSize: 512,
+      });
       const [acceptedPrecalcClassification] = await db
         .insert(resultClassifications)
         .values({
@@ -709,22 +729,68 @@ describe("three-stage URANS canary production DB seam", () => {
           completedAt: new Date(),
         })
         .where(eq(simPrecalcObligations.id, obligationId));
-      const [verify] = await db
-        .insert(simUransVerifyQueue)
-        .values({
-          airfoilId,
-          revisionId,
-          aoaDeg: AOA,
-          backgroundOwner: false,
-          state: "pending",
-          precalcResultId: sourceResultId,
-          precalcResultAttemptId: acceptedPrecalcAttempt.id,
+      await db
+        .update(results)
+        .set({
+          currentResultAttemptId: acceptedPrecalcAttempt.id,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          cl: 0.81,
+          cd: 0.064,
+          cm: -0.05,
+          clCd: 0.81 / 0.064,
+          stalled: true,
+          converged: true,
+          unsteady: true,
+          fidelity: "urans_precalc",
+          simJobId: null,
+          engineJobId: acceptedPrecalcAttempt.engineJobId,
+          engineCaseSlug: acceptedPrecalcAttempt.engineCaseSlug,
+          methodKey: "openfoam.urans",
+          solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+          solverRuntimeBuildId: null,
+          error: null,
         })
-        .returning();
-      await db.insert(simUransVerifyQueueRequests).values({
-        queueId: verify.id,
+        .where(eq(results.id, sourceResultId));
+      const finalRequest = {
+        airfoilId,
+        revisionId,
+        aoaDeg: AOA,
         requestId,
-      });
+      };
+      expect(await enqueuePrecalcVerifications(db, finalRequest)).toBe(0);
+      expect(
+        await db
+          .select({ id: simUransVerifyQueue.id })
+          .from(simUransVerifyQueue)
+          .where(
+            eq(
+              simUransVerifyQueue.precalcResultAttemptId,
+              acceptedPrecalcAttempt.id,
+            ),
+          ),
+      ).toEqual([]);
+      const acceptedPrecalcArchive = await createVerifiedRestartArchiveFixture(
+        db,
+        {
+          resultId: sourceResultId,
+          resultAttemptId: acceptedPrecalcAttempt.id,
+        },
+      );
+      expect(await enqueuePrecalcVerifications(db, finalRequest)).toBe(1);
+      const [verify] = await db
+        .select()
+        .from(simUransVerifyQueue)
+        .where(
+          eq(
+            simUransVerifyQueue.precalcResultAttemptId,
+            acceptedPrecalcAttempt.id,
+          ),
+        )
+        .limit(1);
+      if (!verify)
+        throw new Error("verified preliminary evidence did not seed FINAL");
       try {
         const exactVerify = await loadOwnershipSnapshot();
         expect(exactVerify.verifyRequestIds).toEqual([requestId]);
@@ -1088,6 +1154,30 @@ describe("three-stage URANS canary production DB seam", () => {
         }
       } finally {
         await db
+          .update(results)
+          .set({
+            currentResultAttemptId: sourceResultAttemptId,
+            status: "done",
+            source: "solved",
+            regime: "rans",
+            cl: 0.83,
+            cd: 0.061,
+            cm: -0.052,
+            clCd: 0.83 / 0.061,
+            stalled: true,
+            converged: false,
+            unsteady: false,
+            fidelity: "rans",
+            simJobId: parentJobId,
+            engineJobId: `${PREFIX}-rans-engine`,
+            engineCaseSlug: `aoa_${AOA}`,
+            methodKey: "openfoam.rans",
+            solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+            solverRuntimeBuildId: null,
+            error: "steady RANS did not converge",
+          })
+          .where(eq(results.id, sourceResultId));
+        await db
           .delete(simUransVerifyQueue)
           .where(eq(simUransVerifyQueue.id, verify.id));
         await db
@@ -1103,6 +1193,9 @@ describe("three-stage URANS canary production DB seam", () => {
         await db
           .delete(resultAttempts)
           .where(eq(resultAttempts.id, acceptedPrecalcAttempt.id));
+        await db
+          .delete(solverEvidenceBlobs)
+          .where(eq(solverEvidenceBlobs.id, acceptedPrecalcArchive.blobId));
         await db
           .delete(simPrecalcObligationRequests)
           .where(

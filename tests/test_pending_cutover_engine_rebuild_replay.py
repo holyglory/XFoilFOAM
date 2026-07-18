@@ -144,12 +144,17 @@ def _fixture_sources(tmp_path: Path) -> tuple[Path, Path, Path, str, str]:
         "tests/test_pending_cutover_node_api_repair.py",
     ):
         source = ROOT / relative
-        source_bytes = (
-            _git_file(SEALED_TARGET_REVISION, relative)
-            if relative == "apps/api/src/admin-routes.ts"
-            else source.read_bytes()
+        # This is a replay of one sealed historical incident, not a synthetic
+        # checkout of today's tree. Every target member whose exact digest is
+        # pinned by the replay wrapper must come from the same sealed revision;
+        # otherwise an unrelated later hardening change makes the fixture fail
+        # before it reaches the safety behavior under test.
+        source_bytes = _git_file(SEALED_TARGET_REVISION, relative)
+        _write(
+            target / relative,
+            source_bytes,
+            executable=os.access(source, os.X_OK),
         )
-        _write(target / relative, source_bytes, executable=os.access(source, os.X_OK))
 
     fake_rebuild = rb"""#!/usr/bin/env bash
 set -euo pipefail

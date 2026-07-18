@@ -5,6 +5,7 @@ import {
   fieldColorScales,
   enqueuePrecalcVerifications,
   forceHistory,
+  hasExactValidSolverManifest,
   laneKeyId,
   onResultIngested,
   onResultIngestedWithAutomaticPrecalcHandoff,
@@ -222,9 +223,7 @@ export function validateRansPrecalcPromotionSignal(opts: {
   triggerFailureDisposition: PolarPoint["failure_disposition"] | null;
   jobAoas: number[];
 }): { attemptedAoas: number[]; intentionallyOmittedAoas: number[] } | null {
-  const attemptedAoas = uniqueFiniteAoasInOrder(
-    opts.promotion.attempted_aoas,
-  );
+  const attemptedAoas = uniqueFiniteAoasInOrder(opts.promotion.attempted_aoas);
   const intentionallyOmittedAoas = uniqueFiniteAoasInOrder(
     opts.promotion.intentionally_omitted_aoas,
   );
@@ -1389,7 +1388,8 @@ async function insertResultAttempt(opts: {
         .limit(1);
       if (
         !raced ||
-        stableHash(raced.evidencePayload ?? null) !== stableHash(evidencePayload)
+        stableHash(raced.evidencePayload ?? null) !==
+          stableHash(evidencePayload)
       ) {
         throw new Error(
           `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
@@ -2050,9 +2050,7 @@ function stableHash(value: unknown): string {
     .slice(0, 24);
 }
 
-function attemptEvidenceRecord(
-  value: unknown,
-): Record<string, unknown> | null {
+function attemptEvidenceRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
@@ -4310,27 +4308,6 @@ async function stageForceHistory(
     });
 }
 
-async function selectedManifestExists(
-  tx: DB,
-  resultId: string,
-  resultAttemptId: string,
-): Promise<boolean> {
-  const rows = (await tx.execute(sql`
-    SELECT count(*)::int AS count,
-           COALESCE(bool_and(
-             sha256 ~ '^[0-9a-fA-F]{64}$'
-             AND byte_size > 0
-             AND length(trim(storage_key)) > 0
-             AND length(trim(mime_type)) > 0
-           ), false) AS valid
-    FROM solver_evidence_artifacts
-    WHERE result_id = ${resultId}
-      AND result_attempt_id = ${resultAttemptId}
-      AND kind = 'manifest'
-  `)) as unknown as Array<{ count: number; valid: boolean }>;
-  return rows[0]?.count === 1 && rows[0].valid === true;
-}
-
 async function currentTerminalState(
   tx: DB,
   resultId: string,
@@ -4458,7 +4435,7 @@ async function publishStagedPoints(
           "fidelity",
           "fidelity",
         );
-        const hasManifest = await selectedManifestExists(
+        const hasManifest = await hasExactValidSolverManifest(
           tx,
           candidate.resultId,
           candidate.resultAttemptId,
@@ -4789,25 +4766,31 @@ export async function publishRepairedResultAttempt(opts: {
     scope.revisionId,
     {
       afterAttemptClassifications: async (tx) => {
-        const [cell] = await tx
+        // The polar advisory is already held by refreshPolarCacheForRevision.
+        // Observe the pointer first, lock any exact FINAL queue authorization,
+        // then lock/revalidate the result row. This matches every ladder
+        // projection's polar -> queue -> result order and removes the former
+        // result -> queue inversion.
+        const [observedCell] = await tx
           .select({
             currentAttemptId: results.currentResultAttemptId,
             status: results.status,
           })
           .from(results)
           .where(eq(results.id, opts.resultId))
-          .for("update")
           .limit(1);
         if (
-          !cell ||
-          ["pending", "queued", "running", "stale"].includes(cell.status)
+          !observedCell ||
+          ["pending", "queued", "running", "stale"].includes(
+            observedCell.status,
+          )
         ) {
           return;
         }
         let exactFinalRepairReplacement = false;
         if (
-          cell.currentAttemptId !== null &&
-          cell.currentAttemptId !== opts.resultAttemptId
+          observedCell.currentAttemptId !== null &&
+          observedCell.currentAttemptId !== opts.resultAttemptId
         ) {
           const [authorization] = (await tx.execute(sql`
             SELECT verify_item.id
@@ -4820,7 +4803,7 @@ export async function publishRepairedResultAttempt(opts: {
              AND repaired_attempt.source = 'solved'
              AND repaired_attempt.evidence_payload ->> 'fidelity' = 'urans_full'
             JOIN result_attempts current_attempt
-              ON current_attempt.id = ${cell.currentAttemptId}
+              ON current_attempt.id = ${observedCell.currentAttemptId}
              AND current_attempt.result_id = ${opts.resultId}
              AND current_attempt.status = 'done'
              AND current_attempt.source = 'solved'
@@ -4857,6 +4840,22 @@ export async function publishRepairedResultAttempt(opts: {
           `)) as unknown as Array<{ id: string }>;
           if (!authorization) return;
           exactFinalRepairReplacement = true;
+        }
+        const [cell] = await tx
+          .select({
+            currentAttemptId: results.currentResultAttemptId,
+            status: results.status,
+          })
+          .from(results)
+          .where(eq(results.id, opts.resultId))
+          .for("update")
+          .limit(1);
+        if (
+          !cell ||
+          cell.currentAttemptId !== observedCell.currentAttemptId ||
+          cell.status !== observedCell.status
+        ) {
+          return;
         }
         const [repair] = await tx
           .select({

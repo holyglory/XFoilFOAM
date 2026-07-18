@@ -15,6 +15,8 @@ import {
   MISSING_URANS_VIDEO_REASON,
   URANS_BUDGET_STOP_MARKER,
   URANS_CONTINUATION_REQUIRED_MARKER,
+  URANS_VERIFY_DELTA_CD_LIMIT,
+  URANS_VERIFY_DELTA_CL_LIMIT,
 } from "@aerodb/core";
 import {
   and,
@@ -29,7 +31,18 @@ import {
 
 import type { DB } from "./client";
 import {
+  hasExactValidSolverManifest,
+  hasExactVerifiedRestartableEvidenceArchive,
+} from "./evidence-manifest";
+import {
+  ensureRevisionMethodCompatibilityHash,
+  POLAR_COMPATIBILITY_VERSION,
+  resolveRevisionMethodCompatibilityHash,
+} from "./polar-compatibility-cache";
+import {
   ensurePrecalcObligationsInTransaction,
+  hasPrecalcContinuationWarning,
+  refreshPrecalcSettlementCampaigns,
   type PrecalcObligationCell,
 } from "./precalc-obligations";
 import {
@@ -41,13 +54,17 @@ import {
   resultAttempts,
   resultClassifications,
   results,
+  simulationPresetRevisions,
   simCampaigns,
   simJobs,
+  simPrecalcObligationAttempts,
+  simPrecalcObligationCampaigns,
   simPrecalcObligationRequests,
   simPrecalcObligations,
   simUransRequestCampaigns,
   simUransRequests,
   simUransVerifyQueue,
+  simUransVerifyQueueCampaigns,
   simUransVerifyQueueRequests,
   type SimPrecalcObligation,
   type SimUransRequest,
@@ -89,6 +106,456 @@ export const FINAL_URANS_OUTCOMES = {
   ownerless: "ownerless",
 } as const;
 
+export interface RunningPrecalcPartialSettlement {
+  obligationId: string;
+  resultId: string;
+  resultAttemptId: string;
+  verifyQueueId: string | null;
+  verifyQueueCreated: boolean;
+  changed: boolean;
+}
+
+interface AcceptedPrecalcVerificationCandidate {
+  resultId: string;
+  resultAttemptId: string;
+  airfoilId: string;
+  revisionId: string;
+  aoaDeg: number;
+}
+
+interface AcceptedPrecalcVerificationOwners {
+  backgroundOwner: boolean;
+  campaignIds: string[];
+  requestIds: string[];
+  includeResultCampaignOwners?: boolean;
+}
+
+/** Project newly accepted running-partial PRECALC evidence into both durable
+ * ladder ledgers without terminalizing the multi-case engine job.
+ *
+ * The terminal job settlement cannot be reused here: it judges every sibling
+ * obligation in the composition, including cases the engine has not published
+ * yet. This accepted-only path therefore requires all of the following exact
+ * identities before it touches one physical cell:
+ *
+ * - the obligation id named by this PRECALC composition,
+ * - the obligation's current job owner,
+ * - an immutable result attempt produced by that same job, and
+ * - an ACCEPTED `urans_precalc` classification for that exact attempt.
+ *
+ * Obligation/submission completion commits first. A separate, replayable
+ * transaction projects the settled generation into FINAL ownership using the
+ * campaign lifecycle lock order (campaign -> queue -> request). This mirrors
+ * terminal PRECALC settlement and prevents an obligation lock from inverting
+ * against pause/cancel. Replayed running result.json payloads are idempotent;
+ * unpublished siblings have no accepted manifest-backed join and remain
+ * running/submitted.
+ */
+export async function settleAcceptedRunningPrecalcPartials(
+  db: DB,
+  input: { simJobId: string; obligationIds: string[] },
+): Promise<RunningPrecalcPartialSettlement[]> {
+  const obligationIds = [...new Set(input.obligationIds)].filter(Boolean);
+  if (!obligationIds.length) return [];
+
+  const phaseA = await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const candidates = await tx
+      .select({
+        obligationId: simPrecalcObligations.id,
+        backgroundOwner: simPrecalcObligations.backgroundOwner,
+        obligationState: simPrecalcObligations.state,
+        sourceResultId: simPrecalcObligations.sourceResultId,
+        sourceResultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+        submissionId: simPrecalcObligationAttempts.id,
+        submissionState: simPrecalcObligationAttempts.state,
+        submissionResultAttemptId: simPrecalcObligationAttempts.resultAttemptId,
+        resultId: results.id,
+        currentResultAttemptId: results.currentResultAttemptId,
+        resultAttemptId: resultAttempts.id,
+        qualityWarnings: resultAttempts.qualityWarnings,
+        classificationState: resultClassifications.state,
+        supersededByResultId: resultClassifications.supersededByResultId,
+        airfoilId: results.airfoilId,
+        revisionId: results.simulationPresetRevisionId,
+        aoaDeg: results.aoaDeg,
+      })
+      .from(simPrecalcObligations)
+      .innerJoin(
+        simPrecalcObligationAttempts,
+        and(
+          eq(
+            simPrecalcObligationAttempts.obligationId,
+            simPrecalcObligations.id,
+          ),
+          eq(simPrecalcObligationAttempts.simJobId, input.simJobId),
+        ),
+      )
+      .innerJoin(
+        results,
+        and(
+          eq(results.airfoilId, simPrecalcObligations.airfoilId),
+          eq(
+            results.simulationPresetRevisionId,
+            simPrecalcObligations.revisionId,
+          ),
+          eq(results.aoaDeg, simPrecalcObligations.aoaDeg),
+        ),
+      )
+      .innerJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.resultId, results.id),
+          eq(resultAttempts.simJobId, input.simJobId),
+          eq(resultAttempts.airfoilId, results.airfoilId),
+          eq(
+            resultAttempts.simulationPresetRevisionId,
+            results.simulationPresetRevisionId,
+          ),
+          eq(resultAttempts.aoaDeg, results.aoaDeg),
+        ),
+      )
+      .innerJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
+      .where(
+        and(
+          inArray(simPrecalcObligations.id, obligationIds),
+          eq(simPrecalcObligations.latestSimJobId, input.simJobId),
+          eq(results.status, "done"),
+          eq(results.source, "solved"),
+          eq(resultAttempts.status, "done"),
+          eq(resultAttempts.source, "solved"),
+          sql`${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_precalc'`,
+          inArray(resultClassifications.state, [
+            "accepted",
+            "superseded_by_urans",
+          ]),
+        ),
+      )
+      .orderBy(
+        simPrecalcObligations.id,
+        sql`${resultAttempts.createdAt} DESC`,
+        sql`${resultAttempts.id} DESC`,
+      )
+      .for("update");
+
+    const settlements: RunningPrecalcPartialSettlement[] = [];
+    const acceptedByObligation = new Map<string, (typeof candidates)[number]>();
+    for (const candidate of candidates) {
+      if (hasPrecalcContinuationWarning(candidate.qualityWarnings)) continue;
+      if (!acceptedByObligation.has(candidate.obligationId)) {
+        acceptedByObligation.set(candidate.obligationId, candidate);
+      }
+    }
+    for (const candidate of acceptedByObligation.values()) {
+      if (!candidate.revisionId) continue;
+      if (
+        !(await hasExactValidSolverManifest(
+          tx,
+          candidate.resultId,
+          candidate.resultAttemptId,
+        ))
+      ) {
+        continue;
+      }
+      // A newer canonical pointer is allowed to suppress a duplicate FINAL
+      // only when it is itself exact accepted manifest-backed FINAL evidence.
+      // RANS, null, rejected, malformed, or unrelated pointers leave the FAST
+      // handoff unresolved so a later ingest/reconciliation can repair truth.
+      if (candidate.currentResultAttemptId !== candidate.resultAttemptId) {
+        const [currentFull] = candidate.currentResultAttemptId
+          ? ((await tx.execute(sql`
+              SELECT full_attempt.id
+              FROM results canonical_result
+              JOIN result_attempts full_attempt
+                ON full_attempt.id = canonical_result.current_result_attempt_id
+               AND full_attempt.result_id = canonical_result.id
+               AND full_attempt.airfoil_id = canonical_result.airfoil_id
+               AND full_attempt.simulation_preset_revision_id =
+                   canonical_result.simulation_preset_revision_id
+               AND full_attempt.aoa_deg = canonical_result.aoa_deg
+              JOIN result_classifications full_classification
+                ON full_classification.result_attempt_id = full_attempt.id
+               AND full_classification.state = 'accepted'
+              JOIN result_classifications canonical_classification
+                ON canonical_classification.result_id = canonical_result.id
+               AND canonical_classification.result_attempt_id IS NULL
+               AND canonical_classification.state = 'accepted'
+               AND canonical_classification.regime IS NOT DISTINCT FROM
+                   canonical_result.regime
+              LEFT JOIN sim_jobs full_job
+                ON full_job.id = full_attempt.sim_job_id
+              WHERE canonical_result.id = ${candidate.resultId}
+                AND canonical_result.current_result_attempt_id =
+                    ${candidate.currentResultAttemptId}
+                AND canonical_result.airfoil_id = ${candidate.airfoilId}
+                AND canonical_result.simulation_preset_revision_id =
+                    ${candidate.revisionId}
+                AND canonical_result.aoa_deg = ${candidate.aoaDeg}
+                AND canonical_result.status = 'done'
+                AND canonical_result.source = 'solved'
+                AND canonical_result.method_key = 'openfoam.urans'
+                AND canonical_result.fidelity = 'urans_full'
+                AND canonical_result.regime IS NOT DISTINCT FROM full_attempt.regime
+                AND canonical_result.solver_implementation_id IS NOT DISTINCT FROM
+                    full_attempt.solver_implementation_id
+                AND full_attempt.status = 'done'
+                AND full_attempt.source = 'solved'
+                AND full_attempt.regime IN ('rans', 'urans')
+                AND full_attempt.method_key = 'openfoam.urans'
+                AND full_attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+                AND (
+                  EXISTS (
+                    SELECT 1
+                    FROM sim_urans_verify_queue payload_queue
+                    WHERE payload_queue.id::text =
+                          full_job.request_payload ->> 'verifyQueueItemId'
+                      AND full_job.request_payload
+                            ->> 'verifyPrecalcResultAttemptId'
+                          = ${candidate.resultAttemptId}::uuid::text
+                      AND payload_queue.airfoil_id = canonical_result.airfoil_id
+                      AND payload_queue.revision_id =
+                          canonical_result.simulation_preset_revision_id
+                      AND payload_queue.aoa_deg = canonical_result.aoa_deg
+                      AND payload_queue.precalc_result_id = canonical_result.id
+                      AND payload_queue.precalc_result_attempt_id =
+                          ${candidate.resultAttemptId}
+                      AND (
+                        payload_queue.sim_job_id = full_attempt.sim_job_id
+                        OR payload_queue.latest_result_attempt_id = full_attempt.id
+                      )
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM sim_urans_verify_queue linked_queue
+                    WHERE linked_queue.latest_result_attempt_id = full_attempt.id
+                      AND linked_queue.airfoil_id = canonical_result.airfoil_id
+                      AND linked_queue.revision_id =
+                          canonical_result.simulation_preset_revision_id
+                      AND linked_queue.aoa_deg = canonical_result.aoa_deg
+                      AND linked_queue.precalc_result_id = canonical_result.id
+                      AND linked_queue.precalc_result_attempt_id =
+                          ${candidate.resultAttemptId}
+                  )
+                )
+              LIMIT 1
+            `)) as unknown as Array<{ id: string }>)
+          : [];
+        if (
+          !currentFull ||
+          candidate.classificationState !== "superseded_by_urans" ||
+          candidate.supersededByResultId !== candidate.resultId ||
+          !(await hasExactValidSolverManifest(
+            tx,
+            candidate.resultId,
+            currentFull.id,
+          ))
+        ) {
+          continue;
+        }
+      } else if (candidate.classificationState !== "accepted") {
+        continue;
+      }
+      const changed = !(
+        candidate.obligationState === "satisfied" &&
+        candidate.sourceResultId === candidate.resultId &&
+        candidate.sourceResultAttemptId === candidate.resultAttemptId &&
+        candidate.submissionState === "accepted" &&
+        candidate.submissionResultAttemptId === candidate.resultAttemptId
+      );
+      if (changed) {
+        const completedAt = new Date();
+        const [completedObligation] = await tx
+          .update(simPrecalcObligations)
+          .set({
+            state: "satisfied",
+            sourceResultId: candidate.resultId,
+            sourceResultAttemptId: candidate.resultAttemptId,
+            lastOutcome: "accepted",
+            lastError: null,
+            nextSubmitAt: null,
+            completedAt,
+          })
+          .where(
+            and(
+              eq(simPrecalcObligations.id, candidate.obligationId),
+              eq(simPrecalcObligations.latestSimJobId, input.simJobId),
+            ),
+          )
+          .returning({ id: simPrecalcObligations.id });
+        if (!completedObligation) {
+          throw new Error(
+            `accepted PRECALC partial lost exact obligation ${candidate.obligationId}`,
+          );
+        }
+        const [completedSubmission] = await tx
+          .update(simPrecalcObligationAttempts)
+          .set({
+            state: "accepted",
+            outcome: "accepted",
+            resultAttemptId: candidate.resultAttemptId,
+            error: null,
+            completedAt,
+          })
+          .where(
+            and(
+              eq(simPrecalcObligationAttempts.id, candidate.submissionId),
+              eq(
+                simPrecalcObligationAttempts.obligationId,
+                candidate.obligationId,
+              ),
+              eq(simPrecalcObligationAttempts.simJobId, input.simJobId),
+            ),
+          )
+          .returning({ id: simPrecalcObligationAttempts.id });
+        if (!completedSubmission) {
+          throw new Error(
+            `accepted PRECALC partial lost exact submission ${candidate.submissionId}`,
+          );
+        }
+      }
+
+      const resolvedIncidents =
+        await resolveSolverIncidentsForOwnerInTransaction(tx, {
+          precalcObligationId: candidate.obligationId,
+        });
+      settlements.push({
+        obligationId: candidate.obligationId,
+        resultId: candidate.resultId,
+        resultAttemptId: candidate.resultAttemptId,
+        verifyQueueId: null,
+        verifyQueueCreated: false,
+        changed: changed || resolvedIncidents > 0,
+      });
+    }
+    return settlements;
+  });
+
+  // Phase B deliberately re-derives durable evidence and live ownership. A
+  // crash or lifecycle race after Phase A simply leaves a satisfied FAST row;
+  // every active PRECALC reconcile tick retries this exact projection.
+  const outcome: RunningPrecalcPartialSettlement[] = [];
+  for (const settled of phaseA) {
+    const projected = await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      const [candidate] = await tx
+        .select({
+          backgroundOwner: simPrecalcObligations.backgroundOwner,
+          resultId: simPrecalcObligations.sourceResultId,
+          resultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+          airfoilId: simPrecalcObligations.airfoilId,
+          revisionId: simPrecalcObligations.revisionId,
+          aoaDeg: simPrecalcObligations.aoaDeg,
+        })
+        .from(simPrecalcObligations)
+        .where(
+          and(
+            eq(simPrecalcObligations.id, settled.obligationId),
+            eq(simPrecalcObligations.state, "satisfied"),
+          ),
+        )
+        .limit(1);
+      if (!candidate?.resultId || !candidate.resultAttemptId) {
+        return { queueId: null, created: false, changed: false };
+      }
+      const campaignOwners = await tx
+        .select({ campaignId: simPrecalcObligationCampaigns.campaignId })
+        .from(simPrecalcObligationCampaigns)
+        .where(
+          and(
+            eq(
+              simPrecalcObligationCampaigns.obligationId,
+              settled.obligationId,
+            ),
+            eq(simPrecalcObligationCampaigns.state, "active"),
+          ),
+        );
+      const requestOwners = await tx
+        .select({
+          requestId: simPrecalcObligationRequests.requestId,
+          state: simUransRequests.state,
+        })
+        .from(simPrecalcObligationRequests)
+        .innerJoin(
+          simUransRequests,
+          eq(simUransRequests.id, simPrecalcObligationRequests.requestId),
+        )
+        .where(
+          eq(simPrecalcObligationRequests.obligationId, settled.obligationId),
+        );
+      const verification =
+        await enqueueAcceptedPrecalcVerificationInTransaction(
+          tx,
+          {
+            resultId: candidate.resultId,
+            resultAttemptId: candidate.resultAttemptId,
+            airfoilId: candidate.airfoilId,
+            revisionId: candidate.revisionId,
+            aoaDeg: candidate.aoaDeg,
+          },
+          {
+            backgroundOwner: candidate.backgroundOwner,
+            campaignIds: campaignOwners.map((owner) => owner.campaignId),
+            requestIds: requestOwners.map((owner) => owner.requestId),
+          },
+          { allowCurrentFullProjection: true },
+        );
+      for (const requestId of requestOwners.map((owner) => owner.requestId)) {
+        const projectedState = await refreshFullUransRequestStateInTransaction(
+          tx,
+          requestId,
+        );
+        if (
+          projectedState !== null &&
+          projectedState !==
+            requestOwners.find((owner) => owner.requestId === requestId)?.state
+        ) {
+          verification.changed = true;
+        }
+      }
+      return verification;
+    });
+    outcome.push({
+      ...settled,
+      verifyQueueId: projected.queueId,
+      verifyQueueCreated: projected.created,
+      changed: settled.changed || projected.changed,
+    });
+  }
+
+  const changedOutcome = outcome.filter(
+    (settlement) => settlement.changed || settlement.verifyQueueCreated,
+  );
+  if (changedOutcome.length) {
+    const campaignIds = await db
+      .selectDistinct({
+        campaignId: simPrecalcObligationCampaigns.campaignId,
+      })
+      .from(simPrecalcObligationCampaigns)
+      .innerJoin(
+        simCampaigns,
+        eq(simCampaigns.id, simPrecalcObligationCampaigns.campaignId),
+      )
+      .where(
+        and(
+          inArray(
+            simPrecalcObligationCampaigns.obligationId,
+            changedOutcome.map((settlement) => settlement.obligationId),
+          ),
+          eq(simPrecalcObligationCampaigns.state, "active"),
+          inArray(simCampaigns.status, ["active", "attention", "paused"]),
+        ),
+      );
+    await refreshPrecalcSettlementCampaigns(
+      db,
+      campaignIds.map((owner) => owner.campaignId),
+    );
+  }
+  return outcome;
+}
+
 export type FinalUransOutcome =
   (typeof FINAL_URANS_OUTCOMES)[keyof typeof FINAL_URANS_OUTCOMES];
 
@@ -122,12 +589,25 @@ async function enqueueAutomaticPrecalcContinuations(
       )
     `);
     const candidates = (await tx.execute(sql`
-      SELECT r.id, r.airfoil_id, r.simulation_preset_revision_id, r.aoa_deg::float8 AS aoa_deg
+      SELECT r.id, attempt.id AS result_attempt_id, r.airfoil_id,
+             r.simulation_preset_revision_id, r.aoa_deg::float8 AS aoa_deg
       FROM results r
-      JOIN result_classifications rc ON rc.result_id = r.id
+      JOIN result_attempts attempt
+        ON attempt.id = r.current_result_attempt_id
+       AND attempt.result_id = r.id
+       AND attempt.airfoil_id = r.airfoil_id
+       AND attempt.simulation_preset_revision_id =
+           r.simulation_preset_revision_id
+       AND attempt.aoa_deg = r.aoa_deg
+      JOIN result_classifications rc
+        ON rc.result_attempt_id = attempt.id
+       AND rc.state = 'rejected'
+      JOIN simulation_preset_revisions revision
+        ON revision.id = r.simulation_preset_revision_id
       JOIN sim_campaign_points p
         ON p.campaign_id = ${opts.campaignId}
        AND p.result_id = r.id
+       AND p.result_attempt_id = attempt.id
        AND p.state = 'terminal'
        AND p.derived_by_symmetry = false
       JOIN sim_campaigns campaign
@@ -137,23 +617,57 @@ async function enqueueAutomaticPrecalcContinuations(
         AND r.simulation_preset_revision_id = ${opts.revisionId}
         AND r.status = 'done'
         ${opts.aoaDeg == null ? sql`` : sql`AND r.aoa_deg = ${opts.aoaDeg}`}
-        AND r.fidelity = 'urans_precalc'
-        AND rc.state = 'rejected'
+        AND attempt.status IN ('done', 'failed')
+        AND attempt.source = 'solved'
+        AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        AND attempt.solver_implementation_id IS NOT NULL
+        AND revision.solver_implementation_id IS NOT NULL
+        AND attempt.solver_implementation_id =
+            revision.solver_implementation_id
         AND COALESCE(rc.reasons, ARRAY[]::text[])
               <> ARRAY[${MISSING_URANS_VIDEO_REASON}]::text[]
-        AND r.engine_job_id IS NOT NULL
-        AND r.engine_case_slug IS NOT NULL
+        AND attempt.engine_job_id IS NOT NULL
+        AND attempt.engine_case_slug IS NOT NULL
         AND EXISTS (
           SELECT 1
-          FROM unnest(COALESCE(r.quality_warnings, ARRAY[]::text[])) warning
+          FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
           WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
              OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+        )
+        AND (
+          SELECT count(*) = 1
+            AND bool_and(
+              artifact.airfoil_id = attempt.airfoil_id
+              AND artifact.sim_job_id IS NOT DISTINCT FROM attempt.sim_job_id
+              AND artifact.engine_job_id IS NOT DISTINCT FROM attempt.engine_job_id
+              AND artifact.engine_case_slug IS NOT DISTINCT FROM
+                  attempt.engine_case_slug
+              AND artifact.aoa_deg IS NOT DISTINCT FROM attempt.aoa_deg
+              AND artifact.sha256 ~ '^[0-9a-fA-F]{64}$'
+              AND artifact.byte_size > 0
+              AND length(trim(artifact.storage_key)) > 0
+              AND length(trim(artifact.mime_type)) > 0
+            )
+          FROM solver_evidence_artifacts artifact
+          WHERE artifact.result_id = attempt.result_id
+            AND artifact.result_attempt_id = attempt.id
+            AND artifact.kind = 'manifest'
         )
         AND NOT EXISTS (
           SELECT 1
           FROM sim_urans_requests prior
           LEFT JOIN sim_jobs prior_job ON prior_job.id = prior.sim_job_id
           WHERE prior.continue_from_result_id = r.id
+            AND (
+              prior.continue_from_result_attempt_id = attempt.id
+              OR (
+                prior.continue_from_result_attempt_id IS NULL
+                AND prior_job.request_payload ->> 'continueFromResultId' =
+                    r.id::text
+                AND prior_job.request_payload
+                      ->> 'continueFromResultAttemptId' = attempt.id::text
+              )
+            )
             AND prior.state NOT IN ('pending', 'running')
             AND (
               prior.state = 'done'
@@ -164,58 +678,149 @@ async function enqueueAutomaticPrecalcContinuations(
       FOR UPDATE OF r
     `)) as unknown as Array<{
       id: string;
+      result_attempt_id: string;
       airfoil_id: string;
       simulation_preset_revision_id: string;
       aoa_deg: number;
     }>;
     let created = 0;
     for (const candidate of candidates) {
-      const [covering] = (await tx.execute(sql`
-        SELECT id
+      if (
+        !(await hasExactVerifiedRestartableEvidenceArchive(
+          tx,
+          candidate.id,
+          candidate.result_attempt_id,
+        ))
+      ) {
+        continue;
+      }
+
+      const covering = (await tx.execute(sql`
+        SELECT id,
+               aoa_deg::float8 AS aoa_deg,
+               state,
+               sim_job_id,
+               continue_from_result_id,
+               continue_from_result_attempt_id,
+               background_owner
         FROM sim_urans_requests
         WHERE airfoil_id = ${candidate.airfoil_id}
           AND revision_id = ${candidate.simulation_preset_revision_id}
           AND fidelity = 'precalc'
           AND state IN ('pending', 'running')
           AND (aoa_deg = ${candidate.aoa_deg} OR aoa_deg IS NULL)
-        ORDER BY (aoa_deg IS NULL) DESC, "createdAt" ASC
-        LIMIT 1
-      `)) as unknown as Array<{ id: string }>;
-      let requestId = covering?.id;
+        ORDER BY (aoa_deg IS NULL), "createdAt" ASC
+        FOR UPDATE
+      `)) as unknown as Array<{
+        id: string;
+        aoa_deg: number | null;
+        state: string;
+        sim_job_id: string | null;
+        continue_from_result_id: string | null;
+        continue_from_result_attempt_id: string | null;
+        background_owner: boolean;
+      }>;
+
+      // A whole-polar request is different physical work. Never relabel it as
+      // an exact same-case continuation, and never schedule duplicate work
+      // while it still covers this angle.
+      if (covering.some((request) => request.aoa_deg == null)) continue;
+
+      const exactPair = covering.find(
+        (request) =>
+          request.aoa_deg === candidate.aoa_deg &&
+          request.continue_from_result_id === candidate.id &&
+          request.continue_from_result_attempt_id ===
+            candidate.result_attempt_id,
+      );
+      let requestId = exactPair?.id;
+      const conflict = covering.find(
+        (request) => request.aoa_deg === candidate.aoa_deg && !exactPair,
+      );
+      if (conflict) {
+        // Once a conflicting request crossed the submission boundary, defer
+        // this checkpoint. It will be reevaluated after that work settles;
+        // neither duplicate CFD nor false continuation ownership is created.
+        if (conflict.state !== "pending" || conflict.sim_job_id != null) {
+          continue;
+        }
+
+        // Replace an unsubmitted composition atomically. If insertion or
+        // ownership migration fails, the surrounding transaction restores the
+        // original row instead of losing the user's pending request.
+        await tx.execute(sql`
+          UPDATE sim_urans_requests
+          SET state = 'cancelled', "updatedAt" = now()
+          WHERE id = ${conflict.id}
+            AND state = 'pending'
+            AND sim_job_id IS NULL
+        `);
+        const [inserted] = (await tx.execute(sql`
+          INSERT INTO sim_urans_requests (
+            airfoil_id, revision_id, aoa_deg, fidelity, state, requested_by,
+            background_owner, continue_from_result_id,
+            continue_from_result_attempt_id, budget_override_s
+          ) VALUES (
+            ${candidate.airfoil_id}, ${candidate.simulation_preset_revision_id},
+            ${candidate.aoa_deg}, 'precalc', 'pending',
+            ${AUTO_PRECALC_CONTINUATION_REQUESTED_BY},
+            ${conflict.background_owner}, ${candidate.id},
+            ${candidate.result_attempt_id},
+            ${AUTO_PRECALC_CONTINUATION_BUDGET_S}
+          )
+          RETURNING id
+        `)) as unknown as Array<{ id: string }>;
+        if (!inserted) {
+          throw new Error(
+            `failed to atomically replace unsubmitted PRECALC request ${conflict.id}`,
+          );
+        }
+        requestId = inserted.id;
+        await tx.execute(sql`
+          INSERT INTO sim_urans_request_campaigns (
+            request_id, campaign_id, state, cancelled_at
+          )
+          SELECT ${requestId}::uuid, campaign_id, state, cancelled_at
+          FROM sim_urans_request_campaigns
+          WHERE request_id = ${conflict.id}
+          ON CONFLICT (request_id, campaign_id) DO UPDATE
+            SET state = EXCLUDED.state,
+                cancelled_at = EXCLUDED.cancelled_at,
+                "updatedAt" = now()
+        `);
+        await tx.execute(sql`
+          UPDATE sim_urans_request_campaigns
+          SET state = 'cancelled', cancelled_at = now(), "updatedAt" = now()
+          WHERE request_id = ${conflict.id}
+            AND state = 'active'
+        `);
+        created += 1;
+      }
       if (!requestId) {
         const [inserted] = (await tx.execute(sql`
           INSERT INTO sim_urans_requests (
             airfoil_id, revision_id, aoa_deg, fidelity, state, requested_by,
-            continue_from_result_id, budget_override_s
+            continue_from_result_id, continue_from_result_attempt_id,
+            budget_override_s
           ) VALUES (
             ${candidate.airfoil_id}, ${candidate.simulation_preset_revision_id},
             ${candidate.aoa_deg}, 'precalc', 'pending',
             ${AUTO_PRECALC_CONTINUATION_REQUESTED_BY}, ${candidate.id},
+            ${candidate.result_attempt_id},
             ${AUTO_PRECALC_CONTINUATION_BUDGET_S}
           )
-          ON CONFLICT DO NOTHING
           RETURNING id
         `)) as unknown as Array<{ id: string }>;
-        requestId = inserted?.id;
-        if (requestId) created += 1;
+        if (!inserted) {
+          throw new Error(
+            `failed to create exact PRECALC continuation for ${candidate.id}/${candidate.result_attempt_id}`,
+          );
+        }
+        requestId = inserted.id;
+        created += 1;
       }
-      if (!requestId) {
-        const [raced] = (await tx.execute(sql`
-          SELECT id FROM sim_urans_requests
-          WHERE airfoil_id = ${candidate.airfoil_id}
-            AND revision_id = ${candidate.simulation_preset_revision_id}
-            AND fidelity = 'precalc'
-            AND state IN ('pending', 'running')
-            AND (aoa_deg = ${candidate.aoa_deg} OR aoa_deg IS NULL)
-          ORDER BY (aoa_deg IS NULL) DESC, "createdAt" ASC
-          LIMIT 1
-        `)) as unknown as Array<{ id: string }>;
-        requestId = raced?.id;
-      }
-      if (!requestId) continue;
       // Every live campaign referencing the same source evidence becomes an
-      // owner, even if another campaign or an independent whole-polar request
-      // created the physical row first.
+      // owner, but only after the physical request proves the same exact pair.
       await tx.execute(sql`
         INSERT INTO sim_urans_request_campaigns (request_id, campaign_id, state)
         SELECT DISTINCT ${requestId}::uuid, campaign.id, 'active'
@@ -246,54 +851,612 @@ async function seedFinalContinuationFromRequestInTransaction(
     revisionId: string;
     aoaDeg: number;
   },
-): Promise<void> {
+): Promise<boolean> {
   const [request] = await tx
     .select({
       fidelity: simUransRequests.fidelity,
       continueFromResultId: simUransRequests.continueFromResultId,
+      continueFromResultAttemptId: simUransRequests.continueFromResultAttemptId,
       budgetOverrideS: simUransRequests.budgetOverrideS,
     })
     .from(simUransRequests)
     .where(eq(simUransRequests.id, input.requestId))
     .limit(1);
-  if (request?.fidelity !== "full" || !request.continueFromResultId) return;
+  if (
+    request?.fidelity !== "full" ||
+    !request.continueFromResultId ||
+    !request.continueFromResultAttemptId
+  )
+    return false;
 
   const [source] = (await tx.execute(sql`
-    SELECT attempt.id
+    SELECT attempt.id, attempt.result_id
     FROM result_attempts attempt
+    JOIN sim_urans_verify_queue target_queue
+      ON target_queue.id = ${input.queueId}
+     AND target_queue.airfoil_id = ${input.airfoilId}
+     AND target_queue.revision_id = ${input.revisionId}
+     AND target_queue.aoa_deg = ${input.aoaDeg}
+     AND target_queue.precalc_result_id = ${request.continueFromResultId}
+     AND target_queue.precalc_result_attempt_id IS NOT NULL
+    JOIN simulation_preset_revisions target_revision
+      ON target_revision.id = ${input.revisionId}
+    JOIN result_classifications classification
+      ON classification.result_attempt_id = attempt.id
+     AND classification.state = 'rejected'
+    LEFT JOIN sim_jobs continuation_job
+      ON continuation_job.id = attempt.sim_job_id
     WHERE attempt.airfoil_id = ${input.airfoilId}
       AND attempt.simulation_preset_revision_id = ${input.revisionId}
       AND attempt.aoa_deg = ${input.aoaDeg}
       AND attempt.result_id = ${request.continueFromResultId}
+      AND attempt.id = ${request.continueFromResultAttemptId}
+      AND attempt.status IN ('done', 'failed')
       AND attempt.source = 'solved'
       AND attempt.engine_job_id IS NOT NULL
       AND attempt.engine_case_slug IS NOT NULL
       AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+      AND attempt.solver_implementation_id IS NOT NULL
+      AND target_revision.solver_implementation_id IS NOT NULL
+      AND attempt.solver_implementation_id IS NOT DISTINCT FROM
+        target_revision.solver_implementation_id
+      AND (
+        (
+          continuation_job.request_payload ->> 'verifyQueueItemId'
+            = target_queue.id::text
+          AND continuation_job.request_payload
+                ->> 'verifyPrecalcResultAttemptId'
+            = target_queue.precalc_result_attempt_id::text
+        )
+        OR target_queue.latest_result_attempt_id = attempt.id
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+        WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+           OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+      )
     ORDER BY attempt."createdAt" DESC, attempt.id DESC
     LIMIT 1
-  `)) as unknown as Array<{ id: string }>;
-  if (!source) return;
+  `)) as unknown as Array<{ id: string; result_id: string }>;
+  if (
+    !source ||
+    !(await hasExactValidSolverManifest(tx, source.result_id, source.id)) ||
+    !(await hasExactVerifiedRestartableEvidenceArchive(
+      tx,
+      source.result_id,
+      source.id,
+    ))
+  )
+    return false;
 
-  await tx.execute(sql`
+  // A later owner may safely raise the budget, but replay must never erase
+  // measured recovery progress/backoff from an already-seeded queue.
+  const budgetRaised = (await tx.execute(sql`
+    UPDATE sim_urans_verify_queue queue
+    SET continuation_budget_override_s = GREATEST(
+          COALESCE(queue.continuation_budget_override_s, 0),
+          ${request.budgetOverrideS ?? 0}::int
+        ),
+        "updatedAt" = CASE
+          WHEN ${request.budgetOverrideS ?? 0}::int >
+               COALESCE(queue.continuation_budget_override_s, 0)
+            THEN now()
+          ELSE queue."updatedAt"
+        END
+    WHERE queue.id = ${input.queueId}
+      AND queue.state = 'pending'
+      AND ${request.budgetOverrideS ?? null}::int IS NOT NULL
+      AND ${request.budgetOverrideS ?? 0}::int >
+        COALESCE(queue.continuation_budget_override_s, 0)
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  const seeded = (await tx.execute(sql`
     UPDATE sim_urans_verify_queue queue
     SET latest_result_attempt_id = ${source.id},
         fresh_attempt_count = GREATEST(queue.fresh_attempt_count, 1),
         continuation_no_progress_count = 0,
-        continuation_budget_override_s = CASE
-          WHEN ${request.budgetOverrideS ?? null}::int IS NULL
-            THEN queue.continuation_budget_override_s
-          ELSE GREATEST(
-            COALESCE(queue.continuation_budget_override_s, 0),
-            ${request.budgetOverrideS ?? null}::int
-          )
-        END,
         last_outcome = ${FINAL_URANS_OUTCOMES.continuationPending},
         last_error = NULL,
         next_submit_at = NULL,
         "updatedAt" = now()
     WHERE queue.id = ${input.queueId}
       AND queue.state = 'pending'
+      AND queue.latest_result_attempt_id IS NULL
+      AND queue.fresh_attempt_count = 0
+      AND queue.continuation_attempt_count = 0
+      AND queue.continuation_no_progress_count = 0
+      AND queue.last_outcome IS NULL
+      AND queue.last_error IS NULL
+      AND queue.next_submit_at IS NULL
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  return budgetRaised.length > 0 || seeded.length > 0;
+}
+
+/** Allocate or reuse the generation-scoped FINAL ledger and transfer every
+ * live owner in the same transaction. Both terminal ingestion and running
+ * partial ingestion use this path so request continuation seeding, campaign
+ * ownership, cancellation recovery, and idempotency cannot drift. */
+async function enqueueAcceptedPrecalcVerificationInTransaction(
+  tx: DB,
+  candidate: AcceptedPrecalcVerificationCandidate,
+  owners: AcceptedPrecalcVerificationOwners,
+  options: { allowCurrentFullProjection?: boolean } = {},
+): Promise<{ queueId: string | null; created: boolean; changed: boolean }> {
+  const campaignIds = new Set(owners.campaignIds.filter(Boolean));
+  const requestIds = [...new Set(owners.requestIds.filter(Boolean))];
+  if (owners.includeResultCampaignOwners) {
+    const resultCampaignOwners = (await tx.execute(sql`
+      SELECT DISTINCT campaign.id
+      FROM sim_campaign_points point
+      JOIN sim_campaigns campaign ON campaign.id = point.campaign_id
+      WHERE point.result_id = ${candidate.resultId}
+        AND point.result_attempt_id = ${candidate.resultAttemptId}
+        AND point.derived_by_symmetry = false
+        AND campaign.status IN ('active', 'attention', 'paused')
+    `)) as unknown as Array<{ id: string }>;
+    resultCampaignOwners.forEach((owner) => campaignIds.add(owner.id));
+  }
+  const directCampaignIds = new Set(campaignIds);
+  if (requestIds.length) {
+    const requestCampaignOwners = await tx
+      .selectDistinct({ campaignId: simUransRequestCampaigns.campaignId })
+      .from(simUransRequestCampaigns)
+      .where(
+        and(
+          inArray(simUransRequestCampaigns.requestId, requestIds),
+          eq(simUransRequestCampaigns.state, "active"),
+        ),
+      );
+    requestCampaignOwners.forEach((owner) => campaignIds.add(owner.campaignId));
+  }
+
+  // Campaign lifecycle is the outer lock domain. Pause/cancel takes the same
+  // campaign rows before shared queue/request rows, so this projection cannot
+  // deadlock by starting from an obligation or queue row.
+  if (campaignIds.size) {
+    await tx
+      .select({ id: simCampaigns.id })
+      .from(simCampaigns)
+      .where(inArray(simCampaigns.id, [...campaignIds]))
+      .orderBy(asc(simCampaigns.id))
+      .for("share");
+  }
+  await acquireCoveragePolarLock(tx, candidate.airfoilId, candidate.revisionId);
+  const liveCampaignRows = campaignIds.size
+    ? await tx
+        .select({ id: simCampaigns.id })
+        .from(simCampaigns)
+        .where(
+          and(
+            inArray(simCampaigns.id, [...campaignIds]),
+            inArray(simCampaigns.status, ["active", "attention", "paused"]),
+          ),
+        )
+    : [];
+  const liveCampaignIds = new Set(liveCampaignRows.map((row) => row.id));
+
+  await tx.execute(sql`
+    SELECT pg_advisory_xact_lock(
+      hashtextextended(
+        ${`final-verify-generation:${candidate.resultAttemptId}`},
+        0
+      )
+    )
   `);
+  let [existing] = (await tx.execute(sql`
+    SELECT id, state
+    FROM sim_urans_verify_queue
+    WHERE precalc_result_attempt_id = ${candidate.resultAttemptId}
+    ORDER BY
+      CASE state
+        WHEN 'done' THEN 0
+        WHEN 'disagreed' THEN 1
+        WHEN 'pending' THEN 2
+        WHEN 'running' THEN 3
+        WHEN 'blocked' THEN 4
+        ELSE 5
+      END,
+      "createdAt",
+      id
+    LIMIT 1
+    FOR UPDATE
+  `)) as unknown as Array<{ id: string; state: string }>;
+
+  // Queue precedes full-request rows in the shared lifecycle order. Lock all
+  // requested owners now, then re-evaluate their state/ownership under lock.
+  const lockedRequests = requestIds.length
+    ? await tx
+        .select({
+          id: simUransRequests.id,
+          fidelity: simUransRequests.fidelity,
+          state: simUransRequests.state,
+          backgroundOwner: simUransRequests.backgroundOwner,
+        })
+        .from(simUransRequests)
+        .where(inArray(simUransRequests.id, requestIds))
+        .orderBy(asc(simUransRequests.id))
+        .for("update")
+    : [];
+  const liveRequestCampaignRows = requestIds.length
+    ? await tx
+        .select({
+          requestId: simUransRequestCampaigns.requestId,
+          campaignId: simUransRequestCampaigns.campaignId,
+        })
+        .from(simUransRequestCampaigns)
+        .where(
+          and(
+            inArray(simUransRequestCampaigns.requestId, requestIds),
+            eq(simUransRequestCampaigns.state, "active"),
+          ),
+        )
+    : [];
+  const liveRequestIds = lockedRequests
+    .filter(
+      (request) =>
+        request.fidelity === "full" &&
+        ["pending", "running"].includes(request.state) &&
+        (request.backgroundOwner ||
+          liveRequestCampaignRows.some(
+            (owner) =>
+              owner.requestId === request.id &&
+              liveCampaignIds.has(owner.campaignId),
+          )),
+    )
+    .map((request) => request.id);
+
+  // Revalidate the immutable FAST generation only after the lifecycle locks.
+  // This also prevents a classification-only row from allocating a physical
+  // queue before its durable manifest exists.
+  const [precalc] = await tx
+    .select({
+      currentResultAttemptId: results.currentResultAttemptId,
+      cl: resultAttempts.cl,
+      cd: resultAttempts.cd,
+      cm: resultAttempts.cm,
+      qualityWarnings: resultAttempts.qualityWarnings,
+      classificationState: resultClassifications.state,
+      supersededByResultId: resultClassifications.supersededByResultId,
+    })
+    .from(results)
+    .innerJoin(
+      resultAttempts,
+      and(
+        eq(resultAttempts.id, candidate.resultAttemptId),
+        eq(resultAttempts.resultId, results.id),
+        eq(resultAttempts.airfoilId, results.airfoilId),
+        eq(
+          resultAttempts.simulationPresetRevisionId,
+          results.simulationPresetRevisionId,
+        ),
+        eq(resultAttempts.aoaDeg, results.aoaDeg),
+      ),
+    )
+    .innerJoin(
+      resultClassifications,
+      eq(resultClassifications.resultAttemptId, resultAttempts.id),
+    )
+    .where(
+      and(
+        eq(results.id, candidate.resultId),
+        eq(results.airfoilId, candidate.airfoilId),
+        eq(results.simulationPresetRevisionId, candidate.revisionId),
+        eq(results.aoaDeg, candidate.aoaDeg),
+        eq(results.status, "done"),
+        eq(resultAttempts.status, "done"),
+        eq(resultAttempts.source, "solved"),
+        sql`${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_precalc'`,
+        inArray(resultClassifications.state, [
+          "accepted",
+          "superseded_by_urans",
+        ]),
+      ),
+    )
+    .for("update")
+    .limit(1);
+  if (
+    !precalc ||
+    hasPrecalcContinuationWarning(precalc.qualityWarnings) ||
+    !(await hasExactValidSolverManifest(
+      tx,
+      candidate.resultId,
+      candidate.resultAttemptId,
+    )) ||
+    !(await hasExactVerifiedRestartableEvidenceArchive(
+      tx,
+      candidate.resultId,
+      candidate.resultAttemptId,
+    ))
+  ) {
+    return { queueId: null, created: false, changed: false };
+  }
+
+  const [currentFull] =
+    options.allowCurrentFullProjection &&
+    precalc.currentResultAttemptId &&
+    precalc.currentResultAttemptId !== candidate.resultAttemptId
+      ? (
+          (await tx.execute(sql`
+          SELECT full_attempt.id,
+                 full_attempt.result_id,
+                 full_attempt.sim_job_id,
+                 full_attempt.cl,
+                 full_attempt.cd,
+                 full_attempt.cm
+          FROM results canonical_result
+          JOIN result_attempts full_attempt
+            ON full_attempt.id = canonical_result.current_result_attempt_id
+           AND full_attempt.result_id = canonical_result.id
+           AND full_attempt.airfoil_id = canonical_result.airfoil_id
+           AND full_attempt.simulation_preset_revision_id =
+               canonical_result.simulation_preset_revision_id
+           AND full_attempt.aoa_deg = canonical_result.aoa_deg
+          JOIN result_classifications full_classification
+            ON full_classification.result_attempt_id = full_attempt.id
+           AND full_classification.state = 'accepted'
+          JOIN result_classifications canonical_classification
+            ON canonical_classification.result_id = canonical_result.id
+           AND canonical_classification.result_attempt_id IS NULL
+           AND canonical_classification.state = 'accepted'
+           AND canonical_classification.regime IS NOT DISTINCT FROM
+               canonical_result.regime
+          LEFT JOIN sim_jobs full_job
+            ON full_job.id = full_attempt.sim_job_id
+          WHERE canonical_result.id = ${candidate.resultId}
+            AND canonical_result.current_result_attempt_id =
+                ${precalc.currentResultAttemptId}
+            AND canonical_result.airfoil_id = ${candidate.airfoilId}
+            AND canonical_result.simulation_preset_revision_id =
+                ${candidate.revisionId}
+            AND canonical_result.aoa_deg = ${candidate.aoaDeg}
+            AND canonical_result.status = 'done'
+            AND canonical_result.source = 'solved'
+            AND canonical_result.method_key = 'openfoam.urans'
+            AND canonical_result.fidelity = 'urans_full'
+            AND canonical_result.regime IS NOT DISTINCT FROM full_attempt.regime
+            AND canonical_result.solver_implementation_id IS NOT DISTINCT FROM
+                full_attempt.solver_implementation_id
+            AND full_attempt.status = 'done'
+            AND full_attempt.source = 'solved'
+            AND full_attempt.regime IN ('rans', 'urans')
+            AND full_attempt.method_key = 'openfoam.urans'
+            AND full_attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+            AND (
+              EXISTS (
+                SELECT 1
+                FROM sim_urans_verify_queue payload_queue
+                WHERE payload_queue.id::text =
+                      full_job.request_payload ->> 'verifyQueueItemId'
+                  AND full_job.request_payload
+                        ->> 'verifyPrecalcResultAttemptId'
+                      = ${candidate.resultAttemptId}::uuid::text
+                  AND payload_queue.airfoil_id = canonical_result.airfoil_id
+                  AND payload_queue.revision_id =
+                      canonical_result.simulation_preset_revision_id
+                  AND payload_queue.aoa_deg = canonical_result.aoa_deg
+                  AND payload_queue.precalc_result_id = canonical_result.id
+                  AND payload_queue.precalc_result_attempt_id =
+                      ${candidate.resultAttemptId}
+                  AND (
+                    payload_queue.sim_job_id = full_attempt.sim_job_id
+                    OR payload_queue.latest_result_attempt_id = full_attempt.id
+                  )
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sim_urans_verify_queue linked_queue
+                WHERE linked_queue.latest_result_attempt_id = full_attempt.id
+                  AND linked_queue.airfoil_id = canonical_result.airfoil_id
+                  AND linked_queue.revision_id =
+                      canonical_result.simulation_preset_revision_id
+                  AND linked_queue.aoa_deg = canonical_result.aoa_deg
+                  AND linked_queue.precalc_result_id = canonical_result.id
+                  AND linked_queue.precalc_result_attempt_id =
+                      ${candidate.resultAttemptId}
+              )
+            )
+          LIMIT 1
+          FOR UPDATE OF canonical_result, full_attempt,
+            full_classification, canonical_classification
+        `)) as unknown as Array<{
+            id: string;
+            result_id: string;
+            sim_job_id: string | null;
+            cl: number | null;
+            cd: number | null;
+            cm: number | null;
+          }>
+        ).map((row) => ({
+          id: row.id,
+          resultId: row.result_id,
+          simJobId: row.sim_job_id,
+          cl: row.cl,
+          cd: row.cd,
+          cm: row.cm,
+        }))
+      : [];
+  const selectedPrecalc =
+    precalc.currentResultAttemptId === candidate.resultAttemptId &&
+    precalc.classificationState === "accepted";
+  const selectedFull = Boolean(
+    currentFull &&
+    precalc.classificationState === "superseded_by_urans" &&
+    precalc.supersededByResultId === candidate.resultId &&
+    (await hasExactValidSolverManifest(tx, candidate.resultId, currentFull.id)),
+  );
+  if (!selectedPrecalc && !selectedFull) {
+    return { queueId: null, created: false, changed: false };
+  }
+
+  const liveDirectCampaignIds = [...directCampaignIds].filter((campaignId) =>
+    liveCampaignIds.has(campaignId),
+  );
+  const hasLiveOwner =
+    owners.backgroundOwner ||
+    liveDirectCampaignIds.length > 0 ||
+    liveRequestIds.length > 0;
+  if (!hasLiveOwner) return { queueId: null, created: false, changed: false };
+
+  const delta = (full: number | null, fast: number | null): number | null =>
+    full != null && fast != null ? full - fast : null;
+  let created = false;
+  let changed = false;
+  if (selectedFull && currentFull) {
+    const deltaCl = delta(currentFull.cl, precalc.cl);
+    const deltaCd = delta(currentFull.cd, precalc.cd);
+    const deltaCm = delta(currentFull.cm, precalc.cm);
+    const disagreed =
+      (deltaCl !== null && Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
+      (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
+    if (existing) {
+      const updated = (await tx.execute(sql`
+        UPDATE sim_urans_verify_queue
+        SET state = ${disagreed ? "disagreed" : "done"},
+            sim_job_id = ${currentFull.simJobId},
+            verify_result_id = ${currentFull.resultId},
+            delta_cl = ${deltaCl}, delta_cd = ${deltaCd}, delta_cm = ${deltaCm},
+            fresh_attempt_count = GREATEST(fresh_attempt_count, 1),
+            latest_result_attempt_id = ${currentFull.id},
+            next_submit_at = NULL,
+            last_outcome = ${
+              disagreed
+                ? FINAL_URANS_OUTCOMES.disagreed
+                : FINAL_URANS_OUTCOMES.accepted
+            },
+            last_error = NULL, "updatedAt" = now()
+        WHERE id = ${existing.id}
+          AND (
+            state IS DISTINCT FROM ${disagreed ? "disagreed" : "done"}
+            OR sim_job_id IS DISTINCT FROM ${currentFull.simJobId}
+            OR verify_result_id IS DISTINCT FROM ${currentFull.resultId}
+            OR delta_cl IS DISTINCT FROM ${deltaCl}
+            OR delta_cd IS DISTINCT FROM ${deltaCd}
+            OR delta_cm IS DISTINCT FROM ${deltaCm}
+            OR latest_result_attempt_id IS DISTINCT FROM ${currentFull.id}
+            OR next_submit_at IS NOT NULL
+            OR last_outcome IS DISTINCT FROM ${
+              disagreed
+                ? FINAL_URANS_OUTCOMES.disagreed
+                : FINAL_URANS_OUTCOMES.accepted
+            }
+            OR last_error IS NOT NULL
+          )
+        RETURNING id
+      `)) as unknown as Array<{ id: string }>;
+      changed = updated.length > 0;
+      existing = { ...existing, state: disagreed ? "disagreed" : "done" };
+    } else {
+      [existing] = (await tx.execute(sql`
+        INSERT INTO sim_urans_verify_queue (
+          airfoil_id, revision_id, aoa_deg, background_owner, state,
+          sim_job_id, precalc_result_id, precalc_result_attempt_id,
+          verify_result_id, delta_cl, delta_cd, delta_cm,
+          fresh_attempt_count, latest_result_attempt_id, last_outcome
+        ) VALUES (
+          ${candidate.airfoilId}, ${candidate.revisionId}, ${candidate.aoaDeg},
+          ${owners.backgroundOwner}, ${disagreed ? "disagreed" : "done"},
+          ${currentFull.simJobId}, ${candidate.resultId},
+          ${candidate.resultAttemptId}, ${currentFull.resultId},
+          ${deltaCl}, ${deltaCd}, ${deltaCm}, 1, ${currentFull.id},
+          ${
+            disagreed
+              ? FINAL_URANS_OUTCOMES.disagreed
+              : FINAL_URANS_OUTCOMES.accepted
+          }
+        )
+        RETURNING id, state
+      `)) as unknown as Array<{ id: string; state: string }>;
+      created = Boolean(existing);
+      changed = created;
+    }
+  } else if (!existing) {
+    [existing] = (await tx.execute(sql`
+      INSERT INTO sim_urans_verify_queue (
+        airfoil_id, revision_id, aoa_deg, background_owner, state,
+        precalc_result_id, precalc_result_attempt_id
+      ) VALUES (
+        ${candidate.airfoilId}, ${candidate.revisionId}, ${candidate.aoaDeg},
+        ${owners.backgroundOwner}, 'pending', ${candidate.resultId},
+        ${candidate.resultAttemptId}
+      )
+      ON CONFLICT (precalc_result_attempt_id)
+        WHERE precalc_result_attempt_id IS NOT NULL
+          AND state IN ('pending', 'running')
+        DO NOTHING
+      RETURNING id, state
+    `)) as unknown as Array<{ id: string; state: string }>;
+    created = Boolean(existing);
+    changed = created;
+    if (!existing) {
+      [existing] = (await tx.execute(sql`
+        SELECT id, state FROM sim_urans_verify_queue
+        WHERE precalc_result_attempt_id = ${candidate.resultAttemptId}
+        ORDER BY "createdAt", id LIMIT 1 FOR UPDATE
+      `)) as unknown as Array<{ id: string; state: string }>;
+    }
+  }
+  const physical = existing;
+  if (!physical) {
+    throw new Error(
+      `accepted PRECALC could not allocate FINAL verification for ${candidate.resultAttemptId}`,
+    );
+  }
+
+  if (owners.backgroundOwner) {
+    const backgroundUpdated = (await tx.execute(sql`
+      UPDATE sim_urans_verify_queue
+      SET background_owner = true, "updatedAt" = now()
+      WHERE id = ${physical.id}
+        AND background_owner = false
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    changed ||= backgroundUpdated.length > 0;
+  }
+  if (selectedPrecalc && physical.state === "cancelled") {
+    const reopened = (await tx.execute(sql`
+      UPDATE sim_urans_verify_queue
+      SET state = 'pending', sim_job_id = NULL, next_submit_at = NULL,
+          "updatedAt" = now()
+      WHERE id = ${physical.id}
+        AND state = 'cancelled'
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    changed ||= reopened.length > 0;
+  }
+  if (liveDirectCampaignIds.length) {
+    for (const campaignId of liveDirectCampaignIds) {
+      const associated = (await tx.execute(sql`
+        INSERT INTO sim_urans_verify_queue_campaigns (
+          queue_id, campaign_id, state, cancelled_at
+        ) VALUES (${physical.id}, ${campaignId}, 'active', NULL)
+        ON CONFLICT (queue_id, campaign_id) DO UPDATE
+          SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
+          WHERE sim_urans_verify_queue_campaigns.state <> 'active'
+             OR sim_urans_verify_queue_campaigns.cancelled_at IS NOT NULL
+        RETURNING queue_id
+      `)) as unknown as Array<{ queue_id: string }>;
+      changed ||= associated.length > 0;
+    }
+  }
+  for (const requestId of liveRequestIds) {
+    const [requestAssociation] = await tx
+      .insert(simUransVerifyQueueRequests)
+      .values({ queueId: physical.id, requestId })
+      .onConflictDoNothing()
+      .returning({ queueId: simUransVerifyQueueRequests.queueId });
+    changed ||= Boolean(requestAssociation);
+    changed ||= await seedFinalContinuationFromRequestInTransaction(tx, {
+      requestId,
+      queueId: physical.id,
+      airfoilId: candidate.airfoilId,
+      revisionId: candidate.revisionId,
+      aoaDeg: candidate.aoaDeg,
+    });
+  }
+
+  return { queueId: physical.id, created, changed };
 }
 
 export async function enqueuePrecalcVerifications(
@@ -309,9 +1472,8 @@ export async function enqueuePrecalcVerifications(
   },
 ): Promise<number> {
   await enqueueAutomaticPrecalcContinuations(db, opts);
-  return db.transaction(async (tx) => {
-    const campaignJoin = opts.campaignId
-      ? sql`JOIN sim_campaign_points selected_point
+  const campaignJoin = opts.campaignId
+    ? sql`JOIN sim_campaign_points selected_point
               ON selected_point.campaign_id = ${opts.campaignId}
              AND selected_point.result_id = r.id
              AND selected_point.result_attempt_id = precalc_attempt.id
@@ -320,11 +1482,12 @@ export async function enqueuePrecalcVerifications(
             JOIN sim_campaigns selected_campaign
               ON selected_campaign.id = selected_point.campaign_id
              AND selected_campaign.status IN ('active', 'attention', 'paused')`
-      : sql``;
-    const candidates = (await tx.execute(sql`
+    : sql``;
+  const candidates = (await db.execute(sql`
       SELECT r.id, precalc_attempt.id AS precalc_result_attempt_id,
              r.airfoil_id, r.simulation_preset_revision_id,
-             r.aoa_deg::float8 AS aoa_deg
+             r.aoa_deg::float8 AS aoa_deg,
+             precalc_attempt.quality_warnings
       FROM results r
       JOIN result_attempts precalc_attempt
         ON precalc_attempt.id = r.current_result_attempt_id
@@ -345,122 +1508,39 @@ export async function enqueuePrecalcVerifications(
         AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
         AND rc.state = 'accepted'
       ORDER BY r.id
-      FOR UPDATE OF r
     `)) as unknown as Array<{
-      id: string;
-      precalc_result_attempt_id: string;
-      airfoil_id: string;
-      simulation_preset_revision_id: string;
-      aoa_deg: number;
-    }>;
-    let created = 0;
-    for (const candidate of candidates) {
-      // The result row lock serializes ordinary ingest replays. The advisory
-      // lock also serializes explicit full-request coverage, which does not
-      // otherwise own that mutable row, so one preliminary generation can
-      // never mint two retry ledgers after reaching a terminal state.
-      await tx.execute(sql`
-        SELECT pg_advisory_xact_lock(
-          hashtextextended(
-            ${`final-verify-generation:${candidate.precalc_result_attempt_id}`},
-            0
-          )
-        )
-      `);
-      const [existing] = (await tx.execute(sql`
-        SELECT id, state
-        FROM sim_urans_verify_queue
-        WHERE precalc_result_attempt_id =
-              ${candidate.precalc_result_attempt_id}
-        ORDER BY
-          CASE state
-            WHEN 'done' THEN 0
-            WHEN 'disagreed' THEN 1
-            WHEN 'pending' THEN 2
-            WHEN 'running' THEN 3
-            WHEN 'blocked' THEN 4
-            ELSE 5
-          END,
-          "createdAt",
-          id
-        LIMIT 1
-      `)) as unknown as Array<{ id: string; state: string }>;
-      const [inserted] = existing
-        ? []
-        : ((await tx.execute(sql`
-            INSERT INTO sim_urans_verify_queue (
-              airfoil_id, revision_id, aoa_deg, background_owner, state,
-              precalc_result_id, precalc_result_attempt_id
-            ) VALUES (
-              ${candidate.airfoil_id},
-              ${candidate.simulation_preset_revision_id},
-              ${candidate.aoa_deg},
-              ${!opts.campaignId && !opts.requestId},
-              'pending',
-              ${candidate.id},
-              ${candidate.precalc_result_attempt_id}
-            )
-            ON CONFLICT (precalc_result_attempt_id)
-              WHERE precalc_result_attempt_id IS NOT NULL
-                AND state IN ('pending', 'running')
-              DO NOTHING
-            RETURNING id, state
-          `)) as unknown as Array<{ id: string; state: string }>);
-      if (inserted?.id) created += 1;
-      const physical = existing ?? inserted;
-      if (!physical?.id) continue;
-      if (!opts.campaignId && !opts.requestId) {
-        await tx.execute(sql`
-          UPDATE sim_urans_verify_queue
-          SET background_owner = true, "updatedAt" = now()
-          WHERE id = ${physical.id}
-        `);
-      }
-      if (opts.requestId) {
-        await tx
-          .insert(simUransVerifyQueueRequests)
-          .values({ queueId: physical.id, requestId: opts.requestId })
-          .onConflictDoNothing();
-        await seedFinalContinuationFromRequestInTransaction(
-          tx as unknown as DB,
+    id: string;
+    precalc_result_attempt_id: string;
+    airfoil_id: string;
+    simulation_preset_revision_id: string;
+    aoa_deg: number;
+    quality_warnings: string[] | null;
+  }>;
+  let created = 0;
+  for (const candidate of candidates) {
+    if (hasPrecalcContinuationWarning(candidate.quality_warnings)) continue;
+    const verification = await db.transaction(
+      async (rawTx) =>
+        await enqueueAcceptedPrecalcVerificationInTransaction(
+          rawTx as unknown as DB,
           {
-            requestId: opts.requestId,
-            queueId: physical.id,
+            resultId: candidate.id,
+            resultAttemptId: candidate.precalc_result_attempt_id,
             airfoilId: candidate.airfoil_id,
             revisionId: candidate.simulation_preset_revision_id,
             aoaDeg: candidate.aoa_deg,
           },
-        );
-      }
-      if (!opts.requestId) {
-        await tx.execute(sql`
-          INSERT INTO sim_urans_verify_queue_campaigns (
-            queue_id, campaign_id, state
-          )
-          SELECT DISTINCT ${physical.id}::uuid, campaign.id, 'active'
-          FROM sim_campaign_points point
-          JOIN sim_campaigns campaign ON campaign.id = point.campaign_id
-          WHERE point.result_id = ${candidate.id}
-            AND point.result_attempt_id =
-                ${candidate.precalc_result_attempt_id}
-            AND point.derived_by_symmetry = false
-            AND campaign.status IN ('active', 'attention', 'paused')
-          ON CONFLICT (queue_id, campaign_id) DO UPDATE
-            SET state = 'active', cancelled_at = NULL, "updatedAt" = now()
-        `);
-      }
-      if (physical.state === "cancelled") {
-        await tx.execute(sql`
-          UPDATE sim_urans_verify_queue
-          SET state = 'pending', sim_job_id = NULL, next_submit_at = NULL,
-              "updatedAt" = now()
-          WHERE id = ${physical.id}
-            AND state = 'cancelled'
-        `);
-      }
-    }
-    return created;
-  });
+          {
+            backgroundOwner: !opts.campaignId && !opts.requestId,
+            campaignIds: [],
+            requestIds: opts.requestId ? [opts.requestId] : [],
+            includeResultCampaignOwners: !opts.requestId,
+          },
+        ),
+    );
+    if (verification.created) created += 1;
+  }
+  return created;
 }
 
 export interface FullUransRequestCoverage {
@@ -494,10 +1574,7 @@ function uniqueSortedCoverageCells(
     if (!Number.isFinite(cell.aoaDeg)) {
       throw new Error("full URANS request coverage requires finite AoA values");
     }
-    byKey.set(
-      `${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`,
-      cell,
-    );
+    byKey.set(coverageCellKey(cell), cell);
   }
   return [...byKey.values()].sort(
     (a, b) =>
@@ -505,6 +1582,388 @@ function uniqueSortedCoverageCells(
       a.revisionId.localeCompare(b.revisionId) ||
       a.aoaDeg - b.aoaDeg,
   );
+}
+
+function coverageCellKey(
+  cell: Pick<PrecalcObligationCell, "airfoilId" | "revisionId" | "aoaDeg">,
+): string {
+  return `${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`;
+}
+
+/** Match the canonical polar writer's compatibility -> revision lock order.
+ * Classification and current-result authority are meaningful only inside this
+ * boundary; queue projection must never race the refresh that publishes them. */
+async function acquireCoveragePolarLock(
+  tx: DB,
+  airfoilId: string,
+  revisionId: string,
+): Promise<void> {
+  const compatibilityHash = await resolveRevisionMethodCompatibilityHash(
+    tx,
+    revisionId,
+  );
+  if (compatibilityHash) {
+    await tx.execute(sql`
+      SELECT pg_advisory_xact_lock(
+        hashtextextended(
+          ${`polar-compatibility:${POLAR_COMPATIBILITY_VERSION}:${airfoilId}:${compatibilityHash}`},
+          0
+        )
+      )
+    `);
+  }
+  await tx.execute(sql`
+    SELECT pg_advisory_xact_lock(
+      hashtextextended(${`polar-revision:${airfoilId}:${revisionId}`}, 0)
+    )
+  `);
+  const persistedCompatibilityHash =
+    await ensureRevisionMethodCompatibilityHash(tx, revisionId);
+  if (persistedCompatibilityHash !== compatibilityHash) {
+    throw new Error(
+      `revision method compatibility hash changed while acquiring ordered coverage locks (${revisionId})`,
+    );
+  }
+}
+
+interface FullCoverageAcceptedCandidate {
+  id: string;
+  result_attempt_id: string;
+  sim_job_id: string | null;
+  selected_cl: number | null;
+  selected_cd: number | null;
+  selected_cm: number | null;
+  selected_quality_warnings: string[] | null;
+  fidelity: string;
+  precalc_result_attempt_id: string | null;
+  precalc_cl: number | null;
+  precalc_cd: number | null;
+  precalc_cm: number | null;
+  precalc_quality_warnings: string[] | null;
+}
+
+async function acceptedFullCoverageCandidate(
+  tx: DB,
+  cell: PrecalcObligationCell,
+  prelockedGenerationId: string | undefined,
+): Promise<FullCoverageAcceptedCandidate | null> {
+  const currentCandidates = (await tx.execute(sql`
+    SELECT
+      result.id,
+      selected_attempt.id AS result_attempt_id,
+      selected_attempt.sim_job_id,
+      selected_attempt.cl AS selected_cl,
+      selected_attempt.cd AS selected_cd,
+      selected_attempt.cm AS selected_cm,
+      selected_attempt.quality_warnings AS selected_quality_warnings,
+      selected_attempt.evidence_payload ->> 'fidelity' AS fidelity,
+      preliminary_attempt.id AS precalc_result_attempt_id,
+      preliminary_attempt.cl AS precalc_cl,
+      preliminary_attempt.cd AS precalc_cd,
+      preliminary_attempt.cm AS precalc_cm,
+      preliminary_attempt.quality_warnings AS precalc_quality_warnings
+    FROM results result
+    JOIN result_attempts selected_attempt
+      ON selected_attempt.id = result.current_result_attempt_id
+     AND selected_attempt.result_id = result.id
+     AND selected_attempt.airfoil_id = result.airfoil_id
+     AND selected_attempt.simulation_preset_revision_id =
+         result.simulation_preset_revision_id
+     AND selected_attempt.aoa_deg = result.aoa_deg
+    JOIN result_classifications classification
+      ON classification.result_attempt_id = selected_attempt.id
+     AND classification.state = 'accepted'
+    LEFT JOIN sim_jobs selected_job
+      ON selected_job.id = selected_attempt.sim_job_id
+    LEFT JOIN result_classifications canonical_classification
+      ON canonical_classification.result_id = result.id
+     AND canonical_classification.result_attempt_id IS NULL
+    LEFT JOIN LATERAL (
+      WITH linked_preliminary AS (
+        SELECT DISTINCT
+          attempt.id,
+          attempt.cl,
+          attempt.cd,
+          attempt.cm,
+          attempt.quality_warnings
+        FROM result_attempts attempt
+        JOIN result_classifications attempt_classification
+          ON attempt_classification.result_attempt_id = attempt.id
+         AND attempt_classification.state = 'superseded_by_urans'
+         AND attempt_classification.superseded_by_result_id = result.id
+        WHERE attempt.result_id = result.id
+          AND attempt.airfoil_id = result.airfoil_id
+          AND attempt.simulation_preset_revision_id =
+              result.simulation_preset_revision_id
+          AND attempt.aoa_deg = result.aoa_deg
+          AND attempt.status = 'done'
+          AND attempt.source = 'solved'
+          AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue payload_queue
+              WHERE payload_queue.id::text =
+                    selected_job.request_payload ->> 'verifyQueueItemId'
+                AND selected_job.request_payload
+                      ->> 'verifyPrecalcResultAttemptId' = attempt.id::text
+                AND payload_queue.airfoil_id = result.airfoil_id
+                AND payload_queue.revision_id =
+                    result.simulation_preset_revision_id
+                AND payload_queue.aoa_deg = result.aoa_deg
+                AND payload_queue.precalc_result_id = result.id
+                AND payload_queue.precalc_result_attempt_id = attempt.id
+                AND (
+                  payload_queue.sim_job_id = selected_attempt.sim_job_id
+                  OR payload_queue.latest_result_attempt_id = selected_attempt.id
+                )
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM sim_urans_verify_queue linked_queue
+              WHERE linked_queue.latest_result_attempt_id = selected_attempt.id
+                AND linked_queue.airfoil_id = result.airfoil_id
+                AND linked_queue.revision_id =
+                    result.simulation_preset_revision_id
+                AND linked_queue.aoa_deg = result.aoa_deg
+                AND linked_queue.precalc_result_id = result.id
+                AND linked_queue.precalc_result_attempt_id = attempt.id
+            )
+          )
+          AND (
+            SELECT count(*) = 1
+              AND bool_and(
+                artifact.airfoil_id = attempt.airfoil_id
+                AND artifact.sim_job_id IS NOT DISTINCT FROM attempt.sim_job_id
+                AND artifact.engine_job_id IS NOT DISTINCT FROM attempt.engine_job_id
+                AND artifact.engine_case_slug IS NOT DISTINCT FROM attempt.engine_case_slug
+                AND artifact.aoa_deg IS NOT DISTINCT FROM attempt.aoa_deg
+                AND artifact.sha256 ~ '^[0-9a-fA-F]{64}$'
+                AND artifact.byte_size > 0
+                AND length(trim(artifact.storage_key)) > 0
+                AND length(trim(artifact.mime_type)) > 0
+              )
+            FROM solver_evidence_artifacts artifact
+            WHERE artifact.result_id = attempt.result_id
+              AND artifact.result_attempt_id = attempt.id
+              AND artifact.kind = 'manifest'
+          )
+      )
+      SELECT linked_preliminary.*
+      FROM linked_preliminary
+      WHERE (SELECT count(*) FROM linked_preliminary) = 1
+    ) preliminary_attempt ON true
+    WHERE result.airfoil_id = ${cell.airfoilId}
+      AND result.simulation_preset_revision_id = ${cell.revisionId}
+      AND result.aoa_deg = ${cell.aoaDeg}
+      AND result.status = 'done'
+      AND selected_attempt.status = 'done'
+      AND selected_attempt.source = 'solved'
+      AND selected_attempt.evidence_payload ->> 'fidelity'
+          IN ('urans_precalc', 'urans_full')
+      AND (
+        selected_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        OR (
+          result.source = 'solved'
+          AND result.method_key = 'openfoam.urans'
+          AND result.fidelity = 'urans_full'
+          AND result.regime IS NOT DISTINCT FROM selected_attempt.regime
+          AND result.solver_implementation_id IS NOT DISTINCT FROM
+              selected_attempt.solver_implementation_id
+          AND selected_attempt.regime IN ('rans', 'urans')
+          AND selected_attempt.method_key = 'openfoam.urans'
+          AND canonical_classification.state = 'accepted'
+          AND canonical_classification.regime IS NOT DISTINCT FROM result.regime
+          AND preliminary_attempt.id IS NOT NULL
+        )
+      )
+      AND (
+        SELECT count(*) = 1
+          AND bool_and(
+            artifact.airfoil_id = selected_attempt.airfoil_id
+            AND artifact.sim_job_id IS NOT DISTINCT FROM selected_attempt.sim_job_id
+            AND artifact.engine_job_id IS NOT DISTINCT FROM selected_attempt.engine_job_id
+            AND artifact.engine_case_slug IS NOT DISTINCT FROM selected_attempt.engine_case_slug
+            AND artifact.aoa_deg IS NOT DISTINCT FROM selected_attempt.aoa_deg
+            AND artifact.sha256 ~ '^[0-9a-fA-F]{64}$'
+            AND artifact.byte_size > 0
+            AND length(trim(artifact.storage_key)) > 0
+            AND length(trim(artifact.mime_type)) > 0
+          )
+        FROM solver_evidence_artifacts artifact
+        WHERE artifact.result_id = selected_attempt.result_id
+          AND artifact.result_attempt_id = selected_attempt.id
+          AND artifact.kind = 'manifest'
+      )
+    ORDER BY CASE selected_attempt.evidence_payload ->> 'fidelity'
+      WHEN 'urans_full' THEN 0
+      ELSE 1
+    END
+    LIMIT 1
+  `)) as unknown as FullCoverageAcceptedCandidate[];
+  let candidate: FullCoverageAcceptedCandidate | undefined =
+    currentCandidates[0];
+  if (!candidate) {
+    const fallbackRows = (await tx.execute(sql`
+      SELECT
+        result.id,
+        preliminary_attempt.id AS result_attempt_id,
+        preliminary_attempt.sim_job_id,
+        preliminary_attempt.cl AS selected_cl,
+        preliminary_attempt.cd AS selected_cd,
+        preliminary_attempt.cm AS selected_cm,
+        preliminary_attempt.quality_warnings AS selected_quality_warnings,
+        'urans_precalc'::text AS fidelity,
+        NULL::uuid AS precalc_result_attempt_id,
+        NULL::float8 AS precalc_cl,
+        NULL::float8 AS precalc_cd,
+        NULL::float8 AS precalc_cm,
+        NULL::text[] AS precalc_quality_warnings,
+        EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue owned_queue
+          WHERE owned_queue.airfoil_id = result.airfoil_id
+            AND owned_queue.revision_id = result.simulation_preset_revision_id
+            AND owned_queue.aoa_deg = result.aoa_deg
+            AND owned_queue.precalc_result_id = result.id
+            AND owned_queue.precalc_result_attempt_id = preliminary_attempt.id
+        ) AS queue_owned,
+        EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue linked_queue
+          WHERE linked_queue.airfoil_id = result.airfoil_id
+            AND linked_queue.revision_id = result.simulation_preset_revision_id
+            AND linked_queue.aoa_deg = result.aoa_deg
+            AND linked_queue.precalc_result_id = result.id
+            AND linked_queue.precalc_result_attempt_id = preliminary_attempt.id
+            AND (
+              linked_queue.latest_result_attempt_id = current_attempt.id
+              OR (
+                linked_queue.id::text =
+                  current_job.request_payload ->> 'verifyQueueItemId'
+                AND current_job.request_payload
+                      ->> 'verifyPrecalcResultAttemptId'
+                    = preliminary_attempt.id::text
+                AND linked_queue.sim_job_id = current_attempt.sim_job_id
+              )
+            )
+        ) AS linked_to_current
+      FROM results result
+      JOIN result_attempts current_attempt
+        ON current_attempt.id = result.current_result_attempt_id
+       AND current_attempt.result_id = result.id
+      LEFT JOIN sim_jobs current_job
+        ON current_job.id = current_attempt.sim_job_id
+      JOIN result_attempts preliminary_attempt
+        ON preliminary_attempt.result_id = result.id
+       AND preliminary_attempt.airfoil_id = result.airfoil_id
+       AND preliminary_attempt.simulation_preset_revision_id =
+           result.simulation_preset_revision_id
+       AND preliminary_attempt.aoa_deg = result.aoa_deg
+      JOIN result_classifications preliminary_classification
+        ON preliminary_classification.result_attempt_id = preliminary_attempt.id
+       AND preliminary_classification.state IN (
+         'accepted', 'superseded_by_urans'
+       )
+       AND (
+         preliminary_classification.state = 'accepted'
+         OR preliminary_classification.superseded_by_result_id = result.id
+       )
+      WHERE result.airfoil_id = ${cell.airfoilId}
+        AND result.simulation_preset_revision_id = ${cell.revisionId}
+        AND result.aoa_deg = ${cell.aoaDeg}
+        AND result.status = 'done'
+        AND preliminary_attempt.status = 'done'
+        AND preliminary_attempt.source = 'solved'
+        AND preliminary_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        AND (
+          SELECT count(*) = 1
+            AND bool_and(
+              artifact.airfoil_id = preliminary_attempt.airfoil_id
+              AND artifact.sim_job_id IS NOT DISTINCT FROM
+                  preliminary_attempt.sim_job_id
+              AND artifact.engine_job_id IS NOT DISTINCT FROM
+                  preliminary_attempt.engine_job_id
+              AND artifact.engine_case_slug IS NOT DISTINCT FROM
+                  preliminary_attempt.engine_case_slug
+              AND artifact.aoa_deg IS NOT DISTINCT FROM preliminary_attempt.aoa_deg
+              AND artifact.sha256 ~ '^[0-9a-fA-F]{64}$'
+              AND artifact.byte_size > 0
+              AND length(trim(artifact.storage_key)) > 0
+              AND length(trim(artifact.mime_type)) > 0
+            )
+          FROM solver_evidence_artifacts artifact
+          WHERE artifact.result_id = preliminary_attempt.result_id
+            AND artifact.result_attempt_id = preliminary_attempt.id
+            AND artifact.kind = 'manifest'
+        )
+      ORDER BY preliminary_attempt.id
+    `)) as unknown as Array<
+      FullCoverageAcceptedCandidate & {
+        queue_owned: boolean;
+        linked_to_current: boolean;
+      }
+    >;
+    const usable = fallbackRows.filter(
+      (row) => !hasPrecalcContinuationWarning(row.selected_quality_warnings),
+    );
+    const linked = usable.filter((row) => row.linked_to_current);
+    const queueOwned = usable.filter((row) => row.queue_owned);
+    candidate =
+      (linked.length === 1 ? linked[0] : undefined) ??
+      (linked.length === 0 && queueOwned.length === 1
+        ? queueOwned[0]
+        : undefined) ??
+      (linked.length === 0 && queueOwned.length === 0 && usable.length === 1
+        ? usable[0]
+        : undefined);
+  }
+  if (!candidate) return null;
+  const generationId =
+    candidate.fidelity === "urans_precalc"
+      ? candidate.result_attempt_id
+      : candidate.precalc_result_attempt_id;
+  if (
+    prelockedGenerationId !== undefined &&
+    generationId !== prelockedGenerationId
+  ) {
+    throw new Error(
+      `accepted URANS generation changed while materializing coverage for ${coverageCellKey(cell)}`,
+    );
+  }
+  const preliminaryWarnings =
+    candidate.fidelity === "urans_precalc"
+      ? candidate.selected_quality_warnings
+      : candidate.precalc_quality_warnings;
+  if (hasPrecalcContinuationWarning(preliminaryWarnings)) return null;
+  if (
+    !(await hasExactValidSolverManifest(
+      tx,
+      candidate.id,
+      candidate.result_attempt_id,
+    )) ||
+    (candidate.fidelity === "urans_precalc" &&
+      !(await hasExactVerifiedRestartableEvidenceArchive(
+        tx,
+        candidate.id,
+        candidate.result_attempt_id,
+      ))) ||
+    (candidate.fidelity === "urans_full" &&
+      (!candidate.precalc_result_attempt_id ||
+        !(await hasExactValidSolverManifest(
+          tx,
+          candidate.id,
+          candidate.precalc_result_attempt_id,
+        )) ||
+        !(await hasExactVerifiedRestartableEvidenceArchive(
+          tx,
+          candidate.id,
+          candidate.precalc_result_attempt_id,
+        ))))
+  ) {
+    return null;
+  }
+  return candidate;
 }
 
 /** Materialize the one truthful per-point sequence for an explicit final
@@ -529,12 +1988,109 @@ export async function ensureFullUransRequestCoverage(
   if (!cells.length) {
     throw new FullUransRequestCoverageIncompleteError(input.requestId, []);
   }
-  return db.transaction(async (rawTx) => {
+  const requestScope = cells[0]!;
+  if (
+    cells.some(
+      (cell) =>
+        cell.airfoilId !== requestScope.airfoilId ||
+        cell.revisionId !== requestScope.revisionId,
+    )
+  ) {
+    throw new Error(
+      `full URANS request ${input.requestId} coverage spans more than one immutable setup`,
+    );
+  }
+  const outcome = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
+
+    // Campaign lifecycle owns the outer lock. Match pause/cancel's global
+    // order (campaign -> queue -> request -> obligation), then re-read all
+    // authority under those locks. An optimistic request/owner read here
+    // would let coverage survive a cancellation that was already queued.
+    const associatedCampaigns = (await tx.execute(sql`
+      SELECT DISTINCT ownership.campaign_id
+      FROM sim_urans_request_campaigns ownership
+      WHERE ownership.request_id = ${input.requestId}
+      ORDER BY ownership.campaign_id
+    `)) as unknown as Array<{ campaign_id: string }>;
+    if (associatedCampaigns.length) {
+      await tx.execute(sql`
+        SELECT campaign.id
+        FROM sim_campaigns campaign
+        WHERE campaign.id = ANY(${sql`ARRAY[${sql.join(
+          associatedCampaigns.map((row) => sql`${row.campaign_id}::uuid`),
+          sql`, `,
+        )}]`})
+        ORDER BY campaign.id
+        FOR SHARE OF campaign
+      `);
+    }
+    await acquireCoveragePolarLock(
+      tx,
+      requestScope.airfoilId,
+      requestScope.revisionId,
+    );
+    const coverageCells = sql.join(
+      cells.map(
+        (cell) =>
+          sql`(${cell.airfoilId}::uuid, ${cell.revisionId}::uuid, ${cell.aoaDeg}::float8)`,
+      ),
+      sql`, `,
+    );
+
+    // The immutable PRECALC generation is the shared serialization key for
+    // every FAST -> FINAL projection. Discover the generation optimistically,
+    // then acquire all generation locks in UUID order *before* touching a
+    // queue row. The exact evidence/current-pointer query below revalidates the
+    // same generation while holding the result row; a generation published
+    // after this snapshot is deliberately left to the replayable handoff.
+    const prelockedGenerationByCell = new Map<string, string>();
+    for (const cell of cells) {
+      const candidate = await acceptedFullCoverageCandidate(
+        tx,
+        cell,
+        undefined,
+      );
+      if (!candidate) continue;
+      const generationId =
+        candidate.fidelity === "urans_precalc"
+          ? candidate.result_attempt_id
+          : candidate.precalc_result_attempt_id;
+      if (!generationId) continue;
+      prelockedGenerationByCell.set(coverageCellKey(cell), generationId);
+    }
+    const serializationKeys = [
+      ...cells.map(
+        (cell) =>
+          `full-urans-coverage:${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`,
+      ),
+      ...[...new Set(prelockedGenerationByCell.values())].map(
+        (generationId) => `final-verify-generation:${generationId}`,
+      ),
+    ].sort();
+    for (const serializationKey of serializationKeys) {
+      await tx.execute(sql`
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(${serializationKey}, 0)
+        )
+      `);
+    }
+
+    await tx.execute(sql`
+      SELECT queue.id
+      FROM sim_urans_verify_queue queue
+      JOIN (VALUES ${coverageCells}) target(airfoil_id, revision_id, aoa_deg)
+        ON target.airfoil_id = queue.airfoil_id
+       AND target.revision_id = queue.revision_id
+       AND target.aoa_deg = queue.aoa_deg
+      ORDER BY queue.id
+      FOR UPDATE OF queue
+    `);
     const [request] = await tx
       .select()
       .from(simUransRequests)
       .where(eq(simUransRequests.id, input.requestId))
+      .for("update")
       .limit(1);
     if (!request || request.fidelity !== "full") {
       throw new Error(
@@ -574,99 +2130,93 @@ export async function ensureFullUransRequestCoverage(
         .update(simUransRequests)
         .set({ state: "cancelled", simJobId: null })
         .where(eq(simUransRequests.id, request.id));
-      throw new Error(`full URANS request ${request.id} has no live owner`);
+      return { orphanedRequestId: request.id } as const;
+    }
+
+    // Preflight truth without result-row locks. Missing FAST evidence takes its
+    // durable obligation before any result row, preserving the global order.
+    // Candidate result rows are then locked by UUID and revalidated under the
+    // polar advisory before a queue is mutated.
+    const acceptedByCell = new Map<string, FullCoverageAcceptedCandidate>();
+    const missingPrecalc: PrecalcObligationCell[] = [];
+    for (const cell of cells) {
+      const accepted = await acceptedFullCoverageCandidate(
+        tx,
+        cell,
+        prelockedGenerationByCell.get(coverageCellKey(cell)),
+      );
+      if (accepted) {
+        acceptedByCell.set(coverageCellKey(cell), accepted);
+      } else {
+        missingPrecalc.push(cell);
+      }
+    }
+
+    let precalcObligations: SimPrecalcObligation[] = [];
+    if (missingPrecalc.length) {
+      precalcObligations = await ensurePrecalcObligationsInTransaction(
+        tx,
+        missingPrecalc,
+        {
+          campaignIds,
+          requestIds: [request.id],
+        },
+      );
+    }
+
+    const acceptedResultIds = [
+      ...new Set([...acceptedByCell.values()].map((candidate) => candidate.id)),
+    ].sort();
+    if (acceptedResultIds.length) {
+      await tx.execute(sql`
+        SELECT result.id
+        FROM results result
+        WHERE result.id = ANY(${sql`ARRAY[${sql.join(
+          acceptedResultIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}]`})
+        ORDER BY result.id
+        FOR UPDATE OF result
+      `);
+    }
+    for (const cell of cells) {
+      const before = acceptedByCell.get(coverageCellKey(cell));
+      if (!before) continue;
+      const after = await acceptedFullCoverageCandidate(
+        tx,
+        cell,
+        prelockedGenerationByCell.get(coverageCellKey(cell)),
+      );
+      if (
+        !after ||
+        after.id !== before.id ||
+        after.result_attempt_id !== before.result_attempt_id ||
+        after.fidelity !== before.fidelity ||
+        after.precalc_result_attempt_id !== before.precalc_result_attempt_id
+      ) {
+        throw new Error(
+          `accepted URANS evidence changed while materializing coverage for ${coverageCellKey(cell)}`,
+        );
+      }
+      acceptedByCell.set(coverageCellKey(cell), after);
     }
 
     const verifyQueueIds: string[] = [];
-    const missingPrecalc: PrecalcObligationCell[] = [];
     for (const cell of cells) {
-      // Serialize terminal-queue projection for legacy accepted final rows.
-      // Ordinary pending inserts remain protected by their partial unique
-      // index; every coverage caller takes these locks in the same sort order.
-      await tx.execute(sql`
-        SELECT pg_advisory_xact_lock(
-          hashtextextended(
-            ${`full-urans-coverage:${cell.airfoilId}:${cell.revisionId}:${Number(cell.aoaDeg)}`},
-            0
-          )
-        )
-      `);
-
-      const [accepted] = (await tx.execute(sql`
-        SELECT
-          result.id,
-          selected_attempt.id AS result_attempt_id,
-          selected_attempt.evidence_payload ->> 'fidelity' AS fidelity,
-          preliminary_attempt.id AS precalc_result_attempt_id
-        FROM results result
-        JOIN result_attempts selected_attempt
-          ON selected_attempt.id = result.current_result_attempt_id
-         AND selected_attempt.result_id = result.id
-         AND selected_attempt.airfoil_id = result.airfoil_id
-         AND selected_attempt.simulation_preset_revision_id =
-             result.simulation_preset_revision_id
-         AND selected_attempt.aoa_deg = result.aoa_deg
-        JOIN result_classifications classification
-          ON classification.result_attempt_id = selected_attempt.id
-         AND classification.state = 'accepted'
-        LEFT JOIN LATERAL (
-          SELECT attempt.id
-          FROM result_attempts attempt
-          JOIN result_classifications attempt_classification
-            ON attempt_classification.result_attempt_id = attempt.id
-           AND attempt_classification.state = 'accepted'
-          WHERE attempt.result_id = result.id
-            AND attempt.airfoil_id = result.airfoil_id
-            AND attempt.simulation_preset_revision_id =
-                result.simulation_preset_revision_id
-            AND attempt.aoa_deg = result.aoa_deg
-            AND attempt.status = 'done'
-            AND attempt.source = 'solved'
-            AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
-          ORDER BY attempt."createdAt" DESC, attempt.id DESC
-          LIMIT 1
-        ) preliminary_attempt ON true
-        WHERE result.airfoil_id = ${cell.airfoilId}
-          AND result.simulation_preset_revision_id = ${cell.revisionId}
-          AND result.aoa_deg = ${cell.aoaDeg}
-          AND result.status = 'done'
-          AND selected_attempt.status = 'done'
-          AND selected_attempt.source = 'solved'
-          AND selected_attempt.evidence_payload ->> 'fidelity'
-              IN ('urans_precalc', 'urans_full')
-        ORDER BY CASE selected_attempt.evidence_payload ->> 'fidelity'
-          WHEN 'urans_full' THEN 0
-          ELSE 1
-        END
-        LIMIT 1
-      `)) as unknown as Array<{
-        id: string;
-        result_attempt_id: string;
-        fidelity: string;
-        precalc_result_attempt_id: string | null;
-      }>;
+      const accepted = acceptedByCell.get(coverageCellKey(cell));
+      if (!accepted) continue;
       const acceptedPrecalcAttemptId =
         accepted?.fidelity === "urans_precalc"
           ? accepted.result_attempt_id
           : (accepted?.precalc_result_attempt_id ?? null);
-      if (acceptedPrecalcAttemptId) {
-        await tx.execute(sql`
-          SELECT pg_advisory_xact_lock(
-            hashtextextended(
-              ${`final-verify-generation:${acceptedPrecalcAttemptId}`},
-              0
-            )
-          )
-        `);
-      }
       const queueGenerationScope =
         accepted?.fidelity === "urans_precalc"
           ? sql`AND queue.precalc_result_attempt_id = ${accepted.result_attempt_id}`
           : accepted?.fidelity === "urans_full"
-            ? sql`AND (
-                queue.state IN ('done', 'disagreed')
-                ${acceptedPrecalcAttemptId ? sql`OR queue.precalc_result_attempt_id = ${acceptedPrecalcAttemptId}` : sql``}
-              )`
+            ? acceptedPrecalcAttemptId
+              ? sql`AND queue.precalc_result_attempt_id = ${acceptedPrecalcAttemptId}`
+              : sql`AND queue.precalc_result_attempt_id IS NULL
+                    AND queue.state IN ('done', 'disagreed')`
             : sql`AND false`;
       const queues = (await tx.execute(sql`
         SELECT queue.id, queue.state
@@ -690,23 +2240,69 @@ export async function ensureFullUransRequestCoverage(
       `)) as unknown as Array<{ id: string; state: string }>;
 
       let queueId =
-        queues.find((queue) => ["done", "disagreed"].includes(queue.state))
-          ?.id ?? null;
-      if (!queueId && accepted?.fidelity === "urans_full") {
-        const [terminal] = (await tx.execute(sql`
+        accepted?.fidelity === "urans_full"
+          ? (queues[0]?.id ?? null)
+          : (queues.find((queue) => ["done", "disagreed"].includes(queue.state))
+              ?.id ?? null);
+      if (accepted?.fidelity === "urans_full") {
+        const delta = (
+          full: number | null,
+          fast: number | null,
+        ): number | null => (full != null && fast != null ? full - fast : null);
+        const deltaCl = delta(accepted.selected_cl, accepted.precalc_cl);
+        const deltaCd = delta(accepted.selected_cd, accepted.precalc_cd);
+        const deltaCm = delta(accepted.selected_cm, accepted.precalc_cm);
+        const disagreed =
+          (deltaCl !== null &&
+            Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
+          (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
+        if (queueId) {
+          await tx.execute(sql`
+            UPDATE sim_urans_verify_queue
+            SET state = ${disagreed ? "disagreed" : "done"},
+                sim_job_id = ${accepted.sim_job_id},
+                verify_result_id = ${accepted.id},
+                delta_cl = ${deltaCl}, delta_cd = ${deltaCd},
+                delta_cm = ${deltaCm},
+                fresh_attempt_count = GREATEST(fresh_attempt_count, 1),
+                latest_result_attempt_id = ${accepted.result_attempt_id},
+                next_submit_at = NULL,
+                last_outcome = ${
+                  disagreed
+                    ? FINAL_URANS_OUTCOMES.disagreed
+                    : FINAL_URANS_OUTCOMES.accepted
+                },
+                last_error = NULL, "updatedAt" = now()
+            WHERE id = ${queueId}
+          `);
+        } else {
+          const [terminal] = (await tx.execute(sql`
           INSERT INTO sim_urans_verify_queue (
             airfoil_id, revision_id, aoa_deg, background_owner, state,
-            precalc_result_id, precalc_result_attempt_id, verify_result_id,
-            delta_cl, delta_cd, delta_cm, last_outcome
+            sim_job_id, precalc_result_id, precalc_result_attempt_id,
+            verify_result_id, delta_cl, delta_cd, delta_cm,
+            fresh_attempt_count, latest_result_attempt_id, last_outcome
           ) VALUES (
             ${cell.airfoilId}, ${cell.revisionId}, ${cell.aoaDeg}, false,
-            'done', ${accepted.id}, ${acceptedPrecalcAttemptId},
-            ${accepted.id}, 0, 0, 0,
-            ${FINAL_URANS_OUTCOMES.accepted}
+            ${disagreed ? "disagreed" : "done"}, ${accepted.sim_job_id},
+            ${accepted.id}, ${acceptedPrecalcAttemptId}, ${accepted.id},
+            ${deltaCl}, ${deltaCd}, ${deltaCm}, 1,
+            ${accepted.result_attempt_id},
+            ${
+              disagreed
+                ? FINAL_URANS_OUTCOMES.disagreed
+                : FINAL_URANS_OUTCOMES.accepted
+            }
           )
           RETURNING id
         `)) as unknown as Array<{ id: string }>;
-        queueId = terminal?.id ?? null;
+          queueId = terminal?.id ?? null;
+        }
+        if (queueId) {
+          await resolveSolverIncidentsForOwnerInTransaction(tx, {
+            verifyQueueId: queueId,
+          });
+        }
       }
       queueId ??=
         queues.find((queue) => ["pending", "running"].includes(queue.state))
@@ -746,12 +2342,7 @@ export async function ensureFullUransRequestCoverage(
       }
 
       if (!queueId) {
-        missingPrecalc.push({
-          airfoilId: cell.airfoilId,
-          revisionId: cell.revisionId,
-          aoaDeg: cell.aoaDeg,
-        });
-        continue;
+        throw new FullUransRequestCoverageIncompleteError(request.id, [cell]);
       }
       if (queues.find((queue) => queue.id === queueId)?.state === "cancelled") {
         await tx.execute(sql`
@@ -774,18 +2365,6 @@ export async function ensureFullUransRequestCoverage(
         aoaDeg: cell.aoaDeg,
       });
       verifyQueueIds.push(queueId);
-    }
-
-    let precalcObligations: SimPrecalcObligation[] = [];
-    if (missingPrecalc.length) {
-      precalcObligations = await ensurePrecalcObligationsInTransaction(
-        tx,
-        missingPrecalc,
-        {
-          campaignIds,
-          requestIds: [request.id],
-        },
-      );
     }
 
     const coveredCells = (await tx.execute(sql`
@@ -857,6 +2436,12 @@ export async function ensureFullUransRequestCoverage(
       verifyQueueIds: linkedQueueRows.map((row) => row.queueId),
     };
   });
+  if ("orphanedRequestId" in outcome) {
+    throw new Error(
+      `full URANS request ${outcome.orphanedRequestId} has no live owner`,
+    );
+  }
+  return outcome;
 }
 
 export type FullUransRequestProjectedState =
@@ -1022,6 +2607,12 @@ export async function refreshFullUransRequestStateInTransaction(
         eq(simUransRequests.id, requestId),
         eq(simUransRequests.fidelity, "full"),
         sql`${simUransRequests.state} <> 'cancelled'`,
+        or(
+          sql`${simUransRequests.state} IS DISTINCT FROM ${projectedState}`,
+          activePhysicalJob
+            ? sql`${simUransRequests.simJobId} IS DISTINCT FROM ${activePhysicalJob.id}`
+            : sql`${simUransRequests.simJobId} IS NOT NULL`,
+        ),
       ),
     );
   return projectedState;
@@ -2591,9 +4182,18 @@ export async function createUransRequest(
     fidelity: "precalc" | "full";
     requestedBy?: string | null;
     continueFromResultId?: string | null;
+    continueFromResultAttemptId?: string | null;
     budgetOverrideS?: number | null;
   },
 ): Promise<{ request: SimUransRequest; created: boolean }> {
+  if (
+    Boolean(input.continueFromResultId) !==
+    Boolean(input.continueFromResultAttemptId)
+  ) {
+    throw new Error(
+      "continuation requests require both the stable result id and exact result-attempt id",
+    );
+  }
   return db.transaction(async (tx) => {
     await tx.execute(sql`
       SELECT pg_advisory_xact_lock(
@@ -2672,7 +4272,9 @@ export async function createUransRequest(
       // for a reuse the caller will reject as incompatible.
       if (
         input.continueFromResultId != null &&
-        covering.continueFromResultId !== input.continueFromResultId
+        (covering.continueFromResultId !== input.continueFromResultId ||
+          covering.continueFromResultAttemptId !==
+            input.continueFromResultAttemptId)
       ) {
         return { request: covering, created: false };
       }
@@ -2706,6 +4308,7 @@ export async function createUransRequest(
         backgroundOwner: true,
         requestedBy: input.requestedBy ?? null,
         continueFromResultId: input.continueFromResultId ?? null,
+        continueFromResultAttemptId: input.continueFromResultAttemptId ?? null,
         budgetOverrideS: input.budgetOverrideS ?? null,
       })
       .returning();
@@ -2776,6 +4379,7 @@ export type FinalUransRecoveryPlan =
   | { mode: "fresh" }
   | {
       mode: "continuation";
+      resultId: string;
       resultAttemptId: string;
       engineJobId: string;
       engineCaseSlug: string;
@@ -2889,6 +4493,26 @@ export async function finalUransRecoveryPlanForVerifyItem(
   if (item.lastOutcome === FINAL_URANS_OUTCOMES.mediaRepairPending) {
     return { mode: "media_repair" };
   }
+  if (
+    !item.precalcResultId ||
+    !item.precalcResultAttemptId ||
+    !(await hasExactValidSolverManifest(
+      db,
+      item.precalcResultId,
+      item.precalcResultAttemptId,
+    )) ||
+    !(await hasExactVerifiedRestartableEvidenceArchive(
+      db,
+      item.precalcResultId,
+      item.precalcResultAttemptId,
+    ))
+  ) {
+    return {
+      mode: "exhausted",
+      reason:
+        "the exact preliminary URANS restart archive is missing or unverified; FINAL cannot start from untrusted storage and will not silently fresh-solve",
+    };
+  }
   const continuationRequested =
     item.lastOutcome === FINAL_URANS_OUTCOMES.continuationPending ||
     item.lastOutcome === FINAL_URANS_OUTCOMES.continuationRetryWait;
@@ -2896,17 +4520,26 @@ export async function finalUransRecoveryPlanForVerifyItem(
     const [source] = await db
       .select({
         id: resultAttempts.id,
+        resultId: resultAttempts.resultId,
         airfoilId: resultAttempts.airfoilId,
         revisionId: resultAttempts.simulationPresetRevisionId,
         aoaDeg: resultAttempts.aoaDeg,
+        status: resultAttempts.status,
+        source: resultAttempts.source,
         engineJobId: resultAttempts.engineJobId,
         engineCaseSlug: resultAttempts.engineCaseSlug,
         solverImplementationId: resultAttempts.solverImplementationId,
+        qualityWarnings: resultAttempts.qualityWarnings,
+        classification: resultClassifications.state,
         fidelity: sql<
           string | null
         >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
       })
       .from(resultAttempts)
+      .innerJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
       .where(eq(resultAttempts.id, item.latestResultAttemptId))
       .limit(1);
     if (
@@ -2914,12 +4547,25 @@ export async function finalUransRecoveryPlanForVerifyItem(
       source.airfoilId === item.airfoilId &&
       source.revisionId === item.revisionId &&
       Number(source.aoaDeg) === Number(item.aoaDeg) &&
+      source.resultId != null &&
+      ["done", "failed"].includes(source.status) &&
+      source.source === "solved" &&
       source.fidelity === "urans_full" &&
+      source.classification === "rejected" &&
+      source.solverImplementationId != null &&
+      hasPrecalcContinuationWarning(source.qualityWarnings) &&
       source.engineJobId &&
-      source.engineCaseSlug
+      source.engineCaseSlug &&
+      (await hasExactValidSolverManifest(db, source.resultId, source.id)) &&
+      (await hasExactVerifiedRestartableEvidenceArchive(
+        db,
+        source.resultId,
+        source.id,
+      ))
     ) {
       return {
         mode: "continuation",
+        resultId: source.resultId,
         resultAttemptId: source.id,
         engineJobId: source.engineJobId,
         engineCaseSlug: source.engineCaseSlug,
@@ -2928,6 +4574,11 @@ export async function finalUransRecoveryPlanForVerifyItem(
           item.continuationBudgetOverrideS ?? FINAL_URANS_CONTINUATION_BUDGET_S,
       };
     }
+    return {
+      mode: "exhausted",
+      reason:
+        "the exact final URANS continuation checkpoint is missing, incomplete, or unverified; automatic recovery will not discard saved-state identity with a fresh solve",
+    };
   }
   if (item.freshAttemptCount < item.maxFreshAttempts) {
     return { mode: "fresh" };

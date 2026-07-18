@@ -359,6 +359,7 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
       reviewBucket: null,
       workDisposition: null,
       continuable: false,
+      continuationResultAttemptId: null,
       verify: null,
       ...(over.point ?? {}),
     },

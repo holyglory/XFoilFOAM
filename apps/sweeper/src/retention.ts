@@ -209,14 +209,43 @@ export async function stripTerminalJobs(
         EXISTS (
           SELECT 1
           FROM result_attempts attempt
+          JOIN result_classifications attempt_classification
+            ON attempt_classification.result_attempt_id = attempt.id
+           AND attempt_classification.state = 'rejected'
+          JOIN simulation_preset_revisions attempt_revision
+            ON attempt_revision.id = attempt.simulation_preset_revision_id
           WHERE attempt.engine_job_id IS NOT NULL
             AND attempt.engine_case_slug IS NOT NULL
+            AND attempt.status IN ('done', 'failed')
+            AND attempt.source = 'solved'
             AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            AND attempt.solver_implementation_id IS NOT NULL
+            AND attempt_revision.solver_implementation_id IS NOT NULL
+            AND attempt.solver_implementation_id =
+                attempt_revision.solver_implementation_id
             AND EXISTS (
               SELECT 1
               FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
               WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
                  OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+            )
+            AND (
+              SELECT count(*) = 1
+                AND bool_and(
+                  artifact.airfoil_id = attempt.airfoil_id
+                  AND artifact.sim_job_id IS NOT DISTINCT FROM attempt.sim_job_id
+                  AND artifact.engine_job_id IS NOT DISTINCT FROM attempt.engine_job_id
+                  AND artifact.engine_case_slug IS NOT DISTINCT FROM attempt.engine_case_slug
+                  AND artifact.aoa_deg IS NOT DISTINCT FROM attempt.aoa_deg
+                  AND artifact.sha256 ~ '^[0-9a-fA-F]{64}$'
+                  AND artifact.byte_size > 0
+                  AND length(trim(artifact.storage_key)) > 0
+                  AND length(trim(artifact.mime_type)) > 0
+                )
+              FROM solver_evidence_artifacts artifact
+              WHERE artifact.result_id = attempt.result_id
+                AND artifact.result_attempt_id = attempt.id
+                AND artifact.kind = 'manifest'
             )
             AND (
               attempt.sim_job_id = j.id

@@ -340,19 +340,11 @@ export function CellSidePanel({
     void loadLadder();
   }, [loadLadder]);
 
-  const doRequestUrans = async (fidelity: "precalc" | "full") => {
+  const doRequestFinalVerification = async () => {
     if (uransBusy) return;
-    const tierLabel =
-      fidelity === "precalc"
-        ? "Preliminary URANS (fast)"
-        : "Verified URANS (final)";
-    const requestMeaning =
-      fidelity === "precalc"
-        ? "Fast results will be calculated for every angle."
-        : "Missing fast results will be calculated first; final verification follows automatically.";
     if (
       !window.confirm(
-        `Queue ${tierLabel} for the whole polar of ${airfoil.name} at Re ${formatRe(condition.reynolds)}? ${requestMeaning}`,
+        `Ensure final verification for the whole polar of ${airfoil.name} at Re ${formatRe(condition.reynolds)}? Missing FAST URANS results run first automatically; FINAL URANS verification follows.`,
       )
     )
       return;
@@ -362,12 +354,12 @@ export function CellSidePanel({
       const res = await requestUrans({
         airfoilId: airfoil.airfoilId,
         revisionId: condition.revisionId,
-        fidelity,
+        fidelity: "full",
       });
       setUransNotice(
         res.created
-          ? `${tierLabel} requested for the whole polar.`
-          : `${tierLabel} already ${res.request.state}; the existing request is reused.`,
+          ? "Final verification requested for the whole polar; FAST URANS runs first where needed."
+          : `Final verification is already ${res.request.state}; the existing sequence is reused.`,
       );
       await loadLadder();
       onChanged();
@@ -513,6 +505,12 @@ export function CellSidePanel({
   }, [simOpen, airfoil.slug, condition.revisionId]);
 
   const counters = cell ?? null;
+  const openFinalVerification = ladder?.requests.find(
+    (request) =>
+      request.aoaDeg == null &&
+      request.fidelity === "full" &&
+      (request.state === "pending" || request.state === "running"),
+  );
 
   return (
     <>
@@ -754,85 +752,80 @@ export function CellSidePanel({
           onOpenResult={onPreliminaryResultClick}
         />
 
-        <div
-          data-testid="cell-urans-request-controls"
+        <details
+          data-testid="cell-operator-overrides"
           style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "flex-end",
-            gap: 6,
-            flexWrap: "wrap",
-            minHeight: 34,
+            fontFamily: MONO,
+            fontSize: 10,
+            color: C.dim,
           }}
         >
-          <span
+          <summary
             style={{
-              marginRight: 2,
-              fontFamily: MONO,
-              fontSize: 9.5,
-              color: C.dim,
+              width: "fit-content",
+              cursor: "pointer",
+              letterSpacing: "0.08em",
             }}
           >
-            Whole-polar request
-          </span>
-          {(["precalc", "full"] as const).map((fidelity) => {
-            const open = ladder?.requests.find(
-              (request) =>
-                request.aoaDeg == null &&
-                request.fidelity === fidelity &&
-                (request.state === "pending" || request.state === "running"),
-            );
-            const label = fidelity === "precalc" ? "Fast URANS" : "Final URANS";
-            return (
-              <button
-                key={fidelity}
-                type="button"
-                data-testid={`cell-request-urans-${fidelity}`}
-                disabled={uransBusy || !!open}
-                title={
-                  open
-                    ? `${label} whole-polar request is ${open.state}.`
-                    : fidelity === "precalc"
-                      ? "Request fast preliminary URANS for every angle."
-                      : "Request final verified URANS for every angle."
-                }
-                onClick={() => void doRequestUrans(fidelity)}
-                style={{
-                  ...ghostBtn,
-                  padding: "4px 9px",
-                  fontSize: 10,
-                  color: open ? C.dim : C.teal,
-                  borderColor: open ? C.stroke : C.tealBorder,
-                  opacity: uransBusy ? 0.6 : 1,
-                  cursor: uransBusy || open ? "not-allowed" : "pointer",
-                }}
-              >
-                {open ? `${label} · ${open.state}` : label}
-              </button>
-            );
-          })}
-          {!ladder && !ladderError && (
-            <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
-              …
+            OPERATOR OVERRIDES
+          </summary>
+          <div
+            data-testid="cell-urans-request-controls"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              flexWrap: "wrap",
+              marginTop: 7,
+              padding: 8,
+              border: `1px solid ${C.borderSoft}`,
+              borderRadius: 8,
+              background: C.panel2,
+            }}
+          >
+            <span style={{ marginRight: 2, color: C.muted }}>
+              Manual whole-polar verification
             </span>
-          )}
-          {ladderError && (
-            <span
-              role="alert"
-              style={{ fontFamily: MONO, fontSize: 10, color: C.red }}
+            <button
+              type="button"
+              data-testid="cell-request-final-verification"
+              disabled={uransBusy || !!openFinalVerification}
+              title={
+                openFinalVerification
+                  ? `Final verification for the whole polar is ${openFinalVerification.state}.`
+                  : "Ensure final verification for every angle; FAST URANS runs first automatically where needed."
+              }
+              onClick={() => void doRequestFinalVerification()}
+              style={{
+                ...ghostBtn,
+                padding: "4px 9px",
+                fontSize: 10,
+                color: openFinalVerification ? C.dim : C.teal,
+                borderColor: openFinalVerification ? C.stroke : C.tealBorder,
+                opacity: uransBusy ? 0.6 : 1,
+                cursor:
+                  uransBusy || openFinalVerification
+                    ? "not-allowed"
+                    : "pointer",
+              }}
             >
-              Couldn&apos;t load request state.
-            </span>
-          )}
-          {uransNotice && (
-            <span
-              role="status"
-              style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}
-            >
-              {uransNotice}
-            </span>
-          )}
-        </div>
+              {openFinalVerification
+                ? `Final verification · ${openFinalVerification.state}`
+                : "Ensure final verification"}
+            </button>
+            {!ladder && !ladderError && <span style={{ color: C.dim }}>…</span>}
+            {ladderError && (
+              <span role="alert" style={{ color: C.red }}>
+                Couldn&apos;t load request state.
+              </span>
+            )}
+            {uransNotice && (
+              <span role="status" style={{ color: C.muted }}>
+                {uransNotice}
+              </span>
+            )}
+          </div>
+        </details>
 
         {/* provenance disclosure */}
         <div>

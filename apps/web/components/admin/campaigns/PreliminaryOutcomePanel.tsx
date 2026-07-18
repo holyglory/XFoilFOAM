@@ -18,6 +18,7 @@ import type {
   AdminCampaignPreliminaryOutcomes,
 } from "@/lib/admin";
 import {
+  preliminaryOutcomeCriticalAnnouncement,
   preliminaryOutcomeCurrentCounts,
   preliminaryOutcomeCurrentStage,
   preliminaryOutcomeView,
@@ -155,6 +156,9 @@ export function PreliminaryOutcomePanel({
   const currentCounts = outcomes
     ? preliminaryOutcomeCurrentCounts(outcomes.items)
     : null;
+  const criticalAnnouncement = outcomes
+    ? preliminaryOutcomeCriticalAnnouncement(outcomes.items)
+    : "";
 
   return (
     <section
@@ -413,6 +417,9 @@ export function PreliminaryOutcomePanel({
         }
         .stage-node.queued,
         .stage-node.running {
+          color: ${C.violet};
+        }
+        .stage-node.automatic-next {
           color: ${C.violet};
         }
         .stage-node.critical {
@@ -869,12 +876,24 @@ export function PreliminaryOutcomePanel({
         )}
       </header>
 
+      <span
+        className="sr-only"
+        data-testid="cell-preliminary-critical-announcement"
+        role="status"
+        aria-live="assertive"
+        aria-atomic="true"
+      >
+        {criticalAnnouncement
+          ? `Critical solver incidents: ${criticalAnnouncement}`
+          : ""}
+      </span>
+
       <div className="flow-guide">
         <span className="guide-label">POINT</span>
         <div
           className="shared-rail"
           data-testid="cell-preliminary-handoff-rail"
-          aria-label="RANS screen, normal handoff to fast preliminary URANS, then final verified URANS"
+          aria-label="Each point starts with RANS screening. An accepted RANS result stops there; aerodynamic non-convergence hands off automatically to fast preliminary URANS, then final verified URANS."
         >
           <div className="shared-stage" data-flow-stage="rans">
             <CircleDot size={15} strokeWidth={1.8} aria-hidden />
@@ -961,6 +980,7 @@ export function PreliminaryOutcomePanel({
             const hasActiveWork =
               (view.ransStage === "not_started" && !view.critical) ||
               view.ransHandoffPending ||
+              view.finalAutomaticNext ||
               view.fastState === "queued" ||
               view.fastState === "running" ||
               view.finalState === "queued" ||
@@ -1030,7 +1050,7 @@ export function PreliminaryOutcomePanel({
                       item.criticalStage === "preflight"
                         ? "RANS: not started; automatic mesh/runtime repair is critical"
                         : item.criticalStage === "rans"
-                          ? "RANS: attempt recorded; automatic recovery exhausted before fast URANS"
+                          ? "RANS: evidence recorded; a machine fault exhausted system recovery before FAST URANS"
                           : ransDidHandoff
                             ? "RANS: screened; normal handoff to fast URANS, which starts automatically"
                             : `RANS: ${view.ransLabel}`
@@ -1091,8 +1111,8 @@ export function PreliminaryOutcomePanel({
                         ? view.ransAcceptedResult
                           ? "skipped"
                           : ""
-                        : view.fastRecoveredByFinal
-                          ? "warning"
+                        : view.finalAutomaticNext
+                          ? "active"
                           : view.fastState === "critical"
                             ? "critical"
                             : view.fastState === "accepted"
@@ -1108,11 +1128,13 @@ export function PreliminaryOutcomePanel({
                     className={`stage-node ${
                       view.finalState === "critical"
                         ? "critical"
-                        : item.finalComparison === "disagreed"
-                          ? "comparison-warning"
-                          : item.finalActivityState === "critical"
-                            ? "update-warning"
-                            : view.finalState
+                        : view.finalAutomaticNext
+                          ? "automatic-next"
+                          : item.finalComparison === "disagreed"
+                            ? "comparison-warning"
+                            : item.finalActivityState === "critical"
+                              ? "update-warning"
+                              : view.finalState
                     }`}
                     testId={`cell-preliminary-final-${item.aoaDeg}`}
                     current={currentStage === "final"}
@@ -1237,7 +1259,7 @@ export function PreliminaryOutcomePanel({
                           <FastStageIcon state={view.fastState} />
                         </span>
                         <span className="detail-stage-copy">
-                          <strong>URANS FAST</strong>
+                          <strong>FAST URANS</strong>
                           <span>{view.fastLabel}</span>
                           <small>{view.fastProvenanceLabel}</small>
                         </span>
@@ -1262,7 +1284,7 @@ export function PreliminaryOutcomePanel({
                           />
                         </span>
                         <span className="detail-stage-copy">
-                          <strong>URANS FINAL</strong>
+                          <strong>FINAL URANS</strong>
                           <span>{view.finalLabel}</span>
                           <small>{view.finalProvenanceLabel}</small>
                         </span>

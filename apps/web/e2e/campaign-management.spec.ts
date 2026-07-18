@@ -784,7 +784,7 @@ test.describe
       "cell-preliminary-handoff-rail",
     );
     await expect(handoffRail).toHaveAccessibleName(
-      "RANS screen, normal handoff to fast preliminary URANS, then final verified URANS",
+      "Each point starts with RANS screening. An accepted RANS result stops there; aerodynamic non-convergence hands off automatically to fast preliminary URANS, then final verified URANS.",
     );
     await expect(handoffRail.locator('[data-flow-stage="rans"]')).toHaveCount(
       1,
@@ -849,7 +849,7 @@ test.describe
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/not_started/);
     await expect(preliminary).toContainText(
-      "CRITICAL · SCREENING RECOVERY EXHAUSTED",
+      "CRITICAL · RANS RECOVERY EXHAUSTED",
     );
 
     // The open dialog revalidates this point without page interaction. Each
@@ -897,6 +897,9 @@ test.describe
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/critical/);
+    await expect(pointTrack.locator(".connector").nth(1)).toHaveClass(
+      /critical/,
+    );
     await expect(
       preliminary.getByTestId("cell-preliminary-incident-0"),
     ).toHaveAttribute(
@@ -1012,19 +1015,27 @@ test.describe
     ).toHaveClass(/screened/);
     await expect(pointTrack).toHaveAccessibleName(/RANS screened/i);
     await expect(pointTrack.locator(".connector").first()).toHaveClass(
-      /complete/,
+      /handoff/,
     );
     await expect(preliminary).not.toContainText("RANS failure");
     await expect(preliminary).not.toContainText("no action required");
     await expect(preliminary).not.toContainText("solver evidence rejected");
     await expect(panel.locator(".cell-fidelity-ladder")).toHaveCount(0);
-    await expect(panel.getByText("Whole-polar request")).toBeVisible();
+    const operatorOverrides = panel.getByTestId("cell-operator-overrides");
+    await expect(operatorOverrides).not.toHaveAttribute("open", "");
     await expect(
-      panel.getByRole("button", { name: "Fast URANS" }),
+      panel.getByRole("button", { name: "Ensure final verification" }),
+    ).toBeHidden();
+    await operatorOverrides.locator("summary").click();
+    await expect(
+      panel.getByText("Manual whole-polar verification"),
     ).toBeVisible();
     await expect(
-      panel.getByRole("button", { name: "Final URANS" }),
+      panel.getByRole("button", { name: "Ensure final verification" }),
     ).toBeVisible();
+    await expect(
+      panel.getByRole("button", { name: "Fast URANS", exact: true }),
+    ).toHaveCount(0);
     await expect(panel.getByText("FAILED POINTS", { exact: true })).toHaveCount(
       0,
     );

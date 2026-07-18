@@ -464,6 +464,17 @@ widen its identifiers from an open-work query.
 - Continuation first validates live state. If live fields were stripped, it
   reconstructs the exact case from the immutable local or GCS-backed evidence
   archive and verifies paths and archive integrity before solving.
+- Same-case continuation identity is the immutable result/result-attempt pair,
+  never a mutable result container alone. A one-sided or mismatched pair fails
+  closed. Legacy result-only ownership is accepted only when it resolves to the
+  exact retained request link; it cannot rediscover another generation by
+  rounded cell values or recency.
+- The exact generation must own one valid manifest and one current, verified,
+  generation-pinned GCS Zstandard restart archive. The archive must contain the
+  transient marker, mesh, dictionaries for the recorded OpenFOAM distribution,
+  a complete positive-time field set, and force coefficients. If those bytes
+  disappear after a request is created, submission still fails closed rather
+  than trusting the earlier decision.
 - The checkpoint's immutable solver implementation identity must equal the
   requested and executing runtime identity. OpenCFD 2406 state may continue
   only on the matching 2406 implementation; an OpenCFD 2606 successor starts
@@ -494,6 +505,10 @@ widen its identifiers from an open-work query.
 - Fresh starts remain bounded. Same-case continuation segments preserve one
   physical solve’s accumulated state and immutable audit sequence rather than
   masquerading as independent solver attempts.
+- A caller-authorized exact continuation keeps its pinned checkpoint and
+  explicit corrective budget. Queue reconciliation may add ownership, but it
+  cannot silently replace that source with another attempt or shrink the
+  operator-approved integration window.
 - Each pimpleFoam chunk checkpoints its last-known-good time fields and force
   history. A structured numerical failure preserves its failed dictionaries,
   log, force history, and last written fields before the version-2 conservative
@@ -515,6 +530,11 @@ widen its identifiers from an open-work query.
   incidents with the same signature trigger investigation of the algorithm,
   runtime, storage, or mesh recovery path and a regression before normal
   campaign processing is considered reliable.
+- A running multi-angle job publishes each completed exact attempt, manifest,
+  archive, classification, and point before advancing its completed-case
+  counter. The sweeper ingests that partial idempotently and schedules FINAL
+  only after the accepted FAST generation is durably restartable; a progress
+  counter can never outrun the evidence it claims exists.
 - Fast/final coefficient disagreement is stored comparison evidence, not a
   solver incident. The accepted final generation remains canonical and the UI
   presents the real deltas as a non-critical quality warning.
@@ -557,6 +577,11 @@ Regression coverage must prove:
   older immutable attempt, resolves only the older mesh incident, and records a
   new critical versioned incident if the newer physical repair also exhausts;
 - a live or archive-backed preliminary checkpoint resumes without remeshing;
+- exact continuation requires the same result/result-attempt pair, solver
+  implementation, boundary condition, manifest, and verified restart archive;
+  mismatched, incomplete, one-sided, or post-creation-lost evidence fails
+  closed, while a valid operator-pinned continuation keeps its checkpoint and
+  budget;
 - a cross-engine or cross-version checkpoint is refused before solve work and
   the successor cell is scheduled fresh;
 - a missing capability advert is treated as legacy version 0, malformed or
@@ -602,6 +627,9 @@ Regression coverage must prove:
 - exact and whole-polar admin final requests own the ordinary PRECALC plus
   verification children, never submit a direct full bypass, and settle only
   after every owned child settles;
+- running partial publication cannot advance completed-case progress before
+  the exact attempt and archive are available, and accepted FAST evidence
+  creates exactly one FINAL item only after that archive gate passes;
 - the UI uses one three-stage per-point sequence and reserves red critical
   treatment for exceptional preflight, RANS-recovery, preliminary-, or
   final-URANS exhaustion, never normal RANS handoff;

@@ -47,6 +47,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { db, sql as pgClient } from "../src/db";
 import { sql } from "drizzle-orm";
 import { buildServer } from "../src/server";
+import { createExactResultAttemptFixture } from "./exact-result-fixture";
 
 const PREFIX = `pw-revbuck-${process.pid}-${Date.now().toString(36)}`;
 // Unique speed → unique physics hash → this campaign pins its own revision.
@@ -160,7 +161,7 @@ beforeAll(async () => {
         spanM: 1,
         areaMode: "derived",
         excludedConditions: [],
-        baseSweep: { fromDeg: -2, toDeg: 5, stepDeg: 1, listDeg: null },
+        baseSweep: { fromDeg: -2, toDeg: 6, stepDeg: 1, listDeg: null },
         objectives: {
           ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
           clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
@@ -293,6 +294,24 @@ beforeAll(async () => {
     qualityWarnings: [BUDGET_STOP_WARNING],
   });
   await classify(contId, -1, "urans", "rejected", ["insufficient-periods"]);
+  const contAttemptId = await createExactResultAttemptFixture(db, contId, {
+    publication: "legacy-selected-reclassified",
+  });
+  await db.insert(resultClassifications).values({
+    resultAttemptId: contAttemptId,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg: -1,
+    regime: "urans",
+    classifierVersion: "test-exact-continuation-v1",
+    state: "rejected",
+    reasons: ["insufficient-periods"],
+    confidence: 0.9,
+  });
+  await db
+    .update(simCampaignPoints)
+    .set({ resultAttemptId: contAttemptId })
+    .where(eq(simCampaignPoints.resultId, contId));
   // aoa +3 — REJECTED urans_precalc with an OPEN verify item: still scheduled,
   // so NEITHER refined bucket (stays in the deprecated 'rejected' alias only).
   const verifyCoveredId = await insertResult({
@@ -386,6 +405,46 @@ beforeAll(async () => {
     "insufficient-periods",
   ]);
 
+  // aoa +6 — a typed hard-solver RANS stop whose FAST obligation is already
+  // pending. This is the ordinary RANS -> FAST handoff, not a critical point.
+  const failedHandoffId = await insertResult({
+    ...base,
+    aoaDeg: 6,
+    status: "failed",
+    source: "solved",
+    regime: "rans",
+    fidelity: "rans",
+    converged: false,
+    stalled: true,
+    error: "steady RANS did not converge",
+    solvedAt: null,
+  });
+  await classify(failedHandoffId, 6, "rans", "rejected", ["not-converged"]);
+  const failedHandoffAttemptId = await createExactResultAttemptFixture(
+    db,
+    failedHandoffId,
+    {
+      publication: "legacy-selected-reclassified",
+      evidencePayload: { failure_disposition: "hard_solver" },
+    },
+  );
+  await db
+    .update(simCampaignPoints)
+    .set({ resultAttemptId: failedHandoffAttemptId })
+    .where(eq(simCampaignPoints.resultId, failedHandoffId));
+  await ensurePrecalcObligations(
+    db,
+    [
+      {
+        airfoilId,
+        revisionId,
+        aoaDeg: 6,
+        sourceResultId: failedHandoffId,
+      },
+    ],
+    { campaignIds: [campaignId] },
+  );
+
   // The seed classifies AFTER each terminal-link, so the last cell's verdict
   // post-dates its counter recompute — refresh the stored counters the way the
   // sweeper's post-refresh settle does before asserting against them.
@@ -431,7 +490,7 @@ describe("campaign payloads: awaitingUrans / needsReview derived from the canoni
 
   it("does not count explicit legacy URANS with NULL fidelity as a RANS precalc obligation", async () => {
     const tiers = await campaignOpenTierCounts(db, campaignId);
-    expect(tiers.precalcOpen).toBe(1); // only the real rejected RANS row at +1°
+    expect(tiers.precalcOpen).toBe(2); // done reject at +1° + failed hard-solver handoff at +6°
   });
 
   it("MUST-CATCH (count = click-through): a derived symmetry mirror of a failed source does NOT inflate needsReview", async () => {
@@ -510,7 +569,7 @@ describe("campaign payloads: awaitingUrans / needsReview derived from the canoni
 });
 
 describe("Points tab API: awaiting_urans / needs_review filters, deprecated alias, continuable flag", () => {
-  it("status=awaiting_urans returns exactly the rans reject, labelled with its reviewBucket", async () => {
+  it("status=awaiting_urans returns both done-rejected and failed hard-solver RANS handoffs", async () => {
     const res = await app.inject({
       method: "GET",
       url: listUrl({ campaignId, status: "awaiting_urans" }),
@@ -519,13 +578,27 @@ describe("Points tab API: awaiting_urans / needs_review filters, deprecated alia
     const body = res.json() as {
       items: Array<{
         aoaDeg: number;
+        bucket: string;
         reviewBucket: string | null;
+        workDisposition: string | null;
         continuable: boolean;
       }>;
     };
-    expect(body.items.map((i) => i.aoaDeg)).toEqual([1]);
-    expect(body.items[0].reviewBucket).toBe("awaiting_urans");
-    expect(body.items[0].continuable).toBe(false);
+    expect(body.items.map((i) => i.aoaDeg).sort((a, b) => a - b)).toEqual([
+      1, 6,
+    ]);
+    expect(
+      body.items.every(
+        (item) =>
+          item.bucket === "rejected" &&
+          item.reviewBucket === "awaiting_urans" &&
+          !item.continuable,
+      ),
+    ).toBe(true);
+    expect(body.items.find((item) => item.aoaDeg === 6)).toMatchObject({
+      bucket: "rejected",
+      workDisposition: "scheduled",
+    });
   });
 
   it("status=needs_review stays empty for crash, continuable, and exhausted solver outcomes", async () => {
@@ -554,7 +627,7 @@ describe("Points tab API: awaiting_urans / needs_review filters, deprecated alia
       items: Array<{ aoaDeg: number; reviewBucket: string | null }>;
     };
     expect(body.items.map((i) => i.aoaDeg).sort((a, b) => a - b)).toEqual([
-      -2, -1, 1, 3, 4, 5,
+      -2, -1, 1, 3, 4, 5, 6,
     ]);
     // Scheduled urans rejects are in NEITHER refined bucket.
     const byAoa = new Map(body.items.map((i) => [i.aoaDeg, i]));
@@ -570,9 +643,9 @@ describe("Points tab API: awaiting_urans / needs_review filters, deprecated alia
     });
     expect(res.statusCode).toBe(200);
     const counts = (res.json() as { counts: Record<string, number> }).counts;
-    expect(counts.awaiting_urans).toBe(1);
+    expect(counts.awaiting_urans).toBe(2);
     expect(counts.needs_review).toBe(0);
-    expect(counts.rejected).toBe(6);
+    expect(counts.rejected).toBe(7);
     expect(counts.failed).toBe(1);
     expect(counts.accepted).toBe(1);
   });
@@ -608,6 +681,24 @@ describe("Points tab API: awaiting_urans / needs_review filters, deprecated alia
     };
     expect(awaiting.point.reviewBucket).toBe("awaiting_urans");
     expect(awaiting.point.continuable).toBe(false);
+
+    const failedHandoffRes = await app.inject({
+      method: "GET",
+      url: `/api/admin/point-history/${resultIdByAoa.get(6)}/story`,
+    });
+    expect(failedHandoffRes.statusCode).toBe(200);
+    const failedHandoff = failedHandoffRes.json() as {
+      point: {
+        status: string;
+        reviewBucket: string | null;
+        workDisposition: string | null;
+      };
+    };
+    expect(failedHandoff.point).toMatchObject({
+      status: "failed",
+      reviewBucket: "awaiting_urans",
+      workDisposition: "scheduled",
+    });
 
     const legacyUransRes = await app.inject({
       method: "GET",

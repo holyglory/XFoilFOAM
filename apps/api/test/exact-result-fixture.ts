@@ -4,6 +4,7 @@ import {
   resultAttempts,
   resultMedia,
   results,
+  simulationPresetRevisions,
   solverEvidenceArtifacts,
 } from "@aerodb/db";
 import { and, eq, isNull } from "drizzle-orm";
@@ -50,6 +51,18 @@ export async function createExactResultAttemptFixture(
     .where(eq(results.id, resultId))
     .limit(1);
   if (!result) throw new Error(`test result ${resultId} does not exist`);
+  const [revision] = result.simulationPresetRevisionId
+    ? await db
+        .select({
+          solverImplementationId:
+            simulationPresetRevisions.solverImplementationId,
+        })
+        .from(simulationPresetRevisions)
+        .where(
+          eq(simulationPresetRevisions.id, result.simulationPresetRevisionId),
+        )
+        .limit(1)
+    : [];
 
   const [history] = await db
     .select()
@@ -101,6 +114,11 @@ export async function createExactResultAttemptFixture(
       engineCaseSlug:
         result.engineCaseSlug ??
         `aoa-${String(result.aoaDeg).replace("-", "m")}`,
+      methodKey: result.methodKey,
+      solverImplementationId:
+        result.solverImplementationId ??
+        revision?.solverImplementationId ??
+        null,
       status: result.status,
       source: result.source,
       regime: result.regime,

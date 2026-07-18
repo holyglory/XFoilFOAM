@@ -314,6 +314,233 @@ def test_multi_speed_chord_produces_multiple_polars(client, fake_run_case, naca0
         assert len(polar["points"]) == 3  # 0,2,4
 
 
+def test_cold_case_parallel_publishes_result_before_completed_count(
+    tmp_path, monkeypatch, fake_run_case, naca0012_selig_text
+):
+    """A finished cold case must publish evidence before advertising progress.
+
+    The second case stays inside ``run_case`` until the first running partial is
+    durably readable.  This proves both that cold case-parallel publication is
+    per-future (not end-of-batch) and that ``completed_cases`` can never lead
+    the result file consumed by the sweeper.
+    """
+    import threading
+
+    from airfoilfoam.config import Settings
+    from airfoilfoam.models import AoASpec, ResourceParams, SolverParams
+
+    partial_written = threading.Event()
+    slow_case_returned = threading.Event()
+    count_observations: list[bool] = []
+    partial_observations: list[bool] = []
+    job_id = "cold-case-parallel-partial-order"
+
+    def point_count(result: JobResult | None) -> int:
+        if result is None:
+            return 0
+        return sum(len(polar.points) for polar in result.polars)
+
+    class ObservingStore(JobStore):
+        def write_status(self, status):
+            if status.state is JobState.running and status.completed_cases == 1:
+                visible = self.read_result(status.job_id)
+                count_observations.append(
+                    visible is not None
+                    and visible.state is JobState.running
+                    and point_count(visible) == 1
+                )
+            super().write_status(status)
+
+        def write_result(self, result):
+            super().write_result(result)
+            if result.state is JobState.running and point_count(result) == 1:
+                # Observe before waking the slow case: the partial was written
+                # while its sibling future was still genuinely open.
+                partial_observations.append(not slow_case_returned.is_set())
+                partial_written.set()
+
+    def controlled_run_case(
+        case_dir,
+        airfoil,
+        spec,
+        fluid,
+        roughness,
+        mesh_params,
+        solver_params,
+        mesher,
+        runner,
+        **_kwargs,
+    ):
+        if spec.aoa_deg == 1.0:
+            assert partial_written.wait(timeout=5.0)
+            slow_case_returned.set()
+        return CaseOutcome(
+            spec=spec,
+            reynolds=100_000.0,
+            cl=0.1 + spec.aoa_deg,
+            cd=0.02,
+            cm=0.0,
+            cl_cd=(0.1 + spec.aoa_deg) / 0.02,
+            converged=True,
+        )
+
+    monkeypatch.setattr(jobs, "run_case", controlled_run_case)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        cpu_token_state_path=tmp_path / "cpu-tokens.json",
+        worker_cpu_budget=2,
+        case_concurrency=2,
+        solver_processes=1,
+    )
+    store = ObservingStore(settings)
+    request = PolarRequest(
+        airfoil=AirfoilInput(
+            name="naca0012",
+            coordinates=naca0012_selig_text,
+        ),
+        aoa=AoASpec(angles=[0.0, 1.0]),
+        solver=SolverParams(
+            force_transient=True,
+            warm_start=False,
+            write_images=[],
+        ),
+        resources=ResourceParams(
+            policy="case_parallel",
+            cpu_budget=2,
+            case_concurrency=2,
+            solver_processes=1,
+        ),
+    )
+    store.create(job_id, request)
+
+    result = jobs.execute_job(
+        job_id,
+        request,
+        store=store,
+        settings=settings,
+    )
+
+    assert partial_observations == [True]
+    # More than one status callback may legitimately persist the same
+    # completed count while the sibling remains open; every such snapshot
+    # must observe the already-published partial.
+    assert count_observations
+    assert all(count_observations)
+    assert result.state is JobState.completed
+    assert point_count(result) == 2
+
+
+def test_cold_case_parallel_serializes_status_context_writes(
+    tmp_path, monkeypatch, fake_run_case, naca0012_selig_text
+):
+    """Concurrent case callbacks must not tear the singular status snapshot.
+
+    ``JobStatus`` intentionally keeps one representative active case for
+    compatibility.  More than one cold future can report phase progress at the
+    same instant, so mutation of the shared status context and its persisted
+    snapshot must be serialized.  This fixture forces two callbacks to enter
+    together and makes an overlapping store write deterministic.
+    """
+    import threading
+    import time
+
+    from airfoilfoam.config import Settings
+    from airfoilfoam.models import AoASpec, JobPhase, ResourceParams, SolverParams
+
+    callback_barrier = threading.Barrier(2)
+    write_guard = threading.Lock()
+    concurrent_writes = 0
+    max_concurrent_writes = 0
+    observed_pairs: list[tuple[str | None, float | None]] = []
+
+    class ObservingStore(JobStore):
+        def write_status(self, status):
+            nonlocal concurrent_writes, max_concurrent_writes
+            if (
+                status.state is JobState.running
+                and status.message == "parallel observability probe"
+            ):
+                with write_guard:
+                    concurrent_writes += 1
+                    max_concurrent_writes = max(max_concurrent_writes, concurrent_writes)
+                # Keep the first writer inside the persistence boundary long
+                # enough for its sibling to expose an absent status lock.
+                time.sleep(0.05)
+                observed_pairs.append((status.active_case_slug, status.active_aoa_deg))
+                try:
+                    return super().write_status(status)
+                finally:
+                    with write_guard:
+                        concurrent_writes -= 1
+            return super().write_status(status)
+
+    def controlled_run_case(
+        case_dir,
+        airfoil,
+        spec,
+        fluid,
+        roughness,
+        mesh_params,
+        solver_params,
+        mesher,
+        runner,
+        **kwargs,
+    ):
+        callback_barrier.wait(timeout=5.0)
+        kwargs["phase_progress"](
+            JobPhase.solving_urans,
+            spec.aoa_deg,
+            spec.slug,
+            "pimpleFoam",
+            "parallel observability probe",
+        )
+        return CaseOutcome(
+            spec=spec,
+            reynolds=100_000.0,
+            cl=0.1 + spec.aoa_deg,
+            cd=0.02,
+            cm=0.0,
+            cl_cd=(0.1 + spec.aoa_deg) / 0.02,
+            converged=True,
+        )
+
+    monkeypatch.setattr(jobs, "run_case", controlled_run_case)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        cpu_token_state_path=tmp_path / "cpu-tokens.json",
+        worker_cpu_budget=2,
+        case_concurrency=2,
+        solver_processes=1,
+    )
+    store = ObservingStore(settings)
+    request = PolarRequest(
+        airfoil=AirfoilInput(name="naca0012", coordinates=naca0012_selig_text),
+        aoa=AoASpec(angles=[-5.0, -4.0]),
+        solver=SolverParams(force_transient=True, warm_start=False, write_images=[]),
+        resources=ResourceParams(
+            policy="case_parallel",
+            cpu_budget=2,
+            case_concurrency=2,
+            solver_processes=1,
+        ),
+    )
+    store.create("cold-parallel-status-lock", request)
+
+    result = jobs.execute_job(
+        "cold-parallel-status-lock",
+        request,
+        store=store,
+        settings=settings,
+    )
+
+    expected = {(spec.slug, spec.aoa_deg) for spec in request.cases()}
+    assert set(observed_pairs) == expected
+    assert max_concurrent_writes == 1
+    assert result.state is JobState.completed
+
+
 def test_job_not_found(client):
     assert client.get("/jobs/doesnotexist").status_code == 404
 

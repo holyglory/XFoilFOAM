@@ -17,17 +17,24 @@ import {
   mediums,
   meshProfiles,
   outputProfiles,
+  OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
   referenceGeometryProfiles,
+  resultAttempts,
+  resultClassifications,
   results,
   schedulingProfiles,
   simulationPresetRevisions,
   simulationPresets,
   simUransRequests,
+  solverEvidenceArchives,
+  solverEvidenceArtifactMembers,
+  solverEvidenceArtifacts,
+  solverEvidenceBlobs,
   solverProfiles,
   sweepDefinitions,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -45,6 +52,28 @@ let revisionId = "";
 let mediumId = "";
 let bcId = "";
 const registryIds: { table: string; id: string }[] = [];
+const evidenceBlobIds: string[] = [];
+
+const RESTART_ARCHIVE_MEMBERS = [
+  "openfoam/transient/transient_start.json",
+  "openfoam/transient/system/controlDict",
+  "openfoam/transient/system/fvSchemes",
+  "openfoam/transient/system/fvSolution",
+  "openfoam/transient/constant/polyMesh/points",
+  "openfoam/transient/constant/polyMesh/faces",
+  "openfoam/transient/constant/polyMesh/owner",
+  "openfoam/transient/constant/polyMesh/neighbour",
+  "openfoam/transient/constant/polyMesh/boundary",
+  "openfoam/transient/constant/transportProperties",
+  "openfoam/transient/constant/turbulenceProperties",
+  "time_directories/10/U",
+  "time_directories/10/p",
+  "time_directories/10/k",
+  "time_directories/10/omega",
+  "time_directories/10/nut",
+  "time_directories/10/phi",
+  "openfoam/postProcessing/forceCoeffs1/0/coefficient.dat",
+] as const;
 
 beforeAll(async () => {
   process.env.ADMIN_AUTH_REQUIRED = "true";
@@ -184,6 +213,7 @@ beforeAll(async () => {
       signatureHash: `${PREFIX}-sig`,
       reynolds: 300000,
       referenceLengthM: 1,
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
       snapshot: {},
     })
     .returning({ id: simulationPresetRevisions.id });
@@ -200,6 +230,253 @@ beforeAll(async () => {
   );
 });
 
+async function attachExactRestartArchive(input: {
+  resultId: string;
+  resultAttemptId: string;
+  airfoilId: string;
+  engineJobId: string | null;
+  engineCaseSlug: string | null;
+  aoaDeg: number;
+  omitMember?: string;
+  backend?: "gcs" | "volume";
+  compression?: "zstd" | "gzip";
+}): Promise<void> {
+  const [manifest] = await db
+    .select({ id: solverEvidenceArtifacts.id })
+    .from(solverEvidenceArtifacts)
+    .where(
+      sql`${solverEvidenceArtifacts.resultId} = ${input.resultId}::uuid
+        AND ${solverEvidenceArtifacts.resultAttemptId} = ${input.resultAttemptId}::uuid
+        AND ${solverEvidenceArtifacts.kind} = 'manifest'`,
+    )
+    .limit(1);
+  if (!manifest) throw new Error("exact continuation manifest missing");
+  const [bundle] = await db
+    .insert(solverEvidenceArtifacts)
+    .values({
+      resultId: input.resultId,
+      resultAttemptId: input.resultAttemptId,
+      airfoilId: input.airfoilId,
+      engineJobId: input.engineJobId,
+      engineCaseSlug: input.engineCaseSlug,
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+      aoaDeg: input.aoaDeg,
+      kind: "engine_bundle",
+      storageKey: `test/${PREFIX}/${input.resultAttemptId}/engine.tar.zst`,
+      mimeType: "application/zstd",
+      sha256: "b".repeat(64),
+      byteSize: 4096,
+    })
+    .returning({ id: solverEvidenceArtifacts.id });
+  const backend = input.backend ?? "gcs";
+  const compression = input.compression ?? "zstd";
+  const [blob] = await db
+    .insert(solverEvidenceBlobs)
+    .values({
+      backend,
+      bucket: backend === "gcs" ? "exact-continuation-api-test" : null,
+      objectKey: `${PREFIX}/${input.resultAttemptId}.tar.${compression === "zstd" ? "zst" : "gz"}`,
+      generation:
+        backend === "gcs" ? String(30_000 + evidenceBlobIds.length) : null,
+      compression,
+      mimeType:
+        compression === "zstd" ? "application/zstd" : "application/gzip",
+      sha256: "c".repeat(64),
+      byteSize: 4096,
+      crc32c: "AAAAAA==",
+      uncompressedTarSha256: "d".repeat(64),
+      uncompressedTarByteSize: 8192,
+      verifiedAt: new Date(),
+    })
+    .returning({ id: solverEvidenceBlobs.id });
+  evidenceBlobIds.push(blob.id);
+  const [archive] = await db
+    .insert(solverEvidenceArchives)
+    .values({
+      resultId: input.resultId,
+      resultAttemptId: input.resultAttemptId,
+      sourceArtifactId: bundle.id,
+      blobId: blob.id,
+    })
+    .returning({ id: solverEvidenceArchives.id });
+  const memberPaths = RESTART_ARCHIVE_MEMBERS.filter(
+    (path) => path !== input.omitMember,
+  );
+  const members = await db
+    .insert(solverEvidenceArtifacts)
+    .values(
+      memberPaths.map((path, index) => ({
+        resultId: input.resultId,
+        resultAttemptId: input.resultAttemptId,
+        airfoilId: input.airfoilId,
+        engineJobId: input.engineJobId,
+        engineCaseSlug: input.engineCaseSlug,
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        aoaDeg: input.aoaDeg,
+        kind: "time_directory" as const,
+        storageKey: `test/${PREFIX}/${input.resultAttemptId}/${path}`,
+        mimeType: "application/octet-stream",
+        sha256: (index % 16).toString(16).repeat(64),
+        byteSize: 64,
+      })),
+    )
+    .returning({ id: solverEvidenceArtifacts.id });
+  await db.insert(solverEvidenceArtifactMembers).values([
+    {
+      archiveId: archive.id,
+      artifactId: manifest.id,
+      memberPath: "evidence_manifest.json",
+    },
+    ...members.map((member, index) => ({
+      archiveId: archive.id,
+      artifactId: member.id,
+      memberPath: memberPaths[index]!,
+    })),
+  ]);
+}
+
+async function attachRestartableAttempt(
+  resultId: string,
+  opts: {
+    archive?: "valid" | "missing" | "incomplete" | "volume" | "gzip";
+    classification?: "accepted" | "rejected";
+    engineCase?: boolean;
+    revisionId?: string;
+    aoaDeg?: number;
+    fidelity?: "rans" | "urans_precalc" | "urans_full";
+    source?: "queued" | "solved";
+    status?: "done" | "failed" | "running";
+    warnings?: string[];
+  } = {},
+): Promise<string> {
+  const [result] = await db
+    .select()
+    .from(results)
+    .where(eq(results.id, resultId))
+    .limit(1);
+  if (!result) throw new Error(`missing continuation fixture ${resultId}`);
+  const targetRevisionId = opts.revisionId ?? result.simulationPresetRevisionId;
+  if (!targetRevisionId)
+    throw new Error(`continuation fixture ${resultId} has no revision`);
+  const aoaDeg = opts.aoaDeg ?? result.aoaDeg;
+  const engineCase = opts.engineCase ?? true;
+  const warnings = opts.warnings ??
+    result.qualityWarnings ?? [
+      `URANS continuation ${URANS_CONTINUATION_REQUIRED_MARKER}: restartable test checkpoint retained`,
+    ];
+  const [attempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId,
+      airfoilId: result.airfoilId,
+      bcId: result.bcId,
+      simulationPresetRevisionId: targetRevisionId,
+      aoaDeg,
+      engineJobId: engineCase
+        ? (result.engineJobId ?? `${PREFIX}-engine-${aoaDeg}`)
+        : null,
+      engineCaseSlug: engineCase
+        ? (result.engineCaseSlug ?? `aoa_${aoaDeg}`)
+        : null,
+      methodKey: "openfoam.urans",
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+      status: opts.status ?? "done",
+      source: opts.source ?? "solved",
+      regime: "urans",
+      validForPolar: false,
+      cl: result.cl,
+      cd: result.cd,
+      cm: result.cm,
+      converged: result.converged,
+      unsteady: true,
+      qualityWarnings: warnings,
+      evidencePayload: {
+        fidelity: opts.fidelity ?? result.fidelity ?? "urans_precalc",
+      },
+      solvedAt: result.solvedAt ?? new Date(),
+    })
+    .returning();
+  await db.insert(resultClassifications).values({
+    resultAttemptId: attempt.id,
+    airfoilId: result.airfoilId,
+    simulationPresetRevisionId: targetRevisionId,
+    aoaDeg,
+    regime: "urans",
+    classifierVersion: "exact-continuation-api-test-v1",
+    state: opts.classification ?? "rejected",
+    region: "post_stall",
+    confidence: 1,
+    reasons: ["continuation-required"],
+  });
+  await db.insert(solverEvidenceArtifacts).values({
+    resultId,
+    resultAttemptId: attempt.id,
+    airfoilId: result.airfoilId,
+    engineJobId: attempt.engineJobId,
+    engineCaseSlug: attempt.engineCaseSlug,
+    aoaDeg,
+    kind: "manifest",
+    storageKey: `test/${PREFIX}/${resultId}/${attempt.id}/manifest.json`,
+    mimeType: "application/json",
+    sha256: "a".repeat(64),
+    byteSize: 1,
+    metadata: { fixture: "exact-continuation" },
+  });
+  await db
+    .update(results)
+    .set({ currentResultAttemptId: attempt.id })
+    .where(eq(results.id, resultId));
+  if (opts.archive !== "missing") {
+    await attachExactRestartArchive({
+      resultId,
+      resultAttemptId: attempt.id,
+      airfoilId: result.airfoilId,
+      engineJobId: attempt.engineJobId,
+      engineCaseSlug: attempt.engineCaseSlug,
+      aoaDeg,
+      ...(opts.archive === "incomplete"
+        ? { omitMember: "time_directories/10/p" }
+        : {}),
+      ...(opts.archive === "volume" ? { backend: "volume" as const } : {}),
+      ...(opts.archive === "gzip" ? { compression: "gzip" as const } : {}),
+    });
+  }
+  return attempt.id;
+}
+
+async function createContinuationSource(
+  aoaDeg: number,
+  opts: Parameters<typeof attachRestartableAttempt>[1] = {},
+): Promise<{ resultId: string; resultAttemptId: string }> {
+  const [source] = await db
+    .insert(results)
+    .values({
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      status: "done",
+      source: "solved",
+      regime: "urans",
+      fidelity: opts.fidelity === "urans_full" ? "urans_full" : "urans_precalc",
+      unsteady: true,
+      converged: true,
+      cl: 0.4 + aoaDeg / 100,
+      cd: 0.05,
+      engineJobId: `${PREFIX}-guard-${aoaDeg}`,
+      engineCaseSlug: `aoa_${aoaDeg}`,
+      qualityWarnings: opts.warnings ?? [
+        `URANS ${URANS_CONTINUATION_REQUIRED_MARKER}: exact checkpoint retained`,
+      ],
+      solvedAt: new Date(),
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+      methodKey: "openfoam.urans",
+    })
+    .returning({ id: results.id });
+  const resultAttemptId = await attachRestartableAttempt(source.id, opts);
+  return { resultId: source.id, resultAttemptId };
+}
+
 afterAll(async () => {
   if (db) {
     await db
@@ -209,6 +486,11 @@ afterAll(async () => {
     await db
       .delete(results)
       .where(eq(results.simulationPresetRevisionId, revisionId));
+    if (evidenceBlobIds.length) {
+      await db
+        .delete(solverEvidenceBlobs)
+        .where(inArray(solverEvidenceBlobs.id, evidenceBlobIds));
+    }
     if (bcId)
       await db
         .delete(boundaryConditions)
@@ -474,12 +756,19 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
         solvedAt: new Date(),
       })
       .returning({ id: results.id });
+    const sourceAttemptId = await attachRestartableAttempt(source.id, {
+      fidelity: "urans_full",
+    });
 
     const res = await app.inject({
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: source.id, budgetOverrideS: 21600 },
+      payload: {
+        continueFromResultId: source.id,
+        continueFromResultAttemptId: sourceAttemptId,
+        budgetOverrideS: 21600,
+      },
     });
     expect(res.statusCode).toBe(201);
     const body = res.json() as {
@@ -491,6 +780,7 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
         fidelity: string;
         state: string;
         continueFromResultId: string | null;
+        continueFromResultAttemptId: string | null;
         budgetOverrideS: number | null;
         requestedBy: string | null;
       };
@@ -502,9 +792,150 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
     expect(body.request.fidelity).toBe("full"); // derived from urans_full evidence
     expect(body.request.state).toBe("pending");
     expect(body.request.continueFromResultId).toBe(source.id);
+    expect(body.request.continueFromResultAttemptId).toBe(sourceAttemptId);
     expect(body.request.budgetOverrideS).toBe(21600);
     expect(body.request.requestedBy).toBe(ADMIN_EMAIL);
   });
+
+  it("MUST-CATCH: requires one exact result+attempt pair and rejects every non-restartable generation shape", async () => {
+    const paired = await createContinuationSource(40);
+    for (const payload of [
+      { continueFromResultId: paired.resultId },
+      { continueFromResultAttemptId: paired.resultAttemptId },
+    ]) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/admin/urans-requests",
+        headers: { cookie: adminCookie },
+        payload,
+      });
+      expect(response.statusCode).toBe(400);
+    }
+
+    const otherAngle = await createContinuationSource(41);
+    const mismatchedAnglePair = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: {
+        continueFromResultId: paired.resultId,
+        continueFromResultAttemptId: otherAngle.resultAttemptId,
+      },
+    });
+    expect(mismatchedAnglePair.statusCode).toBe(404);
+
+    const [otherAirfoil] = await db
+      .insert(airfoils)
+      .values({
+        slug: `${PREFIX}-other-continuation-owner`,
+        name: `${PREFIX} other continuation owner`,
+        categoryId,
+        points: [
+          { x: 1, y: 0 },
+          { x: 0, y: 0 },
+          { x: 1, y: 0 },
+        ],
+      })
+      .returning({ id: airfoils.id });
+    const [otherOwnerResult] = await db
+      .insert(results)
+      .values({
+        airfoilId: otherAirfoil.id,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: 42,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        unsteady: true,
+        converged: true,
+        engineJobId: `${PREFIX}-other-owner-job`,
+        engineCaseSlug: "aoa_42",
+        qualityWarnings: [
+          `URANS ${URANS_CONTINUATION_REQUIRED_MARKER}: exact checkpoint retained`,
+        ],
+        solvedAt: new Date(),
+        solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        methodKey: "openfoam.urans",
+      })
+      .returning({ id: results.id });
+    const otherOwnerAttemptId = await attachRestartableAttempt(
+      otherOwnerResult.id,
+    );
+    const mismatchedOwnerPair = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: {
+        continueFromResultId: paired.resultId,
+        continueFromResultAttemptId: otherOwnerAttemptId,
+      },
+    });
+    expect(mismatchedOwnerPair.statusCode).toBe(404);
+    await db.delete(airfoils).where(eq(airfoils.id, otherAirfoil.id));
+
+    const variants = [
+      { name: "attempt-status", opts: { status: "running" as const } },
+      { name: "typed-source", opts: { source: "queued" as const } },
+      { name: "wrong-fidelity", opts: { fidelity: "rans" as const } },
+      {
+        name: "classification",
+        opts: { classification: "accepted" as const },
+      },
+      { name: "marker", opts: { warnings: [] } },
+      { name: "missing-archive", opts: { archive: "missing" as const } },
+      {
+        name: "incomplete-archive",
+        opts: { archive: "incomplete" as const },
+      },
+    ];
+    for (let index = 0; index < variants.length; index += 1) {
+      const variant = variants[index]!;
+      const source = await createContinuationSource(43 + index / 10, {
+        ...variant.opts,
+      });
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/admin/urans-requests",
+        headers: { cookie: adminCookie },
+        payload: {
+          continueFromResultId: source.resultId,
+          continueFromResultAttemptId: source.resultAttemptId,
+          budgetOverrideS: 7200,
+        },
+      });
+      expect(response.statusCode, variant.name).toBe(422);
+      expect(
+        await db
+          .select({ id: simUransRequests.id })
+          .from(simUransRequests)
+          .where(
+            eq(
+              simUransRequests.continueFromResultAttemptId,
+              source.resultAttemptId,
+            ),
+          ),
+        variant.name,
+      ).toEqual([]);
+    }
+
+    const invalidResultStatus = await createContinuationSource(44.5);
+    await db
+      .update(results)
+      .set({ status: "pending" })
+      .where(eq(results.id, invalidResultStatus.resultId));
+    const invalidResultResponse = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: {
+        continueFromResultId: invalidResultStatus.resultId,
+        continueFromResultAttemptId: invalidResultStatus.resultAttemptId,
+      },
+    });
+    expect(invalidResultResponse.statusCode).toBe(422);
+  }, 120_000);
 
   it("422s a source without saved case state, 404s unknown sources, 400s a stray budget override", async () => {
     const [noCase] = await db
@@ -525,11 +956,19 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
         solvedAt: new Date(),
       })
       .returning({ id: results.id });
+    const noCaseAttemptId = await attachRestartableAttempt(noCase.id, {
+      engineCase: false,
+      fidelity: "urans_precalc",
+    });
     const missingCase = await app.inject({
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: noCase.id, budgetOverrideS: 7200 },
+      payload: {
+        continueFromResultId: noCase.id,
+        continueFromResultAttemptId: noCaseAttemptId,
+        budgetOverrideS: 7200,
+      },
     });
     expect(missingCase.statusCode).toBe(422);
 
@@ -537,7 +976,10 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: "00000000-0000-4000-8000-000000000000" },
+      payload: {
+        continueFromResultId: "00000000-0000-4000-8000-000000000000",
+        continueFromResultAttemptId: "00000000-0000-4000-8000-000000000001",
+      },
     });
     expect(unknown.statusCode).toBe(404);
 
@@ -577,12 +1019,19 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
         solvedAt: new Date(),
       })
       .returning({ id: results.id });
+    const sourceAttemptId = await attachRestartableAttempt(source.id, {
+      fidelity: "urans_precalc",
+    });
     // 24h is the engine's le= bound: accepted here, accepted at engine submit.
     const atCap = await app.inject({
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: source.id, budgetOverrideS: 24 * 3600 },
+      payload: {
+        continueFromResultId: source.id,
+        continueFromResultAttemptId: sourceAttemptId,
+        budgetOverrideS: 24 * 3600,
+      },
     });
     expect(atCap.statusCode).toBe(201);
     // 48h passed the old zod bound but the engine 422s it at submit and the
@@ -591,7 +1040,11 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: source.id, budgetOverrideS: 48 * 3600 },
+      payload: {
+        continueFromResultId: source.id,
+        continueFromResultAttemptId: sourceAttemptId,
+        budgetOverrideS: 48 * 3600,
+      },
     });
     expect(aboveCap.statusCode).toBe(400);
   });
@@ -617,6 +1070,9 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
         solvedAt: new Date(),
       })
       .returning({ id: results.id });
+    const sourceAttemptId = await attachRestartableAttempt(source.id, {
+      fidelity: "urans_precalc",
+    });
     // An admin queues an ordinary fresh-solve request-URANS on the cell first.
     const fresh = await app.inject({
       method: "POST",
@@ -631,7 +1087,11 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: source.id, budgetOverrideS: 21600 },
+      payload: {
+        continueFromResultId: source.id,
+        continueFromResultAttemptId: sourceAttemptId,
+        budgetOverrideS: 21600,
+      },
     });
     expect(cont.statusCode).toBe(409);
     const body = cont.json() as {
@@ -661,22 +1121,130 @@ describe("POST /api/admin/urans-requests continuation mode (amendment C)", () =>
         solvedAt: new Date(),
       })
       .returning({ id: results.id });
+    const source14AttemptId = await attachRestartableAttempt(source14.id, {
+      fidelity: "urans_precalc",
+    });
     const first = await app.inject({
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: source14.id, budgetOverrideS: 7200 },
+      payload: {
+        continueFromResultId: source14.id,
+        continueFromResultAttemptId: source14AttemptId,
+        budgetOverrideS: 7200,
+      },
     });
     expect(first.statusCode).toBe(201);
     const replay = await app.inject({
       method: "POST",
       url: "/api/admin/urans-requests",
       headers: { cookie: adminCookie },
-      payload: { continueFromResultId: source14.id, budgetOverrideS: 7200 },
+      payload: {
+        continueFromResultId: source14.id,
+        continueFromResultAttemptId: source14AttemptId,
+        budgetOverrideS: 7200,
+      },
     });
     expect(replay.statusCode).toBe(200);
     expect((replay.json() as { created: boolean }).created).toBe(false);
   });
+
+  it("MUST-CATCH: exact-pair reuse never retargets a pending/running different generation or a whole-polar request", async () => {
+    const source = await createContinuationSource(51);
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: {
+        continueFromResultId: source.resultId,
+        continueFromResultAttemptId: source.resultAttemptId,
+        budgetOverrideS: 7200,
+      },
+    });
+    expect(first.statusCode).toBe(201);
+    const firstRequest = (first.json() as { request: { id: string } }).request;
+
+    const competingAttemptId = await attachRestartableAttempt(source.resultId);
+    const pendingConflict = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: {
+        continueFromResultId: source.resultId,
+        continueFromResultAttemptId: competingAttemptId,
+        budgetOverrideS: 7200,
+      },
+    });
+    expect(pendingConflict.statusCode).toBe(409);
+    expect(
+      (pendingConflict.json() as { request: { id: string } }).request.id,
+    ).toBe(firstRequest.id);
+
+    await db
+      .update(simUransRequests)
+      .set({ state: "running" })
+      .where(eq(simUransRequests.id, firstRequest.id));
+    const runningConflict = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: {
+        continueFromResultId: source.resultId,
+        continueFromResultAttemptId: competingAttemptId,
+      },
+    });
+    expect(runningConflict.statusCode).toBe(409);
+    const [stillPinned] = await db
+      .select()
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, firstRequest.id));
+    expect(stillPinned).toMatchObject({
+      state: "running",
+      continueFromResultId: source.resultId,
+      continueFromResultAttemptId: source.resultAttemptId,
+    });
+    await db
+      .update(simUransRequests)
+      .set({ state: "cancelled" })
+      .where(eq(simUransRequests.id, firstRequest.id));
+
+    const wholeSource = await createContinuationSource(52);
+    const [whole] = await db
+      .insert(simUransRequests)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: null,
+        fidelity: "precalc",
+        state: "pending",
+        backgroundOwner: true,
+        requestedBy: `${PREFIX}-whole-conflict`,
+      })
+      .returning();
+    const wholeConflict = await app.inject({
+      method: "POST",
+      url: "/api/admin/urans-requests",
+      headers: { cookie: adminCookie },
+      payload: {
+        continueFromResultId: wholeSource.resultId,
+        continueFromResultAttemptId: wholeSource.resultAttemptId,
+      },
+    });
+    expect(wholeConflict.statusCode).toBe(409);
+    expect(
+      (wholeConflict.json() as { request: { id: string } }).request.id,
+    ).toBe(whole.id);
+    const [stillWhole] = await db
+      .select()
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, whole.id));
+    expect(stillWhole).toMatchObject({
+      state: "pending",
+      aoaDeg: null,
+      continueFromResultId: null,
+      continueFromResultAttemptId: null,
+    });
+  }, 120_000);
 });
 
 describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
@@ -771,7 +1339,7 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
           spanM: 1,
           areaMode: "derived",
           excludedConditions: [],
-          baseSweep: { fromDeg: 5, toDeg: 7, stepDeg: 1, listDeg: null },
+          baseSweep: { fromDeg: 5, toDeg: 11, stepDeg: 1, listDeg: null },
           objectives: {
             ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
             clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
@@ -800,7 +1368,13 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
     // Three terminal-rejected precalc rows in the campaign: 5° is budget-
     // stopped and 7° reached the bounded same-case chunk cap; both have saved
     // state and are continuable. 6° has no restartable marker and is excluded.
-    const mkRow = async (aoa: number, warnings: string[]) => {
+    const mkRow = async (
+      aoa: number,
+      warnings: string[],
+      archive: Parameters<
+        typeof attachRestartableAttempt
+      >[1]["archive"] = "valid",
+    ) => {
       const [row] = await db
         .insert(results)
         .values({
@@ -826,21 +1400,37 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
         INSERT INTO result_classifications (result_id, airfoil_id, simulation_preset_revision_id, aoa_deg, regime, classifier_version, state, region, confidence)
         VALUES (${row.id}, ${airfoilId}, ${campaignRevisionId}, ${aoa}, 'urans', 'test-fixture', 'rejected', 'post_stall', 0.9)
       `);
+      const resultAttemptId = await attachRestartableAttempt(row.id, {
+        revisionId: campaignRevisionId,
+        aoaDeg: aoa,
+        fidelity: "urans_precalc",
+        warnings,
+        archive,
+      });
       await db.execute(sql`
-        UPDATE sim_campaign_points SET state = 'terminal', result_id = ${row.id}
+        UPDATE sim_campaign_points
+        SET state = 'terminal', result_id = ${row.id},
+            result_attempt_id = ${resultAttemptId}
         WHERE campaign_id = ${campaignId} AND aoa_deg = ${aoa} AND NOT derived_by_symmetry
       `);
-      return row.id;
+      return { resultId: row.id, resultAttemptId };
     };
     const budgetStopped =
       "URANS integration stopped by the wall-clock budget guard: retained 1.1 of 3 periods (budget)";
-    const idA = await mkRow(5, [budgetStopped]);
+    const rowA = await mkRow(5, [budgetStopped]);
     await mkRow(6, [
       "URANS quality could not be measured: missing or flat shedding history.",
     ]);
-    const idC = await mkRow(7, [
+    const rowC = await mkRow(7, [
       `URANS continuation ${URANS_CONTINUATION_REQUIRED_MARKER}: reached the 6-chunk in-run safety cap with restartable saved case state; URANS window not stationary (precalc established-oscillation test): cycle means trend upward monotonically`,
     ]);
+    const restartableWarning = [
+      `URANS continuation ${URANS_CONTINUATION_REQUIRED_MARKER}: exact saved state retained`,
+    ];
+    await mkRow(8, restartableWarning, "missing");
+    await mkRow(9, restartableWarning, "incomplete");
+    await mkRow(10, restartableWarning, "volume");
+    await mkRow(11, restartableWarning, "gzip");
 
     const res = await app.inject({
       method: "POST",
@@ -865,7 +1455,11 @@ describe("POST /api/admin/urans-requests/bulk-continue (bulk resume)", () => {
       expect(q.state).toBe("pending");
       expect(q.fidelity).toBe("precalc");
       expect(q.budgetOverrideS).toBe(21600);
-      expect([idA, idC]).toContain(q.continueFromResultId);
+      const expected = [rowA, rowC].find(
+        (row) => row.resultId === q.continueFromResultId,
+      );
+      expect(expected).toBeDefined();
+      expect(q.continueFromResultAttemptId).toBe(expected!.resultAttemptId);
     }
 
     // Replay: the queued cells are now SCHEDULED, so they leave the

@@ -285,6 +285,12 @@ def _transient_case(tmp_path: Path) -> tuple[Path, Path]:
     (tcase / "system" / "controlDict").write_text("startFrom latestTime;\n")
     (tcase / "constant" / "polyMesh").mkdir(parents=True)
     (tcase / "constant" / "polyMesh" / "points").write_text("mesh points")
+    (tcase / "constant" / "transportProperties").write_text(
+        "FoamFile { object transportProperties; }\n"
+    )
+    (tcase / "constant" / "turbulenceProperties").write_text(
+        "FoamFile { object turbulenceProperties; }\n"
+    )
     _write_time_dir(tcase, "0")
     write_transient_start_marker(tcase, 0.0)
     return case_dir, tcase

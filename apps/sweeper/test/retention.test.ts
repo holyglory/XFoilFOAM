@@ -17,14 +17,16 @@ import {
   simJobs,
   simPrecalcObligationAttempts,
   simPrecalcObligations,
+  simulationPresetRevisions,
   simulationPresets,
   simUransRequests,
+  solverEvidenceArtifacts,
   solverProfiles,
   sweepDefinitions,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { EngineError, type EngineClient } from "@aerodb/engine-client";
-import { eq, inArray, like, sql as dsql } from "drizzle-orm";
+import { and, eq, inArray, like, sql as dsql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { runOrphanSweep, stripTerminalJobs } from "../src/retention";
@@ -42,6 +44,7 @@ let airfoilId = "";
 let categoryId = "";
 let mediumId = "";
 let revisionId = "";
+let solverImplementationId = "";
 let bcId = "";
 const profileIds = { boundary: "", mesh: "", solver: "", output: "" };
 let nextAoa = 1000;
@@ -150,6 +153,9 @@ async function insertClassifiedResult(
 ) {
   const pointAoa = aoa();
   const regime = opts.regime ?? "urans";
+  const fidelity = opts.fidelity ?? "urans_precalc";
+  const methodKey = regime === "rans" ? "openfoam.rans" : "openfoam.urans";
+  const engineCaseSlug = opts.engineCaseSlug ?? `aoa_${pointAoa}`;
   const [row] = await db
     .insert(results)
     .values({
@@ -160,7 +166,7 @@ async function insertClassifiedResult(
       status: "done",
       source: "solved",
       regime,
-      fidelity: opts.fidelity ?? "urans_precalc",
+      fidelity,
       reynolds: Math.round((SPEED * CHORD) / NU),
       speed: SPEED,
       chord: CHORD,
@@ -171,22 +177,75 @@ async function insertClassifiedResult(
       converged: true,
       simJobId: job.id,
       engineJobId: job.engineJobId,
-      engineCaseSlug: opts.engineCaseSlug ?? `aoa_${pointAoa}`,
+      engineCaseSlug,
+      methodKey,
+      solverImplementationId,
       qualityWarnings: opts.qualityWarnings,
       solvedAt: OLD,
     })
     .returning();
-  await db.insert(resultClassifications).values({
-    resultId: row.id,
+  const [attempt] = await db
+    .insert(resultAttempts)
+    .values({
+      resultId: row.id,
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: pointAoa,
+      simJobId: job.id,
+      engineJobId: job.engineJobId,
+      engineCaseSlug,
+      methodKey,
+      solverImplementationId,
+      status: "done",
+      source: "solved",
+      regime,
+      validForPolar: opts.state === "accepted",
+      cl: row.cl,
+      cd: row.cd,
+      cm: row.cm,
+      clCd: row.clCd,
+      converged: true,
+      unsteady: regime === "urans",
+      qualityWarnings: opts.qualityWarnings,
+      evidencePayload: { fidelity },
+      solvedAt: OLD,
+    })
+    .returning({ id: resultAttempts.id });
+  await db
+    .update(results)
+    .set({ currentResultAttemptId: attempt.id })
+    .where(eq(results.id, row.id));
+  const classification = {
     airfoilId,
     simulationPresetRevisionId: revisionId,
     aoaDeg: pointAoa,
     regime,
     classifierVersion: "retention-test",
     state: opts.state,
-    region: "post_stall",
+    region: "post_stall" as const,
     confidence: 0.9,
     reasons: opts.state === "rejected" ? ["insufficient-periods"] : [],
+  };
+  await db.insert(resultClassifications).values([
+    { ...classification, resultId: row.id },
+    { ...classification, resultAttemptId: attempt.id },
+  ]);
+  await db.insert(solverEvidenceArtifacts).values({
+    resultId: row.id,
+    resultAttemptId: attempt.id,
+    airfoilId,
+    simJobId: job.id,
+    engineJobId: job.engineJobId,
+    engineCaseSlug,
+    methodKey,
+    solverImplementationId,
+    aoaDeg: pointAoa,
+    kind: "manifest",
+    storageKey: `${PREFIX}/${attempt.id}/manifest.json`,
+    mimeType: "application/json",
+    sha256: "b".repeat(64),
+    byteSize: 1,
   });
   return row;
 }
@@ -303,6 +362,18 @@ beforeAll(async () => {
     .where(eq(simCampaignConditions.campaignId, campaignId))
     .limit(1);
   revisionId = condition.simulationPresetRevisionId;
+  const [revision] = await db
+    .select({
+      solverImplementationId:
+        simulationPresetRevisions.solverImplementationId,
+    })
+    .from(simulationPresetRevisions)
+    .where(eq(simulationPresetRevisions.id, revisionId))
+    .limit(1);
+  if (!revision?.solverImplementationId) {
+    throw new Error("retention fixture requires a solver implementation");
+  }
+  solverImplementationId = revision.solverImplementationId;
   const [preset] = await db
     .select({
       legacyBoundaryConditionId: simulationPresets.legacyBoundaryConditionId,
@@ -439,7 +510,13 @@ describe("terminal strip reaper", () => {
     await db
       .update(resultClassifications)
       .set({ state: "superseded_by_urans", supersededByResultId: row.id })
-      .where(eq(resultClassifications.resultId, row.id));
+      .where(
+        and(
+          eq(resultClassifications.airfoilId, airfoilId),
+          eq(resultClassifications.simulationPresetRevisionId, revisionId),
+          eq(resultClassifications.aoaDeg, row.aoaDeg),
+        ),
+      );
 
     await stripTerminalJobs(db, engine, {
       now: new Date(NOW.getTime() + 60_000),
@@ -542,6 +619,8 @@ describe("terminal strip reaper", () => {
         simJobId: precalcJob.id,
         engineJobId: precalcJob.engineJobId,
         engineCaseSlug: `aoa_${canonical.aoaDeg}`,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
         status: "done",
         source: "solved",
         regime: "urans",
@@ -570,6 +649,22 @@ describe("terminal strip reaper", () => {
       region: "post_stall",
       confidence: 0.8,
       reasons: ["insufficient-periods"],
+    });
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: canonical.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simJobId: precalcJob.id,
+      engineJobId: precalcJob.engineJobId,
+      engineCaseSlug: `aoa_${canonical.aoaDeg}`,
+      methodKey: "openfoam.urans",
+      solverImplementationId,
+      aoaDeg: canonical.aoaDeg,
+      kind: "manifest",
+      storageKey: `${PREFIX}/${attempt.id}/manifest.json`,
+      mimeType: "application/json",
+      sha256: "c".repeat(64),
+      byteSize: 1,
     });
     const [obligation] = await db
       .insert(simPrecalcObligations)

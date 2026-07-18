@@ -30,6 +30,10 @@ import {
   USER_TERMINAL_CAMPAIGN_RESULT_SQL,
 } from "./campaign-execution";
 import type { DB } from "./client";
+import {
+  exactValidSolverManifestSql,
+  exactVerifiedRestartableEvidenceArchiveSql,
+} from "./evidence-manifest";
 import { lockPrecalcCells } from "./precalc-cell-lock";
 import {
   solverIncidentSummary,
@@ -1636,31 +1640,61 @@ async function reconcileLinkedCampaignLadderWork(
   `;
   const continuationCandidateSql = sql`
     SELECT p.airfoil_id, p.revision_id, p.aoa_deg::float8 AS aoa_deg,
-           r.id AS result_id
+           r.id AS result_id, attempt.id AS result_attempt_id
     FROM sim_campaign_points p
     JOIN results r ON r.id = p.result_id
-    JOIN result_classifications rc ON rc.result_id = r.id
+    JOIN result_attempts attempt
+      ON attempt.id = r.current_result_attempt_id
+     AND attempt.id = p.result_attempt_id
+     AND attempt.result_id = r.id
+     AND attempt.airfoil_id = r.airfoil_id
+     AND attempt.simulation_preset_revision_id = r.simulation_preset_revision_id
+     AND attempt.aoa_deg = r.aoa_deg
+    JOIN result_classifications rc
+      ON rc.result_attempt_id = attempt.id
+     AND rc.state = 'rejected'
+    JOIN simulation_preset_revisions revision
+      ON revision.id = r.simulation_preset_revision_id
     WHERE p.campaign_id = ${campaignId}
       AND p.state = 'terminal'
       AND p.derived_by_symmetry = false
       AND r.status = 'done'
-      AND r.fidelity = 'urans_precalc'
-      AND rc.state = 'rejected'
+      AND attempt.status IN ('done', 'failed')
+      AND attempt.source = 'solved'
+      AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      AND attempt.solver_implementation_id IS NOT NULL
+      AND revision.solver_implementation_id IS NOT NULL
+      AND attempt.solver_implementation_id = revision.solver_implementation_id
       AND COALESCE(rc.reasons, ARRAY[]::text[])
             <> ARRAY[${MISSING_URANS_VIDEO_REASON}]::text[]
-      AND r.engine_job_id IS NOT NULL
-      AND r.engine_case_slug IS NOT NULL
+      AND attempt.engine_job_id IS NOT NULL
+      AND attempt.engine_case_slug IS NOT NULL
       AND EXISTS (
         SELECT 1
-        FROM unnest(COALESCE(r.quality_warnings, ARRAY[]::text[])) warning
+        FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
         WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
            OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
       )
+      AND ${exactValidSolverManifestSql(sql`r.id`, sql`attempt.id`)}
+      AND ${exactVerifiedRestartableEvidenceArchiveSql(
+        sql`r.id`,
+        sql`attempt.id`,
+      )}
       AND NOT EXISTS (
         SELECT 1
-        FROM sim_urans_requests prior
-        LEFT JOIN sim_jobs prior_job ON prior_job.id = prior.sim_job_id
-        WHERE prior.continue_from_result_id = r.id
+          FROM sim_urans_requests prior
+          LEFT JOIN sim_jobs prior_job ON prior_job.id = prior.sim_job_id
+          WHERE prior.continue_from_result_id = r.id
+            AND (
+              prior.continue_from_result_attempt_id = attempt.id
+              OR (
+                prior.continue_from_result_attempt_id IS NULL
+                AND prior_job.request_payload ->> 'continueFromResultId' =
+                    r.id::text
+                AND prior_job.request_payload
+                      ->> 'continueFromResultAttemptId' = attempt.id::text
+              )
+            )
           AND prior.state NOT IN ('pending', 'running')
           AND (
             prior.state = 'done'
@@ -1676,9 +1710,11 @@ async function reconcileLinkedCampaignLadderWork(
       SELECT DISTINCT
         'urans-request:' || candidate.airfoil_id::text || ':' || candidate.revision_id::text || ':precalc' AS lock_key
       FROM (
-        ${candidateSql}
+        SELECT candidate.airfoil_id, candidate.revision_id
+        FROM (${candidateSql}) candidate
         UNION ALL
-        ${continuationCandidateSql}
+        SELECT candidate.airfoil_id, candidate.revision_id
+        FROM (${continuationCandidateSql}) candidate
       ) candidate
       ORDER BY lock_key
     ) lock_target
@@ -1731,6 +1767,11 @@ async function reconcileLinkedCampaignLadderWork(
       AND precalc_attempt.source = 'solved'
       AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
       AND rc.state = 'accepted'
+      AND ${exactValidSolverManifestSql(sql`r.id`, sql`precalc_attempt.id`)}
+      AND ${exactVerifiedRestartableEvidenceArchiveSql(
+        sql`r.id`,
+        sql`precalc_attempt.id`,
+      )}
     ORDER BY r.id
     FOR UPDATE OF r
   `);
@@ -1757,6 +1798,11 @@ async function reconcileLinkedCampaignLadderWork(
       AND precalc_attempt.source = 'solved'
       AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
       AND rc.state = 'accepted'
+      AND ${exactValidSolverManifestSql(sql`r.id`, sql`precalc_attempt.id`)}
+      AND ${exactVerifiedRestartableEvidenceArchiveSql(
+        sql`r.id`,
+        sql`precalc_attempt.id`,
+      )}
     ORDER BY precalc_attempt.id
   `);
 
@@ -1786,6 +1832,11 @@ async function reconcileLinkedCampaignLadderWork(
       AND precalc_attempt.source = 'solved'
       AND precalc_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
       AND rc.state = 'accepted'
+      AND ${exactValidSolverManifestSql(sql`r.id`, sql`precalc_attempt.id`)}
+      AND ${exactVerifiedRestartableEvidenceArchiveSql(
+        sql`r.id`,
+        sql`precalc_attempt.id`,
+      )}
       AND NOT EXISTS (
         SELECT 1
         FROM sim_urans_verify_queue generation_queue
@@ -1887,11 +1938,13 @@ async function reconcileLinkedCampaignLadderWork(
   await db.execute(sql`
     INSERT INTO sim_urans_requests (
       airfoil_id, revision_id, aoa_deg, fidelity, state, requested_by,
-      continue_from_result_id, budget_override_s
+      continue_from_result_id, continue_from_result_attempt_id,
+      budget_override_s
     )
     SELECT DISTINCT candidate.airfoil_id, candidate.revision_id,
            candidate.aoa_deg, 'precalc', 'pending',
            ${AUTO_PRECALC_CONTINUATION_REQUESTED_BY}, candidate.result_id,
+           candidate.result_attempt_id,
            ${AUTO_PRECALC_CONTINUATION_BUDGET_S}::int
     FROM (${continuationCandidateSql}) candidate
     WHERE NOT EXISTS (

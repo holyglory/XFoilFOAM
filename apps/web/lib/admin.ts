@@ -685,6 +685,8 @@ export interface AdminUransRequest {
   fidelity: "precalc" | "full" | string;
   state: "pending" | "running" | "done" | "blocked" | "cancelled" | string;
   simJobId: string | null;
+  continueFromResultId: string | null;
+  continueFromResultAttemptId: string | null;
   backgroundOwner: boolean;
   requestedBy: string | null;
   independentOwner: boolean;
@@ -741,13 +743,18 @@ export const requestUrans = (body: {
  *  requestUrans (created=false replays the open item). */
 export const continueUransResult = (
   resultId: string,
+  resultAttemptId: string,
   budgetOverrideS: number,
 ) =>
   aj<{ request: AdminUransRequest; created: boolean }>(
     "/api/admin/urans-requests",
     {
       method: "POST",
-      body: JSON.stringify({ continueFromResultId: resultId, budgetOverrideS }),
+      body: JSON.stringify({
+        continueFromResultId: resultId,
+        continueFromResultAttemptId: resultAttemptId,
+        budgetOverrideS,
+      }),
     },
   );
 

@@ -267,6 +267,14 @@ class CaseBuilder:
                 "writePrecision": 8,
                 "writeCompression": "off",
                 "timeFormat": "general",
+                # Adaptive timesteps routinely create restart directories with
+                # more than the OpenFOAM default six significant digits.
+                # decomposePar preserves the exact directory name; keep the
+                # solver's Time formatter equally precise so a continuation
+                # never rounds (for example) 601.0650259374383 to 601.065 and
+                # then looks for processor fields in a directory that does not
+                # exist.
+                "timePrecision": 16,
                 "runTimeModifiable": "true",
                 "adjustTimeStep": "yes",
                 "maxCo": self.solver.transient_max_courant,

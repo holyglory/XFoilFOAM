@@ -179,6 +179,11 @@ def test_foundation14_case_uses_foundation_dictionary_and_function_object_dialec
     builder.write_transient(case, start_time=100.0, end_time=101.0, delta_t=1e-4)
     transient_control = (case / "system" / "controlDict").read_text()
     assert "solver incompressibleFluid;" in _words(transient_control)
+    # A continued adaptive-time run can own a directory such as
+    # ``601.0650259374383``.  decomposePar preserves that exact name; the
+    # restarted solver must not round it to ``601.065`` and then look for a
+    # non-existent processor field directory.
+    assert "timePrecision 16;" in _words(transient_control)
     assert FOUNDATION_14.steady_solver_command == "foamRun -solver incompressibleFluid"
     assert FOUNDATION_14.transient_solver_command == "foamRun -solver incompressibleFluid"
     assert FOUNDATION_14.coefficient_filename == "forceCoeffs.dat"
@@ -188,7 +193,7 @@ def test_foundation14_case_uses_foundation_dictionary_and_function_object_dialec
 def test_opencfd_2606_case_uses_verified_opencfd_dictionary_and_command_dialect(
     tmp_path, naca0012_selig_text
 ):
-    _builder_obj, case = _builder(tmp_path, naca0012_selig_text, OPENCFD_2606)
+    builder, case = _builder(tmp_path, naca0012_selig_text, OPENCFD_2606)
     control = (case / "system" / "controlDict").read_text()
 
     assert (case / "constant" / "transportProperties").is_file()
@@ -199,6 +204,17 @@ def test_opencfd_2606_case_uses_verified_opencfd_dictionary_and_command_dialect(
     assert "writeInterval 1;" in _words(control)
     assert OPENCFD_2606.steady_solver_command == "simpleFoam"
     assert OPENCFD_2606.coefficient_filename == "coefficient.dat"
+
+    builder.write_transient(
+        case,
+        start_time=601.0650259374383,
+        end_time=601.1650259374383,
+        delta_t=1e-4,
+    )
+    transient_control = (case / "system" / "controlDict").read_text()
+    assert "startFrom latestTime;" in _words(transient_control)
+    assert "timeFormat general;" in _words(transient_control)
+    assert "timePrecision 16;" in _words(transient_control)
 
 
 def test_opencfd_2406_identity_is_historical_but_not_executable_or_routable():

@@ -9,6 +9,8 @@ import {
   FINAL_URANS_MAX_NO_PROGRESS_SEGMENTS,
   FINAL_URANS_OUTCOMES,
   FINAL_URANS_RETRY_BACKOFF_MS,
+  hasExactValidSolverManifest,
+  hasExactVerifiedRestartableEvidenceArchive,
   inspectParentRansPolarPromotions,
   laneKeyId,
   laneTick,
@@ -30,6 +32,7 @@ import {
   resultClassifications,
   results,
   resolveSolverIncidentsForOwnerInTransaction,
+  settleAcceptedRunningPrecalcPartials,
   settlePrecalcObligationsForJob,
   settlePrecalcObligationsForJobInTransaction,
   simCampaignLanes,
@@ -745,6 +748,7 @@ interface VerifyJobPayload {
   uransFidelity?: string;
   precalcObligationIds?: string[];
   finalRecoveryMode?: "fresh" | "continuation";
+  continueFromResultId?: string;
   continueFromResultAttemptId?: string;
 }
 
@@ -814,6 +818,7 @@ async function settleUransLadderForJob(
       ? await tx
           .select({
             resultAttemptId: resultAttempts.id,
+            bcId: resultAttempts.bcId,
             cl: resultAttempts.cl,
             cd: resultAttempts.cd,
             cm: resultAttempts.cm,
@@ -844,6 +849,115 @@ async function settleUransLadderForJob(
     ) {
       throw new Error(
         `verify job ${job.id} preliminary attempt ${payload.verifyPrecalcResultAttemptId} does not match queue owner ${precalc.resultAttemptId}`,
+      );
+    }
+
+    const continuationPairComplete = Boolean(
+      payload.finalRecoveryMode === "continuation" &&
+      typeof payload.continueFromResultId === "string" &&
+      typeof payload.continueFromResultAttemptId === "string",
+    );
+    const continuationSourceAttemptId = continuationPairComplete
+      ? payload.continueFromResultAttemptId!
+      : null;
+    const continuationSourceResultId = continuationPairComplete
+      ? payload.continueFromResultId!
+      : null;
+    const [continuationSource] =
+      continuationSourceAttemptId &&
+      continuationSourceResultId &&
+      item.latestResultAttemptId === continuationSourceAttemptId &&
+      (item.lastOutcome === FINAL_URANS_OUTCOMES.continuationPending ||
+        item.lastOutcome === FINAL_URANS_OUTCOMES.continuationRetryWait)
+        ? await tx
+            .select({
+              id: resultAttempts.id,
+              resultId: resultAttempts.resultId,
+              airfoilId: resultAttempts.airfoilId,
+              bcId: resultAttempts.bcId,
+              revisionId: resultAttempts.simulationPresetRevisionId,
+              aoaDeg: resultAttempts.aoaDeg,
+              status: resultAttempts.status,
+              source: resultAttempts.source,
+              fidelity: sql<
+                string | null
+              >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+              engineJobId: resultAttempts.engineJobId,
+              engineCaseSlug: resultAttempts.engineCaseSlug,
+              solverImplementationId: resultAttempts.solverImplementationId,
+              targetSolverImplementationId:
+                simulationPresetRevisions.solverImplementationId,
+              qualityWarnings: resultAttempts.qualityWarnings,
+              evidencePayload: resultAttempts.evidencePayload,
+              classification: resultClassifications.state,
+            })
+            .from(resultAttempts)
+            .innerJoin(
+              simulationPresetRevisions,
+              eq(
+                simulationPresetRevisions.id,
+                resultAttempts.simulationPresetRevisionId,
+              ),
+            )
+            .innerJoin(
+              resultClassifications,
+              eq(resultClassifications.resultAttemptId, resultAttempts.id),
+            )
+            .where(
+              and(
+                eq(resultAttempts.id, continuationSourceAttemptId),
+                eq(resultAttempts.resultId, continuationSourceResultId),
+              ),
+            )
+            .limit(1)
+        : [];
+    const continuationSourceMatchesAuthorization = Boolean(
+      continuationSource &&
+      continuationSource.resultId === continuationSourceResultId &&
+      continuationSource.id === item.latestResultAttemptId &&
+      continuationSource.airfoilId === item.airfoilId &&
+      continuationSource.airfoilId === job.airfoilId &&
+      continuationSource.bcId === precalc.bcId &&
+      job.bcIds.length === 1 &&
+      job.bcIds[0] === continuationSource.bcId &&
+      continuationSource.revisionId === item.revisionId &&
+      continuationSource.revisionId === job.simulationPresetRevisionId &&
+      Number(continuationSource.aoaDeg) === Number(item.aoaDeg) &&
+      ["done", "failed"].includes(continuationSource.status) &&
+      continuationSource.source === "solved" &&
+      continuationSource.fidelity === "urans_full" &&
+      continuationSource.classification === "rejected" &&
+      continuationSource.engineJobId &&
+      continuationSource.engineCaseSlug &&
+      continuationSource.solverImplementationId &&
+      continuationSource.solverImplementationId ===
+        continuationSource.targetSolverImplementationId &&
+      continuationSource.solverImplementationId ===
+        job.solverImplementationId &&
+      (continuationSource.qualityWarnings ?? []).some(
+        (warning) =>
+          warning.includes(URANS_BUDGET_STOP_MARKER) ||
+          warning.includes(URANS_CONTINUATION_REQUIRED_MARKER),
+      ),
+    );
+    const isContinuation = Boolean(
+      continuationSourceMatchesAuthorization &&
+      continuationSourceResultId &&
+      continuationSourceAttemptId &&
+      (await hasExactValidSolverManifest(
+        tx,
+        continuationSourceResultId,
+        continuationSourceAttemptId,
+      )) &&
+      (await hasExactVerifiedRestartableEvidenceArchive(
+        tx,
+        continuationSourceResultId,
+        continuationSourceAttemptId,
+      )),
+    );
+    if (payload.finalRecoveryMode === "continuation" && !isContinuation) {
+      console.error(
+        `[sweeper] final continuation trust check rejected for verify item ${item.id}, job ${job.id}; exact current result/attempt, cell, boundary condition, solver implementation, manifest, and restart archive are required. This physical run is accounted as fresh.`,
       );
     }
 
@@ -911,9 +1025,6 @@ async function settleUransLadderForJob(
       const disagreed =
         (deltaCl !== null && Math.abs(deltaCl) > URANS_VERIFY_DELTA_CL_LIMIT) ||
         (deltaCd !== null && Math.abs(deltaCd) > URANS_VERIFY_DELTA_CD_LIMIT);
-      const isContinuation =
-        payload.finalRecoveryMode === "continuation" ||
-        typeof payload.continueFromResultAttemptId === "string";
       await tx
         .update(simUransVerifyQueue)
         .set({
@@ -989,9 +1100,6 @@ async function settleUransLadderForJob(
       FROM sim_urans_verify_queue q
       WHERE q.id = ${item.id}
     `)) as unknown as Array<{ live: boolean }>;
-    const isContinuation =
-      payload.finalRecoveryMode === "continuation" ||
-      typeof payload.continueFromResultAttemptId === "string";
     const continuationFailureKind = isContinuation
       ? (opts.terminalContinuationFailureKind ?? null)
       : null;
@@ -1012,35 +1120,7 @@ async function settleUransLadderForJob(
     const continuationAttemptCount =
       item.continuationAttemptCount +
       (isContinuation && consumesRecoveryAttempt ? 1 : 0);
-    const continuationSourceAttemptId = isContinuation
-      ? typeof payload.continueFromResultAttemptId === "string"
-        ? payload.continueFromResultAttemptId
-        : item.latestResultAttemptId
-      : null;
-    const exactContinuationSourceAttemptId =
-      continuationSourceAttemptId != null &&
-      continuationSourceAttemptId === item.latestResultAttemptId
-        ? continuationSourceAttemptId
-        : null;
-    const [continuationSource] = exactContinuationSourceAttemptId
-      ? await tx
-          .select({
-            airfoilId: resultAttempts.airfoilId,
-            revisionId: resultAttempts.simulationPresetRevisionId,
-            aoaDeg: resultAttempts.aoaDeg,
-            evidencePayload: resultAttempts.evidencePayload,
-          })
-          .from(resultAttempts)
-          .where(eq(resultAttempts.id, exactContinuationSourceAttemptId))
-          .limit(1)
-      : [];
-    const continuationSourceMatchesCell = Boolean(
-      continuationSource &&
-      continuationSource.airfoilId === item.airfoilId &&
-      continuationSource.revisionId === item.revisionId &&
-      Number(continuationSource.aoaDeg) === Number(item.aoaDeg),
-    );
-    const continuationSourceProgress = continuationSourceMatchesCell
+    const continuationSourceProgress = isContinuation
       ? precalcContinuationProgressFromEvidence(
           continuationSource!.evidencePayload,
         )
@@ -2274,6 +2354,7 @@ export async function submitUransRetryForJob(
         precalcObligationIds: obligationIds,
         ...(continuation
           ? {
+              continueFromResultId: continuation.resultId,
               continueFromResultAttemptId: continuation.resultAttemptId,
               budgetOverrideS: continuation.budgetOverrideS,
               uransRecoveryVersion,
@@ -2622,6 +2703,7 @@ async function submitCampaignUransRetries(
           precalcObligationIds: obligationIds,
           ...(continuation
             ? {
+                continueFromResultId: continuation.resultId,
                 continueFromResultAttemptId: continuation.resultAttemptId,
                 budgetOverrideS: continuation.budgetOverrideS,
                 uransRecoveryVersion: opts.uransRecoveryVersion,
@@ -2932,6 +3014,50 @@ async function ingestCompletedJob(
   }
 }
 
+function precalcObligationIdsForJob(job: SimJobRow): string[] {
+  if (uransFidelityForJob(job) !== "precalc") return [];
+  const obligationIds = (
+    requestPayload(job) as { precalcObligationIds?: unknown }
+  ).precalcObligationIds;
+  if (!Array.isArray(obligationIds)) return [];
+  return [...new Set(obligationIds)].filter(
+    (id): id is string => typeof id === "string" && id.length > 0,
+  );
+}
+
+/** Retry the durable FAST→FINAL projection independently from engine result
+ * counts. Point ingest and this ownership handoff are separate commits; after
+ * a crash the database can already contain accepted exact evidence while the
+ * engine and sim_job completed-case counters are equal, so no result fetch is
+ * warranted. Failure is intentionally local to this projection: the engine
+ * job remains running and ordinary polling continues while every later tick
+ * retries the exact idempotent transaction. */
+async function reconcileRunningPrecalcHandoff(
+  db: DB,
+  job: SimJobRow,
+): Promise<void> {
+  const obligationIds = precalcObligationIdsForJob(job);
+  if (!obligationIds.length) return;
+  try {
+    const settled = await settleAcceptedRunningPrecalcPartials(db, {
+      simJobId: job.id,
+      obligationIds,
+    });
+    const changed = settled.filter(
+      (item) => item.changed || item.verifyQueueCreated,
+    ).length;
+    if (changed > 0) {
+      console.log(
+        `[sweeper] running PRECALC handoff reconciled ${changed} newly accepted point(s) or exact FINAL verification generation(s) (sim_job ${job.id}, engine ${job.engineJobId ?? "unsubmitted"})`,
+      );
+    }
+  } catch (error) {
+    console.error(
+      `[sweeper] running PRECALC handoff retry deferred for sim_job ${job.id} (engine ${job.engineJobId ?? "unsubmitted"}): ${errorMessage(error)}`,
+    );
+  }
+}
+
 async function ingestRunningPartialJob(
   db: DB,
   engine: EngineClient,
@@ -2984,6 +3110,10 @@ async function ingestRunningPartialJob(
       await refreshPolarCachesForJob(db, job, () =>
         renewIngestAndHeartbeat(db, lease),
       );
+    }
+    if (uransFidelityForJob(job) === "precalc") {
+      await renewIngestLeaseOrThrow(db, lease);
+      await reconcileRunningPrecalcHandoff(db, job);
     }
     if (ingested.ransPrecalcPromotions.length > 0) {
       await renewIngestLeaseOrThrow(db, lease);
@@ -3839,6 +3969,7 @@ export async function reconcile(
   }
 
   for (const job of jobs) {
+    await reconcileRunningPrecalcHandoff(db, job);
     if (!job.engineJobId) continue;
     // Engine API calls take seconds when the worker saturates every core; a
     // 10+-job reconcile pass must not leave the heartbeat silent meanwhile.

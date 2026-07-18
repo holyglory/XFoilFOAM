@@ -25,6 +25,12 @@ export const AUTO_PRECALC_CONTINUATION_REQUESTED_BY =
   "system:precalc-continuation-v1";
 export const AUTO_PRECALC_CONTINUATION_BUDGET_S = 2 * 60 * 60;
 
+/** Final-vs-preliminary coefficient disagreement bounds. These are domain
+ * policy, not an engine transport detail: every producer and presenter of a
+ * FINAL comparison must use the same authoritative values. */
+export const URANS_VERIFY_DELTA_CL_LIMIT = 0.05;
+export const URANS_VERIFY_DELTA_CD_LIMIT = 0.01;
+
 /** Exact engine error markers for the immutable precalc mesh-QA class. A row
  * carrying both is a setup blocker: repeating the same revision cannot repair
  * it, so review/requeue surfaces must not present it as a coefficient verdict. */

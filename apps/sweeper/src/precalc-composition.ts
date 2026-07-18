@@ -89,12 +89,37 @@ export async function composePhysicalPrecalcJob(
     continueFromResultAttemptId?: unknown;
     continueFromResultId?: unknown;
   };
+  const hasContinuationResult =
+    typeof payload.continueFromResultId === "string" &&
+    payload.continueFromResultId.length > 0;
+  const hasContinuationAttempt =
+    typeof payload.continueFromResultAttemptId === "string" &&
+    payload.continueFromResultAttemptId.length > 0;
+  const mentionsContinuation =
+    payload.continueFromResultId !== undefined ||
+    payload.continueFromResultAttemptId !== undefined;
+  if (
+    mentionsContinuation &&
+    (ids.length !== 1 || !hasContinuationResult || !hasContinuationAttempt)
+  ) {
+    throw new Error(
+      "physical precalc continuation must pin one exact result/attempt pair for one obligation",
+    );
+  }
   const sameCaseContinuation =
     ids.length === 1 &&
-    ((typeof payload.continueFromResultAttemptId === "string" &&
-      payload.continueFromResultAttemptId.length > 0) ||
-      (typeof payload.continueFromResultId === "string" &&
-        payload.continueFromResultId.length > 0));
+    hasContinuationAttempt &&
+    hasContinuationResult;
+  const jobBoundaryConditionIds = Array.isArray(spec.job.bcIds)
+    ? spec.job.bcIds.filter(
+        (id): id is string => typeof id === "string" && id.length > 0,
+      )
+    : [];
+  if (sameCaseContinuation && jobBoundaryConditionIds.length !== 1) {
+    throw new Error(
+      "physical precalc continuation must target one exact boundary condition",
+    );
+  }
   const remoteProvenance =
     typeof payload.syncPromiseId === "string" &&
     payload.remoteSolver === true &&
@@ -182,7 +207,7 @@ export async function composePhysicalPrecalcJob(
       .orderBy(simPrecalcObligations.id)
       .for("update");
     if (obligations.length !== ids.length) return null;
-    const restartableAtMax = sameCaseContinuation
+    const exactRestartableContinuation = sameCaseContinuation
       ? ((await tx.execute(sql`
           SELECT obligation.id
           FROM sim_precalc_obligations obligation
@@ -190,6 +215,7 @@ export async function composePhysicalPrecalcJob(
             AND ${restartablePrecalcCheckpointSql(sql`obligation.id`, {
               targetSolverImplementationId:
                 spec.job.solverImplementationId ?? null,
+              targetBoundaryConditionId: jobBoundaryConditionIds[0] ?? null,
               continuationResultAttemptId:
                 typeof payload.continueFromResultAttemptId === "string"
                   ? payload.continueFromResultAttemptId
@@ -201,7 +227,9 @@ export async function composePhysicalPrecalcJob(
             })}
         `)) as unknown as Array<{ id: string }>)
       : [];
-    const restartableAtMaxIds = new Set(restartableAtMax.map((row) => row.id));
+    const exactRestartableContinuationIds = new Set(
+      exactRestartableContinuation.map((row) => row.id),
+    );
 
     const latestIds = obligations
       .map((obligation) => obligation.latestSimJobId)
@@ -220,8 +248,9 @@ export async function composePhysicalPrecalcJob(
         : null;
       if (
         obligation.state !== "pending" ||
-        (obligation.attemptCount >= obligation.maxAttempts &&
-          !restartableAtMaxIds.has(obligation.id)) ||
+        (sameCaseContinuation
+          ? !exactRestartableContinuationIds.has(obligation.id)
+          : obligation.attemptCount >= obligation.maxAttempts) ||
         (obligation.nextSubmitAt &&
           new Date(obligation.nextSubmitAt).getTime() > now) ||
         (!obligation.backgroundOwner && !runnableOwnerIds.has(obligation.id)) ||

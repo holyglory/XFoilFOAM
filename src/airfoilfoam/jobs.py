@@ -195,6 +195,12 @@ def execute_job(
     cache = EngineCache.from_settings(settings)
 
     lock = threading.Lock()
+    # ``results`` publication and status persistence have different lock
+    # orders: bump() already owns ``lock`` before it reports status.  Keep a
+    # dedicated re-entrant status lock so concurrent cold-case callbacks
+    # cannot tear the shared representative phase/case tuple or race two
+    # read-modify-write status.json updates.
+    status_lock = threading.RLock()
     completed = {"n": 0}
     phase_ctx = {
         "phase": JobPhase.pending,
@@ -223,48 +229,49 @@ def execute_job(
         failure_disposition: Optional[FailureDisposition] = None,
         continuation_failure_kind: Optional[ContinuationFailureKind] = None,
     ) -> None:
-        if state == JobState.running:
-            ensure_not_cancelled()
-        if phase is not None:
-            phase_ctx["phase"] = phase
-        if message is not None:
-            phase_ctx["message"] = message
-        if active_solver is not None or phase is not None:
-            phase_ctx["active_solver"] = active_solver
-        if active_case_slug is not None or phase is not None:
-            phase_ctx["active_case_slug"] = active_case_slug
-        if active_aoa_deg is not None or phase is not None:
-            phase_ctx["active_aoa_deg"] = active_aoa_deg
-        if cpu_tokens_waiting is not None:
-            phase_ctx["cpu_tokens_waiting"] = cpu_tokens_waiting
-        if cpu_tokens_held is not None:
-            phase_ctx["cpu_tokens_held"] = cpu_tokens_held
-        st = JobStatus(
-            job_id=job_id, state=state, total_cases=total,
-            phase=phase_ctx["phase"],
-            completed_cases=completed["n"],
-            message=message if message is not None else phase_ctx["message"],
-            active_solver=phase_ctx["active_solver"],
-            active_case_slug=phase_ctx["active_case_slug"],
-            active_aoa_deg=phase_ctx["active_aoa_deg"],
-            cpu_tokens_waiting=int(phase_ctx["cpu_tokens_waiting"] or 0),
-            cpu_tokens_held=int(phase_ctx["cpu_tokens_held"] or 0),
-            scheduling=plan.metadata(
-                mesh_build_count=mesh_stats["count"],
-                aoa_case_count=total,
-                mesh_reuse_mode=mesh_reuse_mode,
-            ),
-            requested_engine=expected_engine,
-            requested_execution_pool=dialect.queue_name,
-            engine=runtime_engine,
-            execution_pool=settings.celery_queue,
-            mesh_recovery_version=MESH_RECOVERY_VERSION,
-            failure_disposition=failure_disposition,
-            continuation_failure_kind=continuation_failure_kind,
-        )
-        store.write_status(st)
-        if progress:
-            progress(st)
+        with status_lock:
+            if state == JobState.running:
+                ensure_not_cancelled()
+            if phase is not None:
+                phase_ctx["phase"] = phase
+            if message is not None:
+                phase_ctx["message"] = message
+            if active_solver is not None or phase is not None:
+                phase_ctx["active_solver"] = active_solver
+            if active_case_slug is not None or phase is not None:
+                phase_ctx["active_case_slug"] = active_case_slug
+            if active_aoa_deg is not None or phase is not None:
+                phase_ctx["active_aoa_deg"] = active_aoa_deg
+            if cpu_tokens_waiting is not None:
+                phase_ctx["cpu_tokens_waiting"] = cpu_tokens_waiting
+            if cpu_tokens_held is not None:
+                phase_ctx["cpu_tokens_held"] = cpu_tokens_held
+            st = JobStatus(
+                job_id=job_id, state=state, total_cases=total,
+                phase=phase_ctx["phase"],
+                completed_cases=completed["n"],
+                message=message if message is not None else phase_ctx["message"],
+                active_solver=phase_ctx["active_solver"],
+                active_case_slug=phase_ctx["active_case_slug"],
+                active_aoa_deg=phase_ctx["active_aoa_deg"],
+                cpu_tokens_waiting=int(phase_ctx["cpu_tokens_waiting"] or 0),
+                cpu_tokens_held=int(phase_ctx["cpu_tokens_held"] or 0),
+                scheduling=plan.metadata(
+                    mesh_build_count=mesh_stats["count"],
+                    aoa_case_count=total,
+                    mesh_reuse_mode=mesh_reuse_mode,
+                ),
+                requested_engine=expected_engine,
+                requested_execution_pool=dialect.queue_name,
+                engine=runtime_engine,
+                execution_pool=settings.celery_queue,
+                mesh_recovery_version=MESH_RECOVERY_VERSION,
+                failure_disposition=failure_disposition,
+                continuation_failure_kind=continuation_failure_kind,
+            )
+            store.write_status(st)
+            if progress:
+                progress(st)
 
     def bump() -> None:
         with lock:
@@ -440,7 +447,14 @@ def execute_job(
             )
         )
 
-    def record_outcome(chord: float, speed: float, item: StoredCaseOutcome, accepted: bool) -> None:
+    def record_outcome(
+        chord: float,
+        speed: float,
+        item: StoredCaseOutcome,
+        accepted: bool,
+        *,
+        precalc_promotion=None,
+    ) -> None:
         key = (chord, speed)
         aoa = item.outcome.spec.aoa_deg
         with lock:
@@ -448,6 +462,8 @@ def execute_job(
                 results.setdefault(key, {})[aoa] = (item.slug, item.outcome)
             else:
                 attempts.setdefault(key, []).append((item.slug, item.outcome))
+            if precalc_promotion is not None:
+                rans_precalc_promotions[key] = precalc_promotion
             write_partial_result_locked()
 
     # Numerical marching is solver intent, not a resource-policy suggestion.
@@ -585,13 +601,17 @@ def execute_job(
                 urans_mesh=request.urans_mesh,
                 urans_precalc_mesh=request.urans_precalc_mesh,
             )
-        bump()
         record_outcome(
             spec.chord,
             spec.speed,
             StoredCaseOutcome(slug=spec.slug, outcome=outcome),
             accepted=outcome.error is None,
         )
+        # A continuation is still one physical case publication.  Persist its
+        # running result before advancing completed_cases, exactly like the
+        # cold case-parallel path, so partial-ingest polling cannot observe a
+        # new counter with no corresponding immutable point.
+        bump()
     elif use_warm_start:
         # 2a. WARM-START: one polar per (chord, speed), marched serially over AoA,
         #     polars run concurrently. Image URLs are namespaced under the polar dir.
@@ -643,6 +663,15 @@ def execute_job(
                     progress=bump,
                     phase_progress=phase_progress,
                     outcome_progress=lambda item, accepted, c=chord, s=speed: record_outcome(c, s, item, accepted),
+                    precalc_promotion_progress=(
+                        lambda item, promotion, c=chord, s=speed: record_outcome(
+                            c,
+                            s,
+                            item,
+                            False,
+                            precalc_promotion=promotion,
+                        )
+                    ),
                     cancel_check=ensure_not_cancelled,
                     cache=cache,
                     media_budget_s=settings.media_budget_seconds(),
@@ -738,7 +767,6 @@ def execute_job(
                     media_budget_s=settings.media_budget_seconds(),
                     mesh_quality_warnings=mesh_quality_warnings,
                 )
-            bump()
             return spec, outcome
 
         specs = request.cases()
@@ -749,6 +777,12 @@ def execute_job(
                 with lock:
                     results.setdefault((spec.chord, spec.speed), {})[spec.aoa_deg] = (spec.slug, outcome)
                     write_partial_result_locked()
+                # Publish the immutable case outcome before advertising a
+                # larger completed_cases count.  The sweeper keys running-
+                # partial ingestion from that counter; advancing it first
+                # leaves a race where GET /result still returns 409 and the
+                # persisted counter then suppresses every later partial poll.
+                bump()
 
     # 3. Assemble polars (request order).
     polars = build_polars()

@@ -128,17 +128,23 @@ function pendingSubmitWhere(jobId: string, campaignId: string | null) {
                    OR obligation.state NOT IN ('pending', 'running')
                    OR obligation.latest_sim_job_id IS DISTINCT FROM ${simJobs.id}
                    OR (
-                     obligation.attempt_count >= obligation.max_attempts
+                     (
+                       obligation.attempt_count >= obligation.max_attempts
+                       OR ${simJobs.requestPayload} ? 'continueFromResultAttemptId'
+                       OR ${simJobs.requestPayload} ? 'continueFromResultId'
+                     )
                      AND NOT (
                        jsonb_array_length(
                          ${simJobs.requestPayload} -> 'precalcObligationIds'
                        ) = 1
+                       AND jsonb_typeof(${simJobs.bcIds}) = 'array'
+                       AND jsonb_array_length(${simJobs.bcIds}) = 1
                        AND (
                          NULLIF(
                            ${simJobs.requestPayload} ->> 'continueFromResultAttemptId',
                            ''
                          ) IS NOT NULL
-                         OR NULLIF(
+                         AND NULLIF(
                            ${simJobs.requestPayload} ->> 'continueFromResultId',
                            ''
                          ) IS NOT NULL
@@ -147,6 +153,7 @@ function pendingSubmitWhere(jobId: string, campaignId: string | null) {
                          sql`obligation.id`,
                          {
                            targetSolverImplementationId: sql`${simJobs.solverImplementationId}`,
+                           targetBoundaryConditionId: sql`${simJobs.bcIds} ->> 0`,
                            continuationResultAttemptId: sql`${simJobs.requestPayload} ->> 'continueFromResultAttemptId'`,
                            continuationResultId: sql`${simJobs.requestPayload} ->> 'continueFromResultId'`,
                          },

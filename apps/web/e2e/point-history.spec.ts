@@ -7,11 +7,16 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("Point History Explorer (read-only)", () => {
-  test("Points tab lists rows and the story panel opens/closes in place", async ({ page }) => {
+  test("Points tab lists rows and the story panel owns scroll/focus across nested evidence", async ({
+    page,
+  }) => {
     await page.goto("/admin?section=queue&tab=points");
 
     // Tab is active and the explorer owns the viewport (no queue sections).
-    await expect(page.getByTestId("solver-tab-points")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("solver-tab-points")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     const panel = page.getByTestId("point-history-panel");
     await expect(panel).toBeVisible();
 
@@ -20,19 +25,65 @@ test.describe("Point History Explorer (read-only)", () => {
     await expect(rows.first()).toBeVisible();
 
     // Status chips render live counts (the "all" chip always has a number).
-    await expect(page.getByTestId("points-chip-all")).toContainText(/all [\d,]+/);
+    await expect(page.getByTestId("points-chip-all")).toContainText(
+      /all [\d,]+/,
+    );
 
     // Row click opens the story side panel in place — URL keeps the tab.
-    await rows.first().click();
+    const trigger = rows.first();
+    await trigger.focus();
+    await expect(trigger).toBeFocused();
+    const scrollBeforeOpen = await page.evaluate(() => window.scrollY);
+    await trigger.click();
     const story = page.getByTestId("point-story-panel");
     await expect(story).toBeVisible();
+    await expect(story).toHaveAttribute("role", "dialog");
+    await expect(story).toHaveAttribute("aria-modal", "true");
+    await expect(
+      story.getByRole("button", { name: "Close point story" }),
+    ).toBeFocused();
+    await expect
+      .poll(() => page.evaluate(() => document.body.style.position))
+      .toBe("fixed");
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.style.overflow))
+      .toBe("hidden");
     await expect(page).toHaveURL(/[?&]tab=points/);
     // The timeline (or the honest derived/source note) renders.
-    await expect(story.getByTestId(/timeline-(now|attempt)/).first().or(story.getByTestId("point-open-source"))).toBeVisible();
+    await expect(
+      story
+        .getByTestId(/timeline-(now|attempt)/)
+        .first()
+        .or(story.getByTestId("point-open-source")),
+    ).toBeVisible();
 
-    // Escape closes the panel back to the table.
+    // The evidence viewer is the top modal: the point story becomes inert,
+    // then owns scroll/focus again when the nested dialog closes.
+    const resultTrigger = story.getByTestId("point-solver-results");
+    await resultTrigger.click();
+    await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+    await expect(story).toHaveAttribute("aria-hidden", "true");
+    await expect(story).toHaveAttribute("inert", "");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
+    await expect(story).not.toHaveAttribute("aria-hidden", "true");
+    await expect(story).not.toHaveAttribute("inert", "");
+    await expect(resultTrigger).toBeFocused();
+    await expect
+      .poll(() => page.evaluate(() => document.body.style.position))
+      .toBe("fixed");
+
+    // Escape closes the story back to the table and restores both focus and
+    // the exact document-scroll ownership snapshot.
     await page.keyboard.press("Escape");
     await expect(story).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+    await expect
+      .poll(() => page.evaluate(() => document.body.style.position))
+      .toBe("");
+    await expect
+      .poll(() => page.evaluate(() => window.scrollY))
+      .toBe(scrollBeforeOpen);
 
     // Status chip click-filter round-trips through the URL (replace semantics).
     await page.getByTestId("points-chip-failed").click();

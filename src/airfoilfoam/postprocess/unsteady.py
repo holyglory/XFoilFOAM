@@ -351,6 +351,41 @@ def _window_series(
     return out_t, out_cl, out_cd, out_cm
 
 
+def trailing_period_series(
+    times: "np.ndarray | list[float]",
+    cl: "np.ndarray | list[float]",
+    cd: "np.ndarray | list[float]",
+    cm: "np.ndarray | list[float]",
+    period_s: float,
+    cycles: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the exact trailing ``cycles * period_s`` physical-time window.
+
+    The boundary is interpolated between its two real neighbouring samples,
+    matching the evidence-preserving window machinery used for integer-period
+    statistics.  The caller retains the complete source arrays; this helper
+    only returns a certification view and never deletes startup history.
+    """
+
+    t, wcl, wcd, wcm = _normalise_series(times, cl, cd, cm)
+    if (
+        t.size < 2
+        or not math.isfinite(period_s)
+        or period_s <= 0
+        or not math.isfinite(cycles)
+        or cycles <= 0
+    ):
+        return t, wcl, wcd, wcm
+    end = float(t[-1])
+    window = PeriodWindow(
+        start=end - float(cycles) * float(period_s),
+        end=end,
+        cycles=max(1, int(math.floor(float(cycles)))),
+        period_s=float(period_s),
+    )
+    return _window_series(t, wcl, wcd, wcm, window)
+
+
 def _time_weighted_mean_std(times: np.ndarray, values: np.ndarray) -> tuple[float, float]:
     if values.size == 0:
         return 0.0, 0.0

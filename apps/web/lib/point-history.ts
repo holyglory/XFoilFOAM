@@ -200,6 +200,8 @@ export interface PointStoryPayload {
     /** Amendment C: rejected urans row with restartable saved case state — the
      *  story panel renders Continue +2h/+6h on exactly these. */
     continuable: boolean;
+    /** Exact immutable generation named by a continuation action. */
+    continuationResultAttemptId: string | null;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;
   };
@@ -376,8 +378,14 @@ export function formatBulkContinueOutcome(o: BulkContinueOutcome): string {
 /** Contract-4 disagreement bounds — pinned here for label emphasis only; the
  *  authoritative comparison lives in the sweeper (engine-client fidelity.ts).
  *  Drift is caught by the fidelity-ladder web test pinning the same values. */
-export const URANS_VERIFY_DELTA_CL_LIMIT = 0.05;
-export const URANS_VERIFY_DELTA_CD_LIMIT = 0.01;
+export {
+  URANS_VERIFY_DELTA_CD_LIMIT,
+  URANS_VERIFY_DELTA_CL_LIMIT,
+} from "@aerodb/core";
+import {
+  URANS_VERIFY_DELTA_CD_LIMIT,
+  URANS_VERIFY_DELTA_CL_LIMIT,
+} from "@aerodb/core";
 
 export interface FidelityChipView {
   label: string;

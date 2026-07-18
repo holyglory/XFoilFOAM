@@ -14,6 +14,8 @@ import {
   operatingConditions,
   outputProfiles,
   referenceGeometryProfiles,
+  resultAttempts,
+  resultClassifications,
   results,
   schedulingProfiles,
   simJobs,
@@ -32,6 +34,9 @@ import {
   campaignBacklogStrip,
   claimSimJobCancellation,
   createUransRequest,
+  hasExactValidSolverManifest,
+  hasExactVerifiedRestartableEvidenceArchive,
+  isExactRestartablePrecalcAttempt,
   outsideLiveSimJobIngestLeaseWhere,
   PrecalcObligationTerminalConflict,
   refreshPrecalcSettlementCampaigns,
@@ -48,7 +53,11 @@ import {
   solverIncidentSummary,
   syncLegacyBoundaryConditionForPreset as syncLegacyBoundaryConditionForPresetDb,
 } from "@aerodb/db";
-import { DEFAULT_TRANSIENT_MAX_COURANT } from "@aerodb/core";
+import {
+  DEFAULT_TRANSIENT_MAX_COURANT,
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "@aerodb/core";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import {
   ensureEnabledSimulationPresetRevisions,
@@ -4361,18 +4370,24 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
             };
           }
           const classified = classifyQueueLifecycle(job, runtime, engineQueue);
-          const phase = runtime?.status_phase ?? runtime?.runtime_phase ?? null;
+          // In a case-parallel job the singular persisted status is the most
+          // recent callback, which may belong to a case being postprocessed
+          // while another selected OpenFOAM process is still advancing. The
+          // runtime heartbeat publishes one internally coherent live-process
+          // tuple; prefer that tuple as a unit and retain status as the
+          // backwards-compatible fallback for quiet/older workers.
+          const phase = runtime?.runtime_phase ?? runtime?.status_phase ?? null;
           const activeSolver =
-            runtime?.status_active_solver ??
             runtime?.runtime_active_solver ??
+            runtime?.status_active_solver ??
             null;
           const activeCaseSlug =
-            runtime?.status_active_case_slug ??
             runtime?.runtime_active_case_slug ??
+            runtime?.status_active_case_slug ??
             null;
           const activeAoaDeg =
-            runtime?.status_active_aoa_deg ??
             runtime?.runtime_active_aoa_deg ??
+            runtime?.status_active_aoa_deg ??
             null;
           const cpuTokensWaiting =
             runtime?.status_cpu_tokens_waiting ??
@@ -4569,7 +4584,10 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // (cell, fidelity) — replaying returns the existing open request with
   // created=false.
   //
-  // CONTINUATION mode (amendment C): { continueFromResultId, budgetOverrideS? }
+  // CONTINUATION mode (amendment C): the client names one immutable result
+  // generation with BOTH owner ids. A mutable result row is never resolved to
+  // a "latest" attempt here: doing so could resume a different CFD trajectory
+  // after the UI was rendered.
   // resumes a budget-stopped URANS solve from its saved engine case state with
   // an increased wall-clock budget (+2h/+6h/+24h UI choices). The cell, angle and
   // fidelity derive from the SOURCE results row — the client names only the
@@ -4585,6 +4603,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
           aoaDeg: z.number().finite().optional(),
           fidelity: z.enum(["precalc", "full"]).optional(),
           continueFromResultId: z.string().uuid().optional(),
+          continueFromResultAttemptId: z.string().uuid().optional(),
           // 1 min .. 24 h — mirrors the engine's URANS_BUDGET_OVERRIDE_MAX_S
           // (models.py, le=86400): a larger value would be accepted here, queued,
           // then 422-rejected at engine submit and the request cancelled. Reject
@@ -4603,32 +4622,111 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         });
       const body = parsed.data;
 
-      if (body.continueFromResultId) {
+      if (
+        Boolean(body.continueFromResultId) !==
+        Boolean(body.continueFromResultAttemptId)
+      ) {
+        return reply.code(400).send({
+          error:
+            "continuation mode requires both continueFromResultId and continueFromResultAttemptId",
+        });
+      }
+
+      if (body.continueFromResultId && body.continueFromResultAttemptId) {
         const [source] = await db
           .select({
             id: results.id,
-            airfoilId: results.airfoilId,
-            revisionId: results.simulationPresetRevisionId,
-            aoaDeg: results.aoaDeg,
-            fidelity: results.fidelity,
-            regime: results.regime,
-            engineJobId: results.engineJobId,
-            engineCaseSlug: results.engineCaseSlug,
+            resultAttemptId: resultAttempts.id,
+            airfoilId: resultAttempts.airfoilId,
+            revisionId: resultAttempts.simulationPresetRevisionId,
+            aoaDeg: resultAttempts.aoaDeg,
+            status: resultAttempts.status,
+            source: resultAttempts.source,
+            evidencePayload: resultAttempts.evidencePayload,
+            qualityWarnings: resultAttempts.qualityWarnings,
+            engineJobId: resultAttempts.engineJobId,
+            engineCaseSlug: resultAttempts.engineCaseSlug,
+            solverImplementationId: resultAttempts.solverImplementationId,
+            revisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            classificationState: resultClassifications.state,
           })
-          .from(results)
-          .where(eq(results.id, body.continueFromResultId))
+          .from(resultAttempts)
+          .innerJoin(
+            results,
+            and(
+              eq(results.id, body.continueFromResultId),
+              eq(resultAttempts.id, body.continueFromResultAttemptId),
+              eq(resultAttempts.resultId, results.id),
+              eq(resultAttempts.airfoilId, results.airfoilId),
+              eq(resultAttempts.bcId, results.bcId),
+              eq(
+                resultAttempts.simulationPresetRevisionId,
+                results.simulationPresetRevisionId,
+              ),
+              eq(resultAttempts.aoaDeg, results.aoaDeg),
+            ),
+          )
+          .innerJoin(
+            resultClassifications,
+            eq(resultClassifications.resultAttemptId, resultAttempts.id),
+          )
+          .innerJoin(
+            simulationPresetRevisions,
+            eq(
+              simulationPresetRevisions.id,
+              resultAttempts.simulationPresetRevisionId,
+            ),
+          )
           .limit(1);
         if (!source)
           return reply
             .code(404)
-            .send({ error: "continuation source result not found" });
-        if (
-          source.regime !== "urans" &&
-          !(source.fidelity ?? "").startsWith("urans")
-        ) {
-          return reply
-            .code(422)
-            .send({ error: "only URANS solves can be continued" });
+            .send({ error: "exact continuation result generation not found" });
+        const evidence =
+          source.evidencePayload && typeof source.evidencePayload === "object"
+            ? (source.evidencePayload as Record<string, unknown>)
+            : null;
+        const evidenceFidelity = evidence?.fidelity;
+        const continuationFidelity =
+          evidenceFidelity === "urans_full"
+            ? "full"
+            : evidenceFidelity === "urans_precalc"
+              ? "precalc"
+              : null;
+        if (!continuationFidelity) {
+          return reply.code(422).send({
+            error:
+              "only an exact preliminary or final URANS generation can be continued",
+          });
+        }
+        if (body.fidelity && body.fidelity !== continuationFidelity) {
+          return reply.code(422).send({
+            error:
+              "continuation fidelity must match the exact saved URANS generation",
+          });
+        }
+        const restartableWarning = (source.qualityWarnings ?? []).some(
+          (warning) =>
+            warning.includes(URANS_BUDGET_STOP_MARKER) ||
+            warning.includes(URANS_CONTINUATION_REQUIRED_MARKER),
+        );
+        const exactRestartable =
+          continuationFidelity === "precalc"
+            ? await isExactRestartablePrecalcAttempt(
+                db,
+                source.id,
+                source.resultAttemptId,
+              )
+            : ["done", "failed"].includes(source.status) &&
+              source.source === "solved" &&
+              source.classificationState === "rejected" &&
+              restartableWarning;
+        if (!exactRestartable) {
+          return reply.code(422).send({
+            error:
+              "the exact URANS generation is not a rejected restartable solve",
+          });
         }
         if (!source.engineJobId || !source.engineCaseSlug) {
           return reply.code(422).send({
@@ -4641,26 +4739,57 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
             error: "continuation source has no pinned simulation revision",
           });
         }
+        if (
+          !source.solverImplementationId ||
+          !source.revisionSolverImplementationId ||
+          source.solverImplementationId !==
+            source.revisionSolverImplementationId
+        ) {
+          return reply.code(422).send({
+            error:
+              "continuation source does not match the pinned solver implementation",
+          });
+        }
+        if (
+          !(await hasExactValidSolverManifest(
+            db,
+            source.id,
+            source.resultAttemptId,
+          )) ||
+          !(await hasExactVerifiedRestartableEvidenceArchive(
+            db,
+            source.id,
+            source.resultAttemptId,
+          ))
+        ) {
+          return reply.code(422).send({
+            error: "continuation source has no exact verified restart archive",
+          });
+        }
         const { request, created } = await createUransRequest(db, {
           airfoilId: source.airfoilId,
           revisionId: source.revisionId,
           aoaDeg: source.aoaDeg,
           // The resumed run keeps the tier the evidence was solved at.
-          fidelity:
-            body.fidelity ??
-            (source.fidelity === "urans_full" ? "full" : "precalc"),
+          fidelity: continuationFidelity,
           requestedBy: sessionEmail(req),
           continueFromResultId: source.id,
+          continueFromResultAttemptId: source.resultAttemptId,
           budgetOverrideS: body.budgetOverrideS ?? null,
         });
         // Idempotency is per (cell, fidelity): a reused open item that is NOT a
         // continuation of this result would run a FRESH solve, silently
         // discarding the saved case state the admin asked to resume. Refuse
         // honestly instead of presenting a from-scratch job as a resume.
-        if (!created && request.continueFromResultId !== source.id) {
+        if (
+          !created &&
+          (request.continueFromResultId !== source.id ||
+            request.continueFromResultAttemptId !== source.resultAttemptId)
+        ) {
           return reply.code(409).send({
             error:
-              request.continueFromResultId == null
+              request.continueFromResultId == null ||
+              request.continueFromResultAttemptId == null
                 ? `an open ${request.state} URANS request already covers this cell and is NOT a continuation — it will solve from scratch; wait for it to settle (or cancel it) before queuing this resume`
                 : `an open ${request.state} URANS request already covers this cell but continues a different result; wait for it to settle before queuing this resume`,
             request,
@@ -4672,13 +4801,13 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       if (body.budgetOverrideS != null) {
         return reply.code(400).send({
           error:
-            "budgetOverrideS is only valid with continueFromResultId (continuation mode)",
+            "budgetOverrideS is only valid with an exact continuation result generation",
         });
       }
       if (!body.airfoilId || !body.revisionId || !body.fidelity) {
         return reply.code(400).send({
           error:
-            "airfoilId, revisionId and fidelity are required (or pass continueFromResultId)",
+            "airfoilId, revisionId and fidelity are required (or pass both continuation owner ids)",
         });
       }
       const [airfoil] = await db
@@ -4772,10 +4901,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
           fidelity: row.fidelity === "urans_full" ? "full" : "precalc",
           requestedBy: sessionEmail(req),
           continueFromResultId: row.resultId,
+          continueFromResultAttemptId: row.resultAttemptId,
           budgetOverrideS: body.budgetOverrideS,
         });
         if (isNew) created += 1;
-        else if (request.continueFromResultId === row.resultId) reused += 1;
+        else if (
+          request.continueFromResultId === row.resultId &&
+          request.continueFromResultAttemptId === row.resultAttemptId
+        )
+          reused += 1;
         // An open item covering the cell that is NOT this row's continuation
         // would run from scratch (or resume a different result) — count it
         // honestly instead of pretending this row was queued for resume.

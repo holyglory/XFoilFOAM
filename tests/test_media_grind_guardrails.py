@@ -702,6 +702,153 @@ def test_newest_progress_file_mtime_tracks_coeffs_frames_and_vtus(tmp_path):
     assert tasks.newest_progress_file_mtime(tmp_path / "nowhere") is None
 
 
+def test_parallel_runtime_case_observation_keeps_slug_and_aoa_from_one_case():
+    """MUST-CATCH: a live am4 process must never inherit am5's global AoA."""
+    from airfoilfoam.models import AirfoilInput, AoASpec, PolarRequest
+
+    request = PolarRequest(
+        airfoil=AirfoilInput(name="unit", points=[[1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]),
+        aoa=AoASpec(angles=[-5.0, -4.0]),
+    )
+    cases = {case.aoa_deg: case for case in request.cases()}
+    status = JobStatus(
+        job_id="parallel",
+        state=JobState.running,
+        # Another future most recently reported postprocessing.  The selected
+        # live pimpleFoam process still owns a coherent URANS runtime tuple.
+        phase=JobPhase.postprocessing,
+        active_case_slug=cases[-5.0].slug,
+        active_aoa_deg=-5.0,
+    )
+    processes = [
+        {
+            "pid": 41,
+            "command": "pimpleFoam",
+            "case_slug": cases[-4.0].slug,
+            "solver_mode": "urans",
+        }
+    ]
+
+    _active, slug, aoa = tasks._runtime_active_case(processes, status, request)
+
+    assert _active["command"] == "pimpleFoam"
+    assert tasks._runtime_active_phase(_active, status) is JobPhase.solving_urans
+    assert slug == cases[-4.0].slug
+    assert aoa == pytest.approx(-4.0)
+
+
+def test_parallel_runtime_case_observation_never_borrows_unrelated_aoa():
+    """FALSE-POSITIVE GUARD: unknown/nested live slugs report AoA unknown."""
+    from airfoilfoam.models import AirfoilInput, AoASpec, PolarRequest
+
+    request = PolarRequest(
+        airfoil=AirfoilInput(name="unit", points=[[1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]),
+        aoa=AoASpec(angles=[-5.0, -4.0]),
+    )
+    status = JobStatus(
+        job_id="parallel",
+        state=JobState.running,
+        phase=JobPhase.solving_urans,
+        active_case_slug=request.cases()[0].slug,
+        active_aoa_deg=-5.0,
+    )
+    processes = [
+        {
+            "pid": 42,
+            "command": "pimpleFoam",
+            "case_slug": "nested-polar-case",
+            "solver_mode": "urans",
+        }
+    ]
+
+    _active, slug, aoa = tasks._runtime_active_case(processes, status, request)
+
+    assert slug == "nested-polar-case"
+    assert aoa is None
+
+
+def test_active_case_progress_mtime_is_targeted_and_never_invented(tmp_path):
+    """Only the selected case's real coefficient append advances progress."""
+    job_dir = tmp_path / "job"
+    active_slug = "c1_u50_am4"
+    sibling_slug = "c1_u50_am5"
+    active = (
+        job_dir
+        / "cases"
+        / active_slug
+        / "transient"
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0.02"
+        / "coefficient.dat"
+    )
+    sibling = (
+        job_dir
+        / "cases"
+        / sibling_slug
+        / "transient"
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0.02"
+        / "coefficient.dat"
+    )
+    active.parent.mkdir(parents=True)
+    sibling.parent.mkdir(parents=True)
+    active.write_text("# Time Cl\n0.02 0.1\n")
+    sibling.write_text("# Time Cl\n0.02 0.2\n")
+    active_mtime = time_mod.time() - 30.0
+    sibling_mtime = time_mod.time() - 1.0
+    os.utime(active, (active_mtime, active_mtime))
+    os.utime(sibling, (sibling_mtime, sibling_mtime))
+
+    assert tasks._active_case_progress_mtime(job_dir, active_slug) == pytest.approx(
+        active_mtime, abs=2.0
+    )
+    assert tasks._active_case_progress_mtime(job_dir, "missing") is None
+    assert tasks._active_case_progress_mtime(job_dir, None) is None
+
+
+def test_parallel_runtime_progress_never_borrows_newer_sibling_status_token():
+    """A busy sibling must not make a stale representative case look fresh."""
+
+    now = datetime.now(timezone.utc)
+    stale_active_token = now - timedelta(hours=2)
+    sibling_status = JobStatus(
+        job_id="parallel-progress",
+        state=JobState.running,
+        phase=JobPhase.postprocessing,
+        active_case_slug="c1_u50_am5",
+        active_aoa_deg=-5.0,
+        last_progress_at=now,
+    )
+    active_process = {
+        "pid": 42,
+        "command": "pimpleFoam",
+        "case_slug": "c1_u50_am4",
+        "solver_mode": "urans",
+    }
+
+    observed = tasks._runtime_last_progress_at(
+        active_process,
+        sibling_status,
+        stale_active_token.timestamp(),
+    )
+
+    assert observed == stale_active_token
+    # The same-case status token remains valid, and when process inspection has
+    # no representative the singular status is still the best available token.
+    sibling_status.active_case_slug = active_process["case_slug"]
+    assert (
+        tasks._runtime_last_progress_at(
+            active_process,
+            sibling_status,
+            stale_active_token.timestamp(),
+        )
+        == now
+    )
+    assert tasks._runtime_last_progress_at(None, sibling_status, None) == now
+
+
 def _write_stale_running_job(store: JobStore, job_id: str, phase: JobPhase) -> None:
     status = JobStatus(
         job_id=job_id,

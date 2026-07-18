@@ -31,13 +31,17 @@ import {
   results,
   simCampaignConditions,
   simCampaigns,
+  simJobs,
   simulationPresetRevisions,
   simulationPresets,
+  solverEvidenceArchives,
   solverEvidenceArtifacts,
+  solverEvidenceBlobs,
   solverProfiles,
   sweepDefinitions,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
 import { and, eq, inArray, like, sql as dsql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -54,6 +58,7 @@ let campaignB = "";
 let airfoilId = "";
 let categoryId = "";
 let mediumId = "";
+let restartBlobId = "";
 const profileIds = { boundary: "", mesh: "", solver: "", output: "" };
 
 async function launchCampaign(name: string, speed: number): Promise<string> {
@@ -166,6 +171,10 @@ afterAll(async () => {
     campaignIds: [campaignA, campaignB],
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
   });
+  if (restartBlobId)
+    await db
+      .delete(solverEvidenceBlobs)
+      .where(eq(solverEvidenceBlobs.id, restartBlobId));
   if (profileIds.boundary)
     await db
       .delete(boundaryProfiles)
@@ -251,15 +260,41 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
       .select({
         revisionId: simCampaignConditions.simulationPresetRevisionId,
         bcId: simulationPresets.legacyBoundaryConditionId,
+        solverImplementationId:
+          simulationPresetRevisions.solverImplementationId,
       })
       .from(simCampaignConditions)
       .innerJoin(
         simulationPresets,
         eq(simulationPresets.id, simCampaignConditions.presetId),
       )
+      .innerJoin(
+        simulationPresetRevisions,
+        eq(
+          simulationPresetRevisions.id,
+          simCampaignConditions.simulationPresetRevisionId,
+        ),
+      )
       .where(eq(simCampaignConditions.campaignId, campaignA))
       .limit(1);
     expect(setup?.bcId).toBeTruthy();
+    const [evidenceJob] = await db
+      .insert(simJobs)
+      .values({
+        engineJobId: `${PREFIX}-cleanup-evidence`,
+        methodKey: "openfoam.urans",
+        solverImplementationId: setup.solverImplementationId,
+        airfoilId,
+        bcIds: [setup.bcId!],
+        simulationPresetRevisionId: setup.revisionId,
+        campaignId: campaignA,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        status: "done",
+        totalCases: 1,
+        completedCases: 1,
+      })
+      .returning({ id: simJobs.id });
     const [evidenceResult] = await db
       .insert(results)
       .values({
@@ -267,6 +302,11 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
         bcId: setup.bcId!,
         simulationPresetRevisionId: setup.revisionId,
         aoaDeg: 6,
+        simJobId: evidenceJob.id,
+        engineJobId: `${PREFIX}-cleanup-evidence`,
+        engineCaseSlug: "a6",
+        methodKey: "openfoam.urans",
+        solverImplementationId: setup.solverImplementationId,
         status: "done",
         source: "solved",
         regime: "rans",
@@ -291,8 +331,11 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
         bcId: setup.bcId!,
         simulationPresetRevisionId: setup.revisionId,
         aoaDeg: 6,
+        simJobId: evidenceJob.id,
         engineJobId: `${PREFIX}-cleanup-evidence`,
         engineCaseSlug: "a6",
+        methodKey: "openfoam.urans",
+        solverImplementationId: setup.solverImplementationId,
         status: "done",
         source: "solved",
         regime: "rans",
@@ -311,8 +354,11 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
       resultId: evidenceResult.id,
       resultAttemptId: attempt.id,
       airfoilId,
+      simJobId: evidenceJob.id,
       engineJobId: `${PREFIX}-cleanup-evidence`,
       engineCaseSlug: "a6",
+      methodKey: "openfoam.urans",
+      solverImplementationId: setup.solverImplementationId,
       aoaDeg: 6,
       kind: "manifest",
       storageKey: `${PREFIX}/cleanup-evidence/manifest.json`,
@@ -321,6 +367,11 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
       byteSize: 64,
       metadata: { evidenceBase: `${PREFIX}/cleanup-evidence` },
     });
+    const restartArchive = await createVerifiedRestartArchiveFixture(db, {
+      resultId: evidenceResult.id,
+      resultAttemptId: attempt.id,
+    });
+    restartBlobId = restartArchive.blobId;
     await db
       .update(results)
       .set({ currentResultAttemptId: attempt.id })
@@ -349,6 +400,15 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
       );
     expect(currentBefore).toHaveLength(1);
 
+    // MUST-CATCH for the verified-restart-archive cleanup regression: the
+    // production immutability trigger correctly rejects the old job-first
+    // order because ON DELETE SET NULL would rewrite linked archive evidence.
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.delete(simJobs).where(eq(simJobs.id, evidenceJob.id));
+      }),
+    ).rejects.toThrow(/linked solver evidence artifacts are immutable/);
+
     await cleanupCampaignFixtures(db, {
       campaignIds: [campaignA],
       presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}-aaa`,
@@ -366,6 +426,40 @@ describe("campaign fixture cleanup: shared find-or-create registry rows", () => 
         like(simulationPresets.slug, `campaign-${PREFIX.toLowerCase()}-aaa%`),
       );
     expect(aPresets.length).toBe(0);
+    const leftoverEvidenceGraph = await Promise.all([
+      db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(eq(simJobs.id, evidenceJob.id)),
+      db
+        .select({ id: results.id })
+        .from(results)
+        .where(eq(results.id, evidenceResult.id)),
+      db
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, attempt.id)),
+      db
+        .select({ id: solverEvidenceArtifacts.id })
+        .from(solverEvidenceArtifacts)
+        .where(eq(solverEvidenceArtifacts.resultId, evidenceResult.id)),
+      db
+        .select({ id: solverEvidenceArchives.id })
+        .from(solverEvidenceArchives)
+        .where(eq(solverEvidenceArchives.resultId, evidenceResult.id)),
+    ]);
+    expect(leftoverEvidenceGraph).toEqual([[], [], [], [], []]);
+    // Physical object identity is outside the logical campaign graph by
+    // design; the fixture owner removes it explicitly after proving cleanup.
+    const retainedBlob = await db
+      .select({ id: solverEvidenceBlobs.id })
+      .from(solverEvidenceBlobs)
+      .where(eq(solverEvidenceBlobs.id, restartBlobId));
+    expect(retainedBlob).toHaveLength(1);
+    await db
+      .delete(solverEvidenceBlobs)
+      .where(eq(solverEvidenceBlobs.id, restartBlobId));
+    restartBlobId = "";
     // …but the shared geometry row SURVIVES: campaign B still references it.
     const survivors = await db
       .select({ id: referenceGeometryProfiles.id })

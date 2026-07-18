@@ -46,11 +46,16 @@ import {
   simUransRequests,
   simUransVerifyQueue,
   simUransVerifyQueueCampaigns,
+  solverEvidenceArchives,
+  solverEvidenceBlobs,
   solverProfiles,
   type DB,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
-import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
+import {
+  createAcceptedPrecalcAttemptFixture,
+  createVerifiedRestartArchiveFixture,
+} from "@aerodb/db/test-fixtures";
 import {
   EngineClient,
   type EngineQueueState,
@@ -89,6 +94,7 @@ let mediumId = "";
 const profileIds = { boundary: "", mesh: "", solver: "", output: "" };
 const campaignIds: string[] = [];
 const extraAirfoilIds: string[] = [];
+const evidenceBlobIds: string[] = [];
 const campaigns = {
   active: "",
   paused: "",
@@ -213,6 +219,13 @@ async function selectExactFixtureGeneration(
     state,
     reasons,
   });
+  if (result.fidelity === "urans_precalc") {
+    const archive = await createVerifiedRestartArchiveFixture(db, {
+      resultId: result.id,
+      resultAttemptId,
+    });
+    evidenceBlobIds.push(archive.blobId);
+  }
   return resultAttemptId;
 }
 
@@ -403,6 +416,14 @@ afterAll(async () => {
     campaignIds,
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
   });
+  if (evidenceBlobIds.length) {
+    await db
+      .delete(solverEvidenceArchives)
+      .where(inArray(solverEvidenceArchives.blobId, evidenceBlobIds));
+    await db
+      .delete(solverEvidenceBlobs)
+      .where(inArray(solverEvidenceBlobs.id, evidenceBlobIds));
+  }
   if (profileIds.boundary)
     await db
       .delete(boundaryProfiles)
@@ -766,6 +787,11 @@ describe("campaign verification lifecycle guard", () => {
       state: "rejected",
       reasons: ["insufficient-periods"],
     });
+    const retryableReuseAttemptId = await selectExactFixtureGeneration(
+      retryableReuse,
+      "rejected",
+      ["insufficient-periods"],
+    );
     for (const campaignId of [
       campaigns.sharedA,
       campaigns.sharedB,
@@ -773,7 +799,11 @@ describe("campaign verification lifecycle guard", () => {
     ]) {
       await db
         .update(simCampaignPoints)
-        .set({ state: "terminal", resultId: retryableReuse.id })
+        .set({
+          state: "terminal",
+          resultId: retryableReuse.id,
+          resultAttemptId: retryableReuseAttemptId,
+        })
         .where(
           and(
             eq(simCampaignPoints.campaignId, campaignId),
@@ -791,6 +821,7 @@ describe("campaign verification lifecycle guard", () => {
         state: "cancelled",
         requestedBy: AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
         continueFromResultId: retryableReuse.id,
+        continueFromResultAttemptId: retryableReuseAttemptId,
         budgetOverrideS: 7200,
       })
       .returning();
@@ -889,6 +920,151 @@ describe("campaign verification lifecycle guard", () => {
         ]),
       );
   }, 120000);
+
+  it("MUST-CATCH: a legacy result-only continuation spends only the exact generation retained by its job payload", async () => {
+    const campaignId = await launchCampaign(
+      "legacy-result-only-exact-spend",
+      40.237,
+    );
+    const setup = await campaignSetup(campaignId);
+    const source = await insertPrecalc(setup, 2);
+    await db
+      .update(results)
+      .set({
+        engineJobId: `${PREFIX}-legacy-exact-source`,
+        engineCaseSlug: "aoa_2.00",
+        qualityWarnings: [
+          "URANS integration stopped by the wall-clock budget guard: retained 1.1 of 3 periods (budget)",
+        ],
+      })
+      .where(eq(results.id, source.id));
+    await db.insert(resultClassifications).values({
+      resultId: source.id,
+      airfoilId,
+      simulationPresetRevisionId: setup.revisionId,
+      aoaDeg: 2,
+      regime: "urans",
+      classifierVersion: `${PREFIX}-legacy-exact-result`,
+      state: "rejected",
+      reasons: ["insufficient-periods"],
+    });
+    const attemptA = await selectExactFixtureGeneration(source, "rejected", [
+      "insufficient-periods",
+    ]);
+    const attemptB = await selectExactFixtureGeneration(source, "rejected", [
+      "insufficient-periods",
+    ]);
+    await db
+      .update(simCampaignPoints)
+      .set({
+        state: "terminal",
+        resultId: source.id,
+        resultAttemptId: attemptB,
+      })
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.aoaDeg, 2),
+        ),
+      );
+
+    const [legacyJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [setup.bcId],
+        simulationPresetRevisionId: setup.revisionId,
+        campaignId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "done",
+        engineState: "completed",
+        engineJobId: `${PREFIX}-legacy-exact-continuation-a`,
+        submittedAt: new Date(),
+        finishedAt: new Date(),
+        totalCases: 1,
+        completedCases: 1,
+        requestPayload: {
+          aoas: [2],
+          uransFidelity: "precalc",
+          continueFromResultId: source.id,
+          continueFromResultAttemptId: attemptA,
+        },
+      })
+      .returning({ id: simJobs.id });
+    const [legacyRequest] = await db
+      .insert(simUransRequests)
+      .values({
+        airfoilId,
+        revisionId: setup.revisionId,
+        aoaDeg: 2,
+        fidelity: "precalc",
+        state: "done",
+        requestedBy: AUTO_PRECALC_CONTINUATION_REQUESTED_BY,
+        continueFromResultId: source.id,
+        continueFromResultAttemptId: null,
+        simJobId: legacyJob.id,
+      })
+      .returning({ id: simUransRequests.id });
+    await db.insert(simUransRequestCampaigns).values({
+      requestId: legacyRequest.id,
+      campaignId,
+    });
+
+    await enqueuePrecalcVerifications(db, {
+      airfoilId,
+      revisionId: setup.revisionId,
+      campaignId,
+      aoaDeg: 2,
+    });
+    const exactBRequests = await db
+      .select({ id: simUransRequests.id, state: simUransRequests.state })
+      .from(simUransRequests)
+      .where(
+        and(
+          eq(simUransRequests.continueFromResultId, source.id),
+          eq(simUransRequests.continueFromResultAttemptId, attemptB),
+        ),
+      );
+    expect(exactBRequests).toHaveLength(1);
+    expect(exactBRequests[0].state).toBe("pending");
+
+    await db
+      .update(simUransRequests)
+      .set({ state: "cancelled" })
+      .where(eq(simUransRequests.id, exactBRequests[0].id));
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attemptA })
+      .where(eq(results.id, source.id));
+    await db
+      .update(simCampaignPoints)
+      .set({ resultAttemptId: attemptA })
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.aoaDeg, 2),
+        ),
+      );
+    await enqueuePrecalcVerifications(db, {
+      airfoilId,
+      revisionId: setup.revisionId,
+      campaignId,
+      aoaDeg: 2,
+    });
+    expect(
+      await db
+        .select({ id: simUransRequests.id })
+        .from(simUransRequests)
+        .where(
+          and(
+            eq(simUransRequests.continueFromResultId, source.id),
+            eq(simUransRequests.continueFromResultAttemptId, attemptA),
+          ),
+        ),
+    ).toEqual([]);
+  });
 
   it("reopens a completed campaign with owned verify and request work when add-airfoil reuses preliminary evidence", async () => {
     const completedCampaignId = await launchCampaign(
@@ -1193,9 +1369,18 @@ describe("campaign verification lifecycle guard", () => {
       state: "rejected",
       reasons: ["insufficient-periods"],
     });
+    const sourceAttemptId = await selectExactFixtureGeneration(
+      source,
+      "rejected",
+      ["insufficient-periods"],
+    );
     await db
       .update(simCampaignPoints)
-      .set({ state: "terminal", resultId: source.id })
+      .set({
+        state: "terminal",
+        resultId: source.id,
+        resultAttemptId: sourceAttemptId,
+      })
       .where(
         and(
           eq(simCampaignPoints.campaignId, campaigns.paused),

@@ -54,6 +54,9 @@ describe("per-point solver sequence panel", () => {
     expect(source).toContain(
       "RANS non-convergence is a normal handoff; fast URANS starts automatically",
     );
+    expect(source).toContain(
+      "An accepted RANS result stops there; aerodynamic non-convergence hands off automatically",
+    );
   });
 
   it("keeps technical evidence nested and collapsed, and makes critical rows system-owned and visually red", () => {
@@ -171,8 +174,8 @@ describe("per-point solver sequence panel", () => {
 
     expect(disclosureStart).toBeGreaterThan(-1);
     expect(html.slice(disclosureStart)).toContain("RANS SCREEN");
-    expect(html.slice(disclosureStart)).toContain("URANS FAST");
-    expect(html.slice(disclosureStart)).toContain("URANS FINAL");
+    expect(html.slice(disclosureStart)).toContain("FAST URANS");
+    expect(html.slice(disclosureStart)).toContain("FINAL URANS");
     expect(html.slice(disclosureStart)).toContain("2 evidence records");
     expect(html.slice(disclosureStart)).toContain("1/2 physical attempts");
     expect(html.slice(disclosureStart)).toContain("1 evidence record");
@@ -264,12 +267,100 @@ describe("per-point solver sequence panel", () => {
 
     expect(html).toContain("URANS final · verified");
     expect(html).toContain('data-testid="cell-preliminary-incident-4"');
+    expect(html).toContain(
+      'data-testid="cell-preliminary-critical-announcement"',
+    );
+    expect(html).toContain(
+      "Critical solver incidents: α 4.0° · FAST URANS EXHAUSTED",
+    );
     expect(html).toContain("FAST URANS EXHAUSTED");
     expect(html).toContain("SYSTEM");
+    expect(html.match(/class="connector critical"/g)).toHaveLength(1);
+    expect(html).not.toContain('class="connector warning"');
     expect(html).toContain(
       "Result and incident facets: 0 active, 0 RANS accepted, 0 fast ready, 1 verified, 1 critical",
     );
     expect(html).not.toMatch(/<details[^>]*\sopen(?:=|\s|>)/);
+  });
+
+  it("MUST-CATCH: renders accepted FAST evidence as active automatic FINAL-next work without claiming it is queued", () => {
+    const item: AdminCampaignPreliminaryOutcome = {
+      aoaDeg: 8,
+      sourceAoaDeg: 8,
+      derivedBySymmetry: false,
+      affectedAoaDegs: [8],
+      affectedPointCount: 1,
+      state: "satisfied",
+      outcome: "accepted",
+      ransStage: "screened",
+      fastState: "accepted",
+      finalState: "not_started",
+      finalActivityState: null,
+      finalComparison: null,
+      finalDeltaCl: null,
+      finalDeltaCd: null,
+      finalDeltaCm: null,
+      finalSource: null,
+      criticalStage: null,
+      fastResultId: "fast-result",
+      fastResultAttemptId: "fast-attempt",
+      finalResultId: null,
+      finalResultAttemptId: null,
+      finalEvidenceReasons: [],
+      finalSubmitError: null,
+      finalSubmitHttpStatus: null,
+      physicalAttemptsUsed: 1,
+      physicalAttemptsMax: 2,
+      recoverySubmissions: 1,
+      nonPhysicalSubmissions: 0,
+      interruptedPhysicalRuns: 0,
+      ransEvidenceRuns: 1,
+      preliminaryEvidenceRuns: 1,
+      fullUransEvidenceRuns: 0,
+      legacyUransEvidenceRuns: 0,
+      evidenceReasons: [],
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    };
+    const reactError = vi
+      .spyOn(console, "error")
+      .mockImplementation((message, ...args) => {
+        const rendered = [message, ...args].map(String).join(" ");
+        if (
+          !rendered.includes("non-boolean attribute") ||
+          !rendered.includes("jsx")
+        ) {
+          throw new Error(`Unexpected React render error: ${rendered}`);
+        }
+      });
+    vi.stubGlobal("React", React);
+    let html: string;
+    try {
+      html = renderToStaticMarkup(
+        React.createElement(PreliminaryOutcomePanel, {
+          outcomes: {
+            total: 1,
+            recovering: 0,
+            critical: 0,
+            unavailable: 0,
+            verified: 0,
+            items: [item],
+          },
+          error: null,
+        }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      reactError.mockRestore();
+    }
+
+    expect(html).toContain('data-current-stage="final"');
+    expect(html).toContain('class="stage-node automatic-next"');
+    expect(html).toContain("FINAL URANS · automatic next");
+    expect(html).toContain(
+      "Result and incident facets: 1 active, 0 RANS accepted, 0 fast ready, 0 verified, 0 critical",
+    );
+    expect(html).not.toContain("URANS fast · ready");
+    expect(html).not.toContain("FINAL URANS · queued");
   });
 
   it("separates evidence-record counts from confirmed physical work in the compact stage summaries", () => {
@@ -277,8 +368,8 @@ describe("per-point solver sequence panel", () => {
     expect(source).toContain('data-detail-stage="fast"');
     expect(source).toContain('data-detail-stage="final"');
     expect(source).toContain("RANS SCREEN");
-    expect(source).toContain("URANS FAST");
-    expect(source).toContain("URANS FINAL");
+    expect(source).toContain("FAST URANS");
+    expect(source).toContain("FINAL URANS");
     expect(source).toContain("view.evidenceLabel");
     expect(source).not.toMatch(/ransEvidenceRuns\}\s*physical run/);
     expect(source).toContain("physical");

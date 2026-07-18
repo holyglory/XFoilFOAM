@@ -1,21 +1,17 @@
+import { f1 } from "@aerodb/core";
+
 import type { AdminCampaignPreliminaryOutcome } from "./admin";
 
-const reasonLabels: Record<string, string> = {
+const stageNeutralReasonLabels: Record<string, string> = {
   "non-stationary": "Repeatable averaging window not reached.",
   "insufficient-periods": "Too few repeatable shedding periods.",
   "incomplete-urans-integration": "Transient continuation still needed.",
   "missing-coefficients": "No usable coefficients stored.",
-  "not-converged": "URANS did not settle.",
-  "solver-stalled": "URANS stopped making measurable progress.",
-  "solver-error": "URANS stopped before evidence was stored.",
-  "not-solved": "No completed URANS result.",
   "non-positive-drag": "Drag coefficient is not publishable.",
   "non-physical-coefficients": "Coefficients failed physical checks.",
   "missing-force-history": "Force history required for averaging is missing.",
   "missing-urans-video": "Required transient field media is missing.",
   "sparse-frame-track": "Too few saved field frames.",
-  "selected-attempt-needs-more-evidence": "More evidence is required.",
-  "selected-attempt-rejected": "Publication checks did not pass.",
   "mesh-quality-failure": "Automatic mesh repair exhausted.",
   "engine-infrastructure-failure": "Automatic runtime recovery exhausted.",
   "solver-execution-failed": "Automatic screening recovery exhausted.",
@@ -25,8 +21,26 @@ const reasonLabels: Record<string, string> = {
 const plural = (value: number, singular: string, pluralForm = `${singular}s`) =>
   `${value} ${value === 1 ? singular : pluralForm}`;
 
-const diagnosticFor = (reason: string) =>
-  reasonLabels[reason] ?? `Solver · ${reason.replace(/[-_]+/g, " ")}.`;
+type DiagnosticStage = "rans" | "fast" | "final";
+
+const diagnosticFor = (reason: string, stage: DiagnosticStage) => {
+  const solver =
+    stage === "rans" ? "RANS" : stage === "fast" ? "FAST URANS" : "FINAL URANS";
+  const stageAwareLabels: Record<string, string> = {
+    "not-converged":
+      stage === "rans" ? "RANS did not converge." : `${solver} did not settle.`,
+    "solver-stalled": `${solver} stopped making measurable progress.`,
+    "solver-error": `${solver} stopped before evidence was stored.`,
+    "not-solved": `No completed ${solver} result.`,
+    "selected-attempt-needs-more-evidence": `${solver} needs more evidence.`,
+    "selected-attempt-rejected": `${solver} publication checks did not pass.`,
+  };
+  return (
+    stageAwareLabels[reason] ??
+    stageNeutralReasonLabels[reason] ??
+    `Solver · ${reason.replace(/[-_]+/g, " ")}.`
+  );
+};
 
 const NORMAL_RANS_HANDOFF_REASONS = new Set([
   "not-converged",
@@ -51,7 +65,8 @@ export interface PreliminaryOutcomeView {
   incidentLabel: string | null;
   ransAcceptedResult: boolean;
   ransHandoffPending: boolean;
-  fastRecoveredByFinal: boolean;
+  finalAutomaticNext: boolean;
+  finalAcceptedAfterFastExhaustion: boolean;
   ransProvenanceLabel: string;
   fastProvenanceLabel: string;
   finalProvenanceLabel: string;
@@ -88,11 +103,33 @@ function ransHandoffAwaitingFast(
   item: AdminCampaignPreliminaryOutcome,
 ): boolean {
   return (
-    item.ransStage === "screened" &&
-    item.fastState === "not_started" &&
+    ransHandedOffToFast(item) &&
+    ["not_started", "queued", "running"].includes(item.fastState) &&
     item.finalState === "not_started" &&
-    item.criticalStage === null &&
+    item.criticalStage === null
+  );
+}
+
+/** A screened, non-publishable RANS result is a successful routing decision,
+ * even after FAST work has already entered the queue. Keep that completed
+ * handoff distinct from both an accepted-RANS stop and a machine incident. */
+function ransHandedOffToFast(item: AdminCampaignPreliminaryOutcome): boolean {
+  return (
+    item.ransStage === "screened" &&
+    item.criticalStage !== "preflight" &&
+    item.criticalStage !== "rans" &&
     !ransAcceptedWithoutUrans(item)
+  );
+}
+
+function fastAcceptedAwaitingAutomaticFinal(
+  item: AdminCampaignPreliminaryOutcome,
+): boolean {
+  return (
+    item.fastState === "accepted" &&
+    item.finalState === "not_started" &&
+    item.finalActivityState === null &&
+    item.criticalStage === null
   );
 }
 
@@ -120,7 +157,10 @@ function preliminaryOutcomeIncident(
   if (item.criticalStage === "rans") {
     return {
       incidentStage: "rans",
-      incidentLabel: "RANS RECOVERY EXHAUSTED",
+      incidentLabel:
+        item.outcome === "mesh_unavailable"
+          ? "MESH REPAIR EXHAUSTED"
+          : "PRE-URANS SYSTEM RECOVERY EXHAUSTED",
     };
   } else if (item.finalState === "critical") {
     return {
@@ -149,6 +189,19 @@ function preliminaryOutcomeIncident(
   return { incidentStage: null, incidentLabel: null };
 }
 
+export function preliminaryOutcomeCriticalAnnouncement(
+  items: AdminCampaignPreliminaryOutcome[],
+): string {
+  const incidents = new Set<string>();
+  for (const item of items) {
+    const { incidentLabel } = preliminaryOutcomeIncident(item);
+    if (incidentLabel) {
+      incidents.add(`α ${f1(item.aoaDeg)}° · ${incidentLabel}`);
+    }
+  }
+  return [...incidents].join("; ");
+}
+
 /** The rail describes one point's current solver journey. A queued, critical
  * preflight/RANS, or terminal accepted-RANS row remains at RANS; only an
  * actual handoff advances the current marker to fast URANS. */
@@ -162,7 +215,8 @@ export function preliminaryOutcomeCurrentStage(
   ) {
     return "rans";
   }
-  return item.finalState !== "not_started" ||
+  return fastAcceptedAwaitingAutomaticFinal(item) ||
+    item.finalState !== "not_started" ||
     item.finalActivityState !== null ||
     item.finalComparison !== null
     ? "final"
@@ -195,6 +249,7 @@ export function preliminaryOutcomeCurrentCounts(
       ransHandoffAwaitingFast(item) ||
       item.finalState === "queued" ||
       item.finalState === "running" ||
+      fastAcceptedAwaitingAutomaticFinal(item) ||
       item.finalActivityState === "queued" ||
       item.finalActivityState === "running"
     ) {
@@ -204,7 +259,10 @@ export function preliminaryOutcomeCurrentCounts(
       counts.verified += 1;
     } else if (ransAcceptedWithoutUrans(item)) {
       counts.ransAccepted += 1;
-    } else if (item.fastState === "accepted") {
+    } else if (
+      item.fastState === "accepted" &&
+      !fastAcceptedAwaitingAutomaticFinal(item)
+    ) {
       counts.fastReady += 1;
     }
   }
@@ -217,8 +275,10 @@ export function preliminaryOutcomeView(
 ): PreliminaryOutcomeView {
   const ransOnlyAccepted = ransAcceptedWithoutUrans(item);
   const ransHandoff = ransHandoffAwaitingFast(item);
+  const ransDidHandoff = ransHandedOffToFast(item);
   const ransQueued =
     item.ransStage === "not_started" && item.criticalStage === null;
+  const finalAutomaticNext = fastAcceptedAwaitingAutomaticFinal(item);
   let rans = {
     screened: {
       label: "Screened",
@@ -244,9 +304,9 @@ export function preliminaryOutcomeView(
   }[item.ransStage];
   if (item.criticalStage === "rans") {
     rans = {
-      label: "Recovery exhausted",
+      label: "System recovery exhausted",
       diagnostic:
-        "RANS attempt evidence exists; automatic recovery exhausted before fast URANS.",
+        "RANS evidence exists, but a machine fault exhausted recovery before FAST URANS could start.",
     };
   } else if (ransQueued) {
     rans = {
@@ -258,7 +318,7 @@ export function preliminaryOutcomeView(
       label: "Accepted",
       diagnostic: "RANS produced an accepted point; URANS is not required.",
     };
-  } else if (ransHandoff) {
+  } else if (ransDidHandoff) {
     rans = {
       label: "Handed off",
       diagnostic: "Normal aerodynamic handoff to URANS fast.",
@@ -278,7 +338,7 @@ export function preliminaryOutcomeView(
     accepted: "Verified",
     critical: "Exhausted",
   }[item.finalState];
-  const fastRecoveredByFinal =
+  const finalAcceptedAfterFastExhaustion =
     item.fastState === "critical" && item.finalState === "accepted";
   const incident = preliminaryOutcomeIncident(item);
   if (ransOnlyAccepted) {
@@ -288,8 +348,10 @@ export function preliminaryOutcomeView(
     fastLabel = "Waiting";
     finalLabel = "Waiting";
   } else if (ransHandoff) {
-    fastLabel = "Queued";
+    if (item.fastState === "not_started") fastLabel = "Queued";
     finalLabel = "Waiting";
+  } else if (finalAutomaticNext) {
+    finalLabel = "Automatic next";
   } else if (
     item.finalState === "accepted" &&
     item.finalComparison === "disagreed"
@@ -326,7 +388,10 @@ export function preliminaryOutcomeView(
     status = { label: "CRITICAL · SOLVER COULD NOT START", tone: "critical" };
   } else if (item.criticalStage === "rans") {
     status = {
-      label: "CRITICAL · SCREENING RECOVERY EXHAUSTED",
+      label:
+        item.outcome === "mesh_unavailable"
+          ? "CRITICAL · MESH REPAIR EXHAUSTED"
+          : "CRITICAL · PRE-URANS SYSTEM RECOVERY",
       tone: "critical",
     };
   } else if (item.finalState === "critical") {
@@ -349,6 +414,8 @@ export function preliminaryOutcomeView(
     };
   } else if (item.fastState === "critical") {
     status = { label: "CRITICAL · FAST URANS EXHAUSTED", tone: "critical" };
+  } else if (finalAutomaticNext) {
+    status = { label: "FINAL URANS · automatic next", tone: "violet" };
   } else if (item.fastState === "accepted") {
     status = { label: "URANS fast · ready", tone: "teal" };
   } else if (item.fastState === "running") {
@@ -389,13 +456,17 @@ export function preliminaryOutcomeView(
   const diagnostics = [
     ...item.evidenceReasons
       .filter(
-        (reason) => !ransHandoff || !NORMAL_RANS_HANDOFF_REASONS.has(reason),
+        (reason) => !ransDidHandoff || !NORMAL_RANS_HANDOFF_REASONS.has(reason),
       )
-      .map(diagnosticFor),
-    ...item.finalEvidenceReasons.map(diagnosticFor),
+      .map((reason) =>
+        diagnosticFor(reason, item.criticalStage === "rans" ? "rans" : "fast"),
+      ),
+    ...item.finalEvidenceReasons.map((reason) =>
+      diagnosticFor(reason, "final"),
+    ),
   ];
   if (item.fastState === "critical") {
-    if (fastRecoveredByFinal) {
+    if (finalAcceptedAfterFastExhaustion) {
       diagnostics.unshift(
         "Final URANS is authoritative; the fast path exhausted automatic recovery.",
       );
@@ -415,7 +486,7 @@ export function preliminaryOutcomeView(
     diagnostics.unshift("RANS and fast URANS did not start.");
   } else if (item.criticalStage === "rans") {
     diagnostics.unshift(
-      "RANS attempt evidence exists; automatic recovery exhausted before fast URANS.",
+      "RANS evidence exists, but a machine fault exhausted recovery before FAST URANS could start.",
     );
   }
   if (item.finalComparison === "disagreed") {
@@ -472,13 +543,15 @@ export function preliminaryOutcomeView(
   const finalProvenanceLabel =
     item.fullUransEvidenceRuns > 0
       ? plural(item.fullUransEvidenceRuns, "evidence record")
-      : item.finalState === "running"
-        ? "physical run active"
-        : item.finalState === "queued"
-          ? "verification queued"
-          : item.finalState === "critical"
-            ? "recovery exhausted"
-            : "not started";
+      : finalAutomaticNext
+        ? "automatic next"
+        : item.finalState === "running"
+          ? "physical run active"
+          : item.finalState === "queued"
+            ? "verification queued"
+            : item.finalState === "critical"
+              ? "recovery exhausted"
+              : "not started";
 
   return {
     ransStage: item.ransStage,
@@ -495,7 +568,8 @@ export function preliminaryOutcomeView(
     incidentLabel: incident.incidentLabel,
     ransAcceptedResult: ransOnlyAccepted,
     ransHandoffPending: ransHandoff,
-    fastRecoveredByFinal,
+    finalAutomaticNext,
+    finalAcceptedAfterFastExhaustion,
     ransProvenanceLabel,
     fastProvenanceLabel,
     finalProvenanceLabel,
@@ -503,11 +577,15 @@ export function preliminaryOutcomeView(
       ? "Fast URANS · not required"
       : ransQueued
         ? "Fast URANS · waits for RANS handoff"
-        : ransHandoff
+        : ransHandoff && item.fastState === "not_started"
           ? "Fast URANS · handoff pending"
-          : item.fastState === "not_started"
-            ? "Fast URANS · not started"
-            : `Fast URANS · ${item.physicalAttemptsUsed}/${item.physicalAttemptsMax} physical attempts`,
+          : item.fastState === "queued"
+            ? "Fast URANS · queued"
+            : item.fastState === "running"
+              ? "Fast URANS · running"
+              : item.fastState === "not_started"
+                ? "Fast URANS · not started"
+                : `Fast URANS · ${item.physicalAttemptsUsed}/${item.physicalAttemptsMax} physical attempts`,
     evidenceLabel:
       evidence.length > 0
         ? `Evidence · ${evidence.join(" · ")}`

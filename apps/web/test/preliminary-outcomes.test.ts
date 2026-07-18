@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AdminCampaignPreliminaryOutcome } from "../lib/admin";
 import {
+  preliminaryOutcomeCriticalAnnouncement,
   preliminaryOutcomeCurrentCounts,
   preliminaryOutcomeCurrentStage,
   preliminaryOutcomeView,
@@ -113,6 +114,8 @@ describe("per-angle solver flow copy", () => {
       criticalStage: null,
       physicalAttemptsUsed: 0,
       physicalAttemptsMax: 2,
+      nonPhysicalSubmissions: 0,
+      interruptedPhysicalRuns: 0,
       ransEvidenceRuns: 1,
       preliminaryEvidenceRuns: 0,
       evidenceReasons: ["not-converged", "solver-stalled"],
@@ -136,11 +139,41 @@ describe("per-angle solver flow copy", () => {
     });
   });
 
+  it("MUST-CATCH: the real queued FAST DTO keeps RANS nonconvergence on the normal handoff, not FAST diagnostics", () => {
+    const queuedFast = outcome({
+      state: "pending",
+      outcome: "recovering",
+      ransStage: "screened",
+      fastState: "queued",
+      finalState: "not_started",
+      criticalStage: null,
+      physicalAttemptsUsed: 0,
+      physicalAttemptsMax: 2,
+      nonPhysicalSubmissions: 0,
+      interruptedPhysicalRuns: 0,
+      ransEvidenceRuns: 1,
+      preliminaryEvidenceRuns: 0,
+      evidenceReasons: ["not-converged", "solver-stalled"],
+    });
+
+    const view = preliminaryOutcomeView(queuedFast);
+    expect(preliminaryOutcomeCurrentStage(queuedFast)).toBe("fast");
+    expect(view.ransLabel).toBe("Handed off");
+    expect(view.fastLabel).toBe("Queued");
+    expect(view.finalLabel).toBe("Waiting");
+    expect(view.statusLabel).toBe("URANS fast · queued");
+    expect(view.ransHandoffPending).toBe(true);
+    expect(view.critical).toBe(false);
+    expect(view.budgetLabel).toBe("Fast URANS · queued");
+    expect(view.diagnostics).toEqual([]);
+    expect(JSON.stringify(view)).not.toMatch(/FAST URANS did not settle/i);
+  });
+
   it("MUST-CATCH: fast URANS exhaustion is a critical incident, while run accounting stays diagnostic", () => {
     const view = preliminaryOutcomeView(outcome());
 
     expect(view.fastLabel).toBe("Exhausted");
-    expect(view.ransLabel).toBe("Screened");
+    expect(view.ransLabel).toBe("Handed off");
     expect(view.finalLabel).toBe("Next");
     expect(view.statusLabel).toBe("CRITICAL · FAST URANS EXHAUSTED");
     expect(view.statusTone).toBe("critical");
@@ -160,6 +193,24 @@ describe("per-angle solver flow copy", () => {
     );
     expect(JSON.stringify(view)).not.toMatch(/no action required/i);
     expect(JSON.stringify(view)).not.toMatch(/RANS failure/i);
+  });
+
+  it("deduplicates live critical announcements by AoA and solver stage", () => {
+    const fastCritical = outcome({ aoaDeg: 12 });
+    const finalCritical = outcome({
+      aoaDeg: 13,
+      fastState: "accepted",
+      finalState: "critical",
+      criticalStage: "final",
+    });
+
+    expect(
+      preliminaryOutcomeCriticalAnnouncement([
+        fastCritical,
+        fastCritical,
+        finalCritical,
+      ]),
+    ).toBe("α 12.0° · FAST URANS EXHAUSTED; α 13.0° · FINAL URANS EXHAUSTED");
   });
 
   it.each([
@@ -230,7 +281,7 @@ describe("per-angle solver flow copy", () => {
     ).toBe("rans");
   });
 
-  it("MUST-CATCH: attempted RANS recovery exhaustion is critical without pretending RANS never started", () => {
+  it("MUST-CATCH: a pre-URANS machine-recovery incident is critical without calling normal RANS nonconvergence a failure", () => {
     const attemptedRans = outcome({
       state: "blocked",
       outcome: "recovery_unavailable",
@@ -242,20 +293,22 @@ describe("per-angle solver flow copy", () => {
       physicalAttemptsMax: 0,
       ransEvidenceRuns: 2,
       preliminaryEvidenceRuns: 0,
-      evidenceReasons: ["solver-execution-failed"],
+      evidenceReasons: ["solver-execution-failed", "not-converged"],
     });
 
     const view = preliminaryOutcomeView(attemptedRans);
     expect(preliminaryOutcomeCurrentStage(attemptedRans)).toBe("rans");
-    expect(view.ransLabel).toBe("Recovery exhausted");
+    expect(view.ransLabel).toBe("System recovery exhausted");
     expect(view.fastLabel).toBe("Next");
     expect(view.finalLabel).toBe("Next");
-    expect(view.statusLabel).toBe("CRITICAL · SCREENING RECOVERY EXHAUSTED");
+    expect(view.statusLabel).toBe("CRITICAL · PRE-URANS SYSTEM RECOVERY");
     expect(view.statusTone).toBe("critical");
     expect(view.evidenceLabel).toContain("2 RANS evidence records");
     expect(view.diagnostics.join(" ")).toContain(
-      "RANS attempt evidence exists; automatic recovery exhausted before fast URANS",
+      "RANS evidence exists, but a machine fault exhausted recovery before FAST URANS could start",
     );
+    expect(view.diagnostics.join(" ")).toContain("RANS did not converge");
+    expect(view.diagnostics.join(" ")).not.toContain("URANS did not settle");
     expect(view.diagnostics.join(" ")).not.toContain(
       "RANS and fast URANS did not start",
     );
@@ -296,7 +349,7 @@ describe("per-angle solver flow copy", () => {
       );
 
       expect(view.fastLabel).toBe(entry.fastLabel);
-      expect(view.finalLabel).toBe("Next");
+      expect(view.finalLabel).toBe("Waiting");
       expect(view.statusLabel).toBe(entry.status);
       expect(view.statusTone).toBe("violet");
       expect(view.critical).toBe(false);
@@ -327,26 +380,37 @@ describe("per-angle solver flow copy", () => {
     expect(view.statusTone).toBe("violet");
   });
 
-  it("shows an accepted fast result as a successful result while final URANS is next", () => {
-    const view = preliminaryOutcomeView(
-      outcome({
-        state: "satisfied",
-        outcome: "accepted",
-        fastState: "accepted",
-        finalState: "not_started",
-        criticalStage: null,
-        fastResultId: "fast-result",
-        fastResultAttemptId: "fast-attempt",
-        physicalAttemptsUsed: 1,
-        interruptedPhysicalRuns: 0,
-        nonPhysicalSubmissions: 0,
-        evidenceReasons: [],
-      }),
-    );
+  it("MUST-CATCH: accepted fast evidence advances to automatic final next without inventing a queued row", () => {
+    const item = outcome({
+      state: "satisfied",
+      outcome: "accepted",
+      fastState: "accepted",
+      finalState: "not_started",
+      criticalStage: null,
+      fastResultId: "fast-result",
+      fastResultAttemptId: "fast-attempt",
+      physicalAttemptsUsed: 1,
+      interruptedPhysicalRuns: 0,
+      nonPhysicalSubmissions: 0,
+      evidenceReasons: [],
+    });
+    const view = preliminaryOutcomeView(item);
 
-    expect(view.statusLabel).toBe("URANS fast · ready");
-    expect(view.statusTone).toBe("teal");
+    expect(preliminaryOutcomeCurrentStage(item)).toBe("final");
+    expect(view.fastLabel).toBe("Accepted");
+    expect(view.finalLabel).toBe("Automatic next");
+    expect(view.finalAutomaticNext).toBe(true);
+    expect(view.finalProvenanceLabel).toBe("automatic next");
+    expect(view.statusLabel).toBe("FINAL URANS · automatic next");
+    expect(view.statusLabel).not.toMatch(/queued/i);
+    expect(view.statusTone).toBe("violet");
     expect(view.critical).toBe(false);
+    expect(preliminaryOutcomeCurrentCounts([item])).toMatchObject({
+      active: 1,
+      fastReady: 0,
+      verified: 0,
+      critical: 0,
+    });
   });
 
   it("renders exact accepted final evidence as verified", () => {
@@ -395,7 +459,7 @@ describe("per-angle solver flow copy", () => {
     expect(view.fastLabel).toBe("Exhausted");
     expect(view.statusLabel).toBe("URANS final · verified");
     expect(view.statusTone).toBe("teal");
-    expect(view.fastRecoveredByFinal).toBe(true);
+    expect(view.finalAcceptedAfterFastExhaustion).toBe(true);
     expect(view.critical).toBe(true);
     expect(view.incidentStage).toBe("fast");
     expect(view.incidentLabel).toBe("FAST URANS EXHAUSTED");
@@ -541,6 +605,16 @@ describe("per-angle solver flow copy", () => {
       preliminaryOutcomeCurrentStage(
         outcome({
           fastState: "accepted",
+          finalState: "not_started",
+          finalActivityState: null,
+          criticalStage: null,
+        }),
+      ),
+    ).toBe("final");
+    expect(
+      preliminaryOutcomeCurrentStage(
+        outcome({
+          fastState: "accepted",
           finalState: "accepted",
           finalActivityState: null,
         }),
@@ -623,9 +697,9 @@ describe("per-angle solver flow copy", () => {
 
     const counts = preliminaryOutcomeCurrentCounts(items);
     expect(counts).toEqual({
-      active: 2,
+      active: 3,
       ransAccepted: 1,
-      fastReady: 1,
+      fastReady: 0,
       verified: 3,
       critical: 1,
       total: 6,

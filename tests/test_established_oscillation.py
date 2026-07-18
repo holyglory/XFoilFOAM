@@ -362,6 +362,11 @@ def test_precalc_tier_accepts_established_cycle_and_discloses_scatter(tmp_path, 
     ft = outcome.frame_track
     assert ft is not None
     assert ft.stationary
+    # The longer retained trace may prove that this monotonic short slice is a
+    # bounded modulation, but it must not replace the exact certification tail
+    # that owns the published coefficient/media window.
+    assert ft.periods_retained == pytest.approx(4.5, rel=0.03)
+    assert ft.window.t_start > 609.0
     assert ft.drift_frac > 0.05  # the strict gate would have rejected this
     assert not any("not stationary" in w for w in outcome.quality_warnings)
     scatter = [w for w in outcome.quality_warnings if "cycle means scatter" in w]
@@ -403,6 +408,11 @@ def test_precalc_tier_still_rejects_relaxing_startup(tmp_path, monkeypatch):
     ft = outcome.frame_track
     assert ft is not None
     assert not ft.stationary
+    # Conversely, the longer retained trace may expose persistent relaxation
+    # hidden by the short tail's numerical trend floor without reverting the
+    # published window to startup-biased whole-history statistics.
+    assert ft.periods_retained == pytest.approx(4.5, rel=0.03)
+    assert ft.window.t_start > 609.0
     warnings = [w for w in outcome.quality_warnings if "not stationary" in w]
     assert len(warnings) == 1
     assert "established-oscillation" in warnings[0]
@@ -534,6 +544,151 @@ def test_wave1_conditional_policy_aborts_remaining_rans_for_external_precalc(
     # slice of the execution order.
     assert result.precalc_promotion.intentionally_omitted_aoas == [-2.0, 4.0]
     assert [item.outcome.spec.aoa_deg for item in result.attempts] == [0.0, 2.0]
+
+
+def test_promotion_snapshot_precedes_completed_counter_without_later_event(
+    tmp_path, monkeypatch, naca0012_selig_text
+):
+    """MUST-CATCH: the counter-triggered reconcile sees the promotion.
+
+    Stop the job inside the exact ``completed_cases == 2`` status write for
+    the core hard-RANS attempt.  There is deliberately no omitted-angle solve,
+    sibling condition, or terminal result write to rescue a missed partial.
+    The durable running result read *after* persisting that counter must
+    already contain both the rejected attempt and its typed whole-polar
+    PRECALC promotion.
+    """
+    from airfoilfoam import jobs
+    from airfoilfoam.config import Settings
+    from airfoilfoam.models import (
+        AirfoilInput,
+        AoASpec,
+        JobState,
+        PolarRequest,
+        ResourceParams,
+    )
+    from airfoilfoam.storage import JobStore
+
+    class ReconcileObserved(RuntimeError):
+        pass
+
+    class FakeMesher:
+        def patches(self, _resolved):
+            return {}
+
+    class FakeRunResult:
+        ok = True
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+        def check(self):
+            return self
+
+    reconciled_snapshots = []
+    terminal_result_writes = []
+
+    class ReconcileAtCounterStore(JobStore):
+        def write_result(self, result):
+            if result.state is not JobState.running:
+                terminal_result_writes.append(result.state)
+            return super().write_result(result)
+
+        def write_status(self, status):
+            super().write_status(status)
+            if (
+                status.state is JobState.running
+                and status.completed_cases == 2
+            ):
+                # This models the sweeper's counter-triggered running-result
+                # reconcile at the only event it is guaranteed to receive.
+                reconciled_snapshots.append(self.read_result(status.job_id))
+                raise ReconcileObserved("stop before omitted/terminal events")
+
+    def fake_prepare_mesh(mesh_dir, _airfoil, resolved, *_args, **_kwargs):
+        mesh_dir.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(n_cells=100, patches=[], span_chords=0.1), resolved, False
+
+    solved_aoas = []
+
+    def fake_cold(*args, **_kwargs):
+        solved_aoas.append(args[5].aoa_deg)
+        return FakeRunResult(
+            "Time = 1\nSIMPLE solution converged in 1 iterations\n"
+        )
+
+    def fake_warm(_polar_dir, spec, *_args, **_kwargs):
+        solved_aoas.append(spec.aoa_deg)
+        return FakeRunResult(
+            "Time = 2\n"
+            if spec.aoa_deg == 2.0
+            else "Time = 2\nSIMPLE solution converged in 1 iterations\n"
+        )
+
+    def fake_finalize(_case_dir, outcome, *_args, **_kwargs):
+        outcome.cl = 0.1 * outcome.spec.aoa_deg
+        outcome.cd = 0.02
+        outcome.cm = 0.0
+        outcome.cl_cd = outcome.cl / outcome.cd
+
+    monkeypatch.setattr(jobs, "get_mesher", lambda _name: FakeMesher())
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", fake_prepare_mesh)
+    monkeypatch.setattr(pipeline, "_solve_cold_marched", fake_cold)
+    monkeypatch.setattr(pipeline, "_solve_warm", fake_warm)
+    monkeypatch.setattr(pipeline, "_finalize_outcome", fake_finalize)
+    monkeypatch.setattr(pipeline, "_publish_steady_seed", lambda *_a, **_k: None)
+
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        cpu_token_state_path=tmp_path / "cpu-tokens.json",
+        worker_cpu_budget=1,
+        case_concurrency=1,
+        solver_processes=1,
+    )
+    store = ReconcileAtCounterStore(settings)
+    request = PolarRequest(
+        airfoil=AirfoilInput(
+            name="naca0012",
+            coordinates=naca0012_selig_text,
+        ),
+        speeds=[25.0],
+        aoa=AoASpec(angles=[0.0, 2.0, 4.0]),
+        solver=SolverParams(
+            warm_start=True,
+            transient_fallback=False,
+            rans_failure_policy="abort_for_precalc",
+            write_images=[],
+        ),
+        resources=ResourceParams(
+            policy="case_parallel",
+            cpu_budget=1,
+            case_concurrency=1,
+            solver_processes=1,
+        ),
+    )
+    job_id = "promotion-before-completed-counter"
+    store.create(job_id, request)
+
+    with pytest.raises(ReconcileObserved, match="omitted/terminal"):
+        jobs.execute_job(job_id, request, store=store, settings=settings)
+
+    assert solved_aoas == [0.0, 2.0]
+    assert terminal_result_writes == []
+    status = store.read_status(job_id)
+    assert status is not None
+    assert status.state is JobState.running
+    assert status.completed_cases == 2
+    assert len(reconciled_snapshots) == 1
+    snapshot = reconciled_snapshots[0]
+    assert snapshot is not None
+    assert snapshot.state is JobState.running
+    polar = snapshot.polars[0]
+    assert polar.rans_precalc_promotion is not None
+    assert polar.rans_precalc_promotion.trigger_aoa_deg == 2.0
+    assert polar.rans_precalc_promotion.attempted_aoas == [0.0, 2.0]
+    assert polar.rans_precalc_promotion.intentionally_omitted_aoas == [4.0]
+    assert [attempt.aoa_deg for attempt in polar.attempts] == [0.0, 2.0]
 
 
 def test_engine_publishes_condition_promotion_before_sibling_speed_finishes(

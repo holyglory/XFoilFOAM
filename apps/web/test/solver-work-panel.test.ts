@@ -261,8 +261,9 @@ describe("solver-work popover assembly", () => {
   });
 
   it("pins the continuation POST payload used by the shared admin endpoint", () => {
-    expect(buildContinueUransPayload("res-time", 6)).toEqual({
+    expect(buildContinueUransPayload("res-time", "attempt-time", 6)).toEqual({
       continueFromResultId: "res-time",
+      continueFromResultAttemptId: "attempt-time",
       budgetOverrideS: 21600,
     });
   });

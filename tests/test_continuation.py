@@ -52,6 +52,7 @@ from airfoilfoam.models import (
     EngineRuntimeIdentity,
     FailureDisposition,
     FluidProperties,
+    JobState,
     MeshParams,
     PolarRequest,
     RoughnessParams,
@@ -121,6 +122,12 @@ def _make_saved_case(
     )
     (tcase / "constant" / "polyMesh").mkdir(parents=True)
     (tcase / "constant" / "polyMesh" / "points").write_text("mesh points")
+    (tcase / "constant" / "transportProperties").write_text(
+        "FoamFile { object transportProperties; }\n"
+    )
+    (tcase / "constant" / "turbulenceProperties").write_text(
+        "FoamFile { object turbulenceProperties; }\n"
+    )
     _write_time_dir(tcase, "0")
     _write_time_dir(tcase, latest)
     coeff = tcase / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
@@ -1240,6 +1247,39 @@ def test_stage_continuation_missing_or_unrestartable_sources_fail_honestly(tmp_p
         stage_continuation_case(no_control, dst)
 
 
+@pytest.mark.parametrize(
+    "missing_dictionary",
+    ["transportProperties", "turbulenceProperties"],
+)
+def test_opencfd_continuation_requires_both_constant_dictionaries_before_solver_launch(
+    tmp_path,
+    missing_dictionary,
+):
+    source = (
+        tmp_path
+        / "jobs"
+        / ("d4" * 16)
+        / "cases"
+        / f"missing-{missing_dictionary}"
+    )
+    _make_saved_case(source)
+    _write_source_job_metadata(
+        source,
+        engine_identity=OPENCFD_2606_IDENTITY,
+    )
+    (source / "transient" / "constant" / missing_dictionary).unlink()
+
+    with pytest.raises(
+        OpenFOAMError,
+        match=rf"missing required constant dictionaries {missing_dictionary}",
+    ):
+        stage_continuation_case(
+            source,
+            tmp_path / "never-launched",
+            expected_engine=OPENCFD_2606_IDENTITY,
+        )
+
+
 def test_transient_start_recovery_without_marker(tmp_path):
     # Warm-seeded transient (no in-case init log): transient owns segment 0.
     warm = tmp_path / "warm"
@@ -1579,6 +1619,7 @@ def test_run_case_resume_skips_mesh_and_steady_stages(tmp_path, monkeypatch):
 
 def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     captured = {}
+    completed_count_observations: list[bool] = []
     source = ContinuationSource(
         transient_subdir="transient",
         transient_start=0.42,
@@ -1619,9 +1660,26 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     monkeypatch.setattr(jobs, "run_case", fake_run_case)
     monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", forbid_mesh)
 
+    class ObservingStore(JobStore):
+        def write_status(self, status):
+            if (
+                status.state is JobState.running
+                and status.completed_cases == 1
+            ):
+                partial = self.read_result(status.job_id)
+                completed_count_observations.append(
+                    partial is not None
+                    and partial.state is JobState.running
+                    and sum(
+                        len(polar.points) for polar in partial.polars
+                    )
+                    == 1
+                )
+            super().write_status(status)
+
     request = _continuation_request(naca0012_selig_text)
     settings = get_settings()
-    store = JobStore(settings)
+    store = ObservingStore(settings)
     result = jobs.execute_job("continuation-wiring-test", request, store=store, settings=settings)
 
     assert result.state.value == "completed"
@@ -1647,6 +1705,7 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     assert points[0].case_slug == SPEC.slug
     assert points[0].fidelity == "urans_full"
     assert points[0].continuation_transient_subdir == "transient_refined"
+    assert completed_count_observations == [True]
 
 
 def test_execute_job_continuation_missing_source_fails_honestly(monkeypatch, naca0012_selig_text):
@@ -1749,6 +1808,12 @@ def test_timed_out_transient_leaves_restartable_state_for_continuation(tmp_path,
     (tcase / "system" / "controlDict").write_text("startFrom latestTime;\n")
     (tcase / "constant" / "polyMesh").mkdir(parents=True)
     (tcase / "constant" / "polyMesh" / "points").write_text("mesh points")
+    (tcase / "constant" / "transportProperties").write_text(
+        "FoamFile { object transportProperties; }\n"
+    )
+    (tcase / "constant" / "turbulenceProperties").write_text(
+        "FoamFile { object turbulenceProperties; }\n"
+    )
     _write_time_dir(tcase, "0")
     write_transient_start_marker(tcase, 0.0)
     dirs_before = {d.name for d in tcase.iterdir()}

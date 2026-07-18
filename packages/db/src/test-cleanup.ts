@@ -225,9 +225,6 @@ export async function cleanupCampaignFixtures(
       await db
         .delete(simUransRequests)
         .where(inArray(simUransRequests.revisionId, revisionIds));
-      await db
-        .delete(simJobs)
-        .where(inArray(simJobs.simulationPresetRevisionId, revisionIds));
     }
 
     // Capture registry candidates BEFORE deleting campaigns (created_by is
@@ -270,8 +267,22 @@ export async function cleanupCampaignFixtures(
       ]),
     ];
 
+    // Capture campaign-owned jobs before campaign deletion clears their
+    // campaign_id through ON DELETE SET NULL. Jobs are intentionally deleted
+    // only after their exact result/attempt/artifact graph below: an archived
+    // solver artifact is immutable, so deleting its producing job first would
+    // make the sim_job FK's ON DELETE SET NULL attempt a forbidden artifact
+    // UPDATE. Revision locks above prevent a late revision-owned job insert.
+    const campaignJobIds = campaignIds.length
+      ? (
+          await db
+            .select({ id: simJobs.id })
+            .from(simJobs)
+            .where(inArray(simJobs.campaignId, campaignIds))
+        ).map((row) => row.id)
+      : [];
+
     if (campaignIds.length) {
-      await db.delete(simJobs).where(inArray(simJobs.campaignId, campaignIds));
       await db
         .delete(simCampaigns)
         .where(inArray(simCampaigns.id, campaignIds));
@@ -325,6 +336,20 @@ export async function cleanupCampaignFixtures(
       await db
         .delete(results)
         .where(inArray(results.simulationPresetRevisionId, revisionIds));
+    }
+
+    // Immutable archived artifacts have now cascaded with their exact
+    // attempts/results, so job deletion can no longer invoke a forbidden
+    // ON DELETE SET NULL update on linked evidence. Keep both scopes: revision
+    // ownership is authoritative, while captured campaign ids cover any
+    // partially-created fixture job that never acquired a revision.
+    if (revisionIds.length) {
+      await db
+        .delete(simJobs)
+        .where(inArray(simJobs.simulationPresetRevisionId, revisionIds));
+    }
+    if (campaignJobIds.length) {
+      await db.delete(simJobs).where(inArray(simJobs.id, campaignJobIds));
     }
 
     if (presetIds.length) {

@@ -36,6 +36,7 @@ export interface SolverWorkPoint {
   aoaDeg: number;
   state: SolverWorkPointState;
   resultId: string | null;
+  continuationResultAttemptId?: string | null;
   fidelity: string | null;
   cl: number | null;
   cd: number | null;
@@ -423,9 +424,18 @@ export function solverWorkResultContext(
 
 export function buildContinueUransPayload(
   resultId: string,
+  resultAttemptId: string,
   hours: 2 | 6 | 24,
-): { continueFromResultId: string; budgetOverrideS: number } {
-  return { continueFromResultId: resultId, budgetOverrideS: hours * 3600 };
+): {
+  continueFromResultId: string;
+  continueFromResultAttemptId: string;
+  budgetOverrideS: number;
+} {
+  return {
+    continueFromResultId: resultId,
+    continueFromResultAttemptId: resultAttemptId,
+    budgetOverrideS: hours * 3600,
+  };
 }
 
 export function buildSolverWorkPopoverView(

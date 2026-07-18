@@ -29,6 +29,10 @@ import {
   type CampaignErrorClass,
 } from "./campaigns";
 import type { DB } from "./client";
+import {
+  exactValidSolverManifestSql,
+  exactVerifiedRestartableEvidenceArchiveSql,
+} from "./evidence-manifest";
 import { lockPrecalcCells } from "./precalc-cell-lock";
 
 /** Filterable status buckets. 'rejected' is a DEPRECATED alias kept for old
@@ -46,28 +50,13 @@ export const POINT_HISTORY_BUCKETS = [
 ] as const;
 export type PointHistoryBucket = (typeof POINT_HISTORY_BUCKETS)[number];
 
-/** Single source of truth for the status chips AND the bucket filter.
- *  `r` = results row, `rc` = LEFT-joined result-level classification.
- *  - solving covers the whole open pipeline: pending (re-claimable), queued
- *    (claimed) and running rows.
- *  - done rows without a matching classification state (superseded /
- *    unclassified / stale) fall into 'other' — they appear under "all" only,
- *    never silently inflate a chip. */
-const BUCKET_SQL = sql`CASE
-  WHEN r.status = 'failed' THEN 'failed'
-  WHEN r.status IN ('pending', 'queued', 'running') THEN 'solving'
-  WHEN r.status = 'done' AND rc.state = 'rejected' THEN 'rejected'
-  WHEN r.status = 'done' AND rc.state = 'needs_urans' THEN 'needs_urans'
-  WHEN r.status = 'done' AND rc.state = 'accepted' THEN 'accepted'
-  ELSE 'other'
-END`;
-
 // ---------------------------------------------------------------------------
 // Amendment-A semantic split, applied to RAW results rows — the same rule the
 // campaign payloads derive from sim_campaign_points (see the canonical
 // definition + rationale in urans-ladder.ts campaignReviewBucketRows):
-//   awaiting_urans — done + rejected at fidelity 'rans' (or NULL on a row not
-//     explicitly marked URANS): the stage-2 queue, violet, no repair verbs.
+//   awaiting_urans — rejected/needs-URANS evidence or a typed hard RANS
+//     non-convergence/stall while runnable FAST URANS owns the exact cell:
+//     the normal stage-1 → stage-2 handoff, violet, no repair verbs.
 //   needs_review — reserved for an explicit future evidence-adjudication
 //     workflow. Solver crashes, setup/mesh defects, exhausted period
 //     acquisition and missing media are machine failures: they stay visible
@@ -115,33 +104,147 @@ const SCHEDULED_WORK_SQL = sql`(
   )
 )`;
 
-const WORK_DISPOSITION_SQL = sql`CASE
-  WHEN ${BLOCKED_WORK_SQL} THEN 'blocked'
-  WHEN ${SCHEDULED_WORK_SQL} THEN 'scheduled'
-  ELSE NULL
-END`;
-
-const AWAITING_URANS_RESULT_SQL = sql`(
-  r.status = 'done' AND rc.state = 'rejected'
+/** One per-point journey: a typed hard RANS failure (or legacy explicit
+ * non-convergence/stall) is a normal handoff while FAST URANS owns runnable
+ * work for the same physical cell. Structured deterministic-mesh and
+ * infrastructure failures remain critical even if some unrelated request is
+ * open; the conservative legacy fallback also excludes obvious machine,
+ * storage, archive and mesh failures. */
+const RANS_FAST_HANDOFF_SQL = sql`(
+  r.status IN ('done', 'failed')
   AND (
     r.fidelity = 'rans'
     OR (r.fidelity IS NULL AND r.regime IS DISTINCT FROM 'urans')
   )
   AND ${SCHEDULED_WORK_SQL}
   AND NOT ${BLOCKED_WORK_SQL}
+  AND NOT EXISTS (
+    SELECT 1
+    FROM result_attempts infrastructure_attempt
+    WHERE infrastructure_attempt.id = r.current_result_attempt_id
+      AND infrastructure_attempt.result_id = r.id
+      AND infrastructure_attempt.evidence_payload ->> 'failure_disposition'
+          IN ('deterministic_mesh', 'infrastructure')
+  )
+  AND (
+    (r.status = 'done' AND rc.state IN ('rejected', 'needs_urans'))
+    OR (
+      r.status = 'failed'
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM result_attempts handoff_attempt
+          WHERE handoff_attempt.id = r.current_result_attempt_id
+            AND handoff_attempt.result_id = r.id
+            AND handoff_attempt.evidence_payload ->> 'failure_disposition'
+                = 'hard_solver'
+        )
+        OR (
+          NOT EXISTS (
+            SELECT 1
+            FROM result_attempts typed_attempt
+            WHERE typed_attempt.id = r.current_result_attempt_id
+              AND typed_attempt.result_id = r.id
+              AND typed_attempt.evidence_payload ? 'failure_disposition'
+          )
+          AND (
+            r.stalled IS TRUE
+            OR COALESCE(r.error, '') ~* '(not[- ]?converg|solver[- ]?stall)'
+          )
+          AND COALESCE(r.error, '') !~* '(mesh|storage|archive|gcs|blob|disk|connect|unreachable|econn|segmentation|out of memory|\\boom\\b|\\bkilled\\b|\\bcrash)'
+        )
+      )
+    )
+  )
 )`;
+
+/** Single source of truth for the status chips AND the bucket filter.
+ *  `r` = results row, `rc` = LEFT-joined result-level classification.
+ *  - solving covers the whole open pipeline: pending (re-claimable), queued
+ *    (claimed) and running rows.
+ *  - a failed/stalled RANS generation already handed to FAST URANS is part of
+ *    the calm automatic journey, never a critical failed-point bucket.
+ *  - done rows without a matching classification state (superseded /
+ *    unclassified / stale) fall into 'other' — they appear under "all" only,
+ *    never silently inflate a chip. */
+const BUCKET_SQL = sql`CASE
+  WHEN ${RANS_FAST_HANDOFF_SQL} THEN 'rejected'
+  WHEN r.status = 'failed' THEN 'failed'
+  WHEN r.status IN ('pending', 'queued', 'running') THEN 'solving'
+  WHEN r.status = 'done' AND rc.state = 'rejected' THEN 'rejected'
+  WHEN r.status = 'done' AND rc.state = 'needs_urans' THEN 'needs_urans'
+  WHEN r.status = 'done' AND rc.state = 'accepted' THEN 'accepted'
+  ELSE 'other'
+END`;
+
+const WORK_DISPOSITION_SQL = sql`CASE
+  WHEN ${BLOCKED_WORK_SQL} THEN 'blocked'
+  WHEN ${SCHEDULED_WORK_SQL} THEN 'scheduled'
+  ELSE NULL
+END`;
+
+const AWAITING_URANS_RESULT_SQL = RANS_FAST_HANDOFF_SQL;
 
 /** Continuable (amendment C): a rejected urans_* row whose engine warning says
  * either (a) wall-clock budget stopped a restartable solve or (b) the bounded
  * in-run controller still requires same-case integration, and whose saved case
  * state is addressable. This is machine/action time, never human review. */
 export const CONTINUABLE_SQL = sql`(
-  r.status = 'done' AND rc.state = 'rejected' AND r.fidelity LIKE 'urans%'
-  AND r.engine_job_id IS NOT NULL AND r.engine_case_slug IS NOT NULL
+  r.status = 'done'
   AND EXISTS (
-    SELECT 1 FROM unnest(COALESCE(r.quality_warnings, ARRAY[]::text[])) w
-    WHERE w LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
-       OR w LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+    SELECT 1
+    FROM result_attempts continuation_attempt
+    JOIN result_classifications continuation_classification
+      ON continuation_classification.result_attempt_id = continuation_attempt.id
+     AND continuation_classification.state = 'rejected'
+    JOIN simulation_preset_revisions continuation_revision
+      ON continuation_revision.id = continuation_attempt.simulation_preset_revision_id
+    WHERE continuation_attempt.id = r.current_result_attempt_id
+      AND continuation_attempt.result_id = r.id
+      AND continuation_attempt.airfoil_id = r.airfoil_id
+      AND continuation_attempt.bc_id = r.bc_id
+      AND continuation_attempt.simulation_preset_revision_id =
+          r.simulation_preset_revision_id
+      AND continuation_attempt.aoa_deg = r.aoa_deg
+      AND continuation_attempt.status IN ('done', 'failed')
+      AND continuation_attempt.source = 'solved'
+      AND continuation_attempt.evidence_payload ->> 'fidelity'
+          IN ('urans_precalc', 'urans_full')
+      AND continuation_attempt.engine_job_id IS NOT NULL
+      AND continuation_attempt.engine_case_slug IS NOT NULL
+      AND continuation_attempt.solver_implementation_id IS NOT NULL
+      AND continuation_revision.solver_implementation_id IS NOT NULL
+      AND continuation_attempt.solver_implementation_id =
+          continuation_revision.solver_implementation_id
+      AND EXISTS (
+        SELECT 1
+        FROM unnest(
+          COALESCE(continuation_attempt.quality_warnings, ARRAY[]::text[])
+        ) warning
+        WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+           OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+      )
+      AND (
+        SELECT count(*) = 1
+          AND bool_and(
+            artifact.airfoil_id = continuation_attempt.airfoil_id
+            AND artifact.sim_job_id IS NOT DISTINCT FROM
+                continuation_attempt.sim_job_id
+            AND artifact.engine_job_id IS NOT DISTINCT FROM
+                continuation_attempt.engine_job_id
+            AND artifact.engine_case_slug IS NOT DISTINCT FROM
+                continuation_attempt.engine_case_slug
+            AND artifact.aoa_deg IS NOT DISTINCT FROM continuation_attempt.aoa_deg
+            AND artifact.sha256 ~ '^[0-9a-fA-F]{64}$'
+            AND artifact.byte_size > 0
+            AND length(trim(artifact.storage_key)) > 0
+            AND length(trim(artifact.mime_type)) > 0
+          )
+        FROM solver_evidence_artifacts artifact
+        WHERE artifact.result_id = continuation_attempt.result_id
+          AND artifact.result_attempt_id = continuation_attempt.id
+          AND artifact.kind = 'manifest'
+      )
   )
 )`;
 
@@ -819,6 +922,8 @@ export interface PointStory {
     /** Amendment C: rejected urans row with restartable saved case state — the
      *  story panel renders Continue +2h/+6h on exactly these. */
     continuable: boolean;
+    /** Exact immutable generation that the Continue action must name. */
+    continuationResultAttemptId: string | null;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;
   };
@@ -846,6 +951,9 @@ export async function pointStory(
       r.error, r.quality_warnings, r.simulation_preset_revision_id AS revision_id,
       r."solvedAt" AS solved_at, r."updatedAt" AS updated_at, r.fidelity,
       ${REVIEW_BUCKET_SQL} AS review_bucket, ${CONTINUABLE_SQL} AS continuable,
+      CASE WHEN ${CONTINUABLE_SQL}
+        THEN r.current_result_attempt_id ELSE NULL
+      END AS continuation_result_attempt_id,
       ${WORK_DISPOSITION_SQL} AS work_disposition,
       rc.state::text AS cls_state, rc.reasons AS cls_reasons, rc.confidence AS cls_confidence,
       rc.classifier_version AS cls_version,
@@ -906,6 +1014,7 @@ export async function pointStory(
     review_bucket: "awaiting_urans" | "needs_review" | null;
     work_disposition: "scheduled" | "blocked" | null;
     continuable: boolean | null;
+    continuation_result_attempt_id: string | null;
     verify_state: string | null;
     verify_delta_cl: number | string | null;
     verify_delta_cd: number | string | null;
@@ -1053,6 +1162,7 @@ export async function pointStory(
       reviewBucket: p.review_bucket ?? null,
       workDisposition: p.work_disposition ?? null,
       continuable: Boolean(p.continuable),
+      continuationResultAttemptId: p.continuation_result_attempt_id,
       verify:
         p.verify_state == null
           ? null
@@ -1273,6 +1383,7 @@ export async function listContinuableNeedsReview(
 ): Promise<
   Array<{
     resultId: string;
+    resultAttemptId: string;
     airfoilId: string;
     revisionId: string;
     aoaDeg: number;
@@ -1283,17 +1394,49 @@ export async function listContinuableNeedsReview(
     ? sql`AND EXISTS (
         SELECT 1 FROM sim_campaign_points p
         WHERE p.campaign_id = ${opts.campaignId} AND NOT p.derived_by_symmetry
-          AND ((p.result_id = r.id)
+          AND ((p.result_id = r.id AND p.result_attempt_id = attempt.id)
             OR (p.state = 'requested' AND p.revision_id = r.simulation_preset_revision_id
                 AND p.airfoil_id = r.airfoil_id AND p.aoa_deg = r.aoa_deg))
       )`
     : sql``;
   const rows = (await db.execute(sql`
-    SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
-           r.aoa_deg::float8 AS aoa_deg, r.fidelity
+    SELECT r.id AS result_id, attempt.id AS result_attempt_id,
+           r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
+           r.aoa_deg::float8 AS aoa_deg,
+           attempt.evidence_payload ->> 'fidelity' AS fidelity
     FROM results r
-    LEFT JOIN result_classifications rc ON rc.result_id = r.id
-    WHERE ${CONTINUABLE_SQL}
+    JOIN result_attempts attempt
+      ON attempt.id = r.current_result_attempt_id
+     AND attempt.result_id = r.id
+     AND attempt.airfoil_id = r.airfoil_id
+     AND attempt.simulation_preset_revision_id = r.simulation_preset_revision_id
+     AND attempt.aoa_deg = r.aoa_deg
+    JOIN result_classifications rc
+      ON rc.result_attempt_id = attempt.id
+     AND rc.state = 'rejected'
+    JOIN simulation_preset_revisions revision
+      ON revision.id = attempt.simulation_preset_revision_id
+    WHERE r.status = 'done'
+      AND attempt.status IN ('done', 'failed')
+      AND attempt.source = 'solved'
+      AND attempt.evidence_payload ->> 'fidelity'
+          IN ('urans_precalc', 'urans_full')
+      AND attempt.engine_job_id IS NOT NULL
+      AND attempt.engine_case_slug IS NOT NULL
+      AND attempt.solver_implementation_id IS NOT NULL
+      AND revision.solver_implementation_id IS NOT NULL
+      AND attempt.solver_implementation_id = revision.solver_implementation_id
+      AND EXISTS (
+        SELECT 1
+        FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+        WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+           OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+      )
+      AND ${exactValidSolverManifestSql(sql`r.id`, sql`attempt.id`)}
+      AND ${exactVerifiedRestartableEvidenceArchiveSql(
+        sql`r.id`,
+        sql`attempt.id`,
+      )}
       AND NOT EXISTS (
         SELECT 1 FROM sim_urans_requests req
         WHERE req.airfoil_id = r.airfoil_id
@@ -1306,6 +1449,7 @@ export async function listContinuableNeedsReview(
     ORDER BY r."updatedAt" ASC
   `)) as unknown as Array<{
     result_id: string;
+    result_attempt_id: string;
     airfoil_id: string;
     revision_id: string;
     aoa_deg: number;
@@ -1313,6 +1457,7 @@ export async function listContinuableNeedsReview(
   }>;
   return rows.map((r) => ({
     resultId: r.result_id,
+    resultAttemptId: r.result_attempt_id,
     airfoilId: r.airfoil_id,
     revisionId: r.revision_id,
     aoaDeg: Number(r.aoa_deg),
