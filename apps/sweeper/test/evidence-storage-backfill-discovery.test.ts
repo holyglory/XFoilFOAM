@@ -11,8 +11,21 @@ import {
 
 const roots: string[] = [];
 
-async function receipt(root: string, jobId: string, caseId = "case-one") {
-  const evidence = join(root, "jobs", jobId, "cases", caseId, "a0", "evidence");
+async function receipt(
+  root: string,
+  jobId: string,
+  caseId = "case-one",
+  angle = "a0",
+) {
+  const evidence = join(
+    root,
+    "jobs",
+    jobId,
+    "cases",
+    caseId,
+    angle,
+    "evidence",
+  );
   await mkdir(evidence, { recursive: true });
   const path = join(evidence, MIGRATION_RECEIPT_NAME);
   await writeFile(path, "{}", "utf8");
@@ -20,7 +33,9 @@ async function receipt(root: string, jobId: string, caseId = "case-one") {
 }
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true })));
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true })),
+  );
 });
 
 describe("evidence migration receipt discovery", () => {
@@ -72,5 +87,80 @@ describe("evidence migration receipt discovery", () => {
       calls.some((path) => path.startsWith(join(root, "jobs", "job-b"))),
     ).toBe(false);
     expect(calls.some((path) => path.startsWith(heavy))).toBe(false);
+  });
+
+  it("selects sorted deduplicated exact paths without prefix leakage and is idempotent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "evidence-discovery-exact-"));
+    roots.push(root);
+    const first = await receipt(root, "job-selected", "case-one", "a0");
+    const second = await receipt(root, "job-selected", "case-one", "a1");
+    await receipt(root, "job-selected", "case-one", "a1-extra");
+    const selectedPaths = [
+      "cases/case-one/a1/evidence",
+      "cases/case-one/a0/evidence",
+      "cases/case-one/a1/evidence",
+    ];
+
+    const discover = () =>
+      discoverEvidenceMigrationReceipts(root, {
+        jobIds: new Set(["job-selected"]),
+        evidencePaths: selectedPaths,
+      });
+
+    await expect(discover()).resolves.toEqual([first, second]);
+    await expect(discover()).resolves.toEqual([first, second]);
+  });
+
+  it.each([
+    "../job-two/cases/case-one/a0/evidence",
+    "/cases/case-one/a0/evidence",
+    "cases//case-one/a0/evidence",
+    "cases/./case-one/a0/evidence",
+    "cases/case-one/../a0/evidence",
+    "cases\\case-one\\a0\\evidence",
+    "cases/case-one/a0/evidence\n",
+  ])("rejects unsafe exact evidence path %j", async (evidencePath) => {
+    const root = await mkdtemp(join(tmpdir(), "evidence-discovery-unsafe-"));
+    roots.push(root);
+
+    await expect(
+      discoverEvidenceMigrationReceipts(root, {
+        jobIds: new Set(["job-selected"]),
+        evidencePaths: [evidencePath],
+      }),
+    ).rejects.toThrow(/--evidence-path/);
+  });
+
+  it("requires one exact job, forbids limit, and fails closed on cross-job paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "evidence-discovery-scope-"));
+    roots.push(root);
+    await receipt(root, "job-one", "case-one");
+    await receipt(root, "job-two", "only-job-two");
+    const path = "cases/case-one/a0/evidence";
+
+    await expect(
+      discoverEvidenceMigrationReceipts(root, {
+        evidencePaths: [path],
+      }),
+    ).rejects.toThrow("requires exactly one --job-id");
+    await expect(
+      discoverEvidenceMigrationReceipts(root, {
+        jobIds: new Set(["job-one", "job-two"]),
+        evidencePaths: [path],
+      }),
+    ).rejects.toThrow("requires exactly one --job-id");
+    await expect(
+      discoverEvidenceMigrationReceipts(root, {
+        jobIds: new Set(["job-one"]),
+        evidencePaths: [path],
+        limit: 1,
+      }),
+    ).rejects.toThrow("cannot be combined with --limit");
+    await expect(
+      discoverEvidenceMigrationReceipts(root, {
+        jobIds: new Set(["job-one"]),
+        evidencePaths: [path, "cases/only-job-two/a0/evidence"],
+      }),
+    ).rejects.toThrow("did not resolve in the exact job");
   });
 });

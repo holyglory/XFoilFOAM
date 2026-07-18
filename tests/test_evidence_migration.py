@@ -12,6 +12,7 @@ from pathlib import Path
 import google_crc32c
 import pytest
 
+from airfoilfoam import evidence_migration
 from airfoilfoam.config import Settings
 from airfoilfoam.evidence_migration import (
     EvidenceMigrationError,
@@ -19,6 +20,7 @@ from airfoilfoam.evidence_migration import (
     discover_targets,
     migrate_target,
     plan_target,
+    run_migration,
 )
 from airfoilfoam.evidence_store import (
     EvidenceObjectStore,
@@ -470,6 +472,147 @@ def test_dry_run_and_discovery_never_mutate_and_skip_active_jobs(tmp_path: Path)
     assert planned.to_dict()["sourcePaths"] == ["openfoam_evidence.tar.gz"]
     assert (target.evidence_dir / "openfoam_evidence.tar.gz").is_file()
     assert not (target.evidence_dir / "engine_evidence.tar.zst").exists()
+
+
+def test_exact_evidence_paths_are_sorted_deduplicated_and_never_prefix_match(
+    tmp_path: Path,
+) -> None:
+    target, settings = _fixture(tmp_path)
+    selected_second = (
+        target.job_root / "cases" / "case-one" / "a1" / "evidence"
+    )
+    prefix_neighbor = (
+        target.job_root / "cases" / "case-one" / "a1-extra" / "evidence"
+    )
+    shutil.copytree(target.evidence_dir, selected_second)
+    shutil.copytree(target.evidence_dir, prefix_neighbor)
+    first_path = target.relative_evidence_path
+    second_path = selected_second.relative_to(target.job_root).as_posix()
+
+    discovered = list(
+        discover_targets(
+            target.job_root.parent,
+            job_ids={target.job_id},
+            evidence_paths=[second_path, first_path, second_path],
+        )
+    )
+
+    assert [row.relative_evidence_path for row in discovered] == [
+        first_path,
+        second_path,
+    ]
+    assert prefix_neighbor.relative_to(target.job_root).as_posix() not in {
+        row.relative_evidence_path for row in discovered
+    }
+    planned = run_migration(
+        settings,
+        jobs_root=target.job_root.parent,
+        job_ids={target.job_id},
+        evidence_paths=[second_path, first_path, second_path],
+    )
+    assert [row.evidence_path for row in planned] == [first_path, second_path]
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "../job-two/cases/case-one/a0/evidence",
+        "/cases/case-one/a0/evidence",
+        "cases//case-one/a0/evidence",
+        "cases/./case-one/a0/evidence",
+        "cases/case-one/../a0/evidence",
+        "cases\\case-one\\a0\\evidence",
+        "cases/case-one/a0/evidence\n",
+    ],
+)
+def test_exact_evidence_path_rejects_traversal_and_noncanonical_paths(
+    tmp_path: Path,
+    unsafe_path: str,
+) -> None:
+    target, _settings = _fixture(tmp_path)
+
+    with pytest.raises(EvidenceMigrationError, match="evidence path"):
+        list(
+            discover_targets(
+                target.job_root.parent,
+                job_ids={target.job_id},
+                evidence_paths=[unsafe_path],
+            )
+        )
+
+
+def test_exact_evidence_paths_require_one_job_and_every_path_to_resolve(
+    tmp_path: Path,
+) -> None:
+    target, settings = _fixture(tmp_path)
+    other_job = target.job_root.parent / "job-two"
+    shutil.copytree(target.job_root, other_job)
+    other_evidence = other_job / "cases" / "other-case" / "evidence"
+    shutil.copytree(target.evidence_dir, other_evidence)
+    cross_job_path = other_evidence.relative_to(other_job).as_posix()
+
+    for job_ids in (None, {target.job_id, other_job.name}):
+        with pytest.raises(EvidenceMigrationError, match="exactly one job id"):
+            list(
+                discover_targets(
+                    target.job_root.parent,
+                    job_ids=job_ids,
+                    evidence_paths=[target.relative_evidence_path],
+                )
+            )
+
+    with pytest.raises(EvidenceMigrationError, match="did not resolve"):
+        list(
+            discover_targets(
+                target.job_root.parent,
+                job_ids={target.job_id},
+                evidence_paths=[target.relative_evidence_path, cross_job_path],
+            )
+        )
+    with pytest.raises(EvidenceMigrationError, match="did not resolve"):
+        run_migration(
+            settings,
+            jobs_root=target.job_root.parent,
+            execute=True,
+            job_ids={target.job_id},
+            evidence_paths=[target.relative_evidence_path, cross_job_path],
+        )
+    assert not (target.evidence_dir / "engine_evidence.tar.zst").exists()
+    assert not (target.evidence_dir / "storage_migration.json").exists()
+
+
+def test_cli_exact_evidence_paths_require_one_job_and_forbid_limit() -> None:
+    with pytest.raises(SystemExit) as missing_job:
+        evidence_migration._parse_args(  # noqa: SLF001 - MUST-CATCH CLI contract
+            ["--evidence-path", "cases/case-one/a0/evidence"]
+        )
+    assert missing_job.value.code == 2
+
+    with pytest.raises(SystemExit) as repeated_job:
+        evidence_migration._parse_args(  # noqa: SLF001 - MUST-CATCH CLI contract
+            [
+                "--job-id",
+                "job-one",
+                "--job-id",
+                "job-one",
+                "--evidence-path",
+                "cases/case-one/a0/evidence",
+            ]
+        )
+    assert repeated_job.value.code == 2
+
+    with pytest.raises(SystemExit) as limited:
+        evidence_migration._parse_args(  # noqa: SLF001 - MUST-CATCH CLI contract
+            [
+                "--job-id",
+                "job-one",
+                "--evidence-path",
+                "cases/case-one/a0/evidence",
+                "--limit",
+                "1",
+            ]
+        )
+    assert limited.value.code == 2
 
 
 def test_discovery_and_execution_reject_symlinked_job_roots(tmp_path: Path) -> None:

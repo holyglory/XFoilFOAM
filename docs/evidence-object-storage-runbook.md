@@ -944,20 +944,31 @@ healthy.
 
 Do not page through the same sorted discovery set with `--limit`: completed
 targets remain discoverable for idempotency, so a repeated limit would keep
-selecting the same prefix. Select exactly one legacy job, keep that job pinned
-through upload, database registration, and finalization, and only then select
-another. The `--job-id` executors process every discoverable evidence target
-under that job, so a selectable job must be homogeneous: every target returned
-by `discover_targets(..., job_ids={job_id})` must be legacy-gzip-owned. A job
-that mixes legacy evidence with native Zstandard/canary evidence is unsafe for
-this runbook even if only one target still needs migration.
+selecting the same prefix. Select exactly one legacy job and a deterministic
+exact subset of its evidence targets, keep that job/subset pinned through
+upload, database registration, and finalization, and only then select another
+subset. Every executor receives one `--job-id` plus the same repeatable
+`--evidence-path` arguments. Exact selection resolves the complete sorted,
+deduplicated requested set before yielding a target; an unsafe path, missing
+path, cross-job path, or partial match stops before mutation. `--limit` is
+forbidden with exact selection.
+
+A selectable job must still be homogeneous: every target returned by
+`discover_targets(..., job_ids={job_id})` must be legacy-gzip-owned. A job that
+mixes legacy evidence with native Zstandard/canary evidence is unsafe for this
+runbook even when the selected subset contains only legacy targets. Exact
+partitioning is solely a capacity boundary, never a way to hide mixed ownership
+or corrupt siblings.
 
 Write a complete read-only inventory before every cycle. The inventory is also
 the fail-closed incident artifact: any active mixed job, invalid receipt,
-missing/zero-byte legacy source, or exact job above the 4 GiB gzip-input cap
-stops selection before mutation. Do not skip such a row or repeatedly select it
-without resolving the recorded reason. Define the inventory, selector, capacity
-planner, and verifier once:
+missing/zero-byte legacy source, or individual evidence target above the 4 GiB
+gzip-input cap stops all selection before mutation. A valid homogeneous job
+whose aggregate upload input exceeds 4 GiB is `partition-required`, not corrupt:
+the selector packs its lexically ordered, same-phase targets into a deterministic
+subset whose aggregate gzip input is at most 4 GiB. Do not skip a blocking row
+or repeatedly select it without resolving the recorded reason. Define the
+inventory, selector, capacity planner, and verifier once:
 
 ```bash
 write_migration_inventory() {
@@ -969,7 +980,7 @@ from airfoilfoam.evidence_migration import discover_targets
 from airfoilfoam.evidence_store import read_remote_pointer
 
 root = Path("/data/airfoilfoam/jobs")
-phase_rank = {"upload": 0, "register": 1, "finalize": 2}
+phase_rank = {"finalize": 0, "register": 1, "upload": 2}
 max_upload_bytes = 4 * 1024 * 1024 * 1024
 gzip_names = ("engine_evidence.tar.gz", "openfoam_evidence.tar.gz")
 jobs = defaultdict(list)
@@ -989,6 +1000,36 @@ def read_json_object(path, errors, label):
         errors.append(f"{label} is not a JSON object")
         return None
     return value
+
+def pack_same_phase(rows, phase):
+    selected = []
+    selected_upload_bytes = 0
+    for row in rows:
+        if phase != "upload":
+            selected.append(row)
+            continue
+        target_bytes = row["localGzipBytes"]
+        if target_bytes > max_upload_bytes:
+            continue
+        if selected_upload_bytes + target_bytes > max_upload_bytes:
+            break
+        selected.append(row)
+        selected_upload_bytes += target_bytes
+    return selected, selected_upload_bytes
+
+# MUST-CATCH algorithm self-test: a clean aggregate-over-cap job partitions;
+# aggregate size alone creates no blocker, and the exact lexical prefix stays
+# within the hard cap.
+partition_probe = [
+    {"evidencePath": "cases/a/evidence", "localGzipBytes": 3 * 1024**3},
+    {"evidencePath": "cases/b/evidence", "localGzipBytes": 2 * 1024**3},
+]
+probe_blockers = []
+probe_selected, probe_bytes = pack_same_phase(partition_probe, "upload")
+assert sum(row["localGzipBytes"] for row in partition_probe) > max_upload_bytes
+assert probe_blockers == []
+assert [row["evidencePath"] for row in probe_selected] == ["cases/a/evidence"]
+assert 0 < probe_bytes <= max_upload_bytes
 
 for target in discover_targets(root):
     evidence = target.evidence_dir
@@ -1155,9 +1196,11 @@ for job_id in sorted(jobs):
         )
         if active else None
     )
-    upload_bytes = sum(
-        row["localGzipBytes"]
-        for row in required_rows
+    phase_rows = [
+        row for row in required_rows if row["requiredPhase"] == required_phase
+    ]
+    phase_upload_bytes = sum(
+        row["localGzipBytes"] for row in phase_rows
         if row["requiredPhase"] == "upload"
     )
     blockers = []
@@ -1174,16 +1217,36 @@ for job_id in sorted(jobs):
                 blockers.append(
                     f"{row['evidencePath']}: missing_or_zero_legacy_gzip_input"
                 )
-        if required_phase == "upload" and upload_bytes == 0:
-            blockers.append("exact_job_has_zero_legacy_gzip_input")
-        if upload_bytes > max_upload_bytes:
-            blockers.append("exact_job_exceeds_4_GiB_gzip_input_cap")
+            if (
+                row["requiredPhase"] == "upload"
+                and row["localGzipBytes"] > max_upload_bytes
+            ):
+                blockers.append(
+                    f"{row['evidencePath']}: exact_target_exceeds_4_GiB_gzip_input_cap"
+                )
+        if required_phase == "upload" and phase_upload_bytes == 0:
+            blockers.append("selected_phase_has_zero_legacy_gzip_input")
+
+    selected_rows, selected_upload_bytes = pack_same_phase(
+        phase_rows,
+        required_phase,
+    )
+    if active and not selected_rows:
+        blockers.append("no_exact_targets_fit_the_selected_phase")
+    partition_required = (
+        required_phase == "upload"
+        and phase_upload_bytes > max_upload_bytes
+        and not blockers
+    )
     row = {
         "kind": "job",
         "jobId": job_id,
         "active": active,
         "requiredPhase": required_phase,
-        "uploadGzipBytes": upload_bytes,
+        "uploadGzipBytes": selected_upload_bytes,
+        "phaseUploadGzipBytes": phase_upload_bytes,
+        "partitionRequired": partition_required,
+        "selectedTargetPaths": [row["evidencePath"] for row in selected_rows],
         "allTargetPaths": [row["evidencePath"] for row in targets],
         "legacyTargetPaths": [row["evidencePath"] for row in legacy],
         "nonLegacyTargetPaths": [
@@ -1195,6 +1258,25 @@ for job_id in sorted(jobs):
     rows.append(row)
     if blockers:
         blocking_jobs.append(job_id)
+
+# MUST-CATCH partition invariant: aggregate over-capacity alone is never a
+# corruption blocker. A valid oversized upload phase always exposes a nonempty
+# deterministic subset whose exact input remains within the hard 4 GiB cap.
+for inventory_row in rows:
+    oversized_valid_upload = (
+        inventory_row["active"]
+        and inventory_row["requiredPhase"] == "upload"
+        and inventory_row["phaseUploadGzipBytes"] > max_upload_bytes
+        and not inventory_row["blockingReasons"]
+    )
+    if oversized_valid_upload:
+        assert inventory_row["partitionRequired"], inventory_row
+        assert inventory_row["selectedTargetPaths"], inventory_row
+        assert 0 < inventory_row["uploadGzipBytes"] <= max_upload_bytes, inventory_row
+    if inventory_row["partitionRequired"]:
+        assert inventory_row["blockingReasons"] == [], inventory_row
+        assert inventory_row["phaseUploadGzipBytes"] > max_upload_bytes, inventory_row
+        assert 0 < inventory_row["uploadGzipBytes"] <= max_upload_bytes, inventory_row
 
 payload = {
     "schemaVersion": 1,
@@ -1227,6 +1309,11 @@ for row in payload.get("jobs", []):
     if row.get("active") and row.get("requiredPhase") == phase:
         weight = row.get("uploadGzipBytes", 0) if phase == "upload" else 0
         assert isinstance(weight, int) and weight >= 0, row
+        selected = row.get("selectedTargetPaths")
+        assert isinstance(selected, list) and selected == sorted(set(selected)), row
+        assert selected, row
+        if phase == "upload":
+            assert 0 < weight <= 4 * 1024**3, row
         candidates.append((weight, row["jobId"]))
 if candidates:
     print(min(candidates)[1])
@@ -1274,7 +1361,7 @@ expected_paths = json.loads(os.environ["MIGRATION_EXPECTED_TARGETS_JSON"])
 gzip_names = ("engine_evidence.tar.gz", "openfoam_evidence.tar.gz")
 max_gzip_input = 4 * 1024**3
 minimum_reserve = 80 * 1024**3
-phase_rank = {"upload": 0, "register": 1, "finalize": 2}
+phase_rank = {"finalize": 0, "register": 1, "upload": 2}
 settings = get_settings()
 cache_root = settings.resolved_evidence_hydration_cache_dir()
 assert settings.data_dir / "jobs" == jobs_root, settings.data_dir
@@ -1375,7 +1462,21 @@ try:
     assert expected_phase in {*phase_rank, "finalize_or_complete"}, expected_phase
     assert isinstance(expected_paths, list) and expected_paths
     assert expected_paths == sorted(set(expected_paths)), expected_paths
-    targets = list(discover_targets(jobs_root, job_ids={job_id}))
+    all_job_targets = list(discover_targets(jobs_root, job_ids={job_id}))
+    assert all_job_targets, "exact job no longer has discoverable evidence targets"
+    for job_target in all_job_targets:
+        receipt_path = job_target.evidence_dir / "storage_migration.json"
+        assert not receipt_path.is_symlink(), receipt_path
+        receipt = strict_json(receipt_path) if receipt_path.is_file() else None
+        assert legacy_owned(job_target.evidence_dir, receipt), (
+            "exact job gained a nonlegacy/mixed target: "
+            + job_target.relative_evidence_path
+        )
+    targets = list(discover_targets(
+        jobs_root,
+        job_ids={job_id},
+        evidence_paths=set(expected_paths),
+    ))
     actual_paths = sorted(target.relative_evidence_path for target in targets)
     assert actual_paths == expected_paths, {
         "expected": expected_paths,
@@ -1603,6 +1704,22 @@ def legacy_owned(evidence, receipt):
     sources = validate_sources(receipt)
     return any(row.get("compression") == "gzip" for row in sources)
 
+def job_target_legacy_owned(target):
+    evidence = target.evidence_dir
+    receipt_path = evidence / "storage_migration.json"
+    assert not receipt_path.is_symlink(), receipt_path
+    local_gzip = False
+    for name in ("engine_evidence.tar.gz", "openfoam_evidence.tar.gz"):
+        path = evidence / name
+        if path.exists() or path.is_symlink():
+            assert path.is_file() and not path.is_symlink(), path
+            assert path.stat().st_size > 0, path
+            local_gzip = True
+    if not receipt_path.is_file():
+        return local_gzip
+    receipt = strict_json(receipt_path)
+    return local_gzip or legacy_owned(evidence, receipt)
+
 def nonempty_string(value):
     return isinstance(value, str) and value and value == value.strip()
 
@@ -1666,7 +1783,18 @@ def validate_ack(ack, target, pointer, receipt, receipt_path):
         assert receipt.get("databaseAcknowledgement") == ack
 
 rows = []
-targets = list(discover_targets(root, job_ids={job_id}))
+all_job_targets = list(discover_targets(root, job_ids={job_id}))
+assert all_job_targets, "exact job no longer has discoverable evidence targets"
+for job_target in all_job_targets:
+    assert job_target_legacy_owned(job_target), (
+        "exact job gained a nonlegacy/mixed target: "
+        + job_target.relative_evidence_path
+    )
+targets = list(discover_targets(
+    root,
+    job_ids={job_id},
+    evidence_paths=set(expected_paths),
+))
 actual_paths = sorted(target.relative_evidence_path for target in targets)
 assert actual_paths == expected_paths, {"expected": expected_paths, "actual": actual_paths}
 store = evidence_object_store(get_settings())
@@ -1745,11 +1873,15 @@ PY
 status before populating the array. Do not replace it with
 `mapfile < <(next_migration_jobs ...)`: Bash reports `mapfile`'s status, not a
 failed process substitution, so a broken selector can otherwise look like an
-honestly empty batch. The inventory persists the exact homogeneous target set;
-the capacity planner and every phase verifier require the recomputed
-`discover_targets` set to match it exactly. The verifier also uses the canonical
-pointer parser, verifies the pinned remote generation, and compares receipt,
-pointer, acknowledgement, job, evidence path, hashes, and generation identity.
+honestly empty batch. The inventory validates the complete job for homogeneous
+legacy ownership, then persists the exact same-phase subset selected for this
+cycle. The capacity planner and every phase verifier pass that subset back to
+`discover_targets` and require every requested path to resolve exactly. They
+also rescan the complete pinned job and stop if any sibling has become
+nonlegacy or mixed since the inventory snapshot. The verifier uses the
+canonical pointer parser, verifies the pinned remote generation, and compares
+receipt, pointer, acknowledgement, job, evidence path, hashes, and generation
+identity.
 
 Capacity planning has one fail-closed runtime prerequisite: the deployed API
 image must expose libzstd's `ZSTD_compressBound` symbol. The planner deliberately
@@ -1761,8 +1893,8 @@ an approximation.
 ### One exact three-pass cycle
 
 Prioritize an already-started job (`finalize`, then `register`) before selecting
-a fresh upload. Every selector returns at most one ID. Pin that ID for the
-whole cycle:
+a fresh upload. Every selector returns at most one ID and the inventory carries
+its deterministic same-phase target subset. Pin both for the whole cycle:
 
 ```bash
 set -Eeuo pipefail
@@ -1788,18 +1920,53 @@ if [[ -z "$MIGRATION_JOB" ]]; then
 fi
 
 MIGRATION_EXPECTED_TARGETS_JSON="$(
-  python3 - "$MIGRATION_INVENTORY" "$MIGRATION_JOB" <<'PY'
+  python3 - "$MIGRATION_INVENTORY" "$MIGRATION_JOB" \
+    "$MIGRATION_START_PHASE" <<'PY'
 import json, sys
-payload = json.load(open(sys.argv[1], encoding="utf-8"))
-matches = [row for row in payload["jobs"] if row["jobId"] == sys.argv[2]]
+inventory_path, job_id, phase = sys.argv[1:]
+payload = json.load(open(inventory_path, encoding="utf-8"))
+matches = [row for row in payload["jobs"] if row["jobId"] == job_id]
 assert len(matches) == 1, matches
 row = matches[0]
 assert row["active"] and not row["blockingReasons"], row
 assert row["allTargetPaths"] == row["legacyTargetPaths"], row
-print(json.dumps(row["allTargetPaths"], separators=(",", ":")))
+assert row["requiredPhase"] == phase, row
+selected = row["selectedTargetPaths"]
+assert selected == sorted(set(selected)) and selected, row
+if phase == "upload":
+    assert 0 < row["uploadGzipBytes"] <= 4 * 1024**3, row
+print(json.dumps(selected, separators=(",", ":")))
 PY
 )"
 test -n "$MIGRATION_EXPECTED_TARGETS_JSON"
+
+# Materialize the exact JSON selection into a Bash argument array without
+# eval. The path validator mirrors the CLI's safe-relative-path contract, and
+# an ordinary file preserves the producer's exit status (unlike a process
+# substitution hidden behind mapfile).
+MIGRATION_PATHS_FILE="$AUDIT_DIR/bulk-targets-$MIGRATION_JOB-$MIGRATION_START_PHASE.txt"
+if ! python3 - "$MIGRATION_EXPECTED_TARGETS_JSON" >"$MIGRATION_PATHS_FILE" <<'PY'
+import json, sys
+paths = json.loads(sys.argv[1])
+assert isinstance(paths, list) and paths == sorted(set(paths)) and paths
+for path in paths:
+    assert isinstance(path, str) and path and path == path.strip(), path
+    assert not path.startswith("/") and "\\" not in path and "\0" not in path, path
+    assert all(ord(character) >= 32 and ord(character) != 127 for character in path), path
+    assert all(part not in {"", ".", ".."} for part in path.split("/")), path
+    print(path)
+PY
+then
+  echo "refusing bulk mutation; cannot materialize exact target paths" >&2
+  exit 1
+fi
+MIGRATION_EVIDENCE_PATHS=()
+mapfile -t MIGRATION_EVIDENCE_PATHS <"$MIGRATION_PATHS_FILE"
+((${#MIGRATION_EVIDENCE_PATHS[@]}))
+MIGRATION_TARGET_ARGS=(--job-id "$MIGRATION_JOB")
+for evidence_path in "${MIGRATION_EVIDENCE_PATHS[@]}"; do
+  MIGRATION_TARGET_ARGS+=(--evidence-path "$evidence_path")
+done
 
 # The planner streams every upload-needed gzip to obtain the exact tar byte
 # count, asks libzstd for ZSTD_compressBound, and reserves simultaneous space
@@ -1816,14 +1983,14 @@ if ! plan_migration_capacity "$MIGRATION_JOB" "$MIGRATION_START_PHASE" \
 fi
 
 compose exec -T api python3 -m airfoilfoam.evidence_migration \
-  --execute --job-id "$MIGRATION_JOB" \
+  --execute "${MIGRATION_TARGET_ARGS[@]}" \
   2>&1 | tee -a "$AUDIT_DIR/bulk-pass1-python.jsonl"
 verify_migration_job "$MIGRATION_JOB" uploaded \
   "$MIGRATION_EXPECTED_TARGETS_JSON" \
   | tee -a "$AUDIT_DIR/bulk-pass1-verified.jsonl"
 
 compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
-  src/evidence-storage-backfill.ts --execute --job-id "$MIGRATION_JOB" \
+  src/evidence-storage-backfill.ts --execute "${MIGRATION_TARGET_ARGS[@]}" \
   2>&1 | tee -a "$AUDIT_DIR/bulk-pass2-node.jsonl"
 verify_migration_job "$MIGRATION_JOB" registered \
   "$MIGRATION_EXPECTED_TARGETS_JSON" \
@@ -1840,7 +2007,7 @@ if ! plan_migration_capacity "$MIGRATION_JOB" finalize_or_complete \
 fi
 
 compose exec -T api python3 -m airfoilfoam.evidence_migration \
-  --execute --job-id "$MIGRATION_JOB" \
+  --execute "${MIGRATION_TARGET_ARGS[@]}" \
   2>&1 | tee -a "$AUDIT_DIR/bulk-pass3-python.jsonl"
 verify_migration_job "$MIGRATION_JOB" finalized \
   "$MIGRATION_EXPECTED_TARGETS_JSON" \
@@ -1848,8 +2015,9 @@ verify_migration_job "$MIGRATION_JOB" finalized \
 ```
 
 There is no `--continue-on-error`: this is one atomic operator cycle, and any
-failed target stops it on the same pinned job. Restarting the exact cycle is
-safe and idempotent. Select another job only after the final verifier succeeds.
+failed target stops it on the same pinned job/subset. Restarting the exact cycle
+is safe and idempotent: repeated paths are deduplicated and every requested path
+must still resolve. Select another subset only after the final verifier succeeds.
 Repeat the inventory before each new cycle so state drift, mixed scope, and
 corrupt candidates cannot be hidden by an earlier snapshot. End only when all
 three selectors return empty, the inventory has no blocking job, and

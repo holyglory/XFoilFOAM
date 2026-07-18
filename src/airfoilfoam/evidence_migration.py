@@ -119,15 +119,56 @@ class MigrationResult:
         }
 
 
+def _safe_relative_evidence_path(value: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise EvidenceMigrationError(
+            "evidence path must be a non-empty exact relative path"
+        )
+    if (
+        value.startswith("/")
+        or "\\" in value
+        or "\0" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise EvidenceMigrationError("evidence path must be a safe relative path")
+    return value
+
+
 def discover_targets(
     jobs_root: Path,
     *,
     job_ids: set[str] | None = None,
+    evidence_paths: Iterable[str] | None = None,
 ) -> Iterator[MigrationTarget]:
-    """Yield terminal-job evidence directories with a local or remote bundle."""
+    """Yield terminal-job evidence directories with a local or remote bundle.
+
+    Exact evidence-path selection is all-or-nothing: one job is fully scanned,
+    every requested path must match a discoverable target exactly, and only
+    then are the sorted, deduplicated targets yielded.
+    """
 
     jobs_root = Path(jobs_root)
+    selected_paths = (
+        tuple(sorted({_safe_relative_evidence_path(path) for path in evidence_paths}))
+        if evidence_paths is not None
+        else None
+    )
+    if selected_paths is not None:
+        if not selected_paths:
+            raise EvidenceMigrationError(
+                "at least one evidence path is required when exact selection is enabled"
+            )
+        if job_ids is None or len(job_ids) != 1:
+            raise EvidenceMigrationError(
+                "exact evidence-path selection requires exactly one job id"
+            )
     if not jobs_root.is_dir():
+        if selected_paths is not None:
+            raise EvidenceMigrationError(
+                "requested evidence paths did not resolve in the exact job: "
+                + ", ".join(selected_paths)
+            )
         return
     if job_ids is None:
         job_roots = sorted(
@@ -149,6 +190,7 @@ def discover_targets(
             candidate = jobs_root / job_id
             if candidate.is_dir() and not candidate.is_symlink():
                 job_roots.append(candidate)
+    selected_targets: dict[str, MigrationTarget] = {}
     for job_root in job_roots:
         try:
             job_root.resolve(strict=True).relative_to(jobs_root.resolve(strict=True))
@@ -186,7 +228,27 @@ def discover_targets(
                 or EVIDENCE_POINTER_NAME in names
                 or any(name in names for name in LEGACY_GZIP_NAMES)
             ):
-                yield MigrationTarget(job_root=job_root, evidence_dir=current)
+                target = MigrationTarget(job_root=job_root, evidence_dir=current)
+                if selected_paths is None:
+                    yield target
+                    continue
+                relative_path = target.relative_evidence_path
+                if relative_path in selected_paths:
+                    if relative_path in selected_targets:
+                        raise EvidenceMigrationError(
+                            f"requested evidence path resolved more than once: {relative_path}"
+                        )
+                    selected_targets[relative_path] = target
+
+    if selected_paths is not None:
+        missing = [path for path in selected_paths if path not in selected_targets]
+        if missing:
+            raise EvidenceMigrationError(
+                "requested evidence paths did not resolve in the exact job: "
+                + ", ".join(missing)
+            )
+        for path in selected_paths:
+            yield selected_targets[path]
 
 
 def plan_target(target: MigrationTarget) -> MigrationResult:
@@ -436,11 +498,20 @@ def run_migration(
     execute: bool = False,
     limit: int | None = None,
     job_ids: set[str] | None = None,
+    evidence_paths: Iterable[str] | None = None,
     continue_on_error: bool = False,
 ) -> list[MigrationResult]:
     root = Path(jobs_root) if jobs_root is not None else settings.data_dir / "jobs"
+    if evidence_paths is not None and limit is not None:
+        raise EvidenceMigrationError(
+            "--limit cannot be combined with exact evidence-path selection"
+        )
     results: list[MigrationResult] = []
-    for target in discover_targets(root, job_ids=job_ids):
+    for target in discover_targets(
+        root,
+        job_ids=job_ids,
+        evidence_paths=evidence_paths,
+    ):
         if limit is not None and len(results) >= limit:
             break
         try:
@@ -880,13 +951,34 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="upload and verify; remove local packages only after database acknowledgement",
     )
     parser.add_argument("--jobs-root", type=Path, help="override <data-dir>/jobs")
-    parser.add_argument("--job-id", action="append", dest="job_ids", help="limit to one job id (repeatable)")
+    parser.add_argument(
+        "--job-id",
+        action="append",
+        dest="job_ids",
+        help="limit to a job id (repeatable unless --evidence-path is used)",
+    )
+    parser.add_argument(
+        "--evidence-path",
+        action="append",
+        dest="evidence_paths",
+        help=(
+            "process one exact evidence path relative to its job root; repeatable "
+            "and requires exactly one --job-id"
+        ),
+    )
     parser.add_argument("--limit", type=int, help="maximum evidence directories to process")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--jsonl", type=Path, help="also append one JSON result per line")
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
+    if args.evidence_paths:
+        if not args.job_ids or len(args.job_ids) != 1:
+            parser.error(
+                "--evidence-path requires exactly one --job-id option"
+            )
+        if args.limit is not None:
+            parser.error("--evidence-path cannot be combined with --limit")
     return args
 
 
@@ -898,6 +990,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         execute=args.execute,
         limit=args.limit,
         job_ids=set(args.job_ids) if args.job_ids else None,
+        evidence_paths=args.evidence_paths,
         continue_on_error=args.continue_on_error,
     )
     jsonl = args.jsonl.open("a", encoding="utf-8") if args.jsonl else None

@@ -25,7 +25,7 @@ import {
   stat,
   unlink,
 } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -182,6 +182,10 @@ function safeRelative(value: unknown, label: string): string {
     text.startsWith("/") ||
     text.includes("\\") ||
     text.includes("\0") ||
+    [...text].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    }) ||
     text.split("/").some((part) => !part || part === "." || part === "..")
   ) {
     throw new Error(`${label} must be a safe relative path`);
@@ -1349,6 +1353,7 @@ export async function discoverEvidenceMigrationReceipts(
   mediaRoot: string,
   opts: {
     jobIds?: ReadonlySet<string>;
+    evidencePaths?: Iterable<string>;
     limit?: number | null;
     readDirectory?: ReadDirectory;
   } = {},
@@ -1364,6 +1369,21 @@ export async function discoverEvidenceMigrationReceipts(
       throw new Error("--job-id must be one path segment");
     return safe;
   });
+  const requestedEvidencePaths = [
+    ...new Set(
+      [...(opts.evidencePaths ?? [])].map((evidencePath) =>
+        safeRelative(evidencePath, "--evidence-path"),
+      ),
+    ),
+  ].sort();
+  if (requestedEvidencePaths.length) {
+    if (requested.length !== 1) {
+      throw new Error("--evidence-path requires exactly one --job-id");
+    }
+    if (limit != null) {
+      throw new Error("--evidence-path cannot be combined with --limit");
+    }
+  }
   let jobRoots: string[];
   if (requested.length) {
     // Never enumerate siblings for an explicit trial/batch selection.
@@ -1419,6 +1439,33 @@ export async function discoverEvidenceMigrationReceipts(
       }
     }
   }
+  if (requestedEvidencePaths.length) {
+    const jobRoot = jobRoots[0]!;
+    const receiptsByEvidencePath = new Map<string, string>();
+    for (const receiptPath of found) {
+      const evidencePath = relative(jobRoot, dirname(receiptPath))
+        .split(sep)
+        .join("/");
+      if (!requestedEvidencePaths.includes(evidencePath)) continue;
+      if (receiptsByEvidencePath.has(evidencePath)) {
+        throw new Error(
+          `--evidence-path resolved more than once: ${evidencePath}`,
+        );
+      }
+      receiptsByEvidencePath.set(evidencePath, receiptPath);
+    }
+    const missing = requestedEvidencePaths.filter(
+      (evidencePath) => !receiptsByEvidencePath.has(evidencePath),
+    );
+    if (missing.length) {
+      throw new Error(
+        `--evidence-path did not resolve in the exact job: ${missing.join(", ")}`,
+      );
+    }
+    return requestedEvidencePaths.map(
+      (evidencePath) => receiptsByEvidencePath.get(evidencePath)!,
+    );
+  }
   return found;
 }
 
@@ -1441,12 +1488,31 @@ async function main(): Promise<number> {
     throw new Error("--limit must be a positive integer");
   }
   const jobIds = new Set<string>();
+  const jobIdArgs: string[] = [];
+  const evidencePaths = new Set<string>();
+  const evidencePathArgs: string[] = [];
   args.forEach((arg, index) => {
-    if (arg === "--job-id") jobIds.add(args[index + 1] ?? "");
+    if (arg === "--job-id") {
+      const jobId = args[index + 1] ?? "";
+      jobIdArgs.push(jobId);
+      jobIds.add(jobId);
+    }
+    if (arg === "--evidence-path") {
+      const evidencePath = args[index + 1] ?? "";
+      evidencePathArgs.push(evidencePath);
+      evidencePaths.add(evidencePath);
+    }
   });
+  if (evidencePathArgs.length && jobIdArgs.length !== 1) {
+    throw new Error("--evidence-path requires exactly one --job-id option");
+  }
+  if (evidencePathArgs.length && limit != null) {
+    throw new Error("--evidence-path cannot be combined with --limit");
+  }
   const mediaRoot = resolve(process.env.MEDIA_DIR ?? "/data/airfoilfoam");
   const receipts = await discoverEvidenceMigrationReceipts(mediaRoot, {
     jobIds,
+    evidencePaths,
     limit,
   });
   const { db, sql, engine } = makeContext();
