@@ -935,6 +935,223 @@ The current product has this authenticated API surface but no `apps/web`
 quarantine list/detail UI. Do not claim a browser UI proof or send an operator
 looking for a page that does not exist.
 
+### C. One incomplete terminal package: immutable forensic quarantine
+
+This path is exceptional and must run before bulk selection when the complete
+read-only gzip scan finds a truncated terminal package. It does not repair the
+package, create a solver result, or register a canonical evidence archive. It
+preserves the exact corrupt gzip and every exact retained/recovered byte in a
+separate content-addressed object under `solver-evidence-partial/v1`, records
+the declared retained/missing partition, and permits local cleanup only after
+an immutable database row and a fresh generation-pinned all-member restore.
+
+Do not use the complete-evidence orphan quarantine for this case. Do not change
+the original manifest, omit missing members, infer AoA from an `aNN` directory,
+or register coefficients/artifacts. A sibling archive may supply a member only
+when that entire donor archive authenticates and the member's path, SHA-256,
+and byte size exactly match the incomplete target's original manifest.
+
+Migration `0077_solver_evidence_incomplete_quarantine.sql` must be applied and
+the matching API/sweeper code must be deployed first. Pin one exact target and
+explicit donor list for all three passes. For the production incident found on
+2026-07-18, `a19` is only the storage directory; the manifest/database map it
+to AoA 14 degrees, and the quarantine intentionally stores no AoA field:
+
+```bash
+PARTIAL_JOB='7dcc7eef17ca4b658fde00720fd6a0ed'
+PARTIAL_TARGET='cases/c0p05_u30/a19/evidence'
+PARTIAL_DONOR='cases/c0p05_u30/a18/evidence'
+PARTIAL_PY_ARGS=(
+  --job-id "$PARTIAL_JOB"
+  --evidence-path "$PARTIAL_TARGET"
+  --donor-evidence-path "$PARTIAL_DONOR"
+)
+PARTIAL_NODE_ARGS=(
+  --job-id "$PARTIAL_JOB"
+  --evidence-path "$PARTIAL_TARGET"
+)
+```
+
+First run the complete read-only analysis. It streams the corrupt source to
+its terminal error, authenticates every donor member, inventories all local
+raw bytes, and builds the conservation plan without writing the target:
+
+```bash
+compose exec -T api python3 -m airfoilfoam.evidence_incomplete_quarantine \
+  "${PARTIAL_PY_ARGS[@]}" \
+  | tee "$AUDIT_DIR/incomplete-quarantine-plan.json"
+
+python3 - "$AUDIT_DIR/incomplete-quarantine-plan.json" <<'PY'
+import json, sys
+row = json.load(open(sys.argv[1], encoding="utf-8"))
+assert row["status"] == "planned-incomplete-quarantine", row
+assert row["jobId"] == "7dcc7eef17ca4b658fde00720fd6a0ed", row
+assert row["evidencePath"] == "cases/c0p05_u30/a19/evidence", row
+assert row["expectedMembers"] == 362, row
+assert row["retainedMembers"] == 347, row
+assert row["missingMembers"] == 15, row
+assert row["retainedMembers"] + row["missingMembers"] == row["expectedMembers"]
+PY
+```
+
+If any count differs, stop and preserve the job unchanged. Capture a new
+read-only incident inventory rather than adjusting the expected counts to make
+the command pass.
+
+Pass 1 creates a deterministic lossless outer tar.zst, restores every package
+member locally, uploads with `ifGenerationMatch=0`, verifies the pinned remote
+generation, writes the distinct remote pointer and an
+`awaiting_database_registration` receipt, and keeps all original/local bytes:
+
+```bash
+compose exec -T api python3 -m airfoilfoam.evidence_incomplete_quarantine \
+  --execute "${PARTIAL_PY_ARGS[@]}" \
+  | tee "$AUDIT_DIR/incomplete-quarantine-pass1.json"
+
+python3 - "$AUDIT_DIR/incomplete-quarantine-pass1.json" <<'PY'
+import json, re, sys
+row = json.load(open(sys.argv[1], encoding="utf-8"))
+assert row["status"] == "awaiting-database-registration", row
+assert (row["expectedMembers"], row["retainedMembers"], row["missingMembers"]) == (362, 347, 15), row
+assert row["objectUri"].startswith(
+    "gs://airfoils-pro-storage-bucket/solver-evidence-partial/v1/sha256/"
+), row
+assert re.fullmatch(r"[1-9][0-9]*", row["generation"]), row
+assert row["verification"].startswith("archive+manifest+all-members-restore:"), row
+PY
+```
+
+Pass 2 registers only the immutable physical blob and incomplete-quarantine
+row. The Node command is deliberately exact-only and defaults to dry-run:
+
+```bash
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/evidence-incomplete-quarantine.ts "${PARTIAL_NODE_ARGS[@]}" \
+  | tee "$AUDIT_DIR/incomplete-quarantine-pass2-plan.json"
+
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/evidence-incomplete-quarantine.ts --execute \
+  "${PARTIAL_NODE_ARGS[@]}" \
+  | tee "$AUDIT_DIR/incomplete-quarantine-pass2.json"
+```
+
+Before pass 3, verify database truth directly. One immutable quarantine row
+must own the exact partial-prefix blob, and this exact evidence path must own no
+canonical artifact or archive. Sibling-angle results under the same outer case
+are allowed and must not be counted as ownership of this path:
+
+```bash
+compose exec -T postgres psql -U aerodb -d aerodb -v ON_ERROR_STOP=1 \
+  -v job_id="$PARTIAL_JOB" -v evidence_path="$PARTIAL_TARGET" \
+  -At <<'SQL' | tee "$AUDIT_DIR/incomplete-quarantine-database-proof.txt"
+WITH q AS (
+  SELECT q.*, b.backend, b.bucket, b.object_key, b.generation,
+         b.compression, b.sha256 AS blob_sha256
+    FROM solver_evidence_incomplete_quarantines q
+    JOIN solver_evidence_blobs b ON b.id = q.blob_id
+   WHERE q.engine_job_id = :'job_id'
+     AND q.evidence_path = :'evidence_path'
+)
+SELECT json_build_object(
+  'rows', (SELECT count(*) FROM q),
+  'retained', (SELECT retained_member_count FROM q),
+  'missing', (SELECT missing_member_count FROM q),
+  'backend', (SELECT backend FROM q),
+  'compression', (SELECT compression FROM q),
+  'objectKey', (SELECT object_key FROM q),
+  'canonicalArtifacts', (
+    SELECT count(*) FROM solver_evidence_artifacts a
+     WHERE a.engine_job_id = :'job_id'
+       AND left(a.storage_key, length('jobs/' || :'job_id' || '/' || :'evidence_path' || '/')) =
+           'jobs/' || :'job_id' || '/' || :'evidence_path' || '/'
+  ),
+  'canonicalArchives', (
+    SELECT count(*) FROM solver_evidence_archives a
+     WHERE a.blob_id = (SELECT blob_id FROM q)
+  )
+);
+SQL
+
+python3 - "$AUDIT_DIR/incomplete-quarantine-database-proof.txt" <<'PY'
+import json, sys
+row = json.loads(open(sys.argv[1], encoding="utf-8").read().strip())
+assert row["rows"] == 1, row
+assert (row["retained"], row["missing"]) == (347, 15), row
+assert row["backend"] == "gcs" and row["compression"] == "zstd", row
+assert row["objectKey"].startswith("solver-evidence-partial/v1/sha256/"), row
+assert row["canonicalArtifacts"] == 0 and row["canonicalArchives"] == 0, row
+PY
+```
+
+Pass 3 revalidates the receipt/pointer/ack identities, performs a fresh pinned
+download, authenticates every member against the retained package manifest,
+then removes only the original gzip, packaged raw directories, and temporary
+local forensic tar.zst. It retains the original/package manifests, remote
+pointer, complete receipt, and database acknowledgement:
+
+```bash
+compose exec -T api python3 -m airfoilfoam.evidence_incomplete_quarantine \
+  --execute "${PARTIAL_PY_ARGS[@]}" \
+  | tee "$AUDIT_DIR/incomplete-quarantine-pass3.json"
+
+compose exec -T api python3 - "$PARTIAL_JOB" "$PARTIAL_TARGET" <<'PY' \
+  | tee "$AUDIT_DIR/incomplete-quarantine-final-proof.json"
+import json, sys
+from pathlib import Path
+
+job_id, evidence_path = sys.argv[1:]
+evidence = Path("/data/airfoilfoam/jobs") / job_id / evidence_path
+receipt = json.loads((evidence / "incomplete_evidence_quarantine.receipt.json").read_text())
+ack = json.loads((evidence / "incomplete_evidence_quarantine.database.json").read_text())
+pointer = json.loads((evidence / "incomplete_evidence_quarantine.remote.json").read_text())
+assert receipt["state"] == "complete", receipt
+assert receipt["databaseAcknowledgement"] == ack, (receipt, ack)
+assert receipt["remote"] == pointer, (receipt, pointer)
+assert (len(receipt["expectedMembers"]), len(receipt["retainedMembers"]), len(receipt["missingMembers"])) == (362, 347, 15)
+for name in (
+    "openfoam_evidence.tar.gz",
+    "engine_evidence.tar.gz",
+    "engine_evidence.tar.zst",
+    "incomplete_evidence_quarantine.tar.zst",
+    "openfoam",
+    "time_directories",
+    "VTK",
+):
+    assert not (evidence / name).exists(), name
+for name in (
+    "evidence_manifest.json",
+    "incomplete_evidence_quarantine.manifest.json",
+    "incomplete_evidence_quarantine.remote.json",
+    "incomplete_evidence_quarantine.receipt.json",
+    "incomplete_evidence_quarantine.database.json",
+):
+    assert (evidence / name).is_file(), name
+print(json.dumps({
+    "state": receipt["state"],
+    "retained": len(receipt["retainedMembers"]),
+    "missing": len(receipt["missingMembers"]),
+    "generation": pointer["generation"],
+}, sort_keys=True))
+PY
+
+# Reparse the completed receipt and prove it still matches the immutable row.
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/evidence-incomplete-quarantine.ts "${PARTIAL_NODE_ARGS[@]}" \
+  | tee "$AUDIT_DIR/incomplete-quarantine-final-database-replay.json"
+
+python3 - "$AUDIT_DIR/incomplete-quarantine-final-database-replay.json" <<'PY'
+import json, sys
+row = json.load(open(sys.argv[1], encoding="utf-8"))
+assert row["status"] == "already-incomplete-quarantined", row
+assert (row["retainedMemberCount"], row["missingMemberCount"]) == (347, 15), row
+PY
+```
+
+Re-run the read-only gzip inventory after this proof. The target is no longer a
+canonical legacy candidate because it retains only distinct partial-quarantine
+control names. Its other complete sibling targets remain ordinary bulk
+migration work.
+
 ## 8. Bulk three-pass migration
 
 Keep the campaign running. The migrator only takes terminal, unlocked jobs and
@@ -2038,10 +2255,13 @@ from pathlib import Path
 
 root = Path("/data/airfoilfoam/jobs")
 states = Counter()
+partial_states = Counter()
 legacy_gzip = 0
 local_zstd = 0
+partial_local_zstd = 0
 packaged_raw = 0
 pointers = 0
+partial_pointers = 0
 unprotected_raw_dirs = 0
 unprotected_raw_bytes = 0
 
@@ -2065,6 +2285,25 @@ for receipt in root.glob("*/cases/**/evidence/storage_migration.json"):
         "openfoam", "time_directories", "VTK"
     ))
 
+for receipt in root.glob(
+    "*/cases/**/evidence/incomplete_evidence_quarantine.receipt.json"
+):
+    row = json.loads(receipt.read_text(encoding="utf-8"))
+    partial_states[str(row.get("state"))] += 1
+    evidence = receipt.parent
+    partial_pointers += int(
+        (evidence / "incomplete_evidence_quarantine.remote.json").is_file()
+    )
+    partial_local_zstd += size(
+        evidence / "incomplete_evidence_quarantine.tar.zst"
+    )
+    legacy_gzip += sum(size(evidence / name) for name in (
+        "engine_evidence.tar.gz", "openfoam_evidence.tar.gz"
+    ))
+    packaged_raw += sum(size(evidence / name) for name in (
+        "openfoam", "time_directories", "VTK"
+    ))
+
 terminal = {"completed", "failed", "cancelled"}
 for job in sorted(path for path in root.iterdir() if path.is_dir()):
     try:
@@ -2078,6 +2317,8 @@ for job in sorted(path for path in root.iterdir() if path.is_dir()):
         protected = any((evidence / name).is_file() for name in (
             "engine_evidence.tar.zst", "engine_evidence.tar.gz",
             "openfoam_evidence.tar.gz", "engine_evidence.remote.json",
+            "incomplete_evidence_quarantine.tar.zst",
+            "incomplete_evidence_quarantine.remote.json",
         ))
         if raw and not protected:
             unprotected_raw_dirs += 1
@@ -2086,9 +2327,12 @@ for job in sorted(path for path in root.iterdir() if path.is_dir()):
 cache = Path("/data/airfoilfoam/evidence-hydration-cache")
 print(json.dumps({
     "receiptStates": dict(states),
+    "partialReceiptStates": dict(partial_states),
     "pointers": pointers,
+    "partialPointers": partial_pointers,
     "legacyGzipBytes": legacy_gzip,
     "localZstdBytes": local_zstd,
+    "partialLocalZstdBytes": partial_local_zstd,
     "packagedRawBytes": packaged_raw,
     "terminalUnprotectedRawDirs": unprotected_raw_dirs,
     "terminalUnprotectedRawBytes": unprotected_raw_bytes,
@@ -2098,9 +2342,11 @@ PY
 ```
 
 Once every migration receipt is complete, `legacyGzipBytes`, `localZstdBytes`,
-and `packagedRawBytes` must be zero. The cache is expected to fluctuate and is
-not canonical evidence. `terminalUnprotectedRawDirs` must also be zero; a
-terminal raw tree with no local archive or verified pointer is evidence that
+`partialLocalZstdBytes`, and `packagedRawBytes` must be zero. Every canonical
+receipt and the one forensic receipt must be `complete`; the pointer counts
+must equal their respective receipt counts. The cache is expected to fluctuate
+and is not canonical evidence. `terminalUnprotectedRawDirs` must also be zero;
+a terminal raw tree with no local archive or verified pointer is evidence that
 cannot be migrated or safely deleted and requires investigation.
 
 ### Database truth
@@ -2131,11 +2377,28 @@ compose exec -T postgres psql -U aerodb -d aerodb -v ON_ERROR_STOP=1 -P pager=of
         WHERE a.state = 'current' AND b.backend = 'gcs'
      ) objects;" \
   | tee -a "$AUDIT_DIR/database-evidence-storage.txt"
+
+compose exec -T postgres psql -U aerodb -d aerodb -v ON_ERROR_STOP=1 -P pager=off -c \
+  "SELECT count(*) AS incomplete_quarantines,
+          sum(expected_member_count) AS expected_members,
+          sum(retained_member_count) AS retained_members,
+          sum(missing_member_count) AS missing_members,
+          count(*) FILTER (
+            WHERE b.object_key LIKE 'solver-evidence-partial/v1/sha256/%'
+              AND b.backend = 'gcs'
+              AND b.compression = 'zstd'
+          ) AS exact_partial_blobs
+     FROM solver_evidence_incomplete_quarantines q
+     JOIN solver_evidence_blobs b ON b.id = q.blob_id;" \
+  | tee -a "$AUDIT_DIR/database-evidence-storage.txt"
 ```
 
 Every final migration receipt has already validated one exact current GCS
 archive and all of its registered members. Any receipt left in
 `awaiting_database_registration` is incomplete work, not reclaimed storage.
+For the 2026-07-18 corpus, the incomplete-quarantine query must report exactly
+one row, 362 expected members, 347 retained members, 15 missing members, and
+one exact partial-prefix blob.
 
 ### GCS, disk, cache, and logs
 
@@ -2147,6 +2410,11 @@ gcloud storage du --summarize "gs://$BUCKET/$OBJECT_PREFIX" \
 gcloud storage ls --recursive "gs://$BUCKET/$OBJECT_PREFIX" \
   | tee "$AUDIT_DIR/gcs-objects.txt" | wc -l \
   | tee "$AUDIT_DIR/gcs-object-count.txt"
+gcloud storage du --summarize "gs://$BUCKET/solver-evidence-partial/v1" \
+  | tee "$AUDIT_DIR/gcs-partial-bytes.txt"
+gcloud storage ls --recursive "gs://$BUCKET/solver-evidence-partial/v1" \
+  | tee "$AUDIT_DIR/gcs-partial-objects.txt" | wc -l \
+  | tee "$AUDIT_DIR/gcs-partial-object-count.txt"
 
 df -B1 "$APP_DIR" | tee "$AUDIT_DIR/disk-after.txt"
 compose exec -T api du -sb /data/airfoilfoam/evidence-hydration-cache \

@@ -238,6 +238,20 @@ repeated S1223 work was deterministic waste, not transient solver recovery.
   resume the old campaign. The running sweeper process is currently limited to
   repair/reconciliation by `sweeper_state.enabled=false`.
 
+Fresh strongly verified post-GCS-cycle-4/pre-0077 backup retained on the VPS
+and copied to `/tmp/airfoils-prod-backups` locally:
+
+- Container: `11bdf1c7443dbe16f5c974be430d8c9624a6819b7e322103f75230944aba1f1d`
+- Dump: `/opt/airfoils-pro/.codex-db-backups/app-postgres-1-aerodb-20260718T145950Z-3c481b12.dump`
+- Bytes: `300,341,352`
+- SHA-256: `d69f0291940195f293bdc15df6ccca28d1ed7991a0ee5e41b25e559ef25c38f3`
+- The v2.1 backup helper locked the exact immutable container id and strongly
+  verified the custom-format database dump at `2026-07-18T15:04:02Z` by
+  restoring it into a scratch database, matching all 83 tables, 1 sequence,
+  0 views, and 17 functions, and removing the scratch database. The dump and
+  verification-bearing manifest are mode `0600`; both backup directories are
+  mode `0700`.
+
 Fresh verified post-0057/post-backfill backup retained on the VPS and copied to
 `/tmp/airfoils-prod-backups` locally:
 

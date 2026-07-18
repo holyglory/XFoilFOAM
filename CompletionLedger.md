@@ -17,12 +17,19 @@
 
 - **GCS Zstandard evidence migration:** Remote-only Zstandard finalization and
   verified restore are live, but the legacy corpus migration and local
-  reclamation are incomplete. Continue one protected terminal job at a time,
-  delete local raw/archive duplicates only after exact remote verification,
-  and report final object/evidence counts and reclaimed bytes. Add a distinct
+  reclamation are incomplete. Keep the remaining 2,987 normal migration targets
+  unresolved and continue them one protected terminal job at a time. The one
+  AG26 a19 (manifest/DB AoA 14°) target has incomplete/corrupt terminal
+  packaging and remains a separate unresolved blob-only forensic quarantine.
+  Preserve its exact original gzip/raw bytes unchanged inside a lossless outer tar.zst,
+  together with retained/sibling-derived/missing conservation, until the new
+  quarantine has an exact database acknowledgement and a fresh pinned restore.
+  Delete local raw/archive duplicates only after their applicable proof and
+  report final object/evidence counts and reclaimed bytes. Add a distinct
   attestation-backed cleanup for canary-only archives that have no canonical
-  database owner; never invent an acknowledgement or register canary evidence
-  as campaign data.
+  database owner; never invent an acknowledgement or member, repair a partial
+  package into canonical evidence, or register canary/quarantine bytes as
+  campaign data.
 
 - **Production evidence capacity:** The 500 GiB VPS currently has about
   113 GiB free (77% used). Preserve at least 80 GiB free while the campaign is

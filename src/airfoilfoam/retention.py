@@ -60,6 +60,7 @@ import json
 import os
 import shutil
 import tarfile
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -71,6 +72,7 @@ import zstandard
 from .evidence_store import (
     MAX_EVIDENCE_MANIFEST_BYTES,
     EvidenceStoreError,
+    extract_verified_evidence_archive,
     read_remote_pointer,
 )
 
@@ -112,6 +114,11 @@ _EVIDENCE_KEEP_NAMES = {
     "engine_evidence.remote.json",
     "storage_migration.json",
     "storage_migration.database.json",
+    "incomplete_evidence_quarantine.tar.zst",
+    "incomplete_evidence_quarantine.remote.json",
+    "incomplete_evidence_quarantine.manifest.json",
+    "incomplete_evidence_quarantine.receipt.json",
+    "incomplete_evidence_quarantine.database.json",
     "VTK",
     "openfoam",
     "time_directories",
@@ -119,10 +126,16 @@ _EVIDENCE_KEEP_NAMES = {
     "scaled_media",
     "custom_renders",
 }
+_LOCAL_EVIDENCE_ARCHIVES = (
+    ("engine_evidence.tar.zst", "zstd"),
+    ("engine_evidence.tar.gz", "gzip"),
+    ("openfoam_evidence.tar.gz", "gzip"),
+)
+_RETENTION_VERIFY_ONLY_PREFIX = "__retention_verify_only__"
 
 
 class JobRetentionRefused(RuntimeError):
-    """Raised when a job may still be executing and retention must not mutate it."""
+    """Raised when retention cannot prove that mutating a job is safe."""
 
 
 @dataclass
@@ -188,6 +201,9 @@ def strip_job_dir(job_root: Path, keep_case_state: bool = False) -> StripReport:
                 no_op=True,
                 marker_path=str(marker),
             )
+
+        if not keep_case_state:
+            _require_full_strip_archive_integrity(job_root)
 
         report = StripReport(job_id=job_root.name, kept_case_state=keep_case_state, marker_path=str(marker))
 
@@ -272,6 +288,87 @@ def _write_marker(marker: Path, keep_case_state: bool, report: StripReport) -> N
         "dirs_removed": report.dirs_removed,
     }
     marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _require_full_strip_archive_integrity(job_root: Path) -> None:
+    """Authenticate local evidence before removing any restartable state.
+
+    A completed job can retain its only trustworthy copy of mesh, dictionaries,
+    logs, fields, and force history in a local gzip or Zstandard bundle.  A
+    filename is not proof that the bundle survived finalization intact.  Full
+    strip therefore preflights *all* applicable evidence directories before it
+    removes the shared mesh or any live case state.
+
+    The existing verified extractor streams every archive member and checks it
+    against the bundled manifest.  A deliberately impossible include prefix
+    materializes only ``evidence_manifest.json`` in a temporary directory; the
+    remaining members are still read and authenticated without being written.
+    Any one valid local archive is sufficient, preserving mixed legacy/current
+    migration layouts while failing closed when every local copy is corrupt.
+    """
+
+    for manifest_path in sorted(job_root.rglob("evidence_manifest.json")):
+        evidence_dir = manifest_path.parent
+        candidates = [
+            (evidence_dir / name, compression)
+            for name, compression in _LOCAL_EVIDENCE_ARCHIVES
+            if (evidence_dir / name).exists()
+            or (evidence_dir / name).is_symlink()
+        ]
+        if not candidates:
+            continue
+        try:
+            if manifest_path.is_symlink() or not manifest_path.is_file():
+                raise OSError("manifest is not a regular local file")
+            if manifest_path.stat().st_size > MAX_EVIDENCE_MANIFEST_BYTES:
+                raise OSError(
+                    "manifest exceeds the permitted "
+                    f"{MAX_EVIDENCE_MANIFEST_BYTES}-byte size"
+                )
+            manifest_bytes = manifest_path.read_bytes()
+        except OSError as exc:
+            relative = _relative_retention_path(job_root, evidence_dir)
+            raise JobRetentionRefused(
+                f"full strip refused for {relative}: cannot authenticate the "
+                f"local evidence manifest: {exc}"
+            ) from exc
+
+        failures: list[str] = []
+        verified = False
+        for archive_path, compression in candidates:
+            try:
+                if archive_path.is_symlink() or not archive_path.is_file():
+                    raise OSError("archive is not a regular local file")
+                with tempfile.TemporaryDirectory(
+                    prefix="airfoilfoam-retention-verify-"
+                ) as temporary:
+                    extract_verified_evidence_archive(
+                        archive_path,
+                        Path(temporary) / "manifest-only",
+                        compression=compression,
+                        include_prefixes=(_RETENTION_VERIFY_ONLY_PREFIX,),
+                        expected_manifest=manifest_bytes,
+                    )
+                verified = True
+                break
+            except (EvidenceStoreError, OSError, ValueError) as exc:
+                failures.append(f"{archive_path.name}: {exc}")
+
+        if not verified:
+            relative = _relative_retention_path(job_root, evidence_dir)
+            detail = "; ".join(failures)
+            raise JobRetentionRefused(
+                f"full strip refused for {relative}: no local evidence archive "
+                f"streamed and authenticated every bundled manifest member"
+                + (f" ({detail})" if detail else "")
+            )
+
+
+def _relative_retention_path(job_root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(job_root))
+    except ValueError:
+        return str(path)
 
 
 @contextmanager

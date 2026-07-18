@@ -2060,6 +2060,161 @@ export const solverEvidenceOrphanQuarantines = pgTable(
   }),
 );
 
+/**
+ * Immutable preservation record for a terminal solver evidence directory whose
+ * original package is incomplete and therefore cannot be registered as a
+ * canonical engine bundle.  The forensic package is intentionally linked only
+ * to its physical GCS blob: it owns no result, result attempt, AoA, evidence
+ * artifact, or solver-evidence archive.
+ */
+export const solverEvidenceIncompleteQuarantines = pgTable(
+  "solver_evidence_incomplete_quarantines",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references((): AnyPgColumn => simJobs.id),
+    engineJobId: text("engine_job_id").notNull(),
+    engineCaseSlug: text("engine_case_slug").notNull(),
+    evidencePath: text("evidence_path").notNull(),
+    quarantineReason: text("quarantine_reason")
+      .notNull()
+      .default("terminal_uningested_incomplete_archive"),
+    blobId: uuid("blob_id")
+      .notNull()
+      .references(() => solverEvidenceBlobs.id),
+    originalManifestSha256: text("original_manifest_sha256").notNull(),
+    originalManifestByteSize: bigint("original_manifest_byte_size", {
+      mode: "number",
+    }).notNull(),
+    expectedMemberSetSha256: text("expected_member_set_sha256").notNull(),
+    expectedMemberCount: integer("expected_member_count").notNull(),
+    retainedMemberSetSha256: text("retained_member_set_sha256").notNull(),
+    retainedMemberCount: integer("retained_member_count").notNull(),
+    missingMemberSetSha256: text("missing_member_set_sha256").notNull(),
+    missingMemberCount: integer("missing_member_count").notNull(),
+    expectedMembers: jsonb("expected_members")
+      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
+      .notNull(),
+    retainedMembers: jsonb("retained_members")
+      .$type<
+        Array<{
+          path: string;
+          sha256: string;
+          byteSize: number;
+          packagePath: string;
+          sources: Array<
+            | { kind: "local_raw"; sourcePath: string }
+            | {
+                kind: "corrupt_archive_member" | "sibling_archive_member";
+                sourceArchiveSha256: string;
+                memberPath: string;
+              }
+          >;
+        }>
+      >()
+      .notNull(),
+    missingMembers: jsonb("missing_members")
+      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
+      .notNull(),
+    sourceArchives: jsonb("source_archives")
+      .$type<
+        Array<{
+          role: "corrupt_original" | "recovery_sibling";
+          jobId: string;
+          evidencePath: string;
+          path: string;
+          compression: "gzip" | "zstd";
+          sha256: string;
+          byteSize: number;
+          integrity: "truncated" | "verified_complete";
+          packagePath?: string;
+          readableTarByteSize?: number;
+          terminalError?: string;
+          uncompressedTarSha256?: string;
+          uncompressedTarByteSize?: number;
+        }>
+      >()
+      .notNull(),
+    packageManifestSha256: text("package_manifest_sha256").notNull(),
+    packageManifestByteSize: bigint("package_manifest_byte_size", {
+      mode: "number",
+    }).notNull(),
+    packageMemberSetSha256: text("package_member_set_sha256").notNull(),
+    packageMemberCount: integer("package_member_count").notNull(),
+    packageMembers: jsonb("package_members")
+      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
+      .notNull(),
+    migrationReceiptSha256: text("migration_receipt_sha256").notNull(),
+    migrationReceiptByteSize: bigint("migration_receipt_byte_size", {
+      mode: "number",
+    }).notNull(),
+    verificationMode: text("verification_mode").notNull(),
+    remoteVerifiedAt: ts().notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    jobEvidenceUq: unique(
+      "solver_evidence_incomplete_quarantines_job_evidence_uq",
+    ).on(t.engineJobId, t.evidencePath),
+    blobUq: unique("solver_evidence_incomplete_quarantines_blob_uq").on(
+      t.blobId,
+    ),
+    simJobIdx: index(
+      "solver_evidence_incomplete_quarantines_sim_job_idx",
+    ).on(t.simJobId),
+    createdIdx: index(
+      "solver_evidence_incomplete_quarantines_created_idx",
+    ).on(t.createdAt),
+    jobIdCheck: check(
+      "solver_evidence_incomplete_quarantines_job_id_check",
+      sql`btrim(${t.engineJobId}) <> '' AND ${t.engineJobId} !~ '[/\\\\]'`,
+    ),
+    caseSlugCheck: check(
+      "solver_evidence_incomplete_quarantines_case_slug_check",
+      sql`btrim(${t.engineCaseSlug}) <> '' AND ${t.engineCaseSlug} !~ '[/\\\\]' AND ${t.engineCaseSlug} NOT IN ('.', '..')`,
+    ),
+    evidencePathCheck: check(
+      "solver_evidence_incomplete_quarantines_evidence_path_check",
+      sql`btrim(${t.evidencePath}) <> '' AND ${t.evidencePath} NOT LIKE '/%' AND ${t.evidencePath} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.evidencePath}) = 0`,
+    ),
+    reasonCheck: check(
+      "solver_evidence_incomplete_quarantines_reason_check",
+      sql`${t.quarantineReason} = 'terminal_uningested_incomplete_archive'`,
+    ),
+    identityChecks: check(
+      "solver_evidence_incomplete_quarantines_identity_checks",
+      sql`${t.originalManifestSha256} ~ '^[0-9a-f]{64}$'
+        AND ${t.originalManifestByteSize} > 0
+        AND ${t.expectedMemberSetSha256} ~ '^[0-9a-f]{64}$'
+        AND ${t.retainedMemberSetSha256} ~ '^[0-9a-f]{64}$'
+        AND ${t.missingMemberSetSha256} ~ '^[0-9a-f]{64}$'
+        AND ${t.packageManifestSha256} ~ '^[0-9a-f]{64}$'
+        AND ${t.packageManifestByteSize} > 0
+        AND ${t.packageMemberSetSha256} ~ '^[0-9a-f]{64}$'
+        AND ${t.migrationReceiptSha256} ~ '^[0-9a-f]{64}$'
+        AND ${t.migrationReceiptByteSize} > 0`,
+    ),
+    countChecks: check(
+      "solver_evidence_incomplete_quarantines_count_checks",
+      sql`${t.expectedMemberCount} > 0
+        AND ${t.retainedMemberCount} >= 0
+        AND ${t.missingMemberCount} >= 0
+        AND ${t.expectedMemberCount} = ${t.retainedMemberCount} + ${t.missingMemberCount}
+        AND ${t.packageMemberCount} > 0`,
+    ),
+    jsonChecks: check(
+      "solver_evidence_incomplete_quarantines_json_checks",
+      sql`jsonb_typeof(${t.expectedMembers}) = 'array'
+        AND jsonb_typeof(${t.retainedMembers}) = 'array'
+        AND jsonb_typeof(${t.missingMembers}) = 'array'
+        AND jsonb_typeof(${t.sourceArchives}) = 'array'
+        AND jsonb_array_length(${t.sourceArchives}) > 0
+        AND jsonb_typeof(${t.packageMembers}) = 'array'`,
+    ),
+  }),
+);
+
 export const fieldRenderCache = pgTable(
   "field_render_cache",
   {
@@ -4738,6 +4893,8 @@ export type SolverEvidenceArtifactMember =
   typeof solverEvidenceArtifactMembers.$inferSelect;
 export type SolverEvidenceOrphanQuarantine =
   typeof solverEvidenceOrphanQuarantines.$inferSelect;
+export type SolverEvidenceIncompleteQuarantine =
+  typeof solverEvidenceIncompleteQuarantines.$inferSelect;
 export type FieldRenderCache = typeof fieldRenderCache.$inferSelect;
 export type ForceHistoryRow = typeof forceHistory.$inferSelect;
 export type ResultClassification = typeof resultClassifications.$inferSelect;

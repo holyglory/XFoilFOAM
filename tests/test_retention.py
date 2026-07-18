@@ -5,6 +5,8 @@ import shutil
 import fcntl
 import base64
 import hashlib
+import io
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,10 @@ from fastapi.testclient import TestClient
 import airfoilfoam.pipeline as pipeline
 from airfoilfoam.api.main import app
 from airfoilfoam.config import Settings, get_settings
-from airfoilfoam.evidence_store import extract_verified_evidence_archive
+from airfoilfoam.evidence_store import (
+    extract_verified_evidence_archive,
+    transcode_gzip_tar_to_zst,
+)
 from airfoilfoam.models import CaseSpec
 from airfoilfoam.pipeline import CaseOutcome
 from airfoilfoam.retention import JobRetentionRefused, delete_job_dir, strip_job_dir
@@ -28,6 +33,25 @@ def _write(path: Path, payload: bytes = b"x" * 17) -> Path:
 def _write_json(path: Path, payload: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_gzip_evidence_archive(
+    path: Path,
+    manifest: Path,
+    members: dict[str, bytes],
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    archived = {
+        "evidence_manifest.json": manifest.read_bytes(),
+        **members,
+    }
+    with tarfile.open(path, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+        for name, payload in archived.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(payload))
     return path
 
 
@@ -68,11 +92,6 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
     frame_png = _write(segment / "frames" / "vorticity" / "f0000.png", b"\x89PNG\r\n\x1a\nframe")
 
     evidence = segment / "evidence"
-    manifest = _write_json(
-        evidence / "evidence_manifest.json",
-        {"windowStart": 1.0, "windowEnd": 2.0, "bundleExcludes": ["frames"]},
-    )
-    bundle = _write(evidence / "openfoam_evidence.tar.gz", b"bundle")
     scaled = _write(evidence / "scaled_media" / "default_v1" / "v1" / "pressure.png", b"\x89PNG scaled")
     custom = _write(evidence / "custom_renders" / "hash" / "pressure.png", b"\x89PNG custom")
     rerender_vtk = _write(evidence / "VTK" / "window.vtu", b"vtk-window")
@@ -80,6 +99,43 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
     archived_frame = _write(evidence / "frames" / "vorticity" / "f0000.png", b"\x89PNG archived-frame")
     redundant_openfoam = _write(evidence / "openfoam" / "system" / "controlDict", b"redundant-control")
     redundant_time = _write(evidence / "time_directories" / "141" / "U", b"redundant-time")
+    incomplete_quarantine_controls = [
+        _write(evidence / name, f"retained-{name}".encode("utf-8"))
+        for name in (
+            "incomplete_evidence_quarantine.tar.zst",
+            "incomplete_evidence_quarantine.remote.json",
+            "incomplete_evidence_quarantine.manifest.json",
+            "incomplete_evidence_quarantine.receipt.json",
+            "incomplete_evidence_quarantine.database.json",
+        )
+    ]
+    archive_members = {
+        "VTK/window.vtu": rerender_vtk.read_bytes(),
+        "VTK/window.series": rerender_series.read_bytes(),
+        "openfoam/system/controlDict": redundant_openfoam.read_bytes(),
+        "time_directories/141/U": redundant_time.read_bytes(),
+    }
+    manifest = _write_json(
+        evidence / "evidence_manifest.json",
+        {
+            "windowStart": 1.0,
+            "windowEnd": 2.0,
+            "bundleExcludes": ["frames"],
+            "files": [
+                {
+                    "path": name,
+                    "byteSize": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+                for name, payload in archive_members.items()
+            ],
+        },
+    )
+    bundle = _write_gzip_evidence_archive(
+        evidence / "openfoam_evidence.tar.gz",
+        manifest,
+        archive_members,
+    )
 
     unknown_path = None
     if unknown:
@@ -99,6 +155,7 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
         "archived_frame": archived_frame,
         "redundant_openfoam": redundant_openfoam,
         "redundant_time": redundant_time,
+        "incomplete_quarantine_controls": incomplete_quarantine_controls,
         "mesh_evidence": mesh_evidence,
         "unknown": unknown_path,
     }
@@ -168,6 +225,8 @@ def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
         "archived_frame",
     ):
         assert paths[key].is_file(), key
+    for control in paths["incomplete_quarantine_controls"]:
+        assert control.is_file(), control
 
 
 def test_finished_urans_archives_immutable_transient_markers_before_full_strip(
@@ -447,7 +506,7 @@ def test_mismatched_remote_pointer_never_authorizes_evidence_deletion(tmp_path: 
 
 
 @pytest.mark.parametrize("bundle_bytes", [b"", b"truncated-not-a-tar"])
-def test_invalid_local_bundle_never_authorizes_packaged_evidence_deletion(
+def test_invalid_local_bundle_refuses_full_strip_before_mutation(
     tmp_path: Path,
     bundle_bytes: bytes,
 ) -> None:
@@ -455,12 +514,118 @@ def test_invalid_local_bundle_never_authorizes_packaged_evidence_deletion(
     paths = _make_realistic_job(job_root)
     paths["bundle"].write_bytes(bundle_bytes)
 
-    strip_job_dir(job_root)
+    with pytest.raises(JobRetentionRefused, match="no local evidence archive"):
+        strip_job_dir(job_root)
 
+    assert (job_root / "meshes" / "c1" / "constant" / "polyMesh" / "points").is_file()
+    assert (paths["case"] / "141" / "U").is_file()
     assert paths["bundle"].is_file()
     assert paths["rerender_vtk"].is_file()
     assert paths["redundant_openfoam"].is_file()
     assert paths["redundant_time"].is_file()
+    assert not (job_root / ".stripped.json").exists()
+
+
+def test_truncated_production_style_gzip_preserves_all_live_and_raw_evidence(
+    tmp_path: Path,
+) -> None:
+    """MUST-CATCH: job 7dcc.../a19 had a present but truncated gzip.
+
+    Retention must authenticate the bundle before its first removal.  Keeping
+    only the corrupt archive after deleting the shared mesh and live case would
+    make the completed result neither reproducible nor continuable.
+    """
+
+    job_root = tmp_path / "7dcc-retention-regression"
+    paths = _make_realistic_job(job_root)
+    case = paths["case"]
+    (case / "a0").rename(case / "a19")
+    evidence = case / "a19" / "evidence"
+    gzip_archive = evidence / "openfoam_evidence.tar.gz"
+    complete_bundle = gzip_archive.read_bytes()
+    truncated_bundle = complete_bundle[:-8]
+    gzip_archive.write_bytes(truncated_bundle)
+
+    with pytest.raises(JobRetentionRefused, match="no local evidence archive"):
+        strip_job_dir(job_root)
+
+    # Shared mesh and the complete live solver state survive the failed proof.
+    assert (job_root / "meshes" / "c1" / "constant" / "polyMesh" / "points").is_file()
+    for relative in (
+        "0/U",
+        "141/U",
+        "3.5/p",
+        "constant/polyMesh/points",
+        "system/controlDict",
+        "postProcessing/forceCoeffs1/0/coefficient.dat",
+        "VTK/case.vtu",
+        "processor0/141/U",
+        "log.simpleFoam",
+    ):
+        assert (case / relative).is_file(), relative
+
+    # The corrupt source and every unpacked raw/rerender source also survive.
+    assert gzip_archive.read_bytes() == truncated_bundle
+    for relative in (
+        "VTK/window.vtu",
+        "VTK/window.series",
+        "openfoam/system/controlDict",
+        "time_directories/141/U",
+    ):
+        assert (evidence / relative).is_file(), relative
+    assert not (job_root / ".stripped.json").exists()
+
+
+def test_one_valid_alternate_archive_allows_full_strip(tmp_path: Path) -> None:
+    job_root = tmp_path / "job-valid-alternate-archive"
+    paths = _make_realistic_job(job_root)
+    evidence = paths["case"] / "a0" / "evidence"
+    transcode_gzip_tar_to_zst(
+        paths["bundle"],
+        evidence / "engine_evidence.tar.zst",
+    )
+    paths["bundle"].write_bytes(paths["bundle"].read_bytes()[:-8])
+
+    report = strip_job_dir(job_root)
+
+    assert report.unknown_entries == []
+    assert not (job_root / "meshes").exists()
+    assert (job_root / ".stripped.json").is_file()
+
+
+def test_every_evidence_directory_passes_before_full_strip_mutates_job(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "job-one-corrupt-segment"
+    paths = _make_realistic_job(job_root)
+    case = paths["case"]
+    shutil.copytree(case / "a0", case / "a1")
+    corrupt = case / "a1" / "evidence" / "openfoam_evidence.tar.gz"
+    corrupt.write_bytes(corrupt.read_bytes()[:-8])
+
+    with pytest.raises(JobRetentionRefused, match="cases/c1_u25/a1/evidence"):
+        strip_job_dir(job_root)
+
+    assert (job_root / "meshes" / "c1" / "constant" / "polyMesh" / "points").is_file()
+    assert (case / "141" / "U").is_file()
+    assert paths["bundle"].is_file()
+    assert corrupt.is_file()
+    assert not (job_root / ".stripped.json").exists()
+
+
+def test_case_state_strip_does_not_require_complete_local_archive(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "job-keep-state-corrupt-bundle"
+    paths = _make_realistic_job(job_root)
+    paths["bundle"].write_bytes(paths["bundle"].read_bytes()[:-8])
+
+    report = strip_job_dir(job_root, keep_case_state=True)
+
+    assert report.kept_case_state is True
+    assert (job_root / "meshes").is_dir()
+    assert (paths["case"] / "141" / "U").is_file()
+    assert paths["bundle"].is_file()
 
 
 def test_strip_idempotency_uses_marker(tmp_path: Path):

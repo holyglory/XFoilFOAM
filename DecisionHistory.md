@@ -39,7 +39,37 @@
   active solve state and bounded temporary render hydration. Complete solver
   evidence is conserved, local raw VTK is removed only after verified remote
   restore, and production uses attached workload identity rather than exported
-  credentials. [D-2026-07-15-gcs-zstd-evidence]
+  credentials. Full retention fails closed before deleting live mesh/state,
+  and incomplete terminal packaging is preserved as immutable forensic blobs,
+  never reinterpreted as canonical solver evidence.
+  [D-2026-07-15-gcs-zstd-evidence]
+  [D-2026-07-18-incomplete-evidence-quarantine]
+
+## D-2026-07-18-incomplete-evidence-quarantine — Corrupt terminal packaging remains forensic, not solver evidence
+
+Detail: [DecisionDetails/D-2026-07-18-incomplete-evidence-quarantine.md](DecisionDetails/D-2026-07-18-incomplete-evidence-quarantine.md)
+
+- Decision: before a full retention pass deletes any shared mesh or live case
+  state, preflight the whole job and require every protected evidence directory
+  with a sidecar manifest and local gzip/Zstandard candidates to retain at
+  least one candidate that streams completely and authenticates every bundled
+  manifest member. Preserve an incomplete or corrupt terminal package in a
+  separate immutable blob-only forensic quarantine: exact original bytes,
+  exact retained/sibling-derived/missing member conservation, content and
+  generation identity, database acknowledgement, and a fresh pinned restore
+  precede local cleanup. Its tar.zst is a lossless outer envelope that keeps
+  original gzip bytes unchanged, not a repaired canonical bundle; an exact
+  sibling member is allowed only with byte-identity proof and provenance. It
+  has no result/attempt ownership and cannot feed polars, rendering, or the
+  complete-evidence orphan path; a later rerun is a distinct generation.
+- Why: shrinking the manifest or repacking only retained members would rewrite
+  the incident and falsely manufacture complete evidence; widening the
+  complete orphan-evidence table would erase the contract boundary between an
+  authentic archive and partial forensic material; rerunning alone may recover
+  a coefficient but discards the original failure bytes needed to diagnose and
+  prevent recurrence. Fail-closed retention plus byte-exact quarantine and no
+  invented members preserve both solver truth and incident evidence without
+  inventing a result.
 
 ## D-2026-07-16-preliminary-urans-reliability — Every point follows one automatic fidelity sequence
 

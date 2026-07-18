@@ -540,6 +540,20 @@
       "when": 1787443200000,
       "tag": "0076_exact_urans_continuation_attempt",
       "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "7",
+      "when": 1787529600000,
+      "tag": "0077_solver_evidence_incomplete_quarantine",
+      "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "7",
+      "when": 1787616000000,
+      "tag": "0078_incomplete_quarantine_durable_guards",
+      "breakpoints": true
     }
   ]
 }

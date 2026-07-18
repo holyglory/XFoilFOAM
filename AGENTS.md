@@ -279,6 +279,26 @@
   dictionaries, logs/stdout/stderr, force coefficients, y+ output when present,
   selected RANS latest time or exact URANS integer-period window, and VTU/VTK
   field exports.
+- Full retention must preflight the entire job before its first deletion. Every
+  local archive candidate relied on to protect an evidence directory must
+  stream to end-of-file and authenticate every bundled manifest member; every
+  evidence directory with a sidecar manifest and local gzip/Zstandard
+  candidate set must retain at least one such complete proof. If any directory
+  has no authenticated candidate, keep its shared mesh, live solver state,
+  archive bytes, and unpacked raw evidence and refuse the full strip.
+- Incomplete or corrupt terminal packaging is forensic material, never
+  canonical solver evidence. Preserve the exact original blobs in a separate
+  immutable blob-only quarantine. A forensic tar.zst is only a lossless outer
+  envelope: original gzip/raw blob bytes remain unchanged and are not repacked
+  as a canonical evidence archive. Conserve and record manifest-declared,
+  original-retained, exact sibling-derived, and missing members; a sibling may
+  supply a member only when its bytes match the declared size/hash exactly and
+  its source provenance is retained. Never shrink the manifest, invent a
+  placeholder, repack a subset as complete, or widen complete-evidence orphan
+  ownership. Local cleanup requires an exact database acknowledgement plus a
+  fresh generation-pinned restore of every quarantined blob. A corrective
+  rerun is a separate result generation and must not replace or mutate the
+  incident bytes.
 - Result media is a stored artifact, not an on-open side effect. Solver
   finalization must render and persist the default media for every supported
   evidence-backed field. Detail dialogs, Browse/Search/Compare surfaces, and
